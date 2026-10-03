@@ -304,17 +304,22 @@ Finite budgets and callers without that ledger keep their existing stale-lease b
 successors replay for free even if the caller later lowers its cap. Interruptions count toward
 the same three-generation ceiling; an exhausted cell remains invalid.
 
-Without a retained whole-cell reservation, interrupted ancestors leave aggregate simulation
-spend and total execution cost unknown. Their lineage and receipts are still verified. Valid
-successor rollouts determine report costs. A completed report may replay under a lower cap;
-missing judgments with that unknown prior liability require explicit uncapped authorization.
+An unbounded paid-response liability, or an interrupted ancestor without a retained whole-cell
+reservation, leaves aggregate simulation spend and total execution cost unknown. A numeric
+reservation estimate is not a verified upper bound. Lineage and receipts are still verified,
+and valid successor rollouts determine report costs. A completed report may replay under a lower
+cap; missing judgments with unknown prior liability require explicit uncapped authorization.
+Invalid usage remains nonretryable even when its owning receipt records unbounded liability.
 
-A Chat response with retained `finish_reason="length"` whose tool arguments end inside JSON
-raises `ProviderTruncatedResponseError`. EOF or an unterminated string is required; a length
-label alone does not upgrade structural tool errors or malformed complete values. This error
-never retries the HTTP request. Explicitly uncapped evaluations may instead use the same bounded
-fresh-generation policy, retaining prior raw receipts and invalid evidence. Malformed ordinary
-stop responses keep their existing behavior, and a valid length response retains its length flag.
+A Chat response with retained `finish_reason="length"` whose tool arguments form an unfinished
+JSON object prefix raises `ProviderTruncatedResponseError`. Partial strings, literals, numbers
+and Unicode escapes qualify only when the preceding grammar is valid. A length label alone does
+not upgrade structural tool errors or malformed complete values. This error never retries the
+HTTP request. Catalog-backed evaluation saves the decoded HTTP body before rejection; exact
+replay raises from that saved body without contacting the provider. Explicitly uncapped
+evaluations may instead use the same bounded fresh-generation policy, retaining prior raw
+receipts and invalid evidence. Malformed ordinary stop responses keep their existing behavior,
+and a valid length response retains its length flag.
 
 ## OpenAI-compatible listing metadata
 

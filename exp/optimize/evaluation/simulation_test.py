@@ -1,9 +1,7 @@
 """Fresh rollout generations preserve paid responses and unknown pricing evidence."""
 
 import json
-from collections.abc import Mapping
 from pathlib import Path
-from typing import cast
 
 import pytest
 
@@ -15,15 +13,10 @@ from exp.common.project import ProjectStore
 from exp.common.project.request_budget import RequestBudgetStore
 from exp.common.rollouts import StopReason
 from exp.optimize.evaluation.simulation import run_or_load_simulation
+from exp.optimize.evaluation.spending import BudgetedCompletion
 from exp.runtime.models.budget import RequestBudget
-from exp.runtime.models.providers.errors import (
-    ProviderPricingUnavailableError,
-    ProviderTruncatedResponseError,
-)
-from exp.runtime.models.providers.openai_compatible import (
-    OpenAICompatibleClient,
-    openai_compatible_response,
-)
+from exp.runtime.models.providers.errors import ProviderPricingUnavailableError
+from exp.runtime.models.providers.openai_compatible import OpenAICompatibleClient
 from exp.runtime.models.providers.transport import (
     JsonHttpResponse,
     RetryPolicy,
@@ -35,6 +28,7 @@ from exp.simulation.engines.text.resume import MAXIMUM_CELL_ATTEMPTS
 from exp.simulation.engines.text.simulator import WorldModelSimulator
 from exp.simulation.engines.text.simulator_test import (
     _cell,
+    _completion_reservation,
     _persist_completion_contract,
     _persist_plan,
     _persist_task_set,
@@ -535,12 +529,11 @@ def test_uncapped_interrupted_cells_preserve_receipts_and_retry_fresh_generation
     assert len(client.requests) == min(interruptions + 1, MAXIMUM_CELL_ATTEMPTS)
 
 
-class _DurableTruncatedTransport(ScriptedJsonTransport):
-    """Retain raw HTTP 200 bodies before the actual provider parser rejects a tool fragment."""
+class _TruncatedTransport(ScriptedJsonTransport):
+    """Supply paid HTTP bodies while the real completion wrapper owns their persistence."""
 
-    def __init__(self, budget: RequestBudget, failures: int) -> None:
-        """Bind one genuine request ledger and deterministic, provider-free raw responses."""
-        self.budget = budget
+    def __init__(self, failures: int) -> None:
+        """Prepare deterministic provider-free bodies, without a transport-side ledger."""
         broken: JsonObject = {
             "model": "candidate-a",
             "choices": [
@@ -567,25 +560,6 @@ class _DurableTruncatedTransport(ScriptedJsonTransport):
         ]
         super().__init__([JsonHttpResponse(status_code=200, body=body) for body in self.bodies])
 
-    def post(
-        self, url: str, *, headers: Mapping[str, str], payload: JsonObject, timeout_seconds: float
-    ) -> JsonHttpResponse:
-        """Save or replay the exact raw body without reissuing a completed HTTP request."""
-        body = self.budget.call(
-            role="wire-candidate",
-            fingerprint=sha256_json(payload),
-            maximum_cost_usd=0.1,
-            operation=lambda: (
-                ScriptedJsonTransport.post(
-                    self, url, headers=headers, payload=payload, timeout_seconds=timeout_seconds
-                ).body
-            ),
-            encode=lambda value: json.dumps(value),
-            decode=lambda raw: cast(JsonObject, json.loads(raw)),
-            charge=lambda _: None,
-        )
-        return JsonHttpResponse(status_code=200, body=body)
-
 
 @pytest.mark.parametrize("authority, failures", [("uncapped", 1), ("uncapped", 3), ("finite", 1)])
 def test_truncated_tool_response_retries_only_fresh_uncapped_generations(
@@ -598,13 +572,19 @@ def test_truncated_tool_response_retries_only_fresh_uncapped_generations(
         identity="truncated-evaluation",
         maximum_cost_usd=1 if authority == "finite" else None,
     )
-    transport = _DurableTruncatedTransport(budget, failures)
-    candidate = OpenAICompatibleClient(
+    transport = _TruncatedTransport(failures)
+    candidate_client = OpenAICompatibleClient(
         model=_snapshot("candidate-a"),
         base_url="https://example.test/v1",
         api_key="fake-key",
         transport=transport,
         retry_policy=RetryPolicy(maximum_attempts=3, initial_delay_seconds=0),
+    )
+    candidate = BudgetedCompletion(
+        candidate_client,
+        budget,
+        _completion_reservation("candidate-a"),
+        role="assistant:candidate-a",
     )
     world = _ScriptedClient(
         [_response('{"message":"done","terminal":true}', snapshot=_snapshot("world-model-a"))]
@@ -637,23 +617,12 @@ def test_truncated_tool_response_retries_only_fresh_uncapped_generations(
     assert first.simulation_binding is not None and len(transport.requests) == 1
     identity = binding_digest(first.simulation_binding)
     store = RequestBudgetStore(project, "truncated-evaluation")
-    key = sha256_json({"scope": f"{identity}:0", "role": "wire-candidate", "ordinal": 0})
+    key = sha256_json({"scope": f"{identity}:0", "role": "assistant:candidate-a", "ordinal": 0})
     receipt = store.read(key)
     assert receipt is not None and receipt.state == "unknown" and receipt.response is not None
     raw = store.response(receipt)
-    assert raw is not None and json.loads(raw) == transport.bodies[0]
-    with budget.scope(f"{identity}:0"), pytest.raises(ProviderTruncatedResponseError):
-        openai_compatible_response(
-            transport.post(
-                "https://example.test/v1/chat/completions",
-                headers={},
-                payload=transport.requests[0].payload,
-                timeout_seconds=1,
-            ).body,
-            configured_model=_snapshot("candidate-a"),
-            latency_seconds=0,
-        )
-    assert len(transport.requests) == 1
+    assert raw is not None and json.loads(raw)["raw_response"] == transport.bodies[0]
+    assert not receipt.charge_is_upper_bound
     if authority == "uncapped":
         before = project.artifacts.list_ids()
         finite = RequestBudget(project, identity="truncated-evaluation", maximum_cost_usd=1)
@@ -662,7 +631,12 @@ def test_truncated_tool_response_retries_only_fresh_uncapped_generations(
             plan,
             plan_input,
             tasks,
-            candidate,
+            BudgetedCompletion(
+                candidate_client,
+                finite,
+                _completion_reservation("candidate-a"),
+                role="assistant:candidate-a",
+            ),
             world,
             completion_contract_input=completion,
             request_budget=finite,
@@ -691,9 +665,13 @@ def test_truncated_tool_response_retries_only_fresh_uncapped_generations(
     assert store.read(key) == receipt and store.response(receipt) == raw
     for attempt in range(expected_calls):
         saved = store.read(
-            sha256_json({"scope": f"{identity}:{attempt}", "role": "wire-candidate", "ordinal": 0})
+            sha256_json(
+                {"scope": f"{identity}:{attempt}", "role": "assistant:candidate-a", "ordinal": 0}
+            )
         )
         assert saved is not None and saved.response is not None
+        if attempt < failures:
+            assert json.loads(store.response(saved))["raw_response"] == transport.bodies[attempt]
     assert (
         run_or_load_simulation(
             project,

@@ -11,8 +11,10 @@ from exp.common.rollouts.artifact import (
     StopReason,
 )
 from exp.common.rollouts.dispatch_failures import (
+    UNKNOWN_DISPATCH_IS_UPPER_BOUND_KEY,
     UNKNOWN_DISPATCH_RESERVED_COST_KEY,
     retryable_dispatch_failure,
+    unknown_dispatch_reservation_is_upper_bound,
     unknown_dispatch_reserved_cost_usd,
     unknown_spend_failure,
 )
@@ -26,6 +28,7 @@ from exp.common.rollouts.otel import (
 )
 
 __all__ = [
+    "UNKNOWN_DISPATCH_IS_UPPER_BOUND_KEY",
     "UNKNOWN_DISPATCH_RESERVED_COST_KEY",
     "ProductionSimulatorSnapshot",
     "ProviderFreeSourceProvenance",
@@ -42,6 +45,7 @@ __all__ = [
     "StopReason",
     "WorldModelSimulatorSnapshot",
     "retryable_dispatch_failure",
+    "unknown_dispatch_reservation_is_upper_bound",
     "unknown_dispatch_reserved_cost_usd",
     "unknown_spend_failure",
 ]

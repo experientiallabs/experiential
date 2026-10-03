@@ -41,6 +41,7 @@ from exp.runtime.models.providers.openai_compatible import (
     openai_compatible_response,
     openai_embedding_request,
     openai_embedding_response_raw,
+    parse_openai_wire_tool_call,
 )
 from exp.runtime.models.providers.transport import (
     JsonHttpResponse,
@@ -945,7 +946,35 @@ def test_buffered_request_folds_non_leading_system_turns_on_a_leading_only_rung(
     assert [message["role"] for message in kept] == ["system", "user", "system", "user"]
 
 
-@pytest.mark.parametrize("arguments", ['{"a":1', '{"a":', '{"a":"unfinished'])
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        '{"a":1',
+        '{"a":',
+        '{"a":"unfinished',
+        '{"a":t',
+        '{"a":tr',
+        '{"a":tru',
+        '{"a":f',
+        '{"a":fa',
+        '{"a":fal',
+        '{"a":fals',
+        '{"a":n',
+        '{"a":nu',
+        '{"a":nul',
+        '{"a":-',
+        '{"a":1.',
+        '{"a":1e',
+        '{"a":1e-',
+        '{"a":-2.3E+',
+        r'{"a":"\u',
+        r'{"a":"\u0',
+        r'{"a":"\u01',
+        r'{"a":"\u012',
+        r'{"a":[true,{"key":"\u12',
+        r'{"\u01',
+    ],
+)
 @pytest.mark.parametrize("finish_reason", ["length", "stop", "tool_calls"])
 def test_incomplete_tool_json_requires_retained_length_and_never_http_retries(
     arguments: str, finish_reason: str
@@ -994,7 +1023,36 @@ def test_incomplete_tool_json_requires_retained_length_and_never_http_retries(
     assert len(transport.requests) == 1
 
 
-@pytest.mark.parametrize("arguments", ['{"a": invalid}', "[]", '{"a":1,}', '{"a":"bad\\x"}'])
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        '{"a": invalid}',
+        "[]",
+        '[{"a":',
+        '{"a":1,}',
+        '{"a":"bad\\x"}',
+        '{"a":truX',
+        '{"a":tru ',
+        '{"a":True',
+        '{"a":nux',
+        '{"a":01',
+        '{"a":1.e',
+        '{"a":1e+-',
+        '{"a":1. ',
+        '{"a":+1',
+        '{"a":--',
+        '{"a":١',
+        r'{"a":"\u0x',
+        r'{"a":"\q',
+        '{"a":"bad\n',
+        '{"a":1 "b":"unfinished',
+        '{"a":1,] ',
+        '{"a":[1,}',
+        '{"a":true false',
+        "{} {",
+        '{"a" "b":',
+    ],
+)
 def test_length_does_not_upgrade_malformed_or_structural_tool_arguments(arguments: str) -> None:
     """A length label alone cannot turn an invalid complete value into infrastructure evidence."""
     with pytest.raises(OpenAICompatibleResponseError):
@@ -1042,3 +1100,30 @@ def test_length_keeps_valid_output_and_rejects_missing_tool_identity() -> None:
             latency_seconds=0,
         )
     assert not isinstance(caught.value, ProviderTruncatedResponseError)
+
+
+@pytest.mark.parametrize(
+    "complete",
+    [
+        r'{"a":[true,false,null, -12.34e+5, {"\u00e9":"x\n\u0000"}]}',
+        r'{"a":0,"b":-0.001,"c":1E-9,"d":1.0e+10,"e":"quote\"slash\\"}',
+    ],
+)
+def test_every_proper_prefix_of_nested_tool_json_is_truncated(complete: str) -> None:
+    """Every cut inside a valid object is recoverable without accepting its partial contents."""
+    for end in range(1, len(complete)):
+        with pytest.raises(ProviderTruncatedResponseError):
+            parse_openai_wire_tool_call(
+                {
+                    "id": "call-a",
+                    "function": {"name": "create_ticket", "arguments": complete[:end]},
+                },
+                0,
+                hit_length_limit=True,
+            )
+    result = parse_openai_wire_tool_call(
+        {"id": "call-a", "function": {"name": "create_ticket", "arguments": complete}},
+        0,
+        hit_length_limit=True,
+    )
+    assert result.raw_arguments == complete

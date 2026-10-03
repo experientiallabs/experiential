@@ -30,10 +30,17 @@ from exp.common.models import (
     completion_cost_reservation,
 )
 from exp.common.models.catalog_prices import GatewayTokenPrices
-from exp.common.rollouts import StopReason
+from exp.common.rollouts import (
+    UNKNOWN_DISPATCH_IS_UPPER_BOUND_KEY,
+    UNKNOWN_DISPATCH_RESERVED_COST_KEY,
+    StopReason,
+)
 from exp.common.tasks import TaskCase, ToolSchema
 from exp.runtime.models import ResolvedModel
-from exp.runtime.models.providers.errors import ProviderPricingUnavailableError
+from exp.runtime.models.providers.errors import (
+    ProviderPricingUnavailableError,
+    ProviderTransportError,
+)
 from exp.runtime.models.providers.openai import openai_responses_response
 from exp.runtime.models.providers.transport import ScriptedJsonTransport
 from exp.runtime.models.registry import RuntimeModelCatalog
@@ -814,6 +821,56 @@ def test_world_invalid_usage_retains_unknown_spend_after_dispatch() -> None:
     assert error.value.failure.details["provider_dispatch_unknown_spend"] is True
     assert len(candidate_client.requests) == 1
     assert len(world_client.requests) == 1
+
+
+@pytest.mark.parametrize("role", ["candidate", "world"])
+@pytest.mark.parametrize("complete_tariff", [False, True])
+def test_transport_failure_preserves_whether_the_reservation_is_a_bound(
+    role: str, complete_tariff: bool
+) -> None:
+    """An incomplete tariff leaves a transport failure unbounded despite its saved estimate."""
+    card = GatewayTokenPrices(
+        input_nano_usd_per_million_tokens=1_000_000_000,
+        cached_input_nano_usd_per_million_tokens=500_000_000,
+        cache_creation_input_nano_usd_per_million_tokens=1_500_000_000,
+        cache_creation_1h_input_nano_usd_per_million_tokens=1_500_000_000,
+        output_nano_usd_per_million_tokens=2_000_000_000,
+        reasoning_nano_usd_per_million_tokens=2_000_000_000 if complete_tariff else None,
+    )
+
+    class FailedClient(_ScriptedClient):
+        """Stop at the provider boundary without a priceable response."""
+
+        def complete(self, request: ModelRequest) -> ModelResponse:
+            """Record one provider-free dispatch and preserve the transport classification."""
+            self.requests.append(request)
+            raise ProviderTransportError("scripted connection interrupted")
+
+    candidate = (
+        FailedClient([])
+        if role == "candidate"
+        else _ScriptedClient([_response("answer", model=_snapshot("candidate-a"))])
+    )
+    world = FailedClient([])
+    reservations = [
+        _completion_reservation(alias).model_copy(update={"token_prices": card})
+        if alias.startswith(role)
+        else _completion_reservation(alias)
+        for alias in ("candidate-a", "world-model-a")
+    ]
+    recorder = _recorder(
+        candidate,
+        world,
+        candidate_request=reservations[0],
+        world_request=reservations[1],
+    )
+    with pytest.raises(TextSimulationError) as raised:
+        recorder.complete(ModelRequest(messages=(ModelMessage(role="user", content="Help."),)))
+    failure = raised.value.failure
+    assert failure.exception_type == "ProviderTransportError"
+    assert failure.details[UNKNOWN_DISPATCH_IS_UPPER_BOUND_KEY] is complete_tariff
+    reservation = failure.details[UNKNOWN_DISPATCH_RESERVED_COST_KEY]
+    assert isinstance(reservation, (int, float)) and reservation > 0
 
 
 def test_recorder_dispatches_only_through_the_artifact_bound_grounded_executor() -> None:

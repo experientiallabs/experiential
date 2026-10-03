@@ -20,12 +20,35 @@ class ProviderResponseError(ValueError):
     """A provider returned a completed response that violates EXP's typed contract."""
 
 
+def retain_unbounded_response_liability(error: BaseException) -> None:
+    """Attach an owning durable receipt's unknown liability without changing retry policy.
+
+    Call only after a paid response was saved without a verified charge or upper bound.
+    The exception's class and message retain their original validation meaning.
+    """
+    error.__dict__["_exp_unbounded_response_liability"] = True
+
+
+def has_unbounded_response_liability(error: BaseException) -> bool:
+    """Read explicit receipt-owner evidence, never infer it from generic error text."""
+    return error.__dict__.get("_exp_unbounded_response_liability") is True
+
+
 class ProviderTruncatedResponseError(ProviderResponseError):
     """A length-terminated tool response ended inside JSON, with no HTTP retry authority.
 
     An explicitly uncapped evaluation may retain this invalid attempt and start a new bounded
     rollout generation. The same request must not be resent by the provider client.
+
+    Attributes:
+        response_body: Successful decoded HTTP body retained by the owning client boundary,
+            or None when no HTTP body has been attached. It never appears in the error message.
     """
+
+    def __init__(self, message: str, *, response_body: JsonObject | None = None) -> None:
+        """Retain one sanitized failure and optional paid body for durable outer wrappers."""
+        super().__init__(message)
+        self.response_body = response_body
 
 
 class ProviderRetryableResponseError(ProviderResponseError):

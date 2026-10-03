@@ -175,6 +175,7 @@ class RecordingCandidateClient:
         self._failure: TextSimulationError | None = None
         self._provider_dispatch_unknown_spend = False
         self._unknown_dispatch_reserved_cost_usd: float | None = None
+        self._unknown_dispatch_is_upper_bound = False
         self._overspend_warned = False
 
     def observe_tool(self, action: ToolCall) -> Observation:
@@ -296,6 +297,7 @@ class RecordingCandidateClient:
                 retry_uncapped_infrastructure=self._retry_uncapped_infrastructure,
                 unknown_spend=self._provider_dispatch_unknown_spend,
                 reserved_cost_usd=self._unknown_dispatch_reserved_cost_usd,
+                reserved_cost_is_upper_bound=self._unknown_dispatch_is_upper_bound,
             )
             text_error = TextSimulationError(StopReason.FAILURE, failure)
             self._failure = self._failure or text_error
@@ -385,7 +387,14 @@ class RecordingCandidateClient:
                 if self._candidate_request is not None
                 else None
             ),
+            reserved_cost_is_upper_bound=(
+                self._candidate_request is not None
+                and self._candidate_request.maximum_is_upper_bound()
+                and self._token_counter.count(candidate_request)
+                <= self._candidate_request.planning_input_tokens()
+            ),
         )
+        self._unknown_dispatch_is_upper_bound = False
         candidate_response, pricing_error = priced_response(
             candidate_response, self._candidate_request
         )
@@ -479,6 +488,7 @@ class RecordingCandidateClient:
             # The retained retrieval estimate above already covers this dispatch's worst case
             # in every reconciliation path, so the window's incremental reservation is zero.
             reserved_cost_usd=0.0,
+            reserved_cost_is_upper_bound=True,
         )
         self._clear_unknown_dispatch()
         transition = self._complete_world_turn(prepared, candidate_ended_at)
@@ -570,9 +580,16 @@ class RecordingCandidateClient:
                 if self._world_model_request is not None
                 else None
             ),
+            reserved_cost_is_upper_bound=(
+                self._world_model_request is not None
+                and self._world_model_request.maximum_is_upper_bound()
+                and self._token_counter.count(prepared.request)
+                <= self._world_model_request.planning_input_tokens()
+            ),
         )
         world_request = dispatched.request
         world_response = dispatched.response
+        self._unknown_dispatch_is_upper_bound = False
         world_response, pricing_error = priced_response(world_response, self._world_model_request)
         dispatched = replace(dispatched, response=world_response)
         world_ended_at = timestamp(self._clock, not_before=world_started_at)
@@ -734,12 +751,14 @@ class RecordingCandidateClient:
         operation: Callable[[], ResultT],
         *,
         reserved_cost_usd: float | None,
+        reserved_cost_is_upper_bound: bool,
     ) -> ResultT:
         """Run one provider dispatch inside an explicit unknown-spend accounting window.
 
         Args:
             operation: One provider dispatch whose spend is ambiguous until it returns.
-            reserved_cost_usd: Retry-inclusive worst-case charge admitted for this dispatch.
+            reserved_cost_usd: Retained retry-inclusive estimate for this dispatch.
+            reserved_cost_is_upper_bound: Whether that estimate bounds all possible charges.
 
         Returns:
             The successful dispatch result.
@@ -749,12 +768,14 @@ class RecordingCandidateClient:
         """
         self._provider_dispatch_unknown_spend = True
         self._unknown_dispatch_reserved_cost_usd = reserved_cost_usd
+        self._unknown_dispatch_is_upper_bound = reserved_cost_is_upper_bound
         return operation()
 
     def _clear_unknown_dispatch(self) -> None:
         """Mark the most recent provider dispatch as fully priced and recorded."""
         self._provider_dispatch_unknown_spend = False
         self._unknown_dispatch_reserved_cost_usd = None
+        self._unknown_dispatch_is_upper_bound = False
 
 
 def _require_completion_request_bounds(

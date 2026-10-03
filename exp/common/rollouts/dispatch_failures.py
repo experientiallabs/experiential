@@ -2,8 +2,8 @@
 
 A simulated cell can fail after a provider request left the process but before its priced
 response arrived, so the exact spend of that dispatch is unknown. These helpers give every
-spend reconciler one canonical way to recognize such evidence, read its persisted worst-case
-reservation, and decide whether the failed dispatch belongs to the transport-retryable class
+spend reconciler one canonical way to recognize such evidence, distinguish a reservation
+estimate from a proven bound, and decide whether the failed dispatch belongs to the retryable class
 that resume may re-execute under fresh budget. A completed response whose pricing is
 unavailable or whose tool JSON is truncated may also qualify when an uncapped request ledger
 authorized the retry.
@@ -16,7 +16,10 @@ import math
 from exp.common.core.artifacts import FailureCode, StructuredFailure
 
 UNKNOWN_DISPATCH_RESERVED_COST_KEY = "unknown_dispatch_reserved_cost_usd"
-"""Failure-detail key holding the conservative worst-case charge for an unknown dispatch."""
+"""Failure-detail key holding the retained reservation estimate for an unknown dispatch."""
+
+UNKNOWN_DISPATCH_IS_UPPER_BOUND_KEY = "unknown_dispatch_reserved_cost_is_upper_bound"
+"""Failure-detail key stating whether the reservation bounds the unknown liability."""
 
 _RETRYABLE_DISPATCH_PHASES = frozenset({"candidate_or_world_model", "world_model_protocol"})
 """Persisted failure phases whose retryable provider failures resume may re-execute.
@@ -47,7 +50,7 @@ def unknown_spend_failure(failure: StructuredFailure | None) -> bool:
 
 
 def unknown_dispatch_reserved_cost_usd(failure: StructuredFailure | None) -> float | None:
-    """Return the persisted worst-case charge for one unknown-spend dispatch failure.
+    """Return the retained estimate, without asserting that it bounds the unknown charge.
 
     Args:
         failure: Structured failure retained by a rollout artifact, or ``None``.
@@ -65,6 +68,33 @@ def unknown_dispatch_reserved_cost_usd(failure: StructuredFailure | None) -> flo
     if not math.isfinite(amount) or amount < 0:
         return None
     return amount
+
+
+def unknown_dispatch_reservation_is_upper_bound(failure: StructuredFailure | None) -> bool:
+    """Distinguish bounded dispatch reservations from unpriceable paid outcomes.
+
+    An explicit marker must be a true boolean. Without that marker, existing transport and
+    whole-cell reservations retain their bounded meaning, but saved pricing or truncation
+    classifications never establish a bound, even when they retain a numeric estimate.
+
+    Args:
+        failure: Immutable failure evidence whose reservation is being reconciled.
+
+    Returns:
+        Whether the marker and failure semantics permit using a separately validated
+        numeric reservation as a cost bound.
+    """
+    if failure is None:
+        return False
+    if failure.exception_type in {
+        "ProviderPricingUnavailableError",
+        "ProviderTruncatedResponseError",
+    } or failure.details.get("retry_classification") in (
+        "unpriceable_completed_response",
+        "truncated_completed_response",
+    ):
+        return False
+    return failure.details.get(UNKNOWN_DISPATCH_IS_UPPER_BOUND_KEY, True) is True
 
 
 def retryable_dispatch_failure(failure: StructuredFailure | None) -> bool:

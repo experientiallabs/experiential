@@ -1,12 +1,16 @@
 """Public failure types for immutable text-world-model simulation."""
 
 from exp.common.core.artifacts import FailureAttribution, FailureCode, JsonObject, StructuredFailure
-from exp.common.rollouts import UNKNOWN_DISPATCH_RESERVED_COST_KEY
+from exp.common.rollouts import (
+    UNKNOWN_DISPATCH_IS_UPPER_BOUND_KEY,
+    UNKNOWN_DISPATCH_RESERVED_COST_KEY,
+)
 from exp.runtime.models.providers.errors import (
     ProviderPricingUnavailableError,
     ProviderRefusalError,
     ProviderRetryableResponseError,
     ProviderTruncatedResponseError,
+    has_unbounded_response_liability,
 )
 from exp.runtime.models.providers.transport import classify_retry
 
@@ -39,6 +43,7 @@ def stale_cell_failure(
     details: JsonObject = {"phase": "paid_cell_stale_lease", "lease_id": lease_id}
     if reserved_cost_usd is not None:
         details[UNKNOWN_DISPATCH_RESERVED_COST_KEY] = reserved_cost_usd
+        details[UNKNOWN_DISPATCH_IS_UPPER_BOUND_KEY] = True
     return StructuredFailure(
         code=FailureCode.CANCELLED if retry_uncapped else FailureCode.BUDGET,
         message=(
@@ -56,6 +61,7 @@ def provider_call_failure(
     retry_uncapped_infrastructure: bool,
     unknown_spend: bool,
     reserved_cost_usd: float | None,
+    reserved_cost_is_upper_bound: bool,
 ) -> StructuredFailure:
     """Classify one aborted candidate or world-model call without authorizing HTTP replay.
 
@@ -64,6 +70,8 @@ def provider_call_failure(
         retry_uncapped_infrastructure: True only with an explicitly uncapped shared request ledger.
         unknown_spend: Whether dispatched provider liability remains unresolved.
         reserved_cost_usd: Retained request reservation, never a measured charge.
+        reserved_cost_is_upper_bound: Whether the reservation bounds the unresolved charge.
+            Unpriceable or invalid paid-response evidence always overrides this assertion.
 
     Returns:
         Durable cell failure; pricing and truncated-response failures are infrastructure evidence.
@@ -80,8 +88,15 @@ def provider_call_failure(
         if truncated
         else classification.reason,
     }
-    if unknown_spend:
+    unbounded_response = has_unbounded_response_liability(exception)
+    if unknown_spend or unbounded_response:
         details["provider_dispatch_unknown_spend"] = True
+        details[UNKNOWN_DISPATCH_IS_UPPER_BOUND_KEY] = (
+            reserved_cost_usd is not None
+            and reserved_cost_is_upper_bound
+            and not infrastructure
+            and not unbounded_response
+        )
         if reserved_cost_usd is not None:
             details[UNKNOWN_DISPATCH_RESERVED_COST_KEY] = reserved_cost_usd
     return StructuredFailure(

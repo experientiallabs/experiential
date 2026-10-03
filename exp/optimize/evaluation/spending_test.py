@@ -48,11 +48,20 @@ from exp.runtime.models.providers.async_transport import (
     HttpxAsyncJsonTransport,
     ProviderDeadlineExceeded,
 )
-from exp.runtime.models.providers.errors import ProviderPricingUnavailableError
+from exp.runtime.models.providers.errors import (
+    ProviderPricingUnavailableError,
+    ProviderTruncatedResponseError,
+    has_unbounded_response_liability,
+)
 from exp.runtime.models.providers.openai_compatible import OpenAICompatibleClient
-from exp.runtime.models.providers.transport import RetryPolicy, is_known_unbilled_failure
+from exp.runtime.models.providers.transport import (
+    RetryPolicy,
+    classify_retry,
+    is_known_unbilled_failure,
+)
 from exp.runtime.models.registry import RuntimeModelCatalog
 from exp.runtime.models.registry_test import _catalog as _runtime_catalog
+from exp.simulation.engines.text.tokens import Utf8UpperBoundTokenCounter
 
 
 class _Client:
@@ -98,8 +107,9 @@ def test_budgeted_completion_accepts_only_the_configured_served_identity(
         messages=(ModelMessage(role="user", content="hello"),), maximum_output_tokens=1
     )
     if drift is not None:
-        with budget.scope("cell"), pytest.raises(ValueError, match="identity"):
+        with budget.scope("cell"), pytest.raises(ValueError, match="identity") as caught:
             wrapper.complete(request)
+        assert not has_unbounded_response_liability(caught.value)
         return
     with budget.scope("cell"):
         first = wrapper.complete(request)
@@ -312,6 +322,95 @@ def test_standard_catalog_admission_retries_charge_only_the_successful_dispatch(
     asyncio.run(http_client.aclose())
 
 
+@pytest.mark.parametrize("role", ["assistant", "world", "judge"])
+@pytest.mark.parametrize("limit", [None, 1.0])
+def test_catalog_truncated_response_is_durable_before_rejection_and_free_replay(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, role: str, limit: float | None
+) -> None:
+    """The real catalog client preserves a paid invalid body without a second wire ledger."""
+    requests: list[httpx.Request] = []
+    raw = {
+        "id": "completed-response",
+        "choices": [
+            {
+                "finish_reason": "length",
+                "message": {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "call-1",
+                            "type": "function",
+                            "function": {"name": "lookup", "arguments": '{"query":'},
+                        }
+                    ],
+                },
+            }
+        ],
+        "usage": {"prompt_tokens": 100, "completion_tokens": 10},
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        """Return one paid HTTP 200 through the ordinary catalog transport."""
+        requests.append(request)
+        return httpx.Response(200, json=raw)
+
+    http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    monkeypatch.setattr(async_transport, "_pooled_client", lambda: http_client)
+    catalog = _runtime_catalog(provider="openai-compatible", base_url="https://provider.test/v1")
+    resolved = RuntimeModelCatalog(catalog, environment={"FIXTURE_API_KEY": "fixture"}).resolve(
+        "fixture-model"
+    )
+    reservation = completion_cost_reservation(
+        model=resolved.snapshot,
+        input_usd_per_million_tokens=1,
+        output_usd_per_million_tokens=4,
+        cached_input_usd_per_million_tokens=1,
+        cache_write_usd_per_million_tokens=1,
+        maximum_attempts=3,
+        maximum_input_tokens=1_000,
+        maximum_output_tokens=500,
+    )
+    project = ProjectStore(tmp_path, "truncated")
+    budget = RequestBudget(project, identity="truncated", maximum_cost_usd=limit)
+    wrapper = BudgetedCompletion(resolved.client, budget, reservation, role=role)
+    request = ModelRequest(
+        messages=(ModelMessage(role="user", content="hello"),), maximum_output_tokens=500
+    )
+    with budget.scope("cell"), pytest.raises(ProviderTruncatedResponseError) as caught:
+        wrapper.complete(request)
+    assert not classify_retry(caught.value).retryable
+    assert has_unbounded_response_liability(caught.value)
+    assert len(requests) == 1
+    store = RequestBudgetStore(project, "truncated")
+    key = sha256_json({"scope": "cell", "role": role, "ordinal": 0})
+    receipt = store.read(key)
+    assert receipt is not None and receipt.response is not None
+    assert receipt.state == "unknown" and not receipt.charge_is_upper_bound
+    payload = store.response(receipt)
+    assert json.loads(payload)["raw_response"] == raw
+    assert json.loads(payload)["charge_usd"] is None
+    original_artifacts = project.artifacts.list_ids()
+
+    reopened = RequestBudget(project, identity="truncated", maximum_cost_usd=0.000001)
+    replay = BudgetedCompletion(resolved.client, reopened, reservation, role=role)
+    with reopened.scope("cell"), pytest.raises(ProviderTruncatedResponseError) as replayed:
+        replay.complete(request)
+    assert has_unbounded_response_liability(replayed.value)
+    assert len(requests) == 1
+    assert store.read(key) == receipt and store.response(receipt) == payload
+    assert project.artifacts.list_ids() == original_artifacts
+    changed = request.model_copy(update={"maximum_output_tokens": 499})
+    with (
+        reopened.scope("cell"),
+        pytest.raises(ValueError, match="saved provider request changed") as changed_error,
+    ):
+        replay.complete(changed)
+    assert not has_unbounded_response_liability(changed_error.value)
+    assert len(requests) == 1
+    asyncio.run(http_client.aclose())
+
+
 @pytest.mark.parametrize("mode", ["unpaid", "unknown_then_unpaid", "unpaid_then_inflight"])
 def test_sync_completion_timeout_preserves_whole_request_billing_evidence(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str
@@ -462,6 +561,8 @@ def test_unknown_tariff_saves_paid_output_and_replays_error_under_lower_cap(
     with original.scope("cell"), pytest.raises(expected_error, match=message) as raised:
         wrapper.complete(request)
     assert type(raised.value) is expected_error
+    assert has_unbounded_response_liability(raised.value)
+    assert not classify_retry(raised.value).retryable
     store = RequestBudgetStore(project, "schedule")
     key = sha256_json({"scope": "cell", "role": "assistant", "ordinal": 0})
     receipt = store.read(key)
@@ -476,7 +577,111 @@ def test_unknown_tariff_saves_paid_output_and_replays_error_under_lower_cap(
     with resumed.scope("cell"), pytest.raises(expected_error, match=message) as replayed:
         resumed_wrapper.complete(request)
     assert type(replayed.value) is expected_error
+    assert has_unbounded_response_liability(replayed.value)
+    assert not classify_retry(replayed.value).retryable
     with resumed.scope("new-cell"), pytest.raises(ValueError, match="complete applicable"):
         resumed_wrapper.complete(request)
     assert client.calls == 1
     assert store.read(key) == receipt and store.response(receipt) == raw
+
+
+@pytest.mark.parametrize("limit", [None, 1.0])
+def test_over_request_charge_retains_paid_response_before_invalid_bound_failure(
+    tmp_path: Path, limit: float | None
+) -> None:
+    """A charge above the actual request bound cannot discard the paid response body."""
+    project = ProjectStore(tmp_path, "over-request")
+    reservation = completion_cost_reservation(
+        model=_model(),
+        input_usd_per_million_tokens=1,
+        output_usd_per_million_tokens=4,
+        cached_input_usd_per_million_tokens=1,
+        cache_write_usd_per_million_tokens=1,
+        maximum_attempts=1,
+        maximum_input_tokens=10_000,
+        maximum_output_tokens=1,
+    )
+    client = _PaidClient()
+    client.response = client.response.model_copy(
+        update={
+            "economics": OperationEconomics(
+                usage=Usage(input_tokens=9_999, output_tokens=1), provider_attempts=1
+            )
+        }
+    )
+    request = ModelRequest(
+        messages=(ModelMessage(role="user", content="hello"),), maximum_output_tokens=1
+    )
+    assert Utf8UpperBoundTokenCounter().count(request) < 9_999 < reservation.maximum_input_tokens
+    budget = RequestBudget(project, identity="over-request", maximum_cost_usd=limit)
+    wrapper = BudgetedCompletion(client, budget, reservation, role="assistant")
+    with (
+        budget.scope("cell"),
+        pytest.raises(ValueError, match="charge exceeds the admitted") as caught,
+    ):
+        wrapper.complete(request)
+    assert type(caught.value) is ValueError and not classify_retry(caught.value).retryable
+    store = RequestBudgetStore(project, "over-request")
+    key = sha256_json({"scope": "cell", "role": "assistant", "ordinal": 0})
+    receipt = store.read(key)
+    assert receipt is not None and receipt.response is not None
+    assert receipt.state == "unknown" and not receipt.charge_is_upper_bound
+    assert has_unbounded_response_liability(caught.value)
+    payload = store.response(receipt)
+    assert ModelResponse.model_validate(json.loads(payload)["response"]) == client.response
+    assert json.loads(payload)["charge_usd"] is None
+    reopened = RequestBudget(project, identity="over-request", maximum_cost_usd=0.000001)
+    replay = BudgetedCompletion(client, reopened, reservation, role="assistant")
+    with reopened.scope("cell"), pytest.raises(ValueError, match="charge exceeds the admitted"):
+        replay.complete(request)
+    with reopened.scope("new-cell"), pytest.raises(ValueError, match="resolved earlier charges"):
+        replay.complete(request)
+    assert client.calls == 1
+    assert store.read(key) == receipt and store.response(receipt) == payload
+
+
+def test_known_charge_can_exceed_an_uncapped_incomplete_tariff_estimate(tmp_path: Path) -> None:
+    """An estimate never becomes a hard ceiling when actual observed usage is priceable."""
+    project = ProjectStore(tmp_path, "known-charge")
+    reservation = completion_cost_reservation(
+        model=_model(),
+        token_prices=prices().model_copy(update={"reasoning_nano_usd_per_million_tokens": None}),
+        input_usd_per_million_tokens=1,
+        output_usd_per_million_tokens=4,
+        cached_input_usd_per_million_tokens=0.1,
+        cache_write_usd_per_million_tokens=2,
+        maximum_attempts=1,
+        maximum_input_tokens=10_000,
+        maximum_output_tokens=1,
+    )
+    client = _PaidClient()
+    client.response = client.response.model_copy(
+        update={
+            "economics": OperationEconomics(
+                usage=Usage(
+                    input_tokens=9_999,
+                    output_tokens=1,
+                    cached_input_tokens=0,
+                    cache_write_input_tokens=0,
+                    reasoning_tokens=0,
+                ),
+                provider_attempts=1,
+            )
+        }
+    )
+    request = ModelRequest(
+        messages=(ModelMessage(role="user", content="hello"),), maximum_output_tokens=1
+    )
+    budget = RequestBudget(project, identity="known-charge", maximum_cost_usd=None)
+    wrapper = BudgetedCompletion(client, budget, reservation, role="assistant")
+    with budget.scope("cell"):
+        assert wrapper.complete(request) == client.response
+    store = RequestBudgetStore(project, "known-charge")
+    key = sha256_json({"scope": "cell", "role": "assistant", "ordinal": 0})
+    receipt = store.read(key)
+    assert receipt is not None and receipt.state == "complete"
+    assert receipt.charge == pytest.approx(0.010003)
+    assert receipt.charge > reservation.attempt_cost_usd(
+        input_tokens=Utf8UpperBoundTokenCounter().count(request), output_tokens=1
+    )
+    assert not store.has_unbounded_liability()

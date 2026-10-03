@@ -10,10 +10,10 @@ from exp.common.core.artifacts import ArtifactInput
 from exp.common.evaluations.evidence import read_rollout
 from exp.common.project import ProjectStore
 from exp.common.rollouts import (
-    UNKNOWN_DISPATCH_RESERVED_COST_KEY,
     RolloutArtifact,
     RolloutEventKind,
     SimulationArtifactSet,
+    unknown_dispatch_reservation_is_upper_bound,
     unknown_dispatch_reserved_cost_usd,
     unknown_spend_failure,
 )
@@ -21,7 +21,6 @@ from exp.optimize.router.errors import RouterCompositionError
 from exp.simulation.engines.text.errors import SimulationConfigurationError
 from exp.simulation.engines.text.grounding import load_completion_contract
 from exp.simulation.engines.text.lineage_spend import lineage_spend
-from exp.simulation.engines.text.resume import interrupted_cell_failure
 
 
 def observed_rollout_spend(rollout: RolloutArtifact) -> float:
@@ -30,7 +29,7 @@ def observed_rollout_spend(rollout: RolloutArtifact) -> float:
     A rollout whose failure left one dispatch's spend unknown is charged its exact persisted
     worst-case reservation on top of every priced operation, so one ambiguous cell counts
     conservatively against the ceiling instead of aborting reconciliation for every other
-    valid rollout. Unknown-spend evidence with no persisted reservation stays fail-closed.
+    valid rollout. Unknown-spend evidence without a proven reservation bound stays fail-closed.
 
     Args:
         rollout: Completed simulation evidence whose provider economics are inspected.
@@ -42,6 +41,17 @@ def observed_rollout_spend(rollout: RolloutArtifact) -> float:
     Raises:
         RouterCompositionError: A dispatched operation is unknown, unpriced, or misclassified.
     """
+    amount = _observed_rollout_spend(rollout)
+    if amount is None:
+        raise RouterCompositionError(
+            "simulation rollout has unknown dispatched spend and no persisted reservation "
+            "proven as an upper bound; reconcile pricing before finite-budget execution"
+        )
+    return amount
+
+
+def _observed_rollout_spend(rollout: RolloutArtifact) -> float | None:
+    """Validate every recorded economy before preserving any unresolved dispatch liability."""
     unknown_spend = unknown_spend_failure(rollout.failure)
     economics = []
     costs = []
@@ -90,32 +100,31 @@ def observed_rollout_spend(rollout: RolloutArtifact) -> float:
             raise RouterCompositionError("simulation rollout spend is not fully observed")
         costs.append(cost.value)
     if unknown_spend:
-        costs.append(_unknown_dispatch_charge(rollout))
+        charge = _unknown_dispatch_charge(rollout)
+        if charge is None:
+            return None
+        costs.append(charge)
     return math.fsum(costs)
 
 
-def _unknown_dispatch_charge(rollout: RolloutArtifact) -> float:
-    """Return the exact persisted worst-case charge for one unknown-spend failure.
+def _unknown_dispatch_charge(rollout: RolloutArtifact) -> float | None:
+    """Return a verified reservation bound for one unknown-spend failure, when available.
 
     Args:
         rollout: Failed evidence whose dispatched spend is permanently ambiguous.
 
     Returns:
         The reservation persisted with the failure, or the durable sandbox episode ceiling
-        for environment dispatches that predate per-failure reservation persistence.
-
-    Raises:
-        RouterCompositionError: No durable worst-case reservation was persisted.
+        for environment dispatches that predate per-failure reservation persistence, or None
+        when the retained estimate cannot bound the liability.
     """
+    if not unknown_dispatch_reservation_is_upper_bound(rollout.failure):
+        return None
     reserved = unknown_dispatch_reserved_cost_usd(rollout.failure)
     if reserved is None and rollout.evidence_source == "sandbox":
         binding = rollout.sandbox_binding
         if binding is not None:
             reserved = binding.environment_maximum_episode_cost_usd
-    if reserved is None:
-        raise RouterCompositionError(
-            "simulation rollout has unknown dispatched spend and no persisted reservation"
-        )
     return reserved
 
 
@@ -139,7 +148,7 @@ def verified_simulation_spend(
     *,
     allow_unknown_interrupted: Literal[True],
 ) -> float | None:
-    """Preserve unknown interrupted spend for shared-ledger execution or free replay."""
+    """Preserve unresolved spend for shared-ledger execution or free replay."""
     ...
 
 
@@ -157,11 +166,11 @@ def verified_simulation_spend(
         expected: Exact artifact set returned for the simulation phase.
         completion_contract_input: Reviewed completion reservation contract reference used to
             charge superseded retry attempts conservatively.
-        allow_unknown_interrupted: Shared-ledger callers may retain unknown interrupted spend
+        allow_unknown_interrupted: Shared-ledger callers may retain unknown dispatched spend
             for uncapped execution or free replay, without fabricating whole-cell reservations.
 
     Returns:
-        Reconciled total, or None for permitted interrupted spend with no retained reservation.
+        Reconciled total, or None when permitted dispatched liability has no proven cost bound.
 
     Raises:
         RouterCompositionError: The set, index, rollout, or economics cannot be verified.
@@ -187,18 +196,7 @@ def verified_simulation_spend(
         read_rollout(project.artifacts, identity)[0] for identity in artifact_set.artifact_ids
     )
 
-    def measure(rollout: RolloutArtifact) -> float | None:
-        """Validate ordinary economics while leaving eligible interrupted liability unknown."""
-        if (
-            allow_unknown_interrupted
-            and interrupted_cell_failure(rollout)
-            and rollout.failure is not None
-            and UNKNOWN_DISPATCH_RESERVED_COST_KEY not in rollout.failure.details
-        ):
-            return None
-        return observed_rollout_spend(rollout)
-
-    total = lineage_spend(project.artifacts, rollouts, measure=measure)
+    total = lineage_spend(project.artifacts, rollouts, measure=_observed_rollout_spend)
     if total is None and not allow_unknown_interrupted:
         raise RouterCompositionError("simulation lineage spend is unknown")
     return total

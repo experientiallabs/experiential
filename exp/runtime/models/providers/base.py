@@ -7,6 +7,7 @@ import asyncio
 import math
 import time
 from collections.abc import Coroutine, Mapping
+from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, ClassVar, Literal
 from uuid import uuid4
@@ -32,6 +33,7 @@ from exp.runtime.models.providers.async_transport import (
 from exp.runtime.models.providers.errors import (
     ProviderCapabilityError,
     ProviderRetryableResponseError,
+    ProviderTruncatedResponseError,
 )
 from exp.runtime.models.providers.transport import (
     JsonHttpTransport,
@@ -596,6 +598,12 @@ class ProviderHttpClient(abc.ABC):
                     response.body,
                     latency_seconds=time.monotonic() - started_at,
                 )
+            except ProviderTruncatedResponseError as error:
+                # A typed response cannot represent unfinished tool JSON. Preserve the
+                # paid body for the owning durable wrapper before it rejects this action.
+                raise ProviderTruncatedResponseError(
+                    str(error), response_body=deepcopy(response.body)
+                ) from error
             except ProviderRetryableResponseError:
                 if idempotency_key is None:
                     # Replaying a cached, completed empty response cannot produce usable output.
