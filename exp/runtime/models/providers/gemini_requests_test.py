@@ -301,3 +301,18 @@ def test_a_non_reasoning_route_sends_no_thinking_config() -> None:
     )
     generation = cast("JsonObject", payload.get("generationConfig", {}))
     assert "thinkingConfig" not in generation
+
+
+def test_the_display_kill_switch_stops_asking_for_thoughts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``EXP_GATEWAY_REASONING_DISPLAY=0`` sends no thinking config without an effort."""
+    monkeypatch.setenv("EXP_GATEWAY_REASONING_DISPLAY", "0")
+    request = ModelRequest(messages=(ModelMessage(role="user", content="hi"),))
+    payload = gemini_generate_request(
+        "gemini-2.5-pro",
+        request,
+        supports_reasoning=True,
+        default_maximum_output_tokens=None,
+    )
+    assert "thinkingConfig" not in cast("JsonObject", payload["generationConfig"])

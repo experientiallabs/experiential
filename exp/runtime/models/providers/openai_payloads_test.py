@@ -5,6 +5,8 @@ from __future__ import annotations
 
 from typing import cast
 
+import pytest
+
 from exp.common.core.artifacts import JsonObject
 from exp.common.models.model import ToolCall
 from exp.runtime.gateway.contracts import (
@@ -530,3 +532,17 @@ def test_effort_none_asks_for_no_summary() -> None:
     )
     reasoning = cast("JsonObject", payload["reasoning"])
     assert "summary" not in reasoning
+
+
+def test_the_display_kill_switch_stops_asking_for_a_summary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``EXP_GATEWAY_REASONING_DISPLAY=0`` restores the provider's no-summary default."""
+    monkeypatch.setenv("EXP_GATEWAY_REASONING_DISPLAY", "0")
+    payload = openai_responses_stream_payload(
+        "gpt-5.6-luna",
+        _reasoning_request(reasoning_effort="high"),
+        supports_temperature=False,
+        supports_reasoning=True,
+    )
+    assert payload["reasoning"] == {"effort": "high"}

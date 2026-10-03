@@ -9,7 +9,7 @@ use serde_json::{json, Value};
 use crate::encode::{reasoning_carrier_candidate, stable_public_id};
 use crate::errors::{Failure, PublicError};
 use crate::events::{Event, Usage};
-use crate::reasoning_display::{unsigned_thinking_text, ReasoningOutput};
+use crate::reasoning_display::{unsigned_thinking_delta, DisplayJoiner, ReasoningOutput};
 
 use super::{messages_usage, refusal_failure, stop_reason};
 
@@ -113,9 +113,10 @@ pub fn completed_messages_body_with_reasoning(
     // sentinel, after later text.
     let mut slots: Vec<Option<Value>> = Vec::new();
     let reasoning = reasoning_carrier_candidate(events)?;
+    let mut joiner = DisplayJoiner::default();
     let reasoning_text: String = events
         .iter()
-        .filter_map(|event| unsigned_thinking_text(event, reasoning_output))
+        .filter_map(|event| unsigned_thinking_delta(&mut joiner, event, reasoning_output))
         .collect();
     if !reasoning_text.is_empty() {
         slots.push(Some(

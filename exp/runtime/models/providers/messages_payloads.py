@@ -32,6 +32,7 @@ from exp.runtime.models.providers.reasoning_compat import (
     anthropic_reasoning_effort,
     anthropic_thinking_budget_tokens,
     anthropic_thinks_without_config,
+    reasoning_display_enabled,
 )
 from exp.runtime.models.providers.wire_messages import (
     anthropic_blocks,
@@ -364,7 +365,7 @@ def anthropic_messages_stream_payload(
         payload["output_config"] = output_config
     if request.stop:
         payload["stop_sequences"] = list(request.stop)
-    if supports_reasoning:
+    if supports_reasoning and reasoning_display_enabled():
         _display_summarized_thinking(model_id, payload)
     _require_forced_tool_choice_support(model_id, request, payload)
     return payload

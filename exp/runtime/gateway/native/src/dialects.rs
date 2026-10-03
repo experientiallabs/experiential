@@ -717,7 +717,13 @@ impl Normalizer {
             }
         }
         self.usage = observed;
-        if events.iter().any(Event::is_output_token) {
+        // Display-only reasoning is held privately until real output, so it
+        // must not turn a mid-reasoning abnormal end into a settled
+        // `Incomplete`: that turn still fails over as terminal-less.
+        if events
+            .iter()
+            .any(|event| event.is_output_token() && !matches!(event, Event::ReasoningTextDelta(_)))
+        {
             self.emitted_output = true;
         }
         if events.iter().any(Event::is_terminal) {

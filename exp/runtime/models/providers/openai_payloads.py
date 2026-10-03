@@ -23,6 +23,7 @@ from exp.runtime.models.providers.instruction_turns import (
 )
 from exp.runtime.models.providers.reasoning_compat import (
     openai_reasoning_effort,
+    reasoning_display_enabled,
     require_sampling_reasoning_compatibility,
 )
 from exp.runtime.models.providers.wire_messages import (
@@ -243,7 +244,9 @@ def openai_responses_stream_payload(
         reasoning["effort"] = openai_reasoning_effort(model_id, effective_reasoning_effort)
     if supports_reasoning and request.reasoning_summary is not None:
         reasoning["summary"] = request.reasoning_summary
-    elif supports_reasoning and effective_reasoning_effort != "none":
+    elif (
+        supports_reasoning and effective_reasoning_effort != "none" and reasoning_display_enabled()
+    ):
         # OpenAI returns readable reasoning only as summaries, and only when
         # asked; the caller's own selector above always wins.
         reasoning["summary"] = "auto"

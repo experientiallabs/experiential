@@ -9,14 +9,8 @@ reasoning carrier.
 
 from __future__ import annotations
 
-import os
-from typing import Final
-
 from exp.common.models.model import ModelCapabilities
-
-REASONING_DISPLAY_ENVIRONMENT: Final = "EXP_GATEWAY_REASONING_DISPLAY"
-"""Process-wide kill switch: ``0`` withholds every rung's reasoning text, exactly
-as a per-rung ``reasoning_output_hidden`` stamp does. Read per admission."""
+from exp.runtime.models.providers.reasoning_compat import reasoning_display_enabled
 
 
 def reasoning_output_hidden(capabilities: ModelCapabilities | None) -> bool:
@@ -28,6 +22,6 @@ def reasoning_output_hidden(capabilities: ModelCapabilities | None) -> bool:
     Returns:
         ``True`` when the kill switch is set or the rung opts out.
     """
-    if os.environ.get(REASONING_DISPLAY_ENVIRONMENT, "1") == "0":
+    if not reasoning_display_enabled():
         return True
     return capabilities is not None and capabilities.reasoning_output_hidden

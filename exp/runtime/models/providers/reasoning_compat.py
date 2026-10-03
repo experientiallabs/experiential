@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import logging
+import os
 from collections.abc import Collection, Mapping, Sequence
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Final, cast
 
 from pydantic import JsonValue
 
@@ -21,6 +22,22 @@ if TYPE_CHECKING:
     from exp.runtime.models.providers.base import GatewayWireProfile
 
 _logger = logging.getLogger(__name__)
+
+REASONING_DISPLAY_ENVIRONMENT: Final = "EXP_GATEWAY_REASONING_DISPLAY"
+"""Process-wide reasoning display kill switch: ``0`` withholds every rung's
+reasoning display copy and stops asking providers for readable reasoning
+(Anthropic summarized display, Gemini thoughts, OpenAI summaries), restoring
+the provider defaults. Read per request."""
+
+
+def reasoning_display_enabled() -> bool:
+    """Return whether the reasoning display kill switch leaves display on.
+
+    Returns:
+        ``False`` only when ``EXP_GATEWAY_REASONING_DISPLAY`` is ``0``.
+    """
+    return os.environ.get(REASONING_DISPLAY_ENVIRONMENT, "1") != "0"
+
 
 REASONING_EFFORTS = (
     "none",

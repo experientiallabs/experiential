@@ -13,7 +13,7 @@ use crate::encode::{
 };
 use crate::errors::{Failure, PublicError};
 use crate::events::{Event, Usage};
-use crate::reasoning_display::{unsigned_thinking_text, ReasoningOutput};
+use crate::reasoning_display::{unsigned_thinking_delta, DisplayJoiner, ReasoningOutput};
 use crate::tool_search::MessagesToolSearch;
 use crate::web_search::MessagesWebSearch;
 
@@ -151,6 +151,8 @@ pub struct MessagesSseEncoder {
     reasoning: ReasoningCarrierState,
     reasoning_content_carrier: Option<String>,
     reasoning_output: ReasoningOutput,
+    /// Paragraph-joins provider units inside the unsigned thinking block.
+    reasoning_display: DisplayJoiner,
     /// The gateway-executed web search, rendered as the leading blocks at
     /// `start` and metered on every usage object; `None` changes nothing.
     web_search: Option<MessagesWebSearch>,
@@ -201,6 +203,7 @@ impl MessagesSseEncoder {
             reasoning: ReasoningCarrierState::default(),
             reasoning_content_carrier: None,
             reasoning_output: ReasoningOutput::default(),
+            reasoning_display: DisplayJoiner::default(),
             web_search: None,
             tool_search: None,
             synthetic_blocks: 0,
@@ -375,8 +378,12 @@ impl MessagesSseEncoder {
             Event::ReasoningContentDelta { .. }
             | Event::ReasoningTextDelta(_)
             | Event::ReasoningSummaryDelta { .. } => {
-                match unsigned_thinking_text(event, self.reasoning_output) {
-                    Some(delta) => self.thinking_delta(EXPOSED_REASONING_BLOCK_INDEX, delta),
+                match unsigned_thinking_delta(
+                    &mut self.reasoning_display,
+                    event,
+                    self.reasoning_output,
+                ) {
+                    Some(delta) => self.thinking_delta(EXPOSED_REASONING_BLOCK_INDEX, &delta),
                     None => Ok(Vec::new()),
                 }
             }
@@ -594,9 +601,16 @@ impl MessagesSseEncoder {
         if let Some(position) = self
             .blocks
             .iter()
-            .position(|block| block.kind == BlockKind::Thinking(index))
+            .rposition(|block| block.kind == BlockKind::Thinking(index))
         {
-            return position;
+            // Display reasoning that resumes after a later block closed the
+            // unsigned block opens a fresh one; buffering into the closed
+            // block would never flush.
+            let open = self.blocks[position].anthropic_index.is_none()
+                || self.open_position == Some(position);
+            if open || index != EXPOSED_REASONING_BLOCK_INDEX {
+                return position;
+            }
         }
         self.blocks
             .push(PendingBlock::new(BlockKind::Thinking(index)));

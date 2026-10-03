@@ -115,6 +115,33 @@ fn chat_completed_body_carries_flattened_reasoning() {
 }
 
 #[test]
+fn messages_stream_reasoning_that_resumes_after_text_in_a_fresh_block() {
+    let events = vec![
+        Event::ReasoningTextDelta("first".to_string()),
+        Event::TextDelta("answer".to_string()),
+        Event::ReasoningTextDelta("later".to_string()),
+        Event::Completed,
+    ];
+    let mut encoder = MessagesSseEncoder::new_with_ignored("request-1", "m", Vec::new());
+    encoder.set_reasoning_output(DISPLAYED);
+    let mut frames = encoder.start().unwrap();
+    for event in &events {
+        frames.extend(encoder.feed(event).unwrap());
+    }
+    let chunks = payloads(&frames);
+    let thinking: Vec<&str> = chunks
+        .iter()
+        .filter_map(|chunk| chunk["delta"]["thinking"].as_str())
+        .collect();
+    assert_eq!(thinking, vec!["first", "later"]);
+    let opened = chunks
+        .iter()
+        .filter(|chunk| chunk["content_block"]["type"] == json!("thinking"))
+        .count();
+    assert_eq!(opened, 2);
+}
+
+#[test]
 fn messages_render_non_anthropic_reasoning_as_one_unsigned_thinking_block() {
     let events = vec![
         Event::ReasoningTextDelta("plain".to_string()),
@@ -138,7 +165,8 @@ fn messages_render_non_anthropic_reasoning_as_one_unsigned_thinking_block() {
         .iter()
         .filter_map(|chunk| chunk["delta"]["thinking"].as_str())
         .collect();
-    assert_eq!(thinking, "plain summary");
+    // Provider units stay separate paragraphs, exactly as on Chat.
+    assert_eq!(thinking, "plain\n\n summary");
     assert!(chunks.iter().any(|chunk| chunk["content_block"]
         == json!({"type": "thinking", "thinking": "", "signature": ""})));
 
@@ -148,7 +176,7 @@ fn messages_render_non_anthropic_reasoning_as_one_unsigned_thinking_block() {
             .body;
     assert_eq!(
         body["content"][0],
-        json!({"type": "thinking", "thinking": "plain summary", "signature": ""})
+        json!({"type": "thinking", "thinking": "plain\n\n summary", "signature": ""})
     );
     let hidden =
         completed_messages_body_with_reasoning("request-1", "m", &events, &[], None, false)

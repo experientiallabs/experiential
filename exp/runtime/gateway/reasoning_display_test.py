@@ -5,9 +5,10 @@ from __future__ import annotations
 import pytest
 
 from exp.common.models.model import ModelCapabilities
-from exp.runtime.gateway.reasoning_display import (
+from exp.runtime.gateway.reasoning_display import reasoning_output_hidden
+from exp.runtime.models.providers.reasoning_compat import (
     REASONING_DISPLAY_ENVIRONMENT,
-    reasoning_output_hidden,
+    reasoning_display_enabled,
 )
 
 
@@ -26,3 +27,13 @@ def test_kill_switch_withholds_every_rung(monkeypatch: pytest.MonkeyPatch) -> No
     assert reasoning_output_hidden(ModelCapabilities()) is True
     monkeypatch.setenv(REASONING_DISPLAY_ENVIRONMENT, "1")
     assert reasoning_output_hidden(ModelCapabilities()) is False
+
+
+def test_kill_switch_restores_provider_reasoning_defaults(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With display off no request builder asks a provider for readable reasoning."""
+    monkeypatch.setenv(REASONING_DISPLAY_ENVIRONMENT, "0")
+    assert reasoning_display_enabled() is False
+    monkeypatch.delenv(REASONING_DISPLAY_ENVIRONMENT)
+    assert reasoning_display_enabled() is True

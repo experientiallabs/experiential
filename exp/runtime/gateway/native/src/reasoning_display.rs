@@ -107,6 +107,20 @@ pub(crate) fn unsigned_thinking_text(event: &Event, output: ReasoningOutput) -> 
     (!delta.is_empty()).then_some(delta.as_str())
 }
 
+/// The joined text one Messages delta adds to the gateway's unsigned thinking
+/// block: the `unsigned_thinking_text` gate, flattened like Chat so
+/// consecutive provider units (OpenAI summary parts) stay separate
+/// paragraphs. Exposed route reasoning is display text here, since the
+/// Messages wire has no `reasoning_content` field.
+pub(crate) fn unsigned_thinking_delta(
+    joiner: &mut DisplayJoiner,
+    event: &Event,
+    output: ReasoningOutput,
+) -> Option<String> {
+    unsigned_thinking_text(event, output)?;
+    joiner.delta(event, false)
+}
+
 #[cfg(test)]
 #[path = "reasoning_display_tests.rs"]
 mod tests;

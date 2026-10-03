@@ -425,3 +425,22 @@ def test_display_free_thinking_configs_stay_untouched(config: JsonObject) -> Non
         maximum_output_tokens=128_000,
     )
     assert payload["thinking"] == config
+
+
+def test_the_display_kill_switch_restores_omitted_thinking(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``EXP_GATEWAY_REASONING_DISPLAY=0`` adds no display and no implicit thinking."""
+    monkeypatch.setenv("EXP_GATEWAY_REASONING_DISPLAY", "0")
+    implicit = anthropic_messages_stream_payload(
+        "claude-opus-5-5", _plain_request(), supports_reasoning=True, maximum_output_tokens=128_000
+    )
+    assert "thinking" not in implicit
+    config: JsonObject = {"type": "adaptive"}
+    explicit = anthropic_messages_stream_payload(
+        "claude-opus-5",
+        _plain_request(provider_thinking_config=config),
+        supports_reasoning=True,
+        maximum_output_tokens=128_000,
+    )
+    assert explicit["thinking"] == {"type": "adaptive"}

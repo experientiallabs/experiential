@@ -118,13 +118,12 @@ impl Normalizer {
                     // summary carries only display text, which streams below as
                     // plaintext reasoning instead.
                     let thought = part.get("thought") == Some(&Value::Bool(true));
-                    let thought_text = thought
-                        && part
-                            .get("text")
-                            .and_then(Value::as_str)
-                            .is_some_and(|text| !text.is_empty());
-                    let retained_whole =
-                        part.contains_key("thoughtSignature") || (thought && !thought_text);
+                    let thought_text = part
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .filter(|text| thought && !text.is_empty());
+                    let retained_whole = part.contains_key("thoughtSignature")
+                        || (thought && thought_text.is_none());
                     if retained_whole {
                         let bytes = crate::dialects::records_retained_bytes(raw_part)
                             .ok_or_else(|| malformed(super::OUTPUT_OVERFLOW_MESSAGE))?;
@@ -137,11 +136,7 @@ impl Normalizer {
                         // The thought summary text is the model's displayable
                         // reasoning: it renders as plaintext reasoning on rungs
                         // whose reasoning display is on.
-                        if let Some(text) = part
-                            .get("text")
-                            .and_then(Value::as_str)
-                            .filter(|text| !text.is_empty())
-                        {
+                        if let Some(text) = thought_text {
                             // A signed part was charged whole above.
                             if !retained_whole {
                                 self.reserve_summary_bytes(text.len())?;
