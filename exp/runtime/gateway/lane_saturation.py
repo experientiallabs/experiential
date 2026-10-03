@@ -22,8 +22,9 @@ Two rules close that:
    (``saturated_overflow``: "policy never manufactures a failure"). That is
    still the default for an AUTHORED bound, and an authored rung may opt into
    ``saturation="refuse"``; the default lane bound refuses too. A priority
-   caller (the host's paying organizations) is the exception on both: its
-   shed overflows, capped at twice the bound so the worker stays protected. A refusal is a fast,
+   caller (the host's paying and Pro organizations) is the exception on both:
+   its shed overflows, capped at 1.5x / 2x the bound so the worker stays
+   protected. A refusal is a fast,
    retryable 429 (``lane_saturated_failure``) with the protocol's throttle
    Retry-After, answered
    before any dispatch, so the caller's retry lands when a slot frees rather
@@ -51,6 +52,27 @@ DEFAULT_LANE_SHARE = 0.5
 # retry after it lands on a freed slot instead of stacking a queue the
 # request deadline would have to drain.
 LANE_SATURATED_RETRY_AFTER_SECONDS = THROTTLED_RETRY_AFTER_SECONDS
+
+# How far past a refusing bound each ``AuthorizationSnapshot.priority_admission``
+# level may overflow, as a multiple of the bound: free callers never, paying
+# callers to 1.5x, Pro callers to 2x. The cap keeps one flooding organization
+# from holding every admission permit.
+PRIORITY_OVERFLOW_FACTORS = (1.0, 1.5, 2.0)
+
+
+def priority_overflow_ceiling(bound: int | None, priority_admission: int) -> float | None:
+    """The in-flight ceiling a forced priority overflow may not reach, or ``None``.
+
+    Args:
+        bound: The rung's effective bound (authored or the worker default).
+        priority_admission: The caller's level (0 free, 1 paying, 2 Pro).
+
+    Returns:
+        ``bound * factor`` for a priority caller on a bounded rung, else ``None``.
+    """
+    if bound is None or not priority_admission:
+        return None
+    return bound * PRIORITY_OVERFLOW_FACTORS[priority_admission]
 
 
 def default_lane_bound(max_active_requests: int, share: float = DEFAULT_LANE_SHARE) -> int:
@@ -107,9 +129,9 @@ def overflow_target(
     ``saturation="refuse"``, unless the caller is a priority caller
     (``AuthorizationSnapshot.priority_admission``): a priority request always
     overflows, so on a saturated lane only non-priority callers are turned
-    away. The reservation caps that overflow at twice the rung's bound
-    (``RungShed.overflow_ceiling``), so a flooding priority organization still
-    cannot hold every permit. A bypass that was not a registry shed
+    away. The reservation caps that overflow (``priority_overflow_ceiling``:
+    1.5x the bound for paying callers, 2x for Pro); a shed at the cap
+    (``RungShed.overflow_ceiling``) is refused like any other. A bypass that was not a registry shed
     (a cold throttle failover) keeps the historical overflow.
 
     Args:
@@ -125,9 +147,11 @@ def overflow_target(
     if not policy_sheds:
         return None
     depth = policy_sheds[0][0]
+    shed = shed_records.get(depth)
+    if shed is not None and shed.overflow_ceiling:
+        return None
     if route.snapshot.authorization.priority_admission:
         return depth
-    shed = shed_records.get(depth)
     if shed is not None and shed.default_bound:
         return None
     policy = route.deployments[depth].gateway.dispatch

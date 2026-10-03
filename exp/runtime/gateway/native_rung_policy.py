@@ -26,6 +26,7 @@ from collections.abc import Callable
 from exp.common.models.gateway_catalog import ExactModelDeployment
 from exp.runtime.gateway.contracts import GatewayEvent, GatewayFailure, GatewayFailureClass
 from exp.runtime.gateway.health import DeploymentHealthKey, DeploymentHealthRegistry
+from exp.runtime.gateway.lane_saturation import priority_overflow_ceiling
 from exp.runtime.gateway.native_execution import (
     THROTTLE_BACKOFF,
     THROTTLE_FAILOVER_COLD,
@@ -123,10 +124,10 @@ def reserve_rung_slot(
         fresh_spill_fraction=fresh_fraction,
         force=force,
         # A refusing bound (the worker default, or an authored refuse) stays
-        # hard for a non-priority caller. A priority caller's shed overflows it
-        # (lane_saturation.overflow_target), capped at twice the bound.
+        # hard for a free caller. A priority caller's shed overflows it
+        # (lane_saturation.overflow_target), capped by its level.
         hard_bound=refusing and not priority,
-        overflow_ceiling=2 * bound if refusing and priority and bound is not None else None,
+        overflow_ceiling=priority_overflow_ceiling(bound, priority) if refusing else None,
         rate_retry=rate_retry,
     )
     if isinstance(result, RungShed) and applies_default and result.reason == "queue_bound":

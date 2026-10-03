@@ -436,7 +436,7 @@ class NativeAttemptAccounting:
                 if policy_sheds and last_failure is None and not forced_overflow:
                     candidate = (
                         None
-                        if selected_first
+                        if selected_first and not entry.authorization.priority_admission
                         else overflow_target(route, policy_sheds, shed_records)
                     )
                     forced_overflow = candidate is not None
@@ -501,14 +501,6 @@ class NativeAttemptAccounting:
                 policy_sheds.append((candidate, ticket.reason))
                 shed_records[candidate] = ticket
                 self._health.release_probe(keys[candidate])
-                if ticket.overflow_ceiling:
-                    # A priority overflow already at twice the bound: refuse
-                    # rather than retry the same forced admission.
-                    last_failure = lane_saturated_failure()
-                    capacity_refused = True
-                    with self._lock:
-                        self._rung_saturation_refusals += 1
-                    break
                 forced_overflow = not selected_first and shed_keeps_rung(
                     route, candidate, redial_depth, last_failure, ticket.reason
                 )

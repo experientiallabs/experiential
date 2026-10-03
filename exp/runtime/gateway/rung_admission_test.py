@@ -629,6 +629,53 @@ class TestFreshSessionSpill:
         assert _reserve(registry, "org-a", warm_session=False) == RungShed("queue_bound")
 
 
+class TestPriorityOverflowCeiling:
+    """A forced priority admission is capped by its ceiling, not the bound."""
+
+    def test_forced_admission_stops_at_the_ceiling(self) -> None:
+        """Past the bound a forced reservation admits until the ceiling, then sheds marked."""
+        registry = _registry([0.0])
+        for _ in range(2):
+            assert isinstance(_reserve(registry, "org-a", bound=2), str)
+        for _ in range(2):
+            ticket = registry.reserve(
+                _KEY,
+                organization_id="org-pro",
+                weight=10,
+                bound=2,
+                fair_share=True,
+                force=True,
+                overflow_ceiling=4.0,
+            )
+            assert isinstance(ticket, str)
+        assert registry.reserve(
+            _KEY,
+            organization_id="org-pro",
+            weight=10,
+            bound=2,
+            fair_share=True,
+            force=True,
+            overflow_ceiling=4.0,
+        ) == RungShed("queue_bound", overflow_ceiling=True)
+
+    def test_forced_rate_redial_rechecks_only_rate_windows_under_a_ceiling(self) -> None:
+        """A priority throttle redial at the bound is not shed by the bound it may overflow."""
+        registry = _registry([0.0])
+        for _ in range(2):
+            assert isinstance(_reserve(registry, "org-a", bound=2), str)
+        ticket = registry.reserve(
+            _KEY,
+            organization_id="org-pro",
+            weight=10,
+            bound=2,
+            fair_share=True,
+            force=True,
+            rate_retry=True,
+            overflow_ceiling=4.0,
+        )
+        assert isinstance(ticket, str)
+
+
 class TestRegistryContracts:
     """Construction and counter contracts."""
 

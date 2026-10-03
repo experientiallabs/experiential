@@ -898,12 +898,8 @@ class AuthorizationSnapshot(ContractModel):
     Attributes:
         model_chain_authority: Optional backend-issued binding, revalidated by
             the host at acceptance and every attempt reservation.
-        fair_share_weight: Organization weight in [1, 1,000,000], default 1,
-            used only on rungs authoring weighted fair-share admission.
-        priority_admission: Whether the host vouches for the caller as a
-            priority (paying) caller, default False. A priority request shed
-            off a ``saturation="refuse"`` rung's authored bound overflows onto
-            it instead of being refused.
+        fair_share_weight: Organization weight in [1, 1,000,000], default 1.
+        priority_admission: Host-vouched 0 free, 1 paying, 2 Pro (lane_saturation caps).
         descendant_start_authorized: False unless the host proves root funding
             and policy gates before allowing a request to start at a child.
         zdr_requested: Caller demand for stricter ZDR filtering, default False.
@@ -939,10 +935,9 @@ class AuthorizationSnapshot(ContractModel):
     and never a credential; ``None`` when no trusted hop yields an address (an
     allowlist then fails closed, a denylist open). 45 chars fits any IPv6 form."""
     fair_share_weight: int = Field(default=1, ge=1, le=1_000_000)
-    priority_admission: bool = False
+    priority_admission: int = Field(default=0, ge=0, le=2)
     descendant_start_authorized: bool = False
     zdr_requested: bool = False
-    # Fair-share weights default to equal shares and apply only on opted-in rungs.
 
 
 class ExecutionSnapshot(ContractModel):

@@ -1302,7 +1302,7 @@ def _admit(
     request_id: str,
     organization_id: str = "organization-one",
     weight: int = 1,
-    priority_admission: bool = False,
+    priority_admission: int = 0,
     failover_mode: FailoverMode = "maximize_availability",
     throttle_cache_threshold: float | None = None,
     throttle_redial: GatewayThrottleRedialPolicy | None = None,
@@ -1781,7 +1781,7 @@ class TestLaneSaturation:
             ),
         )
         _admit(registry, only, request_id="request-1")
-        _admit(registry, only, request_id="request-paid", priority_admission=True)
+        _admit(registry, only, request_id="request-paid", priority_admission=2)
         _admit(registry, only, request_id="request-free")
         assert _start(registry, ordinal=0, request_id="request-1")["route_depth"] == 0
         paid = _start(registry, ordinal=0, request_id="request-paid")
@@ -1799,7 +1799,7 @@ class TestLaneSaturation:
         for request_id in ("request-1", "request-free"):
             _admit(registry, only, request_id=request_id)
         for request_id in ("request-paid-1", "request-paid-2"):
-            _admit(registry, only, request_id=request_id, priority_admission=True)
+            _admit(registry, only, request_id=request_id, priority_admission=2)
         assert _start(registry, ordinal=0, request_id="request-1")["route_depth"] == 0
         free = _start(registry, ordinal=0, request_id="request-free")
         assert free["exhausted"] is True
@@ -1808,6 +1808,26 @@ class TestLaneSaturation:
         assert ledger.started[-1]["dispatch_reason"] == "saturated_overflow"
         # Two in flight on a default bound of one: the ceiling refuses the next.
         capped = _start(registry, ordinal=0, request_id="request-paid-2")
+        assert capped["exhausted"] is True
+        assert cast("JsonObject", capped["failure"])["failure_class"] == "throttled"
+
+    def test_paying_callers_overflow_to_one_and_a_half_times_the_bound(self) -> None:
+        """A paying (level 1) caller on a refusing bound of 2 reaches 3 in flight, never 4."""
+        ledger = _RecordingLedger()
+        registry = NativeAttemptAccounting(ledger)
+        only = (
+            _deployment(
+                "deployment-a",
+                connection_sha256="b" * 64,
+                dispatch=GatewayRungDispatchPolicy(concurrency_bound=2, saturation="refuse"),
+            ),
+        )
+        request_ids = [f"request-paying-{index}" for index in range(4)]
+        for request_id in request_ids:
+            _admit(registry, only, request_id=request_id, priority_admission=1)
+        for request_id in request_ids[:3]:
+            assert _start(registry, ordinal=0, request_id=request_id)["route_depth"] == 0
+        capped = _start(registry, ordinal=0, request_id=request_ids[3])
         assert capped["exhausted"] is True
         assert cast("JsonObject", capped["failure"])["failure_class"] == "throttled"
 
@@ -1824,7 +1844,7 @@ class TestLaneSaturation:
         )
         request_ids = [f"request-paid-{index}" for index in range(5)]
         for request_id in request_ids:
-            _admit(registry, only, request_id=request_id, priority_admission=True)
+            _admit(registry, only, request_id=request_id, priority_admission=2)
         for request_id in request_ids[:4]:
             assert _start(registry, ordinal=0, request_id=request_id)["route_depth"] == 0
         capped = _start(registry, ordinal=0, request_id=request_ids[4])
@@ -1879,6 +1899,29 @@ def test_selected_first_route_refuses_load_shed_without_spill_or_overflow(
     assert len(ledger.started) == 1
     assert registry.rung_admission_counters() == (1, 0, 1)
     assert registry.entry("selected") is None
+
+
+def test_selected_first_route_overflows_its_own_rung_for_a_priority_caller() -> None:
+    """A Pro caller's selected rung overflows in place: no sideways move, still a ceiling."""
+    ledger = _RecordingLedger()
+    registry = NativeAttemptAccounting(ledger, default_lane_bound=1)
+    deployments = (
+        _deployment("deployment-a", connection_sha256="b" * 64),
+        _deployment("deployment-b", connection_sha256="c" * 64),
+    )
+    _admit(registry, deployments, request_id="occupied")
+    for request_id in ("selected-1", "selected-2"):
+        selected = _admit(registry, deployments, request_id=request_id, priority_admission=2)
+        selected.route = selected.route.model_copy(
+            update={"resolved_route_id": "route_" + "a" * 64}
+        )
+    assert _start(registry, ordinal=0, request_id="occupied")["route_depth"] == 0
+    assert _start(registry, ordinal=0, request_id="selected-1")["route_depth"] == 0
+    assert ledger.started[-1]["dispatch_reason"] == "saturated_overflow"
+    capped = _start(registry, ordinal=0, request_id="selected-2")
+    assert capped["exhausted"] is True
+    assert cast("JsonObject", capped["failure"])["failure_class"] == "throttled"
+    assert all(row["route_depth"] == 0 for row in ledger.started)
 
 
 @pytest.mark.parametrize("probe_occupied", [False, True])

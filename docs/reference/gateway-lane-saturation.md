@@ -36,8 +36,8 @@ failure"). Two things change:
   authored rung set to `refuse` answers the caller at once instead of dispatching one more
   request onto a lane already at its bound.
 - A shed by the DEFAULT lane bound (`RungShed.default_bound`) refuses too: the default
-  exists to protect the worker, so only a priority caller overflows it, and only to twice
-  the bound (below).
+  exists to protect the worker, so only a priority caller overflows it, and only to its
+  level's ceiling (below).
 
 The refusal is `lane_saturated_failure()`: failure class `throttled`, safe message
 "every lane for this model is at its in-flight bound on this gateway worker; retry in 5
@@ -53,13 +53,13 @@ shed reason (`shed_keeps_pin`), the documented continuity-over-spill trade.
 
 ## Priority callers and default fairness
 
-A PRIORITY caller (`AuthorizationSnapshot.priority_admission`, which the hosted platform sets
-for paying organizations) is never refused by a bound, on every rung and with nothing to
+A PRIORITY caller (`AuthorizationSnapshot.priority_admission`: 1 for a paying organization,
+2 for Pro, as the hosted platform sets it; 0 free) is never refused by a bound, on every rung and with nothing to
 author: when either refusing bound (an authored `refuse` or the worker's default lane bound)
 sheds it, `overflow_target` force-admits it onto the rung as under `overflow`
-(`saturated_overflow`), so on a saturated lane only non-priority callers get the 429. The
-overflow is capped at twice the rung's bound in flight (`RungShed.overflow_ceiling`); past
-that a priority request is refused like any other, so one flooding paying organization still
+(`saturated_overflow`), so on a saturated lane only free callers get the 429. The overflow is
+capped by level (`PRIORITY_OVERFLOW_FACTORS`: 1.5x the bound in flight for paying, 2x for Pro;
+`RungShed.overflow_ceiling`); past that a priority request is refused like any other, so one flooding paying organization still
 cannot hold every admission permit.
 
 `GatewayRungDispatchPolicy.fair_share` defaults to ON (`None`): every bounded rung, including

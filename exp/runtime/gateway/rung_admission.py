@@ -141,9 +141,9 @@ class RungShed:
     overflow_ceiling: bool = False
     """Whether a priority caller's forced overflow hit its ceiling.
 
-    A priority caller overflows a refusing bound by at most the bound again
-    (twice the bound in flight); past that the request is refused like any
-    other, so a flooding priority organization still cannot hold the worker.
+    A priority caller overflows a refusing bound only up to its level's
+    ceiling (1.5x the bound paying, 2x Pro); past that the request is refused
+    like any other, so a flooding priority organization cannot hold the worker.
     """
     default_bound: bool = False
     """Whether the bound that shed was the worker's default lane share.
@@ -252,7 +252,7 @@ class RungLoadRegistry:
         fresh_spill_fraction: float | None = None,
         force: bool = False,
         hard_bound: bool = False,
-        overflow_ceiling: int | None = None,
+        overflow_ceiling: float | None = None,
         rate_retry: bool = False,
     ) -> str | RungShed:
         """Reserve one slot on a policy-bounded rung, or shed with a reason.
@@ -303,7 +303,9 @@ class RungLoadRegistry:
                     rung,
                     organization,
                     now=now,
-                    bound=bound,
+                    # A priority overflow's capacity is its ceiling (checked
+                    # above), so a forced rate redial rechecks only rate windows.
+                    bound=None if force and overflow_ceiling is not None else bound,
                     fair_share=fair_share,
                     requests_per_minute=requests_per_minute,
                     tokens_per_minute=tokens_per_minute,
