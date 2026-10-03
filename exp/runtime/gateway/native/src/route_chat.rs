@@ -225,7 +225,7 @@ pub(crate) async fn chat(
         output_token_cap: admission.maximum_output_tokens,
         tool_search: admission.tool_search.as_ref(),
         inspection: admission
-            .runtime_inspection
+            .guardrail_inspection
             .then_some(crate::waterfall::InspectionContext {
                 web_search: admission.web_search.as_ref(),
                 responses: false,

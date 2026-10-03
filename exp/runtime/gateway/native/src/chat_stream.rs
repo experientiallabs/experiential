@@ -14,8 +14,7 @@ use crate::admission::{served_headers, Admission};
 use crate::encode::ChatSseEncoder;
 use crate::errors::{Failure, FailureClass};
 use crate::events::{Event, Usage};
-use crate::guardrails::runtime::{inspect_events, RuntimeInspector};
-use crate::guardrails::{released_events, StreamRedactor};
+use crate::guardrails::StreamGuardrails;
 use crate::relay::track_event;
 use crate::replay::OwnerLease;
 use crate::respond::{
@@ -77,10 +76,12 @@ pub(super) async fn stream_response(
         let mut replayable = lease.is_some();
         // Deterministic output redaction as bytes flow: only the trailing
         // window the detector cannot yet decide about is withheld.
-        let mut redactor = incremental_guardrail.then(|| StreamRedactor::new(&request_id));
-        let mut runtime_inspector = admission
-            .runtime_inspection
-            .then(|| RuntimeInspector::new(&request_id, deadline));
+        let mut output_guardrails = StreamGuardrails::new(
+            &request_id,
+            incremental_guardrail,
+            admission.guardrail_inspection,
+            deadline,
+        );
 
         macro_rules! fail_stream {
             ($failure:expr) => {{
@@ -182,24 +183,13 @@ pub(super) async fn stream_response(
             let outward = outward_event(&event, &mut visible_refusal);
             // A byte that reaches the caller has already been through the
             // detector, and a terminal flushes whatever is still buffered.
-            let outward_events = match released_events(
-                redactor.as_mut(),
-                &guard.bridge,
-                outward,
-                event.is_terminal(),
-            )
-            .await
+            let outward_events = match output_guardrails
+                .release(&guard.bridge, outward, event.is_terminal())
+                .await
             {
                 Ok(events) => events,
                 Err(failure) => fail_stream!(failure),
             };
-            let outward_events =
-                match inspect_events(runtime_inspector.as_mut(), &guard.bridge, outward_events)
-                    .await
-                {
-                    Ok(events) => events,
-                    Err(failure) => fail_stream!(failure),
-                };
             if event.is_terminal() {
                 committed.relay.close_transport();
                 if matches!(event, Event::Completed | Event::StoppedAtSequence(_)) {

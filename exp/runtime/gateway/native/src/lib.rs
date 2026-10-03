@@ -672,7 +672,7 @@ fn exp_gateway_native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(failure_public_error_fixture, module)?)?;
     module.add("__version__", env!("CARGO_PKG_VERSION"))?;
     module.add("AUTOMATIC_VERTEX_CACHE_CONTRACT_VERSION", 1)?;
-    module.add("RUNTIME_INSPECTION_CONTRACT_VERSION", 1)?;
+    module.add("GUARDRAIL_INSPECTION_CONTRACT_VERSION", 1)?;
     module.add("MODEL_STAGE_CONTRACT_VERSION", MODEL_STAGE_CONTRACT_VERSION)?;
     Ok(())
 }

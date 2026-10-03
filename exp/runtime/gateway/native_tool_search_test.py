@@ -25,7 +25,7 @@ class _Accounting:
 
 
 class _Plane(NativeToolSearchMixin):
-    _runtime_guardrail = None
+    _guardrails = None
 
     def __init__(self, entry: InflightRequest | None) -> None:
         self._accounting: _Registry = _Accounting(entry)

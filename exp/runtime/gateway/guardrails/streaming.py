@@ -14,9 +14,63 @@ without per-request state.
 
 from __future__ import annotations
 
-from typing import Protocol, runtime_checkable
+from collections.abc import Awaitable
+from typing import Literal, Protocol, runtime_checkable
+
+from pydantic import Field
 
 from exp.common.core.artifacts import ContractModel
+from exp.runtime.gateway.contracts import GatewayRequest
+from exp.runtime.gateway.guardrails.contracts import ClassifierVerdict, GuardrailCheck
+
+
+class GuardrailFragment(ContractModel):
+    """One inspectable output channel held until the engine authorizes release.
+
+    Attributes:
+        kind: Text, refusal, reasoning, complete tool arguments, or retrieved content.
+        channel: Request-local channel identity, never shared across requests.
+        text: Exact pending content, retained only in memory.
+        name: Name of a completed tool when applicable.
+    """
+
+    kind: Literal["text", "refusal", "reasoning", "tool", "retrieved"]
+    channel: str = Field(max_length=1024)
+    text: str = Field(max_length=1_048_576, repr=False)
+    name: str | None = Field(default=None, max_length=256)
+
+
+class GuardrailOutput(ContractModel):
+    """Ordered additions to one request's classifier context.
+
+    Attributes:
+        request_id: Exact admitted request owning this segment.
+        fragments: Newly generated or retrieved content, not yet released.
+        final: Whether this session has received its final output segment.
+    """
+
+    request_id: str
+    fragments: tuple[GuardrailFragment, ...] = Field(max_length=1024, repr=False)
+    final: bool
+
+
+class ClassifierOutputSession(Protocol):
+    """A request-owned classifier capability run by the engine's bounded executor."""
+
+    def inspect_output(self, output: GuardrailOutput) -> Awaitable[ClassifierVerdict]:
+        """Inspect new content using this request's context and return a content-free verdict."""
+        ...
+
+
+@runtime_checkable
+class IncrementalClassifier(Protocol):
+    """Optional streaming capability of an existing classifier adapter."""
+
+    def open_output_session(
+        self, *, request: GatewayRequest, check: GuardrailCheck
+    ) -> Awaitable[ClassifierOutputSession | None]:
+        """Create fresh request state, or return None to require complete-output buffering."""
+        ...
 
 
 @runtime_checkable

@@ -5,6 +5,8 @@ from __future__ import annotations
 import socket
 import sqlite3
 import threading
+import time
+from collections.abc import Mapping
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Literal
@@ -15,14 +17,23 @@ import pytest
 
 from exp.common.core.artifacts import JsonObject
 from exp.common.models import ModelCapabilities
-from exp.runtime.gateway.contracts import (
-    AuthorizationSnapshot,
-    GatewayFailure,
-    GatewayFailureClass,
-    GatewayRequest,
+from exp.runtime.gateway.contracts import GatewayRequest
+from exp.runtime.gateway.guardrails.bounded import BoundedInspect
+from exp.runtime.gateway.guardrails.classifiers import ClassifierRegistry
+from exp.runtime.gateway.guardrails.client import DirectClassifierClient, InspectingClassifier
+from exp.runtime.gateway.guardrails.contracts import (
+    ClassifierVerdict,
+    GuardrailAction,
+    GuardrailCapabilityKind,
+    GuardrailCheck,
+    GuardrailCheckStage,
+    GuardrailCompletion,
+    GuardrailPolicy,
+    MandatoryGuardrailPolicy,
 )
-from exp.runtime.gateway.guardrails.contracts import GuardrailRejected
-from exp.runtime.gateway.guardrails.runtime import RuntimeOutput
+from exp.runtime.gateway.guardrails.enforcement import GuardrailEngine
+from exp.runtime.gateway.guardrails.store import MappingGuardrailStore
+from exp.runtime.gateway.guardrails.streaming import GuardrailOutput
 from exp.runtime.gateway.lifecycle import load_gateway_components
 from exp.runtime.gateway.lifecycle_test import _configured_gateway
 from exp.runtime.gateway.native_bridge import NativeBridgeError, NativeControlPlane
@@ -45,51 +56,86 @@ def _tool_chunk(arguments: str, *, start: bool = False) -> bytes:
 
 
 class _Session:
-    """Accumulate split synthetic markers in one request-owned inspection session."""
+    """Accumulate split synthetic markers in one request-owned classifier session."""
 
     def __init__(self) -> None:
         """Start with no content inherited from another request."""
         self.text = ""
 
-    def inspect_output(self, output: RuntimeOutput, *, deadline_monotonic: float) -> None:
-        """Reject a marker even when provider transport splits it into deltas."""
+    async def inspect_output(self, output: GuardrailOutput) -> ClassifierVerdict:
+        """Flag a marker even when provider transport splits it into deltas."""
         self.text += "".join(fragment.text for fragment in output.fragments)
-        if "withhold-marker" in self.text:
-            raise GuardrailRejected(
-                GatewayFailure(
-                    failure_class=GatewayFailureClass.GUARDRAIL,
-                    safe_message="Synthetic policy violation",
-                )
-            )
+        return ClassifierVerdict(flagged="withhold-marker" in self.text)
 
 
-class _Guard:
-    """Host-owned policy with no customer identity assignment."""
+class _Guard(GuardrailEngine):
+    """Compose a synthetic adapter through the normal engine and mandatory policy layer."""
 
-    revision = "synthetic-runtime-policy-v1"
-
-    def __init__(self, *, block_input: bool = False) -> None:
-        """Bind the admission outcome and collect inspected request context."""
-        self.block_input = block_input
-        self.requests: list[GatewayRequest] = []
-        self.sessions: list[_Session] = []
-
-    def open(
+    def __init__(
         self,
         *,
-        authorization: AuthorizationSnapshot,
-        request: GatewayRequest,
-        deadline_monotonic: float,
-    ) -> _Session:
-        """Check the full canonical request before creating a fresh output session."""
+        block_input: bool = False,
+        policies: tuple[GuardrailPolicy, ...] = (),
+        adapters: Mapping[str, InspectingClassifier] | None = None,
+        incremental: bool = True,
+        inspects: BoundedInspect | None = None,
+        timeout_ms: int = 5000,
+        max_response_bytes: int = 1_048_576,
+    ) -> None:
+        """Use the same registry and executor for operator and customer checks."""
+        self.block_input = block_input
+        self.incremental = incremental
+        self.requests: list[GatewayRequest] = []
+        self.sessions: list[_Session] = []
+        self.completions: list[GuardrailCompletion] = []
+        super().__init__(
+            store=MappingGuardrailStore(policies),
+            client=DirectClassifierClient(
+                ClassifierRegistry({**(adapters or {}), "mandatory": self})
+            ),
+            monotonic=time.monotonic,
+            inspects=inspects,
+            mandatory_policy=MandatoryGuardrailPolicy(
+                policy_id="mandatory-test",
+                revision="synthetic-policy-v1",
+                max_response_bytes=max_response_bytes,
+                checks=tuple(
+                    GuardrailCheck(
+                        check_id=f"mandatory-{stage.value}",
+                        capability=GuardrailCapabilityKind.CONTENT_SAFETY,
+                        stage=stage,
+                        action=GuardrailAction.BLOCK,
+                        timeout_ms=timeout_ms,
+                        adapter_id="mandatory",
+                    )
+                    for stage in (GuardrailCheckStage.INPUT, GuardrailCheckStage.OUTPUT)
+                ),
+            ),
+        )
+
+    async def inspect_input(
+        self, *, request: GatewayRequest, check: GuardrailCheck
+    ) -> ClassifierVerdict:
+        """Record input after every expansion and return a standard classifier verdict."""
         self.requests.append(request)
-        if self.block_input:
-            raise GuardrailRejected(
-                GatewayFailure(
-                    failure_class=GatewayFailureClass.GUARDRAIL,
-                    safe_message="Synthetic policy violation",
-                )
-            )
+        return ClassifierVerdict(flagged=self.block_input)
+
+    async def inspect_output(
+        self, *, completion: GuardrailCompletion, check: GuardrailCheck
+    ) -> ClassifierVerdict:
+        """Offer the existing complete-output classifier contract as well."""
+        self.completions.append(completion)
+        return ClassifierVerdict(
+            flagged="withhold-marker" in completion.text
+            or any("withhold-marker" in call.arguments for call in completion.tool_calls)
+        )
+
+    async def open_output_session(
+        self, *, request: GatewayRequest, check: GuardrailCheck
+    ) -> _Session | None:
+        """Bind fresh classifier state to this request's complete input context."""
+        if not self.incremental:
+            return None
         session = _Session()
         self.sessions.append(session)
         return session
@@ -100,7 +146,7 @@ def test_mandatory_input_refuses_before_durable_acceptance(tmp_path: Path) -> No
     _, raw_key = _configured_gateway(tmp_path)
     components = load_gateway_components(tmp_path, environment={"TEST_PROVIDER_KEY": "synthetic"})
     guard = _Guard(block_input=True)
-    control = NativeControlPlane(components, runtime_guardrail=guard)
+    control = NativeControlPlane(components, guardrails=guard)
     with pytest.raises(NativeBridgeError):
         _admit(control, raw_key, _chat_body())
     assert len(guard.requests) == 1
@@ -113,11 +159,13 @@ def test_mandatory_input_refuses_before_durable_acceptance(tmp_path: Path) -> No
 @pytest.mark.parametrize("surface", ["chat", "responses", "messages"])
 @pytest.mark.parametrize("streaming", [False, True])
 @pytest.mark.parametrize("tool_call", [False, True, "large"])
-def test_real_native_runtime_inspection_holds_each_segment(
+@pytest.mark.parametrize("incremental", [False, True])
+def test_real_native_guardrail_inspection_holds_each_segment(
     tmp_path: Path,
     surface: str,
     streaming: bool,
     tool_call: bool | Literal["large"],
+    incremental: bool,
 ) -> None:
     """A safe prefix streams before generation ends; the violating segment never escapes."""
     continue_output = threading.Event()
@@ -137,7 +185,7 @@ def test_real_native_runtime_inspection_holds_each_segment(
             try:
                 self.wfile.write(_content_chunk(prefix))
                 self.wfile.flush()
-                if streaming:
+                if streaming and incremental:
                     continue_output.wait(5)
                 arguments = '{"q":"' + ("x" * 600_000 if tool_call == "large" else "") + "withhold-"
                 frames = (
@@ -171,11 +219,11 @@ def test_real_native_runtime_inspection_holds_each_segment(
         base_url=f"http://127.0.0.1:{provider.server_port}/v1",
         capabilities=ModelCapabilities(maximum_output_tokens=128_000, supports_tools=True),
     )
-    guard = _Guard()
+    guard = _Guard(incremental=incremental)
     components = load_gateway_components(tmp_path, environment={"TEST_PROVIDER_KEY": "synthetic"})
     control = NativeControlPlane(
         components,
-        runtime_guardrail=guard,
+        guardrails=guard,
     )
     with socket.socket() as probe:
         probe.bind(("127.0.0.1", 0))
@@ -235,12 +283,17 @@ def test_real_native_runtime_inspection_holds_each_segment(
                     assert not upstream_finished.is_set()
                     continue_output.set()
             result = "".join(chunks)
-            assert response.status_code == (200 if streaming else 400)
+            assert response.status_code == (200 if streaming and incremental else 400)
         assert "withhold-" not in result
-        assert "Synthetic policy violation" in result
+        assert "blocked by a gateway guardrail" in result
         assert len(guard.requests) == 1
-        assert "withhold-marker" in guard.sessions[0].text
-        if streaming:
+        if incremental:
+            assert "withhold-marker" in guard.sessions[0].text
+        else:
+            assert prefix not in result
+            assert not guard.sessions
+            assert any("withhold-marker" in item.model_dump_json() for item in guard.completions)
+        if streaming and incremental:
             assert continue_output.is_set()
         with sqlite3.connect(components.ledger.database_path) as connection:
             rows = connection.execute(

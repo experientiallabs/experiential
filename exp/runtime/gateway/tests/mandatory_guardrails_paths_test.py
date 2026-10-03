@@ -16,12 +16,14 @@ import httpx
 import pytest
 
 from exp.common.core.artifacts import JsonObject
-from exp.runtime.gateway.contracts import AuthorizationSnapshot, GatewayRequest
+from exp.runtime.gateway.contracts import GatewayRequest
+from exp.runtime.gateway.guardrails.contracts import ClassifierVerdict, GuardrailCheck
 from exp.runtime.gateway.lifecycle import load_gateway_components
 from exp.runtime.gateway.management import GatewayManagement
 from exp.runtime.gateway.native_bridge import NativeControlPlane
 from exp.runtime.gateway.native_server import serve_native_gateway
 from exp.runtime.gateway.tests.launch_test import _unused_port
+from exp.runtime.gateway.tests.mandatory_guardrails_test import _Guard
 from exp.runtime.gateway.tests.native_tool_search_test import (
     _configure,
     _search_call_turn,
@@ -31,7 +33,6 @@ from exp.runtime.gateway.tests.native_waterfall_test import (
     _sse_frame,
     _terminal_frames,
 )
-from exp.runtime.gateway.tests.runtime_guardrails_test import _Guard, _Session
 from exp.runtime.gateway.tests.web_search_backend_fixture_test import StaticWebSearchBackend
 from exp.runtime.gateway.tool_search.round import perform_round
 from exp.runtime.gateway.web_search.contracts import GatewayWebSearchResult
@@ -40,32 +41,14 @@ from exp.runtime.gateway.web_search.contracts import GatewayWebSearchResult
 class _RetrievedGuard(_Guard):
     """Refuse the marker only when it enters the conversation, including retrieved turns."""
 
-    def open(
-        self,
-        *,
-        authorization: AuthorizationSnapshot,
-        request: GatewayRequest,
-        deadline_monotonic: float,
-    ) -> _Session:
-        """Inspect messages after each gateway-owned conversation expansion.
-
-        Args:
-            authorization: Authority of this request.
-            request: Complete conversation and dispatch metadata.
-            deadline_monotonic: Absolute inspection deadline.
-
-        Returns:
-            A fresh session for allowed context.
-
-        Raises:
-            GuardrailRejected: Retrieved conversation text contains the test marker.
-        """
+    async def inspect_input(
+        self, *, request: GatewayRequest, check: GuardrailCheck
+    ) -> ClassifierVerdict:
+        """Inspect messages after each gateway-owned conversation expansion."""
         self.block_input = any(
             "withhold-marker" in message.model_dump_json() for message in request.messages
         )
-        return super().open(
-            authorization=authorization, request=request, deadline_monotonic=deadline_monotonic
-        )
+        return await super().inspect_input(request=request, check=check)
 
 
 @contextmanager
@@ -105,6 +88,7 @@ def _serving(control: NativeControlPlane) -> Iterator[str]:
 
 @pytest.mark.parametrize("surface", ["chat", "responses", "messages"])
 @pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("incremental", [False, True])
 @pytest.mark.parametrize(
     "path", ["refusal", "search", "empty-search", "search-input", "empty-search-input"]
 )
@@ -113,6 +97,7 @@ def test_precommit_and_synthesized_output_is_inspected_before_settlement(
     surface: str,
     stream: bool,
     path: str,
+    incremental: bool,
 ) -> None:
     """A real refusal flush or search prelude cannot release the synthetic marker."""
     provider_requests: list[JsonObject] = []
@@ -190,7 +175,11 @@ def test_precommit_and_synthesized_output_is_inspected_before_settlement(
         refusal_failover=True,
     )
     components = load_gateway_components(tmp_path, environment={"TEST_PROVIDER_KEY": "synthetic"})
-    policy = _RetrievedGuard() if path.endswith("-input") else _Guard()
+    policy = (
+        _RetrievedGuard(incremental=incremental)
+        if path.endswith("-input")
+        else _Guard(incremental=incremental)
+    )
     search = StaticWebSearchBackend(
         (
             GatewayWebSearchResult(
@@ -199,7 +188,7 @@ def test_precommit_and_synthesized_output_is_inspected_before_settlement(
             ),
         )
     )
-    control = NativeControlPlane(components, runtime_guardrail=policy, web_search=search)
+    control = NativeControlPlane(components, guardrails=policy, web_search=search)
     body: JsonObject = {
         "model": "coding" if path == "refusal" else "coding:online",
         "stream": stream,
@@ -221,7 +210,7 @@ def test_precommit_and_synthesized_output_is_inspected_before_settlement(
             )
         assert response.status_code == 400, response.text
         assert "withhold-marker" not in response.text
-        assert "Synthetic policy violation" in response.text
+        assert "blocked by a gateway guardrail" in response.text
         blocked_input = path.endswith("-input")
         assert len(provider_requests) == (0 if blocked_input else 1)
         if blocked_input:
@@ -229,7 +218,12 @@ def test_precommit_and_synthesized_output_is_inspected_before_settlement(
                 "withhold-marker" in request.model_dump_json() for request in policy.requests
             )
         else:
-            assert any("withhold-marker" in session.text for session in policy.sessions)
+            if incremental:
+                assert any("withhold-marker" in session.text for session in policy.sessions)
+            else:
+                assert any(
+                    "withhold-marker" in item.model_dump_json() for item in policy.completions
+                )
         with sqlite3.connect(components.ledger.database_path) as connection:
             assert connection.execute(
                 "select state, failure_class from gateway_attempts"
@@ -244,6 +238,7 @@ def test_precommit_and_synthesized_output_is_inspected_before_settlement(
 
 
 @pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("incremental", [False, True])
 @pytest.mark.parametrize(
     ("phase", "surface"),
     [("render", "responses")]
@@ -254,7 +249,7 @@ def test_precommit_and_synthesized_output_is_inspected_before_settlement(
     ],
 )
 def test_tool_search_is_inspected_before_execution_redial_and_rendering(
-    tmp_path: Path, stream: bool, phase: str, surface: str
+    tmp_path: Path, stream: bool, phase: str, surface: str, incremental: bool
 ) -> None:
     """Reject unsafe generated queries before search and retrieved results before redial."""
     provider_requests: list[JsonObject] = []
@@ -288,8 +283,12 @@ def test_tool_search_is_inspected_before_execution_redial_and_rendering(
     worker.start()
     key = _configure(tmp_path, f"http://127.0.0.1:{provider.server_port}/v1")
     components = load_gateway_components(tmp_path, environment={"TEST_PROVIDER_KEY": "synthetic"})
-    policy = _RetrievedGuard() if phase == "retrieved" else _Guard()
-    control = NativeControlPlane(components, runtime_guardrail=policy)
+    policy = (
+        _RetrievedGuard(incremental=incremental)
+        if phase == "retrieved"
+        else _Guard(incremental=incremental)
+    )
+    control = NativeControlPlane(components, guardrails=policy)
     description = "Current weather" + (" withhold-marker" if phase != "query" else "")
     function: JsonObject = {
         "name": "get_weather",
@@ -340,7 +339,7 @@ def test_tool_search_is_inspected_before_execution_redial_and_rendering(
             )
         assert response.status_code == 400, response.text
         assert "withhold-marker" not in response.text
-        assert "Synthetic policy violation" in response.text
+        assert "blocked by a gateway guardrail" in response.text
         assert search.call_count == (0 if phase == "query" else 1)
         assert len(provider_requests) == (2 if phase == "render" else 1)
         if phase != "render":
@@ -354,8 +353,10 @@ def test_tool_search_is_inspected_before_execution_redial_and_rendering(
                 "withhold-marker" in request.messages[-1].model_dump_json()
                 for request in policy.requests
             )
-        else:
+        elif incremental:
             assert any("withhold-marker" in session.text for session in policy.sessions)
+        else:
+            assert any("withhold-marker" in item.model_dump_json() for item in policy.completions)
         with sqlite3.connect(components.ledger.database_path) as connection:
             attempts = connection.execute(
                 "select state, failure_class, input_tokens, output_tokens "

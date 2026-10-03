@@ -24,8 +24,7 @@ use crate::encode::{compact_json, reasoning_carrier_candidate};
 use crate::encode_responses::ResponsesSseEncoder;
 use crate::errors::{Failure, FailureClass, PublicError};
 use crate::events::{Event, Usage};
-use crate::guardrails::runtime::{inspect_events, RuntimeInspector};
-use crate::guardrails::{released_events, StreamRedactor};
+use crate::guardrails::StreamGuardrails;
 use crate::metrics::{classify_escalation, METRICS};
 use crate::relay::{collect_committed, collection_public_error, track_event};
 use crate::replay::{CachedResponse, Claim, OwnerLease, ReplayKey};
@@ -233,7 +232,7 @@ pub(crate) async fn responses(
         output_token_cap: admission.maximum_output_tokens,
         tool_search: admission.tool_search.as_ref(),
         inspection: admission
-            .runtime_inspection
+            .guardrail_inspection
             .then_some(crate::waterfall::InspectionContext {
                 web_search: admission.web_search.as_ref(),
                 responses: true,
@@ -745,10 +744,12 @@ async fn stream_responses(
         let mut retention = ResponsesRetention::default();
         let mut reasoning_content_carrier: Option<String> = None;
         // Withhold pending redaction and host-inspection segments.
-        let mut redactor = incremental_guardrail.then(|| StreamRedactor::new(&request_id));
-        let mut runtime_inspector = admission
-            .runtime_inspection
-            .then(|| RuntimeInspector::new(&request_id, deadline));
+        let mut output_guardrails = StreamGuardrails::new(
+            &request_id,
+            incremental_guardrail,
+            admission.guardrail_inspection,
+            deadline,
+        );
         let terminal_frames: Vec<String>;
 
         macro_rules! fail_stream {
@@ -828,7 +829,7 @@ async fn stream_responses(
             if matches!(event, Event::Failed(_)) {
                 usage = committed.relay.usage_before_failure(usage.take());
             }
-            if redactor.is_none() && runtime_inspector.is_none() {
+            if !output_guardrails.enabled() {
                 // A guarded stream retains what the caller actually saw, so
                 // a continuation replays the redacted text, never the raw
                 // completion; retention then runs over the released events.
@@ -839,14 +840,10 @@ async fn stream_responses(
             let outward = outward_event(&event, &mut visible_refusal);
             // A byte that reaches the caller has already been through the
             // detector, and a terminal flushes whatever is still buffered.
-            let guarded = redactor.is_some() || runtime_inspector.is_some();
-            let outward_events = match released_events(
-                redactor.as_mut(),
-                &guard.bridge,
-                outward,
-                event.is_terminal(),
-            )
-            .await
+            let guarded = output_guardrails.enabled();
+            let outward_events = match output_guardrails
+                .release(&guard.bridge, outward, event.is_terminal())
+                .await
             {
                 Ok(events) => events,
                 Err(failure) => fail_stream!(failure),
@@ -854,13 +851,6 @@ async fn stream_responses(
             // The terminal is recorded before its frames flush, so a
             // disconnect during the final flush still settles by the
             // provider's outcome instead of as a cancellation.
-            let outward_events =
-                match inspect_events(runtime_inspector.as_mut(), &guard.bridge, outward_events)
-                    .await
-                {
-                    Ok(events) => events,
-                    Err(failure) => fail_stream!(failure),
-                };
             if guarded {
                 for released in &outward_events {
                     retention.track(released);

@@ -47,7 +47,7 @@ from exp.runtime.gateway.guardrails.regex import (
     RegexClassifier,
 )
 from exp.runtime.gateway.guardrails.store import MappingGuardrailStore
-from exp.runtime.gateway.tests.runtime_guardrails_test import _Guard
+from exp.runtime.gateway.tests.mandatory_guardrails_test import _Guard
 
 
 def _authorization() -> AuthorizationSnapshot:
@@ -126,7 +126,7 @@ def test_unguarded_native_input_does_not_call_classifiers() -> None:
     assert policy is None
 
 
-def test_runtime_policy_checks_customer_rewrites_before_dispatch() -> None:
+def test_mandatory_policy_checks_customer_rewrites_before_dispatch() -> None:
     """A customer-controlled replacement cannot introduce uninspected instructions."""
     request = GatewayRequest(
         surface=GatewayApiSurface.CHAT_COMPLETIONS,
@@ -148,33 +148,24 @@ def test_runtime_policy_checks_customer_rewrites_before_dispatch() -> None:
             ),
         ),
     )
-    engine = GuardrailEngine(
-        store=MappingGuardrailStore((policy,)),
-        monotonic=time.monotonic,
-        client=DirectClassifierClient(
-            ClassifierRegistry(
-                {
-                    "scripted": ScriptedClassifier(
-                        input_verdict=ClassifierVerdict(
-                            flagged=True, replacement_messages=replacement
-                        )
-                    )
-                }
+    engine = _Guard(
+        policies=(policy,),
+        adapters={
+            "scripted": ScriptedClassifier(
+                input_verdict=ClassifierVerdict(flagged=True, replacement_messages=replacement)
             )
-        ),
+        },
     )
-    runtime = _Guard()
     transformed, _, session = inspect_native_input(
         engine,
-        runtime,
         authorization=_authorization(),
         request=request,
         deadline_monotonic=time.monotonic() + 10,
     )
     assert transformed.messages == replacement
-    assert [item.messages for item in runtime.requests] == [request.messages, replacement]
-    assert len(runtime.sessions) == 2
-    assert session is runtime.sessions[-1]
+    assert [item.messages for item in engine.requests] == [request.messages, replacement]
+    assert len(engine.sessions) == 2
+    assert session is not None and session.sessions[0][1] is engine.sessions[-1]
 
 
 def test_native_input_runs_the_async_chain_on_a_private_loop() -> None:
@@ -194,6 +185,62 @@ def test_native_input_runs_the_async_chain_on_a_private_loop() -> None:
 
     assert policy is not None
     assert rewritten.messages[0].content == "hello"
+
+
+@pytest.mark.parametrize("blocked_stage", ["original", "replacement"])
+def test_customer_rewrite_cannot_erase_or_introduce_blocked_intent(blocked_stage: str) -> None:
+    """The mandatory policy sees both sides of a customer transformation."""
+
+    class IntentGuard(_Guard):
+        """Classify a synthetic intent marker through the shared adapter registry."""
+
+        async def inspect_input(
+            self, *, request: GatewayRequest, check: GuardrailCheck
+        ) -> ClassifierVerdict:
+            self.requests.append(request)
+            return ClassifierVerdict(
+                flagged=any(message.content == "blocked intent" for message in request.messages)
+            )
+
+    request = GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=(
+            GatewayMessage(
+                role="user", content="blocked intent" if blocked_stage == "original" else "safe"
+            ),
+        ),
+    )
+    customer = ScriptedClassifier(
+        input_verdict=ClassifierVerdict(
+            flagged=True,
+            replacement_messages=(
+                GatewayMessage(
+                    role="user",
+                    content="blocked intent" if blocked_stage == "replacement" else "safe",
+                ),
+            ),
+        )
+    )
+    policy = _engine().policy_for("organization-one", "identity-one")
+    assert policy is not None
+    policy = policy.model_copy(
+        update={
+            "checks": (
+                policy.input_checks[0].model_copy(update={"action": GuardrailAction.MODIFY}),
+            )
+        }
+    )
+    engine = IntentGuard(policies=(policy,), adapters={"scripted": customer})
+    with pytest.raises(GuardrailRejected) as rejected:
+        inspect_native_input(
+            engine,
+            authorization=_authorization(),
+            request=request,
+            deadline_monotonic=time.monotonic() + 10,
+        )
+    assert rejected.value.failure.failure_class.value == "guardrail"
+    assert customer.input_calls == (1 if blocked_stage == "replacement" else 0)
+    assert len(engine.requests) == (2 if blocked_stage == "replacement" else 1)
 
 
 def test_native_output_payload_round_trips_tool_calls() -> None:

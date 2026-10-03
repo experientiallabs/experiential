@@ -68,7 +68,7 @@ pub(crate) struct Admission {
     pub output_guardrail: OutputGuardrailMode,
     /// Host policy applies independently of every customer identity policy.
     #[serde(default)]
-    pub runtime_inspection: bool,
+    pub guardrail_inspection: bool,
     /// The resolved output chain when every check binds a deterministic
     /// detector. The data plane enforces it in place, so the request pays no
     /// python callback. A chain with any non-deterministic adapter omits the
@@ -147,7 +147,7 @@ impl Admission {
             wire.upstream_payload.get("logprobs") != Some(&Value::Bool(true))
                 || (wire.dialect == "openai_compatible"
                     && !self.output_guardrail.enforces()
-                    && !self.runtime_inspection
+                    && !self.guardrail_inspection
                     && wire.stop_sequences.is_empty())
         })
     }
@@ -176,7 +176,7 @@ impl Admission {
     pub(crate) fn buffers_output(&self) -> bool {
         self.output_guardrail.enforces()
             || self.guardrail_output_plan.is_some()
-            || (self.runtime_inspection && !self.stream)
+            || (self.guardrail_inspection && !self.stream)
     }
 
     /// Whether the rung at `depth` returns plaintext reasoning to the caller.
@@ -399,9 +399,9 @@ pub(crate) async fn apply_output_guardrail(
         events
     };
     let mut inspector = admission
-        .runtime_inspection
-        .then(|| guardrails::runtime::RuntimeInspector::new(&admission.request_id, deadline));
-    guardrails::runtime::inspect_events(inspector.as_mut(), &state.bridge, events).await
+        .guardrail_inspection
+        .then(|| guardrails::inspection::StreamInspector::new(&admission.request_id, deadline));
+    guardrails::inspection::inspect_events(inspector.as_mut(), &state.bridge, events).await
 }
 
 #[cfg(test)]

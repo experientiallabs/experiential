@@ -37,14 +37,13 @@ from exp.runtime.gateway.guardrails import deterministic
 from exp.runtime.gateway.guardrails.client import assert_not_internal_classification
 from exp.runtime.gateway.guardrails.contracts import GuardrailRejected
 from exp.runtime.gateway.guardrails.enforcement import GuardrailEngine
+from exp.runtime.gateway.guardrails.inspection import (
+    validate_guardrail_engine,
+)
 from exp.runtime.gateway.guardrails.native import (
     NativeGuardrailsMixin,
     inspect_native_input,
     native_output_mode,
-)
-from exp.runtime.gateway.guardrails.runtime import (
-    RuntimeGuardrail,
-    validate_runtime_guardrail,
 )
 from exp.runtime.gateway.model_chain_authority import authorize_serving_model_chains
 from exp.runtime.gateway.native_accounting import (
@@ -202,7 +201,6 @@ class NativeControlPlane(
         recovery_host: RecoveryHost | None = None,
         native_route_eligible: Callable[[GatewayRoute, GatewayRequest], bool] | None = None,
         guardrails: GuardrailEngine | None = None,
-        runtime_guardrail: RuntimeGuardrail | None = None,
         capture: CaptureController | None = None,
         web_search: WebSearchBackend | None = None,
         default_lane_bound: int | None = None,
@@ -228,8 +226,7 @@ class NativeControlPlane(
                 so subsidized replay cannot buy fair-share weight. ``None``
                 admits every sample; a raising gate skips the sample.
             native_route_eligible: Optional hosted policy for complete native semantics.
-            guardrails: Optional identity-scoped engine. ``None`` leaves traffic unguarded.
-            runtime_guardrail: Host-owned inspection independent of identity policy settings.
+            guardrails: Shared mandatory and identity policy engine. ``None`` skips both.
             capture: Optional identity-scoped native capture controller.
             web_search: Gateway web-search backend; ``None`` binds Exa from ``EXA_API_KEY``.
             default_lane_bound: Per-worker in-flight cap for rungs that author
@@ -244,7 +241,7 @@ class NativeControlPlane(
         if request_timeout_seconds <= 0:
             raise ValueError("request_timeout_seconds must be positive")
         self._components = components
-        self._runtime_guardrail = validate_runtime_guardrail(runtime_guardrail)
+        validate_guardrail_engine(guardrails)
         self._automatic_cache = automatic_cache
         self._explicit_cache = validate_cache_hosts(explicit_cache, automatic_cache)
         self._capture = capture
@@ -384,9 +381,8 @@ class NativeControlPlane(
             raise NativeBridgeError(error) from exc
 
         try:
-            request, policy, runtime_inspection = inspect_native_input(
+            request, policy, guardrail_inspection = inspect_native_input(
                 self._guardrails,
-                self._runtime_guardrail,
                 authorization=authorization,
                 request=request,
                 deadline_monotonic=deadline,
@@ -429,7 +425,9 @@ class NativeControlPlane(
         pinned_reasoning_route = verified_reasoning_route
         request = strip_stale_reasoning_history(request)
         if request != captured_request:
-            runtime_inspection = self.reopen_runtime_inspection(authorization, request, deadline)
+            guardrail_inspection = self.reopen_guardrail_inspection(
+                authorization, request, deadline
+            )
         if pinned_reasoning_route is not None and not has_active_reasoning_content(request):
             pinned_reasoning_route = None
         if continuation_context is not None:
@@ -524,7 +522,9 @@ class NativeControlPlane(
             request, tool_search_state = planned.request, planned.state
             tool_search_admission = planned.admission
             if request != inspection_request:
-                runtime_inspection = self.inspect_admitted_runtime(authorization, request, deadline)
+                guardrail_inspection = self.inspect_admitted_guardrails(
+                    authorization, request, deadline
+                )
             _require_bound_wire_authority(
                 None
                 if continuation_context is None
@@ -734,11 +734,11 @@ class NativeControlPlane(
                 deadline_monotonic=deadline,
                 continuation=continuation_context,
                 no_paid_prework=(
-                    self._runtime_guardrail is None
+                    (self._guardrails is None or self._guardrails.mandatory_policy is None)
                     and admission_without_effects(authorization, captured_request, policy)
                 ),
                 policy=policy,
-                runtime_inspection=runtime_inspection,
+                guardrail_inspection=guardrail_inspection,
                 signers=tuple(signers),
                 dispatch_bindings=tuple(dispatch_bindings),
                 reasoning_carrier_authorities=tuple(carrier_authorities),
@@ -785,12 +785,13 @@ class NativeControlPlane(
             "ignored_parameters": list(public_request.ignored_parameters),
             **attempt_policy(request.gateway).model_dump(mode="json"),
             "refusal_failover": authorization.refusal_failover,
-            "runtime_inspection": runtime_inspection is not None,
+            "guardrail_inspection": guardrail_inspection is not None,
             "output_guardrail": native_output_mode(
                 self._guardrails,
                 policy,
                 public_request,
                 wire_route=wire_route,
+                inspection=guardrail_inspection,
             ).value,
             "caller_scope": f"{authorization.organization_id}:{authorization.identity_id}",
         }
@@ -932,8 +933,8 @@ class NativeControlPlane(
             authorization,
             request,
             inspection_revision=None
-            if self._runtime_guardrail is None
-            else self._runtime_guardrail.revision,
+            if self._guardrails is None
+            else self._guardrails.inspection_revision,
         )
 
     def remember(self, argument: str) -> str:

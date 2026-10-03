@@ -18,7 +18,7 @@ from exp.runtime.gateway.lifecycle_test import _configured_gateway
 from exp.runtime.gateway.native_bridge import NativeBridgeError, NativeControlPlane
 from exp.runtime.gateway.native_bridge_test import _admit, _chat_body, _project_control_plane
 from exp.runtime.gateway.tests.guardrails_native_bridge_test import _engine
-from exp.runtime.gateway.tests.runtime_guardrails_test import _Guard
+from exp.runtime.gateway.tests.mandatory_guardrails_test import _Guard
 from exp.runtime.gateway.tests.web_search_backend_fixture_test import (
     FailingWebSearchBackend,
     StaticWebSearchBackend,
@@ -42,7 +42,7 @@ def _start(control: NativeControlPlane, raw_key: str, request_id: str) -> JsonOb
 
 
 @pytest.mark.parametrize(
-    "prework", ["search_success", "search_failure", "input_guardrail", "runtime_guardrail"]
+    "prework", ["search_success", "search_failure", "input_guardrail", "mandatory_guardrail"]
 )
 def test_paid_admission_work_prevents_capacity_certificate_and_same_key_reentry(
     tmp_path: Path,
@@ -62,8 +62,13 @@ def test_paid_admission_work_prevents_capacity_certificate_and_same_key_reentry(
         load_gateway_components(tmp_path, environment={"TEST_PROVIDER_KEY": "fixture"}),
         default_lane_bound=1,
         web_search=search,
-        guardrails=_engine(classifier) if prework == "input_guardrail" else None,
-        runtime_guardrail=_Guard() if prework == "runtime_guardrail" else None,
+        guardrails=(
+            _engine(classifier)
+            if prework == "input_guardrail"
+            else _Guard()
+            if prework == "mandatory_guardrail"
+            else None
+        ),
     )
     occupied = _admit(control, key, _chat_body())
     assert "attempt_id" in _start(control, key, str(occupied["request_id"]))

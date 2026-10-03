@@ -1,4 +1,4 @@
-//! Host-owned incremental inspection, separate from customer redaction policies.
+//! Project withheld events for incremental adapters in the shared guardrail engine.
 
 use std::collections::BTreeMap;
 use std::time::Instant;
@@ -32,7 +32,7 @@ fn unsupported() -> Failure {
 }
 
 /// Rust retains exact events; the host receives only ordered inspectable text.
-pub(crate) struct RuntimeInspector {
+pub(crate) struct StreamInspector {
     request_id: String,
     pending: Vec<Event>,
     fragments: Vec<Value>,
@@ -42,7 +42,7 @@ pub(crate) struct RuntimeInspector {
     deadline: Instant,
 }
 
-impl RuntimeInspector {
+impl StreamInspector {
     pub(crate) fn new(request_id: &str, deadline: Instant) -> Self {
         Self {
             request_id: request_id.to_owned(),
@@ -238,7 +238,7 @@ impl RuntimeInspector {
         }));
         let remaining = self.deadline.saturating_duration_since(Instant::now());
         let payload =
-            tokio::time::timeout(remaining, bridge.call("inspect_runtime_output", argument))
+            tokio::time::timeout(remaining, bridge.call("inspect_guardrail_output", argument))
                 .await
                 .map_err(|_| unavailable())?
                 .map_err(|_| unavailable())?;
@@ -254,13 +254,29 @@ impl RuntimeInspector {
     }
 }
 
+/// Compose mandatory inspection after optional redaction and before encoding.
+pub(crate) async fn inspect_events(
+    inspector: Option<&mut StreamInspector>,
+    bridge: &Bridge,
+    events: Vec<Event>,
+) -> Result<Vec<Event>, Failure> {
+    let Some(inspector) = inspector else {
+        return Ok(events);
+    };
+    let mut released = Vec::new();
+    for event in events {
+        released.extend(inspector.admit(bridge, event).await?);
+    }
+    Ok(released)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn unknown_tool_deltas_fail_before_they_can_be_released() {
-        let mut inspector = RuntimeInspector::new("request", Instant::now());
+        let mut inspector = StreamInspector::new("request", Instant::now());
         let result = inspector.project(&Event::ToolArgumentsDelta {
             index: 7,
             delta: "uninspected".into(),
@@ -277,7 +293,7 @@ mod tests {
 
     #[test]
     fn tool_start_keeps_later_text_pending_until_the_tool_finishes() {
-        let mut inspector = RuntimeInspector::new("request", Instant::now());
+        let mut inspector = StreamInspector::new("request", Instant::now());
         inspector
             .project(&Event::ServerToolUseStarted {
                 index: 1,
@@ -302,7 +318,7 @@ mod tests {
     #[test]
     fn complete_tool_arguments_above_half_the_content_limit_are_counted_once() {
         let arguments = "x".repeat(600_000);
-        let mut inspector = RuntimeInspector::new("request", Instant::now());
+        let mut inspector = StreamInspector::new("request", Instant::now());
         let events = [
             Event::ServerToolUseStarted {
                 index: 1,
@@ -342,7 +358,7 @@ mod tests {
 
     #[test]
     fn output_channels_preserve_refusal_and_retrieval_provenance() {
-        let mut inspector = RuntimeInspector::new("request", Instant::now());
+        let mut inspector = StreamInspector::new("request", Instant::now());
         inspector
             .project(&Event::RefusalDelta("I cannot assist".into()))
             .unwrap();
@@ -358,7 +374,7 @@ mod tests {
 
     #[test]
     fn images_are_unsupported_not_content_violations() {
-        let mut inspector = RuntimeInspector::new("request", Instant::now());
+        let mut inspector = StreamInspector::new("request", Instant::now());
         assert!(matches!(
             inspector.project(&Event::Image("image".into())),
             Err(Failure {
@@ -367,20 +383,4 @@ mod tests {
             })
         ));
     }
-}
-
-/// Compose mandatory inspection after optional redaction and before encoding.
-pub(crate) async fn inspect_events(
-    inspector: Option<&mut RuntimeInspector>,
-    bridge: &Bridge,
-    events: Vec<Event>,
-) -> Result<Vec<Event>, Failure> {
-    let Some(inspector) = inspector else {
-        return Ok(events);
-    };
-    let mut released = Vec::new();
-    for event in events {
-        released.extend(inspector.admit(bridge, event).await?);
-    }
-    Ok(released)
 }

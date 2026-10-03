@@ -21,9 +21,8 @@ from exp.runtime.gateway.guardrails.contracts import (
 )
 from exp.runtime.gateway.guardrails.deterministic import NativeDetector, native_input_request
 from exp.runtime.gateway.guardrails.enforcement import GuardrailEngine
-from exp.runtime.gateway.guardrails.runtime import (
-    RuntimeGuardrail,
-    RuntimeGuardrailSession,
+from exp.runtime.gateway.guardrails.inspection import (
+    GuardrailInspection,
     inspect_argument,
     open_inspection,
 )
@@ -36,18 +35,16 @@ if TYPE_CHECKING:
 
 def inspect_native_input(
     engine: GuardrailEngine | None,
-    runtime: RuntimeGuardrail | None,
     *,
     authorization: AuthorizationSnapshot,
     request: GatewayRequest,
     deadline_monotonic: float,
     detectors: Mapping[str, NativeDetector] | None = None,
-) -> tuple[GatewayRequest, GuardrailPolicy | None, RuntimeGuardrailSession | None]:
+) -> tuple[GatewayRequest, GuardrailPolicy | None, GuardrailInspection | None]:
     """Check original intent and optional rewrites before dispatch or charging.
 
     Args:
-        engine: Optional customer-controlled input enforcement chain.
-        runtime: Host-owned policy, independent of customer assignments.
+        engine: Shared engine with optional mandatory and identity policy layers.
         authorization: Frozen authenticated tenant and identity.
         request: Canonical request after continuation expansion.
         deadline_monotonic: Absolute request-wide inspection deadline.
@@ -61,7 +58,7 @@ def inspect_native_input(
         GuardrailRecursionError: A classifier re-entered the public route.
     """
     session = open_inspection(
-        runtime, authorization=authorization, request=request, deadline_monotonic=deadline_monotonic
+        engine, authorization=authorization, request=request, deadline_monotonic=deadline_monotonic
     )
     transformed, policy = enforce_native_input(
         engine,
@@ -72,7 +69,7 @@ def inspect_native_input(
     )
     if transformed != request:
         session = open_inspection(
-            runtime,
+            engine,
             authorization=authorization,
             request=transformed,
             deadline_monotonic=deadline_monotonic,
@@ -143,6 +140,7 @@ def native_output_mode(
     *,
     image_output: bool = False,
     wire_route: Sequence[JsonObject] = (),
+    inspection: GuardrailInspection | None = None,
 ) -> OutputGuardrailMode:
     """Return the output enforcement shape one admission must use.
 
@@ -155,12 +153,15 @@ def native_output_mode(
             images, or whose payload asks its provider for readable reasoning
             the caller may not have requested (reasoning display defaults),
             rules out a reasoning-free incremental stream.
+        inspection: Request-owned classifier capabilities resolved by the engine.
 
     Returns:
         ``off``, ``buffer``, or ``stream`` for the data plane.
     """
     if engine is None:
         return OutputGuardrailMode.OFF
+    if inspection is not None and inspection.buffers_output:
+        return OutputGuardrailMode.BUFFER
     mode = engine.output_mode(
         policy,
         streaming=request.stream,
@@ -383,18 +384,17 @@ class _GuardrailPlane(Protocol):
 
     _accounting: NativeAttemptAccounting
     _guardrails: GuardrailEngine | None
-    _runtime_guardrail: RuntimeGuardrail | None
 
 
 class NativeGuardrailsMixin:
     """Native output callbacks bound to the admitted request's frozen policy."""
 
-    def reopen_runtime_inspection(
+    def reopen_guardrail_inspection(
         self: _GuardrailPlane,
         authorization: AuthorizationSnapshot,
         request: GatewayRequest,
         deadline: float,
-    ) -> RuntimeGuardrailSession | None:
+    ) -> GuardrailInspection | None:
         """Inspect authenticated plaintext after sealed-history expansion.
 
         Args:
@@ -410,7 +410,7 @@ class NativeGuardrailsMixin:
         """
         try:
             return open_inspection(
-                self._runtime_guardrail,
+                self._guardrails,
                 authorization=authorization,
                 request=request,
                 deadline_monotonic=deadline,
@@ -418,12 +418,12 @@ class NativeGuardrailsMixin:
         except GuardrailRejected as exc:
             raise NativeBridgeError(public_failure_error(exc.failure)) from None
 
-    def inspect_admitted_runtime(
+    def inspect_admitted_guardrails(
         self: _GuardrailPlane,
         authorization: AuthorizationSnapshot,
         request: GatewayRequest,
         deadline: float,
-    ) -> RuntimeGuardrailSession | None:
+    ) -> GuardrailInspection | None:
         """Reinspect a search-expanded request and finalize any admitted rejection.
 
         Args:
@@ -439,7 +439,7 @@ class NativeGuardrailsMixin:
         """
         try:
             return open_inspection(
-                self._runtime_guardrail,
+                self._guardrails,
                 authorization=authorization,
                 request=request,
                 deadline_monotonic=deadline,
@@ -464,7 +464,7 @@ class NativeGuardrailsMixin:
             self._guardrails, policy, argument, deadline_monotonic=deadline
         )
 
-    def inspect_runtime_output(self: _GuardrailPlane, argument: str) -> str:
+    def inspect_guardrail_output(self: _GuardrailPlane, argument: str) -> str:
         """Inspect a pending segment through its exact admitted request session.
 
         Args:
@@ -489,6 +489,8 @@ class NativeGuardrailsMixin:
         entry = self._accounting.entry(request_id)
         policy = None if entry is None else entry.policy
         deadline = time.monotonic() if entry is None else entry.deadline_monotonic
+        if entry is not None and policy is None and entry.guardrail_inspection is not None:
+            return encode_output_decision(action=GuardrailAction.ALLOW.value)
         return enforce_native_output(
             self._guardrails,
             policy,

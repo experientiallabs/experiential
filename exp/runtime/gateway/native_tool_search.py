@@ -16,13 +16,12 @@ from typing import Protocol
 from exp.common.core.artifacts import JsonObject
 from exp.runtime.gateway.contracts import GatewayFailure, GatewayFailureClass, GatewayRequest
 from exp.runtime.gateway.guardrails.contracts import GuardrailRejected
-from exp.runtime.gateway.guardrails.runtime import (
-    RuntimeFragment,
-    RuntimeGuardrail,
-    RuntimeOutput,
+from exp.runtime.gateway.guardrails.enforcement import GuardrailEngine
+from exp.runtime.gateway.guardrails.inspection import (
     open_inspection,
     require_output,
 )
+from exp.runtime.gateway.guardrails.streaming import GuardrailFragment, GuardrailOutput
 from exp.runtime.gateway.native_accounting import NativeBridgeError, internal_protocol_error
 from exp.runtime.gateway.native_execution import InflightRequest
 from exp.runtime.gateway.native_reasoning import rung_provider_request
@@ -38,10 +37,10 @@ class _Registry(Protocol):
 
 class _Plane(Protocol):
     _accounting: _Registry
-    _runtime_guardrail: RuntimeGuardrail | None
+    _guardrails: GuardrailEngine | None
 
 
-def _search_output(request_id: str, calls: Sequence[WithheldSearchCall]) -> RuntimeOutput:
+def _search_output(request_id: str, calls: Sequence[WithheldSearchCall]) -> GuardrailOutput:
     """Validate complete generated calls before a gateway-owned search action.
 
     Args:
@@ -55,11 +54,11 @@ def _search_output(request_id: str, calls: Sequence[WithheldSearchCall]) -> Runt
         GuardrailRejected: A call exceeds the inspection contract's coverage.
     """
     try:
-        return RuntimeOutput(
+        return GuardrailOutput(
             request_id=request_id,
             final=False,
             fragments=tuple(
-                RuntimeFragment(
+                GuardrailFragment(
                     kind="tool",
                     channel=f"search:{call.call_id}",
                     text=call.raw_arguments,
@@ -114,28 +113,28 @@ class NativeToolSearchMixin:
         calls = parse_calls(data.get("calls"))
         rounds: list[JsonObject] = []
         try:
-            if entry.runtime_inspection is not None:
+            if entry.guardrail_inspection is not None:
                 require_output(
-                    entry.runtime_inspection,
+                    entry.guardrail_inspection,
                     _search_output(entry.authorization.request_id, calls),
                     deadline_monotonic=entry.deadline_monotonic,
                 )
             outcome = perform_round(provider_request, entry.tool_search, calls)
             rounds = list(outcome.rounds)
             session = open_inspection(
-                self._runtime_guardrail,
+                self._guardrails,
                 authorization=entry.authorization,
                 request=outcome.request,
                 deadline_monotonic=entry.deadline_monotonic,
             )
-            if (session is None) != (entry.runtime_inspection is None):
+            if (session is None) != (entry.guardrail_inspection is None):
                 raise GuardrailRejected(
                     GatewayFailure(
                         failure_class=GatewayFailureClass.UNAVAILABLE,
                         safe_message="Content inspection changed during this request. Retry later.",
                     )
                 )
-            entry.runtime_inspection = session
+            entry.guardrail_inspection = session
         except GuardrailRejected as exc:
             return json.dumps(
                 {"inspection_failure": exc.failure.model_dump(mode="json"), "rounds": rounds}
