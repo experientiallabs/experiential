@@ -37,6 +37,7 @@ from exp.runtime.gateway.execution_resolution import (
 )
 from exp.runtime.gateway.execution_resolution import alias_native_blockers as alias_native_blockers
 from exp.runtime.gateway.guardrails.contracts import GuardrailPolicy
+from exp.runtime.gateway.guardrails.inspection import GuardrailInspection
 from exp.runtime.gateway.health import DeploymentHealthKey, DeploymentHealthRegistry
 from exp.runtime.gateway.model_plan import project_stage_selection
 from exp.runtime.gateway.native_fallback_rules import FallbackRules, eligible_depths
@@ -145,10 +146,8 @@ class FrozenDispatchBinding:
 class InflightRequest:
     """One admitted request awaiting its terminal settlement.
 
-    The entry carries everything ``start_attempt`` needs to reserve each
-    physical dispatch (the frozen route, the provider request for budget
-    sizing, and the per-deployment attempt counters) plus the retention
-    facts the terminal settlement consumes.
+    Binds the frozen route, budget-sized provider request, attempt counters
+    and retention facts needed for dispatch reservations and settlement.
 
     Attributes:
         attempt_service_tiers: Frozen pricing authority keyed by physical attempt, initially
@@ -175,6 +174,7 @@ class InflightRequest:
         no_paid_prework: Trusted admission without possible paid prework, default false.
         explicit_cache_state: Private marked-prefix plans and durable operation bindings,
             absent unless a host provides explicit cache spending authority.
+        guardrail_inspection: Request-owned host inspection state, never shared across requests.
     """
 
     authorization: AuthorizationSnapshot
@@ -185,11 +185,8 @@ class InflightRequest:
     attempt_counts: list[int] = field(default_factory=list)
     ordinary_attempt_counts: list[int] = field(default_factory=list)
     attempt_policy: RequestAttemptPolicy = field(default_factory=RequestAttemptPolicy)
-    # Post-backoff redials reserved per route depth, and the budget each
-    # depth was given at admission (the schedule scaled by the cache at
-    # stake); only these redials spend it, never a retryable-class redial of
-    # the same rung. An entry built without the admission step gets the
-    # schedule's full budget on every rung.
+    # Only post-backoff redials spend the admission's cache-scaled schedule,
+    # not retryable-class redials. Without admission, use full rung budgets.
     throttle_redials: list[int] = field(default_factory=list)
     throttle_redial_budgets: tuple[int, ...] = ()
     total_attempts: int = 0
@@ -207,6 +204,7 @@ class InflightRequest:
     # successful terminal; chat attempts carry ``None``.
     continuation: ContinuationContext | None = None
     policy: GuardrailPolicy | None = None
+    guardrail_inspection: GuardrailInspection | None = field(default=None, repr=False)
     # One signer per route deployment, for body-signing dialects (Bedrock
     # SigV4); ``None`` at a depth whose dialect serializes its own payload.
     signers: tuple[GatewayDispatchSigner | None, ...] = ()

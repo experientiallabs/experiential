@@ -473,6 +473,7 @@ impl Harness {
             output_less_retention: None,
             output_token_cap: None,
             tool_search: None,
+            inspection: None,
         };
         let won = acquire_attempt(&context, &mut guard).await;
         (won, guard)

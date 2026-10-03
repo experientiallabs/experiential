@@ -39,3 +39,17 @@ def test_session_hint_does_not_substitute_for_idempotency_key() -> None:
     )
     with pytest.raises(OpenAIProtocolError, match="Idempotency-Key"):
         replay_scope_payload(_route().snapshot.authorization, request)
+
+
+def test_inspection_revision_refuses_cached_output_from_another_policy() -> None:
+    """Policy or detector changes conflict with stale keyed output before dispatch."""
+    request = GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=(GatewayMessage(role="user", content="hello"),),
+        idempotency_key="same-operation",
+    )
+    auth = _route().snapshot.authorization
+    before = json.loads(replay_scope_payload(auth, request, inspection_revision="observe-v1"))
+    after = json.loads(replay_scope_payload(auth, request, inspection_revision="enforce-v1"))
+    assert before["caller_operation_sha256"] == after["caller_operation_sha256"]
+    assert before["canonical_request_sha256"] != after["canonical_request_sha256"]

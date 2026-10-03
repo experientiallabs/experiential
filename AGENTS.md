@@ -328,10 +328,11 @@ uv run pytest -q
 13. **Run `/ready-for-merge` before every PR merge.** No PR is merged until the
     `ready-for-merge` skill (`.claude/skills/ready-for-merge/SKILL.md`) has been run and passes:
     `/code-review --fix` at an effort level scaled to the PR's breadth (see the skill), every
-    review comment (Cursor, Greptile, humans) resolved, and a full AGENTS.md compliance audit
-    of the diff. When opening or updating a PR, fetch Greptile review comments in the same
+    review comment (Cursor, Codex, humans) resolved, and a full AGENTS.md compliance audit
+    of the diff. When opening or updating a PR, fetch Cursor and Codex review comments in the same
     turn and address them immediately: fix valid findings, reply on the thread, and resolve
-    it. Do not wait for `/ready-for-merge` to start that loop.
+    it. Request `@codex review` after each push and verify both reviewers completed on the
+    final commit. Do not wait for `/ready-for-merge` to start that loop.
 
 14. **No silent legacy, shims, or backwards compatibility.** Any legacy path, shim,
     compatibility constant, migration branch, deprecated alias, versioned fallback, or other

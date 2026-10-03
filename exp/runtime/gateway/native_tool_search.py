@@ -10,14 +10,23 @@ response renders.
 from __future__ import annotations
 
 import json
+from collections.abc import Sequence
 from typing import Protocol
 
-from exp.runtime.gateway.contracts import GatewayRequest
+from exp.common.core.artifacts import JsonObject
+from exp.runtime.gateway.contracts import GatewayFailure, GatewayFailureClass, GatewayRequest
+from exp.runtime.gateway.guardrails.contracts import GuardrailRejected
+from exp.runtime.gateway.guardrails.enforcement import GuardrailEngine
+from exp.runtime.gateway.guardrails.inspection import (
+    open_inspection,
+    require_output,
+)
+from exp.runtime.gateway.guardrails.streaming import GuardrailFragment, GuardrailOutput
 from exp.runtime.gateway.native_accounting import NativeBridgeError, internal_protocol_error
 from exp.runtime.gateway.native_execution import InflightRequest
 from exp.runtime.gateway.native_reasoning import rung_provider_request
 from exp.runtime.gateway.native_rungs import build_rung_dispatch
-from exp.runtime.gateway.tool_search.round import parse_calls, perform_round
+from exp.runtime.gateway.tool_search.round import WithheldSearchCall, parse_calls, perform_round
 
 
 class _Registry(Protocol):
@@ -28,6 +37,43 @@ class _Registry(Protocol):
 
 class _Plane(Protocol):
     _accounting: _Registry
+    _guardrails: GuardrailEngine | None
+
+
+def _search_output(request_id: str, calls: Sequence[WithheldSearchCall]) -> GuardrailOutput:
+    """Validate complete generated calls before a gateway-owned search action.
+
+    Args:
+        request_id: Exact admitted request whose output session owns the calls.
+        calls: Complete withheld search calls in provider order.
+
+    Returns:
+        A bounded output segment without truncating any call argument.
+
+    Raises:
+        GuardrailRejected: A call exceeds the inspection contract's coverage.
+    """
+    try:
+        return GuardrailOutput(
+            request_id=request_id,
+            final=False,
+            fragments=tuple(
+                GuardrailFragment(
+                    kind="tool",
+                    channel=f"search:{call.call_id}",
+                    text=call.raw_arguments,
+                    name=call.name,
+                )
+                for call in calls
+            ),
+        )
+    except ValueError:
+        raise GuardrailRejected(
+            GatewayFailure(
+                failure_class=GatewayFailureClass.UNSUPPORTED_CAPABILITY,
+                safe_message="Content inspection does not support this generated tool call.",
+            )
+        ) from None
 
 
 class NativeToolSearchMixin:
@@ -41,7 +87,8 @@ class NativeToolSearchMixin:
                 ``round``, and ``calls`` (``{call_id, name, arguments}`` each).
 
         Returns:
-            JSON ``{"wire": <DeploymentWire>, "rounds": [...], "exhausted": bool}``.
+            JSON dispatch and completed search rounds, or an inspection failure
+            and only the search rounds that actually executed.
 
         Raises:
             NativeBridgeError: The request is unknown, carries no tool search,
@@ -63,7 +110,37 @@ class NativeToolSearchMixin:
         provider_request = entry.request
         if not isinstance(provider_request, GatewayRequest):
             raise NativeBridgeError(internal_protocol_error())
-        outcome = perform_round(provider_request, entry.tool_search, parse_calls(data.get("calls")))
+        calls = parse_calls(data.get("calls"))
+        rounds: list[JsonObject] = []
+        try:
+            if entry.guardrail_inspection is not None:
+                require_output(
+                    entry.guardrail_inspection,
+                    _search_output(entry.authorization.request_id, calls),
+                    deadline_monotonic=entry.deadline_monotonic,
+                )
+            outcome = perform_round(provider_request, entry.tool_search, calls)
+            rounds = list(outcome.rounds)
+            session = open_inspection(
+                self._guardrails,
+                authorization=entry.authorization,
+                request=outcome.request,
+                deadline_monotonic=entry.deadline_monotonic,
+            )
+            if (session is None) != (entry.guardrail_inspection is None):
+                raise GuardrailRejected(
+                    GatewayFailure(
+                        failure_class=GatewayFailureClass.UNAVAILABLE,
+                        safe_message="Content inspection changed during this request. Retry later.",
+                    )
+                )
+            if session is not None and entry.guardrail_inspection is not None:
+                session.continue_request(entry.guardrail_inspection)
+            entry.guardrail_inspection = session
+        except GuardrailRejected as exc:
+            return json.dumps(
+                {"inspection_failure": exc.failure.model_dump(mode="json"), "rounds": rounds}
+            )
         deployment = entry.route.deployments[depth]
         profile, client = entry.resolved_wires[depth]
         budget = (

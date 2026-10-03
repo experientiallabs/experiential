@@ -24,7 +24,7 @@ use crate::encode::compact_json;
 use crate::encode_messages::{anthropic_error_body, AggregatedMessage, MessagesSseEncoder};
 use crate::errors::{Failure, FailureClass, PublicError};
 use crate::events::{Event, Usage};
-use crate::guardrails::{released_events, StreamRedactor};
+use crate::guardrails::StreamGuardrails;
 use crate::metrics::{classify_escalation, METRICS};
 use crate::reasoning_display::ReasoningOutput;
 use crate::relay::{collect_committed, collection_public_error, track_event};
@@ -228,6 +228,12 @@ pub(crate) async fn messages(
         output_less_retention: None,
         output_token_cap: admission.maximum_output_tokens,
         tool_search: admission.tool_search.as_ref(),
+        inspection: admission
+            .guardrail_inspection
+            .then_some(crate::waterfall::InspectionContext {
+                web_search: admission.web_search.as_ref(),
+                responses: false,
+            }),
     };
     let mut won = acquire_attempt(&context, &mut guard).await;
     adopt_outcome(&mut admission, &mut won);
@@ -653,7 +659,12 @@ async fn stream_messages(
         let mut terminal: Option<Event> = None;
         // Deterministic output redaction as bytes flow: only the trailing
         // window the detector cannot yet decide about is withheld.
-        let mut redactor = incremental_guardrail.then(|| StreamRedactor::new(&request_id));
+        let mut output_guardrails = StreamGuardrails::new(
+            &request_id,
+            incremental_guardrail,
+            admission.guardrail_inspection,
+            deadline,
+        );
         let mut empty_completion = false;
 
         macro_rules! fail_stream {
@@ -742,13 +753,9 @@ async fn stream_messages(
             let outward = outward_event(&event, &mut visible_refusal);
             // A byte that reaches the caller has already been through the
             // detector, and a terminal flushes whatever is still buffered.
-            let outward_events = match released_events(
-                redactor.as_mut(),
-                &guard.bridge,
-                outward,
-                event.is_terminal(),
-            )
-            .await
+            let outward_events = match output_guardrails
+                .release(&guard.bridge, outward, event.is_terminal())
+                .await
             {
                 Ok(events) => events,
                 Err(failure) => fail_stream!(failure),

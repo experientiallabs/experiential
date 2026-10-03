@@ -4,18 +4,25 @@ from __future__ import annotations
 
 import json
 
-from exp.common.core.artifacts import JsonObject
+from exp.common.core.artifacts import JsonObject, sha256_json
 from exp.runtime.gateway.contracts import AuthorizationSnapshot, GatewayRequest
 from exp.runtime.openai_protocol.errors import OpenAIProtocolError
 from exp.runtime.openai_protocol.state import ProtocolNamespace, replay_key
 
 
-def replay_scope_payload(authorization: AuthorizationSnapshot, request: GatewayRequest) -> str:
+def replay_scope_payload(
+    authorization: AuthorizationSnapshot,
+    request: GatewayRequest,
+    *,
+    inspection_revision: str | None = None,
+) -> str:
     """Return one replay-store scope after the caller and request have been authorized.
 
     Args:
         authorization: Frozen caller and canonical request identity.
         request: Decoded request carrying its standard idempotency key.
+        inspection_revision: Host policy, detector, and rollout revision.
+            A changed revision refuses stale replay.
 
     Returns:
         JSON containing only scope identifiers and hashed operation identity.
@@ -31,7 +38,16 @@ def replay_scope_payload(authorization: AuthorizationSnapshot, request: GatewayR
         ),
         surface=request.surface,
         caller_operation=request.idempotency_key,
-        canonical_request_sha256=authorization.canonical_request_sha256,
+        canonical_request_sha256=(
+            authorization.canonical_request_sha256
+            if inspection_revision is None
+            else sha256_json(
+                {
+                    "request": authorization.canonical_request_sha256,
+                    "inspection": inspection_revision,
+                }
+            )
+        ),
     )
     if key is None:
         raise OpenAIProtocolError(

@@ -11,10 +11,22 @@
 use super::{WaterfallContext, Won};
 use crate::errors::{Failure, FailureClass, PublicError};
 use crate::events::Usage;
+use crate::relay::collection_public_error;
 use crate::settlement::AttemptGuard;
 use crate::tool_search::{
     round_argument, ToolSearchRound, ToolSearchRoundReply, WithheldSearchCall,
 };
+use serde::Deserialize;
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum RoundReply {
+    Rejected {
+        inspection_failure: Failure,
+        rounds: Vec<ToolSearchRound>,
+    },
+    Completed(Box<ToolSearchRoundReply>),
+}
 
 /// The failure of a search call the round budget (or the control plane's
 /// withdrawal of the tool) no longer allows: neither retryable nor
@@ -44,16 +56,34 @@ pub(super) async fn negotiate(
     // request's finalizing failure, carrying every round metered so far, so
     // the searches are never lost to an attempt-less abandon.
     let argument = round_argument(ctx.request_id, depth, round, calls, usage);
-    let reply: Option<ToolSearchRoundReply> =
-        match ctx.bridge.call("tool_search_round", argument).await {
-            Ok(text) => serde_json::from_str(&text).ok(),
-            Err(_) => None,
-        };
+    let reply: Option<RoundReply> = match ctx.bridge.call("tool_search_round", argument).await {
+        Ok(text) => serde_json::from_str(&text).ok(),
+        Err(_) => None,
+    };
     let Some(reply) = reply else {
         guard.record_tool_search_requests(rounds.len() as u32);
         return Err(
             fail_closed(guard, usage, tool_names, "gateway tool search round failed").await,
         );
+    };
+    let reply = match reply {
+        RoundReply::Completed(reply) => *reply,
+        RoundReply::Rejected {
+            inspection_failure,
+            rounds: inspected_rounds,
+        } => {
+            rounds.extend(inspected_rounds);
+            guard.record_tool_search_requests(rounds.len() as u32);
+            if !guard
+                .settle("failed", usage, tool_names, Some(&inspection_failure), true)
+                .await
+            {
+                return Err(Won::Failed(PublicError::internal()));
+            }
+            return Err(Won::Failed(collection_public_error(
+                &inspection_failure.boundary(),
+            )));
+        }
     };
     rounds.extend(reply.rounds.iter().cloned());
     guard.record_tool_search_requests(rounds.len() as u32);

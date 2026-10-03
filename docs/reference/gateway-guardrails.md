@@ -1,5 +1,120 @@
 # Gateway guardrails
 
+## Mandatory policies in the shared engine
+
+Hosts bind mandatory checks to the same engine and classifier registry as customer
+policies:
+
+```python
+engine = GuardrailEngine(
+    store=customer_policies,
+    client=DirectClassifierClient(classifier_registry),
+    monotonic=time.monotonic,
+    mandatory_policy=MandatoryGuardrailPolicy(
+        policy_id="platform-content-policy",
+        revision="detector-and-rollout-v1",
+        checks=(
+            GuardrailCheck(
+                check_id="platform-input",
+                capability="content_safety",
+                stage="input",
+                action="block",
+                adapter_id="platform-classifier",
+                timeout_ms=1000,
+            ),
+            GuardrailCheck(
+                check_id="platform-output",
+                capability="content_safety",
+                stage="output",
+                action="block",
+                adapter_id="platform-classifier",
+                timeout_ms=1000,
+            ),
+        ),
+    ),
+)
+control = NativeControlPlane(components, guardrails=engine)
+```
+
+`MandatoryGuardrailPolicy` is an immutable operator configuration from
+`exp.runtime.gateway.guardrails.contracts`. It permits only blocking checks,
+is always fail-closed, and cannot be removed by a customer identity assignment.
+It uses `GuardrailEngine`'s existing classifier client, bounded executor,
+per-check timeouts, request deadlines, decision metrics, and verdict actions.
+Default request and response inspection bounds are 1 MiB. Hosts may lower them;
+response inspection cannot exceed the native 1 MiB coverage bound.
+
+The engine inspects the authenticated, normalized input after continuation
+expansion and before customer rewrites, ledger acceptance, route selection, or
+provider dispatch. It inspects customer rewrites again. Recovered plaintext
+reasoning, gateway search results, and loaded tool schemas are also checked before
+the next provider dispatch. Output checks bind fresh adapter state to that exact
+expanded request. There is one `guardrails` binding on `NativeControlPlane`.
+
+Existing classifier adapters can participate without a new transport or policy
+executor. Adapters that implement only `inspect_input` and `inspect_output` use
+complete-response buffering. The engine projects visible text, refusals,
+reasoning, retrieved content, and complete tool arguments into their existing
+`GuardrailCompletion` contract before any response content is released. Generated
+gateway-owned tool calls are also checked before execution.
+
+An adapter may implement `IncrementalClassifier.open_output_session` from
+`exp.runtime.gateway.guardrails.streaming`. It returns a request-owned
+`ClassifierOutputSession`, or `None` to require complete-response buffering.
+The session receives ordered `GuardrailOutput` segments and returns the same
+`ClassifierVerdict` as ordinary checks. Session creation and segment calls share
+the engine's bounded executor and recursion guard. Calls for a session are ordered
+but may use different isolation worker loops; adapters must not retain loop-bound
+clients between calls. Classifiers use their own transport, never a public gateway
+route, and must not log inspected content.
+
+For incremental adapters, plain text normally flushes at 256 counted UTF-8 bytes
+or a terminal event. The count includes channel and tool names. Tool frames remain
+withheld until complete arguments are available. Text, refusals, visible reasoning,
+tool arguments, and retrieved content carry separate provenance. Native pending
+content is bounded at 1 MiB and 1,024 events, with a separate 2 MiB retained-event
+bound because tool completion repeats argument deltas. The engine enforces a
+request-wide output bound across all segments. Adapters must retain enough exact
+context to interpret later segments and fail explicitly if their own coverage
+limit is exceeded.
+
+Output goes through customer redaction and mandatory inspection before encoding
+or continuation retention. A stream may release allowed prefixes before generation
+ends; those bytes cannot be recalled if later content changes the decision. This
+mode does not guarantee zero leakage. Complete-only adapters hold the entire
+response. Buffering and classifier inference both affect latency and need separate
+measurement. There is no classifier call or mandatory stream buffering when no
+mandatory policy is configured.
+
+Infrastructure failures become sanitized `unavailable` errors, distinct from a
+flagged policy verdict. No later segment inherits an earlier segment's allow
+result. Sessions belong to live request accounting entries, with no tenant-shared
+safe-prefix cache. The engine hashes the entire mandatory configuration, including
+`revision`, into keyed replay scope. Change `revision` whenever the detector or
+external rollout configuration changes; stale keyed replays then conflict.
+
+Startup requires the compiled `GUARDRAIL_INSPECTION_CONTRACT_VERSION=1` marker.
+Publish coordinated engine and native releases before a downstream host updates
+its exact PyPI pins. Coverage includes native Chat Completions, Responses
+(including WebSocket admission), and Messages. Separate image, embedding, batch,
+and host-specific inference routes require explicit host fencing. Image output
+and token probabilities are unsupported. Encrypted reasoning and signatures remain
+opaque. Provider-executed tools can act before their events reach the gateway;
+inspection gates delivery, not that remote execution.
+
+Initial input rejection precedes durable acceptance and attempts. Gateway search
+rejection can occur after acceptance and search work but before a provider attempt.
+Rejection of generated tool-search arguments preserves the provider turn's usage
+and prevents search execution. Rejection after retrieval meters completed search
+work and prevents another provider dial. Output rejection uses normal failed-attempt
+settlement and available usage, or the existing disconnect estimate, without
+failover. Admission with mandatory checks suppresses the zero-work capacity retry
+certificate because classifier calls may perform paid I/O. Hosts must verify their
+own billing policy. This integration supplies enforcement machinery; it does not
+itself supply a hosted detector, model-quality validation, or production rollout.
+
+## Customer identity policies
+
 Identity-scoped guardrails inspect a request after authentication and, when
 configured, inspect the winning completion before any caller byte is delivered.
 They are default-off. Lookup is by authenticated `organization_id` plus

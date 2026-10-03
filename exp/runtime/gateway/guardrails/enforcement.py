@@ -4,10 +4,18 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Awaitable, Callable, Mapping, Sequence
+from hashlib import sha256
 
-from exp.runtime.gateway.contracts import GatewayMessage, GatewayRequest
+from exp.common.core.artifacts import canonical_json_bytes
+from exp.runtime.gateway.contracts import (
+    AuthorizationSnapshot,
+    GatewayFailure,
+    GatewayFailureClass,
+    GatewayMessage,
+    GatewayRequest,
+)
 from exp.runtime.gateway.guardrails.bounded import BoundedInspect, ClassifierTimeoutError
-from exp.runtime.gateway.guardrails.client import InternalClassifierClient
+from exp.runtime.gateway.guardrails.client import InternalClassifierClient, classification_scope
 from exp.runtime.gateway.guardrails.contracts import (
     ClassifierVerdict,
     GuardrailAction,
@@ -15,12 +23,17 @@ from exp.runtime.gateway.guardrails.contracts import (
     GuardrailCompletion,
     GuardrailPolicy,
     GuardrailRejected,
+    MandatoryGuardrailPolicy,
     OutputGuardrailMode,
     guardrail_failure,
     request_content_bytes,
 )
+from exp.runtime.gateway.guardrails.inspection import GuardrailInspection
 from exp.runtime.gateway.guardrails.store import GuardrailPolicyStore
 from exp.runtime.gateway.guardrails.streaming import (
+    ClassifierOutputSession,
+    GuardrailOutput,
+    IncrementalClassifier,
     StreamingRedactor,
     StreamSegment,
     release_segment,
@@ -131,6 +144,7 @@ class GuardrailEngine:
         monotonic: Callable[[], float],
         inspects: BoundedInspect | None = None,
         deterministic_specifications: Mapping[str, str] | None = None,
+        mandatory_policy: MandatoryGuardrailPolicy | None = None,
     ) -> None:
         """Bind lookup, the internal client, and the deadline clock.
 
@@ -145,17 +159,118 @@ class GuardrailEngine:
                 that runs the Rust data plane compiles these once and lets
                 matching chains run in plane. Omitting them keeps every
                 chain on this engine.
+            mandatory_policy: Operator-owned checks applied independently of
+                identity assignments, through this engine's existing client,
+                bounded executor, and decision recorder.
         """
         self.deterministic_specifications: Mapping[str, str] = dict(
             deterministic_specifications or {}
         )
         self._store = store
+        self._mandatory_policy = mandatory_policy
+        self.inspection_revision = (
+            None
+            if mandatory_policy is None
+            else sha256(canonical_json_bytes(mandatory_policy)).hexdigest()
+        )
         self._client = client
         self._monotonic = monotonic
         self._inspects = inspects or BoundedInspect()
         self.input_invocations = 0
         self.output_invocations = 0
         self.classifier_calls = 0
+
+    @property
+    def mandatory_policy(self) -> MandatoryGuardrailPolicy | None:
+        """Return the immutable operator policy captured when this engine was composed."""
+        return self._mandatory_policy
+
+    async def open_inspection(
+        self,
+        *,
+        authorization: AuthorizationSnapshot,
+        request: GatewayRequest,
+        deadline_monotonic: float,
+    ) -> GuardrailInspection | None:
+        """Enforce mandatory input and bind fresh output capabilities to one request.
+
+        Ordinary adapters retain complete-output enforcement. Adapters that
+        implement the incremental capability share the same per-check deadlines,
+        cancellation isolation, and decision metrics as complete-output checks.
+
+        Args:
+            authorization: Authenticated identity used for mandatory policy binding.
+            request: Full normalized provider-bound input.
+            deadline_monotonic: Absolute deadline shared with request execution.
+
+        Returns:
+            Request-owned output capabilities, or None when no output checks exist.
+
+        Raises:
+            GuardrailRejected: Input was blocked or a mandatory capability failed.
+        """
+        if self.mandatory_policy is None:
+            return None
+        policy = self.mandatory_policy.bind(
+            authorization.organization_id, authorization.identity_id
+        )
+        await self.enforce_input(
+            policy=policy, request=request, deadline_monotonic=deadline_monotonic
+        )
+        if not policy.output_checks:
+            return None
+        sessions: list[tuple[GuardrailCheck, ClassifierOutputSession | None]] = []
+        client = self._client
+        for check in policy.output_checks:
+            session = None
+            if isinstance(client, IncrementalClassifier):
+                budget = min(check.timeout_ms / 1000, deadline_monotonic - self._monotonic())
+                try:
+                    session = await self._inspects.run(
+                        lambda bound=check: client.open_output_session(
+                            request=request, check=bound
+                        ),
+                        budget,
+                        adapter_id=check.adapter_id,
+                    )
+                except Exception:  # noqa: BLE001 - opening an adapter is also fail-closed.
+                    self._uncertain(policy, check, GuardrailAction.ERROR)
+            sessions.append((check, session))
+        return GuardrailInspection(engine=self, policy=policy, sessions=tuple(sessions))
+
+    async def inspect_output_segment(
+        self,
+        *,
+        policy: GuardrailPolicy,
+        check: GuardrailCheck,
+        session: ClassifierOutputSession,
+        output: GuardrailOutput,
+        deadline_monotonic: float,
+    ) -> None:
+        """Run an incremental adapter through the shared executor and decision recorder.
+
+        Args:
+            policy: Frozen mandatory policy bound to the admitted identity.
+            check: Output check whose action governs the verdict.
+            session: Request-owned adapter state.
+            output: Withheld additions to the request's generated content.
+            deadline_monotonic: Original request deadline.
+
+        Raises:
+            GuardrailRejected: The check blocked or failed closed.
+        """
+        self.output_invocations += 1
+
+        async def inspect() -> ClassifierVerdict:
+            """Preserve the public-route recursion guard on the isolated worker."""
+            with classification_scope():
+                return await session.inspect_output(output)
+
+        verdict = await self._run_check(
+            policy=policy, check=check, inspect=inspect, deadline_monotonic=deadline_monotonic
+        )
+        if verdict is not None:
+            self._apply_output(policy, check, GuardrailCompletion(), verdict)
 
     def policy_for(self, organization_id: str, identity_id: str) -> GuardrailPolicy | None:
         """Return the assigned policy, or ``None`` for unguarded traffic."""
@@ -418,6 +533,16 @@ class GuardrailEngine:
         """Apply fail-closed or skip-and-continue for an uncertain check."""
         self._record(policy, check, action, 0.0)
         if policy.protected:
+            if (
+                self.mandatory_policy is not None
+                and policy.policy_id == self.mandatory_policy.policy_id
+            ):
+                raise GuardrailRejected(
+                    GatewayFailure(
+                        failure_class=GatewayFailureClass.UNAVAILABLE,
+                        safe_message="Content inspection is unavailable. Retry later.",
+                    )
+                )
             raise GuardrailRejected(
                 guardrail_failure(action=GuardrailAction.ERROR, check_id=check.check_id)
             )

@@ -242,6 +242,8 @@ pub struct WaterfallContext<'a> {
     /// withholds every call to its tool and the waterfall runs at most
     /// `max_rounds` search rounds. `None` withholds nothing.
     pub tool_search: Option<&'a ToolSearchAdmission>,
+    /// Request-bound host inspection, independent of customer guardrails.
+    pub inspection: Option<super::InspectionContext<'a>>,
 }
 
 /// The bound on one dial's open (request/response-header) phase: the

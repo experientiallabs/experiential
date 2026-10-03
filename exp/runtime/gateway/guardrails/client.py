@@ -13,7 +13,12 @@ from exp.runtime.gateway.guardrails.contracts import (
     GuardrailCheck,
     GuardrailCompletion,
 )
-from exp.runtime.gateway.guardrails.streaming import StreamableClassifier, StreamingRedactor
+from exp.runtime.gateway.guardrails.streaming import (
+    ClassifierOutputSession,
+    IncrementalClassifier,
+    StreamableClassifier,
+    StreamingRedactor,
+)
 
 _INTERNAL_CLASSIFICATION: ContextVar[bool] = ContextVar(
     "exp_gateway_guardrail_internal",
@@ -162,6 +167,20 @@ class DirectClassifierClient:
         if not isinstance(adapter, StreamableClassifier):
             return None
         return adapter.stream_redactor()
+
+    async def open_output_session(
+        self, *, request: GatewayRequest, check: GuardrailCheck
+    ) -> ClassifierOutputSession | None:
+        """Resolve an adapter's optional request-owned streaming capability.
+
+        Adapters without this capability retain full-completion inspection.
+        Session creation runs under the same recursion guard as ordinary checks.
+        """
+        adapter = self._registry.require(check.adapter_id)
+        if not isinstance(adapter, IncrementalClassifier):
+            return None
+        with classification_scope():
+            return await adapter.open_output_session(request=request, check=check)
 
 
 class ClassifierLookup(Protocol):

@@ -1,4 +1,4 @@
-//! Output-chain enforcement for identity-scoped guardrails.
+//! Output-chain enforcement for mandatory and identity-scoped guardrails.
 //!
 //! Rust owns buffering and delivery. A chain whose checks all bind
 //! deterministic detectors runs natively through `plan`, with the compiled
@@ -9,15 +9,47 @@
 //! This module never logs request text, completions, or replacements.
 
 pub mod detector;
+pub(crate) mod inspection;
 pub mod plan;
 mod syntax;
 
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::time::Instant;
 
 use crate::bridge::Bridge;
 use crate::errors::{Failure, FailureClass};
 use crate::events::Event;
+
+/// Shared streamed-output enforcement for deterministic and model-backed checks.
+pub(crate) struct StreamGuardrails {
+    redactor: Option<StreamRedactor>,
+    inspector: Option<inspection::StreamInspector>,
+}
+
+impl StreamGuardrails {
+    pub(crate) fn new(request_id: &str, redact: bool, inspect: bool, deadline: Instant) -> Self {
+        Self {
+            redactor: redact.then(|| StreamRedactor::new(request_id)),
+            inspector: inspect.then(|| inspection::StreamInspector::new(request_id, deadline)),
+        }
+    }
+
+    pub(crate) fn enabled(&self) -> bool {
+        self.redactor.is_some() || self.inspector.is_some()
+    }
+
+    /// No route may emit a customer rewrite before the mandatory checks authorize it.
+    pub(crate) async fn release(
+        &mut self,
+        bridge: &Bridge,
+        event: Event,
+        terminal: bool,
+    ) -> Result<Vec<Event>, Failure> {
+        let events = released_events(self.redactor.as_mut(), bridge, event, terminal).await?;
+        inspection::inspect_events(self.inspector.as_mut(), bridge, events).await
+    }
+}
 
 /// Decision returned by one Python `enforce_output` callback.
 #[derive(Debug, Deserialize)]

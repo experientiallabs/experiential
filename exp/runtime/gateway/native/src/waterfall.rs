@@ -40,6 +40,10 @@ use crate::settlement::AttemptGuard;
 use crate::throttle_backoff::{track_retry_after, with_largest_retry_after};
 use crate::tool_search::{ToolSearchRound, WithheldSearchCall};
 
+mod inspection;
+use inspection::inspect_outward;
+pub use inspection::InspectionContext;
+
 /// Byte bound for withheld refusal deltas, matching the python executor's
 /// `_MAX_WITHHELD_REFUSAL_BYTES`.
 pub const MAXIMUM_WITHHELD_REFUSAL_BYTES: usize = 65_536;
@@ -183,8 +187,7 @@ enum AttemptEnd {
     },
     /// Accounting failed mid-attempt; the request is answered internal.
     Accounting,
-    /// The attempt settled, but retaining its output-less continuation
-    /// failed; the public retention error answers the caller.
+    /// The attempt finalized, but inspection or continuation retention failed.
     Retention(PublicError),
 }
 
@@ -373,6 +376,7 @@ pub async fn acquire_attempt(ctx: &WaterfallContext<'_>, guard: &mut AttemptGuar
             depth,
             &mut repaired[depth],
             repair_redial,
+            &tool_search_rounds,
         )
         .await;
         match end {
@@ -381,6 +385,22 @@ pub async fn acquire_attempt(ctx: &WaterfallContext<'_>, guard: &mut AttemptGuar
                 // semantic chunk, so an aggregator's upstream label (if any)
                 // is known here; settle it with whatever outcome follows.
                 guard.record_upstream_provider(committed.relay.upstream_provider());
+                if let Err(failure) = inspect_outward(ctx, &tool_search_rounds, &[], false).await {
+                    committed.relay.close_transport();
+                    if !guard
+                        .settle(
+                            "failed",
+                            committed.usage.as_ref(),
+                            &committed.tool_names,
+                            Some(&failure),
+                            true,
+                        )
+                        .await
+                    {
+                        return Won::Failed(PublicError::internal());
+                    }
+                    return Won::Failed(collection_public_error(&failure.boundary()));
+                }
                 committed.tool_search_rounds = std::mem::take(&mut tool_search_rounds);
                 return Won::Committed(committed);
             }
@@ -545,6 +565,30 @@ pub async fn acquire_attempt(ctx: &WaterfallContext<'_>, guard: &mut AttemptGuar
                         &failure,
                         refusal_eligible,
                     );
+                if !possible
+                    && (!exhaustion_flush.is_empty()
+                        || failure.failure_class == FailureClass::EmptyCompletion)
+                {
+                    if let Err(inspection_failure) =
+                        inspect_outward(ctx, &tool_search_rounds, &exhaustion_flush, true).await
+                    {
+                        if !guard
+                            .settle(
+                                "failed",
+                                usage.as_ref(),
+                                &tool_names,
+                                Some(&inspection_failure),
+                                true,
+                            )
+                            .await
+                        {
+                            return Won::Failed(PublicError::internal());
+                        }
+                        return Won::Failed(collection_public_error(
+                            &inspection_failure.boundary(),
+                        ));
+                    }
+                }
                 if !guard
                     .settle(
                         "failed",

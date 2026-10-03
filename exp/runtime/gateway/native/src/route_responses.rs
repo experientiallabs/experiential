@@ -24,7 +24,7 @@ use crate::encode::{compact_json, reasoning_carrier_candidate};
 use crate::encode_responses::ResponsesSseEncoder;
 use crate::errors::{Failure, FailureClass, PublicError};
 use crate::events::{Event, Usage};
-use crate::guardrails::{released_events, StreamRedactor};
+use crate::guardrails::StreamGuardrails;
 use crate::metrics::{classify_escalation, METRICS};
 use crate::relay::{collect_committed, collection_public_error, track_event};
 use crate::replay::{CachedResponse, Claim, OwnerLease, ReplayKey};
@@ -231,6 +231,12 @@ pub(crate) async fn responses(
         )),
         output_token_cap: admission.maximum_output_tokens,
         tool_search: admission.tool_search.as_ref(),
+        inspection: admission
+            .guardrail_inspection
+            .then_some(crate::waterfall::InspectionContext {
+                web_search: admission.web_search.as_ref(),
+                responses: true,
+            }),
     };
     let mut won = acquire_attempt(&context, &mut guard).await;
     adopt_outcome(&mut admission, &mut won);
@@ -312,8 +318,7 @@ pub(crate) async fn responses(
 }
 
 /// Answer one Responses attempt that the waterfall already settled: a
-/// successful terminal with no semantic output, or an exhausted ladder
-/// flushing withheld refusal output ahead of the failing terminal.
+/// terminal without semantics or an exhausted ladder flushing inspected refusals.
 async fn settled_responses_response(
     admission: &Admission,
     settled: SettledAttempt,
@@ -727,9 +732,7 @@ async fn stream_responses(
         let mut committed = committed;
         let mut lease = lease;
         let mut delivery = Delivery::new(sender.clone(), lease.is_some());
-        // Keyed streams capture every public frame so the owner can publish
-        // the exact byte stream; terminal frames flow through the shared
-        // publication tail, matching the chat surface.
+        // Keyed streams retain exact public frames through the publication tail.
         let mut capture: Vec<u8> = Vec::new();
         let mut replayable = lease.is_some();
         let mut encoder = ResponsesSseEncoder::new(&request_id, &alias, created_at, envelope);
@@ -740,11 +743,13 @@ async fn stream_responses(
         let mut terminal: Option<Event> = None;
         let mut retention = ResponsesRetention::default();
         let mut reasoning_content_carrier: Option<String> = None;
-        // Deterministic output redaction as bytes flow: only the trailing
-        // window the detector cannot yet decide about is withheld.
-        let mut redactor = incremental_guardrail.then(|| StreamRedactor::new(&request_id));
-        // Terminal frames are withheld until continuation retention lands,
-        // mirroring the python stream body's ordering.
+        // Withhold pending redaction and host-inspection segments.
+        let mut output_guardrails = StreamGuardrails::new(
+            &request_id,
+            incremental_guardrail,
+            admission.guardrail_inspection,
+            deadline,
+        );
         let terminal_frames: Vec<String>;
 
         macro_rules! fail_stream {
@@ -824,7 +829,7 @@ async fn stream_responses(
             if matches!(event, Event::Failed(_)) {
                 usage = committed.relay.usage_before_failure(usage.take());
             }
-            if redactor.is_none() {
+            if !output_guardrails.enabled() {
                 // A guarded stream retains what the caller actually saw, so
                 // a continuation replays the redacted text, never the raw
                 // completion; retention then runs over the released events.
@@ -835,26 +840,22 @@ async fn stream_responses(
             let outward = outward_event(&event, &mut visible_refusal);
             // A byte that reaches the caller has already been through the
             // detector, and a terminal flushes whatever is still buffered.
-            let guarded = redactor.is_some();
-            let outward_events = match released_events(
-                redactor.as_mut(),
-                &guard.bridge,
-                outward,
-                event.is_terminal(),
-            )
-            .await
+            let guarded = output_guardrails.enabled();
+            let outward_events = match output_guardrails
+                .release(&guard.bridge, outward, event.is_terminal())
+                .await
             {
                 Ok(events) => events,
                 Err(failure) => fail_stream!(failure),
             };
+            // The terminal is recorded before its frames flush, so a
+            // disconnect during the final flush still settles by the
+            // provider's outcome instead of as a cancellation.
             if guarded {
                 for released in &outward_events {
                     retention.track(released);
                 }
             }
-            // The terminal is recorded before its frames flush, so a
-            // disconnect during the final flush still settles by the
-            // provider's outcome instead of as a cancellation.
             if event.is_terminal() {
                 committed.relay.close_transport();
                 terminal = Some(event.clone());

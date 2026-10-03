@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import time
 from collections.abc import Mapping, Sequence
-from typing import cast
+from typing import TYPE_CHECKING, Protocol, cast
 
 from exp.common.core.artifacts import JsonObject
 from exp.runtime.gateway.contracts import AuthorizationSnapshot, GatewayRequest
@@ -21,6 +21,60 @@ from exp.runtime.gateway.guardrails.contracts import (
 )
 from exp.runtime.gateway.guardrails.deterministic import NativeDetector, native_input_request
 from exp.runtime.gateway.guardrails.enforcement import GuardrailEngine
+from exp.runtime.gateway.guardrails.inspection import (
+    GuardrailInspection,
+    inspect_argument,
+    open_inspection,
+)
+from exp.runtime.gateway.native_accounting_errors import NativeBridgeError
+from exp.runtime.openai_protocol.errors import public_failure_error
+
+if TYPE_CHECKING:
+    from exp.runtime.gateway.native_accounting import NativeAttemptAccounting
+
+
+def inspect_native_input(
+    engine: GuardrailEngine | None,
+    *,
+    authorization: AuthorizationSnapshot,
+    request: GatewayRequest,
+    deadline_monotonic: float,
+    detectors: Mapping[str, NativeDetector] | None = None,
+) -> tuple[GatewayRequest, GuardrailPolicy | None, GuardrailInspection | None]:
+    """Check original intent and optional rewrites before dispatch or charging.
+
+    Args:
+        engine: Shared engine with optional mandatory and identity policy layers.
+        authorization: Frozen authenticated tenant and identity.
+        request: Canonical request after continuation expansion.
+        deadline_monotonic: Absolute request-wide inspection deadline.
+        detectors: Compiled customer detectors indexed by adapter.
+
+    Returns:
+        The transformed request, customer policy, and fresh host session.
+
+    Raises:
+        GuardrailRejected: Either policy rejected or could not inspect input.
+        GuardrailRecursionError: A classifier re-entered the public route.
+    """
+    session = open_inspection(
+        engine, authorization=authorization, request=request, deadline_monotonic=deadline_monotonic
+    )
+    transformed, policy = enforce_native_input(
+        engine,
+        authorization=authorization,
+        request=request,
+        deadline_monotonic=deadline_monotonic,
+        detectors=detectors,
+    )
+    if transformed != request:
+        session = open_inspection(
+            engine,
+            authorization=authorization,
+            request=transformed,
+            deadline_monotonic=deadline_monotonic,
+        )
+    return transformed, policy, session
 
 
 def enforce_native_input(
@@ -86,6 +140,7 @@ def native_output_mode(
     *,
     image_output: bool = False,
     wire_route: Sequence[JsonObject] = (),
+    inspection: GuardrailInspection | None = None,
 ) -> OutputGuardrailMode:
     """Return the output enforcement shape one admission must use.
 
@@ -98,12 +153,15 @@ def native_output_mode(
             images, or whose payload asks its provider for readable reasoning
             the caller may not have requested (reasoning display defaults),
             rules out a reasoning-free incremental stream.
+        inspection: Request-owned classifier capabilities resolved by the engine.
 
     Returns:
         ``off``, ``buffer``, or ``stream`` for the data plane.
     """
     if engine is None:
         return OutputGuardrailMode.OFF
+    if inspection is not None and inspection.buffers_output:
+        return OutputGuardrailMode.BUFFER
     mode = engine.output_mode(
         policy,
         streaming=request.stream,
@@ -319,3 +377,123 @@ def upstream_requests_reasoning(wire_route: Sequence[JsonObject]) -> bool:
         ):
             return True
     return False
+
+
+class _GuardrailPlane(Protocol):
+    """The typed accounting and policy seams used by native output callbacks."""
+
+    _accounting: NativeAttemptAccounting
+    _guardrails: GuardrailEngine | None
+
+
+class NativeGuardrailsMixin:
+    """Native output callbacks bound to the admitted request's frozen policy."""
+
+    def reopen_guardrail_inspection(
+        self: _GuardrailPlane,
+        authorization: AuthorizationSnapshot,
+        request: GatewayRequest,
+        deadline: float,
+    ) -> GuardrailInspection | None:
+        """Inspect authenticated plaintext after sealed-history expansion.
+
+        Args:
+            authorization: Authenticated request authority.
+            request: Full request with authenticated plaintext history.
+            deadline: Original absolute request deadline.
+
+        Returns:
+            A fresh session for the actual provider-bound context.
+
+        Raises:
+            NativeBridgeError: The policy rejected or failed to inspect input.
+        """
+        try:
+            return open_inspection(
+                self._guardrails,
+                authorization=authorization,
+                request=request,
+                deadline_monotonic=deadline,
+            )
+        except GuardrailRejected as exc:
+            raise NativeBridgeError(public_failure_error(exc.failure)) from None
+
+    def inspect_admitted_guardrails(
+        self: _GuardrailPlane,
+        authorization: AuthorizationSnapshot,
+        request: GatewayRequest,
+        deadline: float,
+    ) -> GuardrailInspection | None:
+        """Reinspect a search-expanded request and finalize any admitted rejection.
+
+        Args:
+            authorization: Authority of the already accepted request.
+            request: Exact request after gateway search and tool planning.
+            deadline: Original absolute request deadline.
+
+        Returns:
+            A fresh session bound to all provider-bound context.
+
+        Raises:
+            NativeBridgeError: Inspection rejected the request before provider dispatch.
+        """
+        try:
+            return open_inspection(
+                self._guardrails,
+                authorization=authorization,
+                request=request,
+                deadline_monotonic=deadline,
+            )
+        except GuardrailRejected as exc:
+            self._accounting.finish_request_quietly(authorization, exc.failure)
+            raise NativeBridgeError(public_failure_error(exc.failure)) from None
+
+    def enforce_output_segment(self: _GuardrailPlane, argument: str) -> str:
+        """Release the settled part of one streamed customer-redaction tail.
+
+        Args:
+            argument: Native JSON payload containing the admitted request ID.
+
+        Returns:
+            A native JSON decision bound to that entry's policy and deadline.
+        """
+        entry = self._accounting.entry(str(json.loads(argument).get("request_id") or ""))
+        policy = None if entry is None else entry.policy
+        deadline = time.monotonic() if entry is None else entry.deadline_monotonic
+        return enforce_native_output_segment(
+            self._guardrails, policy, argument, deadline_monotonic=deadline
+        )
+
+    def inspect_guardrail_output(self: _GuardrailPlane, argument: str) -> str:
+        """Inspect a pending segment through its exact admitted request session.
+
+        Args:
+            argument: Native JSON payload containing the admitted request ID.
+
+        Returns:
+            A native JSON decision bound to that entry's policy and deadline.
+        """
+        return inspect_argument(self._accounting, argument)
+
+    def enforce_output(self: _GuardrailPlane, argument: str) -> str:
+        """Run a customer output-chain callback for a buffered completion.
+
+        Args:
+            argument: Native JSON payload containing the admitted request ID.
+
+        Returns:
+            A native JSON decision bound to that entry's policy and deadline.
+        """
+        data = json.loads(argument)
+        request_id = str(data.get("request_id") or "")
+        entry = self._accounting.entry(request_id)
+        policy = None if entry is None else entry.policy
+        deadline = time.monotonic() if entry is None else entry.deadline_monotonic
+        if entry is not None and policy is None and entry.guardrail_inspection is not None:
+            return encode_output_decision(action=GuardrailAction.ALLOW.value)
+        return enforce_native_output(
+            self._guardrails,
+            policy,
+            argument,
+            deadline_monotonic=deadline,
+        )

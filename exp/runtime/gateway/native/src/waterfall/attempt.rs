@@ -13,7 +13,7 @@ use crate::rate_limit_headers::harvest_rate_limit_headers;
 use crate::relay::{ended_without_terminal, remaining, track_event, UpstreamRelay};
 use crate::replay_repair::AttemptRepair;
 use crate::settlement::AttemptGuard;
-use crate::tool_search::withheld_overflow_failure;
+use crate::tool_search::{withheld_overflow_failure, ToolSearchRound};
 use crate::upstream::open_stream;
 use serde_json::Value;
 use std::time::{Duration, Instant};
@@ -28,6 +28,7 @@ pub(super) async fn run_attempt(
     depth: usize,
     repaired: &mut Option<Value>,
     reactive_repair: bool,
+    search_rounds: &[ToolSearchRound],
 ) -> AttemptEnd {
     let Some(dialect) = Dialect::from_str(&wire.dialect) else {
         // Admission validated every dialect; reaching here is wire drift.
@@ -452,6 +453,7 @@ pub(super) async fn run_attempt(
                                 tool_names,
                                 depth,
                                 encrypted_reasoning_stripped,
+                                search_rounds,
                             )
                             .await;
                         }
@@ -483,6 +485,7 @@ pub(super) async fn run_attempt(
                         tool_names,
                         depth,
                         encrypted_reasoning_stripped,
+                        search_rounds,
                     )
                     .await;
                 }
