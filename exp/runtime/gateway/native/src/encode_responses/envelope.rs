@@ -44,6 +44,11 @@ pub struct ResponsesEnvelope {
     pub previous_response_id: Value,
     #[serde(default)]
     pub include_encrypted_reasoning: bool,
+    /// Whether the winning rung returns its plaintext reasoning to the caller
+    /// (`reasoning_output_exposed` on the route). A rung fact, not a request
+    /// field: never deserialized, stamped by the route once an attempt wins.
+    #[serde(skip)]
+    pub reasoning_output_exposed: bool,
 }
 
 impl Default for ResponsesEnvelope {
@@ -60,6 +65,7 @@ impl Default for ResponsesEnvelope {
             max_output_tokens: Value::Null,
             previous_response_id: Value::Null,
             include_encrypted_reasoning: false,
+            reasoning_output_exposed: false,
         }
     }
 }

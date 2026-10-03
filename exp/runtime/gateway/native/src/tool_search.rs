@@ -681,8 +681,10 @@ pub(crate) fn configure_responses_encoder(
 
 /// Aggregate one Responses turn for the admission, rendering its search
 /// rounds as hosted items ahead of the answer and citing its web search.
+/// `depth` is the winning attempt's rung, whose reasoning exposure applies.
 pub(crate) fn completed_responses_body_for(
     admission: &Admission,
+    depth: usize,
     created_at: i64,
     events: &[Event],
     reasoning_content_carrier: Option<&str>,
@@ -691,7 +693,7 @@ pub(crate) fn completed_responses_body_for(
         &admission.request_id,
         &admission.alias,
         created_at,
-        admission.envelope.clone().unwrap_or_default(),
+        admission.responses_envelope_at(depth),
         events,
         reasoning_content_carrier,
         admission.web_search.as_ref(),
@@ -699,14 +701,16 @@ pub(crate) fn completed_responses_body_for(
     )
 }
 
-/// Encode admitted Responses events with their unchanged gateway tool configuration.
+/// Encode admitted Responses events with their unchanged gateway tool
+/// configuration and the reasoning exposure of the rung that won at `depth`.
 pub(crate) fn encode_responses_sse(
     admission: &Admission,
+    depth: usize,
     created_at: i64,
     events: &[Event],
     reasoning_content_carrier: Option<&str>,
 ) -> Result<Vec<u8>, PublicError> {
-    let envelope = admission.envelope.clone().unwrap_or_default();
+    let envelope = admission.responses_envelope_at(depth);
     let mut encoder = ResponsesSseEncoder::new(
         &admission.request_id,
         &admission.alias,

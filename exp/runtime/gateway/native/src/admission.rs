@@ -179,6 +179,14 @@ impl Admission {
             .is_some_and(|wire| wire.reasoning_output_exposed)
     }
 
+    /// The Responses envelope for the attempt that won at `depth`, carrying
+    /// that rung's plaintext-reasoning exposure.
+    pub(crate) fn responses_envelope_at(&self, depth: usize) -> ResponsesEnvelope {
+        let mut envelope = self.envelope.clone().unwrap_or_default();
+        envelope.reasoning_output_exposed = self.reasoning_exposed_at(depth);
+        envelope
+    }
+
     /// Whether the attempt at `depth` may enforce its output chain as bytes
     /// stream, instead of buffering the whole completion first.
     ///

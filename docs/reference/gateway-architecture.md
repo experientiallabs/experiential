@@ -644,7 +644,11 @@ payload to the sealed carrier that admission authenticates and pins to its issui
 dropping the unsigned display duplicate beside it. On the Responses surface over Anthropic routes,
 thinking text is projected onto the reasoning-summary channel (signatures deliberately dropped)
 so callers receive the reasoning they pay for, while the Chat surface has no reasoning
-representation and drops it like summary deltas. Streaming emits the Anthropic
+representation and drops it like summary deltas. The same channel carries an exposure-gated
+rung's plaintext on the Responses surface: the route reasoning item streams it as one
+`summary_text` part and still carries the sealed carrier as `encrypted_content` on tool turns,
+so the replay contract is unchanged (the decoder reads the carrier and ignores the summary).
+Streaming emits the Anthropic
 lifecycle (`message_start`, `ping`, content blocks, `message_delta` with the mapped stop reason
 and usage, `message_stop`, or one terminal `error` event); the non-streaming body is the
 Anthropic message object. Completed streams stop with `end_turn` (`tool_use` when tool calls are

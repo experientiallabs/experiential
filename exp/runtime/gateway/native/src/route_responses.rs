@@ -333,7 +333,7 @@ async fn settled_responses_response(
     }
     let headers = served_headers(admission, client_request_id.as_deref(), served);
     if admission.stream {
-        let body = match encode_responses_sse(admission, created_at, &events, None) {
+        let body = match encode_responses_sse(admission, served.depth, created_at, &events, None) {
             Ok(body) => body,
             Err(error) => return error_response(&error),
         };
@@ -360,10 +360,11 @@ async fn settled_responses_response(
         }
         return sse_body_response(&headers, body);
     }
-    let aggregated = match completed_responses_body_for(admission, created_at, &events, None) {
-        Ok(aggregated) => aggregated,
-        Err(error) => return error_response(&error),
-    };
+    let aggregated =
+        match completed_responses_body_for(admission, served.depth, created_at, &events, None) {
+            Ok(aggregated) => aggregated,
+            Err(error) => return error_response(&error),
+        };
     if let Some(failure) = &aggregated.failure {
         if let Some(mut owner) = lease.take() {
             owner.abandon().await;
@@ -421,6 +422,7 @@ async fn respond_from_responses_events(
         };
     let aggregated = match completed_responses_body_for(
         &admission,
+        depth,
         created_at,
         &events,
         reasoning_content_carrier.as_deref(),
@@ -524,6 +526,7 @@ async fn respond_from_responses_events(
     if stream_body {
         let body = match encode_responses_sse(
             &admission,
+            depth,
             created_at,
             &events,
             reasoning_content_carrier.as_deref(),
@@ -710,7 +713,7 @@ async fn stream_responses(
     let header_pairs = served_headers(&admission, client_request_id.as_deref(), committed.served());
     let request_id = admission.request_id.clone();
     let alias = admission.alias.clone();
-    let envelope = admission.envelope.clone().unwrap_or_default();
+    let envelope = admission.responses_envelope_at(committed.depth);
     let phase_timeout = admission.phase_timeout(committed.depth);
     let mut cached_headers = header_pairs.clone();
     cached_headers.sort();

@@ -18,6 +18,7 @@ mod close;
 mod envelope;
 mod output;
 mod provider;
+mod route_reasoning;
 
 // Expose the carrier variant for tests and hosts without search; HTTP routes use
 // the web-search-aware variant.
@@ -337,7 +338,7 @@ impl ResponsesSseEncoder {
             Event::ReasoningContentDelta {
                 route_sha256,
                 delta,
-            } => self.fireworks_reasoning(route_sha256, delta),
+            } => self.route_reasoning(route_sha256, delta),
             Event::EncryptedReasoning {
                 output_index,
                 item_id,
@@ -554,48 +555,6 @@ impl ResponsesSseEncoder {
             }),
         ));
         Ok(())
-    }
-
-    /// Open one opaque Fireworks reasoning item without exposing plaintext.
-    fn fireworks_reasoning(
-        &mut self,
-        route_sha256: &str,
-        _delta: &str,
-    ) -> Result<Vec<String>, PublicError> {
-        if let Some(existing) = &self.fireworks_reasoning_route_sha256 {
-            if existing != route_sha256 {
-                return Err(invalid_provider_stream(
-                    "Responses Fireworks reasoning changed provider route.",
-                ));
-            }
-        } else {
-            self.fireworks_reasoning_route_sha256 = Some(route_sha256.to_string());
-        }
-        if self.fireworks_reasoning.is_some() {
-            return Ok(Vec::new());
-        }
-        let state = ReasoningState {
-            item_id: stable_public_id("rs", &format!("{}:fireworks", self.response_id)),
-            output_index: self.output_order.len(),
-            parts: BTreeMap::new(),
-            encrypted_content: None,
-            status: Some(ProviderOutputItemStatus::InProgress),
-            done: false,
-        };
-        let frame = self.event(
-            "response.output_item.added",
-            json!({
-                "output_index": state.output_index,
-                "item": state.item(
-                    false,
-                    ProviderOutputItemStatus::InProgress,
-                    false,
-                ),
-            }),
-        );
-        self.fireworks_reasoning = Some(state);
-        self.output_order.push(OutputSlot::FireworksReasoning);
-        Ok(vec![frame])
     }
 
     /// Start one reasoning item/summary part as needed and emit its text delta.
@@ -891,7 +850,7 @@ impl ResponsesSseEncoder {
                     frames.extend(self.close_hosted(index));
                 }
                 OutputSlot::FireworksReasoning => {
-                    frames.extend(self.close_fireworks_reasoning(fallback_status));
+                    frames.extend(self.close_route_reasoning(fallback_status));
                 }
                 OutputSlot::Message(_)
                 | OutputSlot::Tool(_)
@@ -907,31 +866,6 @@ impl ResponsesSseEncoder {
         );
         frames.push(frame);
         Ok(frames)
-    }
-
-    /// Complete the gateway-issued Fireworks reasoning item.
-    fn close_fireworks_reasoning(
-        &mut self,
-        fallback_status: ProviderOutputItemStatus,
-    ) -> Vec<String> {
-        let Some(state) = self.fireworks_reasoning.as_mut() else {
-            return Vec::new();
-        };
-        if state.done {
-            return Vec::new();
-        }
-        state.done = true;
-        state.status = Some(fallback_status);
-        let output_index = state.output_index;
-        let item = state.item(
-            true,
-            fallback_status,
-            self.envelope.include_encrypted_reasoning,
-        );
-        vec![self.event(
-            "response.output_item.done",
-            json!({"output_index": output_index, "item": item}),
-        )]
     }
 
     /// Complete every summary part and its containing reasoning item.
@@ -997,3 +931,6 @@ impl ResponsesSseEncoder {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod exposed_reasoning_tests;
