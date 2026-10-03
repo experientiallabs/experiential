@@ -35,13 +35,15 @@ failure"). Two things change:
 - `GatewayRungDispatchPolicy.saturation` — `overflow` (default, unchanged) or `refuse`. An
   authored rung set to `refuse` answers the caller at once instead of dispatching one more
   request onto a lane already at its bound.
-- A shed by the DEFAULT lane bound (`RungShed.default_bound`) always refuses: the default
-  exists to protect the worker, and overflowing it would protect nothing.
+- A shed by the DEFAULT lane bound (`RungShed.default_bound`) refuses too: the default
+  exists to protect the worker, so only a priority caller overflows it, and only to its
+  level's ceiling (below).
 
-The refusal is `lane_saturated_failure()`: failure class `throttled`, safe message
-"every lane for this model is at its in-flight bound on this gateway worker; retry in 5
-seconds", `retry_after_seconds = 5` (`THROTTLED_RETRY_AFTER_SECONDS`, the floor the protocol
-renderer applies to every throttled wait, so the message, the payload and the header agree).
+The refusal is `lane_saturated_failure()`: failure class `throttled`, consumer-facing safe
+message "This model is at capacity right now. Please retry in a few seconds. Pro subscribers
+get priority access when models are busy.", `retry_after_seconds = 5`
+(`THROTTLED_RETRY_AFTER_SECONDS`, the floor the protocol renderer applies to every throttled
+wait, so the payload and the header agree).
 The data plane renders it as the caller-facing 429 `unavailable_route` with `Retry-After: 5`,
 before any dispatch, so the retry lands on a freed slot instead of queueing behind the slow
 lane. Nothing is down, so it is not
@@ -49,6 +51,33 @@ lane. Nothing is down, so it is not
 bypass that was not a registry shed (a cold throttle failover) keeps the historical overflow.
 A reasoning-pinned continuation's first dispatch still force-admits its pinned rung for every
 shed reason (`shed_keeps_pin`), the documented continuity-over-spill trade.
+
+## Priority callers and default fairness
+
+A PRIORITY caller (`AuthorizationSnapshot.priority_admission`: 1 for a paying organization,
+2 for Pro, as the hosted platform sets it; 0 free) is not refused at a bound, on every rung
+and with nothing to author: when either refusing bound (an authored `refuse` or the worker's
+default lane bound) sheds it, `overflow_target` force-admits it onto the first bypassed rung
+still below its ceiling (`saturated_overflow`), so on a saturated lane free callers get the
+429 first. A priority caller's caller-selected first dial overflows its own rung the same way,
+even on a soft (`overflow`) bound. The overflow is capped per level and floors to whole
+slots (`priority_overflow_ceiling`):
+
+| Bound | Paying | Pro |
+| --- | --- | --- |
+| Authored (`PRIORITY_OVERFLOW_FACTORS`) | 1.5x | 2x |
+| Worker default (`DEFAULT_BOUND_OVERFLOW_FACTORS`) | 1.25x | 1.5x |
+
+The default bound is already half the worker's permits, so its Pro factor stays below
+`1 / DEFAULT_LANE_SHARE` and one lane's priority traffic never holds every permit. A rung whose
+forced admission hit its ceiling (`RungShed.overflow_ceiling`) is skipped, and the request is
+refused once every bypassed rung is capped.
+
+Weighted fairness is ALWAYS on: every bounded rung, including one bounded only by the worker
+default, weighs organizations by `AuthorizationSnapshot.fair_share_weight` under contention.
+`GatewayRungDispatchPolicy.fair_share` stays in the contract only because persisted catalog
+snapshots serialize it and their identity digests read it; its value no longer changes
+admission (an authored `true` still requires a bound). No catalog digest moves.
 
 ## Durable retry and billing proof
 

@@ -126,17 +126,20 @@ class GatewayRungDispatchPolicy(ContractModel):
     worker's admission permits than its bound allows, at the price of a
     manufactured refusal when every rung of the pool is full. The default
     bound a worker applies to rungs that author no ``concurrency_bound``
-    (``exp.runtime.gateway.lane_saturation``) always refuses: it exists to
-    protect the worker, and overflowing it would protect nothing.
+    (``exp.runtime.gateway.lane_saturation``) refuses too. Either refusal
+    spares a priority caller (``AuthorizationSnapshot.priority_admission``),
+    whose shed overflows up to its level's ceiling.
     """
     fair_share: bool = False
-    """Whether contended admission on this rung is weighted max-min fair.
+    """Authored fairness flag; weighted fairness itself is ALWAYS on.
 
-    When the rung is at or near its ``concurrency_bound``, each organization's
-    admissions are limited to its weighted share of the bound (weights ride
-    ``AuthorizationSnapshot.fair_share_weight``), with freed capacity reserved
-    for recently active under-share organizations. Work-conserving: a lone
-    organization borrows the whole bound. Requires ``concurrency_bound``.
+    Every bounded rung (an authored bound, or the worker's default lane bound)
+    limits each organization near the bound to its weighted share (weights
+    ride ``AuthorizationSnapshot.fair_share_weight``), with freed capacity
+    reserved for recently active under-share organizations. Work-conserving: a
+    lone organization borrows the whole bound. The field stays because
+    persisted catalog snapshots serialize it and their identity digests read
+    it; an authored ``True`` still requires ``concurrency_bound``.
     """
     affinity_weight: float | None = Field(default=None, gt=0, allow_inf_nan=False)
     """Rendezvous weight under ``maximize_cache_affinity`` (``None`` means 1.0).

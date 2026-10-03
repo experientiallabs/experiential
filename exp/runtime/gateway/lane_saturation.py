@@ -21,8 +21,10 @@ Two rules close that:
    accounting used to force-admit past the first shed rung
    (``saturated_overflow``: "policy never manufactures a failure"). That is
    still the default for an AUTHORED bound, and an authored rung may opt into
-   ``saturation="refuse"``; the default lane bound always refuses, because a
-   protective bound that overflows protects nothing. A refusal is a fast,
+   ``saturation="refuse"``; the default lane bound refuses too. A priority
+   caller (the host's paying and Pro organizations) is the exception on both:
+   its shed overflows, capped at 1.5x / 2x the bound so the worker stays
+   protected. A refusal is a fast,
    retryable 429 (``lane_saturated_failure``) with the protocol's throttle
    Retry-After, answered
    before any dispatch, so the caller's retry lands when a slot frees rather
@@ -50,6 +52,37 @@ DEFAULT_LANE_SHARE = 0.5
 # retry after it lands on a freed slot instead of stacking a queue the
 # request deadline would have to drain.
 LANE_SATURATED_RETRY_AFTER_SECONDS = THROTTLED_RETRY_AFTER_SECONDS
+
+# How far past a refusing AUTHORED bound each
+# ``AuthorizationSnapshot.priority_admission`` level may overflow, as a multiple
+# of the bound: free callers never, paying callers to 1.5x, Pro callers to 2x.
+PRIORITY_OVERFLOW_FACTORS = (1.0, 1.5, 2.0)
+
+# The same for the worker's DEFAULT lane bound, which is already a share of the
+# worker's permits (DEFAULT_LANE_SHARE): the Pro factor stays strictly below
+# 1 / DEFAULT_LANE_SHARE, so one lane's priority traffic can never hold every
+# permit (1.5 x half the permits leaves a quarter for every other lane).
+DEFAULT_BOUND_OVERFLOW_FACTORS = (1.0, 1.25, 1.5)
+
+
+def priority_overflow_ceiling(
+    bound: int | None, priority_admission: int, *, default_bound: bool
+) -> float | None:
+    """The in-flight ceiling a forced priority overflow may not exceed, or ``None``.
+
+    Args:
+        bound: The rung's effective bound (authored or the worker default).
+        priority_admission: The caller's level (0 free, 1 paying, 2 Pro).
+        default_bound: Whether ``bound`` is the worker's default lane bound.
+
+    Returns:
+        ``bound * factor`` for a priority caller on a bounded rung, else
+        ``None``. The admitted count floors against it (1.5x of 5 holds 7).
+    """
+    if bound is None or not priority_admission:
+        return None
+    factors = DEFAULT_BOUND_OVERFLOW_FACTORS if default_bound else PRIORITY_OVERFLOW_FACTORS
+    return bound * factors[priority_admission]
 
 
 def default_lane_bound(max_active_requests: int, share: float = DEFAULT_LANE_SHARE) -> int:
@@ -79,15 +112,16 @@ def lane_saturated_failure() -> GatewayFailure:
 
     Throttled, not provider-internal: nothing is down, the pool is full on
     this worker and the caller should retry shortly. The class renders as the
-    caller-facing 429 ``unavailable_route`` with the Retry-After the message
-    states, exactly like a pool whose every rung sits in a provider throttle
-    window.
+    caller-facing 429 ``unavailable_route`` with ``Retry-After: 5``, exactly
+    like a pool whose every rung sits in a provider throttle window. The
+    message is consumer copy (it reaches end users verbatim through clients),
+    so it names capacity and the Pro priority benefit, never worker internals.
     """
     return GatewayFailure(
         failure_class=GatewayFailureClass.THROTTLED,
         safe_message=(
-            "every lane for this model is at its in-flight bound on this gateway worker; "
-            f"retry in {LANE_SATURATED_RETRY_AFTER_SECONDS} seconds"
+            "This model is at capacity right now. Please retry in a few seconds. "
+            "Pro subscribers get priority access when models are busy."
         ),
         retry_after_seconds=LANE_SATURATED_RETRY_AFTER_SECONDS,
     )
@@ -102,8 +136,14 @@ def overflow_target(
 
     The historical target is the first bypassed rung in ladder order. It is
     refused when that rung's shed came from the worker's default lane bound
-    (never force-admitted: the default protects the worker), or when the rung
-    authors ``saturation="refuse"``. A bypass that was not a registry shed
+    (the default protects the worker) or when the rung authors
+    ``saturation="refuse"``, unless the caller is a priority caller
+    (``AuthorizationSnapshot.priority_admission``): a priority request always
+    overflows, so on a saturated lane only non-priority callers are turned
+    away. The reservation caps that overflow (``priority_overflow_ceiling``);
+    a rung whose forced admission hit its cap (``RungShed.overflow_ceiling``)
+    is skipped for the next bypassed rung, and the request is refused once
+    every bypassed rung is capped. A bypass that was not a registry shed
     (a cold throttle failover) keeps the historical overflow.
 
     Args:
@@ -117,6 +157,15 @@ def overflow_target(
         The route depth to force-admit, or ``None`` when the request is refused.
     """
     if not policy_sheds:
+        return None
+    if route.snapshot.authorization.priority_admission:
+        # The first bypassed rung still below its priority ceiling; a rung
+        # whose forced admission already hit the ceiling is skipped, never
+        # retried, so the walk ends in a refusal once every rung is capped.
+        for depth, _reason in policy_sheds:
+            shed = shed_records.get(depth)
+            if shed is None or not shed.overflow_ceiling:
+                return depth
         return None
     depth = policy_sheds[0][0]
     shed = shed_records.get(depth)

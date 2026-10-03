@@ -14,11 +14,13 @@ from exp.runtime.gateway.contracts import (
     GatewayApiSurface,
 )
 from exp.runtime.gateway.lane_saturation import (
+    DEFAULT_BOUND_OVERFLOW_FACTORS,
     DEFAULT_LANE_SHARE,
     LANE_SATURATED_RETRY_AFTER_SECONDS,
     default_lane_bound,
     lane_saturated_failure,
     overflow_target,
+    priority_overflow_ceiling,
 )
 from exp.runtime.gateway.routing import GatewayRoute
 from exp.runtime.gateway.rung_admission import RungShed
@@ -44,7 +46,7 @@ def _deployment(
     )
 
 
-def _route(*deployments: ExactModelDeployment) -> GatewayRoute:
+def _route(*deployments: ExactModelDeployment, priority_admission: int = 0) -> GatewayRoute:
     authorization = AuthorizationSnapshot(
         request_id="request-one",
         organization_id="organization-one",
@@ -57,6 +59,7 @@ def _route(*deployments: ExactModelDeployment) -> GatewayRoute:
         catalog_sha256="a" * 64,
         canonical_request_sha256="d" * 64,
         deadline_monotonic=1.0,
+        priority_admission=priority_admission,
     )
     return GatewayRoute(
         snapshot=ExecutionSnapshot(
@@ -93,8 +96,10 @@ def test_lane_saturated_failure_is_a_retryable_throttle_with_the_wait_it_states(
     failure = lane_saturated_failure()
     assert failure.failure_class is GatewayFailureClass.THROTTLED
     assert failure.retry_after_seconds == LANE_SATURATED_RETRY_AFTER_SECONDS
-    assert f"retry in {LANE_SATURATED_RETRY_AFTER_SECONDS} seconds" in failure.safe_message
-    assert "in-flight bound" in failure.safe_message
+    assert failure.safe_message == (
+        "This model is at capacity right now. Please retry in a few seconds. "
+        "Pro subscribers get priority access when models are busy."
+    )
     assert failure.failover_eligible is False
 
 
@@ -118,6 +123,22 @@ def test_overflow_target_refuses_when_the_first_shed_rung_authors_refuse() -> No
     assert overflow_target(route, [(0, "queue_bound"), (1, "queue_bound")], sheds) is None
 
 
+def test_overflow_target_overflows_a_refusing_rung_for_a_priority_caller() -> None:
+    """A priority caller overflows both refusing bounds: an authored refuse and the default."""
+    refusing = (
+        _deployment("a", GatewayRungDispatchPolicy(concurrency_bound=1, saturation="refuse")),
+        _deployment("b", GatewayRungDispatchPolicy(concurrency_bound=1)),
+    )
+    sheds = {0: RungShed("queue_bound"), 1: RungShed("queue_bound")}
+    shed_order = [(0, "queue_bound"), (1, "queue_bound")]
+    assert overflow_target(_route(*refusing, priority_admission=2), shed_order, sheds) == 0
+    # The worker's default bound overflows for a priority caller too (the
+    # reservation caps it at twice the bound).
+    unauthored = _route(_deployment("a", None), _deployment("b", None), priority_admission=2)
+    default_shed = {0: RungShed("queue_bound", default_bound=True)}
+    assert overflow_target(unauthored, [(0, "queue_bound")], default_shed) == 0
+
+
 def test_overflow_target_never_force_admits_past_the_default_lane_bound() -> None:
     """A shed by the worker's default share refuses: overflowing it would protect nothing."""
     route = _route(_deployment("a", None), _deployment("b", None))
@@ -135,3 +156,34 @@ def test_overflow_target_has_nothing_to_overflow_without_a_shed() -> None:
     """No policy bypass means no overflow target (the caller reads the exhaustion elsewhere)."""
     route = _route(_deployment("a", None))
     assert overflow_target(route, [], {}) is None
+
+
+def test_priority_overflow_ceiling_scales_the_bound_by_level() -> None:
+    """Free callers get no overflow; paying callers 1.5x the bound; Pro callers 2x."""
+    assert priority_overflow_ceiling(4, 0, default_bound=False) is None
+    assert priority_overflow_ceiling(4, 1, default_bound=False) == 6.0
+    assert priority_overflow_ceiling(4, 2, default_bound=False) == 8.0
+    assert priority_overflow_ceiling(None, 2, default_bound=False) is None
+    # The default bound is half the worker's permits: Pro stays below all of them.
+    assert priority_overflow_ceiling(32, 1, default_bound=True) == 40.0
+    assert priority_overflow_ceiling(32, 2, default_bound=True) == 48.0
+    assert DEFAULT_BOUND_OVERFLOW_FACTORS[2] < 1 / DEFAULT_LANE_SHARE
+
+
+def test_overflow_target_refuses_a_shed_at_the_priority_ceiling() -> None:
+    """A forced priority overflow that hit its level's ceiling is refused, never retried."""
+    route = _route(_deployment("a", None), priority_admission=2)
+    capped = {0: RungShed("queue_bound", overflow_ceiling=True)}
+    assert overflow_target(route, [(0, "queue_bound")], capped) is None
+
+
+def test_overflow_target_moves_past_a_capped_rung_to_the_next_bypassed_rung() -> None:
+    """A priority caller capped on the first rung overflows the next one still below its cap."""
+    route = _route(_deployment("a", None), _deployment("b", None), priority_admission=2)
+    sheds = {
+        0: RungShed("queue_bound", overflow_ceiling=True),
+        1: RungShed("queue_bound", default_bound=True),
+    }
+    assert overflow_target(route, [(0, "queue_bound"), (1, "queue_bound")], sheds) == 1
+    sheds[1] = RungShed("queue_bound", overflow_ceiling=True)
+    assert overflow_target(route, [(0, "queue_bound"), (1, "queue_bound")], sheds) is None

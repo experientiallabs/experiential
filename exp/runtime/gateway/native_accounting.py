@@ -436,7 +436,7 @@ class NativeAttemptAccounting:
                 if policy_sheds and last_failure is None and not forced_overflow:
                     candidate = (
                         None
-                        if selected_first
+                        if selected_first and not entry.authorization.priority_admission
                         else overflow_target(route, policy_sheds, shed_records)
                     )
                     forced_overflow = candidate is not None

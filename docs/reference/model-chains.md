@@ -25,7 +25,7 @@ Each stage owns its failover mode, cache threshold, and throttle-redial schedule
 
 A live reasoning issuer retains first position after authorization and capability narrowing. Cache or affinity preferences cannot demote it before a real eligible failure. A filtered issuer is not restored. A default lane bound or authored `saturation="refuse"` policy refuses a saturated reasoning issuer rather than bypassing capacity or stripping reasoning to switch providers. Recovery trials require the same default or authored lane headroom. Following an eligible failure, authorized compatible successors can run with provider-bound reasoning removed as required by the existing continuation contract. Semantic commitment, including a tool-call start, ends fallback eligibility even before client receipt is confirmed.
 
-Default lane bounds and authored `saturation="refuse"` bounds are hard limits on ordinary routes as well as model chains. Reasoning pins and forced retries cannot exceed them. Explicitly permitted soft overflow remains distinct from these hard bounds; authored chains do not grant an exception.
+Default lane bounds and authored `saturation="refuse"` bounds are hard limits on ordinary routes as well as model chains for free callers. Reasoning pins and forced retries cannot exceed them. A priority caller (`AuthorizationSnapshot.priority_admission`: 1 paying, 2 Pro) is the one exception on every route: a forced admission may exceed an authored bound up to 1.5x (paying) or 2x (Pro) and the worker default up to 1.25x or 1.5x, and is refused at that ceiling (docs/reference/gateway-lane-saturation.md). Explicitly permitted soft overflow remains distinct from these hard bounds; authored chains do not grant an exception.
 
 ## Accounting and recovery
 

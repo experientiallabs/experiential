@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 from datetime import UTC, datetime
 
 import pytest
@@ -182,6 +183,38 @@ def test_reserve_rung_slot_lets_an_authored_bound_replace_the_default() -> None:
         loads, StickySpillRegistry(), entry, deployment, reserved_tokens=10, force=False
     )
     assert shed == RungShed("queue_bound")
+
+
+def test_fair_share_is_always_on_for_every_bounded_rung() -> None:
+    """Tier weighting applies on every bounded rung, whatever the persisted flag says."""
+
+    def second_free_request(dispatch: GatewayRungDispatchPolicy | None) -> str | RungShed | None:
+        loads = RungLoadRegistry(default_bound=4)
+        deployment = _deployment("deployment-a", connection_sha256="b" * 64, dispatch=dispatch)
+        sticky = StickySpillRegistry()
+        free = _entry((deployment,))
+        paid = _entry((deployment,))
+        paid = dataclasses.replace(
+            paid,
+            authorization=paid.authorization.model_copy(
+                update={"organization_id": "organization-paid", "fair_share_weight": 10}
+            ),
+        )
+        for entry in (free, paid):
+            assert isinstance(
+                reserve_rung_slot(loads, sticky, entry, deployment, reserved_tokens=1, force=False),
+                str,
+            )
+        return reserve_rung_slot(loads, sticky, free, deployment, reserved_tokens=1, force=False)
+
+    # The weight-10 org's share of a bound of 4 is reserved for it: the weight-1
+    # org's second request sheds, on an authored bound and on the worker default.
+    assert second_free_request(GatewayRungDispatchPolicy(concurrency_bound=4)) == RungShed(
+        "fair_share_shed"
+    )
+    assert second_free_request(None) == RungShed("fair_share_shed")
+    explicit = GatewayRungDispatchPolicy(concurrency_bound=4, fair_share=False)
+    assert second_free_request(explicit) == RungShed("fair_share_shed")
 
 
 def test_registry_refuses_a_default_bound_below_one() -> None:

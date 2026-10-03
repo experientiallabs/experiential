@@ -197,7 +197,7 @@ def stage_affinity_ordered_rungs(
             bound=accounting.loads.default_bound
             if policy is None or policy.concurrency_bound is None
             else policy.concurrency_bound,
-            fair_share=policy is not None and policy.fair_share,
+            fair_share=True,
             requests_per_minute=None if policy is None else policy.requests_per_minute,
             tokens_per_minute=None if policy is None else policy.tokens_per_minute,
             cache_priority_alpha=None if policy is None else policy.cache_priority_alpha,
