@@ -2797,6 +2797,61 @@ def test_fireworks_stateless_carrier_include_survives_route_shaping() -> None:
     assert payload["model"] == "accounts/fireworks/models/deepseek-v4-flash-0731"
 
 
+def test_hunyuan_scheme_carrier_include_survives_route_shaping() -> None:
+    """A declared ``reasoning_content_native`` rung is a gateway carrier channel too.
+
+    Codex sends the encrypted-reasoning include on every turn; a homogeneous
+    Hunyuan-scheme route (Tencent, or a self-hosted vLLM origin that declares
+    the native reasoning contract) seals its tool turns, so the include is
+    admitted exactly like a Fireworks route.
+    """
+    native = GatewayWireProfile(
+        dialect="openai_compatible",
+        url="https://glm.example.test/v1/chat/completions",
+        model_id="glm-5.3-flash",
+        hunyuan_reasoning_route_sha256="a" * 64,
+        reasoning_output_exposed=True,
+    )
+    request = GatewayRequest(
+        surface=GatewayApiSurface.RESPONSES,
+        messages=(GatewayMessage(role="user", content="use a tool"),),
+        tools=(GatewayToolDefinition(name="lookup", parameters={"type": "object"}),),
+        response_store=False,
+        include_encrypted_reasoning=True,
+        stream=True,
+        include_usage=True,
+    )
+
+    route_generation_parameter_requests((native, native), request)
+    assert dialect_stream_payload(native, request)["model"] == "glm-5.3-flash"
+
+
+def test_mixed_carrier_schemes_fail_closed() -> None:
+    """A Hunyuan rung beside a Fireworks rung cannot replay the other's carrier."""
+    native = GatewayWireProfile(
+        dialect="openai_compatible",
+        url="https://glm.example.test/v1/chat/completions",
+        hunyuan_reasoning_route_sha256="a" * 64,
+    )
+    fireworks = GatewayWireProfile(
+        dialect="openai_compatible",
+        url="https://api.fireworks.ai/inference/v1/chat/completions",
+        fireworks_reasoning_route_sha256="f" * 64,
+    )
+    uncarried = GatewayWireProfile(dialect="openai_compatible", url="https://plain.test")
+    request = GatewayRequest(
+        surface=GatewayApiSurface.RESPONSES,
+        messages=(GatewayMessage(role="user", content="go"),),
+        response_store=False,
+        include_encrypted_reasoning=True,
+    )
+
+    for route in ((native, fireworks), (native, uncarried)):
+        with pytest.raises(ProviderParameterError) as raised:
+            route_generation_parameter_requests(route, request)
+        assert raised.value.param == "include"
+
+
 def test_mixed_native_and_fireworks_reasoning_channels_fail_closed() -> None:
     """One include selector cannot promise two incompatible carrier authorities."""
     responses = GatewayWireProfile(

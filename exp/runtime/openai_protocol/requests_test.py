@@ -25,7 +25,10 @@ from exp.runtime.gateway.contracts import (
     GatewayNamedToolChoice,
     GatewayRequest,
 )
-from exp.runtime.gateway.reasoning_carrier import FIREWORKS_REASONING_CONTENT_PREFIX
+from exp.runtime.gateway.reasoning_carrier import (
+    FIREWORKS_REASONING_CONTENT_PREFIX,
+    HUNYUAN_SCHEME,
+)
 from exp.runtime.gateway.replay_identity import (
     canonical_request_sha256,
     provider_replay_authority,
@@ -1554,6 +1557,65 @@ def test_responses_decoder_groups_fireworks_carrier_with_all_tool_calls(
     assert tuple(call.call_id for call in assistant.tool_calls) == ("call-1", "call-2")
     assert assistant.provider_reasoning[0].kind == "sealed_reasoning_content"
     assert assistant.provider_reasoning[0].carrier == carrier
+
+
+def test_responses_decoder_takes_a_hunyuan_scheme_carrier_beside_its_summary() -> None:
+    """A Codex replay of a native rung's reasoning item decodes as its sealed carrier.
+
+    The exposed rung's item carries the plaintext as summary text and the sealed
+    carrier as encrypted_content; the carrier's own prefix names its scheme, so a
+    Hunyuan-scheme carrier is the gateway's, never a provider's opaque reasoning.
+    """
+    deployment = base64.urlsafe_b64encode(b"glm-rung").rstrip(b"=").decode()
+    envelope = base64.urlsafe_b64encode(b"x" * 32).rstrip(b"=").decode()
+    carrier = f"{HUNYUAN_SCHEME.prefix}{deployment}:{envelope}"
+
+    decoded = decode_responses(
+        {
+            "model": "coding",
+            "store": False,
+            "include": ["reasoning.encrypted_content"],
+            "input": [
+                {"role": "user", "content": "hi"},
+                {
+                    "type": "reasoning",
+                    "id": "rs_glm",
+                    "summary": [{"type": "summary_text", "text": "check the weather"}],
+                    "encrypted_content": carrier,
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "call-1",
+                    "name": "lookup",
+                    "arguments": "{}",
+                },
+                {"type": "function_call_output", "call_id": "call-1", "output": "done"},
+            ],
+        }
+    )
+
+    assistant = decoded.request.messages[1]
+    assert assistant.provider_reasoning[0].kind == "sealed_reasoning_content"
+    assert assistant.provider_reasoning[0].carrier == carrier
+    assert tuple(call.call_id for call in assistant.tool_calls) == ("call-1",)
+
+
+def test_responses_decoder_rejects_a_malformed_hunyuan_scheme_carrier() -> None:
+    """A Hunyuan-prefixed item cannot fall back to native opaque replay either."""
+    with pytest.raises(OpenAIProtocolError):
+        decode_responses(
+            {
+                "model": "coding",
+                "input": [
+                    {
+                        "type": "reasoning",
+                        "id": "rs_malformed",
+                        "summary": [],
+                        "encrypted_content": f"{HUNYUAN_SCHEME.prefix}broken",
+                    }
+                ],
+            }
+        )
 
 
 def test_responses_decoder_rejects_malformed_gateway_carrier() -> None:

@@ -30,7 +30,6 @@ from exp.runtime.gateway.embeddings_contracts import (
     EmbeddingTokenIds,
 )
 from exp.runtime.gateway.reasoning_carrier import (
-    FIREWORKS_REASONING_CONTENT_PREFIX,
     parse_reasoning_content_carrier,
     scheme_for_carrier,
 )
@@ -875,10 +874,15 @@ def _response_input_messages(
                     ReplayedNativeItem(index=index, role="assistant", item=raw_items[index])
                 )
                 continue
-            if item.encrypted_content.startswith(FIREWORKS_REASONING_CONTENT_PREFIX):
+            # The carrier's own prefix names the scheme it was sealed under
+            # (Fireworks or Hunyuan, the latter including every declared
+            # ``reasoning_content_native`` origin); any other value is a native
+            # provider's encrypted reasoning.
+            scheme = scheme_for_carrier(item.encrypted_content)
+            if scheme is not None:
                 try:
                     block: EncryptedReasoningBlock | SealedReasoningContentBlock = (
-                        parse_reasoning_content_carrier(item.encrypted_content)
+                        parse_reasoning_content_carrier(item.encrypted_content, scheme=scheme)
                     )
                 except ValueError as exc:
                     raise invalid_field(

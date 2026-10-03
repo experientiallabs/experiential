@@ -864,15 +864,20 @@ def route_generation_parameter_requests(
             param="include",
             code="unsupported_parameter",
         )
+    # A carrier route seals under exactly one scheme, so a mixed route could not
+    # replay what another rung issued: the channel needs every rung native
+    # Responses, or every rung one gateway carrier scheme (Fireworks, or
+    # Hunyuan, which also covers declared ``reasoning_content_native`` origins).
     encrypted_reasoning_channel = request.include_encrypted_reasoning and (
         all(profile.dialect == "openai_responses" for profile in profiles)
         or all(profile.fireworks_reasoning_route_sha256 is not None for profile in profiles)
+        or all(profile.hunyuan_reasoning_route_sha256 is not None for profile in profiles)
     )
     if request.include_encrypted_reasoning and not encrypted_reasoning_channel:
         raise ProviderParameterError(
             message=(
                 "The parameter 'reasoning.encrypted_content' requires one homogeneous "
-                "native Responses or Fireworks reasoning-carrier route."
+                "native Responses or gateway reasoning-carrier route."
             ),
             param="include",
             code="unsupported_parameter",
