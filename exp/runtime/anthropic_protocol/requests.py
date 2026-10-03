@@ -39,6 +39,7 @@ from exp.common.models.model import ToolCall
 from exp.runtime.anthropic_protocol.gateway_reasoning import (
     EMPTY_GATEWAY_BLOCK,
     gateway_reasoning_block,
+    merge_exposed_reasoning,
 )
 from exp.runtime.anthropic_protocol.manifest import (
     MESSAGES_BETA_TOKENS_FORWARDED,
@@ -747,6 +748,8 @@ def _gateway_messages(message: _Message, index: int) -> list[GatewayMessage]:
             reasoning[:] = [
                 block for block in reasoning if block.kind != "exposed_reasoning_content"
             ]
+        else:
+            reasoning[:] = merge_exposed_reasoning(reasoning, f"{param}.content")
         # The verbatim block order exists for Anthropic-signed history, whose
         # signatures the provider verifies in place; gateway-issued blocks
         # (unsigned plaintext, sealed carriers) never replay on that wire.
