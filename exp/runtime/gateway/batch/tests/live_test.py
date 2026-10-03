@@ -27,6 +27,7 @@ from exp.runtime.gateway.batch.contracts import (
 )
 from exp.runtime.gateway.batch.providers import (
     AnthropicBatchClient,
+    DoublewordBatchClient,
     OpenAIBatchClient,
     OpenRouterBatchClient,
     ProviderBatchClient,
@@ -145,4 +146,22 @@ def test_live_openrouter_chat_batch() -> None:
             {"messages": [{"role": "user", "content": "Say ok."}], "max_tokens": 8},
         ),
         os.environ["OPENROUTER_API_KEY"],
+    )
+
+
+@pytest.mark.skipif(
+    not (_LIVE and os.environ.get("DOUBLEWORD_API_KEY")),
+    reason="set EXP_LIVE_BATCH=1 and DOUBLEWORD_API_KEY to run the live Doubleword batch",
+)
+def test_live_doubleword_chat_batch() -> None:
+    """One real two-line Kimi K3 chat batch on Doubleword completes and settles."""
+    _run(
+        DoublewordBatchClient(),
+        _job(
+            "doubleword",
+            "/v1/chat/completions",
+            "moonshotai/kimi-k3",
+            {"messages": [{"role": "user", "content": "Say ok."}], "max_tokens": 8},
+        ),
+        os.environ["DOUBLEWORD_API_KEY"],
     )
