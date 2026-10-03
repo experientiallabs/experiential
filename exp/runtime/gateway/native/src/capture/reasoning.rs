@@ -156,7 +156,9 @@ pub(crate) fn observe_winner(
         request_id: admission.request_id.clone(),
         reasoning_exposed: admission.reasoning_exposed_at(depth),
         hidden_reasoning,
-        native_thinking,
+        // An output guardrail may rewrite the frames and drop thinking, so a
+        // guardrailed request keeps it here rather than risk losing it.
+        native_thinking: native_thinking && !admission.buffers_output(),
     };
     observer
         .collector
