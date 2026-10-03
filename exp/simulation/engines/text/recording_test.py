@@ -828,7 +828,12 @@ def test_world_invalid_usage_retains_unknown_spend_after_dispatch() -> None:
 def test_transport_failure_preserves_whether_the_reservation_is_a_bound(
     role: str, complete_tariff: bool
 ) -> None:
-    """An incomplete tariff leaves a transport failure unbounded despite its saved estimate."""
+    """An incomplete tariff leaves a transport failure unbounded despite its saved estimate.
+
+    Args:
+        role: Candidate or world-model recorder that encounters the transport failure.
+        complete_tariff: Whether the authored tariff supplies the reasoning-token rate.
+    """
     card = GatewayTokenPrices(
         input_nano_usd_per_million_tokens=1_000_000_000,
         cached_input_nano_usd_per_million_tokens=500_000_000,

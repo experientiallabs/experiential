@@ -470,7 +470,12 @@ def test_request_ledger_retries_without_scanning_rollouts_under_cell_locks(
 def test_catalog_runtime_supersedes_legacy_interrupted_cells_with_its_actual_uncapped_ledger(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Catalog-backed execution carries current ledger authority past saved legacy finals."""
+    """Catalog-backed execution carries current ledger authority past saved legacy finals.
+
+    Args:
+        tmp_path: Isolated project root for catalog, rollout, judgment, and receipt artifacts.
+        monkeypatch: Fixture that installs deterministic completion interruptions.
+    """
     project, catalog, state, prepared = _prepare(tmp_path)
     original_complete = BudgetedCompletion.complete
     paused = False
@@ -481,7 +486,18 @@ def test_catalog_runtime_supersedes_legacy_interrupted_cells_with_its_actual_unc
         """Stop after one durably saved paid response, before its rollout is complete."""
 
     def complete(client: BudgetedCompletion, request: ModelRequest) -> ModelResponse:
-        """Interrupt exactly one paid candidate call while retaining its actual ledger response."""
+        """Interrupt exactly one paid candidate call while retaining its actual ledger response.
+
+        Args:
+            client: Catalog-backed completion wrapper with the shared request ledger.
+            request: Exact model request passed to the original completion implementation.
+
+        Returns:
+            The original completion result when no configured interruption applies.
+
+        Raises:
+            Paused: Before the held judge call, or after the first assistant response is durable.
+        """
         nonlocal paused
         if client._role == "judge" and pause_before_judge:
             raise Paused

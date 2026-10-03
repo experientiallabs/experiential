@@ -278,7 +278,12 @@ def test_stale_lease_failure_charges_its_persisted_whole_ceiling_barrier() -> No
 def test_unbounded_attempt_stays_unknown_after_retry_and_blocks_finite_judging(
     tmp_path: Path, kind: str
 ) -> None:
-    """A paid failed ancestor stays unknown after success and cannot fund a finite judge."""
+    """A paid failed ancestor stays unknown after success and cannot fund a finite judge.
+
+    Args:
+        tmp_path: Isolated project root retaining failed ancestors, receipts, and finite replay.
+        kind: Pricing, truncated-response, or nonretryable invalid-usage failure to exercise.
+    """
     project = ProjectStore(tmp_path, "project-a")
     budget = RequestBudget(project, identity="unknown-ancestor", maximum_cost_usd=None)
     if kind == "pricing":
@@ -381,7 +386,11 @@ def test_unbounded_attempt_stays_unknown_after_retry_and_blocks_finite_judging(
 
 @pytest.mark.parametrize("component", ["candidate", "retrieval", "orchestration"])
 def test_unknown_reservation_never_skips_recorded_economics_validation(component: str) -> None:
-    """Unbounded failure evidence cannot hide negative prices or forged cost provenance."""
+    """Unbounded failure evidence cannot hide negative prices or forged cost provenance.
+
+    Args:
+        component: Candidate, retrieval, or orchestration economics containing a negative cost.
+    """
     failure = _unknown_spend_failure(reserved=0.25)
     failure = failure.model_copy(
         update={
@@ -398,7 +407,11 @@ def test_unknown_reservation_never_skips_recorded_economics_validation(component
 
 
 def test_unknown_current_attempt_still_validates_its_priced_failed_ancestor(tmp_path: Path) -> None:
-    """A current unknown charge does not short-circuit validation of a prior retry's cost."""
+    """A current unknown charge does not short-circuit validation of a prior retry's cost.
+
+    Args:
+        tmp_path: Isolated artifact root containing the malformed priced ancestor.
+    """
     project = ProjectStore(tmp_path, "project-a")
     binding = _binding()
     parent_id = rollout_id_for_binding(binding, attempt=0)

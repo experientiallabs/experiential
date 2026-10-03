@@ -48,6 +48,14 @@ class _DurableMeteredClient:
     def __init__(
         self, budget: RequestBudget, *, role: str, failures: int, typed: bool = True
     ) -> None:
+        """Configure deterministic responses and retain every physical request and answer.
+
+        Args:
+            budget: Shared ledger that owns physical dispatch and exact response replay.
+            role: Candidate or world-model role represented by the fixture.
+            failures: Number of new responses that omit price-relevant cache meters.
+            typed: Whether missing meters raise the typed pricing error instead of ValueError.
+        """
         self.budget = budget
         self.role = role
         self.failures = failures
@@ -56,10 +64,25 @@ class _DurableMeteredClient:
         self.responses: list[ModelResponse] = []
 
     def complete(self, request: ModelRequest) -> ModelResponse:
-        """Model an adapter that checkpoints a paid HTTP 200 before reporting unknown cost."""
+        """Model an adapter that checkpoints a paid HTTP 200 before reporting unknown cost.
+
+        Args:
+            request: Immutable request whose fingerprint identifies its saved wire response.
+
+        Returns:
+            The new or replayed response with observed cost when its usage is priceable.
+
+        Raises:
+            ProviderPricingUnavailableError: Typed mode saved an answer with missing cache meters.
+            ValueError: Untyped mode saved an answer with missing cache meters.
+        """
 
         def dispatch() -> ModelResponse:
-            """Produce a new physical answer only when its coordinate has no receipt."""
+            """Produce a new physical answer only when its coordinate has no receipt.
+
+            Returns:
+                A recorded synthetic response with cache meters determined by the failure count.
+            """
             self.requests.append(request)
             response = _response(
                 "I can help." if self.role == "candidate" else '{"message":"done","terminal":true}',
@@ -124,7 +147,17 @@ class _InterruptedMeteredClient(_DurableMeteredClient):
     interruption_calls = 0
 
     def complete(self, request: ModelRequest) -> ModelResponse:
-        """Retain the exact paid response and unknown liability before ending execution."""
+        """Retain the exact paid response and unknown liability before ending execution.
+
+        Args:
+            request: Exact request used for the durable answer and interrupted follow-up coordinate.
+
+        Returns:
+            The parent's priced response when its configured metering failures are exhausted.
+
+        Raises:
+            _ExecutionPaused: The paid response is saved and a follow-up dispatch is interrupted.
+        """
         try:
             return super().complete(request)
         except ProviderPricingUnavailableError:
@@ -151,7 +184,13 @@ class _InterruptedMeteredClient(_DurableMeteredClient):
 def test_uncapped_pricing_failure_retries_only_fresh_cell_generations(
     tmp_path: Path, role: str, failures: int
 ) -> None:
-    """Same-cell fresh generations keep raw paid receipts, unknown cost, and bounded failures."""
+    """Same-cell fresh generations keep raw paid receipts, unknown cost, and bounded failures.
+
+    Args:
+        tmp_path: Isolated project root for rollout artifacts and durable request receipts.
+        role: Candidate or world-model role whose responses lack required usage meters.
+        failures: Number of failing physical responses before success or generation exhaustion.
+    """
     project = ProjectStore(tmp_path, "project-a")
     budget = RequestBudget(project, identity="metered-evaluation", maximum_cost_usd=None)
     client = _DurableMeteredClient(budget, role=role, failures=failures)
@@ -241,7 +280,12 @@ def test_uncapped_pricing_failure_retries_only_fresh_cell_generations(
 def test_pricing_retry_rechecks_current_cap_without_consuming_a_generation(
     tmp_path: Path, role: str
 ) -> None:
-    """A finite reopen preserves the paid failure until an uncapped retry is authorized."""
+    """A finite reopen preserves the paid failure until an uncapped retry is authorized.
+
+    Args:
+        tmp_path: Isolated project root retained across uncapped and finite reopenings.
+        role: Candidate or world-model role whose first saved response is unpriceable.
+    """
     project = ProjectStore(tmp_path, "project-a")
     budget = RequestBudget(project, identity="cap-transition", maximum_cost_usd=None)
     client = _DurableMeteredClient(budget, role=role, failures=1)
@@ -266,7 +310,14 @@ def test_pricing_retry_rechecks_current_cap_without_consuming_a_generation(
     spec = _spec(plan_input, tasks, (cell.cell_id,), completion_contract_input=completion)
 
     def simulator(current_budget: RequestBudget | None) -> WorldModelSimulator:
-        """Reopen the same immutable execution with its current operator authorization."""
+        """Reopen the same immutable execution with its current operator authorization.
+
+        Args:
+            current_budget: Current shared-ledger policy, or None for the no-ledger control.
+
+        Returns:
+            A simulator bound to the original plan, tasks, clients, and completion contract.
+        """
         return _simulator(
             project.artifacts,
             plan,
@@ -345,7 +396,12 @@ def test_pricing_retry_rechecks_current_cap_without_consuming_a_generation(
 def test_finite_or_untyped_pricing_failure_keeps_frozen_nonretryable_evidence(
     tmp_path: Path, finite: bool
 ) -> None:
-    """A cap never authorizes this retry, and historical plain ValueErrors never upgrade."""
+    """A cap never authorizes this retry, and historical plain ValueErrors never upgrade.
+
+    Args:
+        tmp_path: Isolated project root for the original failure and replayed artifact set.
+        finite: Selects a capped typed failure instead of an uncapped generic ValueError.
+    """
     project = ProjectStore(tmp_path, "project-a")
     budget = RequestBudget(
         project, identity="finite-or-historical", maximum_cost_usd=1 if finite else None
@@ -389,7 +445,13 @@ def test_finite_or_untyped_pricing_failure_keeps_frozen_nonretryable_evidence(
 def test_uncapped_interrupted_cells_preserve_receipts_and_retry_fresh_generations(
     tmp_path: Path, legacy: bool, interruptions: int
 ) -> None:
-    """Interrupted generations, including saved legacy finals, recover only with current consent."""
+    """Interrupted generations, including saved legacy finals, recover only with current consent.
+
+    Args:
+        tmp_path: Isolated project root retaining leases, receipts, and all rollout generations.
+        legacy: Uses the exact historical stale-lease failure shape when True.
+        interruptions: Number of interrupted generations before success or bounded exhaustion.
+    """
     project = ProjectStore(tmp_path, "project-a")
     budget = RequestBudget(project, identity="interrupted-evaluation", maximum_cost_usd=None)
     client = _InterruptedMeteredClient(budget, role="candidate", failures=interruptions)
@@ -404,7 +466,14 @@ def test_uncapped_interrupted_cells_preserve_receipts_and_retry_fresh_generation
     spec = _spec(plan_input, tasks, (cell.cell_id,), completion_contract_input=completion)
 
     def simulator(current_budget: RequestBudget | None) -> WorldModelSimulator:
-        """Reuse the exact task, model and receipt bindings under current authorization."""
+        """Reuse the exact task, model and receipt bindings under current authorization.
+
+        Args:
+            current_budget: Current ledger authority for the saved execution, or None.
+
+        Returns:
+            A simulator with unchanged task, model, receipt, and completion-contract bindings.
+        """
         return _simulator(
             project.artifacts,
             plan,
@@ -533,7 +602,11 @@ class _TruncatedTransport(ScriptedJsonTransport):
     """Supply paid HTTP bodies while the real completion wrapper owns their persistence."""
 
     def __init__(self, failures: int) -> None:
-        """Prepare deterministic provider-free bodies, without a transport-side ledger."""
+        """Prepare deterministic provider-free bodies, without a transport-side ledger.
+
+        Args:
+            failures: Number of incomplete JSON tool responses placed before one successful answer.
+        """
         broken: JsonObject = {
             "model": "candidate-a",
             "choices": [
@@ -565,7 +638,13 @@ class _TruncatedTransport(ScriptedJsonTransport):
 def test_truncated_tool_response_retries_only_fresh_uncapped_generations(
     tmp_path: Path, authority: str, failures: int
 ) -> None:
-    """Parser failures retain paid raw bodies, bounded invalidity and exact cell identity."""
+    """Parser failures retain paid raw bodies, bounded invalidity and exact cell identity.
+
+    Args:
+        tmp_path: Isolated project root for raw paid receipts and rollout generations.
+        authority: Current uncapped or finite shared-ledger policy.
+        failures: Number of incomplete tool responses before success or generation exhaustion.
+    """
     project = ProjectStore(tmp_path, "project-a")
     budget = RequestBudget(
         project,

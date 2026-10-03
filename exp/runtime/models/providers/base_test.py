@@ -125,10 +125,25 @@ def _client(
 
 
 def test_completed_pricing_error_never_retries_the_http_request() -> None:
-    """Only a fresh uncapped rollout may retry; the completed HTTP operation runs once."""
+    """Only a fresh uncapped rollout may retry; the completed HTTP operation runs once.
+
+    Raises:
+        AssertionError: A completed pricing failure causes more than one HTTP request.
+    """
 
     class UnpriceableClient(_EchoClient):
+        """Reject a completed provider response with the typed pricing error."""
+
         def _parse_response(self, payload: JsonObject, *, latency_seconds: float) -> ModelResponse:
+            """Model a pricing failure after the provider has completed the HTTP request.
+
+            Args:
+                payload: Completed HTTP response body intentionally rejected by this fixture.
+                latency_seconds: Observed request duration supplied by the provider client.
+
+            Raises:
+                ProviderPricingUnavailableError: Every completed response has unknown metering.
+            """
             raise ProviderPricingUnavailableError("saved response has unknown metering")
 
     transport = _ok_transport()

@@ -45,7 +45,15 @@ class _RecordedCompletion(ContractModel):
 
     @model_validator(mode="after")
     def _require_one_response(self) -> Self:
-        """Keep saved usable and truncated responses distinct, with unknown truncated cost."""
+        """Keep saved usable and truncated responses distinct, with unknown truncated cost.
+
+        Returns:
+            This envelope after validating its mutually exclusive response representations.
+
+        Raises:
+            ValueError: The envelope has no response, or combines a raw truncated body with
+                a parsed response, pricing error or known charge.
+        """
         if self.raw_response is not None:
             if (
                 self.response is not None

@@ -51,7 +51,19 @@ def observed_rollout_spend(rollout: RolloutArtifact) -> float:
 
 
 def _observed_rollout_spend(rollout: RolloutArtifact) -> float | None:
-    """Validate every recorded economy before preserving any unresolved dispatch liability."""
+    """Validate every recorded economy before preserving any unresolved dispatch liability.
+
+    Args:
+        rollout: Immutable simulation evidence with observed costs and retained dispatch bounds.
+
+    Returns:
+        The sum of verified costs and bounded reservations, or None when a dispatched charge
+        remains unknown without a proven upper bound.
+
+    Raises:
+        RouterCompositionError: Evidence is not simulation output, lacks required bindings or
+            costs, or contains invalid cost values or provenance.
+    """
     unknown_spend = unknown_spend_failure(rollout.failure)
     economics = []
     costs = []

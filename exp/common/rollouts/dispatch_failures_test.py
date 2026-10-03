@@ -89,7 +89,11 @@ def test_reserved_cost_parsing_rejects_non_finite_and_negative_values() -> None:
 
 @pytest.mark.parametrize("marker", [False, None, 1, "true"])
 def test_estimate_is_not_a_bound_without_an_explicit_true_marker(marker: JsonValue) -> None:
-    """A false or malformed bound declaration never grants numerical spending authority."""
+    """A false or malformed bound declaration never grants numerical spending authority.
+
+    Args:
+        marker: False or malformed persisted upper-bound declaration to reject.
+    """
     failure = _failure(
         details={
             UNKNOWN_DISPATCH_RESERVED_COST_KEY: 0.25,
@@ -111,7 +115,13 @@ def test_estimate_is_not_a_bound_without_an_explicit_true_marker(marker: JsonVal
 def test_saved_unpriceable_outcome_is_unknown_without_rewriting_its_estimate(
     exception_type: str, classification: str, binding: str
 ) -> None:
-    """Existing typed outcomes retain unknown liability even before the bound marker existed."""
+    """Existing typed outcomes retain unknown liability even before the bound marker existed.
+
+    Args:
+        exception_type: Saved pricing or truncation exception name.
+        classification: Corresponding saved infrastructure-failure classification.
+        binding: Whether the fixture identifies the outcome by exception type or classification.
+    """
     details: dict[str, JsonValue] = {UNKNOWN_DISPATCH_RESERVED_COST_KEY: 0.25}
     if binding == "classification":
         details["retry_classification"] = classification

@@ -327,7 +327,14 @@ def test_standard_catalog_admission_retries_charge_only_the_successful_dispatch(
 def test_catalog_truncated_response_is_durable_before_rejection_and_free_replay(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, role: str, limit: float | None
 ) -> None:
-    """The real catalog client preserves a paid invalid body without a second wire ledger."""
+    """The real catalog client preserves a paid invalid body without a second wire ledger.
+
+    Args:
+        tmp_path: Isolated catalog and request-ledger root retained across replay.
+        monkeypatch: Fixture replacing only the pooled HTTP client with a local transport.
+        role: Assistant, world-model, or judge role using the catalog completion wrapper.
+        limit: Initial aggregate spending cap, or None for explicit uncapped authority.
+    """
     requests: list[httpx.Request] = []
     raw = {
         "id": "completed-response",
@@ -589,7 +596,12 @@ def test_unknown_tariff_saves_paid_output_and_replays_error_under_lower_cap(
 def test_over_request_charge_retains_paid_response_before_invalid_bound_failure(
     tmp_path: Path, limit: float | None
 ) -> None:
-    """A charge above the actual request bound cannot discard the paid response body."""
+    """A charge above the actual request bound cannot discard the paid response body.
+
+    Args:
+        tmp_path: Isolated request-ledger root for the invalid response and free replay.
+        limit: Aggregate cap, or None, with a true per-request reservation in either case.
+    """
     project = ProjectStore(tmp_path, "over-request")
     reservation = completion_cost_reservation(
         model=_model(),
@@ -641,7 +653,11 @@ def test_over_request_charge_retains_paid_response_before_invalid_bound_failure(
 
 
 def test_known_charge_can_exceed_an_uncapped_incomplete_tariff_estimate(tmp_path: Path) -> None:
-    """An estimate never becomes a hard ceiling when actual observed usage is priceable."""
+    """An estimate never becomes a hard ceiling when actual observed usage is priceable.
+
+    Args:
+        tmp_path: Isolated ledger root for an uncapped request with a nonbinding estimate.
+    """
     project = ProjectStore(tmp_path, "known-charge")
     reservation = completion_cost_reservation(
         model=_model(),

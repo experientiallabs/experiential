@@ -15,7 +15,12 @@ from exp.simulation.engines.text.errors import provider_call_failure
 @pytest.mark.parametrize("uncapped", [False, True])
 @pytest.mark.parametrize("typed", [False, True])
 def test_metering_type_and_uncapped_policy_are_both_required(uncapped: bool, typed: bool) -> None:
-    """A generic ValueError or finite/no-ledger authorization cannot widen the retry policy."""
+    """A generic ValueError or finite/no-ledger authorization cannot widen the retry policy.
+
+    Args:
+        uncapped: Whether the current execution authorizes uncapped infrastructure retries.
+        typed: Whether the error is the pricing type instead of an ordinary ValueError.
+    """
     error = (ProviderPricingUnavailableError if typed else ValueError)("private response detail")
     failure = provider_call_failure(
         error,
@@ -36,7 +41,11 @@ def test_metering_type_and_uncapped_policy_are_both_required(uncapped: bool, typ
 
 @pytest.mark.parametrize("uncapped", [False, True])
 def test_truncated_response_is_infrastructure_but_only_uncapped_can_retry(uncapped: bool) -> None:
-    """The fresh-generation classifier does not grant the provider client HTTP retry authority."""
+    """The fresh-generation classifier does not grant the provider client HTTP retry authority.
+
+    Args:
+        uncapped: Current authorization for a fresh rollout generation after truncation.
+    """
     failure = provider_call_failure(
         ProviderTruncatedResponseError("tool arguments ended inside JSON"),
         retry_uncapped_infrastructure=uncapped,
@@ -51,7 +60,11 @@ def test_truncated_response_is_infrastructure_but_only_uncapped_can_retry(uncapp
 
 
 def test_saved_invalid_response_preserves_unknown_charge_without_becoming_retryable() -> None:
-    """An owned unbounded receipt is accounting evidence, not extra retry authority."""
+    """An owned unbounded receipt is accounting evidence, not extra retry authority.
+
+    Raises:
+        AssertionError: The receipt marker changes the error type, retryability, or bound truth.
+    """
     error = ValueError("saved response exceeds its admitted usage bound")
     retain_unbounded_response_liability(error)
     failure = provider_call_failure(

@@ -35,7 +35,11 @@ from exp.common.project import ProjectConfig, ProjectStore
 
 @pytest.mark.parametrize("invalid", ["attempts", "input", "measured_cost"])
 def test_invalid_evidence_is_not_retryable_pricing_unavailability(invalid: str) -> None:
-    """Missing subset meters cannot mask invalid bounds as a fresh-generation signal."""
+    """Missing subset meters cannot mask invalid bounds as a fresh-generation signal.
+
+    Args:
+        invalid: Invalid attempt count, input bound, or measured cost paired with missing meters.
+    """
     reservation = completion_cost_reservation(
         model=_model(),
         token_prices=prices(),

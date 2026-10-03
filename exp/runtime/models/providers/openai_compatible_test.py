@@ -979,7 +979,12 @@ def test_buffered_request_folds_non_leading_system_turns_on_a_leading_only_rung(
 def test_incomplete_tool_json_requires_retained_length_and_never_http_retries(
     arguments: str, finish_reason: str
 ) -> None:
-    """EOF tool fragments merit only a fresh rollout; normal-stop malformed data stays unchanged."""
+    """EOF tool fragments merit only a fresh rollout; normal-stop malformed data stays unchanged.
+
+    Args:
+        arguments: Exact incomplete tool-argument JSON retained in the response body.
+        finish_reason: Length, stop, or tool-calls terminal reason paired with that fragment.
+    """
     transport = ScriptedJsonTransport(
         [
             JsonHttpResponse(
@@ -1054,7 +1059,11 @@ def test_incomplete_tool_json_requires_retained_length_and_never_http_retries(
     ],
 )
 def test_length_does_not_upgrade_malformed_or_structural_tool_arguments(arguments: str) -> None:
-    """A length label alone cannot turn an invalid complete value into infrastructure evidence."""
+    """A length label alone cannot turn an invalid complete value into infrastructure evidence.
+
+    Args:
+        arguments: Complete or malformed JSON that cannot qualify as a valid object prefix.
+    """
     with pytest.raises(OpenAICompatibleResponseError):
         openai_compatible_response(
             {
@@ -1078,7 +1087,11 @@ def test_length_does_not_upgrade_malformed_or_structural_tool_arguments(argument
 
 
 def test_length_keeps_valid_output_and_rejects_missing_tool_identity() -> None:
-    """Complete length output retains the native limit flag; absent call identity is unchanged."""
+    """Complete length output retains the native limit flag; absent call identity is unchanged.
+
+    Raises:
+        AssertionError: Valid length-limited output or missing tool identity changes classification.
+    """
     payload: JsonObject = {"choices": [{"finish_reason": "length", "message": {"content": "done"}}]}
     response = openai_compatible_response(payload, configured_model=_snapshot(), latency_seconds=0)
     assert response.finish_reason == ModelFinishReason.LENGTH
@@ -1110,7 +1123,11 @@ def test_length_keeps_valid_output_and_rejects_missing_tool_identity() -> None:
     ],
 )
 def test_every_proper_prefix_of_nested_tool_json_is_truncated(complete: str) -> None:
-    """Every cut inside a valid object is recoverable without accepting its partial contents."""
+    """Every cut inside a valid object is recoverable without accepting its partial contents.
+
+    Args:
+        complete: Valid nested JSON object whose proper prefixes are tested independently.
+    """
     for end in range(1, len(complete)):
         with pytest.raises(ProviderTruncatedResponseError):
             parse_openai_wire_tool_call(

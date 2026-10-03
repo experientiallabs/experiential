@@ -776,6 +776,13 @@ def _incomplete_json_object_prefix(value: str) -> bool:
     Track container grammar as well as tokens: EOF inside a literal, exponent
     or escape is recoverable only when all preceding structure is valid. This
     neither repairs arguments nor accepts a complete non-object value.
+
+    Args:
+        value: Exact decoded tool-argument string rejected by the JSON parser.
+
+    Returns:
+        True only when appending characters could complete the started JSON object
+        without changing its existing tokens or container grammar.
     """
     if not value.lstrip(" \t\r\n").startswith("{"):
         return False
