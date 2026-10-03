@@ -4,6 +4,55 @@ use super::*;
 use serde_json::json;
 
 #[test]
+fn coherent_additive_sample_corrects_provisional_subset_accounting() {
+    check_coherent_reasoning_sample(true);
+}
+
+#[test]
+fn coherent_subset_sample_corrects_provisional_additive_accounting() {
+    check_coherent_reasoning_sample(false);
+}
+
+fn check_coherent_reasoning_sample(additive: bool) {
+    for chat in [false, true] {
+        let (input, output, details) = if chat {
+            (
+                "prompt_tokens",
+                "completion_tokens",
+                "completion_tokens_details",
+            )
+        } else {
+            ("input_tokens", "output_tokens", "output_tokens_details")
+        };
+        let mut accumulator = OpenAiUsageAccumulator::default();
+        for report in [
+            json!({input: 100, output: 10, "total_tokens": if additive { 110 } else { 115 }}),
+            json!({details: {"reasoning_tokens": 5}}),
+        ] {
+            if chat {
+                accumulator.update_chat(&report).unwrap();
+            } else {
+                accumulator.update_responses(Some(&report)).unwrap();
+            }
+        }
+        let final_report = json!({
+            input: if additive { 100 } else { 105 }, output: 10,
+            details: {"reasoning_tokens": 5}, "total_tokens": 115
+        });
+        let observed = if chat {
+            accumulator.update_chat(&final_report).unwrap()
+        } else {
+            accumulator
+                .update_responses(Some(&final_report))
+                .unwrap()
+                .unwrap()
+        };
+        assert_eq!(observed.output_tokens, Some(if additive { 15 } else { 10 }));
+        assert_eq!(observed.reasoning_tokens, Some(5));
+    }
+}
+
+#[test]
 fn output_tokens_lead_a_turn_but_control_frames_do_not() {
     // Content, reasoning, and tool-call deltas are the first visible output.
     assert!(Event::TextDelta("hi".to_string()).is_output_token());

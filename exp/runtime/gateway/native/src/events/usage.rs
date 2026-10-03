@@ -202,6 +202,10 @@ pub fn openai_usage(value: Option<&Value>) -> Result<Option<Usage>, String> {
 pub(crate) struct OpenAiUsageAccumulator {
     reported: Usage,
     reasoning_accounting: Option<ReasoningAccounting>,
+    reasoning_accounting_confirmed: bool,
+    reasoning_counters_changed: bool,
+    input_tokens_changed: bool,
+    initial_total_tokens: Option<u64>,
     writes_within_reads: bool,
     // Sparse TTL evidence stays private until a write total can cover it.
     pending_cache_creation_1h_input_tokens: Option<u64>,
@@ -211,11 +215,6 @@ impl OpenAiUsageAccumulator {
     /// Select the rung's cache-write accounting before any usage arrives.
     pub(crate) fn set_writes_within_reads(&mut self, writes_within_reads: bool) {
         self.writes_within_reads = writes_within_reads;
-    }
-
-    /// Whether reported cache writes are a subset of reported cache reads.
-    pub(crate) fn writes_within_reads(&self) -> bool {
-        self.writes_within_reads
     }
 
     pub(crate) fn update_chat(&mut self, value: &Value) -> Result<Usage, String> {
@@ -289,6 +288,23 @@ impl OpenAiUsageAccumulator {
             }
         }
         let mut candidate = self.clone();
+        let input_changed = self
+            .reported
+            .input_tokens
+            .zip(input_tokens)
+            .is_some_and(|(old, new)| old != new);
+        candidate.input_tokens_changed |= input_changed;
+        candidate.reasoning_counters_changed |= input_changed
+            || [
+                (self.reported.output_tokens, output_tokens),
+                (self.reported.reasoning_tokens, reasoning_tokens),
+                (self.initial_total_tokens, total_tokens),
+            ]
+            .into_iter()
+            .any(|(old, new)| old.zip(new).is_some_and(|(old, new)| old != new));
+        candidate.initial_total_tokens = (!candidate.reasoning_counters_changed)
+            .then_some(self.initial_total_tokens.or(total_tokens))
+            .flatten();
         candidate.pending_cache_creation_1h_input_tokens = covering_writes
             .is_none()
             .then_some(cache_creation_1h_input_tokens)
@@ -301,17 +317,33 @@ impl OpenAiUsageAccumulator {
             cache_creation_1h_input_tokens: covering_writes.and(cache_creation_1h_input_tokens),
             reasoning_tokens,
         });
-        // Only this update's total can establish the attempt's accounting.
-        // Sparse growth can coincide with an old total without proving a mode.
-        // Once established, later sparse counters keep that interpretation.
-        candidate.reasoning_accounting = candidate.reasoning_accounting.or_else(|| {
-            openai_reasoning_accounting(
-                candidate.reported.input_tokens,
-                candidate.reported.output_tokens,
-                candidate.reported.reasoning_tokens,
+        // Initial split fragments support a provisional mode until counters
+        // change. A coherent raw output/reasoning/total sample may correct it;
+        // an established coherent mode then survives sparse and stale updates.
+        // Only an unchanged input count may be reused by a coherent sample.
+        if !candidate.reasoning_accounting_confirmed {
+            let coherent = openai_reasoning_accounting(
+                input_tokens.or_else(|| {
+                    (!candidate.input_tokens_changed)
+                        .then_some(self.reported.input_tokens)
+                        .flatten()
+                }),
+                output_tokens,
+                reasoning_tokens,
                 total_tokens,
-            )
-        });
+            );
+            if coherent.is_some() {
+                candidate.reasoning_accounting = coherent;
+                candidate.reasoning_accounting_confirmed = true;
+            } else if !candidate.reasoning_counters_changed {
+                candidate.reasoning_accounting = openai_reasoning_accounting(
+                    candidate.reported.input_tokens,
+                    candidate.reported.output_tokens,
+                    candidate.reported.reasoning_tokens,
+                    candidate.initial_total_tokens,
+                );
+            }
+        }
         let mut normalized = candidate.reported.clone();
         if self.writes_within_reads {
             separate_written_reads(&mut normalized)?;
@@ -691,6 +723,94 @@ mod sparse_tests {
             .unwrap()
             .unwrap();
         assert_eq!(observed.output_tokens, Some(25));
+    }
+
+    #[test]
+    fn late_totals_cannot_establish_accounting_after_raw_growth() {
+        for (later_output, late_total) in [(15, 115), (20, 120)] {
+            let mut accumulator = OpenAiUsageAccumulator::default();
+            for report in [
+                json!({"input_tokens": 100, "output_tokens": 10, "total_tokens": 115}),
+                json!({"output_tokens": 15, "output_tokens_details": {"reasoning_tokens": 5}}),
+                json!({"output_tokens": later_output}),
+                json!({"total_tokens": late_total}),
+            ] {
+                accumulator.update_responses(Some(&report)).unwrap();
+            }
+            assert!(accumulator.reasoning_accounting.is_none());
+            for additive in [false, true] {
+                let mut decided = accumulator.clone();
+                let observed = decided
+                    .update_responses(Some(&json!({
+                        "output_tokens": 25, "output_tokens_details": {"reasoning_tokens": 5},
+                        "total_tokens": if additive { 130 } else { 125 }
+                    })))
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(observed.output_tokens, Some(if additive { 30 } else { 25 }));
+            }
+        }
+    }
+
+    #[test]
+    fn coherent_old_snapshot_establishes_mode_from_its_own_raw_counts() {
+        let mut accumulator = OpenAiUsageAccumulator::default();
+        accumulator
+            .update_responses(Some(&json!({"input_tokens": 100, "output_tokens": 20})))
+            .unwrap();
+        let observed = accumulator
+            .update_responses(Some(&json!({
+                "input_tokens": 100, "output_tokens": 10,
+                "output_tokens_details": {"reasoning_tokens": 5}, "total_tokens": 115
+            })))
+            .unwrap()
+            .unwrap();
+        assert_eq!(observed.output_tokens, Some(25));
+    }
+
+    #[test]
+    fn changed_input_cannot_be_reused_in_a_delayed_counter_sample() {
+        let mut accumulator = OpenAiUsageAccumulator::default();
+        for report in [
+            json!({"input_tokens": 100, "output_tokens": 10, "total_tokens": 115}),
+            json!({"input_tokens": 105}),
+            json!({"output_tokens": 10, "output_tokens_details": {"reasoning_tokens": 5},
+                "total_tokens": 115}),
+        ] {
+            accumulator.update_responses(Some(&report)).unwrap();
+        }
+        assert!(accumulator.reasoning_accounting.is_none());
+        let observed = accumulator
+            .update_responses(Some(&json!({
+                "input_tokens": 105, "output_tokens": 15,
+                "output_tokens_details": {"reasoning_tokens": 5}, "total_tokens": 125
+            })))
+            .unwrap()
+            .unwrap();
+        assert_eq!(observed.output_tokens, Some(20));
+    }
+
+    #[test]
+    fn unchanged_initial_fragments_preserve_total_first_accounting() {
+        for additive in [false, true] {
+            let pieces = [
+                json!({"input_tokens": 100}),
+                json!({"output_tokens": 10}),
+                json!({"output_tokens_details": {"reasoning_tokens": 5}}),
+                json!({"total_tokens": if additive { 115 } else { 110 }}),
+            ];
+            for order in [[0, 1, 2, 3], [3, 0, 1, 2], [2, 3, 1, 0], [1, 0, 3, 2]] {
+                let mut accumulator = OpenAiUsageAccumulator::default();
+                let mut observed = None;
+                for index in order {
+                    observed = accumulator.update_responses(Some(&pieces[index])).unwrap();
+                }
+                assert_eq!(
+                    observed.unwrap().output_tokens,
+                    Some(if additive { 15 } else { 10 })
+                );
+            }
+        }
     }
 
     #[test]

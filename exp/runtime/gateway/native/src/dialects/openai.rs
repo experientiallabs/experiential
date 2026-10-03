@@ -838,6 +838,7 @@ impl Normalizer {
                         .update_responses(response.get("usage"))
                         .map_err(|message| malformed(&message))?
                     {
+                        self.usage = Some(usage.clone());
                         events.push(Event::Usage(usage));
                     }
                     if let Some(error) = response.get("error").and_then(Value::as_object) {

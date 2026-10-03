@@ -524,6 +524,46 @@ fn a_failed_terminal_reports_its_billed_usage() {
     }
 }
 
+#[test]
+fn failed_terminal_replaces_provisional_reasoning_usage() {
+    for additive in [false, true] {
+        let mut normalizer = Normalizer::new(Dialect::OpenAiResponses);
+        // Seed the owning accumulator's retained partial snapshot to exercise
+        // failed-terminal retention independently of earlier event shapes.
+        for usage in [
+            serde_json::json!({"input_tokens": 100, "output_tokens": 10,
+                "total_tokens": if additive { 110 } else { 115 }}),
+            serde_json::json!({"output_tokens_details": {"reasoning_tokens": 5}}),
+        ] {
+            normalizer.usage = normalizer
+                .openai_usage
+                .update_responses(Some(&usage))
+                .unwrap();
+        }
+        let events = normalizer
+            .feed(&hosted_frame(serde_json::json!({
+                "type": "response.failed", "response": {
+                    "status": "failed", "error": {"code": "server_error"},
+                    "usage": {"input_tokens": if additive { 100 } else { 105 },
+                        "output_tokens": 10, "output_tokens_details": {"reasoning_tokens": 5},
+                        "total_tokens": 115}
+                }
+            })))
+            .unwrap();
+        match events.as_slice() {
+            [Event::Usage(usage), Event::Failed(_)] => {
+                assert_eq!(usage.output_tokens, Some(if additive { 15 } else { 10 }));
+                assert_eq!(usage.reasoning_tokens, Some(5));
+            }
+            other => panic!("unexpected events: {other:?}"),
+        }
+        assert_eq!(
+            normalizer.observed_usage().unwrap().output_tokens,
+            Some(if additive { 15 } else { 10 })
+        );
+    }
+}
+
 /// A status frame trailing the item's `done` is dropped, never a failed
 /// stream: the final item already reached the caller and is the authority.
 #[test]

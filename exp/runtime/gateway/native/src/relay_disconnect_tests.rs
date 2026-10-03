@@ -165,6 +165,56 @@ fn close_preserves_latest_cumulative_usage() {
     assert_eq!(after.output_tokens, Some(4));
 }
 
+#[test]
+fn corrected_reasoning_meter_survives_completion_and_close() {
+    for additive in [false, true] {
+        for terminal in [false, true] {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut relay = UpstreamRelay::from_stream(
+                futures_util::stream::pending().boxed(),
+                Dialect::OpenAiCompatible,
+                deadline,
+            );
+            let observed = Observation::default();
+            relay.set_observation(observed.clone());
+            for usage in [
+                serde_json::json!({"prompt_tokens": 100, "completion_tokens": 10,
+                    "total_tokens": if additive { 110 } else { 115 }}),
+                serde_json::json!({"completion_tokens_details": {"reasoning_tokens": 5}}),
+                serde_json::json!({"prompt_tokens": if additive { 100 } else { 105 },
+                    "completion_tokens": 10, "total_tokens": 115,
+                    "completion_tokens_details": {"reasoning_tokens": 5}}),
+            ] {
+                let events = relay
+                    .normalizer
+                    .feed(&crate::sse::SseEvent {
+                        event: None,
+                        data: serde_json::json!({"choices": [], "usage": usage}).to_string(),
+                    })
+                    .unwrap();
+                relay.queue_events(events);
+            }
+            if terminal {
+                let events = relay
+                    .normalizer
+                    .feed(&crate::sse::SseEvent {
+                        event: None,
+                        data: "[DONE]".into(),
+                    })
+                    .unwrap();
+                relay.queue_events(events);
+            }
+            relay.close_transport();
+            let snapshot = observed.snapshot();
+            assert_eq!(snapshot.terminal.is_some(), terminal);
+            let usage = snapshot.usage.unwrap();
+            assert_eq!(usage.input_tokens, Some(if additive { 100 } else { 105 }));
+            assert_eq!(usage.output_tokens, Some(if additive { 15 } else { 10 }));
+            assert_eq!(usage.reasoning_tokens, Some(5));
+        }
+    }
+}
+
 #[tokio::test]
 async fn malformed_sparse_frame_retains_meter_through_relay_failure() {
     let wire = concat!(
