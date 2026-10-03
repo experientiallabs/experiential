@@ -24,6 +24,7 @@ from exp.runtime.gateway.budgets import (
     BudgetScopeKind,
     SQLiteBudgetStore,
 )
+from exp.runtime.gateway.client_apps import ClientApp, with_client_identity
 from exp.runtime.gateway.contracts import (
     AuthorizationSnapshot,
     DirectTarget,
@@ -1825,6 +1826,50 @@ def test_first_token_and_app_attribution_default_to_null(tmp_path: Path) -> None
     assert attempt_row["first_token_at"] is None
     assert request_row["app_referer"] is None
     assert request_row["app_title"] is None
+
+
+def test_usage_snapshot_groups_requests_by_calling_app(tmp_path: Path) -> None:
+    """Accepted requests aggregate per classified app, with unidentified callers together."""
+    clock = FakeLedgerClock()
+    store, ledger, raw_key = _authority_fixture(tmp_path, clock)
+    for user_agent in ("claude-cli/2.1.0 (external, cli)", "opencode/1.18.31", None, None):
+        authorization = with_client_identity(
+            store.authorize_request(
+                raw_key=raw_key,
+                alias="coding",
+                request=_request("prompt"),
+                deadline_monotonic=clock.monotonic() + 30,
+            ),
+            {"user_agent": user_agent},
+        )
+        ledger.accept_request(authorization=authorization)
+        attempt_id = ledger.start_attempt(
+            snapshot=_execution(authorization),
+            deployment=_deployment(),
+            attempt_ordinal=0,
+            route_depth=0,
+        )
+        ledger.finish_attempt(
+            attempt_id=attempt_id,
+            terminal_event=GatewayEvent(
+                kind=GatewayEventKind.COMPLETED,
+                sequence_number=1,
+                usage=GatewayUsage(input_tokens=10, output_tokens=5),
+            ),
+            failure=None,
+        )
+
+    by_app = {
+        usage.client_app: (usage.requests, usage.attempts, usage.input_tokens)
+        for usage in ledger.usage_snapshot(
+            organization_id=authorization.organization_id
+        ).by_client_app
+    }
+    assert by_app == {
+        ClientApp.CLAUDE_CODE: (1, 1, 10),
+        ClientApp.OPENCODE: (1, 1, 10),
+        None: (2, 2, 20),
+    }
 
 
 def _tiered_deployment() -> ExactModelDeployment:

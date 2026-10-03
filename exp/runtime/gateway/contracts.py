@@ -26,6 +26,7 @@ from exp.common.models.gateway_catalog import (
 )
 from exp.common.models.gateway_chains import ModelExecutionStage, ModelTraversalEvent
 from exp.common.models.model import MAXIMUM_TOOL_CALL_ID_CHARACTERS, ReasoningEffort, ToolCall
+from exp.runtime.gateway.client_apps import ClientAttribution
 from exp.runtime.gateway.model_chain_authority import ModelChainAuthority
 from exp.runtime.gateway.reasoning_blocks import EncryptedReasoningBlock as EncryptedReasoningBlock
 from exp.runtime.gateway.reasoning_blocks import (
@@ -892,7 +893,7 @@ class ProjectSelection(ContractModel):
     fallback_reason: str | None = Field(default=None, max_length=512)
 
 
-class AuthorizationSnapshot(ContractModel):
+class AuthorizationSnapshot(ClientAttribution):
     """Immutable authority and alias target frozen before learned model selection.
 
     Attributes:
@@ -937,7 +938,6 @@ class AuthorizationSnapshot(ContractModel):
     fair_share_weight: int = Field(default=1, ge=1, le=1_000_000)
     descendant_start_authorized: bool = False
     zdr_requested: bool = False
-    # Fair-share weights default to equal shares and apply only on opted-in rungs.
 
 
 class ExecutionSnapshot(ContractModel):

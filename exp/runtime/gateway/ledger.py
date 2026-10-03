@@ -55,6 +55,7 @@ from exp.runtime.gateway.ledger_usage import (
     IdentityUsage,
     LedgerUsageSnapshot,
     billing_source_usage_rows,
+    client_app_usage_rows,
     identity_usage_rows,
 )
 from exp.runtime.gateway.ledger_valuation import (
@@ -249,8 +250,8 @@ class SQLiteAttemptLedger(LocalSnapshotMemoOwner):
                 request_id, organization_id, identity_id, key_id, alias_id,
                 alias_revision_id, api_surface, canonical_request_sha256,
                 caller_operation_sha256, accepted_at, deadline_at,
-                app_referer, app_title
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                app_referer, app_title, client_app, user_agent
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 authorization.request_id,
@@ -266,6 +267,8 @@ class SQLiteAttemptLedger(LocalSnapshotMemoOwner):
                 utc_text(deadline_at),
                 authorization.app_referer,
                 authorization.app_title,
+                authorization.client_app,
+                authorization.user_agent,
             ),
         )
 
@@ -955,11 +958,13 @@ class SQLiteAttemptLedger(LocalSnapshotMemoOwner):
                     predicate=source_predicate,
                     parameters=parameters,
                 )
+                by_client_app = client_app_usage_rows(
+                    connection, predicate=source_predicate, parameters=parameters
+                )
             finally:
                 connection.rollback()
         return LedgerUsageSnapshot(
-            identities=identities,
-            by_billing_source=by_billing_source,
+            identities=identities, by_billing_source=by_billing_source, by_client_app=by_client_app
         )
 
     @contextmanager

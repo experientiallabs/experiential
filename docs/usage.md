@@ -178,11 +178,14 @@ one-time key was not saved, issue a replacement with
 The accounting database stays content-free. Local traffic content is captured separately by default;
 use `--ghost` to disable it. See [local traffic capture](reference/local_gateway_traffic.md).
 Raw virtual keys and resolved provider credentials are never copied into capture or accounting.
-`GET /usage` and `GET /usage.json` expose the same schema-v2 content-free overall and per-identity
+`GET /usage` and `GET /usage.json` expose the same schema-v3 content-free overall and per-identity
 counts, token usage, latency, terminal states, and attributed estimated cost. Their attempt-only
 `by_billing_source` buckets conserve attempts, tokens, known cost, unknown-cost attempts, and
 terminal states across `host_managed` and `customer_managed`; logical request counts are not
-partitioned. Estimated cost is not provider invoice cost.
+partitioned. `by_client_app` attributes each request to the calling app (Claude Code, Codex,
+OpenCode, Hermes Agent, and the rest of `exp.runtime.gateway.client_apps.ClientApp`), classified
+from the `User-Agent`, Codex `originator`, `X-Title`, and `HTTP-Referer` headers; callers no rule
+recognizes report as unidentified. Estimated cost is not provider invoice cost.
 
 One-time virtual-key material appears only in the successful key-issue receipt or a newly created
 mode-`0600` output file. Human key issuance on a non-terminal requires `--json` or `--output`.

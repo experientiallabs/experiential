@@ -175,7 +175,7 @@ def test_noninteractive_management_story_emits_stable_secret_safe_json(
     assert usage.exit_code == 0, usage.output
     assert raw_key not in key_list.stdout
     assert raw_key not in usage.stdout
-    assert json.loads(usage.stdout)["schema_version"] == 2
+    assert json.loads(usage.stdout)["schema_version"] == 3
 
     readiness = runner.invoke(
         app,

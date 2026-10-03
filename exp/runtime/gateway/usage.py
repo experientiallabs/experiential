@@ -8,9 +8,11 @@ from typing import Literal
 from pydantic import Field
 
 from exp.common.core.artifacts import ContractModel
+from exp.runtime.gateway.client_apps import CLIENT_APP_LABELS
 from exp.runtime.gateway.ledger import SQLiteAttemptLedger
 from exp.runtime.gateway.ledger_usage import (
     BillingSourceUsage,
+    ClientAppUsage,
     IdentityUsage,
     UsageTerminalCount,
 )
@@ -32,13 +34,14 @@ class GatewayUsageTotals(ContractModel):
 
 
 class GatewayUsageReport(ContractModel):
-    """Versioned aggregate and per-identity attributed usage report."""
+    """Versioned aggregate, per-identity and per-application attributed usage report."""
 
-    schema_version: Literal[2] = 2
+    schema_version: Literal[3] = 3
     organization_id: str
     totals: GatewayUsageTotals
     identities: tuple[IdentityUsage, ...]
     by_billing_source: tuple[BillingSourceUsage, ...]
+    by_client_app: tuple[ClientAppUsage, ...]
     cost_description: str = "attributed estimated cost, not provider invoice cost"
 
 
@@ -90,6 +93,7 @@ def read_usage_report(
         totals=totals,
         identities=identities,
         by_billing_source=by_billing_source,
+        by_client_app=snapshot.by_client_app,
     )
 
 
@@ -132,6 +136,18 @@ def usage_html(report: GatewayUsageReport) -> str:
         "</tr>"
         for item in report.by_billing_source
     )
+    app_rows = "".join(
+        "<tr>"
+        f"<td>{escape(_client_app_label(item))}</td>"
+        f"<td>{item.requests}</td>"
+        f"<td>{item.attempts}</td>"
+        f"<td>{item.input_tokens}</td>"
+        f"<td>{item.output_tokens}</td>"
+        f"<td>{item.known_estimated_cost_nano_usd}</td>"
+        f"<td>{item.unknown_cost_attempts}</td>"
+        "</tr>"
+        for item in report.by_client_app
+    )
     totals = report.totals
     return (
         "<!doctype html><html><head><meta charset='utf-8'>"
@@ -157,8 +173,18 @@ def usage_html(report: GatewayUsageReport) -> str:
         "<th>Input tokens</th><th>Cached input</th><th>Output tokens</th>"
         "<th>Reasoning tokens</th><th>Known nano-USD</th>"
         "<th>Unknown-cost attempts</th><th>Terminal states</th></tr></thead>"
-        f"<tbody>{source_rows}</tbody></table></body></html>"
+        f"<tbody>{source_rows}</tbody></table>"
+        "<h2>Requests by calling app</h2>"
+        "<table><thead><tr><th>App</th><th>Requests</th><th>Attempts</th>"
+        "<th>Input tokens</th><th>Output tokens</th><th>Known nano-USD</th>"
+        "<th>Unknown-cost attempts</th></tr></thead>"
+        f"<tbody>{app_rows}</tbody></table></body></html>"
     )
+
+
+def _client_app_label(usage: ClientAppUsage) -> str:
+    """Return the display name of one application row, naming unidentified callers."""
+    return "Unidentified app" if usage.client_app is None else CLIENT_APP_LABELS[usage.client_app]
 
 
 def _terminal_summary(usage: IdentityUsage) -> str:

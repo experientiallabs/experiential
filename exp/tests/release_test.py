@@ -2159,7 +2159,7 @@ def _installed_release_driver() -> None:
         usage_json_body = usage_json_response.text
         usage_html_body = usage_html_response.text
         usage_payload = usage_json_response.json()
-        assert usage_payload["schema_version"] == 2
+        assert usage_payload["schema_version"] == 3
         identity_usage = usage_payload["identities"][0]
         assert usage_payload["totals"]["requests"] >= 14
         assert usage_payload["totals"]["attempts"] > usage_payload["totals"]["requests"]
@@ -2267,8 +2267,26 @@ def _installed_release_driver() -> None:
                 ),
             )
         )
+        # The released CLI sends no app headers, so every request is one unidentified app row.
+        app_buckets = usage_payload["by_client_app"]
+        assert [bucket["client_app"] for bucket in app_buckets] == [None]
+        assert app_buckets[0]["requests"] == identity_usage["requests"]
+        assert app_buckets[0]["attempts"] == identity_usage["attempts"]
+        expected_app_cells = tuple(
+            value
+            for bucket in app_buckets
+            for value in (
+                "Unidentified app",
+                bucket["requests"],
+                bucket["attempts"],
+                bucket["input_tokens"],
+                bucket["output_tokens"],
+                bucket["known_estimated_cost_nano_usd"],
+                bucket["unknown_cost_attempts"],
+            )
+        )
         assert tuple(re.findall(r"<td>(.*?)</td>", usage_html_body)) == tuple(
-            str(value) for value in (*expected_cells, *expected_source_cells)
+            str(value) for value in (*expected_cells, *expected_source_cells, *expected_app_cells)
         )
 
         invalid_auth = httpx.get(
@@ -3537,7 +3555,7 @@ def test_documentation_index_commands_and_release_scope_are_current() -> None:
     assert "exp config gateway pool certify" in usage
     assert "exp --root ROOT" in usage
     assert "OpenAI `3.0.0`" in usage
-    assert "schema-v2" in usage
+    assert "schema-v3" in usage
     assert "by_billing_source" in usage
     assert "exp optimize route" not in usage.replace("exp optimize router", "")
     assert "exp auth" not in usage
@@ -3562,7 +3580,7 @@ def test_documentation_index_commands_and_release_scope_are_current() -> None:
     assert "POST /v1/chat/completions" in architecture
     assert "POST /v1/responses" in architecture
     assert "provider_certification.py" in architecture
-    assert "schema-v2" in architecture
+    assert "schema-v3" in architecture
     assert "by_billing_source" in architecture
     assert "inert contracts" not in architecture
     assert "does not claim that a gateway server" not in architecture

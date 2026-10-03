@@ -31,7 +31,7 @@ use crate::relay::{collect_committed, collection_public_error, track_event};
 use crate::respond::{
     bearer_key, client_ip, complete_visible_refusal, escalation_error, json_response,
     latin1_header_list, outward_event, read_body, send_bounded, settle_stream_end,
-    sse_body_response,
+    sse_body_response, with_app_identity,
 };
 use crate::respond::{log_stream_exit, stream_delivery::Delivery};
 use crate::route_chat::{seal_reasoning_candidate, seal_reasoning_events};
@@ -167,14 +167,16 @@ pub(crate) async fn messages(
     // decoder can retain allowlisted tokens (e.g. the 1M context window)
     // for Anthropic dispatch and disclose the rest.
     let anthropic_beta = latin1_header_list(&headers, "anthropic-beta");
-    let admit_argument = compact_json(&json!({
+    let mut admit_value = json!({
         "raw_key": raw_key,
         "body": body_text,
         "surface": "messages",
         "anthropic_beta": anthropic_beta,
         "client_ip": client_ip(&headers),
         "capture_session_id": crate::capture::session_id(&headers),
-    }));
+    });
+    with_app_identity(&mut admit_value, &headers);
+    let admit_argument = compact_json(&admit_value);
     let admission_text = match state.bridge.call("admit", admit_argument).await {
         Ok(text) => text,
         Err(error) => return messages_error_response(&error),

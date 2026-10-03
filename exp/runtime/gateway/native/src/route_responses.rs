@@ -32,7 +32,7 @@ use crate::respond::{
     bearer_key, cached_response, capture_frame, client_ip, complete_visible_refusal,
     emit_responses_failure, error_response, escalation_error, finish_stream_terminal,
     json_response, latin1_header, outward_event, read_body, settle_stream_end, sse_body_response,
-    stream_delivery::Delivery,
+    stream_delivery::Delivery, with_app_identity,
 };
 use crate::responses_retention::{remember_argument, remember_continuation, ResponsesRetention};
 use crate::route_chat::{seal_reasoning_candidate, seal_reasoning_events};
@@ -124,7 +124,7 @@ pub(crate) async fn responses(
         }
     }
 
-    let admit_argument = compact_json(&json!({
+    let mut admit_value = json!({
         "raw_key": raw_key,
         "body": body_text,
         "surface": "responses",
@@ -132,7 +132,9 @@ pub(crate) async fn responses(
         "client_request_id": client_request_id,
         "client_ip": client_ip(&headers),
         "capture_session_id": crate::capture::session_id(&headers),
-    }));
+    });
+    with_app_identity(&mut admit_value, &headers);
+    let admit_argument = compact_json(&admit_value);
     let admission_text = match state.bridge.call("admit", admit_argument).await {
         Ok(text) => text,
         Err(error) => {
