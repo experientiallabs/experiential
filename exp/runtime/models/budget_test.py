@@ -48,9 +48,11 @@ def test_unknown_price_retains_response_and_blocks_capped_new_work(tmp_path: Pat
             )
 
     uncapped = RequestBudget(project, identity="fixture", maximum_cost_usd=None)
+    assert uncapped.is_uncapped
     assert call(uncapped, "first") == "paid response"
     assert uncapped.accounted_usd == 2
     capped = RequestBudget(project, identity="fixture", maximum_cost_usd=100)
+    assert not capped.is_uncapped
     assert call(capped, "first") == "paid response"
     with pytest.raises(ValueError, match="resolved earlier charges"):
         call(capped, "second", known=True)

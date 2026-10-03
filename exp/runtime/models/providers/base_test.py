@@ -28,6 +28,7 @@ from exp.runtime.models.providers.base import (
     ProviderHttpClient,
     completion_timeout_seconds,
 )
+from exp.runtime.models.providers.errors import ProviderPricingUnavailableError
 from exp.runtime.models.providers.transport import (
     JsonHttpResponse,
     JsonHttpTransport,
@@ -121,6 +122,22 @@ def _client(
         base_url=base_url,
         transport=transport,
     )
+
+
+def test_completed_pricing_error_never_retries_the_http_request() -> None:
+    """Only a fresh uncapped rollout may retry; the completed HTTP operation runs once."""
+
+    class UnpriceableClient(_EchoClient):
+        def _parse_response(self, payload: JsonObject, *, latency_seconds: float) -> ModelResponse:
+            raise ProviderPricingUnavailableError("saved response has unknown metering")
+
+    transport = _ok_transport()
+    client = UnpriceableClient(
+        model=_snapshot(), api_key="fixture", base_url="https://echo.test", transport=transport
+    )
+    with pytest.raises(ProviderPricingUnavailableError):
+        client.complete(ModelRequest(messages=(ModelMessage(role="user", content="hello"),)))
+    assert len(transport.requests) == 1
 
 
 def test_rejects_an_empty_api_key_naming_the_concrete_client() -> None:

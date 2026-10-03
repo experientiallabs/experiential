@@ -48,6 +48,7 @@ from exp.runtime.models.providers.async_transport import (
     HttpxAsyncJsonTransport,
     ProviderDeadlineExceeded,
 )
+from exp.runtime.models.providers.errors import ProviderPricingUnavailableError
 from exp.runtime.models.providers.openai_compatible import OpenAICompatibleClient
 from exp.runtime.models.providers.transport import RetryPolicy, is_known_unbilled_failure
 from exp.runtime.models.registry import RuntimeModelCatalog
@@ -453,8 +454,14 @@ def test_unknown_tariff_saves_paid_output_and_replays_error_under_lower_cap(
     )
     original = RequestBudget(project, identity="schedule", maximum_cost_usd=None)
     wrapper = BudgetedCompletion(client, original, reservation, role="assistant")
-    with original.scope("cell"), pytest.raises(ValueError, match=message):
+    expected_error = (
+        ProviderPricingUnavailableError
+        if failure in {"unknown_tariff", "missing_usage", "retry_unknown_tariff"}
+        else ValueError
+    )
+    with original.scope("cell"), pytest.raises(expected_error, match=message) as raised:
         wrapper.complete(request)
+    assert type(raised.value) is expected_error
     store = RequestBudgetStore(project, "schedule")
     key = sha256_json({"scope": "cell", "role": "assistant", "ordinal": 0})
     receipt = store.read(key)
@@ -466,8 +473,9 @@ def test_unknown_tariff_saves_paid_output_and_replays_error_under_lower_cap(
     assert saved["charge_usd"] is None
     resumed = RequestBudget(project, identity="schedule", maximum_cost_usd=0.0000001)
     resumed_wrapper = BudgetedCompletion(client, resumed, reservation, role="assistant")
-    with resumed.scope("cell"), pytest.raises(ValueError, match=message):
+    with resumed.scope("cell"), pytest.raises(expected_error, match=message) as replayed:
         resumed_wrapper.complete(request)
+    assert type(replayed.value) is expected_error
     with resumed.scope("new-cell"), pytest.raises(ValueError, match="complete applicable"):
         resumed_wrapper.complete(request)
     assert client.calls == 1

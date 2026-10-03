@@ -16,6 +16,7 @@ from exp.common.models import (
     reconcile_completion_economics,
 )
 from exp.common.rollouts import RolloutEventKind, RolloutSpan
+from exp.runtime.models.providers.errors import ProviderPricingUnavailableError
 from exp.simulation.engines.text.packing import pack_world_model_request
 from exp.simulation.engines.text.prompt import TextWorldModelTransition, retry_world_model_request
 from exp.simulation.engines.text.redaction import redact_json
@@ -58,7 +59,9 @@ def priced_response(
     try:
         economics = reconcile_completion_economics(reservation, response.economics)
     except ValueError as error:
-        if reservation.token_prices is None:
+        if reservation.token_prices is None and not isinstance(
+            error, ProviderPricingUnavailableError
+        ):
             raise
         return response.model_copy(
             update={"economics": response.economics.model_copy(update={"cost_usd": None})}

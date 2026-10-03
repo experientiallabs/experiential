@@ -4,7 +4,8 @@ A simulated cell can fail after a provider request left the process but before i
 response arrived, so the exact spend of that dispatch is unknown. These helpers give every
 spend reconciler one canonical way to recognize such evidence, read its persisted worst-case
 reservation, and decide whether the failed dispatch belongs to the transport-retryable class
-that resume may re-execute under fresh budget.
+that resume may re-execute under fresh budget. A completed response whose pricing is
+unavailable may also qualify when an uncapped request ledger authorized the retry.
 """
 
 from __future__ import annotations
@@ -68,8 +69,8 @@ def unknown_dispatch_reserved_cost_usd(failure: StructuredFailure | None) -> flo
 def retryable_dispatch_failure(failure: StructuredFailure | None) -> bool:
     """Return whether a persisted provider dispatch failure is stochastically retryable.
 
-    Only candidate or world-model transport dispatch failures and world-model protocol
-    output failures qualify, and only when the persisted failure is marked retryable.
+    Candidate or world-model transport, explicitly uncapped pricing-unavailable, and
+    world-model protocol output failures qualify only when persisted as retryable.
     Budget, validation, and stale-lease failures never qualify.
 
     Args:

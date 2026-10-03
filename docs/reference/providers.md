@@ -261,6 +261,32 @@ that budget amount while token usage and the provider cost estimate stay unknown
 same assignment is a no-op; a different assignment is refused. Holds survive request completion
 and process restarts until this explicit reconciliation, so unresolved work cannot fund repeats.
 
+## Completed responses with unknown pricing
+
+An adapter that has durably saved a completed paid response and its unknown liability can
+report missing price-relevant usage through the typed boundary:
+
+```python
+from exp.runtime.models.providers.errors import ProviderPricingUnavailableError
+
+raise ProviderPricingUnavailableError(
+    "Saved response cannot be priced from its reported usage; inspect the retained receipt."
+)
+```
+
+This error does not retry the HTTP request or permit the unpriceable answer to execute. A text
+evaluation using an explicitly uncapped `RequestBudget` records infrastructure-invalid evidence
+and may create a fresh rollout generation for the same task, model, and repeat. The existing
+three-generation limit includes the initial attempt. Every generation has new request coordinates;
+prior responses, invalid rollouts, and unknown liabilities remain saved. Persistent failure stays
+invalid after the final generation. Evaluation orchestration retries eligible cells after the
+current simulation phase completes.
+
+Finite budgets and simulations without a shared request ledger do not enable this retry.
+Generic `ValueError` failures, including previously saved ones, remain nonretryable. Identity,
+reservation-bound, and persistence failures must not be translated into the pricing-unavailable
+type. Missing usage is never replaced with zero or a measured charge.
+
 ## OpenAI-compatible listing metadata
 
 `provider = "openai-compatible"` is the only OpenAI-shaped listing path that reads optional

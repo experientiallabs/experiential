@@ -77,10 +77,7 @@ from exp.simulation.engines.text.leases import (
 )
 from exp.simulation.engines.text.lineage_spend import prefix_retry_credit, resolution_spend
 from exp.simulation.engines.text.prompt import WORLD_MODEL_TEXT_PROMPT_VERSION
-from exp.simulation.engines.text.recording import (
-    RecordingCandidateClient,
-    text_prompt_digest,
-)
+from exp.simulation.engines.text.recording import RecordingCandidateClient, text_prompt_digest
 from exp.simulation.engines.text.redaction import redact_rollout_secrets, redacted_field_set
 from exp.simulation.engines.text.resume import (
     ROLLOUT_FILE,
@@ -749,6 +746,9 @@ class WorldModelSimulator:
             ),
             maximum_cost_usd=maximum_cell_cost_usd,
             stop_on_overspend=spec.stop_on_overspend,
+            retry_pricing_unavailable=(
+                self._request_budget is not None and self._request_budget.is_uncapped
+            ),
             maximum_steps=spec.maximum_steps,
             maximum_rollout_output_tokens=spec.maximum_rollout_output_tokens,
             maximum_output_tokens=settings.maximum_output_tokens,

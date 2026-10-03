@@ -8,6 +8,9 @@ from enum import StrEnum
 from pydantic import JsonValue
 
 from exp.common.core.artifacts import JsonObject
+from exp.common.models.pricing import (
+    ProviderPricingUnavailableError as ProviderPricingUnavailableError,
+)
 from exp.runtime.gateway.contracts import GatewayFailure, GatewayFailureClass
 from exp.runtime.models.providers.async_transport import ProviderDeadlineExceeded
 from exp.runtime.models.providers.transport import ProviderTransportError

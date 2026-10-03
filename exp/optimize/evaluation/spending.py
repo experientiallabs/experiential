@@ -18,6 +18,7 @@ from exp.common.models import (
 )
 from exp.common.models.token_cost import schedule_prices_complete
 from exp.runtime.models.budget import RequestBudget
+from exp.runtime.models.providers.errors import ProviderPricingUnavailableError
 from exp.simulation.engines.text.tokens import Utf8UpperBoundTokenCounter
 
 
@@ -122,6 +123,14 @@ class BudgetedCompletion:
             ),
         )
         if recorded.pricing_error is not None:
+            # Recover the type from the exact saved economics and frozen reservation,
+            # never from error-message matching or by dispatching the request again.
+            try:
+                reconcile_completion_economics(self._reservation, recorded.response.economics)
+            except ProviderPricingUnavailableError:
+                raise ProviderPricingUnavailableError(recorded.pricing_error) from None
+            except ValueError:
+                pass
             raise ValueError(recorded.pricing_error)
         return recorded.response
 

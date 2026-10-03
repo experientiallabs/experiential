@@ -30,6 +30,16 @@ from exp.common.models.token_cost import (
 from exp.common.project import ArtifactStore, artifact_input
 
 
+class ProviderPricingUnavailableError(ValueError):
+    """A completed response lacks the evidence needed to price its usage.
+
+    Execution owners must retain the paid response and unknown liability before exposing
+    this error. It never authorizes HTTP retry or use of the unpriceable answer. Explicitly
+    uncapped evaluations may retry the failed cell as a fresh rollout generation. Identity,
+    bounds, and persistence failures must retain their own exception types.
+    """
+
+
 class CandidateTokenPrice(ContractModel):
     """Frozen candidate prices, with an optional complete per-request tariff.
 
@@ -422,10 +432,22 @@ def reconcile_completion_economics(
     """
     usage = economics.usage
     measured = economics.cost_usd
-    if usage is None:
-        raise ValueError("completion provider returned unknown usage and spend")
     if measured is not None and measured.value < 0:
         raise ValueError("completion provider spend cannot be negative")
+    attempts = economics.provider_attempts or reservation.maximum_attempts
+    if economics.unbilled_attempts and economics.provider_attempts is None:
+        raise ValueError("unbilled attempts require an observed total attempt count")
+    attempts -= economics.unbilled_attempts
+    if attempts < 1:
+        raise ValueError("successful completion requires at least one potentially billed attempt")
+    if attempts > reservation.maximum_attempts:
+        raise ValueError("observed provider attempts exceed the request reservation")
+    if measured is not None and measured.value > reservation.absolute_maximum_call_cost_usd():
+        raise ValueError("derived completion spend exceeds its request reservation")
+    if usage is None:
+        raise ProviderPricingUnavailableError(
+            "completion provider returned unknown usage and spend"
+        )
     if (
         usage.input_tokens > reservation.maximum_input_tokens
         or usage.output_tokens > reservation.maximum_output_tokens
@@ -478,7 +500,7 @@ def reconcile_completion_economics(
     if reservation.token_prices is not None:
         observed = schedule_usage_cost_nano_usd(reservation.token_prices, usage)
         if observed is None:
-            raise ValueError(
+            raise ProviderPricingUnavailableError(
                 "completion usage is not priceable under its frozen schedule; "
                 "preserve the response and supply complete prices or usage"
             )
@@ -486,14 +508,6 @@ def reconcile_completion_economics(
     maximum_attempt_cost = reservation.attempt_cost_usd(
         input_tokens=usage.input_tokens, output_tokens=reservation.maximum_output_tokens
     )
-    attempts = economics.provider_attempts or reservation.maximum_attempts
-    if economics.unbilled_attempts and economics.provider_attempts is None:
-        raise ValueError("unbilled attempts require an observed total attempt count")
-    attempts -= economics.unbilled_attempts
-    if attempts < 1:
-        raise ValueError("successful completion requires at least one potentially billed attempt")
-    if attempts > reservation.maximum_attempts:
-        raise ValueError("observed provider attempts exceed the request reservation")
     if (
         attempts > 1
         and reservation.token_prices is not None
@@ -501,7 +515,7 @@ def reconcile_completion_economics(
             reservation.token_prices, maximum_input_tokens=usage.input_tokens
         )
     ):
-        raise ValueError(
+        raise ProviderPricingUnavailableError(
             "earlier completion attempts have unbounded tariff liability; preserve the response"
         )
     retry_inclusive_cost = successful_cost + (attempts - 1) * maximum_attempt_cost

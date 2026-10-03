@@ -85,6 +85,11 @@ class RequestBudget:
             self._scope.reset(token)
 
     @property
+    def is_uncapped(self) -> bool:
+        """Return whether this ledger's current authorization has no aggregate spend cap."""
+        return self._limit is None
+
+    @property
     def accounted_usd(self) -> float:
         """Return completed charges plus conservative reservations for unknown dispatches."""
         return self._store.total()

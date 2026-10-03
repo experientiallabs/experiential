@@ -55,6 +55,7 @@ from exp.common.tasks import TaskCase, TaskSet, ToolSchema
 from exp.runtime.agents import AgentEpisode, AgentRuntime
 from exp.runtime.environments import EnvironmentSession
 from exp.runtime.models import ResolvedModel
+from exp.runtime.models.budget import RequestBudget
 from exp.runtime.models.providers.errors import ProviderRefusalError, ProviderRefusalSignal
 from exp.runtime.models.providers.transport import ProviderTransportError
 from exp.simulation.engines.text.bindings import (
@@ -636,6 +637,7 @@ def _simulator(
     fit_retriever: TraceRAGRetriever | _FitRetriever | None = None,
     fit_rag_input: ArtifactInput | None = None,
     completion_contract_input: ArtifactInput | None = None,
+    request_budget: RequestBudget | None = None,
 ) -> WorldModelSimulator:
     """Bind deterministic clients and an exact fit retriever to the simulator.
 
@@ -651,6 +653,7 @@ def _simulator(
         fit_retriever: Optional exact read-only fit retriever.
         fit_rag_input: Optional explicit fit-only RAG pointer.
         completion_contract_input: Optional exact completion reservation artifact.
+        request_budget: Optional shared request ledger with explicit aggregate authorization.
 
     Returns:
         Fully bound text-world-model simulator.
@@ -678,6 +681,7 @@ def _simulator(
         },
         agent_factory=agent_factory,
         completion_contract_input=completion_contract_input,
+        request_budget=request_budget,
         clock=lambda: _TIME,
         monotonic=lambda: 1.0,
     )

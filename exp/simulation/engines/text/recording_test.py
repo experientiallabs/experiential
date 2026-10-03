@@ -33,6 +33,7 @@ from exp.common.models.catalog_prices import GatewayTokenPrices
 from exp.common.rollouts import StopReason
 from exp.common.tasks import TaskCase, ToolSchema
 from exp.runtime.models import ResolvedModel
+from exp.runtime.models.providers.errors import ProviderPricingUnavailableError
 from exp.runtime.models.providers.openai import openai_responses_response
 from exp.runtime.models.providers.transport import ScriptedJsonTransport
 from exp.runtime.models.registry import RuntimeModelCatalog
@@ -249,6 +250,7 @@ def _recorder(
     maximum_cost_usd: float = 10.0,
     stop_on_overspend: bool = False,
     maximum_steps: int = 2,
+    retry_pricing_unavailable: bool = False,
     maximum_rollout_output_tokens: int = 1_000_000,
     output_limit: int | None = 16_000,
     world_model_json_object_output: bool = False,
@@ -272,6 +274,7 @@ def _recorder(
         active_input_price: Active catalog input price for secure reservation tests.
         maximum_cost_usd: Reconciled provider-spend ceiling for the recorded cell.
         stop_on_overspend: Fail before the next paid dispatch once spend reaches the ceiling.
+        retry_pricing_unavailable: Whether the caller owns explicitly uncapped authorization.
         output_limit: Published candidate and world output limit, or ``None``.
         world_model_json_object_output: Explicit frozen world-only JSON output control.
         maximum_transition_attempts: Permitted simulator replies for the same candidate turn.
@@ -345,6 +348,7 @@ def _recorder(
         maximum_cost_usd=maximum_cost_usd,
         stop_on_overspend=stop_on_overspend,
         maximum_steps=maximum_steps,
+        retry_pricing_unavailable=retry_pricing_unavailable,
         maximum_rollout_output_tokens=maximum_rollout_output_tokens,
         maximum_output_tokens=16_000,
         world_model_json_object_output=world_model_json_object_output,
@@ -682,7 +686,10 @@ def test_recorder_persists_estimated_cost_for_native_candidate_and_world_usage()
 
 
 @pytest.mark.parametrize("role", ["candidate", "world"])
-def test_unpriceable_paid_response_is_retained_before_recorder_failure(role: str) -> None:
+@pytest.mark.parametrize("uncapped", [False, True])
+def test_unpriceable_paid_response_is_retained_before_recorder_failure(
+    role: str, uncapped: bool
+) -> None:
     """Unknown full-schedule valuation keeps paid text and usage, never an unrelated price."""
     card = GatewayTokenPrices(
         input_nano_usd_per_million_tokens=1_000_000_000,
@@ -711,10 +718,16 @@ def test_unpriceable_paid_response_is_retained_before_recorder_failure(role: str
     candidate = _ScriptedClient([_response("paid candidate", model=_snapshot("candidate-a"))])
     world = _ScriptedClient([_response("paid world", model=_snapshot("world-model-a"))])
     recorder = _recorder(
-        candidate, world, candidate_request=reservations[0], world_request=reservations[1]
+        candidate,
+        world,
+        candidate_request=reservations[0],
+        world_request=reservations[1],
+        retry_pricing_unavailable=uncapped,
     )
-    with pytest.raises(TextSimulationError):
+    with pytest.raises(TextSimulationError) as raised:
         recorder.complete(ModelRequest(messages=(ModelMessage(role="user", content="Help."),)))
+    assert isinstance(raised.value.__cause__, ProviderPricingUnavailableError)
+    assert raised.value.failure.retryable is uncapped
     recorded = recorder.recorded
     spans = recorded.candidate_spans if role == "candidate" else recorded.world_model_spans
     economics = (

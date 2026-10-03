@@ -10,8 +10,6 @@ from datetime import datetime
 from threading import Lock
 from typing import TYPE_CHECKING, cast
 
-from pydantic import JsonValue
-
 from exp.common.core.artifacts import (
     FailureAttribution,
     FailureCode,
@@ -38,7 +36,6 @@ from exp.common.models import (
 )
 from exp.common.models.catalog_prices import GatewayTokenPrices
 from exp.common.rollouts import (
-    UNKNOWN_DISPATCH_RESERVED_COST_KEY,
     RolloutEventKind,
     RolloutSpan,
     StopReason,
@@ -47,10 +44,9 @@ from exp.common.rollouts.checkpoint import TextRolloutCheckpoint
 from exp.common.tasks import TaskCase
 from exp.runtime.environments import Observation
 from exp.runtime.models import ResolvedModel
-from exp.runtime.models.providers.errors import ProviderRefusalError, ProviderRetryableResponseError
-from exp.runtime.models.providers.transport import classify_retry
 from exp.simulation.engines.clock import timestamp
 from exp.simulation.engines.text.environment import SimulatedToolUseError
+from exp.simulation.engines.text.errors import provider_call_failure
 from exp.simulation.engines.text.grounding import estimate_retrieval_economics
 from exp.simulation.engines.text.prompt import (
     SimulatedToolResult,
@@ -110,6 +106,7 @@ class RecordingCandidateClient:
         maximum_cost_usd: float,
         stop_on_overspend: bool,
         maximum_steps: int,
+        retry_pricing_unavailable: bool = False,
         maximum_rollout_output_tokens: int = 1_000_000,
         maximum_output_tokens: int,
         world_model_json_object_output: bool = False,
@@ -133,6 +130,7 @@ class RecordingCandidateClient:
             stop_on_overspend: When true, reconciled spend reaching the ceiling blocks the
                 next dispatch; by default the authorized episode warns once and continues.
             maximum_steps: Maximum candidate model turns allowed in this episode.
+            retry_pricing_unavailable: Whether an uncapped ledger allows a fresh cell generation.
             maximum_output_tokens: Per-call output budget used without silent truncation.
             world_model_json_object_output: Frozen provider JSON mode for simulation responses.
             maximum_transition_attempts: Bounded simulator attempts for each candidate action.
@@ -154,6 +152,7 @@ class RecordingCandidateClient:
         self._maximum_cost_usd = maximum_cost_usd
         self._stop_on_overspend = stop_on_overspend
         self._maximum_steps = maximum_steps
+        self._retry_pricing_unavailable = retry_pricing_unavailable
         self._maximum_rollout_output_tokens = maximum_rollout_output_tokens
         self._maximum_output_tokens = maximum_output_tokens
         self._world_model_json_object_output = world_model_json_object_output
@@ -292,24 +291,11 @@ class RecordingCandidateClient:
             self._failure = self._failure or exc
             raise
         except Exception as exc:  # noqa: BLE001 - provider exceptions become durable episode evidence
-            classification = classify_retry(exc)
-            details: dict[str, JsonValue] = {
-                "phase": "candidate_or_world_model",
-                "retry_classification": classification.reason,
-            }
-            if self._provider_dispatch_unknown_spend:
-                details["provider_dispatch_unknown_spend"] = True
-                reserved = self._unknown_dispatch_reserved_cost_usd
-                if reserved is not None:
-                    details[UNKNOWN_DISPATCH_RESERVED_COST_KEY] = reserved
-            failure = StructuredFailure(
-                code=FailureCode.PROVIDER,
-                message=f"text simulation provider call failed with {type(exc).__name__}",
-                retryable=classification.retryable
-                or isinstance(exc, (ProviderRefusalError, ProviderRetryableResponseError)),
-                exception_type=type(exc).__name__,
-                attribution=FailureAttribution.MODEL,
-                details=details,
+            failure = provider_call_failure(
+                exc,
+                retry_pricing_unavailable=self._retry_pricing_unavailable,
+                unknown_spend=self._provider_dispatch_unknown_spend,
+                reserved_cost_usd=self._unknown_dispatch_reserved_cost_usd,
             )
             text_error = TextSimulationError(StopReason.FAILURE, failure)
             self._failure = self._failure or text_error

@@ -28,8 +28,35 @@ from exp.common.models.catalog_prices import (
     GatewayServiceTierPrices,
     GatewayTokenPrices,
 )
+from exp.common.models.pricing import ProviderPricingUnavailableError
 from exp.common.models.token_cost_test import prices
 from exp.common.project import ProjectConfig, ProjectStore
+
+
+@pytest.mark.parametrize("invalid", ["attempts", "input", "measured_cost"])
+def test_invalid_evidence_is_not_retryable_pricing_unavailability(invalid: str) -> None:
+    """Missing subset meters cannot mask invalid bounds as a fresh-generation signal."""
+    reservation = completion_cost_reservation(
+        model=_model(),
+        token_prices=prices(),
+        input_usd_per_million_tokens=1,
+        output_usd_per_million_tokens=4,
+        cached_input_usd_per_million_tokens=0.1,
+        cache_write_usd_per_million_tokens=2,
+        maximum_attempts=1,
+        maximum_input_tokens=100,
+        maximum_output_tokens=20,
+    )
+    economics = OperationEconomics(
+        usage=Usage(input_tokens=101 if invalid == "input" else 10, output_tokens=5),
+        provider_attempts=2 if invalid == "attempts" else 1,
+        cost_usd=NumericMeasurement(value=1, provenance="observed")
+        if invalid == "measured_cost"
+        else None,
+    )
+    with pytest.raises(ValueError) as raised:
+        reconcile_completion_economics(reservation, economics)
+    assert not isinstance(raised.value, ProviderPricingUnavailableError)
 
 
 def test_pricing_snapshot_replay_reuses_original_materialization_time(tmp_path: Path) -> None:
