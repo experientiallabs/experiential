@@ -29,6 +29,8 @@ def test_historical_zero_attempt_failure_migrates_without_a_certificate(tmp_path
     ledger.finish_request(authorization=original, failure=failure)
     close_idle_connections()
     with sqlite3.connect(tmp_path / "gateway.db") as connection:
+        connection.execute("ALTER TABLE gateway_requests DROP COLUMN user_agent")
+        connection.execute("ALTER TABLE gateway_requests DROP COLUMN client_app")
         connection.execute("ALTER TABLE gateway_requests DROP COLUMN failed_without_effects")
         connection.execute("PRAGMA user_version = 25")
     restored = SQLiteAttemptLedger(tmp_path / "gateway.db", clock=clock)

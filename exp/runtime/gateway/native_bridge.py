@@ -22,6 +22,7 @@ from collections.abc import Callable
 
 from exp.common.core.artifacts import JsonObject
 from exp.runtime.gateway.attempt_tokens import counted_input_tokens
+from exp.runtime.gateway.client_apps import with_client_identity
 from exp.runtime.gateway.contracts import (
     AuthorizationSnapshot,
     DirectTarget,
@@ -303,8 +304,7 @@ class NativeControlPlane(
         Args:
             argument: JSON object with ``raw_key``, ``body`` (raw request
                 body text), optional ``surface`` (``"chat"`` or
-                ``"responses"``, defaulting to chat), and optional
-                ``app_referer``/``app_title`` caller app identity.
+                ``"responses"``, defaulting to chat), and caller app headers.
 
         Returns:
             The ordered certified ``route`` with dispatch and retry configuration,
@@ -329,7 +329,6 @@ class NativeControlPlane(
         request = decoded.request
         deadline = time.monotonic() + self._request_timeout_seconds
         try:
-            # Freeze native app attribution and the trusted client IP onto caller authority.
             authorization = self._components.store.authorize_request(
                 raw_key=data["raw_key"],
                 alias=decoded.alias,
@@ -340,6 +339,7 @@ class NativeControlPlane(
                 client_ip=optional_text(data.get("client_ip")),
             )
             authorization = authorize_serving_model_chains(self._components, authorization)
+            authorization = with_client_identity(authorization, data)  # reporting-only app facts
         except Exception as exc:  # noqa: BLE001 - boundary sanitizes every failure.
             mapped = _authority_error(exc)
             pointer = self._batch_pointer_error(alias=decoded.alias, mapped=mapped)

@@ -196,6 +196,27 @@ pub(crate) fn client_ip(headers: &HeaderMap) -> Option<String> {
         .map(str::to_string)
 }
 
+/// Caller app identity headers forwarded to admission, decoded latin-1 like every other
+/// header: OpenRouter's `HTTP-Referer` and `X-Title`, the `User-Agent`, and Codex's
+/// `originator`. They are content-free reporting inputs for per-agent usage attribution and
+/// never authorize anything. Absent headers are forwarded as JSON null.
+const APP_IDENTITY_HEADERS: [(&str, &str); 4] = [
+    ("app_referer", "http-referer"),
+    ("app_title", "x-title"),
+    ("user_agent", "user-agent"),
+    ("originator", "originator"),
+];
+
+/// Add the caller app identity fields to one admission argument object.
+pub(crate) fn with_app_identity(argument: &mut Value, headers: &HeaderMap) {
+    if let Value::Object(fields) = argument {
+        for (field, header) in APP_IDENTITY_HEADERS {
+            let value = latin1_header(headers, header).map_or(Value::Null, Value::String);
+            fields.insert(field.to_string(), value);
+        }
+    }
+}
+
 /// Read one request body under the shared explicit cap.
 pub(crate) async fn read_body(body: Body) -> Result<Bytes, PublicError> {
     axum::body::to_bytes(body, MAXIMUM_REQUEST_BODY_BYTES)
@@ -533,5 +554,39 @@ mod tests {
         headers.append("x-real-ip", "   ".parse().unwrap());
         headers.append("x-forwarded-for", "203.0.113.7, ".parse().unwrap());
         assert_eq!(client_ip(&headers).as_deref(), Some("203.0.113.7"));
+    }
+
+    #[test]
+    fn app_identity_forwards_every_attribution_header() {
+        let mut headers = HeaderMap::new();
+        headers.append(
+            "user-agent",
+            "claude-cli/2.1.278 (external, cli)".parse().unwrap(),
+        );
+        headers.append("x-title", "Hermes Agent".parse().unwrap());
+        headers.append(
+            "http-referer",
+            "https://hermes-agent.nousresearch.com".parse().unwrap(),
+        );
+        headers.append("originator", "codex_cli_rs".parse().unwrap());
+        let mut argument = serde_json::json!({"raw_key": "k", "body": "{}"});
+        with_app_identity(&mut argument, &headers);
+        assert_eq!(argument["user_agent"], "claude-cli/2.1.278 (external, cli)");
+        assert_eq!(argument["app_title"], "Hermes Agent");
+        assert_eq!(
+            argument["app_referer"],
+            "https://hermes-agent.nousresearch.com"
+        );
+        assert_eq!(argument["originator"], "codex_cli_rs");
+        assert_eq!(argument["raw_key"], "k");
+    }
+
+    #[test]
+    fn app_identity_forwards_absent_headers_as_null() {
+        let mut argument = serde_json::json!({"raw_key": "k"});
+        with_app_identity(&mut argument, &HeaderMap::new());
+        for field in ["user_agent", "app_title", "app_referer", "originator"] {
+            assert!(argument[field].is_null(), "{field} should be null");
+        }
     }
 }

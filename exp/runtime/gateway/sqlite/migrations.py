@@ -16,7 +16,7 @@ from exp.runtime.gateway.sqlite.nano_usd_migration import (
     migrate_money_to_nano_usd,
 )
 
-SCHEMA_VERSION = 26
+SCHEMA_VERSION = 27
 
 
 class GatewaySchemaError(RuntimeError):
@@ -744,6 +744,10 @@ _MIGRATIONS: dict[int, tuple[MigrationStep, ...]] = {
     26: (
         "ALTER TABLE gateway_requests ADD COLUMN failed_without_effects INTEGER NOT NULL "
         "DEFAULT 0 CHECK (failed_without_effects IN (0, 1))",
+    ),
+    27: (  # content-free calling-application attribution (client_apps.py)
+        "ALTER TABLE gateway_requests ADD COLUMN client_app TEXT",
+        "ALTER TABLE gateway_requests ADD COLUMN user_agent TEXT",
     ),
     24: (  # plan sign-in kind: part of the connection identity digest, so it rides the revision
         "ALTER TABLE provider_connection_revisions ADD COLUMN subscription TEXT "

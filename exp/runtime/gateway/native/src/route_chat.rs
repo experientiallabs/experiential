@@ -28,6 +28,7 @@ use crate::replay::{CachedResponse, Claim, OwnerLease, ReplayKey};
 use crate::respond::{
     bearer_key, cached_response, client_ip, complete_visible_refusal, error_response,
     escalation_error, json_response, latin1_header, read_body, sse_body_response,
+    with_app_identity,
 };
 use crate::server::AppState;
 use crate::settlement::{settle_guarded_failure, AttemptGuard};
@@ -116,14 +117,16 @@ pub(crate) async fn chat(
         }
     }
 
-    let admit_argument = compact_json(&json!({
+    let mut admit_value = json!({
         "raw_key": raw_key,
         "body": body_text,
         "idempotency_key": idempotency_key,
         "client_request_id": client_request_id,
         "client_ip": client_ip(&headers),
         "capture_session_id": crate::capture::session_id(&headers),
-    }));
+    });
+    with_app_identity(&mut admit_value, &headers);
+    let admit_argument = compact_json(&admit_value);
     let admission_text = match state.bridge.call("admit", admit_argument).await {
         Ok(text) => text,
         Err(error) => {

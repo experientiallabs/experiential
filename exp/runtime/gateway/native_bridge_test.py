@@ -5226,6 +5226,43 @@ def test_admit_persists_caller_app_identity_for_attribution(tmp_path: Path) -> N
     assert row == ("https://app.example.com", "Example App")
 
 
+def test_admit_classifies_and_persists_the_calling_app(tmp_path: Path) -> None:
+    """Forwarded User-Agent and app headers classify the caller onto the durable request."""
+    control, raw_key = _control_plane(tmp_path)
+    attempt_ids: dict[str, str] = {}
+    for label, headers in {
+        "claude": {"user_agent": "claude-cli/2.1.278 (external, cli)"},
+        "hermes": {"user_agent": "OpenAI/Python 2.8.1", "app_title": "Hermes Agent"},
+        "unknown": {"user_agent": "python-httpx/0.28.1"},
+        "absent": {},
+    }.items():
+        admission = json.loads(
+            control.admit(json.dumps({"raw_key": raw_key, "body": _chat_body(), **headers}))
+        )
+        attempt_ids[label] = str(_flatten_started(control, admission)["attempt_id"])
+
+    ledger = cast("SQLiteAttemptLedger", control._components.ledger)  # noqa: SLF001
+    with sqlite3.connect(ledger.database_path) as connection:
+        rows = {
+            label: connection.execute(
+                """
+                SELECT r.client_app, r.user_agent
+                FROM gateway_requests AS r
+                JOIN gateway_attempts AS a ON a.request_id = r.request_id
+                WHERE a.attempt_id = ?
+                """,
+                (attempt_id,),
+            ).fetchone()
+            for label, attempt_id in attempt_ids.items()
+        }
+    assert rows == {
+        "claude": ("claude_code", "claude-cli/2.1.278 (external, cli)"),
+        "hermes": ("hermes", "OpenAI/Python 2.8.1"),
+        "unknown": (None, "python-httpx/0.28.1"),
+        "absent": (None, None),
+    }
+
+
 class _HostedComponents:
     """Hosted-shaped components: no group-commit writer, sync ledger only.
 
