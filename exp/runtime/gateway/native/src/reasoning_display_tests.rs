@@ -246,3 +246,27 @@ fn messages_text_only_counts_readable_forms_the_rung_shows() {
     };
     assert_eq!(unsigned_thinking_text(&thinking, DISPLAYED), None);
 }
+
+#[test]
+fn messages_aggregate_keeps_interleaved_reasoning_in_provider_order() {
+    let events = vec![
+        Event::ReasoningTextDelta("first".to_string()),
+        Event::TextDelta("partial ".to_string()),
+        Event::ReasoningTextDelta("second".to_string()),
+        Event::TextDelta("answer".to_string()),
+        Event::Completed,
+    ];
+    let body =
+        completed_messages_body_with_reasoning("request-1", "m", &events, &[], None, DISPLAYED)
+            .unwrap()
+            .body;
+    assert_eq!(
+        body["content"],
+        json!([
+            {"type": "thinking", "thinking": "first", "signature": ""},
+            {"type": "text", "text": "partial "},
+            {"type": "thinking", "thinking": "second", "signature": ""},
+            {"type": "text", "text": "answer"},
+        ])
+    );
+}
