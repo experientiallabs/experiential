@@ -9,10 +9,12 @@ import pytest
 from exp.runtime.anthropic_protocol.gateway_reasoning import (
     EMPTY_GATEWAY_BLOCK,
     gateway_reasoning_block,
+    merge_exposed_reasoning,
 )
 from exp.runtime.gateway.contracts import (
     ExposedReasoningContentBlock,
     SealedReasoningContentBlock,
+    ThinkingBlock,
 )
 from exp.runtime.openai_protocol.errors import OpenAIProtocolError
 
@@ -53,3 +55,19 @@ def test_carrier_prefixed_redacted_thinking_is_the_sealed_carrier() -> None:
         gateway_reasoning_block(
             _Redacted(data="x-experiential-hunyuan-reasoning-v1:broken"), "messages.1.content.2"
         )
+
+
+def test_exposed_slices_concatenate_in_place_and_other_blocks_keep_order() -> None:
+    """Exposed slices fold into one block at the first slice's position."""
+    signed = ThinkingBlock(text="anthropic", signature="sig==")
+    first = ExposedReasoningContentBlock(content="one ")
+    second = ExposedReasoningContentBlock(content="two")
+    merged = merge_exposed_reasoning([first, signed, second], "messages.1.content")
+    assert merged[1] is signed
+    assert [block.kind for block in merged] == ["exposed_reasoning_content", "thinking"]
+    assert isinstance(merged[0], ExposedReasoningContentBlock)
+    assert merged[0].content == "one two"
+    assert merge_exposed_reasoning([first], "p") == [first]
+    half = ExposedReasoningContentBlock(content="x" * (4 * 1024 * 1024 + 1))
+    with pytest.raises(OpenAIProtocolError, match="8,388,608"):
+        merge_exposed_reasoning([half, half], "p")

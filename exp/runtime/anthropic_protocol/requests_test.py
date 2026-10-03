@@ -21,7 +21,7 @@ from exp.runtime.gateway.contracts import (
 from exp.runtime.models.providers.base import GatewayWireProfile
 from exp.runtime.models.providers.errors import ProviderParameterError
 from exp.runtime.models.providers.streaming_requests import route_generation_parameter_requests
-from exp.runtime.models.providers.wire_messages import anthropic_blocks
+from exp.runtime.models.providers.wire_messages import anthropic_blocks, openai_chat_message
 from exp.runtime.openai_protocol.errors import OpenAIProtocolError
 
 _PNG_BASE64 = (
@@ -2011,6 +2011,77 @@ def test_unsigned_thinking_block_decodes_as_gateway_plaintext_reasoning() -> Non
         )
     )
     assert empty.request.messages[1].provider_reasoning == ()
+
+
+def test_split_unsigned_thinking_blocks_fold_into_one_chat_carrier() -> None:
+    """Several unsigned thinking blocks in one assistant turn replay as one block.
+
+    The Messages encoder opens a fresh unsigned thinking block whenever an
+    exposed rung's display reasoning resumes after text or a tool_use, so a
+    client echoing the turn sends interleaved slices of one reasoning_content.
+    They concatenate in order, so the Chat wire builder, which carries exactly
+    one plaintext reasoning per assistant message, forwards the whole text.
+    """
+    decoded = decode_messages(
+        _body(
+            messages=[
+                {"role": "user", "content": "go"},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "thinking", "thinking": "first, ", "signature": ""},
+                        {"type": "text", "text": "Looking."},
+                        {"type": "thinking", "thinking": "", "signature": ""},
+                        {"type": "thinking", "thinking": "then list", "signature": ""},
+                        {"type": "tool_use", "id": "call-1", "name": "lookup", "input": {}},
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "tool_result", "tool_use_id": "call-1", "content": "done"}
+                    ],
+                },
+            ]
+        )
+    )
+    assistant = decoded.request.messages[1]
+    assert [block.kind for block in assistant.provider_reasoning] == ["exposed_reasoning_content"]
+    exposed = assistant.provider_reasoning[0]
+    assert isinstance(exposed, ExposedReasoningContentBlock)
+    assert exposed.content == "first, then list"
+    payload = openai_chat_message(assistant, reasoning_output_exposed=True)
+    assert payload["reasoning_content"] == "first, then list"
+
+    # Beside a sealed carrier every display slice stays capture-only.
+    sealed = decode_messages(
+        _body(
+            messages=[
+                {"role": "user", "content": "go"},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "thinking", "thinking": "a", "signature": ""},
+                        {"type": "text", "text": "Looking."},
+                        {"type": "thinking", "thinking": "b", "signature": ""},
+                        {"type": "tool_use", "id": "call-1", "name": "lookup", "input": {}},
+                        {"type": "redacted_thinking", "data": _CARRIER},
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "tool_result", "tool_use_id": "call-1", "content": "done"}
+                    ],
+                },
+            ]
+        )
+    ).request.messages[1]
+    assert [block.kind for block in sealed.provider_reasoning] == ["sealed_reasoning_content"]
+    assert [block.kind for block in sealed.capture_only_reasoning] == [
+        "exposed_reasoning_content",
+        "exposed_reasoning_content",
+    ]
 
 
 def test_redacted_thinking_carrying_a_gateway_carrier_decodes_sealed() -> None:

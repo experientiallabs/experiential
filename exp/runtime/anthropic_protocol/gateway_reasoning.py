@@ -14,12 +14,14 @@ Anthropic's own block, carried verbatim for its wire.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Protocol
 
 from pydantic import ValidationError
 
 from exp.runtime.gateway.contracts import (
     ExposedReasoningContentBlock,
+    ProviderReasoningBlock,
     SealedReasoningContentBlock,
 )
 from exp.runtime.gateway.reasoning_carrier import (
@@ -86,3 +88,45 @@ def gateway_reasoning_block(
             "redacted_thinking data is not a complete gateway reasoning carrier. Replay "
             "the block exactly as the gateway returned it.",
         ) from exc
+
+
+def merge_exposed_reasoning(
+    reasoning: Sequence[ProviderReasoningBlock], param: str
+) -> list[ProviderReasoningBlock]:
+    """Fold one assistant turn's unsigned thinking blocks into one plaintext block.
+
+    The Messages encoder opens a fresh unsigned ``thinking`` block whenever an
+    exposed rung's display reasoning resumes after a text or tool_use block,
+    so one assistant turn can replay several. They are consecutive slices of
+    the single ``reasoning_content`` the rung produced for that turn, and the
+    Chat wire carries exactly one, so they concatenate in caller order into
+    one block at the position of the first. Every other block keeps its place.
+
+    Args:
+        reasoning: The turn's decoded reasoning blocks, in caller order.
+        param: Public field path of the turn, for the rejection.
+
+    Returns:
+        The blocks with at most one ``exposed_reasoning_content`` block.
+
+    Raises:
+        OpenAIProtocolError: The concatenated text exceeds the block limit.
+    """
+    exposed = [block for block in reasoning if isinstance(block, ExposedReasoningContentBlock)]
+    if len(exposed) < 2:
+        return list(reasoning)
+    try:
+        merged = ExposedReasoningContentBlock(content="".join(block.content for block in exposed))
+    except ValidationError as exc:
+        raise invalid_field(
+            param,
+            "unsigned thinking text exceeds 8,388,608 characters. Shorten the "
+            "replayed thinking blocks and retry.",
+        ) from exc
+    folded: list[ProviderReasoningBlock] = []
+    for block in reasoning:
+        if not isinstance(block, ExposedReasoningContentBlock):
+            folded.append(block)
+        elif block is exposed[0]:
+            folded.append(merged)
+    return folded
