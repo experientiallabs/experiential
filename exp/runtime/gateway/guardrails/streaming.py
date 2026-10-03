@@ -1,4 +1,4 @@
-"""Incremental redaction of a streamed completion by a deterministic adapter.
+"""Streaming capabilities for deterministic redactors and context-bearing classifiers.
 
 A deterministic redactor decides about a prefix of a completion without
 seeing the rest of it, so a streamed completion does not have to be buffered
@@ -7,9 +7,9 @@ that makes that safe: the adapter names how much of the buffered tail is
 still undecided, everything before that point is redacted and released, and
 the tail stays buffered until more text arrives or the stream ends.
 
-The caller (the native data plane) owns the buffer. Every function here is
-pure, so a release decision can run on any control-plane worker thread
-without per-request state.
+The native data plane owns withheld events. Deterministic release helpers are
+pure; model-backed classifiers instead create request-owned sessions and inspect
+ordered output fragments through the engine's bounded executor.
 """
 
 from __future__ import annotations
@@ -58,7 +58,14 @@ class ClassifierOutputSession(Protocol):
     """A request-owned classifier capability run by the engine's bounded executor."""
 
     def inspect_output(self, output: GuardrailOutput) -> Awaitable[ClassifierVerdict]:
-        """Inspect new content using this request's context and return a content-free verdict."""
+        """Inspect new content using the exact request context retained by this session.
+
+        Args:
+            output: Ordered additions across visible content channels, held before release.
+
+        Returns:
+            A content-free verdict applied using the configured check action.
+        """
         ...
 
 
@@ -69,7 +76,16 @@ class IncrementalClassifier(Protocol):
     def open_output_session(
         self, *, request: GatewayRequest, check: GuardrailCheck
     ) -> Awaitable[ClassifierOutputSession | None]:
-        """Create fresh request state, or return None to require complete-output buffering."""
+        """Create fresh request state for one configured output check.
+
+        Args:
+            request: Complete normalized input after authenticated context expansion.
+            check: Immutable output check bound by the engine.
+
+        Returns:
+            A session, or None to require complete-output buffering. Calls may
+            execute on different isolation loops, so state must not own loop-bound I/O.
+        """
         ...
 
 

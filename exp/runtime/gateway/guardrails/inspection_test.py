@@ -215,15 +215,39 @@ def test_output_context_is_request_owned_and_spans_channels() -> None:
     assert engine.sessions[1].text == "marker"
 
 
+def test_output_coverage_does_not_reset_after_tool_search() -> None:
+    """A new context-bound adapter session preserves the same request-wide byte budget."""
+    engine = _Guard(max_response_bytes=20)
+    first, continued = _session(engine), _session(engine)
+    output = GuardrailOutput(
+        request_id="req",
+        fragments=(GuardrailFragment(kind="text", channel="t", text="a" * 10),),
+        final=False,
+    )
+    assert (
+        json.loads(output_decision(first, output, deadline_monotonic=time.monotonic() + 10))[
+            "action"
+        ]
+        == "allow"
+    )
+    continued.continue_request(first)
+    result = json.loads(
+        output_decision(continued, output, deadline_monotonic=time.monotonic() + 10)
+    )
+    assert result["failure"]["failure_class"] == "unsupported_capability"
+
+
 class _BlockingSession(_Session):
     """Keep a real isolation slot occupied until the test releases it."""
 
     def __init__(self) -> None:
+        """Create explicit start and release signals for the occupied worker."""
         super().__init__()
         self.started = threading.Event()
         self.finish = threading.Event()
 
     async def inspect_output(self, output: GuardrailOutput) -> ClassifierVerdict:
+        """Block until released even if the caller's deadline has already expired."""
         self.started.set()
         assert self.finish.wait(5)
         return ClassifierVerdict(flagged=False)
@@ -288,6 +312,7 @@ class _SlowFactoryGuard(_Guard):
     async def open_output_session(
         self, *, request: GatewayRequest, check: GuardrailCheck
     ) -> _Session:
+        """Delay session creation beyond the configured per-check budget."""
         await asyncio.sleep(1)
         return _Session()
 

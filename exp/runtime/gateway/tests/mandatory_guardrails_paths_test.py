@@ -23,7 +23,7 @@ from exp.runtime.gateway.management import GatewayManagement
 from exp.runtime.gateway.native_bridge import NativeControlPlane
 from exp.runtime.gateway.native_server import serve_native_gateway
 from exp.runtime.gateway.tests.launch_test import _unused_port
-from exp.runtime.gateway.tests.mandatory_guardrails_test import _Guard
+from exp.runtime.gateway.tests.mandatory_guardrails_test import _Guard, _Session
 from exp.runtime.gateway.tests.native_tool_search_test import (
     _configure,
     _search_call_turn,
@@ -49,6 +49,18 @@ class _RetrievedGuard(_Guard):
             "withhold-marker" in message.model_dump_json() for message in request.messages
         )
         return await super().inspect_input(request=request, check=check)
+
+
+class _ChangingGuard(_Guard):
+    """Expose a different buffering requirement after retrieval expands the context."""
+
+    async def open_output_session(
+        self, *, request: GatewayRequest, check: GuardrailCheck
+    ) -> _Session | None:
+        """Switch the required output capability only after a tool result is appended."""
+        if any(message.role == "tool" for message in request.messages):
+            return None if self.incremental else _Session()
+        return await super().open_output_session(request=request, check=check)
 
 
 @contextmanager
@@ -244,7 +256,7 @@ def test_precommit_and_synthesized_output_is_inspected_before_settlement(
     [("render", "responses")]
     + [
         (phase, surface)
-        for phase in ("query", "retrieved")
+        for phase in ("query", "retrieved", "capability-change")
         for surface in ("chat", "responses", "messages")
     ],
 )
@@ -283,13 +295,14 @@ def test_tool_search_is_inspected_before_execution_redial_and_rendering(
     worker.start()
     key = _configure(tmp_path, f"http://127.0.0.1:{provider.server_port}/v1")
     components = load_gateway_components(tmp_path, environment={"TEST_PROVIDER_KEY": "synthetic"})
-    policy = (
-        _RetrievedGuard(incremental=incremental)
-        if phase == "retrieved"
-        else _Guard(incremental=incremental)
+    guard_type = {"retrieved": _RetrievedGuard, "capability-change": _ChangingGuard}.get(
+        phase, _Guard
     )
+    policy = guard_type(incremental=incremental)
     control = NativeControlPlane(components, guardrails=policy)
-    description = "Current weather" + (" withhold-marker" if phase != "query" else "")
+    description = "Current weather" + (
+        " withhold-marker" if phase in {"retrieved", "render"} else ""
+    )
     function: JsonObject = {
         "name": "get_weather",
         "description": description,
@@ -337,9 +350,13 @@ def test_tool_search_is_inspected_before_execution_redial_and_rendering(
                 json=body,
                 timeout=10,
             )
-        assert response.status_code == 400, response.text
+        assert response.status_code == (503 if phase == "capability-change" else 400), response.text
         assert "withhold-marker" not in response.text
-        assert "blocked by a gateway guardrail" in response.text
+        assert (
+            "Content inspection changed"
+            if phase == "capability-change"
+            else "blocked by a gateway guardrail"
+        ) in response.text
         assert search.call_count == (0 if phase == "query" else 1)
         assert len(provider_requests) == (2 if phase == "render" else 1)
         if phase != "render":
@@ -353,6 +370,8 @@ def test_tool_search_is_inspected_before_execution_redial_and_rendering(
                 "withhold-marker" in request.messages[-1].model_dump_json()
                 for request in policy.requests
             )
+        elif phase == "capability-change":
+            assert len(policy.requests) >= 2
         elif incremental:
             assert any("withhold-marker" in session.text for session in policy.sessions)
         else:
@@ -362,7 +381,10 @@ def test_tool_search_is_inspected_before_execution_redial_and_rendering(
                 "select state, failure_class, input_tokens, output_tokens "
                 "from gateway_attempts order by rowid"
             ).fetchall()
-        assert attempts[-1][:2] == ("failed", "guardrail")
+        assert attempts[-1][:2] == (
+            "failed",
+            "unavailable" if phase == "capability-change" else "guardrail",
+        )
         assert attempts[0][2:] == (50, 8)
         assert len(attempts) == len(provider_requests)
     finally:

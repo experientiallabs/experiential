@@ -56,12 +56,43 @@ class GuardrailInspection:
         """Require the existing full-response path when any adapter needs complete output."""
         return any(session is None for _, session in self.sessions)
 
+    def continue_request(self, previous: GuardrailInspection) -> None:
+        """Retain coverage and the admitted release mode across a tool-search redial.
+
+        The fresh adapter context includes the expanded conversation. Native
+        delivery still uses the admission's frozen buffering mode, so a new
+        capability cannot silently switch a streamed response to complete-only
+        inspection after admission.
+
+        Args:
+            previous: Inspection state from this same admitted request before redial.
+
+        Raises:
+            GuardrailRejected: Policy or buffering requirements changed.
+        """
+        if self.policy != previous.policy or self.buffers_output != previous.buffers_output:
+            raise GuardrailRejected(
+                GatewayFailure(
+                    failure_class=GatewayFailureClass.UNAVAILABLE,
+                    safe_message="Content inspection changed during this request. Retry later.",
+                )
+            )
+        self.response_bytes = previous.response_bytes
+
     def inspect_output(self, output: GuardrailOutput, *, deadline_monotonic: float) -> None:
         """Run this segment through the shared asynchronous policy executor."""
         run_on_native_loop(self._inspect(output, deadline_monotonic=deadline_monotonic))
 
     async def _inspect(self, output: GuardrailOutput, *, deadline_monotonic: float) -> None:
-        """Apply request-wide bounds, incremental checks, and final complete-output checks."""
+        """Apply request-wide bounds and the configured output checks before release.
+
+        Args:
+            output: Ordered fragments from the native plane or a gateway-owned action.
+            deadline_monotonic: Original request deadline.
+
+        Raises:
+            GuardrailRejected: Coverage was exceeded or an engine check failed closed.
+        """
         self.response_bytes += sum(
             len(fragment.text.encode("utf-8"))
             + len(fragment.channel.encode("utf-8"))

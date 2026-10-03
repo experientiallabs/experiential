@@ -197,6 +197,7 @@ def test_customer_rewrite_cannot_erase_or_introduce_blocked_intent(blocked_stage
         async def inspect_input(
             self, *, request: GatewayRequest, check: GuardrailCheck
         ) -> ClassifierVerdict:
+            """Reject only the explicit synthetic marker while retaining observed input."""
             self.requests.append(request)
             return ClassifierVerdict(
                 flagged=any(message.content == "blocked intent" for message in request.messages)

@@ -134,6 +134,8 @@ class NativeToolSearchMixin:
                         safe_message="Content inspection changed during this request. Retry later.",
                     )
                 )
+            if session is not None and entry.guardrail_inspection is not None:
+                session.continue_request(entry.guardrail_inspection)
             entry.guardrail_inspection = session
         except GuardrailRejected as exc:
             return json.dumps(

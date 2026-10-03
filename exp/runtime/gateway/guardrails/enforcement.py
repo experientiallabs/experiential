@@ -197,6 +197,17 @@ class GuardrailEngine:
         Ordinary adapters retain complete-output enforcement. Adapters that
         implement the incremental capability share the same per-check deadlines,
         cancellation isolation, and decision metrics as complete-output checks.
+
+        Args:
+            authorization: Authenticated identity used for mandatory policy binding.
+            request: Full normalized provider-bound input.
+            deadline_monotonic: Absolute deadline shared with request execution.
+
+        Returns:
+            Request-owned output capabilities, or None when no output checks exist.
+
+        Raises:
+            GuardrailRejected: Input was blocked or a mandatory capability failed.
         """
         if self.mandatory_policy is None:
             return None
@@ -236,7 +247,18 @@ class GuardrailEngine:
         output: GuardrailOutput,
         deadline_monotonic: float,
     ) -> None:
-        """Run an incremental adapter through the same executor and recorder as any check."""
+        """Run an incremental adapter through the shared executor and decision recorder.
+
+        Args:
+            policy: Frozen mandatory policy bound to the admitted identity.
+            check: Output check whose action governs the verdict.
+            session: Request-owned adapter state.
+            output: Withheld additions to the request's generated content.
+            deadline_monotonic: Original request deadline.
+
+        Raises:
+            GuardrailRejected: The check blocked or failed closed.
+        """
         self.output_invocations += 1
 
         async def inspect() -> ClassifierVerdict:
