@@ -52,12 +52,17 @@ from exp.runtime.models import ModelConnectionError, RuntimeModelCatalog
 from exp.runtime.models.credentials import ModelCredentialError
 from exp.runtime.models.providers.base import GatewayWireProfile
 from exp.runtime.models.providers.cache_policy import cache_markers
-from exp.runtime.models.providers.errors import ProviderCapabilityError, ProviderParameterError
+from exp.runtime.models.providers.errors import (
+    ProviderCapabilityError,
+    ProviderParameterError,
+    normalized_provider_failure,
+)
 from exp.runtime.models.providers.openrouter_routing import (
     openrouter_cache_writes_within_reads,
     openrouter_chat_wire,
 )
 from exp.runtime.models.providers.protocol import GatewayDispatchSigner, NativeWireClient
+from exp.runtime.models.providers.transport import ProviderTransportError
 
 if TYPE_CHECKING:
     from exp.runtime.gateway.lifecycle import LocalGatewayComponents
@@ -559,15 +564,15 @@ def next_route_candidate(
     return claim_route_from(health, keys, current_depth + 1, depths) if depths else None
 
 
-# Resolve-time deadness that a frozen route narrows past at admission instead
-# of failing the whole request. A missing credential, connection drift, or
-# capability drift means the deployment cannot be dispatched right now; it is an
-# operational outage, not a request fault, so the route narrows past the rung
-# and the rung's health circuit is fed like any runtime failure so it recovers
-# automatically when it heals. Operator-*disabled* deployments never reach here:
-# the catalog drops a disabled deployment from the live route on its ~15s
-# refresh, so this path only ever sees operational deadness that should recover.
-_ADMISSION_DEAD_ERRORS = (ModelConnectionError, ModelCredentialError, ProviderCapabilityError)
+# Admission narrows past resolve-time credential, connection, capability, and profile
+# transport errors, feeding the runtime health circuit so each rung can recover.
+# Catalog refresh drops operator-disabled deployments before they reach this path.
+_ADMISSION_DEAD_ERRORS = (
+    ModelConnectionError,
+    ModelCredentialError,
+    ProviderCapabilityError,
+    ProviderTransportError,
+)
 
 
 @dataclass(frozen=True)
@@ -728,14 +733,11 @@ def dispatchable_route_profiles(
 
 
 def _admission_dead_failure(exc: Exception) -> GatewayFailure:
-    """Classify one admission-time deadness into a health-circuit failure.
+    """Classify admission deadness for the shared health circuit.
 
-    A missing credential mirrors a runtime auth rejection (a hard failure that
-    opens the circuit at once); a connection or capability drift mirrors a
-    runtime transport failure (an operational failure that opens after the
-    circuit threshold). Both stay honest by feeding the same circuit that
-    runtime failures do, so recovery is the existing cooldown plus half-open
-    probe and never a permanent blacklist.
+    Credential and profile transport failures retain runtime classification.
+    Connection and capability drift behave as transport failures. Recovery uses
+    the existing cooldown and half-open probe, never a permanent blacklist.
     """
     match exc:
         case ModelCredentialError():
@@ -746,6 +748,8 @@ def _admission_dead_failure(exc: Exception) -> GatewayFailure:
                     "failing over to the next deployment"
                 ),
             )
+        case ProviderTransportError():
+            return normalized_provider_failure(exc)
         case _:
             return GatewayFailure(
                 failure_class=GatewayFailureClass.TRANSPORT,
