@@ -139,7 +139,7 @@ fn fireworks_chat_reasoning_round_trips_only_as_sealed_carrier() {
 fn exposed_tool_reasoning_is_plaintext_not_concatenated_with_a_carrier() {
     let events = fireworks_tool_events();
     let mut stream = ChatSseEncoder::new_with_ignored("request", "model", 1, false, vec![]);
-    stream.set_reasoning_output_exposed(true);
+    stream.set_reasoning_output(true.into());
     stream.set_reasoning_content_carrier("opaque-carrier".into());
     let mut frames = stream.start().unwrap();
     for event in &events {
@@ -309,7 +309,7 @@ fn exposed_rung_returns_plaintext_reasoning_without_a_carrier() {
         false,
         Vec::new(),
     );
-    exposed.set_reasoning_output_exposed(true);
+    exposed.set_reasoning_output(true.into());
     let mut frames = exposed.start().expect("stream start must encode");
     for event in &events {
         frames.extend(exposed.feed(event).expect("event must encode"));

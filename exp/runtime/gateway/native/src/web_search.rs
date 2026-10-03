@@ -19,6 +19,7 @@ use crate::encode_messages::{
 };
 use crate::errors::PublicError;
 use crate::events::{CompletedToolCall, Event};
+use crate::reasoning_display::ReasoningOutput;
 
 /// The Anthropic server tool name the synthesized blocks carry.
 pub const WEB_SEARCH_TOOL_NAME: &str = "web_search";
@@ -351,7 +352,7 @@ pub fn completed_messages_body_with_web_search(
     events: &[Event],
     ignored_parameters: &[String],
     reasoning_content_carrier: Option<&str>,
-    reasoning_output_exposed: bool,
+    reasoning_output: impl Into<ReasoningOutput>,
     web_search: Option<&WebSearchAdmission>,
 ) -> Result<AggregatedMessage, PublicError> {
     let Some(web_search) = web_search else {
@@ -361,7 +362,7 @@ pub fn completed_messages_body_with_web_search(
             events,
             ignored_parameters,
             reasoning_content_carrier,
-            reasoning_output_exposed,
+            reasoning_output,
         );
     };
     let mut prefixed = web_search_prelude_events(web_search, request_id);
@@ -372,7 +373,7 @@ pub fn completed_messages_body_with_web_search(
         &prefixed,
         ignored_parameters,
         reasoning_content_carrier,
-        reasoning_output_exposed,
+        reasoning_output,
     )?;
     let provider_searched = events.iter().any(|event| {
         matches!(event, Event::ServerToolUseCompleted { call, .. } if call.name == WEB_SEARCH_TOOL_NAME)

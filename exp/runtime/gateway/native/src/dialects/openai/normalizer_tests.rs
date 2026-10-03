@@ -142,11 +142,11 @@ fn compatible_reasoning_content_requires_fireworks_route_authority() {
         }] if route == &route_sha256 && delta == "provider private"
     ));
 
-    let mut generic = Normalizer::new(Dialect::OpenAiCompatible);
-    assert!(generic
+    // Without a route the plaintext is display copy, never route reasoning.
+    let events = Normalizer::new(Dialect::OpenAiCompatible)
         .feed(&frame)
-        .expect("generic compatible extension is ignored")
-        .is_empty());
+        .unwrap();
+    assert!(matches!(events.as_slice(), [Event::ReasoningTextDelta(d)] if d == "provider private"));
 }
 
 #[test]

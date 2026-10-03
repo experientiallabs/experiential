@@ -144,8 +144,16 @@ def test_opus_55_thinking_rule_does_not_claim_unknown_releases(model_id: str) ->
         "claude-fable-5-1",
     ),
 )
-def test_omitted_thinking_and_effort_stay_omitted_on_wire(model_id: str) -> None:
-    """A catalog default does not opt an unspecified request into reasoning."""
+def test_omitted_thinking_stays_adaptive_with_a_summarized_display_and_no_effort(
+    model_id: str,
+) -> None:
+    """An unspecified request on a default-thinking generation asks to see its reasoning.
+
+    These generations already think adaptively when the request omits
+    ``thinking``, so the payload states that mode with a ``summarized``
+    display. The catalog default still does not opt the request into an
+    effort, so no ``output_config`` is sent.
+    """
     profile = _anthropic_profile(model_id)
     request = GatewayRequest(
         surface=GatewayApiSurface.MESSAGES,
@@ -154,7 +162,7 @@ def test_omitted_thinking_and_effort_stay_omitted_on_wire(model_id: str) -> None
     )
     _, provider = route_generation_parameter_requests((profile,), request)
     payload = dialect_stream_payload(profile, provider)
-    assert "thinking" not in payload
+    assert payload["thinking"] == {"type": "adaptive", "display": "summarized"}
     assert "output_config" not in payload
 
 

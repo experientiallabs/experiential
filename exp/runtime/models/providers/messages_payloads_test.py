@@ -135,7 +135,7 @@ def test_other_releases_force_tools_verbatim_under_adaptive_thinking() -> None:
         maximum_output_tokens=128_000,
     )
     assert payload["tool_choice"] == {"type": "any"}
-    assert payload["thinking"] == {"type": "adaptive"}
+    assert payload["thinking"] == {"type": "adaptive", "display": "summarized"}
     named = anthropic_messages_stream_payload(
         "claude-sonnet-4-6",
         _tool_request(tool_choice=GatewayNamedToolChoice(name="lookup")),
@@ -372,3 +372,56 @@ def test_a_marker_on_a_collapsed_assistant_turn_moves_to_a_neighboring_block() -
         {"type": "text", "text": " \n", "cache_control": {"type": "ephemeral"}},
         {"type": "tool_use", "id": "call-1", "name": "lookup", "input": {}},
     ]
+
+
+def _plain_request(**overrides: object) -> GatewayRequest:
+    """Build one streaming Messages request with no tools or reasoning controls."""
+    request = GatewayRequest(
+        surface=GatewayApiSurface.MESSAGES,
+        messages=(GatewayMessage(role="user", content="hi"),),
+        stream=True,
+        include_usage=True,
+    )
+    return request.model_copy(update=dict(overrides))
+
+
+def test_an_explicit_caller_display_is_kept_verbatim() -> None:
+    """A caller who chose ``omitted`` keeps it; the summarized default never overrides."""
+    config: JsonObject = {"type": "adaptive", "display": "omitted"}
+    payload = anthropic_messages_stream_payload(
+        "claude-opus-5",
+        _plain_request(provider_thinking_config=config),
+        supports_reasoning=True,
+        maximum_output_tokens=128_000,
+    )
+    assert payload["thinking"] == {"type": "adaptive", "display": "omitted"}
+
+
+@pytest.mark.parametrize("model_id", ("claude-opus-4-7", "claude-opus-4-8"))
+def test_generations_that_skip_thinking_without_a_config_gain_no_thinking(model_id: str) -> None:
+    """Opus 4.7 and 4.8 run without thinking when none is asked, so none is added."""
+    payload = anthropic_messages_stream_payload(
+        model_id,
+        _plain_request(),
+        supports_reasoning=True,
+        maximum_output_tokens=128_000,
+    )
+    assert "thinking" not in payload
+
+
+@pytest.mark.parametrize(
+    "config",
+    (
+        {"type": "between_tools"},
+        {"type": "disabled"},
+    ),
+)
+def test_display_free_thinking_configs_stay_untouched(config: JsonObject) -> None:
+    """Configs that take no display reach the wire exactly as the caller sent them."""
+    payload = anthropic_messages_stream_payload(
+        "claude-opus-5",
+        _plain_request(provider_thinking_config=config),
+        supports_reasoning=True,
+        maximum_output_tokens=128_000,
+    )
+    assert payload["thinking"] == config

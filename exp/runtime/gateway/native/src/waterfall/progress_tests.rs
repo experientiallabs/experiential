@@ -610,3 +610,22 @@ fn visible_output_then_pings_is_terminal_not_a_second_dispatch() {
         assert_eq!(harness.story().await["counts"], json!([1, 0]));
     });
 }
+
+#[test]
+fn unrouted_reasoning_waits_for_output_then_leads_the_prefix_coalesced() {
+    block_on(async {
+        let primary = paced_rung(vec![REASONING, REASONING_ALIAS, TEXT, DONE]).await;
+        let harness = Harness::new();
+        let mut rung = private_wire(&primary);
+        rung.fireworks_reasoning_route_sha256 = None;
+        let (won, _guard) = harness.run(&[rung], None, Duration::from_secs(3)).await;
+        let Won::Committed(committed) = won else {
+            panic!("visible text commits the attempt")
+        };
+        assert!(matches!(
+            committed.prefix.as_slice(),
+            [Event::ReasoningTextDelta(held), Event::TextDelta(text)]
+                if held == "private thoughtprivate thought" && text == "answer"
+        ));
+    });
+}

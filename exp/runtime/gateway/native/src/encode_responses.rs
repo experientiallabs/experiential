@@ -334,6 +334,7 @@ impl ResponsesSseEncoder {
                 self.reasoning_summary_delta(*index, 0, &item_id, delta)
             }
             Event::GeminiThoughtPart(_) => Ok(Vec::new()),
+            Event::ReasoningTextDelta(delta) => self.displayed_reasoning(delta),
             Event::ThinkingSignature { .. } | Event::RedactedThinking { .. } => Ok(Vec::new()),
             Event::ReasoningContentDelta {
                 route_sha256,

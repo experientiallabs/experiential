@@ -485,3 +485,48 @@ def test_replayed_message_strips_only_output_text_probabilities() -> None:
     assert isinstance(first, dict) and "logprobs" not in first
     assert isinstance(second, dict)
     assert second.get("logprobs") == {"customer": "keep"}
+
+
+def _reasoning_request(**overrides: object) -> GatewayRequest:
+    """Build one streaming Responses request for reasoning-summary checks."""
+    request = GatewayRequest(
+        surface=GatewayApiSurface.RESPONSES,
+        messages=(GatewayMessage(role="user", content="go"),),
+        stream=True,
+        include_usage=True,
+    )
+    return request.model_copy(update=dict(overrides))
+
+
+def test_a_caller_summary_wins_over_the_auto_default() -> None:
+    """The caller's ``detailed`` selector forwards instead of the ``auto`` default."""
+    payload = openai_responses_stream_payload(
+        "gpt-5.6-luna",
+        _reasoning_request(reasoning_effort="high", reasoning_summary="detailed"),
+        supports_temperature=False,
+        supports_reasoning=True,
+    )
+    assert payload["reasoning"] == {"effort": "high", "summary": "detailed"}
+
+
+def test_a_reasoning_route_with_no_effort_still_asks_for_a_summary() -> None:
+    """Readable reasoning is requested even when no effort is pinned."""
+    payload = openai_responses_stream_payload(
+        "gpt-5.6-luna",
+        _reasoning_request(),
+        supports_temperature=False,
+        supports_reasoning=True,
+    )
+    assert payload["reasoning"] == {"summary": "auto"}
+
+
+def test_effort_none_asks_for_no_summary() -> None:
+    """A request that turns reasoning off is never asked for a summary."""
+    payload = openai_responses_stream_payload(
+        "gpt-5.6-luna",
+        _reasoning_request(reasoning_effort="none"),
+        supports_temperature=False,
+        supports_reasoning=True,
+    )
+    reasoning = cast("JsonObject", payload["reasoning"])
+    assert "summary" not in reasoning

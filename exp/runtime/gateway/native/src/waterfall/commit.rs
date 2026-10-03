@@ -19,6 +19,20 @@ pub(super) struct PrivateReasoning(Option<Event>);
 
 impl PrivateReasoning {
     pub(super) fn withhold(&mut self, event: &Event, exposed: bool) -> bool {
+        if let Event::ReasoningTextDelta(delta) = event {
+            // Display-only reasoning waits for the turn's first real output:
+            // a stall or an answerless stop before it still fails over, and
+            // the coalesced text leads the committed prefix.
+            if delta.is_empty() {
+                return false;
+            }
+            match &mut self.0 {
+                Some(Event::ReasoningTextDelta(held)) => held.push_str(delta),
+                None => self.0 = Some(event.clone()),
+                _ => return false,
+            }
+            return true;
+        }
         let Event::ReasoningContentDelta {
             route_sha256,
             delta,
@@ -42,8 +56,12 @@ impl PrivateReasoning {
 
     /// Successful private-only terminals must still run the ordinary encoder
     /// and continuation seal path, not silently lose their carrier or usage.
+    /// Display-only reasoning has no carrier: a turn that produced nothing
+    /// else is an empty completion and keeps that handling.
     pub(super) fn completes(&self, event: &Event) -> bool {
-        self.0.is_some() && event.is_terminal() && !matches!(event, Event::Failed(_))
+        matches!(self.0, Some(Event::ReasoningContentDelta { .. }))
+            && event.is_terminal()
+            && !matches!(event, Event::Failed(_))
     }
 
     pub(super) fn prefix(

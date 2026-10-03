@@ -109,11 +109,6 @@ fn frame_key_names(payload: &serde_json::Map<String, Value>) -> String {
 }
 
 impl Normalizer {
-    /// Consume a progress observation without retaining or exposing its text.
-    pub(crate) fn take_unexposed_reasoning_progress(&mut self) -> bool {
-        std::mem::take(&mut self.unexposed_reasoning_progress)
-    }
-
     pub(in crate::dialects) fn feed_openai_compatible(
         &mut self,
         frame: &crate::sse::SseEvent,
@@ -276,11 +271,15 @@ impl Normalizer {
                     });
                 }
             }
-        } else if reasoning
+        } else if let Some(text) = reasoning
             .and_then(Value::as_str)
-            .is_some_and(|text| !text.is_empty())
+            .filter(|text| !text.is_empty())
         {
-            self.unexposed_reasoning_progress = true;
+            // No replay route: the plaintext is display copy only. Encoders
+            // render it on rungs whose reasoning display is on; it never seals
+            // a carrier and never replays.
+            self.reserve_summary_bytes(text.len())?;
+            events.push(Event::ReasoningTextDelta(text.to_string()));
         }
         if let Some(raw_tools) = delta.get("tool_calls") {
             if !raw_tools.is_null() {

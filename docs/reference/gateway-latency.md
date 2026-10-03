@@ -149,11 +149,13 @@ visible text and client-tool output still commit. A private-only successful term
 the existing encoding and accounting behavior. Known usage received before a stall settles
 with that physical attempt; absence of a report remains unknown, never invented zero usage.
 
-An OpenAI-compatible stream can also send nonempty `reasoning_content` without an authorized
-replay carrier. Those deltas start and refresh generation-idle timing without retaining their
-text, exposing an event, or committing the attempt. Empty reasoning, usage reports and
-keepalives cannot renew that timer. These discarded deltas do not stamp `first_token_at`;
-the first normalized output token still owns that measurement.
+An OpenAI-compatible stream can also send nonempty `reasoning_content` (or `reasoning`)
+without an authorized replay carrier, and a Gemini stream sends thought-summary text. That
+text is display-only reasoning: it starts and refreshes generation-idle timing and stamps
+`first_token_at`, but like route-bound reasoning it is held privately and does not commit the
+attempt. A stall or an answerless stop before the first real output still fails over, and the
+held text leads the committed prefix once text or a tool call arrives. After commitment it
+streams live. Empty reasoning, usage reports and keepalives cannot renew the timer.
 
 Structural output may commit a surface before generation begins, but does not shorten its
 first-progress allowance to the connection timeout. In particular omitted Anthropic thinking

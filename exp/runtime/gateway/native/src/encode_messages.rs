@@ -13,6 +13,7 @@ use crate::encode::{
 };
 use crate::errors::{Failure, PublicError};
 use crate::events::{Event, Usage};
+use crate::reasoning_display::{unsigned_thinking_text, ReasoningOutput};
 use crate::tool_search::MessagesToolSearch;
 use crate::web_search::MessagesWebSearch;
 
@@ -149,7 +150,7 @@ pub struct MessagesSseEncoder {
     ignored_parameters: Vec<String>,
     reasoning: ReasoningCarrierState,
     reasoning_content_carrier: Option<String>,
-    reasoning_output_exposed: bool,
+    reasoning_output: ReasoningOutput,
     /// The gateway-executed web search, rendered as the leading blocks at
     /// `start` and metered on every usage object; `None` changes nothing.
     web_search: Option<MessagesWebSearch>,
@@ -199,7 +200,7 @@ impl MessagesSseEncoder {
             pre_dispatch_input_estimate: None,
             reasoning: ReasoningCarrierState::default(),
             reasoning_content_carrier: None,
-            reasoning_output_exposed: false,
+            reasoning_output: ReasoningOutput::default(),
             web_search: None,
             tool_search: None,
             synthetic_blocks: 0,
@@ -254,14 +255,14 @@ impl MessagesSseEncoder {
 
     /// Show the model's plaintext reasoning to the caller as a thinking block.
     ///
-    /// Off by default so hidden-reasoning providers never leak; on only for
-    /// rungs the catalog marks `reasoning_output_exposed` (Tencent/DeepSeek),
-    /// whose plaintext the Chat wire already returns as `reasoning_content`.
-    /// The block carries an EMPTY signature: Anthropic signs every thinking
-    /// block it issues, so an unsigned block is recognizably the gateway's own
-    /// plaintext when the caller replays it.
-    pub fn set_reasoning_output_exposed(&mut self, exposed: bool) {
-        self.reasoning_output_exposed = exposed;
+    /// Off by default. Exposure (rungs the catalog marks
+    /// `reasoning_output_exposed`, Tencent/DeepSeek) and display (every rung
+    /// that has not opted out) both render readable non-Anthropic reasoning
+    /// in one block carrying an EMPTY signature: Anthropic signs every
+    /// thinking block it issues, so an unsigned block is recognizably the
+    /// gateway's own plaintext when the caller replays it.
+    pub fn set_reasoning_output(&mut self, output: ReasoningOutput) {
+        self.reasoning_output = output;
     }
 
     /// Return the validated carrier candidate accumulated by a live stream.
@@ -366,15 +367,17 @@ impl MessagesSseEncoder {
                 self.refusal_seen = true;
                 Ok(Vec::new())
             }
-            Event::ReasoningContentDelta { delta, .. } => {
-                // An exposure-gated rung's plaintext reasoning streams as one
-                // unsigned thinking block, the Messages twin of the Chat
-                // wire's `reasoning_content` deltas; elsewhere it stays
-                // dropped. The sealed tool-turn carrier rides independently.
-                if self.reasoning_output_exposed && !delta.is_empty() {
-                    self.thinking_delta(EXPOSED_REASONING_BLOCK_INDEX, delta)
-                } else {
-                    Ok(Vec::new())
+            // An exposure-gated or reasoning-displaying rung's plaintext
+            // reasoning (route reasoning, plaintext reasoning, OpenAI summaries)
+            // streams as one unsigned thinking block, the Messages twin of the
+            // Chat wire's reasoning fields; elsewhere it stays dropped. The
+            // sealed tool-turn carrier rides independently.
+            Event::ReasoningContentDelta { .. }
+            | Event::ReasoningTextDelta(_)
+            | Event::ReasoningSummaryDelta { .. } => {
+                match unsigned_thinking_text(event, self.reasoning_output) {
+                    Some(delta) => self.thinking_delta(EXPOSED_REASONING_BLOCK_INDEX, delta),
+                    None => Ok(Vec::new()),
                 }
             }
             Event::ProviderRefusalDelta { .. } => {
@@ -384,7 +387,6 @@ impl MessagesSseEncoder {
             // OpenAI-only reasoning shapes have no Messages representation.
             Event::ProviderOutputItemStarted { .. }
             | Event::ProviderOutputItemCompleted { .. }
-            | Event::ReasoningSummaryDelta { .. }
             | Event::GeminiThoughtPart(_)
             | Event::EncryptedReasoning { .. } => Ok(Vec::new()),
             Event::ThinkingDelta { index, delta } => self.thinking_delta(*index, delta),

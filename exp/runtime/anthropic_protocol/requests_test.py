@@ -1732,7 +1732,7 @@ def test_a_bare_claude_code_thinking_request_serves_on_an_openai_route() -> None
     assert coercion.disclosures == ("thinking->reasoning_effort:medium(gateway_default)",)
     _public, provider = route_generation_parameter_requests((profile,), coercion.request)
     payload = dialect_stream_payload(profile, provider)
-    assert payload["reasoning"] == {"effort": "medium"}
+    assert payload["reasoning"] == {"effort": "medium", "summary": "auto"}
     assert "thinking" not in payload
 
 

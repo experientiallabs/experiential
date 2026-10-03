@@ -550,6 +550,14 @@ class ModelCapabilities(ContractModel):
     wire on a carrier-route identity, so an absent capability fails closed and
     reasoning stays stripped even on an otherwise-exposable endpoint.
     """
+    reasoning_output_hidden: bool = False
+    """Whether this rung withholds its model's reasoning text from the caller.
+
+    Off by default: every rung returns the readable reasoning its provider
+    streams (plaintext reasoning, thinking, and reasoning summaries) as display
+    copy beside the content. Display never changes replay or the sealed
+    carrier. Stamping it is the per-rung operator opt-out.
+    """
     reasoning_content_native: bool = False
     """Whether this OpenAI-compatible rung speaks the native ``reasoning_content`` contract.
 
@@ -668,6 +676,7 @@ class ModelCapabilities(ContractModel):
             "reasoning_effort",
             "sampling_requires_reasoning_none",
             "reasoning_output_exposed",
+            "reasoning_output_hidden",
             "reasoning_content_native",
             "system_messages_leading_only",
             "chat_max_tokens_field",

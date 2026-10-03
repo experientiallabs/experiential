@@ -39,6 +39,7 @@ fn config() -> Configuration {
         relay_metadata: false,
         truncate_request: false,
         asynchronous_delivery: true,
+        capture_hidden_reasoning: true,
     }
 }
 

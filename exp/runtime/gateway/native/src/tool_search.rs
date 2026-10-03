@@ -34,6 +34,7 @@ use crate::encode_responses::{
 };
 use crate::errors::{Failure, FailureClass, PublicError};
 use crate::events::{CompletedToolCall, Event, Usage};
+use crate::reasoning_display::ReasoningOutput;
 use crate::waterfall::{CommittedAttempt, DeploymentWire, Won};
 use crate::web_search::{
     completed_messages_body_with_web_search, configure_messages_encoder, WebSearchAdmission,
@@ -533,7 +534,7 @@ pub fn completed_messages_body_with_gateway_tools(
     events: &[Event],
     ignored_parameters: &[String],
     reasoning_content_carrier: Option<&str>,
-    reasoning_output_exposed: bool,
+    reasoning_output: impl Into<ReasoningOutput>,
     web_search: Option<&WebSearchAdmission>,
     tool_search: Option<&MessagesToolSearch>,
 ) -> Result<AggregatedMessage, PublicError> {
@@ -544,7 +545,7 @@ pub fn completed_messages_body_with_gateway_tools(
             events,
             ignored_parameters,
             reasoning_content_carrier,
-            reasoning_output_exposed,
+            reasoning_output,
             web_search,
         );
     };
@@ -556,7 +557,7 @@ pub fn completed_messages_body_with_gateway_tools(
         &prefixed,
         ignored_parameters,
         reasoning_content_carrier,
-        reasoning_output_exposed,
+        reasoning_output,
         web_search,
     )?;
     for name in [TOOL_SEARCH_BM25_TOOL_NAME, TOOL_SEARCH_REGEX_TOOL_NAME] {
@@ -653,7 +654,7 @@ pub(crate) fn completed_messages_body_for(
     admission: &Admission,
     events: &[Event],
     reasoning_content_carrier: Option<&str>,
-    reasoning_output_exposed: bool,
+    reasoning_output: impl Into<ReasoningOutput>,
 ) -> Result<AggregatedMessage, PublicError> {
     completed_messages_body_with_gateway_tools(
         &admission.request_id,
@@ -661,7 +662,7 @@ pub(crate) fn completed_messages_body_for(
         events,
         &admission.ignored_parameters,
         reasoning_content_carrier,
-        reasoning_output_exposed,
+        reasoning_output,
         admission.web_search.as_ref(),
         messages_tool_search(&admission.tool_search_rounds, &admission.request_id).as_ref(),
     )

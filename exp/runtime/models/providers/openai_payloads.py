@@ -243,6 +243,10 @@ def openai_responses_stream_payload(
         reasoning["effort"] = openai_reasoning_effort(model_id, effective_reasoning_effort)
     if supports_reasoning and request.reasoning_summary is not None:
         reasoning["summary"] = request.reasoning_summary
+    elif supports_reasoning and effective_reasoning_effort != "none":
+        # OpenAI returns readable reasoning only as summaries, and only when
+        # asked; the caller's own selector above always wins.
+        reasoning["summary"] = "auto"
     if supports_reasoning and request.reasoning_context is not None:
         # Forwarded verbatim: the value controls provider-side re-rendering
         # of prior turns' reasoning and has no gateway semantics.

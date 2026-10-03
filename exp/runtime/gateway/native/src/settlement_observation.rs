@@ -63,7 +63,8 @@ impl StreamedOutput {
             }
             Event::ReasoningSummaryDelta { delta, .. }
             | Event::ThinkingDelta { delta, .. }
-            | Event::ReasoningContentDelta { delta, .. } => Self::append(
+            | Event::ReasoningContentDelta { delta, .. }
+            | Event::ReasoningTextDelta(delta) => Self::append(
                 &mut self.reasoning,
                 &mut self.reasoning_overflow_chars,
                 delta,

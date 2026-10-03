@@ -287,7 +287,7 @@ def test_vertex_native_profile_and_payload_share_exact_generation_gates() -> Non
     assert "temperature" not in generation
     assert "topP" not in generation
     assert generation["topK"] == 32
-    assert generation["thinkingConfig"] == {"thinkingLevel": "HIGH"}
+    assert generation["thinkingConfig"] == {"thinkingLevel": "HIGH", "includeThoughts": True}
     assert generation["maxOutputTokens"] == 128
     assert native_payload == payload
 

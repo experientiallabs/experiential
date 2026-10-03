@@ -17,6 +17,7 @@ results, and plans do not live here.
 | `reference/gateway-request-policy.md` | Per-request retry bounds, backoff, opaque route selection, replay and physical-attempt accounting. |
 | `reference/gateway-failover-rules.md` | Per-rung conditional failover (`failover_only_on`): the token vocabulary, first-dial and successor rules, the ledger `fallback_reason`, and the fail-closed cases. |
 | `reference/gateway-guardrails.md` | Identity-scoped gateway guardrails: data flow, latency, privacy, standard pack, http_json adapters, and inappropriate-content use. |
+| `reference/gateway-reasoning-display.md` | Reasoning text every rung returns by default: per-surface rendering, request defaults, failover, opt-out and capture. |
 | `reference/gateway-latency.md` | Routine CI gateway-latency report against a local mock: schedule, artifact schema, and numeric latency badge. |
 | `reference/openai-compatible-recipes.md` | Verified Fireworks, Modal, and Experiential Cloud connection recipes through the openai-compatible provider family. |
 | `reference/ingest.md` | Current declared local trace source contract for every supported source. |

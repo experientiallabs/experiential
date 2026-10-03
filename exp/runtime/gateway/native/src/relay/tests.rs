@@ -43,10 +43,10 @@ async fn first_token_at_is_stamped_on_the_first_output_delta() {
 }
 
 #[tokio::test]
-async fn discarded_reasoning_is_progress_without_a_first_token_measurement() {
+async fn unrouted_reasoning_is_display_output_with_a_first_token_measurement() {
     let frames = vec![
         Ok::<_, reqwest::Error>(Bytes::from_static(
-            b"data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"private thought\"}}]}\n\n",
+            b"data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"plain thought\"}}]}\n\n",
         )),
         Ok::<_, reqwest::Error>(Bytes::from_static(b"data: [DONE]\n\n")),
     ];
@@ -65,11 +65,9 @@ async fn discarded_reasoning_is_progress_without_a_first_token_measurement() {
         .await
         .unwrap()
         .unwrap();
-    assert!(matches!(event, Event::Completed));
+    assert!(matches!(&event, Event::ReasoningTextDelta(delta) if delta == "plain thought"));
     assert!(relay.last_progress_at.is_some());
-    assert!(!relay.stall_bound_armed);
-    assert!(!relay.committed);
-    assert!(relay.first_token_at().is_none());
+    assert!(relay.first_token_at().is_some());
 }
 
 #[tokio::test]

@@ -650,11 +650,11 @@ def test_partial_meter_disconnect_estimates_the_unreported_output(
 
 
 @pytest.mark.parametrize("surface", ["chat", "messages"])
-def test_hidden_thinking_has_heartbeats_and_retains_input_meter(
+def test_post_commit_reasoning_displays_with_heartbeats_and_retains_input_meter(
     engine: _ServingEngine,
     surface: str,
 ) -> None:
-    """Hidden thought and provider pings neither count as public tokens nor suppress heartbeats."""
+    """Reasoning after commitment streams as display copy; pings never suppress heartbeats."""
     prompt = f"hidden-pings-{surface}"
     client, request_id, received = _open_quiet(engine, prompt, surface=surface)
     try:
@@ -662,15 +662,15 @@ def test_hidden_thinking_has_heartbeats_and_retains_input_meter(
         while b": keepalive" not in received:
             assert time.monotonic() < until
             received += client.recv(4096)
-        assert b"private canary" not in received
+        assert b"private canary" in received
     finally:
         _abort(client)
     assert _PROVIDER_CLOSED[prompt].wait(0.25)
     row = _attempt(engine, request_id)
     assert row["state"] == "cancelled"
     assert row["input_tokens"] == 19
-    # Private reasoning is generated output the provider bills: it is
-    # estimated into the meter without ever reaching the caller or a log.
+    # Reasoning is generated output the provider bills: it is estimated into
+    # the meter, and its text reaches the caller but never a log.
     assert row["reasoning_tokens"] == _tokens("private canary")
     assert row["output_tokens"] == _tokens("public prefix") + _tokens("private canary")
     assert row["usage_source"] == "estimated"

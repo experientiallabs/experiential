@@ -829,7 +829,9 @@ def test_a_thinking_config_translates_to_an_effort_on_an_openai_route() -> None:
 
         _public, provider = route_generation_parameter_requests((profile,), coercion.request)
         payload = dialect_stream_payload(profile, provider)
-        assert payload["reasoning"] == {"effort": expected}
+        # Any effort but none also asks for the readable reasoning summary.
+        summary = {} if expected == "none" else {"summary": "auto"}
+        assert payload["reasoning"] == {"effort": expected, **summary}
         assert "thinking" not in payload
 
 

@@ -31,6 +31,7 @@ from exp.runtime.models.providers.reasoning_compat import (
     anthropic_budgeted_enabled_only,
     anthropic_reasoning_effort,
     anthropic_thinking_budget_tokens,
+    anthropic_thinks_without_config,
 )
 from exp.runtime.models.providers.wire_messages import (
     anthropic_blocks,
@@ -363,8 +364,33 @@ def anthropic_messages_stream_payload(
         payload["output_config"] = output_config
     if request.stop:
         payload["stop_sequences"] = list(request.stop)
+    if supports_reasoning:
+        _display_summarized_thinking(model_id, payload)
     _require_forced_tool_choice_support(model_id, request, payload)
     return payload
+
+
+def _display_summarized_thinking(model_id: str, payload: JsonObject) -> None:
+    """Ask for readable thinking wherever adaptive thinking runs.
+
+    Current Claude generations default ``thinking.display`` to ``omitted`` and
+    stream thinking blocks with empty text. Adaptive thinking without an
+    explicit display, including the implicit adaptive thinking of generations
+    that think without a config, is asked for ``summarized`` so the caller gets
+    the reasoning it pays for. An explicit caller display is kept, and budgeted,
+    disabled and ``between_tools`` configs (which take no display) are
+    untouched.
+
+    Args:
+        model_id: Exact Anthropic model identifier.
+        payload: The built Messages payload, updated in place.
+    """
+    thinking = payload.get("thinking")
+    if isinstance(thinking, dict):
+        if thinking.get("type") == "adaptive" and "display" not in thinking:
+            payload["thinking"] = {**thinking, "display": "summarized"}
+    elif thinking is None and anthropic_thinks_without_config(model_id):
+        payload["thinking"] = {"type": "adaptive", "display": "summarized"}
 
 
 _UNMARKABLE_BLOCK_TYPES = frozenset({"thinking", "redacted_thinking"})

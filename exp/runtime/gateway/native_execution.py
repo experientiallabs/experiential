@@ -43,6 +43,7 @@ from exp.runtime.gateway.native_fallback_rules import FallbackRules, eligible_de
 from exp.runtime.gateway.native_responses import ContinuationContext
 from exp.runtime.gateway.native_settlement import deployment_operation_key
 from exp.runtime.gateway.reasoning_carrier import ReasoningCarrierAuthority
+from exp.runtime.gateway.reasoning_display import reasoning_output_hidden
 from exp.runtime.gateway.recovery import FrozenRecoveryBinding
 from exp.runtime.gateway.request_policy import RequestAttemptPolicy, attempt_policy
 from exp.runtime.gateway.routing import GatewayRoute, GatewayRoutingError
@@ -921,6 +922,7 @@ def deployment_wire_entry(
         "fireworks_reasoning_route_sha256": profile.fireworks_reasoning_route_sha256,
         "hunyuan_reasoning_route_sha256": profile.hunyuan_reasoning_route_sha256,
         "reasoning_output_exposed": profile.reasoning_output_exposed,
+        "reasoning_output_hidden": reasoning_output_hidden(deployment.capabilities),
         # Gateway-emulated stop sequences: the stream is cut at the first
         # match and terminates with a stop-sequence reason. Empty for rungs
         # whose payload already carries the caller's stop field.

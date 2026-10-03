@@ -94,6 +94,9 @@ pub(crate) struct Observer {
     collector: Arc<Collector>,
     request_id: String,
     reasoning_exposed: bool,
+    /// Retain readable reasoning the caller never saw: the rung did not
+    /// display it and the collector captures hidden reasoning.
+    hidden_reasoning: bool,
 }
 
 impl Observer {
@@ -103,7 +106,16 @@ impl Observer {
                 self.collector
                     .gemini_thought_part(&self.request_id, part.clone());
             }
-            Event::ReasoningContentDelta { delta, .. } if self.reasoning_exposed => {
+            Event::ReasoningContentDelta { delta, .. }
+                if self.reasoning_exposed || self.hidden_reasoning =>
+            {
+                self.collector.reasoning(&self.request_id, delta);
+            }
+            Event::ReasoningTextDelta(delta)
+            | Event::ReasoningSummaryDelta { delta, .. }
+            | Event::ThinkingDelta { delta, .. }
+                if self.hidden_reasoning =>
+            {
                 self.collector.reasoning(&self.request_id, delta);
             }
             Event::ToolCallCompleted { call, .. } => {
@@ -114,8 +126,10 @@ impl Observer {
     }
 }
 
-/// Only the selected attempt contributes. Capture policy still gates persistence;
-/// private provider reasoning never becomes plaintext merely because capture is on.
+/// Only the selected attempt contributes. Capture policy still gates persistence.
+/// Reasoning the caller saw is retained in the response frames; reasoning a rung
+/// did not display is retained as `provider_reasoning` when the collector
+/// captures hidden reasoning, under the same consent as the response.
 pub(crate) fn observe_winner(
     collector: Option<Arc<Collector>>,
     admission: &Admission,
@@ -128,10 +142,13 @@ pub(crate) fn observe_winner(
         Won::Settled(attempt) => attempt.depth,
         Won::Failed(_) => return,
     };
+    let hidden_reasoning =
+        collector.captures_hidden_reasoning() && !admission.reasoning_displayed_at(depth);
     let observer = Observer {
         collector,
         request_id: admission.request_id.clone(),
         reasoning_exposed: admission.reasoning_exposed_at(depth),
+        hidden_reasoning,
     };
     observer
         .collector

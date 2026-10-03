@@ -691,7 +691,7 @@ def test_openai_responses_stream_payload_forwards_reasoning_with_route_capabilit
         reasoning_effort="medium",
     )
 
-    assert payload["reasoning"] == {"effort": "high"}
+    assert payload["reasoning"] == {"effort": "high", "summary": "auto"}
 
 
 def test_openai_responses_stream_payload_forwards_reasoning_summary() -> None:
@@ -1919,7 +1919,7 @@ def test_chat_adaptive_thinking_dispatches_natively_on_a_mixed_claude_route() ->
         reasoning_effort="medium",
         maximum_output_tokens=128_000,
     )
-    assert anthropic_payload["thinking"] == {"type": "adaptive"}
+    assert anthropic_payload["thinking"] == {"type": "adaptive", "display": "summarized"}
     assert anthropic_payload["output_config"] == {"effort": "medium"}
     openrouter_payload = openai_compatible_stream_payload(
         "anthropic/claude-opus-5",
@@ -2202,11 +2202,11 @@ def test_reasoning_effort_uses_each_provider_native_wire_shape() -> None:
 
     assert openrouter["reasoning"] == {"effort": "high"}
     assert "reasoning_effort" not in openrouter
-    assert anthropic["thinking"] == {"type": "adaptive"}
+    assert anthropic["thinking"] == {"type": "adaptive", "display": "summarized"}
     assert anthropic["output_config"] == {"effort": "high"}
     assert "reasoning" not in anthropic
     generation = cast("dict[str, object]", gemini["generationConfig"])
-    assert generation["thinkingConfig"] == {"thinkingLevel": "HIGH"}
+    assert generation["thinkingConfig"] == {"thinkingLevel": "HIGH", "includeThoughts": True}
 
 
 @pytest.mark.parametrize(
@@ -2292,7 +2292,7 @@ def test_anthropic_payload_merges_reasoning_schema_and_tool_controls() -> None:
         "type": "auto",
         "disable_parallel_tool_use": True,
     }
-    assert payload["thinking"] == {"type": "adaptive"}
+    assert payload["thinking"] == {"type": "adaptive", "display": "summarized"}
     assert payload["output_config"] == {
         "effort": "high",
         "format": {
@@ -2601,7 +2601,7 @@ def test_anthropic_payload_carries_verbatim_thinking_config_over_adaptive() -> N
         reasoning_effort="high",
         maximum_output_tokens=128_000,
     )
-    assert adaptive["thinking"] == {"type": "adaptive"}
+    assert adaptive["thinking"] == {"type": "adaptive", "display": "summarized"}
     assert adaptive["output_config"] == {"effort": "high"}
 
 
@@ -2854,7 +2854,7 @@ def test_gpt_56_efforts_match_the_provider_and_ultra_rejects_loud() -> None:
         supports_temperature=True,
         supports_reasoning=True,
     )
-    assert payload["reasoning"] == {"effort": "max"}
+    assert payload["reasoning"] == {"effort": "max", "summary": "auto"}
 
     with pytest.raises(UnsupportedReasoningEffortError) as raised:
         route_generation_parameter_requests((codex,), request_with("ultra"))
@@ -2876,7 +2876,7 @@ def test_reasoning_context_passes_through_verbatim_and_narrows_per_rung() -> Non
         supports_temperature=True,
         supports_reasoning=True,
     )
-    assert payload["reasoning"] == {"effort": "high", "context": "all_turns"}
+    assert payload["reasoning"] == {"effort": "high", "summary": "auto", "context": "all_turns"}
 
     responses = GatewayWireProfile(
         dialect="openai_responses",
@@ -3016,7 +3016,7 @@ def test_bare_enabled_thinking_translates_to_adaptive_without_a_budget_promise()
         reasoning_effort="medium",
         maximum_output_tokens=128_000,
     )
-    assert payload["thinking"] == {"type": "adaptive"}
+    assert payload["thinking"] == {"type": "adaptive", "display": "summarized"}
     assert payload["output_config"] == {"effort": "medium"}
     # The translation stays explicit on routes that pin no effort, so the
     # caller's request to think never degrades to an implicit provider default.
@@ -3367,7 +3367,7 @@ def test_output_config_seeds_the_payload_and_engine_keys_fill_gaps() -> None:
     )
     # Caller effort survives verbatim over the catalog-pinned "low".
     assert payload["output_config"] == {"effort": "high", "future_key": 1}
-    assert payload["thinking"] == {"type": "adaptive"}
+    assert payload["thinking"] == {"type": "adaptive", "display": "summarized"}
 
     pinned_only = GatewayRequest(
         surface=GatewayApiSurface.MESSAGES,

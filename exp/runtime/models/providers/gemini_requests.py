@@ -139,10 +139,15 @@ def gemini_generate_request(
     elif json_object_output:
         generation["responseMimeType"] = "application/json"
     effective_reasoning_effort = request.reasoning_effort or reasoning_effort
-    if supports_reasoning and effective_reasoning_effort is not None:
-        generation["thinkingConfig"] = {
-            "thinkingLevel": gemini_thinking_level(model_id, effective_reasoning_effort).upper()
-        }
+    if supports_reasoning:
+        # Thought summaries are the readable reasoning Google returns; without
+        # includeThoughts a thinking model streams only opaque signatures.
+        thinking_config: JsonObject = {"includeThoughts": True}
+        if effective_reasoning_effort is not None:
+            thinking_config["thinkingLevel"] = gemini_thinking_level(
+                model_id, effective_reasoning_effort
+            ).upper()
+        generation["thinkingConfig"] = thinking_config
     # The normalized gateway response has no logprob representation. Keep the
     # route flag for shared capability plumbing, but ignore these controls so
     # provider output is never requested and then silently discarded.

@@ -187,6 +187,13 @@ _ANTHROPIC_ALWAYS_THINKING_FAMILIES = (
 )
 # Opus 5.5 changes the off-switch contract without changing the whole generation.
 _ANTHROPIC_ALWAYS_THINKING_RELEASES = ("claude-opus-5-5",)
+# Generations that run adaptive thinking when the request carries no thinking
+# config. Opus 4.7 and 4.8 run WITHOUT thinking then, so they are absent.
+_ANTHROPIC_DEFAULT_THINKING_FAMILIES = (
+    *_ANTHROPIC_ALWAYS_THINKING_FAMILIES,
+    "claude-opus-5",
+    "claude-sonnet-5",
+)
 
 
 def anthropic_adaptive_only_thinking(model_id: str) -> bool:
@@ -205,6 +212,19 @@ def anthropic_adaptive_only_thinking(model_id: str) -> bool:
     """
     normalized = _normalized_model(model_id)
     return any(family in normalized for family in _ANTHROPIC_ADAPTIVE_ONLY_FAMILIES)
+
+
+def anthropic_thinks_without_config(model_id: str) -> bool:
+    """Return whether a request with no thinking config still runs adaptive thinking.
+
+    Args:
+        model_id: Exact Anthropic model identifier.
+
+    Returns:
+        ``True`` for the generations whose omitted ``thinking`` means adaptive.
+    """
+    normalized = _normalized_model(model_id)
+    return any(family in normalized for family in _ANTHROPIC_DEFAULT_THINKING_FAMILIES)
 
 
 def anthropic_budgeted_enabled_only(model_id: str) -> bool:

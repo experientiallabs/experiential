@@ -28,6 +28,7 @@ mod memory;
 mod metrics;
 mod param_attribution;
 mod rate_limit_headers;
+mod reasoning_display;
 mod rejection_shapes;
 mod relay;
 mod replay;
@@ -436,6 +437,7 @@ fn parse_fixture_events(events_json: &str) -> Result<Vec<events::Event>, String>
                 status,
                 phase,
             },
+            "reasoning_text_delta" => events::Event::ReasoningTextDelta(text),
             "reasoning_summary_delta" => events::Event::ReasoningSummaryDelta {
                 output_index: object
                     .get("output_index")
