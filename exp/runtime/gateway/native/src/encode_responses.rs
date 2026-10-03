@@ -60,6 +60,8 @@ pub struct ResponsesSseEncoder {
     hosted: HashMap<u32, HostedToolState>,
     fireworks_reasoning: Option<ReasoningState>,
     fireworks_reasoning_route_sha256: Option<String>,
+    /// Reasoning-map key of the open display-only reasoning item, if any.
+    displayed_reasoning_key: Option<u32>,
     reasoning_content_carrier: Option<String>,
     messages: HashMap<MessageKey, MessageState>,
     provider_output_starts: HashMap<u32, ProviderOutputStart>,
@@ -92,6 +94,7 @@ impl ResponsesSseEncoder {
             hosted: HashMap::new(),
             fireworks_reasoning: None,
             fireworks_reasoning_route_sha256: None,
+            displayed_reasoning_key: None,
             reasoning_content_carrier: None,
             messages: HashMap::new(),
             provider_output_starts: HashMap::new(),

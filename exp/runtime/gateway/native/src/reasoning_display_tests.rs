@@ -296,3 +296,63 @@ fn responses_withheld_rung_drops_provider_summaries_and_thinking() {
         assert_eq!(deltas, expected);
     }
 }
+
+#[test]
+fn resumed_display_reasoning_opens_fresh_items_in_provider_order() {
+    let events = vec![
+        Event::ReasoningTextDelta("first".to_string()),
+        Event::TextDelta("partial ".to_string()),
+        Event::ReasoningSummaryDelta {
+            output_index: 0,
+            summary_index: 0,
+            item_id: "rs_1".to_string(),
+            delta: "second".to_string(),
+        },
+        Event::TextDelta("answer".to_string()),
+        Event::Completed,
+    ];
+    // Messages: the resumed block starts without a synthetic paragraph break.
+    let mut encoder = MessagesSseEncoder::new_with_ignored("request-1", "m", Vec::new());
+    encoder.set_reasoning_output(DISPLAYED);
+    let mut frames = encoder.start().unwrap();
+    for event in &events {
+        frames.extend(encoder.feed(event).unwrap());
+    }
+    let thinking: Vec<String> = payloads(&frames)
+        .iter()
+        .filter_map(|chunk| chunk["delta"]["thinking"].as_str().map(str::to_string))
+        .collect();
+    assert_eq!(thinking, vec!["first".to_string(), "second".to_string()]);
+
+    // Responses: display text that resumes after the message opens a new item.
+    let text_events = vec![
+        Event::ReasoningTextDelta("first".to_string()),
+        Event::TextDelta("partial ".to_string()),
+        Event::ReasoningTextDelta("second".to_string()),
+        Event::TextDelta("answer".to_string()),
+        Event::Completed,
+    ];
+    let envelope = ResponsesEnvelope {
+        reasoning_displayed: true,
+        ..ResponsesEnvelope::default()
+    };
+    let mut encoder = ResponsesSseEncoder::new("request-1", "m", 1, envelope);
+    let mut frames = encoder.start().unwrap();
+    for event in &text_events {
+        frames.extend(encoder.feed(event).unwrap());
+    }
+    let chunks = payloads(&frames);
+    let completed = chunks
+        .iter()
+        .find(|chunk| chunk["type"] == "response.completed")
+        .unwrap();
+    let kinds: Vec<&str> = completed["response"]["output"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|item| item["type"].as_str().unwrap())
+        .collect();
+    // Answer text shares one message item; the resumed reasoning is a new
+    // item after it instead of being appended to the first.
+    assert_eq!(kinds, vec!["reasoning", "message", "reasoning"]);
+}

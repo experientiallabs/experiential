@@ -186,6 +186,11 @@ pub fn completed_messages_body_with_reasoning(
             Event::ReasoningContentDelta { .. }
             | Event::ReasoningTextDelta(_)
             | Event::ReasoningSummaryDelta { .. } => {
+                // A new block (later output intervened) starts without the
+                // paragraph break that only separates units inside one block.
+                if display_position.is_some_and(|position| position + 1 != slots.len()) {
+                    joiner = DisplayJoiner::default();
+                }
                 let Some(delta) = unsigned_thinking_delta(&mut joiner, event, reasoning_output)
                 else {
                     continue;

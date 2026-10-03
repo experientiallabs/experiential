@@ -13,7 +13,7 @@ use crate::encode::{
 };
 use crate::errors::{Failure, PublicError};
 use crate::events::{Event, Usage};
-use crate::reasoning_display::{unsigned_thinking_delta, DisplayJoiner, ReasoningOutput};
+use crate::reasoning_display::{DisplayJoiner, ReasoningOutput};
 use crate::tool_search::MessagesToolSearch;
 use crate::web_search::MessagesWebSearch;
 
@@ -377,16 +377,7 @@ impl MessagesSseEncoder {
             // sealed tool-turn carrier rides independently.
             Event::ReasoningContentDelta { .. }
             | Event::ReasoningTextDelta(_)
-            | Event::ReasoningSummaryDelta { .. } => {
-                match unsigned_thinking_delta(
-                    &mut self.reasoning_display,
-                    event,
-                    self.reasoning_output,
-                ) {
-                    Some(delta) => self.thinking_delta(EXPOSED_REASONING_BLOCK_INDEX, &delta),
-                    None => Ok(Vec::new()),
-                }
-            }
+            | Event::ReasoningSummaryDelta { .. } => self.displayed_thinking(event),
             Event::ProviderRefusalDelta { .. } => {
                 self.refusal_seen = true;
                 Ok(Vec::new())
@@ -964,6 +955,7 @@ impl MessagesSseEncoder {
 }
 
 mod aggregate;
+mod display;
 mod errors;
 mod usage;
 

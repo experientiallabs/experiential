@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import time
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from typing import cast
 
 from exp.common.core.artifacts import JsonObject
@@ -85,6 +85,7 @@ def native_output_mode(
     request: GatewayRequest,
     *,
     image_output: bool = False,
+    wire_route: Sequence[JsonObject] = (),
 ) -> OutputGuardrailMode:
     """Return the output enforcement shape one admission must use.
 
@@ -93,6 +94,10 @@ def native_output_mode(
         policy: Policy resolved during input enforcement, if any.
         request: Canonical request after continuation expansion.
         image_output: Any admitted rung may generate image content.
+        wire_route: The admission's wire entries. A rung that may generate
+            images, or whose payload asks its provider for readable reasoning
+            the caller may not have requested (reasoning display defaults),
+            rules out a reasoning-free incremental stream.
 
     Returns:
         ``off``, ``buffer``, or ``stream`` for the data plane.
@@ -109,9 +114,11 @@ def native_output_mode(
             request.reasoning_summary is not None
             or request.reasoning_effort is not None
             or request.thinking_default_enable
+            or upstream_requests_reasoning(wire_route)
         ),
     )
 
+    image_output = image_output or any(wire.get("image_output") is True for wire in wire_route)
     if image_output and mode != OutputGuardrailMode.OFF:
         return OutputGuardrailMode.BUFFER
     return mode
@@ -286,3 +293,29 @@ def enforce_native_output(
             replacement_text=result.text,
         )
     return encode_output_decision(action=GuardrailAction.ALLOW.value)
+
+
+def upstream_requests_reasoning(wire_route: Sequence[JsonObject]) -> bool:
+    """Return whether any rung's built payload asks for readable reasoning.
+
+    Reasoning display defaults add an OpenAI ``reasoning.summary`` or an
+    Anthropic ``thinking.display`` the caller never sent; a streamed output
+    chain must then buffer, because it cannot judge or redact reasoning.
+
+    Args:
+        wire_route: The admission's ordered wire entries.
+
+    Returns:
+        ``True`` when a payload carries a summary or a thinking display.
+    """
+    for wire in wire_route:
+        payload = wire.get("upstream_payload")
+        if not isinstance(payload, dict):
+            continue
+        reasoning = payload.get("reasoning")
+        thinking = payload.get("thinking")
+        if (isinstance(reasoning, dict) and "summary" in reasoning) or (
+            isinstance(thinking, dict) and "display" in thinking
+        ):
+            return True
+    return False

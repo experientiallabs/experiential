@@ -17,10 +17,10 @@ use super::*;
 /// The one summary part an exposed route reasoning item streams into.
 const EXPOSED_SUMMARY_INDEX: u32 = 0;
 
-/// Reasoning-map key of the one item that carries display-only plaintext
+/// Reasoning-map key of the first item that carries display-only plaintext
 /// reasoning (OpenAI-compatible origins without a replay route, Gemini thought
-/// summaries). Provider output indices and Anthropic block indices never reach
-/// it.
+/// summaries); each resumed segment counts down from it. Provider output
+/// indices and Anthropic block indices never reach this range.
 const DISPLAYED_REASONING_OUTPUT_INDEX: u32 = u32::MAX - 1;
 
 impl ResponsesSseEncoder {
@@ -115,8 +115,18 @@ impl ResponsesSseEncoder {
         // An `item_` id marks the item as the gateway's own: a caller that
         // echoes it back has it dropped instead of sent to a provider that
         // never issued it.
-        let item_id = stable_public_id("item", &format!("{}:reasoning", self.response_id));
-        self.reasoning_summary_delta(DISPLAYED_REASONING_OUTPUT_INDEX, 0, &item_id, delta)
+        // Reasoning that resumes after another output item opens a fresh item,
+        // so the response keeps provider order.
+        let key = match self.displayed_reasoning_key {
+            Some(key) if matches!(self.output_order.last(), Some(OutputSlot::Reasoning(last)) if *last == key) => {
+                key
+            }
+            Some(key) => key - 1,
+            None => DISPLAYED_REASONING_OUTPUT_INDEX,
+        };
+        self.displayed_reasoning_key = Some(key);
+        let item_id = stable_public_id("item", &format!("{}:reasoning:{key}", self.response_id));
+        self.reasoning_summary_delta(key, 0, &item_id, delta)
     }
 
     /// Complete the route reasoning item, closing its exposed summary part.

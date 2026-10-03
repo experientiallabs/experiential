@@ -774,7 +774,7 @@ class NativeControlPlane(
                 self._guardrails,
                 policy,
                 public_request,
-                image_output=any(wire.get("image_output") is True for wire in wire_route),
+                wire_route=wire_route,
             ).value,
             "caller_scope": f"{authorization.organization_id}:{authorization.identity_id}",
         }
