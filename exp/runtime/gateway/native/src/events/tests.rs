@@ -312,6 +312,12 @@ fn bedrock_usage_reads_the_cache_write_ttl_split_from_cache_details() {
         "inputTokens": 9, "outputTokens": 4, "cacheDetails": [{"ttl":"5m"}],
     })))
     .is_err());
+    // An unpriceable TTL still counts toward the reported total.
+    assert!(hour(json!([{"ttl":"1h","inputTokens":4},{"ttl":"24h","inputTokens":7}])).is_err());
+    assert!(bedrock_usage(Some(&json!({
+        "inputTokens": 9, "outputTokens": 4, "cacheDetails": [{"ttl":"24h","inputTokens":3}],
+    })))
+    .is_err());
     assert_eq!(
         bedrock_usage(Some(
             &json!({"inputTokens": 9, "outputTokens": 4, "cacheDetails": []})

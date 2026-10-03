@@ -582,22 +582,23 @@ fn bedrock_cache_write_hour(usage: &Map<String, Value>, total: u64) -> Result<Op
             .as_array()
             .ok_or_else(|| "Bedrock cacheDetails must be an array".to_string())?,
     };
-    let (mut five, mut hour, mut unpriceable) = (0u64, 0u64, false);
+    // Every entry counts toward the contradiction check, priced TTL or not.
+    let (mut covered, mut hour, mut unpriceable) = (0u64, 0u64, false);
     for detail in details {
         let detail = detail
             .as_object()
             .ok_or_else(|| "Bedrock cacheDetails entries must be objects".to_string())?;
         let tokens = count_if_present(detail, "inputTokens", "Bedrock cacheDetails")?
             .ok_or_else(|| "Bedrock cacheDetails.inputTokens is required".to_string())?;
+        covered = bounded_ledger_sum(&[covered, tokens], "Bedrock cacheDetails")?;
         match detail.get("ttl").and_then(Value::as_str) {
-            Some("5m") => five = bounded_ledger_sum(&[five, tokens], "Bedrock cacheDetails")?,
+            Some("5m") => {}
             Some("1h") => hour = bounded_ledger_sum(&[hour, tokens], "Bedrock cacheDetails")?,
             // A TTL this parser cannot price leaves the split unknown.
             Some(_) => unpriceable = true,
             None => return Err("Bedrock cacheDetails.ttl must be text".to_string()),
         }
     }
-    let covered = bounded_ledger_sum(&[five, hour], "Bedrock cacheDetails")?;
     if covered > total {
         return Err("Bedrock cacheDetails TTL counts exceed cacheWriteInputTokens".to_string());
     }
