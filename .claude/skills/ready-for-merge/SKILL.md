@@ -1,6 +1,6 @@
 ---
 name: ready-for-merge
-description: Mandatory pre-merge gate for every PR. Runs /code-review --fix at an effort level scaled to the PR's breadth, resolves every review comment (Cursor, Greptile, humans), and verifies the diff complies with AGENTS.md. Use whenever the user says a PR is ready to merge, asks to merge, or invokes /ready-for-merge.
+description: Mandatory pre-merge gate for every PR. Runs /code-review --fix at an effort level scaled to the PR's breadth, resolves every review comment (Cursor, Codex, humans), and verifies the diff complies with AGENTS.md. Use whenever the user says a PR is ready to merge, asks to merge, or invokes /ready-for-merge.
 ---
 
 # Ready for Merge
@@ -8,9 +8,9 @@ description: Mandatory pre-merge gate for every PR. Runs /code-review --fix at a
 This is the **mandatory gate before merging any PR** in this repository. Do not tell the user
 a PR is ready to merge until every step below has been completed and passes.
 
-**Address Greptile as soon as a PR exists.** When you open or update a PR, run Step 2 in the
-same turn: fetch Greptile comments, fix valid findings, reply, and resolve threads. Do not
-leave Greptile feedback for a later merge pass.
+**Address Cursor and Codex reviews as soon as a PR exists.** When you open or update a PR,
+run Step 2 in the same turn: fetch their comments, fix valid findings, reply, and resolve
+threads. Request `@codex review` after each push and confirm Cursor also reviewed that head.
 
 **Merging requires explicit human approval, not a human clicking the merge button.** After
 all gates pass, the assistant may run `gh pr merge` when the user or an authorized repository
@@ -45,7 +45,7 @@ gate afterwards (see Step 3).
 
 ## Step 2 — Resolve every review comment on the PR
 
-Fetch **all** comments and review threads on the PR — from Cursor (bugbot), Greptile, any other
+Fetch **all** comments and review threads on the PR from Cursor (bugbot), Codex, any other
 bot reviewers, and human reviewers:
 
 ```bash
@@ -67,13 +67,13 @@ query above; do not assume.
 
 ## This process is iterative — poll for reviewers, don't sleep blind
 
-Every time you push fixes, Cursor and Greptile re-review the PR and humans may leave new
-comments. One pass is never enough. After each push:
+Every time you push fixes, request Cursor and Codex review of the new commit. Humans may
+also leave new comments. After each push:
 
 1. Poll for reviewer reaction instead of sleeping a fixed 3 minutes: check every ~20 seconds
    for new comments or review threads (same queries as Step 2), and stop polling as soon as a
    new bot review lands — bots usually post within 60–90 seconds. Cap the wait at 3 minutes;
-   a capped wait with no new activity counts as a quiet window.
+   a capped wait with no new activity does not establish that a pending review completed.
    ```bash
    start=$(date +%s); while [ $(( $(date +%s) - start )) -lt 180 ]; do
      # re-fetch comments/threads; break out early if anything new appeared
@@ -82,8 +82,8 @@ comments. One pass is never enough. After each push:
    ```
 2. If new unresolved comments appeared, handle them exactly as in Step 2 (fix or reply, then
    resolve), push, and repeat from 1.
-3. Only exit the loop when a quiet window produces **zero** new comments and zero unresolved
-   threads.
+3. Only exit the loop when Cursor and Codex have completed reviews of the final commit,
+   with zero unresolved actionable findings. Report unavailable reviews as a blocker.
 
 ## Step 3 — AGENTS.md compliance
 
@@ -121,7 +121,7 @@ Push any fixes made in Steps 1-3, then report a checklist to the user:
 - [ ] AGENTS.md audit clean (note any rules that required fixes)
 - [ ] Checks green (lint/types always; tests scoped to the diff, one full run before hand-off
       when the PR touches `exp/`)
-- [ ] Final polled quiet window after the last push produced zero new comments
+- [ ] Cursor and Codex completed reviews of the final commit with no unresolved actionable findings
 
 If anything cannot be resolved, report it as a blocker and do not merge.
 
