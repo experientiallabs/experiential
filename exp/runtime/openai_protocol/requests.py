@@ -896,11 +896,14 @@ def _response_input_messages(
                     output_index=index,
                     status=item.status,
                 )
-            summary = "\n\n".join(part.text for part in item.summary if part.text)
             try:
                 visible = (
-                    (ExposedReasoningContentBlock(content=summary),)
-                    if scheme is not None and summary
+                    tuple(
+                        ExposedReasoningContentBlock(content=part.text)
+                        for part in item.summary
+                        if part.text
+                    )
+                    if scheme is not None
                     else ()
                 )
             except ValidationError as exc:

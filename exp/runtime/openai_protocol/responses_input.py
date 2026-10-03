@@ -19,13 +19,18 @@ from exp.runtime.openai_protocol.errors import invalid_field
 
 @dataclass(frozen=True)
 class ReplayedReasoning:
-    """One validated provider reasoning item and its public input index."""
+    """One validated provider reasoning item and its public input index.
+
+    Attributes:
+        index: The item's position in the caller's ``input`` array.
+        block: The provider-opaque encrypted reasoning or the gateway-sealed carrier.
+        visible: The caller-visible summary parts replayed beside a gateway
+            carrier, one block per part. Trace capture keeps them; provider
+            replay never sees them, since the carrier holds the authenticated text.
+    """
 
     index: int
     block: EncryptedReasoningBlock | SealedReasoningContentBlock
-    # The caller-visible summary replayed beside a gateway carrier: trace
-    # capture keeps it, provider replay never sees it (the carrier holds the
-    # authenticated text).
     visible: tuple[ExposedReasoningContentBlock, ...] = ()
 
 
@@ -109,7 +114,8 @@ def responses_input_messages(value: str | tuple[ReplayedInput, ...]) -> tuple[Ga
             if len(assistant_items) > 1:
                 raise invalid_field(
                     f"input.{assistant_items[1].index}",
-                    "A Fireworks continuation may contain only one assistant message item.",
+                    "A gateway reasoning-carrier continuation may contain only one "
+                    "assistant message item.",
                 )
             content = assistant_items[0].message.content if assistant_items else None
             calls = tuple(item.call for item in segment if isinstance(item, ReplayedFunctionCall))
