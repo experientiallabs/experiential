@@ -267,7 +267,14 @@ class _ThinkingConfig(AnthropicWireModel):
 
 
 class _MessagesRequest(AnthropicWireModel):
-    """Closed gateway Anthropic Messages request profile."""
+    """Closed gateway Anthropic Messages request profile.
+
+    Attributes:
+        safeguards: Claude Code's server-side auto-mode review request,
+            validated as an array of objects and never dispatched (see the
+            ``MESSAGES_MANIFEST`` rationale). The entry shape is an evolving
+            provider beta, so validation stays shallow.
+    """
 
     model: str = Field(min_length=1, max_length=256)
     messages: tuple[_Message, ...] = Field(min_length=1)
@@ -297,6 +304,7 @@ class _MessagesRequest(AnthropicWireModel):
     rungs, and dropped with disclosure elsewhere: a cache hint changes
     cost, not semantics."""
     inference_geo: str | None = Field(default=None, min_length=1, max_length=64)
+    safeguards: tuple[JsonObject, ...] | None = None
     provider: ProviderRoutingPreferences | None = None
     gateway: GatewayRequestPolicy | None = None
     """The gateway's cross-surface ZDR demand / OpenRouter routing preferences."""
@@ -467,7 +475,11 @@ def _decode(
             ),
             inference_geo=request.inference_geo,
             provider_beta_tokens=forwarded_betas,
-            ignored_parameters=(*dropped_beta_disclosures, *channels.disclosures),
+            ignored_parameters=(
+                *dropped_beta_disclosures,
+                *channels.disclosures,
+                *(("safeguards",) if request.safeguards is not None else ()),
+            ),
             gateway=request.gateway,
             zdr_requested=request.provider is not None and request.provider.demands_zdr,
             provider_preferences=(
