@@ -27,6 +27,8 @@ def _reserve(
     reserved_tokens: int = 0,
     warm_session: bool = True,
     fresh_spill_fraction: float | None = None,
+    priority: bool = False,
+    priority_reserve_fraction: float | None = None,
     force: bool = False,
 ) -> str | RungShed:
     """Reserve one slot on the shared test rung."""
@@ -42,6 +44,8 @@ def _reserve(
         reserved_tokens=reserved_tokens,
         warm_session=warm_session,
         fresh_spill_fraction=fresh_spill_fraction,
+        priority=priority,
+        priority_reserve_fraction=priority_reserve_fraction,
         force=force,
     )
 
@@ -627,6 +631,79 @@ class TestFreshSessionSpill:
         for _ in range(4):
             assert isinstance(_reserve(registry, "org-a", warm_session=False), str)
         assert _reserve(registry, "org-a", warm_session=False) == RungShed("queue_bound")
+
+
+class TestPriorityReserve:
+    """Non-priority callers stop below the bound; priority callers own the top slice."""
+
+    def test_non_priority_sheds_at_the_sub_bound_and_priority_fills_the_bound(self) -> None:
+        """Bound 5 with a 0.4 reserve: free callers hold 3 slots, priority reaches 5."""
+        registry = _registry([0.0])
+        for _ in range(3):
+            assert isinstance(
+                _reserve(registry, "org-free", bound=5, priority_reserve_fraction=0.4), str
+            )
+        assert _reserve(registry, "org-free", bound=5, priority_reserve_fraction=0.4) == RungShed(
+            "queue_bound", priority_reserve=True
+        )
+        for _ in range(2):
+            assert isinstance(
+                _reserve(
+                    registry, "org-paid", bound=5, priority=True, priority_reserve_fraction=0.4
+                ),
+                str,
+            )
+        assert _reserve(
+            registry, "org-paid", bound=5, priority=True, priority_reserve_fraction=0.4
+        ) == RungShed("queue_bound")
+        assert registry.inflight(_KEY) == 5
+
+    def test_priority_callers_may_also_use_the_unreserved_slots(self) -> None:
+        """The reserve is a floor for priority demand, never a ceiling on it."""
+        registry = _registry([0.0])
+        for _ in range(4):
+            assert isinstance(
+                _reserve(
+                    registry, "org-paid", bound=5, priority=True, priority_reserve_fraction=0.4
+                ),
+                str,
+            )
+        assert _reserve(registry, "org-free", bound=5, priority_reserve_fraction=0.4) == RungShed(
+            "queue_bound", priority_reserve=True
+        )
+
+    def test_no_fraction_means_first_come_admission(self) -> None:
+        """Without an authored reserve the priority flag changes nothing."""
+        registry = _registry([0.0])
+        for _ in range(4):
+            assert isinstance(_reserve(registry, "org-free"), str)
+        assert _reserve(registry, "org-paid", priority=True) == RungShed("queue_bound")
+
+    def test_can_admit_honors_the_reserve(self) -> None:
+        """The elective headroom hint applies the same sub-bound to non-priority callers."""
+        registry = _registry([0.0])
+        for _ in range(3):
+            assert isinstance(
+                _reserve(registry, "org-free", bound=5, priority_reserve_fraction=0.4), str
+            )
+
+        def admits(organization_id: str, *, priority: bool) -> bool:
+            return registry.can_admit(
+                _KEY,
+                organization_id=organization_id,
+                weight=1,
+                bound=5,
+                fair_share=False,
+                requests_per_minute=None,
+                tokens_per_minute=None,
+                cache_priority_alpha=None,
+                reserved_tokens=0,
+                priority=priority,
+                priority_reserve_fraction=0.4,
+            )
+
+        assert not admits("org-free", priority=False)
+        assert admits("org-paid", priority=True)
 
 
 class TestRegistryContracts:

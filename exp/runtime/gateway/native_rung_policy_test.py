@@ -82,6 +82,7 @@ def _entry(
     throttle_cache_threshold: float | None = None,
     throttle_redial: GatewayThrottleRedialPolicy | None = None,
     affinity_fingerprint: bytes | None = None,
+    priority_admission: bool = False,
 ) -> InflightRequest:
     """Build one admitted request over the given rung ladder."""
     authorization = AuthorizationSnapshot(
@@ -96,6 +97,7 @@ def _entry(
         catalog_sha256="a" * 64,
         canonical_request_sha256="d" * 64,
         deadline_monotonic=1.0,
+        priority_admission=priority_admission,
     )
     route = GatewayRoute(
         snapshot=ExecutionSnapshot(
@@ -182,6 +184,28 @@ def test_reserve_rung_slot_lets_an_authored_bound_replace_the_default() -> None:
         loads, StickySpillRegistry(), entry, deployment, reserved_tokens=10, force=False
     )
     assert shed == RungShed("queue_bound")
+
+
+def test_reserve_rung_slot_holds_the_priority_reserve_for_priority_authorizations() -> None:
+    """The snapshot's priority flag reaches the registry: only priority fills the reserve."""
+    loads = RungLoadRegistry()
+    deployment = _deployment(
+        "deployment-a",
+        connection_sha256="b" * 64,
+        dispatch=GatewayRungDispatchPolicy(concurrency_bound=2, priority_reserve_fraction=0.5),
+    )
+    free = _entry((deployment,))
+    paid = _entry((deployment,), priority_admission=True)
+    sticky = StickySpillRegistry()
+    assert isinstance(
+        reserve_rung_slot(loads, sticky, free, deployment, reserved_tokens=10, force=False), str
+    )
+    assert reserve_rung_slot(
+        loads, sticky, free, deployment, reserved_tokens=10, force=False
+    ) == RungShed("queue_bound", priority_reserve=True)
+    assert isinstance(
+        reserve_rung_slot(loads, sticky, paid, deployment, reserved_tokens=10, force=False), str
+    )
 
 
 def test_registry_refuses_a_default_bound_below_one() -> None:

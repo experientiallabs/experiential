@@ -138,6 +138,13 @@ class RungShed:
     it; the durable disclosure column stays the bare reason code. A float
     because the ceiling can sit below one request per minute per worker.
     """
+    priority_reserve: bool = False
+    """Whether the ``queue_bound`` shed was the rung's priority reserve.
+
+    A non-priority caller shed below the hard bound, because the remaining
+    slots are reserved for priority callers. Carried for logs and counters;
+    the durable disclosure stays ``queue_bound`` (a bound shed either way).
+    """
     default_bound: bool = False
     """Whether the bound that shed was the worker's default lane share.
 
@@ -243,6 +250,8 @@ class RungLoadRegistry:
         reserved_tokens: int = 0,
         warm_session: bool = True,
         fresh_spill_fraction: float | None = None,
+        priority: bool = False,
+        priority_reserve_fraction: float | None = None,
         force: bool = False,
         hard_bound: bool = False,
         rate_retry: bool = False,
@@ -267,6 +276,9 @@ class RungLoadRegistry:
                 here); fresh sessions shed at the early threshold.
             fresh_spill_fraction: Fraction of the bound where fresh sessions
                 shed early; ``None`` disables the early threshold.
+            priority: Whether the caller may use the rung's priority reserve.
+            priority_reserve_fraction: Top fraction of the bound only priority
+                callers may occupy; ``None`` disables the reserve.
             force: Admit past soft policy limits when the caller permits overflow.
             hard_bound: Recheck the capacity ceiling even on a forced rate-window retry.
             rate_retry: Skip rate windows, not capacity, fairness or fresh-session checks.
@@ -299,6 +311,8 @@ class RungLoadRegistry:
                     reserved_tokens=reserved_tokens,
                     warm_session=warm_session,
                     fresh_spill_fraction=fresh_spill_fraction,
+                    priority=priority,
+                    priority_reserve_fraction=priority_reserve_fraction,
                     skip_rate=rate_retry,
                 )
                 if shed is not None:
@@ -328,6 +342,8 @@ class RungLoadRegistry:
         tokens_per_minute: int | None,
         cache_priority_alpha: float | None,
         reserved_tokens: int,
+        priority: bool = False,
+        priority_reserve_fraction: float | None = None,
     ) -> bool:
         """Check current local headroom without reserving or consuming a rate-window slot.
 
@@ -357,6 +373,8 @@ class RungLoadRegistry:
                     reserved_tokens=reserved_tokens,
                     warm_session=True,
                     fresh_spill_fraction=None,
+                    priority=priority,
+                    priority_reserve_fraction=priority_reserve_fraction,
                 )
                 is None
             )
@@ -375,14 +393,19 @@ class RungLoadRegistry:
         reserved_tokens: int,
         warm_session: bool,
         fresh_spill_fraction: float | None,
+        priority: bool = False,
+        priority_reserve_fraction: float | None = None,
         skip_rate: bool = False,
     ) -> RungShed | None:
         """Decide one reservation under the registry lock; ``None`` admits.
 
         The bound is hard: at or beyond it every arrival spills, which is the
-        queue-death fix. Fresh sessions (no warm sticky standing on this rung)
-        spill earlier, at ``bound * fresh_spill_fraction``, reserving the top
-        slice of the bound for sessions whose provider cache lives here. The
+        queue-death fix. Non-priority callers spill earlier, at
+        ``bound * (1 - priority_reserve_fraction)``, keeping the reserved top
+        slice free for a priority caller. Fresh sessions (no warm sticky
+        standing on this rung) spill earlier, at
+        ``bound * fresh_spill_fraction``, reserving the top slice of the bound
+        for sessions whose provider cache lives here. The
         rate check sheds a dispatch the sliding window cannot absorb under the
         working ceiling (the authored rate clamped by the learned one) BEFORE
         the provider answers 429. Below all of those, fairness sheds an
@@ -402,6 +425,12 @@ class RungLoadRegistry:
         if bound is not None:
             if rung.total >= bound:
                 return RungShed("queue_bound")
+            if (
+                priority_reserve_fraction is not None
+                and not priority
+                and rung.total >= bound * (1.0 - priority_reserve_fraction)
+            ):
+                return RungShed("queue_bound", priority_reserve=True)
             if (
                 fresh_spill_fraction is not None
                 and not warm_session

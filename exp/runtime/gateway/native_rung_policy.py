@@ -119,6 +119,8 @@ def reserve_rung_slot(
         reserved_tokens=reserved_tokens if tokens_per_minute is not None else 0,
         warm_session=warm_session,
         fresh_spill_fraction=fresh_fraction,
+        priority=entry.authorization.priority_admission,
+        priority_reserve_fraction=None if policy is None else policy.priority_reserve_fraction,
         force=force,
         hard_bound=applies_default or (policy is not None and policy.saturation == "refuse"),
         rate_retry=rate_retry,

@@ -138,6 +138,21 @@ class GatewayRungDispatchPolicy(ContractModel):
     for recently active under-share organizations. Work-conserving: a lone
     organization borrows the whole bound. Requires ``concurrency_bound``.
     """
+    priority_reserve_fraction: float | None = Field(default=None, gt=0, lt=1)
+    """Fraction of ``concurrency_bound`` held back for priority callers.
+
+    A caller whose ``AuthorizationSnapshot.priority_admission`` is false sheds
+    (``queue_bound``) once the rung's in-flight dispatches reach
+    ``concurrency_bound * (1 - fraction)``; a priority caller is admitted up
+    to the full bound. A priority request arriving at a saturated rung
+    therefore finds the reserved top slice free instead of a slot taken by
+    whichever caller arrived first, without waiting on fairness to observe
+    its organization as recently active on this worker. The reserve is not
+    work-conserving: reserved slots stay empty while no priority caller
+    needs them, which is the price of priority callers never queueing
+    behind non-priority demand. ``None`` disables the reserve. Requires
+    ``concurrency_bound``.
+    """
     affinity_weight: float | None = Field(default=None, gt=0, allow_inf_nan=False)
     """Rendezvous weight under ``maximize_cache_affinity`` (``None`` means 1.0).
 
@@ -208,13 +223,15 @@ class GatewayRungDispatchPolicy(ContractModel):
     def _require_coherent_authoring(self) -> GatewayRungDispatchPolicy:
         """Reject values whose prerequisite lever is not authored.
 
-        Fairness and the fresh-session threshold divide a capacity, so both
-        need the bound; the cache-priority term scales fairness weights, so it
+        Fairness, the priority reserve, and the fresh-session threshold divide
+        a capacity, so each needs the bound; the cache-priority term scales fairness weights, so it
         needs fairness. Failing closed here keeps an inert combination from
         being authored and silently doing nothing.
         """
         if self.fair_share and self.concurrency_bound is None:
             raise ValueError("fair_share requires a concurrency_bound to share")
+        if self.priority_reserve_fraction is not None and self.concurrency_bound is None:
+            raise ValueError("priority_reserve_fraction requires a concurrency_bound to reserve")
         if self.cache_priority_alpha is not None and not self.fair_share:
             raise ValueError("cache_priority_alpha requires fair_share to weight")
         if self.fresh_session_spill_fraction is not None:

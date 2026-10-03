@@ -202,6 +202,8 @@ def stage_affinity_ordered_rungs(
             tokens_per_minute=None if policy is None else policy.tokens_per_minute,
             cache_priority_alpha=None if policy is None else policy.cache_priority_alpha,
             reserved_tokens=reserved_tokens,
+            priority=authorization.priority_admission,
+            priority_reserve_fraction=None if policy is None else policy.priority_reserve_fraction,
         )
 
     if request_carries_cache_markers(request):

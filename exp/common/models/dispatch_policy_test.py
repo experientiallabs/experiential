@@ -60,6 +60,17 @@ def test_rate_and_cache_fields_validate_their_prerequisites() -> None:
     assert full.cache_priority_alpha == 2.0
 
 
+def test_priority_reserve_requires_a_bound_and_an_open_fraction() -> None:
+    """The reserve slices a bound, so it needs one, and must leave both sides nonempty."""
+    with pytest.raises(ValueError, match="concurrency_bound"):
+        GatewayRungDispatchPolicy(priority_reserve_fraction=0.4)
+    for fraction in (0.0, 1.0):
+        with pytest.raises(ValueError):
+            GatewayRungDispatchPolicy(concurrency_bound=5, priority_reserve_fraction=fraction)
+    policy = GatewayRungDispatchPolicy(concurrency_bound=5, priority_reserve_fraction=0.4)
+    assert policy.priority_reserve_fraction == 0.4
+
+
 def test_default_policy_contributes_zero_identity_bytes() -> None:
     """An all-default policy dumps empty under exclude-defaults.
 

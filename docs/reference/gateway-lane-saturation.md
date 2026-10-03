@@ -50,6 +50,23 @@ bypass that was not a registry shed (a cold throttle failover) keeps the histori
 A reasoning-pinned continuation's first dispatch still force-admits its pinned rung for every
 shed reason (`shed_keeps_pin`), the documented continuity-over-spill trade.
 
+## Priority reserve
+
+First-come admission on a saturated lane lets whoever arrives first hold the bound, and
+fairness (`fair_share`) cannot help a caller that is not yet recently active on THIS worker:
+the hard bound is checked before fairness, so its first request still meets a full rung.
+`GatewayRungDispatchPolicy.priority_reserve_fraction` (0 < f < 1, requires
+`concurrency_bound`) holds the top slice of the bound for priority callers. A request whose
+`AuthorizationSnapshot.priority_admission` is false sheds (`queue_bound`, carried as
+`RungShed.priority_reserve` for logs) once the rung's in-flight count reaches
+`bound * (1 - f)`; a priority request is admitted up to the full bound. With bound 5 and
+f = 0.4, non-priority callers share 3 slots per worker and priority callers can always
+reach the remaining 2, plus any unreserved slot that is free. On a `refuse` rung the
+non-priority shed is the same retryable 429 as a full bound. The reserve is not
+work-conserving: reserved slots stay empty while no priority caller needs them. The host
+decides who is a priority caller (the hosted platform marks paying organizations); the
+engine only reads the flag.
+
 ## Durable retry and billing proof
 
 A local capacity refusal carries `x-gateway-admission-refused: true` only after the
