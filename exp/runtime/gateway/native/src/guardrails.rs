@@ -10,6 +10,7 @@
 
 pub mod detector;
 pub mod plan;
+pub(crate) mod runtime;
 mod syntax;
 
 use serde::Deserialize;

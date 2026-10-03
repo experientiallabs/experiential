@@ -14,6 +14,7 @@ use crate::admission::{served_headers, Admission};
 use crate::encode::ChatSseEncoder;
 use crate::errors::{Failure, FailureClass};
 use crate::events::{Event, Usage};
+use crate::guardrails::runtime::{inspect_events, RuntimeInspector};
 use crate::guardrails::{released_events, StreamRedactor};
 use crate::relay::track_event;
 use crate::replay::OwnerLease;
@@ -77,6 +78,9 @@ pub(super) async fn stream_response(
         // Deterministic output redaction as bytes flow: only the trailing
         // window the detector cannot yet decide about is withheld.
         let mut redactor = incremental_guardrail.then(|| StreamRedactor::new(&request_id));
+        let mut runtime_inspector = admission
+            .runtime_inspection
+            .then(|| RuntimeInspector::new(&request_id, deadline));
 
         macro_rules! fail_stream {
             ($failure:expr) => {{
@@ -189,6 +193,13 @@ pub(super) async fn stream_response(
                 Ok(events) => events,
                 Err(failure) => fail_stream!(failure),
             };
+            let outward_events =
+                match inspect_events(runtime_inspector.as_mut(), &guard.bridge, outward_events)
+                    .await
+                {
+                    Ok(events) => events,
+                    Err(failure) => fail_stream!(failure),
+                };
             if event.is_terminal() {
                 committed.relay.close_transport();
                 if matches!(event, Event::Completed | Event::StoppedAtSequence(_)) {

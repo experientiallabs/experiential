@@ -1,5 +1,67 @@
 # Gateway guardrails
 
+## Host-owned runtime inspection
+
+Hosts can bind an independent policy when composing the native gateway:
+
+```python
+control = NativeControlPlane(components, runtime_guardrail=host_policy)
+```
+
+`host_policy` implements `RuntimeGuardrail` from
+`exp.runtime.gateway.guardrails.runtime`. Its `open` method receives the
+authenticated organization and complete normalized request after continuation
+expansion and reasoning authentication. It runs before customer guardrails,
+ledger acceptance, route selection and provider dispatch. If a customer rule
+rewrites the request, the host inspects that exact replacement as well. Customer
+identity assignments cannot remove this binding. Return a request-owned
+`RuntimeGuardrailSession`; only an operator-selected exemption may return `None`.
+Recovered plaintext reasoning is checked again before dispatch. Startup requires
+the compiled `RUNTIME_INSPECTION_CONTRACT_VERSION=1` marker; an older native wheel
+cannot silently ignore output inspection. Publish the coordinated engine and
+native releases before a downstream host updates its exact PyPI pins.
+
+The session's `inspect_output` receives ordered `RuntimeOutput` segments. Plain
+text normally flushes at 256 UTF-8 bytes or at the terminal event. Tool frames
+remain withheld until complete tool arguments are available. Text, refusals,
+visible reasoning, tool arguments, and retrieved content have separate provenance.
+Native pending storage is limited to 1 MiB and 1,024 events. Model state and
+context limits remain the host's responsibility. The host must retain enough
+exact context to interpret later segments without silently truncating; exceeding
+its supported coverage must be an explicit error.
+
+The host must honor the supplied request deadline, bound its own I/O/queues,
+and avoid content logging. The bridge refuses expired decisions. Unexpected
+callback errors become sanitized `unavailable` failures; an explicit
+`GuardrailRejected` carries the host's sanitized policy or coverage failure.
+No future segment inherits a previous segment's allow result. Output is inspected
+after optional redaction and before encoding or continuation retention. A live
+stream can release allowed prefixes before generation completes. Earlier bytes
+cannot be recalled if a later segment changes the policy decision. The engine
+does not claim zero leakage or provide a model-quality guarantee.
+
+`revision` binds the policy, detector, and operator rollout configuration to keyed
+replay. Change it whenever any of those changes: an old replay then conflicts
+instead of serving content under a stale inspection decision. Sessions are bound
+to a live accounting entry, never a tenant-shared safe-prefix cache.
+
+This hook covers native Chat Completions, Responses (including its WebSocket
+admission), and Messages. It does **not** cover separate image, embedding, batch,
+or host-specific inference routes. Hosts must explicitly fence those surfaces
+when enforcing a mandatory policy. Image output and token probabilities are
+unsupported by the segment contract. Encrypted reasoning/signatures are opaque,
+not a claim of inspected plaintext. Provider-executed tools may execute before
+the gateway receives their events; the hook gates delivery, not that execution.
+
+Input rejection precedes durable acceptance and attempts. Output rejection may
+occur after provider usage: the normal failed-attempt settlement records available
+usage (or the existing disconnect estimate) and closes the stream without
+failover. Hosts must verify their own customer billing policy separately. This
+change provides the runtime seam, not a hosted criminal-abuse detector, rollout,
+or production enforcement. Existing customer guardrails remain independent.
+
+## Customer identity policies
+
 Identity-scoped guardrails inspect a request after authentication and, when
 configured, inspect the winning completion before any caller byte is delivered.
 They are default-off. Lookup is by authenticated `organization_id` plus

@@ -38,10 +38,14 @@ from exp.runtime.gateway.guardrails.client import assert_not_internal_classifica
 from exp.runtime.gateway.guardrails.contracts import GuardrailRejected
 from exp.runtime.gateway.guardrails.enforcement import GuardrailEngine
 from exp.runtime.gateway.guardrails.native import (
-    enforce_native_input,
-    enforce_native_output,
-    enforce_native_output_segment,
+    NativeGuardrailsMixin,
+    inspect_native_input,
     native_output_mode,
+)
+from exp.runtime.gateway.guardrails.runtime import (
+    RuntimeGuardrail,
+    open_inspection,
+    validate_runtime_guardrail,
 )
 from exp.runtime.gateway.model_chain_authority import authorize_serving_model_chains
 from exp.runtime.gateway.native_accounting import (
@@ -166,6 +170,7 @@ _REQUEST_TIMEOUT_SECONDS = 120.0
 
 class NativeControlPlane(
     NativeAuthenticationMixin,
+    NativeGuardrailsMixin,
     NativeDecodeMixin,
     NativeExplicitCacheMixin,
     NativeBatchRelayMixin,
@@ -198,6 +203,7 @@ class NativeControlPlane(
         recovery_host: RecoveryHost | None = None,
         native_route_eligible: Callable[[GatewayRoute, GatewayRequest], bool] | None = None,
         guardrails: GuardrailEngine | None = None,
+        runtime_guardrail: RuntimeGuardrail | None = None,
         capture: CaptureController | None = None,
         web_search: WebSearchBackend | None = None,
         default_lane_bound: int | None = None,
@@ -224,6 +230,7 @@ class NativeControlPlane(
                 admits every sample; a raising gate skips the sample.
             native_route_eligible: Optional hosted policy for complete native semantics.
             guardrails: Optional identity-scoped engine. ``None`` leaves traffic unguarded.
+            runtime_guardrail: Host-owned inspection independent of identity policy settings.
             capture: Optional identity-scoped native capture controller.
             web_search: Gateway web-search backend; ``None`` binds Exa from ``EXA_API_KEY``.
             default_lane_bound: Per-worker in-flight cap for rungs that author
@@ -238,6 +245,7 @@ class NativeControlPlane(
         if request_timeout_seconds <= 0:
             raise ValueError("request_timeout_seconds must be positive")
         self._components = components
+        self._runtime_guardrail = validate_runtime_guardrail(runtime_guardrail)
         self._automatic_cache = automatic_cache
         self._explicit_cache = validate_cache_hosts(explicit_cache, automatic_cache)
         self._capture = capture
@@ -376,17 +384,17 @@ class NativeControlPlane(
             )
             raise NativeBridgeError(error) from exc
 
-        policy = None
         try:
-            request, policy = enforce_native_input(
+            request, policy, runtime_inspection = inspect_native_input(
                 self._guardrails,
+                self._runtime_guardrail,
                 authorization=authorization,
                 request=request,
                 deadline_monotonic=deadline,
                 detectors=self._guardrail_detectors,
             )
         except GuardrailRejected as exc:
-            raise NativeBridgeError(public_failure_error(exc.failure)) from exc
+            raise NativeBridgeError(public_failure_error(exc.failure)) from None
         captured_request = request
         retention_request = strip_stale_reasoning_history(request)
         try:
@@ -421,6 +429,16 @@ class NativeControlPlane(
             )
         pinned_reasoning_route = verified_reasoning_route
         request = strip_stale_reasoning_history(request)
+        if request != captured_request:
+            try:
+                runtime_inspection = open_inspection(
+                    self._runtime_guardrail,
+                    authorization=authorization,
+                    request=request,
+                    deadline_monotonic=deadline,
+                )
+            except GuardrailRejected as exc:
+                raise NativeBridgeError(public_failure_error(exc.failure)) from None
         if pinned_reasoning_route is not None and not has_active_reasoning_content(request):
             pinned_reasoning_route = None
         if continuation_context is not None:
@@ -428,11 +446,8 @@ class NativeControlPlane(
             # continuation store keeps the post-guardrail history sealed.
             continuation_context.messages = retention_request.messages
 
-        # The ledger accepts the logical request before route selection, so a
-        # keyed operation whose durable terminal already exists (or whose key
-        # was reused with different content) fails closed here, before
-        # learned selection can run request-time embedding or any other
-        # provider-touching work.
+        # Accept before routing so replay conflicts fail before learned
+        # selection can run embeddings or other provider work.
         try:
             self._write_ledger.accept_request(authorization=authorization)
         except Exception as exc:  # noqa: BLE001 - boundary sanitizes every failure.
@@ -724,6 +739,7 @@ class NativeControlPlane(
                 continuation=continuation_context,
                 no_paid_prework=admission_without_effects(authorization, captured_request, policy),
                 policy=policy,
+                runtime_inspection=runtime_inspection,
                 signers=tuple(signers),
                 dispatch_bindings=tuple(dispatch_bindings),
                 reasoning_carrier_authorities=tuple(carrier_authorities),
@@ -770,6 +786,7 @@ class NativeControlPlane(
             "ignored_parameters": list(public_request.ignored_parameters),
             **attempt_policy(request.gateway).model_dump(mode="json"),
             "refusal_failover": authorization.refusal_failover,
+            "runtime_inspection": runtime_inspection is not None,
             "output_guardrail": native_output_mode(
                 self._guardrails,
                 policy,
@@ -844,29 +861,6 @@ class NativeControlPlane(
         """
         return self._accounting.abandon(argument)
 
-    def enforce_output_segment(self, argument: str) -> str:
-        """Release the settled part of one streamed ``stream`` mode tail."""
-        entry = self._accounting.entry(str(json.loads(argument).get("request_id") or ""))
-        policy = None if entry is None else entry.policy
-        deadline = time.monotonic() if entry is None else entry.deadline_monotonic
-        return enforce_native_output_segment(
-            self._guardrails, policy, argument, deadline_monotonic=deadline
-        )
-
-    def enforce_output(self, argument: str) -> str:
-        """Run one output-chain callback for a native buffered completion."""
-        data = json.loads(argument)
-        request_id = str(data.get("request_id") or "")
-        entry = self._accounting.entry(request_id)
-        policy = None if entry is None else entry.policy
-        deadline = time.monotonic() if entry is None else entry.deadline_monotonic
-        return enforce_native_output(
-            self._guardrails,
-            policy,
-            argument,
-            deadline_monotonic=deadline,
-        )
-
     def seal_reasoning_content(self, argument: str) -> str:
         """Seal one winning Fireworks turn before terminal settlement."""
         return seal_reasoning_carrier_content(self._accounting, argument)
@@ -935,7 +929,13 @@ class NativeControlPlane(
                 return _escalation(str(exc))
             except Exception:  # noqa: BLE001 - the owner's admission records this failure.
                 pass
-        return replay_scope_payload(authorization, request)
+        return replay_scope_payload(
+            authorization,
+            request,
+            inspection_revision=None
+            if self._runtime_guardrail is None
+            else self._runtime_guardrail.revision,
+        )
 
     def remember(self, argument: str) -> str:
         """Retain one finished Responses continuation within strict bounds.

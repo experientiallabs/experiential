@@ -36,6 +36,7 @@ from exp.runtime.gateway.guardrails.native import (
     enforce_native_input,
     enforce_native_output,
     enforce_native_output_segment,
+    inspect_native_input,
     native_output_mode,
     parse_output_payload,
     upstream_requests_reasoning,
@@ -46,6 +47,7 @@ from exp.runtime.gateway.guardrails.regex import (
     RegexClassifier,
 )
 from exp.runtime.gateway.guardrails.store import MappingGuardrailStore
+from exp.runtime.gateway.tests.runtime_guardrails_test import _Guard
 
 
 def _authorization() -> AuthorizationSnapshot:
@@ -122,6 +124,57 @@ def test_unguarded_native_input_does_not_call_classifiers() -> None:
 
     assert unchanged is request
     assert policy is None
+
+
+def test_runtime_policy_checks_customer_rewrites_before_dispatch() -> None:
+    """A customer-controlled replacement cannot introduce uninspected instructions."""
+    request = GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=(GatewayMessage(role="user", content="original request"),),
+    )
+    replacement = (GatewayMessage(role="user", content="rewritten request"),)
+    policy = GuardrailPolicy(
+        policy_id="rewrite",
+        organization_id="organization-one",
+        identity_id="identity-one",
+        checks=(
+            GuardrailCheck(
+                check_id="rewrite-input",
+                capability=GuardrailCapabilityKind.CONTENT_SAFETY,
+                stage=GuardrailCheckStage.INPUT,
+                action=GuardrailAction.MODIFY,
+                timeout_ms=100,
+                adapter_id="scripted",
+            ),
+        ),
+    )
+    engine = GuardrailEngine(
+        store=MappingGuardrailStore((policy,)),
+        monotonic=time.monotonic,
+        client=DirectClassifierClient(
+            ClassifierRegistry(
+                {
+                    "scripted": ScriptedClassifier(
+                        input_verdict=ClassifierVerdict(
+                            flagged=True, replacement_messages=replacement
+                        )
+                    )
+                }
+            )
+        ),
+    )
+    runtime = _Guard()
+    transformed, _, session = inspect_native_input(
+        engine,
+        runtime,
+        authorization=_authorization(),
+        request=request,
+        deadline_monotonic=time.monotonic() + 10,
+    )
+    assert transformed.messages == replacement
+    assert [item.messages for item in runtime.requests] == [request.messages, replacement]
+    assert len(runtime.sessions) == 2
+    assert session is runtime.sessions[-1]
 
 
 def test_native_input_runs_the_async_chain_on_a_private_loop() -> None:

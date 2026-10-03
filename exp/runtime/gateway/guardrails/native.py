@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import time
 from collections.abc import Mapping, Sequence
-from typing import cast
+from typing import TYPE_CHECKING, Protocol, cast
 
 from exp.common.core.artifacts import JsonObject
 from exp.runtime.gateway.contracts import AuthorizationSnapshot, GatewayRequest
@@ -21,6 +21,45 @@ from exp.runtime.gateway.guardrails.contracts import (
 )
 from exp.runtime.gateway.guardrails.deterministic import NativeDetector, native_input_request
 from exp.runtime.gateway.guardrails.enforcement import GuardrailEngine
+from exp.runtime.gateway.guardrails.runtime import (
+    RuntimeGuardrail,
+    RuntimeGuardrailSession,
+    inspect_argument,
+    open_inspection,
+)
+
+if TYPE_CHECKING:
+    from exp.runtime.gateway.native_accounting import NativeAttemptAccounting
+
+
+def inspect_native_input(
+    engine: GuardrailEngine | None,
+    runtime: RuntimeGuardrail | None,
+    *,
+    authorization: AuthorizationSnapshot,
+    request: GatewayRequest,
+    deadline_monotonic: float,
+    detectors: Mapping[str, NativeDetector] | None = None,
+) -> tuple[GatewayRequest, GuardrailPolicy | None, RuntimeGuardrailSession | None]:
+    """Check original intent and any optional rewrite before dispatch or charging."""
+    session = open_inspection(
+        runtime, authorization=authorization, request=request, deadline_monotonic=deadline_monotonic
+    )
+    transformed, policy = enforce_native_input(
+        engine,
+        authorization=authorization,
+        request=request,
+        deadline_monotonic=deadline_monotonic,
+        detectors=detectors,
+    )
+    if transformed != request:
+        session = open_inspection(
+            runtime,
+            authorization=authorization,
+            request=transformed,
+            deadline_monotonic=deadline_monotonic,
+        )
+    return transformed, policy, session
 
 
 def enforce_native_input(
@@ -319,3 +358,41 @@ def upstream_requests_reasoning(wire_route: Sequence[JsonObject]) -> bool:
         ):
             return True
     return False
+
+
+class _GuardrailPlane(Protocol):
+    """The typed accounting and policy seams used by native output callbacks."""
+
+    _accounting: NativeAttemptAccounting
+    _guardrails: GuardrailEngine | None
+
+
+class NativeGuardrailsMixin:
+    """Native output callbacks bound to the admitted request's frozen policy."""
+
+    def enforce_output_segment(self: _GuardrailPlane, argument: str) -> str:
+        """Release the settled part of one streamed ``stream`` mode tail."""
+        entry = self._accounting.entry(str(json.loads(argument).get("request_id") or ""))
+        policy = None if entry is None else entry.policy
+        deadline = time.monotonic() if entry is None else entry.deadline_monotonic
+        return enforce_native_output_segment(
+            self._guardrails, policy, argument, deadline_monotonic=deadline
+        )
+
+    def inspect_runtime_output(self: _GuardrailPlane, argument: str) -> str:
+        """Inspect a pending native segment through its exact admitted request session."""
+        return inspect_argument(self._accounting, argument)
+
+    def enforce_output(self: _GuardrailPlane, argument: str) -> str:
+        """Run one output-chain callback for a native buffered completion."""
+        data = json.loads(argument)
+        request_id = str(data.get("request_id") or "")
+        entry = self._accounting.entry(request_id)
+        policy = None if entry is None else entry.policy
+        deadline = time.monotonic() if entry is None else entry.deadline_monotonic
+        return enforce_native_output(
+            self._guardrails,
+            policy,
+            argument,
+            deadline_monotonic=deadline,
+        )

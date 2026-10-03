@@ -24,6 +24,7 @@ use crate::encode::{compact_json, reasoning_carrier_candidate};
 use crate::encode_responses::ResponsesSseEncoder;
 use crate::errors::{Failure, FailureClass, PublicError};
 use crate::events::{Event, Usage};
+use crate::guardrails::runtime::{inspect_events, RuntimeInspector};
 use crate::guardrails::{released_events, StreamRedactor};
 use crate::metrics::{classify_escalation, METRICS};
 use crate::relay::{collect_committed, collection_public_error, track_event};
@@ -743,6 +744,9 @@ async fn stream_responses(
         // Deterministic output redaction as bytes flow: only the trailing
         // window the detector cannot yet decide about is withheld.
         let mut redactor = incremental_guardrail.then(|| StreamRedactor::new(&request_id));
+        let mut runtime_inspector = admission
+            .runtime_inspection
+            .then(|| RuntimeInspector::new(&request_id, deadline));
         // Terminal frames are withheld until continuation retention lands,
         // mirroring the python stream body's ordering.
         let terminal_frames: Vec<String>;
@@ -824,7 +828,7 @@ async fn stream_responses(
             if matches!(event, Event::Failed(_)) {
                 usage = committed.relay.usage_before_failure(usage.take());
             }
-            if redactor.is_none() {
+            if redactor.is_none() && runtime_inspector.is_none() {
                 // A guarded stream retains what the caller actually saw, so
                 // a continuation replays the redacted text, never the raw
                 // completion; retention then runs over the released events.
@@ -835,7 +839,7 @@ async fn stream_responses(
             let outward = outward_event(&event, &mut visible_refusal);
             // A byte that reaches the caller has already been through the
             // detector, and a terminal flushes whatever is still buffered.
-            let guarded = redactor.is_some();
+            let guarded = redactor.is_some() || runtime_inspector.is_some();
             let outward_events = match released_events(
                 redactor.as_mut(),
                 &guard.bridge,
@@ -847,14 +851,21 @@ async fn stream_responses(
                 Ok(events) => events,
                 Err(failure) => fail_stream!(failure),
             };
+            // The terminal is recorded before its frames flush, so a
+            // disconnect during the final flush still settles by the
+            // provider's outcome instead of as a cancellation.
+            let outward_events =
+                match inspect_events(runtime_inspector.as_mut(), &guard.bridge, outward_events)
+                    .await
+                {
+                    Ok(events) => events,
+                    Err(failure) => fail_stream!(failure),
+                };
             if guarded {
                 for released in &outward_events {
                     retention.track(released);
                 }
             }
-            // The terminal is recorded before its frames flush, so a
-            // disconnect during the final flush still settles by the
-            // provider's outcome instead of as a cancellation.
             if event.is_terminal() {
                 committed.relay.close_transport();
                 terminal = Some(event.clone());

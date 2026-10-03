@@ -24,6 +24,7 @@ use crate::encode::compact_json;
 use crate::encode_messages::{anthropic_error_body, AggregatedMessage, MessagesSseEncoder};
 use crate::errors::{Failure, FailureClass, PublicError};
 use crate::events::{Event, Usage};
+use crate::guardrails::runtime::{inspect_events, RuntimeInspector};
 use crate::guardrails::{released_events, StreamRedactor};
 use crate::metrics::{classify_escalation, METRICS};
 use crate::reasoning_display::ReasoningOutput;
@@ -654,6 +655,9 @@ async fn stream_messages(
         // Deterministic output redaction as bytes flow: only the trailing
         // window the detector cannot yet decide about is withheld.
         let mut redactor = incremental_guardrail.then(|| StreamRedactor::new(&request_id));
+        let mut runtime_inspector = admission
+            .runtime_inspection
+            .then(|| RuntimeInspector::new(&request_id, deadline));
         let mut empty_completion = false;
 
         macro_rules! fail_stream {
@@ -753,6 +757,13 @@ async fn stream_messages(
                 Ok(events) => events,
                 Err(failure) => fail_stream!(failure),
             };
+            let outward_events =
+                match inspect_events(runtime_inspector.as_mut(), &guard.bridge, outward_events)
+                    .await
+                {
+                    Ok(events) => events,
+                    Err(failure) => fail_stream!(failure),
+                };
             if event.is_terminal() {
                 committed.relay.close_transport();
                 if matches!(event, Event::Completed | Event::StoppedAtSequence(_)) {

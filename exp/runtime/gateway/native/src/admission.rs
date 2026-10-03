@@ -66,6 +66,9 @@ pub(crate) struct Admission {
     /// callback. See [`OutputGuardrailMode`].
     #[serde(default)]
     pub output_guardrail: OutputGuardrailMode,
+    /// Host policy applies independently of every customer identity policy.
+    #[serde(default)]
+    pub runtime_inspection: bool,
     /// The resolved output chain when every check binds a deterministic
     /// detector. The data plane enforces it in place, so the request pays no
     /// python callback. A chain with any non-deterministic adapter omits the
@@ -144,6 +147,7 @@ impl Admission {
             wire.upstream_payload.get("logprobs") != Some(&Value::Bool(true))
                 || (wire.dialect == "openai_compatible"
                     && !self.output_guardrail.enforces()
+                    && !self.runtime_inspection
                     && wire.stop_sequences.is_empty())
         })
     }
@@ -170,7 +174,9 @@ impl Admission {
     /// Whether the winning completion must be buffered for an output chain,
     /// natively or across the python boundary.
     pub(crate) fn buffers_output(&self) -> bool {
-        self.output_guardrail.enforces() || self.guardrail_output_plan.is_some()
+        self.output_guardrail.enforces()
+            || self.guardrail_output_plan.is_some()
+            || (self.runtime_inspection && !self.stream)
     }
 
     /// Whether the rung at `depth` returns plaintext reasoning to the caller.
@@ -194,7 +200,8 @@ impl Admission {
     /// whole request: guardrails judge content, not reasoning, so display copy
     /// would carry text the chain never saw.
     pub(crate) fn reasoning_displayed_at(&self, depth: usize) -> bool {
-        !self.buffers_output()
+        !self.output_guardrail.enforces()
+            && self.guardrail_output_plan.is_none()
             && self
                 .route
                 .get(depth)
@@ -384,13 +391,17 @@ pub(crate) async fn apply_output_guardrail(
     events: Vec<Event>,
     deadline: Instant,
 ) -> Result<Vec<Event>, Failure> {
-    if let Some(plan) = admission.guardrail_output_plan.as_ref() {
-        return guardrails::plan::enforce(plan, &state.guardrail_detectors, events, deadline);
-    }
-    if !admission.output_guardrail.enforces() {
-        return Ok(events);
-    }
-    guardrails::enforce_collected_output(&state.bridge, &admission.request_id, events).await
+    let events = if let Some(plan) = admission.guardrail_output_plan.as_ref() {
+        guardrails::plan::enforce(plan, &state.guardrail_detectors, events, deadline)?
+    } else if admission.output_guardrail.enforces() {
+        guardrails::enforce_collected_output(&state.bridge, &admission.request_id, events).await?
+    } else {
+        events
+    };
+    let mut inspector = admission
+        .runtime_inspection
+        .then(|| guardrails::runtime::RuntimeInspector::new(&admission.request_id, deadline));
+    guardrails::runtime::inspect_events(inspector.as_mut(), &state.bridge, events).await
 }
 
 #[cfg(test)]
