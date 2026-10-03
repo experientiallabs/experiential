@@ -146,10 +146,8 @@ class FrozenDispatchBinding:
 class InflightRequest:
     """One admitted request awaiting its terminal settlement.
 
-    The entry carries everything ``start_attempt`` needs to reserve each
-    physical dispatch (the frozen route, the provider request for budget
-    sizing, and the per-deployment attempt counters) plus the retention
-    facts the terminal settlement consumes.
+    Binds the frozen route, budget-sized provider request, attempt counters
+    and retention facts needed for dispatch reservations and settlement.
 
     Attributes:
         attempt_service_tiers: Frozen pricing authority keyed by physical attempt, initially
@@ -187,11 +185,8 @@ class InflightRequest:
     attempt_counts: list[int] = field(default_factory=list)
     ordinary_attempt_counts: list[int] = field(default_factory=list)
     attempt_policy: RequestAttemptPolicy = field(default_factory=RequestAttemptPolicy)
-    # Post-backoff redials reserved per route depth, and the budget each
-    # depth was given at admission (the schedule scaled by the cache at
-    # stake); only these redials spend it, never a retryable-class redial of
-    # the same rung. An entry built without the admission step gets the
-    # schedule's full budget on every rung.
+    # Only post-backoff redials spend the admission's cache-scaled schedule,
+    # not retryable-class redials. Without admission, use full rung budgets.
     throttle_redials: list[int] = field(default_factory=list)
     throttle_redial_budgets: tuple[int, ...] = ()
     total_attempts: int = 0

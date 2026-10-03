@@ -44,7 +44,6 @@ from exp.runtime.gateway.guardrails.native import (
 )
 from exp.runtime.gateway.guardrails.runtime import (
     RuntimeGuardrail,
-    open_inspection,
     validate_runtime_guardrail,
 )
 from exp.runtime.gateway.model_chain_authority import authorize_serving_model_chains
@@ -430,15 +429,7 @@ class NativeControlPlane(
         pinned_reasoning_route = verified_reasoning_route
         request = strip_stale_reasoning_history(request)
         if request != captured_request:
-            try:
-                runtime_inspection = open_inspection(
-                    self._runtime_guardrail,
-                    authorization=authorization,
-                    request=request,
-                    deadline_monotonic=deadline,
-                )
-            except GuardrailRejected as exc:
-                raise NativeBridgeError(public_failure_error(exc.failure)) from None
+            runtime_inspection = self.reopen_runtime_inspection(authorization, request, deadline)
         if pinned_reasoning_route is not None and not has_active_reasoning_content(request):
             pinned_reasoning_route = None
         if continuation_context is not None:
@@ -737,7 +728,10 @@ class NativeControlPlane(
                 request=provider_request,
                 deadline_monotonic=deadline,
                 continuation=continuation_context,
-                no_paid_prework=admission_without_effects(authorization, captured_request, policy),
+                no_paid_prework=(
+                    self._runtime_guardrail is None
+                    and admission_without_effects(authorization, captured_request, policy)
+                ),
                 policy=policy,
                 runtime_inspection=runtime_inspection,
                 signers=tuple(signers),

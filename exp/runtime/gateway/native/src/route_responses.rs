@@ -232,6 +232,12 @@ pub(crate) async fn responses(
         )),
         output_token_cap: admission.maximum_output_tokens,
         tool_search: admission.tool_search.as_ref(),
+        inspection: admission
+            .runtime_inspection
+            .then_some(crate::waterfall::InspectionContext {
+                web_search: admission.web_search.as_ref(),
+                responses: true,
+            }),
     };
     let mut won = acquire_attempt(&context, &mut guard).await;
     adopt_outcome(&mut admission, &mut won);
@@ -313,8 +319,7 @@ pub(crate) async fn responses(
 }
 
 /// Answer one Responses attempt that the waterfall already settled: a
-/// successful terminal with no semantic output, or an exhausted ladder
-/// flushing withheld refusal output ahead of the failing terminal.
+/// terminal without semantics or an exhausted ladder flushing inspected refusals.
 async fn settled_responses_response(
     admission: &Admission,
     settled: SettledAttempt,
@@ -728,9 +733,7 @@ async fn stream_responses(
         let mut committed = committed;
         let mut lease = lease;
         let mut delivery = Delivery::new(sender.clone(), lease.is_some());
-        // Keyed streams capture every public frame so the owner can publish
-        // the exact byte stream; terminal frames flow through the shared
-        // publication tail, matching the chat surface.
+        // Keyed streams retain exact public frames through the publication tail.
         let mut capture: Vec<u8> = Vec::new();
         let mut replayable = lease.is_some();
         let mut encoder = ResponsesSseEncoder::new(&request_id, &alias, created_at, envelope);
@@ -741,14 +744,11 @@ async fn stream_responses(
         let mut terminal: Option<Event> = None;
         let mut retention = ResponsesRetention::default();
         let mut reasoning_content_carrier: Option<String> = None;
-        // Deterministic output redaction as bytes flow: only the trailing
-        // window the detector cannot yet decide about is withheld.
+        // Withhold pending redaction and host-inspection segments.
         let mut redactor = incremental_guardrail.then(|| StreamRedactor::new(&request_id));
         let mut runtime_inspector = admission
             .runtime_inspection
             .then(|| RuntimeInspector::new(&request_id, deadline));
-        // Terminal frames are withheld until continuation retention lands,
-        // mirroring the python stream body's ordering.
         let terminal_frames: Vec<String>;
 
         macro_rules! fail_stream {

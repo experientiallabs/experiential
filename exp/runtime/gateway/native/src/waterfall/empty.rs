@@ -6,7 +6,9 @@
 use super::{AttemptEnd, DeploymentWire, SettledAttempt, WaterfallContext};
 use crate::errors::Failure;
 use crate::events::{Event, Usage};
+use crate::relay::collection_public_error;
 use crate::settlement::AttemptGuard;
+use crate::tool_search::ToolSearchRound;
 
 /// Do not regenerate an image when a provider reports success without any
 /// deliverable output. The first attempt may already have incurred image cost.
@@ -65,7 +67,21 @@ pub(super) async fn settle_output_less(
     tool_names: Vec<String>,
     depth: usize,
     encrypted_reasoning_stripped: bool,
+    search_rounds: &[ToolSearchRound],
 ) -> AttemptEnd {
+    if let Some(tracked) = usage.as_ref() {
+        events.push(Event::Usage(tracked.clone()));
+    }
+    events.push(terminal.clone());
+    if let Err(failure) = super::inspect_outward(ctx, search_rounds, &events, true).await {
+        if !guard
+            .settle("failed", usage.as_ref(), &tool_names, Some(&failure), true)
+            .await
+        {
+            return AttemptEnd::Accounting;
+        }
+        return AttemptEnd::Retention(collection_public_error(&failure.boundary()));
+    }
     let retention_failure = match &ctx.output_less_retention {
         Some(argument) => ctx.bridge.call("remember", argument.clone()).await.err(),
         None => None,
@@ -86,10 +102,6 @@ pub(super) async fn settle_output_less(
         // attempt's retention failure; only the HTTP result reports it.
         return AttemptEnd::Retention(error);
     }
-    if let Some(tracked) = usage {
-        events.push(Event::Usage(tracked));
-    }
-    events.push(terminal);
     AttemptEnd::Settled(SettledAttempt {
         depth,
         events,

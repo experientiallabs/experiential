@@ -224,6 +224,12 @@ pub(crate) async fn chat(
         output_less_retention: None,
         output_token_cap: admission.maximum_output_tokens,
         tool_search: admission.tool_search.as_ref(),
+        inspection: admission
+            .runtime_inspection
+            .then_some(crate::waterfall::InspectionContext {
+                web_search: admission.web_search.as_ref(),
+                responses: false,
+            }),
     };
     let mut won = acquire_attempt(&context, &mut guard).await;
     adopt_outcome(&mut admission, &mut won);

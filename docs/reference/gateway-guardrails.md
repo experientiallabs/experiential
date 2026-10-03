@@ -43,7 +43,12 @@ does not claim zero leakage or provide a model-quality guarantee.
 `revision` binds the policy, detector, and operator rollout configuration to keyed
 replay. Change it whenever any of those changes: an old replay then conflicts
 instead of serving content under a stale inspection decision. Sessions are bound
-to a live accounting entry, never a tenant-shared safe-prefix cache.
+to a live accounting entry, never a tenant-shared safe-prefix cache. Gateway-run
+search results and generated tool schemas are inspected before encoders synthesize
+their preambles. Exhausted refusal output and empty-turn search results are checked
+before final settlement removes that entry. Admission inspection suppresses the
+zero-work capacity retry certificate, since the host may perform paid I/O even
+when it returns no output session.
 
 This hook covers native Chat Completions, Responses (including its WebSocket
 admission), and Messages. It does **not** cover separate image, embedding, batch,

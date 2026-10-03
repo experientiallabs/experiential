@@ -216,6 +216,18 @@ impl RuntimeInspector {
         {
             return Ok(Vec::new());
         }
+        self.flush(bridge, final_segment).await
+    }
+
+    /// Inspect a complete gateway-generated prefix before encoders synthesize it.
+    pub(crate) async fn flush(
+        &mut self,
+        bridge: &Bridge,
+        final_segment: bool,
+    ) -> Result<Vec<Event>, Failure> {
+        if !self.tools.is_empty() {
+            return Err(unavailable());
+        }
         let argument = crate::encode::compact_json(&json!({
             "request_id": self.request_id, "fragments": self.fragments, "final": final_segment,
         }));

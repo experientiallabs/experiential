@@ -27,6 +27,8 @@ from exp.runtime.gateway.guardrails.runtime import (
     inspect_argument,
     open_inspection,
 )
+from exp.runtime.gateway.native_accounting_errors import NativeBridgeError
+from exp.runtime.openai_protocol.errors import public_failure_error
 
 if TYPE_CHECKING:
     from exp.runtime.gateway.native_accounting import NativeAttemptAccounting
@@ -41,7 +43,23 @@ def inspect_native_input(
     deadline_monotonic: float,
     detectors: Mapping[str, NativeDetector] | None = None,
 ) -> tuple[GatewayRequest, GuardrailPolicy | None, RuntimeGuardrailSession | None]:
-    """Check original intent and any optional rewrite before dispatch or charging."""
+    """Check original intent and optional rewrites before dispatch or charging.
+
+    Args:
+        engine: Optional customer-controlled input enforcement chain.
+        runtime: Host-owned policy, independent of customer assignments.
+        authorization: Frozen authenticated tenant and identity.
+        request: Canonical request after continuation expansion.
+        deadline_monotonic: Absolute request-wide inspection deadline.
+        detectors: Compiled customer detectors indexed by adapter.
+
+    Returns:
+        The transformed request, customer policy, and fresh host session.
+
+    Raises:
+        GuardrailRejected: Either policy rejected or could not inspect input.
+        GuardrailRecursionError: A classifier re-entered the public route.
+    """
     session = open_inspection(
         runtime, authorization=authorization, request=request, deadline_monotonic=deadline_monotonic
     )
@@ -365,10 +383,40 @@ class _GuardrailPlane(Protocol):
 
     _accounting: NativeAttemptAccounting
     _guardrails: GuardrailEngine | None
+    _runtime_guardrail: RuntimeGuardrail | None
 
 
 class NativeGuardrailsMixin:
     """Native output callbacks bound to the admitted request's frozen policy."""
+
+    def reopen_runtime_inspection(
+        self: _GuardrailPlane,
+        authorization: AuthorizationSnapshot,
+        request: GatewayRequest,
+        deadline: float,
+    ) -> RuntimeGuardrailSession | None:
+        """Inspect authenticated plaintext after sealed-history expansion.
+
+        Args:
+            authorization: Authenticated request authority.
+            request: Full request with authenticated plaintext history.
+            deadline: Original absolute request deadline.
+
+        Returns:
+            A fresh session for the actual provider-bound context.
+
+        Raises:
+            NativeBridgeError: The policy rejected or failed to inspect input.
+        """
+        try:
+            return open_inspection(
+                self._runtime_guardrail,
+                authorization=authorization,
+                request=request,
+                deadline_monotonic=deadline,
+            )
+        except GuardrailRejected as exc:
+            raise NativeBridgeError(public_failure_error(exc.failure)) from None
 
     def enforce_output_segment(self: _GuardrailPlane, argument: str) -> str:
         """Release the settled part of one streamed ``stream`` mode tail."""
