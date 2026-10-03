@@ -13,7 +13,9 @@ control = NativeControlPlane(components, runtime_guardrail=host_policy)
 authenticated organization and complete normalized request after continuation
 expansion and reasoning authentication. It runs before customer guardrails,
 ledger acceptance, route selection and provider dispatch. If a customer rule
-rewrites the request, the host inspects that exact replacement as well. Customer
+rewrites the request, the host inspects that exact replacement as well. Search
+results and planned tools are checked again before the first provider dispatch.
+Customer
 identity assignments cannot remove this binding. Return a request-owned
 `RuntimeGuardrailSession`; only an operator-selected exemption may return `None`.
 Recovered plaintext reasoning is checked again before dispatch. Startup requires
@@ -25,7 +27,9 @@ The session's `inspect_output` receives ordered `RuntimeOutput` segments. Plain
 text normally flushes at 256 UTF-8 bytes or at the terminal event. Tool frames
 remain withheld until complete tool arguments are available. Text, refusals,
 visible reasoning, tool arguments, and retrieved content have separate provenance.
-Native pending storage is limited to 1 MiB and 1,024 events. Model state and
+Native pending content is limited to 1 MiB and 1,024 events. Retained event payload
+is separately bounded at 2 MiB because a completed tool repeats its argument
+deltas; each argument is counted once toward the content limit. Model state and
 context limits remain the host's responsibility. The host must retain enough
 exact context to interpret later segments without silently truncating; exceeding
 its supported coverage must be an explicit error.
@@ -43,9 +47,12 @@ does not claim zero leakage or provide a model-quality guarantee.
 `revision` binds the policy, detector, and operator rollout configuration to keyed
 replay. Change it whenever any of those changes: an old replay then conflicts
 instead of serving content under a stale inspection decision. Sessions are bound
-to a live accounting entry, never a tenant-shared safe-prefix cache. Gateway-run
-search results and generated tool schemas are inspected before encoders synthesize
-their preambles. Exhausted refusal output and empty-turn search results are checked
+to a live accounting entry, never a tenant-shared safe-prefix cache. Generated
+gateway tool-search calls are inspected before search executes. The extended
+conversation and loaded schemas are checked before the next provider dial; its
+output session starts from that exact expanded context. Gateway-run search results
+and generated tool schemas are also inspected before encoders synthesize their
+preambles. Exhausted refusal output and empty-turn search results are checked
 before final settlement removes that entry. Admission inspection suppresses the
 zero-work capacity retry certificate, since the host may perform paid I/O even
 when it returns no output session.
@@ -58,7 +65,12 @@ unsupported by the segment contract. Encrypted reasoning/signatures are opaque,
 not a claim of inspected plaintext. Provider-executed tools may execute before
 the gateway receives their events; the hook gates delivery, not that execution.
 
-Input rejection precedes durable acceptance and attempts. Output rejection may
+Initial input rejection precedes durable acceptance and attempts. Rejection of
+gateway web-search results occurs after acceptance and search work, but before
+any provider attempt. Rejection of a generated tool-search query preserves that
+provider turn's usage without executing the search; rejecting the retrieved result
+also meters the search that already ran, and prevents another provider dial.
+Output rejection may
 occur after provider usage: the normal failed-attempt settlement records available
 usage (or the existing disconnect estimate) and closes the stream without
 failover. Hosts must verify their own customer billing policy separately. This

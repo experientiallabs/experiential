@@ -154,17 +154,44 @@ def output_decision(
     Returns:
         JSON allowing the segment or describing a sanitized policy/infrastructure error.
     """
-    if time.monotonic() >= deadline_monotonic:
-        return unavailable_decision()
     try:
-        session.inspect_output(output, deadline_monotonic=deadline_monotonic)
+        require_output(session, output, deadline_monotonic=deadline_monotonic)
     except GuardrailRejected as exc:
         return json.dumps({"action": "error", "failure": exc.failure.model_dump(mode="json")})
-    except Exception:  # noqa: BLE001 - callback exceptions may contain customer content.
-        return unavailable_decision()
-    if time.monotonic() >= deadline_monotonic:
-        return unavailable_decision()
     return '{"action":"allow"}'
+
+
+def require_output(
+    session: RuntimeGuardrailSession,
+    output: RuntimeOutput,
+    *,
+    deadline_monotonic: float,
+) -> None:
+    """Inspect generated output before delivery or a gateway-owned tool action.
+
+    Args:
+        session: Exact request-owned inspection state.
+        output: Complete pending segment or withheld tool call.
+        deadline_monotonic: Original absolute request deadline.
+
+    Raises:
+        GuardrailRejected: A policy rejection or sanitized inspection failure.
+    """
+    try:
+        if time.monotonic() >= deadline_monotonic:
+            raise TimeoutError
+        session.inspect_output(output, deadline_monotonic=deadline_monotonic)
+        if time.monotonic() >= deadline_monotonic:
+            raise TimeoutError
+    except GuardrailRejected:
+        raise
+    except Exception:  # noqa: BLE001 - callbacks can include customer content in exceptions.
+        raise GuardrailRejected(
+            GatewayFailure(
+                failure_class=GatewayFailureClass.UNAVAILABLE,
+                safe_message="Content inspection is unavailable. Retry later.",
+            )
+        ) from None
 
 
 def unavailable_decision() -> str:

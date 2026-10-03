@@ -511,6 +511,7 @@ class NativeControlPlane(
                 authorization=authorization,
                 continuation=continuation_context,
             )
+            inspection_request = request
             searched = plan_web_search(
                 request,
                 [profile.dialect for profile, _client in resolved_wires],
@@ -522,6 +523,8 @@ class NativeControlPlane(
             planned = plan_tool_search(request, [p.dialect for p, _c in resolved_wires])
             request, tool_search_state = planned.request, planned.state
             tool_search_admission = planned.admission
+            if request != inspection_request:
+                runtime_inspection = self.inspect_admitted_runtime(authorization, request, deadline)
             _require_bound_wire_authority(
                 None
                 if continuation_context is None
@@ -529,6 +532,8 @@ class NativeControlPlane(
                 route,
                 resolved_wires,
             )
+        except NativeBridgeError:
+            raise
         except NativeDialectUnavailableError as exc:
             return self._escalate_accepted(authorization, str(exc))
         except OpenAIProtocolError as exc:

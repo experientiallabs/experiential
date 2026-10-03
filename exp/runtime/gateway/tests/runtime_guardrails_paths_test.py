@@ -9,12 +9,14 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from unittest.mock import patch
 
 import exp_gateway_native
 import httpx
 import pytest
 
 from exp.common.core.artifacts import JsonObject
+from exp.runtime.gateway.contracts import AuthorizationSnapshot, GatewayRequest
 from exp.runtime.gateway.lifecycle import load_gateway_components
 from exp.runtime.gateway.management import GatewayManagement
 from exp.runtime.gateway.native_bridge import NativeControlPlane
@@ -29,9 +31,41 @@ from exp.runtime.gateway.tests.native_waterfall_test import (
     _sse_frame,
     _terminal_frames,
 )
-from exp.runtime.gateway.tests.runtime_guardrails_test import _Guard
+from exp.runtime.gateway.tests.runtime_guardrails_test import _Guard, _Session
 from exp.runtime.gateway.tests.web_search_backend_fixture_test import StaticWebSearchBackend
+from exp.runtime.gateway.tool_search.round import perform_round
 from exp.runtime.gateway.web_search.contracts import GatewayWebSearchResult
+
+
+class _RetrievedGuard(_Guard):
+    """Refuse the marker only when it enters the conversation, including retrieved turns."""
+
+    def open(
+        self,
+        *,
+        authorization: AuthorizationSnapshot,
+        request: GatewayRequest,
+        deadline_monotonic: float,
+    ) -> _Session:
+        """Inspect messages after each gateway-owned conversation expansion.
+
+        Args:
+            authorization: Authority of this request.
+            request: Complete conversation and dispatch metadata.
+            deadline_monotonic: Absolute inspection deadline.
+
+        Returns:
+            A fresh session for allowed context.
+
+        Raises:
+            GuardrailRejected: Retrieved conversation text contains the test marker.
+        """
+        self.block_input = any(
+            "withhold-marker" in message.model_dump_json() for message in request.messages
+        )
+        return super().open(
+            authorization=authorization, request=request, deadline_monotonic=deadline_monotonic
+        )
 
 
 @contextmanager
@@ -71,7 +105,9 @@ def _serving(control: NativeControlPlane) -> Iterator[str]:
 
 @pytest.mark.parametrize("surface", ["chat", "responses", "messages"])
 @pytest.mark.parametrize("stream", [False, True])
-@pytest.mark.parametrize("path", ["refusal", "search", "empty-search"])
+@pytest.mark.parametrize(
+    "path", ["refusal", "search", "empty-search", "search-input", "empty-search-input"]
+)
 def test_precommit_and_synthesized_output_is_inspected_before_settlement(
     tmp_path: Path,
     surface: str,
@@ -79,13 +115,16 @@ def test_precommit_and_synthesized_output_is_inspected_before_settlement(
     path: str,
 ) -> None:
     """A real refusal flush or search prelude cannot release the synthetic marker."""
+    provider_requests: list[JsonObject] = []
 
     class Provider(BaseHTTPRequestHandler):
         """Serve a refusal, an empty completion, or a safe answer."""
 
         def do_POST(self) -> None:  # noqa: N802
             """Return a finite synthetic SSE stream with actual usage."""
-            self.rfile.read(int(self.headers["content-length"]))
+            provider_requests.append(
+                json.loads(self.rfile.read(int(self.headers["content-length"])))
+            )
             if path == "refusal":
                 payload = (
                     _sse_frame(
@@ -110,7 +149,7 @@ def test_precommit_and_synthesized_output_is_inspected_before_settlement(
                     )
                     + b"data: [DONE]\n\n"
                 )
-            elif path == "empty-search":
+            elif path.removesuffix("-input") == "empty-search":
                 payload = (
                     _sse_frame(
                         {
@@ -151,7 +190,7 @@ def test_precommit_and_synthesized_output_is_inspected_before_settlement(
         refusal_failover=True,
     )
     components = load_gateway_components(tmp_path, environment={"TEST_PROVIDER_KEY": "synthetic"})
-    policy = _Guard()
+    policy = _RetrievedGuard() if path.endswith("-input") else _Guard()
     search = StaticWebSearchBackend(
         (
             GatewayWebSearchResult(
@@ -183,11 +222,21 @@ def test_precommit_and_synthesized_output_is_inspected_before_settlement(
         assert response.status_code == 400, response.text
         assert "withhold-marker" not in response.text
         assert "Synthetic policy violation" in response.text
-        assert "withhold-marker" in policy.sessions[0].text
+        blocked_input = path.endswith("-input")
+        assert len(provider_requests) == (0 if blocked_input else 1)
+        if blocked_input:
+            assert any(
+                "withhold-marker" in request.model_dump_json() for request in policy.requests
+            )
+        else:
+            assert any("withhold-marker" in session.text for session in policy.sessions)
         with sqlite3.connect(components.ledger.database_path) as connection:
             assert connection.execute(
                 "select state, failure_class from gateway_attempts"
-            ).fetchall() == [("failed", "guardrail")]
+            ).fetchall() == ([] if blocked_input else [("failed", "guardrail")])
+            assert connection.execute(
+                "select terminal_state, terminal_at is not null from gateway_requests"
+            ).fetchall() == [("failed", 1)]
     finally:
         provider.shutdown()
         provider.server_close()
@@ -195,10 +244,20 @@ def test_precommit_and_synthesized_output_is_inspected_before_settlement(
 
 
 @pytest.mark.parametrize("stream", [False, True])
-def test_synthesized_responses_tool_search_schema_is_inspected(
-    tmp_path: Path, stream: bool
+@pytest.mark.parametrize(
+    ("phase", "surface"),
+    [("render", "responses")]
+    + [
+        (phase, surface)
+        for phase in ("query", "retrieved")
+        for surface in ("chat", "responses", "messages")
+    ],
+)
+def test_tool_search_is_inspected_before_execution_redial_and_rendering(
+    tmp_path: Path, stream: bool, phase: str, surface: str
 ) -> None:
-    """A tool-search result schema is checked before Responses synthesizes hosted items."""
+    """Reject unsafe generated queries before search and retrieved results before redial."""
+    provider_requests: list[JsonObject] = []
 
     class Provider(BaseHTTPRequestHandler):
         """Select a deferred tool, then return a safe answer."""
@@ -206,10 +265,14 @@ def test_synthesized_responses_tool_search_schema_is_inspected(
         def do_POST(self) -> None:  # noqa: N802
             """Choose the search call only before its result enters the conversation."""
             body = json.loads(self.rfile.read(int(self.headers["content-length"])))
+            provider_requests.append(body)
+            search_turn = _search_call_turn("tool_search")
+            if phase == "query":
+                search_turn = search_turn.replace(b"current weather", b"withhold-marker")
             payload = (
                 _content_chunk("Allowed answer.") + _terminal_frames()
                 if any(message.get("role") == "tool" for message in body["messages"])
-                else _search_call_turn("tool_search")
+                else search_turn
             )
             self.send_response(200)
             self.send_header("content-type", "text/event-stream")
@@ -225,35 +288,82 @@ def test_synthesized_responses_tool_search_schema_is_inspected(
     worker.start()
     key = _configure(tmp_path, f"http://127.0.0.1:{provider.server_port}/v1")
     components = load_gateway_components(tmp_path, environment={"TEST_PROVIDER_KEY": "synthetic"})
-    policy = _Guard()
+    policy = _RetrievedGuard() if phase == "retrieved" else _Guard()
     control = NativeControlPlane(components, runtime_guardrail=policy)
-    response_tools: list[JsonObject] = [
-        {
-            "type": "function",
-            "name": "get_weather",
-            "defer_loading": True,
-            "description": "Current weather withhold-marker",
-            "parameters": {"type": "object", "properties": {"city": {"type": "string"}}},
-        },
-        {"type": "tool_search"},
-    ]
-    try:
-        with _serving(control) as url:
-            response = httpx.post(
-                url + "/v1/responses",
-                headers={"authorization": f"Bearer {key}"},
-                json={
-                    "model": "coding",
-                    "stream": stream,
-                    "input": "What's the weather?",
-                    "tools": response_tools,
+    description = "Current weather" + (" withhold-marker" if phase != "query" else "")
+    function: JsonObject = {
+        "name": "get_weather",
+        "description": description,
+        "parameters": {"type": "object", "properties": {"city": {"type": "string"}}},
+    }
+    body: JsonObject = {"model": "coding", "stream": stream}
+    if surface == "responses":
+        route = "/v1/responses"
+        body.update(
+            input="What's the weather?",
+            tools=[
+                {"type": "function", **function, "defer_loading": True},
+                {"type": "tool_search"},
+            ],
+        )
+    else:
+        route = "/v1/messages" if surface == "messages" else "/v1/chat/completions"
+        body.update(messages=[{"role": "user", "content": "What's the weather?"}], max_tokens=1000)
+        if surface == "messages":
+            body["tools"] = [
+                {
+                    "name": "get_weather",
+                    "description": description,
+                    "input_schema": function["parameters"],
+                    "defer_loading": True,
                 },
+                {"type": "tool_search_tool_bm25", "name": "tool_search_tool_bm25"},
+            ]
+        else:
+            body["tools"] = [
+                {"type": "function", "function": function, "defer_loading": True},
+                {"type": "openrouter:tool_search"},
+            ]
+    try:
+        with (
+            patch(
+                "exp.runtime.gateway.native_tool_search.perform_round", wraps=perform_round
+            ) as search,
+            patch.object(control._accounting, "settle", wraps=control._accounting.settle) as settle,
+            _serving(control) as url,
+        ):
+            response = httpx.post(
+                url + route,
+                headers={"authorization": f"Bearer {key}"},
+                json=body,
                 timeout=10,
             )
         assert response.status_code == 400, response.text
         assert "withhold-marker" not in response.text
         assert "Synthetic policy violation" in response.text
-        assert "withhold-marker" in policy.sessions[0].text
+        assert search.call_count == (0 if phase == "query" else 1)
+        assert len(provider_requests) == (2 if phase == "render" else 1)
+        if phase != "render":
+            metered = [
+                json.loads(call.args[0]).get("tool_search_requests", 0)
+                for call in settle.call_args_list
+            ]
+            assert metered == [0 if phase == "query" else 1]
+        if phase == "retrieved":
+            assert any(
+                "withhold-marker" in request.messages[-1].model_dump_json()
+                for request in policy.requests
+            )
+        else:
+            assert any("withhold-marker" in session.text for session in policy.sessions)
+        with sqlite3.connect(components.ledger.database_path) as connection:
+            attempts = connection.execute(
+                "select state, failure_class, input_tokens, output_tokens "
+                "from gateway_attempts order by rowid"
+            ).fetchall()
+        assert attempts[-1][:2] == ("failed", "guardrail")
+        assert attempts[0][2:] == (50, 8)
+        assert len(attempts) == len(provider_requests)
     finally:
         provider.shutdown()
         provider.server_close()

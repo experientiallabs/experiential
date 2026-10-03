@@ -1,6 +1,6 @@
 //! Host-owned incremental inspection, separate from customer redaction policies.
 
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 use std::time::Instant;
 
 use serde_json::{json, Value};
@@ -11,6 +11,9 @@ use crate::events::Event;
 
 const SEGMENT_BYTES: usize = 256;
 const MAX_PENDING_BYTES: usize = 1_048_576;
+// Tool completion events repeat the deltas' argument bytes. Bound this actual
+// event payload separately without halving the inspectable-content limit.
+const MAX_RETAINED_BYTES: usize = 2 * MAX_PENDING_BYTES;
 const MAX_PENDING_EVENTS: usize = 1024;
 
 /// A runtime error never implies that the content violated a policy.
@@ -35,7 +38,7 @@ pub(crate) struct RuntimeInspector {
     fragments: Vec<Value>,
     bytes: usize,
     retained_bytes: usize,
-    tools: BTreeSet<(bool, u32)>,
+    tools: BTreeMap<(bool, u32), usize>,
     deadline: Instant,
 }
 
@@ -47,7 +50,7 @@ impl RuntimeInspector {
             fragments: Vec::new(),
             bytes: 0,
             retained_bytes: 0,
-            tools: BTreeSet::new(),
+            tools: BTreeMap::new(),
             deadline,
         }
     }
@@ -106,29 +109,31 @@ impl RuntimeInspector {
                 None,
             ),
             Event::ToolCallStarted { index, .. } => {
-                if !self.tools.insert((false, *index)) {
+                if self.tools.insert((false, *index), 0).is_some() {
                     return Err(unavailable());
                 }
             }
             Event::ServerToolUseStarted { index, .. } => {
-                if !self.tools.insert((true, *index)) {
+                if self.tools.insert((true, *index), 0).is_some() {
                     return Err(unavailable());
                 }
             }
             Event::ToolArgumentsDelta { index, delta }
             | Event::ServerToolArgumentsDelta { index, delta } => {
                 let server = matches!(event, Event::ServerToolArgumentsDelta { .. });
-                if !self.tools.contains(&(server, *index)) {
+                let Some(argument_bytes) = self.tools.get_mut(&(server, *index)) else {
                     return Err(unavailable());
-                }
+                };
+                *argument_bytes = argument_bytes.saturating_add(delta.len());
                 self.bytes = self.bytes.saturating_add(delta.len());
             }
             Event::ToolCallCompleted { index, call }
             | Event::ServerToolUseCompleted { index, call } => {
                 let server = matches!(event, Event::ServerToolUseCompleted { .. });
-                if !self.tools.remove(&(server, *index)) {
+                let Some(argument_bytes) = self.tools.remove(&(server, *index)) else {
                     return Err(unavailable());
-                }
+                };
+                self.bytes = self.bytes.saturating_sub(argument_bytes);
                 self.fragment(
                     "tool",
                     format!("tool:{server}:{index}:{}", call.call_id),
@@ -203,7 +208,7 @@ impl RuntimeInspector {
         );
         self.pending.push(event);
         if self.bytes > MAX_PENDING_BYTES
-            || self.retained_bytes > MAX_PENDING_BYTES
+            || self.retained_bytes > MAX_RETAINED_BYTES
             || self.pending.len() > MAX_PENDING_EVENTS
         {
             return Err(unsupported());
@@ -289,9 +294,50 @@ mod tests {
         inspector
             .project(&Event::TextDelta("later text".into()))
             .unwrap();
-        assert!(inspector.tools.contains(&(true, 1)));
+        assert!(inspector.tools.contains_key(&(true, 1)));
         assert_eq!(inspector.fragments.len(), 1);
         assert_eq!(inspector.fragments[0]["text"], "later text");
+    }
+
+    #[test]
+    fn complete_tool_arguments_above_half_the_content_limit_are_counted_once() {
+        let arguments = "x".repeat(600_000);
+        let mut inspector = RuntimeInspector::new("request", Instant::now());
+        let events = [
+            Event::ServerToolUseStarted {
+                index: 1,
+                call_id: "call".into(),
+                name: "lookup".into(),
+            },
+            Event::ServerToolArgumentsDelta {
+                index: 1,
+                delta: arguments.clone(),
+            },
+            Event::ServerToolUseCompleted {
+                index: 1,
+                call: crate::events::CompletedToolCall {
+                    call_id: "call".into(),
+                    name: "lookup".into(),
+                    namespace: None,
+                    caller: None,
+                    provider_item_id: None,
+                    provider_status: None,
+                    raw_arguments: arguments,
+                    custom: false,
+                },
+            },
+        ];
+        for event in &events {
+            inspector.project(event).unwrap();
+        }
+        assert!(inspector.tools.is_empty());
+        assert!(inspector.bytes > 600_000 && inspector.bytes < MAX_PENDING_BYTES);
+        let retained: usize = events.iter().map(crate::relay::event_retained_bytes).sum();
+        assert!(retained > MAX_PENDING_BYTES && retained < MAX_RETAINED_BYTES);
+        assert_eq!(
+            inspector.fragments[0]["text"].as_str().unwrap().len(),
+            600_000
+        );
     }
 
     #[test]

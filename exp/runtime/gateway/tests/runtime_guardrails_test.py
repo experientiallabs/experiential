@@ -7,6 +7,7 @@ import sqlite3
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from typing import Literal
 
 import exp_gateway_native
 import httpx
@@ -111,12 +112,12 @@ def test_mandatory_input_refuses_before_durable_acceptance(tmp_path: Path) -> No
 
 @pytest.mark.parametrize("surface", ["chat", "responses", "messages"])
 @pytest.mark.parametrize("streaming", [False, True])
-@pytest.mark.parametrize("tool_call", [False, True])
+@pytest.mark.parametrize("tool_call", [False, True, "large"])
 def test_real_native_runtime_inspection_holds_each_segment(
     tmp_path: Path,
     surface: str,
     streaming: bool,
-    tool_call: bool,
+    tool_call: bool | Literal["large"],
 ) -> None:
     """A safe prefix streams before generation ends; the violating segment never escapes."""
     continue_output = threading.Event()
@@ -138,8 +139,9 @@ def test_real_native_runtime_inspection_holds_each_segment(
                 self.wfile.flush()
                 if streaming:
                     continue_output.wait(5)
+                arguments = '{"q":"' + ("x" * 600_000 if tool_call == "large" else "") + "withhold-"
                 frames = (
-                    (_tool_chunk('{"q":"withhold-', start=True), _tool_chunk('marker"}'))
+                    (_tool_chunk(arguments, start=True), _tool_chunk('marker"}'))
                     if tool_call
                     else (_content_chunk("withhold-"), _content_chunk("marker"))
                 )

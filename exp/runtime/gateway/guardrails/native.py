@@ -418,6 +418,36 @@ class NativeGuardrailsMixin:
         except GuardrailRejected as exc:
             raise NativeBridgeError(public_failure_error(exc.failure)) from None
 
+    def inspect_admitted_runtime(
+        self: _GuardrailPlane,
+        authorization: AuthorizationSnapshot,
+        request: GatewayRequest,
+        deadline: float,
+    ) -> RuntimeGuardrailSession | None:
+        """Reinspect a search-expanded request and finalize any admitted rejection.
+
+        Args:
+            authorization: Authority of the already accepted request.
+            request: Exact request after gateway search and tool planning.
+            deadline: Original absolute request deadline.
+
+        Returns:
+            A fresh session bound to all provider-bound context.
+
+        Raises:
+            NativeBridgeError: Inspection rejected the request before provider dispatch.
+        """
+        try:
+            return open_inspection(
+                self._runtime_guardrail,
+                authorization=authorization,
+                request=request,
+                deadline_monotonic=deadline,
+            )
+        except GuardrailRejected as exc:
+            self._accounting.finish_request_quietly(authorization, exc.failure)
+            raise NativeBridgeError(public_failure_error(exc.failure)) from None
+
     def enforce_output_segment(self: _GuardrailPlane, argument: str) -> str:
         """Release the settled part of one streamed customer-redaction tail.
 

@@ -8,9 +8,12 @@ from typing import cast
 
 import pytest
 
+from exp.runtime.gateway.contracts import GatewayFailureClass
+from exp.runtime.gateway.guardrails.contracts import GuardrailRejected
 from exp.runtime.gateway.native_accounting import NativeBridgeError
 from exp.runtime.gateway.native_execution import InflightRequest
-from exp.runtime.gateway.native_tool_search import NativeToolSearchMixin, _Registry
+from exp.runtime.gateway.native_tool_search import NativeToolSearchMixin, _Registry, _search_output
+from exp.runtime.gateway.tool_search.round import WithheldSearchCall
 
 
 class _Accounting:
@@ -22,6 +25,8 @@ class _Accounting:
 
 
 class _Plane(NativeToolSearchMixin):
+    _runtime_guardrail = None
+
     def __init__(self, entry: InflightRequest | None) -> None:
         self._accounting: _Registry = _Accounting(entry)
 
@@ -38,3 +43,12 @@ def test_unknown_request_or_missing_state_is_a_protocol_error() -> None:
     plane = _Plane(entry)
     with pytest.raises(NativeBridgeError):
         plane.tool_search_round(json.dumps({"request_id": "req", "route_depth": 0, "calls": []}))
+
+
+def test_oversized_search_call_is_unsupported_without_exposing_content() -> None:
+    """A generated query cannot execute after it exceeds the inspection contract."""
+    call = WithheldSearchCall("search", "tool_search", "private-marker" * 90_000)
+    with pytest.raises(GuardrailRejected) as rejected:
+        _search_output("req", [call])
+    assert rejected.value.failure.failure_class is GatewayFailureClass.UNSUPPORTED_CAPABILITY
+    assert "private-marker" not in str(rejected.value)
