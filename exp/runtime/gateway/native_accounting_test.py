@@ -1791,17 +1791,45 @@ class TestLaneSaturation:
         assert refused["exhausted"] is True
         assert cast("JsonObject", refused["failure"])["failure_class"] == "throttled"
 
-    def test_default_lane_bound_refuses_a_priority_caller_too(self) -> None:
-        """The worker's default bound protects the worker: priority never overflows it."""
+    def test_default_lane_bound_overflows_a_priority_caller_up_to_twice_the_bound(self) -> None:
+        """Priority overflows the worker default too, capped at 2x; free callers are refused."""
         ledger = _RecordingLedger()
         registry = NativeAttemptAccounting(ledger, default_lane_bound=1)
         only = (_deployment("deployment-a", connection_sha256="b" * 64),)
-        _admit(registry, only, request_id="request-1")
-        _admit(registry, only, request_id="request-paid", priority_admission=True)
+        for request_id in ("request-1", "request-free"):
+            _admit(registry, only, request_id=request_id)
+        for request_id in ("request-paid-1", "request-paid-2"):
+            _admit(registry, only, request_id=request_id, priority_admission=True)
         assert _start(registry, ordinal=0, request_id="request-1")["route_depth"] == 0
-        refused = _start(registry, ordinal=0, request_id="request-paid")
-        assert refused["exhausted"] is True
-        assert cast("JsonObject", refused["failure"])["failure_class"] == "throttled"
+        free = _start(registry, ordinal=0, request_id="request-free")
+        assert free["exhausted"] is True
+        paid = _start(registry, ordinal=0, request_id="request-paid-1")
+        assert paid["route_depth"] == 0
+        assert ledger.started[-1]["dispatch_reason"] == "saturated_overflow"
+        # Two in flight on a default bound of one: the ceiling refuses the next.
+        capped = _start(registry, ordinal=0, request_id="request-paid-2")
+        assert capped["exhausted"] is True
+        assert cast("JsonObject", capped["failure"])["failure_class"] == "throttled"
+
+    def test_refuse_saturation_caps_priority_overflow_at_twice_the_bound(self) -> None:
+        """An authored refusing bound of 2 admits priority callers to 4 in flight, never 5."""
+        ledger = _RecordingLedger()
+        registry = NativeAttemptAccounting(ledger)
+        only = (
+            _deployment(
+                "deployment-a",
+                connection_sha256="b" * 64,
+                dispatch=GatewayRungDispatchPolicy(concurrency_bound=2, saturation="refuse"),
+            ),
+        )
+        request_ids = [f"request-paid-{index}" for index in range(5)]
+        for request_id in request_ids:
+            _admit(registry, only, request_id=request_id, priority_admission=True)
+        for request_id in request_ids[:4]:
+            assert _start(registry, ordinal=0, request_id=request_id)["route_depth"] == 0
+        capped = _start(registry, ordinal=0, request_id=request_ids[4])
+        assert capped["exhausted"] is True
+        assert cast("JsonObject", capped["failure"])["failure_class"] == "throttled"
 
 
 @pytest.mark.parametrize(

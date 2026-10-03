@@ -107,12 +107,14 @@ def reserve_rung_slot(
             else sticky.bound_deployment(entry.affinity_fingerprint) == deployment.deployment_id
         )
     tokens_per_minute = None if policy is None else policy.tokens_per_minute
+    refusing = applies_default or (policy is not None and policy.saturation == "refuse")
+    priority = entry.authorization.priority_admission
     result = loads.reserve(
         rung_load_key(deployment),
         organization_id=entry.authorization.organization_id,
         weight=entry.authorization.fair_share_weight,
         bound=bound,
-        fair_share=policy is not None and policy.fair_share,
+        fair_share=policy is None or policy.fair_share is not False,
         requests_per_minute=None if policy is None else policy.requests_per_minute,
         tokens_per_minute=tokens_per_minute,
         cache_priority_alpha=None if policy is None else policy.cache_priority_alpha,
@@ -120,15 +122,11 @@ def reserve_rung_slot(
         warm_session=warm_session,
         fresh_spill_fraction=fresh_fraction,
         force=force,
-        # A refusing rung keeps its bound hard for everyone but a priority
-        # caller, whose shed overflows it (lane_saturation.overflow_target);
-        # the default lane bound stays hard for every caller.
-        hard_bound=applies_default
-        or (
-            policy is not None
-            and policy.saturation == "refuse"
-            and not entry.authorization.priority_admission
-        ),
+        # A refusing bound (the worker default, or an authored refuse) stays
+        # hard for a non-priority caller. A priority caller's shed overflows it
+        # (lane_saturation.overflow_target), capped at twice the bound.
+        hard_bound=refusing and not priority,
+        overflow_ceiling=2 * bound if refusing and priority and bound is not None else None,
         rate_retry=rate_retry,
     )
     if isinstance(result, RungShed) and applies_default and result.reason == "queue_bound":

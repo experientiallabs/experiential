@@ -120,7 +120,7 @@ def test_overflow_target_refuses_when_the_first_shed_rung_authors_refuse() -> No
 
 
 def test_overflow_target_overflows_a_refusing_rung_for_a_priority_caller() -> None:
-    """A priority caller overflows ``refuse`` like ``overflow``; the default bound still refuses."""
+    """A priority caller overflows both refusing bounds: an authored refuse and the default."""
     refusing = (
         _deployment("a", GatewayRungDispatchPolicy(concurrency_bound=1, saturation="refuse")),
         _deployment("b", GatewayRungDispatchPolicy(concurrency_bound=1)),
@@ -128,9 +128,11 @@ def test_overflow_target_overflows_a_refusing_rung_for_a_priority_caller() -> No
     sheds = {0: RungShed("queue_bound"), 1: RungShed("queue_bound")}
     shed_order = [(0, "queue_bound"), (1, "queue_bound")]
     assert overflow_target(_route(*refusing, priority_admission=True), shed_order, sheds) == 0
+    # The worker's default bound overflows for a priority caller too (the
+    # reservation caps it at twice the bound).
     unauthored = _route(_deployment("a", None), _deployment("b", None), priority_admission=True)
     default_shed = {0: RungShed("queue_bound", default_bound=True)}
-    assert overflow_target(unauthored, [(0, "queue_bound")], default_shed) is None
+    assert overflow_target(unauthored, [(0, "queue_bound")], default_shed) == 0
 
 
 def test_overflow_target_never_force_admits_past_the_default_lane_bound() -> None:

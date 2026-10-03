@@ -35,13 +35,9 @@ failure"). Two things change:
 - `GatewayRungDispatchPolicy.saturation` — `overflow` (default, unchanged) or `refuse`. An
   authored rung set to `refuse` answers the caller at once instead of dispatching one more
   request onto a lane already at its bound.
-- A PRIORITY caller (`AuthorizationSnapshot.priority_admission`, which the hosted platform
-  sets for paying organizations) is never refused by an authored `refuse`: its shed
-  overflows onto the rung exactly as under `overflow`, so on a saturated lane only
-  non-priority callers get the 429. The authored bound becomes the non-priority ceiling;
-  priority traffic past it is bounded only by the worker's admission permits.
-- A shed by the DEFAULT lane bound (`RungShed.default_bound`) always refuses: the default
-  exists to protect the worker, and overflowing it would protect nothing.
+- A shed by the DEFAULT lane bound (`RungShed.default_bound`) refuses too: the default
+  exists to protect the worker, so only a priority caller overflows it, and only to twice
+  the bound (below).
 
 The refusal is `lane_saturated_failure()`: failure class `throttled`, safe message
 "every lane for this model is at its in-flight bound on this gateway worker; retry in 5
@@ -54,6 +50,23 @@ lane. Nothing is down, so it is not
 bypass that was not a registry shed (a cold throttle failover) keeps the historical overflow.
 A reasoning-pinned continuation's first dispatch still force-admits its pinned rung for every
 shed reason (`shed_keeps_pin`), the documented continuity-over-spill trade.
+
+## Priority callers and default fairness
+
+A PRIORITY caller (`AuthorizationSnapshot.priority_admission`, which the hosted platform sets
+for paying organizations) is never refused by a bound, on every rung and with nothing to
+author: when either refusing bound (an authored `refuse` or the worker's default lane bound)
+sheds it, `overflow_target` force-admits it onto the rung as under `overflow`
+(`saturated_overflow`), so on a saturated lane only non-priority callers get the 429. The
+overflow is capped at twice the rung's bound in flight (`RungShed.overflow_ceiling`); past
+that a priority request is refused like any other, so one flooding paying organization still
+cannot hold every admission permit.
+
+`GatewayRungDispatchPolicy.fair_share` defaults to ON (`None`): every bounded rung, including
+one bounded only by the worker default, weighs organizations by
+`AuthorizationSnapshot.fair_share_weight` under contention. An explicit `False` opts a rung
+out. An unauthored value still contributes zero identity bytes, so the default moves no
+catalog digest.
 
 ## Durable retry and billing proof
 

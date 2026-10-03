@@ -138,6 +138,13 @@ class RungShed:
     it; the durable disclosure column stays the bare reason code. A float
     because the ceiling can sit below one request per minute per worker.
     """
+    overflow_ceiling: bool = False
+    """Whether a priority caller's forced overflow hit its ceiling.
+
+    A priority caller overflows a refusing bound by at most the bound again
+    (twice the bound in flight); past that the request is refused like any
+    other, so a flooding priority organization still cannot hold the worker.
+    """
     default_bound: bool = False
     """Whether the bound that shed was the worker's default lane share.
 
@@ -245,6 +252,7 @@ class RungLoadRegistry:
         fresh_spill_fraction: float | None = None,
         force: bool = False,
         hard_bound: bool = False,
+        overflow_ceiling: int | None = None,
         rate_retry: bool = False,
     ) -> str | RungShed:
         """Reserve one slot on a policy-bounded rung, or shed with a reason.
@@ -269,6 +277,8 @@ class RungLoadRegistry:
                 shed early; ``None`` disables the early threshold.
             force: Admit past soft policy limits when the caller permits overflow.
             hard_bound: Recheck the capacity ceiling even on a forced rate-window retry.
+            overflow_ceiling: In-flight cap a forced admission may not reach
+                (a priority caller overflowing a refusing bound); ``None`` = none.
             rate_retry: Skip rate windows, not capacity, fairness or fresh-session checks.
 
         Returns:
@@ -286,6 +296,8 @@ class RungLoadRegistry:
             self._prune_window(rung, now)
             if hard_bound and bound is not None and rung.total >= bound:
                 return RungShed("queue_bound")
+            if force and overflow_ceiling is not None and rung.total >= overflow_ceiling:
+                return RungShed("queue_bound", overflow_ceiling=True)
             if not force or rate_retry:
                 shed = self._shed_reason(
                     rung,

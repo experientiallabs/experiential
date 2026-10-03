@@ -21,9 +21,9 @@ Two rules close that:
    accounting used to force-admit past the first shed rung
    (``saturated_overflow``: "policy never manufactures a failure"). That is
    still the default for an AUTHORED bound, and an authored rung may opt into
-   ``saturation="refuse"`` (which still overflows for a priority caller, the
-   host's paying organizations); the default lane bound always refuses, because a
-   protective bound that overflows protects nothing. A refusal is a fast,
+   ``saturation="refuse"``; the default lane bound refuses too. A priority
+   caller (the host's paying organizations) is the exception on both: its
+   shed overflows, capped at twice the bound so the worker stays protected. A refusal is a fast,
    retryable 429 (``lane_saturated_failure``) with the protocol's throttle
    Retry-After, answered
    before any dispatch, so the caller's retry lands when a slot frees rather
@@ -103,11 +103,13 @@ def overflow_target(
 
     The historical target is the first bypassed rung in ladder order. It is
     refused when that rung's shed came from the worker's default lane bound
-    (never force-admitted: the default protects the worker), or when the rung
-    authors ``saturation="refuse"`` and the caller is not a priority caller
-    (``AuthorizationSnapshot.priority_admission``): a priority request
-    overflows a refusing rung exactly as it would an ``overflow`` rung, so on a
-    saturated lane only non-priority callers are turned away. A bypass that was not a registry shed
+    (the default protects the worker) or when the rung authors
+    ``saturation="refuse"``, unless the caller is a priority caller
+    (``AuthorizationSnapshot.priority_admission``): a priority request always
+    overflows, so on a saturated lane only non-priority callers are turned
+    away. The reservation caps that overflow at twice the rung's bound
+    (``RungShed.overflow_ceiling``), so a flooding priority organization still
+    cannot hold every permit. A bypass that was not a registry shed
     (a cold throttle failover) keeps the historical overflow.
 
     Args:
@@ -123,14 +125,12 @@ def overflow_target(
     if not policy_sheds:
         return None
     depth = policy_sheds[0][0]
+    if route.snapshot.authorization.priority_admission:
+        return depth
     shed = shed_records.get(depth)
     if shed is not None and shed.default_bound:
         return None
     policy = route.deployments[depth].gateway.dispatch
-    if (
-        policy is not None
-        and policy.saturation == "refuse"
-        and not route.snapshot.authorization.priority_admission
-    ):
+    if policy is not None and policy.saturation == "refuse":
         return None
     return depth
