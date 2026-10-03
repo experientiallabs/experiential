@@ -444,3 +444,16 @@ def test_the_display_kill_switch_restores_omitted_thinking(
         maximum_output_tokens=128_000,
     )
     assert explicit["thinking"] == {"type": "adaptive"}
+
+
+def test_sampling_controls_keep_omitted_thinking_omitted() -> None:
+    """A request carrying temperature gains no explicit thinking config."""
+    payload = anthropic_messages_stream_payload(
+        "claude-sonnet-5",
+        _plain_request(temperature=0.2),
+        supports_reasoning=True,
+        supports_temperature=True,
+        maximum_output_tokens=128_000,
+    )
+    assert payload.get("temperature") == 0.2
+    assert "thinking" not in payload

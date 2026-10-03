@@ -318,6 +318,13 @@ impl ResponsesSseEncoder {
                 *status,
                 *phase,
             ),
+            // A rung that withholds reasoning drops its readable text here;
+            // the item lifecycle and encrypted carrier are unaffected.
+            Event::ReasoningSummaryDelta { .. } | Event::ThinkingDelta { .. }
+                if self.envelope.reasoning_withheld =>
+            {
+                Ok(Vec::new())
+            }
             Event::ReasoningSummaryDelta {
                 output_index,
                 summary_index,

@@ -232,7 +232,7 @@ pub(crate) async fn chat(
         deadline,
     )
     .await;
-    observe_winner(state.capture.clone(), &admission, &guard, &mut won);
+    observe_winner(state.capture.clone(), &admission, &guard, &mut won, false);
 
     let created_at = SystemTime::now()
         .duration_since(UNIX_EPOCH)

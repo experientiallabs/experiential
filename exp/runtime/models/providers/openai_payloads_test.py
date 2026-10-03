@@ -507,6 +507,7 @@ def test_a_caller_summary_wins_over_the_auto_default() -> None:
         _reasoning_request(reasoning_effort="high", reasoning_summary="detailed"),
         supports_temperature=False,
         supports_reasoning=True,
+        requests_reasoning_summary=True,
     )
     assert payload["reasoning"] == {"effort": "high", "summary": "detailed"}
 
@@ -518,6 +519,7 @@ def test_a_reasoning_route_with_no_effort_still_asks_for_a_summary() -> None:
         _reasoning_request(),
         supports_temperature=False,
         supports_reasoning=True,
+        requests_reasoning_summary=True,
     )
     assert payload["reasoning"] == {"summary": "auto"}
 
@@ -529,6 +531,7 @@ def test_effort_none_asks_for_no_summary() -> None:
         _reasoning_request(reasoning_effort="none"),
         supports_temperature=False,
         supports_reasoning=True,
+        requests_reasoning_summary=True,
     )
     reasoning = cast("JsonObject", payload["reasoning"])
     assert "summary" not in reasoning
@@ -544,5 +547,18 @@ def test_the_display_kill_switch_stops_asking_for_a_summary(
         _reasoning_request(reasoning_effort="high"),
         supports_temperature=False,
         supports_reasoning=True,
+        requests_reasoning_summary=True,
+    )
+    assert payload["reasoning"] == {"effort": "high"}
+
+
+def test_a_customer_managed_rung_is_never_asked_for_a_summary() -> None:
+    """A BYOK key may belong to an unverified organization, which 400s on summaries."""
+    payload = openai_responses_stream_payload(
+        "gpt-5.6-luna",
+        _reasoning_request(reasoning_effort="high"),
+        supports_temperature=False,
+        supports_reasoning=True,
+        requests_reasoning_summary=False,
     )
     assert payload["reasoning"] == {"effort": "high"}

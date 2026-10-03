@@ -237,7 +237,7 @@ pub(crate) async fn messages(
         deadline,
     )
     .await;
-    observe_winner(state.capture.clone(), &admission, &guard, &mut won);
+    observe_winner(state.capture.clone(), &admission, &guard, &mut won, true);
 
     let capture = state.capture.clone();
     let capture_request_id = admission.request_id.clone();

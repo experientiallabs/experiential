@@ -207,6 +207,7 @@ impl Admission {
         let mut envelope = self.envelope.clone().unwrap_or_default();
         envelope.reasoning_output_exposed = self.reasoning_exposed_at(depth);
         envelope.reasoning_displayed = self.reasoning_displayed_at(depth);
+        envelope.reasoning_withheld = !envelope.reasoning_displayed;
         envelope
     }
 

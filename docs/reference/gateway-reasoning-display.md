@@ -9,17 +9,21 @@ it interacts with replay and failover, and how an operator turns it off.
 Readable reasoning is OpenAI-compatible plaintext (`reasoning_content` / `reasoning`), Anthropic thinking, OpenAI
 reasoning summaries and Gemini thought summaries, and the request builders ask for it where the
 provider withholds it by default: Anthropic adaptive thinking carries `display: "summarized"`
-unless the caller chose a display, Gemini thinking carries `includeThoughts`, and an OpenAI
-Responses reasoning route asks for `reasoning.summary: "auto"` unless the caller chose a summary
-or the effort is `none`. Chat renders it as `delta.reasoning` / `message.reasoning` (OpenRouter's
+unless the caller chose a display (a generation that thinks without a config gets that config
+explicitly, unless the request carries sampling controls), Gemini thinking carries
+`includeThoughts`, and a host-managed OpenAI Responses reasoning rung asks for
+`reasoning.summary: "auto"` unless the caller chose a summary or the effort is `none` (a
+customer's own key is never asked: OpenAI rejects summaries for unverified organizations). Chat renders it as `delta.reasoning` / `message.reasoning` (OpenRouter's
 field, so `reasoning_content` keeps meaning the exposed plaintext or the sealed carrier), Messages
 as one unsigned `thinking` block for non-Anthropic reasoning (Anthropic thinking keeps its own
 signed blocks), and Responses as `summary_text` of a reasoning item with no encrypted content.
 Display never changes replay: echoed display copy is caller-owned plaintext, forwarded only to
 exposing rungs and dropped with disclosure elsewhere. A rung stamped `reasoning_output_hidden`
 opts out, `EXP_GATEWAY_REASONING_DISPLAY=0` withholds it on every rung, and a request with an
-output guardrail never displays reasoning, because the chain judges content it would not see.
-Reasoning a caller did not see is retained as the capture's `provider_reasoning` when the
+output guardrail never displays reasoning, because the chain judges content it would not see. On such a rung the Responses surface also drops
+provider summaries and projected thinking; the Messages surface keeps Anthropic's own signed
+thinking blocks, which replay depends on.
+Reasoning a caller did not see is retained once, as the capture's `provider_reasoning`, when the
 collector's `capture_hidden_reasoning` is on; displayed reasoning is retained in the captured
 response itself.
 

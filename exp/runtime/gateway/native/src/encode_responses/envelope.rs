@@ -54,6 +54,13 @@ pub struct ResponsesEnvelope {
     /// `reasoning_output_exposed`, never deserialized.
     #[serde(skip)]
     pub reasoning_displayed: bool,
+    /// Whether the winning rung withholds all reasoning text (an opted-out
+    /// rung, the display kill switch, or an output guardrail): provider
+    /// summaries and projected Anthropic thinking are dropped too. Separate
+    /// from `reasoning_displayed` so an envelope built without a rung keeps
+    /// the provider's own summaries.
+    #[serde(skip)]
+    pub reasoning_withheld: bool,
 }
 
 impl Default for ResponsesEnvelope {
@@ -72,6 +79,7 @@ impl Default for ResponsesEnvelope {
             include_encrypted_reasoning: false,
             reasoning_output_exposed: false,
             reasoning_displayed: false,
+            reasoning_withheld: false,
         }
     }
 }

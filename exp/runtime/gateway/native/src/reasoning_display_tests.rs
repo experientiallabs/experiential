@@ -270,3 +270,29 @@ fn messages_aggregate_keeps_interleaved_reasoning_in_provider_order() {
         ])
     );
 }
+
+#[test]
+fn responses_withheld_rung_drops_provider_summaries_and_thinking() {
+    for withheld in [false, true] {
+        let envelope = ResponsesEnvelope {
+            reasoning_withheld: withheld,
+            ..ResponsesEnvelope::default()
+        };
+        let mut encoder = ResponsesSseEncoder::new("request-1", "m", 1, envelope);
+        let mut frames = encoder.start().unwrap();
+        for event in &every_form() {
+            frames.extend(encoder.feed(event).unwrap());
+        }
+        let deltas: Vec<String> = payloads(&frames)
+            .iter()
+            .filter(|chunk| chunk["type"] == "response.reasoning_summary_text.delta")
+            .filter_map(|chunk| chunk["delta"].as_str().map(str::to_string))
+            .collect();
+        let expected: Vec<String> = if withheld {
+            Vec::new()
+        } else {
+            vec!["summary".to_string(), "thinking".to_string()]
+        };
+        assert_eq!(deltas, expected);
+    }
+}

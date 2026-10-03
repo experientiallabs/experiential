@@ -691,7 +691,7 @@ def test_openai_responses_stream_payload_forwards_reasoning_with_route_capabilit
         reasoning_effort="medium",
     )
 
-    assert payload["reasoning"] == {"effort": "high", "summary": "auto"}
+    assert payload["reasoning"] == {"effort": "high"}
 
 
 def test_openai_responses_stream_payload_forwards_reasoning_summary() -> None:
@@ -2854,7 +2854,7 @@ def test_gpt_56_efforts_match_the_provider_and_ultra_rejects_loud() -> None:
         supports_temperature=True,
         supports_reasoning=True,
     )
-    assert payload["reasoning"] == {"effort": "max", "summary": "auto"}
+    assert payload["reasoning"] == {"effort": "max"}
 
     with pytest.raises(UnsupportedReasoningEffortError) as raised:
         route_generation_parameter_requests((codex,), request_with("ultra"))
@@ -2876,7 +2876,7 @@ def test_reasoning_context_passes_through_verbatim_and_narrows_per_rung() -> Non
         supports_temperature=True,
         supports_reasoning=True,
     )
-    assert payload["reasoning"] == {"effort": "high", "summary": "auto", "context": "all_turns"}
+    assert payload["reasoning"] == {"effort": "high", "context": "all_turns"}
 
     responses = GatewayWireProfile(
         dialect="openai_responses",

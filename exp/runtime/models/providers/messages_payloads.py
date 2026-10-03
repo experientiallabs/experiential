@@ -390,7 +390,13 @@ def _display_summarized_thinking(model_id: str, payload: JsonObject) -> None:
     if isinstance(thinking, dict):
         if thinking.get("type") == "adaptive" and "display" not in thinking:
             payload["thinking"] = {**thinking, "display": "summarized"}
-    elif thinking is None and anthropic_thinks_without_config(model_id):
+    elif (
+        thinking is None
+        and anthropic_thinks_without_config(model_id)
+        and not any(key in payload for key in ("temperature", "top_p", "top_k"))
+    ):
+        # A request carrying sampling controls keeps its exact shape: an
+        # explicit thinking config beside them is a different request.
         payload["thinking"] = {"type": "adaptive", "display": "summarized"}
 
 

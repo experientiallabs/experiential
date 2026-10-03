@@ -97,6 +97,9 @@ pub(crate) struct Observer {
     /// Retain readable reasoning the caller never saw: the rung did not
     /// display it and the collector captures hidden reasoning.
     hidden_reasoning: bool,
+    /// The surface returns Anthropic thinking blocks natively (Messages), so
+    /// that text is already in the captured response and is never stored twice.
+    native_thinking: bool,
 }
 
 impl Observer {
@@ -111,9 +114,12 @@ impl Observer {
             {
                 self.collector.reasoning(&self.request_id, delta);
             }
-            Event::ReasoningTextDelta(delta)
-            | Event::ReasoningSummaryDelta { delta, .. }
-            | Event::ThinkingDelta { delta, .. }
+            Event::ThinkingDelta { delta, .. }
+                if self.hidden_reasoning && !self.native_thinking =>
+            {
+                self.collector.reasoning(&self.request_id, delta);
+            }
+            Event::ReasoningTextDelta(delta) | Event::ReasoningSummaryDelta { delta, .. }
                 if self.hidden_reasoning =>
             {
                 self.collector.reasoning(&self.request_id, delta);
@@ -135,6 +141,7 @@ pub(crate) fn observe_winner(
     admission: &Admission,
     guard: &crate::settlement::AttemptGuard,
     won: &mut Won,
+    native_thinking: bool,
 ) {
     let Some(collector) = collector else { return };
     let depth = match won {
@@ -149,6 +156,7 @@ pub(crate) fn observe_winner(
         request_id: admission.request_id.clone(),
         reasoning_exposed: admission.reasoning_exposed_at(depth),
         hidden_reasoning,
+        native_thinking,
     };
     observer
         .collector
