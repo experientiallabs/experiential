@@ -199,9 +199,8 @@ pub fn completed_messages_body_with_reasoning(
                     }
                     None => {
                         display_position = Some(slots.len());
-                        let text = delta.trim_start_matches('\n');
                         slots.push(Some(
-                            json!({"type": "thinking", "thinking": text, "signature": ""}),
+                            json!({"type": "thinking", "thinking": delta, "signature": ""}),
                         ));
                     }
                 }
