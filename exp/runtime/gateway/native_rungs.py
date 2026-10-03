@@ -152,6 +152,13 @@ def build_rung_dispatch(
         native_tool_translation=rung_request.native_tool_translation,
         zdr_constrained=zdr_constrained,
     )
+    if authorization.generation_timeouts is not None:
+        # The wire entry is request-local; never mutate the shared deployment
+        # or client profile. Tool-search rounds use this same frozen authority.
+        wire_entry["time_to_first_token_base_seconds"] = (
+            authorization.generation_timeouts.first_token_base_seconds
+        )
+        wire_entry["timeout_seconds"] = authorization.generation_timeouts.progress_seconds
     binding = (
         None
         if signer is None or upstream_body is None

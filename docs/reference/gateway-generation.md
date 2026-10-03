@@ -307,3 +307,21 @@ requires exact-version provider and ledger verification in its authorized enviro
 OpenRouter documents omission of optional upstream token caps, not a universal numeric default.
 Its public streaming schema carries argument strings and termination reasons; it does not
 specify an internal repair algorithm for every malformed tool response.
+
+## Host-authorized generation waits
+
+A hosted control store can return an `AuthorizationSnapshot` with
+`generation_timeouts=GatewayGenerationTimeouts(first_token_base_seconds=600,
+progress_seconds=600)` (from `exp.runtime.gateway.generation_timeouts`). Resolve
+this policy from the authenticated organization, never a caller-supplied header
+or request parameter. Both waits must be positive finite numbers of at most
+3,600 seconds. An absent policy preserves the deployment defaults.
+
+The policy applies to every provider attempt and tool-search round for that
+request. It changes only the base wait for the first semantic token and the
+maximum gap without generation progress. The existing input-size allowance is
+still added to the first-token base. Response-header/connect bounds and the
+total request deadline remain in force, so the shorter remaining deadline wins.
+Keepalive comments do not count as progress. Longer waits also delay failover
+from a genuinely stalled provider. Shared catalog entries and client profiles
+are never mutated by an organization's policy.

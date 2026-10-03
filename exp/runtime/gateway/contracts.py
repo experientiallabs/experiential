@@ -27,6 +27,7 @@ from exp.common.models.gateway_catalog import (
 from exp.common.models.gateway_chains import ModelExecutionStage, ModelTraversalEvent
 from exp.common.models.model import MAXIMUM_TOOL_CALL_ID_CHARACTERS, ReasoningEffort, ToolCall
 from exp.runtime.gateway.client_apps import ClientAttribution
+from exp.runtime.gateway.generation_timeouts import GatewayGenerationTimeouts
 from exp.runtime.gateway.model_chain_authority import ModelChainAuthority
 from exp.runtime.gateway.reasoning_blocks import EncryptedReasoningBlock as EncryptedReasoningBlock
 from exp.runtime.gateway.reasoning_blocks import (
@@ -897,10 +898,8 @@ class AuthorizationSnapshot(ClientAttribution):
     """Immutable authority and alias target frozen before learned model selection.
 
     Attributes:
-        model_chain_authority: Optional backend-issued binding, revalidated by
-            the host at acceptance and every attempt reservation.
-        fair_share_weight: Organization weight in [1, 1,000,000], default 1,
-            used only on rungs authoring weighted fair-share admission.
+        model_chain_authority: Host binding revalidated at acceptance and attempt reservation.
+        fair_share_weight: Weight [1, 1,000,000], default 1, for weighted fair-share admission.
         descendant_start_authorized: False unless the host proves root funding
             and policy gates before allowing a request to start at a child.
         zdr_requested: Caller demand for stricter ZDR filtering, default False.
@@ -936,6 +935,7 @@ class AuthorizationSnapshot(ClientAttribution):
     and never a credential; ``None`` when no trusted hop yields an address (an
     allowlist then fails closed, a denylist open). 45 chars fits any IPv6 form."""
     fair_share_weight: int = Field(default=1, ge=1, le=1_000_000)
+    generation_timeouts: GatewayGenerationTimeouts | None = None
     descendant_start_authorized: bool = False
     zdr_requested: bool = False
 
