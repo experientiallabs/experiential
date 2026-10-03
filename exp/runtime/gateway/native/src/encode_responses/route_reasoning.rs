@@ -112,7 +112,10 @@ impl ResponsesSseEncoder {
         if !self.envelope.reasoning_displayed || delta.is_empty() {
             return Ok(Vec::new());
         }
-        let item_id = stable_public_id("rs", &format!("{}:reasoning", self.response_id));
+        // An `item_` id marks the item as the gateway's own: a caller that
+        // echoes it back has it dropped instead of sent to a provider that
+        // never issued it.
+        let item_id = stable_public_id("item", &format!("{}:reasoning", self.response_id));
         self.reasoning_summary_delta(DISPLAYED_REASONING_OUTPUT_INDEX, 0, &item_id, delta)
     }
 

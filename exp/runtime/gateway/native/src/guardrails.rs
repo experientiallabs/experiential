@@ -259,7 +259,6 @@ fn classify(event: &Event) -> StreamAdmission {
         | Event::ReasoningSummaryDelta { .. }
         | Event::ThinkingDelta { .. }
         | Event::ReasoningContentDelta { .. }
-        | Event::ReasoningTextDelta(_)
         | Event::ToolCallStarted { .. }
         | Event::ToolArgumentsDelta { .. }
         | Event::ToolCallCompleted { .. }
@@ -286,6 +285,10 @@ fn classify(event: &Event) -> StreamAdmission {
         | Event::StoppedAtSequence(_)
         | Event::PausedTurn
         | Event::GeminiThoughtPart(_)
+        // Display-only reasoning never renders on a guardrailed request
+        // (display is off whenever an output chain runs), so it carries no
+        // caller-visible text to judge.
+        | Event::ReasoningTextDelta(_)
         | Event::Failed(_) => StreamAdmission::Passthrough,
     }
 }
