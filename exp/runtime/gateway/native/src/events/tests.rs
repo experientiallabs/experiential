@@ -302,7 +302,16 @@ fn bedrock_usage_reads_the_cache_write_ttl_split_from_cache_details() {
     assert!(hour(json!([{"inputTokens":10}])).is_err());
     assert!(hour(json!([{"ttl":"5m"}])).is_err());
     assert!(hour(json!([{"ttl":"5m","inputTokens":-1}])).is_err());
-    // No write, no subset.
+    // No write, no subset, but its entries are still checked.
+    assert!(bedrock_usage(Some(&json!({
+        "inputTokens": 9, "outputTokens": 4, "cacheWriteInputTokens": 0,
+        "cacheDetails": [{"ttl":"5m","inputTokens":3}],
+    })))
+    .is_err());
+    assert!(bedrock_usage(Some(&json!({
+        "inputTokens": 9, "outputTokens": 4, "cacheDetails": [{"ttl":"5m"}],
+    })))
+    .is_err());
     assert_eq!(
         bedrock_usage(Some(
             &json!({"inputTokens": 9, "outputTokens": 4, "cacheDetails": []})

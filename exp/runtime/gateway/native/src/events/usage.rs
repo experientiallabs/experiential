@@ -582,9 +582,6 @@ fn bedrock_cache_write_hour(usage: &Map<String, Value>, total: u64) -> Result<Op
             .as_array()
             .ok_or_else(|| "Bedrock cacheDetails must be an array".to_string())?,
     };
-    if total == 0 {
-        return Ok(None);
-    }
     let (mut five, mut hour, mut unpriceable) = (0u64, 0u64, false);
     for detail in details {
         let detail = detail
@@ -604,7 +601,8 @@ fn bedrock_cache_write_hour(usage: &Map<String, Value>, total: u64) -> Result<Op
     if covered > total {
         return Err("Bedrock cacheDetails TTL counts exceed cacheWriteInputTokens".to_string());
     }
-    Ok((!unpriceable && covered == total).then_some(hour))
+    // A zero write has no subset to price; its entries were still validated.
+    Ok((total > 0 && !unpriceable && covered == total).then_some(hour))
 }
 
 /// Fetch a required string field from a provider JSON object.
