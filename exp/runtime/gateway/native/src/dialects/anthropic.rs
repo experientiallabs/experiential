@@ -159,6 +159,7 @@ impl Normalizer {
                         // provider produced.
                         let serialized = compact_json(&Value::Object(block.clone()));
                         self.reserve_tool_bytes(serialized.len())?;
+                        self.server_tool_result_seen = true;
                         events.push(Event::ServerToolResult {
                             index,
                             block: serialized,
@@ -317,6 +318,7 @@ impl Normalizer {
                 {
                     self.cache_read = value;
                 }
+                let start_write = self.cache_write;
                 self.cache_write = count_if_present(
                     usage,
                     "cache_creation_input_tokens",
@@ -325,8 +327,22 @@ impl Normalizer {
                 .map_err(|message| malformed(&message))?
                 .or(self.cache_write)
                 .or(self.input_tokens.map(|_| 0));
-                if usage.contains_key("cache_creation_input_tokens")
-                    || usage.contains_key("cache_creation")
+                // The delta repeats the cumulative write total without the TTL
+                // breakdown. An unchanged total keeps the start split. Growth
+                // keeps it only after a server tool result: the breakpoint
+                // Anthropic then places automatically "always uses the default
+                // 5-minute TTL" (Tool use with prompt caching, "Server tool
+                // results are cached automatically"). Any other growth, or a
+                // start report without a split, leaves the TTL unknown.
+                let start_split_covers = usage.get("cache_creation").is_none_or(Value::is_null)
+                    && self.cache_write_1h.is_some()
+                    && start_write.is_some_and(|start| {
+                        self.cache_write == Some(start)
+                            || (self.server_tool_result_seen && self.cache_write > Some(start))
+                    });
+                if !start_split_covers
+                    && (usage.contains_key("cache_creation_input_tokens")
+                        || usage.contains_key("cache_creation"))
                 {
                     self.cache_write_1h =
                         cache_write::hour_subset(usage, self.cache_write.unwrap_or(0))?;

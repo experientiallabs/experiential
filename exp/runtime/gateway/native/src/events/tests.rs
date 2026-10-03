@@ -270,6 +270,50 @@ fn parsed_counts_are_bounded_to_the_persistable_ledger_range() {
 }
 
 #[test]
+fn bedrock_usage_reads_the_cache_write_ttl_split_from_cache_details() {
+    let hour = |details: serde_json::Value| {
+        bedrock_usage(Some(&json!({
+            "inputTokens": 9,
+            "outputTokens": 4,
+            "cacheWriteInputTokens": 10,
+            "cacheDetails": details,
+        })))
+        .map(|usage| usage.cache_creation_1h_input_tokens)
+    };
+    // Complete evidence, sorted 1h before 5m as Converse documents it.
+    assert_eq!(
+        hour(json!([{"ttl":"1h","inputTokens":4},{"ttl":"5m","inputTokens":6}])),
+        Ok(Some(4))
+    );
+    assert_eq!(hour(json!([{"ttl":"5m","inputTokens":10}])), Ok(Some(0)));
+    assert_eq!(hour(json!([{"ttl":"1h","inputTokens":10}])), Ok(Some(10)));
+    // Absent, empty, partial, or unpriceable evidence stays unknown.
+    assert_eq!(hour(serde_json::Value::Null), Ok(None));
+    assert_eq!(hour(json!([])), Ok(None));
+    assert_eq!(hour(json!([{"ttl":"1h","inputTokens":4}])), Ok(None));
+    assert_eq!(
+        hour(json!([{"ttl":"1h","inputTokens":4},{"ttl":"24h","inputTokens":6}])),
+        Ok(None)
+    );
+    // Evidence that contradicts the provider's own total, or is malformed,
+    // fails the stream rather than reaching settlement.
+    assert!(hour(json!([{"ttl":"1h","inputTokens":4},{"ttl":"5m","inputTokens":7}])).is_err());
+    assert!(hour(json!({"ttl":"5m","inputTokens":10})).is_err());
+    assert!(hour(json!([{"inputTokens":10}])).is_err());
+    assert!(hour(json!([{"ttl":"5m"}])).is_err());
+    assert!(hour(json!([{"ttl":"5m","inputTokens":-1}])).is_err());
+    // No write, no subset.
+    assert_eq!(
+        bedrock_usage(Some(
+            &json!({"inputTokens": 9, "outputTokens": 4, "cacheDetails": []})
+        ))
+        .unwrap()
+        .cache_creation_1h_input_tokens,
+        None
+    );
+}
+
+#[test]
 fn bedrock_usage_folds_cache_legs_and_rejects_unrepresentable_totals() {
     let usage = bedrock_usage(Some(&json!({
         "inputTokens": 9,

@@ -441,6 +441,9 @@ pub struct Normalizer {
     cache_read: u64,
     cache_write: Option<u64>,
     cache_write_1h: Option<u64>,
+    // A server tool result arrived: Anthropic's automatic five-minute
+    // breakpoint is the only source of writes after `message_start`.
+    server_tool_result_seen: bool,
     stop_reason: Option<String>,
     // OpenAI-compatible and Gemini accumulation.
     usage: Option<Usage>,
@@ -511,6 +514,7 @@ impl Normalizer {
             cache_read: 0,
             cache_write: None,
             cache_write_1h: None,
+            server_tool_result_seen: false,
             stop_reason: None,
             usage: None,
             openai_usage: crate::events::OpenAiUsageAccumulator::default(),
