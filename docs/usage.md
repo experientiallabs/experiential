@@ -504,6 +504,9 @@ Conservative experiment-spend accounting remains separate from the report's oper
 
 When a catalog model carries `gateway.prices`, preparation freezes the complete
 `GatewayTokenPrices` in its request reservations and `CandidateTokenPrice.token_prices`.
+Gateway metadata containing only capabilities leaves the model's existing flat rates in use.
+An explicitly supplied empty price card instead declares unknown pricing and cannot be replaced
+by those flat rates. Saving and reloading the catalog preserves this distinction.
 Long-context thresholds apply to each request's original input total, never to the sum of a
 rollout's calls. Cache reads and writes remain disjoint input subsets; reasoning remains an
 output subset. Launch estimates also price each captured request before averaging source

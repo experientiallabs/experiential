@@ -234,3 +234,14 @@ def test_authored_catalog_unit_refusals() -> None:
         read_model_catalog_document(json.dumps(stray))
     with pytest.raises(CatalogSnapshotUnitError, match="schema_version must be an integer"):
         upgrade_model_catalog_document({"schema_version": "2", "models": {}})
+
+
+@pytest.mark.parametrize("schema", [2, 3])
+def test_money_upgrade_keeps_an_absent_tariff_absent(schema: int) -> None:
+    """Upgrading capability-only metadata cannot introduce a null or empty price card."""
+    raw: JsonObject = {
+        "schema_version": schema,
+        "models": {"one": {"gateway": {"capabilities": {"supports_streaming": True}}}},
+    }
+    upgraded = upgrade_model_catalog_document(raw)
+    assert upgraded["models"] == raw["models"]

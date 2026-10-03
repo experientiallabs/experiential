@@ -277,8 +277,7 @@ class RuntimeModelCatalog:
     def resolve(self, alias: str, *, role: CatalogRoleName | None = None) -> ResolvedModel:
         """Resolve the client and bind the same catalog's complete pricing schedule."""
         resolved = self._resolve(alias, role=role)
-        gateway = self._catalog.models[alias].gateway
-        return replace(resolved, token_prices=gateway.prices if gateway is not None else None)
+        return replace(resolved, token_prices=self._catalog.models[alias].token_prices)
 
     def _resolve(self, alias: str, *, role: CatalogRoleName | None = None) -> ResolvedModel:
         """Build the one approved client shape named by an alias.

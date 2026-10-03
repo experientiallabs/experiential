@@ -121,31 +121,45 @@ pub fn bounded_ledger_sum(legs: &[u64], label: &str) -> Result<u64, String> {
         .ok_or_else(|| format!("{label} token total overflows a persistable count"))
 }
 
-/// Resolve the output total of an OpenAI-shaped usage object so that
-/// `reasoning_tokens` names a subset of it (see the module documentation).
-///
-/// The provider's own `total_tokens` is authoritative when it matches either
-/// accounting: `input + output` is the documented subset shape and the output
-/// total is forwarded as reported; `input + output + reasoning` is the
-/// additive shape (xAI, natively or relayed by Azure Foundry) and reasoning is
-/// folded in. Without a decisive total, a reasoning count above the output
-/// total cannot occur under subset semantics and is folded.
-fn fold_openai_shaped_reasoning(
+/// Accounting established by a provider total within one completion attempt.
+#[derive(Clone, Copy)]
+enum ReasoningAccounting {
+    Subset,
+    Additive,
+}
+
+/// A positive reasoning count distinguishes the two possible total shapes.
+fn openai_reasoning_accounting(
     input_tokens: Option<u64>,
-    output_tokens: u64,
+    output_tokens: Option<u64>,
     reasoning_tokens: Option<u64>,
     total_tokens: Option<u64>,
+) -> Option<ReasoningAccounting> {
+    let reasoning = reasoning_tokens.filter(|reasoning| *reasoning > 0)?;
+    let subset_total = input_tokens?.checked_add(output_tokens?)?;
+    match total_tokens? {
+        total if total == subset_total => Some(ReasoningAccounting::Subset),
+        total if Some(total) == subset_total.checked_add(reasoning) => {
+            Some(ReasoningAccounting::Additive)
+        }
+        _ => None,
+    }
+}
+
+/// Fold additive reasoning once, leaving undecided reports on the count heuristic.
+fn fold_openai_shaped_reasoning(
+    output_tokens: u64,
+    reasoning_tokens: Option<u64>,
+    accounting: Option<ReasoningAccounting>,
     label: &str,
 ) -> Result<u64, String> {
     let Some(reasoning) = reasoning_tokens.filter(|reasoning| *reasoning > 0) else {
         return Ok(output_tokens);
     };
-    let subset_total = input_tokens.and_then(|input| input.checked_add(output_tokens));
-    let additive_total = subset_total.and_then(|total| total.checked_add(reasoning));
-    let additive = match total_tokens {
-        Some(total) if Some(total) == subset_total => false,
-        Some(total) if Some(total) == additive_total => true,
-        _ => reasoning > output_tokens,
+    let additive = match accounting {
+        Some(ReasoningAccounting::Subset) => false,
+        Some(ReasoningAccounting::Additive) => true,
+        None => reasoning > output_tokens,
     };
     if additive {
         bounded_ledger_sum(&[output_tokens, reasoning], label)
@@ -187,7 +201,7 @@ pub fn openai_usage(value: Option<&Value>) -> Result<Option<Usage>, String> {
 #[derive(Clone, Default)]
 pub(crate) struct OpenAiUsageAccumulator {
     reported: Usage,
-    total_tokens: Option<u64>,
+    reasoning_accounting: Option<ReasoningAccounting>,
     writes_within_reads: bool,
     // Sparse TTL evidence stays private until a write total can cover it.
     pending_cache_creation_1h_input_tokens: Option<u64>,
@@ -287,7 +301,17 @@ impl OpenAiUsageAccumulator {
             cache_creation_1h_input_tokens: covering_writes.and(cache_creation_1h_input_tokens),
             reasoning_tokens,
         });
-        candidate.total_tokens = candidate.total_tokens.max(total_tokens);
+        // Only this update's total can establish the attempt's accounting.
+        // Sparse growth can coincide with an old total without proving a mode.
+        // Once established, later sparse counters keep that interpretation.
+        candidate.reasoning_accounting = candidate.reasoning_accounting.or_else(|| {
+            openai_reasoning_accounting(
+                candidate.reported.input_tokens,
+                candidate.reported.output_tokens,
+                candidate.reported.reasoning_tokens,
+                total_tokens,
+            )
+        });
         let mut normalized = candidate.reported.clone();
         if self.writes_within_reads {
             separate_written_reads(&mut normalized)?;
@@ -297,10 +321,9 @@ impl OpenAiUsageAccumulator {
             .output_tokens
             .map(|output| {
                 fold_openai_shaped_reasoning(
-                    normalized.input_tokens,
                     output,
                     normalized.reasoning_tokens,
-                    candidate.total_tokens,
+                    candidate.reasoning_accounting,
                     "OpenAI output",
                 )
             })
@@ -558,6 +581,117 @@ pub fn require_u64(object: &Map<String, Value>, key: &str, label: &str) -> Resul
 mod sparse_tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn established_reasoning_accounting_survives_sparse_growth_and_stale_totals() {
+        for chat in [false, true] {
+            for additive in [false, true] {
+                let (input, output, details) = if chat {
+                    (
+                        "prompt_tokens",
+                        "completion_tokens",
+                        "completion_tokens_details",
+                    )
+                } else {
+                    ("input_tokens", "output_tokens", "output_tokens_details")
+                };
+                let first = json!({
+                    input: 100, output: 10, details: {"reasoning_tokens": 5},
+                    "total_tokens": if additive { 115 } else { 110 }
+                });
+                let mut accumulator = OpenAiUsageAccumulator::default();
+                for (report, expected_output, expected_reasoning) in [
+                    (first.clone(), if additive { 15 } else { 10 }, 5),
+                    // For additive accounting the retained old total now matches
+                    // input + raw output, but it must not change the dialect.
+                    (json!({output: 15}), if additive { 20 } else { 15 }, 5),
+                    (json!({output: 20}), if additive { 25 } else { 20 }, 5),
+                    (
+                        json!({details: {"reasoning_tokens": 8}}),
+                        if additive { 28 } else { 20 },
+                        8,
+                    ),
+                    (first, if additive { 28 } else { 20 }, 8),
+                    (json!({}), if additive { 28 } else { 20 }, 8),
+                    (
+                        json!({"total_tokens": if additive { 128 } else { 120 }}),
+                        if additive { 28 } else { 20 },
+                        8,
+                    ),
+                ] {
+                    let observed = accumulator
+                        .update(report.as_object().unwrap(), chat)
+                        .unwrap();
+                    assert_eq!(observed.input_tokens, Some(100));
+                    assert_eq!(observed.output_tokens, Some(expected_output), "{report}");
+                    assert_eq!(observed.reasoning_tokens, Some(expected_reasoning));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn additive_reasoning_growth_rejects_overflow_without_advancing_raw_state() {
+        let mut accumulator = OpenAiUsageAccumulator::default();
+        let first = json!({
+            "input_tokens": 100, "output_tokens": 10,
+            "output_tokens_details": {"reasoning_tokens": 5}, "total_tokens": 115
+        });
+        accumulator.update_responses(Some(&first)).unwrap();
+        assert!(accumulator
+            .update_responses(Some(&json!({"output_tokens": MAXIMUM_LEDGER_COUNT})))
+            .is_err());
+        let observed = accumulator
+            .update_responses(Some(&json!({"output_tokens": 20})))
+            .unwrap()
+            .unwrap();
+        assert_eq!(observed.output_tokens, Some(25));
+        assert_eq!(observed.reasoning_tokens, Some(5));
+    }
+
+    #[test]
+    fn undecided_reasoning_waits_for_a_positive_decisive_total() {
+        for first in [
+            json!({"input_tokens": 100, "output_tokens": 2,
+                "output_tokens_details": {"reasoning_tokens": 5}}),
+            json!({"input_tokens": 100, "output_tokens": 2,
+                "output_tokens_details": {"reasoning_tokens": 0}, "total_tokens": 102}),
+        ] {
+            let mut accumulator = OpenAiUsageAccumulator::default();
+            accumulator.update_responses(Some(&first)).unwrap();
+            let observed = accumulator
+                .update_responses(Some(&json!({
+                    "output_tokens": 10, "output_tokens_details": {"reasoning_tokens": 5},
+                    "total_tokens": 110
+                })))
+                .unwrap()
+                .unwrap();
+            assert_eq!(observed.output_tokens, Some(10));
+            assert!(matches!(
+                accumulator.reasoning_accounting,
+                Some(ReasoningAccounting::Subset)
+            ));
+        }
+    }
+
+    #[test]
+    fn missing_reasoning_does_not_let_a_stale_total_establish_subset_accounting() {
+        let mut accumulator = OpenAiUsageAccumulator::default();
+        for report in [
+            json!({"input_tokens": 100, "output_tokens": 10, "total_tokens": 115}),
+            json!({"output_tokens": 15, "output_tokens_details": {"reasoning_tokens": 5}}),
+        ] {
+            accumulator.update_responses(Some(&report)).unwrap();
+        }
+        let observed = accumulator
+            .update_responses(Some(&json!({
+                "output_tokens": 20, "output_tokens_details": {"reasoning_tokens": 5},
+                "total_tokens": 125
+            })))
+            .unwrap()
+            .unwrap();
+        assert_eq!(observed.output_tokens, Some(25));
+    }
 
     #[test]
     fn unreported_meter_marker_rejects_malformed_or_contradictory_evidence() {

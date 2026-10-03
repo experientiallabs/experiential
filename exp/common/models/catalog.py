@@ -719,22 +719,14 @@ class GatewayDeploymentMetadata(ContractModel):
 
 
 class ModelRecord(ContractModel):
-    """A stable local alias, exact capability snapshot, and provider-side model name.
+    """A stable alias, capability snapshot, and provider-side model identity.
 
-    An omitted capability declaration means the catalog cannot prove any optional protocol
-    feature or token limit. Unknown declarations stay permissive: capability preflight blocks
-    only an explicit declaration that rules a requirement out, so an undeclared model remains
-    usable and the provider reports any real protocol gap.
-
-    ``served_model_id`` accepts an alternate identifier the provider echoes in responses when it
-    differs from the requested ``model``, for example a vLLM endpoint that publishes an alias in
-    ``/models`` but reports its canonical served name in every completion.
-
-    ``supported_reasoning_efforts`` preserves discovery choices for setup without changing
-    the identity-bearing capability snapshot. ``None`` means the listing did not declare them.
-
-    ``discovery`` retains published tri-state flags so an explicit denial survives reload
-    and remains distinguishable from an undeclared capability's default value.
+    Unknown capabilities stay permissive; only explicit declarations rule out protocol features
+    or token limits. ``served_model_id`` pins an alternate provider-echoed model name.
+    ``supported_reasoning_efforts`` preserves setup choices outside capability identity;
+    ``None`` means the listing did not declare them. ``discovery`` retains published tri-state
+    flags so explicit denials survive reload. Capability-only gateway metadata has no authored
+    tariff; an explicitly supplied empty price card retains unknown pricing authority.
     """
 
     connection: str = Field(min_length=1, max_length=128)
@@ -751,7 +743,28 @@ class ModelRecord(ContractModel):
     @property
     def token_prices(self) -> GatewayTokenPrices | None:
         """Return the complete authored schedule when this model carries one."""
-        return self.gateway.prices if self.gateway is not None else None
+        if self.gateway is None or "prices" not in self.gateway.model_fields_set:
+            return None
+        return self.gateway.prices
+
+    @model_serializer(mode="wrap")
+    def _serialize_authored_gateway_prices(
+        self, handler: SerializerFunctionWrapHandler
+    ) -> dict[str, object]:
+        """Preserve tariff absence without changing normalized gateway metadata's wire shape."""
+        serialized: dict[str, object] = handler(self)
+        gateway = serialized.get("gateway")
+        if isinstance(gateway, dict) and self.token_prices is None:
+            gateway.pop("prices", None)
+        return serialized
+
+    def __eq__(self, other: object) -> bool:
+        """Include tariff presence when deciding whether an authored catalog changed."""
+        return (
+            isinstance(other, ModelRecord)
+            and super().__eq__(other)
+            and self.token_prices == other.token_prices
+        )
 
     @model_validator(mode="after")
     def _require_secret_free_model_identity(self) -> ModelRecord:

@@ -158,7 +158,7 @@ def _visit_record(record: JsonValue, *, where: str, upgrade: bool) -> JsonValue:
     if not isinstance(record, dict):
         return record
     gateway = record.get("gateway")
-    if not isinstance(gateway, dict):
+    if not isinstance(gateway, dict) or "prices" not in gateway:
         return record
     prices_where = f"{where}.gateway.prices"
     upgraded_gateway: JsonObject = dict(gateway)

@@ -94,7 +94,11 @@ def test_legacy_project_candidates_gain_only_certified_streaming_transport(
                 connection="provider",
                 model="legacy-model",
                 billing_source=BillingSource.CUSTOMER_MANAGED,
-                capabilities=ModelCapabilities(supports_tools=True),
+                capabilities=ModelCapabilities(
+                    supports_tools=True,
+                    input_cost_per_million_tokens_usd=1.0,
+                    output_cost_per_million_tokens_usd=2.0,
+                ),
             ),
             "legacy-unknown": ModelRecord(
                 connection="provider",
@@ -151,6 +155,8 @@ def test_legacy_project_candidates_gain_only_certified_streaming_transport(
     migrated = load_model_catalog(tmp_path / "models.toml")
 
     assert changed is True
+    assert migrated.models["legacy"].token_prices is None
+    assert migrated.models["legacy"].capabilities == catalog.models["legacy"].capabilities
     assert migrated.models["legacy"].gateway == GatewayDeploymentMetadata(
         capabilities=GatewayDeploymentCapabilities(
             supports_streaming=True,

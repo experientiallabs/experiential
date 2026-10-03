@@ -46,7 +46,6 @@ from exp.common.core.locks import file_write_lock
 from exp.common.models import (
     BillingSource,
     GatewayDeploymentCapabilities,
-    GatewayTokenPrices,
     ModelCapabilities,
 )
 from exp.common.progress import report
@@ -285,7 +284,7 @@ def interactive_gateway_setup(
                             supports_streaming=True,
                             supports_streaming_tool_arguments=supports_streaming_tool_arguments,
                         ),
-                        prices=GatewayTokenPrices(),
+                        prices=None,
                         pricing_source=None,
                         billing_source=(
                             BillingSource.HOST_MANAGED

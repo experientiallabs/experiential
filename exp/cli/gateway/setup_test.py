@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -151,6 +152,20 @@ def test_gateway_setup_persists_selected_connections_and_one_initial_alias(
 ) -> None:
     """First-run setup accepts all displayed defaults with one empty line."""
     endpoints, models = _prepared_gateway_models()
+    assert models[0].capabilities is not None
+    models = (
+        replace(
+            models[0],
+            capabilities=models[0].capabilities.model_copy(
+                update={
+                    "input_cost_per_million_tokens_usd": 1.0,
+                    "output_cost_per_million_tokens_usd": 2.0,
+                    "cached_input_cost_per_million_tokens_usd": 0.25,
+                    "cache_write_cost_per_million_tokens_usd": 1.25,
+                }
+            ),
+        ),
+    )
     monkeypatch.setattr(
         setup,
         "select_providers",
@@ -188,6 +203,9 @@ def test_gateway_setup_persists_selected_connections_and_one_initial_alias(
     authored = load_model_catalog(tmp_path / "models.toml").models["gpt-5-6-luna"]
     assert authored.gateway is not None
     assert authored.gateway.capabilities.supports_streaming_tool_arguments
+    assert authored.token_prices is None
+    assert authored.capabilities is not None
+    assert authored.capabilities.input_cost_per_million_tokens_usd == 1.0
     assert load_settings(tmp_path).commands.maximum_cost_usd == 50.0
 
 

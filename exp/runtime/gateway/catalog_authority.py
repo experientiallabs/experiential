@@ -169,7 +169,7 @@ def plan_singleton_deployment_update(
     revision: str | None,
     capabilities: ModelCapabilities,
     gateway_capabilities: GatewayDeploymentCapabilities,
-    prices: GatewayTokenPrices,
+    prices: GatewayTokenPrices | None,
     pricing_source: str | None,
     billing_source: BillingSource = BillingSource.CUSTOMER_MANAGED,
     replace: bool,
@@ -186,7 +186,7 @@ def plan_singleton_deployment_update(
         revision: Optional exact provider revision.
         capabilities: Existing runtime capability declaration.
         gateway_capabilities: Gateway protocol capability declaration.
-        prices: Integer attribution rates, with unknown represented by ``None``.
+        prices: Authored attribution card, or None when only capabilities are declared.
         pricing_source: Optional provenance label for the rates.
         billing_source: Credential ownership frozen for every dispatched attempt.
         replace: Whether an existing deployment alias may change.
@@ -221,18 +221,20 @@ def plan_singleton_deployment_update(
         raise GatewayCatalogAuthoringError(
             f"unknown provider connection {connection_name!r}; add it first"
         )
+    metadata = GatewayDeploymentMetadata(
+        exact_model_id=exact_model_id,
+        capabilities=gateway_capabilities,
+        pricing_source=pricing_source,
+    )
+    if prices is not None:
+        metadata = metadata.model_copy(update={"prices": prices})
     record = ModelRecord(
         connection=connection_name,
         model=provider_model,
         revision=revision,
         billing_source=billing_source,
         capabilities=capabilities,
-        gateway=GatewayDeploymentMetadata(
-            exact_model_id=exact_model_id,
-            capabilities=gateway_capabilities,
-            prices=prices,
-            pricing_source=pricing_source,
-        ),
+        gateway=metadata,
     )
     existing = current.models.get(deployment_alias)
     if existing is not None and existing != record and not replace:

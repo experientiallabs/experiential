@@ -29,8 +29,9 @@ from exp.common.models import (
     ModelSnapshot,
     Usage,
 )
-from exp.common.models.catalog import GatewayDeploymentMetadata
+from exp.common.models.catalog import GatewayDeploymentMetadata, GatewayTokenPrices
 from exp.common.models.gateway_catalog import normalize_gateway_catalog
+from exp.common.models.pricing import completion_cost_reservation
 from exp.common.models.token_cost_test import prices
 from exp.runtime.gateway.execution_resolution import _resolved_wire_profile
 from exp.runtime.models.credentials import (
@@ -1026,3 +1027,77 @@ def test_claude_plan_connection_needs_the_operator_app_and_then_signs_each_dispa
         "Authorization": "Bearer injected"
     }
     assert built == ["claude-plan:anthropic"]
+
+
+@pytest.mark.parametrize("card", [None, GatewayTokenPrices()])
+def test_runtime_preserves_absent_or_explicit_unknown_tariffs(
+    card: GatewayTokenPrices | None,
+) -> None:
+    """Runtime binding shares catalog pricing authority after complete JSON persistence."""
+    catalog = _catalog()
+    metadata = (
+        GatewayDeploymentMetadata() if card is None else GatewayDeploymentMetadata(prices=card)
+    )
+    record = catalog.models["fixture-model"].model_copy(update={"gateway": metadata})
+    catalog = ModelCatalog.model_validate_json(
+        catalog.model_copy(update={"models": {"fixture-model": record}}).model_dump_json()
+    )
+    resolved = RuntimeModelCatalog(
+        catalog,
+        environment={"FIXTURE_API_KEY": "fixture-key"},
+        transport_factory=ScriptedJsonTransport,
+    ).resolve("fixture-model")
+    assert resolved.token_prices == card
+
+
+@pytest.mark.parametrize("authored", [False, True])
+def test_capability_only_metadata_keeps_flat_budget_pricing(authored: bool) -> None:
+    """An absent tariff permits flat reservations; an explicit unknown card cannot be masked."""
+    catalog = _catalog()
+    metadata = (
+        GatewayDeploymentMetadata(prices=GatewayTokenPrices())
+        if authored
+        else GatewayDeploymentMetadata()
+    )
+    record = catalog.models["fixture-model"].model_copy(
+        update={
+            "gateway": metadata,
+            "capabilities": ModelCapabilities(
+                input_cost_per_million_tokens_usd=1,
+                output_cost_per_million_tokens_usd=2,
+                cached_input_cost_per_million_tokens_usd=0.25,
+                cache_write_cost_per_million_tokens_usd=1.25,
+            ),
+        }
+    )
+    catalog = ModelCatalog.model_validate_json(
+        catalog.model_copy(update={"models": {"fixture-model": record}}).model_dump_json()
+    )
+    resolved = RuntimeModelCatalog(
+        catalog,
+        environment={"FIXTURE_API_KEY": "fixture-key"},
+        transport_factory=ScriptedJsonTransport,
+    ).resolve("fixture-model")
+
+    def reserve() -> float:
+        """Exercise the real pricing boundary without any provider dispatch."""
+        reservation = completion_cost_reservation(
+            model=resolved.snapshot,
+            input_usd_per_million_tokens=1,
+            output_usd_per_million_tokens=2,
+            cached_input_usd_per_million_tokens=0.25,
+            cache_write_usd_per_million_tokens=1.25,
+            maximum_attempts=1,
+            maximum_input_tokens=100,
+            maximum_output_tokens=20,
+            token_prices=resolved.token_prices,
+        )
+        return reservation.estimated_maximum_call_cost_usd
+
+    if authored:
+        with pytest.raises(
+            ValueError, match="flat prices differ from the complete token schedule base"
+        ):
+            reserve()
+    else:
+        assert reserve() == pytest.approx(0.000165)

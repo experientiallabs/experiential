@@ -23,6 +23,7 @@ from exp.common.models import (
     ReasoningEffort,
     SFTModelProvenance,
     load_model_catalog,
+    normalize_gateway_catalog,
     write_model_catalog,
 )
 from exp.common.models.catalog import (
@@ -1048,3 +1049,45 @@ def test_plan_identity_differs_from_the_api_key_origin_and_serializes_only_when_
     assert "subscription" not in key.model_dump(mode="json")
     assert plan.model_dump(mode="json")["subscription"] == "anthropic"
     assert ConnectionConfig.model_validate(plan.model_dump(mode="json")) == plan
+
+
+@pytest.mark.parametrize(
+    "card",
+    [
+        None,
+        GatewayTokenPrices(),
+        GatewayTokenPrices(input_nano_usd_per_million_tokens=1_000_000_000),
+    ],
+)
+def test_authored_price_presence_survives_json_and_toml(
+    card: GatewayTokenPrices | None, tmp_path: Path
+) -> None:
+    """Capability metadata and an explicitly unknown price card stay distinct on reload."""
+    catalog = _catalog()
+    metadata = (
+        GatewayDeploymentMetadata() if card is None else GatewayDeploymentMetadata(prices=card)
+    )
+    record = catalog.models["candidate-economy"].model_copy(update={"gateway": metadata})
+    catalog = catalog.model_copy(update={"models": {"candidate-economy": record}})
+    snapshot = normalize_gateway_catalog(catalog)
+    path = tmp_path / "models.toml"
+    write_model_catalog(path, catalog)
+    restored = (
+        ModelCatalog.model_validate_json(catalog.model_dump_json()),
+        load_model_catalog(path),
+    )
+    for loaded in restored:
+        assert loaded.models["candidate-economy"].token_prices == card
+        assert normalize_gateway_catalog(loaded).model_dump() == snapshot.model_dump()
+    assert record.token_prices == card
+
+
+def test_capability_only_metadata_differs_from_an_authored_unknown_card() -> None:
+    """Catalog equality must not discard an intended change in pricing authority."""
+    record = _catalog().models["candidate-economy"]
+    absent = record.model_copy(update={"gateway": GatewayDeploymentMetadata()})
+    unknown = record.model_copy(
+        update={"gateway": GatewayDeploymentMetadata(prices=GatewayTokenPrices())}
+    )
+    assert absent.gateway == unknown.gateway
+    assert absent != unknown
