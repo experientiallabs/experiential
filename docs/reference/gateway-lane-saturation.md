@@ -35,6 +35,11 @@ failure"). Two things change:
 - `GatewayRungDispatchPolicy.saturation` — `overflow` (default, unchanged) or `refuse`. An
   authored rung set to `refuse` answers the caller at once instead of dispatching one more
   request onto a lane already at its bound.
+- A PRIORITY caller (`AuthorizationSnapshot.priority_admission`, which the hosted platform
+  sets for paying organizations) is never refused by an authored `refuse`: its shed
+  overflows onto the rung exactly as under `overflow`, so on a saturated lane only
+  non-priority callers get the 429. The authored bound becomes the non-priority ceiling;
+  priority traffic past it is bounded only by the worker's admission permits.
 - A shed by the DEFAULT lane bound (`RungShed.default_bound`) always refuses: the default
   exists to protect the worker, and overflowing it would protect nothing.
 

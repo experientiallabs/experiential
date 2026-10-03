@@ -44,7 +44,7 @@ def _deployment(
     )
 
 
-def _route(*deployments: ExactModelDeployment) -> GatewayRoute:
+def _route(*deployments: ExactModelDeployment, priority_admission: bool = False) -> GatewayRoute:
     authorization = AuthorizationSnapshot(
         request_id="request-one",
         organization_id="organization-one",
@@ -57,6 +57,7 @@ def _route(*deployments: ExactModelDeployment) -> GatewayRoute:
         catalog_sha256="a" * 64,
         canonical_request_sha256="d" * 64,
         deadline_monotonic=1.0,
+        priority_admission=priority_admission,
     )
     return GatewayRoute(
         snapshot=ExecutionSnapshot(
@@ -116,6 +117,20 @@ def test_overflow_target_refuses_when_the_first_shed_rung_authors_refuse() -> No
     )
     sheds = {0: RungShed("queue_bound"), 1: RungShed("queue_bound")}
     assert overflow_target(route, [(0, "queue_bound"), (1, "queue_bound")], sheds) is None
+
+
+def test_overflow_target_overflows_a_refusing_rung_for_a_priority_caller() -> None:
+    """A priority caller overflows ``refuse`` like ``overflow``; the default bound still refuses."""
+    refusing = (
+        _deployment("a", GatewayRungDispatchPolicy(concurrency_bound=1, saturation="refuse")),
+        _deployment("b", GatewayRungDispatchPolicy(concurrency_bound=1)),
+    )
+    sheds = {0: RungShed("queue_bound"), 1: RungShed("queue_bound")}
+    shed_order = [(0, "queue_bound"), (1, "queue_bound")]
+    assert overflow_target(_route(*refusing, priority_admission=True), shed_order, sheds) == 0
+    unauthored = _route(_deployment("a", None), _deployment("b", None), priority_admission=True)
+    default_shed = {0: RungShed("queue_bound", default_bound=True)}
+    assert overflow_target(unauthored, [(0, "queue_bound")], default_shed) is None
 
 
 def test_overflow_target_never_force_admits_past_the_default_lane_bound() -> None:

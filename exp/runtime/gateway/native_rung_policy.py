@@ -120,7 +120,15 @@ def reserve_rung_slot(
         warm_session=warm_session,
         fresh_spill_fraction=fresh_fraction,
         force=force,
-        hard_bound=applies_default or (policy is not None and policy.saturation == "refuse"),
+        # A refusing rung keeps its bound hard for everyone but a priority
+        # caller, whose shed overflows it (lane_saturation.overflow_target);
+        # the default lane bound stays hard for every caller.
+        hard_bound=applies_default
+        or (
+            policy is not None
+            and policy.saturation == "refuse"
+            and not entry.authorization.priority_admission
+        ),
         rate_retry=rate_retry,
     )
     if isinstance(result, RungShed) and applies_default and result.reason == "queue_bound":
