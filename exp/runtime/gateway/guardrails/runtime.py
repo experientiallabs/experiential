@@ -62,7 +62,15 @@ class RuntimeGuardrailSession(Protocol):
     """
 
     def inspect_output(self, output: RuntimeOutput, *, deadline_monotonic: float) -> None:
-        """Inspect a complete pending segment before any of its events are released."""
+        """Inspect a complete pending segment before any events are released.
+
+        Args:
+            output: Ordered additions to this request's exact inspected context.
+            deadline_monotonic: Absolute deadline bounding all inspection work.
+
+        Raises:
+            GuardrailRejected: A sanitized policy, coverage or infrastructure failure.
+        """
         ...
 
 
@@ -88,12 +96,34 @@ class RuntimeGuardrail(Protocol):
         violation, unsupported coverage, or unavailable inspection. This
         contract covers normalized chat requests, not batch, image, or
         embedding admission; hosts must fence those separate surfaces.
+
+        Args:
+            authorization: Frozen authenticated tenant and identity.
+            request: Complete normalized request after continuation expansion.
+            deadline_monotonic: Absolute deadline bounding all inspection work.
+
+        Returns:
+            A fresh output session, or None for an operator-selected exemption.
+
+        Raises:
+            GuardrailRejected: A sanitized policy, coverage or infrastructure failure.
         """
         ...
 
 
 def validate_runtime_guardrail(guard: RuntimeGuardrail | None) -> RuntimeGuardrail | None:
-    """Refuse startup when the loaded native wheel cannot enforce output inspection."""
+    """Refuse startup when the native wheel cannot enforce output inspection.
+
+    Args:
+        guard: Host policy selected at composition, or None to disable inspection.
+
+    Returns:
+        The unchanged policy after its revision and native contract are verified.
+
+    Raises:
+        ValueError: The revision is invalid or the native contract is incompatible.
+        ModuleNotFoundError: The required native extension is not installed.
+    """
     if guard is None:
         return None
     native = importlib.import_module("exp_gateway_native")
@@ -114,7 +144,16 @@ def output_decision(
     *,
     deadline_monotonic: float,
 ) -> str:
-    """Return a content-free native verdict; unexpected errors fail as infrastructure."""
+    """Return a content-free native verdict; unexpected errors are infrastructure failures.
+
+    Args:
+        session: Exact request-owned host inspection state.
+        output: Pending additions that have not reached the caller.
+        deadline_monotonic: Original absolute request deadline.
+
+    Returns:
+        JSON allowing the segment or describing a sanitized policy/infrastructure error.
+    """
     if time.monotonic() >= deadline_monotonic:
         return unavailable_decision()
     try:
@@ -148,7 +187,20 @@ def open_inspection(
     request: GatewayRequest,
     deadline_monotonic: float,
 ) -> RuntimeGuardrailSession | None:
-    """Open a mandatory host session without exposing callback failures."""
+    """Open a mandatory host session without exposing callback failures.
+
+    Args:
+        guard: Configured host policy, independent of customer assignments.
+        authorization: Frozen authenticated request authority.
+        request: Complete context to inspect before dispatch.
+        deadline_monotonic: Original absolute request deadline.
+
+    Returns:
+        A fresh output session, or None when the operator exempts this request.
+
+    Raises:
+        GuardrailRejected: The policy refused input or inspection failed/expired.
+    """
     if guard is None:
         return None
     try:
@@ -172,7 +224,15 @@ def open_inspection(
 
 
 def inspect_argument(accounting: NativeAttemptAccounting, argument: str) -> str:
-    """Bind a segment to its exact live request; stale sessions never authorize content."""
+    """Bind a segment to its exact live request; stale sessions never authorize content.
+
+    Args:
+        accounting: Live admitted entries owning request-specific sessions.
+        argument: Native JSON containing the request ID and pending fragments.
+
+    Returns:
+        A sanitized native verdict; invalid payloads and absent sessions fail closed.
+    """
     try:
         output = RuntimeOutput.model_validate_json(argument)
     except ValueError:

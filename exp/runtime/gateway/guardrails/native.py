@@ -419,7 +419,14 @@ class NativeGuardrailsMixin:
             raise NativeBridgeError(public_failure_error(exc.failure)) from None
 
     def enforce_output_segment(self: _GuardrailPlane, argument: str) -> str:
-        """Release the settled part of one streamed ``stream`` mode tail."""
+        """Release the settled part of one streamed customer-redaction tail.
+
+        Args:
+            argument: Native JSON payload containing the admitted request ID.
+
+        Returns:
+            A native JSON decision bound to that entry's policy and deadline.
+        """
         entry = self._accounting.entry(str(json.loads(argument).get("request_id") or ""))
         policy = None if entry is None else entry.policy
         deadline = time.monotonic() if entry is None else entry.deadline_monotonic
@@ -428,11 +435,25 @@ class NativeGuardrailsMixin:
         )
 
     def inspect_runtime_output(self: _GuardrailPlane, argument: str) -> str:
-        """Inspect a pending native segment through its exact admitted request session."""
+        """Inspect a pending segment through its exact admitted request session.
+
+        Args:
+            argument: Native JSON payload containing the admitted request ID.
+
+        Returns:
+            A native JSON decision bound to that entry's policy and deadline.
+        """
         return inspect_argument(self._accounting, argument)
 
     def enforce_output(self: _GuardrailPlane, argument: str) -> str:
-        """Run one output-chain callback for a native buffered completion."""
+        """Run a customer output-chain callback for a buffered completion.
+
+        Args:
+            argument: Native JSON payload containing the admitted request ID.
+
+        Returns:
+            A native JSON decision bound to that entry's policy and deadline.
+        """
         data = json.loads(argument)
         request_id = str(data.get("request_id") or "")
         entry = self._accounting.entry(request_id)
