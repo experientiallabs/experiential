@@ -95,8 +95,10 @@ def test_lane_saturated_failure_is_a_retryable_throttle_with_the_wait_it_states(
     failure = lane_saturated_failure()
     assert failure.failure_class is GatewayFailureClass.THROTTLED
     assert failure.retry_after_seconds == LANE_SATURATED_RETRY_AFTER_SECONDS
-    assert f"retry in {LANE_SATURATED_RETRY_AFTER_SECONDS} seconds" in failure.safe_message
-    assert "in-flight bound" in failure.safe_message
+    assert failure.safe_message == (
+        "This model is at capacity right now. Please retry in a few seconds. "
+        "Pro subscribers get priority access when models are busy."
+    )
     assert failure.failover_eligible is False
 
 

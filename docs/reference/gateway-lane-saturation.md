@@ -39,10 +39,11 @@ failure"). Two things change:
   exists to protect the worker, so only a priority caller overflows it, and only to its
   level's ceiling (below).
 
-The refusal is `lane_saturated_failure()`: failure class `throttled`, safe message
-"every lane for this model is at its in-flight bound on this gateway worker; retry in 5
-seconds", `retry_after_seconds = 5` (`THROTTLED_RETRY_AFTER_SECONDS`, the floor the protocol
-renderer applies to every throttled wait, so the message, the payload and the header agree).
+The refusal is `lane_saturated_failure()`: failure class `throttled`, consumer-facing safe
+message "This model is at capacity right now. Please retry in a few seconds. Pro subscribers
+get priority access when models are busy.", `retry_after_seconds = 5`
+(`THROTTLED_RETRY_AFTER_SECONDS`, the floor the protocol renderer applies to every throttled
+wait, so the payload and the header agree).
 The data plane renders it as the caller-facing 429 `unavailable_route` with `Retry-After: 5`,
 before any dispatch, so the retry lands on a freed slot instead of queueing behind the slow
 lane. Nothing is down, so it is not

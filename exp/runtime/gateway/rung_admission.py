@@ -296,7 +296,9 @@ class RungLoadRegistry:
             self._prune_window(rung, now)
             if hard_bound and bound is not None and rung.total >= bound:
                 return RungShed("queue_bound")
-            if force and overflow_ceiling is not None and rung.total >= overflow_ceiling:
+            # The admitted count itself must stay within the ceiling, so a
+            # fractional ceiling floors: 1.5x a bound of 5 holds 7, never 8.
+            if force and overflow_ceiling is not None and rung.total + 1 > overflow_ceiling:
                 return RungShed("queue_bound", overflow_ceiling=True)
             if not force or rate_retry:
                 shed = self._shed_reason(

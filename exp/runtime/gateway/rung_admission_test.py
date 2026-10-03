@@ -658,6 +658,28 @@ class TestPriorityOverflowCeiling:
             overflow_ceiling=4.0,
         ) == RungShed("queue_bound", overflow_ceiling=True)
 
+    def test_a_fractional_ceiling_floors_the_admitted_count(self) -> None:
+        """A paying 1.5x of a bound of 5 holds 7 in flight, never 8."""
+        registry = _registry([0.0])
+        for _ in range(5):
+            assert isinstance(_reserve(registry, "org-a", bound=5), str)
+
+        def forced() -> str | RungShed:
+            return registry.reserve(
+                _KEY,
+                organization_id="org-paying",
+                weight=4,
+                bound=5,
+                fair_share=True,
+                force=True,
+                overflow_ceiling=7.5,
+            )
+
+        for _ in range(2):
+            assert isinstance(forced(), str)
+        assert forced() == RungShed("queue_bound", overflow_ceiling=True)
+        assert registry.inflight(_KEY) == 7
+
     def test_forced_rate_redial_rechecks_only_rate_windows_under_a_ceiling(self) -> None:
         """A priority throttle redial at the bound is not shed by the bound it may overflow."""
         registry = _registry([0.0])

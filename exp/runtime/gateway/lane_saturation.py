@@ -102,15 +102,16 @@ def lane_saturated_failure() -> GatewayFailure:
 
     Throttled, not provider-internal: nothing is down, the pool is full on
     this worker and the caller should retry shortly. The class renders as the
-    caller-facing 429 ``unavailable_route`` with the Retry-After the message
-    states, exactly like a pool whose every rung sits in a provider throttle
-    window.
+    caller-facing 429 ``unavailable_route`` with ``Retry-After: 5``, exactly
+    like a pool whose every rung sits in a provider throttle window. The
+    message is consumer copy (it reaches end users verbatim through clients),
+    so it names capacity and the Pro priority benefit, never worker internals.
     """
     return GatewayFailure(
         failure_class=GatewayFailureClass.THROTTLED,
         safe_message=(
-            "every lane for this model is at its in-flight bound on this gateway worker; "
-            f"retry in {LANE_SATURATED_RETRY_AFTER_SECONDS} seconds"
+            "This model is at capacity right now. Please retry in a few seconds. "
+            "Pro subscribers get priority access when models are busy."
         ),
         retry_after_seconds=LANE_SATURATED_RETRY_AFTER_SECONDS,
     )
