@@ -71,6 +71,7 @@ from exp.runtime.gateway.native_settlement import (
     exhausted_attempt_payload,
     failure_from_boundary_payload,
     ledger_failure,
+    pins_native_responses_route,
     settlement_metadata,
     settlement_rate_limit,
     terminal_from_settlement,
@@ -638,8 +639,9 @@ class NativeAttemptAccounting:
             # An empty forced claim means every deployment is provider-throttled.
             # Otherwise report unavailable without a free-capacity certificate.
             throttled_remaining = self._health.throttled_remaining_seconds(keys)
+            pinned = pins_native_responses_route(entry.request)
             exhaustion = (
-                all_routes_throttled_failure(throttled_remaining)
+                all_routes_throttled_failure(throttled_remaining, native_responses_pinned=pinned)
                 if throttled_remaining is not None
                 else all_routes_unavailable_failure()
             )
