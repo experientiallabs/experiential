@@ -185,8 +185,8 @@ def test_reserve_rung_slot_lets_an_authored_bound_replace_the_default() -> None:
     assert shed == RungShed("queue_bound")
 
 
-def test_fair_share_is_on_by_default_and_an_explicit_false_opts_out() -> None:
-    """An unauthored fair_share weighs tiers on every bounded rung; False restores first-come."""
+def test_fair_share_is_always_on_for_every_bounded_rung() -> None:
+    """Tier weighting applies on every bounded rung, whatever the persisted flag says."""
 
     def second_free_request(dispatch: GatewayRungDispatchPolicy | None) -> str | RungShed | None:
         loads = RungLoadRegistry(default_bound=4)
@@ -213,8 +213,8 @@ def test_fair_share_is_on_by_default_and_an_explicit_false_opts_out() -> None:
         "fair_share_shed"
     )
     assert second_free_request(None) == RungShed("fair_share_shed")
-    opted_out = GatewayRungDispatchPolicy(concurrency_bound=4, fair_share=False)
-    assert isinstance(second_free_request(opted_out), str)
+    explicit = GatewayRungDispatchPolicy(concurrency_bound=4, fair_share=False)
+    assert second_free_request(explicit) == RungShed("fair_share_shed")
 
 
 def test_registry_refuses_a_default_bound_below_one() -> None:

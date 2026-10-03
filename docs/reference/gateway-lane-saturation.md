@@ -55,19 +55,29 @@ shed reason (`shed_keeps_pin`), the documented continuity-over-spill trade.
 ## Priority callers and default fairness
 
 A PRIORITY caller (`AuthorizationSnapshot.priority_admission`: 1 for a paying organization,
-2 for Pro, as the hosted platform sets it; 0 free) is never refused by a bound, on every rung and with nothing to
-author: when either refusing bound (an authored `refuse` or the worker's default lane bound)
-sheds it, `overflow_target` force-admits it onto the rung as under `overflow`
-(`saturated_overflow`), so on a saturated lane only free callers get the 429. The overflow is
-capped by level (`PRIORITY_OVERFLOW_FACTORS`: 1.5x the bound in flight for paying, 2x for Pro;
-`RungShed.overflow_ceiling`); past that a priority request is refused like any other, so one flooding paying organization still
-cannot hold every admission permit.
+2 for Pro, as the hosted platform sets it; 0 free) is not refused at a bound, on every rung
+and with nothing to author: when either refusing bound (an authored `refuse` or the worker's
+default lane bound) sheds it, `overflow_target` force-admits it onto the first bypassed rung
+still below its ceiling (`saturated_overflow`), so on a saturated lane free callers get the
+429 first. A priority caller's caller-selected first dial overflows its own rung the same way,
+even on a soft (`overflow`) bound. The overflow is capped per level and floors to whole
+slots (`priority_overflow_ceiling`):
 
-`GatewayRungDispatchPolicy.fair_share` defaults to ON (`None`): every bounded rung, including
-one bounded only by the worker default, weighs organizations by
-`AuthorizationSnapshot.fair_share_weight` under contention. An explicit `False` opts a rung
-out. An unauthored value still contributes zero identity bytes, so the default moves no
-catalog digest.
+| Bound | Paying | Pro |
+| --- | --- | --- |
+| Authored (`PRIORITY_OVERFLOW_FACTORS`) | 1.5x | 2x |
+| Worker default (`DEFAULT_BOUND_OVERFLOW_FACTORS`) | 1.25x | 1.5x |
+
+The default bound is already half the worker's permits, so its Pro factor stays below
+`1 / DEFAULT_LANE_SHARE` and one lane's priority traffic never holds every permit. A rung whose
+forced admission hit its ceiling (`RungShed.overflow_ceiling`) is skipped, and the request is
+refused once every bypassed rung is capped.
+
+Weighted fairness is ALWAYS on: every bounded rung, including one bounded only by the worker
+default, weighs organizations by `AuthorizationSnapshot.fair_share_weight` under contention.
+`GatewayRungDispatchPolicy.fair_share` stays in the contract only because persisted catalog
+snapshots serialize it and their identity digests read it; its value no longer changes
+admission (an authored `true` still requires a bound). No catalog digest moves.
 
 ## Durable retry and billing proof
 

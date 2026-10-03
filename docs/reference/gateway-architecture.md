@@ -404,13 +404,13 @@ at the authored rate when one exists; each creep step is the probe that rediscov
 no synthetic traffic is ever sent), and a ceiling unthrottled for six hours is forgotten. The
 learned ceiling is a float and may sit below one request per minute: per-worker ceilings
 multiply across the fleet, and some provider accounts allow less than one request per worker
-per minute. With
-`fair_share: true` (which requires the bound), a contended rung additionally
+per minute. Weighted fairness is always on (`fair_share` no longer changes admission; see
+gateway-lane-saturation.md): a contended rung, authored or default bound, additionally
 limits each organization to its weighted max-min share of the bound; weights arrive per request
 on `AuthorizationSnapshot.fair_share_weight` (default 1) from the hosted store, capacity below
 the bound is always borrowable (a lone organization uses the whole rung), freed slots are
 reserved for recently active under-share organizations, and running dispatches are never
-preempted. With `cache_priority_alpha` authored on a fair-share rung, each organization's
+preempted. With `cache_priority_alpha` authored (it still requires an authored `fair_share: true`), each organization's
 effective weight becomes `weight * (1 + alpha * congestion * cached_fraction)`, where congestion
 is the rung's in-flight total over its bound and the cached fraction is the worker's time-decayed
 EWMA (half-life roughly ten minutes) of the organization's settled cached-token share on that

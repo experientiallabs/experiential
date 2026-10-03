@@ -31,13 +31,8 @@ def test_rate_and_cache_fields_validate_their_prerequisites() -> None:
         GatewayRungDispatchPolicy(requests_per_minute=0)
     with pytest.raises(ValueError):
         GatewayRungDispatchPolicy(tokens_per_minute=0)
-    # Fairness is on unless opted out, so the cache term needs no explicit
-    # fair_share; an opted-out rung has nothing for it to weight.
-    assert (
-        GatewayRungDispatchPolicy(concurrency_bound=8, cache_priority_alpha=2.0).fair_share is None
-    )
     with pytest.raises(ValueError, match="fair_share"):
-        GatewayRungDispatchPolicy(concurrency_bound=8, fair_share=False, cache_priority_alpha=2.0)
+        GatewayRungDispatchPolicy(concurrency_bound=8, cache_priority_alpha=2.0)
     with pytest.raises(ValueError):
         GatewayRungDispatchPolicy(
             concurrency_bound=8, fair_share=True, cache_priority_alpha=float("nan")

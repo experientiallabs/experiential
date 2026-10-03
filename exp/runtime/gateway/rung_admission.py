@@ -128,32 +128,31 @@ def _cached_fraction(rung: _RungLoad, organization_id: str) -> float:
 
 @dataclass(frozen=True)
 class RungShed:
-    """One refused reservation and the disclosure reason for the bypass."""
+    """One refused reservation and the disclosure reason for the bypass.
+
+    Attributes:
+        reason: The durable disclosure reason code for the bypass.
+        learned_requests_per_minute: The learned working request ceiling behind
+            a ``rate_limit`` shed, default ``None``. Carried so the shed can be
+            logged and counted with the ceiling that caused it; the durable
+            disclosure column stays the bare reason code. A float because the
+            ceiling can sit below one request per minute per worker.
+        overflow_ceiling: Whether a priority caller's forced overflow hit its
+            level's ceiling (``lane_saturation.priority_overflow_ceiling``),
+            default ``False``. ``overflow_target`` never retries such a rung, so
+            a flooding priority organization cannot hold the worker.
+        default_bound: Whether the bound that shed was the worker's default lane
+            share, default ``False``. Such a ``queue_bound`` shed is never
+            force-admitted for a free caller when the ladder is exhausted (the
+            default keeps one lane from holding every admission permit); a
+            priority caller overflows it only to its capped ceiling. An
+            authored bound keeps its authored ``saturation``.
+    """
 
     reason: RungShedReason
     learned_requests_per_minute: float | None = None
-    """The learned working request ceiling behind a ``rate_limit`` shed.
-
-    Carried so the shed can be logged and counted with the ceiling that caused
-    it; the durable disclosure column stays the bare reason code. A float
-    because the ceiling can sit below one request per minute per worker.
-    """
     overflow_ceiling: bool = False
-    """Whether a priority caller's forced overflow hit its ceiling.
-
-    A priority caller overflows a refusing bound only up to its level's
-    ceiling (1.5x the bound paying, 2x Pro); past that the request is refused
-    like any other, so a flooding priority organization cannot hold the worker.
-    """
     default_bound: bool = False
-    """Whether the bound that shed was the worker's default lane share.
-
-    A ``queue_bound`` shed by a bound the rung never authored (the worker's
-    default in-flight share, ``exp.runtime.gateway.lane_saturation``) is never
-    force-admitted when the ladder is exhausted: the default exists to keep
-    one lane from holding every admission permit, so overflowing it would
-    protect nothing. An authored bound keeps its authored ``saturation``.
-    """
 
 
 @dataclass

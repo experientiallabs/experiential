@@ -109,13 +109,15 @@ def reserve_rung_slot(
         )
     tokens_per_minute = None if policy is None else policy.tokens_per_minute
     refusing = applies_default or (policy is not None and policy.saturation == "refuse")
+    selected_first = entry.route.resolved_route_id is not None and entry.total_attempts == 0
     priority = entry.authorization.priority_admission
     result = loads.reserve(
         rung_load_key(deployment),
         organization_id=entry.authorization.organization_id,
         weight=entry.authorization.fair_share_weight,
         bound=bound,
-        fair_share=policy is None or policy.fair_share is not False,
+        # Weighted fairness is on for every bounded rung (dispatch_policy.fair_share).
+        fair_share=True,
         requests_per_minute=None if policy is None else policy.requests_per_minute,
         tokens_per_minute=tokens_per_minute,
         cache_priority_alpha=None if policy is None else policy.cache_priority_alpha,
@@ -125,9 +127,12 @@ def reserve_rung_slot(
         force=force,
         # A refusing bound (the worker default, or an authored refuse) stays
         # hard for a free caller. A priority caller's shed overflows it
-        # (lane_saturation.overflow_target), capped by its level.
+        # (lane_saturation.overflow_target), capped by its level; so does its
+        # caller-selected first dial, which overflows even a soft bound.
         hard_bound=refusing and not priority,
-        overflow_ceiling=priority_overflow_ceiling(bound, priority) if refusing else None,
+        overflow_ceiling=priority_overflow_ceiling(bound, priority, default_bound=applies_default)
+        if refusing or selected_first
+        else None,
         rate_retry=rate_retry,
     )
     if isinstance(result, RungShed) and applies_default and result.reason == "queue_bound":

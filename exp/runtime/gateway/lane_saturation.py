@@ -53,26 +53,36 @@ DEFAULT_LANE_SHARE = 0.5
 # request deadline would have to drain.
 LANE_SATURATED_RETRY_AFTER_SECONDS = THROTTLED_RETRY_AFTER_SECONDS
 
-# How far past a refusing bound each ``AuthorizationSnapshot.priority_admission``
-# level may overflow, as a multiple of the bound: free callers never, paying
-# callers to 1.5x, Pro callers to 2x. The cap keeps one flooding organization
-# from holding every admission permit.
+# How far past a refusing AUTHORED bound each
+# ``AuthorizationSnapshot.priority_admission`` level may overflow, as a multiple
+# of the bound: free callers never, paying callers to 1.5x, Pro callers to 2x.
 PRIORITY_OVERFLOW_FACTORS = (1.0, 1.5, 2.0)
 
+# The same for the worker's DEFAULT lane bound, which is already a share of the
+# worker's permits (DEFAULT_LANE_SHARE): the Pro factor stays strictly below
+# 1 / DEFAULT_LANE_SHARE, so one lane's priority traffic can never hold every
+# permit (1.5 x half the permits leaves a quarter for every other lane).
+DEFAULT_BOUND_OVERFLOW_FACTORS = (1.0, 1.25, 1.5)
 
-def priority_overflow_ceiling(bound: int | None, priority_admission: int) -> float | None:
-    """The in-flight ceiling a forced priority overflow may not reach, or ``None``.
+
+def priority_overflow_ceiling(
+    bound: int | None, priority_admission: int, *, default_bound: bool
+) -> float | None:
+    """The in-flight ceiling a forced priority overflow may not exceed, or ``None``.
 
     Args:
         bound: The rung's effective bound (authored or the worker default).
         priority_admission: The caller's level (0 free, 1 paying, 2 Pro).
+        default_bound: Whether ``bound`` is the worker's default lane bound.
 
     Returns:
-        ``bound * factor`` for a priority caller on a bounded rung, else ``None``.
+        ``bound * factor`` for a priority caller on a bounded rung, else
+        ``None``. The admitted count floors against it (1.5x of 5 holds 7).
     """
     if bound is None or not priority_admission:
         return None
-    return bound * PRIORITY_OVERFLOW_FACTORS[priority_admission]
+    factors = DEFAULT_BOUND_OVERFLOW_FACTORS if default_bound else PRIORITY_OVERFLOW_FACTORS
+    return bound * factors[priority_admission]
 
 
 def default_lane_bound(max_active_requests: int, share: float = DEFAULT_LANE_SHARE) -> int:
@@ -130,9 +140,10 @@ def overflow_target(
     ``saturation="refuse"``, unless the caller is a priority caller
     (``AuthorizationSnapshot.priority_admission``): a priority request always
     overflows, so on a saturated lane only non-priority callers are turned
-    away. The reservation caps that overflow (``priority_overflow_ceiling``:
-    1.5x the bound for paying callers, 2x for Pro); a shed at the cap
-    (``RungShed.overflow_ceiling``) is refused like any other. A bypass that was not a registry shed
+    away. The reservation caps that overflow (``priority_overflow_ceiling``);
+    a rung whose forced admission hit its cap (``RungShed.overflow_ceiling``)
+    is skipped for the next bypassed rung, and the request is refused once
+    every bypassed rung is capped. A bypass that was not a registry shed
     (a cold throttle failover) keeps the historical overflow.
 
     Args:
@@ -147,12 +158,17 @@ def overflow_target(
     """
     if not policy_sheds:
         return None
+    if route.snapshot.authorization.priority_admission:
+        # The first bypassed rung still below its priority ceiling; a rung
+        # whose forced admission already hit the ceiling is skipped, never
+        # retried, so the walk ends in a refusal once every rung is capped.
+        for depth, _reason in policy_sheds:
+            shed = shed_records.get(depth)
+            if shed is None or not shed.overflow_ceiling:
+                return depth
+        return None
     depth = policy_sheds[0][0]
     shed = shed_records.get(depth)
-    if shed is not None and shed.overflow_ceiling:
-        return None
-    if route.snapshot.authorization.priority_admission:
-        return depth
     if shed is not None and shed.default_bound:
         return None
     policy = route.deployments[depth].gateway.dispatch

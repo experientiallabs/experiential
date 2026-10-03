@@ -1791,22 +1791,23 @@ class TestLaneSaturation:
         assert refused["exhausted"] is True
         assert cast("JsonObject", refused["failure"])["failure_class"] == "throttled"
 
-    def test_default_lane_bound_overflows_a_priority_caller_up_to_twice_the_bound(self) -> None:
-        """Priority overflows the worker default too, capped at 2x; free callers are refused."""
+    def test_default_lane_bound_overflows_a_pro_caller_up_to_one_and_a_half_times(self) -> None:
+        """Pro overflows the worker default to 1.5x (never all permits); free is refused."""
         ledger = _RecordingLedger()
-        registry = NativeAttemptAccounting(ledger, default_lane_bound=1)
+        registry = NativeAttemptAccounting(ledger, default_lane_bound=2)
         only = (_deployment("deployment-a", connection_sha256="b" * 64),)
-        for request_id in ("request-1", "request-free"):
+        for request_id in ("request-1", "request-2", "request-free"):
             _admit(registry, only, request_id=request_id)
         for request_id in ("request-paid-1", "request-paid-2"):
             _admit(registry, only, request_id=request_id, priority_admission=2)
         assert _start(registry, ordinal=0, request_id="request-1")["route_depth"] == 0
+        assert _start(registry, ordinal=0, request_id="request-2")["route_depth"] == 0
         free = _start(registry, ordinal=0, request_id="request-free")
         assert free["exhausted"] is True
         paid = _start(registry, ordinal=0, request_id="request-paid-1")
         assert paid["route_depth"] == 0
         assert ledger.started[-1]["dispatch_reason"] == "saturated_overflow"
-        # Two in flight on a default bound of one: the ceiling refuses the next.
+        # Three in flight on a default bound of two (1.5x): the next is refused.
         capped = _start(registry, ordinal=0, request_id="request-paid-2")
         assert capped["exhausted"] is True
         assert cast("JsonObject", capped["failure"])["failure_class"] == "throttled"
@@ -1902,11 +1903,19 @@ def test_selected_first_route_refuses_load_shed_without_spill_or_overflow(
 
 
 def test_selected_first_route_overflows_its_own_rung_for_a_priority_caller() -> None:
-    """A Pro caller's selected rung overflows in place: no sideways move, still a ceiling."""
+    """A Pro caller's selected rung overflows in place: no sideways move, still a ceiling.
+
+    The rung's authored bound is SOFT (``overflow``), which a selected first
+    dial would otherwise exceed without limit: the Pro ceiling (2x) caps it.
+    """
     ledger = _RecordingLedger()
-    registry = NativeAttemptAccounting(ledger, default_lane_bound=1)
+    registry = NativeAttemptAccounting(ledger)
     deployments = (
-        _deployment("deployment-a", connection_sha256="b" * 64),
+        _deployment(
+            "deployment-a",
+            connection_sha256="b" * 64,
+            dispatch=GatewayRungDispatchPolicy(concurrency_bound=1),
+        ),
         _deployment("deployment-b", connection_sha256="c" * 64),
     )
     _admit(registry, deployments, request_id="occupied")

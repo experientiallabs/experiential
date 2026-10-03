@@ -14,6 +14,7 @@ from exp.runtime.gateway.contracts import (
     GatewayApiSurface,
 )
 from exp.runtime.gateway.lane_saturation import (
+    DEFAULT_BOUND_OVERFLOW_FACTORS,
     DEFAULT_LANE_SHARE,
     LANE_SATURATED_RETRY_AFTER_SECONDS,
     default_lane_bound,
@@ -159,10 +160,14 @@ def test_overflow_target_has_nothing_to_overflow_without_a_shed() -> None:
 
 def test_priority_overflow_ceiling_scales_the_bound_by_level() -> None:
     """Free callers get no overflow; paying callers 1.5x the bound; Pro callers 2x."""
-    assert priority_overflow_ceiling(4, 0) is None
-    assert priority_overflow_ceiling(4, 1) == 6.0
-    assert priority_overflow_ceiling(4, 2) == 8.0
-    assert priority_overflow_ceiling(None, 2) is None
+    assert priority_overflow_ceiling(4, 0, default_bound=False) is None
+    assert priority_overflow_ceiling(4, 1, default_bound=False) == 6.0
+    assert priority_overflow_ceiling(4, 2, default_bound=False) == 8.0
+    assert priority_overflow_ceiling(None, 2, default_bound=False) is None
+    # The default bound is half the worker's permits: Pro stays below all of them.
+    assert priority_overflow_ceiling(32, 1, default_bound=True) == 40.0
+    assert priority_overflow_ceiling(32, 2, default_bound=True) == 48.0
+    assert DEFAULT_BOUND_OVERFLOW_FACTORS[2] < 1 / DEFAULT_LANE_SHARE
 
 
 def test_overflow_target_refuses_a_shed_at_the_priority_ceiling() -> None:
@@ -170,3 +175,15 @@ def test_overflow_target_refuses_a_shed_at_the_priority_ceiling() -> None:
     route = _route(_deployment("a", None), priority_admission=2)
     capped = {0: RungShed("queue_bound", overflow_ceiling=True)}
     assert overflow_target(route, [(0, "queue_bound")], capped) is None
+
+
+def test_overflow_target_moves_past_a_capped_rung_to_the_next_bypassed_rung() -> None:
+    """A priority caller capped on the first rung overflows the next one still below its cap."""
+    route = _route(_deployment("a", None), _deployment("b", None), priority_admission=2)
+    sheds = {
+        0: RungShed("queue_bound", overflow_ceiling=True),
+        1: RungShed("queue_bound", default_bound=True),
+    }
+    assert overflow_target(route, [(0, "queue_bound"), (1, "queue_bound")], sheds) == 1
+    sheds[1] = RungShed("queue_bound", overflow_ceiling=True)
+    assert overflow_target(route, [(0, "queue_bound"), (1, "queue_bound")], sheds) is None

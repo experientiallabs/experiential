@@ -128,19 +128,18 @@ class GatewayRungDispatchPolicy(ContractModel):
     bound a worker applies to rungs that author no ``concurrency_bound``
     (``exp.runtime.gateway.lane_saturation``) refuses too. Either refusal
     spares a priority caller (``AuthorizationSnapshot.priority_admission``),
-    whose shed overflows up to twice the bound.
+    whose shed overflows up to its level's ceiling.
     """
-    fair_share: bool | None = None
-    """Whether contended admission on this rung is weighted max-min fair.
+    fair_share: bool = False
+    """Authored fairness flag; weighted fairness itself is ALWAYS on.
 
-    When the rung is at or near its bound (authored, or the worker's default
-    lane bound), each organization's admissions are limited to its weighted
-    share of the bound (weights ride ``AuthorizationSnapshot.fair_share_weight``),
-    with freed capacity reserved for recently active under-share organizations.
-    Work-conserving: a lone organization borrows the whole bound. ``None`` (the
-    default) means ON, so tier weighting applies on every bounded rung without
-    authoring; ``False`` opts the rung out; an explicit ``True`` requires
-    ``concurrency_bound``.
+    Every bounded rung (an authored bound, or the worker's default lane bound)
+    limits each organization near the bound to its weighted share (weights
+    ride ``AuthorizationSnapshot.fair_share_weight``), with freed capacity
+    reserved for recently active under-share organizations. Work-conserving: a
+    lone organization borrows the whole bound. The field stays because
+    persisted catalog snapshots serialize it and their identity digests read
+    it; an authored ``True`` still requires ``concurrency_bound``.
     """
     affinity_weight: float | None = Field(default=None, gt=0, allow_inf_nan=False)
     """Rendezvous weight under ``maximize_cache_affinity`` (``None`` means 1.0).
@@ -217,9 +216,9 @@ class GatewayRungDispatchPolicy(ContractModel):
         needs fairness. Failing closed here keeps an inert combination from
         being authored and silently doing nothing.
         """
-        if self.fair_share is True and self.concurrency_bound is None:
+        if self.fair_share and self.concurrency_bound is None:
             raise ValueError("fair_share requires a concurrency_bound to share")
-        if self.cache_priority_alpha is not None and self.fair_share is False:
+        if self.cache_priority_alpha is not None and not self.fair_share:
             raise ValueError("cache_priority_alpha requires fair_share to weight")
         if self.fresh_session_spill_fraction is not None:
             if self.concurrency_bound is None:
