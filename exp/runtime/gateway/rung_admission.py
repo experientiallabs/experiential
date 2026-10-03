@@ -163,6 +163,7 @@ class _OrganizationLoad:
     inflight: int = 0
     last_seen: float = 0.0
     weight: int = 1
+    priority: bool = False
 
 
 @dataclass
@@ -294,6 +295,7 @@ class RungLoadRegistry:
             # is reserved as slots free, which is what converges to fairness.
             organization.last_seen = now
             organization.weight = weight
+            organization.priority = priority
             self._prune(key, rung, now)
             self._prune_window(rung, now)
             if hard_bound and bound is not None and rung.total >= bound:
@@ -358,6 +360,7 @@ class RungLoadRegistry:
             organization = rung.organizations.setdefault(organization_id, _OrganizationLoad())
             organization.last_seen = now
             organization.weight = weight
+            organization.priority = priority
             self._prune(key, rung, now)
             self._prune_window(rung, now)
             return (
@@ -410,7 +413,9 @@ class RungLoadRegistry:
         working ceiling (the authored rate clamped by the learned one) BEFORE
         the provider answers 429. Below all of those, fairness sheds an
         over-share organization only when the remaining slots are reserved for
-        other recently active under-share organizations; otherwise unused
+        other recently active under-share organizations (a non-priority
+        organization's deficit claims only slots below the priority reserve's
+        sub-bound, the only ones it could occupy); otherwise unused
         capacity is borrowable. Shares stay EXACT (a 3:1:1 weighting of a
         bound of 8 guarantees 4.8:1.6:1.6, never a per-share rounding), and
         only the AGGREGATE reservation is floored to whole slots: slots are
@@ -478,11 +483,26 @@ class RungLoadRegistry:
         share = bound * own_weight / total_weight
         if organization.inflight + 1 <= share:
             return None
-        reserved_deficit = sum(
-            max(0.0, bound * weight / total_weight - candidate.inflight)
+        deficits = [
+            (candidate.priority, max(0.0, bound * weight / total_weight - candidate.inflight))
             for candidate, weight in weighted
             if candidate is not organization
-        )
+        ]
+        reserved_deficit = sum(deficit for _priority, deficit in deficits)
+        if priority_reserve_fraction is not None:
+            # A non-priority organization can occupy only the slots below the
+            # reserve's sub-bound, so its deficit never claims a reserved slot:
+            # otherwise a shed free caller (still recently active) would hold
+            # the reserve empty against the priority caller it exists for.
+            open_below_reserve = max(
+                0.0, bound * (1.0 - priority_reserve_fraction) - (rung.total + 1)
+            )
+            reserved_deficit = sum(
+                deficit for candidate_priority, deficit in deficits if candidate_priority
+            ) + min(
+                open_below_reserve,
+                sum(deficit for candidate_priority, deficit in deficits if not candidate_priority),
+            )
         if rung.total + 1 + int(reserved_deficit) > bound:
             return RungShed("fair_share_shed")
         return None

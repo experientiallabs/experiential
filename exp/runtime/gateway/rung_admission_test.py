@@ -672,6 +672,37 @@ class TestPriorityReserve:
             "queue_bound", priority_reserve=True
         )
 
+    def test_fairness_never_holds_the_reserve_for_non_priority_deficits(self) -> None:
+        """Shed free organizations stay recently active, yet their deficits skip the reserve.
+
+        Bound 5, reserve 0.4, fair share: three free organizations fill the
+        3-slot sub-bound and many more are shed (still active). The paying
+        organization's weighted share is small against that crowd, but no free
+        organization can occupy a reserved slot, so the paid caller fills both.
+        """
+        registry = _registry([0.0])
+
+        def reserve(organization_id: str, *, priority: bool, weight: int = 1) -> str | RungShed:
+            return _reserve(
+                registry,
+                organization_id,
+                weight=weight,
+                bound=5,
+                fair_share=True,
+                priority=priority,
+                priority_reserve_fraction=0.4,
+            )
+
+        for index in range(3):
+            assert isinstance(reserve(f"org-free-{index}", priority=False), str)
+        for index in range(3, 20):
+            assert reserve(f"org-free-{index}", priority=False) == RungShed(
+                "queue_bound", priority_reserve=True
+            )
+        assert isinstance(reserve("org-paid", priority=True, weight=10), str)
+        assert isinstance(reserve("org-paid", priority=True, weight=10), str)
+        assert registry.inflight(_KEY) == 5
+
     def test_no_fraction_means_first_come_admission(self) -> None:
         """Without an authored reserve the priority flag changes nothing."""
         registry = _registry([0.0])
