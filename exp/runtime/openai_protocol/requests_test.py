@@ -1598,6 +1598,8 @@ def test_responses_decoder_takes_a_hunyuan_scheme_carrier_beside_its_summary() -
     assert assistant.provider_reasoning[0].kind == "sealed_reasoning_content"
     assert assistant.provider_reasoning[0].carrier == carrier
     assert tuple(call.call_id for call in assistant.tool_calls) == ("call-1",)
+    # The visible summary is kept for trace capture only, never provider replay.
+    assert [block.content for block in assistant.capture_only_reasoning] == ["check the weather"]
 
 
 def test_responses_decoder_rejects_a_malformed_hunyuan_scheme_carrier() -> None:

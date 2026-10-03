@@ -10,6 +10,7 @@ from exp.common.models import ToolCall
 from exp.common.models.content import MessageContentPart
 from exp.runtime.gateway.contracts import (
     EncryptedReasoningBlock,
+    ExposedReasoningContentBlock,
     GatewayMessage,
     SealedReasoningContentBlock,
 )
@@ -22,6 +23,10 @@ class ReplayedReasoning:
 
     index: int
     block: EncryptedReasoningBlock | SealedReasoningContentBlock
+    # The caller-visible summary replayed beside a gateway carrier: trace
+    # capture keeps it, provider replay never sees it (the carrier holds the
+    # authenticated text).
+    visible: tuple[ExposedReasoningContentBlock, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -114,6 +119,12 @@ def responses_input_messages(value: str | tuple[ReplayedInput, ...]) -> tuple[Ga
                     content=content,
                     tool_calls=calls,
                     provider_reasoning=tuple(reasoning),
+                    capture_only_reasoning=tuple(
+                        visible
+                        for item in segment
+                        if isinstance(item, ReplayedReasoning)
+                        for visible in item.visible
+                    ),
                 )
             )
             segment.clear()

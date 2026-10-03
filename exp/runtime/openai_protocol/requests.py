@@ -896,7 +896,19 @@ def _response_input_messages(
                     output_index=index,
                     status=item.status,
                 )
-            replayed.append(ReplayedReasoning(index=index, block=block))
+            summary = "\n\n".join(part.text for part in item.summary if part.text)
+            try:
+                visible = (
+                    (ExposedReasoningContentBlock(content=summary),)
+                    if scheme is not None and summary
+                    else ()
+                )
+            except ValidationError as exc:
+                raise invalid_field(
+                    f"input.{index}.summary",
+                    "Replayed reasoning summary exceeds 8,388,608 characters.",
+                ) from exc
+            replayed.append(ReplayedReasoning(index=index, block=block, visible=visible))
         elif isinstance(item, _ResponseMessage):
             converted = _messages((item,), f"input.{index}")
             if converted and item.role == "assistant":
