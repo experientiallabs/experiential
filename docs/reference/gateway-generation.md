@@ -176,7 +176,11 @@ Cumulative reports from one generation are merged, not added. Costs from separat
 generations cannot acquire a known total by adding a known count to an unknown one.
 
 Chat and Responses preserve the observed `cache_write_1h_tokens` detail within total cache
-writes. An omitted split stays unknown; a measured zero stays zero. Where the standard response
+writes. An omitted split stays unknown; a measured zero stays zero. Bedrock's split is read from
+Converse `cacheDetails` (`5m`/`1h` entries) only when the entries cover `cacheWriteInputTokens`;
+an Anthropic `message_delta` that grows the write total without a breakdown keeps the
+`message_start` one-hour subset, because the automatic server-tool breakpoint always writes at
+the five-minute TTL. Where the standard response
 schema requires an integer, `usage.unreported_token_details` names any compatibility zero that
 stands for an unreported meter. Its only allowed names are `cached_tokens`, `cache_write_tokens`,
 `cache_write_1h_tokens`, and `reasoning_tokens`, without duplicates. A named detail must be absent,

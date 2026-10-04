@@ -563,9 +563,47 @@ pub fn bedrock_usage(value: Option<&Value>) -> Result<Usage, String> {
             "cacheWriteInputTokens",
             "Bedrock usage",
         )?,
-        cache_creation_1h_input_tokens: None,
+        cache_creation_1h_input_tokens: bedrock_cache_write_hour(usage, cache_write)?,
         reasoning_tokens: None,
     })
+}
+
+/// Read the one-hour subset of a positive Bedrock cache write from
+/// `cacheDetails`, the per-TTL breakdown (`{ttl: "5m" | "1h", inputTokens}`)
+/// Converse reports beside `cacheWriteInputTokens`. The subset is known only
+/// when every entry names a documented TTL and the entries cover the reported
+/// total; absent, empty, or partial evidence stays unknown, never inferred
+/// from the request. Entries beyond the total contradict the provider's own
+/// report and fail the stream like the Anthropic breakdown does.
+fn bedrock_cache_write_hour(usage: &Map<String, Value>, total: u64) -> Result<Option<u64>, String> {
+    let details = match usage.get("cacheDetails") {
+        None | Some(Value::Null) => return Ok(None),
+        Some(value) => value
+            .as_array()
+            .ok_or_else(|| "Bedrock cacheDetails must be an array".to_string())?,
+    };
+    // Every entry counts toward the contradiction check, priced TTL or not.
+    let (mut covered, mut hour, mut unpriceable) = (0u64, 0u64, false);
+    for detail in details {
+        let detail = detail
+            .as_object()
+            .ok_or_else(|| "Bedrock cacheDetails entries must be objects".to_string())?;
+        let tokens = count_if_present(detail, "inputTokens", "Bedrock cacheDetails")?
+            .ok_or_else(|| "Bedrock cacheDetails.inputTokens is required".to_string())?;
+        covered = bounded_ledger_sum(&[covered, tokens], "Bedrock cacheDetails")?;
+        match detail.get("ttl").and_then(Value::as_str) {
+            Some("5m") => {}
+            Some("1h") => hour = bounded_ledger_sum(&[hour, tokens], "Bedrock cacheDetails")?,
+            // A TTL this parser cannot price leaves the split unknown.
+            Some(_) => unpriceable = true,
+            None => return Err("Bedrock cacheDetails.ttl must be text".to_string()),
+        }
+    }
+    if covered > total {
+        return Err("Bedrock cacheDetails TTL counts exceed cacheWriteInputTokens".to_string());
+    }
+    // A zero write has no subset to price; its entries were still validated.
+    Ok((total > 0 && !unpriceable && covered == total).then_some(hour))
 }
 
 /// Fetch a required string field from a provider JSON object.

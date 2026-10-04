@@ -440,7 +440,7 @@ pub struct Normalizer {
     output_tokens: Option<u64>,
     cache_read: u64,
     cache_write: Option<u64>,
-    cache_write_1h: Option<u64>,
+    cache_write_ttl: anthropic::CacheWriteTtl,
     stop_reason: Option<String>,
     // OpenAI-compatible and Gemini accumulation.
     usage: Option<Usage>,
@@ -510,7 +510,7 @@ impl Normalizer {
             output_tokens: None,
             cache_read: 0,
             cache_write: None,
-            cache_write_1h: None,
+            cache_write_ttl: anthropic::CacheWriteTtl::default(),
             stop_reason: None,
             usage: None,
             openai_usage: crate::events::OpenAiUsageAccumulator::default(),

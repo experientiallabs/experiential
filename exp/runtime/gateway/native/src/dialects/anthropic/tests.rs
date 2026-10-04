@@ -108,6 +108,77 @@ fn anthropic_output_only_delta_preserves_positive_cache_write_ttl() {
 }
 
 #[test]
+fn anthropic_server_tool_write_growth_keeps_the_start_ttl_split() {
+    // Server-tool iterations grow the cumulative write total after
+    // message_start; the delta repeats the total without a TTL breakdown, and
+    // the automatic server-tool breakpoint always writes at five minutes.
+    let split = |five: u64, hour: u64| serde_json::json!({"ephemeral_5m_input_tokens":five,"ephemeral_1h_input_tokens":hour});
+    let grown =
+        serde_json::json!({"input_tokens":40,"cache_creation_input_tokens":9,"output_tokens":7});
+    for (start_split, server_tool, delta_usage, expected_total, expected_hour) in [
+        (split(3, 2), true, grown.clone(), Some(9), Some(2)),
+        (split(5, 0), true, grown.clone(), Some(9), Some(0)),
+        // An unchanged total adds no writes, with or without a server tool.
+        (
+            split(3, 2),
+            false,
+            serde_json::json!({"input_tokens":13,"cache_creation_input_tokens":5,"output_tokens":7}),
+            Some(5),
+            Some(2),
+        ),
+        // Growth with no server tool result has no documented TTL.
+        (split(3, 2), false, grown.clone(), Some(9), None),
+        // A delta that carries its own breakdown is the evidence, even partial.
+        (
+            split(3, 2),
+            true,
+            serde_json::json!({"cache_creation_input_tokens":9,
+                "cache_creation":{"ephemeral_1h_input_tokens":2},"output_tokens":7}),
+            Some(9),
+            None,
+        ),
+        // A start report without a split never gains one.
+        (serde_json::Value::Null, true, grown, Some(9), None),
+    ] {
+        let mut normalizer = Normalizer::new(Dialect::AnthropicMessages);
+        normalizer
+            .feed(&frame(serde_json::json!({
+                "type":"message_start","message":{"usage":{
+                    "input_tokens":13,"output_tokens":1,"cache_creation_input_tokens":5,
+                    "cache_creation":start_split,
+                }},
+            })))
+            .unwrap();
+        if server_tool {
+            normalizer
+                .feed(&frame(serde_json::json!({
+                    "type":"content_block_start","index":0,"content_block":{
+                        "type":"web_search_tool_result","tool_use_id":"srvtoolu_1","content":[],
+                    },
+                })))
+                .unwrap();
+        }
+        normalizer
+            .feed(&frame(serde_json::json!({
+                "type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":delta_usage,
+            })))
+            .unwrap();
+        let observed = normalizer.observed_usage().unwrap();
+        assert_eq!(observed.cache_creation_input_tokens, expected_total);
+        assert_eq!(observed.cache_creation_1h_input_tokens, expected_hour);
+        let events = normalizer
+            .feed(&frame(serde_json::json!({"type":"message_stop"})))
+            .unwrap();
+        assert!(
+            matches!(events.as_slice(), [Event::Usage(usage), Event::Completed]
+            if usage.cache_creation_input_tokens == expected_total
+                && usage.cache_creation_1h_input_tokens == expected_hour),
+            "{events:?}"
+        );
+    }
+}
+
+#[test]
 fn anthropic_partial_usage_never_resets_or_invents_primary_counts() {
     for (start, delta, expected) in [
         (serde_json::json!({}), serde_json::json!({}), (None, None)),
