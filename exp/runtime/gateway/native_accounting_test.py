@@ -1936,6 +1936,27 @@ class TestLaneSaturation:
         assert capped["exhausted"] is True
         assert cast("JsonObject", capped["failure"])["failure_class"] == "throttled"
 
+    def test_authored_overflow_multiple_replaces_the_default_on_its_rung(self) -> None:
+        """A rung authoring priority_overflow_pro=1.0 refuses Pro at the bound like free."""
+        ledger = _RecordingLedger()
+        registry = NativeAttemptAccounting(ledger)
+        only = (
+            _deployment(
+                "deployment-a",
+                connection_sha256="b" * 64,
+                dispatch=GatewayRungDispatchPolicy(
+                    concurrency_bound=2, saturation="refuse", priority_overflow_pro=1.0
+                ),
+            ),
+        )
+        for request_id in ("request-1", "request-2"):
+            _admit(registry, only, request_id=request_id)
+            assert _start(registry, ordinal=0, request_id=request_id)["route_depth"] == 0
+        _admit(registry, only, request_id="request-pro", priority_admission=2)
+        refused = _start(registry, ordinal=0, request_id="request-pro")
+        assert refused["exhausted"] is True
+        assert cast("JsonObject", refused["failure"])["failure_class"] == "throttled"
+
     def test_refuse_saturation_caps_pro_overflow_at_one_and_a_half_times_the_bound(self) -> None:
         """An authored refusing bound of 2 admits Pro callers to 3 in flight, never 4."""
         ledger = _RecordingLedger()

@@ -112,6 +112,14 @@ class GatewayRungDispatchPolicy(ContractModel):
             snapshots serialize it and their identity digests read it; removal
             waits for a snapshot cutover. An authored ``True`` still requires
             ``concurrency_bound``.
+        priority_overflow_paying: Multiple of this rung's bound (authored, or
+            the worker default) a paying caller (``priority_admission`` 1) may
+            reach when a refusing bound sheds it, ``>= 1``; ``None`` (default)
+            keeps ``lane_saturation.PRIORITY_OVERFLOW_FACTORS``. ``1.0`` turns
+            the paying overflow off on this rung.
+        priority_overflow_pro: The same for a Pro caller (``priority_admission``
+            2), ``>= 1``; ``None`` keeps the engine default. When both are
+            authored, paying may not exceed Pro.
     """
 
     concurrency_bound: int | None = Field(default=None, ge=1)
@@ -207,6 +215,8 @@ class GatewayRungDispatchPolicy(ContractModel):
     on the spill target). Author roughly the provider's prompt-cache lifetime.
     ``None`` records no binding for dispatches landing on this rung.
     """
+    priority_overflow_paying: float | None = Field(default=None, ge=1, allow_inf_nan=False)
+    priority_overflow_pro: float | None = Field(default=None, ge=1, allow_inf_nan=False)
 
     @model_validator(mode="after")
     def _require_coherent_authoring(self) -> GatewayRungDispatchPolicy:
@@ -219,6 +229,12 @@ class GatewayRungDispatchPolicy(ContractModel):
         """
         if self.fair_share and self.concurrency_bound is None:
             raise ValueError("fair_share requires a concurrency_bound to share")
+        if (
+            self.priority_overflow_paying is not None
+            and self.priority_overflow_pro is not None
+            and self.priority_overflow_paying > self.priority_overflow_pro
+        ):
+            raise ValueError("priority_overflow_paying may not exceed priority_overflow_pro")
         if self.cache_priority_alpha is not None and not self.fair_share:
             raise ValueError("cache_priority_alpha requires fair_share to weight")
         if self.fresh_session_spill_fraction is not None:

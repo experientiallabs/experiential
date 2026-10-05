@@ -81,6 +81,11 @@ slots (`priority_overflow_ceiling`):
 | Authored (`PRIORITY_OVERFLOW_FACTORS`) | 1.25x | 1.5x |
 | Worker default (`DEFAULT_BOUND_OVERFLOW_FACTORS`) | 1.25x | 1.5x |
 
+A rung may author its own multiples (`GatewayRungDispatchPolicy.priority_overflow_paying` /
+`priority_overflow_pro`, each `>= 1`, paying never above Pro); an unset one keeps the table's
+default, and `1.0` turns that level's overflow off on the rung. The hosted platform authors
+them per lane from its admin dispatch panel.
+
 The default bound is already half the worker's permits, so its Pro factor stays below
 `1 / DEFAULT_LANE_SHARE` and one lane's priority traffic never holds every permit. A rung whose
 forced admission hit its ceiling (`RungShed.overflow_ceiling`) is skipped, and the request is
