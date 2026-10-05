@@ -104,3 +104,16 @@ def test_saturation_policy_defaults_to_overflow_and_accepts_refuse() -> None:
     )
     with pytest.raises(ValidationError):
         GatewayRungDispatchPolicy.model_validate({"saturation": "queue"})
+
+
+def test_priority_overflow_multiples_are_at_least_one_and_paying_never_exceeds_pro() -> None:
+    """Multiples below 1 or non-finite fail; paying above Pro fails; either alone stands."""
+    for value in (0.5, 4.5, float("inf"), float("nan")):
+        with pytest.raises(ValueError):
+            GatewayRungDispatchPolicy(priority_overflow_pro=value)
+    with pytest.raises(ValueError, match="may not exceed"):
+        GatewayRungDispatchPolicy(priority_overflow_paying=2.0, priority_overflow_pro=1.5)
+    assert GatewayRungDispatchPolicy(priority_overflow_paying=1.0).priority_overflow_pro is None
+    both = GatewayRungDispatchPolicy(priority_overflow_paying=1.25, priority_overflow_pro=1.25)
+    assert both.priority_overflow_paying == both.priority_overflow_pro
+    assert GatewayRungDispatchPolicy().model_dump(exclude_defaults=True) == {}

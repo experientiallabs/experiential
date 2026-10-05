@@ -23,7 +23,7 @@ Two rules close that:
    still the default for an AUTHORED bound, and an authored rung may opt into
    ``saturation="refuse"``; the default lane bound refuses too. A priority
    caller (the host's paying and Pro organizations) is the exception on both:
-   its shed overflows, capped at 1.5x / 2x the bound so the worker stays
+   its shed overflows, capped at 1.25x / 1.5x the bound so the worker stays
    protected. A refusal is a fast,
    retryable 429 (``lane_saturated_failure``) with the protocol's throttle
    Retry-After, answered
@@ -55,8 +55,10 @@ LANE_SATURATED_RETRY_AFTER_SECONDS = THROTTLED_RETRY_AFTER_SECONDS
 
 # How far past a refusing AUTHORED bound each
 # ``AuthorizationSnapshot.priority_admission`` level may overflow, as a multiple
-# of the bound: free callers never, paying callers to 1.5x, Pro callers to 2x.
-PRIORITY_OVERFLOW_FACTORS = (1.0, 1.5, 2.0)
+# of the bound: free callers never, paying callers to 1.25x, Pro callers to
+# 1.5x. The Pro cap stays at 1.5x because one organization's long cold
+# prompts at twice a self-hosted origin's bound saturate the origin itself.
+PRIORITY_OVERFLOW_FACTORS = (1.0, 1.25, 1.5)
 
 # The same for the worker's DEFAULT lane bound, which is already a share of the
 # worker's permits (DEFAULT_LANE_SHARE): the Pro factor stays strictly below
@@ -66,7 +68,11 @@ DEFAULT_BOUND_OVERFLOW_FACTORS = (1.0, 1.25, 1.5)
 
 
 def priority_overflow_ceiling(
-    bound: int | None, priority_admission: int, *, default_bound: bool
+    bound: int | None,
+    priority_admission: int,
+    *,
+    default_bound: bool,
+    authored: tuple[float | None, float | None] = (None, None),
 ) -> float | None:
     """The in-flight ceiling a forced priority overflow may not exceed, or ``None``.
 
@@ -74,6 +80,9 @@ def priority_overflow_ceiling(
         bound: The rung's effective bound (authored or the worker default).
         priority_admission: The caller's level (0 free, 1 paying, 2 Pro).
         default_bound: Whether ``bound`` is the worker's default lane bound.
+        authored: The rung's authored ``(priority_overflow_paying,
+            priority_overflow_pro)`` multiples; ``None`` keeps the default.
+            Ignored under the default bound (its factors protect the worker).
 
     Returns:
         ``bound * factor`` for a priority caller on a bounded rung, else
@@ -81,8 +90,14 @@ def priority_overflow_ceiling(
     """
     if bound is None or not priority_admission:
         return None
-    factors = DEFAULT_BOUND_OVERFLOW_FACTORS if default_bound else PRIORITY_OVERFLOW_FACTORS
-    return bound * factors[priority_admission]
+    if default_bound:
+        return bound * DEFAULT_BOUND_OVERFLOW_FACTORS[priority_admission]
+    paying, pro = (
+        PRIORITY_OVERFLOW_FACTORS[level] if value is None else value
+        for level, value in ((1, authored[0]), (2, authored[1]))
+    )
+    # Paying never overflows past Pro, even when only one side is authored.
+    return bound * (pro if priority_admission == 2 else min(paying, pro))
 
 
 def default_lane_bound(max_active_requests: int, share: float = DEFAULT_LANE_SHARE) -> int:

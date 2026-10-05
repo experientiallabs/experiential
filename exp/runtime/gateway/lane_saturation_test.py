@@ -17,6 +17,7 @@ from exp.runtime.gateway.lane_saturation import (
     DEFAULT_BOUND_OVERFLOW_FACTORS,
     DEFAULT_LANE_SHARE,
     LANE_SATURATED_RETRY_AFTER_SECONDS,
+    PRIORITY_OVERFLOW_FACTORS,
     default_lane_bound,
     lane_saturated_failure,
     overflow_target,
@@ -133,7 +134,7 @@ def test_overflow_target_overflows_a_refusing_rung_for_a_priority_caller() -> No
     shed_order = [(0, "queue_bound"), (1, "queue_bound")]
     assert overflow_target(_route(*refusing, priority_admission=2), shed_order, sheds) == 0
     # The worker's default bound overflows for a priority caller too (the
-    # reservation caps it at twice the bound).
+    # reservation caps it at its level's ceiling).
     unauthored = _route(_deployment("a", None), _deployment("b", None), priority_admission=2)
     default_shed = {0: RungShed("queue_bound", default_bound=True)}
     assert overflow_target(unauthored, [(0, "queue_bound")], default_shed) == 0
@@ -159,10 +160,11 @@ def test_overflow_target_has_nothing_to_overflow_without_a_shed() -> None:
 
 
 def test_priority_overflow_ceiling_scales_the_bound_by_level() -> None:
-    """Free callers get no overflow; paying callers 1.5x the bound; Pro callers 2x."""
+    """Free callers get no overflow; paying callers 1.25x the bound; Pro callers 1.5x."""
     assert priority_overflow_ceiling(4, 0, default_bound=False) is None
-    assert priority_overflow_ceiling(4, 1, default_bound=False) == 6.0
-    assert priority_overflow_ceiling(4, 2, default_bound=False) == 8.0
+    assert priority_overflow_ceiling(4, 1, default_bound=False) == 5.0
+    assert priority_overflow_ceiling(4, 2, default_bound=False) == 6.0
+    assert PRIORITY_OVERFLOW_FACTORS[1] < PRIORITY_OVERFLOW_FACTORS[2] <= 1.5
     assert priority_overflow_ceiling(None, 2, default_bound=False) is None
     # The default bound is half the worker's permits: Pro stays below all of them.
     assert priority_overflow_ceiling(32, 1, default_bound=True) == 40.0
@@ -203,3 +205,15 @@ def test_a_rate_window_shed_never_earns_the_priority_exception() -> None:
     assert overflow_target(soft, [(0, "rate_limit")], rate) == 0
     selected = soft.model_copy(update={"resolved_route_id": "route_" + "a" * 64})
     assert overflow_target(selected, [(0, "rate_limit")], rate) is None
+
+
+def test_authored_overflow_multiples_replace_the_default_per_level() -> None:
+    """A rung's authored paying / Pro multiples win; an unset one keeps the default."""
+    assert priority_overflow_ceiling(4, 2, default_bound=False, authored=(None, 2.0)) == 8.0
+    assert priority_overflow_ceiling(4, 1, default_bound=False, authored=(None, 2.0)) == 5.0
+    assert priority_overflow_ceiling(4, 1, default_bound=False, authored=(1.0, None)) == 4.0
+    assert priority_overflow_ceiling(4, 0, default_bound=False, authored=(2.0, 3.0)) is None
+    # Paying never passes Pro: Pro alone at 1.0 turns paying off too.
+    assert priority_overflow_ceiling(4, 1, default_bound=False, authored=(None, 1.0)) == 4.0
+    # The default bound ignores authored multiples (its factors protect the worker).
+    assert priority_overflow_ceiling(32, 2, default_bound=True, authored=(4.0, 4.0)) == 48.0

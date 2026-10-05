@@ -141,7 +141,14 @@ def reserve_rung_slot(
         # (lane_saturation.overflow_target), capped by its level; so does its
         # caller-selected first dial, which overflows even a soft bound.
         hard_bound=refusing and not priority,
-        overflow_ceiling=priority_overflow_ceiling(bound, priority, default_bound=applies_default)
+        overflow_ceiling=priority_overflow_ceiling(
+            bound,
+            priority,
+            default_bound=applies_default,
+            authored=(None, None)
+            if policy is None
+            else (policy.priority_overflow_paying, policy.priority_overflow_pro),
+        )
         if refusing or selected_first
         else None,
         rate_retry=rate_retry,
