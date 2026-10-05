@@ -9,6 +9,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest.mock import patch
 
+import httpx
 import pytest
 
 from exp.common.core.artifacts import JsonObject
@@ -17,7 +18,9 @@ from exp.runtime.gateway.lifecycle import load_gateway_components
 from exp.runtime.gateway.lifecycle_test import _configured_gateway
 from exp.runtime.gateway.native_bridge import NativeBridgeError, NativeControlPlane
 from exp.runtime.gateway.native_bridge_test import _admit, _chat_body, _project_control_plane
+from exp.runtime.gateway.tests.guardrail_policy_integrity_test import _body
 from exp.runtime.gateway.tests.guardrails_native_bridge_test import _engine
+from exp.runtime.gateway.tests.mandatory_guardrails_paths_test import _serving
 from exp.runtime.gateway.tests.mandatory_guardrails_test import _Guard
 from exp.runtime.gateway.tests.web_search_backend_fixture_test import (
     FailingWebSearchBackend,
@@ -85,11 +88,11 @@ def test_paid_admission_work_prevents_capacity_certificate_and_same_key_reentry(
         assert classifier.input_calls == 2
     with sqlite3.connect(manager.database_path) as connection:
         assert connection.execute(
-            "SELECT terminal_state, failed_without_effects, "
+            "SELECT terminal_state, failed_without_effects, web_search_requests, "
             "(SELECT COUNT(*) FROM gateway_attempts WHERE request_id = r.request_id) "
             "FROM gateway_requests r WHERE request_id = ?",
             (admitted["request_id"],),
-        ).fetchone() == ("failed", 0, 0)
+        ).fetchone() == ("failed", 0, int(prework == "search_success"), 0)
     with pytest.raises(NativeBridgeError) as raised:
         _admit(control, key, body, idempotency_key="prework-refusal")
     assert json.loads(raised.value.public_error_json)["code"] == "idempotency_replay_unavailable"
@@ -149,3 +152,40 @@ def test_paid_routing_embedding_prevents_capacity_certificate(tmp_path: Path) ->
         server.shutdown()
         server.server_close()
         worker.join(5)
+
+
+@pytest.mark.parametrize("surface", ["chat", "responses", "messages"])
+@pytest.mark.parametrize("stream", [False, True])
+def test_http_capacity_refusal_records_completed_search(
+    tmp_path: Path, surface: str, stream: bool
+) -> None:
+    """The real native HTTP boundary closes searched requests with no model attempt."""
+    manager, key = _configured_gateway(tmp_path)
+    search = StaticWebSearchBackend(
+        (GatewayWebSearchResult(url="https://example.test/result", title="Fixture"),)
+    )
+    control = NativeControlPlane(
+        load_gateway_components(tmp_path, environment={"TEST_PROVIDER_KEY": "fixture"}),
+        default_lane_bound=1,
+        web_search=search,
+    )
+    occupied = _admit(control, key, _chat_body())
+    assert "attempt_id" in _start(control, key, str(occupied["request_id"]))
+    route, body = _body(surface, stream)
+    body["model"] = "coding:online"
+    if surface == "messages":
+        body["model"] = "coding"
+        body["tools"] = [{"type": "web_search_20250305", "name": "web_search"}]
+    with _serving(control) as url, patch.object(search, "search", wraps=search.search) as calls:
+        response = httpx.post(
+            url + route, headers={"authorization": f"Bearer {key}"}, json=body, timeout=10
+        )
+    assert response.status_code == 429, response.text
+    assert calls.call_count == 1
+    with sqlite3.connect(manager.database_path) as connection:
+        assert connection.execute(
+            "SELECT terminal_state, web_search_requests, failed_without_effects, "
+            "(SELECT COUNT(*) FROM gateway_attempts WHERE request_id = r.request_id) "
+            "FROM gateway_requests r WHERE request_id != ?",
+            (occupied["request_id"],),
+        ).fetchall() == [("failed", 1, 0, 0)]

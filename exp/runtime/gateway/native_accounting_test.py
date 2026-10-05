@@ -4174,6 +4174,7 @@ def test_abandon_during_committed_reservation_retains_and_closes_late_attempt(
         request_id="late-reservation",
         failover_mode="maximize_availability",
     )
+    entry.web_search_requests = 1
     original = ledger.start_attempt
     committed, release = threading.Event(), threading.Event()
     results: list[JsonObject] = []
@@ -4244,6 +4245,8 @@ def test_abandon_during_committed_reservation_retains_and_closes_late_attempt(
     assert ledger.finished[0]["failure_class"] == "cancelled"
     assert ledger.terminal_events[-1] is not None
     assert ledger.terminal_events[-1].usage is None
+    assert ledger.web_search_requests == ([1, 1] if failed_cleanup else [1])
+    assert ledger.request_search_meters == []
     assert accounting.entry("late-reservation") is None
     accounting.sweep_expired()
     assert len(ledger.finished) == 1

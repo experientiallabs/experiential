@@ -754,6 +754,7 @@ class NativeControlPlane(
                 ),
                 guardrails=guardrails,
                 pending_capture=pending_capture,
+                web_search_requests=int(web_search_admission is not None),
                 signers=tuple(signers),
                 dispatch_bindings=tuple(dispatch_bindings),
                 reasoning_carrier_authorities=tuple(carrier_authorities),
@@ -815,7 +816,6 @@ class NativeControlPlane(
         if plan is not None:
             response["guardrail_output_plan"] = plan
         if web_search_admission is not None:
-            # The gateway searched: the data plane cites the sources and counts it.
             response["web_search"] = web_search_admission
         if tool_search_admission is not None:
             response["tool_search"] = tool_search_admission

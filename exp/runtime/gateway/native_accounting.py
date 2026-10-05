@@ -13,10 +13,7 @@ from exp.common.core.artifacts import JsonObject
 from exp.common.models.gateway_catalog import ExactModelDeployment
 from exp.runtime.gateway.attempt_tokens import worst_case_input_tokens, worst_case_output_tokens
 from exp.runtime.gateway.budget_continuation import denied_destination_pool
-from exp.runtime.gateway.budgets import (
-    BudgetReservationRejected,
-    BudgetScopeKind,
-)
+from exp.runtime.gateway.budgets import BudgetReservationRejected, BudgetScopeKind
 from exp.runtime.gateway.contracts import (
     AuthorizationSnapshot,
     GatewayEvent,
@@ -727,11 +724,8 @@ class NativeAttemptAccounting:
     def abandon(self, argument: str) -> str:
         """Terminalize one accepted request with no settleable outcome.
 
-        The data plane calls this when a request ends before any attempt is
-        active (a queue-deadline expiry, a drained permit, admission wire
-        drift, or a dropped handler between attempts). An active attempt is
-        settled with the given failure; otherwise only the accepted request
-        is finalized.
+        Preserve paid admission work on the active attempt, or on the request
+        when none was ever reserved. Failed writes remain owned for retry.
 
         Args:
             argument: JSON object with ``request_id`` and an optional
@@ -741,8 +735,7 @@ class NativeAttemptAccounting:
             An empty JSON object; an unknown request is a no-op.
 
         Raises:
-            NativeBridgeError: The durable terminal write failed; the entry
-                is kept so the deadline sweep can still close it.
+            NativeBridgeError: The terminal write failed; the entry remains for retry.
         """
         data = json.loads(argument)
         request_id = str(data["request_id"])
@@ -772,7 +765,7 @@ class NativeAttemptAccounting:
                     self._record_health(
                         entry, entry.active_attempt_id, opened=False, failure=failure
                     )
-                    self._write_ledger.finish_attempt(
+                    self._finish_attempt(
                         attempt_id=entry.active_attempt_id,
                         terminal_event=GatewayEvent(
                             kind=GatewayEventKind.FAILED,
@@ -781,11 +774,17 @@ class NativeAttemptAccounting:
                         ),
                         failure=failure,
                         finalize_request=True,
+                        **web_search_requests_kwarg(
+                            self._finish_attempt, entry.web_search_requests
+                        ),
                     )
                 else:
-                    self._write_ledger.finish_request(
-                        authorization=entry.authorization,
-                        failure=failure,
+                    self.request_settlements.finish(
+                        entry.authorization,
+                        failure,
+                        web_search_requests=entry.web_search_requests
+                        if not entry.total_attempts
+                        else 0,
                     )
             except Exception as exc:  # noqa: BLE001 - the data plane retries.
                 raise authority_error(exc) from exc
@@ -804,6 +803,9 @@ class NativeAttemptAccounting:
         web_search_requests: int = 0,
     ) -> bool:
         """Retain failed terminal writes and their exact meters for the existing sweep."""
+        entry = self.entry(authorization.request_id)
+        if entry is not None and not entry.total_attempts:
+            web_search_requests = max(web_search_requests, entry.web_search_requests)
         try:
             return self.request_settlements.finish(
                 authorization,

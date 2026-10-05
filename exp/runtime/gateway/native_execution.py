@@ -168,6 +168,7 @@ class InflightRequest:
         recovery_reason: Optional content-free reason for the admitted recovery placement.
         denied_destination_pools: Exactly bound destination-only budget refusals in this request.
         no_paid_prework: Trusted admission without possible paid prework, default false.
+        web_search_requests: Completed gateway searches awaiting terminal settlement.
         explicit_cache_state: Private marked-prefix plans and durable operation bindings,
             absent unless a host provides explicit cache spending authority.
         guardrails: The single request-owned policy and response-release lifecycle.
@@ -179,6 +180,7 @@ class InflightRequest:
     request: ServingRequest
     deadline_monotonic: float
     no_paid_prework: bool = field(default=False, kw_only=True)
+    web_search_requests: int = field(default=0, kw_only=True)
     attempt_counts: list[int] = field(default_factory=list)
     ordinary_attempt_counts: list[int] = field(default_factory=list)
     attempt_policy: RequestAttemptPolicy = field(default_factory=RequestAttemptPolicy)
