@@ -531,7 +531,11 @@ impl Failure {
         error.retry_after_seconds = match self.failure_class {
             // A failure carrying its known throttle window advertises that
             // wait (floored at the fixed default) so the Retry-After header a
-            // client honors never contradicts the message it reads.
+            // client honors never contradicts the message it reads. A missing
+            // provider wait uses that same default (5, `THROTTLED_RETRY_AFTER_SECONDS`).
+            // The control plane's no-hint throttle window is this value too:
+            // advertising less than the window sends the invited retry into a
+            // refusal that never reaches the provider.
             FailureClass::Throttled => Some(self.retry_after_seconds.map_or(5, |wait| wait.max(5))),
             FailureClass::QuotaExceeded => Some(3600),
             FailureClass::Unavailable => Some(2),

@@ -42,6 +42,7 @@ from exp.runtime.gateway.contracts import (
     GatewayServiceTierSettlement,
     GatewayUsage,
 )
+from exp.runtime.gateway.health import DeploymentHealthRegistry
 from exp.runtime.gateway.ledger import AttemptRejectedError
 from exp.runtime.gateway.native_accounting import (
     NativeAttemptAccounting,
@@ -1095,16 +1096,76 @@ def test_a_fully_throttled_route_exhausts_as_throttled_not_provider_internal() -
     assert "throttle window" in message
     retry_after = failure_payload["retry_after_seconds"]
     assert isinstance(retry_after, int)
-    # The advertised Retry-After covers the whole remaining window (floored
-    # at the default backoff) and the message names the same wait, so a
-    # client honoring the header never retries into the window it was told
-    # to sit out.
-    assert THROTTLED_RETRY_AFTER_SECONDS <= retry_after <= 30
+    # The advertised Retry-After is the remaining window and the message names
+    # that same wait. A hintless 429's window is the public default (5s), not
+    # the remainder of a longer silent window, so the header and the sentence
+    # agree and a client that honors the header is not still suppressed.
+    assert retry_after == THROTTLED_RETRY_AFTER_SECONDS
     assert f"retry in {retry_after}s" in message
     public = public_failure_error(GatewayFailure.model_validate(failure_payload))
     assert public.retry_after_seconds == retry_after
     assert [failure.failure_class.value for failure in ledger.finished_requests] == ["throttled"]
     assert registry.entry("request-one") is None
+
+
+def test_a_retry_that_honors_retry_after_is_attempted_after_a_hintless_429() -> None:
+    """One deployment, one 429 with no Retry-After: the invited retry is attempted.
+
+    The first response advertises ``THROTTLED_RETRY_AFTER_SECONDS``. Sleeping
+    that header used to land inside the 30s throttle window, and the gateway
+    answered again with "inside a provider throttle window" without dialing
+    the provider. The historical ``throttle_seconds=30`` configuration is
+    installed here on purpose. Before the header elapses the rung stays
+    quiet; once it has elapsed the next request reserves an attempt.
+    """
+    now = [1_000.0]
+    ledger = _RecordingLedger()
+    registry = NativeAttemptAccounting(ledger)
+    registry._health = DeploymentHealthRegistry(  # noqa: SLF001 - freeze the throttle clock
+        throttle_seconds=30.0,
+        clock=lambda: now[0],
+    )
+    deployment = _deployment("deployment-a", connection_sha256="b" * 64)
+    _admit(registry, (deployment,), request_id="first")
+    started = _start(registry, ordinal=0, request_id="first")
+    _settle(
+        registry,
+        attempt_id=str(started["attempt_id"]),
+        outcome="failed",
+        finalize=True,
+        failure={
+            "failure_class": "throttled",
+            "safe_message": (
+                "provider throttled the request; retry after the delay in the Retry-After header"
+            ),
+        },
+        request_id="first",
+    )
+    hinted = GatewayFailure(
+        failure_class=GatewayFailureClass.THROTTLED,
+        safe_message="provider throttled the request",
+    )
+    assert public_failure_error(hinted).headers() == {
+        "Retry-After": str(THROTTLED_RETRY_AFTER_SECONDS)
+    }
+
+    _admit(registry, (deployment,), request_id="early")
+    early = _start(registry, ordinal=0, request_id="early")
+    assert early["exhausted"] is True
+    early_failure = early["failure"]
+    assert isinstance(early_failure, dict)
+    assert early_failure["failure_class"] == "throttled"
+    assert "throttle window" in str(early_failure["safe_message"])
+    assert early_failure["retry_after_seconds"] == THROTTLED_RETRY_AFTER_SECONDS
+    assert f"retry in {THROTTLED_RETRY_AFTER_SECONDS}s" in str(early_failure["safe_message"])
+    assert len(ledger.started) == 1
+
+    now[0] += THROTTLED_RETRY_AFTER_SECONDS
+    _admit(registry, (deployment,), request_id="honored")
+    honored = _start(registry, ordinal=0, request_id="honored")
+    assert honored["route_depth"] == 0
+    assert "attempt_id" in honored
+    assert len(ledger.started) == 2
 
 
 def test_an_open_circuit_route_still_dispatches_and_never_reports_throttled() -> None:

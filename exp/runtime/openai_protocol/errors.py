@@ -256,7 +256,9 @@ def public_failure_error(
     if failure.failure_class is GatewayFailureClass.THROTTLED:
         # A failure carrying its known throttle window advertises that wait
         # (floored at the default) so the header never contradicts the
-        # message; without one the fixed default backoff applies.
+        # message; without one the fixed default backoff applies. The health
+        # registry's no-hint throttle window is this same default, so a client
+        # that sleeps the header is not still inside a longer suppression.
         retry_after_seconds = max(
             THROTTLED_RETRY_AFTER_SECONDS,
             failure.retry_after_seconds or THROTTLED_RETRY_AFTER_SECONDS,
