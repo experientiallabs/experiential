@@ -112,14 +112,17 @@ class GatewayRungDispatchPolicy(ContractModel):
             snapshots serialize it and their identity digests read it; removal
             waits for a snapshot cutover. An authored ``True`` still requires
             ``concurrency_bound``.
-        priority_overflow_paying: Multiple of this rung's bound (authored, or
-            the worker default) a paying caller (``priority_admission`` 1) may
-            reach when a refusing bound sheds it, ``>= 1``; ``None`` (default)
+        priority_overflow_paying: Multiple of this rung's AUTHORED
+            ``concurrency_bound`` a paying caller (``priority_admission`` 1) may
+            reach when the bound sheds it, in ``[1, 4]``; ``None`` (default)
             keeps ``lane_saturation.PRIORITY_OVERFLOW_FACTORS``. ``1.0`` turns
-            the paying overflow off on this rung.
+            the paying overflow off on this rung. Never read under the
+            worker's default lane bound, whose factors protect the worker.
         priority_overflow_pro: The same for a Pro caller (``priority_admission``
-            2), ``>= 1``; ``None`` keeps the engine default. When both are
-            authored, paying may not exceed Pro.
+            2). Paying never overflows past Pro: an authored paying above
+            Pro is refused, and at runtime the effective paying multiple is
+            clamped to the effective Pro one (an authored Pro of ``1.0`` turns
+            both off).
     """
 
     concurrency_bound: int | None = Field(default=None, ge=1)
@@ -215,8 +218,8 @@ class GatewayRungDispatchPolicy(ContractModel):
     on the spill target). Author roughly the provider's prompt-cache lifetime.
     ``None`` records no binding for dispatches landing on this rung.
     """
-    priority_overflow_paying: float | None = Field(default=None, ge=1, allow_inf_nan=False)
-    priority_overflow_pro: float | None = Field(default=None, ge=1, allow_inf_nan=False)
+    priority_overflow_paying: float | None = Field(default=None, ge=1, le=4, allow_inf_nan=False)
+    priority_overflow_pro: float | None = Field(default=None, ge=1, le=4, allow_inf_nan=False)
 
     @model_validator(mode="after")
     def _require_coherent_authoring(self) -> GatewayRungDispatchPolicy:
