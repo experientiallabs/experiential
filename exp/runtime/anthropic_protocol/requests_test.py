@@ -1183,6 +1183,45 @@ def test_diagnostics_and_speed_are_carried_verbatim_and_shallow_validated() -> N
     assert raised.value.detail.param == "diagnostics"
 
 
+def test_claude_code_safeguards_request_is_accepted_and_dropped_with_disclosure() -> None:
+    """Claude Code's server-side auto-mode review request decodes and drops.
+
+    Production incident (Claude Code 2.1.280 through 2.1.287, 2026-09-26 on):
+    every auto-mode session sends a top-level ``safeguards`` array with one
+    ``dangerous_tool_use`` entry, and each such request 400ed with "The
+    parameter 'safeguards' is not supported". The field is accepted, never
+    dispatched, and disclosed: with no ``safeguard_results`` in the response,
+    Claude Code falls back to its own classifier, so dropping it never
+    weakens the action review the caller asked for. Validation stays shallow
+    because the entry shape is an evolving provider beta, and a non-array
+    value is still a named parameter error.
+    """
+    safeguards: JsonValue = [
+        {"type": "dangerous_tool_use", "classifier_context": {"permission_mode": "auto"}}
+    ]
+    decoded = decode_messages(
+        _body(safeguards=safeguards),
+        anthropic_beta="dangerous-tool-use-2026-09-03",
+    )
+    assert decoded.request.ignored_parameters == (
+        "anthropic-beta.dangerous-tool-use-2026-09-03",
+        "safeguards",
+    )
+    assert decoded.request.provider_beta_tokens == ()
+    assert "safeguards" not in decoded.request.model_dump()
+    counted = decode_messages_count_tokens(
+        {"model": "coding", "messages": [{"role": "user", "content": "hi"}], "safeguards": []}
+    )
+    assert counted.request.ignored_parameters == ("safeguards",)
+    assert decode_messages(_body()).request.ignored_parameters == ()
+
+    for invalid in ("auto", {"type": "dangerous_tool_use"}, ["dangerous_tool_use"]):
+        with pytest.raises(OpenAIProtocolError) as raised:
+            decode_messages(_body(safeguards=invalid))
+        assert raised.value.detail.param is not None
+        assert raised.value.detail.param.startswith("safeguards")
+
+
 def test_caller_beta_tokens_partition_into_allowlist_and_disclosures() -> None:
     """The caller anthropic-beta header forwards only allowlisted tokens.
 

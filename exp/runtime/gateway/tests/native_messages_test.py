@@ -3171,6 +3171,53 @@ def test_chat_thinking_budget_survives_native_http_dispatch(
     "engine", (pytest.param("anthropic:claude-sonnet-5-5", id="sonnet-55"),), indirect=True
 )
 @pytest.mark.parametrize("stream", (False, True))
+def test_claude_code_safeguards_serve_without_dispatch_or_results(
+    engine: _ServingEngine, stream: bool
+) -> None:
+    """A Claude Code auto-mode body serves on an Anthropic rung with the ask dropped.
+
+    The ``safeguards`` request and its beta never reach the provider and the
+    response carries no ``safeguard_results``, which Claude Code reads as
+    "the server does not review this session" and answers by running its own
+    classifier, so auto mode keeps reviewing every action.
+    """
+    with _SseUpstream.payloads_lock:
+        _SseUpstream.payloads.clear()
+    body: JsonObject = {
+        **_messages_body("hi", stream=stream),
+        "safeguards": [
+            {"type": "dangerous_tool_use", "classifier_context": {"permission_mode": "auto"}}
+        ],
+    }
+    response = httpx.post(
+        f"{engine.base}/v1/messages",
+        headers={
+            "x-api-key": engine.raw_key,
+            "anthropic-version": "2023-06-01",
+            "anthropic-beta": "dangerous-tool-use-2026-09-03",
+        },
+        json=body,
+        timeout=_REQUEST_TIMEOUT_SECONDS,
+    )
+    assert response.status_code == 200, response.text
+    assert "safeguard_results" not in response.text
+    if stream:
+        assert "event: message_stop" in response.text
+        assert '"safeguards"' in response.text
+    else:
+        ignored = response.json()["x-experiential-ignored-parameters"]
+        assert "safeguards" in ignored
+        assert "anthropic-beta.dangerous-tool-use-2026-09-03" in ignored
+    with _SseUpstream.payloads_lock:
+        captured = list(_SseUpstream.payloads)
+    assert len(captured) == 1
+    assert "safeguards" not in captured[0]
+
+
+@pytest.mark.parametrize(
+    "engine", (pytest.param("anthropic:claude-sonnet-5-5", id="sonnet-55"),), indirect=True
+)
+@pytest.mark.parametrize("stream", (False, True))
 @pytest.mark.parametrize("effort", (None, "low", "medium", "high"))
 def test_sonnet_55_between_tools_survives_native_http_dispatch(
     engine: _ServingEngine, stream: bool, effort: str | None

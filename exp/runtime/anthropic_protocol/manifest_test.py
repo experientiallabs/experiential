@@ -148,3 +148,14 @@ def test_openrouter_reasoning_extension_is_conditionally_supported() -> None:
     """The OpenRouter ``reasoning`` object is an installed extension, not an SDK field."""
     decisions = {field.field_path: field.disposition for field in MESSAGES_MANIFEST.fields}
     assert decisions["reasoning"] == CompatibilityDisposition.CONDITIONALLY_SUPPORTED
+
+
+def test_claude_code_safeguards_request_is_ignored_not_rejected() -> None:
+    """Claude Code's server-side review ask is accepted and never dispatched.
+
+    The gateway cannot relay ``safeguard_results``, and a response without
+    them makes Claude Code run its own classifier, so the field is IGNORED
+    (valid at the boundary, omitted from dispatch) rather than a 400.
+    """
+    decisions = {field.field_path: field.disposition for field in MESSAGES_MANIFEST.fields}
+    assert decisions["safeguards"] == CompatibilityDisposition.IGNORED

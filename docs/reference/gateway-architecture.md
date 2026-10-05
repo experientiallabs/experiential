@@ -333,6 +333,9 @@ same caller-owned plaintext history a `reasoning_content` echo is; mid-conversat
 them (instruction-hoisting rungs narrow out), and `thinking.display` rides the verbatim thinking
 config. The conditional Claude Code fields `diagnostics` and `speed` forward verbatim on
 Anthropic rungs with their required `anthropic-beta` tokens and drop with disclosure elsewhere.
+Claude Code's auto-mode `safeguards` request is accepted on every route and dropped with a
+`safeguards` disclosure: the gateway re-encodes responses and cannot relay `safeguard_results`,
+and a response without them makes Claude Code fall back to its own classifier requests.
 A caller `anthropic-beta` header forwards through an exact token allowlist (notably
 `context-1m-2025-08-07`, which activates the provider's 1M context window; without it the
 provider serves 200K); non-allowlisted tokens drop with a per-token
