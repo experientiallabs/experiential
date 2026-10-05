@@ -23,7 +23,7 @@ Two rules close that:
    still the default for an AUTHORED bound, and an authored rung may opt into
    ``saturation="refuse"``; the default lane bound refuses too. A priority
    caller (the host's paying and Pro organizations) is the exception on both:
-   its shed overflows, capped at 1.5x / 2x the bound so the worker stays
+   its shed overflows, capped at 1.25x / 1.5x the bound so the worker stays
    protected. A refusal is a fast,
    retryable 429 (``lane_saturated_failure``) with the protocol's throttle
    Retry-After, answered
@@ -55,8 +55,10 @@ LANE_SATURATED_RETRY_AFTER_SECONDS = THROTTLED_RETRY_AFTER_SECONDS
 
 # How far past a refusing AUTHORED bound each
 # ``AuthorizationSnapshot.priority_admission`` level may overflow, as a multiple
-# of the bound: free callers never, paying callers to 1.5x, Pro callers to 2x.
-PRIORITY_OVERFLOW_FACTORS = (1.0, 1.5, 2.0)
+# of the bound: free callers never, paying callers to 1.25x, Pro callers to
+# 1.5x. The Pro cap stays at 1.5x because one organization's long cold
+# prompts at twice a self-hosted origin's bound saturate the origin itself.
+PRIORITY_OVERFLOW_FACTORS = (1.0, 1.25, 1.5)
 
 # The same for the worker's DEFAULT lane bound, which is already a share of the
 # worker's permits (DEFAULT_LANE_SHARE): the Pro factor stays strictly below

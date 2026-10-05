@@ -78,7 +78,7 @@ slots (`priority_overflow_ceiling`):
 
 | Bound | Paying | Pro |
 | --- | --- | --- |
-| Authored (`PRIORITY_OVERFLOW_FACTORS`) | 1.5x | 2x |
+| Authored (`PRIORITY_OVERFLOW_FACTORS`) | 1.25x | 1.5x |
 | Worker default (`DEFAULT_BOUND_OVERFLOW_FACTORS`) | 1.25x | 1.5x |
 
 The default bound is already half the worker's permits, so its Pro factor stays below
