@@ -649,7 +649,7 @@ class NativeAttemptAccounting:
             certify_no_effects=capacity_refused and entry.no_paid_prework,
         )
         with self._lock:
-            if entry.pending_abandon is None:
+            if active or entry.pending_abandon is None:  # Settlement owns active exhaustion.
                 discard_guardrails(self._inflight.pop(request_id, None))
         return exhausted_attempt_payload(exhaustion, known_unbilled=capacity_refused and certified)
 

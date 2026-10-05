@@ -13,6 +13,7 @@ import httpx
 import pytest
 
 from exp.common.core.artifacts import JsonObject
+from exp.runtime.gateway.contracts import AuthorizationSnapshot, GatewayFailure
 from exp.runtime.gateway.guardrails.classifiers import ScriptedClassifier
 from exp.runtime.gateway.lifecycle import load_gateway_components
 from exp.runtime.gateway.lifecycle_test import _configured_gateway
@@ -189,3 +190,87 @@ def test_http_capacity_refusal_records_completed_search(
             "FROM gateway_requests r WHERE request_id != ?",
             (occupied["request_id"],),
         ).fetchall() == [("failed", 1, 0, 0)]
+
+
+@pytest.mark.parametrize("write_fault", ["none", "before_commit", "after_commit"])
+def test_cancellation_during_exhaustion_preserves_original_settlement(
+    tmp_path: Path, write_fault: str
+) -> None:
+    """Concurrent cancellation cannot retain a conflicting verdict and fence all admission."""
+    manager, key = _configured_gateway(tmp_path)
+    search = StaticWebSearchBackend(
+        (GatewayWebSearchResult(url="https://example.test/result", title="Fixture"),)
+    )
+    control = NativeControlPlane(
+        load_gateway_components(tmp_path, environment={"TEST_PROVIDER_KEY": "fixture"}),
+        default_lane_bound=1,
+        web_search=search,
+    )
+    occupied = _admit(control, key, _chat_body())
+    assert "attempt_id" in _start(control, key, str(occupied["request_id"]))
+    admitted = _admit(control, key, _chat_body(model="coding:online"))
+    request_id = str(admitted["request_id"])
+    accounting = control._accounting  # noqa: SLF001 - drive the real retained settlement owner.
+    ledger = accounting._write_ledger  # noqa: SLF001 - pause the real durable write boundary.
+    original_finish = ledger.finish_request
+    writing, release = threading.Event(), threading.Event()
+    results: list[JsonObject] = []
+    errors: list[BaseException] = []
+
+    def pause_terminal_write(
+        *,
+        authorization: AuthorizationSnapshot,
+        failure: GatewayFailure,
+        certify_no_effects: bool = False,
+        web_search_requests: int = 0,
+    ) -> bool:
+        """Pause one request-only write after committing or at a scripted fault boundary."""
+        first = not writing.is_set()
+        result = False
+        if not (first and write_fault == "before_commit"):
+            result = original_finish(
+                authorization=authorization,
+                failure=failure,
+                certify_no_effects=certify_no_effects,
+                web_search_requests=web_search_requests,
+            )
+        if first:
+            writing.set()
+            assert release.wait(5)
+            if write_fault != "none":
+                raise RuntimeError("scripted terminal-write uncertainty")
+        return result
+
+    def exhaust() -> None:
+        """Run real capacity exhaustion while the test injects cancellation."""
+        try:
+            results.append(_start(control, key, request_id))
+        except BaseException as error:  # noqa: BLE001 - report worker failures in the test.
+            errors.append(error)
+
+    with patch.object(ledger, "finish_request", pause_terminal_write):
+        worker = threading.Thread(target=exhaust)
+        worker.start()
+        try:
+            assert writing.wait(5)
+            accounting.abandon(json.dumps({"request_id": request_id}))
+            entry = accounting.entry(request_id)
+            assert entry is not None and entry.pending_abandon is not None
+        finally:
+            release.set()
+            worker.join(5)
+    assert not worker.is_alive()
+    assert errors == []
+    assert len(results) == 1 and results[0]["exhausted"] is True
+    assert accounting.entry(request_id) is None
+    accounting.sweep_expired()
+    accounting.sweep_expired()
+    assert accounting.accounting_healthy
+    with sqlite3.connect(manager.database_path) as connection:
+        assert connection.execute(
+            "SELECT terminal_state, web_search_requests, "
+            "(SELECT COUNT(*) FROM gateway_attempts WHERE request_id = r.request_id) "
+            "FROM gateway_requests r WHERE request_id = ?",
+            (request_id,),
+        ).fetchone() == ("failed", 1, 0)
+    assert _admit(control, key, _chat_body(model="coding:online"))["request_id"] != request_id
