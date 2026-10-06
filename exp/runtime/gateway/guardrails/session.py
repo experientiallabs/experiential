@@ -94,7 +94,7 @@ class GuardrailSession:
         )
 
     def inspect_input(self, request: GatewayRequest, *, defer: bool = False) -> GatewayRequest:
-        """Validate original intent and every rewrite through the same input executor."""
+        """Enforce the authored input chain and validate its final rewrite."""
         if self._closed:
             raise GuardrailRejected(denied_input_failure())
         if self._input_failure is not None:
@@ -118,22 +118,14 @@ class GuardrailSession:
             self._inspected.append((result, result))
         return result
 
-    def _phase_policies(
-        self, stage: GuardrailCheckStage, *, modifying: bool
-    ) -> tuple[GuardrailPolicy, ...]:
-        """Separate modifiers so each earlier constraint can validate the final subject."""
-        result: list[GuardrailPolicy] = []
-        for policy in self.policies:
-            checks = tuple(
-                c
-                for c in policy.checks
-                if c.stage is stage and (c.action is GuardrailAction.MODIFY) == modifying
-            )
-            if modifying:
-                result.extend(policy.model_copy(update={"checks": (c,)}) for c in checks)
-            elif checks:
-                result.append(policy.model_copy(update={"checks": checks}))
-        return tuple(result)
+    def _ordered_checks(self, stage: GuardrailCheckStage) -> tuple[GuardrailPolicy, ...]:
+        """Retain scope and authored order for each check's execution and final validation."""
+        return tuple(
+            policy.model_copy(update={"checks": (check,)})
+            for policy in self.policies
+            for check in policy.checks
+            if check.stage is stage
+        )
 
     async def _enforce_input(
         self, policy: GuardrailPolicy, request: GatewayRequest
@@ -160,25 +152,22 @@ class GuardrailSession:
 
     async def _inspect_input(self, request: GatewayRequest) -> GatewayRequest:
         """Require the final rewrite to preserve every preceding check's constraint."""
-        checks = self._phase_policies(GuardrailCheckStage.INPUT, modifying=False)
-        modifiers = self._phase_policies(GuardrailCheckStage.INPUT, modifying=True)
-        for policy in checks:
-            await self._enforce_input(policy, request)
         result = request
-        for policy in modifiers:
+        approved: list[tuple[GuardrailPolicy, GatewayRequest]] = []
+        for policy in self._ordered_checks(GuardrailCheckStage.INPUT):
             result = await self._enforce_input(policy, result)
-        # Validate each prior modifier against the SAME final subject. Replaying
-        # the whole chain could hide an undo, including a rewrite back to the original.
-        for policy in modifiers[:-1]:
+            approved.append((policy, result))
+        # Validate each changed subject independently. Replaying the whole chain
+        # could hide an undo; checks already accepting the final subject need no replay.
+        for policy, subject in approved:
+            if subject == result:
+                continue
             if await self._enforce_input(policy, result) != result:
                 raise GuardrailRejected(
                     guardrail_failure(
                         action=GuardrailAction.BLOCK, check_id=policy.checks[0].check_id
                     )
                 )
-        if result != request:
-            for policy in checks:
-                await self._enforce_input(policy, result)
         return result
 
     def prepare_dispatch(self, subjects: Sequence[GatewayRequest], *, overlap: bool) -> None:
@@ -347,23 +336,20 @@ class GuardrailSession:
 
     async def _inspect_output(self, completion: GuardrailCompletion) -> GuardrailCompletion:
         """Require every earlier check to accept the exact completion that will be released."""
-        checks = self._phase_policies(GuardrailCheckStage.OUTPUT, modifying=False)
-        modifiers = self._phase_policies(GuardrailCheckStage.OUTPUT, modifying=True)
-        for policy in checks:
-            await self._enforce_output(policy, completion)
         result = completion
-        for policy in modifiers:
+        approved: list[tuple[GuardrailPolicy, GuardrailCompletion]] = []
+        for policy in self._ordered_checks(GuardrailCheckStage.OUTPUT):
             result = await self._enforce_output(policy, result)
-        for policy in modifiers[:-1]:
+            approved.append((policy, result))
+        for policy, subject in approved:
+            if subject == result:
+                continue
             if await self._enforce_output(policy, result) != result:
                 raise GuardrailRejected(
                     guardrail_failure(
                         action=GuardrailAction.BLOCK, check_id=policy.checks[0].check_id
                     )
                 )
-        if result != completion:
-            for policy in checks:
-                await self._enforce_output(policy, result)
         return result
 
     def release_output_segment(

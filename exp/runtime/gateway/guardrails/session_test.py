@@ -395,6 +395,78 @@ def test_completed_future_settlement_uses_verdict_time_not_poll_time(
 @pytest.mark.parametrize("stage", ["input", "output"])
 @pytest.mark.parametrize("separate_scopes", [False, True])
 @pytest.mark.parametrize("native", [False, True])
+@pytest.mark.parametrize("modify_first", [False, True])
+def test_policy_checks_preserve_authored_order_before_final_validation(
+    stage: str, separate_scopes: bool, native: bool, modify_first: bool
+) -> None:
+    """An earlier redaction feeds later blockers; a later redaction cannot bypass a blocker."""
+    checks = [
+        {
+            "check_id": "redact",
+            "capability": "pii",
+            "stage": stage,
+            "action": "modify",
+            "adapter_id": "redact",
+            "timeout_ms": 500,
+        },
+        {
+            "check_id": "block",
+            "capability": "content_safety",
+            "stage": stage,
+            "action": "block",
+            "adapter_id": "block",
+            "timeout_ms": 500,
+        },
+    ]
+    if not modify_first:
+        checks.reverse()
+    policies = [{"policy_id": "platform", "protected": True, "checks": checks}]
+    if separate_scopes:
+        policies[0]["checks"] = checks[:1]
+        policies.append(
+            {
+                "policy_id": "identity",
+                "organization_id": "organization-one",
+                "identity_id": "identity-one",
+                "protected": True,
+                "checks": checks[1:],
+            }
+        )
+    engine = engine_from_document(
+        {
+            "adapters": [
+                {
+                    "kind": "regex",
+                    "adapter_id": "redact",
+                    "patterns": ["secret"],
+                    "replacement": "safe",
+                },
+                {"kind": "regex", "adapter_id": "block", "patterns": ["secret"]},
+            ],
+            "policies": policies,
+        }
+    )
+    session = _session(engine)
+    if native:
+        session.detectors = compile_native_detectors(engine.deterministic_specifications)
+    if not modify_first:
+        with pytest.raises(GuardrailRejected):
+            if stage == "input":
+                session.inspect_input(_request("secret"))
+            else:
+                session.inspect_output(GuardrailCompletion(text="secret"))
+    elif stage == "input":
+        assert session.inspect_input(_request("secret")) == _request("safe")
+    else:
+        assert session.output_plan() is None
+        assert session.inspect_output(GuardrailCompletion(text="secret")).text == "safe"
+    expected_calls = 2 if modify_first else 1
+    assert engine.classifier_calls == (0 if native and stage == "input" else expected_calls)
+
+
+@pytest.mark.parametrize("stage", ["input", "output"])
+@pytest.mark.parametrize("separate_scopes", [False, True])
+@pytest.mark.parametrize("native", [False, True])
 @pytest.mark.parametrize("original", ["secret", "innocent"])
 def test_later_modifier_cannot_undo_an_earlier_redaction(
     stage: str, separate_scopes: bool, native: bool, original: str

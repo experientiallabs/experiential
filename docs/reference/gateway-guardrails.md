@@ -38,10 +38,12 @@ and output requirements. Continuation expansion, rewrites, gateway search rounds
 response delivery, cancellation, and settlement all use that session. No later
 lookup changes a request's policy midway through execution.
 
-Non-modifying input checks inspect original intent before privacy rewrites. If a
-rewrite changes the request, those checks inspect its result again. When multiple
-modifiers apply, every earlier modifier independently validates the final subject;
-conflicting rewrites fail closed even if they restore the original text. Recovered
+Policies run in resolved scope order, with platform policies before identity policies.
+Within each input or output stage, checks run in authored order, so earlier privacy
+rewrites feed later checks. Each check retains the subject it accepted or produced.
+If a later rewrite changes that subject, the earlier check independently validates
+the final result; conflicting rewrites fail closed even if they restore the original
+text. Checks that already accepted the final result are not repeated. Recovered
 plaintext reasoning and gateway-expanded conversation context are inspected before
 the next provider dispatch. Exact duplicate subjects share work only within one
 request. All policies use the same classifier executor, bounds, verdict actions,

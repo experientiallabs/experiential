@@ -25,6 +25,7 @@ from exp.runtime.gateway.contracts import GatewayRequest
 from exp.runtime.gateway.guardrails import session as guardrail_session
 from exp.runtime.gateway.guardrails.classifiers import ClassifierRegistry
 from exp.runtime.gateway.guardrails.client import DirectClassifierClient
+from exp.runtime.gateway.guardrails.config import engine_from_document
 from exp.runtime.gateway.guardrails.contracts import (
     ClassifierVerdict,
     GuardrailAction,
@@ -43,6 +44,8 @@ from exp.runtime.gateway.native_bridge_test import _admit, _chat_body
 from exp.runtime.gateway.native_execution import InflightRequest, deployment_health_key
 from exp.runtime.gateway.native_server import serve_native_gateway
 from exp.runtime.gateway.rung_admission import RungShed
+from exp.runtime.gateway.tests.guardrail_policy_integrity_test import _provider
+from exp.runtime.gateway.tests.mandatory_guardrails_paths_test import _serving
 from exp.runtime.gateway.tests.mandatory_guardrails_test import _tool_chunk
 from exp.runtime.gateway.tests.native_waterfall_test import (
     _content_chunk,
@@ -664,3 +667,95 @@ def test_provider_failure_survives_later_input_denial_and_settlement_recovery(
         provider_thread.join(timeout=5)
         components.write_ledger.close()
         assert not gateway_thread.is_alive()
+
+
+@pytest.mark.parametrize("stage", ["input", "output"])
+@pytest.mark.parametrize("stream", [False, True])
+def test_ordered_redaction_precedes_blocking_through_native_http(
+    tmp_path: Path, stage: str, stream: bool
+) -> None:
+    """A configured redaction removes sensitive content before the following block check."""
+    marker = "sensitive-marker-123"
+    replacement = "[REDACTED]"
+    prompt = f"Input contains {marker}." if stage == "input" else "Safe input."
+    answer = f"Answer contains {marker}." if stage == "output" else "Safe answer."
+    engine = engine_from_document(
+        {
+            "adapters": [
+                {
+                    "adapter_id": "sensitive",
+                    "kind": "regex",
+                    "patterns": [marker],
+                    "replacement": replacement,
+                }
+            ],
+            "policies": [
+                {
+                    "policy_id": "ordered-content",
+                    "protected": True,
+                    "checks": [
+                        {
+                            "check_id": action,
+                            "stage": stage,
+                            "action": action,
+                            "capability": "pii",
+                            "adapter_id": "sensitive",
+                            "timeout_ms": 1000,
+                        }
+                        for action in ("modify", "block")
+                    ],
+                }
+            ],
+        }
+    )
+    with _provider(_content_chunk(answer) + _terminal_frames()) as (base_url, received):
+        _, key = _configured_gateway(tmp_path, base_url=base_url)
+        components = load_gateway_components(tmp_path, environment={"TEST_PROVIDER_KEY": "fixture"})
+        control = NativeControlPlane(components, guardrails=engine)
+        try:
+            with _serving(control) as url:
+                response = httpx.post(
+                    url + "/v1/chat/completions",
+                    headers={"authorization": f"Bearer {key}"},
+                    json={
+                        "model": "coding",
+                        "messages": [{"role": "user", "content": prompt}],
+                        "stream": stream,
+                        "max_tokens": 100,
+                    },
+                    timeout=5,
+                )
+            assert response.status_code == 200, response.text
+            assert len(received) == 1
+            dispatched = json.loads(received[0])
+            assert dispatched["messages"] == [
+                {"role": "user", "content": prompt.replace(marker, replacement)}
+            ]
+            documents = (
+                [
+                    json.loads(line[6:])
+                    for line in response.text.splitlines()
+                    if line.startswith("data: ") and line != "data: [DONE]"
+                ]
+                if stream
+                else [response.json()]
+            )
+            assert all(document.get("error") is None for document in documents)
+            actual_answer = "".join(
+                choice["delta" if stream else "message"].get("content") or ""
+                for document in documents
+                for choice in document.get("choices", [])
+            )
+            assert actual_answer == answer.replace(marker, replacement)
+            assert marker not in response.text
+            if stage == "input":
+                assert marker.encode() not in received[0]
+            with sqlite3.connect(components.ledger.database_path) as db:
+                assert db.execute("SELECT state FROM gateway_attempts").fetchall() == [
+                    ("completed",)
+                ]
+                assert db.execute("SELECT terminal_state FROM gateway_requests").fetchall() == [
+                    ("completed",)
+                ]
+        finally:
+            components.write_ledger.close()
