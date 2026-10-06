@@ -632,7 +632,7 @@ def shape_anthropic_thinking_config(
             provider_updates["provider_thinking_config"] = filled
         disclose(THINKING_BUDGET_DERIVED_DISCLOSURE)
     elif config_type == "disabled":
-        translate_to_adaptive = False
+        always_thinking: list[str] = []
         for profile in profiles:
             if matches_anthropic_release(profile.model_id, ("claude-sonnet-5-5",)):
                 raise ProviderParameterError(
@@ -649,7 +649,7 @@ def shape_anthropic_thinking_config(
                 family in normalized for family in _ANTHROPIC_ALWAYS_THINKING_FAMILIES
             ) or matches_anthropic_release(profile.model_id, _ANTHROPIC_ALWAYS_THINKING_RELEASES)
             if always_thinks:
-                translate_to_adaptive = True
+                always_thinking.append(profile.model_id)
                 continue
             effort = request.reasoning_effort
             if request.provider_output_config is not None:
@@ -666,7 +666,20 @@ def shape_anthropic_thinking_config(
                     param="thinking.type",
                     code="unsupported_parameter",
                 )
-        if translate_to_adaptive:
+        if always_thinking and len(always_thinking) < len(profiles):
+            # Route narrowing never mixes the substitute with a rung that
+            # honors "off" verbatim; a mixed set reaching here keeps the
+            # typed refusal rather than sending adaptive to that rung.
+            raise ProviderParameterError(
+                message=(
+                    "The parameter 'thinking.type' cannot be 'disabled' on every model of "
+                    "this route: some always reason. Choose a model that supports disabling "
+                    "thinking, or explicitly enable thinking."
+                ),
+                param="thinking.type",
+                code="unsupported_parameter",
+            )
+        if always_thinking:
             # No effort disables thinking on these models, and a client that
             # does not recognize the model sends the off switch anyway (Claude
             # Code's session-title call on the dotted alias, 2026-10-05: every

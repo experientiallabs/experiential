@@ -15,6 +15,9 @@ from exp.runtime.models.providers.errors import (
     ProviderParameterError,
     UnsupportedReasoningEffortError,
 )
+from exp.runtime.models.providers.generation_route_compat import (
+    compatible_generation_parameter_profile_indexes,
+)
 from exp.runtime.models.providers.reasoning_compat import (
     anthropic_adaptive_only_thinking,
     anthropic_reasoning_effort,
@@ -696,3 +699,39 @@ def test_anthropic_point_releases_inherit_their_generation_effort_contract() -> 
         anthropic_reasoning_effort("claude-fable-5-1", "ultra")
     # Pre-adaptive families stay budgeted.
     assert anthropic_adaptive_only_thinking("claude-haiku-4-5") is False
+
+
+def _thinking_off_request() -> GatewayRequest:
+    return GatewayRequest(
+        surface=GatewayApiSurface.MESSAGES,
+        messages=(GatewayMessage(role="user", content="Summarize briefly."),),
+        maximum_output_tokens=4096,
+        provider_thinking_config={"type": "disabled"},
+    )
+
+
+@pytest.mark.parametrize("verbatim_model", ("claude-haiku-4-5", "claude-opus-4-8"))
+def test_mixed_route_narrows_thinking_off_to_rungs_that_honor_it(verbatim_model: str) -> None:
+    """The substitute never shares a route with a rung that takes off verbatim.
+
+    One shaped request serves a whole route, so a route holding both would
+    carry adaptive thinking onto the verbatim rung (Haiku 4.5 refuses it).
+    """
+    always = _anthropic_profile("claude-opus-5-5")
+    verbatim = replace(_anthropic_profile(verbatim_model), reasoning_effort=None)
+    request = _thinking_off_request()
+    assert compatible_generation_parameter_profile_indexes((always, verbatim), request) == (1,)
+    assert compatible_generation_parameter_profile_indexes((verbatim, always), request) == (0,)
+    with pytest.raises(ProviderParameterError) as error:
+        route_generation_parameter_requests((always, verbatim), request)
+    assert error.value.param == "thinking.type"
+
+
+def test_all_always_thinking_route_keeps_every_rung_for_thinking_off() -> None:
+    """A route of always-reasoning rungs serves the substitute on each of them."""
+    profiles = (_anthropic_profile("claude-opus-5-5"), _anthropic_profile("claude-fable-5-1"))
+    request = _thinking_off_request()
+    assert compatible_generation_parameter_profile_indexes(profiles, request) == (0, 1)
+    public, provider = route_generation_parameter_requests(profiles, request)
+    assert provider.provider_thinking_config == {"type": "adaptive", "display": "omitted"}
+    assert "thinking.type->adaptive" in public.ignored_parameters

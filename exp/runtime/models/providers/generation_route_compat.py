@@ -43,6 +43,7 @@ def compatible_generation_parameter_profile_indexes(
     # rung. Only if no rung honors it do the serve-with-drop rungs stand in.
     exact: list[int] = []
     serviceable: list[int] = []
+    thinking_kept: list[int] = []
     rejections: list[ProviderParameterError] = []
     for index, profile in enumerate(profiles):
         try:
@@ -51,12 +52,23 @@ def compatible_generation_parameter_profile_indexes(
             rejections.append(exc)
             continue
         serviceable.append(index)
-        if _honors_requested_sampling(request, provider) and _carries_exposed_reasoning(
-            profile, request
+        keeps_thinking = not _substitutes_thinking_off(request, provider)
+        if keeps_thinking:
+            thinking_kept.append(index)
+        if (
+            keeps_thinking
+            and _honors_requested_sampling(request, provider)
+            and _carries_exposed_reasoning(profile, request)
         ):
             exact.append(index)
     if exact:
         return tuple(exact)
+    # A rung that substitutes the caller's thinking config (an always-reasoning
+    # model's stand-in for "off") never shares a route with one that dispatches
+    # it verbatim: the route's one shaped request would carry the substitute
+    # onto the verbatim rung, which may refuse it (Haiku 4.5 rejects adaptive).
+    if thinking_kept:
+        return tuple(thinking_kept)
     if serviceable:
         return tuple(serviceable)
     # No rung can serve the request: raise the first rung's OWN rejection — it
@@ -93,4 +105,18 @@ def _carries_exposed_reasoning(profile: GatewayWireProfile, request: GatewayRequ
         block.kind == "exposed_reasoning_content"
         for message in request.messages
         for block in message.provider_reasoning
+    )
+
+
+def _substitutes_thinking_off(request: GatewayRequest, provider_request: GatewayRequest) -> bool:
+    """Return whether a rung serves a caller's thinking-off with a substitute.
+
+    An always-reasoning model dispatches ``disabled`` as low-effort adaptive
+    thinking; a rung that dispatches it verbatim honors the caller exactly.
+    """
+    requested = request.provider_thinking_config
+    return (
+        requested is not None
+        and requested.get("type") == "disabled"
+        and provider_request.provider_thinking_config != requested
     )
