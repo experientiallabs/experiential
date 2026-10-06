@@ -1142,6 +1142,40 @@ def test_abandon_without_an_active_attempt_finalizes_the_request_row() -> None:
     assert registry.entry("request-one") is None
 
 
+@pytest.mark.parametrize("swept", [False, True])
+@pytest.mark.parametrize("opened", [False, True])
+def test_replayed_cancellation_preserves_successful_open_health(opened: bool, swept: bool) -> None:
+    """A successful provider open clears prior failures after either durable delivery path."""
+    registry, ledger, entry = _registry()
+    started = _start(registry, ordinal=0)
+    key = deployment_health_key(entry.authorization, entry.route.deployment)
+    transport = GatewayFailure(
+        failure_class=GatewayFailureClass.TRANSPORT, safe_message="fixture transport failure"
+    )
+    registry.health.failed(key, transport)
+    assert not registry.health.suppressed(key)
+    data: JsonObject = {
+        "request_id": entry.authorization.request_id,
+        "attempt_id": started["attempt_id"],
+        "outcome": "failed",
+        "failure": {"failure_class": "cancelled", "safe_message": "Input approval withheld."},
+        "opened": opened,
+        "finalize": True,
+    }
+    if swept:
+        ledger.fail_finishes = 1
+        with pytest.raises(NativeBridgeError):
+            registry.settle(json.dumps(data))
+        assert entry.pending_settlement == data
+        registry.sweep_expired()
+    else:
+        registry.settle(json.dumps(data))
+    assert len(ledger.finished) == 1
+    assert registry.entry(entry.authorization.request_id) is None
+    registry.health.failed(key, transport)
+    assert registry.health.suppressed(key) is (not opened)
+
+
 def test_sweep_cancels_the_active_attempt_after_the_deadline() -> None:
     """The deadline sweep closes an unsettled reservation as cancelled."""
     registry, ledger, entry = _registry()

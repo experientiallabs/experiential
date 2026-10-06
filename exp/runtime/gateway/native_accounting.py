@@ -856,13 +856,9 @@ class NativeAttemptAccounting:
                     or policy.tokens_per_minute is not None
                 )
             ):
-                # Passive-adaptive calibration: the provider just proved the
-                # observed dispatch rate is too high for this physical lane,
-                # so the rung's learned ceiling clamps to it. Recovery creep
-                # rediscovers headroom without synthetic probes. Gated on an
-                # admission-participating policy: only such rungs reserve
-                # through the registry, so only they carry a real observed
-                # window (and only they would ever enforce the ceiling).
+                # Clamp the learned ceiling to the observed rate; recovery creep
+                # rediscovers headroom. Only admission-participating rungs reserve
+                # through the registry, providing a real window and enforcing the ceiling.
                 self._loads.record_throttle(rung_load_key(deployment))
             self._health.failed(key, failure)
         else:
@@ -980,7 +976,10 @@ class NativeAttemptAccounting:
             self._accounting_healthy = False
             return False
         failure = terminal.failure
-        self._record_health(entry, attempt_id, opened=False, failure=failure, settlement=settlement)
+        opened = settlement is not None and settlement.get("opened") is True
+        self._record_health(
+            entry, attempt_id, opened=opened, failure=failure, settlement=settlement
+        )
         # Cache-priority observations must not depend on which settlement path succeeds.
         self._record_cache_fraction(entry, attempt_id, terminal)
         record_session_outcome(
