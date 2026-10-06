@@ -20,6 +20,7 @@ import pytest
 from exp.common.core.artifacts import JsonObject
 from exp.common.models import BillingSource, GatewayTokenPrices
 from exp.runtime.gateway.contracts import AuthorizationSnapshot, GatewayRequest
+from exp.runtime.gateway.guardrails.contracts import ClassifierVerdict, GuardrailCheck
 from exp.runtime.gateway.lifecycle import load_gateway_components
 from exp.runtime.gateway.lifecycle_test import _configured_gateway
 from exp.runtime.gateway.native_bridge import NativeBridgeError, NativeControlPlane
@@ -34,8 +35,13 @@ from exp.runtime.gateway.native_execution import InflightRequest
 from exp.runtime.gateway.native_server import serve_native_gateway
 from exp.runtime.gateway.tests.guardrail_policy_integrity_test import _body, _provider
 from exp.runtime.gateway.tests.launch_test import _unused_port
+from exp.runtime.gateway.tests.mandatory_guardrails_paths_test import _RetrievedGuard
+from exp.runtime.gateway.tests.mandatory_guardrails_test import _Guard
+from exp.runtime.gateway.tests.native_tool_search_test import _configure
 from exp.runtime.gateway.tests.native_waterfall_test import _content_chunk, _terminal_frames
 from exp.runtime.gateway.tests.parallel_input_guardrails_test import _Classifier, _engine
+from exp.runtime.gateway.tests.web_search_backend_fixture_test import StaticWebSearchBackend
+from exp.runtime.gateway.web_search.contracts import GatewayWebSearchResult
 
 
 @pytest.mark.parametrize("surface", ["chat", "responses", "messages"])
@@ -525,3 +531,172 @@ def test_customer_funded_capture_begins_after_synchronous_input_approval(
         captured = CaptureRecord.model_validate_json(records[0])
         assert captured.request.request_id == request_id
         assert captured.request.model_id == admission["exact_model_id"]
+
+
+@pytest.mark.parametrize("surface", ["chat", "responses", "messages"])
+@pytest.mark.parametrize("stream", [False, True])
+def test_rejected_search_releases_serial_capture_through_native_http(
+    tmp_path: Path, surface: str, stream: bool
+) -> None:
+    """Repeated denied retrievals release capture capacity without dispatch or delivery."""
+    records: list[str] = []
+    registered: list[str] = []
+    collector = exp_gateway_native.CaptureCollector(
+        CaptureConfiguration(
+            settlement_required=False, maximum_pending_records=1
+        ).model_dump_json(),
+        records.append,
+    )
+
+    def application_for(authorization: AuthorizationSnapshot) -> str:
+        """Record the real serial registrations whose rejection must release capacity."""
+        registered.append(authorization.request_id)
+        return "capture-fixture"
+
+    search = StaticWebSearchBackend(
+        (GatewayWebSearchResult(url="https://example.test/result", title="withhold-marker"),)
+    )
+    with _provider(_content_chunk("unused") + _terminal_frames()) as (base_url, upstream):
+        _, key = _configured_gateway(tmp_path, base_url=base_url)
+        components = load_gateway_components(tmp_path, environment={"TEST_PROVIDER_KEY": "fixture"})
+        control = NativeControlPlane(
+            components,
+            capture=CaptureController(collector, application_for=application_for),
+            guardrails=_RetrievedGuard(),
+            web_search=search,
+        )
+        port = _unused_port()
+        ready = threading.Event()
+        shutdown = exp_gateway_native.shutdown_handle()
+        worker = threading.Thread(
+            target=serve_native_gateway,
+            args=(control,),
+            kwargs={
+                "host": "127.0.0.1",
+                "port": port,
+                "capture": collector,
+                "shutdown": shutdown,
+                "on_listening": ready.set,
+                "graceful_timeout_seconds": 0.1,
+            },
+            daemon=True,
+        )
+        worker.start()
+        try:
+            assert ready.wait(5)
+            path, body = _body(surface, stream)
+            body["model"] = "coding:online"
+            if surface == "messages":
+                body["model"] = "coding"
+                body["tools"] = [{"type": "web_search_20250305", "name": "web_search"}]
+            for _ in range(2):
+                response = httpx.post(
+                    f"http://127.0.0.1:{port}{path}",
+                    headers={"authorization": f"Bearer {key}"},
+                    json=body,
+                    timeout=5,
+                )
+                assert response.status_code == 400, response.text
+                assert "capture_unavailable" not in response.text
+                assert collector.begin(_request_json()), (
+                    "denied retrieval retained capture capacity"
+                )
+                collector.settle("request", False, False)
+            assert len(registered) == len(search.queries) == 2
+            assert upstream == []
+            assert records == []
+            with sqlite3.connect(components.ledger.database_path) as db:
+                assert db.execute(
+                    "SELECT terminal_state, web_search_requests FROM gateway_requests"
+                ).fetchall() == [("failed", 1), ("failed", 1)]
+                assert db.execute("SELECT COUNT(*) FROM gateway_attempts").fetchone() == (0,)
+        finally:
+            shutdown.request_shutdown()
+            worker.join(5)
+            for request_id in [*registered, "request"]:
+                collector.settle(request_id, False, False)
+            assert collector.close(2)
+            components.write_ledger.close()
+            assert not worker.is_alive()
+    assert records == []
+
+
+@pytest.mark.parametrize("phase", ["post-search", "dispatch"])
+@pytest.mark.parametrize("retained_settlement", [False, True])
+def test_late_serial_guardrail_rejection_discards_capture_before_settlement_recovery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, phase: str, retained_settlement: bool
+) -> None:
+    """Both late denial paths free real collector capacity even while ledger writes fail."""
+
+    class DisclosureGuard(_Guard):
+        """Reject the gateway's tool serialization disclosure at final dispatch inspection."""
+
+        async def inspect_input(
+            self, *, request: GatewayRequest, check: GuardrailCheck
+        ) -> ClassifierVerdict:
+            """Allow initial input and reject only the subsequently expanded request."""
+            self.block_input = (
+                "parallel_tool_calls->emulated(serialized_by_gateway)" in request.ignored_parameters
+            )
+            return await super().inspect_input(request=request, check=check)
+
+    key = _configure(tmp_path, "http://127.0.0.1:1/v1")
+    components = load_gateway_components(tmp_path, environment={"TEST_PROVIDER_KEY": "fixture"})
+    records: list[str] = []
+    registered: list[str] = []
+    collector = exp_gateway_native.CaptureCollector(
+        CaptureConfiguration(
+            settlement_required=False, maximum_pending_records=1
+        ).model_dump_json(),
+        records.append,
+    )
+
+    def application_for(authorization: AuthorizationSnapshot) -> str:
+        """Record capture registration before a later guardrail rejection."""
+        registered.append(authorization.request_id)
+        return "capture-fixture"
+
+    guardrail = _RetrievedGuard() if phase == "post-search" else DisclosureGuard()
+    control = NativeControlPlane(
+        components,
+        capture=CaptureController(collector, application_for=application_for),
+        guardrails=guardrail,
+        web_search=StaticWebSearchBackend(
+            (GatewayWebSearchResult(url="https://example.test/result", title="withhold-marker"),)
+        ),
+    )
+    body = json.loads(_chat_body(model="coding:online" if phase == "post-search" else "coding"))
+    if phase == "dispatch":
+        body["tools"] = [
+            {"type": "function", "function": {"name": "lookup", "parameters": {"type": "object"}}}
+        ]
+        body["parallel_tool_calls"] = False
+    try:
+        with monkeypatch.context() as patch:
+            if retained_settlement:
+                patch.setattr(
+                    control._accounting._write_ledger,  # noqa: SLF001 - durable failure injection.
+                    "finish_request",
+                    Mock(side_effect=RuntimeError("private ledger failure")),
+                )
+            with pytest.raises(NativeBridgeError) as error:
+                _admit(control, key, json.dumps(body))
+            assert json.loads(error.value.public_error_json)["code"] == "content_filter"
+            assert len(registered) == 1
+            assert len(guardrail.requests) == 2
+            assert collector.begin(_request_json()), "denied request retained capture capacity"
+            collector.settle("request", False, False)
+            assert control._accounting.request_settlements.pending is retained_settlement  # noqa: SLF001
+        control._accounting.request_settlements.retry(64)  # noqa: SLF001 - durable recovery check.
+        assert not control._accounting.request_settlements.pending  # noqa: SLF001
+        with sqlite3.connect(components.ledger.database_path) as db:
+            assert db.execute(
+                "SELECT terminal_state, web_search_requests FROM gateway_requests"
+            ).fetchall() == [("failed", int(phase == "post-search"))]
+            assert db.execute("SELECT COUNT(*) FROM gateway_attempts").fetchone() == (0,)
+    finally:
+        for request_id in [*registered, "request"]:
+            collector.settle(request_id, False, False)
+        assert collector.close(2)
+        components.write_ledger.close()
+    assert records == []

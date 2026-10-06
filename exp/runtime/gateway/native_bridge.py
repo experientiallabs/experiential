@@ -63,6 +63,7 @@ from exp.runtime.gateway.native_bridge_errors import (
 from exp.runtime.gateway.native_capture import (
     CaptureController,
     PendingCapture,
+    discard_capture,
     select_capture_model,
 )
 from exp.runtime.gateway.native_components import NativeGatewayComponents, SyncWriteLedger
@@ -424,8 +425,7 @@ class NativeControlPlane(
             # continuation store keeps the post-guardrail history sealed.
             continuation_context.messages = retention_request.messages
 
-        # Accept before routing so replay conflicts fail before learned
-        # selection can run embeddings or other provider work.
+        # Reject replay conflicts before routing can run embeddings or other provider work.
         try:
             self._write_ledger.accept_request(authorization=authorization)
         except Exception as exc:  # noqa: BLE001 - boundary sanitizes every failure.
@@ -460,9 +460,7 @@ class NativeControlPlane(
                 if continuation_context is None
                 else continuation_context.required_route_binding,
             )
-            # A rung that is dead at admission (a lost credential, a drifted
-            # connection) is skipped so a live fallback still serves the
-            # request instead of the whole request failing on a dead lead.
+            # Skip unavailable deployments at admission so a live fallback can still serve.
             dispatchable = dispatchable_route_profiles(self._components.runtime_catalogs, route)
             record_dead_admission_rungs(
                 self._accounting,
@@ -507,6 +505,7 @@ class NativeControlPlane(
                 try:
                     request = guardrails.inspect_input(request)
                 except GuardrailRejected as exc:
+                    discard_capture(self._capture, authorization.request_id)
                     self._accounting.finish_request_quietly(
                         authorization,
                         exc.failure,
@@ -729,6 +728,7 @@ class NativeControlPlane(
                     ),
                 )
             except GuardrailRejected as exc:
+                discard_capture(self._capture, authorization.request_id)
                 self._accounting.finish_request_quietly(
                     authorization,
                     exc.failure,
