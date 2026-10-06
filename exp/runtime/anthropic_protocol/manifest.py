@@ -238,6 +238,7 @@ MESSAGES_BETA_TOKENS_FORWARDED = frozenset(
         "context-management-2025-06-27",
         "cache-diagnosis-2026-04-07",
         "fast-mode-2026-02-01",
+        "thinking-display-updates-2026-08-18",
     }
 )
 """Caller ``anthropic-beta`` tokens forwarded verbatim on Anthropic rungs.
@@ -248,9 +249,12 @@ safe to relay. ``context-1m-2025-08-07`` activates the 1M context window
 (Claude Code sends it with 1M-suffixed models; without forwarding, the
 provider serves 200K and long sessions fail). ``interleaved-thinking``
 gates thinking between tool calls, whose blocks this gateway already
-carries opaquely. The remaining three are the same tokens the gateway
+carries opaquely. The remaining four are the same tokens the gateway
 injects itself when the bound field (``context_management``,
-``diagnostics``, ``speed``) is present. Every other caller token is
+``diagnostics``, ``speed``, ``thinking.display: "updates"``) is present;
+Claude Code sends the display token beside ``display: "updates"``, and
+dropping it while the field still dispatched made Anthropic refuse the
+request (2026-10-05). Every other caller token is
 validated and dropped with an ``anthropic-beta.<token>`` disclosure, never
 rejected and never blind-forwarded; notable deliberate drops are
 ``server-side-fallback-*`` and ``fallback-credit-*`` (an upstream model

@@ -554,8 +554,11 @@ def shape_anthropic_thinking_config(
     """Family-gate a caller thinking config for a route with Anthropic rungs.
 
     Budgeted-enabled support and the ability to disable thinking are separate
-    model facts. Valid off switches travel verbatim; an unsupported off switch
-    is refused before dispatch rather than removed. A bare ``enabled`` config
+    model facts. Valid off switches travel verbatim. On a model no effort can
+    stop reasoning, the off switch dispatches as the provider's own substitute,
+    adaptive thinking at effort ``low`` with the reasoning withheld, and both
+    rewrites are disclosed. Any other unsupported off switch is refused before
+    dispatch rather than removed. A bare ``enabled`` config
     gets a disclosed budget only once its output ceiling is known. When the
     ceiling is omitted, per-rung payload construction derives the budget from
     that rung's required output limit. An impossible budget is a refusal.
@@ -629,6 +632,7 @@ def shape_anthropic_thinking_config(
             provider_updates["provider_thinking_config"] = filled
         disclose(THINKING_BUDGET_DERIVED_DISCLOSURE)
     elif config_type == "disabled":
+        translate_to_adaptive = False
         for profile in profiles:
             if matches_anthropic_release(profile.model_id, ("claude-sonnet-5-5",)):
                 raise ProviderParameterError(
@@ -644,24 +648,40 @@ def shape_anthropic_thinking_config(
             always_thinks = any(
                 family in normalized for family in _ANTHROPIC_ALWAYS_THINKING_FAMILIES
             ) or matches_anthropic_release(profile.model_id, _ANTHROPIC_ALWAYS_THINKING_RELEASES)
+            if always_thinks:
+                translate_to_adaptive = True
+                continue
             effort = request.reasoning_effort
             if request.provider_output_config is not None:
                 effort = request.provider_output_config.get("effort", effort)
             if effort is None and profile.reasoning_effort_required:
                 effort = profile.reasoning_effort
-            restricted_effort = "claude-opus-5" in normalized and effort in ("xhigh", "max")
-            if always_thinks or restricted_effort:
-                reason = (
-                    "this model always reasons adaptively"
-                    if always_thinks
-                    else "this model requires thinking at effort xhigh or max"
-                )
+            if "claude-opus-5" in normalized and effort in ("xhigh", "max"):
                 raise ProviderParameterError(
                     message=(
-                        f"The parameter 'thinking.type' cannot be 'disabled': {reason}. "
-                        "Choose a model and effort that support disabling thinking, or "
-                        "explicitly enable thinking."
+                        "The parameter 'thinking.type' cannot be 'disabled': this model "
+                        "requires thinking at effort xhigh or max. Choose a model and effort "
+                        "that support disabling thinking, or explicitly enable thinking."
                     ),
                     param="thinking.type",
                     code="unsupported_parameter",
                 )
+        if translate_to_adaptive:
+            # No effort disables thinking on these models, and a client that
+            # does not recognize the model sends the off switch anyway (Claude
+            # Code's session-title call on the dotted alias, 2026-10-05: every
+            # such call was refused). The provider's own substitute for "off"
+            # is adaptive thinking at the lowest effort, so that is what
+            # dispatches: the reasoning withheld and its depth (and so its
+            # billed tokens) minimized, both rewrites disclosed.
+            provider_updates["provider_thinking_config"] = {
+                "type": "adaptive",
+                "display": "omitted",
+            }
+            disclose("thinking.type->adaptive")
+            output_config = dict(request.provider_output_config or {})
+            if output_config.get("effort", request.reasoning_effort) != "low":
+                disclose("output_config.effort->low")
+            output_config["effort"] = "low"
+            provider_updates["provider_output_config"] = output_config
+            provider_updates["reasoning_effort"] = "low"

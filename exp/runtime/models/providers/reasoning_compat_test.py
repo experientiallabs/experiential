@@ -73,23 +73,10 @@ def _assert_thinking_off_reaches_payload(model_id: str, effort: ReasoningEffort 
         assert payload["output_config"] == {"effort": effort}
 
 
-@pytest.mark.parametrize(
-    ("model_id", "effort"),
-    (
-        ("claude-fable-5", None),
-        ("claude-fable-5-1", "low"),
-        ("anthropic/claude-fable-5.1", None),
-        ("claude-mythos-5-1", "high"),
-        ("claude-mythos-preview", None),
-        ("claude-opus-5", "xhigh"),
-        ("claude-opus-5", "max"),
-    ),
-)
-def test_unsupported_thinking_off_is_never_coerced(
-    model_id: str, effort: ReasoningEffort | None
-) -> None:
-    """Unsupported off requests retain their typed pre-dispatch refusal."""
-    _assert_thinking_off_refused(model_id, effort)
+@pytest.mark.parametrize("effort", ("xhigh", "max"))
+def test_unsupported_thinking_off_is_never_coerced(effort: ReasoningEffort) -> None:
+    """An off switch the model honors at a lower effort keeps its typed refusal."""
+    _assert_thinking_off_refused("claude-opus-5", effort)
 
 
 def _assert_thinking_off_refused(model_id: str, effort: ReasoningEffort | None) -> None:
@@ -110,22 +97,54 @@ def _assert_thinking_off_refused(model_id: str, effort: ReasoningEffort | None) 
     assert request.provider_thinking_config == {"type": "disabled"}
 
 
-@pytest.mark.parametrize(
-    "model_id",
-    (
-        "claude-opus-5-5",
-        "claude-opus-5.5",
-        "anthropic/claude-opus-5.5",
-        "anthropic.claude-opus-5-5-v1:0",
-        "claude-opus-5-5-20260924",
-        "claude-opus-5-5@20260924",
-        "us.anthropic.claude-opus-5-5-20260924-v1:0",
-    ),
+_ALWAYS_THINKING_IDS = (
+    "claude-opus-5-5",
+    "claude-opus-5.5",
+    "anthropic/claude-opus-5.5",
+    "anthropic.claude-opus-5-5-v1:0",
+    "claude-opus-5-5-20260924",
+    "claude-opus-5-5@20260924",
+    "us.anthropic.claude-opus-5-5-20260924-v1:0",
+    "claude-fable-5",
+    "claude-fable-5-1",
+    "anthropic/claude-fable-5.1",
+    "claude-mythos-5-1",
+    "claude-mythos-preview",
 )
-@pytest.mark.parametrize("effort", (None, "low", "medium", "high", "xhigh", "max"))
-def test_opus_55_never_disables_thinking(model_id: str, effort: ReasoningEffort | None) -> None:
-    """The always-adaptive point release refuses off without changing the request."""
-    _assert_thinking_off_refused(model_id, effort)
+
+
+@pytest.mark.parametrize("model_id", _ALWAYS_THINKING_IDS)
+@pytest.mark.parametrize("effort", (None, "low", "medium", "high", "max"))
+def test_always_thinking_off_switch_dispatches_lowest_withheld_adaptive(
+    model_id: str, effort: ReasoningEffort | None
+) -> None:
+    """No effort stops these models reasoning, so off runs as the provider's own substitute.
+
+    Claude Code sends ``thinking: {type: disabled}`` on its session-title call
+    for a model id it does not recognize (the gateway's dotted alias), and a
+    refusal failed every such call. The substitute keeps the caller's other
+    output settings (the title call's JSON format) and discloses each rewrite.
+    """
+    profile = _anthropic_profile(model_id)
+    output_config: JsonObject = {"format": {"type": "json_schema", "schema": {"type": "object"}}}
+    if effort is not None:
+        output_config["effort"] = effort
+    request = GatewayRequest(
+        surface=GatewayApiSurface.MESSAGES,
+        messages=(GatewayMessage(role="user", content="Summarize briefly."),),
+        maximum_output_tokens=4096,
+        provider_thinking_config={"type": "disabled"},
+        reasoning_effort=effort,
+        provider_output_config=output_config,
+    )
+    public, provider = route_generation_parameter_requests((profile,), request)
+    payload = dialect_stream_payload(profile, provider)
+    assert payload["thinking"] == {"type": "adaptive", "display": "omitted"}
+    assert payload["output_config"]["effort"] == "low"
+    assert payload["output_config"]["format"] == output_config["format"]
+    assert "thinking.type->adaptive" in public.ignored_parameters
+    assert ("output_config.effort->low" in public.ignored_parameters) is (effort != "low")
+    assert request.provider_thinking_config == {"type": "disabled"}
 
 
 @pytest.mark.parametrize("model_id", ("claude-opus-5-50", "claude-opus-5-5-1"))

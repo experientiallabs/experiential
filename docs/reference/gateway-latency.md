@@ -134,6 +134,14 @@ bypassing a timer. Already decoded events, including usage and a terminal, drain
 read is judged. Time spent handing events to the downstream consumer pauses generation-idle
 accounting, but never the first-token or total deadlines.
 
+An Anthropic stream buffers a client tool call's long string argument (a whole file for
+Claude Code's Write tool) and sends nothing until it is generated, not even pings. While such a
+call is open the generation-idle window is ten connection timeouts (600 s at the default 60 s,
+Claude Code's own client timeout) instead of one; it reverts when the call closes, other
+dialects stream arguments and keep the single window, and the total request deadline always
+applies. At one window a large write on a long context died at the same byte on every retry
+(2026-10-05).
+
 A progress-idle expiry uses the existing `transport` failure class with the distinct message
 `provider stopped making progress; retry the request`. It never redials the same deployment.
 Before commitment it may advance to an eligible successor; the authored policy still decides,

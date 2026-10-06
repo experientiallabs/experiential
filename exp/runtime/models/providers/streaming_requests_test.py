@@ -1801,7 +1801,7 @@ def test_thinking_default_enable_reads_the_lane_default_before_the_lowest_tier()
     profile = GatewayWireProfile(
         dialect="anthropic_messages",
         url="https://anthropic.test",
-        model_id="claude-opus-5",
+        model_id="claude-sonnet-5-5",
         supports_reasoning=True,
         reasoning_wire_format="anthropic_adaptive",
         reasoning_effort="high",
@@ -3101,13 +3101,27 @@ def test_enabled_thinking_stays_verbatim_on_budget_capable_models() -> None:
     assert payload["thinking"] == config
 
 
-def test_disabled_thinking_rejects_by_name_on_adaptive_only_models() -> None:
-    """Thinking cannot be turned off on the adaptive generation; silently
-    letting the model think anyway would bill the caller for reasoning they
-    explicitly disabled."""
+def test_disabled_thinking_on_always_reasoning_models_is_disclosed_lowest_adaptive() -> None:
+    """Thinking cannot be turned off on an always-reasoning model, so the
+    off switch dispatches the provider's own substitute (adaptive at effort
+    low, reasoning withheld) and discloses it, never silently thinking at the
+    caller's depth."""
     request = _thinking_config_request({"type": "disabled"})
+    public, provider = route_generation_parameter_requests(
+        (_anthropic_profile("claude-fable-5-1"),), request
+    )
+    assert provider.provider_thinking_config == {"type": "adaptive", "display": "omitted"}
+    assert provider.reasoning_effort == "low"
+    assert "thinking.type->adaptive" in public.ignored_parameters
+
+    # An off switch the model only refuses at high effort keeps its refusal.
     with pytest.raises(ProviderParameterError) as raised:
-        route_generation_parameter_requests((_anthropic_profile("claude-fable-5-1"),), request)
+        route_generation_parameter_requests(
+            (_anthropic_profile("claude-opus-5"),),
+            _thinking_config_request({"type": "disabled"}).model_copy(
+                update={"reasoning_effort": "max", "provider_output_config": {"effort": "max"}}
+            ),
+        )
     assert raised.value.param == "thinking.type"
     assert raised.value.code == "unsupported_parameter"
 
@@ -3288,7 +3302,7 @@ def test_assistant_prefill_narrows_out_rungs_whose_model_rejects_it() -> None:
     rejecting = GatewayWireProfile(
         dialect="anthropic_messages",
         url="https://anthropic.test",
-        model_id="claude-opus-5",
+        model_id="claude-sonnet-5-5",
         maximum_output_tokens=128_000,
     )
     bedrock = GatewayWireProfile(
@@ -4709,14 +4723,14 @@ def test_service_tier_scale_strips_on_host_lane_without_rejecting() -> None:
 def test_narrowing_surfaces_the_first_rung_rejection_not_the_route_shape() -> None:
     """When no rung serves, the caller sees the first rung's own field-scoped reason.
 
-    The trigger pairs a ``disabled`` config (the adaptive-only Anthropic rung
-    rejects it by name) with replayed thinking blocks (the fallback rung
+    The trigger pairs a ``disabled`` config (Claude Sonnet 5.5 rejects it by
+    name) with replayed thinking blocks (the fallback rung
     rejects those), so each ordering surfaces its own first rung's error.
     """
     anthropic = GatewayWireProfile(
         dialect="anthropic_messages",
         url="https://anthropic.test",
-        model_id="claude-fable-5-1",
+        model_id="claude-sonnet-5-5",
         supports_reasoning=True,
         reasoning_wire_format="anthropic_adaptive",
         maximum_output_tokens=128_000,

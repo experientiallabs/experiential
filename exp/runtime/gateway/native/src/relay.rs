@@ -193,6 +193,9 @@ pub struct UpstreamRelay {
     /// Irreversible provider tool work has its own phase: byte-idle and the
     /// hard deadline still apply, but generation may legitimately be silent.
     provider_tools: progress::ProviderTools,
+    /// Client tool arguments the provider buffers: generation may stay silent
+    /// longer while one is open, still under the hard deadline.
+    tool_arguments: progress::BufferedToolArguments,
     /// Last genuine normalized generation progress, never the arrival of
     /// transport bytes or protocol scaffolding. The connection timeout bounds
     /// the gap from this instant once generation has begun.
@@ -276,6 +279,9 @@ impl UpstreamRelay {
             stall_bound_armed: true,
             committed: false,
             provider_tools: progress::ProviderTools::default(),
+            tool_arguments: progress::BufferedToolArguments::new(
+                dialect == Dialect::AnthropicMessages,
+            ),
             last_progress_at: None,
             yielded_at: None,
             first_token_deadline,
@@ -393,8 +399,9 @@ impl UpstreamRelay {
                 .is_zero()
                 .then(first_byte_timeout_failure);
         }
+        let idle_bound = self.tool_arguments.idle_bound(phase_timeout);
         self.last_progress_at
-            .filter(|last| last.elapsed() >= phase_timeout)
+            .filter(|last| last.elapsed() >= idle_bound)
             .map(|_| {
                 Failure::new(
                     FailureClass::Transport,
@@ -534,6 +541,7 @@ impl UpstreamRelay {
         // stop-sequence match suppresses later text while still draining the
         // provider's genuine generation to its terminal usage report.
         self.provider_tools.observe(&event);
+        self.tool_arguments.observe(&event);
         if event.is_generation_progress() {
             self.last_progress_at = Some(Instant::now());
             if self.committed {
@@ -643,7 +651,8 @@ impl UpstreamRelay {
             } else if self.stall_bound_armed {
                 self.first_token_deadline
             } else {
-                self.last_progress_at.expect("generation has begun") + phase_timeout
+                self.last_progress_at.expect("generation has begun")
+                    + self.tool_arguments.idle_bound(phase_timeout)
             };
             let bound = remaining(deadline).min(remaining(progress_deadline));
             let chunk = match tokio::time::timeout(bound, self.stream.next()).await {

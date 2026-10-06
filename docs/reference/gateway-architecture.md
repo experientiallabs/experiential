@@ -333,9 +333,9 @@ same caller-owned plaintext history a `reasoning_content` echo is; mid-conversat
 them (instruction-hoisting rungs narrow out), and `thinking.display` rides the verbatim thinking
 config. The conditional Claude Code fields `diagnostics` and `speed` forward verbatim on
 Anthropic rungs with their required `anthropic-beta` tokens and drop with disclosure elsewhere.
-A caller `anthropic-beta` header forwards through an exact token allowlist (notably
-`context-1m-2025-08-07`, which activates the provider's 1M context window; without it the
-provider serves 200K); non-allowlisted tokens drop with a per-token
+A caller `anthropic-beta` header forwards through an exact token allowlist (notably `context-1m-2025-08-07`, which
+activates the provider's 1M context window; without it the provider serves 200K, and `thinking-display-updates-2026-08-18`,
+which the dispatch also adds whenever `thinking.display` is `updates`, since the provider refuses that display without it); non-allowlisted tokens drop with a per-token
 `anthropic-beta.<token>` disclosure, never a rejection and never a blind forward. On the Responses surface, `client_metadata` and `text.verbosity` forward on native rungs
 and drop with disclosure elsewhere. Chat `verbosity` accepts `low`, `medium`, or `high` as the
 same hint: forwarded as `text.verbosity` on native Responses routes and omitted with a

@@ -96,3 +96,121 @@ async fn remote_mcp_listing_keeps_byte_idle_until_its_result() {
         .safe_message
         .contains("stopped making progress"));
 }
+
+/// One Anthropic SSE frame as the relay receives it.
+fn anthropic_frame(payload: &'static str) -> reqwest::Result<Bytes> {
+    Ok(Bytes::from(format!("data: {payload}\n\n")))
+}
+
+/// An Anthropic Write call whose `content` argument arrives after `silence`.
+fn buffered_write_call(silence: Duration) -> BoxStream<'static, reqwest::Result<Bytes>> {
+    stream::iter([
+        anthropic_frame(r#"{"type":"message_start","message":{"usage":{"input_tokens":7,"output_tokens":1}}}"#),
+        anthropic_frame(r#"{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_1","name":"Write","input":{}}}"#),
+        anthropic_frame(r#"{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"file_path\": \"a.html\""}}"#),
+    ])
+    .chain(stream::once(async move {
+        tokio::time::sleep(silence).await;
+        anthropic_frame(r#"{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":", \"content\": \"<html/>\"}"}}"#)
+    }))
+    .chain(stream::iter([
+        anthropic_frame(r#"{"type":"content_block_stop","index":0}"#),
+        anthropic_frame(r#"{"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}"#),
+        anthropic_frame(r#"{"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"done"}}"#),
+    ]))
+    .chain(stream::pending())
+    .boxed()
+}
+
+/// Drain events until `stop` matches one, returning the first failure if any.
+async fn drain_until(
+    relay: &mut UpstreamRelay,
+    deadline: Instant,
+    idle: Duration,
+    start: Instant,
+    stop: impl Fn(&Event) -> bool,
+) -> Result<(), Failure> {
+    loop {
+        let event = relay
+            .next_event(deadline, idle, start)
+            .await?
+            .expect("open stream");
+        if matches!(event, Event::ToolCallStarted { .. }) {
+            relay.commit();
+        }
+        if stop(&event) {
+            return Ok(());
+        }
+    }
+}
+
+#[tokio::test]
+async fn anthropic_buffered_tool_argument_outlasts_the_generation_idle_window() {
+    let start = Instant::now();
+    let idle = Duration::from_millis(20);
+    let mut relay = UpstreamRelay::from_stream(
+        buffered_write_call(idle * 4),
+        Dialect::AnthropicMessages,
+        start + Duration::from_secs(1),
+    );
+    let deadline = start + Duration::from_secs(5);
+    drain_until(&mut relay, deadline, idle, start, |event| {
+        matches!(event, Event::ToolCallCompleted { .. })
+    })
+    .await
+    .expect("a silent buffered argument is not a stall");
+    drain_until(
+        &mut relay,
+        deadline,
+        idle,
+        start,
+        |event| matches!(event, Event::TextDelta(text) if text == "done"),
+    )
+    .await
+    .unwrap();
+    // The widened window closes with the call: later silence is a stall again.
+    let failure = relay.next_event(deadline, idle, start).await.unwrap_err();
+    assert!(failure.safe_message.contains("stopped making progress"));
+    assert!(start.elapsed() < Duration::from_secs(1));
+}
+
+#[tokio::test]
+async fn anthropic_buffered_tool_argument_is_still_bounded() {
+    let start = Instant::now();
+    let idle = Duration::from_millis(10);
+    let mut relay = UpstreamRelay::from_stream(
+        buffered_write_call(Duration::from_secs(5)),
+        Dialect::AnthropicMessages,
+        start + Duration::from_secs(1),
+    );
+    let deadline = start + Duration::from_secs(5);
+    let failure = drain_until(&mut relay, deadline, idle, start, |_| false)
+        .await
+        .unwrap_err();
+    assert!(failure.safe_message.contains("stopped making progress"));
+    let waited = start.elapsed();
+    assert!(waited >= idle * 10, "waited {waited:?}");
+    assert!(waited < Duration::from_secs(1), "waited {waited:?}");
+}
+
+#[tokio::test]
+async fn other_dialects_keep_the_generation_idle_window_for_tool_arguments() {
+    let frames = stream::iter([Ok::<_, reqwest::Error>(Bytes::from_static(
+        b"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"Write\",\"arguments\":\"{\\\"a\\\"\"}}]}}]}\n\n",
+    ))])
+    .chain(stream::pending())
+    .boxed();
+    let start = Instant::now();
+    let idle = Duration::from_millis(10);
+    let mut relay = UpstreamRelay::from_stream(
+        frames,
+        Dialect::OpenAiCompatible,
+        start + Duration::from_secs(1),
+    );
+    let deadline = start + Duration::from_secs(5);
+    let failure = drain_until(&mut relay, deadline, idle, start, |_| false)
+        .await
+        .unwrap_err();
+    assert!(failure.safe_message.contains("stopped making progress"));
+    assert!(start.elapsed() < idle * 10);
+}

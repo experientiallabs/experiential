@@ -1183,6 +1183,40 @@ def test_diagnostics_and_speed_are_carried_verbatim_and_shallow_validated() -> N
     assert raised.value.detail.param == "diagnostics"
 
 
+def test_display_updates_beta_reaches_the_provider_with_its_field() -> None:
+    """Claude Code pairs ``display: "updates"`` with its beta token.
+
+    Dropping the token while the field still dispatched made Anthropic answer
+    400 "thinking.adaptive.display: Input should be 'summarized', 'omitted'"
+    (2026-10-05). The token forwards, and the dispatch carries it even when a
+    caller sends the field alone.
+    """
+    from exp.runtime.models.providers.wire_messages import (
+        ANTHROPIC_THINKING_DISPLAY_UPDATES_BETA,
+        anthropic_request_headers,
+    )
+
+    thinking: JsonObject = {"type": "adaptive", "display": "updates"}
+    decoded = decode_messages(
+        _body(thinking=thinking),
+        anthropic_beta="claude-code-20250219,thinking-display-updates-2026-08-18",
+    )
+    assert decoded.request.provider_beta_tokens == (ANTHROPIC_THINKING_DISPLAY_UPDATES_BETA,)
+    assert "anthropic-beta.thinking-display-updates-2026-08-18" not in (
+        decoded.request.ignored_parameters
+    )
+    headers = anthropic_request_headers({"x-api-key": "k"}, decoded.request)
+    assert headers["anthropic-beta"] == ANTHROPIC_THINKING_DISPLAY_UPDATES_BETA
+
+    bare = decode_messages(_body(thinking=thinking)).request
+    assert bare.provider_beta_tokens == ()
+    headers = anthropic_request_headers({"x-api-key": "k"}, bare)
+    assert headers["anthropic-beta"] == ANTHROPIC_THINKING_DISPLAY_UPDATES_BETA
+
+    summarized = decode_messages(_body(thinking={"type": "adaptive", "display": "summarized"}))
+    assert "anthropic-beta" not in anthropic_request_headers({"x-api-key": "k"}, summarized.request)
+
+
 def test_caller_beta_tokens_partition_into_allowlist_and_disclosures() -> None:
     """The caller anthropic-beta header forwards only allowlisted tokens.
 

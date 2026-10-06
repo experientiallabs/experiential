@@ -43,12 +43,16 @@ their existing identity requirement.
 
 ## Reasoning controls
 
-Valid explicit thinking-off settings remain off. An unsupported off setting is a typed
-pre-dispatch refusal, not a request to use the model's default thinking behavior. Model
-families distinguish support for budgeted thinking from support for disabling thinking.
-Claude Opus 5.5 always uses adaptive thinking, so an explicit `thinking.type: disabled`
-is rejected before dispatch at every effort level. Omit thinking or explicitly use adaptive
-thinking and choose an effort level instead. Opus 5 and older releases keep their own rules.
+Valid explicit thinking-off settings remain off. Model families distinguish support for
+budgeted thinking from support for disabling thinking. Claude Opus 5.5, Fable and Mythos
+always reason: no effort level turns thinking off. On these models an explicit
+`thinking.type: disabled` dispatches as the provider's own substitute for "off", adaptive
+thinking at effort `low` with the reasoning withheld (`display: "omitted"`), and the response
+discloses `thinking.type->adaptive` (plus `output_config.effort->low` when the request named
+another effort). Clients that do not recognize the model send the off switch anyway: Claude
+Code's session-title call does on the gateway's dotted aliases, and a refusal failed every one.
+Any other unsupported off setting stays a typed pre-dispatch refusal (Opus 5 at `xhigh` or
+`max`, Sonnet 5.5 at any effort), never a silent switch to the model's default thinking.
 Opus 5.5 also cannot force a tool selection: the existing capability policy uses `auto`
 only after all eligible routes decline the forced choice and discloses `tool_choice->auto`.
 This does not guarantee a tool call. See the provider's

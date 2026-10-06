@@ -1,6 +1,9 @@
 //! Provider-executed tools are irreversible work, not stalled token generation.
+//! A client tool call whose arguments a provider buffers is the same kind of
+//! legitimate silence, bounded more generously but never removed.
 
 use std::collections::HashSet;
+use std::time::Duration;
 
 use crate::events::{hosted_item_type_is_invocation, Event};
 
@@ -42,6 +45,54 @@ impl ProviderTools {
                 self.hosted_items.remove(item_id);
             }
             _ => {}
+        }
+    }
+}
+
+/// How many generation-idle windows an open client tool call's arguments may
+/// stay silent on a dialect that buffers them. Anthropic emits a long string
+/// argument (a whole file for Claude Code's Write tool) only once it is
+/// generated and sends nothing meanwhile, not even pings: at the default 60 s
+/// window a large write on a long context died at the same byte on every
+/// retry (2026-10-05). Ten windows is 600 s, Claude Code's own client timeout.
+const BUFFERED_TOOL_ARGUMENT_IDLE_WINDOWS: u32 = 10;
+
+/// Track the client tool calls whose arguments are still being generated, on
+/// a dialect whose provider buffers them.
+pub(super) struct BufferedToolArguments {
+    buffered: bool,
+    open: HashSet<u32>,
+}
+
+impl BufferedToolArguments {
+    pub(super) fn new(buffered: bool) -> Self {
+        Self {
+            buffered,
+            open: HashSet::new(),
+        }
+    }
+
+    pub(super) fn observe(&mut self, event: &Event) {
+        if !self.buffered {
+            return;
+        }
+        match event {
+            Event::ToolCallStarted { index, .. } => {
+                self.open.insert(*index);
+            }
+            Event::ToolCallCompleted { index, .. } => {
+                self.open.remove(index);
+            }
+            _ => {}
+        }
+    }
+
+    /// The generation-idle bound: widened only while a buffered argument is open.
+    pub(super) fn idle_bound(&self, phase_timeout: Duration) -> Duration {
+        if self.open.is_empty() {
+            phase_timeout
+        } else {
+            phase_timeout.saturating_mul(BUFFERED_TOOL_ARGUMENT_IDLE_WINDOWS)
         }
     }
 }
