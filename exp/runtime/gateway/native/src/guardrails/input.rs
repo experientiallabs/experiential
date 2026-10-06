@@ -189,6 +189,96 @@ pub(crate) async fn acquire_guarded_attempt(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pyo3::prelude::*;
+
+    #[tokio::test]
+    async fn denial_cancelling_provider_settlement_keeps_health_facts() {
+        Python::initialize();
+        for drop_handler in [false, true] {
+            let plane = Python::attach(|py| {
+                pyo3::types::PyModule::from_code(py, c"import json\nclass Plane:\n def __init__(self): self.writes = []; self.polls = 0\n def guardrail_input_status(self, argument):\n  self.polls += 1\n  if self.polls == 1: return '{\"action\":\"pending\"}'\n  return json.dumps({'action':'error','failure':{'failure_class':'guardrail','safe_message':'Input was rejected.'}})\n def settle(self, argument):\n  self.writes.append(json.loads(argument))\n  return '{}'\n def close_thread_resources(self, argument): return '{}'\n", c"provider_input_plane.py", c"provider_input_plane")
+                    .unwrap().getattr("Plane").unwrap().call0().unwrap().unbind()
+            });
+            let bridge =
+                Arc::new(Bridge::new(Python::attach(|py| plane.clone_ref(py)), 1).unwrap());
+            let gate = Arc::new(InputGate {
+                request_id: "request".into(),
+                deadline: Instant::now() + Duration::from_secs(2),
+                decision: OnceCell::new(),
+            });
+            let mut guard = AttemptGuard::new(
+                bridge.clone(),
+                Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                "request".into(),
+                Instant::now(),
+            );
+            guard.rebind("attempt".into());
+            guard.mark_dispatched();
+            guard.input_gate = Some(gate.clone());
+            let headers = json!({
+                "retry-after": "120",
+                "x-ratelimit-remaining-requests": "0",
+                "x-ratelimit-reset-requests": "120s"
+            })
+            .as_object()
+            .unwrap()
+            .clone();
+            let provider = crate::upstream::transport_failure(Some(429))
+                .with_rate_limit_facts(Some(headers.clone()), Some(120));
+            // A failed open is retained before the waterfall can await the shared gate.
+            guard
+                .capture_observation()
+                .record(&crate::events::Event::Failed(provider.clone()));
+            let mut settling_polled = false;
+            let denied = {
+                let settling = async {
+                    settling_polled = true;
+                    guard
+                        .settle("failed", None, &[], Some(&provider), false)
+                        .await
+                };
+                tokio::pin!(settling);
+                tokio::select! {
+                    biased;
+                    decision = gate.wait(&bridge) => decision.err().expect("input denial"),
+                    _ = &mut settling => panic!("the outer input gate must win"),
+                }
+            };
+            assert!(
+                settling_polled,
+                "cancel an actual in-flight settlement future"
+            );
+            if drop_handler {
+                drop(guard);
+            } else {
+                guard.fail_before_release(&denied.failure).await;
+            }
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while Python::attach(|py| plane.bind(py).getattr("writes").unwrap().len().unwrap())
+                    == 0
+                {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .expect("terminal settlement delivered");
+            let writes: String = Python::attach(|py| {
+                py.import("json")
+                    .unwrap()
+                    .call_method1("dumps", (plane.bind(py).getattr("writes").unwrap(),))
+                    .unwrap()
+                    .extract()
+                    .unwrap()
+            });
+            let writes: Vec<serde_json::Value> = serde_json::from_str(&writes).unwrap();
+            assert_eq!(writes.len(), 1);
+            assert_eq!(writes[0]["failure"]["failure_class"], "throttled");
+            assert_eq!(writes[0]["failure"]["retry_after_seconds"], 120);
+            assert_eq!(writes[0]["rate_limit_headers"], json!(headers));
+            assert_eq!(writes[0]["finalize"], true);
+            assert_eq!(writes[0]["usage_incomplete_due_to_disconnect"], false);
+        }
+    }
 
     #[test]
     fn capture_error_keeps_its_code_and_underlying_settlement_failure() {

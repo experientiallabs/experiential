@@ -704,6 +704,7 @@ class NativeAttemptAccounting:
             with self._lock:
                 entry.pending_settlement = data
             raise authority_error(exc) from exc
+        failure = terminal.failure
         self._record_health(entry, attempt_id, opened=opened, failure=failure, settlement=data)
         self._record_cache_fraction(entry, attempt_id, terminal)
         record_session_outcome(
@@ -836,9 +837,7 @@ class NativeAttemptAccounting:
             failure: The terminal failure, or ``None`` for a success.
             settlement: The settlement payload carrying the harvested rate-limit headers.
         """
-        # The rung's bounded-admission slot frees with the health recording:
-        # both releases are idempotent, so settle, abandon, and the sweep can
-        # each fire without double-counting.
+        # Slot and health releases are idempotent across settlement, abandon, and sweep.
         self._loads.release_attempt(attempt_id)
         depth = entry.attempt_depths.get(attempt_id)
         if depth is None:
@@ -980,6 +979,7 @@ class NativeAttemptAccounting:
         except Exception:  # noqa: BLE001 - keep the entry; the sweep retries.
             self._accounting_healthy = False
             return False
+        failure = terminal.failure
         self._record_health(entry, attempt_id, opened=False, failure=failure, settlement=settlement)
         # Cache-priority observations must not depend on which settlement path succeeds.
         self._record_cache_fraction(entry, attempt_id, terminal)

@@ -40,6 +40,7 @@ from exp.runtime.gateway.lifecycle import load_gateway_components
 from exp.runtime.gateway.lifecycle_test import _configured_gateway
 from exp.runtime.gateway.native_bridge import NativeBridgeError, NativeControlPlane
 from exp.runtime.gateway.native_bridge_test import _admit, _chat_body
+from exp.runtime.gateway.native_execution import InflightRequest, deployment_health_key
 from exp.runtime.gateway.native_server import serve_native_gateway
 from exp.runtime.gateway.rung_admission import RungShed
 from exp.runtime.gateway.tests.mandatory_guardrails_test import _tool_chunk
@@ -481,3 +482,185 @@ def test_parallel_inspection_holds_text_tools_and_customer_settlement(
         provider.shutdown()
         provider.server_close()
         provider_thread.join(timeout=5)
+
+
+@pytest.mark.parametrize(
+    ("failure_class", "provider_status"),
+    [("throttled", 429), ("provider_authentication", 401), ("transport", None)],
+)
+@pytest.mark.parametrize("retained_settlement", [False, True])
+def test_provider_failure_survives_later_input_denial_and_settlement_recovery(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_class: str,
+    provider_status: int | None,
+    retained_settlement: bool,
+) -> None:
+    """Input denial waives customer cost without erasing provider backoff or circuit evidence."""
+    classifier = _Classifier("block")
+    provider_finished = threading.Event()
+    response_received = threading.Event()
+    provider_requests: list[bytes] = []
+    settlements: list[JsonObject] = []
+    entries: list[InflightRequest] = []
+
+    class Provider(BaseHTTPRequestHandler):
+        """Fail an accepted request before the independently blocked input classifier resolves."""
+
+        def do_POST(self) -> None:  # noqa: N802 - standard HTTP fixture protocol.
+            """Expose real status/header or socket-failure evidence to the native client."""
+            provider_requests.append(self.rfile.read(int(self.headers["Content-Length"])))
+            try:
+                if provider_status is None:
+                    self.close_connection = True
+                    self.connection.shutdown(socket.SHUT_RDWR)
+                    return
+                payload = b'{"error":{"message":"private-provider-error","type":"fixture"}}'
+                self.send_response(provider_status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                if provider_status == 429:
+                    self.send_header("Retry-After", "120")
+                    self.send_header("X-RateLimit-Remaining-Requests", "0")
+                self.end_headers()
+                self.wfile.write(payload)
+                self.wfile.flush()
+            finally:
+                provider_finished.set()
+
+        def log_message(self, format: str, *args: object) -> None:
+            """Keep synthetic provider diagnostics out of test logs."""
+
+    provider = ThreadingHTTPServer(("127.0.0.1", 0), Provider)
+    provider_thread = threading.Thread(target=provider.serve_forever, daemon=True)
+    provider_thread.start()
+    _, key = _configured_gateway(
+        tmp_path,
+        base_url=f"http://127.0.0.1:{provider.server_port}/v1",
+        billing_source=BillingSource.HOST_MANAGED,
+        prices=GatewayTokenPrices(
+            input_nano_usd_per_million_tokens=1_000_000_000,
+            output_nano_usd_per_million_tokens=2_000_000_000,
+        ),
+    )
+    components = load_gateway_components(tmp_path, environment={"TEST_PROVIDER_KEY": "fixture"})
+
+    class Control(NativeControlPlane):
+        """Retain observed boundary evidence while preserving real admission and settlement."""
+
+        def admit(self, argument: str) -> str:
+            """Keep the admitted ownership snapshot for health and recovery assertions."""
+            result = super().admit(argument)
+            entry = self._accounting.entry(str(json.loads(result)["request_id"]))
+            assert entry is not None
+            entries.append(entry)
+            return result
+
+        def settle(self, argument: str) -> str:
+            """Observe the unmodified Rust callback, including delivery retries."""
+            settlements.append(json.loads(argument))
+            return super().settle(argument)
+
+    control = Control(components, guardrails=_engine(classifier))
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+    ready = threading.Event()
+    stop = exp_gateway_native.shutdown_handle()
+    gateway_thread = threading.Thread(
+        target=serve_native_gateway,
+        args=(control,),
+        kwargs={
+            "host": "127.0.0.1",
+            "port": port,
+            "shutdown": stop,
+            "on_listening": ready.set,
+            "graceful_timeout_seconds": 0.1,
+        },
+        daemon=True,
+    )
+    gateway_thread.start()
+
+    def request() -> httpx.Response:
+        """Exercise the native endpoint without releasing the classifier from the client."""
+        response = httpx.post(
+            f"http://127.0.0.1:{port}/v1/chat/completions",
+            headers={"authorization": f"Bearer {key}"},
+            json=json.loads(_chat_body()),
+            timeout=8,
+        )
+        response_received.set()
+        return response
+
+    try:
+        assert ready.wait(5)
+        with monkeypatch.context() as patch:
+            if retained_settlement:
+                patch.setattr(
+                    control._accounting,  # noqa: SLF001 - retain the real native settlement.
+                    "_finish_attempt",
+                    Mock(side_effect=RuntimeError("private ledger failure")),
+                )
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                pending = executor.submit(request)
+                try:
+                    assert classifier.started.wait(2)
+                    assert provider_finished.wait(2), "provider waited for the input verdict"
+                    assert not response_received.wait(0.1), "provider error escaped pending input"
+                    classifier.release.set()
+                    response = pending.result(timeout=5)
+                finally:
+                    classifier.release.set()
+            assert response.status_code == 400, response.text
+            assert response.json()["error"]["code"] == "content_filter"
+            assert "private-provider-error" not in response.text
+            assert "private ledger failure" not in response.text
+            assert len(provider_requests) == 1
+            assert len(entries) == 1
+            entry = entries[0]
+            assert (entry.pending_settlement is not None) is retained_settlement
+            if retained_settlement:
+                assert entry.pending_settlement == settlements[0]
+                assert all(item == settlements[0] for item in settlements)
+        if retained_settlement:
+            control._accounting.sweep_expired()  # noqa: SLF001 - replay the retained native write.
+        assert control._accounting.entry(entry.authorization.request_id) is None  # noqa: SLF001
+        with sqlite3.connect(components.ledger.database_path) as db:
+            assert db.execute(
+                "SELECT state, failure_class, budget_settled_nano_usd FROM gateway_attempts"
+            ).fetchall() == [("failed", "guardrail", 0)]
+            assert db.execute("SELECT terminal_state FROM gateway_requests").fetchall() == [
+                ("failed",)
+            ]
+        observed = settlements[0]["failure"]
+        assert isinstance(observed, dict)
+        assert observed["failure_class"] == failure_class
+        health = control._accounting.health  # noqa: SLF001 - actual admission registry.
+        health_key = deployment_health_key(entry.authorization, entry.route.deployment)
+        if provider_status == 429:
+            assert observed["retry_after_seconds"] == 120
+            assert settlements[0]["rate_limit_headers"] == {
+                "retry-after": "120",
+                "x-ratelimit-remaining-requests": "0",
+            }
+            remaining = health.throttled_remaining_seconds((health_key,))
+            assert remaining is not None and 110 < remaining <= 120
+            classifier.outcome = "allow"
+            retried = request()
+            assert retried.status_code == 429, retried.text
+            assert 110 <= int(retried.headers["retry-after"]) <= 120
+            assert len(provider_requests) == 1, "suppressed provider was dialed again"
+        elif provider_status == 401:
+            assert health.suppressed(health_key)
+        else:
+            states = health._states  # noqa: SLF001 - one failure remains below the circuit threshold.
+            assert states[health_key].consecutive_failures == 1
+    finally:
+        classifier.release.set()
+        stop.request_shutdown()
+        gateway_thread.join(timeout=5)
+        provider.shutdown()
+        provider.server_close()
+        provider_thread.join(timeout=5)
+        components.write_ledger.close()
+        assert not gateway_thread.is_alive()

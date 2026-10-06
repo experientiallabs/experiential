@@ -379,6 +379,14 @@ pub async fn acquire_attempt(ctx: &WaterfallContext<'_>, guard: &mut AttemptGuar
             &tool_search_rounds,
         )
         .await;
+        if guard.input_gate.is_some() {
+            if let AttemptEnd::Ladder { failure, .. } | AttemptEnd::Repair { failure, .. } = &end {
+                // Gate rejection can drop settlement while it awaits the same input verdict.
+                guard
+                    .capture_observation()
+                    .record(&Event::Failed(failure.clone()));
+            }
+        }
         match end {
             AttemptEnd::Committed(mut committed) => {
                 // The committed stream has parsed at least its first

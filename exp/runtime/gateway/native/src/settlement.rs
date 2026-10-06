@@ -450,12 +450,6 @@ impl AttemptGuard {
         let observed = self.observation.snapshot();
         let usage = observed.usage.as_ref().or(usage);
         self.record_first_token(observed.first_token_at);
-        // An opened attempt's headers live on the guard; an attempt that
-        // failed at open carries them on its failure instead.
-        let rate_limit_headers = self
-            .rate_limit_headers
-            .as_ref()
-            .or_else(|| failure.and_then(|failure| failure.rate_limit_headers.as_deref()));
         // A failed input gate cancels provider work. Preserve the existing
         // disconnected-meter contract; the host's frozen input decision supplies
         // the public/durable failure and waives the customer charge separately.
@@ -465,7 +459,20 @@ impl AttemptGuard {
                 "Generation cancelled before input approval.",
             )
         });
-        let meter_failure = input_cancellation.as_ref().or(failure);
+        let observed_failure = match observed.terminal.as_ref() {
+            Some(Event::Failed(failure)) => Some(failure.clone().boundary()),
+            _ => None,
+        };
+        let meter_failure = if input_failure.is_some() {
+            observed_failure.as_ref().or(input_cancellation.as_ref())
+        } else {
+            failure
+        };
+        // A known provider failure still owns health and meter evidence after input denial.
+        let rate_limit_headers = self
+            .rate_limit_headers
+            .as_ref()
+            .or_else(|| meter_failure.and_then(|failure| failure.rate_limit_headers.as_deref()));
         let argument = settle_argument(
             &self.request_id,
             &attempt_id,
@@ -668,7 +675,11 @@ impl Drop for AttemptGuard {
                             true,
                             self.opened,
                             self.first_token_at.or(observed.first_token_at),
-                            self.rate_limit_headers.as_ref(),
+                            self.rate_limit_headers.as_ref().or_else(|| {
+                                failure
+                                    .as_ref()
+                                    .and_then(|failure| failure.rate_limit_headers.as_deref())
+                            }),
                             self.upstream_provider.as_deref(),
                             self.web_search_requests,
                             self.tool_search_requests,
