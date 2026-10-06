@@ -140,8 +140,7 @@ def test_always_thinking_off_switch_dispatches_lowest_withheld_adaptive(
     public, provider = route_generation_parameter_requests((profile,), request)
     payload = dialect_stream_payload(profile, provider)
     assert payload["thinking"] == {"type": "adaptive", "display": "omitted"}
-    assert payload["output_config"]["effort"] == "low"
-    assert payload["output_config"]["format"] == output_config["format"]
+    assert payload["output_config"] == {**output_config, "effort": "low"}
     assert "thinking.type->adaptive" in public.ignored_parameters
     assert ("output_config.effort->low" in public.ignored_parameters) is (effort != "low")
     assert request.provider_thinking_config == {"type": "disabled"}
