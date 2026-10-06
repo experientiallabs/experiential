@@ -270,6 +270,42 @@ fn parsed_counts_are_bounded_to_the_persistable_ledger_range() {
 }
 
 #[test]
+fn bedrock_usage_reports_the_one_hour_write_subset_from_cache_details() {
+    let usage = |details: serde_json::Value| {
+        bedrock_usage(Some(&json!({
+            "inputTokens": 10, "outputTokens": 2, "cacheWriteInputTokens": 30,
+            "cacheDetails": details,
+        })))
+    };
+    let complete = json!([{"ttl": "1h", "inputTokens": 20}, {"ttl": "5m", "inputTokens": 10}]);
+    assert_eq!(
+        usage(complete).unwrap().cache_creation_1h_input_tokens,
+        Some(20)
+    );
+    assert_eq!(
+        usage(json!([{"ttl": "5m", "inputTokens": 30}]))
+            .unwrap()
+            .cache_creation_1h_input_tokens,
+        Some(0)
+    );
+    for unknown in [
+        json!(null),
+        json!([]),
+        json!([{"ttl": "1h", "inputTokens": 20}]),
+        json!([{"ttl": "24h", "inputTokens": 30}]),
+    ] {
+        assert_eq!(usage(unknown).unwrap().cache_creation_1h_input_tokens, None);
+    }
+    for malformed in [
+        json!({"ttl": "1h"}),
+        json!([{"ttl": "1h"}]),
+        json!([{"ttl": "1h", "inputTokens": 31}]),
+    ] {
+        assert!(usage(malformed).is_err());
+    }
+}
+
+#[test]
 fn bedrock_usage_folds_cache_legs_and_rejects_unrepresentable_totals() {
     let usage = bedrock_usage(Some(&json!({
         "inputTokens": 9,

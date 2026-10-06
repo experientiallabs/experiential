@@ -317,6 +317,7 @@ impl Normalizer {
                 {
                     self.cache_read = value;
                 }
+                let start_write = self.cache_write;
                 self.cache_write = count_if_present(
                     usage,
                     "cache_creation_input_tokens",
@@ -325,11 +326,15 @@ impl Normalizer {
                 .map_err(|message| malformed(&message))?
                 .or(self.cache_write)
                 .or(self.input_tokens.map(|_| 0));
-                if usage.contains_key("cache_creation_input_tokens")
-                    || usage.contains_key("cache_creation")
-                {
+                // message_delta usage restates the write total without the
+                // `cache_creation` TTL object: keep the start frame's breakdown
+                // while it still covers the same total, and only a changed
+                // total without a fresh breakdown makes the split unknown.
+                if usage.contains_key("cache_creation") {
                     self.cache_write_1h =
                         cache_write::hour_subset(usage, self.cache_write.unwrap_or(0))?;
+                } else if self.cache_write != start_write {
+                    self.cache_write_1h = None;
                 }
                 // The relay may be cancelled before message_stop arrives.
                 // Retain these decoded meters without changing event timing.

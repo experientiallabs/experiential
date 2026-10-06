@@ -563,9 +563,46 @@ pub fn bedrock_usage(value: Option<&Value>) -> Result<Usage, String> {
             "cacheWriteInputTokens",
             "Bedrock usage",
         )?,
-        cache_creation_1h_input_tokens: None,
+        cache_creation_1h_input_tokens: bedrock_cache_hour_subset(usage, cache_write)?,
         reasoning_tokens: None,
     })
+}
+
+/// Return the one-hour subset of Bedrock cache writes from `cacheDetails`
+/// (one `{ttl, inputTokens}` entry per TTL, `5m` or `1h`) only when the entries
+/// cover the reported write total exactly. An absent, empty, partial, or
+/// unrecognized-TTL breakdown stays unknown so the ledger prices it at the
+/// 5-minute rate; a malformed or over-total breakdown fails the stream.
+fn bedrock_cache_hour_subset(
+    usage: &Map<String, Value>,
+    total: u64,
+) -> Result<Option<u64>, String> {
+    let details = match usage.get("cacheDetails") {
+        None | Some(Value::Null) => return Ok(None),
+        Some(value) => value
+            .as_array()
+            .ok_or_else(|| "Bedrock cacheDetails must be an array".to_string())?,
+    };
+    if total == 0 {
+        return Ok(None);
+    }
+    let (mut five, mut hour, mut recognized) = (0u64, 0u64, true);
+    for detail in details {
+        let detail = detail
+            .as_object()
+            .ok_or_else(|| "Bedrock cacheDetails entry must be an object".to_string())?;
+        let tokens = require_u64(detail, "inputTokens", "Bedrock cacheDetails inputTokens")?;
+        match detail.get("ttl").and_then(Value::as_str) {
+            Some("5m") => five = bounded_ledger_sum(&[five, tokens], "Bedrock cacheDetails")?,
+            Some("1h") => hour = bounded_ledger_sum(&[hour, tokens], "Bedrock cacheDetails")?,
+            _ => recognized = false,
+        }
+    }
+    let covered = bounded_ledger_sum(&[five, hour], "Bedrock cacheDetails")?;
+    if covered > total {
+        return Err("Bedrock cacheDetails TTL counts exceed cacheWriteInputTokens".to_string());
+    }
+    Ok((recognized && covered == total).then_some(hour))
 }
 
 /// Fetch a required string field from a provider JSON object.
