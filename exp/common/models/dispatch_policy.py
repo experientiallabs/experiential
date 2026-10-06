@@ -123,6 +123,11 @@ class GatewayRungDispatchPolicy(ContractModel):
             Pro is refused, and at runtime the effective paying multiple is
             clamped to the effective Pro one (an authored Pro of ``1.0`` turns
             both off).
+        upstream_priority: Send the caller's admission level to this rung as
+            the vLLM request ``priority`` body field (Pro 0, paying 1, free 2;
+            lower runs first under ``--scheduling-policy priority``). Author it
+            only on a self-hosted vLLM rung: any other provider would receive
+            an unknown field. Default ``False`` sends nothing.
     """
 
     concurrency_bound: int | None = Field(default=None, ge=1)
@@ -220,6 +225,7 @@ class GatewayRungDispatchPolicy(ContractModel):
     """
     priority_overflow_paying: float | None = Field(default=None, ge=1, le=4, allow_inf_nan=False)
     priority_overflow_pro: float | None = Field(default=None, ge=1, le=4, allow_inf_nan=False)
+    upstream_priority: bool = False
 
     @model_validator(mode="after")
     def _require_coherent_authoring(self) -> GatewayRungDispatchPolicy:

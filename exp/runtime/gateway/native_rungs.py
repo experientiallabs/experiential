@@ -11,6 +11,9 @@ A rung the host flagged in ``snapshot.zdr_constrained_deployment_ids`` is
 frozen with OpenRouter's zero-data-retention routing constraint on its payload
 and the metadata opt-in header on its dispatch; a flagged rung on any other
 wire fails closed here, never dispatching unconstrained.
+
+A rung whose authored dispatch policy sets ``upstream_priority`` (a self-hosted
+vLLM lane) carries the caller's admission level as vLLM's ``priority`` field.
 """
 
 from __future__ import annotations
@@ -51,6 +54,16 @@ from exp.runtime.models.providers.wire_messages import anthropic_request_headers
 
 ZDR_CONSTRAINT_CAPABILITY = "zero_data_retention_constraint"
 """The capability a flagged rung's wire must express, named on the refusal."""
+
+UPSTREAM_PRIORITY_DIALECTS = frozenset({"openai_compatible", "openai_responses"})
+"""The wires a vLLM server answers, where its ``priority`` body field exists."""
+
+UPSTREAM_PRIORITY = {2: 0, 1: 1, 0: 2}
+"""vLLM ``priority`` per ``AuthorizationSnapshot.priority_admission`` level.
+
+Pro 0, paying 1, free 2: vLLM's priority scheduler runs the lowest value
+first and, when KV runs out, preempts the highest value first.
+"""
 
 
 @dataclass(frozen=True, slots=True)
@@ -128,6 +141,18 @@ def build_rung_dispatch(
         upstream_payload = forward_provider_preferences(
             upstream_payload, rung_request.provider_preferences
         )
+    dispatch_policy = deployment.gateway.dispatch
+    if (
+        dispatch_policy is not None
+        and dispatch_policy.upstream_priority
+        and profile.dialect in UPSTREAM_PRIORITY_DIALECTS
+    ):
+        # Only a rung the host authored as self-hosted vLLM: every other
+        # provider would receive an unknown field.
+        upstream_payload = {
+            **upstream_payload,
+            "priority": UPSTREAM_PRIORITY[authorization.priority_admission],
+        }
     request_headers = (
         anthropic_request_headers(dict(profile.headers), rung_request)
         if profile.dialect == "anthropic_messages"

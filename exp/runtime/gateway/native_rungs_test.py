@@ -15,6 +15,7 @@ from exp.common.models.catalog import (
     GatewayDeploymentMetadata,
     GatewayTokenPrices,
 )
+from exp.common.models.dispatch_policy import GatewayRungDispatchPolicy
 from exp.common.models.gateway_catalog import ExactModelDeployment
 from exp.runtime.anthropic_protocol.requests import decode_messages
 from exp.runtime.gateway.attempt_costs import maximum_attempt_cost_nano_usd
@@ -645,3 +646,93 @@ def test_numeric_budget_freezes_each_rungs_total_reservation(model: str) -> None
             == f"max_tokens->default({bound};openai_compatible;declared_bound)"
         )
     assert request.maximum_output_tokens is None
+
+
+def _priority_rung(deployment_id: str, *, upstream_priority: bool) -> ExactModelDeployment:
+    """A compatible rung whose authored dispatch policy sets ``upstream_priority``."""
+    deployment = _deployment(deployment_id, "openrouter")
+    return deployment.model_copy(
+        update={
+            "gateway": deployment.gateway.model_copy(
+                update={"dispatch": GatewayRungDispatchPolicy(upstream_priority=upstream_priority)}
+            )
+        }
+    )
+
+
+@pytest.mark.parametrize(("level", "priority"), [(0, 2), (1, 1), (2, 0)])
+def test_upstream_priority_maps_admission_level_on_opted_in_rung_only(
+    level: int, priority: int
+) -> None:
+    """Pro 0, paying 1, free 2 reach the opted-in rung; the next rung gets no field."""
+    vllm = _priority_rung("vllm", upstream_priority=True)
+    third_party = _deployment("third-party", "openrouter")
+    route = _route((vllm, third_party))
+    authorization = _AUTHORIZATION.model_copy(update={"priority_admission": level})
+    request = _request()
+
+    def payload(deployment: ExactModelDeployment) -> JsonObject:
+        """The frozen upstream payload for one rung at this caller's level."""
+        result = build_rung_dispatch(
+            route,
+            deployment,
+            _profile(),
+            _NoSigningClient(),
+            provider_request=request,
+            public_request=request,
+            authorization=authorization,
+        ).wire_entry["upstream_payload"]
+        assert isinstance(result, dict)
+        return result
+
+    assert payload(vllm)["priority"] == priority
+    assert "priority" not in payload(third_party)
+
+
+@pytest.mark.parametrize("dispatch", [None, GatewayRungDispatchPolicy()])
+def test_upstream_priority_absent_without_opt_in(
+    dispatch: GatewayRungDispatchPolicy | None,
+) -> None:
+    """An unauthored policy, or one leaving the flag off, sends no ``priority``."""
+    base = _deployment("plain", "openrouter")
+    rung = base.model_copy(
+        update={"gateway": base.gateway.model_copy(update={"dispatch": dispatch})}
+    )
+    result = _dispatch(_route((rung,)), rung)
+    payload = result.wire_entry["upstream_payload"]
+    assert isinstance(payload, dict)
+    assert "priority" not in payload
+
+
+def test_upstream_priority_skips_wires_vllm_does_not_answer() -> None:
+    """An opt-in authored on a non-OpenAI wire never adds the field there."""
+    rung = _priority_rung("messages", upstream_priority=True).model_copy(
+        update={"provider": "anthropic"}
+    )
+    request = decode_messages(
+        {
+            "model": "public-model",
+            "max_tokens": 32,
+            "messages": [{"role": "user", "content": "hello"}],
+        }
+    ).request
+    result = build_rung_dispatch(
+        _route((rung,)),
+        rung,
+        _profile("anthropic_messages"),
+        _NoSigningClient(),
+        provider_request=request,
+        public_request=request,
+        authorization=_AUTHORIZATION.model_copy(update={"priority_admission": 2}),
+    )
+    payload = result.wire_entry["upstream_payload"]
+    assert isinstance(payload, dict)
+    assert "priority" not in payload
+
+
+def test_upstream_priority_defaults_off_and_adds_no_identity_bytes() -> None:
+    """The unauthored flag is excluded from the exclude-defaults catalog digest."""
+    assert GatewayRungDispatchPolicy().model_dump(exclude_defaults=True) == {}
+    assert GatewayRungDispatchPolicy(upstream_priority=True).model_dump(exclude_defaults=True) == {
+        "upstream_priority": True
+    }

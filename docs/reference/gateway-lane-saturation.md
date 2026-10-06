@@ -87,6 +87,16 @@ A rung with an authored bound may author its own multiples
 the effective paying multiple is clamped to the effective Pro one. The worker default bound
 never reads them. The hosted platform authors them per lane from its admin dispatch panel.
 
+Admission order ends at the gateway unless the provider queues by priority too. A self-hosted
+vLLM rung may author `GatewayRungDispatchPolicy.upstream_priority: true`; each dispatch to it
+then carries vLLM's `priority` body field from the caller's level (Pro `0`, paying `1`, free
+`2`; `native_rungs.UPSTREAM_PRIORITY`), so a server run with `--scheduling-policy priority`
+schedules Pro ahead of paying ahead of free and preempts free first. Only the
+`openai_compatible` and `openai_responses` wires carry it. Never author it on a third-party
+rung: that provider would receive an unknown field. Unset (the default) sends nothing and adds
+no identity bytes. Like every new dispatch field, author it only after every serving worker
+runs a build that parses it.
+
 The default bound is already half the worker's permits, so its Pro factor stays below
 `1 / DEFAULT_LANE_SHARE` and one lane's priority traffic never holds every permit. A rung whose
 forced admission hit its ceiling (`RungShed.overflow_ceiling`) is skipped, and the request is
