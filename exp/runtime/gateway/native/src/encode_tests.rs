@@ -414,6 +414,7 @@ fn web_search_admission() -> crate::web_search::WebSearchAdmission {
             url: "https://python.org/".to_string(),
             title: "Python".to_string(),
         }],
+        include_sources: false,
     }
 }
 

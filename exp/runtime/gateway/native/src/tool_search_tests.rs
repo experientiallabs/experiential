@@ -87,6 +87,7 @@ fn web_search() -> WebSearchAdmission {
             url: "https://python.org/".to_string(),
             title: "Python".to_string(),
         }],
+        include_sources: false,
     }
 }
 
@@ -582,14 +583,22 @@ fn responses_encoder_streams_the_items_at_start_and_meters_the_web_search_beside
             "response.output_item.done",
             "response.output_item.added",
             "response.output_item.done",
+            "response.output_item.added",
+            "response.output_item.done",
         ]
     );
+    // The web search ran before dispatch, so its item leads the tool search.
     assert_eq!(frame_payload(&start[2])["output_index"], json!(0));
     assert_eq!(
         frame_payload(&start[2])["item"]["type"],
-        json!("tool_search_call")
+        json!("web_search_call")
     );
     assert_eq!(frame_payload(&start[4])["output_index"], json!(1));
+    assert_eq!(
+        frame_payload(&start[4])["item"]["type"],
+        json!("tool_search_call")
+    );
+    assert_eq!(frame_payload(&start[6])["output_index"], json!(2));
     let mut frames = encoder
         .feed(&Event::TextDelta("hi".to_string()))
         .expect("text");
@@ -601,7 +610,11 @@ fn responses_encoder_streams_the_items_at_start_and_meters_the_web_search_beside
         terminal["response"]["usage"]["server_tool_use_details"],
         json!({"web_search_requests": 1, "tool_search_requests": 1})
     );
-    assert_eq!(terminal["response"]["output"][2]["type"], json!("message"));
+    assert_eq!(
+        terminal["response"]["output"][0]["type"],
+        json!("web_search_call")
+    );
+    assert_eq!(terminal["response"]["output"][3]["type"], json!("message"));
 }
 
 #[test]

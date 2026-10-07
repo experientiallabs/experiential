@@ -847,6 +847,14 @@ def route_generation_parameter_requests(
     disclose_anthropic_tool_schemas(profiles, request, ignored)
     disclose_system_fold(profiles, request, ignored)
 
+    if request.include_web_search_sources and not all(
+        profile.dialect == "openai_responses" for profile in profiles
+    ):
+        # Only a native Responses provider understands the selector; on any
+        # other route the gateway runs the search and renders its own
+        # web_search_call item with the sources (native web_search.rs), so
+        # the provider payload simply does not carry it.
+        provider_updates["include_web_search_sources"] = False
     encrypted_reasoning_present = any(
         block.kind == "encrypted_reasoning"
         for message in request.messages

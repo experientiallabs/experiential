@@ -149,6 +149,7 @@ def test_successful_search_injects_after_the_leading_instructions() -> None:
         "query": "What is the latest Rust release?",
         "requests": 1,
         "results": [{"url": "https://rust-lang.org/blog", "title": "Rust Blog"}],
+        "include_sources": False,
     }
     roles = [message.role for message in plan.request.messages]
     assert roles == ["system", "system", "user"]
@@ -250,3 +251,21 @@ def test_a_backend_that_ignores_its_timeout_is_still_bounded() -> None:
     assert time.monotonic() - started < 5
     assert DROPPED_FAILED in plan.request.ignored_parameters
     assert plan.admission is None
+
+
+def test_admission_carries_the_callers_sources_selector() -> None:
+    """The data plane lists sources on its web_search_call item only when asked."""
+    request = GatewayRequest(
+        surface=GatewayApiSurface.RESPONSES,
+        messages=(GatewayMessage(role="user", content="What is the latest Rust release?"),),
+        web_search=GatewayWebSearch(declared_as="responses_tool"),
+        include_web_search_sources=True,
+    )
+    plan = plan_web_search(
+        request,
+        ["openai_compatible"],
+        StaticWebSearchBackend(_HITS),
+        deadline_monotonic=_deadline(),
+    )
+    assert plan.admission is not None
+    assert plan.admission["include_sources"] is True

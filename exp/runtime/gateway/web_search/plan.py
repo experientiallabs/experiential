@@ -338,5 +338,8 @@ def plan_web_search(
         "query": query,
         "requests": 1,
         "results": [{"url": hit.url, "title": hit.title} for hit in results],
+        # The Responses encoder renders a web_search_call item for this search
+        # and lists its sources on the action when the caller asked for them.
+        "include_sources": request.include_web_search_sources,
     }
     return WebSearchPlan(injected, admission)

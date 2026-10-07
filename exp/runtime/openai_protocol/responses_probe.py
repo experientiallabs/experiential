@@ -11,6 +11,7 @@ text-part spelling per role and a non-empty ``input``.
 
 from __future__ import annotations
 
+import re
 from typing import cast
 
 from pydantic import JsonValue
@@ -134,6 +135,46 @@ def official_image_details(entry: JsonObject, param: str) -> JsonObject:
     return {**entry, "content": parts}
 
 
+_SDK_WEB_SEARCH_ACTIONS = frozenset({"search", "open_page", "find_in_page"})
+"""Web search action types the installed SDK's input-item schema enumerates."""
+
+
+_GATEWAY_WEB_SEARCH_ITEM_ID = re.compile(r"wsgw_[0-9a-f]{32}")
+"""The id of a web_search_call item the gateway itself rendered (native
+``web_search.rs``, ``GATEWAY_WEB_SEARCH_ITEM_PREFIX``)."""
+
+
+def drop_gateway_web_search_items(payload: JsonObject) -> JsonObject:
+    """Drop the gateway's own replayed web_search_call items from the input.
+
+    The gateway renders a ``web_search_call`` item for a search it ran
+    itself. Clients like Codex echo previous output items as the next input,
+    and that item was never a provider's, so no rung could accept it (native
+    rungs do not know its id; every other rung refuses hosted items by name).
+    The search results already reached the conversation through the answer.
+
+    Args:
+        payload: Parsed Responses request body.
+
+    Returns:
+        The payload, without any gateway-issued web search item.
+    """
+    raw = payload.get("input")
+    if not isinstance(raw, list):
+        return payload
+    kept = [
+        entry
+        for entry in raw
+        if not (
+            isinstance(entry, dict)
+            and entry.get("type") == "web_search_call"
+            and isinstance(entry.get("id"), str)
+            and _GATEWAY_WEB_SEARCH_ITEM_ID.fullmatch(entry["id"])
+        )
+    ]
+    return payload if len(kept) == len(raw) else {**payload, "input": kept}
+
+
 def official_responses_probe(payload: JsonObject) -> JsonObject:
     """Return the copy of one Responses body the official SDK schema validates."""
     probe = dict(payload)
@@ -175,6 +216,20 @@ def official_responses_probe(payload: JsonObject) -> JsonObject:
                 item = {key: value for key, value in entry.items() if key != "phase"}
                 if item.get("id") is not None and "status" not in item:
                     item["status"] = "completed"
+                adapted.append(item)
+            elif isinstance(entry, dict) and entry.get("type") == "web_search_call":
+                # A replayed provider-executed web search item forwards
+                # byte-for-byte to the native Responses rung that authored it
+                # (every other rung refuses hosted items by name). The
+                # installed SDK enumerates only search / open_page /
+                # find_in_page actions, while Codex echoes others ("Invalid
+                # value for 'input.N.action.type'" on 55 requests, Sep 24 -
+                # Oct 6), so the probe sees an SDK-known action in place of an
+                # unknown one and still checks the item's structure.
+                item = dict(entry)
+                action = item.get("action")
+                if isinstance(action, dict) and action.get("type") not in _SDK_WEB_SEARCH_ACTIONS:
+                    item["action"] = {"type": "search", "query": ""}
                 adapted.append(item)
             elif isinstance(entry, dict) and entry.get("type") == "reasoning":
                 item = dict(entry)

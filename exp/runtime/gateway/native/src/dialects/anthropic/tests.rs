@@ -108,6 +108,31 @@ fn anthropic_output_only_delta_preserves_positive_cache_write_ttl() {
 }
 
 #[test]
+fn anthropic_delta_restating_the_write_total_keeps_the_start_ttl_split() {
+    for (delta_write, expected_hour) in [(5, Some(2)), (9, None)] {
+        let mut normalizer = Normalizer::new(Dialect::AnthropicMessages);
+        normalizer
+            .feed(&frame(serde_json::json!({
+                "type":"message_start","message":{"usage":{
+                    "input_tokens":13,"output_tokens":1,"cache_creation_input_tokens":5,
+                    "cache_creation":{"ephemeral_5m_input_tokens":3,"ephemeral_1h_input_tokens":2},
+                }},
+            })))
+            .unwrap();
+        normalizer
+            .feed(&frame(serde_json::json!({
+                "type":"message_delta","delta":{"stop_reason":"end_turn"},
+                "usage":{"input_tokens":13,"cache_creation_input_tokens":delta_write,
+                         "cache_read_input_tokens":0,"output_tokens":7},
+            })))
+            .unwrap();
+        let observed = normalizer.observed_usage().unwrap();
+        assert_eq!(observed.cache_creation_input_tokens, Some(delta_write));
+        assert_eq!(observed.cache_creation_1h_input_tokens, expected_hour);
+    }
+}
+
+#[test]
 fn anthropic_partial_usage_never_resets_or_invents_primary_counts() {
     for (start, delta, expected) in [
         (serde_json::json!({}), serde_json::json!({}), (None, None)),

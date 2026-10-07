@@ -5123,3 +5123,116 @@ def test_chat_output_limit_spellings_cannot_override_each_other(other: str) -> N
                 other: 256,
             }
         )
+
+
+def test_responses_web_search_sources_selector_is_honored() -> None:
+    """``web_search_call.action.sources`` decodes instead of refusing the request.
+
+    Big-AGI, litellm and pi send it whenever web search is on; refusing it
+    failed every such request (2026-09).
+    """
+    request = decode_responses(
+        {
+            "model": "coding",
+            "input": "hi",
+            "tools": [{"type": "web_search"}],
+            "include": ["web_search_call.action.sources", "reasoning.encrypted_content"],
+        }
+    ).request
+    assert request.include_web_search_sources is True
+    assert request.include_encrypted_reasoning is True
+    assert (
+        decode_responses({"model": "coding", "input": "hi"}).request.include_web_search_sources
+        is False
+    )
+
+
+@pytest.mark.parametrize(
+    "action",
+    [
+        {"type": "other"},
+        {"type": "find", "query": "weather"},
+        {"type": "search", "query": "weather"},
+        {"type": "find_in_page", "url": "https://example.com", "pattern": "rain"},
+    ],
+)
+def test_replayed_web_search_items_decode_whatever_their_action(action: JsonObject) -> None:
+    """A Codex history echoing its provider's web search item replays verbatim.
+
+    The SDK enumerates only search / open_page / find_in_page; Codex echoes
+    others, and the official probe refused them ("Invalid value for
+    'input.N.action.type'"), wedging every later turn of the session.
+    """
+    decoded = decode_responses(
+        {
+            "model": "coding",
+            "input": [
+                {"type": "message", "role": "user", "content": "look it up"},
+                {
+                    "type": "web_search_call",
+                    "id": "ws_1",
+                    "status": "completed",
+                    "action": action,
+                },
+                {"type": "message", "role": "user", "content": "thanks"},
+            ],
+        }
+    )
+    assert decoded.request.surface == GatewayApiSurface.RESPONSES
+
+
+def test_malformed_replayed_web_search_items_are_still_refused() -> None:
+    """Relaxing the action enum keeps the item's structural checks."""
+    with pytest.raises(OpenAIProtocolError):
+        decode_responses(
+            {
+                "model": "coding",
+                "input": [
+                    {"type": "message", "role": "user", "content": "look it up"},
+                    {"type": "web_search_call", "id": "ws_1", "action": {"type": "other"}},
+                ],
+            }
+        )
+
+
+def test_gateway_issued_web_search_items_are_dropped_on_replay() -> None:
+    """Codex echoes the gateway's own web_search_call item; no rung could take it.
+
+    It is dropped before validation, so the turn decodes on any route, while a
+    provider's own web_search_call (``ws_``) is kept for the native rung.
+    """
+    gateway_item = {
+        "type": "web_search_call",
+        "id": "wsgw_" + "a" * 32,
+        "status": "completed",
+        "action": {"type": "search", "query": "weather"},
+    }
+    provider_item = {**gateway_item, "id": "ws_provider"}
+    decoded = decode_responses(
+        {
+            "model": "coding",
+            "input": [
+                {"type": "message", "role": "user", "content": "look it up"},
+                gateway_item,
+                {"type": "message", "role": "user", "content": "thanks"},
+            ],
+        }
+    )
+    assert not any(
+        str((message.provider_native_item or {}).get("id", "")).startswith("wsgw_")
+        for message in decoded.request.messages
+    )
+    kept = decode_responses(
+        {
+            "model": "coding",
+            "input": [
+                {"type": "message", "role": "user", "content": "look it up"},
+                provider_item,
+                {"type": "message", "role": "user", "content": "thanks"},
+            ],
+        }
+    )
+    assert any(
+        (message.provider_native_item or {}).get("id") == "ws_provider"
+        for message in kept.request.messages
+    )
