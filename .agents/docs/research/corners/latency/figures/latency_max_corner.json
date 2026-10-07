@@ -1,0 +1,85 @@
+{
+  "corner": "latency-max",
+  "definition": "mountable config (candidate model x compression arm; routed configs join once the master's per-arm fits land) minimizing per-task p50 model seconds subject to a paired per-scenario reward delta vs the best measured config no worse than -floor",
+  "limitation": "offline mount choice, not per-query latency routing (no online latency term in knn_decision); DECISIONS.md 2026-07-27 three-corners entry",
+  "sweep": [
+    {
+      "quality_floor_pts_below_best": 2.0,
+      "best_config": "opus-5 @ identity",
+      "eligible_configs": 1,
+      "pick": {
+        "arm": "identity",
+        "model": "opus-5",
+        "n_scenarios": 5,
+        "n_scored": 10,
+        "n_unscored": 0,
+        "n_completed": 4,
+        "mean_reward": 0.55,
+        "success_rate": 0.4,
+        "cost_per_completed_usd": 0.44158875,
+        "provider_cost_usd": 1.766355,
+        "overhead_cost_usd": 0.0,
+        "p50_task_s": 42.50926360501035,
+        "p95_task_s": 81.40613184910399,
+        "p50_call_s": 3.8075710624980275,
+        "p95_call_s": 13.021179853646027,
+        "first_call_max_s": 12.606406708000577,
+        "mean_steps": 8.2,
+        "provenance": "wm_simulated"
+      },
+      "paired_delta_vs_best": null
+    },
+    {
+      "quality_floor_pts_below_best": 5.0,
+      "best_config": "opus-5 @ identity",
+      "eligible_configs": 2,
+      "pick": {
+        "arm": "identity",
+        "model": "opus-5",
+        "n_scenarios": 5,
+        "n_scored": 10,
+        "n_unscored": 0,
+        "n_completed": 4,
+        "mean_reward": 0.55,
+        "success_rate": 0.4,
+        "cost_per_completed_usd": 0.44158875,
+        "provider_cost_usd": 1.766355,
+        "overhead_cost_usd": 0.0,
+        "p50_task_s": 42.50926360501035,
+        "p95_task_s": 81.40613184910399,
+        "p50_call_s": 3.8075710624980275,
+        "p95_call_s": 13.021179853646027,
+        "first_call_max_s": 12.606406708000577,
+        "mean_steps": 8.2,
+        "provenance": "wm_simulated"
+      },
+      "paired_delta_vs_best": null
+    },
+    {
+      "quality_floor_pts_below_best": 10.0,
+      "best_config": "opus-5 @ identity",
+      "eligible_configs": 2,
+      "pick": {
+        "arm": "identity",
+        "model": "opus-5",
+        "n_scenarios": 5,
+        "n_scored": 10,
+        "n_unscored": 0,
+        "n_completed": 4,
+        "mean_reward": 0.55,
+        "success_rate": 0.4,
+        "cost_per_completed_usd": 0.44158875,
+        "provider_cost_usd": 1.766355,
+        "overhead_cost_usd": 0.0,
+        "p50_task_s": 42.50926360501035,
+        "p95_task_s": 81.40613184910399,
+        "p50_call_s": 3.8075710624980275,
+        "p95_call_s": 13.021179853646027,
+        "first_call_max_s": 12.606406708000577,
+        "mean_steps": 8.2,
+        "provenance": "wm_simulated"
+      },
+      "paired_delta_vs_best": null
+    }
+  ]
+}
