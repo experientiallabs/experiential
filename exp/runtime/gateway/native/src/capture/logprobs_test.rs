@@ -305,3 +305,42 @@ fn a_refusal_attributed_elsewhere_is_not_redialed() {
     replay.encrypted_reasoning_rejected = true;
     assert!(!may_be_refusal(&replay));
 }
+
+#[test]
+fn each_record_is_checked_by_its_own_representation() {
+    let frame = |records: serde_json::Value, text: &str| {
+        let mut probabilities = ChatProbabilities::Capture(Buffer::default());
+        probabilities.retain(
+            Some(&json!({ "content": records })),
+            0,
+            &FrameOutput {
+                content: text.into(),
+                refusal: String::new(),
+            },
+        );
+        probabilities.take().unwrap().1
+    };
+    // Mixed: bytes on the first, token text on the second.
+    assert!(!frame(
+        json!([
+            {"token":"a","logprob":-1.0,"bytes":[97],"top_logprobs":[]},
+            {"token":"b","logprob":-1.0,"bytes":null,"top_logprobs":[]}
+        ]),
+        "ab"
+    ));
+    // Bytes that contradict the token text are what count.
+    assert!(frame(
+        json!([
+            {"token":"a","logprob":-1.0,"bytes":[120],"top_logprobs":[]},
+            {"token":"b","logprob":-1.0,"bytes":null,"top_logprobs":[]}
+        ]),
+        "ab"
+    ));
+}
+
+#[test]
+fn off_and_caller_states_never_capture() {
+    assert!(!ChatProbabilities::Off.captures());
+    assert!(!ChatProbabilities::Caller.captures());
+    assert!(ChatProbabilities::Capture(Buffer::default()).captures());
+}

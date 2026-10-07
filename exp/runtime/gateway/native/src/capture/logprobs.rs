@@ -32,8 +32,8 @@ pub(crate) const MAXIMUM_HELD_LOGPROB_BYTES: usize = 64 * 1024;
 pub(crate) const RECORD_ENVELOPE_BYTES: usize = 16 * 1024;
 
 /// Probabilities describe the whole answer, so they are kept only beside a
-/// complete captured response: none, a truncated prefix or a stream the client
-/// left early drops them. A
+/// complete, successful captured response: none, a failed exchange, a
+/// truncated prefix or a stream the client left early drops them. A
 /// response still held as wire bytes is judged once delivery decodes it.
 /// Returns the bytes released from the entry's charge.
 pub(crate) fn align_with_response(record: &mut super::record::Record, wire_pending: bool) -> usize {
@@ -41,18 +41,37 @@ pub(crate) fn align_with_response(record: &mut super::record::Record, wire_pendi
         return 0;
     }
     let complete = match &record.response {
-        Some(super::record::Response::Json { .. }) => true,
+        Some(super::record::Response::Json { status, body, .. }) => {
+            (200..300).contains(status) && !reports_failure(body)
+        }
         Some(super::record::Response::Sse {
+            status,
+            frames,
             truncated,
             client_disconnected,
             ..
-        }) => !truncated && !client_disconnected,
+        }) => {
+            (200..300).contains(status)
+                && !truncated
+                && !client_disconnected
+                && !frames.iter().any(reports_failure)
+        }
         None => false,
     };
     if complete {
         return 0;
     }
     release(&mut record.provider_logprobs)
+}
+
+/// A protocol body or frame that reports a failure (an `error` object, or a
+/// Responses/Messages error or failed event) rather than an answer.
+fn reports_failure(value: &Value) -> bool {
+    value.get("error").is_some_and(|error| !error.is_null())
+        || matches!(
+            value.get("type").and_then(Value::as_str),
+            Some("error" | "response.failed")
+        )
 }
 
 /// Clear a sidecar and return the bytes charged for it, so the caller can
@@ -165,23 +184,17 @@ pub(crate) struct FrameOutput {
     pub refusal: String,
 }
 
-/// Whether a channel's records reproduce exactly the text it emitted: by
-/// their bytes when every record carries them, else by their token text.
+/// Whether a channel's records reproduce exactly the text it emitted, each
+/// record by its bytes when it carries them and by its token text otherwise.
 fn reproduces(records: Option<&Vec<TokenLogprob>>, text: &str) -> bool {
-    let records = records.map_or(&[][..], Vec::as_slice);
-    if records.iter().all(|record| record.bytes.is_some()) {
-        let bytes: Vec<u8> = records
-            .iter()
-            .flat_map(|record| record.bytes.clone().unwrap_or_default())
-            .collect();
-        bytes == text.as_bytes()
-    } else {
-        records
-            .iter()
-            .map(|record| record.token.as_str())
-            .collect::<String>()
-            == text
+    let mut produced = Vec::with_capacity(text.len());
+    for record in records.map_or(&[][..], Vec::as_slice) {
+        match &record.bytes {
+            Some(bytes) => produced.extend_from_slice(bytes),
+            None => produced.extend_from_slice(record.token.as_bytes()),
+        }
     }
+    produced == text.as_bytes()
 }
 
 /// Whether the frame has any records, and whether they cover every channel's
@@ -218,6 +231,12 @@ impl ChatProbabilities {
 
     pub(crate) fn requested_by_caller(&self) -> bool {
         matches!(self, Self::Caller)
+    }
+
+    /// Whether capture-only probabilities are being retained (the decoder does
+    /// no per-frame work for them otherwise).
+    pub(crate) fn captures(&self) -> bool {
+        matches!(self, Self::Capture(_))
     }
 
     /// Retain a capture-only choice channel. A frame that carries output text

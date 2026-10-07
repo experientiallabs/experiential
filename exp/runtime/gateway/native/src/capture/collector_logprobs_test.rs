@@ -195,3 +195,36 @@ fn a_stream_the_client_left_early_drops_its_probabilities() {
     let records = drain(&collector, receiver);
     assert!(records[0].provider_logprobs.is_none());
 }
+
+#[test]
+fn a_failed_exchange_drops_its_probabilities() {
+    for failed in [
+        Response::Json {
+            status: 400,
+            body: json!({"error": {"message": "bad"}}),
+            source_json: None,
+        },
+        Response::Json {
+            status: 200,
+            body: json!({"error": {"message": "late"}}),
+            source_json: None,
+        },
+        Response::Sse {
+            status: 200,
+            frames: vec![json!({"choices":[]}), json!({"error": {"message": "late"}})],
+            truncated: false,
+            client_disconnected: false,
+            source_json: None,
+        },
+    ] {
+        let (collector, receiver) = collector(logprobs_config());
+        assert!(collector.begin(request("failed")));
+        assert!(collector.wants_logprobs("failed"));
+        collector.logprobs_injected("failed");
+        collector.logprobs("failed", vec![probability("a")], false);
+        collector.settle("failed", true, true);
+        assert!(collector.finish("failed", Some(failed), Some("d".into())));
+        let records = drain(&collector, receiver);
+        assert!(records[0].provider_logprobs.is_none());
+    }
+}

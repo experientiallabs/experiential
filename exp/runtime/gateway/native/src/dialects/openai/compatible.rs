@@ -232,7 +232,7 @@ impl Normalizer {
             {
                 events.push(Event::ChoiceLogprobsDelta(event));
             }
-        } else {
+        } else if self.chat_logprobs.captures() {
             // Capture-only probabilities never fail or shape the caller's answer.
             // Answer text per channel: typed thinking or reference parts carry none.
             let text = |key: &str| -> String {
