@@ -20,15 +20,19 @@ from exp.runtime.gateway.contracts import GatewayApiSurface, GatewayMessage, Gat
 def test_responses_only_fields_are_refused_on_other_surfaces(field: str, value: object) -> None:
     """Each Responses-only field names itself when set on another surface."""
     with pytest.raises(ValidationError, match=f"{field} is valid only for Responses requests"):
-        GatewayRequest(
-            surface=GatewayApiSurface.CHAT_COMPLETIONS,
-            messages=(GatewayMessage(role="user", content="hi"),),
-            **{field: value},
+        GatewayRequest.model_validate(
+            {
+                "surface": GatewayApiSurface.CHAT_COMPLETIONS,
+                "messages": (GatewayMessage(role="user", content="hi"),),
+                field: value,
+            }
         )
-    GatewayRequest(
-        surface=GatewayApiSurface.RESPONSES,
-        messages=(GatewayMessage(role="user", content="hi"),),
-        **{field: value},
+    GatewayRequest.model_validate(
+        {
+            "surface": GatewayApiSurface.RESPONSES,
+            "messages": (GatewayMessage(role="user", content="hi"),),
+            field: value,
+        }
     )
 
 
