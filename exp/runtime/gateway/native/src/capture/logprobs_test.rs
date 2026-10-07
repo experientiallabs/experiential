@@ -117,8 +117,13 @@ fn a_malformed_channel_marks_the_retained_prefix_truncated() {
     probabilities.retain(
         Some(&json!({"content":[{"token":"a","logprob":-1.0,"bytes":null,"top_logprobs":[]}]})),
         0,
+        true,
     );
-    probabilities.retain(Some(&json!({"content":[{"token":"b","logprob":"bad"}]})), 0);
+    probabilities.retain(
+        Some(&json!({"content":[{"token":"b","logprob":"bad"}]})),
+        0,
+        true,
+    );
     let (taken, truncated) = probabilities.take().unwrap();
     assert_eq!(taken.len(), 1);
     assert!(truncated);
@@ -136,4 +141,17 @@ fn rung_identity_separates_connections_without_keeping_header_values() {
     wire.headers
         .insert("authorization".into(), "Bearer two".into());
     assert_ne!(rung_key(&wire), first);
+}
+
+#[test]
+fn an_output_frame_without_probabilities_marks_the_sequence_incomplete() {
+    for missing in [None, Some(json!(null)), Some(json!({"content": []}))] {
+        let mut probabilities = ChatProbabilities::Capture(Buffer::default());
+        probabilities.retain(missing.as_ref(), 0, true);
+        assert!(probabilities.take().unwrap().1);
+    }
+    // A frame with no output text (role, finish, usage) leaves it complete.
+    let mut probabilities = ChatProbabilities::Capture(Buffer::default());
+    probabilities.retain(None, 0, false);
+    assert!(!probabilities.take().unwrap().1);
 }

@@ -234,8 +234,17 @@ impl Normalizer {
             }
         } else {
             // Capture-only probabilities never fail or shape the caller's answer.
+            let output = choice.get("delta").is_some_and(|delta| {
+                ["content", "refusal"]
+                    .iter()
+                    .any(|key| match delta.get(*key) {
+                        Some(Value::String(text)) => !text.is_empty(),
+                        Some(Value::Array(parts)) => !parts.is_empty(),
+                        _ => false,
+                    })
+            });
             self.chat_logprobs
-                .retain(choice.get("logprobs"), choice_index as u32);
+                .retain(choice.get("logprobs"), choice_index as u32, output);
         }
         // Azure asynchronous content-filter annotations carry no delta. Treat
         // their metadata-only choice as an empty delta, then still process the

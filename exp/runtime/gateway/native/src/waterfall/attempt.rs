@@ -186,9 +186,6 @@ pub(super) async fn run_attempt(
             first_token_deadline = Instant::now() + first_token_allowance_for();
             continue 'dial;
         }
-        if refusal_unconfirmed && opened.is_ok() {
-            crate::capture::logprobs::remember_refusal(&crate::capture::logprobs::rung_key(wire));
-        }
         let response = match opened {
             Ok(response) => response,
             Err(failure) => {
@@ -298,6 +295,7 @@ pub(super) async fn run_attempt(
                     {
                         inject = false;
                         refusal_unconfirmed = true;
+                        guard.forget_discarded_dial();
                         first_byte_deadline = Instant::now() + first_byte_allowance_for();
                         first_token_deadline = Instant::now() + first_token_allowance_for();
                         continue 'dial;
@@ -313,6 +311,14 @@ pub(super) async fn run_attempt(
                     };
                 }
             };
+            if refusal_unconfirmed && !matches!(event, Event::Failed(_)) {
+                // The plain dial produced something other than the same
+                // refusal: the injected field was what the rung refused.
+                refusal_unconfirmed = false;
+                crate::capture::logprobs::remember_refusal(&crate::capture::logprobs::rung_key(
+                    wire,
+                ));
+            }
             track_event(&event, &mut usage, &mut tool_names);
             guard.record_first_token(relay.first_token_at());
             if private_reasoning.withhold(&event, wire.reasoning_output_exposed) {
@@ -402,6 +408,7 @@ pub(super) async fn run_attempt(
                     {
                         inject = false;
                         refusal_unconfirmed = true;
+                        guard.forget_discarded_dial();
                         first_byte_deadline = Instant::now() + first_byte_allowance_for();
                         first_token_deadline = Instant::now() + first_token_allowance_for();
                         continue 'dial;

@@ -273,7 +273,11 @@ impl<R: Serialize> Record<R> {
         record.serialize_field("gemini_thought_parts", &parts)?;
         record.serialize_field("gemini_thought_parts_source_json", &parts_source)?;
         record.serialize_field("captured_at", &self.captured_at)?;
-        if let Some(logprobs) = &self.provider_logprobs {
+        if let Some(logprobs) = self
+            .provider_logprobs
+            .as_ref()
+            .filter(|l| l.logprobs_injected)
+        {
             record.serialize_field("provider_logprobs", logprobs)?;
         }
         record.end()

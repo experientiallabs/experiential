@@ -211,6 +211,10 @@ fn expire_pending(pending: &mut Pending, skipped: &AtomicU64) {
     });
 }
 
+// Capture-only token probabilities (`super::logprobs`), kept beside the collector.
+#[path = "collector_logprobs.rs"]
+mod logprobs_sidecar;
+
 pub(crate) struct Collector {
     pub config: Configuration,
     delivery: Delivery,
@@ -696,15 +700,6 @@ impl Collector {
     /// Append only authorized winning-rung reasoning, charging allocated capacity.
     /// Overflow excludes the exchange instead of silently publishing partial evidence.
     /// Whether reasoning the caller did not see is retained.
-    /// Whether gateway-requested probabilities apply to this admitted request.
-    pub(crate) fn wants_logprobs(&self, request_id: &str) -> bool {
-        self.config.capture_logprobs
-            && self
-                .pending
-                .lock()
-                .is_ok_and(|pending| pending.entries.contains_key(request_id))
-    }
-
     pub(crate) fn captures_hidden_reasoning(&self) -> bool {
         self.config.capture_hidden_reasoning
     }
@@ -755,62 +750,6 @@ impl Collector {
         text.push_str(delta);
         pending.bytes += entry.map_bytes();
         pending.entries.insert(request_id.to_owned(), entry);
-    }
-
-    pub(crate) fn logprobs_injected(&self, request_id: &str) {
-        let Ok(mut pending) = self.pending.lock() else {
-            return;
-        };
-        self.expire(&mut pending);
-        let bytes = super::logprobs::Captured::injected().heap_bytes();
-        let full = self.retained_bytes(&pending) + bytes > self.config.maximum_pending_bytes;
-        let Some(entry) = pending.entries.get_mut(request_id) else {
-            return;
-        };
-        if entry.record.provider_logprobs.is_none() && !full {
-            entry.record.provider_logprobs = Some(super::logprobs::Captured::injected());
-            entry.bytes += bytes;
-            pending.bytes += bytes;
-        }
-    }
-
-    /// Append capture-only probabilities; an overflow truncates them, never the exchange.
-    pub(crate) fn logprobs(
-        &self,
-        request_id: &str,
-        deltas: Vec<crate::logprobs::ChoiceLogprobsDelta>,
-        truncated: bool,
-    ) {
-        if deltas.is_empty() && !truncated {
-            return;
-        }
-        let Ok(mut pending) = self.pending.lock() else {
-            return;
-        };
-        self.expire(&mut pending);
-        let retained = self.retained_bytes(&pending);
-        let maximum_pending = self.config.maximum_pending_bytes;
-        let maximum_response = self.config.maximum_response_bytes;
-        let Some(entry) = pending.entries.get_mut(request_id) else {
-            return;
-        };
-        let record_room = super::logprobs::record_room(
-            self.config.delivery.maximum_record_bytes,
-            entry.request_bytes,
-            maximum_response,
-        );
-        let Some(captured) = entry.record.provider_logprobs.as_mut() else {
-            return;
-        };
-        let already = captured.bytes;
-        let added = captured.extend(deltas, truncated, |extra| {
-            let total = already.saturating_add(extra);
-            total <= maximum_response
-                && total <= record_room
-                && retained.saturating_add(extra) <= maximum_pending
-        });
-        entry.bytes += added;
-        pending.bytes += added;
     }
 
     /// Share bounded provider parts without JSON encoding or copying their content.

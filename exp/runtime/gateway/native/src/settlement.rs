@@ -382,6 +382,15 @@ impl AttemptGuard {
 
     /// Record the allowlisted rate-limit headers of the active attempt's
     /// opened provider response, for settlement.
+    /// Forget an opened dial the attempt discarded (a capture-only probability
+    /// refusal re-dialed plain): its open, first token and headers are not the
+    /// attempt's. Dispatch stays marked; the attempt still holds its reservation.
+    pub(crate) fn forget_discarded_dial(&mut self) {
+        self.opened = false;
+        self.first_token_at = None;
+        self.rate_limit_headers = None;
+    }
+
     pub fn record_rate_limit_headers(&mut self, headers: Option<serde_json::Map<String, Value>>) {
         self.rate_limit_headers = headers;
     }

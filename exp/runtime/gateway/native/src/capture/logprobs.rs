@@ -137,6 +137,19 @@ pub(crate) fn may_be_refusal(failure: &Failure) -> bool {
     )
 }
 
+fn has_records(delta: &ChoiceLogprobsDelta) -> bool {
+    delta.logprobs.as_ref().is_some_and(|logprobs| {
+        logprobs
+            .content
+            .as_ref()
+            .is_some_and(|records| !records.is_empty())
+            || logprobs
+                .refusal
+                .as_ref()
+                .is_some_and(|records| !records.is_empty())
+    })
+}
+
 /// How a normalizer treats Chat probabilities on its wire.
 #[derive(Debug, Default)]
 pub(crate) enum ChatProbabilities {
@@ -162,14 +175,15 @@ impl ChatProbabilities {
         matches!(self, Self::Caller)
     }
 
-    /// Retain a capture-only choice channel; malformed or null channels are dropped.
-    pub(crate) fn retain(&mut self, value: Option<&Value>, choice_index: u32) {
+    /// Retain a capture-only choice channel. A frame that carries output text
+    /// but no usable probabilities, or a malformed channel, leaves a hole: the
+    /// prefix is kept and marked incomplete.
+    pub(crate) fn retain(&mut self, value: Option<&Value>, choice_index: u32, output: bool) {
         if let Self::Capture(buffer) = self {
             match crate::logprobs::parse(value, choice_index) {
-                Ok(Some(delta)) if delta.logprobs.is_some() => buffer.push(delta),
+                Ok(Some(delta)) if has_records(&delta) => buffer.push(delta),
+                Ok(_) if output => buffer.truncated = true,
                 Ok(_) => {}
-                // A malformed channel leaves a hole: keep the prefix and mark it
-                // incomplete so the record never presents a gapped sequence.
                 Err(_) => buffer.truncated = true,
             }
         }
@@ -286,6 +300,7 @@ pub(crate) struct Captured {
 }
 
 impl Captured {
+    #[cfg(test)]
     pub(crate) fn injected() -> Self {
         Self {
             logprobs_injected: true,
