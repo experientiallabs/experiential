@@ -90,7 +90,9 @@ keeps the exchange. A token text carrying NUL is stored with U+FFFD and flags
 channel, or a frame whose answer text (not typed thinking or reference parts)
 its records do not reproduce exactly (by their bytes, else their token text),
 is never a
-failure: it ends retention there and marks the prefix `truncated`. The record's
+failure: it ends retention before that frame and marks the prefix `truncated`.
+Refusal text is not rendered on every surface, so a refusal frame ends
+retention the same way. The record's
 sidecar is reserved when injection is decided, so a dial is injected only when
 its probabilities have room; a reserved sidecar that is never used is not
 serialized. Probabilities are retained only from a

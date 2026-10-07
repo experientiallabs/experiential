@@ -232,3 +232,11 @@ def test_capture_eligibility_respects_qualified_reasoning_efforts() -> None:
         replace(profile, logprobs_reasoning_efforts=("low",)),
         request.model_copy(update={"reasoning_effort": "none"}),
     )
+
+
+def test_capture_eligibility_honors_the_callers_explicit_false() -> None:
+    """A cleared ``logprobs: false`` on the rung request still declines via the caller's."""
+    rung_request = _chat_request()
+    caller = rung_request.model_copy(update={"logprobs": False})
+    assert capture_logprobs_eligible(_profile(), rung_request)
+    assert not capture_logprobs_eligible(_profile(), rung_request, caller=caller)

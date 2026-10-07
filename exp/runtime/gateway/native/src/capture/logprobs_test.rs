@@ -215,8 +215,9 @@ fn records_on_the_wrong_channel_mark_the_sequence_incomplete() {
             refusal: String::new(),
         },
     );
+    // The misaligned frame is never retained; retention ends before it.
     let (taken, truncated) = probabilities.take().unwrap();
-    assert_eq!(taken.len(), 1);
+    assert!(taken.is_empty());
     assert!(truncated);
 }
 
@@ -264,4 +265,30 @@ fn a_held_batch_that_ends_in_a_hole_keeps_its_prefix() {
     held.forward(Some((vec![delta("a")], true)), None);
     assert_eq!(held.pending.len(), 1);
     assert!(held.truncated);
+}
+
+#[test]
+fn misaligned_and_refusal_frames_end_retention_without_entering_it() {
+    let one =
+        |token: &str| json!({"token": token, "logprob": -1.0, "bytes": null, "top_logprobs": []});
+    let mut probabilities = ChatProbabilities::Capture(Buffer::default());
+    let output = |content: &str, refusal: &str| FrameOutput {
+        content: content.into(),
+        refusal: refusal.into(),
+    };
+    probabilities.retain(Some(&json!({"content":[one("a")]})), 0, &output("a", ""));
+    // Records spelling more than the frame emitted are not retained.
+    probabilities.retain(
+        Some(&json!({"content":[one("b"), one("c")]})),
+        0,
+        &output("b", ""),
+    );
+    let (taken, truncated) = probabilities.take().unwrap();
+    assert_eq!(taken.len(), 1);
+    assert!(truncated);
+    let mut probabilities = ChatProbabilities::Capture(Buffer::default());
+    probabilities.retain(Some(&json!({"refusal":[one("no")]})), 0, &output("", "no"));
+    let (taken, truncated) = probabilities.take().unwrap();
+    assert!(taken.is_empty());
+    assert!(truncated);
 }

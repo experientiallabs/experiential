@@ -180,7 +180,7 @@ def build_rung_dispatch(
         throttle_redial_budget=throttle_redial_budget,
         native_tool_translation=rung_request.native_tool_translation,
         zdr_constrained=zdr_constrained,
-        capture_logprobs=capture_logprobs_eligible(profile, rung_request),
+        capture_logprobs=capture_logprobs_eligible(profile, rung_request, caller=public_request),
     )
     binding = (
         None

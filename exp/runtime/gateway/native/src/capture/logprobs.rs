@@ -225,13 +225,16 @@ impl ChatProbabilities {
     ) {
         if let Self::Capture(buffer) = self {
             match crate::logprobs::parse(value, choice_index) {
-                Ok(Some(delta)) => {
-                    let (any, complete) = covers(&delta, output);
-                    if any {
-                        buffer.push(delta);
-                    }
-                    buffer.truncated |= !complete;
-                }
+                // A frame enters the record only when it is aligned with the
+                // captured answer; otherwise retention ends before it. Refusal
+                // text is not rendered on every surface (Messages drops it), so
+                // a refusal frame always ends retention.
+                Ok(Some(delta)) if output.refusal.is_empty() => match covers(&delta, output) {
+                    (true, true) => buffer.push(delta),
+                    (false, true) => {}
+                    (_, false) => buffer.truncated = true,
+                },
+                Ok(Some(_)) => buffer.truncated = true,
                 Ok(None) => {
                     buffer.truncated |= !output.content.is_empty() || !output.refusal.is_empty();
                 }
