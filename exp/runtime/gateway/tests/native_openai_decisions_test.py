@@ -21,6 +21,7 @@ import time
 from collections.abc import Iterator
 from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 
 import httpx
 import pytest
@@ -31,6 +32,7 @@ from exp.common.models import (
     GatewayDeploymentCapabilities,
     GatewayTokenPrices,
     ModelCapabilities,
+    NormalizedGatewayCatalog,
 )
 from exp.common.models.gateway_pools import GatewayEquivalenceCertification
 from exp.runtime.gateway.budgets import BudgetScope, BudgetScopeKind, SQLiteBudgetStore
@@ -186,10 +188,10 @@ class _DecisionsUpstream(BaseHTTPRequestHandler):
         del format, args
 
 
-def _deployment(root: object, alias: str, wire_model: str) -> tuple[object, object]:
+def _deployment(root: Path, alias: str, wire_model: str) -> tuple[NormalizedGatewayCatalog, Path]:
     """Register one OpenAI decisions deployment priced input-only."""
     normalized, snapshot, _changed = upsert_singleton_deployment(
-        root,  # type: ignore[arg-type]
+        root,
         deployment_alias=alias,
         connection_name="openai-loopback",
         provider_model=wire_model,
@@ -237,8 +239,8 @@ def _engine(tmp_path_factory: pytest.TempPathFactory) -> Iterator[_ServingEngine
         alias_name="luna-decisions",
         revision_id="revision-luna",
         pool_id="luna-decisions",
-        snapshot_ref=f"catalog-snapshots/{snapshot.name}",  # type: ignore[attr-defined]
-        catalog_sha256=normalized.identity_sha256(),  # type: ignore[attr-defined]
+        snapshot_ref=f"catalog-snapshots/{snapshot.name}",
+        catalog_sha256=normalized.identity_sha256(),
     )
     manager.add_grant(identity_id="default", alias_id="luna-decisions")
     _deployment(root, "auth-primary", "gpt-6-luna")
@@ -254,7 +256,7 @@ def _engine(tmp_path_factory: pytest.TempPathFactory) -> Iterator[_ServingEngine
             evidence_sha256="c" * 64,
             certified_at=datetime.now(UTC),
         ),
-        expected_catalog_sha256=normalized.identity_sha256(),  # type: ignore[attr-defined]
+        expected_catalog_sha256=normalized.identity_sha256(),
         replace=False,
     )
     manager.activate_direct_alias(
