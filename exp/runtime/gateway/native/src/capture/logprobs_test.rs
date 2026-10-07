@@ -117,12 +117,18 @@ fn a_malformed_channel_marks_the_retained_prefix_truncated() {
     probabilities.retain(
         Some(&json!({"content":[{"token":"a","logprob":-1.0,"bytes":null,"top_logprobs":[]}]})),
         0,
-        true,
+        FrameOutput {
+            content: true,
+            refusal: false,
+        },
     );
     probabilities.retain(
         Some(&json!({"content":[{"token":"b","logprob":"bad"}]})),
         0,
-        true,
+        FrameOutput {
+            content: true,
+            refusal: false,
+        },
     );
     let (taken, truncated) = probabilities.take().unwrap();
     assert_eq!(taken.len(), 1);
@@ -147,12 +153,19 @@ fn rung_identity_separates_connections_without_keeping_header_values() {
 fn an_output_frame_without_probabilities_marks_the_sequence_incomplete() {
     for missing in [None, Some(json!(null)), Some(json!({"content": []}))] {
         let mut probabilities = ChatProbabilities::Capture(Buffer::default());
-        probabilities.retain(missing.as_ref(), 0, true);
+        probabilities.retain(
+            missing.as_ref(),
+            0,
+            FrameOutput {
+                content: true,
+                refusal: false,
+            },
+        );
         assert!(probabilities.take().unwrap().1);
     }
     // A frame with no output text (role, finish, usage) leaves it complete.
     let mut probabilities = ChatProbabilities::Capture(Buffer::default());
-    probabilities.retain(None, 0, false);
+    probabilities.retain(None, 0, FrameOutput::default());
     assert!(!probabilities.take().unwrap().1);
 }
 
@@ -189,4 +202,32 @@ fn only_a_route_with_an_injectable_rung_reserves_a_sidecar() {
     assert!(route_may_inject(std::slice::from_ref(&eligible)));
     remember_refusal(&rung_key(&eligible));
     assert!(!route_may_inject(&[eligible]));
+}
+
+#[test]
+fn records_on_the_wrong_channel_mark_the_sequence_incomplete() {
+    let mut probabilities = ChatProbabilities::Capture(Buffer::default());
+    probabilities.retain(
+        Some(&json!({"refusal":[{"token":"no","logprob":-1.0,"bytes":null,"top_logprobs":[]}]})),
+        0,
+        FrameOutput {
+            content: true,
+            refusal: false,
+        },
+    );
+    let (taken, truncated) = probabilities.take().unwrap();
+    assert_eq!(taken.len(), 1);
+    assert!(truncated);
+}
+
+#[test]
+fn a_relay_holds_only_a_bounded_prefix_before_its_attempt_wins() {
+    let mut held = Held::default();
+    let size = delta("a").retained_bytes();
+    let many: Vec<_> = (0..MAXIMUM_HELD_LOGPROB_BYTES / size + 4)
+        .map(|_| delta("a"))
+        .collect();
+    held.forward(Some((many, false)), None);
+    assert!(held.pending.len() <= MAXIMUM_HELD_LOGPROB_BYTES / size);
+    assert!(held.truncated);
 }

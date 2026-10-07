@@ -234,13 +234,14 @@ impl Normalizer {
             }
         } else {
             // Capture-only probabilities never fail or shape the caller's answer.
-            let output = choice.get("delta").is_some_and(|delta| {
-                ["content", "refusal"]
-                    .iter()
-                    .any(|key| match delta.get(*key) {
-                        Some(Value::String(text)) => !text.is_empty(),
-                        // Answer text only: typed thinking or reference parts carry none.
-                        Some(Value::Array(parts)) => parts.iter().any(|part| {
+            // Answer text per channel: typed thinking or reference parts carry none.
+            let text = |key: &str| {
+                choice
+                    .get("delta")
+                    .and_then(|delta| delta.get(key))
+                    .is_some_and(|value| match value {
+                        Value::String(text) => !text.is_empty(),
+                        Value::Array(parts) => parts.iter().any(|part| {
                             part.get("type").and_then(Value::as_str) == Some("text")
                                 && part
                                     .get("text")
@@ -249,7 +250,11 @@ impl Normalizer {
                         }),
                         _ => false,
                     })
-            });
+            };
+            let output = crate::capture::logprobs::FrameOutput {
+                content: text("content"),
+                refusal: text("refusal"),
+            };
             self.chat_logprobs
                 .retain(choice.get("logprobs"), choice_index as u32, output);
         }

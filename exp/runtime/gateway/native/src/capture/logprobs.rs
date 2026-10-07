@@ -22,6 +22,11 @@ use crate::logprobs::{ChoiceLogprobsDelta, TokenLogprob};
 /// buffer stops growing and the capture record says it was truncated.
 pub(crate) const MAXIMUM_CAPTURED_LOGPROB_BYTES: usize = 4 * 1024 * 1024;
 
+/// Bound on probabilities a relay holds before its attempt wins: commitment
+/// normally follows the first text frame, so only a short withheld prefix
+/// (refusal failover, metadata) can accumulate here, outside the collector.
+pub(crate) const MAXIMUM_HELD_LOGPROB_BYTES: usize = 64 * 1024;
+
 /// Room left for the record's request scope, metrics and keys when sizing
 /// retained probabilities against the destination's record ceiling.
 pub(crate) const RECORD_ENVELOPE_BYTES: usize = 16 * 1024;
@@ -147,17 +152,26 @@ pub(crate) fn may_be_refusal(failure: &Failure) -> bool {
     )
 }
 
-fn has_records(delta: &ChoiceLogprobsDelta) -> bool {
-    delta.logprobs.as_ref().is_some_and(|logprobs| {
-        logprobs
-            .content
-            .as_ref()
-            .is_some_and(|records| !records.is_empty())
-            || logprobs
-                .refusal
-                .as_ref()
-                .is_some_and(|records| !records.is_empty())
-    })
+/// Which channels of one frame carry answer text.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct FrameOutput {
+    pub content: bool,
+    pub refusal: bool,
+}
+
+/// Records per channel; a frame is complete only when every channel that
+/// carries text also carries records (and some record exists at all).
+fn covers(delta: &ChoiceLogprobsDelta, output: FrameOutput) -> (bool, bool) {
+    let filled = |records: Option<&Vec<TokenLogprob>>| records.is_some_and(|r| !r.is_empty());
+    let (content, refusal) = delta.logprobs.as_ref().map_or((false, false), |logprobs| {
+        (
+            filled(logprobs.content.as_ref()),
+            filled(logprobs.refusal.as_ref()),
+        )
+    });
+    let any = content || refusal;
+    let complete = (!output.content || content) && (!output.refusal || refusal);
+    (any, complete)
 }
 
 /// How a normalizer treats Chat probabilities on its wire.
@@ -188,12 +202,17 @@ impl ChatProbabilities {
     /// Retain a capture-only choice channel. A frame that carries output text
     /// but no usable probabilities, or a malformed channel, leaves a hole: the
     /// prefix is kept and marked incomplete.
-    pub(crate) fn retain(&mut self, value: Option<&Value>, choice_index: u32, output: bool) {
+    pub(crate) fn retain(&mut self, value: Option<&Value>, choice_index: u32, output: FrameOutput) {
         if let Self::Capture(buffer) = self {
             match crate::logprobs::parse(value, choice_index) {
-                Ok(Some(delta)) if has_records(&delta) => buffer.push(delta),
-                Ok(_) if output => buffer.truncated = true,
-                Ok(_) => {}
+                Ok(Some(delta)) => {
+                    let (any, complete) = covers(&delta, output);
+                    if any {
+                        buffer.push(delta);
+                    }
+                    buffer.truncated |= !complete;
+                }
+                Ok(None) => buffer.truncated |= output.content || output.refusal,
                 Err(_) => buffer.truncated = true,
             }
         }
@@ -213,6 +232,7 @@ impl ChatProbabilities {
 pub(crate) struct Held {
     pub injected: bool,
     pub pending: Vec<ChoiceLogprobsDelta>,
+    pending_bytes: usize,
     truncated: bool,
 }
 
@@ -229,7 +249,21 @@ impl Held {
         self.truncated |= truncated;
         match observer {
             Some(observer) => observer.logprobs(deltas, self.truncated),
-            None => self.pending.extend(deltas),
+            None => {
+                // Held outside the collector's budget until the winner attaches,
+                // so the hold has its own small bound; beyond it, truncate.
+                for delta in deltas {
+                    let bytes = delta.retained_bytes();
+                    if self.truncated
+                        || self.pending_bytes.saturating_add(bytes) > MAXIMUM_HELD_LOGPROB_BYTES
+                    {
+                        self.truncated = true;
+                        break;
+                    }
+                    self.pending_bytes += bytes;
+                    self.pending.push(delta);
+                }
+            }
         }
     }
 
