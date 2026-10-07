@@ -15,3 +15,6 @@ dist/
 
 # Local-only design notes; not committed.
 DESIGN.md
+
+# Local-only demo scratch (recordings, scripts, planning notes); not committed.
+demos/
