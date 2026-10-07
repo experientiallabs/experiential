@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Never
+
 import pytest
 
 from exp.common.core.artifacts import canonical_json_bytes
@@ -12,6 +14,7 @@ from exp.runtime.gateway.contracts import (
     GatewayRequest,
     GatewayToolDefinition,
 )
+from exp.runtime.gateway.guardrails import contracts
 from exp.runtime.gateway.guardrails.contracts import (
     GuardrailAction,
     GuardrailCapabilityKind,
@@ -21,7 +24,9 @@ from exp.runtime.gateway.guardrails.contracts import (
     GuardrailPolicy,
     GuardrailToolCall,
     request_content_bytes,
+    request_exceeds_inspection_limit,
 )
+from exp.runtime.gateway.guardrails.subjects import observation_subject_bytes
 
 
 def _check(
@@ -191,6 +196,50 @@ def test_request_content_bytes_count_the_compact_json_subject() -> None:
     assert request_content_bytes(request) == len(canonical_json_bytes(request))
     assert request_content_bytes(request) > len("hi") + len('{"q":"ab"}')
     assert completion.content_bytes() == len(canonical_json_bytes(completion))
+
+
+@pytest.mark.parametrize("text", ["benign", "\x00" * 30, "\U0001f642" * 30])
+def test_inspection_bound_counts_private_context_at_its_exact_encoded_size(text: str) -> None:
+    """The shared bound counts hidden carriers and JSON/UTF-8 expansion without changing HTTP."""
+    request = GatewayRequest(
+        surface=GatewayApiSurface.MESSAGES,
+        messages=(GatewayMessage(role="user", content="hi"),),
+        tools=(
+            GatewayToolDefinition(
+                name="lookup",
+                parameters={},
+                input_examples=({"nested": [text, None, True, 4]},),
+                allowed_callers=(text,),
+            ),
+        ),
+    )
+    complete_size = len(observation_subject_bytes(request))
+    assert request_content_bytes(request) == len(canonical_json_bytes(request))
+    assert request_content_bytes(request) < complete_size
+    assert not request_exceeds_inspection_limit(request, complete_size)
+    assert request_exceeds_inspection_limit(request, complete_size - 1)
+
+
+def test_oversized_private_context_is_rejected_before_encoding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An attacker-sized private example cannot allocate an encoded copy during admission."""
+    request = GatewayRequest(
+        surface=GatewayApiSurface.MESSAGES,
+        messages=(GatewayMessage(role="user", content="hi"),),
+        tools=(
+            GatewayToolDefinition(
+                name="lookup", parameters={}, input_examples=({"private": "x" * 65_536},)
+            ),
+        ),
+    )
+
+    def forbidden_encoding(_request: GatewayRequest) -> Never:
+        """Fail if the early character bound permits a large private allocation."""
+        raise AssertionError("oversized private context reached encoding")
+
+    monkeypatch.setattr(contracts, "observation_subject_bytes", forbidden_encoding)
+    assert request_exceeds_inspection_limit(request, 4096)
 
 
 @pytest.mark.parametrize("length", [257, 65_536])

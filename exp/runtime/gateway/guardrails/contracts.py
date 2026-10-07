@@ -17,6 +17,10 @@ from exp.runtime.gateway.contracts import (
     IdentityId,
     OrganizationId,
 )
+from exp.runtime.gateway.guardrails.subjects import (
+    observation_subject_bytes,
+    observation_subject_exceeds,
+)
 
 DEFAULT_MAX_REQUEST_BYTES = 1_048_576
 DEFAULT_MAX_RESPONSE_BYTES = 1_048_576
@@ -116,7 +120,7 @@ class GuardrailPolicy(ContractModel):
         mode: Enforce by default, or observe read-only input checks without gating delivery.
         protected: Fail closed on classifier uncertainty; required for platform policies.
         checks: Ordered checks, empty by default.
-        max_request_bytes: Total canonical input inspection bound, default 1 MiB.
+        max_request_bytes: Complete in-memory input inspection bound, default 1 MiB.
         max_response_bytes: Total canonical output inspection bound, default 1 MiB.
     """
 
@@ -274,9 +278,10 @@ class GuardrailRejected(Exception):
 def request_content_bytes(request: GatewayRequest) -> int:
     """Return UTF-8 size of the compact JSON request subject sent to classifiers.
 
-    The bound is the exact deterministic serialization used as the ``request``
+    This count is the exact deterministic serialization used as the ``request``
     subject on the ``http_json`` contract: every canonical field, including
-    messages, tool definitions, structured schemas, and metadata.
+    messages, tool definitions, structured schemas, and metadata. Inspection
+    admission separately bounds the complete in-memory subject, including exclusions.
 
     Args:
         request: Canonical request after optional continuation expansion.
@@ -285,6 +290,19 @@ def request_content_bytes(request: GatewayRequest) -> int:
         Byte count of the compact UTF-8 JSON subject.
     """
     return len(canonical_json_bytes(request))
+
+
+def request_exceeds_inspection_limit(request: GatewayRequest, maximum_bytes: int) -> bool:
+    """Bound every classifier-visible field before any adapter constructs its projection.
+
+    The ordinary HTTP serialization excludes private provider carriers that local
+    adapters can inspect. Apply a no-copy size lower bound to the complete subject
+    first, then encode only a bounded candidate for exact UTF-8 JSON accounting.
+    The HTTP adapter's narrower wire representation remains unchanged.
+    """
+    return observation_subject_exceeds(request, maximum_bytes) or (
+        len(observation_subject_bytes(request)) > maximum_bytes
+    )
 
 
 def guardrail_failure(*, action: GuardrailAction, check_id: str | None = None) -> GatewayFailure:

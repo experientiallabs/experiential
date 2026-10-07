@@ -33,7 +33,7 @@ from exp.runtime.gateway.guardrails.contracts import (
     GuardrailRejected,
     coverage_failure,
     guardrail_failure,
-    request_content_bytes,
+    request_exceeds_inspection_limit,
 )
 from exp.runtime.gateway.guardrails.redaction import restored_provider_authority
 from exp.runtime.gateway.guardrails.text_coverage import text_input_context
@@ -120,7 +120,7 @@ def native_input_request(
         return request
     if any(check.adapter_id not in detectors for check in policy.input_checks):
         return None
-    if request_content_bytes(request) > policy.max_request_bytes:
+    if request_exceeds_inspection_limit(request, policy.max_request_bytes):
         _record(policy, None, GuardrailAction.ERROR)
         raise GuardrailRejected(coverage_failure())
     current = request

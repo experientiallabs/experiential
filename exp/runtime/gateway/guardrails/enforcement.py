@@ -29,9 +29,13 @@ from exp.runtime.gateway.guardrails.contracts import (
     OutputGuardrailMode,
     coverage_failure,
     guardrail_failure,
-    request_content_bytes,
+    request_exceeds_inspection_limit,
 )
-from exp.runtime.gateway.guardrails.observation import ObservationLease, ObservationOwner
+from exp.runtime.gateway.guardrails.observation import (
+    ObservationAdmission,
+    ObservationLease,
+    ObservationOwner,
+)
 from exp.runtime.gateway.guardrails.recording import ObservationRecord, ObservationRecorder
 from exp.runtime.gateway.guardrails.redaction import restored_provider_authority
 from exp.runtime.gateway.guardrails.session import GuardrailSession
@@ -187,7 +191,7 @@ class GuardrailEngine:
     ) -> GatewayRequest:
         """Evaluate the same bounded checks while granting actions only to enforcing policies."""
         self.input_invocations += 1
-        if request_content_bytes(request) > policy.max_request_bytes:
+        if request_exceeds_inspection_limit(request, policy.max_request_bytes):
             self._decision(policy, None, GuardrailAction.ERROR, GuardrailOutcome.UNSUPPORTED, 0.0)
             if policy.mode == "observe":
                 return request
@@ -364,8 +368,16 @@ class GuardrailEngine:
                 0.0,
             )
 
-        if not self._observations.submit(inspect, subject_bytes=size, on_interrupted=interrupted):
-            self._emit_observation(policy, None, GuardrailOutcome.SKIPPED, 0.0)
+        admission = self._observations.submit(
+            inspect, subject_bytes=size, on_interrupted=interrupted
+        )
+        if admission is not ObservationAdmission.ACCEPTED:
+            outcome = (
+                GuardrailOutcome.UNAVAILABLE
+                if admission is ObservationAdmission.UNAVAILABLE
+                else GuardrailOutcome.SKIPPED
+            )
+            self._emit_observation(policy, None, outcome, 0.0)
 
     def record_unsupported_observations(self, policies: tuple[GuardrailPolicy, ...]) -> None:
         """Record incomplete observation coverage on a surface with no inspection boundary."""

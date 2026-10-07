@@ -115,10 +115,12 @@ class GuardrailSession:
 
     def inspect_input(self, request: GatewayRequest, *, defer: bool = False) -> GatewayRequest:
         """Enforce the authored input chain and validate its final rewrite."""
-        if self._closed:
-            raise GuardrailRejected(denied_input_failure())
         if self._input_failure is not None:
             raise GuardrailRejected(self._input_failure)
+        if self._closed:
+            if self.enforcing_policies:
+                raise GuardrailRejected(denied_input_failure())
+            return request
         self._observe_input(request)
         if not self.enforcing_policies:
             return request
@@ -195,10 +197,12 @@ class GuardrailSession:
 
     def prepare_dispatch(self, subjects: Sequence[GatewayRequest], *, overlap: bool) -> None:
         """Finish admission or start one approval task before any upstream attempt."""
-        if self._closed:
-            raise GuardrailRejected(denied_input_failure())
         if self._input_failure is not None:
             raise GuardrailRejected(self._input_failure)
+        if self._closed:
+            if self.enforcing_policies:
+                raise GuardrailRejected(denied_input_failure())
+            return
         remaining: list[GatewayRequest] = []
         for subject in subjects:
             self._observe_input(subject)

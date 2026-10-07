@@ -8,10 +8,19 @@ import threading
 from collections.abc import Callable, Coroutine, Iterator
 from concurrent.futures import Future
 from contextlib import contextmanager
+from enum import StrEnum
 
 from exp.runtime.gateway.guardrails.bounded import start_on_native_loop
 
 _logger = logging.getLogger(__name__)
+
+
+class ObservationAdmission(StrEnum):
+    """Distinguish admitted work, finite admission skips, and unavailable scheduling."""
+
+    ACCEPTED = "accepted"
+    SKIPPED = "skipped"
+    UNAVAILABLE = "unavailable"
 
 
 class ObservationLease:
@@ -156,7 +165,7 @@ class ObservationOwner:
         *,
         subject_bytes: int,
         on_interrupted: Callable[[bool], None],
-    ) -> bool:
+    ) -> ObservationAdmission:
         """Admit a bounded subject and give every actual worker the same retention lease.
 
         Args:
@@ -165,7 +174,7 @@ class ObservationOwner:
             on_interrupted: True reports cancellation, False an unexpected failure.
 
         Returns:
-            Whether the observation was admitted before shutdown or capacity exhaustion.
+            Accepted work, a capacity/shutdown skip, or scheduler unavailability.
         """
         with self._lock:
             if (
@@ -173,7 +182,7 @@ class ObservationOwner:
                 or len(self._jobs) >= self._max_jobs
                 or self._bytes + subject_bytes > self._max_bytes
             ):
-                return False
+                return ObservationAdmission.SKIPPED
             lease = ObservationLease(subject_bytes, self._release)
             self._jobs[lease] = None
             self._bytes += subject_bytes
@@ -190,7 +199,7 @@ class ObservationOwner:
         except Exception:  # noqa: BLE001 - observation cannot reject serving requests.
             coroutine.close()
             lease.release()
-            return False
+            return ObservationAdmission.UNAVAILABLE
         with self._lock:
             self._jobs[lease] = future
             closed = self._closed
@@ -209,7 +218,7 @@ class ObservationOwner:
         future.add_done_callback(finished)
         if closed:
             lease.cancel()
-        return True
+        return ObservationAdmission.ACCEPTED
 
     def close(self, *, timeout_seconds: float) -> None:
         """Stop admission, drain within the host budget, and cancel remaining actual tasks."""

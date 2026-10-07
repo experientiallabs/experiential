@@ -9,12 +9,19 @@ import pytest
 from exp.common.core.artifacts import JsonObject
 from exp.runtime.gateway.contracts import (
     GatewayApiSurface,
+    GatewayFailureClass,
     GatewayMessage,
     GatewayRequest,
+    GatewayToolDefinition,
     ToolCall,
 )
+from exp.runtime.gateway.guardrails import text_coverage
 from exp.runtime.gateway.guardrails.config import engine_from_document
-from exp.runtime.gateway.guardrails.contracts import GuardrailAction, GuardrailRejected
+from exp.runtime.gateway.guardrails.contracts import (
+    GuardrailAction,
+    GuardrailRejected,
+    request_content_bytes,
+)
 from exp.runtime.gateway.guardrails.deterministic import (
     compile_native_detectors,
     native_input_request,
@@ -33,6 +40,61 @@ from exp.runtime.gateway.guardrails.text_coverage_test import (
     unsupported_text_request,
 )
 from exp.runtime.models.providers.wire_messages import anthropic_blocks, responses_items
+
+
+@pytest.mark.parametrize("execution", ["async", "native"])
+@pytest.mark.parametrize("field", ["input_examples", "allowed_callers"])
+@pytest.mark.parametrize(
+    "payload", ["x" * 8192, "\x00" * 1024, "\U0001f642" * 1536], ids=["ascii", "escaped", "utf8"]
+)
+@pytest.mark.parametrize("protected", [True, False])
+def test_private_tool_context_is_bounded_before_local_projection(
+    execution: str,
+    field: str,
+    payload: str,
+    protected: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Private examples and callers cannot bypass authored bounds in either execution path."""
+    tool = GatewayToolDefinition(name="lookup", parameters={})
+    tool = tool.model_copy(
+        update={field: ({"value": payload},) if field == "input_examples" else (payload,)}
+    )
+    request = GatewayRequest(
+        surface=GatewayApiSurface.MESSAGES,
+        messages=(GatewayMessage(role="user", content="benign"),),
+        tools=(tool,),
+    )
+    assert request_content_bytes(request) < 4096
+    engine = engine_from_document(_adapter(builtin_patterns=["email"]))
+    policy = engine.policies_for("org", "identity")[0].model_copy(
+        update={"protected": protected, "max_request_bytes": 4096}
+    )
+    detectors = compile_native_detectors(engine.deterministic_specifications)
+    projected: list[bool] = []
+
+    def forbidden_projection(_context: JsonObject) -> bytes:
+        """Expose any scanner allocation attempted before the shared admission bound."""
+        projected.append(True)
+        raise AssertionError("oversized context reached local projection")
+
+    monkeypatch.setattr(text_coverage, "canonical_json_bytes", forbidden_projection)
+    try:
+        with pytest.raises(GuardrailRejected) as rejected:
+            if execution == "async":
+                asyncio.run(
+                    engine.enforce_input(policy=policy, request=request, deadline_monotonic=1e12)
+                )
+            else:
+                native_input_request(
+                    policy, detectors, request, monotonic=lambda: 0.0, deadline_monotonic=1e12
+                )
+        assert rejected.value.failure.failure_class is GatewayFailureClass.UNSUPPORTED_CAPABILITY
+        assert not rejected.value.failure.retryable_same_deployment
+        assert not rejected.value.failure.failover_eligible
+        assert not projected
+    finally:
+        engine.close(timeout_seconds=2)
 
 
 @pytest.mark.parametrize("content", ["", "benign"])

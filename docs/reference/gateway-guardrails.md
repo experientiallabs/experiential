@@ -50,6 +50,13 @@ request. All policies use the same classifier executor, bounds, verdict actions,
 and content-free decision recorder. Deterministic native detectors are an execution
 strategy of that pipeline, with the same input and completion contracts.
 
+`max_request_bytes` bounds the complete in-memory request, including fields omitted
+from provider serialization, before native or async input inspection. A no-copy
+character bound rejects obviously oversized input before projection; fitting candidates
+receive an exact UTF-8 JSON size check. Tool examples, allowed callers, private tool
+identifiers and search context cannot escape this bound. This does not expand the
+generic HTTP classifier's declared wire projection or certify its coverage.
+
 Embeddings, image generation, and native Decisions cannot yet use that normalized
 inspection contract. An applicable enforcing platform or identity policy rejects those
 endpoints before request acceptance, reservation, or provider dispatch. Identities
@@ -70,7 +77,9 @@ The shared engine admits observations through the same bounded classifier execut
 abstraction with a separate worker pool and adapter quarantine from enforcement.
 It retains at most 8 jobs and 8 MiB of complete subjects by default, configurable
 through `max_observations` and `max_observation_bytes`. Full queues, byte limits, or
-expired request deadlines produce `skipped`, never an uninspected `allow`. Exact
+expired request deadlines produce `skipped`, never an uninspected `allow`. Scheduler
+startup or submission failure produces `unavailable` and releases its unused job and
+byte reservation. Exact
 duplicate subjects share work only within their request. While observation admission
 remains open, each distinct authenticated context, including recovered history, private
 provider fields and gateway tool results, is considered separately. Fields excluded from provider serialization still count toward
@@ -388,8 +397,9 @@ workers. `http_json` still reuses one keep-alive client per isolation loop.
 Native callbacks submit enforcement onto one shared daemon loop so a Rust
 worker can return while an abandoned inspect still occupies an isolation
 worker. Adapters implement the async contract directly. Request bounds count the
-compact JSON request subject sent to classifiers, including tool definitions,
-structured schemas, and metadata. Response bounds count the serialized completion, including context and tool-call arguments.
+complete in-memory classifier subject, including provider fields excluded from wire
+serialization. Response bounds count the serialized completion, including context
+and tool-call arguments.
 
 ## Privacy
 

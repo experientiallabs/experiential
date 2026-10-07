@@ -24,6 +24,7 @@ from exp.runtime.gateway.guardrails.contracts import (
     ClassifierVerdict,
     GuardrailCheck,
     GuardrailOutcome,
+    GuardrailRejected,
 )
 from exp.runtime.gateway.lifecycle import load_gateway_components
 from exp.runtime.gateway.lifecycle_test import _configured_gateway
@@ -56,8 +57,9 @@ from exp.runtime.gateway.web_search.contracts import GatewayWebSearchResult
 
 
 @pytest.mark.parametrize("release_failure", [False, True])
+@pytest.mark.parametrize("late_callback", ["none", "inspect", "dispatch"])
 def test_observation_retains_required_release_failure_in_native_settlement(
-    tmp_path: Path, release_failure: bool
+    tmp_path: Path, release_failure: bool, late_callback: str
 ) -> None:
     """A host release failure survives polling and paid settlement; plain closure stays optional."""
     _, key = _configured_gateway(
@@ -80,10 +82,26 @@ def test_observation_retains_required_release_failure_in_native_settlement(
         entry = control._accounting.entry(request_id)  # noqa: SLF001 - request lifecycle assertion.
         assert entry is not None and entry.guardrails is not None
         session = entry.guardrails
+        request = entry.request
+        assert isinstance(request, GatewayRequest)
         assert not session.enforcing_policies
         assert session.input_decision() == {"action": "allow"}
         session.cancel(capture_unavailable_failure() if release_failure else None)
         session.cancel()
+
+        def callback() -> None:
+            """Replay the host input seam after session closure without generating more work."""
+            if late_callback == "inspect":
+                assert session.inspect_input(request) is request
+            elif late_callback == "dispatch":
+                session.prepare_dispatch((request,), overlap=True)
+
+        if release_failure and late_callback != "none":
+            with pytest.raises(GuardrailRejected) as rejected:
+                callback()
+            assert rejected.value.failure.safe_details["code"] == "capture_unavailable"
+        else:
+            callback()
         decision = json.loads(
             control.guardrail_input_status(json.dumps({"request_id": request_id}))
         )

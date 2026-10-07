@@ -105,6 +105,40 @@ def test_explicit_required_release_failure_survives_policy_mode_and_later_cancel
         assert failure.safe_details["code"] == "capture_unavailable"
         assert failure.safe_details["input_guardrail_denied"] is True
         assert decision["failure"] == failure.model_dump(mode="json")
+        with pytest.raises(GuardrailRejected) as inspected:
+            session.inspect_input(_request())
+        assert inspected.value.failure == failure
+        with pytest.raises(GuardrailRejected) as dispatched:
+            session.prepare_dispatch((_request(),), overlap=True)
+        assert dispatched.value.failure == failure
+    finally:
+        engine.close(timeout_seconds=2)
+
+
+@pytest.mark.parametrize("defer", [False, True])
+@pytest.mark.parametrize("overlap", [False, True])
+def test_closed_observer_remains_optional_without_accepting_new_subjects(
+    defer: bool, overlap: bool
+) -> None:
+    """Late host callbacks preserve delivery and billing without restarting observation."""
+    engine = GuardrailEngine(
+        store=MappingGuardrailStore((_observer_policy(),)),
+        client=DirectClassifierClient(ClassifierRegistry({"criminal": ScriptedClassifier()})),
+        monotonic=time.monotonic,
+    )
+    try:
+        session = _session(engine)
+        session.cancel()
+        request = _request("late callback")
+        with patch.object(engine, "observe_inputs") as observe:
+            assert session.inspect_input(request, defer=defer) is request
+            session.prepare_dispatch((request,), overlap=overlap)
+            observe.assert_not_called()
+        assert session.input_decision() == {"action": "allow"}
+        assert session.settlement_failure() is None
+        completion = GuardrailCompletion(text="still deliverable")
+        assert session.inspect_output(completion) is completion
+        assert not session.input_pending
     finally:
         engine.close(timeout_seconds=2)
 

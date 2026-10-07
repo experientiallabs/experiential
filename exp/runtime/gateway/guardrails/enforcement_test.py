@@ -28,7 +28,7 @@ from exp.runtime.gateway.contracts import (
     OpaqueReasoningContentBlock,
     SealedReasoningContentBlock,
 )
-from exp.runtime.gateway.guardrails import enforcement
+from exp.runtime.gateway.guardrails import enforcement, observation
 from exp.runtime.gateway.guardrails.bounded import BoundedInspect
 from exp.runtime.gateway.guardrails.classifiers import (
     ClassifierRegistry,
@@ -51,7 +51,7 @@ from exp.runtime.gateway.guardrails.contracts import (
 )
 from exp.runtime.gateway.guardrails.enforcement import GuardrailEngine
 from exp.runtime.gateway.guardrails.http_json import HttpJsonClassifier
-from exp.runtime.gateway.guardrails.observation import ObservationLease
+from exp.runtime.gateway.guardrails.observation import ObservationAdmission, ObservationLease
 from exp.runtime.gateway.guardrails.regex import (
     BuiltinPattern,
     RegexAdapterDocument,
@@ -281,6 +281,37 @@ class _ObservationAdmissionEngine(GuardrailEngine):
         )
 
 
+def test_observation_scheduler_failure_is_unavailable_and_releases_capacity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unavailable loop is distinct from a skip and cannot consume the next subject slot."""
+    engine = _ObservationAdmissionEngine(max_jobs=1)
+    original = observation.start_on_native_loop
+    attempts: list[bool] = []
+
+    def fail(_coroutine: Coroutine[object, object, None]) -> Never:
+        """Fail before the native callback loop can own the observation coroutine."""
+        attempts.append(True)
+        raise RuntimeError("synthetic scheduler startup failure")
+
+    monkeypatch.setattr(observation, "start_on_native_loop", fail)
+    try:
+        engine.observe(_request("first"), ObservedSubjects())
+        assert attempts == [True]
+        assert engine.input_invocations == 0
+        assert not engine._observations._jobs
+        assert engine._observations._bytes == 0
+        assert engine._observations._idle.is_set()
+        monkeypatch.setattr(observation, "start_on_native_loop", original)
+        engine.observe(_request("second"), ObservedSubjects())
+    finally:
+        engine.close(timeout_seconds=2)
+    assert engine.records == [
+        (None, GuardrailOutcome.UNAVAILABLE),
+        ("input", GuardrailOutcome.ALLOW),
+    ]
+
+
 @pytest.mark.parametrize("unavailable", ["jobs", "bytes", "closed", "deadline"])
 @pytest.mark.parametrize("oversized", [False, True])
 def test_new_observation_rejects_before_serialization_when_admission_is_unavailable(
@@ -310,8 +341,13 @@ def test_new_observation_rejects_before_serialization_when_admission_is_unavaila
         pytest.fail("unavailable admission projected an input subject")
 
     if unavailable in {"jobs", "bytes"}:
-        assert engine._observations.submit(
-            hold, subject_bytes=size if unavailable == "bytes" else 1, on_interrupted=lambda _: None
+        assert (
+            engine._observations.submit(
+                hold,
+                subject_bytes=size if unavailable == "bytes" else 1,
+                on_interrupted=lambda _: None,
+            )
+            is ObservationAdmission.ACCEPTED
         )
         assert started.wait(2)
     elif unavailable == "closed":

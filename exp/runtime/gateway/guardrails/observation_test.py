@@ -4,15 +4,62 @@ from __future__ import annotations
 
 import asyncio
 import gc
+import inspect
 import threading
 import time
 import weakref
 from collections.abc import Callable, Coroutine
+from typing import Never
 
 import pytest
 
+from exp.runtime.gateway.guardrails import observation
 from exp.runtime.gateway.guardrails.bounded import BoundedInspect, ClassifierTimeoutError
-from exp.runtime.gateway.guardrails.observation import ObservationLease, ObservationOwner
+from exp.runtime.gateway.guardrails.observation import (
+    ObservationAdmission,
+    ObservationLease,
+    ObservationOwner,
+)
+
+
+def test_scheduler_failure_closes_coroutine_and_releases_its_subject_reservation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Loop startup failure reports unavailability and leaves no retained job or coroutine."""
+    owner = ObservationOwner(max_jobs=1, max_bytes=4)
+    original = observation.start_on_native_loop
+    attempted: list[Coroutine[object, object, None]] = []
+    invoked = threading.Event()
+
+    async def run(_lease: ObservationLease) -> None:
+        """Expose whether the scheduler successfully took ownership of admitted work."""
+        invoked.set()
+
+    def unavailable(coroutine: Coroutine[object, object, None]) -> Never:
+        """Fail before transferring coroutine ownership to a running event loop."""
+        attempted.append(coroutine)
+        raise RuntimeError("synthetic callback loop failure")
+
+    monkeypatch.setattr(observation, "start_on_native_loop", unavailable)
+    try:
+        admission = owner.submit(run, subject_bytes=4, on_interrupted=lambda _: None)
+        assert admission is ObservationAdmission.UNAVAILABLE
+        assert len(attempted) == 1
+        assert inspect.getcoroutinestate(attempted[0]) == inspect.CORO_CLOSED
+        assert not invoked.is_set()
+        assert not owner._jobs
+        assert owner._bytes == 0
+        assert owner._idle.is_set()
+        monkeypatch.setattr(observation, "start_on_native_loop", original)
+        assert (
+            owner.submit(run, subject_bytes=4, on_interrupted=lambda _: None)
+            is ObservationAdmission.ACCEPTED
+        )
+        assert invoked.wait(2)
+    finally:
+        owner.close(timeout_seconds=2)
+    assert not owner._jobs
+    assert owner._bytes == 0
 
 
 def test_capacity_is_reserved_before_constructing_an_observation() -> None:
@@ -34,14 +81,23 @@ def test_capacity_is_reserved_before_constructing_an_observation() -> None:
         return inspect()
 
     try:
-        assert owner.submit(construct, subject_bytes=4, on_interrupted=lambda _: None)
+        assert (
+            owner.submit(construct, subject_bytes=4, on_interrupted=lambda _: None)
+            is ObservationAdmission.ACCEPTED
+        )
         assert started.wait(2)
-        assert not owner.submit(construct, subject_bytes=1, on_interrupted=lambda _: None)
+        assert (
+            owner.submit(construct, subject_bytes=1, on_interrupted=lambda _: None)
+            is ObservationAdmission.SKIPPED
+        )
         assert len(built) == 1
     finally:
         release.set()
         owner.close(timeout_seconds=2)
-    assert not owner.submit(construct, subject_bytes=1, on_interrupted=lambda _: None)
+    assert (
+        owner.submit(construct, subject_bytes=1, on_interrupted=lambda _: None)
+        is ObservationAdmission.SKIPPED
+    )
     assert len(built) == 1
 
 
@@ -66,7 +122,10 @@ def test_shutdown_cancels_a_stalled_observer_within_the_budget() -> None:
         assert is_cancelled
         recorded.set()
 
-    assert owner.submit(inspect, subject_bytes=4, on_interrupted=interrupted)
+    assert (
+        owner.submit(inspect, subject_bytes=4, on_interrupted=interrupted)
+        is ObservationAdmission.ACCEPTED
+    )
     assert started.wait(2)
     owner.close(timeout_seconds=0)
     assert recorded.wait(2)
@@ -121,7 +180,10 @@ def test_job_completion_does_not_end_an_active_deduplication_permit() -> None:
             await asyncio.sleep(0.001)
 
     try:
-        assert owner.submit(inspect, subject_bytes=4, on_interrupted=lambda _: None)
+        assert (
+            owner.submit(inspect, subject_bytes=4, on_interrupted=lambda _: None)
+            is ObservationAdmission.ACCEPTED
+        )
         assert started.wait(2)
         with owner.preparation() as admitted:
             assert not admitted
@@ -196,13 +258,19 @@ def test_subject_budget_outlives_cancel_ignoring_isolated_work(limit: str, inter
         await inspects.run(allowed, 1, adapter_id="second", retention=lease)
 
     try:
-        assert owner.submit(inspect, subject_bytes=4, on_interrupted=lambda _: None)
+        assert (
+            owner.submit(inspect, subject_bytes=4, on_interrupted=lambda _: None)
+            is ObservationAdmission.ACCEPTED
+        )
         assert started.wait(2)
         if interrupt == "shutdown":
             owner.close(timeout_seconds=0)
         assert outer_done.wait(2)
         assert inspects.detached_inspect_count() == 1
-        assert not owner.submit(second, subject_bytes=4, on_interrupted=lambda _: None)
+        assert (
+            owner.submit(second, subject_bytes=4, on_interrupted=lambda _: None)
+            is ObservationAdmission.SKIPPED
+        )
         assert constructed == ["first"]
         assert owner._bytes == 4
         assert len(owner._jobs) == 1
@@ -210,7 +278,10 @@ def test_subject_budget_outlives_cancel_ignoring_isolated_work(limit: str, inter
         assert owner._idle.wait(2)
         assert owner._bytes == 0
         if interrupt == "timeout":
-            assert owner.submit(second, subject_bytes=4, on_interrupted=lambda _: None)
+            assert (
+                owner.submit(second, subject_bytes=4, on_interrupted=lambda _: None)
+                is ObservationAdmission.ACCEPTED
+            )
             deadline = time.monotonic() + 2
             while constructed != ["first", "second"] and time.monotonic() < deadline:
                 time.sleep(0.001)
@@ -252,7 +323,10 @@ def test_idle_worker_cannot_retain_a_released_observation_subject(failed: bool) 
         return work
 
     try:
-        assert owner.submit(factory(subject), subject_bytes=10, on_interrupted=lambda _: None)
+        assert (
+            owner.submit(factory(subject), subject_bytes=10, on_interrupted=lambda _: None)
+            is ObservationAdmission.ACCEPTED
+        )
         del subject
         assert owner._idle.wait(2)
         gc.collect()
