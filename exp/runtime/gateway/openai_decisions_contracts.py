@@ -31,6 +31,10 @@ MAX_OPENAI_DECISION_INPUT_BYTES = 32 * 1024 * 1024
 OPENAI_DECISION_IMAGE_TOKEN_RESERVATION = 2048
 """Planning tokens per inline image; settlement bills the provider's own count."""
 OPENAI_DECISION_QUESTION_OVERHEAD_TOKENS = 256
+MAX_OPENAI_DECISION_MESSAGES = 256
+OPENAI_DECISION_MESSAGE_OVERHEAD_TOKENS = 16
+"""Planning tokens per message for role and framing, so many tiny messages cannot
+exceed the hold."""
 
 _NAME_BYTES = 256
 
@@ -176,6 +180,8 @@ class OpenAIDecisionRequest(DecisionRequest):
                 raise ValueError("decision input must not be empty")
         elif not self.input:
             raise ValueError("decision input must contain at least one message")
+        elif len(self.input) > MAX_OPENAI_DECISION_MESSAGES:
+            raise ValueError("decision input may contain at most 256 messages")
         names = [_bounded_name(question.name, "question names") for question in self.questions]
         if len(set(names)) != len(names):
             raise ValueError("question names must be unique")
@@ -196,6 +202,7 @@ class OpenAIDecisionRequest(DecisionRequest):
         """Reserve text and question bytes plus fixed image and question allowances."""
         text_bytes = 0
         images = 0
+        messages = 0 if isinstance(self.input, str) else len(self.input)
         if isinstance(self.input, str):
             text_bytes += len(self.input.encode("utf-8"))
         else:
@@ -220,6 +227,7 @@ class OpenAIDecisionRequest(DecisionRequest):
             text_bytes
             + question_bytes
             + images * OPENAI_DECISION_IMAGE_TOKEN_RESERVATION
+            + messages * OPENAI_DECISION_MESSAGE_OVERHEAD_TOKENS
             + len(self.questions) * OPENAI_DECISION_QUESTION_OVERHEAD_TOKENS
         )
 

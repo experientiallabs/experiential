@@ -39,7 +39,7 @@ use crate::waterfall::{successor_possible, DeploymentWire, RoutePolicy, StartRes
 
 const PROBABILITY_TOLERANCE: f64 = 1e-6;
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 struct DecisionsAdmission {
     request_id: String,
     alias: String,
@@ -985,5 +985,8 @@ fn served_headers(
     headers
 }
 
+#[cfg(test)]
+#[path = "route_decisions/openai_tests.rs"]
+mod openai_tests;
 #[cfg(test)]
 mod tests;

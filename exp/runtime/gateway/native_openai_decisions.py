@@ -35,7 +35,7 @@ from exp.runtime.gateway.native_accounting import (
 )
 from exp.runtime.gateway.native_admission import record_dead_admission_rungs
 from exp.runtime.gateway.native_components import NativeGatewayComponents, SyncWriteLedger
-from exp.runtime.gateway.native_decisions import _priced_decision_rung
+from exp.runtime.gateway.native_decisions import NativeDecisionsMixin, _priced_decision_rung
 from exp.runtime.gateway.native_execution import (
     MAXIMUM_TOTAL_ATTEMPTS,
     InflightRequest,
@@ -288,3 +288,7 @@ def _finish_unsupported(plane: _OpenAIDecisionsPlane, authorization: Authorizati
             safe_message="the model alias does not serve the OpenAI Decisions API",
         ),
     )
+
+
+class NativeDecisionSurfacesMixin(NativeDecisionsMixin, NativeOpenAIDecisionsMixin):
+    """Both decisions wires' admission boundaries: SystemOne and OpenAI."""

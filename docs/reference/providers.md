@@ -572,3 +572,20 @@ the shared envelope reader (`crate::error_envelope`), all pinned in
   `provider_quota`, `RATE_LIMIT_EXCEEDED` / `TOKEN_LIMIT_EXCEEDED` throttle,
   `FAILED_TO_AUTH` / `ACCESS_DENY` authenticate), see the architecture
   reference.
+
+## OpenAI Decisions API
+
+`POST /v1/decisions` is the OpenAI Decisions API wire of the decisions surface (ledger
+`api_surface = decisions`), served only by direct OpenAI deployments (`provider = "openai"`). It accepts only `model`, `input` (a string, or messages whose content
+is `input_text` and inline base64 `input_image` parts; remote URLs and file ids are refused), and a
+`questions` list of uniquely named `predicate`, `choice` (with `choices`), and `score` (with
+`levels`) questions: at most 32 questions, 64 choices, 10 levels, and 32 MiB. A rung serves it only
+when it declares `supports_decisions`, prices output at exactly zero, and its connection exposes
+OpenAI's own `/decisions` endpoint (direct OpenAI connections; never Azure, ChatGPT plans, or
+SystemOne rungs, and a SystemOne body never reaches an OpenAI rung). Reservations count text and
+question bytes plus 2,048 tokens per image and 256 per question, with no output reservation.
+Answers are validated against the admitted questions (names, types, requested values, unit
+probability totals within the rounding envelope) and returned verbatim in question order with the
+public alias as `model` and the provider's `usage`. The same one-dispatch-per-deployment and
+known-rejection rules apply.
+Reference: https://developers.openai.com/api/docs/guides/decisions

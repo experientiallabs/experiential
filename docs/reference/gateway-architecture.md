@@ -42,10 +42,7 @@ It serves:
   unbillable rather than served for free)
 - `POST /v1/systemone` (TypeSafe native decisions: typed `noul`, `choice`, and `score`
   questions, buffered answers, provider-reported usage, and explicit decision capability and
-  pricing admission; no chat, streaming, continuation, or idempotency replay)
-- `POST /v1/decisions` (the OpenAI Decisions API wire of the same decisions surface: typed
-  `predicate`, `choice`, and `score` questions over text or inline base64 images, answered by a
-  direct OpenAI deployment, buffered, billed on reported input tokens only)
+  pricing admission; no chat, streaming, continuation, or idempotency replay); and `POST /v1/decisions`, its OpenAI Decisions API wire
 - `GET /health/live` and `GET /health/ready`
 - `GET /usage` and `GET /usage.json`
 
@@ -131,21 +128,7 @@ Reservations count repeated state and per-question protocol allowances, not the 
 They are bounded estimates, never provider-enforced token ceilings. Only reported usage settles.
 Only HTTP 400/401/403/404/422 release a known-rejection hold; 401 may use a certified fallback.
 HTTP 402/429/529, ambiguous transport, and malformed answers are terminal unknown outcomes, holds kept.
-At most eight deployments run once each: no redials, chat, streaming, replay, or chat guardrails.
-
-`POST /v1/decisions` is the OpenAI Decisions API wire of the same surface (ledger
-`api_surface = decisions`). It accepts only `model`, `input` (a string, or messages whose content
-is `input_text` and inline base64 `input_image` parts; remote URLs and file ids are refused), and a
-`questions` list of uniquely named `predicate`, `choice` (with `choices`), and `score` (with
-`levels`) questions: at most 32 questions, 64 choices, 10 levels, and 32 MiB. A rung serves it only
-when it declares `supports_decisions`, prices output at exactly zero, and its connection exposes
-OpenAI's own `/decisions` endpoint (direct OpenAI connections; never Azure, ChatGPT plans, or
-SystemOne rungs, and a SystemOne body never reaches an OpenAI rung). Reservations count text and
-question bytes plus 2,048 tokens per image and 256 per question, with no output reservation.
-Answers are validated against the admitted questions (names, types, requested values, unit
-probability totals within the rounding envelope) and returned verbatim in question order with the
-public alias as `model` and the provider's `usage`. The same one-dispatch-per-deployment and
-known-rejection rules apply.
+At most eight deployments run once each: no redials, chat, streaming, replay, or chat guardrails. `POST /v1/decisions`: see [OpenAI Decisions API](providers.md#openai-decisions-api).
 
 Multi-deployment certified pools execute natively. Admission returns the full
 ordered route plus the frozen retry-policy facts without starting an attempt;

@@ -267,3 +267,24 @@ def test_decoder_round_trips_string_input_and_provider_body() -> None:
         "input": "I want a refund.",
         "questions": [{"type": "predicate", "name": "refund", "instructions": "Refund?"}],
     }
+
+
+def test_message_arrays_are_capped_and_reserve_per_message_framing() -> None:
+    """Many tiny messages cannot slip under the budget hold or past the cap."""
+    question = [{"type": "predicate", "name": "a", "instructions": "i"}]
+
+    def reservation(messages: int) -> int:
+        decoded = decode_openai_decision_request(
+            json.dumps(
+                {
+                    "model": "m",
+                    "input": [{"role": "user", "content": "x"}] * messages,
+                    "questions": question,
+                }
+            )
+        )
+        return decoded.request.input_token_reservation
+
+    assert reservation(200) - reservation(100) == 100 * (1 + 16)
+    with pytest.raises(ValueError, match="at most 256 messages"):
+        reservation(257)
