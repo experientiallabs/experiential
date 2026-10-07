@@ -118,3 +118,11 @@ def test_transcription_refuses_unsupported_fields_by_name(field: str) -> None:
     with pytest.raises(OpenAIProtocolError) as raised:
         decode_transcription({"model": "whisper-1", "file": _FILE, field: True})
     assert raised.value.detail.param == field
+
+
+@pytest.mark.parametrize("temperature", ["NaN", "inf", "-Infinity", "1e999", "warm"])
+def test_non_finite_multipart_temperature_is_refused_on_its_field(temperature: str) -> None:
+    """A form temperature the data plane kept as text never becomes the provider default."""
+    with pytest.raises(OpenAIProtocolError) as raised:
+        decode_transcription({"model": "whisper-1", "file": _FILE, "temperature": temperature})
+    assert raised.value.detail.param == "temperature"

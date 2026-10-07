@@ -172,14 +172,17 @@ def _prompt_counter(request: ServingRequest) -> _PromptCounter:
         case ImagesRequest():
             counter.text(request.prompt)
         case SpeechRequest():
-            counter.text(request.input)
+            # Audio rungs enforce this count as a settle ceiling, so text is
+            # bounded by its UTF-8 length (no byte-level tokenizer emits more
+            # tokens than bytes), never by the planning tokenizer's estimate.
+            counter.fixed(_utf8_length(request.input))
             if request.instructions is not None:
-                counter.text(request.instructions)
+                counter.fixed(_utf8_length(request.instructions))
             counter.fixed(AUDIO_INPUT_TOKEN_SLACK)
         case TranscriptionRequest():
             # The provider meters the audio as input tokens at a fixed rate per
-            # second, beside the optional prompt's text.
-            counter.text(request.prompt or "")
+            # second, beside the optional prompt's text (bounded as for speech).
+            counter.fixed(_utf8_length(request.prompt or ""))
             counter.fixed(request.maximum_audio_seconds * TRANSCRIPTION_AUDIO_TOKENS_PER_SECOND)
             counter.fixed(AUDIO_INPUT_TOKEN_SLACK)
         case GatewayRequest():
@@ -187,6 +190,11 @@ def _prompt_counter(request: ServingRequest) -> _PromptCounter:
         case _:  # pragma: no cover - exhaustive over the ServingRequest union.
             assert_never(request)
     return counter
+
+
+def _utf8_length(text: str) -> int:
+    """Upper bound on the tokens any byte-level tokenizer reads from ``text``."""
+    return len(text.encode())
 
 
 def _count_completion_prompt(request: GatewayRequest, counter: _PromptCounter) -> None:

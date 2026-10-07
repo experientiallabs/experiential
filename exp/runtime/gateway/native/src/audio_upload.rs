@@ -219,6 +219,9 @@ fn insert_form_field(
         text.trim()
             .parse::<f64>()
             .ok()
+            // NaN, infinities, and overflows stay text so validation refuses
+            // them, instead of becoming JSON null (the provider default).
+            .filter(|number| number.is_finite())
             .map_or(Value::String(text), |number| json!(number))
     } else {
         Value::String(text)
@@ -316,6 +319,10 @@ mod tests {
         );
         assert_eq!(fields["temperature"], json!(0.2));
         assert_eq!(fields["language"], json!("en"));
+        for invalid in ["NaN", "inf", "-Infinity", "1e999"] {
+            insert_form_field(&mut fields, "temperature", invalid.to_string()).unwrap();
+            assert_eq!(fields["temperature"], json!(invalid), "{invalid}");
+        }
     }
 
     #[test]

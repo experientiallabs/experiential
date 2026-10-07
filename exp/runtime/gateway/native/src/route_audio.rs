@@ -413,7 +413,13 @@ async fn run_ladder(
                     usage,
                 })
             }
-            Err((failure, opened)) => {
+            Err((mut failure, opened)) => {
+                // A customer's own credential or account failing is theirs to
+                // fix: classify it as the chat waterfall does.
+                if wire.billing_customer_managed {
+                    failure =
+                        crate::stream_errors::customer_credential_failure(failure, &wire.provider);
+                }
                 if opened {
                     guard.mark_opened();
                 }

@@ -35,6 +35,7 @@ from exp.runtime.gateway.attempt_tokens import (
     counted_input_tokens,
     worst_case_input_tokens,
 )
+from exp.runtime.gateway.audio_contracts import AUDIO_INPUT_TOKEN_SLACK, SpeechRequest
 from exp.runtime.gateway.contracts import (
     GatewayApiSurface,
     GatewayMessage,
@@ -817,3 +818,10 @@ def test_json_object_estimate_covers_the_provider_instruction() -> None:
     assert counted_input_tokens(json_request) - counted_input_tokens(request) >= (
         MESSAGE_FRAMING_TOKENS + instruction_tokens
     )
+
+
+def test_audio_input_bounds_text_by_its_utf8_length() -> None:
+    """Audio rungs enforce the input count as a ceiling, so text counts its bytes."""
+    text = "中文 speech"  # 2 CJK characters (3 bytes each) and 7 ASCII bytes.
+    request = SpeechRequest(input=text, voice="alloy", instructions="calm")
+    assert counted_input_tokens(request) == 6 + 7 + 4 + AUDIO_INPUT_TOKEN_SLACK
