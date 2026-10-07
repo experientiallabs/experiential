@@ -64,7 +64,7 @@ DOMAINS = ("airline", "retail")
 
 # The user simulator is environment, not candidate: one cheap model, identical for every run.
 USER_LLM = "azure/gpt-5.4-mini"
-BUDGET_STOP = 140.0
+BUDGET_STOP = 170.0
 MAX_CONCURRENCY = 4
 BATCH_TIMEOUT_S = 5400
 

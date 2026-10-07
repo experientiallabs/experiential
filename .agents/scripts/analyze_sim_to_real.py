@@ -147,13 +147,30 @@ def fable_gap(scores: dict[str, float]) -> tuple[float, float]:
     return scores["fable-5"] - st.mean(rest), scores["fable-5"] - max(rest)
 
 
+# The five retail tasks whose reward depends on tau2's NL-assertion judge. They scored nowhere until
+# the judge was repointed off its unroutable OpenAI default, so "without" reproduces the instrument
+# as it stood for the first 720 episodes and "with" is the communication-graded version.
+NL_ASSERTION_SCENARIOS = frozenset(
+    {"retail:2", "retail:3", "retail:4", "retail:16", "retail:19"}
+)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--glm-clean", action="store_true", help="also report the format-corrected arm")
+    parser.add_argument(
+        "--without-nl",
+        action="store_true",
+        help="drop the 5 NL-assertion retail tasks (the instrument as it stood for the first 720 episodes)",
+    )
     args = parser.parse_args()
 
     real, wm = load_real(), load_wm()
+    if args.without_nl:
+        real = [r for r in real if r["scenario_id"] not in NL_ASSERTION_SCENARIOS]
     models = sorted({row["model"] for row in real})
+    ntasks = len({r["scenario_id"] for r in real})
+    print(f"[arm: {'WITHOUT' if args.without_nl else 'WITH'} nl_assertions tasks; {ntasks} tasks]")
 
     print("== REAL (tau2 reward) vs WM (LLM judge), per model")
     print(f"{'model':16} {'real':>16} {'trials':>7} {'wm':>16} {'inline%':>8}")
