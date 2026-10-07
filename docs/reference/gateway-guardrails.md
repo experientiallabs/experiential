@@ -77,16 +77,21 @@ The shared engine admits observations through the same bounded classifier execut
 abstraction with a separate worker pool and adapter quarantine from enforcement.
 It retains at most 8 jobs and 8 MiB of complete subjects by default, configurable
 through `max_observations` and `max_observation_bytes`. Full queues, byte limits, or
-expired request deadlines produce `skipped`, never an uninspected `allow`. Scheduler
-startup or submission failure produces `unavailable` and releases its unused job and
-byte reservation. Exact
+expired request deadlines produce `skipped`, never an uninspected `allow`. A cold,
+starting or unavailable scheduler produces `unavailable` and releases its unused job
+and byte reservation. Optional admission can start the shared callback daemon, but
+does not wait for its startup lock or event-loop readiness; later requests can observe
+once that same loop is ready. Exact
 duplicate subjects share work only within their request. While observation admission
 remains open, each distinct authenticated context, including recovered history, private
 provider fields and gateway tool results, is considered separately. Fields excluded from provider serialization still count toward
 subject identity and retained bytes. Observer capacity or quarantine cannot consume
 the engine's enforcement capacity or quarantine its enforcing calls.
 
-All observing policies share one complete subject encoding per admission boundary.
+All observing policies share one detached deep snapshot and one complete subject
+encoding per admission boundary. Nested caller-owned containers are copied before
+hashing, byte accounting and asynchronous inspection, so later caller mutations cannot
+change an admitted subject or its deduplication identity.
 The owner grants at most one nonblocking preparation permit, separate from retained
 inspection jobs. New sessions reject before projection or hashing when inspection
 capacity is full, admission is closed, or the original deadline has expired. Rejection
@@ -97,7 +102,7 @@ waits: `preparation_unavailable` ends that session's optional coverage and recor
 `check=None, skipped` admission outcome per observing policy. This can include an equal
 subject whose identity could not be compared while another preparation held the permit;
 it is neither a classifier verdict nor evidence of a distinct missed subject.
-Size-walk, encoding or hashing failures record `check=None, unavailable` coverage
+Size-walk, snapshot, encoding or hashing failures record `check=None, unavailable` coverage
 without exposing input or exception diagnostics, and serving continues.
 
 Within the permit, a cheap character-count bound rejects clearly oversized subjects
@@ -116,7 +121,10 @@ ordinary settlement does not cancel it and bias observations toward fast classif
 Its original absolute request deadline and per-check timeout still apply. Hosts call
 `engine.close(timeout_seconds=...)` after serving drains and before stopping their
 recorder. Shutdown stops observation admission, drains within that budget, and cancels
-remaining work cooperatively. A classifier that ignores cancellation retains its job
+remaining work cooperatively. Each owned isolation loop closes its shared HTTP classifier
+client on that loop before destroying it. Slow cleanup keeps its owning worker alive
+without extending the host's shutdown budget; injected clients remain caller-owned.
+A classifier that ignores cancellation retains its job
 and byte reservation until it actually exits; timeout or shutdown cannot admit more
 subjects against that occupied capacity. Work that completes within the drain budget
 retains its actual verdict; cancellation is requested only when that budget expires.

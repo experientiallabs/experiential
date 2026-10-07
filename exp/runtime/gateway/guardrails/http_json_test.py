@@ -28,11 +28,52 @@ from exp.runtime.gateway.guardrails.contracts import (
 from exp.runtime.gateway.guardrails.http_json import (
     ClassifierProtocolError,
     HttpJsonClassifier,
+    close_shared_http_json_client,
     shared_http_json_client,
     validate_classifier_url,
 )
 
 _URL = "https://classifier.example.invalid/v1/inspect"
+
+
+def test_shared_client_close_without_a_client_never_allocates_one(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unused or already-drained loop can be closed without creating a transport."""
+
+    def unexpected(*_args: object, **_kwargs: object) -> httpx.AsyncClient:
+        """Fail if cleanup attempts to instantiate a new shared client."""
+        pytest.fail("closing an unused loop allocated an HTTP client")
+
+    monkeypatch.setattr(httpx, "AsyncClient", unexpected)
+
+    async def scenario() -> None:
+        """Exercise first and repeated empty cleanup on the same loop."""
+        await close_shared_http_json_client()
+        await close_shared_http_json_client()
+
+    asyncio.run(scenario())
+
+
+def test_shared_client_close_detaches_closed_client_before_future_reuse() -> None:
+    """A loop owner may explicitly drain its pool and later create a fresh usable client."""
+
+    async def scenario() -> None:
+        """Keep old client references alive while proving idempotent cleanup and renewal."""
+        first = shared_http_json_client()
+        await close_shared_http_json_client()
+        await close_shared_http_json_client()
+        assert first.is_closed
+        second = shared_http_json_client()
+        try:
+            assert second is not first
+            assert not second.is_closed
+            assert second is shared_http_json_client()
+        finally:
+            await close_shared_http_json_client()
+        assert second.is_closed
+
+    asyncio.run(scenario())
 
 
 def _input_check() -> GuardrailCheck:

@@ -15,6 +15,7 @@ from typing import Never
 
 import httpx
 import pytest
+from pydantic import JsonValue
 
 from exp.common.core.artifacts import canonical_json_bytes
 from exp.common.models.model import ToolCall
@@ -29,7 +30,7 @@ from exp.runtime.gateway.contracts import (
     SealedReasoningContentBlock,
 )
 from exp.runtime.gateway.guardrails import enforcement, observation
-from exp.runtime.gateway.guardrails.bounded import BoundedInspect
+from exp.runtime.gateway.guardrails.bounded import BoundedInspect, start_on_native_loop
 from exp.runtime.gateway.guardrails.classifiers import (
     ClassifierRegistry,
     ScriptedClassifier,
@@ -59,6 +60,12 @@ from exp.runtime.gateway.guardrails.regex import (
 )
 from exp.runtime.gateway.guardrails.store import MappingGuardrailStore
 from exp.runtime.gateway.guardrails.subjects import ObservedSubjects, observation_subject_bytes
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _ready_observation_scheduler() -> None:
+    """Qualify engine decisions on a running scheduler; cold admission has separate coverage."""
+    start_on_native_loop(asyncio.sleep(0)).result(timeout=2)
 
 
 class _Clock:
@@ -281,12 +288,92 @@ class _ObservationAdmissionEngine(GuardrailEngine):
         )
 
 
+def _mutable_observation_subject(field: str) -> tuple[GatewayRequest, list[JsonValue]]:
+    """Expose a caller-owned nested list within one ordinary or private subject field."""
+    request = _request("visible")
+    nested: dict[str, JsonValue] = {"items": ["original"]}
+    match field:
+        case "metadata":
+            request = request.model_copy(update={"metadata": nested})
+            items = request.metadata["items"]
+        case "provider_native_item":
+            message = request.messages[0].model_copy(update={field: nested})
+            request = request.model_copy(update={"messages": (message,)})
+            assert message.provider_native_item is not None
+            items = message.provider_native_item["items"]
+        case "tool_parameters":
+            tool = GatewayToolDefinition(name="fixture", parameters=nested)
+            request = request.model_copy(update={"tools": (tool,)})
+            items = tool.parameters["items"]
+        case "tool_input_examples":
+            tool = GatewayToolDefinition(
+                name="fixture", parameters={"type": "object"}, input_examples=(nested,)
+            )
+            request = request.model_copy(update={"tools": (tool,)})
+            assert tool.input_examples is not None
+            items = tool.input_examples[0]["items"]
+        case _:
+            raise AssertionError(f"unknown fixture field: {field}")
+    assert isinstance(items, list)
+    return request, items
+
+
+@pytest.mark.parametrize(
+    "field", ["metadata", "provider_native_item", "tool_parameters", "tool_input_examples"]
+)
+@pytest.mark.parametrize("replacement", ["modified", "x" * 100_000], ids=["same-size", "oversized"])
+def test_observation_retains_the_subject_hashed_before_caller_mutation(
+    field: str, replacement: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Queued classifiers inspect their admitted copy despite later nested caller mutations."""
+    engine = _ObservationAdmissionEngine(max_jobs=1)
+    request, caller_items = _mutable_observation_subject(field)
+    original = request.model_copy(deep=True)
+    expected = observation_subject_bytes(original)
+    observed = ObservedSubjects()
+    started = threading.Event()
+    release = threading.Event()
+    captured: list[bytes] = []
+
+    async def inspect(
+        *,
+        policy: GuardrailPolicy,
+        request: GatewayRequest,
+        deadline_monotonic: float,
+        retention: ObservationLease | None = None,
+    ) -> GatewayRequest:
+        """Pause the real queued engine job before reading its complete input."""
+        del policy, deadline_monotonic
+        assert retention is not None
+        started.set()
+        await _wait_hold(release)
+        captured.append(observation_subject_bytes(request))
+        return request
+
+    monkeypatch.setattr(engine, "_inspect_input", inspect)
+    try:
+        engine.observe(request, observed)
+        assert started.wait(2)
+        caller_items[0] = replacement
+        assert observation_subject_bytes(request) != expected
+        assert engine._observations._bytes == len(expected)
+        engine.observe(original, observed)
+        assert len(observed.fingerprints) == 1
+        assert len(engine._observations._jobs) == 1
+    finally:
+        release.set()
+        engine.close(timeout_seconds=2)
+    assert captured == [expected]
+    assert not engine._observations._jobs
+    assert engine._observations._bytes == 0
+
+
 def test_observation_scheduler_failure_is_unavailable_and_releases_capacity(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """An unavailable loop is distinct from a skip and cannot consume the next subject slot."""
     engine = _ObservationAdmissionEngine(max_jobs=1)
-    original = observation.start_on_native_loop
+    original = observation.try_start_on_native_loop
     attempts: list[bool] = []
 
     def fail(_coroutine: Coroutine[object, object, None]) -> Never:
@@ -294,7 +381,7 @@ def test_observation_scheduler_failure_is_unavailable_and_releases_capacity(
         attempts.append(True)
         raise RuntimeError("synthetic scheduler startup failure")
 
-    monkeypatch.setattr(observation, "start_on_native_loop", fail)
+    monkeypatch.setattr(observation, "try_start_on_native_loop", fail)
     try:
         engine.observe(_request("first"), ObservedSubjects())
         assert attempts == [True]
@@ -302,7 +389,7 @@ def test_observation_scheduler_failure_is_unavailable_and_releases_capacity(
         assert not engine._observations._jobs
         assert engine._observations._bytes == 0
         assert engine._observations._idle.is_set()
-        monkeypatch.setattr(observation, "start_on_native_loop", original)
+        monkeypatch.setattr(observation, "try_start_on_native_loop", original)
         engine.observe(_request("second"), ObservedSubjects())
     finally:
         engine.close(timeout_seconds=2)
@@ -492,7 +579,7 @@ def test_engine_close_does_not_revoke_an_inflight_encoded_subject(
     assert engine.observation_recording_dropped == 2
 
 
-@pytest.mark.parametrize("stage", ["bound", "encode", "hash"])
+@pytest.mark.parametrize("stage", ["bound", "snapshot", "encode", "hash"])
 def test_failed_preparation_drops_temporary_traceback_before_releasing_the_permit(
     stage: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -515,6 +602,11 @@ def test_failed_preparation_drops_temporary_traceback_before_releasing_the_permi
         """Fail the allocation-free projection before canonical encoding can begin."""
         fail(payload)
 
+    def fail_snapshot(payload: GatewayRequest, *, deep: bool) -> Never:
+        """Fail while allocating the detached nested subject."""
+        assert deep
+        fail(payload)
+
     @contextmanager
     def checked(*, deduplicating: bool = False) -> Iterator[bool]:
         """Verify the temporary is gone before granting any other preparation permission."""
@@ -527,6 +619,8 @@ def test_failed_preparation_drops_temporary_traceback_before_releasing_the_permi
     monkeypatch.setattr(engine._observations, "preparation", checked)
     if stage == "bound":
         monkeypatch.setattr(enforcement, "observation_subject_exceeds", fail_bound)
+    elif stage == "snapshot":
+        monkeypatch.setattr(GatewayRequest, "model_copy", fail_snapshot)
     else:
         monkeypatch.setattr(
             enforcement, "observation_subject_bytes" if stage == "encode" else "sha256", fail

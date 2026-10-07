@@ -11,6 +11,8 @@ from concurrent.futures import CancelledError as FutureCancelledError
 from concurrent.futures import Future
 from typing import Protocol, cast
 
+from exp.runtime.gateway.guardrails.http_json import close_shared_http_json_client
+
 MAX_INFLIGHT_ASYNC_CLASSIFIER_CALLS = 32
 _WORKER_START_TIMEOUT_SECONDS = 5.0
 
@@ -282,7 +284,14 @@ class _IsolationWorker:
             if not self._ready.is_set():
                 self._signal_started(RuntimeError("classifier isolation loop failed to start"))
             if loop is not None:
-                loop.close()
+                with self._state_lock:
+                    self._loop = None
+                try:
+                    loop.run_until_complete(close_shared_http_json_client())
+                except Exception:  # noqa: BLE001 - cleanup failure cannot retain a dead loop
+                    _logger.warning("guardrail HTTP client cleanup failed")
+                finally:
+                    loop.close()
 
 
 class _IsolationPool:
@@ -783,26 +792,9 @@ class _NativeCallbackRunner:
         failed startup is cleared so a later call can retry.
         """
         with self._lock:
-            current = self._loop
-            thread = self._thread
-            if (
-                current is not None
-                and current.is_running()
-                and thread is not None
-                and thread.is_alive()
-            ):
-                return current
-            starting = thread is not None and thread.is_alive()
-            if not starting:
-                self._ready.clear()
-                self._loop = None
-                self._thread = threading.Thread(
-                    target=self._run_forever,
-                    name="exp-guardrail-native",
-                    daemon=True,
-                )
-                self._start_count += 1
-                self._thread.start()
+            current = self._ready_or_start()
+        if current is not None:
+            return current
         if not self._ready.wait(timeout=self._start_timeout):
             self._reset_dead_startup()
             raise RuntimeError("native guardrail callback loop failed to start")
@@ -812,6 +804,35 @@ class _NativeCallbackRunner:
             self._reset_dead_startup()
             raise RuntimeError("native guardrail callback loop failed to start")
         return started
+
+    def ready_loop(self) -> asyncio.AbstractEventLoop | None:
+        """Start the shared daemon if needed, without waiting for its lock or readiness."""
+        if not self._lock.acquire(blocking=False):
+            return None
+        try:
+            return self._ready_or_start()
+        finally:
+            self._lock.release()
+
+    def _ready_or_start(self) -> asyncio.AbstractEventLoop | None:
+        """Under the runner lock, reuse a live loop or start one subject-free daemon."""
+        current, thread = self._loop, self._thread
+        if (
+            current is not None
+            and current.is_running()
+            and thread is not None
+            and thread.is_alive()
+        ):
+            return current
+        if thread is None or not thread.is_alive():
+            self._ready.clear()
+            self._loop = None
+            self._thread = threading.Thread(
+                target=self._run_forever, name="exp-guardrail-native", daemon=True
+            )
+            self._start_count += 1
+            self._thread.start()
+        return None
 
     def _reset_dead_startup(self) -> None:
         """Clear a failed start so a later caller can create one new thread."""
@@ -832,7 +853,7 @@ class _NativeCallbackRunner:
         except Exception:  # noqa: BLE001 - startup failure must unblock the constructor
             self._ready.set()
             raise
-        self._ready.set()
+        loop.call_soon(self._ready.set)
         loop.run_forever()
 
     def submit[T](self, coro: Coroutine[object, object, T]) -> T:
@@ -866,6 +887,17 @@ def start_on_native_loop[T](coro: Coroutine[object, object, T]) -> Future[T]:
         Request-owned future. Its owner cancels it when the request terminates.
     """
     return asyncio.run_coroutine_threadsafe(coro, _NATIVE_RUNNER.loop())
+
+
+def try_start_on_native_loop[T](coro: Coroutine[object, object, T]) -> Future[T] | None:
+    """Submit optional work only when the shared callback loop is already ready.
+
+    This can initiate the one subject-free daemon, but never waits for loop
+    initialization or another caller's startup lock. None leaves coroutine ownership
+    with the caller, which must close it; exceptions also transfer no ownership.
+    """
+    loop = _NATIVE_RUNNER.ready_loop()
+    return None if loop is None else asyncio.run_coroutine_threadsafe(coro, loop)
 
 
 def run_on_native_loop[T](coro: Coroutine[object, object, T]) -> T:

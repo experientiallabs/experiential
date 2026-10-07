@@ -180,6 +180,20 @@ def shared_http_json_client() -> httpx.AsyncClient:
         return client
 
 
+async def close_shared_http_json_client() -> None:
+    """Close only the shared client owned by the running event loop.
+
+    Loop owners call this after inspection stops and before destroying their
+    loop. Injected clients and other loops' pools retain their existing owners.
+    No client is created when this loop has never used the shared transport.
+    """
+    loop = asyncio.get_running_loop()
+    with _clients_lock:
+        client = _clients.pop(loop, None)
+    if client is not None:
+        await client.aclose()
+
+
 class HttpJsonClassifier:
     """POST one inspect request to a dedicated classifier HTTP endpoint.
 

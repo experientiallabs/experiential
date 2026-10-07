@@ -9,12 +9,17 @@ import threading
 import time
 import weakref
 from collections.abc import Callable, Coroutine
+from concurrent.futures import Future
 from typing import Never
 
 import pytest
 
-from exp.runtime.gateway.guardrails import observation
-from exp.runtime.gateway.guardrails.bounded import BoundedInspect, ClassifierTimeoutError
+from exp.runtime.gateway.guardrails import bounded, observation
+from exp.runtime.gateway.guardrails.bounded import (
+    BoundedInspect,
+    ClassifierTimeoutError,
+    _NativeCallbackRunner,
+)
 from exp.runtime.gateway.guardrails.observation import (
     ObservationAdmission,
     ObservationLease,
@@ -22,12 +27,196 @@ from exp.runtime.gateway.guardrails.observation import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _ready_scheduler() -> None:
+    """Warm the shared scheduler for tests requiring accepted work; cold tests replace it."""
+    bounded._NATIVE_RUNNER.loop()
+
+
+def _stop_runner(runner: _NativeCallbackRunner) -> None:
+    """Stop and close only a test-owned runner after its admitted jobs have drained."""
+    loop = runner._loop
+    if loop is not None:
+        loop.call_soon_threadsafe(loop.stop)
+    if runner._thread is not None:
+        runner._thread.join(timeout=2)
+        assert not runner._thread.is_alive()
+    if loop is not None:
+        loop.close()
+
+
+def test_first_observer_does_not_wait_for_callback_loop_startup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Optional admission releases a cold subject while the one shared loop is still starting."""
+    started = threading.Event()
+    release = threading.Event()
+    returned = threading.Event()
+    inspected = threading.Event()
+    admission: list[ObservationAdmission] = []
+    coroutines: list[Coroutine[object, object, None]] = []
+
+    class DelayedRunner(_NativeCallbackRunner):
+        """Hold actual loop initialization without blocking daemon thread creation."""
+
+        def _run_forever(self) -> None:
+            """Expose a startup that can remain stalled while serving must proceed."""
+            started.set()
+            assert release.wait(3)
+            super()._run_forever()
+
+    runner = DelayedRunner()
+    owner = ObservationOwner(max_jobs=1, max_bytes=4)
+    original = observation.try_start_on_native_loop
+    monkeypatch.setattr(bounded, "_NATIVE_RUNNER", runner)
+
+    def tracked_start(coroutine: Coroutine[object, object, None]) -> Future[None] | None:
+        """Keep a reference so rejected coroutine closure can be verified directly."""
+        coroutines.append(coroutine)
+        return original(coroutine)
+
+    monkeypatch.setattr(observation, "try_start_on_native_loop", tracked_start)
+
+    async def inspect_subject(_lease: ObservationLease) -> None:
+        """Expose when a later ready-loop submission begins ordinary inspection."""
+        inspected.set()
+
+    def submit_first() -> None:
+        """Use the actual owner entry point on a serving thread."""
+        admission.append(
+            owner.submit(inspect_subject, subject_bytes=4, on_interrupted=lambda _: None)
+        )
+        returned.set()
+
+    caller = threading.Thread(target=submit_first)
+    caller.start()
+    try:
+        assert started.wait(2)
+        assert returned.wait(0.25), "optional observation waited for callback-loop readiness"
+        assert admission == [ObservationAdmission.UNAVAILABLE]
+        for _ in range(4):
+            assert (
+                owner.submit(inspect_subject, subject_bytes=4, on_interrupted=lambda _: None)
+                is ObservationAdmission.UNAVAILABLE
+            )
+        assert runner._start_count == 1
+        assert not inspected.is_set()
+        assert not owner._jobs
+        assert owner._bytes == 0
+        assert owner._idle.is_set()
+        assert all(inspect.getcoroutinestate(item) == inspect.CORO_CLOSED for item in coroutines)
+        release.set()
+        runner.loop()
+        assert (
+            owner.submit(inspect_subject, subject_bytes=4, on_interrupted=lambda _: None)
+            is ObservationAdmission.ACCEPTED
+        )
+        assert inspected.wait(2)
+    finally:
+        release.set()
+        caller.join(timeout=2)
+        owner.close(timeout_seconds=2)
+        _stop_runner(runner)
+    assert not caller.is_alive()
+
+
+def test_observer_does_not_wait_for_another_callers_startup_lock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A contended shared-runner lock cannot stall an optional request or retain its bytes."""
+    runner = _NativeCallbackRunner()
+    owner = ObservationOwner(max_jobs=1, max_bytes=4)
+    monkeypatch.setattr(bounded, "_NATIVE_RUNNER", runner)
+    returned = threading.Event()
+    admission: list[ObservationAdmission] = []
+
+    async def inspect_subject(_lease: ObservationLease) -> None:
+        """Require readiness before any observation can start."""
+        pytest.fail("a locked cold scheduler must not accept work")
+
+    def submit() -> None:
+        """Exercise optional submission from a request thread contending with startup."""
+        admission.append(
+            owner.submit(inspect_subject, subject_bytes=4, on_interrupted=lambda _: None)
+        )
+        returned.set()
+
+    caller = threading.Thread(target=submit)
+    try:
+        with runner._lock:
+            caller.start()
+            assert returned.wait(0.25), "optional observation waited for the startup lock"
+        caller.join(timeout=2)
+        assert not caller.is_alive()
+        assert admission == [ObservationAdmission.UNAVAILABLE]
+        assert runner._start_count == 0
+        assert not owner._jobs
+        assert owner._bytes == 0
+        assert owner._idle.is_set()
+    finally:
+        caller.join(timeout=2)
+        owner.close(timeout_seconds=2)
+        _stop_runner(runner)
+
+
+def test_observer_retries_after_a_dead_callback_loop_startup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed daemon cannot strand observations or admit work before the replacement is ready."""
+
+    class FailOnceRunner(_NativeCallbackRunner):
+        """Exit the first subject-free startup before an event loop exists."""
+
+        def _run_forever(self) -> None:
+            """Let the next admission retry the one shared scheduler after a dead startup."""
+            if self._start_count == 1:
+                return
+            super()._run_forever()
+
+    runner = FailOnceRunner()
+    owner = ObservationOwner(max_jobs=1, max_bytes=4)
+    monkeypatch.setattr(bounded, "_NATIVE_RUNNER", runner)
+    inspected = threading.Event()
+
+    async def inspect_subject(_lease: ObservationLease) -> None:
+        """Mark only actual ready-loop observation execution."""
+        inspected.set()
+
+    try:
+        before = time.monotonic()
+        assert (
+            owner.submit(inspect_subject, subject_bytes=4, on_interrupted=lambda _: None)
+            is ObservationAdmission.UNAVAILABLE
+        )
+        assert time.monotonic() - before < 0.25
+        assert runner._thread is not None
+        runner._thread.join(timeout=2)
+        assert not runner._thread.is_alive()
+        assert (
+            owner.submit(inspect_subject, subject_bytes=4, on_interrupted=lambda _: None)
+            is ObservationAdmission.UNAVAILABLE
+        )
+        assert runner._start_count == 2
+        assert not owner._jobs
+        assert owner._bytes == 0
+        assert not inspected.is_set()
+        runner.loop()
+        assert (
+            owner.submit(inspect_subject, subject_bytes=4, on_interrupted=lambda _: None)
+            is ObservationAdmission.ACCEPTED
+        )
+        assert inspected.wait(2)
+    finally:
+        owner.close(timeout_seconds=2)
+        _stop_runner(runner)
+
+
 def test_scheduler_failure_closes_coroutine_and_releases_its_subject_reservation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Loop startup failure reports unavailability and leaves no retained job or coroutine."""
     owner = ObservationOwner(max_jobs=1, max_bytes=4)
-    original = observation.start_on_native_loop
+    original = observation.try_start_on_native_loop
     attempted: list[Coroutine[object, object, None]] = []
     invoked = threading.Event()
 
@@ -40,7 +229,7 @@ def test_scheduler_failure_closes_coroutine_and_releases_its_subject_reservation
         attempted.append(coroutine)
         raise RuntimeError("synthetic callback loop failure")
 
-    monkeypatch.setattr(observation, "start_on_native_loop", unavailable)
+    monkeypatch.setattr(observation, "try_start_on_native_loop", unavailable)
     try:
         admission = owner.submit(run, subject_bytes=4, on_interrupted=lambda _: None)
         assert admission is ObservationAdmission.UNAVAILABLE
@@ -50,7 +239,7 @@ def test_scheduler_failure_closes_coroutine_and_releases_its_subject_reservation
         assert not owner._jobs
         assert owner._bytes == 0
         assert owner._idle.is_set()
-        monkeypatch.setattr(observation, "start_on_native_loop", original)
+        monkeypatch.setattr(observation, "try_start_on_native_loop", original)
         assert (
             owner.submit(run, subject_bytes=4, on_interrupted=lambda _: None)
             is ObservationAdmission.ACCEPTED

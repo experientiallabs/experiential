@@ -10,7 +10,7 @@ from concurrent.futures import Future
 from contextlib import contextmanager
 from enum import StrEnum
 
-from exp.runtime.gateway.guardrails.bounded import start_on_native_loop
+from exp.runtime.gateway.guardrails.bounded import try_start_on_native_loop
 
 _logger = logging.getLogger(__name__)
 
@@ -195,8 +195,10 @@ class ObservationOwner:
 
         coroutine = inspect()
         try:
-            future = start_on_native_loop(coroutine)
+            future = try_start_on_native_loop(coroutine)
         except Exception:  # noqa: BLE001 - observation cannot reject serving requests.
+            future = None
+        if future is None:
             coroutine.close()
             lease.release()
             return ObservationAdmission.UNAVAILABLE

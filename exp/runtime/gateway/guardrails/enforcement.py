@@ -305,6 +305,9 @@ class GuardrailEngine:
             for policy, outcome in zip(policies, outcomes, strict=True):
                 self._emit_observation(policy, None, outcome, 0.0)
             return
+        # Frozen contracts can contain mutable JSON containers owned by the caller.
+        # Detach once so the hashed, budgeted and asynchronously inspected subject agrees.
+        request = request.model_copy(deep=True)
         subject: bytes | None = None
         try:
             subject = observation_subject_bytes(request)
