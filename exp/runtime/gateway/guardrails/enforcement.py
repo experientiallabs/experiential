@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from collections.abc import Awaitable, Callable, Mapping
 from hashlib import sha256
 
@@ -31,6 +32,7 @@ from exp.runtime.gateway.guardrails.contracts import (
     request_content_bytes,
 )
 from exp.runtime.gateway.guardrails.observation import ObservationLease, ObservationOwner
+from exp.runtime.gateway.guardrails.recording import ObservationRecord, ObservationRecorder
 from exp.runtime.gateway.guardrails.redaction import restored_provider_authority
 from exp.runtime.gateway.guardrails.session import GuardrailSession
 from exp.runtime.gateway.guardrails.store import GuardrailPolicyStore
@@ -62,6 +64,7 @@ class GuardrailEngine:
         deterministic_specifications: Mapping[str, str] | None = None,
         max_observations: int = 8,
         max_observation_bytes: int = 8 * 1024 * 1024,
+        max_observation_records: int = 128,
     ) -> None:
         """Bind lookup, the internal client, and the deadline clock.
 
@@ -78,6 +81,7 @@ class GuardrailEngine:
                 chain on this engine.
             max_observations: Maximum retained asynchronous observation jobs, default 8.
             max_observation_bytes: Maximum complete subject bytes retained, default 8 MiB.
+            max_observation_records: Maximum queued plus active metadata records, default 128.
         """
         self.deterministic_specifications: Mapping[str, str] = dict(
             deterministic_specifications or {}
@@ -89,6 +93,9 @@ class GuardrailEngine:
         self._observation_inspects = BoundedInspect(max_inflight=max_observations)
         self._observations = ObservationOwner(
             max_jobs=max_observations, max_bytes=max_observation_bytes
+        )
+        self._observation_records = ObservationRecorder(
+            self._deliver_observation, max_records=max_observation_records
         )
         self.input_invocations = 0
         self.output_invocations = 0
@@ -118,6 +125,7 @@ class GuardrailEngine:
     def policy_revision(self, policies: tuple[GuardrailPolicy, ...]) -> str | None:
         """Hash the enforcing snapshot; observation cannot alter response replay identity."""
         policies = tuple(policy for policy in policies if policy.mode == "enforce")
+        adapters = {check.adapter_id for policy in policies for check in policy.checks}
         return (
             None
             if not policies
@@ -125,7 +133,11 @@ class GuardrailEngine:
                 canonical_json_bytes(
                     {
                         "policies": [p.model_dump(mode="json") for p in policies],
-                        "detectors": dict(self.deterministic_specifications),
+                        "detectors": {
+                            key: value
+                            for key, value in self.deterministic_specifications.items()
+                            if key in adapters
+                        },
                     }
                 )
             ).hexdigest()
@@ -243,7 +255,19 @@ class GuardrailEngine:
 
     def close(self, *, timeout_seconds: float = 1.0) -> None:
         """Stop observations and drain within a bounded host shutdown budget."""
+        deadline = time.monotonic() + timeout_seconds
         self._observations.close(timeout_seconds=timeout_seconds)
+        self._observation_records.close(timeout_seconds=max(0.0, deadline - time.monotonic()))
+
+    @property
+    def observation_recording_dropped(self) -> int:
+        """Count metadata records lost to bounded capacity, shutdown, or worker startup."""
+        return self._observation_records.dropped_count
+
+    @property
+    def observation_recording_failed(self) -> int:
+        """Count sink exceptions without exposing recorder diagnostics."""
+        return self._observation_records.failed_count
 
     async def enforce_output(
         self,
@@ -471,8 +495,6 @@ class GuardrailEngine:
                 policy, check, GuardrailOutcome.UNAVAILABLE, self._monotonic() - started
             )
         elapsed = self._monotonic() - started
-        if policy.mode == "observe" and elapsed >= timeout:
-            return self._uncertain(policy, check, GuardrailOutcome.TIMEOUT, elapsed)
         if not verdict.flagged:
             self._decision(policy, check, GuardrailAction.ALLOW, GuardrailOutcome.ALLOW, elapsed)
             return None
@@ -519,11 +541,14 @@ class GuardrailEngine:
         outcome: GuardrailOutcome,
         latency_seconds: float,
     ) -> None:
-        """Keep a failed observation recorder outside request and classifier authority."""
-        try:
-            self._record_observation(policy, check, outcome, latency_seconds)
-        except Exception:  # noqa: BLE001 - optional telemetry cannot reject serving requests.
-            _logger.warning("guardrail observation recording failed")
+        """Queue only immutable metadata; recorder latency never enters serving or inspection."""
+        self._observation_records.submit(ObservationRecord(policy, check, outcome, latency_seconds))
+
+    def _deliver_observation(self, record: ObservationRecord) -> None:
+        """Invoke the host sink only on the separately bounded metadata worker."""
+        self._record_observation(
+            record.policy, record.check, record.outcome, record.latency_seconds
+        )
 
     def _record_observation(
         self,

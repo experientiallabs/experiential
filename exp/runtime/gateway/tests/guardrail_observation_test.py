@@ -7,6 +7,7 @@ import json
 import sqlite3
 import threading
 import time
+from concurrent.futures import Future
 from pathlib import Path
 
 import httpx
@@ -114,6 +115,7 @@ class _Engine(GuardrailEngine):
         max_observation_bytes: int = 8 * 1024 * 1024,
         enforcing: GuardrailPolicy | None = None,
         inspects: BoundedInspect | None = None,
+        max_observation_records: int = 128,
     ) -> None:
         """Build the actual shared executor and bounded observation owner."""
         self.observed: list[tuple[str, str | None, GuardrailOutcome]] = []
@@ -136,6 +138,7 @@ class _Engine(GuardrailEngine):
             ),
             monotonic=time.monotonic,
             inspects=inspects,
+            max_observation_records=max_observation_records,
             max_observations=max_observations,
             max_observation_bytes=max_observation_bytes,
         )
@@ -224,6 +227,7 @@ def test_observer_limits_deadlines_and_shutdown_do_not_admit_unbounded_work() ->
         session.inspect_input(_request("first"))
         assert classifier.started.wait(2)
         session.inspect_input(_request("second"))
+        assert engine.recorded.wait(2)
         assert ("platform-observer", None, GuardrailOutcome.SKIPPED) in engine.observed
         assert classifier.cancelled.wait(2)
         engine.close(timeout_seconds=2)
@@ -231,7 +235,7 @@ def test_observer_limits_deadlines_and_shutdown_do_not_admit_unbounded_work() ->
         assert classifier.input_calls == 1
         assert session.settlement_failure() is None
         session.inspect_input(_request("after-close"))
-        assert engine.observed[-1] == ("platform-observer", None, GuardrailOutcome.SKIPPED)
+        assert engine.observation_recording_dropped == 1
     finally:
         classifier.release.set()
         engine.close(timeout_seconds=0)
@@ -252,6 +256,7 @@ def test_unsupported_or_unadmitted_subjects_are_recorded_without_inspection(boun
         assert session.settlement_failure() is None
         assert classifier.input_calls == 0
         expected = GuardrailOutcome.UNSUPPORTED if bound == "coverage" else GuardrailOutcome.SKIPPED
+        engine.close(timeout_seconds=2)
         assert engine.observed == [("platform-observer", None, expected)]
     finally:
         engine.close(timeout_seconds=0)
@@ -388,6 +393,7 @@ def test_observation_budget_counts_private_context_before_dispatch() -> None:
     try:
         assert _session(engine).inspect_input(request) is request
         assert classifier.input_calls == 0
+        engine.close(timeout_seconds=2)
         assert engine.observed == [("platform-observer", None, GuardrailOutcome.SKIPPED)]
     finally:
         engine.close(timeout_seconds=2)
@@ -519,6 +525,7 @@ def test_observation_recorder_failure_cannot_reject_a_request(
     session = _session(engine)
     try:
         require_unguarded_surface(engine, _authorization(), "embeddings")
+        assert recorded.wait(2)
         recorded.clear()
         assert session.inspect_input(_request()) == _request()
         classifier.release.set()
@@ -535,6 +542,7 @@ def test_observer_only_policies_do_not_fence_unsupported_surfaces(surface: str) 
     classifier = _Classifier(GuardrailOutcome.FLAGGED)
     engine = _Engine(classifier)
     require_unguarded_surface(engine, _authorization(), surface)
+    engine.close(timeout_seconds=2)
     assert engine.observed == [("platform-observer", None, GuardrailOutcome.UNSUPPORTED)]
     assert classifier.input_calls == 0
     engine.close(timeout_seconds=0)
@@ -690,3 +698,81 @@ def test_native_tool_search_observes_expanded_context_without_output_enforcement
         classifier.release.set()
         engine.close(timeout_seconds=2)
         provider.close()
+
+
+@pytest.mark.parametrize("outcome", [GuardrailOutcome.ALLOW, GuardrailOutcome.FLAGGED])
+def test_timely_observer_verdict_survives_delayed_control_loop_delivery(
+    outcome: GuardrailOutcome,
+) -> None:
+    """Delivery latency after worker completion cannot relabel a real verdict as a timeout."""
+
+    class DelayedDelivery(BoundedInspect):
+        """Expose scheduler delay after the actual bounded executor obtained a verdict."""
+
+        async def _await_isolated[T](self, task: Future[T], timeout: float) -> T:
+            """Keep the actual timely worker result while the caller loop pauses."""
+            result = await super()._await_isolated(task, timeout)
+            time.sleep(timeout + 0.025)
+            return result
+
+    classifier = _Classifier(outcome)
+    classifier.release.set()
+    engine = _Engine(classifier, _policy(timeout_ms=500))
+    engine._observation_inspects = DelayedDelivery(max_inflight=1)
+    try:
+        _session(engine).inspect_input(_request())
+        assert engine.recorded.wait(5)
+        assert engine.observed == [("platform-observer", "input", outcome)]
+        assert engine.enforced == []
+    finally:
+        engine.close(timeout_seconds=2)
+
+
+def test_blocked_observation_sink_cannot_stall_skips_or_unsupported_admission(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Saturated inspection and a blocked metadata sink leave subsequent admissions prompt."""
+    classifier = _Classifier(GuardrailOutcome.ALLOW)
+    engine = _Engine(
+        classifier, _policy(timeout_ms=5000), max_observations=1, max_observation_records=2
+    )
+    started = threading.Event()
+    release = threading.Event()
+    threads: list[str] = []
+
+    def blocked(
+        policy: GuardrailPolicy,
+        check: GuardrailCheck | None,
+        outcome: GuardrailOutcome,
+        latency_seconds: float,
+    ) -> None:
+        """Model an unavailable external logging sink without accessing request content."""
+        del policy, check, outcome, latency_seconds
+        threads.append(threading.current_thread().name)
+        started.set()
+        assert release.wait(5)
+
+    monkeypatch.setattr(engine, "_record_observation", blocked)
+    try:
+        session = _session(engine)
+        session.inspect_input(_request("first"))
+        assert classifier.started.wait(2)
+        session.inspect_input(_request("second"))
+        assert started.wait(2)
+        before = time.monotonic()
+        session.inspect_input(_request("third"))
+        require_unguarded_surface(engine, _authorization(), "embeddings")
+        assert time.monotonic() - before < 0.5
+        assert engine.observation_recording_dropped == 1
+        assert classifier.input_calls == 1
+        assert threads == ["exp-guardrail-record"]
+        before = time.monotonic()
+        engine.close(timeout_seconds=0.2)
+        assert time.monotonic() - before < 0.3
+        assert not release.is_set()
+        assert engine.observation_recording_dropped >= 2
+        assert session.settlement_failure() is None
+    finally:
+        classifier.release.set()
+        release.set()
+        engine.close(timeout_seconds=2)

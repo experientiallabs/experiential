@@ -94,7 +94,20 @@ recording seam separate from `_record`, which continues to report enforcing acti
 `unavailable`, `timeout`, and `skipped`. `check.action` reports the authored action
 that would apply under enforcement. Policy IDs and revisions identify rollout state;
 subject text, replacements, and detector diagnostics never enter either recorder.
-Hosts must count observation outcomes separately from actual customer blocks.
+An outcome reports the configured adapter's verdict for its declared input projection,
+not an independent certification that every in-memory field was inspected. Complete-context
+policies must bind an adapter with explicit coverage checks, such as Platform's dedicated
+criminal-abuse adapter on this same engine. Hosts must count observation outcomes separately
+from actual customer blocks.
+Recording runs on one dedicated daemon worker. Only immutable policy/check metadata,
+outcome and elapsed time enter its bounded queue; request text and callback closures
+never enter that queue. `max_observation_records` defaults to 128 queued plus active
+records. A saturated or closed sink drops metadata without delaying admission;
+`engine.observation_recording_dropped` counts those losses and
+`engine.observation_recording_failed` counts sink exceptions. Hosts should expose both
+counters. The inspection owner and metadata recorder share the same overall `close`
+budget. At shutdown expiry queued metadata is discarded and counted, while at most
+one stalled sink call can remain alive holding content-free metadata.
 
 Unsupported surfaces remain available to observation-only callers and record
 `unsupported`. Hosts with additional surfaces, such as provider batches, use
@@ -164,8 +177,9 @@ outages and timeouts return `unavailable`, without exposing detector diagnostics
 claiming that content violated policy. Queues and inflight work remain bounded;
 request removal cancels its pending inspection. Unprotected identity checks may
 observe and continue after uncertain classifier results. Platform policies are
-always protected. Adapters raise `ClassifierCoverageError()` when they cannot inspect
-the complete context or modality; enforcement returns a nonretryable
+always protected. An adapter requiring complete-context coverage raises
+`ClassifierCoverageError()` when its declared inspection contract cannot cover the context
+or modality; enforcement returns a nonretryable
 `unsupported_capability` error, with no failover and no content-violation accusation.
 The input subject bound has the same coverage semantics. `ClassifierUncertainError()`
 distinguishes an inconclusive result from transport or runtime failure in observation;
@@ -173,7 +187,13 @@ protected enforcement continues to return `unavailable` for either case.
 
 Replay keys include the applicable enforcing policies, execution settings, and revision.
 Adding or revising observation-only policies leaves replay unchanged. Promoting an
-observer to enforcement changes replay identity.
+observer to enforcement changes replay identity. Only deterministic detector rules
+referenced by applicable enforcing checks enter that digest.
+
+Version 0.7.162 intentionally establishes a new guarded replay contract. Guarded keys
+accepted on 0.7.161 return `409` after upgrading, even when the authored policy is
+otherwise unchanged. There is no legacy-fingerprint translation. Finish in-flight
+requests before the cutover and use new keys for new operations.
 A keyed admission compares its frozen policy revision with the replay claim before
 inspection, acceptance, search, or model dispatch. A reload between claim and admission
 returns `409`; retrying takes a new snapshot. Change `revision` whenever the detector
@@ -449,9 +469,29 @@ individual checks by check ID (`standard-input-pii`) or `stage.capability`
 stores a credential. The adapter reads that name at inspect time and sends a
 bearer header. Missing values are classifier uncertainty.
 
+Local keyword and regex input checks inspect canonical message text, tool arguments,
+function definitions and examples, tool call/result names and namespaces, structured
+output schemas, and normalized gateway web/tool-search declarations. Recovered or sealed reasoning, capture-only reasoning,
+multimodal attachments, verbatim native message blocks, context management, raw provider
+thinking/output configuration, opaque provider tool-caller objects, and provider-owned
+native/server tools return unsupported coverage. Regex rewrites only message text; matches in tool arguments or immutable
+tool/schema/search context are refused under modify. Exact flattened text blocks and inert
+cache/replay metadata remain supported for inspection. Cached block text is inspectable,
+but a match is refused under local modify because changing only canonical text cannot
+safely rewrite the provider block.
+
 The `http_json` request includes `capability`, `stage`, `action`, `check_id`,
 and exactly one subject: `request` or `completion`. The request subject is the
-compact deterministic JSON of the canonical `GatewayRequest`. The response
+compact deterministic JSON of the public `GatewayRequest` projection. Fields marked
+`exclude=True`, including private reasoning, native provider blocks and configuration,
+and tool examples, are intentionally absent. A hosted modifier may rewrite the visible
+subject while the gateway restores unchanged hidden replay authority; that restoration
+does not inspect the hidden content. An `allow` verdict covers the transmitted projection
+only. Generic `http_json` cannot implement mandatory complete-context criminal inspection
+when private carriers matter; Platform uses its dedicated coverage-aware adapter through
+the same engine. This release does not expand the HTTP wire contract.
+
+The response
 must validate as `ClassifierVerdict`. A non-`modify` check must not return a
 replacement. A flagged `modify` verdict must contain exactly the
 stage-appropriate replacement (`replacement_messages` on input,

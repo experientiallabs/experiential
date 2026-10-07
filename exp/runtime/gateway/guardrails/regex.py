@@ -26,6 +26,7 @@ from exp.runtime.gateway.guardrails.contracts import (
     GuardrailCompletion,
 )
 from exp.runtime.gateway.guardrails.streaming import StreamingRedactor
+from exp.runtime.gateway.guardrails.text_coverage import text_input_context
 
 
 class BuiltinPattern(StrEnum):
@@ -318,22 +319,25 @@ class RegexClassifier:
     async def inspect_input(
         self, *, request: GatewayRequest, check: GuardrailCheck
     ) -> ClassifierVerdict:
-        """Redact message text; a match in tool arguments cannot be safely rewritten."""
+        """Redact message text; tool arguments and contextual constraints are immutable."""
+        context = text_input_context(request)
         messages = []
-        flagged = False
-        tool_match = False
+        flagged = bool(context) and self._redact(context)[0]
+        immutable_match = flagged
         for message in request.messages:
             found, text = self._redact(message.content or "")
             flagged |= found
+            # Cached text blocks replay verbatim; changing only content leaves the original on wire.
+            immutable_match |= found and bool(message.provider_text_blocks)
             messages.append(message.model_copy(update={"content": text}) if found else message)
             for call in message.tool_calls:
                 found, _ = self._redact(call.arguments_json())
                 flagged |= found
-                tool_match |= found
-        if flagged and check.action is GuardrailAction.MODIFY and not tool_match:
+                immutable_match |= found
+        if flagged and check.action is GuardrailAction.MODIFY and not immutable_match:
             return ClassifierVerdict(flagged=True, replacement_messages=tuple(messages))
         # A flagged modify without replacement is refused by the engine, even
-        # under a fail-open policy. Tool arguments must never pass unredacted.
+        # under a fail-open policy. Tool/schema context must never pass unredacted.
         return ClassifierVerdict(flagged=flagged)
 
     async def inspect_output(

@@ -332,3 +332,95 @@ def test_standard_pii_checks_use_modify_on_input_and_output() -> None:
         GuardrailCheckStage.OUTPUT,
     ]
     assert all(check.action is GuardrailAction.MODIFY for check in pii_checks)
+
+
+def _mixed_regex_document() -> JsonObject:
+    """Configure independent enforcing and observing rules through the real file loader."""
+    return {
+        "adapters": [
+            {"adapter_id": mode, "kind": "regex", "patterns": [mode]}
+            for mode in ("enforce", "observe")
+        ],
+        "policies": [
+            {
+                "policy_id": mode,
+                "mode": mode,
+                "protected": True,
+                "organization_id": "organization-one" if mode == "enforce" else None,
+                "identity_id": "identity-one" if mode == "enforce" else None,
+                "checks": [
+                    {
+                        "check_id": "input",
+                        "capability": "content_safety",
+                        "stage": "input",
+                        "action": "block",
+                        "adapter_id": mode,
+                        "timeout_ms": 500,
+                    }
+                ],
+            }
+            for mode in ("enforce", "observe")
+        ],
+    }
+
+
+@pytest.mark.parametrize(
+    "change",
+    ["observer_rule", "observer_added", "enforcing_rule", "shared_rule", "unrelated_identity_rule"],
+)
+def test_replay_hashes_only_rules_referenced_by_applicable_enforcement(change: str) -> None:
+    """Observer-only and other-tenant regex edits preserve the current identity's replay."""
+    document = _mixed_regex_document()
+    adapters, policies = document["adapters"], document["policies"]
+    assert isinstance(adapters, list) and isinstance(policies, list)
+    observed_policy = policies[1]
+    assert isinstance(observed_policy, dict)
+    if change == "shared_rule":
+        checks = observed_policy["checks"]
+        assert isinstance(checks, list) and isinstance(checks[0], dict)
+        checks[0]["adapter_id"] = "enforce"
+    if change == "unrelated_identity_rule":
+        observed_policy.update(
+            {
+                "mode": "enforce",
+                "organization_id": "organization-one",
+                "identity_id": "identity-two",
+            }
+        )
+    original = engine_from_document(document)
+    original_revision = original.policy_revision(
+        original.policies_for("organization-one", "identity-one")
+    )
+    assert original_revision is not None
+    if change == "observer_added":
+        adapters.append({"adapter_id": "extra", "kind": "regex", "patterns": ["additional"]})
+        policies.append(
+            {
+                **observed_policy,
+                "policy_id": "extra",
+                "checks": [
+                    {
+                        "check_id": "input",
+                        "capability": "content_safety",
+                        "stage": "input",
+                        "action": "block",
+                        "adapter_id": "extra",
+                        "timeout_ms": 500,
+                    }
+                ],
+            }
+        )
+    else:
+        changed_adapter = adapters[0 if change in {"enforcing_rule", "shared_rule"} else 1]
+        assert isinstance(changed_adapter, dict)
+        changed_adapter["patterns"] = ["changed"]
+    reloaded = engine_from_document(document)
+    try:
+        actual = reloaded.policy_revision(reloaded.policies_for("organization-one", "identity-one"))
+        if change in {"enforcing_rule", "shared_rule"}:
+            assert actual != original_revision
+        else:
+            assert actual == original_revision
+    finally:
+        original.close(timeout_seconds=0)
+        reloaded.close(timeout_seconds=0)

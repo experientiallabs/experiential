@@ -25,6 +25,108 @@ from exp.runtime.gateway.guardrails.regex import (
     RegexAdapterDocument,
     RegexClassifier,
 )
+from exp.runtime.gateway.guardrails.text_coverage_test import (
+    SUPPORTED_TEXT_CONTEXTS,
+    UNSUPPORTED_TEXT_INPUTS,
+    text_context_request,
+    unsupported_text_request,
+)
+from exp.runtime.models.providers.wire_messages import anthropic_blocks
+
+
+@pytest.mark.parametrize("field", UNSUPPORTED_TEXT_INPUTS)
+@pytest.mark.parametrize("protected", [True, False])
+def test_native_and_python_input_refuse_incomplete_coverage(field: str, protected: bool) -> None:
+    """The native fast path cannot turn a Python coverage failure into a partial allow."""
+    engine = engine_from_document(_adapter(builtin_patterns=["email"]))
+    policy = engine.policies_for("org", "identity")[0].model_copy(update={"protected": protected})
+    detectors = compile_native_detectors(engine.deterministic_specifications)
+    request = unsupported_text_request(field)
+    with pytest.raises(GuardrailRejected) as python:
+        asyncio.run(engine.enforce_input(policy=policy, request=request, deadline_monotonic=1e12))
+    with pytest.raises(GuardrailRejected) as native:
+        native_input_request(
+            policy, detectors, request, monotonic=lambda: 0.0, deadline_monotonic=1e12
+        )
+    assert native.value.failure == python.value.failure
+    assert native.value.failure.failure_class.value == "unsupported_capability"
+
+
+@pytest.mark.parametrize("field", SUPPORTED_TEXT_CONTEXTS)
+def test_native_and_python_context_matches_preserve_immutable_constraints(field: str) -> None:
+    """Native and Python regex agree on benign context and refuse matched constraints."""
+    engine = engine_from_document(_adapter(builtin_patterns=["email"]))
+    policy = engine.policies_for("org", "identity")[0]
+    detectors = compile_native_detectors(engine.deterministic_specifications)
+    benign = text_context_request(field, "benign")
+    assert (
+        asyncio.run(engine.enforce_input(policy=policy, request=benign, deadline_monotonic=1e12))
+        is benign
+    )
+    assert (
+        native_input_request(
+            policy, detectors, benign, monotonic=lambda: 0.0, deadline_monotonic=1e12
+        )
+        is benign
+    )
+    request = text_context_request(field, "alice@example.com")
+    with pytest.raises(GuardrailRejected) as python:
+        asyncio.run(engine.enforce_input(policy=policy, request=request, deadline_monotonic=1e12))
+    with pytest.raises(GuardrailRejected) as native:
+        native_input_request(
+            policy, detectors, request, monotonic=lambda: 0.0, deadline_monotonic=1e12
+        )
+    assert native.value.failure == python.value.failure
+
+
+@pytest.mark.parametrize("protected", [True, False])
+def test_matched_cache_carried_text_cannot_escape_a_modify_rule(protected: bool) -> None:
+    """Refuse rewriting only the canonical text while the provider replays its original blocks."""
+    engine = engine_from_document(_adapter(builtin_patterns=["email"]))
+    policy = engine.policies_for("org", "identity")[0].model_copy(update={"protected": protected})
+    detectors = compile_native_detectors(engine.deterministic_specifications)
+    dispatched: list[tuple[str, list[JsonObject]]] = []
+    for text in ("benign", "alice@example.com"):
+        request = GatewayRequest(
+            surface=GatewayApiSurface.MESSAGES,
+            messages=(
+                GatewayMessage(
+                    role="user",
+                    content=text,
+                    provider_text_blocks=(
+                        {"type": "text", "text": text, "cache_control": {"type": "ephemeral"}},
+                    ),
+                ),
+            ),
+        )
+        if text == "benign":
+            python_result = asyncio.run(
+                engine.enforce_input(policy=policy, request=request, deadline_monotonic=1e12)
+            )
+            native_result = native_input_request(
+                policy, detectors, request, monotonic=lambda: 0.0, deadline_monotonic=1e12
+            )
+            assert python_result is native_result is request
+            assert anthropic_blocks(request.messages[0]) == (
+                "user",
+                [{"type": "text", "text": "benign", "cache_control": {"type": "ephemeral"}}],
+            )
+            continue
+        with pytest.raises(GuardrailRejected) as python:
+            python_result = asyncio.run(
+                engine.enforce_input(policy=policy, request=request, deadline_monotonic=1e12)
+            )
+            dispatched.append(anthropic_blocks(python_result.messages[0]))
+        with pytest.raises(GuardrailRejected) as native:
+            native_result = native_input_request(
+                policy, detectors, request, monotonic=lambda: 0.0, deadline_monotonic=1e12
+            )
+            assert native_result is not None
+            dispatched.append(anthropic_blocks(native_result.messages[0]))
+        assert native.value.failure == python.value.failure
+        assert native.value.failure.failure_class.value == "guardrail"
+        assert dispatched == []
+
 
 _CORPUS = (
     "",

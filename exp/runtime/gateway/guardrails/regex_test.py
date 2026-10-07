@@ -11,6 +11,7 @@ from exp.common.models.model import ToolCall
 from exp.runtime.gateway.contracts import GatewayApiSurface, GatewayMessage, GatewayRequest
 from exp.runtime.gateway.guardrails.config import engine_from_document
 from exp.runtime.gateway.guardrails.contracts import (
+    ClassifierCoverageError,
     GuardrailCompletion,
     GuardrailRejected,
     GuardrailToolCall,
@@ -20,6 +21,42 @@ from exp.runtime.gateway.guardrails.regex import (
     RegexAdapterDocument,
     RegexClassifier,
 )
+from exp.runtime.gateway.guardrails.text_coverage_test import (
+    SUPPORTED_TEXT_CONTEXTS,
+    UNSUPPORTED_TEXT_INPUTS,
+    text_context_request,
+    unsupported_text_request,
+)
+
+
+@pytest.mark.parametrize("field", UNSUPPORTED_TEXT_INPUTS)
+def test_regex_classifier_refuses_uninspectable_input(field: str) -> None:
+    """A deterministic verdict must cover the whole supported prompt."""
+    classifier = RegexClassifier(
+        RegexAdapterDocument(adapter_id="patterns", builtin_patterns=(BuiltinPattern.EMAIL,))
+    )
+    engine = engine_from_document(_document({"builtin_patterns": ["email"]}))
+    check = engine.policies_for("org", "identity")[0].input_checks[0]
+    with pytest.raises(ClassifierCoverageError):
+        asyncio.run(classifier.inspect_input(request=unsupported_text_request(field), check=check))
+
+
+@pytest.mark.parametrize("field", SUPPORTED_TEXT_CONTEXTS)
+def test_regex_context_match_is_flagged_without_rewriting_constraints(field: str) -> None:
+    """A schema or example match is refused like a matched tool argument under modify."""
+    engine = engine_from_document(_document({"builtin_patterns": ["email"]}))
+    policy = engine.policies_for("org", "identity")[0]
+    benign = text_context_request(field, "benign")
+    assert (
+        asyncio.run(engine.enforce_input(policy=policy, request=benign, deadline_monotonic=1e12))
+        is benign
+    )
+    request = text_context_request(field, "alice@example.com")
+    original = request.model_copy(deep=True)
+    with pytest.raises(GuardrailRejected) as rejected:
+        asyncio.run(engine.enforce_input(policy=policy, request=request, deadline_monotonic=1e12))
+    assert rejected.value.failure.failure_class.value == "guardrail"
+    assert request == original
 
 
 def _document(adapter: JsonObject, *, action: str = "modify") -> JsonObject:

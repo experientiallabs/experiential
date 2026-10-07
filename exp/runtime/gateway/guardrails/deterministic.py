@@ -26,6 +26,7 @@ from exp.runtime.gateway.contracts import (
     GatewayRequest,
 )
 from exp.runtime.gateway.guardrails.contracts import (
+    ClassifierCoverageError,
     GuardrailAction,
     GuardrailCheck,
     GuardrailPolicy,
@@ -35,6 +36,7 @@ from exp.runtime.gateway.guardrails.contracts import (
     request_content_bytes,
 )
 from exp.runtime.gateway.guardrails.redaction import restored_provider_authority
+from exp.runtime.gateway.guardrails.text_coverage import text_input_context
 
 _logger = logging.getLogger(__name__)
 
@@ -133,7 +135,10 @@ def native_input_request(
             continue
         started = monotonic()
         try:
-            messages, flagged, tool_match = _redacted_messages(detector, current)
+            messages, flagged, immutable_match = _redacted_messages(detector, current)
+        except ClassifierCoverageError:
+            _record(policy, check, GuardrailAction.ERROR)
+            raise GuardrailRejected(coverage_failure(check_id=check.check_id)) from None
         except ValueError:
             _uncertain(policy, check)
             continue
@@ -146,7 +151,7 @@ def native_input_request(
             _record(policy, check, GuardrailAction.ALLOW, monotonic() - started)
             continue
         _record(policy, check, check.action, monotonic() - started)
-        current = _applied(policy, check, current, messages, tool_match=tool_match)
+        current = _applied(policy, check, current, messages, immutable_match=immutable_match)
     return current
 
 
@@ -154,29 +159,33 @@ def _redacted_messages(
     detector: NativeDetector,
     request: GatewayRequest,
 ) -> tuple[tuple[GatewayMessage, ...], bool, bool]:
-    """Redact message text and flag tool arguments, which are never rewritten.
+    """Redact message text and flag tool/schema context, which is never rewritten.
 
     Returns:
         The rewritten messages, whether anything matched, and whether a
-        match landed in tool-call arguments.
+        match landed in immutable tool/schema context.
 
     Raises:
+        ClassifierCoverageError: The complete input is not supported by a text-only rule.
         ValueError: The subject exceeded an inspection bound.
     """
+    context = text_input_context(request)
     messages: list[GatewayMessage] = []
-    flagged = False
-    tool_match = False
+    flagged = bool(context) and detector.matches(context)
+    immutable_match = flagged
     for message in request.messages:
         rewritten = detector.redact(message.content or "")
         flagged |= rewritten is not None
+        # Cached text blocks replay verbatim; changing only content leaves the original on wire.
+        immutable_match |= rewritten is not None and bool(message.provider_text_blocks)
         messages.append(
             message if rewritten is None else message.model_copy(update={"content": rewritten})
         )
         for call in message.tool_calls:
             found = detector.matches(call.arguments_json())
             flagged |= found
-            tool_match |= found
-    return tuple(messages), flagged, tool_match
+            immutable_match |= found
+    return tuple(messages), flagged, immutable_match
 
 
 def _applied(
@@ -185,20 +194,20 @@ def _applied(
     request: GatewayRequest,
     messages: tuple[GatewayMessage, ...],
     *,
-    tool_match: bool,
+    immutable_match: bool,
 ) -> GatewayRequest:
     """Apply one flagged deterministic input action.
 
     Raises:
         GuardrailRejected: The action blocks, or a modification cannot be
-            applied without leaking a matched tool argument or breaking
+            applied without leaking matched tool/schema context or breaking
             hidden provider replay authority.
     """
     del policy
     if check.action is GuardrailAction.ALLOW:
         return request
     if check.action is GuardrailAction.MODIFY:
-        if tool_match:
+        if immutable_match:
             raise GuardrailRejected(
                 guardrail_failure(action=GuardrailAction.ERROR, check_id=check.check_id)
             )
