@@ -137,6 +137,10 @@ _NO_PARALLEL_TOOL_CONTROL_DIALECTS = frozenset(
 )
 
 
+WEB_SEARCH_SOURCES_DROPPED = "include.web_search_call.action.sources->dropped(gateway_web_search)"
+"""Disclosure for a sources selector on a route the provider does not search."""
+
+
 def route_generation_parameter_requests(
     profiles: Sequence[GatewayWireProfile],
     request: GatewayRequest,
@@ -847,6 +851,16 @@ def route_generation_parameter_requests(
     disclose_anthropic_tool_schemas(profiles, request, ignored)
     disclose_system_fold(profiles, request, ignored)
 
+    if request.include_web_search_sources and not all(
+        profile.dialect == "openai_responses" for profile in profiles
+    ):
+        # Only a native Responses provider emits web_search_call items for the
+        # selector to annotate; where the gateway runs the search itself the
+        # sources are cited in the answer instead. One shaped request serves
+        # the route, so a mixed route drops it for every rung.
+        provider_updates["include_web_search_sources"] = False
+        if WEB_SEARCH_SOURCES_DROPPED not in ignored:
+            ignored.append(WEB_SEARCH_SOURCES_DROPPED)
     encrypted_reasoning_present = any(
         block.kind == "encrypted_reasoning"
         for message in request.messages

@@ -140,6 +140,7 @@ def provider_replay_authority(request: GatewayRequest) -> JsonObject | None:
         and request.inference_geo is None
         and request.service_tier is None
         and not request.include_output_text_logprobs
+        and not request.include_web_search_sources
         and not request.json_object_output
         and not request.provider_beta_tokens
         and not request.provider_server_tools
@@ -176,6 +177,8 @@ def provider_replay_authority(request: GatewayRequest) -> JsonObject | None:
         envelope["provider_preferences"] = request.provider_preferences
     if request.include_output_text_logprobs:
         envelope["include_output_text_logprobs"] = True
+    if request.include_web_search_sources:
+        envelope["include_web_search_sources"] = True
     if request.json_object_output:
         # Schema-free JSON mode changes the answer shape for the same body.
         envelope["json_object_output"] = True

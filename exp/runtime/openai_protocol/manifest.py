@@ -253,9 +253,19 @@ RESPONSES_REASONING_SUMMARIES_ACCEPTED = frozenset({"auto", "concise", "detailed
 """``reasoning.summary`` and ``generate_summary`` values the decoder accepts."""
 
 RESPONSES_INCLUDE_PATHS_ACCEPTED = frozenset(
-    {"reasoning.encrypted_content", "message.output_text.logprobs"}
+    {
+        "reasoning.encrypted_content",
+        "message.output_text.logprobs",
+        "web_search_call.action.sources",
+    }
 )
-"""``include`` selectors the gateway honors."""
+"""``include`` selectors the gateway honors.
+
+``web_search_call.action.sources`` is forwarded to native Responses rungs,
+whose provider-executed ``web_search_call`` items relay verbatim; a rung where
+the gateway runs the search itself emits no such item, so there the selector
+is dropped with a disclosure rather than refusing the request (Big-AGI,
+litellm and pi send it whenever web search is on)."""
 
 RESPONSES_INCLUDE_PATHS_REJECTED = frozenset(
     {
@@ -263,7 +273,6 @@ RESPONSES_INCLUDE_PATHS_REJECTED = frozenset(
         "computer_call_output.output.image_url",
         "file_search_call.results",
         "message.input_image.image_url",
-        "web_search_call.action.sources",
         "web_search_call.results",
     }
 )

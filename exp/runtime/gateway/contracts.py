@@ -443,6 +443,9 @@ class GatewayRequest(ContractModel):
 
     Attributes:
         include_output_text_logprobs: Responses probability selector (default false).
+        include_web_search_sources: Responses ``web_search_call.action.sources``
+            selector (default false): native Responses rungs forward it so the
+            provider's web search items carry their sources.
         top_logprobs: Optional strict integer from zero through twenty for alternative tokens.
         thinking_budget: Optional strict numeric Chat control, at least -1; provider validation
             defines zero and -1 semantics. Excluded from serialization, retained in replay identity.
@@ -473,6 +476,7 @@ class GatewayRequest(ContractModel):
     logprobs: StrictBool | None = None
     top_logprobs: StrictInt | None = Field(default=None, ge=0, le=20)
     include_output_text_logprobs: bool = Field(default=False, exclude=True)
+    include_web_search_sources: bool = Field(default=False, exclude=True)
     reasoning_effort: ReasoningEffort | None = None
     reasoning_effort_parameter: (
         Literal["reasoning_effort", "reasoning.effort", "output_config.effort"] | None
@@ -812,6 +816,8 @@ class GatewayRequest(ContractModel):
             raise ValueError("response_store is valid only for Responses requests")
         if self.include_output_text_logprobs and self.surface != GatewayApiSurface.RESPONSES:
             raise ValueError("include_output_text_logprobs is valid only for Responses requests")
+        if self.include_web_search_sources and self.surface != GatewayApiSurface.RESPONSES:
+            raise ValueError("include_web_search_sources is valid only for Responses requests")
         if self.include_encrypted_reasoning and self.surface != GatewayApiSurface.RESPONSES:
             raise ValueError("include_encrypted_reasoning is valid only for Responses requests")
         if self.reasoning_context is not None and self.surface != GatewayApiSurface.RESPONSES:

@@ -5123,3 +5123,51 @@ def test_chat_output_limit_spellings_cannot_override_each_other(other: str) -> N
                 other: 256,
             }
         )
+
+
+def test_responses_web_search_sources_selector_is_honored() -> None:
+    """``web_search_call.action.sources`` decodes instead of refusing the request.
+
+    Big-AGI, litellm and pi send it whenever web search is on; refusing it
+    failed every such request (2026-09).
+    """
+    request = decode_responses(
+        {
+            "model": "coding",
+            "input": "hi",
+            "tools": [{"type": "web_search"}],
+            "include": ["web_search_call.action.sources", "reasoning.encrypted_content"],
+        }
+    ).request
+    assert request.include_web_search_sources is True
+    assert request.include_encrypted_reasoning is True
+    assert (
+        decode_responses({"model": "coding", "input": "hi"}).request.include_web_search_sources
+        is False
+    )
+
+
+@pytest.mark.parametrize("action_type", ["other", "find", "search", "find_in_page"])
+def test_replayed_web_search_items_decode_whatever_their_action(action_type: str) -> None:
+    """A Codex history echoing its provider's web search item replays verbatim.
+
+    The SDK enumerates only search / open_page / find_in_page; Codex echoes
+    others, and the official probe refused them ("Invalid value for
+    'input.N.action.type'"), wedging every later turn of the session.
+    """
+    decoded = decode_responses(
+        {
+            "model": "coding",
+            "input": [
+                {"type": "message", "role": "user", "content": "look it up"},
+                {
+                    "type": "web_search_call",
+                    "id": "ws_1",
+                    "status": "completed",
+                    "action": {"type": action_type, "query": "weather"},
+                },
+                {"type": "message", "role": "user", "content": "thanks"},
+            ],
+        }
+    )
+    assert decoded.request.surface == GatewayApiSurface.RESPONSES

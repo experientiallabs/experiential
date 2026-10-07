@@ -176,6 +176,17 @@ def official_responses_probe(payload: JsonObject) -> JsonObject:
                 if item.get("id") is not None and "status" not in item:
                     item["status"] = "completed"
                 adapted.append(item)
+            elif isinstance(entry, dict) and entry.get("type") == "web_search_call":
+                # A replayed provider-executed web search item is the
+                # provider's own vocabulary: it forwards byte-for-byte to the
+                # native Responses rung that authored it (every other rung
+                # refuses hosted items by name). The installed SDK enumerates
+                # only search / open_page / find_in_page actions, while Codex
+                # echoes others (`other`, captured as "Invalid value for
+                # 'input.N.action.type'" on 55 requests, Sep 24 - Oct 6), so
+                # the probe never judges the item's internals; the wire model
+                # keeps its shallow type and id checks.
+                continue
             elif isinstance(entry, dict) and entry.get("type") == "reasoning":
                 item = dict(entry)
                 if item.get("id") is None:

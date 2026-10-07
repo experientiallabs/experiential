@@ -43,6 +43,7 @@ from exp.runtime.openai_protocol.errors import invalid_field, unsupported_field
 from exp.runtime.openai_protocol.manifest import (
     CHAT_MANIFEST,
     EMBEDDINGS_MANIFEST,
+    RESPONSES_INCLUDE_PATHS_ACCEPTED,
     RESPONSES_MANIFEST,
     validate_manifest,
 )
@@ -424,9 +425,11 @@ def decode_responses(
         official_probe,
         extension_fields={"top_k", "reasoning", "client_metadata", "provider", "gateway"},
     )
-    include_encrypted_reasoning, include_output_text_logprobs = _responses_include_options(
-        request.include
-    )
+    (
+        include_encrypted_reasoning,
+        include_output_text_logprobs,
+        include_web_search_sources,
+    ) = _responses_include_options(request.include)
     idempotency_key, client_request_id = _validated_operation_headers(
         idempotency_key, client_request_id
     )
@@ -495,6 +498,7 @@ def decode_responses(
             logprobs=None,
             top_logprobs=request.top_logprobs,
             include_output_text_logprobs=include_output_text_logprobs,
+            include_web_search_sources=include_web_search_sources,
             reasoning_effort=(request.reasoning.effort if request.reasoning is not None else None),
             reasoning_context=(
                 request.reasoning.context if request.reasoning is not None else None
@@ -802,31 +806,33 @@ def _responses_tool_choice(
     raise invalid_field("tool_choice")
 
 
-def _responses_include_options(include: tuple[str, ...] | None) -> tuple[bool, bool]:
+def _responses_include_options(include: tuple[str, ...] | None) -> tuple[bool, bool, bool]:
     """Validate the closed ``include`` selector list.
 
     Args:
         include: Raw caller include paths.
 
     Returns:
-        A pair of encrypted-reasoning and output-text-logprobs selectors.
+        The encrypted-reasoning, output-text-logprobs and web-search-sources
+        selectors.
 
     Raises:
         OpenAIProtocolError: An include path is not supported by this gateway.
     """
     if include is None:
-        return False, False
+        return False, False, False
     for path in include:
-        if path not in {"reasoning.encrypted_content", "message.output_text.logprobs"}:
+        if path not in RESPONSES_INCLUDE_PATHS_ACCEPTED:
             raise invalid_field(
                 "include",
                 f"The include path {path!r} is not supported by this gateway. "
-                "Only 'reasoning.encrypted_content' and "
-                "'message.output_text.logprobs' are available.",
+                "Only 'reasoning.encrypted_content', 'message.output_text.logprobs' "
+                "and 'web_search_call.action.sources' are available.",
             )
     return (
         "reasoning.encrypted_content" in include,
         "message.output_text.logprobs" in include,
+        "web_search_call.action.sources" in include,
     )
 
 

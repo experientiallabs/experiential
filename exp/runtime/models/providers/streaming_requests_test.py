@@ -5773,3 +5773,40 @@ def test_a_leading_only_rung_discloses_the_system_fold_only_when_a_turn_moves() 
     leading_only_shape = mid_system.model_copy(update={"messages": mid_system.messages[:2]})
     quiet, _routed = route_generation_parameter_requests((leading_only,), leading_only_shape)
     assert SYSTEM_FOLD_DISCLOSURE not in quiet.ignored_parameters
+
+
+def _web_search_sources_request() -> GatewayRequest:
+    """A Responses request asking for its web search sources."""
+    return GatewayRequest(
+        surface=GatewayApiSurface.RESPONSES,
+        messages=(GatewayMessage(role="user", content="what changed today?"),),
+        stream=True,
+        include_usage=True,
+        include_web_search_sources=True,
+    )
+
+
+def test_openai_responses_stream_payload_forwards_web_search_sources() -> None:
+    """A native Responses rung asks its provider for the web search sources."""
+    _public, provider = route_generation_parameter_requests(
+        (_openai_reasoning_profile(),), _web_search_sources_request()
+    )
+    assert provider.include_web_search_sources is True
+    payload = openai_responses_stream_payload("exact-model", provider, supports_temperature=True)
+    assert "web_search_call.action.sources" in cast("list[str]", payload["include"])
+
+
+def test_web_search_sources_selector_drops_with_disclosure_off_native_responses() -> None:
+    """Where the gateway runs the search itself there is no item to annotate.
+
+    The selector is dropped and disclosed instead of refusing the request.
+    """
+    public, provider = route_generation_parameter_requests(
+        (_openai_reasoning_profile(), _fireworks_profile()), _web_search_sources_request()
+    )
+    assert provider.include_web_search_sources is False
+    assert "include.web_search_call.action.sources->dropped(gateway_web_search)" in (
+        public.ignored_parameters
+    )
+    payload = openai_responses_stream_payload("exact-model", provider, supports_temperature=True)
+    assert "web_search_call.action.sources" not in cast("list[str]", payload.get("include", []))

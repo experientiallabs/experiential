@@ -53,6 +53,14 @@ exclusive (the provider's rule) and are forwarded to the vendor as include/exclu
   "title", "start_index", "end_index"}` annotations, each announced by a
   `response.output_text.annotation.added` event before `response.output_text.done`;
   `usage.server_tool_use_details.web_search_requests` counts the search.
+  `include: ["web_search_call.action.sources"]` is accepted. A native Responses route forwards
+  it, so the provider's relayed `web_search_call` items carry `action.sources`; on a route
+  where the gateway runs the search there is no such item, so the selector is dropped with the
+  `include.web_search_call.action.sources->dropped(gateway_web_search)` disclosure and the
+  sources stay in the citations. A replayed `web_search_call` input item is never judged
+  against the SDK's action enum (Codex echoes action types the SDK does not list): it forwards
+  byte-for-byte to a native Responses route, and every other route refuses hosted items by
+  name.
 * Messages: a `server_tool_use` block (`name: "web_search"`, `input: {"query"}`) and a
   `web_search_tool_result` block (`web_search_result` entries with `url`, `title`, an empty
   `encrypted_content`, `page_age: null`) precede the answer; `usage.server_tool_use.web_search_requests`

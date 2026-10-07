@@ -184,6 +184,10 @@ def openai_responses_stream_payload(
                 "This Responses route cannot preserve output text log probabilities."
             )
         include_paths.append("message.output_text.logprobs")
+    if request.include_web_search_sources:
+        # The provider runs web search on this wire and its web_search_call
+        # items relay verbatim, so the selector reaches the caller intact.
+        include_paths.append("web_search_call.action.sources")
     if include_paths:
         payload["include"] = include_paths
     if request.top_logprobs is not None:
