@@ -79,6 +79,7 @@ class HostedProjectStoreMixin:
                 (evidence.calibration, "judge-calibration"),
             ),
             what="hosted provisional judge evidence",
+            task_set_bound=evidence.setup,
         )
 
     def bind_router_policy(
@@ -239,8 +240,22 @@ def _bind_hosted_pointer_state(
     value: BaseModel,
     expected: tuple[tuple[ArtifactInput, str], ...],
     what: str,
+    task_set_bound: ArtifactInput | None = None,
 ) -> ProjectConfig:
-    """Bind one verified write-once hosted pointer group under the Project lock."""
+    """Bind one verified write-once hosted pointer group under the Project lock.
+
+    Args:
+        store: Project receiving the pointer group.
+        field_name: Write-once configuration field to set.
+        value: Exact pointer group.
+        expected: Every pointer with its required artifact type.
+        what: Human-readable name for errors.
+        task_set_bound: Optional artifact whose inputs must include the build's selected task
+            set at commit time, so evidence prepared before a task-set replacement is refused.
+
+    Returns:
+        Existing identical or newly updated Project configuration.
+    """
     from exp.common.project.store import ArtifactStoreError, ProjectStoreError
 
     store._require_mutable_config()
@@ -254,6 +269,15 @@ def _bind_hosted_pointer_state(
                 return existing
             if current is not None:
                 raise ValueError(f"Project already selects a different {field_name}")
+            if task_set_bound is not None and (
+                existing.build is None
+                or existing.build.task_set
+                not in store.artifacts.read(task_set_bound.artifact_id).manifest.inputs
+            ):
+                raise ValueError(
+                    "evidence was prepared for a different task set than the selected build; "
+                    "prepare it again"
+                )
             updated = ProjectConfig.model_validate(
                 {**existing.model_dump(mode="python"), field_name: value}
             )

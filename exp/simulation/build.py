@@ -498,7 +498,7 @@ def select_build_task_set(store: ProjectStore, task_set: ArtifactInput) -> None:
 
     Raises:
         ValueError: The project has no completed build review, it names another build, or
-            hosted spend, judge or router evidence is bound to the current task set.
+            hosted setup, spend, judge or router evidence is bound to the current task set.
     """
     with _build_review_coordination(store), project_connection(store.paths.root, write=True):
         config = store.load_project()
@@ -514,6 +514,7 @@ def select_build_task_set(store: ProjectStore, task_set: ArtifactInput) -> None:
         if any(
             binding is not None
             for binding in (
+                config.system,
                 config.build_spend_ledger,
                 config.hosted_judge,
                 config.router_policy,

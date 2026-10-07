@@ -615,13 +615,13 @@ def _authored_reference_answer(store: ProjectStore, rollout: RolloutArtifact) ->
 
     Args:
         store: Project-local immutable artifact store.
-        rollout: Verified rollout; only simulated rollouts carry a task-set binding.
+        rollout: Verified rollout; simulated and sandbox rollouts carry a task-set binding.
 
     Returns:
         The authored task's reference answer, or None for production evidence, mined tasks
         and authored tasks without one.
     """
-    binding = rollout.simulation_binding
+    binding = rollout.simulation_binding or rollout.sandbox_binding
     if binding is None:
         return None
     key = (binding.task_set_input.artifact_id, binding.task_set_tasks_sha256)
