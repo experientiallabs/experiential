@@ -201,6 +201,10 @@ fn a_refusal_redials_plain_inside_one_attempt_and_is_remembered() {
             let second: Value = serde_json::from_str(&bodies[1]).unwrap();
             assert_eq!(first["logprobs"], json!(true));
             assert!(second.get("logprobs").is_none());
+            // The injected body never shares the plain payload's key.
+            let keys = rung.keys.lock().unwrap();
+            assert_eq!(keys[0].as_deref(), Some("op-refuses-a.logprobs"));
+            assert_eq!(keys[1].as_deref(), Some("op-refuses-a"));
         }
         // One physical attempt reserved for the caller, not two.
         let story = harness.story().await;

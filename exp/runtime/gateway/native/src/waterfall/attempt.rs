@@ -148,11 +148,18 @@ pub(super) async fn run_attempt(
         .then(|| crate::capture::logprobs::with_logprobs(repair.payload()))
         .flatten();
         let mut logprobs_injected = injected_payload.is_some();
+        // An injected body is a different request: it never shares the plain
+        // payload's Idempotency-Key, so a plain re-dial is never refused as reuse.
+        let injected_key = format!("{}.logprobs", wire.idempotency_key);
         let mut opened = open_stream(
             ctx.http,
             &wire.url,
             &headers,
-            &wire.idempotency_key,
+            if logprobs_injected {
+                &injected_key
+            } else {
+                &wire.idempotency_key
+            },
             injected_payload
                 .as_ref()
                 .unwrap_or_else(|| repair.payload()),

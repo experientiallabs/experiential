@@ -210,7 +210,7 @@ impl Captured {
         mut allowed: impl FnMut(usize) -> bool,
     ) -> usize {
         let mut added = 0usize;
-        self.truncated |= truncated;
+        // Keep the prefix that fits; an upstream truncation only marks the end.
         for delta in deltas {
             if self.truncated {
                 break;
@@ -227,6 +227,7 @@ impl Captured {
             }
         }
         self.bytes += added;
+        self.truncated |= truncated;
         added
     }
 }

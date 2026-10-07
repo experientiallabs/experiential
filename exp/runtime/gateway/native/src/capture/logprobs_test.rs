@@ -75,3 +75,14 @@ fn captured_extend_stops_at_the_admitted_size() {
     assert!(captured.truncated);
     assert_eq!(captured.bytes, size * 2);
 }
+
+#[test]
+fn an_upstream_truncation_keeps_the_prefix_that_fits() {
+    let mut captured = Captured::injected();
+    captured.extend(vec![delta("a"), delta("b")], true, |_| true);
+    assert_eq!(captured.content.len(), 2);
+    assert!(captured.truncated);
+    // Nothing is appended once the record is truncated.
+    captured.extend(vec![delta("c")], false, |_| true);
+    assert_eq!(captured.content.len(), 2);
+}
