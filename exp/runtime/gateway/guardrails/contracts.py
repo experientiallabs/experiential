@@ -113,6 +113,7 @@ class GuardrailPolicy(ContractModel):
         identity_id: Assigned identity, or None for platform scope.
         revision: Detector and rollout revision used to invalidate cached replay.
         input_execution: Inspect before dispatch by default, or overlap safe generation.
+        mode: Enforce by default, or observe read-only input checks without gating delivery.
         protected: Fail closed on classifier uncertainty; required for platform policies.
         checks: Ordered checks, empty by default.
         max_request_bytes: Total canonical input inspection bound, default 1 MiB.
@@ -124,6 +125,7 @@ class GuardrailPolicy(ContractModel):
     identity_id: IdentityId | None = None
     revision: str = Field(default="configured", min_length=1, max_length=256)
     input_execution: Literal["before_dispatch", "parallel"] = "before_dispatch"
+    mode: Literal["enforce", "observe"] = "enforce"
     protected: bool = False
     checks: tuple[GuardrailCheck, ...] = ()
     max_request_bytes: int = Field(default=DEFAULT_MAX_REQUEST_BYTES, ge=1, le=64 * 1024 * 1024)
@@ -146,6 +148,11 @@ class GuardrailPolicy(ContractModel):
             raise ValueError("guardrail scope requires both organization_id and identity_id")
         if self.organization_id is None and not self.protected:
             raise ValueError("platform guardrail policies must be protected")
+        if self.mode == "observe" and any(
+            check.stage is GuardrailCheckStage.OUTPUT or check.action is GuardrailAction.MODIFY
+            for check in self.checks
+        ):
+            raise ValueError("observation requires read-only input checks")
         return self
 
     def bind(self, organization_id: OrganizationId, identity_id: IdentityId) -> GuardrailPolicy:
@@ -207,6 +214,48 @@ class ClassifierVerdict(ContractModel):
     flagged: bool
     replacement_text: str | None = None
     replacement_messages: tuple[GatewayMessage, ...] | None = None
+
+
+class GuardrailOutcome(StrEnum):
+    """Content-free inspection outcomes, distinct from authored enforcement actions."""
+
+    ALLOW = "allow"
+    FLAGGED = "flagged"
+    UNSUPPORTED = "unsupported"
+    UNCERTAIN = "uncertain"
+    UNAVAILABLE = "unavailable"
+    TIMEOUT = "timeout"
+    SKIPPED = "skipped"
+
+
+class ClassifierCoverageError(Exception):
+    """The complete subject cannot be inspected; retries cannot restore coverage."""
+
+    def __init__(self) -> None:
+        """Carry no detector diagnostics or request content across the adapter boundary."""
+        super().__init__("Content inspection does not support this complete request.")
+
+
+class ClassifierUncertainError(Exception):
+    """The classifier completed without establishing an allow or a violation."""
+
+    def __init__(self) -> None:
+        """Keep uncertainty distinguishable without retaining classifier diagnostics."""
+        super().__init__("Content inspection could not determine a decision.")
+
+
+def coverage_failure(*, check_id: str | None = None) -> GatewayFailure:
+    """Return a content-free, nonretryable coverage error with no failover authority."""
+    return GatewayFailure(
+        failure_class=GatewayFailureClass.UNSUPPORTED_CAPABILITY,
+        safe_message=(
+            "Content inspection does not support this complete request. "
+            "Use a supported context or modality."
+        ),
+        safe_details={"action": "error", **({} if check_id is None else {"check_id": check_id})},
+        retryable_same_deployment=False,
+        failover_eligible=False,
+    )
 
 
 class GuardrailRejected(Exception):

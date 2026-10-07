@@ -30,6 +30,7 @@ from exp.runtime.gateway.guardrails.contracts import (
     GuardrailCheck,
     GuardrailPolicy,
     GuardrailRejected,
+    coverage_failure,
     guardrail_failure,
     request_content_bytes,
 )
@@ -119,7 +120,7 @@ def native_input_request(
         return None
     if request_content_bytes(request) > policy.max_request_bytes:
         _record(policy, None, GuardrailAction.ERROR)
-        raise GuardrailRejected(guardrail_failure(action=GuardrailAction.ERROR))
+        raise GuardrailRejected(coverage_failure())
     current = request
     for check in policy.input_checks:
         detector = detectors[check.adapter_id]

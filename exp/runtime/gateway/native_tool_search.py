@@ -104,7 +104,7 @@ class NativeToolSearchMixin:
         calls = parse_calls(data.get("calls"))
         rounds: list[JsonObject] = []
         try:
-            if entry.guardrails is not None:
+            if entry.guardrails is not None and entry.guardrails.enforcing_policies:
                 entry.guardrails.inspect_output(_search_output(calls))
             outcome = perform_round(provider_request, entry.tool_search, calls)
             rounds = list(outcome.rounds)

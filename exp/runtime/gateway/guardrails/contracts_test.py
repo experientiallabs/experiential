@@ -69,6 +69,39 @@ def test_policy_rejects_duplicate_check_ids() -> None:
         )
 
 
+@pytest.mark.parametrize(
+    ("stage", "action"),
+    [
+        (GuardrailCheckStage.OUTPUT, GuardrailAction.BLOCK),
+        (GuardrailCheckStage.INPUT, GuardrailAction.MODIFY),
+    ],
+)
+def test_observation_rejects_output_and_rewrite_checks(
+    stage: GuardrailCheckStage, action: GuardrailAction
+) -> None:
+    """Observation cannot promise output coverage or mutate the provider's input."""
+    with pytest.raises(ValueError, match="observation requires read-only input checks"):
+        GuardrailPolicy(
+            policy_id="platform-observer",
+            protected=True,
+            mode="observe",
+            checks=(_check("observer", stage=stage, action=action),),
+        )
+
+
+def test_observation_preserves_protected_platform_authority() -> None:
+    """Rollout mode is separate from the policy's ownership and authored block action."""
+    policy = GuardrailPolicy(
+        policy_id="platform-observer",
+        protected=True,
+        mode="observe",
+        checks=(_check("observer"),),
+    )
+    assert policy.mode == "observe"
+    assert policy.bind("org", "identity").mode == "observe"
+    assert policy.checks[0].action is GuardrailAction.BLOCK
+
+
 def test_capability_kinds_name_jobs_not_providers() -> None:
     """Capability names stay provider-neutral."""
     assert {item.value for item in GuardrailCapabilityKind} == {

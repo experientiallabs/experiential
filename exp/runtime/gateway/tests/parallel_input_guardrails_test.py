@@ -27,6 +27,7 @@ from exp.runtime.gateway.guardrails.classifiers import ClassifierRegistry
 from exp.runtime.gateway.guardrails.client import DirectClassifierClient
 from exp.runtime.gateway.guardrails.config import engine_from_document
 from exp.runtime.gateway.guardrails.contracts import (
+    ClassifierCoverageError,
     ClassifierVerdict,
     GuardrailAction,
     GuardrailCapabilityKind,
@@ -240,6 +241,8 @@ class _Classifier:
             raise
         if self.outcome == "error":
             raise RuntimeError("private-detector-error-must-not-escape")
+        if self.outcome == "unsupported":
+            raise ClassifierCoverageError
         return ClassifierVerdict(flagged=self.outcome == "block")
 
     async def inspect_output(
@@ -279,7 +282,7 @@ def _engine(classifier: _Classifier, timeout_ms: int = 3000) -> GuardrailEngine:
 
 @pytest.mark.parametrize("surface", ["chat", "responses", "messages"])
 @pytest.mark.parametrize("streaming", [False, True])
-@pytest.mark.parametrize("outcome", ["allow", "block", "error", "timeout"])
+@pytest.mark.parametrize("outcome", ["allow", "block", "error", "timeout", "unsupported"])
 @pytest.mark.parametrize("tool_call", [False, True])
 @pytest.mark.parametrize("provider_phase", ["streaming", "not_open", "completed"])
 def test_parallel_inspection_holds_text_tools_and_customer_settlement(
@@ -429,6 +432,8 @@ def test_parallel_inspection_holds_text_tools_and_customer_settlement(
             json=body,
             timeout=8,
         ) as response:
+            if outcome == "unsupported":
+                assert "retry-after" not in response.headers
             headers_received.set()
             chunks: list[str] = []
             for chunk in response.iter_text():
@@ -453,7 +458,21 @@ def test_parallel_inspection_holds_text_tools_and_customer_settlement(
                         assert not provider_finished.is_set(), "allow buffered the full response"
                     provider_finish.set()
                 status, result = future.result(timeout=3)
-                assert status == (200 if outcome == "allow" else 400 if outcome == "block" else 503)
+                assert status == (
+                    200
+                    if outcome == "allow"
+                    else 400
+                    if outcome in {"block", "unsupported"}
+                    else 503
+                )
+                if outcome == "unsupported":
+                    assert "Content inspection does not support this complete request." in result
+                    expected_code = (
+                        "invalid_request_error"
+                        if surface == "messages"
+                        else "unsupported_capability"
+                    )
+                    assert expected_code in result
                 assert (marker in result) == (outcome == "allow")
                 assert "private-detector-error-must-not-escape" not in result
             finally:
@@ -475,7 +494,13 @@ def test_parallel_inspection_holds_text_tools_and_customer_settlement(
             assert provider_cost is not None and provider_cost > 0
         else:
             assert provider_cost is None  # No usage report, not fictitious zero provider cost.
-        assert failure is None if outcome == "allow" else failure in {"guardrail", "unavailable"}
+        assert (
+            failure is None
+            if outcome == "allow"
+            else failure in {"guardrail", "unavailable", "unsupported_capability"}
+        )
+        if outcome == "unsupported":
+            assert failure == "unsupported_capability"
         assert len(classifier.requests) == 1
     finally:
         classifier.release.set()

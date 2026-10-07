@@ -8,7 +8,7 @@ import threading
 from collections.abc import Awaitable, Callable, Coroutine
 from concurrent.futures import CancelledError as FutureCancelledError
 from concurrent.futures import Future
-from typing import cast
+from typing import Protocol, cast
 
 MAX_INFLIGHT_ASYNC_CLASSIFIER_CALLS = 32
 _WORKER_START_TIMEOUT_SECONDS = 5.0
@@ -18,6 +18,18 @@ _logger = logging.getLogger(__name__)
 
 class ClassifierTimeoutError(TimeoutError):
     """A classifier exceeded its per-check timeout, wait, or quarantine."""
+
+
+class InspectionRetention(Protocol):
+    """Retain a subject's bounded admission until the isolated invocation actually exits."""
+
+    def retain(self) -> None:
+        """Acquire one subject reference before submitting isolated work."""
+        ...
+
+    def release(self) -> None:
+        """Release that reference only after the actual isolated work completes."""
+        ...
 
 
 def _absorb_abandoned(task: Future[object]) -> None:
@@ -82,6 +94,8 @@ class _IsolationWorker:
 
             def finish(done: asyncio.Task[T]) -> None:
                 """Copy the inspect outcome onto the cross-thread future."""
+                if self._task is done and self._active_generation == generation:
+                    self._task = None
                 if result.done():
                     return
                 if done.cancelled():
@@ -556,6 +570,7 @@ class BoundedInspect:
         timeout: float,
         *,
         adapter_id: str,
+        retention: InspectionRetention | None = None,
     ) -> T:
         """Await ``fn`` on an isolation worker and abandon it when ``timeout`` elapses.
 
@@ -563,6 +578,7 @@ class BoundedInspect:
             fn: Zero-argument coroutine factory for one inspect.
             timeout: Positive seconds budget, including worker wait.
             adapter_id: Policy adapter identity used for quarantine.
+            retention: Optional subject owner held beyond timeout until the worker actually exits.
 
         Returns:
             The inspect result.
@@ -594,9 +610,17 @@ class BoundedInspect:
             """Run the inspect on this isolation worker."""
             return await fn()
 
-        pending, generation = worker.submit(isolated)
+        if retention is not None:
+            retention.retain()
+        try:
+            pending, generation = worker.submit(isolated)
+        except BaseException:
+            if retention is not None:
+                retention.release()
+            self._pool.release(worker)
+            raise
         pending.add_done_callback(
-            lambda done: self._reclaim(adapter_id, worker, cast(Future[object], done))
+            lambda done: self._reclaim(adapter_id, worker, cast(Future[object], done), retention)
         )
         try:
             return await self._await_isolated(pending, remaining)
@@ -614,12 +638,16 @@ class BoundedInspect:
         adapter_id: str,
         worker: _IsolationWorker,
         task: Future[object],
+        retention: InspectionRetention | None,
     ) -> None:
         """Return the worker after the isolated inspect actually exits."""
-        self._pool.release(worker)
-        if not task.done():
-            return
-        self._finish_detached(adapter_id, task)
+        try:
+            self._pool.release(worker)
+            if task.done():
+                self._finish_detached(adapter_id, task)
+        finally:
+            if retention is not None:
+                retention.release()
 
 
 class _NativeCallbackRunner:

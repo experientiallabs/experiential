@@ -115,9 +115,14 @@ def require_unguarded_surface(
     surface: str,
 ) -> None:
     """Reject applicable policies before accepting a surface this engine cannot inspect."""
-    if engine is not None and engine.policies_for(
-        authorization.organization_id, authorization.identity_id
-    ):
+    policies = (
+        ()
+        if engine is None
+        else engine.policies_for(authorization.organization_id, authorization.identity_id)
+    )
+    if engine is not None:
+        engine.record_unsupported_observations(policies)
+    if any(policy.mode == "enforce" for policy in policies):
         raise NativeBridgeError(
             OpenAIProtocolError(
                 status_code=400,

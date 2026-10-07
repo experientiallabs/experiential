@@ -51,9 +51,55 @@ and content-free decision recorder. Deterministic native detectors are an execut
 strategy of that pipeline, with the same input and completion contracts.
 
 Embeddings, image generation, and native Decisions cannot yet use that normalized
-inspection contract. An applicable platform or identity policy rejects those
+inspection contract. An applicable enforcing platform or identity policy rejects those
 endpoints before request acceptance, reservation, or provider dispatch. Identities
 with no applicable policy retain access to those surfaces.
+
+## Observation and controlled rollout
+
+`GuardrailPolicy(mode="observe", protected=True, checks=(input_check,))` evaluates
+the same input contract and authored action without blocking, rewriting, withholding,
+cancelling generation, or waiving the customer's normal charge. `mode="enforce"`
+is the default. Observation supports read-only input checks; configuration rejects
+output checks and `modify` actions rather than promising incomplete observation.
+Protected policy ownership remains independent of rollout mode. A host selects the
+mode from authenticated organization scope, then the session freezes it with the
+rest of the policy. Customers cannot choose the operator's mode.
+
+The shared engine admits observations through the same bounded classifier executor
+abstraction with a separate worker pool and adapter quarantine from enforcement.
+It retains at most 8 jobs and 8 MiB of complete subjects by default, configurable
+through `max_observations` and `max_observation_bytes`. Full queues, byte limits, or
+expired request deadlines produce `skipped`, never an uninspected `allow`. Exact
+duplicate subjects share work only within their request. Each distinct authenticated
+context, including recovered history, private provider fields and gateway tool results,
+is observed separately. Fields excluded from provider serialization still count toward
+subject identity and retained bytes. Observer capacity or quarantine cannot consume
+the engine's enforcement capacity or quarantine its enforcing calls.
+
+An admitted observation is engine-owned and may finish after its request completes;
+ordinary settlement does not cancel it and bias observations toward fast classifiers.
+Its original absolute request deadline and per-check timeout still apply. Hosts call
+`engine.close(timeout_seconds=...)` after serving drains and before stopping their
+recorder. Shutdown stops observation admission, drains within that budget, and cancels
+remaining work cooperatively. A classifier that ignores cancellation retains its job
+and byte reservation until it actually exits; timeout or shutdown cannot admit more
+subjects against that occupied capacity. Interrupted or skipped work is counted explicitly.
+Observation may still incur classifier cost, so it does not certify that admission had
+no paid effects.
+
+`_record_observation(policy, check, outcome, latency_seconds)` is a content-free host
+recording seam separate from `_record`, which continues to report enforcing actions.
+`GuardrailOutcome` distinguishes `allow`, `flagged`, `unsupported`, `uncertain`,
+`unavailable`, `timeout`, and `skipped`. `check.action` reports the authored action
+that would apply under enforcement. Policy IDs and revisions identify rollout state;
+subject text, replacements, and detector diagnostics never enter either recorder.
+Hosts must count observation outcomes separately from actual customer blocks.
+
+Unsupported surfaces remain available to observation-only callers and record
+`unsupported`. Hosts with additional surfaces, such as provider batches, use
+`engine.record_unsupported_observations(policies)` for that coverage accounting and
+only refuse the surface when an applicable policy has `mode="enforce"`.
 
 ## Input inspection alongside generation
 
@@ -118,9 +164,16 @@ outages and timeouts return `unavailable`, without exposing detector diagnostics
 claiming that content violated policy. Queues and inflight work remain bounded;
 request removal cancels its pending inspection. Unprotected identity checks may
 observe and continue after uncertain classifier results. Platform policies are
-always protected.
+always protected. Adapters raise `ClassifierCoverageError()` when they cannot inspect
+the complete context or modality; enforcement returns a nonretryable
+`unsupported_capability` error, with no failover and no content-violation accusation.
+The input subject bound has the same coverage semantics. `ClassifierUncertainError()`
+distinguishes an inconclusive result from transport or runtime failure in observation;
+protected enforcement continues to return `unavailable` for either case.
 
-Replay keys include the full applicable policy set, execution settings, and revision.
+Replay keys include the applicable enforcing policies, execution settings, and revision.
+Adding or revising observation-only policies leaves replay unchanged. Promoting an
+observer to enforcement changes replay identity.
 A keyed admission compares its frozen policy revision with the replay claim before
 inspection, acceptance, search, or model dispatch. A reload between claim and admission
 returns `409`; retrying takes a new snapshot. Change `revision` whenever the detector

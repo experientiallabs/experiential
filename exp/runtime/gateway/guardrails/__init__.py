@@ -18,12 +18,15 @@ from exp.runtime.gateway.guardrails.client import (
 )
 from exp.runtime.gateway.guardrails.config import load_guardrail_engine
 from exp.runtime.gateway.guardrails.contracts import (
+    ClassifierCoverageError,
+    ClassifierUncertainError,
     ClassifierVerdict,
     GuardrailAction,
     GuardrailCapabilityKind,
     GuardrailCheck,
     GuardrailCheckStage,
     GuardrailCompletion,
+    GuardrailOutcome,
     GuardrailPolicy,
     GuardrailRejected,
     GuardrailToolCall,
@@ -38,8 +41,10 @@ from exp.runtime.gateway.guardrails.session import GuardrailSession
 from exp.runtime.gateway.guardrails.store import MappingGuardrailStore
 
 __all__ = [
+    "ClassifierCoverageError",
     "ClassifierProtocolError",
     "ClassifierRegistry",
+    "ClassifierUncertainError",
     "ClassifierVerdict",
     "DirectClassifierClient",
     "GuardrailAction",
@@ -48,6 +53,7 @@ __all__ = [
     "GuardrailCheckStage",
     "GuardrailCompletion",
     "GuardrailEngine",
+    "GuardrailOutcome",
     "GuardrailPolicy",
     "GuardrailSession",
     "GuardrailRecursionError",
