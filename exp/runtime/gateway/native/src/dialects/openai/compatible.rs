@@ -398,12 +398,6 @@ impl Normalizer {
         Ok(events)
     }
 
-    /// End an OpenAI-compatible stream on the finish reason it carried.
-    ///
-    /// Reached from the `[DONE]` sentinel, or from a clean EOF that arrived
-    /// after a `finish_reason` chunk (`openai_compatible_stream_end`): the
-    /// finish reason is the provider's declared end of the choice, and both
-    /// paths settle it identically.
     /// Emit one reasoning fragment. On a replay route (Fireworks, Hunyuan)
     /// it is the sealed `reasoning_content` carrier; otherwise the plaintext
     /// is display copy only: encoders render it on rungs whose reasoning
@@ -477,6 +471,12 @@ impl Normalizer {
         Ok(())
     }
 
+    /// End an OpenAI-compatible stream on the finish reason it carried.
+    ///
+    /// Reached from the `[DONE]` sentinel, or from a clean EOF that arrived
+    /// after a `finish_reason` chunk (`openai_compatible_stream_end`): the
+    /// finish reason is the provider's declared end of the choice, and both
+    /// paths settle it identically.
     fn finish_openai_compatible_stream(&mut self) -> Result<Vec<Event>, Failure> {
         let finish = self.finish_reason.as_deref();
         // A tool call cut off by the output budget (finish_reason=length,

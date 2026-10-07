@@ -8,6 +8,7 @@ callers read off the wire.
 from __future__ import annotations
 
 import pytest
+from pydantic import JsonValue
 
 from exp.common.core.artifacts import JsonObject
 from exp.runtime.gateway.contracts import (
@@ -124,7 +125,7 @@ _DESCRIPTIONLESS_TOOL_PROFILES = (
 )
 
 
-def _null_paths(value: object, path: str = "") -> list[str]:
+def _null_paths(value: JsonValue, path: str = "") -> list[str]:
     """Return the JSON paths under ``value`` whose value is null.
 
     Args:
@@ -145,7 +146,7 @@ def _null_paths(value: object, path: str = "") -> list[str]:
     return []
 
 
-def _tools_of(payload: JsonObject) -> object:
+def _tools_of(payload: JsonObject) -> JsonValue:
     """Return the tool declarations of one dialect payload, wherever the dialect keeps them."""
     if "toolConfig" in payload:
         tool_config = payload["toolConfig"]
