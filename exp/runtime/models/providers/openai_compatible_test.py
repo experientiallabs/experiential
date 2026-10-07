@@ -6,8 +6,10 @@ are imported by `azure_test` and `native_test` so every adapter exercises one tr
 
 from __future__ import annotations
 
+import json
 import math
 import os
+from pathlib import Path
 from typing import Literal, cast
 
 import pytest
@@ -1144,3 +1146,57 @@ def test_every_proper_prefix_of_nested_tool_json_is_truncated(complete: str) -> 
         hit_length_limit=True,
     )
     assert result.raw_arguments == complete
+
+
+@pytest.mark.parametrize(
+    ("fixture", "model_id"),
+    [
+        ("mistral_small_2603_reasoning_response.json", "mistral-small-2603"),
+        ("mistral_large_4_response.json", "mistral-large-4"),
+    ],
+)
+def test_mistral_typed_content_parts_answer_with_the_text_parts_only(
+    fixture: str, model_id: str
+) -> None:
+    """A reasoning Mistral response's answer is its text parts, never its thinking.
+
+    The fixtures are verbatim Mistral API responses (2026-10-06) to "What is
+    17*23? Answer with just the number.", whose ``message.content`` is an
+    array of a ``thinking`` part and a ``text`` part.
+    """
+    payload = json.loads((Path(__file__).parent / "testdata" / fixture).read_text())
+    response = openai_compatible_response(
+        payload,
+        configured_model=_snapshot("mistral", model_id),
+        latency_seconds=1,
+    )
+    assert response.output.content == "391"
+
+
+def test_typed_content_parts_concatenate_text_and_reject_non_object_parts() -> None:
+    """Text parts join in order; unknown types are skipped; malformed parts never truncate."""
+    response = openai_compatible_response(
+        {
+            "choices": [
+                {
+                    "message": {
+                        "content": [
+                            {"type": "text", "text": "39"},
+                            {"type": "reference", "reference_ids": [1]},
+                            {"type": "text", "text": "1"},
+                        ]
+                    }
+                }
+            ]
+        },
+        configured_model=_snapshot("mistral", "mistral-small-2603"),
+        latency_seconds=1,
+    )
+    assert response.output.content == "391"
+    for malformed in (["391"], [{"type": "text", "text": "39"}, {"type": "text", "text": 1}]):
+        with pytest.raises(ProviderResponseError, match="part must be"):
+            openai_compatible_response(
+                {"choices": [{"message": {"content": malformed}}]},
+                configured_model=_snapshot("mistral", "mistral-small-2603"),
+                latency_seconds=1,
+            )

@@ -262,6 +262,42 @@ def openai_images_request(model_id: str, request: ImagesRequest) -> JsonObject:
     return body
 
 
+def _message_text(content: JsonValue) -> str | None:
+    """Return a Chat message's answer text from string or typed-part content.
+
+    Mistral answers ``content`` as an array of typed parts whenever the model
+    reasons: ``thinking`` parts hold the reasoning and ``text`` parts the
+    answer. Only the text parts are the answer; this contract carries no
+    reasoning output, so thinking parts are not part of it.
+
+    Args:
+        content: The wire ``message.content`` value.
+
+    Returns:
+        The concatenated answer text, or ``None`` when the message has none.
+
+    Raises:
+        ProviderResponseError: A content part is not a JSON object, or a text
+            part's ``text`` is neither text nor null.
+    """
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return None
+    texts: list[str] = []
+    for part in content:
+        if not isinstance(part, dict):
+            raise ProviderResponseError("OpenAI-compatible content part must be an object")
+        if part.get("type") != "text":
+            continue
+        text = part.get("text")
+        if text is not None and not isinstance(text, str):
+            raise ProviderResponseError("OpenAI-compatible text part must be text")
+        if text:
+            texts.append(text)
+    return "".join(texts) if texts else None
+
+
 def openai_compatible_response(
     payload: JsonObject,
     *,
@@ -293,8 +329,7 @@ def openai_compatible_response(
             provider="openai-compatible",
             signal=ProviderRefusalSignal.CONTENT_POLICY,
         )
-    content_value = message.get("content")
-    content = content_value if isinstance(content_value, str) else None
+    content = _message_text(message.get("content"))
     tool_call_values = _array_or_empty(message)
     tool_calls = tuple(
         parse_openai_wire_tool_call(

@@ -8,8 +8,15 @@ callers read off the wire.
 from __future__ import annotations
 
 import pytest
+from pydantic import JsonValue
 
-from exp.runtime.gateway.contracts import GatewayApiSurface, GatewayMessage, GatewayRequest
+from exp.common.core.artifacts import JsonObject
+from exp.runtime.gateway.contracts import (
+    GatewayApiSurface,
+    GatewayMessage,
+    GatewayRequest,
+    GatewayToolDefinition,
+)
 from exp.runtime.models.providers.base import GatewayWireProfile
 from exp.runtime.models.providers.dialect_dispatch import (
     CACHE_CONTROL_NOT_FORWARDED_SUFFIX,
@@ -86,3 +93,123 @@ def test_non_anthropic_dialect_refuses_geography_constraint() -> None:
     )
     with pytest.raises(ProviderCapabilityError, match="inference_geo"):
         dialect_stream_payload(profile, request)
+
+
+_DESCRIPTIONLESS_TOOL_PROFILES = (
+    GatewayWireProfile(
+        dialect="openai_compatible",
+        url="https://api.mistral.ai/v1/chat/completions",
+        model_id="ministral-3b-2512",
+    ),
+    GatewayWireProfile(
+        dialect="openai_responses",
+        url="https://api.openai.com/v1/responses",
+        model_id="gpt-5.4",
+    ),
+    GatewayWireProfile(
+        dialect="anthropic_messages",
+        url="https://api.anthropic.com/v1/messages",
+        model_id="claude-sonnet-4-6",
+        maximum_output_tokens=128_000,
+    ),
+    GatewayWireProfile(
+        dialect="gemini_generate_content",
+        url="https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash",
+        model_id="gemini-2.5-flash",
+    ),
+    GatewayWireProfile(
+        dialect="bedrock_converse_stream",
+        url="https://bedrock-runtime.us-east-1.amazonaws.com",
+        model_id="mistral.ministral-3-3b-instruct",
+    ),
+)
+
+
+def _null_paths(value: JsonValue, path: str = "") -> list[str]:
+    """Return the JSON paths under ``value`` whose value is null.
+
+    Args:
+        value: Decoded JSON value to walk.
+        path: Path of ``value`` itself.
+
+    Returns:
+        Every path holding ``None``, in walk order.
+    """
+    if value is None:
+        return [path]
+    if isinstance(value, dict):
+        return [hit for key, item in value.items() for hit in _null_paths(item, f"{path}.{key}")]
+    if isinstance(value, list):
+        return [
+            hit for index, item in enumerate(value) for hit in _null_paths(item, f"{path}[{index}]")
+        ]
+    return []
+
+
+def _tools_of(payload: JsonObject) -> JsonValue:
+    """Return the tool declarations of one dialect payload, wherever the dialect keeps them."""
+    if "toolConfig" in payload:
+        tool_config = payload["toolConfig"]
+        assert isinstance(tool_config, dict)
+        if "tools" in tool_config:
+            return tool_config["tools"]
+    return payload["tools"]
+
+
+@pytest.mark.parametrize(
+    "surface",
+    [GatewayApiSurface.CHAT_COMPLETIONS, GatewayApiSurface.RESPONSES, GatewayApiSurface.MESSAGES],
+)
+@pytest.mark.parametrize(
+    "profile", _DESCRIPTIONLESS_TOOL_PROFILES, ids=lambda profile: profile.dialect
+)
+def test_descriptionless_tool_never_serializes_a_null_field(
+    profile: GatewayWireProfile, surface: GatewayApiSurface
+) -> None:
+    """A tool without a description omits the field instead of sending null, on every dialect.
+
+    Mistral rejects ``"description": null`` with "Input should be a valid
+    string" (live 2026-10-06, ministral-3b-2512), directly and behind
+    OpenRouter and Azure; no wire treats null as meaning absent.
+    """
+    request = GatewayRequest(
+        surface=surface,
+        messages=(GatewayMessage(role="user", content="Weather in Paris?"),),
+        tools=(
+            GatewayToolDefinition(
+                name="get_weather",
+                parameters={"type": "object", "properties": {"city": {"type": "string"}}},
+            ),
+        ),
+    )
+    tools = _tools_of(dialect_stream_payload(profile, request))
+    assert _null_paths(tools) == []
+    assert "get_weather" in str(tools)
+
+
+@pytest.mark.parametrize("dialect", ["openai_compatible", "openai_responses"])
+def test_openai_family_tool_keeps_a_supplied_description_and_explicit_strict(dialect: str) -> None:
+    """A supplied description is forwarded verbatim; ``strict`` stays an explicit boolean.
+
+    Responses defaults an omitted ``strict`` to true, so the gateway always
+    states it rather than relying on a wire default.
+    """
+    profile = next(item for item in _DESCRIPTIONLESS_TOOL_PROFILES if item.dialect == dialect)
+    request = GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=(GatewayMessage(role="user", content="Weather in Paris?"),),
+        tools=(
+            GatewayToolDefinition(
+                name="get_weather", description="Look up weather.", parameters={"type": "object"}
+            ),
+        ),
+    )
+    tools = dialect_stream_payload(profile, request)["tools"]
+    assert isinstance(tools, list)
+    (tool,) = tools
+    assert isinstance(tool, dict)
+    declaration = tool["function"] if dialect == "openai_compatible" else tool
+    assert isinstance(declaration, dict)
+    assert declaration["description"] == "Look up weather."
+    assert declaration["strict"] is False
+    assert declaration["parameters"] == {"type": "object"}

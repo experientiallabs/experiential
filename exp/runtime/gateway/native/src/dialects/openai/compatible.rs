@@ -233,10 +233,12 @@ impl Normalizer {
             None if is_filter_annotation => &empty_delta,
             _ => return Err(malformed("OpenAI-compatible delta must be an object")),
         };
-        if let Some(Value::String(content)) = delta.get("content") {
-            if !content.is_empty() {
+        match delta.get("content") {
+            Some(Value::String(content)) if !content.is_empty() => {
                 events.push(Event::TextDelta(content.clone()));
             }
+            Some(Value::Array(parts)) => self.content_part_events(parts, &mut events)?,
+            _ => {}
         }
         if let Some(images) = delta.get("images").filter(|value| !value.is_null()) {
             let images = images.as_array().ok_or_else(|| {
@@ -256,30 +258,14 @@ impl Normalizer {
             .get("reasoning_content")
             .filter(|value| !value.is_null())
             .or_else(|| delta.get("reasoning"));
-        if let Some(route_sha256) = self.reasoning_content_route_sha256.clone() {
-            if let Some(value) = reasoning {
-                let reasoning = match value {
-                    Value::Null => None,
-                    Value::String(text) => Some(text),
-                    _ => return Err(malformed("Fireworks reasoning_content delta must be text")),
-                };
-                if let Some(reasoning) = reasoning.filter(|text| !text.is_empty()) {
-                    self.reserve_summary_bytes(reasoning.len())?;
-                    events.push(Event::ReasoningContentDelta {
-                        route_sha256,
-                        delta: reasoning.clone(),
-                    });
-                }
+        if self.reasoning_content_route_sha256.is_some() {
+            match reasoning {
+                None | Some(Value::Null) => {}
+                Some(Value::String(text)) => self.push_reasoning_text(text, &mut events)?,
+                Some(_) => return Err(malformed("Fireworks reasoning_content delta must be text")),
             }
-        } else if let Some(text) = reasoning
-            .and_then(Value::as_str)
-            .filter(|text| !text.is_empty())
-        {
-            // No replay route: the plaintext is display copy only. Encoders
-            // render it on rungs whose reasoning display is on; it never seals
-            // a carrier and never replays.
-            self.reserve_summary_bytes(text.len())?;
-            events.push(Event::ReasoningTextDelta(text.to_string()));
+        } else if let Some(text) = reasoning.and_then(Value::as_str) {
+            self.push_reasoning_text(text, &mut events)?;
         }
         if let Some(raw_tools) = delta.get("tool_calls") {
             if !raw_tools.is_null() {
@@ -410,6 +396,79 @@ impl Normalizer {
             }
         }
         Ok(events)
+    }
+
+    /// Emit one reasoning fragment. On a replay route (Fireworks, Hunyuan)
+    /// it is the sealed `reasoning_content` carrier; otherwise the plaintext
+    /// is display copy only: encoders render it on rungs whose reasoning
+    /// display is on, and it never seals a carrier or replays.
+    fn push_reasoning_text(&mut self, text: &str, events: &mut Vec<Event>) -> Result<(), Failure> {
+        if text.is_empty() {
+            return Ok(());
+        }
+        self.reserve_summary_bytes(text.len())?;
+        events.push(match self.reasoning_content_route_sha256.clone() {
+            Some(route_sha256) => Event::ReasoningContentDelta {
+                route_sha256,
+                delta: text.to_string(),
+            },
+            None => Event::ReasoningTextDelta(text.to_string()),
+        });
+        Ok(())
+    }
+
+    /// Decode a `content` array of typed parts, in order. Mistral answers
+    /// this shape whenever the model reasons, streamed and whole alike:
+    /// `{"type":"thinking","thinking":[{"type":"text","text":…}]}` parts are
+    /// the model's reasoning and surface exactly like a `reasoning` field,
+    /// and `{"type":"text","text":…}` parts are the answer, so a chunk that
+    /// closes the reasoning and opens the answer keeps both. Other part types
+    /// (Mistral's citation `reference` chunks) carry no answer text and are
+    /// skipped.
+    fn content_part_events(
+        &mut self,
+        parts: &[Value],
+        events: &mut Vec<Event>,
+    ) -> Result<(), Failure> {
+        for part in parts {
+            let part = part
+                .as_object()
+                .ok_or_else(|| malformed("OpenAI-compatible content part must be an object"))?;
+            match part.get("type").and_then(Value::as_str) {
+                Some("text") => {
+                    let text = wire_text(part.get("text"), "OpenAI-compatible text part")?;
+                    if let Some(text) = text.filter(|text| !text.is_empty()) {
+                        events.push(Event::TextDelta(text));
+                    }
+                }
+                Some("thinking") => match part.get("thinking") {
+                    None | Some(Value::Null) => {}
+                    Some(Value::String(text)) => self.push_reasoning_text(text, events)?,
+                    Some(Value::Array(inner)) => {
+                        for fragment in inner {
+                            let fragment = fragment.as_object().ok_or_else(|| {
+                                malformed("OpenAI-compatible thinking part must be an object")
+                            })?;
+                            if fragment.get("type").and_then(Value::as_str) != Some("text") {
+                                continue;
+                            }
+                            let text =
+                                wire_text(fragment.get("text"), "OpenAI-compatible thinking text")?;
+                            if let Some(text) = text {
+                                self.push_reasoning_text(&text, events)?;
+                            }
+                        }
+                    }
+                    Some(_) => {
+                        return Err(malformed(
+                            "OpenAI-compatible thinking part must be text or an array",
+                        ))
+                    }
+                },
+                _ => {}
+            }
+        }
+        Ok(())
     }
 
     /// End an OpenAI-compatible stream on the finish reason it carried.

@@ -15,6 +15,7 @@ from exp.runtime.gateway.contracts import (
     GatewayMessage,
     GatewayNamedToolChoice,
     GatewayRequest,
+    GatewayToolDefinition,
 )
 from exp.runtime.models.providers.audios import openai_chat_audio_part, reject_audio_part
 from exp.runtime.models.providers.documents import (
@@ -720,6 +721,24 @@ def openai_chat_message(
     return payload
 
 
+def _optional_description(tool: GatewayToolDefinition) -> JsonObject:
+    """Return the tool's description field, or nothing when the caller sent none.
+
+    An absent description stays absent on the wire: Mistral (directly, and
+    behind OpenRouter and Azure) rejects ``"description": null`` with "Input
+    should be a valid string", and every OpenAI-family wire treats the field
+    as optional. ``parameters`` is always present (a required schema) and
+    ``strict`` is always a boolean, so neither can serialize as null.
+
+    Args:
+        tool: One caller function declaration.
+
+    Returns:
+        ``{"description": ...}`` when the caller supplied one, else ``{}``.
+    """
+    return {} if tool.description is None else {"description": tool.description}
+
+
 def add_openai_tools(
     payload: JsonObject,
     request: GatewayRequest,
@@ -734,7 +753,7 @@ def add_openai_tools(
                 {
                     "type": "function",
                     "name": tool.name,
-                    "description": tool.description,
+                    **_optional_description(tool),
                     "parameters": tool.parameters,
                     "strict": tool.strict,
                     # OpenAI's deferred-loading marker for its native tool search;
@@ -765,7 +784,7 @@ def add_openai_tools(
                     "type": "function",
                     "function": {
                         "name": tool.name,
-                        "description": tool.description,
+                        **_optional_description(tool),
                         "parameters": tool.parameters,
                         "strict": tool.strict,
                     },

@@ -241,7 +241,7 @@ Adding or revising observation-only policies leaves replay unchanged. Promoting 
 observer to enforcement changes replay identity. Only deterministic detector rules
 referenced by applicable enforcing checks enter that digest.
 
-Version 0.7.165 intentionally establishes a new guarded replay contract. Guarded keys
+Version 0.7.166 intentionally establishes a new guarded replay contract. Guarded keys
 accepted on 0.7.161 return `409` after upgrading, even when the authored policy is
 otherwise unchanged. There is no legacy-fingerprint translation. Finish in-flight
 requests before the cutover and use new keys for new operations.
