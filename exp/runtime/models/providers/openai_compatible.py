@@ -277,7 +277,8 @@ def _message_text(content: JsonValue) -> str | None:
         The concatenated answer text, or ``None`` when the message has none.
 
     Raises:
-        ProviderResponseError: A content part is not a JSON object.
+        ProviderResponseError: A content part is not a JSON object, or a text
+            part's ``text`` is neither text nor null.
     """
     if isinstance(content, str):
         return content
@@ -287,8 +288,12 @@ def _message_text(content: JsonValue) -> str | None:
     for part in content:
         if not isinstance(part, dict):
             raise ProviderResponseError("OpenAI-compatible content part must be an object")
+        if part.get("type") != "text":
+            continue
         text = part.get("text")
-        if part.get("type") == "text" and isinstance(text, str):
+        if text is not None and not isinstance(text, str):
+            raise ProviderResponseError("OpenAI-compatible text part must be text")
+        if text:
             texts.append(text)
     return "".join(texts) if texts else None
 

@@ -1174,7 +1174,7 @@ def test_mistral_typed_content_parts_answer_with_the_text_parts_only(
 
 
 def test_typed_content_parts_concatenate_text_and_reject_non_object_parts() -> None:
-    """Text parts join in order; unknown part types are skipped; a bare part is malformed."""
+    """Text parts join in order; unknown types are skipped; malformed parts never truncate."""
     response = openai_compatible_response(
         {
             "choices": [
@@ -1193,9 +1193,10 @@ def test_typed_content_parts_concatenate_text_and_reject_non_object_parts() -> N
         latency_seconds=1,
     )
     assert response.output.content == "391"
-    with pytest.raises(ProviderResponseError, match="content part"):
-        openai_compatible_response(
-            {"choices": [{"message": {"content": ["391"]}}]},
-            configured_model=_snapshot("mistral", "mistral-small-2603"),
-            latency_seconds=1,
-        )
+    for malformed in (["391"], [{"type": "text", "text": "39"}, {"type": "text", "text": 1}]):
+        with pytest.raises(ProviderResponseError, match="part must be"):
+            openai_compatible_response(
+                {"choices": [{"message": {"content": malformed}}]},
+                configured_model=_snapshot("mistral", "mistral-small-2603"),
+                latency_seconds=1,
+            )
