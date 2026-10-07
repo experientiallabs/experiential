@@ -936,3 +936,7 @@ mod truncation_tests;
 #[cfg(test)]
 #[path = "openai/cut_tests.rs"]
 mod cut_tests;
+
+#[cfg(test)]
+#[path = "openai/content_parts_tests.rs"]
+mod content_parts_tests;

@@ -184,7 +184,7 @@ def perform_round(
                     {
                         "type": "function",
                         "name": tool.name,
-                        "description": tool.description,
+                        **({} if tool.description is None else {"description": tool.description}),
                         "parameters": tool.parameters,
                     }
                     for tool in matched
