@@ -441,9 +441,7 @@ class NativeAttemptAccounting:
                     )
                     forced_overflow = candidate is not None
                     if candidate is None:
-                        last_failure = lane_saturated_failure(
-                            entry.authorization.priority_admission
-                        )
+                        last_failure = lane_saturated_failure(entry.authorization)
                         capacity_refused = True
                         with self._lock:
                             self._rung_saturation_refusals += 1
@@ -512,7 +510,7 @@ class NativeAttemptAccounting:
                     and overflow_target(route, [(candidate, ticket.reason)], {candidate: ticket})
                     is None
                 ):
-                    last_failure = lane_saturated_failure(entry.authorization.priority_admission)
+                    last_failure = lane_saturated_failure(entry.authorization)
                     capacity_refused = True
                     with self._lock:
                         self._rung_saturation_refusals += 1

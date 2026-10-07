@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import math
 
+from exp.runtime.gateway.contracts import AuthorizationSnapshot
 from exp.runtime.gateway.routing import GatewayRoute
 from exp.runtime.gateway.rung_admission import RungShed
 from exp.runtime.gateway.stream_contracts import GatewayFailure, GatewayFailureClass
@@ -137,7 +138,7 @@ higher still, and a Pro caller (already at the top) gets no upsell.
 """
 
 
-def lane_saturated_failure(priority_admission: int) -> GatewayFailure:
+def lane_saturated_failure(authorization: AuthorizationSnapshot) -> GatewayFailure:
     """The fail-fast refusal for a pool whose every rung is at its in-flight bound.
 
     Throttled, not provider-internal: nothing is down, the pool is full on
@@ -149,12 +150,14 @@ def lane_saturated_failure(priority_admission: int) -> GatewayFailure:
     internals.
 
     Args:
-        priority_admission: The caller's level (0 free, 1 paying, 2 Pro),
-            which picks the upsell sentence (``LANE_SATURATED_UPSELL``).
+        authorization: The refused caller; its ``priority_admission`` level
+            (0 free, 1 paying, 2 Pro) picks the upsell sentence
+            (``LANE_SATURATED_UPSELL``).
     """
     return GatewayFailure(
         failure_class=GatewayFailureClass.THROTTLED,
-        safe_message=LANE_SATURATED_MESSAGE + LANE_SATURATED_UPSELL[priority_admission],
+        safe_message=LANE_SATURATED_MESSAGE
+        + LANE_SATURATED_UPSELL[authorization.priority_admission],
         retry_after_seconds=LANE_SATURATED_RETRY_AFTER_SECONDS,
     )
 

@@ -116,7 +116,8 @@ def test_lane_saturated_failure_is_a_retryable_throttle_with_the_wait_it_states(
     Only the upsell varies by tier: free hears about Pro, paying hears Pro is
     higher still, Pro gets none.
     """
-    failure = lane_saturated_failure(priority_admission)
+    route = _route(_deployment("a", None), priority_admission=priority_admission)
+    failure = lane_saturated_failure(route.snapshot.authorization)
     assert failure.failure_class is GatewayFailureClass.THROTTLED
     assert failure.retry_after_seconds == LANE_SATURATED_RETRY_AFTER_SECONDS
     assert failure.safe_message == message
