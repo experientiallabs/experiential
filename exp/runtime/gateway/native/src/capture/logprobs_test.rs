@@ -117,17 +117,17 @@ fn a_malformed_channel_marks_the_retained_prefix_truncated() {
     probabilities.retain(
         Some(&json!({"content":[{"token":"a","logprob":-1.0,"bytes":null,"top_logprobs":[]}]})),
         0,
-        FrameOutput {
-            content: true,
-            refusal: false,
+        &FrameOutput {
+            content: "a".into(),
+            refusal: String::new(),
         },
     );
     probabilities.retain(
         Some(&json!({"content":[{"token":"b","logprob":"bad"}]})),
         0,
-        FrameOutput {
-            content: true,
-            refusal: false,
+        &FrameOutput {
+            content: "a".into(),
+            refusal: String::new(),
         },
     );
     let (taken, truncated) = probabilities.take().unwrap();
@@ -156,16 +156,16 @@ fn an_output_frame_without_probabilities_marks_the_sequence_incomplete() {
         probabilities.retain(
             missing.as_ref(),
             0,
-            FrameOutput {
-                content: true,
-                refusal: false,
+            &FrameOutput {
+                content: "a".into(),
+                refusal: String::new(),
             },
         );
         assert!(probabilities.take().unwrap().1);
     }
     // A frame with no output text (role, finish, usage) leaves it complete.
     let mut probabilities = ChatProbabilities::Capture(Buffer::default());
-    probabilities.retain(None, 0, FrameOutput::default());
+    probabilities.retain(None, 0, &FrameOutput::default());
     assert!(!probabilities.take().unwrap().1);
 }
 
@@ -210,9 +210,9 @@ fn records_on_the_wrong_channel_mark_the_sequence_incomplete() {
     probabilities.retain(
         Some(&json!({"refusal":[{"token":"no","logprob":-1.0,"bytes":null,"top_logprobs":[]}]})),
         0,
-        FrameOutput {
-            content: true,
-            refusal: false,
+        &FrameOutput {
+            content: "a".into(),
+            refusal: String::new(),
         },
     );
     let (taken, truncated) = probabilities.take().unwrap();
@@ -229,5 +229,39 @@ fn a_relay_holds_only_a_bounded_prefix_before_its_attempt_wins() {
         .collect();
     held.forward(Some((many, false)), None);
     assert!(held.pending.len() <= MAXIMUM_HELD_LOGPROB_BYTES / size);
+    assert!(held.truncated);
+}
+
+#[test]
+fn records_must_reproduce_the_emitted_text_exactly() {
+    let record = |token: &str, bytes: Option<Vec<u8>>| json!({"token": token, "logprob": -1.0, "bytes": bytes, "top_logprobs": []});
+    let frame = |records: Vec<serde_json::Value>, text: &str| {
+        let mut probabilities = ChatProbabilities::Capture(Buffer::default());
+        probabilities.retain(
+            Some(&json!({ "content": records })),
+            0,
+            &FrameOutput {
+                content: text.into(),
+                refusal: String::new(),
+            },
+        );
+        probabilities.take().unwrap().1
+    };
+    // Full coverage by bytes and by token text.
+    assert!(!frame(
+        vec![record("a", Some(vec![97])), record("b", Some(vec![98]))],
+        "ab"
+    ));
+    assert!(!frame(vec![record("a", None), record("b", None)], "ab"));
+    // A partial channel is a hole.
+    assert!(frame(vec![record("a", Some(vec![97]))], "ab"));
+    assert!(frame(vec![record("a", None)], "ab"));
+}
+
+#[test]
+fn a_held_batch_that_ends_in_a_hole_keeps_its_prefix() {
+    let mut held = Held::default();
+    held.forward(Some((vec![delta("a")], true)), None);
+    assert_eq!(held.pending.len(), 1);
     assert!(held.truncated);
 }

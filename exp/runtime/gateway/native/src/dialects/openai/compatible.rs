@@ -235,28 +235,23 @@ impl Normalizer {
         } else {
             // Capture-only probabilities never fail or shape the caller's answer.
             // Answer text per channel: typed thinking or reference parts carry none.
-            let text = |key: &str| {
-                choice
-                    .get("delta")
-                    .and_then(|delta| delta.get(key))
-                    .is_some_and(|value| match value {
-                        Value::String(text) => !text.is_empty(),
-                        Value::Array(parts) => parts.iter().any(|part| {
-                            part.get("type").and_then(Value::as_str) == Some("text")
-                                && part
-                                    .get("text")
-                                    .and_then(Value::as_str)
-                                    .is_some_and(|text| !text.is_empty())
-                        }),
-                        _ => false,
-                    })
+            let text = |key: &str| -> String {
+                match choice.get("delta").and_then(|delta| delta.get(key)) {
+                    Some(Value::String(text)) => text.clone(),
+                    Some(Value::Array(parts)) => parts
+                        .iter()
+                        .filter(|part| part.get("type").and_then(Value::as_str) == Some("text"))
+                        .filter_map(|part| part.get("text").and_then(Value::as_str))
+                        .collect(),
+                    _ => String::new(),
+                }
             };
             let output = crate::capture::logprobs::FrameOutput {
                 content: text("content"),
                 refusal: text("refusal"),
             };
             self.chat_logprobs
-                .retain(choice.get("logprobs"), choice_index as u32, output);
+                .retain(choice.get("logprobs"), choice_index as u32, &output);
         }
         // Azure asynchronous content-filter annotations carry no delta. Treat
         // their metadata-only choice as an empty delta, then still process the

@@ -152,25 +152,40 @@ pub(crate) fn may_be_refusal(failure: &Failure) -> bool {
     )
 }
 
-/// Which channels of one frame carry answer text.
-#[derive(Clone, Copy, Debug, Default)]
+/// The answer text one frame emits on each channel (empty when none).
+#[derive(Clone, Debug, Default)]
 pub(crate) struct FrameOutput {
-    pub content: bool,
-    pub refusal: bool,
+    pub content: String,
+    pub refusal: String,
 }
 
-/// Records per channel; a frame is complete only when every channel that
-/// carries text also carries records (and some record exists at all).
-fn covers(delta: &ChoiceLogprobsDelta, output: FrameOutput) -> (bool, bool) {
-    let filled = |records: Option<&Vec<TokenLogprob>>| records.is_some_and(|r| !r.is_empty());
-    let (content, refusal) = delta.logprobs.as_ref().map_or((false, false), |logprobs| {
-        (
-            filled(logprobs.content.as_ref()),
-            filled(logprobs.refusal.as_ref()),
-        )
+/// Whether a channel's records reproduce exactly the text it emitted: by
+/// their bytes when every record carries them, else by their token text.
+fn reproduces(records: Option<&Vec<TokenLogprob>>, text: &str) -> bool {
+    let records = records.map_or(&[][..], Vec::as_slice);
+    if records.iter().all(|record| record.bytes.is_some()) {
+        let bytes: Vec<u8> = records
+            .iter()
+            .flat_map(|record| record.bytes.clone().unwrap_or_default())
+            .collect();
+        bytes == text.as_bytes()
+    } else {
+        records
+            .iter()
+            .map(|record| record.token.as_str())
+            .collect::<String>()
+            == text
+    }
+}
+
+/// Whether the frame has any records, and whether they cover every channel's
+/// emitted text exactly (a missing, partial or wrong-channel record does not).
+fn covers(delta: &ChoiceLogprobsDelta, output: &FrameOutput) -> (bool, bool) {
+    let (content, refusal) = delta.logprobs.as_ref().map_or((None, None), |logprobs| {
+        (logprobs.content.as_ref(), logprobs.refusal.as_ref())
     });
-    let any = content || refusal;
-    let complete = (!output.content || content) && (!output.refusal || refusal);
+    let any = content.is_some_and(|r| !r.is_empty()) || refusal.is_some_and(|r| !r.is_empty());
+    let complete = reproduces(content, &output.content) && reproduces(refusal, &output.refusal);
     (any, complete)
 }
 
@@ -202,7 +217,12 @@ impl ChatProbabilities {
     /// Retain a capture-only choice channel. A frame that carries output text
     /// but no usable probabilities, or a malformed channel, leaves a hole: the
     /// prefix is kept and marked incomplete.
-    pub(crate) fn retain(&mut self, value: Option<&Value>, choice_index: u32, output: FrameOutput) {
+    pub(crate) fn retain(
+        &mut self,
+        value: Option<&Value>,
+        choice_index: u32,
+        output: &FrameOutput,
+    ) {
         if let Self::Capture(buffer) = self {
             match crate::logprobs::parse(value, choice_index) {
                 Ok(Some(delta)) => {
@@ -212,7 +232,9 @@ impl ChatProbabilities {
                     }
                     buffer.truncated |= !complete;
                 }
-                Ok(None) => buffer.truncated |= output.content || output.refusal,
+                Ok(None) => {
+                    buffer.truncated |= !output.content.is_empty() || !output.refusal.is_empty();
+                }
                 Err(_) => buffer.truncated = true,
             }
         }
@@ -246,9 +268,11 @@ impl Held {
         let Some((deltas, truncated)) = taken else {
             return;
         };
-        self.truncated |= truncated;
         match observer {
-            Some(observer) => observer.logprobs(deltas, self.truncated),
+            Some(observer) => {
+                self.truncated |= truncated;
+                observer.logprobs(deltas, self.truncated);
+            }
             None => {
                 // Held outside the collector's budget until the winner attaches,
                 // so the hold has its own small bound; beyond it, truncate.
@@ -263,6 +287,8 @@ impl Held {
                     self.pending_bytes += bytes;
                     self.pending.push(delta);
                 }
+                // The incoming mark only ends the prefix kept above.
+                self.truncated |= truncated;
             }
         }
     }

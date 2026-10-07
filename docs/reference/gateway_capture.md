@@ -87,8 +87,9 @@ response and pending budgets, and by the destination's record ceiling after the
 request and the largest admissible response; an overflow sets `truncated` and
 keeps the exchange. A token text carrying NUL is stored with U+FFFD and flags
 `nul_replaced` (the token's `bytes` keep it exactly). A malformed probability
-channel, or a frame that carries answer text (not typed thinking or reference
-parts) without probabilities, is never a
+channel, or a frame whose answer text (not typed thinking or reference parts)
+its records do not reproduce exactly (by their bytes, else their token text),
+is never a
 failure: it ends retention there and marks the prefix `truncated`. The record's
 sidecar is reserved when injection is decided, so a dial is injected only when
 its probabilities have room; a reserved sidecar that is never used is not
