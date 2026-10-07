@@ -82,18 +82,3 @@ def test_task_origin_governs_source_traces_and_reference_answers() -> None:
     assert set(mined.model_dump(mode="json")) == {*shared, "initial_context", "tools"} | {
         "source_trace_ids"
     }
-
-
-def test_environment_payload_omits_the_reference_answer() -> None:
-    """Environments receive the task record without the judge-only reference answer."""
-    authored = TaskCase(
-        task_id="refund-12",
-        lineage_group_id="refund-lineage",
-        partition="fit",
-        instruction="Help the customer request a refund.",
-        workload_weight=1,
-        origin="authored",
-        reference_answer="Refunded.",
-    )
-    payload = authored.environment_payload()
-    assert "reference_answer" not in payload and payload["origin"] == "authored"

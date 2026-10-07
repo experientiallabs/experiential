@@ -52,6 +52,9 @@ def execute_agent_episode(
         A complete in-memory episode with ordered events and structured failure attribution.
     """
     preflight_agent_runtime(agent)
+    # The reference answer is judge-only evidence: neither the customer agent nor its
+    # environment may see it.
+    task = task.model_copy(update={"reference_answer": None})
     try:
         environment_context = environment_runtime.open(task)
     except EnvironmentResetError as exc:

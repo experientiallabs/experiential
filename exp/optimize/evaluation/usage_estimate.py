@@ -294,7 +294,8 @@ def _authored_usage(
     declared. The answer is sized from the reference answer when one is given, otherwise from
     ``AUTHORED_ANSWER_TOKENS``; a tool call and its simulated result each use
     ``AUTHORED_TOOL_TURN_TOKENS``. The planning estimate is a heuristic: actual usage depends
-    on the candidates. Hard reservations still bound every call.
+    on the candidates. Hard reservations still bound every call. Nothing was captured, so the
+    episode reports zero captured turns.
 
     Args:
         task: Authored scenario with its declared inputs.
@@ -335,7 +336,7 @@ def _authored_usage(
         world_output=math.fsum(call.output_tokens for call in world_requests),
         query_input=queries,
         judge_input=judge,
-        turns=len(turns),
+        turns=0,
         measured_turns=0,
         assistant_requests=tuple(assistant_requests),
         world_requests=tuple(world_requests),

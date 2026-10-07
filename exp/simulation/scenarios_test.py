@@ -1,5 +1,6 @@
 """Authored scenario selection over a completed build's unchanged trace evidence."""
 
+import math
 from pathlib import Path
 
 import pytest
@@ -62,7 +63,8 @@ def test_selection_adds_authored_tasks_and_keeps_build_evidence(tmp_path: Path) 
     replaced = select_authored_scenarios(project, (_scenario("other"),))
     replaced_tasks = load_task_set(project.artifacts, replaced.artifact_id).tasks
     assert len(replaced_tasks) == len(mined) + 1
-    assert replaced_tasks[-1] == authored_task(_scenario("other"))
+    weight = math.fsum(task.workload_weight for task in mined) / len(mined)
+    assert replaced_tasks[-1] == authored_task(_scenario("other"), workload_weight=weight)
     assert select_authored_scenarios(project, ()) == original.task_set
     restored = project.load_project().build
     assert restored == original
@@ -94,8 +96,8 @@ def test_selection_rejects_duplicate_scenario_ids(tmp_path: Path) -> None:
 
 def test_authored_task_identity_binds_every_field() -> None:
     """Changing any authored field changes the task identity; the lineage follows the ID."""
-    base = authored_task(_scenario("refund"))
-    changed = authored_task(_scenario("refund", reference_answer="Refunded."))
+    base = authored_task(_scenario("refund"), workload_weight=1.0)
+    changed = authored_task(_scenario("refund", reference_answer="Refunded."), workload_weight=1.0)
     assert base.task_id != changed.task_id
     assert base.lineage_group_id == changed.lineage_group_id
     assert base.partition == "fit" and base.origin == "authored"

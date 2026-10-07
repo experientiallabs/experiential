@@ -76,10 +76,6 @@ class TaskCase(ContractModel):
             raise ValueError("source_trace_ids must not contain duplicates")
         return value
 
-    def environment_payload(self) -> JsonObject:
-        """Return the task record an environment may see, without the judge-only reference."""
-        return self.model_dump(mode="json", exclude={"reference_answer"})
-
     @model_validator(mode="after")
     def _require_origin_provenance(self) -> TaskCase:
         """Require source traces exactly for mined tasks and a reference only on authored ones."""

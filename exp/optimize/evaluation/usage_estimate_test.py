@@ -242,7 +242,8 @@ def test_authored_scenarios_are_sized_from_declared_inputs() -> None:
         maximum_steps=100,
         maximum_query_tokens=32_768,
     )
-    assert plain.episode_count == 1 and plain.turns == 1 and plain.measured_turns == 0
+    assert plain.episode_count == 1 and plain.turns == plain.measured_turns == 0
+    assert len(plain.assistant_requests) == 1
     assert [call.output_tokens for call in plain.assistant_requests] == [AUTHORED_ANSWER_TOKENS]
     referenced = task_usage(
         TaskCase.model_validate({**shared, "reference_answer": "x" * 40}),
@@ -263,7 +264,7 @@ def test_authored_scenarios_are_sized_from_declared_inputs() -> None:
         maximum_steps=100,
         maximum_query_tokens=32_768,
     )
-    assert with_tools.turns == 2 and len(with_tools.world_requests) == 2
+    assert len(with_tools.assistant_requests) == len(with_tools.world_requests) == 2
     assert with_tools.assistant_requests[0].output_tokens == AUTHORED_TOOL_TURN_TOKENS
     one_step = task_usage(
         TaskCase.model_validate({**shared, "tools": [tool]}),
@@ -273,4 +274,4 @@ def test_authored_scenarios_are_sized_from_declared_inputs() -> None:
         maximum_steps=1,
         maximum_query_tokens=32_768,
     )
-    assert one_step.turns == 1
+    assert len(one_step.assistant_requests) == 1

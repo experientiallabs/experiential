@@ -229,26 +229,6 @@ def _build_evaluation_plan(
     _require_sealed_lineages(loaded_tasks.tasks)
     candidates_by_alias = {candidate.alias: candidate for candidate in candidates}
 
-    observed_by_key: dict[tuple[str, str, int], RolloutArtifact] = {}
-    observed_inputs = []
-    for observed in observed_cells:
-        key = (observed.task_id, observed.candidate_alias, observed.repeat)
-        if key in observed_by_key:
-            raise EvaluationEvidenceError(
-                "observed production evidence repeats a task, candidate, and repeat cell"
-            )
-        task = tasks_by_id.get(observed.task_id)
-        candidate = candidates_by_alias.get(observed.candidate_alias)
-        if task is None or candidate is None or observed.repeat not in repeat_ids:
-            raise EvaluationEvidenceError(
-                "observed production evidence lies outside the requested task, candidate, or "
-                "repeat scope"
-            )
-        rollout, rollout_input = read_rollout(store, observed.rollout_artifact_id)
-        _require_observed_rollout(observed, task, candidate, rollout)
-        observed_by_key[key] = rollout
-        observed_inputs.append(rollout_input)
-
     if task_ids is not None and (
         not task_ids or len(set(task_ids)) != len(task_ids) or not set(task_ids) <= set(tasks_by_id)
     ):
@@ -259,6 +239,32 @@ def _build_evaluation_plan(
     planned_tasks = tuple(
         task for task in loaded_tasks.tasks if planned is None or task.task_id in planned
     )
+
+    observed_by_key: dict[tuple[str, str, int], RolloutArtifact] = {}
+    observed_inputs = []
+    for observed in observed_cells:
+        key = (observed.task_id, observed.candidate_alias, observed.repeat)
+        if key in observed_by_key:
+            raise EvaluationEvidenceError(
+                "observed production evidence repeats a task, candidate, and repeat cell"
+            )
+        task = tasks_by_id.get(observed.task_id)
+        candidate = candidates_by_alias.get(observed.candidate_alias)
+        if (
+            task is None
+            or (planned is not None and task.task_id not in planned)
+            or candidate is None
+            or observed.repeat not in repeat_ids
+        ):
+            raise EvaluationEvidenceError(
+                "observed production evidence lies outside the requested task, candidate, or "
+                "repeat scope"
+            )
+        rollout, rollout_input = read_rollout(store, observed.rollout_artifact_id)
+        _require_observed_rollout(observed, task, candidate, rollout)
+        observed_by_key[key] = rollout
+        observed_inputs.append(rollout_input)
+
     main_cells = tuple(
         _main_cell(
             task,
@@ -345,7 +351,12 @@ def _require_unique_candidates(candidates: tuple[RoutedCandidateSnapshot, ...]) 
 
 
 def _require_sealed_lineages(tasks: Sequence[TaskCase]) -> None:
-    """Reject a task lineage that straddles router fit and held-out partitions."""
+    """Reject a task lineage that straddles router fit and held-out partitions.
+
+    Authored tasks are not router evidence, so a person may copy a held-out request into one
+    without leaking a sealed lineage; only mined tasks are compared.
+    """
+    tasks = tuple(task for task in tasks if task.origin == "mined")
     fit_lineages = {task.lineage_group_id for task in tasks if task.partition == "fit"}
     held_out_lineages = {task.lineage_group_id for task in tasks if task.partition == "held_out"}
     leaked = sorted(fit_lineages.intersection(held_out_lineages))

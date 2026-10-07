@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import threading
+from collections import OrderedDict
 from collections.abc import Callable
 from contextlib import AbstractContextManager, nullcontext
 from datetime import datetime
@@ -599,8 +601,17 @@ def _raw_response(response: ModelResponse) -> JsonObject:
     return cast(JsonObject, value)
 
 
+_REFERENCE_ANSWER_CACHE_SIZE = 8
+_reference_answers: OrderedDict[tuple[str, str], dict[str, str]] = OrderedDict()
+_reference_answers_lock = threading.Lock()
+
+
 def _authored_reference_answer(store: ProjectStore, rollout: RolloutArtifact) -> str | None:
     """Return the expected answer of a simulated rollout's authored scenario, if any.
+
+    Task sets are immutable and content-addressed, so the answers of the few most recently
+    judged sets are kept in memory by artifact ID and task digest instead of re-reading the
+    whole set for every judgment.
 
     Args:
         store: Project-local immutable artifact store.
@@ -609,18 +620,30 @@ def _authored_reference_answer(store: ProjectStore, rollout: RolloutArtifact) ->
     Returns:
         The authored task's reference answer, or None for production evidence, mined tasks
         and authored tasks without one.
-
-    Raises:
-        ManualJudgeError: The bound task set no longer contains the rollout's task.
     """
     binding = rollout.simulation_binding
     if binding is None:
         return None
-    tasks = load_task_set(store.artifacts, binding.task_set_input.artifact_id).tasks
-    task = next((item for item in tasks if item.task_id == rollout.task_id), None)
-    if task is None:
-        raise ManualJudgeError("rollout task is missing from its bound task set")
-    return task.reference_answer
+    key = (binding.task_set_input.artifact_id, binding.task_set_tasks_sha256)
+    with _reference_answers_lock:
+        answers = _reference_answers.get(key)
+        if answers is not None:
+            _reference_answers.move_to_end(key)
+            return answers.get(rollout.task_id)
+    loaded = load_task_set(store.artifacts, binding.task_set_input.artifact_id)
+    if loaded.task_set.tasks_sha256 != binding.task_set_tasks_sha256:
+        raise ManualJudgeError("rollout task set differs from its simulation binding")
+    answers = {
+        task.task_id: task.reference_answer
+        for task in loaded.tasks
+        if task.reference_answer is not None
+    }
+    with _reference_answers_lock:
+        _reference_answers[key] = answers
+        _reference_answers.move_to_end(key)
+        while len(_reference_answers) > _REFERENCE_ANSWER_CACHE_SIZE:
+            _reference_answers.popitem(last=False)
+    return answers.get(rollout.task_id)
 
 
 def _bounded_judge_request(

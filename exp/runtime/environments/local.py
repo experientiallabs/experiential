@@ -630,7 +630,7 @@ class _LocalProcessSession:
         self._io_threads = [stdout_thread, stderr_thread]
         for thread in self._io_threads:
             thread.start()
-        response = self._request({"kind": "open", "task": task.environment_payload()})
+        response = self._request({"kind": "open", "task": task.model_dump(mode="json")})
         if response != {"ready": True}:
             raise LocalProcessProtocolError(
                 "local environment open response must be {'ready': true}"

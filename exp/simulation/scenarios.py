@@ -10,6 +10,7 @@ tasks, the authored ones, or both (``ModelEvaluationOptions.include_mined``).
 
 from __future__ import annotations
 
+import math
 from collections.abc import Sequence
 
 from pydantic import Field, field_validator
@@ -23,7 +24,11 @@ from exp.common.core.artifacts import (
     sha256_bytes,
     stable_id,
 )
-from exp.common.project import ProjectStore, artifact_input
+from exp.common.project import (
+    ProjectStore,
+    artifact_input,
+    coordinate_completed_build_selection,
+)
 from exp.common.tasks import TaskCase, TaskSet, ToolSchema, load_task_set
 from exp.simulation.build import select_build_task_set
 from exp.simulation.mining.bindings import (
@@ -64,11 +69,14 @@ class AuthoredScenario(ContractModel):
         return value
 
 
-def authored_task(scenario: AuthoredScenario) -> TaskCase:
+def authored_task(scenario: AuthoredScenario, *, workload_weight: float) -> TaskCase:
     """Return the canonical evaluated task for one authored scenario.
 
     Args:
         scenario: Written or imported scenario.
+        workload_weight: Positive report weight. A selection gives every authored scenario the
+            mean weight of the build's mined tasks, so a mixed report weighs each authored
+            scenario like an average mined one rather than like the whole mined workload.
 
     Returns:
         A fit-partition authored task whose identity binds every scenario field.
@@ -81,7 +89,7 @@ def authored_task(scenario: AuthoredScenario) -> TaskCase:
         instruction=scenario.instruction,
         initial_context=scenario.initial_context,
         tools=scenario.tools,
-        workload_weight=1.0,
+        workload_weight=workload_weight,
         origin="authored",
         reference_answer=scenario.reference_answer,
     )
@@ -99,8 +107,11 @@ def select_authored_scenarios(
     replaces the previous authored scenarios instead of accumulating them, and an empty
     selection restores the mined task set exactly. The task set reuses the selected set's
     coverage and lineage evidence and keeps its trace dataset, so retrieval and the world model
-    are unchanged. Selecting a different task set discards judge setup bound to the previous
-    one; author the judge afterwards.
+    are unchanged. Each authored scenario carries the mean workload weight of the mined tasks.
+    Selecting a different task set discards judge setup bound to the previous one; author the
+    judge afterwards. Hosted or router-bound projects are refused, because their spend ledger,
+    judge and router evidence bind the mined task set; router optimization of a plain project
+    also expects the mined set, which an empty selection restores.
 
     Args:
         project: Project with a completed build and its build review.
@@ -110,22 +121,43 @@ def select_authored_scenarios(
         The selected task-set manifest input. An identical selection is an exact replay.
 
     Raises:
-        ValueError: The project has no completed build, scenario IDs repeat, or the build
-            review does not name the selected build.
+        ValueError: The project has no completed build or no mined scenarios, is hosted or
+            router-bound, scenario IDs repeat, or the build review does not name the build.
     """
     if len({scenario.scenario_id for scenario in scenarios}) != len(scenarios):
         raise ValueError("authored scenario IDs must be unique; remove the duplicate scenario")
-    build = project.load_project().build
-    if build is None:
-        raise ValueError("select scenarios after the build completes; run exp build first")
-    current = load_task_set(project.artifacts, build.task_set.artifact_id)
-    bindings = load_task_set_lineage_bindings(project.artifacts, build.task_set.artifact_id)
-    tasks = (
-        *(task for task in current.tasks if task.origin == "mined"),
-        *(authored_task(scenario) for scenario in scenarios),
-    )
-    task_set_input = _persist_task_set(project, current.task_set, tasks, bindings)
-    select_build_task_set(project, task_set_input)
+    # Hold the build-selection lock so a concurrent rebuild cannot be replaced by a task set
+    # derived from the build read here.
+    with coordinate_completed_build_selection(project):
+        config = project.load_project()
+        build = config.build
+        if build is None:
+            raise ValueError("select scenarios after the build completes; run exp build first")
+        if any(
+            binding is not None
+            for binding in (
+                config.build_spend_ledger,
+                config.hosted_judge,
+                config.router_policy,
+                config.router_report,
+            )
+        ):
+            raise ValueError(
+                "hosted or router-bound projects keep their mined scenarios; select authored "
+                "scenarios on a plain evaluation project"
+            )
+        current = load_task_set(project.artifacts, build.task_set.artifact_id)
+        bindings = load_task_set_lineage_bindings(project.artifacts, build.task_set.artifact_id)
+        mined = tuple(task for task in current.tasks if task.origin == "mined")
+        if not mined:
+            raise ValueError("the build has no mined scenarios; rebuild it from captured traffic")
+        weight = math.fsum(task.workload_weight for task in mined) / len(mined)
+        tasks = (
+            *mined,
+            *(authored_task(scenario, workload_weight=weight) for scenario in scenarios),
+        )
+        task_set_input = _persist_task_set(project, current.task_set, tasks, bindings)
+        select_build_task_set(project, task_set_input)
     return task_set_input
 
 

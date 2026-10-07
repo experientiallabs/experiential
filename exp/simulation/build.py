@@ -497,24 +497,27 @@ def select_build_task_set(store: ProjectStore, task_set: ArtifactInput) -> None:
     Raises:
         ValueError: The project has no completed build review, or it names another build.
     """
-    config = store.load_project()
-    build = config.build
-    current = store.read_review()
-    if build is None or not isinstance(current, dict) or "build_review" not in current:
-        raise ValueError("project has no completed build review; run exp build first")
-    review = BuildReviewReadiness.model_validate(current["build_review"])
-    if review.task_set != build.task_set or review.trace_dataset != build.trace_dataset:
-        raise ValueError("project build review differs from its selected build; rebuild it")
-    if task_set == build.task_set:
-        return
-    binding = review.model_dump(mode="json", exclude={"readiness_id"})
-    binding["task_set"] = task_set.model_dump(mode="json")
-    select_completed_build(
-        store,
-        build.model_copy(update={"task_set": task_set}),
-        BuildReviewReadiness.model_validate({**binding, "readiness_id": _build_review_id(binding)}),
-        trace_import_id=config.trace_import_id,
-    )
+    with _build_review_coordination(store):
+        config = store.load_project()
+        build = config.build
+        current = store.read_review()
+        if build is None or not isinstance(current, dict) or "build_review" not in current:
+            raise ValueError("project has no completed build review; run exp build first")
+        review = BuildReviewReadiness.model_validate(current["build_review"])
+        if review.task_set != build.task_set or review.trace_dataset != build.trace_dataset:
+            raise ValueError("project build review differs from its selected build; rebuild it")
+        if task_set == build.task_set:
+            return
+        binding = review.model_dump(mode="json", exclude={"readiness_id"})
+        binding["task_set"] = task_set.model_dump(mode="json")
+        select_completed_build(
+            store,
+            build.model_copy(update={"task_set": task_set}),
+            BuildReviewReadiness.model_validate(
+                {**binding, "readiness_id": _build_review_id(binding)}
+            ),
+            trace_import_id=config.trace_import_id,
+        )
 
 
 @contextmanager
