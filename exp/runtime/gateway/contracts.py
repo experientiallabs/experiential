@@ -46,6 +46,7 @@ from exp.runtime.gateway.reasoning_blocks import (
 )
 from exp.runtime.gateway.reasoning_blocks import ThinkingBlock as ThinkingBlock
 from exp.runtime.gateway.request_policy import GatewayRequestPolicy, RequestedRouteId
+from exp.runtime.gateway.request_surface_fields import require_no_responses_only_fields
 from exp.runtime.gateway.service_tiers import (
     GatewayServiceTierAdmission as GatewayServiceTierAdmission,
 )
@@ -443,9 +444,7 @@ class GatewayRequest(ContractModel):
 
     Attributes:
         include_output_text_logprobs: Responses probability selector (default false).
-        include_web_search_sources: Responses ``web_search_call.action.sources``
-            selector (default false): native Responses rungs forward it so the
-            provider's web search items carry their sources.
+        include_web_search_sources: Responses web search sources selector (default false).
         top_logprobs: Optional strict integer from zero through twenty for alternative tokens.
         thinking_budget: Optional strict numeric Chat control, at least -1; provider validation
             defines zero and -1 semantics. Excluded from serialization, retained in replay identity.
@@ -810,18 +809,8 @@ class GatewayRequest(ContractModel):
                 "media handles in one request must all name the same provider; "
                 "no single route can resolve handles from two providers"
             )
-        if self.reasoning_summary is not None and self.surface != GatewayApiSurface.RESPONSES:
-            raise ValueError("reasoning_summary is valid only for Responses requests")
-        if self.response_store is not None and self.surface != GatewayApiSurface.RESPONSES:
-            raise ValueError("response_store is valid only for Responses requests")
-        if self.include_output_text_logprobs and self.surface != GatewayApiSurface.RESPONSES:
-            raise ValueError("include_output_text_logprobs is valid only for Responses requests")
-        if self.include_web_search_sources and self.surface != GatewayApiSurface.RESPONSES:
-            raise ValueError("include_web_search_sources is valid only for Responses requests")
-        if self.include_encrypted_reasoning and self.surface != GatewayApiSurface.RESPONSES:
-            raise ValueError("include_encrypted_reasoning is valid only for Responses requests")
-        if self.reasoning_context is not None and self.surface != GatewayApiSurface.RESPONSES:
-            raise ValueError("reasoning_context is valid only for Responses requests")
+        if self.surface != GatewayApiSurface.RESPONSES:
+            require_no_responses_only_fields(self)
         if self.provider_thinking_config is not None and self.surface not in {
             GatewayApiSurface.MESSAGES,
             GatewayApiSurface.CHAT_COMPLETIONS,
