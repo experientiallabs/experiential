@@ -243,7 +243,7 @@ fn insert_form_field(
         }
         return Ok(());
     }
-    if !fields.contains_key(name) && fields.len() >= MAXIMUM_TEXT_FIELDS {
+    if fields.len() >= MAXIMUM_TEXT_FIELDS {
         return Err(invalid_upload("The upload carries too many form fields."));
     }
     let value = if name == "temperature" {
@@ -257,6 +257,12 @@ fn insert_form_field(
     } else {
         Value::String(text)
     };
+    if fields.contains_key(name) {
+        // Last-value-wins could route or bill a model the caller did not mean.
+        let mut error = invalid_upload(&format!("The {name} field appears more than once."));
+        error.param = Some(name.to_string());
+        return Err(error);
+    }
     fields.insert(name.to_string(), value);
     Ok(())
 }
@@ -351,9 +357,13 @@ mod tests {
         assert_eq!(fields["temperature"], json!(0.2));
         assert_eq!(fields["language"], json!("en"));
         for invalid in ["NaN", "inf", "-Infinity", "1e999"] {
-            insert_form_field(&mut fields, "temperature", invalid.to_string()).unwrap();
-            assert_eq!(fields["temperature"], json!(invalid), "{invalid}");
+            let mut single = Map::new();
+            insert_form_field(&mut single, "temperature", invalid.to_string()).unwrap();
+            assert_eq!(single["temperature"], json!(invalid), "{invalid}");
         }
+        let repeated = insert_form_field(&mut fields, "language", "fr".to_string()).unwrap_err();
+        assert_eq!(repeated.param.as_deref(), Some("language"));
+        assert_eq!(fields["language"], json!("en"));
     }
 
     #[test]

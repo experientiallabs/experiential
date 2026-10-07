@@ -534,10 +534,11 @@ def test_wrong_surface_unsupported_fields_and_unknown_keys_are_refused(
         assert unknown.status_code == 401
 
 
-def test_multipart_refuses_a_second_file_and_an_oversized_text_field(
+def test_oversized_or_repeated_audio_request_parts_are_refused_before_the_bridge(
     engine: _ServingEngine,
 ) -> None:
-    """A second file part or a text field past its byte cap is a 400 on that field."""
+    """A second file or repeated field, or a text field past its byte cap, is a 400
+    on that field; a speech body past its cap is a 413."""
     auth = {"authorization": f"Bearer {engine.raw_key}"}
     twice = httpx.post(
         f"{engine.base}/v1/audio/transcriptions",
@@ -560,6 +561,22 @@ def test_multipart_refuses_a_second_file_and_an_oversized_text_field(
     )
     assert flooded.status_code == 400
     assert flooded.json()["error"]["param"] == "prompt"
+    doubled = httpx.post(
+        f"{engine.base}/v1/audio/transcriptions",
+        headers=auth,
+        data={"model": ["scribe", "narrator"]},
+        files={"file": ("a.wav", _wav(0.1), "audio/wav")},
+        timeout=10.0,
+    )
+    assert doubled.status_code == 400
+    assert doubled.json()["error"]["param"] == "model"
+    oversized = httpx.post(
+        f"{engine.base}/v1/audio/speech",
+        headers=auth,
+        json={"model": "narrator", "input": "x" * (200 * 1024), "voice": "alloy"},
+        timeout=10.0,
+    )
+    assert oversized.status_code == 413
 
 
 def test_provider_client_error_relays_the_parameter(engine: _ServingEngine) -> None:

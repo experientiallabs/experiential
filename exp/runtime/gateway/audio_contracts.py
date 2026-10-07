@@ -3,7 +3,8 @@
 Parallel to the chat ``GatewayRequest`` like the embeddings and images
 contracts: never streamed, never keyed for replay. A speech request carries
 its whole text. A transcription request carries only the facts of its audio
-upload (size, name, type, digest, and duration when the container states it):
+upload (size, name, type, digest, and the duration the data plane measures by
+summing codec frame lengths, never from container timing the uploader controls):
 the audio bytes stay in the native data plane, which rebuilds the provider's
 multipart body itself, so a multi-megabyte upload never crosses the bridge.
 """

@@ -45,7 +45,7 @@ use crate::metrics::{classify_escalation, METRICS};
 use crate::rate_limit_headers::harvest_rate_limit_headers;
 use crate::relay::{collection_public_error, remaining};
 use crate::respond::{
-    bearer_key, error_response, escalation_error, latin1_header, read_body, with_app_identity,
+    bearer_key, error_response, escalation_error, latin1_header, with_app_identity,
 };
 use crate::server::AppState;
 use crate::settlement::AttemptGuard;
@@ -132,9 +132,10 @@ pub(crate) async fn speech(
         Ok(permit) => permit,
         Err(error) => return error_response(&error),
     };
-    let body = match tokio::time::timeout_at(deadline.into(), read_body(raw_body)).await {
+    let read = axum::body::to_bytes(raw_body, MAXIMUM_SPEECH_BODY_BYTES);
+    let body = match tokio::time::timeout_at(deadline.into(), read).await {
         Ok(Ok(body)) => body,
-        Ok(Err(error)) => return error_response(&error),
+        Ok(Err(_)) => return error_response(&PublicError::request_too_large()),
         Err(_) => return error_response(&upload_deadline_error()),
     };
     let body_text = match String::from_utf8(body.to_vec()) {
@@ -201,6 +202,11 @@ pub(crate) async fn transcriptions(
     )
     .await
 }
+
+/// Largest speech request body read: its two long text fields (`input` and
+/// `instructions`, 4,096 characters each) fully `\uXXXX`-escaped, plus room
+/// for the short fields, so an oversized body never reaches the bridge.
+const MAXIMUM_SPEECH_BODY_BYTES: usize = 128 * 1024;
 
 /// Take one data-plane permit before the body is read (no admission or attempt
 /// guard exists yet), under the same request deadline.
