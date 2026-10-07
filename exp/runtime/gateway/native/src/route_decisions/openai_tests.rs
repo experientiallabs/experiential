@@ -29,16 +29,16 @@ fn openai_payload() -> Value {
     json!({
         "model": "gpt-6-luna",
         "answers": [
-            {"type": "predicate", "name": "angry", "probability": 0.31},
             {"type": "choice", "name": "intent", "choice": "refund",
                 "probabilities": [{"value": "refund", "probability": 1}, {"value": "support", "probability": 0}],
                 "confidence": 1},
+            {"type": "predicate", "name": "angry", "probability": 0.31},
             {"type": "score", "name": "urgency", "score": 0.7,
                 "probabilities": [{"value": 0, "label": "low", "probability": 0.3},
                     {"value": 1, "label": "high", "probability": 0.7}],
                 "confidence": 0.7},
         ],
-        "usage": {"input_tokens": 275, "input_tokens_details": {"cached_tokens": 0, "cache_write_tokens": 0},
+        "usage": {"input_tokens": 275, "input_tokens_details": {"cached_tokens": 64, "cache_write_tokens": 128},
             "output_tokens": 0, "output_tokens_details": {"reasoning_tokens": 0}, "total_tokens": 275},
     })
 }
@@ -58,6 +58,8 @@ fn openai_answer_passes_through_in_question_order_with_alias_and_usage() {
     assert_eq!(body["usage"]["input_tokens"], 275);
     assert_eq!(usage.input_tokens, Some(275));
     assert_eq!(usage.output_tokens, Some(0));
+    assert_eq!(usage.cached_input_tokens, Some(64));
+    assert_eq!(usage.cache_creation_input_tokens, Some(128));
 }
 
 #[test]
@@ -65,17 +67,31 @@ fn openai_answers_that_do_not_match_the_questions_are_malformed() {
     let mut missing = openai_payload();
     missing["answers"].as_array_mut().unwrap().pop();
     let mut unknown_choice = openai_payload();
-    unknown_choice["answers"][1]["choice"] = json!("cancel");
+    unknown_choice["answers"][0]["choice"] = json!("cancel");
     let mut wrong_type = openai_payload();
-    wrong_type["answers"][0]["type"] = json!("choice");
+    wrong_type["answers"][1]["type"] = json!("choice");
     let mut bad_total = openai_payload();
-    bad_total["answers"][1]["probabilities"][1]["probability"] = json!(0.5);
+    bad_total["answers"][0]["probabilities"][1]["probability"] = json!(0.5);
     let mut out_of_range = openai_payload();
-    out_of_range["answers"][0]["probability"] = json!(1.5);
+    out_of_range["answers"][1]["probability"] = json!(1.5);
     let mut not_highest = openai_payload();
-    not_highest["answers"][1]["choice"] = json!("support");
+    not_highest["answers"][0]["choice"] = json!("support");
     let mut unbilled = openai_payload();
     unbilled["usage"] = json!({"input_tokens": 0, "output_tokens": 0});
+    let mut out_of_order = openai_payload();
+    out_of_order["answers"].as_array_mut().unwrap().swap(0, 1);
+    let mut renamed = openai_payload();
+    renamed["answers"][1]["name"] = json!("calm");
+    let mut stringly_boolean = openai_payload();
+    stringly_boolean["answers"][0]["choice"] = json!(true);
+    let mut wrong_label = openai_payload();
+    wrong_label["answers"][2]["probabilities"][0]["label"] = json!("high");
+    let mut wrong_index = openai_payload();
+    wrong_index["answers"][2]["probabilities"][1]["value"] = json!(5);
+    let mut score_outside = openai_payload();
+    score_outside["answers"][2]["score"] = json!(3.0);
+    let mut overcached = openai_payload();
+    overcached["usage"]["input_tokens_details"]["cached_tokens"] = json!(275);
     for payload in [
         missing,
         unknown_choice,
@@ -84,6 +100,13 @@ fn openai_answers_that_do_not_match_the_questions_are_malformed() {
         out_of_range,
         not_highest,
         unbilled,
+        out_of_order,
+        renamed,
+        stringly_boolean,
+        wrong_label,
+        wrong_index,
+        score_outside,
+        overcached,
     ] {
         let failure = public_openai_decisions(payload, &openai_admission()).expect_err("malformed");
         assert_eq!(failure.failure_class, FailureClass::MalformedResponse);
@@ -103,4 +126,36 @@ fn openai_wire_admission_deserializes_its_question_list() {
     assert_eq!(admission.wire, DecisionWire::Openai);
     assert_eq!(admission.openai_questions.len(), 1);
     assert!(admission.questions.is_empty());
+}
+
+#[test]
+fn openai_refusals_and_unnamed_questions_pass_through_positionally() {
+    let mut admission = openai_admission();
+    admission.openai_questions[1] =
+        json!({"type": "predicate", "instructions": "Is the customer angry?"});
+    let mut payload = openai_payload();
+    payload["answers"][1] = json!({"type": "predicate", "probability": 0.2});
+    payload["answers"][2] = json!({"type": "refusal", "name": "urgency"});
+    let (body, _usage) = public_openai_decisions(payload, &admission).unwrap();
+    assert_eq!(
+        body["answers"][1],
+        json!({"type": "predicate", "probability": 0.2})
+    );
+    assert_eq!(body["answers"][2]["type"], "refusal");
+}
+
+#[test]
+fn openai_boolean_choice_values_stay_typed() {
+    let mut admission = openai_admission();
+    admission.openai_questions[0] = json!({"type": "choice", "name": "intent",
+        "instructions": "Refund?", "choices": [{"value": true}, {"value": "true"}]});
+    let mut payload = openai_payload();
+    payload["answers"][0] = json!({"type": "choice", "name": "intent", "choice": true,
+        "probabilities": [{"value": "true", "probability": 0.25}, {"value": true, "probability": 0.75}],
+        "confidence": 0.75});
+    let (body, _usage) = public_openai_decisions(payload.clone(), &admission).unwrap();
+    assert_eq!(body["answers"][0]["choice"], json!(true));
+    payload["answers"][0]["choice"] = json!("true");
+    let failure = public_openai_decisions(payload, &admission).expect_err("not highest");
+    assert_eq!(failure.failure_class, FailureClass::MalformedResponse);
 }

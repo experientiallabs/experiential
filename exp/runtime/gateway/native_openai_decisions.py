@@ -126,11 +126,11 @@ class NativeOpenAIDecisionsMixin:
             raise NativeBridgeError(
                 invalid_field(
                     "body",
-                    "Invalid decision request. Send only model, input (text or messages with "
-                    "input_text and inline base64 input_image parts), and questions of type "
-                    "predicate, choice (with choices), or score (with levels), each with a "
-                    "unique name and instructions. Streaming and chat controls are not "
-                    "supported.",
+                    "Invalid decision request. Send model, input (text or user messages with "
+                    "input_text and inline base64 input_image parts), questions of type "
+                    "predicate, choice (with choices), or score (with levels), each with "
+                    "instructions and an optional unique name, and optionally "
+                    "safety_identifier. Streaming and chat controls are not supported.",
                 )
             ) from exc
         deadline = time.monotonic() + self._request_timeout_seconds

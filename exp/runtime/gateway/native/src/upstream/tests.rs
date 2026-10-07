@@ -774,3 +774,61 @@ fn header_phase_timeout_fails_over_without_a_same_deployment_redial() {
         "a header-phase stall must fail over to the next certified rung"
     );
 }
+
+#[tokio::test]
+async fn openai_decision_rejections_keep_decision_semantics_and_the_envelope() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    // (status line, rejected before execution, fails over)
+    let table = [
+        ("401 Unauthorized", true, true),
+        ("400 Bad Request", true, false),
+        ("429 Too Many Requests", false, false),
+        ("500 Internal Server Error", false, false),
+    ];
+    for (status_line, rejected, failover) in table {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            let mut buffer = [0u8; 8192];
+            let _ = socket.read(&mut buffer).await;
+            let body = "{\"error\":{\"code\":\"invalid_value\",\"type\":\"invalid_request_error\",\
+                        \"param\":\"questions\",\"message\":\"Invalid value for questions.\"}}";
+            let response = format!(
+                "HTTP/1.1 {status_line}\r\ncontent-type: application/json\r\n\
+                 content-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body,
+            );
+            socket.write_all(response.as_bytes()).await.expect("write");
+        });
+        let client = build_client(Duration::from_secs(2), false).expect("client");
+        let failure = open_decision_stream(
+            &client,
+            &format!("http://{addr}/v1/decisions"),
+            &HashMap::new(),
+            "idem-decision",
+            &serde_json::json!({"model": "gpt-6-luna", "input": "x", "questions": []}),
+            Duration::from_secs(5),
+            Dialect::OpenAiCompatible,
+        )
+        .await
+        .expect_err("a non-success status must classify as a failure");
+        assert_eq!(
+            failure.decision_provider_rejected, rejected,
+            "rejected for {status_line}"
+        );
+        assert_eq!(
+            failure.failover_eligible, failover,
+            "failover for {status_line}"
+        );
+        assert!(!failure.retryable_same_deployment, "{status_line}");
+        if status_line.starts_with("400") {
+            // The OpenAI envelope still names the caller's parameter.
+            assert_eq!(failure.failure_class, FailureClass::InvalidRequest);
+            assert_eq!(failure.rejected_parameter.as_deref(), Some("questions"));
+        }
+    }
+}

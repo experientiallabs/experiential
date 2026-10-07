@@ -15,7 +15,7 @@ from __future__ import annotations
 import json
 from typing import Annotated, Literal
 
-from pydantic import Field, field_validator, model_validator
+from pydantic import Field, StrictBool, StrictStr, field_validator, model_validator
 
 from exp.common.core.artifacts import ContractModel, JsonValue
 from exp.runtime.gateway.decisions_contracts import (
@@ -32,6 +32,9 @@ OPENAI_DECISION_IMAGE_TOKEN_RESERVATION = 2048
 """Planning tokens per inline image; settlement bills the provider's own count."""
 OPENAI_DECISION_QUESTION_OVERHEAD_TOKENS = 256
 MAX_OPENAI_DECISION_MESSAGES = 256
+MAX_OPENAI_DECISION_IMAGES = 128
+"""OpenAI's cap on image parts across all messages of one request."""
+MAX_OPENAI_SAFETY_IDENTIFIER_CHARACTERS = 128
 OPENAI_DECISION_MESSAGE_OVERHEAD_TOKENS = 16
 """Planning tokens per message for role and framing, so many tiny messages cannot
 exceed the hold."""
@@ -47,18 +50,30 @@ def _bounded_name(value: str, label: str) -> str:
 
 
 class InputTextPart(ContractModel):
-    """One text part of a decision input message."""
+    """One text part of a decision input message.
+
+    Attributes:
+        type: Always ``input_text``.
+        text: The text evidence.
+    """
 
     type: Literal["input_text"] = "input_text"
     text: str
 
 
 class InputImagePart(ContractModel):
-    """One inline image part; OpenAI accepts only base64 data URLs here."""
+    """One inline image part; OpenAI accepts only base64 data URLs here.
+
+    Attributes:
+        type: Always ``input_image``.
+        image_url: A ``data:image/...;base64,`` URL; remote URLs and file ids
+            are refused.
+        detail: The image detail level; the provider defaults to ``auto``.
+    """
 
     type: Literal["input_image"] = "input_image"
     image_url: str
-    detail: Literal["low", "high", "auto"] | None = None
+    detail: Literal["low", "high", "auto", "original"] | None = None
 
     @field_validator("image_url")
     @classmethod
@@ -73,30 +88,50 @@ InputPart = Annotated[InputTextPart | InputImagePart, Field(discriminator="type"
 
 
 class DecisionInputMessage(ContractModel):
-    """One message of a structured decision input."""
+    """One user message of a structured decision input.
 
-    role: Literal["user", "system", "developer"] = "user"
+    Attributes:
+        type: The optional ``message`` discriminator SDKs may serialize.
+        role: Always ``user``; OpenAI refuses every other role here.
+        content: Text, or an ordered list of text and inline image parts.
+    """
+
+    type: Literal["message"] | None = None
+    role: Literal["user"]
     content: str | tuple[InputPart, ...] = Field(min_length=1)
 
 
 class DecisionChoice(ContractModel):
-    """One allowed answer of a ``choice`` question."""
+    """One allowed answer of a ``choice`` question.
 
-    value: str
-    description: str
+    Attributes:
+        value: The answer value. Values are typed: the string ``"true"`` and
+            the boolean ``true`` are different values, never coerced.
+        description: Optional guidance on when this value applies.
+    """
+
+    value: StrictStr | StrictBool
+    description: str | None = None
 
     @field_validator("value")
     @classmethod
-    def _value(cls, value: str) -> str:
-        """Keep answer values bounded identifiers."""
+    def _value(cls, value: str | bool) -> str | bool:
+        """Keep text answer values bounded identifiers."""
+        if isinstance(value, bool):
+            return value
         return _bounded_name(value, "choice values")
 
 
 class DecisionLevel(ContractModel):
-    """One ordered level of a ``score`` question."""
+    """One ordered level of a ``score`` question.
+
+    Attributes:
+        label: The level's label, unique within its question.
+        description: Optional guidance on when this level applies.
+    """
 
     label: str
-    description: str
+    description: str | None = None
 
     @field_validator("label")
     @classmethod
@@ -106,18 +141,32 @@ class DecisionLevel(ContractModel):
 
 
 class PredicateQuestion(ContractModel):
-    """Ask for the probability that a statement is true."""
+    """Ask for the probability that a statement is true.
+
+    Attributes:
+        type: Always ``predicate``.
+        name: Optional identifier, unique among named questions; answers come
+            back in question order either way.
+        instructions: The statement to judge.
+    """
 
     type: Literal["predicate"] = "predicate"
-    name: str
+    name: str | None = None
     instructions: str = Field(min_length=1)
 
 
 class OpenAIChoiceQuestion(ContractModel):
-    """Choose exactly one of the developer-defined values."""
+    """Choose exactly one of the developer-defined values.
+
+    Attributes:
+        type: Always ``choice``.
+        name: Optional identifier, unique among named questions.
+        instructions: What to choose.
+        choices: Two through 64 values, unique by typed value.
+    """
 
     type: Literal["choice"] = "choice"
-    name: str
+    name: str | None = None
     instructions: str = Field(min_length=1)
     choices: tuple[DecisionChoice, ...] = Field(
         min_length=2, max_length=MAX_OPENAI_DECISION_CHOICES
@@ -127,16 +176,24 @@ class OpenAIChoiceQuestion(ContractModel):
     @classmethod
     def _unique(cls, value: tuple[DecisionChoice, ...]) -> tuple[DecisionChoice, ...]:
         """Reject duplicate values, which would make the answer ambiguous."""
-        if len({choice.value for choice in value}) != len(value):
+        # A (type, value) key keeps "true" and true distinct.
+        if len({(type(choice.value), choice.value) for choice in value}) != len(value):
             raise ValueError("choice values must be unique within a question")
         return value
 
 
 class OpenAIScoreQuestion(ContractModel):
-    """Rate the input on an ordered list of levels."""
+    """Rate the input on an ordered list of levels.
+
+    Attributes:
+        type: Always ``score``.
+        name: Optional identifier, unique among named questions.
+        instructions: What to rate.
+        levels: Two through 10 ordered levels, unique by label.
+    """
 
     type: Literal["score"] = "score"
-    name: str
+    name: str | None = None
     instructions: str = Field(min_length=1)
     levels: tuple[DecisionLevel, ...] = Field(min_length=2, max_length=MAX_OPENAI_DECISION_LEVELS)
 
@@ -162,12 +219,22 @@ class OpenAIDecisionRequest(DecisionRequest):
     question (bytes upper-bound tokens) plus a fixed allowance per inline image
     and per question. The wire bills no output tokens, so none are reserved;
     settlement always uses the provider's reported usage.
+
+    Attributes:
+        state: Always ``None``; the SystemOne field this wire does not carry.
+        input: Text, or up to 256 user messages with at most 128 image parts.
+        questions: One through 32 questions; named ones carry unique names.
+        safety_identifier: Optional opaque end-user identifier forwarded to
+            the provider, at most 128 characters.
     """
 
     state: JsonValue = None
     input: str | tuple[DecisionInputMessage, ...]
     questions: tuple[OpenAIDecisionQuestion, ...] = Field(  # type: ignore[assignment]
         min_length=1, max_length=MAX_OPENAI_DECISION_QUESTIONS
+    )
+    safety_identifier: str | None = Field(
+        default=None, max_length=MAX_OPENAI_SAFETY_IDENTIFIER_CHARACTERS
     )
 
     @model_validator(mode="after")
@@ -182,7 +249,13 @@ class OpenAIDecisionRequest(DecisionRequest):
             raise ValueError("decision input must contain at least one message")
         elif len(self.input) > MAX_OPENAI_DECISION_MESSAGES:
             raise ValueError("decision input may contain at most 256 messages")
-        names = [_bounded_name(question.name, "question names") for question in self.questions]
+        elif self._image_count() > MAX_OPENAI_DECISION_IMAGES:
+            raise ValueError("decision input may contain at most 128 image parts")
+        names = [
+            _bounded_name(question.name, "question names")
+            for question in self.questions
+            if question.name is not None
+        ]
         if len(set(names)) != len(names):
             raise ValueError("question names must be unique")
         dumped = self.model_dump(mode="json", exclude_none=True)
@@ -191,6 +264,17 @@ class OpenAIDecisionRequest(DecisionRequest):
         if len(encoded) > MAX_OPENAI_DECISION_INPUT_BYTES:
             raise ValueError("decision request exceeds the 33554432-byte input limit")
         return self
+
+    def _image_count(self) -> int:
+        """Count inline image parts across every message."""
+        if isinstance(self.input, str):
+            return 0
+        return sum(
+            isinstance(part, InputImagePart)
+            for message in self.input
+            if not isinstance(message.content, str)
+            for part in message.content
+        )
 
     @property
     def wire(self) -> Literal["openai"]:
@@ -239,7 +323,7 @@ class OpenAIDecisionRequest(DecisionRequest):
     def provider_body(self, model: str) -> dict[str, JsonValue]:
         """Build the upstream ``/v1/decisions`` body with the deployment's wire id."""
         payload: dict[str, JsonValue] = self.model_dump(
-            mode="json", exclude_none=True, include={"input", "questions"}
+            mode="json", exclude_none=True, include={"input", "questions", "safety_identifier"}
         )
         return {"model": model, **payload}
 
@@ -249,7 +333,12 @@ class OpenAIDecisionRequest(DecisionRequest):
 
 
 class DecodedOpenAIDecisionRequest(ContractModel):
-    """The public alias separated from the typed OpenAI decisions request."""
+    """The public alias separated from the typed OpenAI decisions request.
+
+    Attributes:
+        alias: The public model alias the caller named.
+        request: The typed request.
+    """
 
     alias: str = Field(min_length=1, max_length=512)
     request: OpenAIDecisionRequest
@@ -267,7 +356,7 @@ def decode_openai_decision_request(body: str) -> DecodedOpenAIDecisionRequest:
     Raises:
         ValueError: The body is not strict JSON, repeats a key, exceeds the
             size or nesting bounds, or carries fields other than ``model``,
-            ``input``, and ``questions``.
+            ``input``, ``questions``, and the optional ``safety_identifier``.
     """
 
     def unique(pairs: list[tuple[str, JsonValue]]) -> dict[str, JsonValue]:
@@ -296,12 +385,21 @@ def decode_openai_decision_request(body: str) -> DecodedOpenAIDecisionRequest:
             f"decision JSON nesting exceeds the {MAX_DECISION_JSON_DEPTH}-level limit"
         ) from exc
     _native_json(raw)
-    if not isinstance(raw, dict) or set(raw) != {"model", "input", "questions"}:
-        raise ValueError("decision body requires only model, input, and questions")
+    required = {"model", "input", "questions"}
+    if not isinstance(raw, dict) or not required <= set(raw) <= required | {"safety_identifier"}:
+        raise ValueError(
+            "decision body requires model, input, and questions, and accepts only "
+            "safety_identifier besides them"
+        )
     model = raw["model"]
     if not isinstance(model, str):
         raise ValueError("decision model must be a string")
+    safety_identifier = raw.get("safety_identifier")
+    if safety_identifier is not None and not isinstance(safety_identifier, str):
+        raise ValueError("decision safety_identifier must be a string")
     return DecodedOpenAIDecisionRequest(
         alias=model,
-        request=OpenAIDecisionRequest(input=raw["input"], questions=raw["questions"]),
+        request=OpenAIDecisionRequest(
+            input=raw["input"], questions=raw["questions"], safety_identifier=safety_identifier
+        ),
     )

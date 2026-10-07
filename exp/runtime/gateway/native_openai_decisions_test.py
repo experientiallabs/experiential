@@ -23,10 +23,7 @@ from exp.runtime.gateway.management import GatewayManagement
 from exp.runtime.gateway.native_accounting import NativeBridgeError
 from exp.runtime.gateway.native_bridge import NativeControlPlane
 from exp.runtime.gateway.native_decisions_test import _control_plane as _systemone_control_plane
-from exp.runtime.gateway.openai_decisions_contracts import (
-    OpenAIDecisionRequest,
-    decode_openai_decision_request,
-)
+from exp.runtime.gateway.openai_decisions_contracts import OpenAIDecisionRequest
 
 _PRICES = GatewayTokenPrices(
     input_nano_usd_per_million_tokens=100_000_000,
@@ -248,43 +245,3 @@ def test_invalid_bodies_are_refused_before_acceptance_without_echoing_content(
         assert _public_error(refused.value)["status_code"] == 400
         assert "canary" not in public
     assert _rows(control) == []
-
-
-def test_decoder_round_trips_string_input_and_provider_body() -> None:
-    """A plain-text input forwards verbatim with the deployment's wire id."""
-    decoded = decode_openai_decision_request(
-        json.dumps(
-            {
-                "model": "luna-decisions",
-                "input": "I want a refund.",
-                "questions": [{"type": "predicate", "name": "refund", "instructions": "Refund?"}],
-            }
-        )
-    )
-    assert decoded.alias == "luna-decisions"
-    assert decoded.request.provider_body("gpt-6-luna") == {
-        "model": "gpt-6-luna",
-        "input": "I want a refund.",
-        "questions": [{"type": "predicate", "name": "refund", "instructions": "Refund?"}],
-    }
-
-
-def test_message_arrays_are_capped_and_reserve_per_message_framing() -> None:
-    """Many tiny messages cannot slip under the budget hold or past the cap."""
-    question = [{"type": "predicate", "name": "a", "instructions": "i"}]
-
-    def reservation(messages: int) -> int:
-        decoded = decode_openai_decision_request(
-            json.dumps(
-                {
-                    "model": "m",
-                    "input": [{"role": "user", "content": "x"}] * messages,
-                    "questions": question,
-                }
-            )
-        )
-        return decoded.request.input_token_reservation
-
-    assert reservation(200) - reservation(100) == 100 * (1 + 16)
-    with pytest.raises(ValueError, match="at most 256 messages"):
-        reservation(257)

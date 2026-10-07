@@ -34,8 +34,9 @@ use crate::respond::{
 };
 use crate::server::AppState;
 use crate::settlement::AttemptGuard;
-use crate::upstream::open_stream;
+use crate::upstream::open_decision_stream;
 use crate::waterfall::{successor_possible, DeploymentWire, RoutePolicy, StartResponse};
+use openai::{openai_decision_usage, public_openai_decisions};
 
 const PROBABILITY_TOLERANCE: f64 = 1e-6;
 
@@ -366,13 +367,12 @@ async fn dispatch(
     }
     let phase_timeout =
         Duration::try_from_secs_f64(wire.timeout_seconds.max(0.001)).map_err(|_| wire_failure())?;
-    let response = open_stream(
+    let response = open_decision_stream(
         http,
         &wire.url,
         &wire.headers,
         &wire.idempotency_key,
         &wire.upstream_payload,
-        None,
         remaining(deadline).min(phase_timeout),
         dialect,
     )
@@ -402,7 +402,11 @@ async fn collect_response(
     let payload = strict_json(&bytes)?;
     // Billing evidence is independent of decision validity. Keep it on the
     // attempt guard before any error or cancellation can discard the answer.
-    if let Ok(usage) = decision_usage(&payload) {
+    let usage = match admission.wire {
+        DecisionWire::Systemone => decision_usage(&payload),
+        DecisionWire::Openai => openai_decision_usage(&payload),
+    };
+    if let Ok(usage) = usage {
         guard.record_decision_usage(usage);
     }
     let served = match admission.wire {
@@ -623,155 +627,6 @@ fn public_decisions(
     ))
 }
 
-/// Validate an OpenAI Decisions API answer against the admitted questions.
-///
-/// Every admitted question needs exactly one answer of the same name and type.
-/// Probabilities must be finite, within `[0, 1]`, keyed by exactly the
-/// requested values (choice) or levels (score), and sum to one within the
-/// published-rounding envelope. A choice must name a requested value that can
-/// be highest-probability. Answers pass through verbatim in question order with
-/// the public alias as `model` and the provider's usage block.
-fn public_openai_decisions(
-    payload: Value,
-    admission: &DecisionsAdmission,
-) -> Result<(Value, Usage), Failure> {
-    let answers = payload
-        .get("answers")
-        .and_then(Value::as_array)
-        .ok_or_else(|| malformed("decision response omitted its answers array"))?;
-    if answers.len() != admission.openai_questions.len() {
-        return Err(malformed(
-            "decision response answer count does not match the request",
-        ));
-    }
-    let mut by_name: Map<String, Value> = Map::new();
-    for answer in answers {
-        let name = answer
-            .get("name")
-            .and_then(Value::as_str)
-            .ok_or_else(|| malformed("decision answer omitted its question name"))?;
-        if by_name.insert(name.to_string(), answer.clone()).is_some() {
-            return Err(malformed("decision response repeats a question name"));
-        }
-    }
-    let mut public_answers = Vec::with_capacity(admission.openai_questions.len());
-    for question in &admission.openai_questions {
-        let name = question
-            .get("name")
-            .and_then(Value::as_str)
-            .ok_or_else(wire_failure)?;
-        let kind = question
-            .get("type")
-            .and_then(Value::as_str)
-            .ok_or_else(wire_failure)?;
-        let answer = by_name.get(name).ok_or_else(|| {
-            malformed("decision response question names do not match the request")
-        })?;
-        if answer.get("type").and_then(Value::as_str) != Some(kind) {
-            return Err(malformed(
-                "decision answer type does not match the question",
-            ));
-        }
-        match kind {
-            "predicate" => {
-                probability(&answer["probability"])?;
-            }
-            "choice" => {
-                let values: Vec<&str> = question
-                    .get("choices")
-                    .and_then(Value::as_array)
-                    .ok_or_else(wire_failure)?
-                    .iter()
-                    .map(|choice| choice.get("value").and_then(Value::as_str))
-                    .collect::<Option<_>>()
-                    .ok_or_else(wire_failure)?;
-                let probabilities = listed_distribution(&answer["probabilities"], &values)?;
-                let choice = answer
-                    .get("choice")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| malformed("decision choice is not a requested value"))?;
-                let selected = values
-                    .iter()
-                    .position(|value| *value == choice)
-                    .ok_or_else(|| malformed("decision choice is not a requested value"))?;
-                probability(&answer["confidence"])?;
-                if !choice_can_be_highest(selected, &probabilities) {
-                    return Err(malformed(
-                        "decision choice is not a highest-probability value",
-                    ));
-                }
-            }
-            "score" => {
-                let levels = question
-                    .get("levels")
-                    .and_then(Value::as_array)
-                    .ok_or_else(wire_failure)?;
-                answer
-                    .get("score")
-                    .and_then(Value::as_f64)
-                    .filter(|value| value.is_finite())
-                    .ok_or_else(|| malformed("decision score is not finite numeric data"))?;
-                probability(&answer["confidence"])?;
-                let entries = answer
-                    .get("probabilities")
-                    .and_then(Value::as_array)
-                    .ok_or_else(|| malformed("decision omitted its probability list"))?;
-                if entries.len() != levels.len() {
-                    return Err(malformed(
-                        "decision score probabilities do not match the requested levels",
-                    ));
-                }
-                let values = entries
-                    .iter()
-                    .map(|entry| probability(&entry["probability"]))
-                    .collect::<Result<Vec<_>, _>>()?;
-                unit_total(&values)?;
-            }
-            _ => return Err(wire_failure()),
-        }
-        public_answers.push(answer.clone());
-    }
-    let usage = decision_usage(&payload)?;
-    Ok((
-        json!({"model": admission.alias, "answers": public_answers, "usage": payload["usage"]}),
-        usage,
-    ))
-}
-
-/// Validate a `[{value, probability}]` list covering exactly `values`, returning
-/// probabilities in requested order.
-fn listed_distribution(value: &Value, values: &[&str]) -> Result<Vec<f64>, Failure> {
-    let entries = value
-        .as_array()
-        .ok_or_else(|| malformed("decision omitted its probability list"))?;
-    if entries.len() != values.len() {
-        return Err(malformed(
-            "decision probability values do not match the request",
-        ));
-    }
-    let mut ordered: Vec<Option<f64>> = vec![None; values.len()];
-    for entry in entries {
-        let key = entry
-            .get("value")
-            .and_then(Value::as_str)
-            .ok_or_else(|| malformed("decision probability omitted its value"))?;
-        let index = values
-            .iter()
-            .position(|value| *value == key)
-            .ok_or_else(|| malformed("decision probability values do not match the request"))?;
-        if ordered[index].is_some() {
-            return Err(malformed("decision probability repeats a value"));
-        }
-        ordered[index] = Some(probability(&entry["probability"])?);
-    }
-    let probabilities: Vec<f64> = ordered
-        .into_iter()
-        .map(|value| value.unwrap_or(0.0))
-        .collect();
-    unit_total(&probabilities)?;
-    Ok(probabilities)
-}
-
 /// Require a unit total, allowing only the hundredth-rounding envelope.
 fn unit_total(values: &[f64]) -> Result<(), Failure> {
     let sum: f64 = values.iter().sum();
@@ -985,6 +840,8 @@ fn served_headers(
     headers
 }
 
+#[path = "route_decisions/openai.rs"]
+mod openai;
 #[cfg(test)]
 #[path = "route_decisions/openai_tests.rs"]
 mod openai_tests;

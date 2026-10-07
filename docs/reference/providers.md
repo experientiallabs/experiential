@@ -576,16 +576,24 @@ the shared envelope reader (`crate::error_envelope`), all pinned in
 ## OpenAI Decisions API
 
 `POST /v1/decisions` is the OpenAI Decisions API wire of the decisions surface (ledger
-`api_surface = decisions`), served only by direct OpenAI deployments (`provider = "openai"`). It accepts only `model`, `input` (a string, or messages whose content
-is `input_text` and inline base64 `input_image` parts; remote URLs and file ids are refused), and a
-`questions` list of uniquely named `predicate`, `choice` (with `choices`), and `score` (with
-`levels`) questions: at most 32 questions, 64 choices, 10 levels, and 32 MiB. A rung serves it only
-when it declares `supports_decisions`, prices output at exactly zero, and its connection exposes
-OpenAI's own `/decisions` endpoint (direct OpenAI connections; never Azure, ChatGPT plans, or
-SystemOne rungs, and a SystemOne body never reaches an OpenAI rung). Reservations count text and
-question bytes plus 2,048 tokens per image and 256 per question, with no output reservation.
-Answers are validated against the admitted questions (names, types, requested values, unit
-probability totals within the rounding envelope) and returned verbatim in question order with the
-public alias as `model` and the provider's `usage`. The same one-dispatch-per-deployment and
-known-rejection rules apply.
+`api_surface = decisions`), served only by direct OpenAI deployments (`provider = "openai"`). It
+accepts `model`, `input` (a string, or up to 256 user messages, optionally typed `message`, whose
+content is `input_text` and inline base64 `input_image` parts with at most 128 images; remote URLs
+and file ids are refused), a `questions` list of `predicate`, `choice` (with `choices` whose values
+are typed strings or booleans) and `score` (with `levels`) questions, and an optional
+`safety_identifier` (at most 128 characters, forwarded). Question names and descriptions are
+optional; named questions carry unique names. Bounds: at most 32 questions, 64 choices, 10 levels,
+and 32 MiB. A rung serves it only when it declares `supports_decisions`, prices output at exactly
+zero, and its connection exposes OpenAI's own `/decisions` endpoint (direct OpenAI connections;
+never Azure, ChatGPT plans, or SystemOne rungs, and a SystemOne body never reaches an OpenAI rung).
+Reservations count text and question bytes plus 2,048 tokens per image, 16 per message and 256 per
+question, with no output reservation. Answers are matched to questions by position and validated
+(echoed names, types, typed requested values, level labels and positions, unit probability totals
+within the rounding envelope); a `refusal` answer for one question passes through beside the
+others. The response is OpenAI's shape with the public alias as `model` and the provider's
+`usage`, whose cache read and write counts settle as their own legs, so the lane should author its
+cached and cache-write rates (at the input rate for this input-only wire) or those legs stay
+unknown. The same one-dispatch-per-deployment rule applies, and the HTTP status decides
+known rejection (a rejected credential alone fails over) while the OpenAI error envelope still
+names the caller's parameter.
 Reference: https://developers.openai.com/api/docs/guides/decisions
