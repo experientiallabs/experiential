@@ -534,6 +534,34 @@ def test_wrong_surface_unsupported_fields_and_unknown_keys_are_refused(
         assert unknown.status_code == 401
 
 
+def test_multipart_refuses_a_second_file_and_an_oversized_text_field(
+    engine: _ServingEngine,
+) -> None:
+    """A second file part or a text field past its byte cap is a 400 on that field."""
+    auth = {"authorization": f"Bearer {engine.raw_key}"}
+    twice = httpx.post(
+        f"{engine.base}/v1/audio/transcriptions",
+        headers=auth,
+        data={"model": "scribe"},
+        files=[
+            ("file", ("a.wav", _wav(0.1), "audio/wav")),
+            ("file", ("b.wav", _wav(0.2), "audio/wav")),
+        ],
+        timeout=10.0,
+    )
+    assert twice.status_code == 400
+    assert twice.json()["error"]["param"] == "file"
+    flooded = httpx.post(
+        f"{engine.base}/v1/audio/transcriptions",
+        headers=auth,
+        data={"model": "scribe", "prompt": "x" * (16 * 1024 + 1)},
+        files={"file": ("a.wav", _wav(0.1), "audio/wav")},
+        timeout=10.0,
+    )
+    assert flooded.status_code == 400
+    assert flooded.json()["error"]["param"] == "prompt"
+
+
 def test_provider_client_error_relays_the_parameter(engine: _ServingEngine) -> None:
     """A provider 400 reaches the caller as a 400 naming the rejected field."""
     response = httpx.post(

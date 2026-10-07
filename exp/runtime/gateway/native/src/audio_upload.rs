@@ -146,6 +146,11 @@ async fn parse_multipart(
         };
         let name = field.name().unwrap_or_default().to_string();
         if name == "file" {
+            if upload.is_some() {
+                let mut error = invalid_upload("The upload must carry exactly one file part.");
+                error.param = Some("file".to_string());
+                return Err(error);
+            }
             let filename = field.file_name().unwrap_or("audio").to_string();
             let content_type = field
                 .content_type()
@@ -161,15 +166,41 @@ async fn parse_multipart(
             });
             continue;
         }
-        let text = field
-            .text()
-            .await
-            .map_err(|_| invalid_upload("A multipart text field is malformed."))?;
+        let text = read_text_field(field, &name).await?;
         insert_form_field(&mut fields, &name, text)?;
     }
     let upload = upload
         .ok_or_else(|| invalid_upload("The upload must carry a multipart part named file."))?;
     Ok((fields, upload))
+}
+
+/// Longest text form field accepted, in bytes: the longest supported field
+/// (`prompt`, 4,096 characters) in four-byte UTF-8, so no single field can
+/// carry most of the upload body across the bridge.
+const MAXIMUM_TEXT_FIELD_BYTES: usize = 16 * 1024;
+
+/// Read one multipart text field, refusing it (by name) the moment it passes
+/// [`MAXIMUM_TEXT_FIELD_BYTES`] rather than after buffering all of it.
+async fn read_text_field(
+    mut field: axum::extract::multipart::Field<'_>,
+    name: &str,
+) -> Result<String, PublicError> {
+    let mut bytes: Vec<u8> = Vec::new();
+    while let Some(chunk) = field
+        .chunk()
+        .await
+        .map_err(|_| invalid_upload("A multipart text field is malformed."))?
+    {
+        if bytes.len() + chunk.len() > MAXIMUM_TEXT_FIELD_BYTES {
+            let mut error = invalid_upload(&format!(
+                "The {name} field is longer than {MAXIMUM_TEXT_FIELD_BYTES} bytes."
+            ));
+            error.param = Some(name.trim_end_matches("[]").to_string());
+            return Err(error);
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    String::from_utf8(bytes).map_err(|_| invalid_upload("A multipart text field is not UTF-8."))
 }
 
 /// Most entries one `name[]` list field may carry (`timestamp_granularities`

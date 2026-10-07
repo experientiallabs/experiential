@@ -33,7 +33,6 @@ from exp.runtime.gateway.audio_contracts import (
     TRANSCRIPTION_AUDIO_TOKENS_PER_SECOND,
     SpeechRequest,
     TranscriptionRequest,
-    speech_output_token_bound,
 )
 from exp.runtime.gateway.contracts import GatewayRequest
 from exp.runtime.gateway.decisions_contracts import DecisionRequest
@@ -355,13 +354,11 @@ def worst_case_output_tokens(
     match request:
         case EmbeddingsRequest() | ImagesRequest():
             return 0
-        case SpeechRequest():
-            return speech_output_token_bound(request)
-        case TranscriptionRequest():
+        case SpeechRequest() | TranscriptionRequest():
             capabilities = deployment.capabilities
             maximum = None if capabilities is None else capabilities.maximum_output_tokens
             # A token lane without a ceiling is never admitted (billing_mode);
-            # a unit lane bills seconds, so its output token bound is moot.
+            # a unit lane bills characters or seconds, so its token bound is moot.
             return maximum or 0
         case DecisionRequest():
             return request.output_token_reservation

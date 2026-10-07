@@ -44,7 +44,9 @@ beside token rates), or neither way, has no single meter to bill, so it is not s
 - A token-priced lane (`gpt-4o-mini-tts`) is asked for the provider's SSE format. The gateway
   reassembles the audio from the `speech.audio.delta` events and bills the token usage the
   `speech.audio.done` event reports. A stream without that usage event is refused as
-  unbillable and fails over.
+  unbillable and fails over. Generated audio's length is not bounded by the text, so the lane
+  must declare its provider-enforced `maximum_output_tokens`; that ceiling is reserved and
+  enforced at settlement, and a token lane without it is not served.
 
 ## Transcription: `POST /v1/audio/transcriptions`
 

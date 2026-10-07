@@ -4,12 +4,9 @@ import pytest
 from pydantic import ValidationError
 
 from exp.runtime.gateway.audio_contracts import (
-    SPEECH_AUDIO_TOKENS_PER_SECOND,
-    SPEECH_MINIMUM_CHARACTERS_PER_SECOND,
     SpeechRequest,
     TranscriptionRequest,
     speech_ceiling_nano_usd,
-    speech_output_token_bound,
     transcription_ceiling_nano_usd,
 )
 
@@ -28,39 +25,42 @@ def _upload(**overrides: object) -> TranscriptionRequest:
     return TranscriptionRequest.model_validate(fields)
 
 
-def test_speech_reserves_exactly_its_billed_characters_on_a_unit_lane() -> None:
-    """A per-character lane reserves what it will bill; a token lane bounds the audio."""
+def test_speech_reserves_its_characters_or_its_input_and_declared_output_ceiling() -> None:
+    """A per-character lane reserves what it will bill; a token lane its output cap."""
     request = SpeechRequest(input="Hello there", voice="alloy")
     assert (
         speech_ceiling_nano_usd(
-            request, unit_rate=15_000, input_tokens=4, input_rate=None, output_rate=None
+            request,
+            unit_rate=15_000,
+            input_tokens=4,
+            input_rate=None,
+            output_rate=None,
+            maximum_output_tokens=None,
         )
         == 11 * 15_000
     )
     token_ceiling = speech_ceiling_nano_usd(
-        request, unit_rate=None, input_tokens=4, input_rate=1_000_000, output_rate=2_000_000
+        request,
+        unit_rate=None,
+        input_tokens=4,
+        input_rate=1_000_000,
+        output_rate=2_000_000,
+        maximum_output_tokens=2_000,
     )
-    output_tokens = speech_output_token_bound(request)
-    expected = 4 * 1_000_000 + output_tokens * 2_000_000 + 999_999
-    assert token_ceiling == expected // 1_000_000
-    # 11 characters at the 4/s floor last 2.75 s, plus 5 s padding; 25 tokens/s, plus one.
-    assert output_tokens == int((11 / SPEECH_MINIMUM_CHARACTERS_PER_SECOND + 5) * 25) + 1
-    assert (
-        speech_ceiling_nano_usd(
-            request, unit_rate=None, input_tokens=4, input_rate=1, output_rate=None
+    assert token_ceiling == (4 * 1_000_000 + 2_000 * 2_000_000 + 999_999) // 1_000_000
+    # Generated audio is not bounded by the text: no declared cap, no price.
+    for output_rate, maximum in ((2_000_000, None), (None, 2_000)):
+        assert (
+            speech_ceiling_nano_usd(
+                request,
+                unit_rate=None,
+                input_tokens=4,
+                input_rate=1,
+                output_rate=output_rate,
+                maximum_output_tokens=maximum,
+            )
+            is None
         )
-        is None
-    )
-
-
-def test_speech_token_bound_scales_with_slowness_not_with_the_script() -> None:
-    """The bound follows the slowest plausible reading at the requested speed."""
-    text = "\u4e2d" * 400  # 400 CJK characters, read about as slowly as the floor.
-    normal = speech_output_token_bound(SpeechRequest(input=text, voice="v"))
-    slow = speech_output_token_bound(SpeechRequest(input=text, voice="v", speed=0.25))
-    reading = 400 / SPEECH_MINIMUM_CHARACTERS_PER_SECOND
-    assert normal == int((reading + 5) * SPEECH_AUDIO_TOKENS_PER_SECOND) + 1
-    assert slow == int((4 * reading + 5) * SPEECH_AUDIO_TOKENS_PER_SECOND) + 1
 
 
 def test_transcription_reserves_seconds_or_its_input_and_declared_output_ceiling() -> None:

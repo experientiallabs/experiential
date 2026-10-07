@@ -40,6 +40,30 @@ def flat_unit_rate(prices: GatewayTokenPrices, kind: BilledUnitKind) -> int | No
     return units.rate_for("")
 
 
+def audio_token_rates(prices: GatewayTokenPrices) -> tuple[int | None, int | None]:
+    """The input and output token rates an audio reservation must price at.
+
+    An audio lane's input bound is a byte ceiling that can sit far above its
+    real count, so a long-context schedule is always treated as reachable:
+    each rate is the higher of the base and premium schedules. A rate either
+    schedule leaves unknown leaves the lane unpriced (None).
+
+    Args:
+        prices: The lane's price card.
+
+    Returns:
+        The input and output rates, each None when a schedule leaves it unknown.
+    """
+    tier = prices.long_context
+    schedules = [prices] if tier is None else [prices, tier]
+    input_rates = [schedule.input_nano_usd_per_million_tokens for schedule in schedules]
+    output_rates = [schedule.output_nano_usd_per_million_tokens for schedule in schedules]
+    return (
+        None if None in input_rates else max(rate for rate in input_rates if rate is not None),
+        None if None in output_rates else max(rate for rate in output_rates if rate is not None),
+    )
+
+
 def billing_mode(deployment: ExactModelDeployment, surface: AudioSurface) -> BillingMode | None:
     """Choose how one rung bills: its unit card or complete token rates, never both.
 
@@ -48,10 +72,13 @@ def billing_mode(deployment: ExactModelDeployment, surface: AudioSurface) -> Bil
     of the surface's kind beside any token rate) could never settle both legs;
     a lane priced neither way, or with only one of the two token rates, could
     not price the usage it would receive. Each returns None and the rung is
-    excluded (fail-closed). A token-priced transcription lane must also declare
-    its provider-enforced output ceiling, since a transcript's length is not
-    bounded by the recording. A BYOK audio lane is authored with the rates its
-    own provider charges, which also price the attributed cost.
+    excluded (fail-closed), as is a token lane whose long-context schedule
+    leaves a rate unknown (its reservation could not be priced). A token-priced
+    lane must also declare its provider-enforced output ceiling: neither a
+    transcript's length nor generated audio's is bounded by the request, and
+    the ceiling is both the reservation and the settle bound. A BYOK audio lane
+    is authored with the rates its own provider charges, which also price the
+    attributed cost.
 
     Args:
         deployment: The rung's certified deployment.
@@ -63,17 +90,14 @@ def billing_mode(deployment: ExactModelDeployment, surface: AudioSurface) -> Bil
     kind = BilledUnitKind.CHARACTER if surface == "speech" else BilledUnitKind.AUDIO_SECOND
     prices = deployment.gateway.prices
     unit_priced = flat_unit_rate(prices, kind) is not None
-    rates = (
-        prices.input_nano_usd_per_million_tokens,
-        prices.output_nano_usd_per_million_tokens,
+    any_token_rate = (
+        prices.input_nano_usd_per_million_tokens is not None
+        or prices.output_nano_usd_per_million_tokens is not None
     )
-    any_token_rate = any(rate is not None for rate in rates)
     if unit_priced:
         return None if any_token_rate else "units"
-    if None in rates:
+    if None in audio_token_rates(prices):
         return None
-    if surface == "transcription" and (
-        deployment.capabilities is None or deployment.capabilities.maximum_output_tokens is None
-    ):
+    if deployment.capabilities is None or deployment.capabilities.maximum_output_tokens is None:
         return None
     return "tokens"

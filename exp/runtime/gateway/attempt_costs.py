@@ -4,10 +4,10 @@ from __future__ import annotations
 
 from typing import assert_never
 
-from exp.common.models.catalog_prices import BilledUnitKind, GatewayTokenPrices
+from exp.common.models.catalog_prices import BilledUnitKind
 from exp.common.models.gateway_catalog import ExactModelDeployment
 from exp.runtime.gateway.attempt_tokens import worst_case_input_tokens, worst_case_output_tokens
-from exp.runtime.gateway.audio_billing import flat_unit_rate
+from exp.runtime.gateway.audio_billing import audio_token_rates, flat_unit_rate
 from exp.runtime.gateway.audio_contracts import (
     SpeechRequest,
     TranscriptionRequest,
@@ -71,17 +71,22 @@ def maximum_attempt_cost_nano_usd(
             )
         case SpeechRequest():
             prices = deployment.gateway.prices
-            input_rate, output_rate = _audio_token_rates(prices)
+            input_rate, output_rate = audio_token_rates(prices)
             return speech_ceiling_nano_usd(
                 request,
                 unit_rate=flat_unit_rate(prices, BilledUnitKind.CHARACTER),
                 input_tokens=input_tokens,
                 input_rate=input_rate,
                 output_rate=output_rate,
+                maximum_output_tokens=(
+                    None
+                    if deployment.capabilities is None
+                    else deployment.capabilities.maximum_output_tokens
+                ),
             )
         case TranscriptionRequest():
             prices = deployment.gateway.prices
-            input_rate, output_rate = _audio_token_rates(prices)
+            input_rate, output_rate = audio_token_rates(prices)
             return transcription_ceiling_nano_usd(
                 request,
                 unit_rate=flat_unit_rate(prices, BilledUnitKind.AUDIO_SECOND),
@@ -98,24 +103,6 @@ def maximum_attempt_cost_nano_usd(
             return _token_attempt_cost_nano_usd(request, deployment, input_tokens)
         case _:  # pragma: no cover - exhaustive over the ServingRequest union.
             assert_never(request)
-
-
-def _audio_token_rates(prices: GatewayTokenPrices) -> tuple[int | None, int | None]:
-    """The input and output token rates an audio reservation must price at.
-
-    An audio lane's input bound is a byte ceiling that can sit far above its
-    real count, so a long-context schedule is always treated as reachable:
-    each rate is the higher of the base and premium schedules. A rate either
-    schedule leaves unknown leaves the lane unpriced (None).
-    """
-    tier = prices.long_context
-    schedules = [prices] if tier is None else [prices, tier]
-    input_rates = [schedule.input_nano_usd_per_million_tokens for schedule in schedules]
-    output_rates = [schedule.output_nano_usd_per_million_tokens for schedule in schedules]
-    return (
-        None if None in input_rates else max(rate for rate in input_rates if rate is not None),
-        None if None in output_rates else max(rate for rate in output_rates if rate is not None),
-    )
 
 
 def _token_attempt_cost_nano_usd(

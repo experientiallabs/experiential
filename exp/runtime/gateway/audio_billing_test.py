@@ -7,6 +7,7 @@ from exp.common.models import (
     BillingSource,
     ExactModelDeployment,
     GatewayDeploymentMetadata,
+    GatewayLongContextTier,
     GatewayTokenPrices,
     GatewayUnitPrices,
     ModelCapabilities,
@@ -46,9 +47,10 @@ def test_a_unit_card_of_the_surface_kind_bills_units_else_tokens() -> None:
         input_nano_usd_per_million_tokens=1, output_nano_usd_per_million_tokens=1
     )
     assert billing_mode(_deployment(characters), "speech") == "units"
-    assert billing_mode(_deployment(tokens), "speech") == "tokens"
-    # A per-character card does not price transcription seconds, and a token
-    # transcription lane bills only with a declared output ceiling.
+    # A token lane of either surface bills only with a declared output ceiling.
+    assert billing_mode(_deployment(tokens, maximum_output_tokens=2_000), "speech") == "tokens"
+    assert billing_mode(_deployment(tokens), "speech") is None
+    # A per-character card does not price transcription seconds.
     mixed = characters.model_copy(update=tokens.model_dump(exclude={"units"}))
     assert billing_mode(_deployment(mixed, maximum_output_tokens=2_000), "transcription") == (
         "tokens"
@@ -62,3 +64,9 @@ def test_a_unit_card_of_the_surface_kind_bills_units_else_tokens() -> None:
     assert billing_mode(_deployment(half), "speech") is None
     # A lane priced neither way gives no basis to pick the meter: it serves nothing.
     assert billing_mode(_deployment(GatewayTokenPrices()), "transcription") is None
+    # A long-context schedule that leaves a rate unknown could not price the hold.
+    tier = GatewayLongContextTier(
+        input_threshold_tokens=200_000, input_nano_usd_per_million_tokens=2
+    )
+    tiered = tokens.model_copy(update={"long_context": tier})
+    assert billing_mode(_deployment(tiered, maximum_output_tokens=2_000), "speech") is None

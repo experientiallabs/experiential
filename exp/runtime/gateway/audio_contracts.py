@@ -36,10 +36,6 @@ AUDIO_INPUT_TOKEN_SLACK = 64
 reservation (and its settle ceiling) covers: a provider tokenizer and its
 framing tokens can count slightly above the gateway's count."""
 
-SPEECH_AUDIO_TOKENS_PER_SECOND = 25
-"""Bound on audio output tokens per second of speech for token-priced speech
-models (the GPT speech models emit about 21 per second at any language)."""
-
 MAXIMUM_SPEECH_OUTPUT_BYTES = 64 * 1024 * 1024
 """The data plane's retained-output cap; a speech answer above it is refused."""
 
@@ -183,11 +179,6 @@ class TranscriptionRequest(ContractModel):
         return (self.audio_duration_milli + 999) // 1000 + 1
 
 
-def speech_output_token_bound(request: SpeechRequest) -> int:
-    """Audio output tokens the slowest plausible reading of the input can meter."""
-    return int(request.maximum_audio_seconds * SPEECH_AUDIO_TOKENS_PER_SECOND) + 1
-
-
 def speech_ceiling_nano_usd(
     request: SpeechRequest,
     *,
@@ -195,13 +186,16 @@ def speech_ceiling_nano_usd(
     input_tokens: int,
     input_rate: int | None,
     output_rate: int | None,
+    maximum_output_tokens: int | None,
 ) -> int | None:
     """Return the conservative reservation ceiling for one speech call.
 
     A per-character lane (``tts-1``) reserves exactly what it will bill: every
     input character at the unit rate. A token-priced lane (``gpt-4o-mini-tts``)
-    reserves its text input tokens plus the per-character audio-token bound.
-    A lane with neither price is unpriced (``None``).
+    reserves its byte-bounded input tokens plus the lane's provider-enforced
+    output ceiling: generated audio's length is not bounded by the text (a
+    delivery instruction can add pauses no reading rate predicts), so a token
+    lane without a declared ceiling is unpriced, as is a lane with neither price.
 
     Args:
         request: Canonical speech request.
@@ -209,6 +203,7 @@ def speech_ceiling_nano_usd(
         input_tokens: The text's estimated input-token reservation.
         input_rate: Nano-USD per million input tokens, or None.
         output_rate: Nano-USD per million audio output tokens, or None.
+        maximum_output_tokens: The lane's provider-enforced output ceiling, or None.
 
     Returns:
         Nano-USD ceiling, or None when the lane is unpriced.
@@ -217,10 +212,9 @@ def speech_ceiling_nano_usd(
         return require_representable_nano_usd(
             request.input_characters * unit_rate, what="speech reservation ceiling"
         )
-    if input_rate is None or output_rate is None:
+    if input_rate is None or output_rate is None or maximum_output_tokens is None:
         return None
-    output_tokens = speech_output_token_bound(request)
-    total = input_tokens * input_rate + output_tokens * output_rate
+    total = input_tokens * input_rate + maximum_output_tokens * output_rate
     return require_representable_nano_usd(
         (total + 999_999) // 1_000_000, what="speech reservation ceiling"
     )

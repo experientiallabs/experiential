@@ -463,6 +463,8 @@ async fn dispatch_speech(
 ) -> Dispatched {
     let phase_timeout = Duration::from_secs_f64(wire.timeout_seconds.max(0.001));
     let bound = remaining(deadline).min(phase_timeout);
+    // From here the provider may execute and bill even if no header arrives.
+    guard.mark_dispatched();
     let response = open_stream(
         &state.http,
         &wire.url,
@@ -652,6 +654,7 @@ async fn dispatch_transcription(
             .replace(|c: char| !c.is_ascii_alphanumeric(), "")
     );
     let body = encode_multipart(&boundary, &wire.upstream_payload, upload);
+    guard.mark_dispatched();
     let response = open_upload(
         &state.http,
         &wire.url,
