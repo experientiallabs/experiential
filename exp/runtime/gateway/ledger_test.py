@@ -17,6 +17,7 @@ from exp.common.models.catalog import (
     GatewayLongContextTier,
     GatewayTokenPrices,
 )
+from exp.common.models.catalog_prices import BilledUnitKind, GatewayUnitPrices
 from exp.common.models.gateway_catalog import ExactModelDeployment
 from exp.runtime.gateway.budgets import (
     BudgetReservationRejected,
@@ -53,6 +54,7 @@ from exp.runtime.gateway.native_recovery_test import RecoveryHostFake
 from exp.runtime.gateway.routing import GatewayRoute
 from exp.runtime.gateway.rung_admission import RungLoadKey
 from exp.runtime.gateway.sqlite.store import SQLiteGatewayStore
+from exp.runtime.gateway.stream_contracts import BilledUnits
 
 _CATALOG_DIGEST = "a" * 64
 
@@ -2531,3 +2533,60 @@ def test_cache_write_without_rate_stays_unknown(tmp_path: Path) -> None:
     usage = ledger.usage(organization_id="org-one")
     assert usage[0].known_estimated_cost_nano_usd == 0
     assert usage[0].unknown_cost_attempts == 1
+
+
+def test_unit_only_media_attempt_settles_at_its_frozen_unit_rate(tmp_path: Path) -> None:
+    """A per-character speech attempt has no tokens and still settles exactly.
+
+    The unit card is frozen at reservation, so the settle prices the observed
+    characters at the rate the reservation was sized on, and the billed units
+    and the rate that priced them are persisted beside the cost.
+    """
+    clock = FakeLedgerClock()
+    store, ledger, raw_key = _authority_fixture(tmp_path, clock)
+    speech = _deployment().model_copy(
+        update={
+            "gateway": GatewayDeploymentMetadata(
+                prices=GatewayTokenPrices(
+                    units=GatewayUnitPrices(
+                        kind=BilledUnitKind.CHARACTER, rates={"": 15_000, "hd": 30_000}
+                    )
+                ),
+                pricing_source="provider-docs",
+            )
+        }
+    )
+    authorization = store.authorize_request(
+        raw_key=raw_key,
+        alias="coding",
+        request=_request("speech-by-character"),
+        deadline_monotonic=clock.monotonic() + 30,
+    )
+    ledger.accept_request(authorization=authorization)
+    attempt_id = ledger.start_attempt(
+        snapshot=_execution(authorization),
+        deployment=speech,
+        attempt_ordinal=0,
+        route_depth=0,
+    )
+    ledger.finish_attempt(
+        attempt_id=attempt_id,
+        terminal_event=GatewayEvent(
+            kind=GatewayEventKind.COMPLETED,
+            sequence_number=1,
+            usage=GatewayUsage(
+                billed_units=BilledUnits(
+                    kind=BilledUnitKind.CHARACTER, variant="hd", quantity_milli=1_200_000
+                )
+            ),
+        ),
+        failure=None,
+    )
+    row = _attempt_row(tmp_path, attempt_id)
+    # 1,200 characters at the "hd" rate of 30,000 nano-USD each.
+    assert row["estimated_cost_nano_usd"] == 36_000_000
+    assert (row["billed_unit_kind"], row["billed_unit_variant"]) == ("character", "hd")
+    assert (row["billed_quantity_milli"], row["billed_unit_rate"]) == (1_200_000, 30_000)
+    usage = ledger.usage(organization_id="org-one")
+    assert usage[0].known_estimated_cost_nano_usd == 36_000_000
+    assert usage[0].unknown_cost_attempts == 0

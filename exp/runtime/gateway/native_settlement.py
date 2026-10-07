@@ -37,6 +37,7 @@ from exp.runtime.gateway.rate_limit_headers import (
     rate_limit_observation_from_payload,
 )
 from exp.runtime.gateway.routing import GatewayRoute
+from exp.runtime.gateway.stream_contracts import BilledUnits
 from exp.runtime.openai_protocol.errors import (
     THROTTLED_RETRY_AFTER_SECONDS,
     OpenAIProtocolError,
@@ -596,6 +597,10 @@ def _credible_usage(kind: GatewayEventKind, usage: GatewayUsage | None) -> Gatew
     """
     if usage is None or kind not in {GatewayEventKind.COMPLETED, GatewayEventKind.INCOMPLETE}:
         return usage
+    if usage.billed_units is not None:
+        # Media units are the meter on a per-unit surface; zero tokens beside
+        # them is the expected shape, not a missing report.
+        return usage
     if usage.input_tokens != 0 or usage.output_tokens != 0:
         return usage
     return None
@@ -619,21 +624,24 @@ def _usage_from_payload(
             rides on the usage exactly as ``web_search_requests`` does.
 
     Returns:
-        Typed token or tool-only usage, or None when neither was observed.
+        Typed token, billed-unit, or tool-only usage, or None when none was observed.
 
     Raises:
         ValueError: The observed token totals or subsets are contradictory.
     """
     names = tuple(str(name) for name in tool_names)
+    billed_raw = None if payload is None else payload.get("billed_units")
+    billed = None if billed_raw is None else BilledUnits.model_validate(billed_raw)
     if payload is None or (
         payload.get("input_tokens") is None and payload.get("output_tokens") is None
     ):
-        if not names:
+        if not names and billed is None:
             return None
         return GatewayUsage(
             tool_names=names,
             web_search_requests=web_search_requests,
             tool_search_requests=tool_search_requests,
+            billed_units=billed,
         )
     return GatewayUsage(
         input_tokens=_optional_count(payload.get("input_tokens")),
@@ -647,6 +655,7 @@ def _usage_from_payload(
         tool_names=names,
         web_search_requests=web_search_requests,
         tool_search_requests=tool_search_requests,
+        billed_units=billed,
     )
 
 

@@ -6,6 +6,7 @@ import hashlib
 from typing import assert_never
 
 from exp.common.core.artifacts import JsonObject, Sha256, sha256_json
+from exp.runtime.gateway.audio_contracts import SpeechRequest, TranscriptionRequest
 from exp.runtime.gateway.contracts import EncryptedReasoningBlock, GatewayRequest
 from exp.runtime.gateway.decisions_contracts import DecisionRequest
 from exp.runtime.gateway.embeddings_contracts import EmbeddingsRequest, ServingRequest
@@ -210,8 +211,9 @@ def canonical_request_sha256(request: ServingRequest) -> Sha256:
     request with no carrier digests exactly as its plain serialization, so
     every request decoded before the carriers existed keeps its identity.
 
-    The embeddings, images, and decisions surfaces have no messages, tools, or
-    excluded provider carriers, so they digest exactly as their plain serialization.
+    The embeddings, images, decisions, speech, and transcription surfaces have no
+    messages, tools, or excluded provider carriers, so they digest exactly as
+    their plain serialization.
 
     Args:
         request: Canonical serving request as decoded from the public wire.
@@ -220,7 +222,13 @@ def canonical_request_sha256(request: ServingRequest) -> Sha256:
         The stable canonical request digest.
     """
     match request:
-        case EmbeddingsRequest() | ImagesRequest() | DecisionRequest():
+        case (
+            EmbeddingsRequest()
+            | ImagesRequest()
+            | DecisionRequest()
+            | SpeechRequest()
+            | TranscriptionRequest()
+        ):
             return sha256_json(request)
         case GatewayRequest():
             envelope = provider_replay_authority(request)

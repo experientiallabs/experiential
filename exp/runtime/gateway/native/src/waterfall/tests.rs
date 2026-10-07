@@ -249,6 +249,7 @@ fn usage(output_tokens: Option<u64>, reasoning_tokens: Option<u64>) -> Usage {
         cache_creation_input_tokens: None,
         cache_creation_1h_input_tokens: None,
         reasoning_tokens,
+        billed_units: None,
     }
 }
 

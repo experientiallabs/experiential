@@ -281,3 +281,40 @@ def test_profile_resolution_forwards_service_tier_on_a_tier_priced_house_lane() 
     assert tiered.service_tier_cards == frozenset({"flex"})
     assert tiered.forwards_tier("flex") is True
     assert tiered.forwards_tier("priority") is False
+
+
+def test_audio_claims_without_an_endpoint_or_a_billable_meter_block_the_alias() -> None:
+    """A claimed audio surface the wire cannot carry or the card cannot bill is named at startup."""
+    claims = GatewayDeploymentCapabilities(supports_speech=True, supports_transcription=True)
+    bare = GatewayWireProfile(dialect="openai_compatible", url="https://example.test/v1/chat")
+    served = GatewayWireProfile(
+        dialect="openai_compatible",
+        url="https://example.test/v1/chat",
+        speech_url="https://example.test/v1/audio/speech",
+        transcriptions_url="https://example.test/v1/audio/transcriptions",
+    )
+    unpriced = _deployment(None, claims)
+    assert execution_resolution._audio_claim_blockers(unpriced, bare) == (  # noqa: SLF001
+        "deployment 'primary' claims speech without a speech endpoint",
+        "deployment 'primary' claims transcription without a transcription endpoint",
+    )
+    assert execution_resolution._audio_claim_blockers(unpriced, served) == (  # noqa: SLF001
+        "deployment 'primary' claims speech without a single billable meter",
+        "deployment 'primary' claims transcription without a single billable meter",
+    )
+    priced = unpriced.model_copy(
+        update={
+            "capabilities": ModelCapabilities(maximum_output_tokens=2_000),
+            "gateway": unpriced.gateway.model_copy(
+                update={
+                    "prices": GatewayTokenPrices(
+                        input_nano_usd_per_million_tokens=1,
+                        output_nano_usd_per_million_tokens=1,
+                    )
+                }
+            ),
+        }
+    )
+    assert execution_resolution._audio_claim_blockers(priced, served) == ()  # noqa: SLF001
+    unclaimed = _deployment(None)
+    assert execution_resolution._audio_claim_blockers(unclaimed, bare) == ()  # noqa: SLF001

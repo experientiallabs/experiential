@@ -14,6 +14,7 @@ from exp.common.models.catalog import (
     load_model_catalog,
     write_model_catalog,
 )
+from exp.common.models.catalog_prices import BilledUnitKind, GatewayUnitPrices
 from exp.common.models.client import EmbeddingClient, IdempotentModelClient, ModelClient
 from exp.common.models.connection_authoring import (
     ProviderConnectionAuthoringError,
@@ -138,6 +139,8 @@ __all__ = [
     "GatewayLongContextTier",
     "GatewayRungDispatchPolicy",
     "GatewayTokenPrices",
+    "GatewayUnitPrices",
+    "BilledUnitKind",
     "IdempotentModelClient",
     "KnownModel",
     "ModelCatalog",

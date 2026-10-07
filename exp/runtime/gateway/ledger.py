@@ -59,6 +59,7 @@ from exp.runtime.gateway.ledger_usage import (
     identity_usage_rows,
 )
 from exp.runtime.gateway.ledger_valuation import (
+    billed_unit_columns,
     budget_settlement_nano_usd,
     frozen_usage_cost,
     observed_usage_cost,
@@ -443,11 +444,11 @@ class SQLiteAttemptLedger(LocalSnapshotMemoOwner):
                 dispatch_reason, preferred_deployment_id,
                 preferred_input_rate, preferred_cached_input_rate,
                 preferred_cache_creation_input_rate, preferred_cache_creation_1h_input_rate,
-                preferred_output_rate, preferred_reasoning_rate,
+                preferred_output_rate, preferred_reasoning_rate, unit_prices,
                 state, started_at, budget_period_start, budget_reserved_nano_usd
             ) VALUES (
                 ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                 'dispatched', ?, ?, ?
             )
             """,
@@ -498,6 +499,7 @@ class SQLiteAttemptLedger(LocalSnapshotMemoOwner):
                 None
                 if preferred_prices is None
                 else preferred_prices.reasoning_nano_usd_per_million_tokens,
+                None if prices.units is None else prices.units.model_dump_json(),
                 utc_text(now),
                 period_start,
                 maximum_cost_nano_usd,
@@ -628,7 +630,7 @@ class SQLiteAttemptLedger(LocalSnapshotMemoOwner):
                    preferred_deployment_id, preferred_input_rate,
                    preferred_cached_input_rate, preferred_output_rate,
                    preferred_cache_creation_input_rate, preferred_cache_creation_1h_input_rate,
-                   preferred_reasoning_rate,
+                   preferred_reasoning_rate, unit_prices,
                    (SELECT api_surface FROM gateway_requests
                     WHERE request_id = gateway_attempts.request_id) AS api_surface
             FROM gateway_attempts WHERE attempt_id = ?
@@ -682,7 +684,9 @@ class SQLiteAttemptLedger(LocalSnapshotMemoOwner):
                 budget_settled_nano_usd = ?,
                 retry_after_seconds = ?, ratelimit_limit_requests = ?,
                 ratelimit_remaining_requests = ?, ratelimit_limit_tokens = ?,
-                ratelimit_remaining_tokens = ?, upstream_provider = ?
+                ratelimit_remaining_tokens = ?, upstream_provider = ?,
+                billed_unit_kind = ?, billed_unit_variant = ?, billed_quantity_milli = ?,
+                billed_unit_rate = ?
             WHERE attempt_id = ? AND state = 'dispatched'
             """,
             (
@@ -707,6 +711,7 @@ class SQLiteAttemptLedger(LocalSnapshotMemoOwner):
                 ratelimit_limit_tokens,
                 ratelimit_remaining_tokens,
                 upstream_provider,
+                *billed_unit_columns(row, usage),
                 attempt_id,
             ),
         )

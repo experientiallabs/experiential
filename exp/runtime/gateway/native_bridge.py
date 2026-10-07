@@ -48,6 +48,7 @@ from exp.runtime.gateway.native_admission import (
     resolve_admission_route,
     select_single_route_before_search,
 )
+from exp.runtime.gateway.native_audio import NativeAudioMixin
 from exp.runtime.gateway.native_authentication import NativeAuthenticationMixin
 from exp.runtime.gateway.native_batches import NativeBatchRelayMixin
 from exp.runtime.gateway.native_bridge_errors import (
@@ -70,9 +71,7 @@ from exp.runtime.gateway.native_components import NativeGatewayComponents, SyncW
 from exp.runtime.gateway.native_continuation import (
     continuation_binding_error as _continuation_binding_error,
 )
-from exp.runtime.gateway.native_continuation import (
-    remember_continuation,
-)
+from exp.runtime.gateway.native_continuation import remember_continuation
 from exp.runtime.gateway.native_continuation import (
     require_bound_wire_authority as _require_bound_wire_authority,
 )
@@ -167,6 +166,7 @@ class NativeControlPlane(
     NativeDecisionSurfacesMixin,
     NativeEmbeddingsMixin,
     NativeImagesMixin,
+    NativeAudioMixin,
     NativeObservabilityMixin,
 ):
     """Authority and accounting callbacks for the native data plane.

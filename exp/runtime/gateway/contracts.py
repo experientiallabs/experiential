@@ -38,9 +38,7 @@ from exp.runtime.gateway.reasoning_blocks import (
 from exp.runtime.gateway.reasoning_blocks import (
     ProviderReasoningBlock as ProviderReasoningBlock,
 )
-from exp.runtime.gateway.reasoning_blocks import (
-    RedactedThinkingBlock as RedactedThinkingBlock,
-)
+from exp.runtime.gateway.reasoning_blocks import RedactedThinkingBlock as RedactedThinkingBlock
 from exp.runtime.gateway.reasoning_blocks import (
     SealedReasoningContentBlock as SealedReasoningContentBlock,
 )
@@ -134,6 +132,8 @@ class GatewayApiSurface(StrEnum):
     EMBEDDINGS = "embeddings"
     IMAGES = "images"
     DECISIONS = "decisions"
+    SPEECH = "speech"
+    TRANSCRIPTION = "transcription"
 
 
 class StructuredTextFormat(ContractModel):

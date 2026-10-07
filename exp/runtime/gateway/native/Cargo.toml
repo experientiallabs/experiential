@@ -1,6 +1,6 @@
 [package]
 name = "exp-gateway-native"
-version = "0.3.137"
+version = "0.3.138"
 edition = "2021"
 description = "Rust data plane for the Experiential local gateway (PoC), embedded as a PyO3 extension."
 license = "Apache-2.0"
@@ -33,6 +33,9 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "str
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = { version = "1", features = ["preserve_order", "raw_value"] }
 sha2 = "0.10"
+# Demux-only (no decoding): measures an uploaded audio file's duration from its
+# codec frame lengths so a transcription reservation bounds what the provider meters.
+symphonia = { version = "0.6.1", default-features = false, features = ["wav", "ogg", "mkv", "isomp4", "mp3", "flac", "id3v2"] }
 thiserror = "2"
 rusqlite = { version = "0.38", features = ["bundled"] }
 

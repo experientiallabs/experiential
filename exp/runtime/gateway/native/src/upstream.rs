@@ -196,6 +196,58 @@ async fn open_upstream(
         Some(body) => request.body(body.to_string()).send(),
         None => request.json(payload).send(),
     };
+    classify_open(send, payload, phase_timeout, dialect, decision_surface).await
+}
+
+/// POST one opaque binary body (a hand-encoded multipart upload) and classify
+/// the open exactly like [`open_stream`]: the same timeouts, status mapping,
+/// rate-limit harvesting, and provider-detail attribution. `attribution`
+/// carries the request's text fields so a provider sentence naming the
+/// caller's own model id is not redacted.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn open_upload(
+    client: &UpstreamClient,
+    url: &str,
+    headers: &HashMap<String, String>,
+    idempotency_key: &str,
+    body: Vec<u8>,
+    content_type: &str,
+    attribution: &Value,
+    phase_timeout: Duration,
+) -> Result<reqwest::Response, Failure> {
+    let mut request = client.post(url)?;
+    for (name, value) in headers {
+        if name.eq_ignore_ascii_case("idempotency-key") || name.eq_ignore_ascii_case("content-type")
+        {
+            continue;
+        }
+        request = request.header(name, value);
+    }
+    let send = request
+        .header("Idempotency-Key", idempotency_key)
+        .header("Content-Type", content_type)
+        .body(body)
+        .send();
+    classify_open(
+        send,
+        attribution,
+        phase_timeout,
+        Dialect::OpenAiCompatible,
+        false,
+    )
+    .await
+}
+
+/// Await one upstream send under the header-phase bound and classify a
+/// non-success open into the engine's failure taxonomy (`decision_surface`
+/// selects the decisions surface's status-pinned rejection semantics).
+async fn classify_open(
+    send: impl std::future::Future<Output = Result<reqwest::Response, reqwest::Error>>,
+    payload: &Value,
+    phase_timeout: Duration,
+    dialect: Dialect,
+    decision_surface: bool,
+) -> Result<reqwest::Response, Failure> {
     let phase_started = Instant::now();
     let response = match tokio::time::timeout(phase_timeout, send).await {
         Ok(Ok(response)) => response,

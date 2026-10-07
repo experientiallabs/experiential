@@ -5,6 +5,7 @@ import sqlite3
 import pytest
 
 from exp.common.models.catalog import MAXIMUM_RATE_NANO_USD_PER_MILLION_TOKENS
+from exp.common.models.catalog_prices import BilledUnitKind, GatewayUnitPrices
 from exp.runtime.gateway.contracts import (
     GatewayEvent,
     GatewayEventKind,
@@ -18,9 +19,13 @@ from exp.runtime.gateway.ledger_valuation import (
     NanoUsdOverflowError,
     budget_settlement_nano_usd,
     estimated_cost_nano_usd,
+    frozen_usage_cost,
     optional_int,
     terminal_values,
+    unit_cost_nano_usd,
+    unit_rate_nano_usd,
 )
+from exp.runtime.gateway.stream_contracts import BilledUnits
 
 
 @pytest.mark.parametrize(
@@ -475,3 +480,35 @@ def test_openrouter_gemini_cache_write_call_prices_at_openrouter_bill() -> None:
         )
         == 1_545_916
     )
+
+
+def test_unit_cost_rounds_thousandths_half_up_and_fails_closed() -> None:
+    """Units price at their card's variant rate; anything unpriced stays unknown."""
+    card = GatewayUnitPrices(kind=BilledUnitKind.AUDIO_SECOND, rates={"": 100_000})
+    billed = BilledUnits(kind=BilledUnitKind.AUDIO_SECOND, quantity_milli=12_345)
+    rate = unit_rate_nano_usd(billed, card)
+    assert rate == 100_000
+    # 12.345 s at 100,000 nano-USD/s = 1,234,500 nano-USD exactly.
+    assert unit_cost_nano_usd(billed, rate) == 1_234_500
+    odd = BilledUnits(kind=BilledUnitKind.AUDIO_SECOND, quantity_milli=1)
+    assert unit_cost_nano_usd(odd, 499) == 0
+    assert unit_cost_nano_usd(odd, 500) == 1
+    wrong_kind = BilledUnits(kind=BilledUnitKind.CHARACTER, quantity_milli=1_000)
+    assert unit_rate_nano_usd(wrong_kind, card) is None
+    assert unit_rate_nano_usd(billed, None) is None
+    assert unit_cost_nano_usd(billed, None) is None
+
+
+def test_units_beside_a_partial_token_report_leave_the_cost_unknown() -> None:
+    """Units price alone only when no token evidence exists at all."""
+    connection = sqlite3.connect(":memory:")
+    connection.row_factory = sqlite3.Row
+    row = connection.execute(
+        "SELECT 1 AS input_rate, NULL AS cached_input_rate, NULL AS cache_creation_input_rate, "
+        "NULL AS cache_creation_1h_input_rate, 1 AS output_rate, NULL AS reasoning_rate, "
+        '\'{"kind":"character","rates":{"":1000}}\' AS unit_prices'
+    ).fetchone()
+    units = BilledUnits(kind=BilledUnitKind.CHARACTER, quantity_milli=2_000)
+    assert frozen_usage_cost(row, GatewayUsage(billed_units=units)) == 2_000
+    partial = GatewayUsage(input_tokens=5, billed_units=units)
+    assert frozen_usage_cost(row, partial) is None
