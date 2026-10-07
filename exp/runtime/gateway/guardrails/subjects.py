@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from threading import Lock
+from typing import Literal
 
 from pydantic import BaseModel, JsonValue
 
@@ -16,11 +18,26 @@ class ObservedSubjects:
 
     Attributes:
         fingerprints: Complete encoded subject hashes considered while admission is open.
-        closed: A definitely oversized subject ended this request's optional observation.
+        closed_reason: Content-free terminal admission reason, or None while open.
+        _lock: Serialize terminal admission metadata when request callbacks overlap.
     """
 
     fingerprints: set[bytes] = field(default_factory=set)
-    closed: bool = False
+    closed_reason: Literal["subject_oversized", "preparation_unavailable"] | None = None
+    _lock: Lock = field(default_factory=Lock, repr=False)
+
+    @property
+    def closed(self) -> bool:
+        """Report whether optional coverage ended without retaining the rejected input."""
+        return self.closed_reason is not None
+
+    def close(self, reason: Literal["subject_oversized", "preparation_unavailable"]) -> bool:
+        """Claim the session's one terminal admission record without storing its subject."""
+        with self._lock:
+            if self.closed_reason is not None:
+                return False
+            self.closed_reason = reason
+            return True
 
 
 def observation_subject_exceeds(request: GatewayRequest, limit: int) -> bool:

@@ -232,37 +232,82 @@ class GuardrailEngine:
         deadline_monotonic: float,
         observed: ObservedSubjects | None = None,
     ) -> None:
-        """Encode one complete subject once for every policy and retain only its digest.
+        """Prepare one bounded complete subject under the shared nonblocking permit.
 
-        Clearly oversized text never allocates a serialized copy and ends optional
-        observation for this request with one coverage-admission outcome per policy.
-        Fitting subjects are deduplicated before capacity/deadline rejection, so a
-        repeated pending subject cannot become a second skipped observation. Each
-        actual submission still reserves its own complete bytes atomically.
+        A free permit preserves exact deduplication for known session subjects even
+        when inspection capacity is full. Preparation contention ends this session's
+        optional coverage without claiming that an unknown subject was distinct.
         """
         if any(policy.mode != "observe" for policy in policies):
             raise ValueError("observation requires observe policies")
         if not policies or (observed is not None and observed.closed):
             return
+        deduplicating = observed is not None and bool(observed.fingerprints)
+        if not deduplicating and deadline_monotonic <= self._monotonic():
+            self._preparation_unavailable(policies, observed)
+            return
+        with self._observations.preparation(deduplicating=deduplicating) as admitted:
+            if not admitted:
+                self._preparation_unavailable(policies, observed)
+                return
+            try:
+                self._prepare_observations(
+                    policies=policies,
+                    request=request,
+                    deadline_monotonic=deadline_monotonic,
+                    observed=observed,
+                )
+            except Exception:  # noqa: BLE001 - optional preparation cannot reject serving.
+                pass
+            else:
+                return
+            self._preparation_unavailable(policies, observed, outcome=GuardrailOutcome.UNAVAILABLE)
+
+    def _preparation_unavailable(
+        self,
+        policies: tuple[GuardrailPolicy, ...],
+        observed: ObservedSubjects | None,
+        *,
+        outcome: GuardrailOutcome = GuardrailOutcome.SKIPPED,
+    ) -> None:
+        """End incomplete admission once without declaring a distinct missed subject."""
+        if observed is not None and not observed.close("preparation_unavailable"):
+            return
+        for policy in policies:
+            self._emit_observation(policy, None, outcome, 0.0)
+
+    def _prepare_observations(
+        self,
+        *,
+        policies: tuple[GuardrailPolicy, ...],
+        request: GatewayRequest,
+        deadline_monotonic: float,
+        observed: ObservedSubjects | None,
+    ) -> None:
+        """Release every projection/hash temporary before returning the preparation permit."""
         limit = min(
             self._observations.max_subject_bytes,
             max(policy.max_request_bytes for policy in policies),
         )
         if observation_subject_exceeds(request, limit):
-            if observed is not None:
-                observed.closed = True
-            for policy in policies:
-                outcome = (
-                    GuardrailOutcome.UNSUPPORTED
-                    if observation_subject_exceeds(request, policy.max_request_bytes)
-                    else GuardrailOutcome.SKIPPED
-                )
+            outcomes = tuple(
+                GuardrailOutcome.UNSUPPORTED
+                if observation_subject_exceeds(request, policy.max_request_bytes)
+                else GuardrailOutcome.SKIPPED
+                for policy in policies
+            )
+            if observed is not None and not observed.close("subject_oversized"):
+                return
+            for policy, outcome in zip(policies, outcomes, strict=True):
                 self._emit_observation(policy, None, outcome, 0.0)
             return
-        subject = observation_subject_bytes(request)
-        size = len(subject)
-        fingerprint = sha256(subject).digest()
-        del subject
+        subject: bytes | None = None
+        try:
+            subject = observation_subject_bytes(request)
+            size = len(subject)
+            fingerprint = sha256(subject).digest()
+        finally:
+            del subject
         if observed is not None:
             if fingerprint in observed.fingerprints:
                 return

@@ -78,14 +78,29 @@ subject identity and retained bytes. Observer capacity or quarantine cannot cons
 the engine's enforcement capacity or quarantine its enforcing calls.
 
 All observing policies share one complete subject encoding per admission boundary.
-Fitting subjects retain exact deduplication even when capacity is full or the deadline
-has expired. A cheap character-count bound rejects clearly oversized subjects without
-serializing their text. That rejection closes optional observation for this request and
-records one coverage-admission outcome per observing policy: `unsupported` above the
-policy bound, otherwise `skipped` above the owner's byte capacity. Later contexts are
-not observed after this terminal coverage failure. This bounds preparation work without
-retaining rejected input; the character bound is conservative and JSON escaping can
-expand a fitting candidate before its exact byte check.
+The owner grants at most one nonblocking preparation permit, separate from retained
+inspection jobs. New sessions reject before projection or hashing when inspection
+capacity is full, admission is closed, or the original deadline has expired. Rejection
+at admission has no oversized classification because the content was not projected.
+A session with prior fingerprints may use a free permit to deduplicate an equal complete subject
+even with full inspection capacity or an expired deadline. Concurrent preparation never
+waits: `preparation_unavailable` ends that session's optional coverage and records one
+`check=None, skipped` admission outcome per observing policy. This can include an equal
+subject whose identity could not be compared while another preparation held the permit;
+it is neither a classifier verdict nor evidence of a distinct missed subject.
+Size-walk, encoding or hashing failures record `check=None, unavailable` coverage
+without exposing input or exception diagnostics, and serving continues.
+
+Within the permit, a cheap character-count bound rejects clearly oversized subjects
+without serializing their text. That rejection closes optional observation for this
+request and records one coverage-admission outcome per observing policy: `unsupported`
+above the policy bound, otherwise `skipped` above the owner's byte capacity. Later contexts
+are not observed after terminal admission failure. The permit remains held until all
+projection and hash temporaries are released, including failure paths, and shutdown
+does not release a permit still held by a request thread. Preparation admits one candidate
+under the owner's conservative size lower bound, in addition to retained-job bytes.
+Canonical JSON can expand that single candidate before the exact byte check. These limits
+do not claim an exact process memory ceiling.
 
 An admitted observation is engine-owned and may finish after its request completes;
 ordinary settlement does not cancel it and bias observations toward fast classifiers.
@@ -217,7 +232,7 @@ Adding or revising observation-only policies leaves replay unchanged. Promoting 
 observer to enforcement changes replay identity. Only deterministic detector rules
 referenced by applicable enforcing checks enter that digest.
 
-Version 0.7.164 intentionally establishes a new guarded replay contract. Guarded keys
+Version 0.7.165 intentionally establishes a new guarded replay contract. Guarded keys
 accepted on 0.7.161 return `409` after upgrading, even when the authored policy is
 otherwise unchanged. There is no legacy-fingerprint translation. Finish in-flight
 requests before the cutover and use new keys for new operations.

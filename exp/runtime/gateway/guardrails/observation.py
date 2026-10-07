@@ -5,8 +5,9 @@ from __future__ import annotations
 import asyncio
 import logging
 import threading
-from collections.abc import Callable, Coroutine
+from collections.abc import Callable, Coroutine, Iterator
 from concurrent.futures import Future
+from contextlib import contextmanager
 
 from exp.runtime.gateway.guardrails.bounded import start_on_native_loop
 
@@ -78,9 +79,10 @@ class ObservationLease:
 class ObservationOwner:
     """Own a finite set of ephemeral subjects through actual isolated task termination.
 
-    Scheduling uses the existing classifier loop. A full owner rejects immediately
-    instead of queueing text. Timeout and shutdown cannot free capacity still held by
-    a classifier that ignores cancellation.
+    Scheduling uses the existing classifier loop. One independent preparation permit
+    bounds synchronous projection and hashing before exact retained-byte admission.
+    A full owner rejects new subjects instead of queueing text. Timeout and shutdown
+    cannot free capacity still held by preparation or a cancellation-ignoring classifier.
     """
 
     def __init__(self, *, max_jobs: int, max_bytes: int) -> None:
@@ -92,14 +94,45 @@ class ObservationOwner:
         self._lock = threading.Lock()
         self._jobs: dict[ObservationLease, Future[None] | None] = {}
         self._bytes = 0
+        self._preparing = False
         self._closed = False
         self._idle = threading.Event()
         self._idle.set()
 
     @property
     def max_subject_bytes(self) -> int:
-        """Bound subject preparation by the owner's total retained-byte capacity."""
+        """Bound each preparation candidate by the owner's retained-byte capacity."""
         return self._max_bytes
+
+    @contextmanager
+    def preparation(self, *, deduplicating: bool = False) -> Iterator[bool]:
+        """Try one nonblocking preparation permit without retaining its request.
+
+        A session with known fingerprints may compare another bounded candidate when
+        jobs are full. Other sessions must have retained-job and byte capacity before
+        preparing any input. The caller releases all projection/hash temporaries
+        before leaving this context. Shutdown never revokes an active permit.
+        """
+        with self._lock:
+            admitted = (
+                not self._closed
+                and not self._preparing
+                and (
+                    deduplicating
+                    or (len(self._jobs) < self._max_jobs and self._bytes < self._max_bytes)
+                )
+            )
+            if admitted:
+                self._preparing = True
+                self._idle.clear()
+        try:
+            yield admitted
+        finally:
+            if admitted:
+                with self._lock:
+                    self._preparing = False
+                    if not self._jobs:
+                        self._idle.set()
 
     @property
     def available_subject_bytes(self) -> int:
@@ -114,7 +147,7 @@ class ObservationOwner:
         with self._lock:
             del self._jobs[lease]
             self._bytes -= lease.subject_bytes
-            if not self._jobs:
+            if not self._jobs and not self._preparing:
                 self._idle.set()
 
     def submit(

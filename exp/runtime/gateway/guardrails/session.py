@@ -249,11 +249,11 @@ class GuardrailSession:
 
     def input_decision(self) -> JsonObject:
         """Poll approval without tying up a bridge worker or renewing its deadline."""
+        if self._input_failure is not None:
+            return {"action": "error", "failure": self._input_failure.model_dump(mode="json")}
         if not self.enforcing_policies:
             return {"action": "allow"}
         future = self._input
-        if self._input_failure is not None:
-            return {"action": "error", "failure": self._input_failure.model_dump(mode="json")}
         if self._closed or (future is None and not self._approved_before_deadline()):
             return {"action": "error", "failure": denied_input_failure().model_dump(mode="json")}
         if future is None:

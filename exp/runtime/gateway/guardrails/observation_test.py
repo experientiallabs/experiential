@@ -73,6 +73,89 @@ def test_shutdown_cancels_a_stalled_observer_within_the_budget() -> None:
     assert cancelled.wait(2)
 
 
+def test_preparation_capacity_survives_close_until_its_actual_caller_finishes() -> None:
+    """Shutdown cannot release an encoding permit still held by a live request thread."""
+    owner = ObservationOwner(max_jobs=1, max_bytes=4)
+    started = threading.Event()
+    release = threading.Event()
+
+    def prepare() -> None:
+        """Hold a synchronous preparation beyond the finite shutdown deadline."""
+        with owner.preparation() as admitted:
+            assert admitted
+            started.set()
+            assert release.wait(3)
+
+    caller = threading.Thread(target=prepare)
+    caller.start()
+    try:
+        assert started.wait(2)
+        before = time.monotonic()
+        owner.close(timeout_seconds=0.02)
+        assert time.monotonic() - before < 0.5
+        assert owner._preparing
+        assert not owner._idle.is_set()
+        with owner.preparation(deduplicating=True) as admitted:
+            assert not admitted
+        assert owner._preparing
+    finally:
+        release.set()
+        caller.join(timeout=2)
+    assert not caller.is_alive()
+    assert owner._idle.is_set()
+    assert not owner._preparing
+    with owner.preparation() as admitted:
+        assert not admitted
+
+
+def test_job_completion_does_not_end_an_active_deduplication_permit() -> None:
+    """The idle/drain event covers both running subjects and their bounded preparation."""
+    owner = ObservationOwner(max_jobs=1, max_bytes=4)
+    started = threading.Event()
+    release = threading.Event()
+
+    async def inspect(_lease: ObservationLease) -> None:
+        """Complete a full owner reservation while a deduplication preparation is active."""
+        started.set()
+        while not release.is_set():
+            await asyncio.sleep(0.001)
+
+    try:
+        assert owner.submit(inspect, subject_bytes=4, on_interrupted=lambda _: None)
+        assert started.wait(2)
+        with owner.preparation() as admitted:
+            assert not admitted
+        with owner.preparation(deduplicating=True) as admitted:
+            assert admitted
+            release.set()
+            deadline = time.monotonic() + 2
+            while owner._jobs and time.monotonic() < deadline:
+                time.sleep(0.001)
+            assert not owner._jobs
+            assert not owner._idle.is_set()
+        assert owner._idle.is_set()
+    finally:
+        release.set()
+        owner.close(timeout_seconds=2)
+
+
+def test_preparation_exception_releases_only_its_own_permit() -> None:
+    """Rejected contexts cannot return another caller's permit, even through an exception."""
+    owner = ObservationOwner(max_jobs=1, max_bytes=4)
+    with pytest.raises(ValueError, match="synthetic failure"):
+        with owner.preparation() as admitted:
+            assert admitted
+            with owner.preparation(deduplicating=True) as contending:
+                assert not contending
+            assert owner._preparing
+            raise ValueError("synthetic failure")
+    assert not owner._preparing
+    assert owner._idle.is_set()
+    with owner.preparation() as admitted:
+        assert admitted
+    owner.close(timeout_seconds=0)
+
+
 @pytest.mark.parametrize("limit", ["jobs", "bytes"])
 @pytest.mark.parametrize("interrupt", ["timeout", "shutdown"])
 def test_subject_budget_outlives_cancel_ignoring_isolated_work(limit: str, interrupt: str) -> None:

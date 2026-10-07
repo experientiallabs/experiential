@@ -36,6 +36,7 @@ from exp.runtime.gateway.guardrails.native_test import _authorization
 from exp.runtime.gateway.guardrails.session import GuardrailSession
 from exp.runtime.gateway.guardrails.store import MappingGuardrailStore
 from exp.runtime.gateway.guardrails.subjects import observation_subject_bytes
+from exp.runtime.gateway.native_capture import capture_unavailable_failure
 from exp.runtime.gateway.tests.parallel_input_guardrails_test import _Classifier, _engine
 from exp.runtime.gateway.tool_contracts import GatewayProviderNativeTool
 
@@ -80,6 +81,32 @@ def _observer_policy() -> GuardrailPolicy:
             ),
         ),
     )
+
+
+@pytest.mark.parametrize("mode", ["observe", "enforce"])
+def test_explicit_required_release_failure_survives_policy_mode_and_later_cancel(mode: str) -> None:
+    """Optional observation cannot hide a host capture failure or its charge waiver."""
+    policy = _observer_policy().model_copy(update={"mode": mode})
+    engine = GuardrailEngine(
+        store=MappingGuardrailStore((policy,)),
+        client=DirectClassifierClient(ClassifierRegistry({"criminal": ScriptedClassifier()})),
+        monotonic=time.monotonic,
+    )
+    try:
+        session = _session(engine)
+        session.inspect_input(_request())
+        assert session.input_decision() == {"action": "allow"}
+        session.cancel(capture_unavailable_failure())
+        session.cancel()
+        decision = session.input_decision()
+        assert decision["action"] == "error"
+        failure = session.settlement_failure()
+        assert failure is not None
+        assert failure.safe_details["code"] == "capture_unavailable"
+        assert failure.safe_details["input_guardrail_denied"] is True
+        assert decision["failure"] == failure.model_dump(mode="json")
+    finally:
+        engine.close(timeout_seconds=2)
 
 
 def test_observing_policies_share_one_complete_subject_encoding() -> None:

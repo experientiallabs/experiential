@@ -7,6 +7,7 @@ import pytest
 from exp.common.core.artifacts import canonical_json_bytes
 from exp.runtime.gateway.contracts import GatewayApiSurface, GatewayMessage, GatewayRequest
 from exp.runtime.gateway.guardrails.subjects import (
+    ObservedSubjects,
     observation_subject_bytes,
     observation_subject_exceeds,
 )
@@ -123,3 +124,13 @@ def test_early_subject_size_counts_private_opaque_payload_without_encoding_it() 
         context_management={"opaque": "x" * 100_000},
     )
     assert observation_subject_exceeds(request, 1024)
+
+
+def test_terminal_admission_state_does_not_relabel_or_repeat_its_first_reason() -> None:
+    """Once optional coverage ends, later contexts retain only the original content-free reason."""
+    observed = ObservedSubjects()
+    assert observed.close("preparation_unavailable")
+    assert observed.closed
+    assert not observed.close("subject_oversized")
+    assert observed.closed_reason == "preparation_unavailable"
+    assert observed.fingerprints == set()

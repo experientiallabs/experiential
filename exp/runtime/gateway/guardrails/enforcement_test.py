@@ -3,10 +3,15 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 import json
 import threading
 import time
-from collections.abc import Coroutine
+import weakref
+from collections.abc import Coroutine, Iterator
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
+from typing import Never
 
 import httpx
 import pytest
@@ -23,6 +28,7 @@ from exp.runtime.gateway.contracts import (
     OpaqueReasoningContentBlock,
     SealedReasoningContentBlock,
 )
+from exp.runtime.gateway.guardrails import enforcement
 from exp.runtime.gateway.guardrails.bounded import BoundedInspect
 from exp.runtime.gateway.guardrails.classifiers import (
     ClassifierRegistry,
@@ -36,6 +42,7 @@ from exp.runtime.gateway.guardrails.contracts import (
     GuardrailCheck,
     GuardrailCheckStage,
     GuardrailCompletion,
+    GuardrailOutcome,
     GuardrailPolicy,
     GuardrailRejected,
     GuardrailToolCall,
@@ -44,12 +51,14 @@ from exp.runtime.gateway.guardrails.contracts import (
 )
 from exp.runtime.gateway.guardrails.enforcement import GuardrailEngine
 from exp.runtime.gateway.guardrails.http_json import HttpJsonClassifier
+from exp.runtime.gateway.guardrails.observation import ObservationLease
 from exp.runtime.gateway.guardrails.regex import (
     BuiltinPattern,
     RegexAdapterDocument,
     RegexClassifier,
 )
 from exp.runtime.gateway.guardrails.store import MappingGuardrailStore
+from exp.runtime.gateway.guardrails.subjects import ObservedSubjects, observation_subject_bytes
 
 
 class _Clock:
@@ -224,6 +233,277 @@ def _request(*contents: str) -> GatewayRequest:
         surface=GatewayApiSurface.CHAT_COMPLETIONS,
         messages=tuple(GatewayMessage(role="user", content=item) for item in contents),
     )
+
+
+class _ObservationAdmissionEngine(GuardrailEngine):
+    """Expose content-free admission records under small actual owner limits.
+
+    Attributes:
+        policy: One read-only observer with the configured complete subject limit.
+        records: Recorded check identities and outcomes, populated off the request path.
+        clock: Controllable admission deadline clock.
+    """
+
+    def __init__(self, *, max_jobs: int = 8, max_bytes: int = 65_536) -> None:
+        """Build the real engine with a prompt-free scripted inspection result."""
+        self.policy = GuardrailPolicy(
+            policy_id="observer",
+            protected=True,
+            mode="observe",
+            max_request_bytes=max_bytes,
+            checks=(_check("input"),),
+        )
+        self.records: list[tuple[str | None, GuardrailOutcome]] = []
+        self.clock = _Clock()
+        super().__init__(
+            store=MappingGuardrailStore((self.policy,)),
+            client=DirectClassifierClient(ClassifierRegistry({"scripted": ScriptedClassifier()})),
+            monotonic=self.clock,
+            max_observations=max_jobs,
+            max_observation_bytes=max_bytes,
+        )
+
+    def _record_observation(
+        self,
+        policy: GuardrailPolicy,
+        check: GuardrailCheck | None,
+        outcome: GuardrailOutcome,
+        latency_seconds: float,
+    ) -> None:
+        """Keep only immutable admission or inspection metadata for assertions."""
+        del policy, latency_seconds
+        self.records.append((None if check is None else check.check_id, outcome))
+
+    def observe(self, request: GatewayRequest, observed: ObservedSubjects) -> None:
+        """Exercise the same request-session entry point with the original deadline."""
+        self.observe_inputs(
+            policies=(self.policy,), request=request, deadline_monotonic=200, observed=observed
+        )
+
+
+@pytest.mark.parametrize("unavailable", ["jobs", "bytes", "closed", "deadline"])
+@pytest.mark.parametrize("oversized", [False, True])
+def test_new_observation_rejects_before_serialization_when_admission_is_unavailable(
+    unavailable: str, oversized: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Full, closed and expired sessions cannot allocate another near-cap encoded subject."""
+    engine = _ObservationAdmissionEngine(max_jobs=1 if unavailable == "jobs" else 8)
+    release = threading.Event()
+    started = threading.Event()
+    observed = ObservedSubjects()
+    size = engine._observations.max_subject_bytes
+    content_bytes = size - len(observation_subject_bytes(_request(""))) - 16
+    request = _request("x" * (size * 2 if oversized else content_bytes))
+
+    async def hold(_lease: ObservationLease) -> None:
+        """Retain an existing subject while concurrent requests test unavailable capacity."""
+        started.set()
+        while not release.is_set():
+            await asyncio.sleep(0.001)
+
+    def forbidden(_request: GatewayRequest) -> bytes:
+        """Fail if rejection performs any complete subject encoding."""
+        pytest.fail("unavailable admission serialized an input subject")
+
+    def forbidden_bound(_request: GatewayRequest, _limit: int) -> bool:
+        """Admission rejection has priority over an unknown oversized classification."""
+        pytest.fail("unavailable admission projected an input subject")
+
+    if unavailable in {"jobs", "bytes"}:
+        assert engine._observations.submit(
+            hold, subject_bytes=size if unavailable == "bytes" else 1, on_interrupted=lambda _: None
+        )
+        assert started.wait(2)
+    elif unavailable == "closed":
+        engine._observations.close(timeout_seconds=0)
+    else:
+        engine.clock.now = 201
+    monkeypatch.setattr(enforcement, "observation_subject_bytes", forbidden)
+    monkeypatch.setattr(enforcement, "observation_subject_exceeds", forbidden_bound)
+    try:
+        with ThreadPoolExecutor(max_workers=4) as workers:
+            futures = [workers.submit(engine.observe, request, observed) for _ in range(4)]
+            for future in futures:
+                future.result(timeout=2)
+        engine.observe(request.model_copy(deep=True), observed)
+    finally:
+        release.set()
+        engine.close(timeout_seconds=2)
+    assert observed.closed_reason == "preparation_unavailable"
+    assert observed.fingerprints == set()
+    assert engine.records == [(None, GuardrailOutcome.SKIPPED)]
+
+
+@pytest.mark.parametrize("same_session", [False, True])
+def test_concurrent_preparation_has_one_near_cap_encoder_and_no_waiting_requests(
+    same_session: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Contending sessions return without serializing and record coverage once each."""
+    engine = _ObservationAdmissionEngine()
+    original = enforcement.observation_subject_bytes
+    release = threading.Event()
+    started = threading.Event()
+    prepared: list[int] = []
+    size = engine._observations.max_subject_bytes
+    request = _request("x" * (size - len(original(_request(""))) - 16))
+
+    def blocked(payload: GatewayRequest) -> bytes:
+        """Hold one real encoded allocation while other request threads enter the engine."""
+        subject = original(payload)
+        prepared.append(len(subject))
+        if len(prepared) == 1:
+            started.set()
+            assert release.wait(3)
+        return subject
+
+    monkeypatch.setattr(enforcement, "observation_subject_bytes", blocked)
+    first_state = ObservedSubjects()
+    with ThreadPoolExecutor(max_workers=5) as workers:
+        first = workers.submit(engine.observe, request, first_state)
+        try:
+            assert started.wait(2)
+            rejected = [first_state if same_session else ObservedSubjects() for _ in range(4)]
+            futures = [workers.submit(engine.observe, request, state) for state in rejected]
+            for future in futures:
+                future.result(timeout=1)
+            assert prepared == [size - 16]
+            assert engine._observations._preparing
+            assert all(state.closed_reason == "preparation_unavailable" for state in rejected)
+            for state in rejected:
+                engine.observe(request.model_copy(deep=True), state)
+        finally:
+            release.set()
+            first.result(timeout=2)
+            engine.close(timeout_seconds=2)
+    assert engine.records.count((None, GuardrailOutcome.SKIPPED)) == (1 if same_session else 4)
+    assert engine.records.count(("input", GuardrailOutcome.ALLOW)) == 1
+
+
+def test_known_subject_deduplicates_after_deadline_with_a_free_preparation_permit() -> None:
+    """An exact private-context deep copy does not acquire a second expired outcome."""
+    engine = _ObservationAdmissionEngine()
+    request = _request("original").model_copy(update={"context_management": {"private": "value"}})
+    observed = ObservedSubjects()
+    try:
+        engine.observe(request, observed)
+        assert engine._observations._idle.wait(2)
+        engine.clock.now = 201
+        engine.observe(request.model_copy(deep=True), observed)
+    finally:
+        engine.close(timeout_seconds=2)
+    assert engine.records == [("input", GuardrailOutcome.ALLOW)]
+    assert not observed.closed
+
+
+def test_contended_known_subject_reports_terminal_admission_not_a_distinct_verdict() -> None:
+    """An unavailable preparation cannot identify an equal copy, so coverage ends once."""
+    engine = _ObservationAdmissionEngine()
+    request = _request("original")
+    observed = ObservedSubjects()
+    try:
+        engine.observe(request, observed)
+        assert engine._observations._idle.wait(2)
+        with engine._observations.preparation() as admitted:
+            assert admitted
+            engine.observe(request.model_copy(deep=True), observed)
+            engine.observe(request, observed)
+        assert observed.closed_reason == "preparation_unavailable"
+        assert len(observed.fingerprints) == 1
+    finally:
+        engine.close(timeout_seconds=2)
+    assert engine.records == [("input", GuardrailOutcome.ALLOW), (None, GuardrailOutcome.SKIPPED)]
+
+
+def test_engine_close_does_not_revoke_an_inflight_encoded_subject(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A bounded close leaves the actual encoder charged and rejects later preparation."""
+    engine = _ObservationAdmissionEngine()
+    original = enforcement.observation_subject_bytes
+    started = threading.Event()
+    release = threading.Event()
+    prepared: list[int] = []
+
+    def blocked(request: GatewayRequest) -> bytes:
+        """Retain a real subject allocation beyond the engine's close deadline."""
+        encoded = original(request)
+        prepared.append(len(encoded))
+        started.set()
+        assert release.wait(3)
+        return encoded
+
+    monkeypatch.setattr(enforcement, "observation_subject_bytes", blocked)
+    with ThreadPoolExecutor(max_workers=1) as workers:
+        pending = workers.submit(engine.observe, _request("original"), ObservedSubjects())
+        try:
+            assert started.wait(2)
+            before = time.monotonic()
+            engine.close(timeout_seconds=0.02)
+            assert time.monotonic() - before < 0.5
+            assert engine._observations._preparing
+            assert not engine._observations._idle.is_set()
+            engine.observe(_request("new context"), ObservedSubjects())
+            assert len(prepared) == 1
+        finally:
+            release.set()
+            pending.result(timeout=2)
+            engine.close(timeout_seconds=2)
+    assert not engine._observations._preparing
+    assert engine._observations._idle.is_set()
+    assert not engine._observations._jobs
+    assert engine.records == []
+    assert engine.observation_recording_dropped == 2
+
+
+@pytest.mark.parametrize("stage", ["bound", "encode", "hash"])
+def test_failed_preparation_drops_temporary_traceback_before_releasing_the_permit(
+    stage: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Projection and hashing failures cannot leak a transient allocation past admission."""
+
+    class Temporary:
+        """Represent a private allocation retained only by a failing preparation frame."""
+
+    engine = _ObservationAdmissionEngine()
+    original = engine._observations.preparation
+    retained: list[weakref.ReferenceType[Temporary]] = []
+
+    def fail(_payload: GatewayRequest | bytes) -> Never:
+        """Raise with an observable transient object in the traceback's local frame."""
+        temporary = Temporary()
+        retained.append(weakref.ref(temporary))
+        raise ValueError("synthetic preparation failure")
+
+    def fail_bound(payload: GatewayRequest, _limit: int) -> Never:
+        """Fail the allocation-free projection before canonical encoding can begin."""
+        fail(payload)
+
+    @contextmanager
+    def checked(*, deduplicating: bool = False) -> Iterator[bool]:
+        """Verify the temporary is gone before granting any other preparation permission."""
+        with original(deduplicating=deduplicating) as admitted:
+            yield admitted
+            gc.collect()
+            assert engine._observations._preparing
+            assert retained and retained[0]() is None
+
+    monkeypatch.setattr(engine._observations, "preparation", checked)
+    if stage == "bound":
+        monkeypatch.setattr(enforcement, "observation_subject_exceeds", fail_bound)
+    else:
+        monkeypatch.setattr(
+            enforcement, "observation_subject_bytes" if stage == "encode" else "sha256", fail
+        )
+    observed = ObservedSubjects()
+    try:
+        engine.observe(_request("original"), observed)
+        assert not engine._observations._preparing
+        assert engine._observations._idle.is_set()
+    finally:
+        engine.close(timeout_seconds=2)
+    assert observed.closed_reason == "preparation_unavailable"
+    assert engine.records == [(None, GuardrailOutcome.UNAVAILABLE)]
 
 
 def test_input_chain_runs_once_and_can_transform_the_request() -> None:

@@ -20,19 +20,30 @@ import pytest
 from exp.common.core.artifacts import JsonObject
 from exp.common.models import BillingSource, GatewayTokenPrices
 from exp.runtime.gateway.contracts import AuthorizationSnapshot, GatewayRequest
-from exp.runtime.gateway.guardrails.contracts import ClassifierVerdict, GuardrailCheck
+from exp.runtime.gateway.guardrails.contracts import (
+    ClassifierVerdict,
+    GuardrailCheck,
+    GuardrailOutcome,
+)
 from exp.runtime.gateway.lifecycle import load_gateway_components
 from exp.runtime.gateway.lifecycle_test import _configured_gateway
 from exp.runtime.gateway.native_bridge import NativeBridgeError, NativeControlPlane
-from exp.runtime.gateway.native_bridge_test import _admit, _chat_body
+from exp.runtime.gateway.native_bridge_test import _admit, _admit_started, _chat_body
 from exp.runtime.gateway.native_capture import (
     CaptureConfiguration,
     CaptureController,
     CaptureRecord,
+    capture_unavailable_failure,
 )
 from exp.runtime.gateway.native_capture_test import _request_json
 from exp.runtime.gateway.native_execution import InflightRequest
 from exp.runtime.gateway.native_server import serve_native_gateway
+from exp.runtime.gateway.tests.guardrail_observation_test import (
+    _Classifier as _ObservationClassifier,
+)
+from exp.runtime.gateway.tests.guardrail_observation_test import (
+    _Engine as _ObservationEngine,
+)
 from exp.runtime.gateway.tests.guardrail_policy_integrity_test import _body, _provider
 from exp.runtime.gateway.tests.launch_test import _unused_port
 from exp.runtime.gateway.tests.mandatory_guardrails_paths_test import _RetrievedGuard
@@ -42,6 +53,71 @@ from exp.runtime.gateway.tests.native_waterfall_test import _content_chunk, _ter
 from exp.runtime.gateway.tests.parallel_input_guardrails_test import _Classifier, _engine
 from exp.runtime.gateway.tests.web_search_backend_fixture_test import StaticWebSearchBackend
 from exp.runtime.gateway.web_search.contracts import GatewayWebSearchResult
+
+
+@pytest.mark.parametrize("release_failure", [False, True])
+def test_observation_retains_required_release_failure_in_native_settlement(
+    tmp_path: Path, release_failure: bool
+) -> None:
+    """A host release failure survives polling and paid settlement; plain closure stays optional."""
+    _, key = _configured_gateway(
+        tmp_path,
+        base_url="http://127.0.0.1:1/v1",
+        billing_source=BillingSource.HOST_MANAGED,
+        prices=GatewayTokenPrices(
+            input_nano_usd_per_million_tokens=1_000_000_000,
+            output_nano_usd_per_million_tokens=2_000_000_000,
+        ),
+    )
+    components = load_gateway_components(tmp_path, environment={"TEST_PROVIDER_KEY": "fixture"})
+    classifier = _ObservationClassifier(GuardrailOutcome.ALLOW)
+    classifier.release.set()
+    engine = _ObservationEngine(classifier)
+    control = NativeControlPlane(components, guardrails=engine)
+    try:
+        admission = _admit_started(control, key, _chat_body())
+        request_id = str(admission["request_id"])
+        entry = control._accounting.entry(request_id)  # noqa: SLF001 - request lifecycle assertion.
+        assert entry is not None and entry.guardrails is not None
+        session = entry.guardrails
+        assert not session.enforcing_policies
+        assert session.input_decision() == {"action": "allow"}
+        session.cancel(capture_unavailable_failure() if release_failure else None)
+        session.cancel()
+        decision = json.loads(
+            control.guardrail_input_status(json.dumps({"request_id": request_id}))
+        )
+        assert decision["action"] == ("error" if release_failure else "allow")
+        if release_failure:
+            assert decision["failure"]["safe_details"] == {
+                "code": "capture_unavailable",
+                "input_guardrail_denied": True,
+            }
+        control.settle(
+            json.dumps(
+                {
+                    "request_id": request_id,
+                    "attempt_id": admission["attempt_id"],
+                    "outcome": "completed",
+                    "usage": {"input_tokens": 12, "output_tokens": 5},
+                    "tool_names": [],
+                    "failure": None,
+                }
+            )
+        )
+        with sqlite3.connect(components.ledger.database_path) as db:
+            assert db.execute("select terminal_state from gateway_requests").fetchall() == [
+                ("failed" if release_failure else "completed",)
+            ]
+            state, charged = db.execute(
+                "select state, budget_settled_nano_usd from gateway_attempts"
+            ).fetchone()
+        assert state == ("failed" if release_failure else "completed")
+        assert charged == 0 if release_failure else charged > 0
+        assert control._accounting.entry(request_id) is None  # noqa: SLF001 - terminal ownership.
+    finally:
+        engine.close(timeout_seconds=2)
+        components.write_ledger.close()
 
 
 @pytest.mark.parametrize("surface", ["chat", "responses", "messages"])
