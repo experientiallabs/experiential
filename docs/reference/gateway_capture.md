@@ -87,7 +87,8 @@ response and pending budgets, and by the destination's record ceiling after the
 request and the largest admissible response; an overflow sets `truncated` and
 keeps the exchange. A token text carrying NUL is stored with U+FFFD and flags
 `nul_replaced` (the token's `bytes` keep it exactly). A malformed probability
-channel, or a frame that carries output text without probabilities, is never a
+channel, or a frame that carries answer text (not typed thinking or reference
+parts) without probabilities, is never a
 failure: it ends retention there and marks the prefix `truncated`. The record's
 sidecar is reserved when injection is decided, so a dial is injected only when
 its probabilities have room; a reserved sidecar that is never used is not
@@ -95,10 +96,12 @@ serialized. Probabilities are retained only from a
 committed winning attempt: a turn settled before any output committed (an
 exhausted refusal flush, an empty completion) carries none. An encoded record
 that would exceed the destination ceiling only because of its probabilities
-drops the `provider_logprobs` sidecar rather than the exchange (only on that
-size failure; any other preparation failure retries the record whole).
+drops the `provider_logprobs` sidecar rather than the exchange: a preparation
+failure that repeats with the sidecar and clears without it (the sink's own
+limit, whatever its payload shape) drops it; any other failure retries the
+record whole.
 Probabilities are kept only beside a complete captured response: a truncated
-response prefix drops them. A rung that refuses the field (a request-shaped
+prefix, or a stream the client left early, drops them. A rung that refuses the field (a request-shaped
 4xx, or the same failure as a pre-output stream error under HTTP 200) is re-dialed once without it inside the same physical attempt (fresh
 per-dial first-byte and first-token allowances, its own Idempotency-Key); when that
 plain dial then yields anything but the same refusal, this worker never injects

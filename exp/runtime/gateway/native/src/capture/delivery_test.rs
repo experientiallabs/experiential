@@ -489,3 +489,72 @@ fn microbatch_waits_for_neighbors_but_flushes_on_count_deadline_and_close() {
     );
     assert_eq!(delivery.counts(), [0, 0, 4, 0, 0]);
 }
+
+fn record_with_probabilities(id: &str) -> Record {
+    let mut value = record(id);
+    let mut captured = crate::capture::logprobs::Captured::injected();
+    captured.content.push(crate::logprobs::TokenLogprob {
+        token: "a".into(),
+        logprob: -1.0,
+        bytes: None,
+        top_logprobs: Vec::new(),
+    });
+    value.provider_logprobs = Some(captured);
+    value
+}
+
+/// Prepares a record unless the policy refuses it; writes what it prepared.
+struct ProbabilitySink {
+    refuse: Box<dyn Fn(&Record, usize) -> bool + Send>,
+    calls: Arc<std::sync::atomic::AtomicUsize>,
+    written: mpsc::Sender<bool>,
+}
+
+impl Sink for ProbabilitySink {
+    type Prepared = bool;
+    fn preparation_bytes(_: usize) -> usize {
+        512
+    }
+    fn prepare(&self, record: &Record, _: usize) -> Result<bool, ()> {
+        let call = self.calls.fetch_add(1, Ordering::AcqRel);
+        if (self.refuse)(record, call) {
+            Err(())
+        } else {
+            Ok(record.provider_logprobs.is_some())
+        }
+    }
+    fn write(&mut self, kept: &bool) -> Result<(), ()> {
+        let _ = self.written.send(*kept);
+        Ok(())
+    }
+}
+
+fn deliver_probabilities(refuse: Box<dyn Fn(&Record, usize) -> bool + Send>) -> bool {
+    let (written, observed) = mpsc::channel();
+    let delivery = Delivery::new(
+        limits(),
+        ProbabilitySink {
+            refuse,
+            calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            written,
+        },
+    )
+    .unwrap();
+    assert!(delivery.submit(record_with_probabilities("probabilities")));
+    let kept = observed.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert!(delivery.close_until(Instant::now() + Duration::from_secs(1)));
+    kept
+}
+
+#[test]
+fn a_sink_that_refuses_only_the_probabilities_gets_the_exchange_without_them() {
+    // The sink's own limit (any payload shape) is exceeded only with the sidecar.
+    assert!(!deliver_probabilities(Box::new(|record, _| {
+        record.provider_logprobs.is_some()
+    })));
+}
+
+#[test]
+fn a_transient_preparation_failure_keeps_the_probabilities() {
+    assert!(deliver_probabilities(Box::new(|_, call| call == 0)));
+}

@@ -239,7 +239,14 @@ impl Normalizer {
                     .iter()
                     .any(|key| match delta.get(*key) {
                         Some(Value::String(text)) => !text.is_empty(),
-                        Some(Value::Array(parts)) => !parts.is_empty(),
+                        // Answer text only: typed thinking or reference parts carry none.
+                        Some(Value::Array(parts)) => parts.iter().any(|part| {
+                            part.get("type").and_then(Value::as_str) == Some("text")
+                                && part
+                                    .get("text")
+                                    .and_then(Value::as_str)
+                                    .is_some_and(|text| !text.is_empty())
+                        }),
                         _ => false,
                     })
             });

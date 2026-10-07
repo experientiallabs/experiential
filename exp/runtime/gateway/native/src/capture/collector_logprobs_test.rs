@@ -119,39 +119,6 @@ fn probabilities_never_outgrow_the_destination_record_ceiling() {
 }
 
 #[test]
-fn an_unencodable_record_sheds_its_probabilities_and_keeps_the_exchange() {
-    let mut record = Record {
-        checkpointed: false,
-        schema_version: SCHEMA_VERSION,
-        request: request("shed"),
-        response: Some(response()),
-        transport: None,
-        provider_reasoning: None,
-        provider_reasoning_source_json: None,
-        provider_tool_calls_json: None,
-        deployment_id: None,
-        metrics: None,
-        gemini_thought_parts: Vec::new(),
-        gemini_thought_parts_source_json: None,
-        captured_at: 1.0,
-        provider_logprobs: Some(crate::capture::logprobs::Captured::injected()),
-    };
-    let captured = record.provider_logprobs.as_mut().unwrap();
-    captured.extend(vec![probability("a")], false, |_| true);
-    let full = record.encode(1 << 20).unwrap().len();
-    // A ceiling the probabilities overflow but the exchange fits.
-    let ceiling = full - 8;
-    assert!(record.encode(ceiling).is_none());
-    // A ceiling the record already fits is not a size failure: nothing is shed.
-    assert!(!crate::capture::logprobs::shed(&mut record, full));
-    assert!(record.provider_logprobs.is_some());
-    assert!(crate::capture::logprobs::shed(&mut record, ceiling));
-    assert!(record.encode(ceiling).is_some());
-    assert!(record.provider_logprobs.is_none());
-    assert!(!crate::capture::logprobs::shed(&mut record, ceiling));
-}
-
-#[test]
 fn injection_is_declined_when_its_marker_cannot_be_reserved() {
     let mut config = logprobs_config();
     let (probe, _) = collector(config.clone());
@@ -206,5 +173,25 @@ fn probabilities_stay_only_beside_a_complete_captured_response() {
     assert!(collector.finish("prefix", Some(truncated), Some("d".into())));
     let records = drain(&collector, receiver);
     assert!(records[0].response.is_some());
+    assert!(records[0].provider_logprobs.is_none());
+}
+
+#[test]
+fn a_stream_the_client_left_early_drops_its_probabilities() {
+    let (collector, receiver) = collector(logprobs_config());
+    assert!(collector.begin(request("left")));
+    assert!(collector.wants_logprobs("left"));
+    collector.logprobs_injected("left");
+    collector.logprobs("left", vec![probability("a")], false);
+    collector.settle("left", true, true);
+    let left = Response::Sse {
+        status: 200,
+        frames: vec![json!({"choices":[]})],
+        truncated: false,
+        client_disconnected: true,
+        source_json: None,
+    };
+    assert!(collector.finish("left", Some(left), Some("d".into())));
+    let records = drain(&collector, receiver);
     assert!(records[0].provider_logprobs.is_none());
 }
