@@ -6,6 +6,7 @@ from datetime import datetime
 
 from exp.common.core.artifacts import ArtifactInput
 from exp.common.project import ProjectBuildArtifacts, ProjectStore, artifact_input
+from exp.common.tasks import load_task_set
 from exp.common.traces.ingest.otlp import TraceNormalizationResult
 from exp.optimize.router.errors import RouterCompositionError
 from exp.simulation.build import BuildReviewReadiness, ProjectBuild, build_project
@@ -78,6 +79,14 @@ def reconstruct_completed_project_build(
         raise RouterCompositionError("completed project build review is invalid") from exc
     if review.trace_dataset != completed.trace_dataset or review.task_set != completed.task_set:
         raise RouterCompositionError("completed project build review names different artifacts")
+    if any(
+        task.origin == "authored"
+        for task in load_task_set(project.artifacts, completed.task_set.artifact_id).tasks
+    ):
+        raise RouterCompositionError(
+            "router optimization replays mined scenarios only, and this build selects authored "
+            "scenarios; restore the mined set with select_authored_scenarios(project, ()) first"
+        )
     try:
         trace_input = artifact_input(
             project.artifacts.read(completed.trace_dataset.artifact_id).manifest

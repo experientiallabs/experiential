@@ -488,26 +488,42 @@ def select_build_task_set(store: ProjectStore, task_set: ArtifactInput) -> None:
     """Select another task set over the completed build's unchanged trace evidence.
 
     The trace dataset, retrieval indexes and world model stay selected. The build review is
-    rebound to the new task set, which discards judge state bound to the previous one.
+    rebound to the new task set, which discards judge state bound to the previous one. The
+    check and the rebinding share one project write transaction, so a concurrent build or
+    hosted binding cannot interleave.
 
     Args:
-        store: Project with a completed build and its build review.
+        store: Plain project with a completed build and its build review.
         task_set: Task-set manifest whose only input is the build's trace dataset.
 
     Raises:
-        ValueError: The project has no completed build review, or it names another build.
+        ValueError: The project has no completed build review, it names another build, or
+            hosted spend, judge or router evidence is bound to the current task set.
     """
-    with _build_review_coordination(store):
+    with _build_review_coordination(store), project_connection(store.paths.root, write=True):
         config = store.load_project()
         build = config.build
         current = store.read_review()
         if build is None or not isinstance(current, dict) or "build_review" not in current:
             raise ValueError("project has no completed build review; run exp build first")
         review = BuildReviewReadiness.model_validate(current["build_review"])
-        if review.task_set != build.task_set or review.trace_dataset != build.trace_dataset:
+        if review.trace_dataset != build.trace_dataset or review.task_set != build.task_set:
             raise ValueError("project build review differs from its selected build; rebuild it")
         if task_set == build.task_set:
             return
+        if any(
+            binding is not None
+            for binding in (
+                config.build_spend_ledger,
+                config.hosted_judge,
+                config.router_policy,
+                config.router_report,
+            )
+        ):
+            raise ValueError(
+                "hosted or router-bound projects keep their task set; select scenarios on a "
+                "plain evaluation project"
+            )
         binding = review.model_dump(mode="json", exclude={"readiness_id"})
         binding["task_set"] = task_set.model_dump(mode="json")
         select_completed_build(

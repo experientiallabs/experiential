@@ -736,6 +736,9 @@ class WorldModelSimulator:
             candidate=candidate,
             world_model=world_model,
         )
+        # The reference answer is judge-only: the recorder (the agent's injected model) and the
+        # episode loop receive the task without it.
+        task = task.model_copy(update={"reference_answer": None})
         recorder = RecordingCandidateClient(
             task=task,
             candidate=candidate,

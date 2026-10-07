@@ -129,23 +129,9 @@ def select_authored_scenarios(
     # Hold the build-selection lock so a concurrent rebuild cannot be replaced by a task set
     # derived from the build read here.
     with coordinate_completed_build_selection(project):
-        config = project.load_project()
-        build = config.build
+        build = project.load_project().build
         if build is None:
             raise ValueError("select scenarios after the build completes; run exp build first")
-        if any(
-            binding is not None
-            for binding in (
-                config.build_spend_ledger,
-                config.hosted_judge,
-                config.router_policy,
-                config.router_report,
-            )
-        ):
-            raise ValueError(
-                "hosted or router-bound projects keep their mined scenarios; select authored "
-                "scenarios on a plain evaluation project"
-            )
         current = load_task_set(project.artifacts, build.task_set.artifact_id)
         bindings = load_task_set_lineage_bindings(project.artifacts, build.task_set.artifact_id)
         mined = tuple(task for task in current.tasks if task.origin == "mined")
