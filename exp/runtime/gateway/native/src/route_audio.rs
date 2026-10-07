@@ -185,7 +185,7 @@ pub(crate) async fn transcriptions(
         Err(_) => return error_response(&upload_deadline_error()),
     };
     // Measured under the still-held permit, never under a cancelling timeout.
-    let (fields, upload) = match measure_upload(fields, upload).await {
+    let (fields, upload, permit) = match measure_upload(fields, upload, permit).await {
         Ok(measured) => measured,
         Err(error) => return error_response(&error),
     };

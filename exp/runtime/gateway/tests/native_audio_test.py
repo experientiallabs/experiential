@@ -577,6 +577,28 @@ def test_oversized_or_repeated_audio_request_parts_are_refused_before_the_bridge
         timeout=10.0,
     )
     assert oversized.status_code == 413
+    long_name = httpx.post(
+        f"{engine.base}/v1/audio/transcriptions",
+        headers=auth,
+        data={"model": "scribe"},
+        files={"file": ("a" * 300 + ".wav", _wav(0.1), "audio/wav")},
+        timeout=10.0,
+    )
+    assert long_name.status_code == 400
+    assert long_name.json()["error"]["param"] == "file"
+    audio = base64.b64encode(_wav(0.1)).decode()
+    for input_audio, param in (
+        ({"data": audio, "fromat": "wav"}, "input_audio.fromat"),
+        ({"data": audio, "format": 3}, "input_audio.format"),
+    ):
+        refused = httpx.post(
+            f"{engine.base}/v1/audio/transcriptions",
+            headers=auth,
+            json={"model": "scribe", "input_audio": input_audio},
+            timeout=10.0,
+        )
+        assert refused.status_code == 400
+        assert refused.json()["error"]["param"] == param
 
 
 def test_provider_client_error_relays_the_parameter(engine: _ServingEngine) -> None:

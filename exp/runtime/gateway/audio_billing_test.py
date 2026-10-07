@@ -70,3 +70,14 @@ def test_a_unit_card_of_the_surface_kind_bills_units_else_tokens() -> None:
     )
     tiered = tokens.model_copy(update={"long_context": tier})
     assert billing_mode(_deployment(tiered, maximum_output_tokens=2_000), "speech") is None
+    # Token rates only on the long-context schedule are still a second meter.
+    tier_only = characters.model_copy(
+        update={
+            "long_context": GatewayLongContextTier(
+                input_threshold_tokens=200_000,
+                input_nano_usd_per_million_tokens=2,
+                output_nano_usd_per_million_tokens=2,
+            )
+        }
+    )
+    assert billing_mode(_deployment(tier_only), "speech") is None

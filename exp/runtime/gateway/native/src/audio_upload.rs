@@ -12,6 +12,7 @@ use axum::http::{header, StatusCode};
 use base64::Engine as _;
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
+use tokio::sync::OwnedSemaphorePermit;
 
 use crate::audio_duration;
 use crate::errors::PublicError;
@@ -68,27 +69,33 @@ pub(crate) async fn read_upload(
 
 /// Measure one read upload and add its facts to the fields admission validates.
 ///
-/// Runs after the timed read and under the caller's still-held permit: the
-/// blocking probe cannot be cancelled, so it must never outlive the permit
-/// that bounds concurrent uploads (a deadline here would release the permit
-/// while the probe kept running).
+/// Runs after the timed read and takes the caller's permit into the blocking
+/// probe, which cannot be cancelled: the permit is released only when the
+/// probe exits (never by a dropped handler or a deadline), and is handed back
+/// with the measured upload.
 pub(crate) async fn measure_upload(
     mut fields: Map<String, Value>,
     upload: AudioUpload,
-) -> Result<(Map<String, Value>, AudioUpload), PublicError> {
+    permit: OwnedSemaphorePermit,
+) -> Result<(Map<String, Value>, AudioUpload, OwnedSemaphorePermit), PublicError> {
     let extension = upload
         .filename
         .rsplit('.')
         .next()
         .unwrap_or_default()
         .to_string();
-    // One owned copy for the blocking probe, which the demuxer consumes.
+    // One owned copy for the blocking probe, which the demuxer consumes. The
+    // permit travels with it: a cancelled handler cannot release capacity
+    // while the uncancellable probe still runs, and it comes back on success.
     let bytes = upload.bytes.clone();
-    let measured =
-        tokio::task::spawn_blocking(move || audio_duration::duration_milli(bytes, &extension))
-            .await
-            .ok()
-            .flatten();
+    let (measured, permit) = match tokio::task::spawn_blocking(move || {
+        (audio_duration::duration_milli(bytes, &extension), permit)
+    })
+    .await
+    {
+        Ok((measured, permit)) => (measured, Some(permit)),
+        Err(_) => (None, None),
+    };
     if measured.is_some_and(|milli| milli > MAXIMUM_TRANSCRIPTION_AUDIO_MILLI) {
         let mut error = PublicError::new(
             400,
@@ -119,7 +126,8 @@ pub(crate) async fn measure_upload(
     file.insert("sha256".to_string(), json!(sha256));
     file.insert("duration_milli".to_string(), json!(duration_milli));
     fields.insert("file".to_string(), Value::Object(file));
-    Ok((fields, upload))
+    let permit = permit.ok_or_else(PublicError::internal)?;
+    Ok((fields, upload, permit))
 }
 
 async fn parse_multipart(
@@ -156,6 +164,18 @@ async fn parse_multipart(
                 .content_type()
                 .unwrap_or("application/octet-stream")
                 .to_string();
+            // The canonical contract's limits, enforced before anything is
+            // copied into the probe or the bridge argument.
+            if filename.chars().count() > MAXIMUM_FILENAME_CHARACTERS
+                || content_type.chars().count() > MAXIMUM_CONTENT_TYPE_CHARACTERS
+            {
+                let mut error = invalid_upload(&format!(
+                    "The file part's filename must be at most {MAXIMUM_FILENAME_CHARACTERS} \
+                     characters and its content type at most {MAXIMUM_CONTENT_TYPE_CHARACTERS}."
+                ));
+                error.param = Some("file".to_string());
+                return Err(error);
+            }
             let bytes = field.bytes().await.map_err(|_| {
                 invalid_upload("The multipart file part is malformed or truncated.")
             })?;
@@ -173,6 +193,12 @@ async fn parse_multipart(
         .ok_or_else(|| invalid_upload("The upload must carry a multipart part named file."))?;
     Ok((fields, upload))
 }
+
+/// Longest upload filename accepted (`TranscriptionRequest.audio_filename`).
+const MAXIMUM_FILENAME_CHARACTERS: usize = 256;
+
+/// Longest upload content type accepted (`TranscriptionRequest.audio_content_type`).
+const MAXIMUM_CONTENT_TYPE_CHARACTERS: usize = 128;
 
 /// Longest text form field accepted, in bytes: the longest supported field
 /// (`prompt`, 4,096 characters) in four-byte UTF-8, so no single field can
@@ -291,6 +317,17 @@ async fn parse_json_upload(
             "The upload must carry a multipart file part or an input_audio object.",
         ));
     };
+    // A closed object: a misspelled or extra key is refused, never ignored.
+    if let Some(unknown) = input_audio
+        .keys()
+        .find(|key| !matches!(key.as_str(), "data" | "format"))
+    {
+        let mut error = invalid_upload(&format!(
+            "input_audio.{unknown} is not supported; input_audio takes data and format."
+        ));
+        error.param = Some(format!("input_audio.{unknown}"));
+        return Err(error);
+    }
     let data = input_audio
         .get("data")
         .and_then(Value::as_str)
@@ -298,11 +335,12 @@ async fn parse_json_upload(
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(data)
         .map_err(|_| invalid_upload("input_audio.data is not valid base64."))?;
-    let format = input_audio
-        .get("format")
-        .and_then(Value::as_str)
-        .unwrap_or("wav")
-        .to_ascii_lowercase();
+    // Omitted means WAV; a supplied format must be one of the named strings.
+    let format = match input_audio.get("format") {
+        None => "wav".to_string(),
+        Some(Value::String(format)) => format.to_ascii_lowercase(),
+        Some(_) => String::new(),
+    };
     let content_type = match format.as_str() {
         "wav" => "audio/wav",
         "mp3" | "mpeg" => "audio/mpeg",

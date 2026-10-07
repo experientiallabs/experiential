@@ -90,9 +90,12 @@ def billing_mode(deployment: ExactModelDeployment, surface: AudioSurface) -> Bil
     kind = BilledUnitKind.CHARACTER if surface == "speech" else BilledUnitKind.AUDIO_SECOND
     prices = deployment.gateway.prices
     unit_priced = flat_unit_rate(prices, kind) is not None
-    any_token_rate = (
-        prices.input_nano_usd_per_million_tokens is not None
-        or prices.output_nano_usd_per_million_tokens is not None
+    # A long-context schedule is a second meter too: audio treats it as reachable.
+    schedules = [prices] if prices.long_context is None else [prices, prices.long_context]
+    any_token_rate = any(
+        schedule.input_nano_usd_per_million_tokens is not None
+        or schedule.output_nano_usd_per_million_tokens is not None
+        for schedule in schedules
     )
     if unit_priced:
         return None if any_token_rate else "units"
