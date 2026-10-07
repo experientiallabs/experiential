@@ -46,6 +46,10 @@ on the exact release checkout.
   nonnegative input token rate, and output token rate zero. Requests are bounded to 32 questions,
   64 choice or 10 score criteria, and 262,144 bytes. Accounting reserves bounded per-question
   estimates, not provider-enforced output limits, and settles only provider-reported usage.
+- Native `POST /v1/decisions` serves OpenAI Decisions API requests (`predicate`, `choice`, and
+  `score` questions over text or inline base64 images) on the same decisions surface, through
+  direct OpenAI deployments that declare decisions support and price output at zero, billed on
+  reported input tokens.
   Real Rust HTTP and SQLite tests cover all answer types, authentication, unsupported inputs,
   missing or invalid usage, certified 401 fallback, cancellation, timeout, and content-free accounting.
 - The no-subcommand default gateway launch, the direct `exp run [PROJECT]` form, and the

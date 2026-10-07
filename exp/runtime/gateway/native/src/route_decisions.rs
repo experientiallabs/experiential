@@ -1,4 +1,10 @@
-//! Native `POST /v1/systemone`: buffered TypeSafe decisions, not chat.
+//! Native decisions: `POST /v1/systemone` (TypeSafe SystemOne wire) and
+//! `POST /v1/decisions` (OpenAI Decisions API wire), buffered, not chat.
+//!
+//! Both wires share admission authority, the attempt ladder, settlement and
+//! billing evidence; they differ only in the admission bridge method, the
+//! upstream dialect, and how a provider answer is validated against the
+//! admitted questions.
 //!
 //! Admission builds the exact provider payload and owns authorization and
 //! reservations. Each physical dispatch uses the shared attempt lifecycle;
@@ -41,9 +47,28 @@ struct DecisionsAdmission {
     exact_model_id: String,
     route_reason: String,
     route: Vec<DeploymentWire>,
+    /// SystemOne question definitions keyed by question ID.
+    #[serde(default)]
     questions: Map<String, Value>,
+    /// Which decisions wire this admission dispatches.
+    #[serde(default)]
+    wire: DecisionWire,
+    /// OpenAI question definitions, in request order (OpenAI wire only).
+    #[serde(default)]
+    openai_questions: Vec<Value>,
     maximum_total_attempts: u32,
     maximum_same_deployment_attempts: u32,
+}
+
+/// The upstream decisions wire an admission dispatches.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum DecisionWire {
+    /// TypeSafe SystemOne (`/v1/systemone`).
+    #[default]
+    Systemone,
+    /// OpenAI Decisions API (`/v1/decisions`).
+    Openai,
 }
 
 impl DecisionsAdmission {
@@ -65,9 +90,33 @@ struct Served {
     usage: Usage,
 }
 
+/// `POST /v1/systemone`: the TypeSafe SystemOne decisions wire.
 pub(crate) async fn decisions(
     State(state): State<AppState>,
     request: axum::extract::Request,
+) -> Response {
+    serve(state, request, "admit_decisions", DecisionWire::Systemone).await
+}
+
+/// `POST /v1/decisions`: the OpenAI Decisions API wire.
+pub(crate) async fn openai_decisions(
+    State(state): State<AppState>,
+    request: axum::extract::Request,
+) -> Response {
+    serve(
+        state,
+        request,
+        "admit_openai_decisions",
+        DecisionWire::Openai,
+    )
+    .await
+}
+
+async fn serve(
+    state: AppState,
+    request: axum::extract::Request,
+    admission_method: &'static str,
+    expected_wire: DecisionWire,
 ) -> Response {
     state.handled_requests.fetch_add(1, Ordering::Relaxed);
     let started = Instant::now();
@@ -93,7 +142,7 @@ pub(crate) async fn decisions(
     };
     let client_request_id = latin1_header(&headers, "x-client-request-id");
     let argument = admission_argument(&raw_key, &body_text, &headers);
-    let admission_text = match state.bridge.call("admit_decisions", argument).await {
+    let admission_text = match state.bridge.call(admission_method, argument).await {
         Ok(text) => text,
         Err(error) => return error_response(&error),
     };
@@ -105,9 +154,9 @@ pub(crate) async fn decisions(
         METRICS.record_escalation(classify_escalation(reason.as_str().unwrap_or_default()));
         return error_response(&escalation_error());
     }
-    let admission: DecisionsAdmission = match serde_json::from_value(admission_value.clone()) {
-        Ok(admission) => admission,
-        Err(_) => return wire_drift_response(&state, &admission_value, started).await,
+    let admission = match serde_json::from_value::<DecisionsAdmission>(admission_value.clone()) {
+        Ok(admission) if admission.wire == expected_wire => admission,
+        _ => return wire_drift_response(&state, &admission_value, started).await,
     };
     let mut guard = new_guard(&state, admission.request_id.clone(), started);
     let _permit = match acquire_permit(&state, &mut guard, deadline).await {
@@ -300,7 +349,16 @@ async fn dispatch(
     admission: &DecisionsAdmission,
     guard: &mut AttemptGuard,
 ) -> Result<(Value, Usage), Failure> {
-    if wire.dialect != "typesafe_systemone" || !wire.timeout_seconds.is_finite() {
+    let dialect = match admission.wire {
+        DecisionWire::Systemone if wire.dialect == "typesafe_systemone" => {
+            Dialect::TypesafeSystemone
+        }
+        // Direct OpenAI connections speak the Responses dialect for chat; the
+        // decisions endpoint shares their OpenAI error envelope.
+        DecisionWire::Openai if wire.dialect == "openai_responses" => Dialect::OpenAiCompatible,
+        _ => return Err(wire_failure()),
+    };
+    if !wire.timeout_seconds.is_finite() {
         return Err(wire_failure());
     }
     if remaining(deadline).is_zero() {
@@ -316,7 +374,7 @@ async fn dispatch(
         &wire.upstream_payload,
         None,
         remaining(deadline).min(phase_timeout),
-        Dialect::TypesafeSystemone,
+        dialect,
     )
     .await?;
     collect_response(response, deadline, phase_timeout, admission, guard).await
@@ -347,7 +405,10 @@ async fn collect_response(
     if let Ok(usage) = decision_usage(&payload) {
         guard.record_decision_usage(usage);
     }
-    let served = public_decisions(payload, admission)?;
+    let served = match admission.wire {
+        DecisionWire::Systemone => public_decisions(payload, admission)?,
+        DecisionWire::Openai => public_openai_decisions(payload, admission)?,
+    };
     if remaining(deadline).is_zero() {
         return Err(timeout_failure());
     }
@@ -560,6 +621,166 @@ fn public_decisions(
         "usage": {"input_tokens": usage.input_tokens, "output_tokens": usage.output_tokens}}),
         usage,
     ))
+}
+
+/// Validate an OpenAI Decisions API answer against the admitted questions.
+///
+/// Every admitted question needs exactly one answer of the same name and type.
+/// Probabilities must be finite, within `[0, 1]`, keyed by exactly the
+/// requested values (choice) or levels (score), and sum to one within the
+/// published-rounding envelope. A choice must name a requested value that can
+/// be highest-probability. Answers pass through verbatim in question order with
+/// the public alias as `model` and the provider's usage block.
+fn public_openai_decisions(
+    payload: Value,
+    admission: &DecisionsAdmission,
+) -> Result<(Value, Usage), Failure> {
+    let answers = payload
+        .get("answers")
+        .and_then(Value::as_array)
+        .ok_or_else(|| malformed("decision response omitted its answers array"))?;
+    if answers.len() != admission.openai_questions.len() {
+        return Err(malformed(
+            "decision response answer count does not match the request",
+        ));
+    }
+    let mut by_name: Map<String, Value> = Map::new();
+    for answer in answers {
+        let name = answer
+            .get("name")
+            .and_then(Value::as_str)
+            .ok_or_else(|| malformed("decision answer omitted its question name"))?;
+        if by_name.insert(name.to_string(), answer.clone()).is_some() {
+            return Err(malformed("decision response repeats a question name"));
+        }
+    }
+    let mut public_answers = Vec::with_capacity(admission.openai_questions.len());
+    for question in &admission.openai_questions {
+        let name = question
+            .get("name")
+            .and_then(Value::as_str)
+            .ok_or_else(wire_failure)?;
+        let kind = question
+            .get("type")
+            .and_then(Value::as_str)
+            .ok_or_else(wire_failure)?;
+        let answer = by_name.get(name).ok_or_else(|| {
+            malformed("decision response question names do not match the request")
+        })?;
+        if answer.get("type").and_then(Value::as_str) != Some(kind) {
+            return Err(malformed(
+                "decision answer type does not match the question",
+            ));
+        }
+        match kind {
+            "predicate" => {
+                probability(&answer["probability"])?;
+            }
+            "choice" => {
+                let values: Vec<&str> = question
+                    .get("choices")
+                    .and_then(Value::as_array)
+                    .ok_or_else(wire_failure)?
+                    .iter()
+                    .map(|choice| choice.get("value").and_then(Value::as_str))
+                    .collect::<Option<_>>()
+                    .ok_or_else(wire_failure)?;
+                let probabilities = listed_distribution(&answer["probabilities"], &values)?;
+                let choice = answer
+                    .get("choice")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| malformed("decision choice is not a requested value"))?;
+                let selected = values
+                    .iter()
+                    .position(|value| *value == choice)
+                    .ok_or_else(|| malformed("decision choice is not a requested value"))?;
+                probability(&answer["confidence"])?;
+                if !choice_can_be_highest(selected, &probabilities) {
+                    return Err(malformed(
+                        "decision choice is not a highest-probability value",
+                    ));
+                }
+            }
+            "score" => {
+                let levels = question
+                    .get("levels")
+                    .and_then(Value::as_array)
+                    .ok_or_else(wire_failure)?;
+                answer
+                    .get("score")
+                    .and_then(Value::as_f64)
+                    .filter(|value| value.is_finite())
+                    .ok_or_else(|| malformed("decision score is not finite numeric data"))?;
+                probability(&answer["confidence"])?;
+                let entries = answer
+                    .get("probabilities")
+                    .and_then(Value::as_array)
+                    .ok_or_else(|| malformed("decision omitted its probability list"))?;
+                if entries.len() != levels.len() {
+                    return Err(malformed(
+                        "decision score probabilities do not match the requested levels",
+                    ));
+                }
+                let values = entries
+                    .iter()
+                    .map(|entry| probability(&entry["probability"]))
+                    .collect::<Result<Vec<_>, _>>()?;
+                unit_total(&values)?;
+            }
+            _ => return Err(wire_failure()),
+        }
+        public_answers.push(answer.clone());
+    }
+    let usage = decision_usage(&payload)?;
+    Ok((
+        json!({"model": admission.alias, "answers": public_answers, "usage": payload["usage"]}),
+        usage,
+    ))
+}
+
+/// Validate a `[{value, probability}]` list covering exactly `values`, returning
+/// probabilities in requested order.
+fn listed_distribution(value: &Value, values: &[&str]) -> Result<Vec<f64>, Failure> {
+    let entries = value
+        .as_array()
+        .ok_or_else(|| malformed("decision omitted its probability list"))?;
+    if entries.len() != values.len() {
+        return Err(malformed(
+            "decision probability values do not match the request",
+        ));
+    }
+    let mut ordered: Vec<Option<f64>> = vec![None; values.len()];
+    for entry in entries {
+        let key = entry
+            .get("value")
+            .and_then(Value::as_str)
+            .ok_or_else(|| malformed("decision probability omitted its value"))?;
+        let index = values
+            .iter()
+            .position(|value| *value == key)
+            .ok_or_else(|| malformed("decision probability values do not match the request"))?;
+        if ordered[index].is_some() {
+            return Err(malformed("decision probability repeats a value"));
+        }
+        ordered[index] = Some(probability(&entry["probability"])?);
+    }
+    let probabilities: Vec<f64> = ordered
+        .into_iter()
+        .map(|value| value.unwrap_or(0.0))
+        .collect();
+    unit_total(&probabilities)?;
+    Ok(probabilities)
+}
+
+/// Require a unit total, allowing only the hundredth-rounding envelope.
+fn unit_total(values: &[f64]) -> Result<(), Failure> {
+    let sum: f64 = values.iter().sum();
+    if (sum - 1.0).abs() > PROBABILITY_TOLERANCE
+        && !rounding_bounds(values).is_some_and(|bounds| admits_unit_total(&bounds))
+    {
+        return Err(malformed("decision probabilities do not sum to one"));
+    }
+    Ok(())
 }
 
 /// Validate the provider's billing evidence without trusting the decision answers.

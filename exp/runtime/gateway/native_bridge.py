@@ -100,6 +100,7 @@ from exp.runtime.gateway.native_explicit_cache import (
 )
 from exp.runtime.gateway.native_images import NativeImagesMixin
 from exp.runtime.gateway.native_observability import NativeObservabilityMixin
+from exp.runtime.gateway.native_openai_decisions import NativeOpenAIDecisionsMixin
 from exp.runtime.gateway.native_reasoning import (
     authenticate_reasoning_history,
     has_active_reasoning_content,
@@ -165,6 +166,7 @@ class NativeControlPlane(
     NativeToolSearchMixin,
     NativeCountTokensMixin,
     NativeDecisionsMixin,
+    NativeOpenAIDecisionsMixin,
     NativeEmbeddingsMixin,
     NativeImagesMixin,
     NativeObservabilityMixin,

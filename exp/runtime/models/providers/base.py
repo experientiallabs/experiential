@@ -336,6 +336,11 @@ class GatewayWireProfile:
     decisions_url: str | None = None
     """Full TypeSafe SystemOne endpoint, absent on non-decision connections."""
 
+    openai_decisions_url: str | None = None
+    """Full OpenAI Decisions API ``/decisions`` endpoint, present only on direct
+    OpenAI connections and sharing ``headers``; ``None`` keeps the OpenAI-shaped
+    decisions surface off every other wire."""
+
     images_url: str | None = None
     """Full OpenAI-wire ``/images/generations`` endpoint for this connection,
     sharing ``headers``; ``None`` when the connection speaks no images wire."""
