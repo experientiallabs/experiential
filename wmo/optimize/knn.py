@@ -297,7 +297,6 @@ def fit_knn_artifact(
     se_floor: bool = True,
     floor_q: float = 0.05,
     compression: CompressionConfig | None = None,
-    built: Embedder | None = None,
 ) -> KnnFitOutcome:
     """Fit a knn policy, write it and its bank sidecar, and replay it over the fit matrix.
 
@@ -320,13 +319,7 @@ def fit_knn_artifact(
         raise ValueError("rag_thres must be greater than 0")
     selected_ids = fit_ids if fit_ids is not None else matrix.scenario_ids()
     fit_digest = hashlib.sha256("\0".join(selected_ids).encode("utf-8")).hexdigest()[:16]
-    # `built` lets a caller substitute the embedding COMPUTATION (a reproduction run serving
-    # recorded vectors from a cache) while `embedder` stays the artifact's recorded identity:
-    # the vectors are that spec's vectors wherever they were computed, and serving still
-    # rebuilds from the spec. The substitute must be geometry-identical to the spec or the
-    # bank it fits is a lie; `wmo reproduce` is the only shipped caller.
-    if built is None:
-        built = embedder.build()
+    built = embedder.build()
     if compression is not None:
         # Representation consistency, the C2 rule that makes or breaks a compressed arm: the
         # bank rows and the novelty-floor quantile have to live in the geometry of the text
