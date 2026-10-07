@@ -51,8 +51,8 @@ struct DecisionsAdmission {
     /// SystemOne question definitions keyed by question ID.
     #[serde(default)]
     questions: Map<String, Value>,
-    /// Which decisions wire this admission dispatches.
-    #[serde(default)]
+    /// Which decisions wire this admission dispatches; required, so a stale
+    /// or malformed producer fails closed as wire drift.
     wire: DecisionWire,
     /// OpenAI question definitions, in request order (OpenAI wire only).
     #[serde(default)]

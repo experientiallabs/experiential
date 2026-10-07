@@ -90,6 +90,8 @@ fn openai_answers_that_do_not_match_the_questions_are_malformed() {
     wrong_index["answers"][2]["probabilities"][1]["value"] = json!(5);
     let mut score_outside = openai_payload();
     score_outside["answers"][2]["score"] = json!(3.0);
+    let mut score_mismatch = openai_payload();
+    score_mismatch["answers"][2]["score"] = json!(0.1);
     let mut overcached = openai_payload();
     overcached["usage"]["input_tokens_details"]["cached_tokens"] = json!(275);
     for payload in [
@@ -106,6 +108,7 @@ fn openai_answers_that_do_not_match_the_questions_are_malformed() {
         wrong_label,
         wrong_index,
         score_outside,
+        score_mismatch,
         overcached,
     ] {
         let failure = public_openai_decisions(payload, &openai_admission()).expect_err("malformed");
@@ -158,4 +161,23 @@ fn openai_boolean_choice_values_stay_typed() {
     payload["answers"][0]["choice"] = json!("true");
     let failure = public_openai_decisions(payload, &admission).expect_err("not highest");
     assert_eq!(failure.failure_class, FailureClass::MalformedResponse);
+}
+
+#[test]
+fn openai_one_based_score_values_match_their_weighted_average() {
+    let mut payload = openai_payload();
+    payload["answers"][2]["score"] = json!(1.7);
+    payload["answers"][2]["probabilities"][0]["value"] = json!(1);
+    payload["answers"][2]["probabilities"][1]["value"] = json!(2);
+    public_openai_decisions(payload, &openai_admission()).unwrap();
+}
+
+#[test]
+fn an_admission_without_its_wire_is_refused_as_drift() {
+    let missing = serde_json::from_value::<DecisionsAdmission>(json!({
+        "request_id": "request-1", "alias": "a", "alias_revision_id": "r", "exact_model_id": "m",
+        "route_reason": "direct", "route": [], "questions": {},
+        "maximum_total_attempts": 1, "maximum_same_deployment_attempts": 1,
+    }));
+    assert!(missing.is_err());
 }

@@ -10,8 +10,8 @@
 use serde_json::{json, Value};
 
 use super::{
-    choice_can_be_highest, decision_usage, malformed, probability, token_count, unit_total,
-    wire_failure, DecisionsAdmission, PROBABILITY_TOLERANCE,
+    choice_can_be_highest, decision_usage, malformed, probability, score_matches_distribution,
+    token_count, unit_total, wire_failure, DecisionsAdmission,
 };
 use crate::errors::Failure;
 use crate::events::Usage;
@@ -23,7 +23,7 @@ use crate::events::Usage;
 /// within `[0, 1]`, keyed by exactly the requested values (choice) or levels
 /// in order (score), and sum to one within the published-rounding envelope.
 /// A choice must name a requested value that can be highest-probability; a
-/// score must lie within its levels' value range. Answers pass through
+/// score must equal the probability-weighted average of its level values. Answers pass through
 /// verbatim in question order with the public alias as `model` and the
 /// provider's usage block.
 pub(super) fn public_openai_decisions(
@@ -192,15 +192,12 @@ fn validate_score(question: &Value, answer: &Value) -> Result<(), Failure> {
         probabilities.push(probability(&entry["probability"])?);
     }
     unit_total(&probabilities)?;
-    let (low, high) = match (
-        first,
-        entries.last().and_then(|entry| entry["value"].as_i64()),
-    ) {
-        (Some(low), Some(high)) => (low as f64, high as f64),
-        _ => return Err(wire_failure()),
-    };
-    if score < low - PROBABILITY_TOLERANCE || score > high + PROBABILITY_TOLERANCE {
-        return Err(malformed("decision score lies outside its levels"));
+    // The score is the probability-weighted average of the level values, and
+    // values are base + position, so the score less its base is the
+    // position-weighted average SystemOne scores already satisfy.
+    let base = first.ok_or_else(wire_failure)?;
+    if !score_matches_distribution(score - base as f64, &probabilities) {
+        return Err(malformed("decision score does not match its probabilities"));
     }
     Ok(())
 }

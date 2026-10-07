@@ -255,6 +255,7 @@ def _admit_accepted(
         "exact_model_id": route.snapshot.exact_model_id,
         "route_reason": route.route_reason,
         "route": wire_route,
+        "wire": "systemone",
         "questions": {
             name: question.model_dump(mode="json", exclude_none=True)
             for name, question in request.questions.items()
