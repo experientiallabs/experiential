@@ -399,6 +399,73 @@ def test_observation_budget_counts_private_context_before_dispatch() -> None:
         engine.close(timeout_seconds=2)
 
 
+def test_pending_observation_revisits_do_not_report_skipped_coverage() -> None:
+    """The normal admission/dispatch tuple reuses one pending subject at full capacity."""
+    classifier = _Classifier(GuardrailOutcome.ALLOW)
+    engine = _Engine(classifier, max_observations=1)
+    request = _request("original")
+    session = _session(engine)
+    try:
+        session.inspect_input(request)
+        assert classifier.started.wait(2)
+        session.prepare_dispatch(
+            (request, request.model_copy(deep=True), request, request.model_copy()),
+            overlap=False,
+        )
+        classifier.release.set()
+        engine.close(timeout_seconds=2)
+        assert classifier.input_calls == 1
+        assert engine.observed == [("platform-observer", "input", GuardrailOutcome.ALLOW)]
+    finally:
+        classifier.release.set()
+        engine.close(timeout_seconds=2)
+
+
+@pytest.mark.parametrize("bound", ["policy", "owner"])
+def test_oversized_subject_closes_session_observation_with_one_coverage_outcome(bound: str) -> None:
+    """A rejected large subject records incomplete request coverage once without retaining text."""
+    classifier = _Classifier(GuardrailOutcome.ALLOW)
+    policy = _policy().model_copy(
+        update={"max_request_bytes": 8192 if bound == "policy" else 1_000_000}
+    )
+    engine = _Engine(classifier, policy, max_observation_bytes=8192)
+    request = _request("x" * 100_000)
+    session = _session(engine)
+    try:
+        session.inspect_input(request)
+        session.prepare_dispatch(
+            (request, request.model_copy(deep=True), request, _request("later recovered text")),
+            overlap=False,
+        )
+        engine.close(timeout_seconds=2)
+        outcome = GuardrailOutcome.UNSUPPORTED if bound == "policy" else GuardrailOutcome.SKIPPED
+        assert classifier.input_calls == 0
+        assert engine.observed == [("platform-observer", None, outcome)]
+        assert session._observed.closed
+        assert session._observed.fingerprints == set()
+    finally:
+        engine.close(timeout_seconds=2)
+
+
+def test_nested_private_mutation_remains_a_distinct_observation_subject() -> None:
+    """Deduplication reads complete current values even when the request object is reused."""
+    classifier = _Classifier(GuardrailOutcome.ALLOW)
+    classifier.release.set()
+    engine = _Engine(classifier)
+    _, request = _changed_subject("context_management")
+    session = _session(engine)
+    try:
+        session.inspect_input(request)
+        assert engine._observations._idle.wait(2)
+        assert request.context_management is not None
+        request.context_management["private"] = "changed"
+        session.inspect_input(request)
+        engine.close(timeout_seconds=2)
+        assert classifier.input_calls == 2
+    finally:
+        engine.close(timeout_seconds=2)
+
+
 def test_direct_observe_output_never_enforces_a_response_bound() -> None:
     """The public engine API leaves an input-only observer's completion untouched."""
     classifier = _Classifier(GuardrailOutcome.FLAGGED)
@@ -775,4 +842,65 @@ def test_blocked_observation_sink_cannot_stall_skips_or_unsupported_admission(
     finally:
         classifier.release.set()
         release.set()
+        engine.close(timeout_seconds=2)
+
+
+def test_shutdown_drains_a_timely_observer_verdict_without_cancelling_it() -> None:
+    """A positive host drain budget preserves an observation that completes during shutdown."""
+    classifier = _Classifier(GuardrailOutcome.FLAGGED)
+    engine = _Engine(classifier, _policy(timeout_ms=5000))
+    release = threading.Timer(0.02, classifier.release.set)
+    try:
+        _session(engine).inspect_input(_request())
+        assert classifier.started.wait(2)
+        release.start()
+        engine.close(timeout_seconds=2)
+        assert engine.observed == [("platform-observer", "input", GuardrailOutcome.FLAGGED)]
+        assert not classifier.cancelled.is_set()
+        assert engine.observation_recording_dropped == 0
+        assert engine.observation_recording_failed == 0
+    finally:
+        release.cancel()
+        classifier.release.set()
+        engine.close(timeout_seconds=2)
+
+
+def test_shutdown_late_cancellation_record_counts_as_loss_without_exceeding_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An expired shutdown budget cannot promise delivery of a later SKIPPED callback."""
+    classifier = _Classifier(GuardrailOutcome.FLAGGED)
+    engine = _Engine(classifier, _policy(timeout_ms=5000))
+    callback_started = threading.Event()
+    callback_release = threading.Event()
+    emit = engine._emit_observation
+
+    def delayed_emit(
+        policy: GuardrailPolicy,
+        check: GuardrailCheck | None,
+        outcome: GuardrailOutcome,
+        latency_seconds: float,
+    ) -> None:
+        """Place the shutdown cancellation callback deterministically after recorder closure."""
+        if outcome is GuardrailOutcome.SKIPPED:
+            callback_started.set()
+            assert callback_release.wait(5)
+        emit(policy, check, outcome, latency_seconds)
+
+    monkeypatch.setattr(engine, "_emit_observation", delayed_emit)
+    try:
+        _session(engine).inspect_input(_request())
+        assert classifier.started.wait(2)
+        started = time.monotonic()
+        engine.close(timeout_seconds=0.02)
+        assert time.monotonic() - started < 0.5
+        assert callback_started.wait(2)
+        assert engine.observed == []
+        callback_release.set()
+        assert engine._observations._idle.wait(2)
+        assert engine.observation_recording_dropped == 1
+        assert engine.observed == []
+    finally:
+        callback_release.set()
+        classifier.release.set()
         engine.close(timeout_seconds=2)

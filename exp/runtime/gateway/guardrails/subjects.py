@@ -2,10 +2,63 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
+
 from pydantic import BaseModel, JsonValue
 
 from exp.common.core.artifacts import canonical_json_bytes
 from exp.runtime.gateway.contracts import GatewayRequest
+
+
+@dataclass
+class ObservedSubjects:
+    """Keep content-free request-local identities and terminal coverage admission state.
+
+    Attributes:
+        fingerprints: Complete encoded subject hashes considered while admission is open.
+        closed: A definitely oversized subject ended this request's optional observation.
+    """
+
+    fingerprints: set[bytes] = field(default_factory=set)
+    closed: bool = False
+
+
+def observation_subject_exceeds(request: GatewayRequest, limit: int) -> bool:
+    """Reject a definitely oversized subject using character counts without encoding text.
+
+    Character counts are a lower bound on UTF-8 JSON bytes. This bounded walk
+    stops as soon as the limit is exceeded; fitting subjects still receive exact
+    canonical byte accounting before admission.
+    """
+    remaining = limit
+
+    def visit(value: object) -> bool:
+        """Consume a conservative size lower bound without copying string payloads."""
+        nonlocal remaining
+        if isinstance(value, str):
+            remaining -= len(value) + 2
+        elif isinstance(value, BaseModel):
+            remaining -= 2
+            for name in type(value).model_fields:
+                if visit(name) or visit(getattr(value, name)):
+                    return True
+        elif isinstance(value, dict):
+            remaining -= 2
+            for key, item in value.items():
+                if visit(key) or visit(item):
+                    return True
+        elif isinstance(value, (tuple, list)):
+            remaining -= 2
+            for item in value:
+                if visit(item):
+                    return True
+        elif value is None:
+            remaining -= 4
+        elif isinstance(value, (bool, int, float)):
+            remaining -= 1
+        return remaining < 0
+
+    return visit(request)
 
 
 def observation_subject_bytes(request: GatewayRequest) -> bytes:

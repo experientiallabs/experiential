@@ -6,7 +6,6 @@ import time
 from collections.abc import Mapping, Sequence
 from concurrent.futures import Future
 from dataclasses import dataclass, field
-from hashlib import sha256
 from typing import TYPE_CHECKING
 
 from exp.common.core.artifacts import JsonObject
@@ -27,7 +26,7 @@ from exp.runtime.gateway.guardrails.deterministic import (
     native_output_plan,
 )
 from exp.runtime.gateway.guardrails.streaming import StreamSegment
-from exp.runtime.gateway.guardrails.subjects import observation_subject_bytes
+from exp.runtime.gateway.guardrails.subjects import ObservedSubjects
 
 if TYPE_CHECKING:
     from exp.runtime.gateway.guardrails.enforcement import GuardrailEngine
@@ -67,7 +66,7 @@ class GuardrailSession:
         _input_approved_at: Approval time, or None before the current subject is approved.
         _closed: Whether cancellation closed this session, false initially.
         _inspected: Exact input and approved-result pairs, empty before inspection.
-        _observed: In-memory subject fingerprints submitted once to the bounded engine owner.
+        _observed: Content-free subject identities and optional observation admission state.
     """
 
     engine: GuardrailEngine
@@ -81,7 +80,7 @@ class GuardrailSession:
     _inspected: list[tuple[GatewayRequest, GatewayRequest]] = field(
         default_factory=list, init=False, repr=False
     )
-    _observed: set[bytes] = field(default_factory=set, init=False, repr=False)
+    _observed: ObservedSubjects = field(default_factory=ObservedSubjects, init=False, repr=False)
 
     @property
     def enforcing_policies(self) -> tuple[GuardrailPolicy, ...]:
@@ -93,14 +92,12 @@ class GuardrailSession:
         observers = tuple(p for p in self.policies if p.mode == "observe" and p.input_checks)
         if not observers:
             return
-        fingerprint = sha256(observation_subject_bytes(request)).digest()
-        if fingerprint in self._observed:
-            return
-        self._observed.add(fingerprint)
-        for policy in observers:
-            self.engine.observe_input(
-                policy=policy, request=request, deadline_monotonic=self.deadline_monotonic
-            )
+        self.engine.observe_inputs(
+            policies=observers,
+            request=request,
+            deadline_monotonic=self.deadline_monotonic,
+            observed=self._observed,
+        )
 
     def can_overlap_input(self, request: GatewayRequest) -> bool:
         """Overlap read-only input decisions only when generation cannot cause side effects."""

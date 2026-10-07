@@ -11,7 +11,7 @@ def text_input_context(request: GatewayRequest) -> str:
     """Validate text coverage and extract supported context that must not be rewritten.
 
     Message text and tool arguments are scanned separately by each adapter. Function
-    definitions, examples, call/result names and namespaces, schemas, and normalized
+    definitions, examples, call/result identifiers, names and namespaces, schemas, and normalized
     search declarations are ordinary text too. Opaque provider content, caller objects,
     attachments, and provider-owned tools or prompt configuration require a separately
     validated projection. Internal replay IDs, cache hints, and inert telemetry are not
@@ -63,16 +63,23 @@ def text_input_context(request: GatewayRequest) -> str:
     calls = [call for message in request.messages for call in message.tool_calls]
     if calls:
         context["tool_calls"] = [
-            {"name": call.name, "namespace": call.provider_namespace} for call in calls
+            {"call_id": call.call_id, "name": call.name, "namespace": call.provider_namespace}
+            for call in calls
         ]
     results = [
         message
         for message in request.messages
-        if message.provider_tool_name is not None or message.provider_tool_namespace is not None
+        if message.tool_call_id is not None
+        or message.provider_tool_name is not None
+        or message.provider_tool_namespace is not None
     ]
     if results:
         context["tool_results"] = [
-            {"name": message.provider_tool_name, "namespace": message.provider_tool_namespace}
+            {
+                "call_id": message.tool_call_id,
+                "name": message.provider_tool_name,
+                "namespace": message.provider_tool_namespace,
+            }
             for message in results
         ]
     if request.tool_choice is not None:

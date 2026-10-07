@@ -96,6 +96,19 @@ class ObservationOwner:
         self._idle = threading.Event()
         self._idle.set()
 
+    @property
+    def max_subject_bytes(self) -> int:
+        """Bound subject preparation by the owner's total retained-byte capacity."""
+        return self._max_bytes
+
+    @property
+    def available_subject_bytes(self) -> int:
+        """Hint whether new work can fit; submit still atomically reserves capacity."""
+        with self._lock:
+            if self._closed or len(self._jobs) >= self._max_jobs:
+                return 0
+            return self._max_bytes - self._bytes
+
     def _release(self, lease: ObservationLease) -> None:
         """Remove a reservation only when the outer job and all workers have exited."""
         with self._lock:

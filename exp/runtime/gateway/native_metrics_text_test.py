@@ -58,6 +58,8 @@ def _control_plane() -> JsonObject:
         "reconciled_expired_requests": 0,
         "reconciled_unknown_attempts": 0,
         "accounting_healthy": True,
+        "observation_recording_dropped": 3,
+        "observation_recording_failed": 2,
     }
 
 
@@ -155,6 +157,12 @@ exp_gateway_reconciled_expired_requests_total 0
 # HELP exp_gateway_reconciled_unknown_attempts_total Crashed attempts reconciled at startup.
 # TYPE exp_gateway_reconciled_unknown_attempts_total counter
 exp_gateway_reconciled_unknown_attempts_total 0
+# HELP exp_gateway_observation_recording_dropped_total Observation records lost before delivery.
+# TYPE exp_gateway_observation_recording_dropped_total counter
+exp_gateway_observation_recording_dropped_total 3
+# HELP exp_gateway_observation_recording_failed_total Observation sink calls that failed.
+# TYPE exp_gateway_observation_recording_failed_total counter
+exp_gateway_observation_recording_failed_total 2
 # HELP exp_gateway_inflight_attempts In-flight attempt reservations on the control plane.
 # TYPE exp_gateway_inflight_attempts gauge
 exp_gateway_inflight_attempts 2

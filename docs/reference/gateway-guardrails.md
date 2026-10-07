@@ -71,11 +71,21 @@ abstraction with a separate worker pool and adapter quarantine from enforcement.
 It retains at most 8 jobs and 8 MiB of complete subjects by default, configurable
 through `max_observations` and `max_observation_bytes`. Full queues, byte limits, or
 expired request deadlines produce `skipped`, never an uninspected `allow`. Exact
-duplicate subjects share work only within their request. Each distinct authenticated
-context, including recovered history, private provider fields and gateway tool results,
-is observed separately. Fields excluded from provider serialization still count toward
+duplicate subjects share work only within their request. While observation admission
+remains open, each distinct authenticated context, including recovered history, private
+provider fields and gateway tool results, is considered separately. Fields excluded from provider serialization still count toward
 subject identity and retained bytes. Observer capacity or quarantine cannot consume
 the engine's enforcement capacity or quarantine its enforcing calls.
+
+All observing policies share one complete subject encoding per admission boundary.
+Fitting subjects retain exact deduplication even when capacity is full or the deadline
+has expired. A cheap character-count bound rejects clearly oversized subjects without
+serializing their text. That rejection closes optional observation for this request and
+records one coverage-admission outcome per observing policy: `unsupported` above the
+policy bound, otherwise `skipped` above the owner's byte capacity. Later contexts are
+not observed after this terminal coverage failure. This bounds preparation work without
+retaining rejected input; the character bound is conservative and JSON escaping can
+expand a fitting candidate before its exact byte check.
 
 An admitted observation is engine-owned and may finish after its request completes;
 ordinary settlement does not cancel it and bias observations toward fast classifiers.
@@ -84,7 +94,8 @@ Its original absolute request deadline and per-check timeout still apply. Hosts 
 recorder. Shutdown stops observation admission, drains within that budget, and cancels
 remaining work cooperatively. A classifier that ignores cancellation retains its job
 and byte reservation until it actually exits; timeout or shutdown cannot admit more
-subjects against that occupied capacity. Interrupted or skipped work is counted explicitly.
+subjects against that occupied capacity. Work that completes within the drain budget
+retains its actual verdict; cancellation is requested only when that budget expires.
 Observation may still incur classifier cost, so it does not certify that admission had
 no paid effects.
 
@@ -99,15 +110,31 @@ not an independent certification that every in-memory field was inspected. Compl
 policies must bind an adapter with explicit coverage checks, such as Platform's dedicated
 criminal-abuse adapter on this same engine. Hosts must count observation outcomes separately
 from actual customer blocks.
+An outcome with `check=None` records incomplete observation admission or coverage,
+not a classifier verdict. Keep these coverage counts separate from per-check verdict
+denominators; they do not count every distinct missed subject.
 Recording runs on one dedicated daemon worker. Only immutable policy/check metadata,
 outcome and elapsed time enter its bounded queue; request text and callback closures
 never enter that queue. `max_observation_records` defaults to 128 queued plus active
 records. A saturated or closed sink drops metadata without delaying admission;
 `engine.observation_recording_dropped` counts those losses and
 `engine.observation_recording_failed` counts sink exceptions. Hosts should expose both
-counters. The inspection owner and metadata recorder share the same overall `close`
-budget. At shutdown expiry queued metadata is discarded and counted, while at most
-one stalled sink call can remain alive holding content-free metadata.
+counters. The native `/metrics.json` snapshot exposes both values in `control_plane`;
+`/metrics` exports the unlabeled counters
+`exp_gateway_observation_recording_dropped_total` and
+`exp_gateway_observation_recording_failed_total`.
+The inspection owner and metadata recorder share the same overall `close` budget.
+At shutdown expiry queued metadata is discarded and counted, while at most one stalled
+sink call can remain alive holding content-free metadata. Cancellation callbacks may
+arrive after the recorder closes: their attempted `skipped` record then increments the
+dropped counter instead of delivering an outcome. Shutdown therefore does not promise
+delivery of every `skipped` outcome or extend its deadline to wait for a late callback.
+These loss counters are process-local, like the other gateway counters.
+
+The local CLI closes its engine after native serving ends, including readiness-only
+checks and startup failures, with the configured graceful timeout for observation cleanup.
+The owned Python gateway shares its shutdown deadline between joining the native server
+and draining its engine, then releases the ledger and virtual key.
 
 Unsupported surfaces remain available to observation-only callers and record
 `unsupported`. Hosts with additional surfaces, such as provider batches, use

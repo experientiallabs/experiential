@@ -116,20 +116,25 @@ def test_run_command_starts_the_gateway_directly(
 
 
 @pytest.mark.parametrize("ghost", [False, True])
+@pytest.mark.parametrize("check", [False, True])
 def test_project_option_launches_the_native_gateway_on_loopback(
     monkeypatch: pytest.MonkeyPatch,
     ghost: bool,
+    check: bool,
 ) -> None:
     """Both project compatibility modes launch the ordinary native gateway.
 
     Args:
         monkeypatch: Scoped replacements for runtime and server boundaries.
         ghost: Whether the invocation disables durable interaction state.
+        check: Whether readiness returns before starting the native server.
     """
     prepared: list[tuple[str, Path, str | None]] = []
     loaded: list[tuple[Path, frozenset[str] | None]] = []
     served: list[tuple[object, str, int]] = []
     control_planes: list[object] = []
+    closed: list[float] = []
+    guardrails = SimpleNamespace(close=lambda *, timeout_seconds: closed.append(timeout_seconds))
 
     def prepare(project: str, root: Path, *, policy_id: str | None) -> ProjectGatewayCompatibility:
         """Return one already materialized project-backed gateway alias.
@@ -226,7 +231,7 @@ def test_project_option_launches_the_native_gateway_on_loopback(
     monkeypatch.setattr("exp.runtime.gateway.lifecycle.gateway_instance_lock", instance_lock)
     monkeypatch.setattr(
         "exp.runtime.gateway.guardrails.config.load_guardrail_engine",
-        lambda _root: None,
+        lambda _root: guardrails,
     )
     monkeypatch.setattr(
         "exp.runtime.gateway.native_bridge.NativeControlPlane",
@@ -244,15 +249,20 @@ def test_project_option_launches_the_native_gateway_on_loopback(
         "--port",
         "8123",
         "--json",
+        "--graceful-timeout",
+        "0.25",
     ]
     if ghost:
         arguments.append("--ghost")
+    if check:
+        arguments.append("--check")
     result = CliRunner().invoke(app, arguments)
 
     assert result.exit_code == 0, result.output
     assert prepared == [("project-a", Path("/tmp/local-exp"), "policy-a")]
     assert loaded == [(Path("/tmp/local-exp"), frozenset({"project-a"}))]
-    assert served == [(control_planes[0], "127.0.0.1", 8123)]
+    assert served == ([] if check else [(control_planes[0], "127.0.0.1", 8123)])
+    assert closed == [0.25]
     receipt = json.loads(result.stdout)
     assert receipt["launch_mode"] == "project_alias"
     assert receipt["base_url"] == "http://127.0.0.1:8123/v1"
@@ -301,6 +311,8 @@ def test_unbindable_port_fails_before_any_ready_receipt(
         reconciled_unknown_attempts=0,
         unavailable_aliases=(),
     )
+    closed: list[float] = []
+    guardrails = SimpleNamespace(close=lambda *, timeout_seconds: closed.append(timeout_seconds))
     monkeypatch.setattr("exp.cli.gateway.compatibility.prepare_project_gateway", prepare)
     monkeypatch.setattr(
         "exp.runtime.gateway.lifecycle.load_gateway_components",
@@ -308,7 +320,7 @@ def test_unbindable_port_fails_before_any_ready_receipt(
     )
     monkeypatch.setattr(
         "exp.runtime.gateway.guardrails.config.load_guardrail_engine",
-        lambda _root: None,
+        lambda _root: guardrails,
     )
     monkeypatch.setattr(
         "exp.runtime.gateway.native_bridge.NativeControlPlane",
@@ -340,6 +352,7 @@ def test_unbindable_port_fails_before_any_ready_receipt(
     assert result.exit_code == 2
     assert "bind" in result.output
     assert '"status":"ready"' not in result.output
+    assert closed == [run_app.DEFAULT_GRACEFUL_TIMEOUT_SECONDS]
 
 
 def test_noninteractive_default_gateway_returns_stable_empty_state_json(tmp_path: Path) -> None:

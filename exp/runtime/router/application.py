@@ -72,11 +72,17 @@ class _OwnedGateway:
         self.error: BaseException | None = None
         native = importlib.import_module("exp_gateway_native")
         self.shutdown = native.shutdown_handle()
-        self.control_plane = NativeControlPlane(
-            components,
-            data_plane_metrics=native.metrics_snapshot_json,
-            guardrails=load_guardrail_engine(manager.root),
-        )
+        self.guardrails = load_guardrail_engine(manager.root)
+        try:
+            self.control_plane = NativeControlPlane(
+                components,
+                data_plane_metrics=native.metrics_snapshot_json,
+                guardrails=self.guardrails,
+            )
+        except BaseException:
+            if self.guardrails is not None:
+                self.guardrails.close(timeout_seconds=_SHUTDOWN_JOIN_SECONDS)
+            raise
 
     def start(self) -> None:
         """Serve the native plane on a background thread and await liveness.
@@ -123,17 +129,22 @@ class _OwnedGateway:
         )
 
     def stop(self) -> None:
-        """Stop the plane, drain the writer, and revoke the ephemeral key."""
+        """Stop serving, drain observations within the join budget, and release the owned stack."""
+        deadline = time.monotonic() + _SHUTDOWN_JOIN_SECONDS
         try:
             self.shutdown.request_shutdown()
             if self.thread is not None:
-                self.thread.join(timeout=_SHUTDOWN_JOIN_SECONDS)
+                self.thread.join(timeout=max(0.0, deadline - time.monotonic()))
         finally:
             try:
-                self.components.selection_workers.shutdown()
-                self.components.write_ledger.close()
+                if self.guardrails is not None:
+                    self.guardrails.close(timeout_seconds=max(0.0, deadline - time.monotonic()))
             finally:
-                self.manager.revoke_key(key_id=self.key_id)
+                try:
+                    self.components.selection_workers.shutdown()
+                    self.components.write_ledger.close()
+                finally:
+                    self.manager.revoke_key(key_id=self.key_id)
 
 
 class _RevokingGatewayClient(httpx2.Client):

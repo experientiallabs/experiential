@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable
-from typing import cast
+from typing import TYPE_CHECKING, cast
 
 from exp.common.core.artifacts import JsonObject
 from exp.common.sqlite.connection import close_idle_connections
@@ -32,6 +32,9 @@ from exp.runtime.gateway.native_components import NativeGatewayComponents
 from exp.runtime.gateway.native_metrics_text import render_metrics_text
 from exp.runtime.gateway.usage import GatewayUsageReport, read_usage_report, usage_html
 
+if TYPE_CHECKING:
+    from exp.runtime.gateway.guardrails.enforcement import GuardrailEngine
+
 
 class NativeObservabilityMixin:
     """Content-free read-side callbacks shared by the native control plane."""
@@ -41,6 +44,7 @@ class NativeObservabilityMixin:
     _data_plane_metrics: Callable[[], str] | None
     _usage_reporter: Callable[[], JsonObject] | None
     _readiness_probe: Callable[[], bool] | None
+    _guardrails: GuardrailEngine | None
 
     def models(self, argument: str) -> str:
         """Return the granted model list body for one authenticated key."""
@@ -178,6 +182,12 @@ class NativeObservabilityMixin:
             "reconciled_expired_requests": self._components.reconciled_expired_requests,
             "reconciled_unknown_attempts": self._components.reconciled_unknown_attempts,
             "accounting_healthy": self._accounting.accounting_healthy,
+            "observation_recording_dropped": (
+                0 if self._guardrails is None else self._guardrails.observation_recording_dropped
+            ),
+            "observation_recording_failed": (
+                0 if self._guardrails is None else self._guardrails.observation_recording_failed
+            ),
         }
         return {"data_plane": data_plane, "control_plane": control_plane}
 

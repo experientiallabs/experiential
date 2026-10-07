@@ -6,7 +6,10 @@ import pytest
 
 from exp.common.core.artifacts import canonical_json_bytes
 from exp.runtime.gateway.contracts import GatewayApiSurface, GatewayMessage, GatewayRequest
-from exp.runtime.gateway.guardrails.subjects import observation_subject_bytes
+from exp.runtime.gateway.guardrails.subjects import (
+    observation_subject_bytes,
+    observation_subject_exceeds,
+)
 from exp.runtime.gateway.reasoning_blocks import (
     OpaqueReasoningContentBlock,
     SealedReasoningContentBlock,
@@ -98,3 +101,25 @@ def test_complete_subject_budget_includes_private_payload_bytes() -> None:
     before, _ = _changed_subject("context_management")
     after = before.model_copy(update={"context_management": {"private": "x" * 10_000}})
     assert len(observation_subject_bytes(after)) > len(observation_subject_bytes(before)) + 10_000
+
+
+@pytest.mark.parametrize("text", ["plain text", 'secret\\n\\"', "🌎" * 100, ""])
+def test_early_subject_size_is_a_conservative_canonical_byte_bound(text: str) -> None:
+    """Unicode, escaped strings and structural fields cannot reject a fitting encoded subject."""
+    request = GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=(GatewayMessage(role="user", content=text),),
+    )
+    exact = len(observation_subject_bytes(request))
+    assert not observation_subject_exceeds(request, exact)
+    assert observation_subject_exceeds(request, 0)
+
+
+def test_early_subject_size_counts_private_opaque_payload_without_encoding_it() -> None:
+    """Oversized private context takes the same allocation-free early rejection as message text."""
+    request = GatewayRequest(
+        surface=GatewayApiSurface.MESSAGES,
+        messages=(GatewayMessage(role="user", content="visible"),),
+        context_management={"opaque": "x" * 100_000},
+    )
+    assert observation_subject_exceeds(request, 1024)

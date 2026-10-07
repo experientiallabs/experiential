@@ -52,6 +52,11 @@ from exp.runtime.gateway.contracts import (
 )
 from exp.runtime.gateway.embeddings_contracts import ServingRequest
 from exp.runtime.gateway.group_commit import GroupCommitAttemptLedger
+from exp.runtime.gateway.guardrails.classifiers import ClassifierRegistry
+from exp.runtime.gateway.guardrails.client import DirectClassifierClient
+from exp.runtime.gateway.guardrails.contracts import GuardrailPolicy
+from exp.runtime.gateway.guardrails.enforcement import GuardrailEngine
+from exp.runtime.gateway.guardrails.store import MappingGuardrailStore
 from exp.runtime.gateway.ledger import SQLiteAttemptLedger
 from exp.runtime.gateway.lifecycle import (
     LocalGatewayComponents,
@@ -3783,6 +3788,8 @@ def test_metrics_snapshot_reports_control_plane_state_without_a_data_plane(
     assert control_plane["reconciled_expired_requests"] == 0
     assert control_plane["reconciled_unknown_attempts"] == 0
     assert control_plane["accounting_healthy"] is True
+    assert control_plane["observation_recording_dropped"] == 0
+    assert control_plane["observation_recording_failed"] == 0
 
 
 def test_metrics_snapshot_merges_the_injected_data_plane_registry(tmp_path: Path) -> None:
@@ -3800,6 +3807,52 @@ def test_metrics_snapshot_merges_the_injected_data_plane_registry(tmp_path: Path
     snapshot = control.metrics_snapshot()
 
     assert snapshot["data_plane"] == {"served_requests": 3}
+
+
+def test_metrics_expose_actual_observation_sink_failures_and_saturation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """JSON and Prometheus report actual bounded recorder loss without detector diagnostics."""
+    control, _raw_key = _control_plane(tmp_path)
+    policy = GuardrailPolicy(policy_id="observer", protected=True, mode="observe")
+    engine = GuardrailEngine(
+        store=MappingGuardrailStore((policy,)),
+        client=DirectClassifierClient(ClassifierRegistry({})),
+        monotonic=time.monotonic,
+        max_observation_records=1,
+    )
+    control._guardrails = engine
+    failed = threading.Event()
+    started = threading.Event()
+    release = threading.Event()
+
+    def record(*_metadata: object) -> None:
+        """Fail once, then hold the sole recorder slot to create a real dropped record."""
+        if not failed.is_set():
+            failed.set()
+            raise RuntimeError("private-sink-diagnostic-canary")
+        started.set()
+        assert release.wait(5)
+
+    monkeypatch.setattr(engine, "_record_observation", record)
+    try:
+        engine.record_unsupported_observations((policy,))
+        assert failed.wait(2)
+        assert engine._observation_records._idle.wait(2)
+        engine.record_unsupported_observations((policy,))
+        assert started.wait(2)
+        engine.record_unsupported_observations((policy,))
+        metrics = json.loads(control.metrics_json("{}"))["control_plane"]
+        assert metrics["observation_recording_dropped"] == 1
+        assert metrics["observation_recording_failed"] == 1
+        text = json.loads(control.metrics_text("{}"))["text"]
+        assert "exp_gateway_observation_recording_dropped_total 1\n" in text
+        assert "exp_gateway_observation_recording_failed_total 1\n" in text
+        assert "private-sink-diagnostic-canary" not in text
+    finally:
+        release.set()
+        engine.close(timeout_seconds=2)
 
 
 def test_metrics_snapshot_counts_a_replayed_retained_settlement(tmp_path: Path) -> None:

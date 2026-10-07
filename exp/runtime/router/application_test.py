@@ -12,7 +12,10 @@ from typing import cast
 import pytest
 from openai import OpenAI
 
+import exp.runtime.router.application as application
 from exp.common.routing import RoutingDecision
+from exp.runtime.gateway.lifecycle import LocalGatewayComponents
+from exp.runtime.gateway.management import GatewayManagement
 from exp.runtime.gateway.native_server import NativeGatewayServerError
 from exp.runtime.gateway.project_alias import ProjectGatewayAlias
 from exp.runtime.router.application import RouterApplicationError, load_router
@@ -177,6 +180,17 @@ def test_load_router_serves_the_native_gateway_and_revokes_its_key(
     _install_common_stubs(
         monkeypatch, tmp_path, prepared=prepared, loaded=loaded, components=components
     )
+    closed: list[float] = []
+
+    def close_guardrails(*, timeout_seconds: float) -> None:
+        """Record bounded engine drain before the ledger and key are released."""
+        closed.append(timeout_seconds)
+        shut.append("guardrails")
+
+    monkeypatch.setattr(
+        "exp.runtime.router.application.load_guardrail_engine",
+        lambda _root: SimpleNamespace(close=close_guardrails),
+    )
 
     def fake_serve(
         control_plane: object,
@@ -216,7 +230,8 @@ def test_load_router_serves_the_native_gateway_and_revokes_its_key(
     assert loaded == [(tmp_path, decision_sink, frozenset({"support"}))]
     assert _Management.issued[0][0] == "project-identity"
     assert _Management.revoked == [_Management.issued[0][1]]
-    assert shut == ["workers", "ledger"]
+    assert shut == ["guardrails", "workers", "ledger"]
+    assert len(closed) == 1 and 0 < closed[0] <= 15.0
 
 
 def test_load_router_startup_failure_stops_and_revokes(
@@ -229,6 +244,13 @@ def test_load_router_startup_failure_stops_and_revokes(
         write_ledger=SimpleNamespace(close=lambda: None),
     )
     _install_common_stubs(monkeypatch, tmp_path, prepared=[], loaded=[], components=components)
+    closed: list[float] = []
+    monkeypatch.setattr(
+        "exp.runtime.router.application.load_guardrail_engine",
+        lambda _root: SimpleNamespace(
+            close=lambda *, timeout_seconds: closed.append(timeout_seconds)
+        ),
+    )
 
     def failing_serve(*_args: object, **_kwargs: object) -> None:
         """Fail the native bind immediately."""
@@ -240,6 +262,77 @@ def test_load_router_startup_failure_stops_and_revokes(
         load_router("support", root=tmp_path)
     assert len(_Management.issued) == 1
     assert _Management.revoked == [_Management.issued[0][1]]
+    assert len(closed) == 1 and 0 < closed[0] <= 15.0
+
+
+def test_load_router_control_plane_failure_closes_the_loaded_engine(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Initialization failure cannot orphan an engine before the gateway object is returned."""
+    components = SimpleNamespace()
+    _install_common_stubs(monkeypatch, tmp_path, prepared=[], loaded=[], components=components)
+    closed: list[float] = []
+    monkeypatch.setattr(
+        application,
+        "load_guardrail_engine",
+        lambda _root: SimpleNamespace(
+            close=lambda *, timeout_seconds: closed.append(timeout_seconds)
+        ),
+    )
+
+    def fail_control_plane(*_args: object, **_kwargs: object) -> None:
+        """Fail after the owner has loaded its observation engine."""
+        raise RuntimeError("control plane initialization failed")
+
+    monkeypatch.setattr(application, "NativeControlPlane", fail_control_plane)
+    with pytest.raises(RuntimeError, match="initialization failed"):
+        load_router("support", root=tmp_path)
+    assert closed == [15.0]
+    assert _Management.revoked == [_Management.issued[0][1]]
+
+
+def test_owned_gateway_shares_join_and_observation_drain_deadline(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Time spent draining native serving is not granted again to background observations."""
+    released: list[str] = []
+    components = SimpleNamespace(
+        selection_workers=SimpleNamespace(shutdown=lambda: released.append("workers")),
+        write_ledger=SimpleNamespace(close=lambda: released.append("ledger")),
+    )
+    _install_common_stubs(monkeypatch, tmp_path, prepared=[], loaded=[], components=components)
+    closed: list[float] = []
+    monkeypatch.setattr(
+        application,
+        "load_guardrail_engine",
+        lambda _root: SimpleNamespace(
+            close=lambda *, timeout_seconds: closed.append(timeout_seconds)
+        ),
+    )
+    gateway = application._OwnedGateway(
+        components=cast(LocalGatewayComponents, components),
+        manager=cast(GatewayManagement, _Management(tmp_path)),
+        key_id="owned-key",
+        port=8123,
+    )
+    clock = [100.0]
+    joined: list[float] = []
+
+    def join(*, timeout: float) -> None:
+        """Consume most of the shared shutdown budget on native serving cleanup."""
+        joined.append(timeout)
+        clock[0] += 0.75
+
+    gateway.thread = cast(threading.Thread, SimpleNamespace(join=join))
+    monkeypatch.setattr(application, "time", SimpleNamespace(monotonic=lambda: clock[0]))
+    monkeypatch.setattr(application, "_SHUTDOWN_JOIN_SECONDS", 1.0)
+    gateway.stop()
+    assert joined == [1.0]
+    assert closed == [0.25]
+    assert released == ["workers", "ledger"]
+    assert _Management.revoked == ["owned-key"]
 
 
 def test_ghost_compatibility_rejects_a_persistent_project_decision_sink(tmp_path: Path) -> None:

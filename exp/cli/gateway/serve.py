@@ -250,6 +250,7 @@ def _run_gateway(
         if setup is not None:
             _emit_setup_credentials(port=port, setup=setup)
 
+    guardrails = None
     try:
         with usage_error(ValueError):
             with gateway_instance_lock(root, port=port):
@@ -348,6 +349,9 @@ def _run_gateway(
         if setup is not None:
             _emit_setup_recovery(setup=setup)
         raise
+    finally:
+        if guardrails is not None:
+            guardrails.close(timeout_seconds=graceful_timeout)
 
 
 def _unavailable_alias_entries(

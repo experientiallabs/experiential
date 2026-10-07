@@ -41,7 +41,11 @@ from exp.runtime.gateway.guardrails.streaming import (
     StreamSegment,
     release_segment,
 )
-from exp.runtime.gateway.guardrails.subjects import observation_subject_bytes
+from exp.runtime.gateway.guardrails.subjects import (
+    ObservedSubjects,
+    observation_subject_bytes,
+    observation_subject_exceeds,
+)
 
 _logger = logging.getLogger(__name__)
 
@@ -215,7 +219,77 @@ class GuardrailEngine:
         """
         if policy.mode != "observe":
             raise ValueError("observation requires an observe policy")
-        size = len(observation_subject_bytes(request))
+        self.observe_inputs(
+            policies=(policy,), request=request, deadline_monotonic=deadline_monotonic
+        )
+
+    def observe_inputs(
+        self,
+        *,
+        policies: tuple[GuardrailPolicy, ...],
+        request: GatewayRequest,
+        deadline_monotonic: float,
+        observed: ObservedSubjects | None = None,
+    ) -> None:
+        """Encode one complete subject once for every policy and retain only its digest.
+
+        Clearly oversized text never allocates a serialized copy and ends optional
+        observation for this request with one coverage-admission outcome per policy.
+        Fitting subjects are deduplicated before capacity/deadline rejection, so a
+        repeated pending subject cannot become a second skipped observation. Each
+        actual submission still reserves its own complete bytes atomically.
+        """
+        if any(policy.mode != "observe" for policy in policies):
+            raise ValueError("observation requires observe policies")
+        if not policies or (observed is not None and observed.closed):
+            return
+        limit = min(
+            self._observations.max_subject_bytes,
+            max(policy.max_request_bytes for policy in policies),
+        )
+        if observation_subject_exceeds(request, limit):
+            if observed is not None:
+                observed.closed = True
+            for policy in policies:
+                outcome = (
+                    GuardrailOutcome.UNSUPPORTED
+                    if observation_subject_exceeds(request, policy.max_request_bytes)
+                    else GuardrailOutcome.SKIPPED
+                )
+                self._emit_observation(policy, None, outcome, 0.0)
+            return
+        subject = observation_subject_bytes(request)
+        size = len(subject)
+        fingerprint = sha256(subject).digest()
+        del subject
+        if observed is not None:
+            if fingerprint in observed.fingerprints:
+                return
+            observed.fingerprints.add(fingerprint)
+        if (
+            deadline_monotonic <= self._monotonic()
+            or self._observations.available_subject_bytes == 0
+        ):
+            for policy in policies:
+                self._emit_observation(policy, None, GuardrailOutcome.SKIPPED, 0.0)
+            return
+        for policy in policies:
+            self._submit_observation(
+                policy=policy,
+                request=request,
+                deadline_monotonic=deadline_monotonic,
+                size=size,
+            )
+
+    def _submit_observation(
+        self,
+        *,
+        policy: GuardrailPolicy,
+        request: GatewayRequest,
+        deadline_monotonic: float,
+        size: int,
+    ) -> None:
+        """Reserve one policy's subject using the exact shared encoded size."""
         if size > policy.max_request_bytes:
             self._emit_observation(policy, None, GuardrailOutcome.UNSUPPORTED, 0.0)
             return

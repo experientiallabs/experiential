@@ -35,6 +35,7 @@ from exp.runtime.gateway.guardrails.native import validate_guardrail_engine
 from exp.runtime.gateway.guardrails.native_test import _authorization
 from exp.runtime.gateway.guardrails.session import GuardrailSession
 from exp.runtime.gateway.guardrails.store import MappingGuardrailStore
+from exp.runtime.gateway.guardrails.subjects import observation_subject_bytes
 from exp.runtime.gateway.tests.parallel_input_guardrails_test import _Classifier, _engine
 from exp.runtime.gateway.tool_contracts import GatewayProviderNativeTool
 
@@ -60,6 +61,86 @@ def _await(session: GuardrailSession) -> None:
     while session.input_decision()["action"] == "pending" and time.monotonic() < deadline:
         time.sleep(0.001)
     assert session.input_decision()["action"] != "pending"
+
+
+def _observer_policy() -> GuardrailPolicy:
+    """Select one bounded input observer shared by the admission preparation tests."""
+    return GuardrailPolicy(
+        policy_id="observer",
+        mode="observe",
+        protected=True,
+        checks=(
+            GuardrailCheck(
+                check_id="input",
+                adapter_id="criminal",
+                capability=GuardrailCapabilityKind.CONTENT_SAFETY,
+                stage=GuardrailCheckStage.INPUT,
+                action=GuardrailAction.BLOCK,
+                timeout_ms=1000,
+            ),
+        ),
+    )
+
+
+def test_observing_policies_share_one_complete_subject_encoding() -> None:
+    """Three policies reuse one request-path encoding while copies still deduplicate inspection."""
+    policies = tuple(
+        _observer_policy().model_copy(update={"policy_id": f"observer-{index}"})
+        for index in range(3)
+    )
+    classifier = KeywordClassifier(("blocked",))
+    engine = GuardrailEngine(
+        store=MappingGuardrailStore(policies),
+        client=DirectClassifierClient(ClassifierRegistry({"criminal": classifier})),
+        monotonic=time.monotonic,
+    )
+    session = _session(engine)
+    request = _request("visible")
+    try:
+        with patch(
+            "exp.runtime.gateway.guardrails.enforcement.observation_subject_bytes",
+            wraps=observation_subject_bytes,
+        ) as encoded:
+            assert session.inspect_input(request) is request
+            assert encoded.call_count == 1
+            copied = request.model_copy(deep=True)
+            assert session.inspect_input(copied) is copied
+            assert encoded.call_count == 2
+    finally:
+        engine.close(timeout_seconds=2)
+    assert classifier.input_calls == 3
+
+
+@pytest.mark.parametrize("unavailable", ["expired", "closed", "oversized", "full"])
+def test_rejected_observation_admission_does_not_serialize_the_request(unavailable: str) -> None:
+    """Oversized optional subjects never allocate JSON, including after other admission closes."""
+    classifier = _Classifier("allow")
+    policy = _observer_policy().model_copy(update={"max_request_bytes": 8192})
+    engine = GuardrailEngine(
+        store=MappingGuardrailStore((policy,)),
+        client=DirectClassifierClient(ClassifierRegistry({"criminal": classifier})),
+        monotonic=time.monotonic,
+        max_observations=1,
+    )
+    session = _session(engine)
+    try:
+        if unavailable == "expired":
+            session.deadline_monotonic = time.monotonic() - 1
+        elif unavailable == "closed":
+            engine.close(timeout_seconds=0)
+        elif unavailable == "full":
+            session.inspect_input(_request("first"))
+            assert classifier.started.wait(2)
+        request = _request("x" * 100_000)
+        with patch(
+            "exp.runtime.gateway.guardrails.enforcement.observation_subject_bytes",
+            side_effect=AssertionError("rejected observer serialized customer input"),
+        ):
+            assert session.inspect_input(request) is request
+    finally:
+        classifier.release.set()
+        engine.close(timeout_seconds=2)
+    assert len(classifier.requests) == (1 if unavailable == "full" else 0)
 
 
 @pytest.mark.parametrize("scope", ["platform", "identity"])

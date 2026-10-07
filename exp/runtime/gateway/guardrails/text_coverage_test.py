@@ -65,8 +65,10 @@ SUPPORTED_TEXT_CONTEXTS = (
     "tool_search_name",
     "tool_call_name",
     "tool_call_namespace",
+    "tool_call_id",
     "tool_result_name",
     "tool_result_namespace",
+    "tool_result_id",
 )
 
 
@@ -224,13 +226,13 @@ def text_context_request(field: str, text: str) -> GatewayRequest:
                 tool_type="tool_search_tool_regex",
                 tool_name=text,
             )
-        case "tool_call_name" | "tool_call_namespace":
+        case "tool_call_name" | "tool_call_namespace" | "tool_call_id":
             data["messages"] = (
                 GatewayMessage(
                     role="assistant",
                     tool_calls=(
                         ToolCall(
-                            call_id="call-one",
+                            call_id=text if field == "tool_call_id" else "call-one",
                             name=text if field == "tool_call_name" else "lookup",
                             provider_namespace=text if field == "tool_call_namespace" else None,
                             arguments={},
@@ -238,12 +240,12 @@ def text_context_request(field: str, text: str) -> GatewayRequest:
                     ),
                 ),
             )
-        case "tool_result_name" | "tool_result_namespace":
+        case "tool_result_name" | "tool_result_namespace" | "tool_result_id":
             data["messages"] = (
                 GatewayMessage(
                     role="tool",
                     content="visible",
-                    tool_call_id="call-one",
+                    tool_call_id=text if field == "tool_result_id" else "call-one",
                     provider_tool_name=text if field == "tool_result_name" else "lookup",
                     provider_tool_namespace=text if field == "tool_result_namespace" else None,
                 ),

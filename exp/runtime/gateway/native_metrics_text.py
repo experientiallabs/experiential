@@ -111,6 +111,14 @@ _CONTROL_PLANE_COUNTERS: tuple[tuple[str, str], ...] = (
         "reconciled_unknown_attempts",
         "Crashed attempts reconciled at startup.",
     ),
+    (
+        "observation_recording_dropped",
+        "Observation records lost before delivery.",
+    ),
+    (
+        "observation_recording_failed",
+        "Observation sink calls that failed.",
+    ),
 )
 
 
