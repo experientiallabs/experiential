@@ -1,0 +1,1 @@
+tau2 config.py in this install was modified 2026-07-26: DEFAULT_LLM_NL_ASSERTIONS repointed to azure/gpt-5.4-mini (old default gpt-4.1 was unroutable with Azure-only keys). See wmh-routing-data/findings/master.md 2026-07-26 entry.
