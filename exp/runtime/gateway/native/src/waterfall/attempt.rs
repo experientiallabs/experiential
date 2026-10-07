@@ -144,7 +144,7 @@ pub(super) async fn run_attempt(
             && !wire.billing_customer_managed
             && dialect == Dialect::OpenAiCompatible
             && repair.raw_body().is_none()
-            && !crate::capture::logprobs::refused(&wire.deployment_id))
+            && !crate::capture::logprobs::refused(&crate::capture::logprobs::rung_key(wire)))
         .then(|| crate::capture::logprobs::with_logprobs(repair.payload()))
         .flatten();
         let mut logprobs_injected = injected_payload.is_some();
@@ -192,7 +192,9 @@ pub(super) async fn run_attempt(
             // Only a plain dial that the provider accepts proves the field was
             // the refusal; a request the provider refuses either way is not.
             if opened.is_ok() {
-                crate::capture::logprobs::remember_refusal(&wire.deployment_id);
+                crate::capture::logprobs::remember_refusal(&crate::capture::logprobs::rung_key(
+                    wire,
+                ));
             }
         }
         let response = match opened {

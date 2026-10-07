@@ -18,6 +18,7 @@ from exp.runtime.gateway.contracts import (
     GatewayFailureClass,
     GatewayRequest,
 )
+from exp.runtime.gateway.stream_contracts import TokenLogprob
 
 if TYPE_CHECKING:
     from exp_gateway_native import CaptureCollector
@@ -216,45 +217,22 @@ class CaptureMetrics(ContractModel):
     usage_complete: bool
 
 
-class CaptureLogprobCandidate(ContractModel):
-    """One alternative token at a position.
-
-    Attributes:
-        token: Token text; NUL is stored as U+FFFD (see ``nul_replaced``).
-        logprob: Natural-log probability.
-        bytes: Exact UTF-8 bytes of the token when the provider sent them.
-    """
-
-    token: str
-    logprob: float = Field(allow_inf_nan=False)
-    bytes: tuple[int, ...] | None
-
-
-class CaptureTokenLogprob(CaptureLogprobCandidate):
-    """One generated token's probability with its alternatives.
-
-    Attributes:
-        top_logprobs: Alternatives the provider returned, empty when none were asked.
-    """
-
-    top_logprobs: tuple[CaptureLogprobCandidate, ...]
-
-
 class CaptureProviderLogprobs(ContractModel):
     """Gateway-requested Chat probabilities of the winning attempt.
 
     Attributes:
         logprobs_injected: Always true: the caller did not request them.
         truncated: A retention bound stopped them before the response ended.
-        content: Probabilities of the answer text, in order.
+        content: Probabilities of the answer text, in order (the native parser's
+            strict ``TokenLogprob`` contract; NUL in token text is U+FFFD).
         refusal: Probabilities of refusal text, in order.
         nul_replaced: A token text carried NUL and was stored with U+FFFD.
     """
 
     logprobs_injected: Literal[True]
     truncated: bool = Field(strict=True)
-    content: tuple[CaptureTokenLogprob, ...]
-    refusal: tuple[CaptureTokenLogprob, ...]
+    content: tuple[TokenLogprob, ...]
+    refusal: tuple[TokenLogprob, ...]
     nul_replaced: bool = Field(default=False, strict=True)
 
 

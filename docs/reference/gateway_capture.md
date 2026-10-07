@@ -87,7 +87,11 @@ response and pending budgets, and by the destination's record ceiling after the
 request and the largest admissible response; an overflow sets `truncated` and
 keeps the exchange. A token text carrying NUL is stored with U+FFFD and flags
 `nul_replaced` (the token's `bytes` keep it exactly). A malformed probability
-channel is dropped, never a failure. A rung that refuses the field (a request-shaped
+channel is dropped, never a failure. Probabilities are retained only from a
+committed winning attempt: a turn settled before any output committed (an
+exhausted refusal flush, an empty completion) carries none. An encoded record
+that would exceed the destination ceiling only because of its probabilities
+sheds them (keeping `truncated: true`) rather than the exchange. A rung that refuses the field (a request-shaped
 4xx) is re-dialed once without it inside the same physical attempt (fresh
 per-dial first-byte and first-token allowances, its own Idempotency-Key); when that
 plain dial opens, this worker never injects on the rung again. A request the

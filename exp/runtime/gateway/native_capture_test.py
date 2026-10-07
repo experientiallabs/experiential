@@ -1184,6 +1184,18 @@ def test_capture_records_accept_marked_provider_logprobs() -> None:
         {"truncated": "no"},
         {"logprobs_injected": False},
         {"content": [{"token": "a", "logprob": "x", "bytes": None, "top_logprobs": []}]},
+        {"content": [{"token": "a", "logprob": "-1", "bytes": None, "top_logprobs": []}]},
+        {"content": [{"token": "a", "logprob": -1.0, "bytes": [256], "top_logprobs": []}]},
+        {
+            "content": [
+                {
+                    "token": "a",
+                    "logprob": -1.0,
+                    "bytes": None,
+                    "top_logprobs": [{"token": "b", "logprob": -2.0, "bytes": None}] * 21,
+                }
+            ]
+        },
     ):
         evidence = {**marked.provider_logprobs.model_dump(mode="json"), **malformed}
         with pytest.raises(ValidationError):

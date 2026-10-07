@@ -209,7 +209,15 @@ fn a_refusal_redials_plain_inside_one_attempt_and_is_remembered() {
         // One physical attempt reserved for the caller, not two.
         let story = harness.story().await;
         assert_eq!(story["starts"].as_array().unwrap().len(), 1);
-        assert!(crate::capture::logprobs::refused("refuses-a"));
+        assert!(crate::capture::logprobs::refused(
+            &crate::capture::logprobs::rung_key(&route[0])
+        ));
+        // Another catalog's rung under the same local id is still asked.
+        let mut elsewhere = route[0].clone();
+        elsewhere.url = "http://elsewhere.invalid/v1/chat/completions".into();
+        assert!(!crate::capture::logprobs::refused(
+            &crate::capture::logprobs::rung_key(&elsewhere)
+        ));
         // The worker never injects on that rung again.
         let (won, guard) = run_capture(&harness, &route, true).await;
         let (_, committed) = drain(finish(guard, won).await).await;
@@ -239,6 +247,8 @@ fn a_request_refused_either_way_fails_as_without_injection_and_is_not_remembered
         };
         assert_eq!(format!("{actual:?}"), format!("{expected:?}"));
         assert_eq!(rung.bodies.lock().unwrap().len(), 2);
-        assert!(!crate::capture::logprobs::refused("both-a"));
+        assert!(!crate::capture::logprobs::refused(
+            &crate::capture::logprobs::rung_key(&capture_wire("both-a", &rung.url))
+        ));
     });
 }

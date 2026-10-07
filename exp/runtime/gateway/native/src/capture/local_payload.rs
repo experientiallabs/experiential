@@ -20,6 +20,8 @@ struct Output<'a> {
     metrics: &'a Option<super::metrics::Metrics>,
     gemini_thought_parts: Cow<'a, [Arc<Value>]>,
     gemini_thought_parts_source_json: Option<Cow<'a, str>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    provider_logprobs: &'a Option<super::logprobs::Captured>,
 }
 
 #[derive(Serialize)]
@@ -87,6 +89,7 @@ pub(super) fn encode(
                 metrics: &record.metrics,
                 gemini_thought_parts,
                 gemini_thought_parts_source_json,
+                provider_logprobs: &record.provider_logprobs,
             },
             previous_response_id: parent,
         },

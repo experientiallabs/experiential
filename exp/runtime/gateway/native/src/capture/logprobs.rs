@@ -26,6 +26,20 @@ pub(crate) const MAXIMUM_CAPTURED_LOGPROB_BYTES: usize = 4 * 1024 * 1024;
 /// retained probabilities against the destination's record ceiling.
 pub(crate) const RECORD_ENVELOPE_BYTES: usize = 16 * 1024;
 
+/// Drop a record's retained probabilities (keeping the truncated mark) when
+/// they are what keeps it from encoding; `false` when there was nothing to shed.
+pub(crate) fn shed<R>(record: &mut super::record::Record<R>) -> bool {
+    match record.provider_logprobs.as_mut() {
+        Some(captured) if !captured.content.is_empty() || !captured.refusal.is_empty() => {
+            captured.content = Vec::new();
+            captured.refusal = Vec::new();
+            captured.truncated = true;
+            true
+        }
+        _ => false,
+    }
+}
+
 /// Room the encoded record leaves for probabilities after the full request,
 /// the largest admissible response and the record envelope.
 pub(crate) fn record_room(maximum_record: usize, request: usize, response: usize) -> usize {
@@ -40,23 +54,29 @@ const MAXIMUM_REFUSED_RUNGS: usize = 4096;
 
 static REFUSED: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(Default::default);
 
+/// The rung's identity for refusal memory: a catalog-local deployment id is not
+/// unique across catalogs, so the provider endpoint and wire model join it.
+pub(crate) fn rung_key(wire: &crate::waterfall::DeploymentWire) -> String {
+    format!("{}\n{}\n{}", wire.deployment_id, wire.url, wire.model_id)
+}
+
 /// Whether this worker has seen the rung refuse injected probabilities.
-pub(crate) fn refused(deployment_id: &str) -> bool {
+pub(crate) fn refused(rung: &str) -> bool {
     REFUSED
         .lock()
-        .map(|refused| refused.contains(deployment_id))
+        .map(|refused| refused.contains(rung))
         .unwrap_or(true)
 }
 
 /// Stop injecting on a rung whose plain re-dial opened after a refusal.
-pub(crate) fn remember_refusal(deployment_id: &str) {
+pub(crate) fn remember_refusal(rung: &str) {
     if let Ok(mut refused) = REFUSED.lock() {
         // A full memory starts over rather than ignoring current refusals:
         // forgotten rungs cost one more plain re-dial each, never an error.
         if refused.len() >= MAXIMUM_REFUSED_RUNGS {
             refused.clear();
         }
-        refused.insert(deployment_id.to_owned());
+        refused.insert(rung.to_owned());
     }
 }
 

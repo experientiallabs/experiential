@@ -156,7 +156,8 @@ pub struct DeploymentWire {
     /// the caller did not request (an OpenAI-compatible wire whose model
     /// verifiably supports them, on the platform's own credential). The data
     /// plane injects them only when the collector also captures this request
-    /// with `capture_logprobs` on; absent on older admissions.
+    /// with `capture_logprobs` on. An omitted flag is the off state, never a
+    /// widening (the same convention as the other per-rung flags here).
     #[serde(default)]
     pub capture_logprobs: bool,
 }

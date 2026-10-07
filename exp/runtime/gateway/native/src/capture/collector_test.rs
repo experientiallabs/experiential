@@ -909,3 +909,34 @@ fn probabilities_never_outgrow_the_destination_record_ceiling() {
     assert!(captured.content.is_empty());
     assert!(captured.truncated);
 }
+
+#[test]
+fn an_unencodable_record_sheds_its_probabilities_and_keeps_the_exchange() {
+    let mut record = Record {
+        checkpointed: false,
+        schema_version: SCHEMA_VERSION,
+        request: request("shed"),
+        response: Some(response()),
+        transport: None,
+        provider_reasoning: None,
+        provider_reasoning_source_json: None,
+        provider_tool_calls_json: None,
+        deployment_id: None,
+        metrics: None,
+        gemini_thought_parts: Vec::new(),
+        gemini_thought_parts_source_json: None,
+        captured_at: 1.0,
+        provider_logprobs: Some(crate::capture::logprobs::Captured::injected()),
+    };
+    assert!(!crate::capture::logprobs::shed(&mut record));
+    let captured = record.provider_logprobs.as_mut().unwrap();
+    captured.extend(vec![probability("a")], false, |_| true);
+    let full = record.encode(1 << 20).unwrap().len();
+    // A ceiling the probabilities overflow but the exchange fits.
+    let ceiling = full - 8;
+    assert!(record.encode(ceiling).is_none());
+    assert!(crate::capture::logprobs::shed(&mut record));
+    assert!(record.encode(ceiling).is_some());
+    let captured = record.provider_logprobs.as_ref().unwrap();
+    assert!(captured.truncated && captured.content.is_empty());
+}
