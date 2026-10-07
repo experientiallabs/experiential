@@ -6,12 +6,13 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Literal, Protocol
 
-from pydantic import Field
+from pydantic import Field, field_validator
 
 from exp.common.core.artifacts import ArtifactEnvelope, ArtifactId, ArtifactInput, ContractModel
 from exp.common.evaluations import EvaluationProtocol, ObservedProductionCell
 from exp.common.judging import Judge
 from exp.common.models import ModelSnapshot, RoutedCandidateSnapshot
+from exp.common.tasks import TaskCase
 from exp.optimize.evaluation.simulation import SimulatorFactory
 from exp.runtime.models.budget import RequestBudget
 from exp.simulation.specs import WorldModelSettings
@@ -38,6 +39,8 @@ class EvaluationSetup(ContractModel):
         maximum_rollout_output_tokens: Positive cumulative generation ceiling, default one million.
         maximum_concurrency: Positive phase-wide allowance for simultaneous rollouts or judgments.
         repeats: Independent runs per scenario/model pair, default one and separate from retries.
+        evaluated_task_ids: Ordered subset of the build's task set to replay, or None (the
+            default, omitted from records) for every task.
     """
 
     candidates: tuple[RoutedCandidateSnapshot, ...] = Field(min_length=1)
@@ -57,6 +60,41 @@ class EvaluationSetup(ContractModel):
     maximum_rollout_output_tokens: int = Field(default=1_000_000, gt=0)
     maximum_concurrency: int = Field(gt=0)
     repeats: int = Field(default=1, ge=1)
+    evaluated_task_ids: tuple[ArtifactId, ...] | None = Field(
+        default=None, min_length=1, exclude_if=lambda value: value is None
+    )
+
+    @field_validator("evaluated_task_ids")
+    @classmethod
+    def _require_unique_task_ids(
+        cls, value: tuple[ArtifactId, ...] | None
+    ) -> tuple[ArtifactId, ...] | None:
+        """Reject a subset that names one task twice."""
+        if value is not None and len(set(value)) != len(value):
+            raise ValueError("evaluated task IDs must not repeat")
+        return value
+
+
+def evaluated_tasks(tasks: tuple[TaskCase, ...], setup: EvaluationSetup) -> tuple[TaskCase, ...]:
+    """Return the build tasks an evaluation replays, in task-set order.
+
+    Args:
+        tasks: Every task in the build's selected task set.
+        setup: Frozen evaluation inputs naming an optional subset.
+
+    Returns:
+        Every task, or exactly the named subset.
+
+    Raises:
+        ValueError: The subset names a task outside the task set.
+    """
+    if setup.evaluated_task_ids is None:
+        return tasks
+    selected = set(setup.evaluated_task_ids)
+    chosen = tuple(task for task in tasks if task.task_id in selected)
+    if len(chosen) != len(selected):
+        raise ValueError("evaluated scenarios are missing from the build; prepare a new evaluation")
+    return chosen
 
 
 class EvaluationBudget(ContractModel):

@@ -4,7 +4,13 @@ import pytest
 
 from exp.common.models import Usage
 from exp.common.tasks import TaskCase
-from exp.optimize.evaluation.usage_estimate import model_turns, task_usage, token_estimate
+from exp.optimize.evaluation.usage_estimate import (
+    AUTHORED_ANSWER_TOKENS,
+    AUTHORED_TOOL_TURN_TOKENS,
+    model_turns,
+    task_usage,
+    token_estimate,
+)
 from exp.optimize.router.automatic.service_test import _trace
 from exp.optimize.router.composition_test import _completion_reservation
 from exp.simulation.retrieval.tests.retrieval_test import _tool_trace
@@ -216,3 +222,55 @@ def test_otlp_observations_use_canonical_pairing_for_arbitrary_span_names(call_i
     assert usage.world_output - baseline.world_output == total_increase
     assert usage.judge_input - baseline.judge_input == total_increase
     assert usage.assistant_input - baseline.assistant_input == first_increase
+
+
+def test_authored_scenarios_are_sized_from_declared_inputs() -> None:
+    """Authored scenarios need no source traces; tools add one call and a reference sizes output."""
+    shared = {
+        "task_id": "authored",
+        "lineage_group_id": "authored-lineage",
+        "partition": "fit",
+        "instruction": "Refund order 42.",
+        "workload_weight": 1,
+        "origin": "authored",
+    }
+    plain = task_usage(
+        TaskCase.model_validate(shared),
+        (),
+        (),
+        top_k=2,
+        maximum_steps=100,
+        maximum_query_tokens=32_768,
+    )
+    assert plain.episode_count == 1 and plain.turns == 1 and plain.measured_turns == 0
+    assert [call.output_tokens for call in plain.assistant_requests] == [AUTHORED_ANSWER_TOKENS]
+    referenced = task_usage(
+        TaskCase.model_validate({**shared, "reference_answer": "x" * 40}),
+        (),
+        (),
+        top_k=2,
+        maximum_steps=100,
+        maximum_query_tokens=32_768,
+    )
+    assert [call.output_tokens for call in referenced.assistant_requests] == [10]
+    assert referenced.judge_input == plain.judge_input - AUTHORED_ANSWER_TOKENS + 10 + 10
+    tool = {"name": "lookup", "description": "Find an order.", "input_schema": {}}
+    with_tools = task_usage(
+        TaskCase.model_validate({**shared, "tools": [tool]}),
+        (),
+        (),
+        top_k=2,
+        maximum_steps=100,
+        maximum_query_tokens=32_768,
+    )
+    assert with_tools.turns == 2 and len(with_tools.world_requests) == 2
+    assert with_tools.assistant_requests[0].output_tokens == AUTHORED_TOOL_TURN_TOKENS
+    one_step = task_usage(
+        TaskCase.model_validate({**shared, "tools": [tool]}),
+        (),
+        (),
+        top_k=2,
+        maximum_steps=1,
+        maximum_query_tokens=32_768,
+    )
+    assert one_step.turns == 1

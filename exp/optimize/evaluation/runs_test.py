@@ -11,6 +11,7 @@ from exp.common.models import ModelCatalog
 from exp.common.progress import ProgressEvent
 from exp.common.project import ProjectStore, write_project_config
 from exp.common.project.records import ProjectRecords
+from exp.common.tasks import ToolSchema
 from exp.common.traces.ingest.otlp import TraceNormalizationResult
 from exp.optimize.evaluation.contracts import EvaluationBudget
 from exp.optimize.evaluation.export import export_report, load_report_evidence
@@ -38,6 +39,7 @@ from exp.runtime.models import RuntimeModelCatalog
 from exp.runtime.models.budget import SpendLimitReached
 from exp.simulation.build import build_project, select_completed_build
 from exp.simulation.mining.service import MiningSpec
+from exp.simulation.scenarios import AuthoredScenario, select_authored_scenarios
 
 
 def _twenty_scenarios(root: Path) -> tuple[ProjectStore, ModelCatalog, _ProviderState]:
@@ -270,3 +272,104 @@ def test_lowered_cap_pauses_only_new_dispatch_and_preserves_paid_lineage(
     )
     assert replay == result
     assert before_replay == (tuple(state.completion_calls), tuple(state.embedding_calls))
+
+
+def test_authored_scenarios_replay_alone_or_beside_mined_ones(tmp_path: Path) -> None:
+    """Authored scenarios run without source traces; only the judge sees a reference answer."""
+    project, catalog, state = _twenty_scenarios(tmp_path)
+    reference = "Refund 42 was issued to the original card."
+    selected = select_authored_scenarios(
+        project,
+        (
+            AuthoredScenario(
+                scenario_id="refund",
+                instruction="Refund order 42 for the customer.",
+                reference_answer=reference,
+            ),
+            AuthoredScenario(
+                scenario_id="lookup",
+                instruction="Look up the status of order 7.",
+                tools=(
+                    ToolSchema(
+                        name="lookup_order",
+                        description="Find one order by number.",
+                        input_schema={"type": "object"},
+                    ),
+                ),
+            ),
+        ),
+    )
+    build = project.load_project().build
+    assert build is not None and build.task_set == selected
+    tasks = evaluation_tasks(project)
+    assert len(tasks) == 22
+    assert [task.origin for task in tasks[-2:]] == ["authored", "authored"]
+    authored_ids = tuple(task.task_id for task in tasks[-2:])
+
+    before = len(state.completion_calls), len(state.embedding_calls)
+    run = prepare_run(
+        project,
+        catalog,
+        EvaluationDefaults(
+            models=("candidate-a", "candidate-b"),
+            options=ModelEvaluationOptions(maximum_steps=1, include_mined=False),
+            minimum_scenarios=2,
+        ),
+        code_revision=_REVISION,
+    )
+    assert before == (len(state.completion_calls), len(state.embedding_calls))
+    assert run.prepared.setup.evaluated_task_ids == authored_ids
+    assert run.prepared.cost.scenario_count == 2
+    assert run.prepared.cost.judgment_count == 4
+    assert "Authored scenarios have no captured requests" in run.prepared.cost.estimate_basis
+    assert 0 < run.prepared.cost.estimated_cost_usd <= run.prepared.cost.maximum_cost_usd
+
+    calls_before_run = len(state.completion_calls)
+    runtime = cast(RuntimeModelCatalog, _RuntimeCatalog(catalog, state))
+    result = execute_run(project, run, runtime, provider_spend_consented=True)
+    assert result.report.compared_cells == 2
+    evidence = load_report_evidence(project, load_run(project, run.run_id))
+    assert tuple(task.task_id for task in evidence.tasks) == authored_ids
+    assert {rollout.task_id for rollout in evidence.rollouts} == set(authored_ids)
+    assert len(evidence.rollouts) == 4
+    calls = state.completion_calls[calls_before_run:]
+    judge_prompts = [
+        request.messages[-1].content or "" for alias, request in calls if alias == "judge"
+    ]
+    assert len(judge_prompts) == 4
+    with_reference = [prompt for prompt in judge_prompts if "REFERENCE_ANSWER" in prompt]
+    assert len(with_reference) == 2 and all(reference in prompt for prompt in with_reference)
+    assert not any(
+        reference in request.model_dump_json() for alias, request in calls if alias != "judge"
+    )
+
+    mixed = prepare_run(
+        project,
+        catalog,
+        EvaluationDefaults(
+            models=("candidate-a", "candidate-b"), options=ModelEvaluationOptions(maximum_steps=1)
+        ),
+        code_revision=_REVISION,
+    )
+    assert mixed.prepared.setup.evaluated_task_ids is None
+    assert mixed.prepared.cost.scenario_count == 22
+    assert "evaluated_task_ids" not in mixed.prepared.setup.model_dump(mode="json")
+    assert "include_mined" not in ModelEvaluationOptions().model_dump(mode="json")
+
+
+def test_authored_only_run_requires_authored_scenarios(tmp_path: Path) -> None:
+    """Excluding mined scenarios from a build without authored ones fails before any call."""
+    project, catalog, state = _twenty_scenarios(tmp_path)
+    before = len(state.completion_calls), len(state.embedding_calls)
+    with pytest.raises(ValueError, match="Select more authored scenarios"):
+        prepare_run(
+            project,
+            catalog,
+            EvaluationDefaults(
+                models=("candidate-a", "candidate-b"),
+                options=ModelEvaluationOptions(include_mined=False),
+                minimum_scenarios=1,
+            ),
+            code_revision=_REVISION,
+        )
+    assert before == (len(state.completion_calls), len(state.embedding_calls))

@@ -67,6 +67,7 @@ def load_report_evidence(project: ProjectStore, run: EvaluationRun) -> ReportEvi
     rollouts = tuple(
         load_rollout(project.artifacts, row.rollout_id) for row in dataset.rows if row.rollout_id
     )
+    evaluated = {*dataset.manifest.fit_task_ids, *dataset.manifest.held_out_task_ids}
     return ReportEvidence(
         project=project.paths.project_id,
         run_id=run.run_id,
@@ -74,7 +75,11 @@ def load_report_evidence(project: ProjectStore, run: EvaluationRun) -> ReportEvi
         judgment_status=run.prepared.setup.judgment_status,
         world_model=run.prepared.setup.world_model_settings.world_model_alias,
         judge_model=run.prepared.judge_request.model.model_id,
-        tasks=load_task_set(project.artifacts, dataset.manifest.task_set_id).tasks,
+        tasks=tuple(
+            task
+            for task in load_task_set(project.artifacts, dataset.manifest.task_set_id).tasks
+            if task.task_id in evaluated
+        ),
         rows=dataset.rows,
         rollouts=rollouts,
         simulation_cost_usd=run.simulation_cost_usd,

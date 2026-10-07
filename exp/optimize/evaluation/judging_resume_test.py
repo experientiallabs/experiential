@@ -169,6 +169,7 @@ def test_judging_retry_preserves_rollouts_valid_scores_and_all_attempt_costs(
         candidate_a: RolloutArtifact,
         candidate_b: RolloutArtifact | None,
         *,
+        reference_answer: str | None = None,
         maximum_input_tokens: int | None,
         maximum_output_tokens: int,
     ) -> ModelRequest:
@@ -181,6 +182,7 @@ def test_judging_retry_preserves_rollouts_valid_scores_and_all_attempt_costs(
             rubric,
             candidate_a,
             candidate_b,
+            reference_answer=reference_answer,
             maximum_input_tokens=maximum_input_tokens,
             maximum_output_tokens=maximum_output_tokens,
         )

@@ -12,7 +12,7 @@ from exp.common.models import CompletionCostReservation
 from exp.common.project import ProjectStore
 from exp.common.tasks import load_task_set
 from exp.common.traces import load_trace_dataset
-from exp.optimize.evaluation.contracts import EvaluationSetup
+from exp.optimize.evaluation.contracts import EvaluationSetup, evaluated_tasks
 from exp.optimize.evaluation.usage_estimate import expected_completion_cost, task_usage
 from exp.optimize.router.evaluation.build import completed_project_build
 from exp.optimize.router.evaluation.setup import verify_router_evaluation_setup
@@ -107,7 +107,9 @@ def estimate_model_evaluation(
     if setup.simulation_completion_input is None:
         raise ValueError("evaluation estimates require frozen completion reservations")
     completed = completed_project_build(project)
-    tasks = load_task_set(project.artifacts, completed.task_set.artifact_id).tasks
+    tasks = evaluated_tasks(
+        load_task_set(project.artifacts, completed.task_set.artifact_id).tasks, setup
+    )
     calibration, calibration_input = verify_persisted_calibration(
         project, setup.simulation_protocol.judge_calibration_id
     )
@@ -308,6 +310,13 @@ def estimate_model_evaluation(
             "Judge assumes a transcript plus 1,024 framing tokens and 512 output tokens. "
             "No assumed cache savings or retries. Future reasoning, world state and "
             "model behavior may change usage."
+            + (
+                " Authored scenarios have no captured requests: each assumes one answer "
+                "(sized from its reference answer, else 512 tokens), plus one 128-token tool "
+                "call and result when it declares tools."
+                if any(task.origin == "authored" for task in tasks)
+                else ""
+            )
         ),
         scenario_count=count,
         worker_count=workers,

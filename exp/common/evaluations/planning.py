@@ -64,6 +64,7 @@ def build_evaluation_plan(
     observed_cells: Sequence[ObservedProductionCell],
     additional_inputs: Sequence[ArtifactInput] = (),
     repeats: Sequence[int] = (0,),
+    task_ids: Sequence[ArtifactId] | None = None,
     created_at: datetime,
     code_revision: str,
 ) -> EvaluationPlan:
@@ -77,6 +78,7 @@ def build_evaluation_plan(
         observed_cells: Production rollout assignments that already fill matrix cells.
         additional_inputs: Optional manifest-bound workflow contracts to freeze into the plan.
         repeats: Nonnegative repeat indexes planned for every task and candidate.
+        task_ids: Optional subset of the task set to plan, or None for every task.
         created_at: Time the plan is completed.
         code_revision: Exact EXP revision creating the plan.
 
@@ -93,6 +95,7 @@ def build_evaluation_plan(
         fidelity_overlap_count=None,
         additional_inputs=additional_inputs,
         repeats=repeats,
+        task_ids=task_ids,
         created_at=created_at,
         code_revision=code_revision,
     )
@@ -156,6 +159,7 @@ def _build_evaluation_plan(
     fidelity_overlap_count: int | None,
     additional_inputs: Sequence[ArtifactInput],
     repeats: Sequence[int],
+    task_ids: Sequence[ArtifactId] | None = None,
     created_at: datetime,
     code_revision: str,
 ) -> EvaluationPlan:
@@ -175,6 +179,7 @@ def _build_evaluation_plan(
         fidelity_overlap_count: Optional positive number of observed lineages to measure.
         additional_inputs: Optional manifest-bound workflow contracts to freeze into the plan.
         repeats: Nonnegative repeat indexes planned for every task and candidate.
+        task_ids: Optional subset of the task set to plan, or None for every task.
         created_at: Time the plan is completed.
         code_revision: Exact EXP revision creating the plan.
 
@@ -244,6 +249,16 @@ def _build_evaluation_plan(
         observed_by_key[key] = rollout
         observed_inputs.append(rollout_input)
 
+    if task_ids is not None and (
+        not task_ids or len(set(task_ids)) != len(task_ids) or not set(task_ids) <= set(tasks_by_id)
+    ):
+        raise EvaluationEvidenceError(
+            "planned task subset must name distinct tasks from the task set"
+        )
+    planned = None if task_ids is None else frozenset(task_ids)
+    planned_tasks = tuple(
+        task for task in loaded_tasks.tasks if planned is None or task.task_id in planned
+    )
     main_cells = tuple(
         _main_cell(
             task,
@@ -252,7 +267,7 @@ def _build_evaluation_plan(
             observed_by_key.get((task.task_id, candidate.alias, repeat)),
             task_set_input=task_input,
         )
-        for task in loaded_tasks.tasks
+        for task in planned_tasks
         for candidate in candidates
         for repeat in repeat_ids
     )

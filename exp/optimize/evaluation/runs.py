@@ -169,11 +169,17 @@ def prepare_run(
     config = project.load_project()
     project = project.snapshot(sha256_json(config))
     tasks = evaluation_tasks(project)
+    if not defaults.options.include_mined:
+        tasks = tuple(task for task in tasks if task.origin == "authored")
     if len(tasks) < defaults.minimum_scenarios:
         raise ValueError(
             f"only {len(tasks)} distinct scenarios; this project requires "
             f"{defaults.minimum_scenarios}. "
-            "Ingest more distinct traces before launching a report card."
+            + (
+                "Ingest more distinct traces before launching a report card."
+                if defaults.options.include_mined
+                else "Select more authored scenarios before launching a report card."
+            )
         )
     for task in tasks:
         names = [tool.name for tool in task.tools]

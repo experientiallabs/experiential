@@ -31,6 +31,7 @@ from exp.common.models import (
 )
 from exp.common.project import ArtifactAlreadyExistsError, ProjectStore, artifact_input
 from exp.common.rollouts import RolloutArtifact
+from exp.common.tasks import load_task_set
 from exp.optimize.router.errors import JudgePricingError, JudgeTranscriptAdmissionError
 from exp.optimize.router.judging.contracts import (
     JudgePromptTemplate,
@@ -155,6 +156,7 @@ class TemplateJudgeClient:
         self._maximum_input_tokens = maximum_input_tokens
         self._maximum_output_tokens = maximum_output_tokens
         self._request_scope = request_scope
+        self._reference_answer = _authored_reference_answer(store, rollout)
         self._probes: list[ArtifactInput] = []
         self._provider_calls_made = 0
         self._pairwise_citation_evidence: PairwiseCitationEvidence = ()
@@ -244,6 +246,7 @@ class TemplateJudgeClient:
                         self._rubric,
                         candidate_a,
                         candidate_b,
+                        reference_answer=self._reference_answer,
                         maximum_input_tokens=self._maximum_input_tokens,
                         maximum_output_tokens=self._maximum_output_tokens,
                     )
@@ -596,12 +599,37 @@ def _raw_response(response: ModelResponse) -> JsonObject:
     return cast(JsonObject, value)
 
 
+def _authored_reference_answer(store: ProjectStore, rollout: RolloutArtifact) -> str | None:
+    """Return the expected answer of a simulated rollout's authored scenario, if any.
+
+    Args:
+        store: Project-local immutable artifact store.
+        rollout: Verified rollout; only simulated rollouts carry a task-set binding.
+
+    Returns:
+        The authored task's reference answer, or None for production evidence, mined tasks
+        and authored tasks without one.
+
+    Raises:
+        ManualJudgeError: The bound task set no longer contains the rollout's task.
+    """
+    binding = rollout.simulation_binding
+    if binding is None:
+        return None
+    tasks = load_task_set(store.artifacts, binding.task_set_input.artifact_id).tasks
+    task = next((item for item in tasks if item.task_id == rollout.task_id), None)
+    if task is None:
+        raise ManualJudgeError("rollout task is missing from its bound task set")
+    return task.reference_answer
+
+
 def _bounded_judge_request(
     template: JudgePromptTemplate,
     rubric: Rubric,
     candidate_a: RolloutArtifact,
     candidate_b: RolloutArtifact | None,
     *,
+    reference_answer: str | None = None,
     maximum_input_tokens: int | None,
     maximum_output_tokens: int,
 ) -> ModelRequest:
@@ -612,6 +640,7 @@ def _bounded_judge_request(
         rubric: Finalized scoring rubric.
         candidate_a: Single or first candidate rollout.
         candidate_b: Optional second pairwise candidate.
+        reference_answer: Authored scenario's expected answer, shown only to the judge.
         maximum_input_tokens: Conservative model input capacity, or None for no bound.
         maximum_output_tokens: Reserved per-call output-token ceiling.
 
@@ -625,7 +654,10 @@ def _bounded_judge_request(
         messages=(
             ModelMessage(role="system", content=template.prompt.text),
             ModelMessage(
-                role="user", content=_render_request(template, rubric, candidate_a, candidate_b)
+                role="user",
+                content=_render_request(
+                    template, rubric, candidate_a, candidate_b, reference_answer=reference_answer
+                ),
             ),
         ),
         maximum_output_tokens=maximum_output_tokens,
@@ -645,17 +677,22 @@ def _render_request(
     rubric: Rubric,
     candidate_a: RolloutArtifact,
     candidate_b: RolloutArtifact | None,
+    *,
+    reference_answer: str | None = None,
 ) -> str:
     """Render all finalized mapped variables and the exact saved response schema.
 
     Rollout variables use the shared judge-visible evidence projection, so rendered
-    requests exclude provider request payloads and candidate reasoning content.
+    requests exclude provider request payloads and candidate reasoning content. An authored
+    scenario's reference answer, when present, follows the mapped variables as its own
+    section; requests for every other scenario are unchanged.
 
     Args:
         template: Finalized executable prompt contract.
         rubric: Finalized scoring rubric.
         candidate_a: Single or first candidate rollout.
         candidate_b: Optional second pairwise candidate.
+        reference_answer: Authored scenario's expected answer, shown only to the judge.
 
     Returns:
         Deterministic request body containing every mapped variable and schema.
@@ -673,6 +710,12 @@ def _render_request(
         + json.dumps(values[key], ensure_ascii=False, sort_keys=True)
         for key in template.variable_mapping
     ]
+    if reference_answer is not None:
+        sections.append(
+            "REFERENCE_ANSWER (written by the scenario author as an expected answer; the "
+            "assistant never saw it, and a different answer can still be correct):\n"
+            + json.dumps(reference_answer, ensure_ascii=False)
+        )
     sections.append(
         "RESPONSE_SCHEMA:\n"
         + json.dumps(template.response_schema, ensure_ascii=False, sort_keys=True)

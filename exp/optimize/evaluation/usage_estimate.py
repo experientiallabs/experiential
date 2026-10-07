@@ -124,14 +124,16 @@ def task_usage(
 
     Args:
         task: Selected scenario, with exact source trace IDs and declared tools.
-        traces: Its immutable source traces, not all serialized dataset bytes.
+        traces: Its immutable source traces, not all serialized dataset bytes. An authored
+            scenario has none and is sized from its declared inputs instead.
         transitions: Fit-only examples eligible for this scenario's grounding.
         top_k: Configured retrieved examples per action.
         maximum_steps: Execution ceiling, used only to clip longer observed episodes.
         maximum_query_tokens: Existing per-query embedding admission ceiling.
 
     Returns:
-        Trace-derived usage. Missing token counts use a visible-text heuristic. World state,
+        Trace-derived usage, or the authored-scenario heuristic of ``_authored_usage``.
+        Missing token counts use a visible-text heuristic. World state,
         future reasoning, changed behavior and retries remain uncertain planning inputs.
     """
     evidence = [
@@ -155,6 +157,15 @@ def task_usage(
             "tools": [tool.model_dump(mode="json") for tool in task.tools],
         }
     )
+    if task.origin == "authored":
+        return _authored_usage(
+            task,
+            task_size,
+            example_size,
+            min(len(evidence), top_k),
+            maximum_steps=maximum_steps,
+            maximum_query_tokens=maximum_query_tokens,
+        )
     observations = {
         (item.trace_id, item.action_span_id): item.observation.content
         for item in extract_real_transitions(
@@ -258,6 +269,78 @@ def task_usage(
         world_requests=tuple(call for episode in episodes for call in episode.world_requests),
         judge_inputs=tuple(value for episode in episodes for value in episode.judge_inputs),
         episode_count=len(episodes),
+    )
+
+
+AUTHORED_ANSWER_TOKENS = 512
+"""Assumed final-answer size for an authored scenario without a reference answer."""
+
+AUTHORED_TOOL_TURN_TOKENS = 128
+"""Assumed size of one tool call and of its simulated result in an authored scenario."""
+
+
+def _authored_usage(
+    task: TaskCase,
+    task_size: int,
+    example_size: float,
+    examples: int,
+    *,
+    maximum_steps: int,
+    maximum_query_tokens: int,
+) -> ExpectedUsage:
+    """Size one authored scenario from its declared inputs, without source traces.
+
+    The episode is one answering turn, preceded by one tool-calling turn when tools are
+    declared. The answer is sized from the reference answer when one is given, otherwise from
+    ``AUTHORED_ANSWER_TOKENS``; a tool call and its simulated result each use
+    ``AUTHORED_TOOL_TURN_TOKENS``. The planning estimate is a heuristic: actual usage depends
+    on the candidates. Hard reservations still bound every call.
+
+    Args:
+        task: Authored scenario with its declared inputs.
+        task_size: Visible-text estimate of the instruction, context and tools.
+        example_size: Mean size of one eligible retrieved example.
+        examples: Retrieved examples per world-model request.
+        maximum_steps: Execution ceiling on assistant turns.
+        maximum_query_tokens: Per-query embedding admission ceiling.
+
+    Returns:
+        Expected usage for one synthetic episode.
+    """
+    answer = (
+        token_estimate(task.reference_answer)
+        if task.reference_answer is not None
+        else AUTHORED_ANSWER_TOKENS
+    )
+    turns = [(AUTHORED_TOOL_TURN_TOKENS, 1)] if task.tools else []
+    turns = [*turns, (answer, 0)][-maximum_steps:]
+    system = token_estimate(WORLD_MODEL_TEXT_SYSTEM_PROMPT)
+    transcript = 0.0
+    assistant_requests = []
+    world_requests = []
+    queries = 0.0
+    for output_tokens, calls in turns:
+        input_tokens = task_size + transcript
+        world_input = input_tokens + output_tokens + task_size + system + example_size * examples
+        world_output = (AUTHORED_TOOL_TURN_TOKENS if calls else 0) + 64 + 16 * calls
+        queries += min(maximum_query_tokens, task_size + output_tokens)
+        assistant_requests.append(ExpectedCompletion(input_tokens, output_tokens))
+        world_requests.append(ExpectedCompletion(world_input, world_output))
+        transcript += output_tokens + (AUTHORED_TOOL_TURN_TOKENS if calls else 0)
+    judge = task_size + transcript + 1024 + token_estimate(task.reference_answer)
+    return ExpectedUsage(
+        assistant_input=math.fsum(call.input_tokens for call in assistant_requests),
+        assistant_output=math.fsum(call.output_tokens for call in assistant_requests),
+        world_input=math.fsum(call.input_tokens for call in world_requests),
+        world_output=math.fsum(call.output_tokens for call in world_requests),
+        query_input=queries,
+        judge_input=judge,
+        turns=len(turns),
+        measured_turns=0,
+        assistant_requests=tuple(assistant_requests),
+        world_requests=tuple(world_requests),
+        judge_inputs=(judge,),
+        episode_count=1,
     )
 
 

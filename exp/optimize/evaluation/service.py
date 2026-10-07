@@ -31,6 +31,7 @@ from exp.optimize.evaluation.contracts import (
     EvaluationJudge,
     EvaluationServices,
     EvaluationSetup,
+    evaluated_tasks,
 )
 from exp.optimize.evaluation.simulation import run_or_load_simulation
 from exp.optimize.router.errors import RouterCompositionError
@@ -143,7 +144,9 @@ def evaluate_models(
         rubric_id=calibration.rubric_id,
         calibration_id=calibration.calibration_id,
     )
-    tasks = load_task_set(project.artifacts, completed.task_set.artifact_id).tasks
+    tasks = evaluated_tasks(
+        load_task_set(project.artifacts, completed.task_set.artifact_id).tasks, setup
+    )
     required_judgments = len(tasks) * len(setup.candidates) * setup.repeats
     if required_judgments > budget.maximum_judgments:
         raise ValueError("evaluation judgment ceiling is below scenarios times worker models")
@@ -155,6 +158,7 @@ def evaluate_models(
         pricing_snapshot_id=setup.pricing_snapshot_id,
         observed_cells=(),
         repeats=tuple(range(setup.repeats)),
+        task_ids=setup.evaluated_task_ids,
         additional_inputs=sorted_unique_inputs(
             calibration_input, execution_input, *services.plan_inputs
         ),

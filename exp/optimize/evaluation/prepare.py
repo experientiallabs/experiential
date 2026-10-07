@@ -27,6 +27,7 @@ from exp.common.models import (
 )
 from exp.common.progress import ProgressHook, report
 from exp.common.project import ProjectStore, artifact_input
+from exp.common.tasks import load_task_set
 from exp.common.traces import load_trace_dataset
 from exp.optimize.evaluation.contracts import EvaluationSetup
 from exp.optimize.evaluation.judge_selection import select_judge_model
@@ -72,6 +73,9 @@ class ModelEvaluationOptions(ContractModel):
         maximum_retrieval_query_tokens: Optional aggregate query limit; omission uses the world
             model's input capacity. Lossless chunks separately obey embedding input capacity.
         seed: Reproducible scenario seed, default zero.
+        include_mined: Whether scenarios mined from captured traffic are replayed, default
+            true (omitted from records). False replays only the authored scenarios selected
+            with ``exp.simulation.scenarios.select_authored_scenarios``.
     """
 
     maximum_steps: int = Field(default=100, ge=1)
@@ -83,6 +87,7 @@ class ModelEvaluationOptions(ContractModel):
     maximum_judge_output_tokens: int = Field(default=8_192, gt=0)
     maximum_retrieval_query_tokens: int | None = Field(default=None, gt=0)
     seed: int = 0
+    include_mined: bool = Field(default=True, exclude_if=lambda value: value is True)
 
 
 class PreparedModelEvaluation(ContractModel):
@@ -189,6 +194,15 @@ def prepare_model_evaluation(
         raise ValueError("select at least two distinct worker models")
     report(progress, "Verifying built project")
     completed = completed_project_build(project)
+    evaluated_task_ids = None
+    if not options.include_mined:
+        tasks = load_task_set(project.artifacts, completed.task_set.artifact_id).tasks
+        evaluated_task_ids = tuple(task.task_id for task in tasks if task.origin == "authored")
+        if not evaluated_task_ids:
+            raise ValueError(
+                "no authored scenarios to evaluate; select authored scenarios or include the "
+                "mined scenarios"
+            )
     if (judge_setup is None) != (calibration_id is None):
         raise ValueError("supply both judge setup and calibration, or omit both for task success")
     report(progress, "Preparing judge")
@@ -418,6 +432,7 @@ def prepare_model_evaluation(
         maximum_rollout_output_tokens=options.maximum_rollout_output_tokens,
         maximum_concurrency=options.maximum_concurrency,
         repeats=options.repeats,
+        evaluated_task_ids=evaluated_task_ids,
     )
     report(progress, "Calculating evaluation quote")
     cost = estimate_model_evaluation(
