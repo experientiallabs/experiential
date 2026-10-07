@@ -229,6 +229,7 @@ pub(crate) async fn responses(
         // A guardrail may rewrite the output the probabilities describe; it is
         // checked first so a guarded request never reserves a sidecar.
         capture_logprobs: !admission.buffers_output()
+            && crate::capture::logprobs::route_may_inject(&admission.route)
             && state
                 .capture
                 .as_ref()

@@ -30,9 +30,10 @@ pub(crate) const RECORD_ENVELOPE_BYTES: usize = 16 * 1024;
 /// complete captured response: none, a truncated prefix or a stream the client
 /// left early drops them. A
 /// response still held as wire bytes is judged once delivery decodes it.
-pub(crate) fn align_with_response(record: &mut super::record::Record, wire_pending: bool) {
+/// Returns the bytes released from the entry's charge.
+pub(crate) fn align_with_response(record: &mut super::record::Record, wire_pending: bool) -> usize {
     if wire_pending {
-        return;
+        return 0;
     }
     let complete = match &record.response {
         Some(super::record::Response::Json { .. }) => true,
@@ -43,9 +44,28 @@ pub(crate) fn align_with_response(record: &mut super::record::Record, wire_pendi
         }) => !truncated && !client_disconnected,
         None => false,
     };
-    if !complete {
-        record.provider_logprobs = None;
+    if complete {
+        return 0;
     }
+    release(&mut record.provider_logprobs)
+}
+
+/// Clear a sidecar and return the bytes charged for it, so the caller can
+/// release them from the entry's pending charge.
+pub(crate) fn release(sidecar: &mut Option<Captured>) -> usize {
+    sidecar.take().map_or(0, |captured| captured.heap_bytes())
+}
+
+/// Whether any rung of this admitted route could be dialed with capture-only
+/// probabilities; a route with none never reserves a sidecar.
+pub(crate) fn route_may_inject(route: &[crate::waterfall::DeploymentWire]) -> bool {
+    route.iter().any(|wire| {
+        wire.capture_logprobs
+            && !wire.billing_customer_managed
+            && wire.dialect == "openai_compatible"
+            && wire.upstream_body.is_none()
+            && !refused(&rung_key(wire))
+    })
 }
 
 /// Room the encoded record leaves for probabilities after the full request,

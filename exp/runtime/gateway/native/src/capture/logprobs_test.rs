@@ -155,3 +155,38 @@ fn an_output_frame_without_probabilities_marks_the_sequence_incomplete() {
     probabilities.retain(None, 0, false);
     assert!(!probabilities.take().unwrap().1);
 }
+
+#[test]
+fn clearing_a_sidecar_returns_everything_it_was_charged() {
+    let mut captured = Captured::injected();
+    captured.extend(vec![delta("a"), delta("b")], false, |_| true);
+    let charged = captured.heap_bytes();
+    assert!(charged > std::mem::size_of::<Captured>());
+    let mut sidecar = Some(captured);
+    assert_eq!(release(&mut sidecar), charged);
+    assert!(sidecar.is_none());
+    assert_eq!(release(&mut sidecar), 0);
+}
+
+#[test]
+fn only_a_route_with_an_injectable_rung_reserves_a_sidecar() {
+    let rung = |id: &str, eligible: bool, byok: bool, dialect: &str| {
+        let mut wire: crate::waterfall::DeploymentWire = serde_json::from_value(json!({
+            "provider":"p","deployment_id":id,"dialect":dialect,"url":"https://route",
+            "headers":{},"timeout_seconds":1.0,"idempotency_key":"k"
+        }))
+        .unwrap();
+        wire.capture_logprobs = eligible;
+        wire.billing_customer_managed = byok;
+        wire
+    };
+    assert!(!route_may_inject(&[
+        rung("route-a", false, false, "openai_compatible"),
+        rung("route-b", true, true, "openai_compatible"),
+        rung("route-c", true, false, "openai_responses"),
+    ]));
+    let eligible = rung("route-d", true, false, "openai_compatible");
+    assert!(route_may_inject(std::slice::from_ref(&eligible)));
+    remember_refusal(&rung_key(&eligible));
+    assert!(!route_may_inject(&[eligible]));
+}

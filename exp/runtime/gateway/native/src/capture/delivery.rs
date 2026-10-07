@@ -195,7 +195,7 @@ fn run_worker<S: Sink>(
                             record.provider_reasoning = None;
                             record.provider_tool_calls_json = None;
                         }
-                        super::logprobs::align_with_response(record, false);
+                        let _ = super::logprobs::align_with_response(record, false);
                     }
                     entry.value = sink.prepare(record, maximum_record_bytes).ok();
                     if entry.value.is_none() && record.provider_logprobs.is_some() {

@@ -481,7 +481,7 @@ impl Collector {
             entry.record.provider_tool_calls_json = None;
             entry.record.metrics = None;
             entry.record.gemini_thought_parts.clear();
-            entry.record.provider_logprobs = None;
+            entry.bytes -= super::logprobs::release(&mut entry.record.provider_logprobs);
             entry._admission.handoff(entry.bytes);
             drop(pending);
             self.emit_entry(entry);
@@ -559,7 +559,8 @@ impl Collector {
             entry.record.provider_tool_calls_json = None;
             entry.record.gemini_thought_parts.clear();
         }
-        super::logprobs::align_with_response(&mut entry.record, entry.wire.is_some());
+        entry.bytes -=
+            super::logprobs::align_with_response(&mut entry.record, entry.wire.is_some());
         entry.record.deployment_id = deployment_id;
         entry.record.metrics = if entry.record.response.is_some() || entry.wire.is_some() {
             entry
