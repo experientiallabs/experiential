@@ -763,13 +763,14 @@ impl Collector {
             return;
         };
         self.expire(&mut pending);
+        let bytes = super::logprobs::Captured::injected().heap_bytes();
+        let full =
+            self.retained_bytes(&pending).saturating_add(bytes) > self.config.maximum_pending_bytes;
         let Some(entry) = pending.entries.get_mut(request_id) else {
             return;
         };
-        if entry.record.provider_logprobs.is_none() {
-            let captured = super::logprobs::Captured::injected();
-            let bytes = captured.heap_bytes();
-            entry.record.provider_logprobs = Some(captured);
+        if entry.record.provider_logprobs.is_none() && !full {
+            entry.record.provider_logprobs = Some(super::logprobs::Captured::injected());
             entry.bytes += bytes;
             pending.bytes += bytes;
         }

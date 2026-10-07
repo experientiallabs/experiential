@@ -26,18 +26,10 @@ pub(crate) const MAXIMUM_CAPTURED_LOGPROB_BYTES: usize = 4 * 1024 * 1024;
 /// retained probabilities against the destination's record ceiling.
 pub(crate) const RECORD_ENVELOPE_BYTES: usize = 16 * 1024;
 
-/// Drop a record's retained probabilities (keeping the truncated mark) when
-/// they are what keeps it from encoding; `false` when there was nothing to shed.
+/// Remove a record's probability sidecar when it is what keeps the record from
+/// encoding; `false` when the record carried none.
 pub(crate) fn shed<R>(record: &mut super::record::Record<R>) -> bool {
-    match record.provider_logprobs.as_mut() {
-        Some(captured) if !captured.content.is_empty() || !captured.refusal.is_empty() => {
-            captured.content = Vec::new();
-            captured.refusal = Vec::new();
-            captured.truncated = true;
-            true
-        }
-        _ => false,
-    }
+    record.provider_logprobs.take().is_some()
 }
 
 /// Room the encoded record leaves for probabilities after the full request,
@@ -55,9 +47,27 @@ const MAXIMUM_REFUSED_RUNGS: usize = 4096;
 static REFUSED: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(Default::default);
 
 /// The rung's identity for refusal memory: a catalog-local deployment id is not
-/// unique across catalogs, so the provider endpoint and wire model join it.
+/// unique across catalogs or connections, so the endpoint, wire model and a
+/// digest of the dial headers (credential and connection) join it. Only the
+/// digest is kept, never a header value.
 pub(crate) fn rung_key(wire: &crate::waterfall::DeploymentWire) -> String {
-    format!("{}\n{}\n{}", wire.deployment_id, wire.url, wire.model_id)
+    use sha2::{Digest, Sha256};
+    let mut headers: Vec<_> = wire.headers.iter().collect();
+    headers.sort();
+    let mut digest = Sha256::new();
+    for (name, value) in headers {
+        digest.update(name.as_bytes());
+        digest.update([0]);
+        digest.update(value.as_bytes());
+        digest.update([0]);
+    }
+    format!(
+        "{}\n{}\n{}\n{:x}",
+        wire.deployment_id,
+        wire.url,
+        wire.model_id,
+        digest.finalize()
+    )
 }
 
 /// Whether this worker has seen the rung refuse injected probabilities.
@@ -129,10 +139,12 @@ impl ChatProbabilities {
     /// Retain a capture-only choice channel; malformed or null channels are dropped.
     pub(crate) fn retain(&mut self, value: Option<&Value>, choice_index: u32) {
         if let Self::Capture(buffer) = self {
-            if let Ok(Some(delta)) = crate::logprobs::parse(value, choice_index) {
-                if delta.logprobs.is_some() {
-                    buffer.push(delta);
-                }
+            match crate::logprobs::parse(value, choice_index) {
+                Ok(Some(delta)) if delta.logprobs.is_some() => buffer.push(delta),
+                Ok(_) => {}
+                // A malformed channel leaves a hole: keep the prefix and mark it
+                // incomplete so the record never presents a gapped sequence.
+                Err(_) => buffer.truncated = true,
             }
         }
     }

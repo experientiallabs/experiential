@@ -110,3 +110,30 @@ fn nul_in_token_text_is_replaced_and_flagged() {
         .unwrap()
         .contains("\\u0000"));
 }
+
+#[test]
+fn a_malformed_channel_marks_the_retained_prefix_truncated() {
+    let mut probabilities = ChatProbabilities::Capture(Buffer::default());
+    probabilities.retain(
+        Some(&json!({"content":[{"token":"a","logprob":-1.0,"bytes":null,"top_logprobs":[]}]})),
+        0,
+    );
+    probabilities.retain(Some(&json!({"content":[{"token":"b","logprob":"bad"}]})), 0);
+    let (taken, truncated) = probabilities.take().unwrap();
+    assert_eq!(taken.len(), 1);
+    assert!(truncated);
+}
+
+#[test]
+fn rung_identity_separates_connections_without_keeping_header_values() {
+    let mut wire: crate::waterfall::DeploymentWire = serde_json::from_value(json!({
+        "provider":"p","deployment_id":"d","dialect":"openai_compatible","url":"https://x",
+        "headers":{"authorization":"Bearer one"},"timeout_seconds":1.0,"idempotency_key":"k"
+    }))
+    .unwrap();
+    let first = rung_key(&wire);
+    assert!(!first.contains("Bearer"));
+    wire.headers
+        .insert("authorization".into(), "Bearer two".into());
+    assert_ne!(rung_key(&wire), first);
+}

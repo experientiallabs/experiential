@@ -200,7 +200,7 @@ fn run_worker<S: Sink>(
                     entry.value = sink.prepare(record, maximum_record_bytes).ok();
                     if entry.value.is_none() && super::logprobs::shed(record) {
                         // Probabilities are the one optional sidecar: an
-                        // exchange that only fits without them keeps the rest.
+                        // exchange that only fits without them drops them whole.
                         entry.value = sink.prepare(record, maximum_record_bytes).ok();
                     }
                     if let Some(value) = &entry.value {

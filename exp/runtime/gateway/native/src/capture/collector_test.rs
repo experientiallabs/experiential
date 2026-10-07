@@ -928,7 +928,6 @@ fn an_unencodable_record_sheds_its_probabilities_and_keeps_the_exchange() {
         captured_at: 1.0,
         provider_logprobs: Some(crate::capture::logprobs::Captured::injected()),
     };
-    assert!(!crate::capture::logprobs::shed(&mut record));
     let captured = record.provider_logprobs.as_mut().unwrap();
     captured.extend(vec![probability("a")], false, |_| true);
     let full = record.encode(1 << 20).unwrap().len();
@@ -937,6 +936,28 @@ fn an_unencodable_record_sheds_its_probabilities_and_keeps_the_exchange() {
     assert!(record.encode(ceiling).is_none());
     assert!(crate::capture::logprobs::shed(&mut record));
     assert!(record.encode(ceiling).is_some());
-    let captured = record.provider_logprobs.as_ref().unwrap();
-    assert!(captured.truncated && captured.content.is_empty());
+    assert!(record.provider_logprobs.is_none());
+    assert!(!crate::capture::logprobs::shed(&mut record));
+}
+
+#[test]
+fn the_injection_marker_never_exceeds_the_pending_ceiling() {
+    let mut config = logprobs_config();
+    let (probe, _) = collector(config.clone());
+    assert!(probe.begin(request("size")));
+    let used = probe.retained_bytes(&probe.pending.lock().unwrap());
+    config.maximum_pending_bytes = used.max(config.maximum_response_bytes);
+    config.maximum_request_bytes = config
+        .maximum_request_bytes
+        .min(config.maximum_pending_bytes);
+    let (collector, _) = collector(config);
+    assert!(collector.begin(request("full")));
+    if collector.retained_bytes(&collector.pending.lock().unwrap())
+        + crate::capture::logprobs::Captured::injected().heap_bytes()
+        > collector.config.maximum_pending_bytes
+    {
+        collector.logprobs_injected("full");
+        let pending = collector.pending.lock().unwrap();
+        assert!(pending.entries["full"].record.provider_logprobs.is_none());
+    }
 }
