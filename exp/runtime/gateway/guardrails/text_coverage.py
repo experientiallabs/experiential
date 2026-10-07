@@ -10,7 +10,8 @@ from exp.runtime.gateway.guardrails.contracts import ClassifierCoverageError
 def text_input_context(request: GatewayRequest) -> str:
     """Validate text coverage and extract supported context that must not be rewritten.
 
-    Message text and tool arguments are scanned separately by each adapter. Function
+    Message text, including the canonical folded tool-error prefix, and tool arguments
+    are scanned separately by each adapter. Function
     definitions, examples, call/result identifiers, names and namespaces, schemas, and normalized
     search declarations are ordinary text too. Opaque provider content, caller objects,
     attachments, and provider-owned tools or prompt configuration require a separately

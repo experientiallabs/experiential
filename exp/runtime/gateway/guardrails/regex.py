@@ -325,11 +325,14 @@ class RegexClassifier:
         flagged = bool(context) and self._redact(context)[0]
         immutable_match = flagged
         for message in request.messages:
-            found, text = self._redact(message.content or "")
+            found, text = self._redact(message.folded_tool_error_content())
             flagged |= found
-            # Cached text blocks replay verbatim; changing only content leaves the original on wire.
-            immutable_match |= found and bool(message.provider_text_blocks)
-            messages.append(message.model_copy(update={"content": text}) if found else message)
+            # Cached blocks and generated error prefixes cannot be changed through content alone.
+            immutable = bool(message.provider_text_blocks) or message.tool_is_error
+            immutable_match |= found and immutable
+            messages.append(
+                message.model_copy(update={"content": text}) if found and not immutable else message
+            )
             for call in message.tool_calls:
                 found, _ = self._redact(call.arguments_json())
                 flagged |= found

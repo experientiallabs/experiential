@@ -93,6 +93,7 @@ class GuardrailEngine:
         self._store = store
         self._client = client
         self._monotonic = monotonic
+        self._owns_inspects = inspects is None
         self._inspects = inspects or BoundedInspect()
         self._observation_inspects = BoundedInspect(max_inflight=max_observations)
         self._observations = ObservationOwner(
@@ -331,6 +332,9 @@ class GuardrailEngine:
         """Stop observations and drain within a bounded host shutdown budget."""
         deadline = time.monotonic() + timeout_seconds
         self._observations.close(timeout_seconds=timeout_seconds)
+        self._observation_inspects.close(timeout_seconds=max(0.0, deadline - time.monotonic()))
+        if self._owns_inspects:
+            self._inspects.close(timeout_seconds=max(0.0, deadline - time.monotonic()))
         self._observation_records.close(timeout_seconds=max(0.0, deadline - time.monotonic()))
 
     @property

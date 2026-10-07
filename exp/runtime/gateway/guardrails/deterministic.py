@@ -174,12 +174,15 @@ def _redacted_messages(
     flagged = bool(context) and detector.matches(context)
     immutable_match = flagged
     for message in request.messages:
-        rewritten = detector.redact(message.content or "")
+        rewritten = detector.redact(message.folded_tool_error_content())
         flagged |= rewritten is not None
-        # Cached text blocks replay verbatim; changing only content leaves the original on wire.
-        immutable_match |= rewritten is not None and bool(message.provider_text_blocks)
+        # Cached blocks and generated error prefixes cannot be changed through content alone.
+        immutable = bool(message.provider_text_blocks) or message.tool_is_error
+        immutable_match |= rewritten is not None and immutable
         messages.append(
-            message if rewritten is None else message.model_copy(update={"content": rewritten})
+            message
+            if rewritten is None or immutable
+            else message.model_copy(update={"content": rewritten})
         )
         for call in message.tool_calls:
             found = detector.matches(call.arguments_json())

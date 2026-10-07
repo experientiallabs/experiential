@@ -496,8 +496,9 @@ individual checks by check ID (`standard-input-pii`) or `stage.capability`
 stores a credential. The adapter reads that name at inspect time and sends a
 bearer header. Missing values are classifier uncertainty.
 
-Local keyword and regex input checks inspect canonical message text, tool arguments,
-function definitions and examples, tool call/result names and namespaces, structured
+Local keyword and regex input checks inspect canonical message text, including the
+generated tool-error prefix, tool arguments, function definitions and examples,
+tool call/result identifiers, names and namespaces, structured
 output schemas, and normalized gateway web/tool-search declarations. Recovered or sealed reasoning, capture-only reasoning,
 multimodal attachments, verbatim native message blocks, context management, raw provider
 thinking/output configuration, opaque provider tool-caller objects, and provider-owned
@@ -505,7 +506,8 @@ native/server tools return unsupported coverage. Regex rewrites only message tex
 tool/schema/search context are refused under modify. Exact flattened text blocks and inert
 cache/replay metadata remain supported for inspection. Cached block text is inspectable,
 but a match is refused under local modify because changing only canonical text cannot
-safely rewrite the provider block.
+safely rewrite the provider block. Tool-error text is also immutable under modify:
+rewriting the body cannot remove the typed error flag that generates its prefix.
 
 The `http_json` request includes `capability`, `stage`, `action`, `check_id`,
 and exactly one subject: `request` or `completion`. The request subject is the

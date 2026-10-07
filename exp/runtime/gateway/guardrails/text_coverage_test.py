@@ -72,6 +72,18 @@ SUPPORTED_TEXT_CONTEXTS = (
 )
 
 
+def tool_error_request(*, failed: bool, content: str = "benign") -> GatewayRequest:
+    """Retain the typed tool error flag whose provider projection adds a text prefix."""
+    return GatewayRequest(
+        surface=GatewayApiSurface.RESPONSES,
+        messages=(
+            GatewayMessage(
+                role="tool", tool_call_id="call-one", content=content, tool_is_error=failed
+            ),
+        ),
+    )
+
+
 def unsupported_text_request(field: str) -> GatewayRequest:
     """Build a validated input whose visible text omits some classifier-visible content."""
     message = GatewayMessage(role="assistant", content="visible")
@@ -293,9 +305,18 @@ def test_exactly_flattened_text_blocks_and_inert_metadata_remain_supported() -> 
 
 
 @pytest.mark.parametrize("adapter", ["keyword", "regex"])
-@pytest.mark.parametrize("field", ["recovered_reasoning", "native_response"])
-def test_actual_observation_records_unsupported_instead_of_allow(adapter: str, field: str) -> None:
-    """The asynchronous engine reports the coverage gap without enforcing a customer action."""
+@pytest.mark.parametrize(
+    ("field", "expected"),
+    [
+        ("recovered_reasoning", GuardrailOutcome.UNSUPPORTED),
+        ("native_response", GuardrailOutcome.UNSUPPORTED),
+        ("tool_error", GuardrailOutcome.FLAGGED),
+    ],
+)
+def test_actual_observation_records_coverage_and_tool_errors_truthfully(
+    adapter: str, field: str, expected: GuardrailOutcome
+) -> None:
+    """Asynchronous inspection sees supported wire text and reports opaque coverage gaps."""
     recorded = threading.Event()
     observed: list[GuardrailOutcome] = []
     enforced: list[GuardrailAction] = []
@@ -337,12 +358,12 @@ def test_actual_observation_records_unsupported_instead_of_allow(adapter: str, f
             ),
         ),
     )
+    needle = "[tool error] benign" if field == "tool_error" else "alice@example.com"
+    pattern = r"^\[tool error\] benign$" if field == "tool_error" else "alice@example.com"
     classifier = (
-        KeywordClassifier(("alice@example.com",))
+        KeywordClassifier((needle,))
         if adapter == "keyword"
-        else RegexClassifier(
-            RegexAdapterDocument(adapter_id="local", patterns=("alice@example.com",))
-        )
+        else RegexClassifier(RegexAdapterDocument(adapter_id="local", patterns=(pattern,)))
     )
     engine = RecordingEngine(
         store=MappingGuardrailStore((policy,)),
@@ -352,11 +373,15 @@ def test_actual_observation_records_unsupported_instead_of_allow(adapter: str, f
     try:
         engine.observe_input(
             policy=policy,
-            request=unsupported_text_request(field),
+            request=(
+                tool_error_request(failed=True)
+                if field == "tool_error"
+                else unsupported_text_request(field)
+            ),
             deadline_monotonic=time.monotonic() + 2,
         )
         assert recorded.wait(2)
-        assert observed == [GuardrailOutcome.UNSUPPORTED]
+        assert observed == [expected]
         assert enforced == []
     finally:
         engine.close(timeout_seconds=2)

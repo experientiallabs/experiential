@@ -27,8 +27,21 @@ from exp.runtime.gateway.guardrails.text_coverage_test import (
     SUPPORTED_TEXT_CONTEXTS,
     UNSUPPORTED_TEXT_INPUTS,
     text_context_request,
+    tool_error_request,
     unsupported_text_request,
 )
+
+
+@pytest.mark.parametrize("content", ["", "benign"])
+def test_keyword_classifier_inspects_synthesized_tool_error_text(content: str) -> None:
+    """A failed tool's flag reaches detection even with an empty or benign result body."""
+    classifier = KeywordClassifier((f"[tool error] {content}",))
+    for failed in (False, True):
+        request = tool_error_request(failed=failed, content=content)
+        original = request.model_copy(deep=True)
+        verdict = asyncio.run(classifier.inspect_input(request=request, check=_check()))
+        assert verdict.flagged is failed
+        assert request == original
 
 
 @pytest.mark.parametrize("field", UNSUPPORTED_TEXT_INPUTS)

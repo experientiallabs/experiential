@@ -14,7 +14,7 @@ from exp.runtime.gateway.contracts import (
     ToolCall,
 )
 from exp.runtime.gateway.guardrails.config import engine_from_document
-from exp.runtime.gateway.guardrails.contracts import GuardrailRejected
+from exp.runtime.gateway.guardrails.contracts import GuardrailAction, GuardrailRejected
 from exp.runtime.gateway.guardrails.deterministic import (
     compile_native_detectors,
     native_input_request,
@@ -29,9 +29,70 @@ from exp.runtime.gateway.guardrails.text_coverage_test import (
     SUPPORTED_TEXT_CONTEXTS,
     UNSUPPORTED_TEXT_INPUTS,
     text_context_request,
+    tool_error_request,
     unsupported_text_request,
 )
-from exp.runtime.models.providers.wire_messages import anthropic_blocks
+from exp.runtime.models.providers.wire_messages import anthropic_blocks, responses_items
+
+
+@pytest.mark.parametrize("content", ["", "benign"])
+@pytest.mark.parametrize(
+    "action", [GuardrailAction.ALLOW, GuardrailAction.BLOCK, GuardrailAction.MODIFY]
+)
+@pytest.mark.parametrize("protected", [True, False])
+def test_native_and_python_match_exact_tool_error_wire_text(
+    content: str, action: GuardrailAction, protected: bool
+) -> None:
+    """Anchored rules see the provider prefix; modify cannot erase the underlying error flag."""
+    engine = engine_from_document(_adapter(patterns=[rf"^\[tool error\] {content}$"]))
+    original_policy = engine.policies_for("org", "identity")[0]
+    policy = original_policy.model_copy(
+        update={
+            "protected": protected,
+            "checks": tuple(
+                check.model_copy(update={"action": action}) for check in original_policy.checks
+            ),
+        }
+    )
+    detectors = compile_native_detectors(engine.deterministic_specifications)
+    try:
+        for failed in (False, True):
+            request = tool_error_request(failed=failed, content=content)
+            original = request.model_copy(deep=True)
+            wire = responses_items(request.messages[0])
+            assert wire[0]["output"] == (f"[tool error] {content}" if failed else content)
+            if failed and action is not GuardrailAction.ALLOW:
+                with pytest.raises(GuardrailRejected) as python:
+                    asyncio.run(
+                        engine.enforce_input(
+                            policy=policy, request=request, deadline_monotonic=1e12
+                        )
+                    )
+                with pytest.raises(GuardrailRejected) as native:
+                    native_input_request(
+                        policy, detectors, request, monotonic=lambda: 0.0, deadline_monotonic=1e12
+                    )
+                assert native.value.failure == python.value.failure
+                assert native.value.failure.failure_class.value == "guardrail"
+            else:
+                assert (
+                    asyncio.run(
+                        engine.enforce_input(
+                            policy=policy, request=request, deadline_monotonic=1e12
+                        )
+                    )
+                    is request
+                )
+                assert (
+                    native_input_request(
+                        policy, detectors, request, monotonic=lambda: 0.0, deadline_monotonic=1e12
+                    )
+                    is request
+                )
+            assert request == original
+            assert responses_items(request.messages[0]) == wire
+    finally:
+        engine.close(timeout_seconds=2)
 
 
 @pytest.mark.parametrize("field", UNSUPPORTED_TEXT_INPUTS)

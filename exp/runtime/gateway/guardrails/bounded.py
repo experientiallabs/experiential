@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import threading
+import time
 from collections.abc import Awaitable, Callable, Coroutine
 from concurrent.futures import CancelledError as FutureCancelledError
 from concurrent.futures import Future
@@ -45,6 +46,9 @@ class _IsolationWorker:
         """Start the worker thread without waiting for its loop."""
         self._ready = threading.Event()
         self._start_lock = threading.Lock()
+        self._state_lock = threading.Lock()
+        self._closing = False
+        self._busy = False
         self._start_error: BaseException | None = None
         self._started_callbacks: list[Callable[[BaseException | None], None]] = []
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -72,19 +76,21 @@ class _IsolationWorker:
         loop = self._loop
         if loop is None:
             raise RuntimeError("classifier isolation loop is not running")
-        self._generation += 1
-        generation = self._generation
         result: Future[T] = Future()
 
         def start() -> None:
             """Create the inspect task on the worker loop."""
             if result.cancelled():
                 self._pending_cancels.discard(generation)
+                self._busy = False
+                self._stop_if_idle()
                 return
             try:
                 task = loop.create_task(fn())
             except Exception as exc:  # noqa: BLE001 - factory errors must complete the waiter
+                self._busy = False
                 result.set_exception(exc)
+                self._stop_if_idle()
                 return
             self._task = task
             self._active_generation = generation
@@ -96,21 +102,57 @@ class _IsolationWorker:
                 """Copy the inspect outcome onto the cross-thread future."""
                 if self._task is done and self._active_generation == generation:
                     self._task = None
-                if result.done():
-                    return
-                if done.cancelled():
-                    result.cancel()
-                    return
-                error = done.exception()
-                if error is not None:
-                    result.set_exception(error)
-                    return
-                result.set_result(done.result())
+                    self._busy = False
+                try:
+                    if result.done():
+                        return
+                    if done.cancelled():
+                        result.cancel()
+                        return
+                    error = done.exception()
+                    if error is not None:
+                        result.set_exception(error)
+                        return
+                    result.set_result(done.result())
+                finally:
+                    self._stop_if_idle()
 
             task.add_done_callback(finish)
 
-        loop.call_soon_threadsafe(start)
+        with self._state_lock:
+            if self._closing:
+                raise RuntimeError("classifier isolation worker is closed")
+            self._generation += 1
+            generation = self._generation
+            self._busy = True
+            try:
+                loop.call_soon_threadsafe(start)
+            except RuntimeError:
+                self._busy = False
+                raise
         return result, generation
+
+    def stop_when_idle(self) -> None:
+        """Reject submission and stop this loop only after its actual inspect finishes."""
+        with self._state_lock:
+            self._closing = True
+            loop = self._loop
+            if loop is not None:
+                try:
+                    loop.call_soon_threadsafe(self._stop_if_idle)
+                except RuntimeError:
+                    pass
+
+    def _stop_if_idle(self) -> None:
+        """Stop on the worker loop without destroying pending or cancellation-resistant work."""
+        with self._state_lock:
+            if self._closing and not self._busy and self._loop is not None:
+                self._loop.stop()
+
+    def wait_stopped(self, timeout: float) -> None:
+        """Join within the caller's remaining budget, never joining this worker from itself."""
+        if self._thread is not threading.current_thread():
+            self._thread.join(timeout)
 
     def request_cancel(self, generation: int) -> None:
         """Queue cancellation for one submitted inspect without waiting.
@@ -137,7 +179,10 @@ class _IsolationWorker:
                 return
             self._pending_cancels.add(generation)
 
-        loop.call_soon_threadsafe(cancel)
+        try:
+            loop.call_soon_threadsafe(cancel)
+        except RuntimeError:
+            return
 
     def on_started(self, callback: Callable[[BaseException | None], None]) -> None:
         """Invoke ``callback`` once this worker has started or failed.
@@ -207,6 +252,7 @@ class _IsolationWorker:
     def _announce_running(self) -> None:
         """Mark startup complete after the daemon loop is actually running."""
         self._signal_started(None)
+        self._stop_if_idle()
 
     def _signal_started(self, error: BaseException | None) -> None:
         """Unblock waiters exactly once with ``error`` or success."""
@@ -222,6 +268,7 @@ class _IsolationWorker:
 
     def _run_forever(self) -> None:
         """Own one event loop for the life of this worker."""
+        loop: asyncio.AbstractEventLoop | None = None
         try:
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
@@ -234,6 +281,8 @@ class _IsolationWorker:
         finally:
             if not self._ready.is_set():
                 self._signal_started(RuntimeError("classifier isolation loop failed to start"))
+            if loop is not None:
+                loop.close()
 
 
 class _IsolationPool:
@@ -250,6 +299,34 @@ class _IsolationPool:
         self._idle: list[_IsolationWorker] = []
         self._created = 0
         self._waiters: list[asyncio.Future[_IsolationWorker | None]] = []
+        self._workers: set[_IsolationWorker] = set()
+        self._closed = False
+
+    def close(self, timeout_seconds: float) -> None:
+        """Stop admission and join owned workers within one finite shutdown budget."""
+        if timeout_seconds < 0:
+            raise ValueError("classifier shutdown timeout cannot be negative")
+        deadline = time.monotonic() + timeout_seconds
+        with self._lock:
+            self._closed = True
+            workers = tuple(self._workers)
+            waiters, self._waiters = self._waiters, []
+            self._idle.clear()
+        for waiter in waiters:
+            try:
+                waiter.get_loop().call_soon_threadsafe(self._reject_closed, waiter)
+            except RuntimeError:
+                continue
+        for worker in workers:
+            worker.stop_when_idle()
+        for worker in workers:
+            worker.wait_stopped(max(0.0, deadline - time.monotonic()))
+
+    @staticmethod
+    def _reject_closed(waiter: asyncio.Future[_IsolationWorker | None]) -> None:
+        """Reject pending admission on its caller's event loop."""
+        if not waiter.done():
+            waiter.set_exception(RuntimeError("classifier isolation pool is closed"))
 
     @property
     def worker_count(self) -> int:
@@ -280,6 +357,8 @@ class _IsolationPool:
         loop = asyncio.get_running_loop()
         waiter: asyncio.Future[_IsolationWorker | None] = loop.create_future()
         with self._lock:
+            if self._closed:
+                raise RuntimeError("classifier isolation pool is closed")
             worker = self._take_idle()
             if worker is not None:
                 return worker
@@ -307,17 +386,25 @@ class _IsolationPool:
             worker: Isolation worker whose inspect has actually exited.
         """
         with self._lock:
-            while self._waiters:
-                waiter = self._waiters.pop(0)
-                if waiter.done():
-                    continue
-                waiter.get_loop().call_soon_threadsafe(self._deliver, waiter, worker)
+            if not self._closed:
+                while self._waiters:
+                    waiter = self._waiters.pop(0)
+                    if waiter.done():
+                        continue
+                    try:
+                        waiter.get_loop().call_soon_threadsafe(self._deliver, waiter, worker)
+                    except RuntimeError:
+                        continue
+                    return
+                self._idle.append(worker)
                 return
-            self._idle.append(worker)
+        worker.stop_when_idle()
 
     def _claim(self) -> tuple[_IsolationWorker | None, bool]:
         """Take an idle worker or reserve capacity to start one."""
         with self._lock:
+            if self._closed:
+                raise RuntimeError("classifier isolation pool is closed")
             worker = self._take_idle()
             if worker is not None:
                 return worker, False
@@ -351,6 +438,12 @@ class _IsolationPool:
             with self._lock:
                 self._created -= 1
             raise
+        with self._lock:
+            self._workers.add(worker)
+            closed = self._closed
+        if closed:
+            worker.stop_when_idle()
+            raise RuntimeError("classifier isolation pool is closed")
         ready = worker.attach_ready_waiter()
         start_wait = min(max(0.0, timeout), _WORKER_START_TIMEOUT_SECONDS)
         try:
@@ -363,16 +456,21 @@ class _IsolationPool:
                 self.release(taken)
             raise
         except Exception:  # noqa: BLE001 - startup errors must restore pool capacity
-            with self._lock:
-                self._created -= 1
+            self._discard(worker)
             raise
         try:
             worker.assert_running()
         except RuntimeError:
-            with self._lock:
-                self._created -= 1
+            self._discard(worker)
             raise
         return worker
+
+    def _discard(self, worker: _IsolationWorker) -> None:
+        """Release a failed startup reservation and stop any surviving worker loop."""
+        with self._lock:
+            self._created -= 1
+            self._workers.discard(worker)
+        worker.stop_when_idle()
 
     def _adopt_or_defer(
         self,
@@ -390,14 +488,12 @@ class _IsolationPool:
         """
         if ready.done():
             if ready.cancelled() or ready.exception() is not None:
-                with self._lock:
-                    self._created -= 1
+                self._discard(worker)
                 return None
             try:
                 worker.assert_running()
             except RuntimeError:
-                with self._lock:
-                    self._created -= 1
+                self._discard(worker)
                 return None
             return worker
 
@@ -416,14 +512,12 @@ class _IsolationPool:
             error: Startup failure, or ``None`` on success.
         """
         if error is not None:
-            with self._lock:
-                self._created -= 1
+            self._discard(worker)
             return
         try:
             worker.assert_running()
         except RuntimeError:
-            with self._lock:
-                self._created -= 1
+            self._discard(worker)
             return
         self.release(worker)
 
@@ -444,6 +538,12 @@ class _IsolationPool:
         worker: _IsolationWorker,
     ) -> None:
         """Give ``worker`` to ``waiter`` on that waiter's event loop."""
+        with self._lock:
+            closed = self._closed
+        if closed:
+            self.release(worker)
+            self._reject_closed(waiter)
+            return
         if waiter.done():
             self.release(worker)
             return
@@ -476,6 +576,10 @@ class BoundedInspect:
         self._pool = _IsolationPool(max_inflight)
         self._lock = threading.Lock()
         self._abandoned: dict[str, set[Future[object]]] = {}
+
+    def close(self, *, timeout_seconds: float = 1.0) -> None:
+        """Stop owned workers within a budget while live inspects keep their actual leases."""
+        self._pool.close(timeout_seconds)
 
     def isolation_worker_count(self) -> int:
         """Return how many isolation workers this limiter has started."""

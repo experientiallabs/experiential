@@ -10,6 +10,7 @@ from collections.abc import Callable
 import httpx
 import pytest
 
+from exp.runtime.gateway.contracts import GatewayApiSurface, GatewayMessage, GatewayRequest
 from exp.runtime.gateway.guardrails.bounded import (
     BoundedInspect,
     ClassifierTimeoutError,
@@ -17,7 +18,20 @@ from exp.runtime.gateway.guardrails.bounded import (
     _NativeCallbackRunner,
     run_on_native_loop,
 )
+from exp.runtime.gateway.guardrails.classifiers import ClassifierRegistry, ScriptedClassifier
+from exp.runtime.gateway.guardrails.client import DirectClassifierClient
+from exp.runtime.gateway.guardrails.contracts import (
+    ClassifierVerdict,
+    GuardrailAction,
+    GuardrailCapabilityKind,
+    GuardrailCheck,
+    GuardrailCheckStage,
+    GuardrailPolicy,
+)
+from exp.runtime.gateway.guardrails.enforcement import GuardrailEngine
 from exp.runtime.gateway.guardrails.http_json import shared_http_json_client
+from exp.runtime.gateway.guardrails.store import MappingGuardrailStore
+from exp.runtime.gateway.guardrails.subjects import observation_subject_bytes
 
 
 async def _wait_until(predicate: Callable[[], bool], *, timeout: float = 10.0) -> None:
@@ -871,3 +885,225 @@ def test_native_callback_returns_when_inspect_blocks_before_first_await() -> Non
     finally:
         hold.set()
         _wait_sync(lambda: bound.detached_inspect_count() == 0)
+
+
+class _ShutdownClassifier(ScriptedClassifier):
+    """Expose the actual worker thread and optionally hold cancellation-resistant work."""
+
+    def __init__(self, release: threading.Event | None = None) -> None:
+        """Create a thread receipt and an optional synchronous inspection barrier."""
+        super().__init__()
+        self.release = release
+        self.started = threading.Event()
+        self.threads: list[threading.Thread] = []
+
+    async def inspect_input(
+        self, *, request: GatewayRequest, check: GuardrailCheck
+    ) -> ClassifierVerdict:
+        """Record this worker and finish only after an optional blocking barrier releases."""
+        del request, check
+        self.threads.append(threading.current_thread())
+        self.started.set()
+        if self.release is not None:
+            assert self.release.wait(5)
+        return ClassifierVerdict(flagged=False)
+
+
+def _shutdown_engine(
+    classifier: _ShutdownClassifier, inspects: BoundedInspect | None = None
+) -> tuple[GuardrailEngine, GuardrailPolicy, GatewayRequest]:
+    """Compose the real engine's two worker pools around a synthetic classifier."""
+    policy = GuardrailPolicy(
+        policy_id="shutdown-observer",
+        mode="observe",
+        protected=True,
+        checks=(
+            GuardrailCheck(
+                check_id="input",
+                adapter_id="fixture",
+                capability=GuardrailCapabilityKind.CONTENT_SAFETY,
+                stage=GuardrailCheckStage.INPUT,
+                action=GuardrailAction.BLOCK,
+                timeout_ms=5000,
+            ),
+        ),
+    )
+    engine = GuardrailEngine(
+        store=MappingGuardrailStore((policy,)),
+        client=DirectClassifierClient(ClassifierRegistry({"fixture": classifier})),
+        monotonic=time.monotonic,
+        inspects=inspects,
+        max_observations=1,
+    )
+    request = GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=(GatewayMessage(role="user", content="synthetic shutdown probe"),),
+    )
+    return engine, policy, request
+
+
+def test_repeated_engine_close_stops_owned_observation_and_enforcement_workers() -> None:
+    """Each closed SDK engine releases its idle pool threads instead of accumulating them."""
+    workers: set[threading.Thread] = set()
+    for _ in range(3):
+        classifier = _ShutdownClassifier()
+        engine, policy, request = _shutdown_engine(classifier)
+        try:
+            engine.observe_input(
+                policy=policy, request=request, deadline_monotonic=time.monotonic() + 5
+            )
+            assert classifier.started.wait(2)
+            asyncio.run(
+                engine.enforce_input(
+                    policy=policy.model_copy(update={"mode": "enforce"}),
+                    request=request,
+                    deadline_monotonic=time.monotonic() + 5,
+                )
+            )
+        finally:
+            engine.close(timeout_seconds=1)
+        workers.update(classifier.threads)
+        assert len(set(classifier.threads)) == 2
+        assert all(not worker.is_alive() for worker in workers)
+
+
+def test_engine_close_preserves_a_caller_owned_enforcement_pool() -> None:
+    """An injected pool remains usable after the engine closes its own observer pool."""
+    shared = BoundedInspect(max_inflight=1)
+    classifier = _ShutdownClassifier()
+    engine, policy, request = _shutdown_engine(classifier, shared)
+
+    async def enforce() -> GatewayRequest:
+        """Use the supplied pool through the real engine before shutting down the host."""
+        return await engine.enforce_input(
+            policy=policy.model_copy(update={"mode": "enforce"}),
+            request=request,
+            deadline_monotonic=time.monotonic() + 5,
+        )
+
+    async def reuse() -> int:
+        """Prove the caller still owns pool admission and its running worker."""
+
+        async def inspect() -> int:
+            """Return on the caller's reusable pool."""
+            return 7
+
+        return await shared.run(inspect, 1, adapter_id="independent-owner")
+
+    try:
+        assert asyncio.run(enforce()) == request
+        engine.close(timeout_seconds=1)
+        assert asyncio.run(reuse()) == 7
+        assert classifier.threads[0].is_alive()
+    finally:
+        engine.close(timeout_seconds=1)
+        shared.close(timeout_seconds=1)
+    assert not classifier.threads[0].is_alive()
+
+
+def test_pool_shutdown_preserves_stubborn_observation_ownership_until_actual_exit() -> None:
+    """A bounded close cannot release bytes or destroy a classifier still using its subject."""
+    release = threading.Event()
+    classifier = _ShutdownClassifier(release)
+    engine, policy, request = _shutdown_engine(classifier)
+    try:
+        engine.observe_input(
+            policy=policy, request=request, deadline_monotonic=time.monotonic() + 5
+        )
+        assert classifier.started.wait(2)
+        started = time.monotonic()
+        engine.close(timeout_seconds=0.02)
+        assert time.monotonic() - started < 0.5
+        assert classifier.threads[0].is_alive()
+        assert engine._observations._bytes == len(observation_subject_bytes(request))
+        assert len(engine._observations._jobs) == 1
+
+        async def refused() -> None:
+            """A closed pool must not invoke even a different, nonquarantined adapter."""
+
+            async def inspect() -> None:
+                """Make accidental admission a visible failure."""
+                pytest.fail("closed observation pool invoked a classifier")
+
+            with pytest.raises(RuntimeError, match="closed"):
+                await engine._observation_inspects.run(inspect, 1, adapter_id="later")
+
+        asyncio.run(refused())
+        release.set()
+        _wait_sync(lambda: not classifier.threads[0].is_alive())
+        assert engine._observations._idle.wait(2)
+        assert engine._observations._bytes == 0
+    finally:
+        release.set()
+        engine.close(timeout_seconds=2)
+
+
+def test_pool_close_wakes_queued_acquisition_and_refuses_new_admission() -> None:
+    """Shutdown wakes pending admission without interrupting a still-running inspect."""
+    release = threading.Event()
+    entered = threading.Event()
+    workers: list[threading.Thread] = []
+    bound = BoundedInspect(max_inflight=1)
+
+    async def scenario() -> None:
+        """Close a full pool while another adapter is waiting for its sole worker."""
+
+        async def blocked() -> int:
+            """Keep the worker busy until the test releases it."""
+            workers.append(threading.current_thread())
+            entered.set()
+            assert release.wait(5)
+            return 3
+
+        async def unexpected() -> int:
+            """Fail if queued or new work is admitted during shutdown."""
+            pytest.fail("closed pool admitted another classifier")
+
+        active = asyncio.create_task(bound.run(blocked, 5, adapter_id="active"))
+        await _wait_until(entered.is_set)
+        waiting = asyncio.create_task(bound.run(unexpected, 5, adapter_id="queued"))
+        await _wait_until(lambda: bool(bound._pool._waiters))
+        started = time.monotonic()
+        bound.close(timeout_seconds=0.02)
+        assert time.monotonic() - started < 0.5
+        with pytest.raises(RuntimeError, match="closed"):
+            await waiting
+        with pytest.raises(RuntimeError, match="closed"):
+            await bound.run(unexpected, 1, adapter_id="new")
+        assert not active.done()
+        release.set()
+        assert await active == 3
+        await _wait_until(lambda: not workers[0].is_alive())
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        release.set()
+        bound.close(timeout_seconds=2)
+
+
+def test_pool_close_stops_a_worker_whose_startup_finishes_after_shutdown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A timed-out reserved worker cannot become a parked thread after its owner closes."""
+    release_start = threading.Event()
+    entered = threading.Event()
+    _delay_isolation_worker_start(monkeypatch, release_start, entered)
+    before = set(threading.enumerate())
+    bound = BoundedInspect(max_inflight=1)
+    try:
+        asyncio.run(_timeout_while_isolation_start_is_held(bound))
+        assert entered.wait(2)
+        workers = [
+            thread
+            for thread in threading.enumerate()
+            if thread not in before and thread.name == "exp-guardrail-isolate"
+        ]
+        assert len(workers) == 1
+        bound.close(timeout_seconds=0.01)
+        assert workers[0].is_alive()
+        release_start.set()
+        _wait_sync(lambda: not workers[0].is_alive())
+    finally:
+        release_start.set()
+        bound.close(timeout_seconds=2)
