@@ -39,9 +39,11 @@ failure"). Two things change:
   exists to protect the worker, so only a priority caller overflows it, and only to its
   level's ceiling (below).
 
-The refusal is `lane_saturated_failure()`: failure class `throttled`, consumer-facing safe
-message "This model is at capacity right now. Please retry in a few seconds. Pro subscribers
-get priority access when models are busy.", `retry_after_seconds = 5`
+The refusal is `lane_saturated_failure(priority_admission)`: failure class `throttled`,
+consumer-facing safe message "This model is at capacity right now. Please retry in a few
+seconds." followed by a tier upsell (`LANE_SATURATED_UPSELL`): free callers get " Pro
+subscribers get priority access when models are busy.", paying callers get " Pro orgs get even
+higher priority when models are busy.", Pro callers get nothing more. `retry_after_seconds = 5`
 (`THROTTLED_RETRY_AFTER_SECONDS`, the floor the protocol renderer applies to every throttled
 wait, so the payload and the header agree).
 The data plane renders it as the caller-facing 429 `unavailable_route` with `Retry-After: 5`,

@@ -42,6 +42,7 @@ from exp.runtime.gateway.contracts import (
     GatewayServiceTierSettlement,
     GatewayUsage,
 )
+from exp.runtime.gateway.lane_saturation import lane_saturated_failure
 from exp.runtime.gateway.ledger import AttemptRejectedError
 from exp.runtime.gateway.native_accounting import (
     NativeAttemptAccounting,
@@ -1448,7 +1449,8 @@ class TestLaneSaturation:
         failure = cast("JsonObject", refused["failure"])
         assert failure["failure_class"] == "throttled"
         assert failure["retry_after_seconds"] == 5
-        assert "at capacity right now" in str(failure["safe_message"])
+        # A free caller (the fixture's level 0) hears about Pro priority.
+        assert failure["safe_message"] == lane_saturated_failure(0).safe_message
         assert len(ledger.started) == 1
         assert registry.rung_admission_counters() == (1, 0, 1)
         # The refused request is finished, so the slot it never took frees nothing

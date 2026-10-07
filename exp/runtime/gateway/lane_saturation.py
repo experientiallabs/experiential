@@ -122,7 +122,22 @@ def default_lane_bound(max_active_requests: int, share: float = DEFAULT_LANE_SHA
     return max(1, math.ceil(max_active_requests * share))
 
 
-def lane_saturated_failure() -> GatewayFailure:
+LANE_SATURATED_MESSAGE = "This model is at capacity right now. Please retry in a few seconds."
+"""The refusal every caller gets, before any tier-specific upsell."""
+
+LANE_SATURATED_UPSELL = {
+    0: " Pro subscribers get priority access when models are busy.",
+    1: " Pro orgs get even higher priority when models are busy.",
+    2: "",
+}
+"""The sentence after the refusal, per ``AuthorizationSnapshot.priority_admission``.
+
+A free caller hears about Pro priority, a paying caller hears that Pro is
+higher still, and a Pro caller (already at the top) gets no upsell.
+"""
+
+
+def lane_saturated_failure(priority_admission: int) -> GatewayFailure:
     """The fail-fast refusal for a pool whose every rung is at its in-flight bound.
 
     Throttled, not provider-internal: nothing is down, the pool is full on
@@ -130,14 +145,16 @@ def lane_saturated_failure() -> GatewayFailure:
     caller-facing 429 ``unavailable_route`` with ``Retry-After: 5``, exactly
     like a pool whose every rung sits in a provider throttle window. The
     message is consumer copy (it reaches end users verbatim through clients),
-    so it names capacity and the Pro priority benefit, never worker internals.
+    so it names capacity and, below Pro, the priority benefit, never worker
+    internals.
+
+    Args:
+        priority_admission: The caller's level (0 free, 1 paying, 2 Pro),
+            which picks the upsell sentence (``LANE_SATURATED_UPSELL``).
     """
     return GatewayFailure(
         failure_class=GatewayFailureClass.THROTTLED,
-        safe_message=(
-            "This model is at capacity right now. Please retry in a few seconds. "
-            "Pro subscribers get priority access when models are busy."
-        ),
+        safe_message=LANE_SATURATED_MESSAGE + LANE_SATURATED_UPSELL[priority_admission],
         retry_after_seconds=LANE_SATURATED_RETRY_AFTER_SECONDS,
     )
 
