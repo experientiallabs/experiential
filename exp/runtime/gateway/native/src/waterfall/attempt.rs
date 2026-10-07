@@ -289,7 +289,7 @@ pub(super) async fn run_attempt(
                 }
                 Err(failure) => {
                     if logprobs_injected
-                        && usage.is_none()
+                        && relay.usage_before_failure(usage.clone()).is_none()
                         && withheld.is_empty()
                         && crate::capture::logprobs::may_be_refusal(&failure)
                     {
@@ -402,7 +402,7 @@ pub(super) async fn run_attempt(
             match &event {
                 Event::Failed(failure) => {
                     if logprobs_injected
-                        && usage.is_none()
+                        && relay.usage_before_failure(usage.clone()).is_none()
                         && withheld.is_empty()
                         && crate::capture::logprobs::may_be_refusal(failure)
                     {

@@ -284,3 +284,24 @@ fn a_refusal_under_http_200_redials_plain_before_any_output() {
         ));
     });
 }
+
+#[test]
+fn a_refusal_after_reported_usage_is_never_redialed() {
+    block_on(async {
+        let harness = Harness::new();
+        let rung = spawn_rung(vec![Answer::Stream(&[
+            r#"{"id":"x","choices":[],"usage":{"prompt_tokens":5,"completion_tokens":2,"total_tokens":7}}"#,
+            REFUSED_IN_STREAM,
+        ])])
+        .await;
+        let (won, guard) =
+            run_capture(&harness, &[capture_wire("metered-a", &rung.url)], true).await;
+        let won = finish(guard, won).await;
+        assert!(!matches!(won, Won::Committed(_)));
+        // The metered dial is the attempt's answer: no second provider call.
+        assert_eq!(rung.bodies.lock().unwrap().len(), 1);
+        assert!(!crate::capture::logprobs::refused(
+            &crate::capture::logprobs::rung_key(&capture_wire("metered-a", &rung.url))
+        ));
+    });
+}

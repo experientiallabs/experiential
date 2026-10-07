@@ -144,12 +144,18 @@ pub(crate) fn with_logprobs(payload: &Value) -> Option<Value> {
 }
 
 /// A refused open that a plain re-dial might answer: only request-shaped
-/// refusals, never credential, quota, throttle or transport failures.
+/// refusals not attributed to something else (an encrypted replay, another
+/// named parameter), never credential, quota, throttle or transport failures.
 pub(crate) fn may_be_refusal(failure: &Failure) -> bool {
     matches!(
         failure.failure_class,
         FailureClass::InvalidRequest | FailureClass::UnsupportedCapability
-    )
+    ) && !failure.encrypted_reasoning_rejected
+        // A refusal the provider pins on another parameter is not ours.
+        && failure
+            .rejected_parameter
+            .as_deref()
+            .is_none_or(|param| param == "logprobs" || param == "top_logprobs")
 }
 
 /// The answer text one frame emits on each channel (empty when none).

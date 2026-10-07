@@ -292,3 +292,16 @@ fn misaligned_and_refusal_frames_end_retention_without_entering_it() {
     assert!(taken.is_empty());
     assert!(truncated);
 }
+
+#[test]
+fn a_refusal_attributed_elsewhere_is_not_redialed() {
+    let mut failure = Failure::new(FailureClass::InvalidRequest, "x");
+    assert!(may_be_refusal(&failure));
+    failure.rejected_parameter = Some("logprobs".into());
+    assert!(may_be_refusal(&failure));
+    failure.rejected_parameter = Some("tools".into());
+    assert!(!may_be_refusal(&failure));
+    let mut replay = Failure::new(FailureClass::InvalidRequest, "x");
+    replay.encrypted_reasoning_rejected = true;
+    assert!(!may_be_refusal(&replay));
+}
