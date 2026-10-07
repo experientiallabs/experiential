@@ -23,23 +23,9 @@ It serves:
   (the Anthropic provider client does not forward `count_tokens`), so every answer is an
   estimate and the body says so through the shared `x-experiential-ignored-parameters`
   disclosure (`input_tokens->estimated(gateway_tokenizer)`).
-- `POST /v1/embeddings` (the OpenAI Embeddings API: message-less and never streamed; served
-  only by aliases whose catalog capabilities declare `supports_embeddings` on an OpenAI-wire
-  connection, billed on the provider's reported `prompt_tokens` with no output leg, and
-  returned with the provider's exact vectors in `float` or `base64` form. Input accepts a
-  nonempty string, a batch of nonempty strings, a nonempty integer token sequence, or a
-  batch of nonempty token sequences. A flat token sequence produces one vector; token IDs
-  are forwarded unchanged and must match the selected model's tokenizer. Boolean, fractional,
-  negative, mixed-shape, and empty token inputs are rejected. Omit `stream` or send the literal
-  `false`; `true` and unknown parameters are rejected, and `stream` is never forwarded.
-  Reservations count token IDs directly and retain normal headroom; settlement still uses
-  provider-reported input usage. There is no response cache, and an inbound `Idempotency-Key`
-  is ignored because the surface has no replay protocol)
-- `POST /v1/images/generations` (the OpenAI Images API, generations only: prompt in, images
-  out, never streamed; served only by aliases whose catalog capabilities declare
-  `supports_image_generation` on an OpenAI-wire connection, billed on the provider's reported
-  prompt and image tokens, so a model that answers without token usage is refused as
-  unbillable rather than served for free)
+- `POST /v1/embeddings`, `POST /v1/images/generations`, `POST /v1/audio/speech`, and
+  `POST /v1/audio/transcriptions` (the OpenAI media APIs, buffered and never streamed; see
+  [gateway-media-surfaces.md](gateway-media-surfaces.md))
 - `POST /v1/systemone` (TypeSafe native decisions: typed `noul`, `choice`, and `score`
   questions, buffered answers, provider-reported usage, and explicit decision capability and
   pricing admission; no chat, streaming, continuation, or idempotency replay); and `POST /v1/decisions`, its OpenAI Decisions API wire
@@ -471,6 +457,9 @@ while keyed replay creates no new reservation. A period is the immutable UTC buc
 `YYYY-MM-01T00:00:00+00:00`; rollover selects a new bucket and never clears or rewrites an earlier
 month. Management and remaining-allocation reports are CLI surfaces only. There is no budgets
 dashboard.
+
+Media priced per character, second, or image settles its billed units on the unit card frozen
+at reservation ([gateway-media-surfaces.md](gateway-media-surfaces.md)).
 
 Normalized usage follows OpenAI subset semantics on every wire: `reasoning_tokens` counts a subset
 of `output_tokens`; cache reads and writes are disjoint subsets of `input_tokens`.

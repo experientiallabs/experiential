@@ -6,6 +6,12 @@ import json
 
 from exp.common.core.artifacts import JsonObject
 from exp.runtime.anthropic_protocol.requests import decode_messages, decode_messages_count_tokens
+from exp.runtime.openai_protocol.audio_requests import (
+    DecodedSpeechRequest,
+    DecodedTranscriptionRequest,
+    decode_speech,
+    decode_transcription,
+)
 from exp.runtime.openai_protocol.errors import OpenAIProtocolError
 from exp.runtime.openai_protocol.images_requests import DecodedImagesRequest, decode_images
 from exp.runtime.openai_protocol.requests import (
@@ -165,5 +171,48 @@ def decode_native_images_body(body: str) -> DecodedImagesRequest:
     payload = _load_object_body(body)
     try:
         return decode_images(payload)
+    except OpenAIProtocolError as exc:
+        raise NativeDecodeError(exc) from exc
+
+
+def decode_native_speech_body(body: str) -> DecodedSpeechRequest:
+    """Decode one raw ``/audio/speech`` body with the shared speech decoder.
+
+    Args:
+        body: Raw request body text.
+
+    Returns:
+        The public alias and canonical speech request.
+
+    Raises:
+        NativeDecodeError: The body is not JSON, not an object, or fails shared
+            protocol validation.
+    """
+    payload = _load_object_body(body)
+    try:
+        return decode_speech(payload)
+    except OpenAIProtocolError as exc:
+        raise NativeDecodeError(exc) from exc
+
+
+def decode_native_transcription_upload(upload: str) -> DecodedTranscriptionRequest:
+    """Decode the data plane's parsed ``/audio/transcriptions`` upload.
+
+    The data plane parses the multipart (or JSON ``input_audio``) body itself
+    and keeps the audio bytes; ``upload`` is its JSON object of the text fields
+    plus the measured ``file`` facts.
+
+    Args:
+        upload: JSON text of the parsed upload.
+
+    Returns:
+        The public alias and canonical transcription request.
+
+    Raises:
+        NativeDecodeError: The upload fails shared protocol validation.
+    """
+    payload = _load_object_body(upload)
+    try:
+        return decode_transcription(payload)
     except OpenAIProtocolError as exc:
         raise NativeDecodeError(exc) from exc

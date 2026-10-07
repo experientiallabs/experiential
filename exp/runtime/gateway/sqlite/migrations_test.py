@@ -1180,9 +1180,10 @@ def test_surface_migration_preserves_requests_attempts_and_constraints(
                 None,
                 0,
             )
+            # Plus the v29 frozen unit card and billed media units (5 columns).
             assert tuple(migrated.execute("SELECT * FROM gateway_attempts").fetchone()) == (
                 *before_attempt,
-                *(None for _ in range(11)),
+                *(None for _ in range(16)),
             )
         surviving = migrated.execute(
             "SELECT api_surface FROM gateway_requests WHERE request_id = 'req-1'"

@@ -118,6 +118,10 @@ class GatewayWireProfile:
         supports_logprobs: Verified Chat probability support on this exact model.
         supports_responses_logprobs: Native Responses probability support, opt-in.
         logprobs_reasoning_efforts: Qualified efforts; empty means unknown support.
+        speech_url: Full OpenAI-wire ``/audio/speech`` endpoint sharing ``headers``;
+            None when the connection speaks no speech wire.
+        transcriptions_url: Full OpenAI-wire ``/audio/transcriptions`` endpoint
+            sharing ``headers``; None when the connection speaks no transcription wire.
     """
 
     dialect: str
@@ -344,6 +348,9 @@ class GatewayWireProfile:
     images_url: str | None = None
     """Full OpenAI-wire ``/images/generations`` endpoint for this connection,
     sharing ``headers``; ``None`` when the connection speaks no images wire."""
+
+    speech_url: str | None = None
+    transcriptions_url: str | None = None
 
     @property
     def replays_plaintext_reasoning(self) -> bool:

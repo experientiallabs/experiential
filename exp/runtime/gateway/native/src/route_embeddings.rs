@@ -434,6 +434,7 @@ fn public_embeddings(
         cache_creation_input_tokens: None,
         cache_creation_1h_input_tokens: None,
         reasoning_tokens: None,
+        billed_units: None,
     };
     Ok((Value::Object(public), usage))
 }

@@ -36,6 +36,16 @@ use crate::errors::Failure;
 
 pub use crate::logprobs::{ChoiceLogprobs, ChoiceLogprobsDelta};
 
+/// Media units one attempt consumed or produced (mirrors python `BilledUnits`;
+/// `quantity_milli` is thousandths of a unit, `variant` the priced SKU).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BilledUnits {
+    pub kind: String,
+    #[serde(default)]
+    pub variant: String,
+    pub quantity_milli: u64,
+}
+
 /// Normalized token usage mirroring `GatewayUsage` semantics.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Usage {
@@ -51,6 +61,9 @@ pub struct Usage {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_creation_1h_input_tokens: Option<u64>,
     pub reasoning_tokens: Option<u64>,
+    /// Media units priced by the deployment's unit card; absent on token-priced attempts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub billed_units: Option<BilledUnits>,
 }
 
 /// One completed tool call with provider-order raw argument text.

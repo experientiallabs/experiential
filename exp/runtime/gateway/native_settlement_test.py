@@ -18,6 +18,7 @@ from exp.runtime.gateway.contracts import (
 from exp.runtime.gateway.native_settlement import (
     NativeSettlementPayload,
     StreamedOutput,
+    _credible_usage,  # noqa: PLC2701 - direct unit coverage for normalization.
     _usage_from_payload,  # noqa: PLC2701 - direct unit coverage for normalization.
     accepts_keyword,
     exhausted_attempt_payload,
@@ -789,3 +790,25 @@ def test_tool_search_requests_kwarg_is_withheld_at_zero_and_from_a_legacy_ledger
     assert tool_search_requests_kwarg(pre_tool_search, 2) == {}
     assert tool_search_requests_kwarg(named, 0) == {}
     assert tool_search_requests_kwarg(variadic, 0) == {}
+
+
+def test_settle_payload_carries_billed_units_with_or_without_tokens() -> None:
+    """A per-unit media settle yields usage from its billed units alone."""
+    unit_only = _usage_from_payload(
+        {"billed_units": {"kind": "character", "variant": "", "quantity_milli": 1_200_000}},
+        [],
+    )
+    assert unit_only is not None
+    assert unit_only.billed_units is not None
+    assert unit_only.billed_units.quantity_milli == 1_200_000
+    assert unit_only.input_tokens is None
+    both = _usage_from_payload(
+        {
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "billed_units": {"kind": "audio_second", "quantity_milli": 4_500},
+        },
+        [],
+    )
+    # Zero tokens beside billed units is the per-unit shape, not a missing meter.
+    assert _credible_usage(GatewayEventKind.COMPLETED, both) == both

@@ -6,6 +6,7 @@ import sqlite3
 from datetime import datetime
 
 from exp.common.models import BillingSource
+from exp.common.models.catalog_prices import BilledUnitKind
 from exp.runtime.gateway.auth import utc_text
 from exp.runtime.gateway.contracts import (
     DirectTarget,
@@ -26,6 +27,7 @@ from exp.runtime.gateway.platform import (
     VirtualKeyRecord,
 )
 from exp.runtime.gateway.sqlite.provider_authority import ProviderConnectionBinding
+from exp.runtime.gateway.stream_contracts import BilledUnits
 
 
 def key_record(
@@ -251,6 +253,7 @@ def require_reservation_replay(
             if prices.long_context is None
             else prices.long_context.reasoning_nano_usd_per_million_tokens
         ),
+        None if prices.units is None else prices.units.model_dump_json(),
         request.attempt_ordinal,
         request.route_depth,
         request.maximum_cost_nano_usd,
@@ -284,6 +287,7 @@ def require_reservation_replay(
         record.long_context_cache_creation_1h_input_rate,
         record.long_context_output_rate,
         record.long_context_reasoning_rate,
+        None if row["unit_prices"] is None else str(row["unit_prices"]),
         record.attempt_ordinal,
         record.route_depth,
         record.reserved_nano_usd,
@@ -317,9 +321,19 @@ def usage_record(row: sqlite3.Row) -> GatewayUsage | None:
         row: Durable attempt row including the cache-write total and TTL subset.
 
     Returns:
-        Observed usage, preserving a missing primary leg, or None without either total.
+        Observed usage, preserving a missing primary leg, or None without either
+        token total or billed media units.
     """
-    if row["input_tokens"] is None and row["output_tokens"] is None:
+    billed = (
+        None
+        if row["billed_unit_kind"] is None or row["billed_quantity_milli"] is None
+        else BilledUnits(
+            kind=BilledUnitKind(str(row["billed_unit_kind"])),
+            variant=str(row["billed_unit_variant"] or ""),
+            quantity_milli=int(row["billed_quantity_milli"]),
+        )
+    )
+    if row["input_tokens"] is None and row["output_tokens"] is None and billed is None:
         return None
     return GatewayUsage(
         input_tokens=optional_int(row["input_tokens"]),
@@ -328,4 +342,5 @@ def usage_record(row: sqlite3.Row) -> GatewayUsage | None:
         cache_creation_input_tokens=optional_int(row["cache_creation_input_tokens"]),
         cache_creation_1h_input_tokens=optional_int(row["cache_creation_1h_input_tokens"]),
         reasoning_tokens=optional_int(row["reasoning_tokens"]),
+        billed_units=billed,
     )

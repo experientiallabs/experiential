@@ -1,9 +1,18 @@
-"""Tests for cache-write pricing across service-tier schedule selection."""
+"""Tests for cache-write pricing, service-tier selection, and per-unit media cards."""
+
+import pytest
+from pydantic import ValidationError
 
 from exp.common.models.catalog import (
     GatewayLongContextTier,
     GatewayServiceTierPrices,
     GatewayTokenPrices,
+)
+from exp.common.models.catalog_prices import (
+    MAXIMUM_RATE_NANO_USD_PER_UNIT,
+    MAXIMUM_UNIT_VARIANT_CHARACTERS,
+    BilledUnitKind,
+    GatewayUnitPrices,
 )
 
 
@@ -48,3 +57,42 @@ def test_unset_long_context_does_not_change_snapshot_identity_projection() -> No
     assert prices.model_dump(mode="json", exclude_defaults=True) == {
         "priority": {"input_nano_usd_per_million_tokens": 7}
     }
+
+
+def test_unit_card_prices_a_variant_or_falls_back_to_the_flat_rate() -> None:
+    """A named variant prices itself; an unauthored one uses the flat rate, else nothing."""
+    card = GatewayUnitPrices(
+        kind=BilledUnitKind.VIDEO_SECOND, rates={"": 80_000_000, "1080p": 120_000_000}
+    )
+    assert card.rate_for("1080p") == 120_000_000
+    assert card.rate_for("4k") == 80_000_000
+    assert card.rate_for("") == 80_000_000
+    flatless = GatewayUnitPrices(kind=BilledUnitKind.VIDEO_SECOND, rates={"720p": 1})
+    assert flatless.rate_for("1080p") is None
+
+
+@pytest.mark.parametrize(
+    "rates",
+    [
+        {},
+        {"": -1},
+        {"": MAXIMUM_RATE_NANO_USD_PER_UNIT + 1},
+        {"v" * (MAXIMUM_UNIT_VARIANT_CHARACTERS + 1): 1},
+    ],
+)
+def test_unit_card_rejects_empty_negative_oversized_or_unbounded_rates(
+    rates: dict[str, int],
+) -> None:
+    """A unit card fails closed at authoring instead of pricing at a corrupt rate."""
+    with pytest.raises(ValidationError):
+        GatewayUnitPrices(kind=BilledUnitKind.CHARACTER, rates=rates)
+
+
+def test_unit_card_is_tier_independent_and_absent_by_default() -> None:
+    """Processing tiers reprice tokens only, and a token card serializes unchanged."""
+    units = GatewayUnitPrices(kind=BilledUnitKind.CHARACTER, rates={"": 15_000})
+    card = GatewayTokenPrices(
+        flex=GatewayServiceTierPrices(input_nano_usd_per_million_tokens=1), units=units
+    )
+    assert card.for_service_tier("flex").units == units
+    assert "units" not in GatewayTokenPrices().model_dump(exclude_defaults=True)

@@ -163,6 +163,11 @@ fn settle_argument(
     if finalize && tool_search_requests > 0 {
         argument["tool_search_requests"] = json!(tool_search_requests);
     }
+    // Media units ride the usage object only when metered, so token-priced
+    // settlements keep exactly the bytes they always did.
+    if let Some(billed) = usage.and_then(|usage| usage.billed_units.as_ref()) {
+        argument["usage"]["billed_units"] = json!(billed);
+    }
     compact_json(&argument)
 }
 

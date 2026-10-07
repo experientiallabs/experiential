@@ -461,6 +461,8 @@ class GatewayDeploymentCapabilities(ContractModel):
     Attributes:
         supports_decisions: Whether this deployment serves native typed decisions instead of
             chat.
+        supports_speech: Whether this deployment serves ``/audio/speech`` (fail-closed).
+        supports_transcription: Whether it serves ``/audio/transcriptions`` (fail-closed).
         supports_developer_messages: Whether developer-role messages are supported.
         supports_streaming: Whether streaming responses are supported.
         supports_streaming_tool_arguments: Whether tool arguments can be streamed incrementally.
@@ -610,6 +612,8 @@ class GatewayDeploymentCapabilities(ContractModel):
     """
 
     supports_decisions: bool = False
+    supports_speech: bool = False
+    supports_transcription: bool = False
 
     supports_developer_messages: bool = False
     supports_streaming: bool = False

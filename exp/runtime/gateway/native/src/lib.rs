@@ -7,6 +7,8 @@
 //! tests.
 
 mod admission;
+mod audio_duration;
+mod audio_upload;
 mod bridge;
 mod capture;
 mod codex_native_inversion;
@@ -36,6 +38,7 @@ mod replay_repair;
 mod request_policy;
 mod respond;
 mod responses_retention;
+mod route_audio;
 mod route_batches;
 mod route_chat;
 mod route_decisions;
@@ -549,6 +552,7 @@ fn parse_fixture_events(events_json: &str) -> Result<Vec<events::Event>, String>
                 reasoning_tokens: object
                     .get("reasoning_tokens")
                     .and_then(serde_json::Value::as_u64),
+                billed_units: None,
             }),
             "hosted_tool_item_started" => events::Event::HostedToolItemStarted {
                 output_index: object

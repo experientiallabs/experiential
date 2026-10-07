@@ -291,6 +291,8 @@ class OpenAIClient(OpenAIEmbeddingMixin):
             embeddings_url=f"{self._base_url}/{self._request_path('embeddings')}",
             images_url=f"{self._base_url}/{self._request_path('images/generations')}",
             openai_decisions_url=f"{self._base_url}/{self._request_path('decisions')}",
+            speech_url=f"{self._base_url}/{self._request_path('audio/speech')}",
+            transcriptions_url=f"{self._base_url}/{self._request_path('audio/transcriptions')}",
             headers=self._headers(),
             model_id=self._model.model_id,
             timeout_seconds=self._timeout_seconds,
