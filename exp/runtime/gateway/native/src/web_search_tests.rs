@@ -28,6 +28,7 @@ fn admission() -> WebSearchAdmission {
                 title: "Unmentioned".to_string(),
             },
         ],
+        include_sources: false,
     }
 }
 
@@ -473,7 +474,8 @@ fn responses_synthetic_message_emits_annotation_frames_before_text_done() {
     let first = frame_payload(&frames[done - 2]);
     assert_eq!(first["annotation_index"], json!(0));
     assert_eq!(first["content_index"], json!(0));
-    assert_eq!(first["output_index"], json!(0));
+    // The gateway's web_search_call item leads, so the message is output 1.
+    assert_eq!(first["output_index"], json!(1));
     assert_eq!(
         first["item_id"],
         json!(stable_public_id("msg", "request-1"))
@@ -493,7 +495,7 @@ fn responses_synthetic_message_emits_annotation_frames_before_text_done() {
         json!(1)
     );
     let completed = frame_payload(frames.last().expect("terminal"));
-    let part = &completed["response"]["output"][0]["content"][0];
+    let part = &completed["response"]["output"][1]["content"][0];
     assert_eq!(
         part["annotations"].as_array().expect("annotations").len(),
         2
@@ -526,7 +528,12 @@ fn responses_aggregate_cites_the_search_and_stays_unchanged_without_one() {
         Some(&admission()),
     )
     .expect("aggregates");
-    let annotations = &cited.body["output"][0]["content"][0]["annotations"];
+    let search_item = &cited.body["output"][0];
+    assert_eq!(search_item["type"], json!("web_search_call"));
+    assert_eq!(search_item["status"], json!("completed"));
+    assert!(search_item["id"].as_str().expect("id").starts_with("wsgw_"));
+    assert!(search_item["action"].get("sources").is_none());
+    let annotations = &cited.body["output"][1]["content"][0]["annotations"];
     assert_eq!(annotations.as_array().expect("annotations").len(), 2);
     assert_eq!(annotations[0]["type"], json!("url_citation"));
     assert_eq!(
@@ -585,7 +592,7 @@ fn responses_provider_keyed_messages_keep_only_provider_annotations() {
     assert!(!joined.contains("response.output_text.annotation.added"));
     let completed = frame_payload(frames.last().expect("terminal"));
     assert_eq!(
-        completed["response"]["output"][0]["content"][0]["annotations"],
+        completed["response"]["output"][1]["content"][0]["annotations"],
         json!([])
     );
     // The meter is a request fact and rides usage regardless of the rung.
@@ -593,4 +600,39 @@ fn responses_provider_keyed_messages_keep_only_provider_annotations() {
         completed["response"]["usage"]["server_tool_use_details"],
         json!({"web_search_requests": 1})
     );
+}
+
+#[test]
+fn responses_gateway_search_item_carries_query_and_sources_when_asked() {
+    let mut search = admission();
+    search.include_sources = true;
+    let events = responses_web_search_events("resp_x", &search);
+    let Event::HostedToolItemCompleted {
+        item,
+        item_type,
+        output_index,
+        ..
+    } = &events[1]
+    else {
+        panic!("completed hosted item");
+    };
+    assert_eq!(item_type, "web_search_call");
+    assert_eq!(*output_index, RESPONSES_WEB_SEARCH_OUTPUT_INDEX);
+    let item: Value = serde_json::from_str(item).expect("item json");
+    assert_eq!(item["action"]["type"], json!("search"));
+    assert_eq!(item["action"]["query"], json!(search.query));
+    let urls: Vec<&str> = item["action"]["sources"]
+        .as_array()
+        .expect("sources")
+        .iter()
+        .map(|source| source["url"].as_str().expect("url"))
+        .collect();
+    let expected: Vec<&str> = search
+        .results
+        .iter()
+        .filter(|source| !source.url.is_empty())
+        .map(|source| source.url.as_str())
+        .collect();
+    assert_eq!(urls, expected);
+    assert!(item["id"].as_str().expect("id").starts_with("wsgw_"));
 }

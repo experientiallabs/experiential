@@ -5193,3 +5193,46 @@ def test_malformed_replayed_web_search_items_are_still_refused() -> None:
                 ],
             }
         )
+
+
+def test_gateway_issued_web_search_items_are_dropped_on_replay() -> None:
+    """Codex echoes the gateway's own web_search_call item; no rung could take it.
+
+    It is dropped before validation, so the turn decodes on any route, while a
+    provider's own web_search_call (``ws_``) is kept for the native rung.
+    """
+    gateway_item = {
+        "type": "web_search_call",
+        "id": "wsgw_" + "a" * 32,
+        "status": "completed",
+        "action": {"type": "search", "query": "weather"},
+    }
+    provider_item = {**gateway_item, "id": "ws_provider"}
+    decoded = decode_responses(
+        {
+            "model": "coding",
+            "input": [
+                {"type": "message", "role": "user", "content": "look it up"},
+                gateway_item,
+                {"type": "message", "role": "user", "content": "thanks"},
+            ],
+        }
+    )
+    assert not any(
+        str((message.provider_native_item or {}).get("id", "")).startswith("wsgw_")
+        for message in decoded.request.messages
+    )
+    kept = decode_responses(
+        {
+            "model": "coding",
+            "input": [
+                {"type": "message", "role": "user", "content": "look it up"},
+                provider_item,
+                {"type": "message", "role": "user", "content": "thanks"},
+            ],
+        }
+    )
+    assert any(
+        (message.provider_native_item or {}).get("id") == "ws_provider"
+        for message in kept.request.messages
+    )

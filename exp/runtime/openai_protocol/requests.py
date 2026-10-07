@@ -63,6 +63,7 @@ from exp.runtime.openai_protocol.responses_input import (
     responses_input_messages,
 )
 from exp.runtime.openai_protocol.responses_probe import (
+    drop_gateway_web_search_items,
     official_responses_probe,
     require_responses_input,
     require_responses_text_spelling,
@@ -408,7 +409,7 @@ def decode_responses(
     Raises:
         OpenAIProtocolError: The body is invalid, unknown, or unsupported.
     """
-    payload, alias_disclosures = fold_prompt_cache_key_alias(payload)
+    payload, alias_disclosures = fold_prompt_cache_key_alias(drop_gateway_web_search_items(payload))
     validate_manifest(payload, RESPONSES_MANIFEST)
     # The installed SDK's effort literal lags the newest provider tier
     # ("ultra"), so the strict wire model owns reasoning validation.

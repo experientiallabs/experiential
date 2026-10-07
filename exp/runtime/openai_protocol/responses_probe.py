@@ -11,6 +11,7 @@ text-part spelling per role and a non-empty ``input``.
 
 from __future__ import annotations
 
+import re
 from typing import cast
 
 from pydantic import JsonValue
@@ -136,6 +137,42 @@ def official_image_details(entry: JsonObject, param: str) -> JsonObject:
 
 _SDK_WEB_SEARCH_ACTIONS = frozenset({"search", "open_page", "find_in_page"})
 """Web search action types the installed SDK's input-item schema enumerates."""
+
+
+_GATEWAY_WEB_SEARCH_ITEM_ID = re.compile(r"wsgw_[0-9a-f]{32}")
+"""The id of a web_search_call item the gateway itself rendered (native
+``web_search.rs``, ``GATEWAY_WEB_SEARCH_ITEM_PREFIX``)."""
+
+
+def drop_gateway_web_search_items(payload: JsonObject) -> JsonObject:
+    """Drop the gateway's own replayed web_search_call items from the input.
+
+    The gateway renders a ``web_search_call`` item for a search it ran
+    itself. Clients like Codex echo previous output items as the next input,
+    and that item was never a provider's, so no rung could accept it (native
+    rungs do not know its id; every other rung refuses hosted items by name).
+    The search results already reached the conversation through the answer.
+
+    Args:
+        payload: Parsed Responses request body.
+
+    Returns:
+        The payload, without any gateway-issued web search item.
+    """
+    raw = payload.get("input")
+    if not isinstance(raw, list):
+        return payload
+    kept = [
+        entry
+        for entry in raw
+        if not (
+            isinstance(entry, dict)
+            and entry.get("type") == "web_search_call"
+            and isinstance(entry.get("id"), str)
+            and _GATEWAY_WEB_SEARCH_ITEM_ID.fullmatch(entry["id"])
+        )
+    ]
+    return payload if len(kept) == len(raw) else {**payload, "input": kept}
 
 
 def official_responses_probe(payload: JsonObject) -> JsonObject:

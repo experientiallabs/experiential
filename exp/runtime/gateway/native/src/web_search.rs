@@ -46,6 +46,9 @@ pub struct WebSearchAdmission {
     pub requests: u32,
     #[serde(default)]
     pub results: Vec<WebSearchSource>,
+    /// The caller asked for `web_search_call.action.sources` (Responses).
+    #[serde(default)]
+    pub include_sources: bool,
 }
 
 /// Which public citation object shape to render.
@@ -393,3 +396,54 @@ pub fn completed_messages_body_with_web_search(
 #[cfg(test)]
 #[path = "web_search_tests.rs"]
 mod tests;
+
+/// The id prefix of a gateway-issued Responses `web_search_call` item. A
+/// replayed item carrying it is the gateway's own output, never a provider's,
+/// so the decoder drops it instead of forwarding it to any rung.
+pub const GATEWAY_WEB_SEARCH_ITEM_PREFIX: &str = "wsgw";
+
+/// The reserved Responses output index of the gateway web search item: the
+/// top of the range, above the tool-search rounds, so it leads the output.
+pub const RESPONSES_WEB_SEARCH_OUTPUT_INDEX: u32 = u32::MAX;
+
+/// The hosted-item events rendering a gateway-executed search on the
+/// Responses surface: one completed `web_search_call` item carrying the
+/// query, plus `action.sources` when the caller asked for them, exactly where
+/// a native rung would stream its own search item.
+pub fn responses_web_search_events(response_id: &str, search: &WebSearchAdmission) -> Vec<Event> {
+    let item_id = stable_public_id(
+        GATEWAY_WEB_SEARCH_ITEM_PREFIX,
+        &format!("{response_id}:web_search"),
+    );
+    let mut action = json!({"type": "search", "query": search.query});
+    if search.include_sources {
+        action["sources"] = Value::Array(
+            search
+                .results
+                .iter()
+                .filter(|source| !source.url.is_empty())
+                .map(|source| json!({"type": "url", "url": source.url}))
+                .collect(),
+        );
+    }
+    let item = compact_json(&json!({
+        "type": "web_search_call",
+        "id": item_id,
+        "status": "completed",
+        "action": action,
+    }));
+    vec![
+        Event::HostedToolItemStarted {
+            output_index: RESPONSES_WEB_SEARCH_OUTPUT_INDEX,
+            item_id: item_id.clone(),
+            item_type: "web_search_call".to_string(),
+            item: item.clone(),
+        },
+        Event::HostedToolItemCompleted {
+            output_index: RESPONSES_WEB_SEARCH_OUTPUT_INDEX,
+            item_id,
+            item_type: "web_search_call".to_string(),
+            item,
+        },
+    ]
+}

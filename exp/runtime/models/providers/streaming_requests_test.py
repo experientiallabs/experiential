@@ -5796,17 +5796,17 @@ def test_openai_responses_stream_payload_forwards_web_search_sources() -> None:
     assert "web_search_call.action.sources" in cast("list[str]", payload["include"])
 
 
-def test_web_search_sources_selector_drops_with_disclosure_off_native_responses() -> None:
-    """Where the gateway runs the search itself there is no item to annotate.
+def test_web_search_sources_selector_stays_off_non_native_provider_payloads() -> None:
+    """Off native Responses the gateway renders the sources itself.
 
-    The selector is dropped and disclosed instead of refusing the request.
+    The selector never reaches a non-native provider payload and nothing is
+    disclosed as dropped: the gateway's own web_search_call item carries the
+    sources (native web_search.rs).
     """
     public, provider = route_generation_parameter_requests(
         (_openai_reasoning_profile(), _fireworks_profile()), _web_search_sources_request()
     )
     assert provider.include_web_search_sources is False
-    assert "include.web_search_call.action.sources->dropped(gateway_web_search)" in (
-        public.ignored_parameters
-    )
+    assert not any("web_search_call" in path for path in public.ignored_parameters)
     payload = openai_responses_stream_payload("exact-model", provider, supports_temperature=True)
     assert "web_search_call.action.sources" not in cast("list[str]", payload.get("include", []))

@@ -11,7 +11,9 @@ use crate::events::{
     ProviderOutputItemStatus, Usage,
 };
 use crate::tool_search::ResponsesToolSearch;
-use crate::web_search::{url_citations, CitationShape, WebSearchAdmission};
+use crate::web_search::{
+    responses_web_search_events, url_citations, CitationShape, WebSearchAdmission,
+};
 
 mod aggregate;
 mod close;
@@ -142,7 +144,17 @@ impl ResponsesSseEncoder {
         );
         let mut frames = vec![created, in_progress];
         // The gateway's own search items lead the output, exactly where a
-        // native rung would stream its hosted tool calls.
+        // native rung would stream its hosted tool calls: the web search ran
+        // first (before dispatch), then any tool-search rounds.
+        if let Some(events) = self
+            .web_search
+            .as_ref()
+            .map(|search| responses_web_search_events(&self.response_id, search))
+        {
+            for event in &events {
+                frames.extend(self.feed(event)?);
+            }
+        }
         if let Some(events) = self
             .tool_search
             .as_ref()
