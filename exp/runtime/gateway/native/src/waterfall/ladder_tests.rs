@@ -303,6 +303,7 @@ pub(super) fn wire(deployment_id: &str, url: &str, throttle_redial_budget: u32) 
         throttle_redial: None,
         failover_only_on: None,
         zdr_constrained: false,
+        capture_logprobs: false,
     }
 }
 
@@ -470,6 +471,7 @@ impl Harness {
             time_to_first_token: Duration::from_secs(120),
             approximate_input_tokens: 10.0,
             chat_logprobs: false,
+            capture_logprobs: false,
             output_less_retention: None,
             output_token_cap: None,
             tool_search: None,
@@ -794,6 +796,7 @@ fn rule_wire(deployment_id: &str, url: &str, tokens: &[&str]) -> DeploymentWire 
         billing_customer_managed: true,
         failover_only_on: Some(tokens.iter().map(|token| token.to_string()).collect()),
         zdr_constrained: false,
+        capture_logprobs: false,
         ..wire(deployment_id, url, 0)
     }
 }
@@ -971,5 +974,6 @@ fn a_first_dial_reserved_on_a_failover_only_rung_fails_closed() {
     });
 }
 
+mod capture_logprobs_tests;
 mod logprobs_tests;
 mod responses_logprobs_tests;

@@ -42,7 +42,11 @@ from exp.runtime.models.providers import (
 from exp.runtime.models.providers.base import GatewayWireProfile
 from exp.runtime.models.providers.errors import ProviderCapabilityError
 from exp.runtime.models.providers.generation_parameter_validation import bounded_output_request
-from exp.runtime.models.providers.logprobs import require_chat_logprobs, require_responses_logprobs
+from exp.runtime.models.providers.logprobs import (
+    capture_logprobs_eligible,
+    require_chat_logprobs,
+    require_responses_logprobs,
+)
 from exp.runtime.models.providers.openrouter_routing import (
     constrain_openrouter_zero_data_retention,
     forward_provider_preferences,
@@ -176,6 +180,7 @@ def build_rung_dispatch(
         throttle_redial_budget=throttle_redial_budget,
         native_tool_translation=rung_request.native_tool_translation,
         zdr_constrained=zdr_constrained,
+        capture_logprobs=capture_logprobs_eligible(profile, rung_request),
     )
     binding = (
         None

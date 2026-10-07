@@ -226,6 +226,10 @@ pub(crate) async fn responses(
         // only, never a billing quantity.
         approximate_input_tokens: (body_text.len() as f64) / 4.0,
         chat_logprobs: false,
+        capture_logprobs: state
+            .capture
+            .as_ref()
+            .is_some_and(|capture| capture.wants_logprobs(&admission.request_id)),
         // A turn that ends before any semantic output is still a response
         // the caller can continue from; the waterfall retains it in flight.
         output_less_retention: Some(remember_argument(

@@ -74,6 +74,11 @@ class CaptureConfiguration(ContractModel):
             rung that withholds reasoning display, or a guardrailed request) as
             ``provider_reasoning``, false by default. Displayed reasoning is
             retained in the captured response frames either way.
+        capture_logprobs: Ask eligible OpenAI-compatible rungs of captured requests
+            for Chat token probabilities the caller did not request and retain
+            them as ``provider_logprobs``, false by default. The caller's answer,
+            usage and settlement are unchanged; a rung that refuses the field is
+            re-dialed without it and never asked again by this worker.
     """
 
     delivery: CaptureDeliveryLimits = Field(default_factory=CaptureDeliveryLimits)
@@ -91,6 +96,7 @@ class CaptureConfiguration(ContractModel):
     relay_metadata: bool = False
     truncate_request: bool = False
     capture_hidden_reasoning: bool = False
+    capture_logprobs: bool = False
 
     @model_validator(mode="after")
     def _validate_pending_budget(self) -> CaptureConfiguration:
@@ -226,6 +232,9 @@ class CaptureRecord(ContractModel):
         gemini_thought_parts: Ordered provider summary and signature evidence, not full CoT.
         gemini_thought_parts_source_json: Exact exceptional parts, otherwise None.
         transport: Optional outer-relay headers, timing and redacted wire input.
+        provider_logprobs: Gateway-requested Chat probabilities of the winning
+            attempt (``logprobs_injected``, ``truncated``, ``content``, ``refusal``),
+            present only when the gateway asked for them; otherwise absent.
     """
 
     schema_version: Literal[1]
@@ -242,6 +251,7 @@ class CaptureRecord(ContractModel):
     gemini_thought_parts: tuple[JsonObject, ...]
     gemini_thought_parts_source_json: str | None
     transport: JsonObject | None = None
+    provider_logprobs: JsonObject | None = None
 
 
 class CaptureController:

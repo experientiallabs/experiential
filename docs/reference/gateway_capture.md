@@ -68,6 +68,25 @@ argument text even when Messages presents the arguments as a parsed input object
 Chat tool turns on exposure-enabled routes return plaintext without appending
 an opaque token to the same delta field; private routes retain authenticated tokens.
 
+With `CaptureConfiguration(capture_logprobs=True)` (off by default), an eligible
+rung of a captured request is asked for Chat token probabilities the caller did
+not request. Eligible means the control plane marked the wire `capture_logprobs`:
+an `openai_compatible` dialect whose model verifiably supports Chat logprobs (and,
+for a reasoning model, at the effective effort), on the platform's own credential,
+for a caller who set none of `logprobs`, `top_logprobs` or the Responses logprobs
+include. Only `logprobs: true` is added, never `top_logprobs`. The provider's
+probabilities are parsed into a side buffer, never into the event stream the
+caller's answer is encoded from, so the caller's bytes, usage and settlement are
+the same as without the request. The winning attempt's probabilities land in
+`provider_logprobs` (`logprobs_injected: true`, `truncated`, `content`,
+`refusal`); a record without injection carries no such key. Retention is bounded
+at 4 MiB per attempt and by the collector's response and pending budgets; an
+overflow sets `truncated` and keeps the exchange. A malformed probability channel
+is dropped, never a failure. A rung that refuses the field (a request-shaped
+4xx) is re-dialed once without it inside the same physical attempt; when that
+plain dial opens, this worker never injects on the rung again. A request the
+provider refuses either way answers exactly as it would have without injection.
+
 Postgres cannot represent NUL or lone UTF-16 surrogates. Affected request contexts
 and responses include `source_json`, an escaped JSON string containing the exact
 source value alongside the normalized query projection. Consumers recover the

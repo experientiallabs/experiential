@@ -226,6 +226,10 @@ pub(crate) async fn messages(
         // only, never a billing quantity.
         approximate_input_tokens: (body_text.len() as f64) / 4.0,
         chat_logprobs: false,
+        capture_logprobs: state
+            .capture
+            .as_ref()
+            .is_some_and(|capture| capture.wants_logprobs(&admission.request_id)),
         output_less_retention: None,
         output_token_cap: admission.maximum_output_tokens,
         tool_search: admission.tool_search.as_ref(),

@@ -40,6 +40,7 @@ fn config() -> Configuration {
         truncate_request: false,
         asynchronous_delivery: true,
         capture_hidden_reasoning: true,
+        capture_logprobs: false,
     }
 }
 
@@ -798,3 +799,80 @@ fn stalled_handoffs_remain_inside_admission_count_and_byte_limits() {
 
 #[path = "checkpoint_test.rs"]
 mod checkpoints;
+
+fn probability(token: &str) -> crate::logprobs::ChoiceLogprobsDelta {
+    crate::logprobs::parse(
+        Some(&json!({"content":[{"token":token,"logprob":-1.0,"bytes":null,"top_logprobs":[]}]})),
+        0,
+    )
+    .unwrap()
+    .unwrap()
+}
+
+#[test]
+fn injected_probabilities_are_retained_and_marked_without_touching_the_response() {
+    let (collector, receiver) = collector(Configuration {
+        capture_logprobs: true,
+        ..config()
+    });
+    assert!(collector.begin(request("probabilities")));
+    assert!(collector.wants_logprobs("probabilities"));
+    assert!(!collector.wants_logprobs("unknown"));
+    collector.logprobs_injected("probabilities");
+    collector.logprobs(
+        "probabilities",
+        vec![probability("a"), probability("b")],
+        false,
+    );
+    collector.settle("probabilities", true, true);
+    assert!(collector.finish("probabilities", Some(response()), Some("d".into())));
+    let records = drain(&collector, receiver);
+    let captured = records[0].provider_logprobs.as_ref().unwrap();
+    assert!(captured.logprobs_injected);
+    assert!(!captured.truncated);
+    let tokens: Vec<&str> = captured.content.iter().map(|r| r.token.as_str()).collect();
+    assert_eq!(tokens, ["a", "b"]);
+    let encoded = serde_json::to_value(&records[0]).unwrap();
+    assert_eq!(
+        encoded["provider_logprobs"]["logprobs_injected"],
+        json!(true)
+    );
+    assert_eq!(
+        encoded["response"],
+        serde_json::to_value(response()).unwrap()
+    );
+}
+
+#[test]
+fn records_without_injection_serialize_exactly_as_before() {
+    let (collector, receiver) = collector(config());
+    assert!(collector.begin(request("plain")));
+    assert!(!collector.wants_logprobs("plain"));
+    // Without the injected mark, stray probabilities are never retained.
+    collector.logprobs("plain", vec![probability("a")], false);
+    collector.settle("plain", true, true);
+    assert!(collector.finish("plain", Some(response()), Some("d".into())));
+    let records = drain(&collector, receiver);
+    let encoded = serde_json::to_value(&records[0]).unwrap();
+    assert!(encoded.get("provider_logprobs").is_none());
+}
+
+#[test]
+fn probability_overflow_truncates_instead_of_dropping_the_exchange() {
+    let (collector, receiver) = collector(Configuration {
+        capture_logprobs: true,
+        ..config()
+    });
+    assert!(collector.begin(request("overflow")));
+    collector.logprobs_injected("overflow");
+    let many: Vec<_> = (0..400).map(|i| probability(&format!("t{i}"))).collect();
+    collector.logprobs("overflow", many, false);
+    collector.settle("overflow", true, true);
+    assert!(collector.finish("overflow", Some(response()), Some("d".into())));
+    let records = drain(&collector, receiver);
+    assert_eq!(records.len(), 1);
+    assert!(records[0].response.is_some());
+    let captured = records[0].provider_logprobs.as_ref().unwrap();
+    assert!(captured.truncated);
+    assert!(captured.content.len() < 400);
+}

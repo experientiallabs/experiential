@@ -136,18 +136,55 @@ pub(super) async fn run_attempt(
         let observation = guard.begin_dial_observation();
         let open_bound = open_phase_bound(remaining(ctx.deadline), remaining(first_byte_deadline));
         guard.mark_dispatched();
-        let response = match open_stream(
+        // Capture-only probabilities (`crate::capture::logprobs`): the caller's
+        // answer never carries them, and a refusal re-dials the plain payload
+        // inside this same physical attempt so the caller sees only that dial.
+        let injected_payload = (ctx.capture_logprobs
+            && wire.capture_logprobs
+            && !wire.billing_customer_managed
+            && dialect == Dialect::OpenAiCompatible
+            && repair.raw_body().is_none()
+            && !crate::capture::logprobs::refused(&wire.deployment_id))
+        .then(|| crate::capture::logprobs::with_logprobs(repair.payload()))
+        .flatten();
+        let mut logprobs_injected = injected_payload.is_some();
+        let mut opened = open_stream(
             ctx.http,
             &wire.url,
             &headers,
             &wire.idempotency_key,
-            repair.payload(),
+            injected_payload
+                .as_ref()
+                .unwrap_or_else(|| repair.payload()),
             repair.raw_body(),
             open_bound,
             dialect,
         )
-        .await
+        .await;
+        if logprobs_injected
+            && opened
+                .as_ref()
+                .is_err_and(crate::capture::logprobs::may_be_refusal)
         {
+            logprobs_injected = false;
+            opened = open_stream(
+                ctx.http,
+                &wire.url,
+                &headers,
+                &wire.idempotency_key,
+                repair.payload(),
+                repair.raw_body(),
+                open_phase_bound(remaining(ctx.deadline), remaining(first_byte_deadline)),
+                dialect,
+            )
+            .await;
+            // Only a plain dial that the provider accepts proves the field was
+            // the refusal; a request the provider refuses either way is not.
+            if opened.is_ok() {
+                crate::capture::logprobs::remember_refusal(&wire.deployment_id);
+            }
+        }
+        let response = match opened {
             Ok(response) => response,
             Err(failure) => {
                 if repair.repair_after(&failure) {
@@ -201,6 +238,9 @@ pub(super) async fn run_attempt(
         relay.set_observation(observation);
         relay.set_stop_sequences(wire.stop_sequences.iter().cloned());
         relay.set_probability_output(ctx.chat_logprobs, &wire.upstream_payload);
+        if logprobs_injected {
+            relay.enable_logprobs_capture();
+        }
         relay.set_serialize_tool_calls(wire.serialize_tool_calls);
         relay.set_cache_writes_within_reads(wire.cache_writes_within_reads);
         relay.set_gemini_cache_writes(wire.automatic_cache_written_tokens);

@@ -215,6 +215,8 @@ pub struct UpstreamRelay {
     first_token_at: Option<SystemTime>,
     observation: Option<crate::settlement::Observation>,
     capture_reasoning: Option<crate::capture::reasoning::Observer>,
+    /// Capture-only probabilities this dial requested (`crate::capture::logprobs`).
+    pub(crate) logprobs: crate::capture::logprobs::Held,
 }
 
 impl UpstreamRelay {
@@ -290,6 +292,7 @@ impl UpstreamRelay {
             tool_search: ToolSearchWithholder::default(),
             observation: None,
             capture_reasoning: None,
+            logprobs: Default::default(),
         }
     }
 
@@ -298,7 +301,14 @@ impl UpstreamRelay {
     }
 
     pub(crate) fn set_capture_reasoning(&mut self, observer: crate::capture::reasoning::Observer) {
+        self.logprobs.attach(&observer);
         self.capture_reasoning = Some(observer);
+    }
+
+    /// Parse gateway-requested probabilities into the capture side buffer only.
+    pub(crate) fn enable_logprobs_capture(&mut self) {
+        self.normalizer.enable_logprobs_capture();
+        self.logprobs.injected = true;
     }
 
     /// Close the network body before any settlement callback is awaited.
@@ -338,6 +348,9 @@ impl UpstreamRelay {
     }
 
     fn queue_events(&mut self, events: Vec<Event>) {
+        let taken = self.normalizer.take_captured_logprobs();
+        self.logprobs
+            .forward(taken, self.capture_reasoning.as_ref());
         if let Some(observation) = &self.observation {
             observation.record_service_tier(&self.normalizer.service_tier);
             // Several dialects retain a parsed meter until terminal encoding.

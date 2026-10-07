@@ -34,6 +34,10 @@ pub(crate) struct Configuration {
     /// reasoning is already retained in the captured response frames.
     #[serde(default)]
     pub capture_hidden_reasoning: bool,
+    /// Request Chat token probabilities on eligible rungs of captured requests
+    /// and retain them as `provider_logprobs`, stripped from the caller's answer.
+    #[serde(default)]
+    pub capture_logprobs: bool,
 }
 
 impl Configuration {
@@ -260,6 +264,7 @@ impl Collector {
             metrics: None,
             gemini_thought_parts: Vec::new(),
             gemini_thought_parts_source_json: None,
+            provider_logprobs: None,
             captured_at: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map(|duration| duration.as_secs_f64())
@@ -412,6 +417,7 @@ impl Collector {
             metrics: None,
             gemini_thought_parts: Vec::new(),
             gemini_thought_parts_source_json: None,
+            provider_logprobs: None,
             captured_at: entry.record.captured_at,
         };
         // The context Arc is shared; charge the copied identifiers and receipt/queue nodes.
@@ -688,6 +694,15 @@ impl Collector {
     /// Append only authorized winning-rung reasoning, charging allocated capacity.
     /// Overflow excludes the exchange instead of silently publishing partial evidence.
     /// Whether reasoning the caller did not see is retained.
+    /// Whether gateway-requested probabilities apply to this admitted request.
+    pub(crate) fn wants_logprobs(&self, request_id: &str) -> bool {
+        self.config.capture_logprobs
+            && self
+                .pending
+                .lock()
+                .is_ok_and(|pending| pending.entries.contains_key(request_id))
+    }
+
     pub(crate) fn captures_hidden_reasoning(&self) -> bool {
         self.config.capture_hidden_reasoning
     }
@@ -738,6 +753,58 @@ impl Collector {
         text.push_str(delta);
         pending.bytes += entry.map_bytes();
         pending.entries.insert(request_id.to_owned(), entry);
+    }
+
+    /// Note that the winning dial requested probabilities the caller never asked for.
+    pub(crate) fn logprobs_injected(&self, request_id: &str) {
+        let Ok(mut pending) = self.pending.lock() else {
+            return;
+        };
+        self.expire(&mut pending);
+        let Some(entry) = pending.entries.get_mut(request_id) else {
+            return;
+        };
+        if entry.record.provider_logprobs.is_none() {
+            let captured = super::logprobs::Captured::injected();
+            let bytes = captured.heap_bytes();
+            entry.record.provider_logprobs = Some(captured);
+            entry.bytes += bytes;
+            pending.bytes += bytes;
+        }
+    }
+
+    /// Append the winning attempt's capture-only probabilities. Unlike reasoning,
+    /// an overflow never drops the exchange: it stops retaining probabilities and
+    /// marks them truncated, because the response itself is complete evidence.
+    pub(crate) fn logprobs(
+        &self,
+        request_id: &str,
+        deltas: Vec<crate::logprobs::ChoiceLogprobsDelta>,
+        truncated: bool,
+    ) {
+        if deltas.is_empty() && !truncated {
+            return;
+        }
+        let Ok(mut pending) = self.pending.lock() else {
+            return;
+        };
+        self.expire(&mut pending);
+        let retained = self.retained_bytes(&pending);
+        let maximum_pending = self.config.maximum_pending_bytes;
+        let maximum_response = self.config.maximum_response_bytes;
+        let Some(entry) = pending.entries.get_mut(request_id) else {
+            return;
+        };
+        let Some(captured) = entry.record.provider_logprobs.as_mut() else {
+            return;
+        };
+        let already = captured.bytes;
+        let added = captured.extend(deltas, truncated, |extra| {
+            already.saturating_add(extra) <= maximum_response
+                && retained.saturating_add(extra) <= maximum_pending
+        });
+        entry.bytes += added;
+        pending.bytes += added;
     }
 
     /// Share bounded provider parts without JSON encoding or copying their content.
