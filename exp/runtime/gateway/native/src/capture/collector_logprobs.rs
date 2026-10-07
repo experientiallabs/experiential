@@ -3,6 +3,11 @@
 use super::Collector;
 
 impl Collector {
+    /// Whether the host enabled capture-only probabilities at all.
+    pub(crate) fn captures_logprobs(&self) -> bool {
+        self.config.capture_logprobs
+    }
+
     /// Whether gateway-requested probabilities apply to this admitted request; a
     /// yes reserves the record's (unmarked) sidecar so a later dial's probabilities
     /// always have somewhere to go.

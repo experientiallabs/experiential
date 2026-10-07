@@ -229,11 +229,12 @@ pub(crate) async fn messages(
         // A guardrail may rewrite the output the probabilities describe; it is
         // checked first so a guarded request never reserves a sidecar.
         capture_logprobs: !admission.buffers_output()
-            && crate::capture::logprobs::route_may_inject(&admission.route)
-            && state
-                .capture
-                .as_ref()
-                .is_some_and(|capture| capture.wants_logprobs(&admission.request_id)),
+            && state.capture.as_ref().is_some_and(|capture| {
+                // The switch first: with capture logprobs off, no route scan.
+                capture.captures_logprobs()
+                    && crate::capture::logprobs::route_may_inject(&admission.route)
+                    && capture.wants_logprobs(&admission.request_id)
+            }),
         output_less_retention: None,
         output_token_cap: admission.maximum_output_tokens,
         tool_search: admission.tool_search.as_ref(),

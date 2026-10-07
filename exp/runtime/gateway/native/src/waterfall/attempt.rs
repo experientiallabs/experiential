@@ -270,6 +270,9 @@ pub(super) async fn run_attempt(
         let mut withheld: Vec<Event> = Vec::new();
         let mut withheld_bytes = 0usize;
         let mut private_reasoning = commit::PrivateReasoning::default();
+        // Any event before a failure (private reasoning included) is generated
+        // work: such a dial is the attempt's answer and is never re-dialed.
+        let mut produced = false;
         loop {
             let event = match relay
                 .next_event(ctx.deadline, phase_timeout, guard.started)
@@ -289,6 +292,7 @@ pub(super) async fn run_attempt(
                 }
                 Err(failure) => {
                     if logprobs_injected
+                        && !produced
                         && relay.usage_before_failure(usage.clone()).is_none()
                         && withheld.is_empty()
                         && crate::capture::logprobs::may_be_refusal(&failure)
@@ -311,6 +315,7 @@ pub(super) async fn run_attempt(
                     };
                 }
             };
+            produced |= !matches!(event, Event::Failed(_));
             if refusal_unconfirmed && !matches!(event, Event::Failed(_)) {
                 // The plain dial produced something other than the same
                 // refusal: the injected field was what the rung refused.
@@ -402,6 +407,7 @@ pub(super) async fn run_attempt(
             match &event {
                 Event::Failed(failure) => {
                     if logprobs_injected
+                        && !produced
                         && relay.usage_before_failure(usage.clone()).is_none()
                         && withheld.is_empty()
                         && crate::capture::logprobs::may_be_refusal(failure)
