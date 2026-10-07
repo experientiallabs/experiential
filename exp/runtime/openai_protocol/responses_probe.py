@@ -134,6 +134,10 @@ def official_image_details(entry: JsonObject, param: str) -> JsonObject:
     return {**entry, "content": parts}
 
 
+_SDK_WEB_SEARCH_ACTIONS = frozenset({"search", "open_page", "find_in_page"})
+"""Web search action types the installed SDK's input-item schema enumerates."""
+
+
 def official_responses_probe(payload: JsonObject) -> JsonObject:
     """Return the copy of one Responses body the official SDK schema validates."""
     probe = dict(payload)
@@ -177,16 +181,19 @@ def official_responses_probe(payload: JsonObject) -> JsonObject:
                     item["status"] = "completed"
                 adapted.append(item)
             elif isinstance(entry, dict) and entry.get("type") == "web_search_call":
-                # A replayed provider-executed web search item is the
-                # provider's own vocabulary: it forwards byte-for-byte to the
-                # native Responses rung that authored it (every other rung
-                # refuses hosted items by name). The installed SDK enumerates
-                # only search / open_page / find_in_page actions, while Codex
-                # echoes others (`other`, captured as "Invalid value for
-                # 'input.N.action.type'" on 55 requests, Sep 24 - Oct 6), so
-                # the probe never judges the item's internals; the wire model
-                # keeps its shallow type and id checks.
-                continue
+                # A replayed provider-executed web search item forwards
+                # byte-for-byte to the native Responses rung that authored it
+                # (every other rung refuses hosted items by name). The
+                # installed SDK enumerates only search / open_page /
+                # find_in_page actions, while Codex echoes others ("Invalid
+                # value for 'input.N.action.type'" on 55 requests, Sep 24 -
+                # Oct 6), so the probe sees an SDK-known action in place of an
+                # unknown one and still checks the item's structure.
+                item = dict(entry)
+                action = item.get("action")
+                if isinstance(action, dict) and action.get("type") not in _SDK_WEB_SEARCH_ACTIONS:
+                    item["action"] = {"type": "search", "query": ""}
+                adapted.append(item)
             elif isinstance(entry, dict) and entry.get("type") == "reasoning":
                 item = dict(entry)
                 if item.get("id") is None:

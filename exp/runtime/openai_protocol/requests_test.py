@@ -5147,8 +5147,16 @@ def test_responses_web_search_sources_selector_is_honored() -> None:
     )
 
 
-@pytest.mark.parametrize("action_type", ["other", "find", "search", "find_in_page"])
-def test_replayed_web_search_items_decode_whatever_their_action(action_type: str) -> None:
+@pytest.mark.parametrize(
+    "action",
+    [
+        {"type": "other"},
+        {"type": "find", "query": "weather"},
+        {"type": "search", "query": "weather"},
+        {"type": "find_in_page", "url": "https://example.com", "pattern": "rain"},
+    ],
+)
+def test_replayed_web_search_items_decode_whatever_their_action(action: JsonObject) -> None:
     """A Codex history echoing its provider's web search item replays verbatim.
 
     The SDK enumerates only search / open_page / find_in_page; Codex echoes
@@ -5164,10 +5172,24 @@ def test_replayed_web_search_items_decode_whatever_their_action(action_type: str
                     "type": "web_search_call",
                     "id": "ws_1",
                     "status": "completed",
-                    "action": {"type": action_type, "query": "weather"},
+                    "action": action,
                 },
                 {"type": "message", "role": "user", "content": "thanks"},
             ],
         }
     )
     assert decoded.request.surface == GatewayApiSurface.RESPONSES
+
+
+def test_malformed_replayed_web_search_items_are_still_refused() -> None:
+    """Relaxing the action enum keeps the item's structural checks."""
+    with pytest.raises(OpenAIProtocolError):
+        decode_responses(
+            {
+                "model": "coding",
+                "input": [
+                    {"type": "message", "role": "user", "content": "look it up"},
+                    {"type": "web_search_call", "id": "ws_1", "action": {"type": "other"}},
+                ],
+            }
+        )
