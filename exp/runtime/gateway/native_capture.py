@@ -216,6 +216,48 @@ class CaptureMetrics(ContractModel):
     usage_complete: bool
 
 
+class CaptureLogprobCandidate(ContractModel):
+    """One alternative token at a position.
+
+    Attributes:
+        token: Token text; NUL is stored as U+FFFD (see ``nul_replaced``).
+        logprob: Natural-log probability.
+        bytes: Exact UTF-8 bytes of the token when the provider sent them.
+    """
+
+    token: str
+    logprob: float = Field(allow_inf_nan=False)
+    bytes: tuple[int, ...] | None
+
+
+class CaptureTokenLogprob(CaptureLogprobCandidate):
+    """One generated token's probability with its alternatives.
+
+    Attributes:
+        top_logprobs: Alternatives the provider returned, empty when none were asked.
+    """
+
+    top_logprobs: tuple[CaptureLogprobCandidate, ...]
+
+
+class CaptureProviderLogprobs(ContractModel):
+    """Gateway-requested Chat probabilities of the winning attempt.
+
+    Attributes:
+        logprobs_injected: Always true: the caller did not request them.
+        truncated: A retention bound stopped them before the response ended.
+        content: Probabilities of the answer text, in order.
+        refusal: Probabilities of refusal text, in order.
+        nul_replaced: A token text carried NUL and was stored with U+FFFD.
+    """
+
+    logprobs_injected: Literal[True]
+    truncated: bool = Field(strict=True)
+    content: tuple[CaptureTokenLogprob, ...]
+    refusal: tuple[CaptureTokenLogprob, ...]
+    nul_replaced: bool = Field(default=False, strict=True)
+
+
 class CaptureRecord(ContractModel):
     """One idempotent update delivered to a local or hosted persistence adapter.
 
@@ -251,7 +293,7 @@ class CaptureRecord(ContractModel):
     gemini_thought_parts: tuple[JsonObject, ...]
     gemini_thought_parts_source_json: str | None
     transport: JsonObject | None = None
-    provider_logprobs: JsonObject | None = None
+    provider_logprobs: CaptureProviderLogprobs | None = None
 
 
 class CaptureController:

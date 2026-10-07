@@ -86,3 +86,27 @@ fn an_upstream_truncation_keeps_the_prefix_that_fits() {
     captured.extend(vec![delta("c")], false, |_| true);
     assert_eq!(captured.content.len(), 2);
 }
+
+#[test]
+fn a_full_refusal_memory_still_remembers_the_latest_rung() {
+    for index in 0..MAXIMUM_REFUSED_RUNGS + 1 {
+        remember_refusal(&format!("eviction-{index}"));
+    }
+    assert!(refused(&format!("eviction-{MAXIMUM_REFUSED_RUNGS}")));
+}
+
+#[test]
+fn nul_in_token_text_is_replaced_and_flagged() {
+    let value = json!({"content":[{"token":"a\0b","logprob":-1.0,"bytes":[97,0,98],
+        "top_logprobs":[{"token":"\0","logprob":-2.0,"bytes":[0]}]}]});
+    let delta = crate::logprobs::parse(Some(&value), 0).unwrap().unwrap();
+    let mut captured = Captured::injected();
+    captured.extend(vec![delta], false, |_| true);
+    assert!(captured.nul_replaced);
+    assert_eq!(captured.content[0].token, "a\u{fffd}b");
+    assert_eq!(captured.content[0].top_logprobs[0].token, "\u{fffd}");
+    assert_eq!(captured.content[0].bytes, Some(vec![97, 0, 98]));
+    assert!(!serde_json::to_string(&captured)
+        .unwrap()
+        .contains("\\u0000"));
+}

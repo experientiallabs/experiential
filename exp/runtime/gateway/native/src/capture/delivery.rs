@@ -194,6 +194,7 @@ fn run_worker<S: Sink>(
                         if record.response.is_none() {
                             record.provider_reasoning = None;
                             record.provider_tool_calls_json = None;
+                            record.provider_logprobs = None;
                         }
                     }
                     entry.value = sink.prepare(record, maximum_record_bytes).ok();

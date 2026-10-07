@@ -477,6 +477,7 @@ impl Collector {
             entry.record.provider_tool_calls_json = None;
             entry.record.metrics = None;
             entry.record.gemini_thought_parts.clear();
+            entry.record.provider_logprobs = None;
             entry._admission.handoff(entry.bytes);
             drop(pending);
             self.emit_entry(entry);
@@ -553,6 +554,7 @@ impl Collector {
             entry.record.provider_reasoning = None;
             entry.record.provider_tool_calls_json = None;
             entry.record.gemini_thought_parts.clear();
+            entry.record.provider_logprobs = None;
         }
         entry.record.deployment_id = deployment_id;
         entry.record.metrics = if entry.record.response.is_some() || entry.wire.is_some() {
@@ -773,9 +775,7 @@ impl Collector {
         }
     }
 
-    /// Append the winning attempt's capture-only probabilities. Unlike reasoning,
-    /// an overflow never drops the exchange: it stops retaining probabilities and
-    /// marks them truncated, because the response itself is complete evidence.
+    /// Append capture-only probabilities; an overflow truncates them, never the exchange.
     pub(crate) fn logprobs(
         &self,
         request_id: &str,
@@ -795,12 +795,19 @@ impl Collector {
         let Some(entry) = pending.entries.get_mut(request_id) else {
             return;
         };
+        let record_room = super::logprobs::record_room(
+            self.config.delivery.maximum_record_bytes,
+            entry.request_bytes,
+            maximum_response,
+        );
         let Some(captured) = entry.record.provider_logprobs.as_mut() else {
             return;
         };
         let already = captured.bytes;
         let added = captured.extend(deltas, truncated, |extra| {
-            already.saturating_add(extra) <= maximum_response
+            let total = already.saturating_add(extra);
+            total <= maximum_response
+                && total <= record_room
                 && retained.saturating_add(extra) <= maximum_pending
         });
         entry.bytes += added;

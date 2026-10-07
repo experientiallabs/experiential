@@ -800,6 +800,15 @@ fn stalled_handoffs_remain_inside_admission_count_and_byte_limits() {
 #[path = "checkpoint_test.rs"]
 mod checkpoints;
 
+/// Room for probabilities: a record ceiling well above request plus response.
+fn logprobs_config() -> Configuration {
+    let mut config = config();
+    config.capture_logprobs = true;
+    config.delivery.maximum_record_bytes = 65536;
+    config.delivery.maximum_bytes = 4 * 65536;
+    config
+}
+
 fn probability(token: &str) -> crate::logprobs::ChoiceLogprobsDelta {
     crate::logprobs::parse(
         Some(&json!({"content":[{"token":token,"logprob":-1.0,"bytes":null,"top_logprobs":[]}]})),
@@ -811,10 +820,7 @@ fn probability(token: &str) -> crate::logprobs::ChoiceLogprobsDelta {
 
 #[test]
 fn injected_probabilities_are_retained_and_marked_without_touching_the_response() {
-    let (collector, receiver) = collector(Configuration {
-        capture_logprobs: true,
-        ..config()
-    });
+    let (collector, receiver) = collector(logprobs_config());
     assert!(collector.begin(request("probabilities")));
     assert!(collector.wants_logprobs("probabilities"));
     assert!(!collector.wants_logprobs("unknown"));
@@ -859,10 +865,7 @@ fn records_without_injection_serialize_exactly_as_before() {
 
 #[test]
 fn probability_overflow_truncates_instead_of_dropping_the_exchange() {
-    let (collector, receiver) = collector(Configuration {
-        capture_logprobs: true,
-        ..config()
-    });
+    let (collector, receiver) = collector(logprobs_config());
     assert!(collector.begin(request("overflow")));
     collector.logprobs_injected("overflow");
     let many: Vec<_> = (0..400).map(|i| probability(&format!("t{i}"))).collect();
@@ -875,4 +878,34 @@ fn probability_overflow_truncates_instead_of_dropping_the_exchange() {
     let captured = records[0].provider_logprobs.as_ref().unwrap();
     assert!(captured.truncated);
     assert!(captured.content.len() < 400);
+}
+
+#[test]
+fn denied_response_retention_drops_captured_probabilities() {
+    let (collector, receiver) = collector(logprobs_config());
+    assert!(collector.begin(request("denied-probabilities")));
+    collector.logprobs_injected("denied-probabilities");
+    collector.logprobs("denied-probabilities", vec![probability("a")], false);
+    collector.settle("denied-probabilities", true, false);
+    let records = drain(&collector, receiver);
+    assert!(records[0].response.is_none());
+    assert!(records[0].provider_logprobs.is_none());
+}
+
+#[test]
+fn probabilities_never_outgrow_the_destination_record_ceiling() {
+    // The default test ceiling (8 KiB) leaves no room beside a full response.
+    let (collector, receiver) = collector(Configuration {
+        capture_logprobs: true,
+        ..config()
+    });
+    assert!(collector.begin(request("ceiling")));
+    collector.logprobs_injected("ceiling");
+    collector.logprobs("ceiling", vec![probability("a")], false);
+    collector.settle("ceiling", true, true);
+    assert!(collector.finish("ceiling", Some(response()), Some("d".into())));
+    let records = drain(&collector, receiver);
+    let captured = records[0].provider_logprobs.as_ref().unwrap();
+    assert!(captured.content.is_empty());
+    assert!(captured.truncated);
 }

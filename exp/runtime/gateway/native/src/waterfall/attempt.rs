@@ -110,7 +110,7 @@ pub(super) async fn run_attempt(
             ctx.approximate_input_tokens,
         )
     };
-    let first_byte_deadline = Instant::now() + first_byte_allowance_for();
+    let mut first_byte_deadline = Instant::now() + first_byte_allowance_for();
     // The first-token bound the relay enforces once the headers are in: its
     // own base (thinking models on a chat wire stream nothing for a minute
     // and more), the same input slope, absolute from the same dial.
@@ -122,7 +122,7 @@ pub(super) async fn run_attempt(
             ctx.approximate_input_tokens,
         )
     };
-    let first_token_deadline = Instant::now() + first_token_allowance_for();
+    let mut first_token_deadline = Instant::now() + first_token_allowance_for();
     // What is already known repairs the first dial: the payload this request
     // stripped on an earlier dial of the rung, else the payloads this worker
     // remembers the caller's provider refusing.
@@ -174,6 +174,10 @@ pub(super) async fn run_attempt(
                 .is_err_and(crate::capture::logprobs::may_be_refusal)
         {
             logprobs_injected = false;
+            // The plain dial gets the per-dial allowances it would have had
+            // without injection; the request deadline still bounds both.
+            first_byte_deadline = Instant::now() + first_byte_allowance_for();
+            first_token_deadline = Instant::now() + first_token_allowance_for();
             opened = open_stream(
                 ctx.http,
                 &wire.url,

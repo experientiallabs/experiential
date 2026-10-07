@@ -12,6 +12,7 @@ from unittest.mock import patch
 
 import httpx
 import pytest
+from pydantic import ValidationError
 from websockets.sync.client import ClientConnection, connect
 
 from exp.common.core.artifacts import JsonObject
@@ -1177,4 +1178,13 @@ def test_capture_records_accept_marked_provider_logprobs() -> None:
         }
     )
     assert marked.provider_logprobs is not None
-    assert marked.provider_logprobs["logprobs_injected"] is True
+    assert marked.provider_logprobs.logprobs_injected is True
+    assert marked.provider_logprobs.content[0].token == "a"
+    for malformed in (
+        {"truncated": "no"},
+        {"logprobs_injected": False},
+        {"content": [{"token": "a", "logprob": "x", "bytes": None, "top_logprobs": []}]},
+    ):
+        evidence = {**marked.provider_logprobs.model_dump(mode="json"), **malformed}
+        with pytest.raises(ValidationError):
+            CaptureRecord.model_validate({**base, "provider_logprobs": evidence})

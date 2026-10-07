@@ -229,7 +229,9 @@ pub(crate) async fn responses(
         capture_logprobs: state
             .capture
             .as_ref()
-            .is_some_and(|capture| capture.wants_logprobs(&admission.request_id)),
+            .is_some_and(|capture| capture.wants_logprobs(&admission.request_id))
+            // A guardrail may rewrite the output the probabilities describe.
+            && !admission.buffers_output(),
         // A turn that ends before any semantic output is still a response
         // the caller can continue from; the waterfall retains it in flight.
         output_less_retention: Some(remember_argument(

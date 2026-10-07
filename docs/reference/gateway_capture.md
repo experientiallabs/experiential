@@ -79,11 +79,17 @@ probabilities are parsed into a side buffer, never into the event stream the
 caller's answer is encoded from, so the caller's bytes, usage and settlement are
 the same as without the request. The winning attempt's probabilities land in
 `provider_logprobs` (`logprobs_injected: true`, `truncated`, `content`,
-`refusal`); a record without injection carries no such key. Retention is bounded
-at 4 MiB per attempt and by the collector's response and pending budgets; an
-overflow sets `truncated` and keeps the exchange. A malformed probability channel
-is dropped, never a failure. A rung that refuses the field (a request-shaped
-4xx) is re-dialed once without it inside the same physical attempt; when that
+`refusal`); a record without injection carries no such key. A request with an
+output guardrail is never injected (the guardrail may rewrite the text the
+probabilities describe), and a response the host declines to retain drops its
+probabilities too. Retention is bounded at 4 MiB per attempt, by the collector's
+response and pending budgets, and by the destination's record ceiling after the
+request and the largest admissible response; an overflow sets `truncated` and
+keeps the exchange. A token text carrying NUL is stored with U+FFFD and flags
+`nul_replaced` (the token's `bytes` keep it exactly). A malformed probability
+channel is dropped, never a failure. A rung that refuses the field (a request-shaped
+4xx) is re-dialed once without it inside the same physical attempt (fresh
+per-dial first-byte and first-token allowances, its own Idempotency-Key); when that
 plain dial opens, this worker never injects on the rung again. A request the
 provider refuses either way answers exactly as it would have without injection.
 

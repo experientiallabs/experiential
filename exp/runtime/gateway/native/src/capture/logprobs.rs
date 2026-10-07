@@ -22,6 +22,19 @@ use crate::logprobs::{ChoiceLogprobsDelta, TokenLogprob};
 /// buffer stops growing and the capture record says it was truncated.
 pub(crate) const MAXIMUM_CAPTURED_LOGPROB_BYTES: usize = 4 * 1024 * 1024;
 
+/// Room left for the record's request scope, metrics and keys when sizing
+/// retained probabilities against the destination's record ceiling.
+pub(crate) const RECORD_ENVELOPE_BYTES: usize = 16 * 1024;
+
+/// Room the encoded record leaves for probabilities after the full request,
+/// the largest admissible response and the record envelope.
+pub(crate) fn record_room(maximum_record: usize, request: usize, response: usize) -> usize {
+    maximum_record
+        .saturating_sub(request)
+        .saturating_sub(response)
+        .saturating_sub(RECORD_ENVELOPE_BYTES)
+}
+
 /// Bound on remembered refusing rungs so a churning catalog cannot grow it.
 const MAXIMUM_REFUSED_RUNGS: usize = 4096;
 
@@ -38,9 +51,12 @@ pub(crate) fn refused(deployment_id: &str) -> bool {
 /// Stop injecting on a rung whose plain re-dial opened after a refusal.
 pub(crate) fn remember_refusal(deployment_id: &str) {
     if let Ok(mut refused) = REFUSED.lock() {
-        if refused.len() < MAXIMUM_REFUSED_RUNGS {
-            refused.insert(deployment_id.to_owned());
+        // A full memory starts over rather than ignoring current refusals:
+        // forgotten rungs cost one more plain re-dial each, never an error.
+        if refused.len() >= MAXIMUM_REFUSED_RUNGS {
+            refused.clear();
         }
+        refused.insert(deployment_id.to_owned());
     }
 }
 
@@ -173,6 +189,22 @@ impl Buffer {
     }
 }
 
+/// Replace NUL in token texts (record and alternatives); report whether any was.
+fn storable(record: &mut TokenLogprob) -> bool {
+    let mut replaced = false;
+    let mut clean = |text: &mut String| {
+        if text.contains('\0') {
+            *text = text.replace('\0', "\u{fffd}");
+            replaced = true;
+        }
+    };
+    clean(&mut record.token);
+    for candidate in &mut record.top_logprobs {
+        clean(&mut candidate.token);
+    }
+    replaced
+}
+
 /// The capture record's probabilities: present only when the gateway requested
 /// them, so a caller-requested answer (already in the response frames) and every
 /// record without injection serialize exactly as before.
@@ -185,6 +217,11 @@ pub(crate) struct Captured {
     pub truncated: bool,
     pub content: Vec<TokenLogprob>,
     pub refusal: Vec<TokenLogprob>,
+    /// A token text carried NUL, which JSONB cannot store; it was replaced with
+    /// U+FFFD in the text, and the record's `bytes` (when the provider sent
+    /// them) keep the exact token.
+    #[serde(default)]
+    pub nul_replaced: bool,
     /// Retained-size estimate charged against the collector's budgets.
     #[serde(skip)]
     pub bytes: usize,
@@ -222,8 +259,15 @@ impl Captured {
             }
             added += bytes;
             if let Some(logprobs) = delta.logprobs {
-                self.content.extend(logprobs.content.unwrap_or_default());
-                self.refusal.extend(logprobs.refusal.unwrap_or_default());
+                for (channel, records) in [
+                    (&mut self.content, logprobs.content),
+                    (&mut self.refusal, logprobs.refusal),
+                ] {
+                    for mut record in records.unwrap_or_default() {
+                        self.nul_replaced |= storable(&mut record);
+                        channel.push(record);
+                    }
+                }
             }
         }
         self.bytes += added;
