@@ -132,26 +132,33 @@ pub(super) async fn run_attempt(
     }
     // A repaired payload returns to the outer loop for its own reservation.
     // The refused dial's usage belongs to this attempt alone.
-    {
+    // Capture-only probabilities (`crate::capture::logprobs`): the caller's
+    // answer never carries them. A request-shaped refusal of the injected
+    // dial, at open or as a pre-output failure under HTTP 200, re-dials the
+    // plain payload inside this same physical attempt with a fresh dial
+    // observation and fresh per-dial allowances, so the caller and the ledger
+    // see only the plain dial.
+    let mut inject = ctx.capture_logprobs
+        && wire.capture_logprobs
+        && !wire.billing_customer_managed
+        && dialect == Dialect::OpenAiCompatible
+        && repair.raw_body().is_none()
+        && !crate::capture::logprobs::refused(&crate::capture::logprobs::rung_key(wire));
+    // Set after a refused injected dial: a plain dial that then opens proves
+    // the field was the refusal; one the provider refuses too proves nothing.
+    let mut refusal_unconfirmed = false;
+    // An injected body is a different request: it never shares the plain
+    // payload's Idempotency-Key, so a plain re-dial is never refused as reuse.
+    let injected_key = format!("{}.logprobs", wire.idempotency_key);
+    'dial: loop {
         let observation = guard.begin_dial_observation();
         let open_bound = open_phase_bound(remaining(ctx.deadline), remaining(first_byte_deadline));
         guard.mark_dispatched();
-        // Capture-only probabilities (`crate::capture::logprobs`): the caller's
-        // answer never carries them, and a refusal re-dials the plain payload
-        // inside this same physical attempt so the caller sees only that dial.
-        let injected_payload = (ctx.capture_logprobs
-            && wire.capture_logprobs
-            && !wire.billing_customer_managed
-            && dialect == Dialect::OpenAiCompatible
-            && repair.raw_body().is_none()
-            && !crate::capture::logprobs::refused(&crate::capture::logprobs::rung_key(wire)))
-        .then(|| crate::capture::logprobs::with_logprobs(repair.payload()))
-        .flatten();
-        let mut logprobs_injected = injected_payload.is_some();
-        // An injected body is a different request: it never shares the plain
-        // payload's Idempotency-Key, so a plain re-dial is never refused as reuse.
-        let injected_key = format!("{}.logprobs", wire.idempotency_key);
-        let mut opened = open_stream(
+        let injected_payload = inject
+            .then(|| crate::capture::logprobs::with_logprobs(repair.payload()))
+            .flatten();
+        let logprobs_injected = injected_payload.is_some();
+        let opened = open_stream(
             ctx.http,
             &wire.url,
             &headers,
@@ -173,29 +180,14 @@ pub(super) async fn run_attempt(
                 .as_ref()
                 .is_err_and(crate::capture::logprobs::may_be_refusal)
         {
-            logprobs_injected = false;
-            // The plain dial gets the per-dial allowances it would have had
-            // without injection; the request deadline still bounds both.
+            inject = false;
+            refusal_unconfirmed = true;
             first_byte_deadline = Instant::now() + first_byte_allowance_for();
             first_token_deadline = Instant::now() + first_token_allowance_for();
-            opened = open_stream(
-                ctx.http,
-                &wire.url,
-                &headers,
-                &wire.idempotency_key,
-                repair.payload(),
-                repair.raw_body(),
-                open_phase_bound(remaining(ctx.deadline), remaining(first_byte_deadline)),
-                dialect,
-            )
-            .await;
-            // Only a plain dial that the provider accepts proves the field was
-            // the refusal; a request the provider refuses either way is not.
-            if opened.is_ok() {
-                crate::capture::logprobs::remember_refusal(&crate::capture::logprobs::rung_key(
-                    wire,
-                ));
-            }
+            continue 'dial;
+        }
+        if refusal_unconfirmed && opened.is_ok() {
+            crate::capture::logprobs::remember_refusal(&crate::capture::logprobs::rung_key(wire));
         }
         let response = match opened {
             Ok(response) => response,
@@ -299,6 +291,17 @@ pub(super) async fn run_attempt(
                     }
                 }
                 Err(failure) => {
+                    if logprobs_injected
+                        && usage.is_none()
+                        && withheld.is_empty()
+                        && crate::capture::logprobs::may_be_refusal(&failure)
+                    {
+                        inject = false;
+                        refusal_unconfirmed = true;
+                        first_byte_deadline = Instant::now() + first_byte_allowance_for();
+                        first_token_deadline = Instant::now() + first_token_allowance_for();
+                        continue 'dial;
+                    }
                     return AttemptEnd::Ladder {
                         failure,
                         refusal_eligible: false,
@@ -307,7 +310,7 @@ pub(super) async fn run_attempt(
                         tool_names,
                         opened: true,
                         encrypted_reasoning_stripped,
-                    }
+                    };
                 }
             };
             track_event(&event, &mut usage, &mut tool_names);
@@ -392,6 +395,17 @@ pub(super) async fn run_attempt(
             }
             match &event {
                 Event::Failed(failure) => {
+                    if logprobs_injected
+                        && usage.is_none()
+                        && withheld.is_empty()
+                        && crate::capture::logprobs::may_be_refusal(failure)
+                    {
+                        inject = false;
+                        refusal_unconfirmed = true;
+                        first_byte_deadline = Instant::now() + first_byte_allowance_for();
+                        first_token_deadline = Instant::now() + first_token_allowance_for();
+                        continue 'dial;
+                    }
                     usage = relay.usage_before_failure(usage);
                     if !withheld.iter().any(crate::logprobs::is_refusal)
                         && repair.repair_after(failure)

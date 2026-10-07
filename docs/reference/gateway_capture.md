@@ -92,8 +92,11 @@ channel is never a failure: it ends retention there and marks the prefix
 committed winning attempt: a turn settled before any output committed (an
 exhausted refusal flush, an empty completion) carries none. An encoded record
 that would exceed the destination ceiling only because of its probabilities
-drops the `provider_logprobs` sidecar rather than the exchange. A rung that refuses the field (a request-shaped
-4xx) is re-dialed once without it inside the same physical attempt (fresh
+drops the `provider_logprobs` sidecar rather than the exchange (only on that
+size failure; any other preparation failure retries the record whole).
+Probabilities are kept only beside a complete captured response: a truncated
+response prefix drops them. A rung that refuses the field (a request-shaped
+4xx, or the same failure as a pre-output stream error under HTTP 200) is re-dialed once without it inside the same physical attempt (fresh
 per-dial first-byte and first-token allowances, its own Idempotency-Key); when that
 plain dial opens, this worker never injects on the rung again. A request the
 provider refuses either way answers exactly as it would have without injection.

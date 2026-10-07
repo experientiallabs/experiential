@@ -194,11 +194,12 @@ fn run_worker<S: Sink>(
                         if record.response.is_none() {
                             record.provider_reasoning = None;
                             record.provider_tool_calls_json = None;
-                            record.provider_logprobs = None;
                         }
+                        super::logprobs::align_with_response(record, false);
                     }
                     entry.value = sink.prepare(record, maximum_record_bytes).ok();
-                    if entry.value.is_none() && super::logprobs::shed(record) {
+                    if entry.value.is_none() && super::logprobs::shed(record, maximum_record_bytes)
+                    {
                         // Probabilities are the one optional sidecar: an
                         // exchange that only fits without them drops them whole.
                         entry.value = sink.prepare(record, maximum_record_bytes).ok();

@@ -554,8 +554,8 @@ impl Collector {
             entry.record.provider_reasoning = None;
             entry.record.provider_tool_calls_json = None;
             entry.record.gemini_thought_parts.clear();
-            entry.record.provider_logprobs = None;
         }
+        super::logprobs::align_with_response(&mut entry.record, entry.wire.is_some());
         entry.record.deployment_id = deployment_id;
         entry.record.metrics = if entry.record.response.is_some() || entry.wire.is_some() {
             entry
@@ -757,7 +757,6 @@ impl Collector {
         pending.entries.insert(request_id.to_owned(), entry);
     }
 
-    /// Note that the winning dial requested probabilities the caller never asked for.
     pub(crate) fn logprobs_injected(&self, request_id: &str) {
         let Ok(mut pending) = self.pending.lock() else {
             return;

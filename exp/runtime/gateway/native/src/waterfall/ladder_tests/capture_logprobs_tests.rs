@@ -252,3 +252,35 @@ fn a_request_refused_either_way_fails_as_without_injection_and_is_not_remembered
         ));
     });
 }
+
+const REFUSED_IN_STREAM: &str = r#"{"error":{"message":"logprobs is not supported for this model","type":"invalid_request_error","code":"invalid_request_error","param":"logprobs"}}"#;
+
+#[test]
+fn a_refusal_under_http_200_redials_plain_before_any_output() {
+    block_on(async {
+        let harness = Harness::new();
+        let plain = spawn_rung(vec![Answer::Stream(PLAIN)]).await;
+        let (won, guard) =
+            run_capture(&harness, &[wire("ok200-plain", &plain.url, 0)], false).await;
+        let (baseline, _) = drain(finish(guard, won).await).await;
+
+        let rung = spawn_rung(vec![
+            Answer::Stream(&[REFUSED_IN_STREAM]),
+            Answer::Stream(PLAIN),
+        ])
+        .await;
+        let route = [capture_wire("ok200-a", &rung.url)];
+        let (won, guard) = run_capture(&harness, &route, true).await;
+        let (events, committed) = drain(finish(guard, won).await).await;
+        assert_eq!(encodings(&events), encodings(&baseline));
+        assert!(!committed.relay.logprobs.injected);
+        let keys = rung.keys.lock().unwrap().clone();
+        assert_eq!(keys[0].as_deref(), Some("op-ok200-a.logprobs"));
+        assert_eq!(keys[1].as_deref(), Some("op-ok200-a"));
+        // One reserved attempt per request: the baseline's and this one's.
+        assert_eq!(harness.story().await["starts"].as_array().unwrap().len(), 2);
+        assert!(crate::capture::logprobs::refused(
+            &crate::capture::logprobs::rung_key(&route[0])
+        ));
+    });
+}

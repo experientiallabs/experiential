@@ -26,10 +26,36 @@ pub(crate) const MAXIMUM_CAPTURED_LOGPROB_BYTES: usize = 4 * 1024 * 1024;
 /// retained probabilities against the destination's record ceiling.
 pub(crate) const RECORD_ENVELOPE_BYTES: usize = 16 * 1024;
 
-/// Remove a record's probability sidecar when it is what keeps the record from
-/// encoding; `false` when the record carried none.
-pub(crate) fn shed<R>(record: &mut super::record::Record<R>) -> bool {
-    record.provider_logprobs.take().is_some()
+/// Remove a record's probability sidecar when it alone keeps the record over the
+/// destination ceiling: any other preparation failure keeps the record whole for
+/// the normal retry loop. `false` when there is nothing to shed.
+pub(crate) fn shed(record: &mut super::record::Record, maximum_bytes: usize) -> bool {
+    if record.provider_logprobs.is_none() || record.encode(maximum_bytes).is_some() {
+        return false;
+    }
+    let sidecar = record.provider_logprobs.take();
+    if record.encode(maximum_bytes).is_some() {
+        return true;
+    }
+    record.provider_logprobs = sidecar;
+    false
+}
+
+/// Probabilities describe the whole answer, so they are kept only beside a
+/// complete captured response: none, or a truncated prefix, drops them. A
+/// response still held as wire bytes is judged once delivery decodes it.
+pub(crate) fn align_with_response(record: &mut super::record::Record, wire_pending: bool) {
+    if wire_pending {
+        return;
+    }
+    let complete = match &record.response {
+        Some(super::record::Response::Json { .. }) => true,
+        Some(super::record::Response::Sse { truncated, .. }) => !truncated,
+        None => false,
+    };
+    if !complete {
+        record.provider_logprobs = None;
+    }
 }
 
 /// Room the encoded record leaves for probabilities after the full request,

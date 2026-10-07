@@ -934,10 +934,13 @@ fn an_unencodable_record_sheds_its_probabilities_and_keeps_the_exchange() {
     // A ceiling the probabilities overflow but the exchange fits.
     let ceiling = full - 8;
     assert!(record.encode(ceiling).is_none());
-    assert!(crate::capture::logprobs::shed(&mut record));
+    // A ceiling the record already fits is not a size failure: nothing is shed.
+    assert!(!crate::capture::logprobs::shed(&mut record, full));
+    assert!(record.provider_logprobs.is_some());
+    assert!(crate::capture::logprobs::shed(&mut record, ceiling));
     assert!(record.encode(ceiling).is_some());
     assert!(record.provider_logprobs.is_none());
-    assert!(!crate::capture::logprobs::shed(&mut record));
+    assert!(!crate::capture::logprobs::shed(&mut record, ceiling));
 }
 
 #[test]
@@ -960,4 +963,24 @@ fn the_injection_marker_never_exceeds_the_pending_ceiling() {
         let pending = collector.pending.lock().unwrap();
         assert!(pending.entries["full"].record.provider_logprobs.is_none());
     }
+}
+
+#[test]
+fn probabilities_stay_only_beside_a_complete_captured_response() {
+    let (collector, receiver) = collector(logprobs_config());
+    assert!(collector.begin(request("prefix")));
+    collector.logprobs_injected("prefix");
+    collector.logprobs("prefix", vec![probability("a")], false);
+    collector.settle("prefix", true, true);
+    let truncated = Response::Sse {
+        status: 200,
+        frames: vec![json!({"choices":[]})],
+        truncated: true,
+        client_disconnected: false,
+        source_json: None,
+    };
+    assert!(collector.finish("prefix", Some(truncated), Some("d".into())));
+    let records = drain(&collector, receiver);
+    assert!(records[0].response.is_some());
+    assert!(records[0].provider_logprobs.is_none());
 }
