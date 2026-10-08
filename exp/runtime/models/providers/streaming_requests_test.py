@@ -807,6 +807,40 @@ def test_reasoning_summary_prefers_a_native_responses_rung() -> None:
     assert compatible_generation_parameter_profile_indexes(profiles, request) == (1,)
 
 
+def test_reasoning_summary_outranks_sampling_preference() -> None:
+    """A summary rung that drops temperature still beats a Chat rung that honors it.
+
+    Keeping both would mix the route, and its one shaped request would then drop
+    the summary on the rung that can carry it (Bugbot on #1251).
+    """
+    request = GatewayRequest(
+        surface=GatewayApiSurface.RESPONSES,
+        messages=(GatewayMessage(role="user", content="hello"),),
+        temperature=0.2,
+        reasoning_summary="auto",
+        reasoning_summary_parameters=("reasoning.summary",),
+    )
+    profiles = (
+        GatewayWireProfile(
+            dialect="openai_compatible",
+            url="https://azure.test/openai/v1",
+            supports_reasoning=True,
+            reasoning_wire_format="reasoning",
+        ),
+        GatewayWireProfile(
+            dialect="openai_responses",
+            url="https://openai.test",
+            supports_temperature=False,
+            supports_reasoning=True,
+            reasoning_wire_format="openai_responses",
+        ),
+    )
+
+    assert compatible_generation_parameter_profile_indexes(profiles, request) == (1,)
+    _public, provider = route_generation_parameter_requests((profiles[1],), request)
+    assert provider.reasoning_summary == "auto"
+
+
 def _tool_image_message() -> GatewayMessage:
     """One tool message carrying a screenshot beside its text."""
     return GatewayMessage(

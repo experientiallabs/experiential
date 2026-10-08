@@ -140,3 +140,38 @@ def test_an_allowed_name_outside_the_tools_list_is_refused() -> None:
                 },
             )
         )
+
+
+@pytest.mark.parametrize("mode", [[], {}, 1, None])
+def test_a_non_string_mode_is_a_field_scoped_client_error(mode: JsonValue) -> None:
+    """An unhashable or non-string mode is a 400 on the mode field, never a TypeError."""
+    with pytest.raises(OpenAIProtocolError) as raised:
+        responses_tool_choice(
+            {"type": "allowed_tools", "mode": mode, "tools": [{"type": "function", "name": "a"}]}
+        )
+
+    assert raised.value.detail.param == "tool_choice.mode"
+
+
+def test_responses_carries_non_function_entries_verbatim() -> None:
+    """The official SDK's mcp and image_generation entries are allowed, not refused."""
+    choice = responses_tool_choice(
+        {
+            "type": "allowed_tools",
+            "mode": "auto",
+            "tools": [
+                {"type": "function", "name": "a"},
+                {"type": "mcp", "server_label": "deepwiki"},
+                {"type": "image_generation"},
+            ],
+        }
+    )
+
+    assert choice == GatewayAllowedToolsChoice(
+        mode="auto",
+        names=("a",),
+        provider_entries=(
+            {"type": "mcp", "server_label": "deepwiki"},
+            {"type": "image_generation"},
+        ),
+    )

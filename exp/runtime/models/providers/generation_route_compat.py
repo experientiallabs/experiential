@@ -7,6 +7,7 @@ from collections.abc import Sequence
 from exp.runtime.gateway.contracts import GatewayRequest
 from exp.runtime.models.providers.base import GatewayWireProfile
 from exp.runtime.models.providers.errors import ProviderParameterError
+from exp.runtime.models.providers.generation_parameter_validation import serves_reasoning_summary
 from exp.runtime.models.providers.streaming_requests import route_generation_parameter_requests
 
 
@@ -36,6 +37,29 @@ def compatible_generation_parameter_profile_indexes(
     """
     if not profiles:
         raise ValueError("generation parameter selection requires at least one wire profile")
+    if request.reasoning_summary is not None:
+        # A summary is best effort, but a rung that carries it outranks every
+        # rung that would serve by dropping it, before any other preference:
+        # the route's one shaped request drops the summary on a mixed route.
+        carrying = tuple(
+            index for index, profile in enumerate(profiles) if serves_reasoning_summary(profile)
+        )
+        if carrying:
+            try:
+                ranked = _ranked_profile_indexes(
+                    tuple(profiles[index] for index in carrying), request
+                )
+            except ProviderParameterError:
+                pass
+            else:
+                return tuple(carrying[index] for index in ranked)
+    return _ranked_profile_indexes(profiles, request)
+
+
+def _ranked_profile_indexes(
+    profiles: Sequence[GatewayWireProfile], request: GatewayRequest
+) -> tuple[int, ...]:
+    """Rank every rung by how exactly it preserves the request (see the caller)."""
     # Prefer rungs that HONOR the caller's sampling exactly over rungs that can
     # only serve it by dropping temperature/top_p (a reasoning route at an effort
     # other than none). Both are servable, but preserving the caller's intent
@@ -59,7 +83,6 @@ def compatible_generation_parameter_profile_indexes(
             keeps_thinking
             and _honors_requested_sampling(request, provider)
             and _carries_exposed_reasoning(profile, request)
-            and _keeps_reasoning_summary(request, provider)
         ):
             exact.append(index)
     if exact:
@@ -90,15 +113,6 @@ def _honors_requested_sampling(request: GatewayRequest, provider_request: Gatewa
     if request.top_p is not None and provider_request.top_p is None:
         return False
     return not (request.top_k is not None and provider_request.top_k is None)
-
-
-def _keeps_reasoning_summary(request: GatewayRequest, provider_request: GatewayRequest) -> bool:
-    """Return whether a rung kept a requested reasoning summary.
-
-    A rung with no summary channel serves the turn by dropping the selector
-    (a disclosed drop), so it is only a fallback behind a rung that carries it.
-    """
-    return request.reasoning_summary is None or provider_request.reasoning_summary is not None
 
 
 def _carries_exposed_reasoning(profile: GatewayWireProfile, request: GatewayRequest) -> bool:

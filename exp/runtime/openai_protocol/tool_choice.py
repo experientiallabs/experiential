@@ -83,8 +83,13 @@ def responses_tool_choice(value: JsonValue) -> GatewayToolChoice:
 def _allowed_tools(
     mode: JsonValue, tools: JsonValue, *, param: str, chat: bool
 ) -> GatewayAllowedToolsChoice:
-    """Decode one allowed-tools body: its mode and the function names it allows."""
-    if mode not in _ALLOWED_MODES:
+    """Decode one allowed-tools body: its mode, function names and native entries.
+
+    Chat allows only functions. Responses also allows the official SDK's
+    non-function entries (``mcp``, ``custom``, ``image_generation``...), carried
+    verbatim for the provider that owns their schema.
+    """
+    if not isinstance(mode, str) or mode not in _ALLOWED_MODES:
         raise invalid_field(
             f"{param}.mode",
             f"Invalid value for '{param}.mode': expected one of 'auto' or 'required'.",
@@ -95,30 +100,44 @@ def _allowed_tools(
             f"Invalid value for '{param}.tools': expected a non-empty array of tools.",
         )
     names: list[str] = []
+    provider_entries: list[JsonObject] = []
     for index, entry in enumerate(tools):
+        path = f"{param}.tools[{index}]"
+        if not chat and isinstance(entry, dict) and _native_entry(entry):
+            if entry in provider_entries:
+                raise invalid_field(
+                    path, f"Invalid value for '{path}': the tool is listed more than once."
+                )
+            provider_entries.append(entry)
+            continue
         name = _function_name(entry, chat=chat)
         if name is None:
             raise invalid_field(
-                f"{param}.tools[{index}]",
-                f"Invalid value for '{param}.tools[{index}]': only function tools "
+                path,
+                f"Invalid value for '{path}': expected "
                 + (
-                    "({'type': 'function', 'function': {'name': ...}}) "
+                    "a function tool ({'type': 'function', 'function': {'name': ...}})."
                     if chat
-                    else "({'type': 'function', 'name': ...}) "
-                )
-                + "can be allowed.",
+                    else "a tool object with a 'type' (functions also need a 'name')."
+                ),
             )
         if name in names:
             raise invalid_field(
-                f"{param}.tools[{index}]",
-                f"Invalid value for '{param}.tools[{index}]': the function {name!r} "
-                "is listed more than once.",
+                path,
+                f"Invalid value for '{path}': the function {name!r} is listed more than once.",
             )
         names.append(name)
     return GatewayAllowedToolsChoice(
         mode=cast(Literal["auto", "required"], mode),
         names=tuple(names),
+        provider_entries=tuple(provider_entries),
     )
+
+
+def _native_entry(entry: JsonObject) -> bool:
+    """Whether one Responses entry names a non-function tool by its type."""
+    kind = entry.get("type")
+    return isinstance(kind, str) and bool(kind) and kind != "function"
 
 
 def _function_name(entry: JsonValue, *, chat: bool) -> str | None:
@@ -141,6 +160,9 @@ def responses_tool_choice_echo(request: GatewayRequest) -> JsonObject | str:
         return {
             "type": "allowed_tools",
             "mode": choice.mode,
-            "tools": [{"type": "function", "name": name} for name in choice.names],
+            "tools": [
+                *({"type": "function", "name": name} for name in choice.names),
+                *choice.provider_entries,
+            ],
         }
     return {"type": "function", "name": choice.name}

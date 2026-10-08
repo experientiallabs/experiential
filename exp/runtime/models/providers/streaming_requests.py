@@ -13,6 +13,7 @@ from exp.runtime.gateway.contracts import (
 )
 from exp.runtime.gateway.tool_search.contracts import gateway_tool_search_name
 from exp.runtime.models.providers.allowed_tools import (
+    ALLOWED_TOOLS_CLEARED,
     ALLOWED_TOOLS_DISCLOSURE,
     needs_allowed_tools_translation,
     restrict_to_allowed_tools,
@@ -947,12 +948,16 @@ def route_generation_parameter_requests(
     if request.logprobs is False:
         ignore("logprobs")
 
-    translate_allowed_tools = needs_allowed_tools_translation(profiles, request)
-    if translate_allowed_tools and ALLOWED_TOOLS_DISCLOSURE not in ignored:
-        ignored.append(ALLOWED_TOOLS_DISCLOSURE)
+    restricted: GatewayRequest | None = None
+    if needs_allowed_tools_translation(profiles, request):
+        restricted = restrict_to_allowed_tools(request.model_copy(update=provider_updates))
+        disclosures = (ALLOWED_TOOLS_DISCLOSURE,)
+        if restricted.tool_choice is None:
+            disclosures = (*disclosures, ALLOWED_TOOLS_CLEARED)
+        ignored.extend(item for item in disclosures if item not in ignored)
     ignored_parameters = tuple(ignored)
     public_request = request.model_copy(update={"ignored_parameters": ignored_parameters})
     provider_request = public_request.model_copy(update=provider_updates)
-    if translate_allowed_tools:
+    if restricted is not None:
         provider_request = restrict_to_allowed_tools(provider_request)
     return public_request, provider_request

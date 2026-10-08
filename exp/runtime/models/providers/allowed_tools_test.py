@@ -10,7 +10,11 @@ import pytest
 from exp.common.core.artifacts import JsonObject
 from exp.runtime.gateway.contracts import GatewayRequest
 from exp.runtime.gateway.tool_contracts import GatewayAllowedToolsChoice
-from exp.runtime.models.providers.allowed_tools import ALLOWED_TOOLS_DISCLOSURE
+from exp.runtime.models.providers.allowed_tools import (
+    ALLOWED_TOOLS_CLEARED,
+    ALLOWED_TOOLS_DISCLOSURE,
+    restrict_to_allowed_tools,
+)
 from exp.runtime.models.providers.base import GatewayWireProfile
 from exp.runtime.models.providers.capability_policy import coerce_capability
 from exp.runtime.models.providers.dialect_dispatch import dialect_stream_payload
@@ -199,3 +203,72 @@ def test_forced_tool_choice_coercion_relaxes_required_to_auto() -> None:
         mode="auto", names=("get_weather",)
     )
     assert coerce_capability("forced_tool_choice", _chat("auto")) is None
+
+
+def _native_request(mode: str) -> GatewayRequest:
+    """A Responses request allowing one function and one hosted MCP server."""
+    return decode_responses(
+        cast(
+            JsonObject,
+            {
+                "model": "gpt-5.5",
+                "input": "hi",
+                "tools": [
+                    {"type": "function", "name": "get_weather", "parameters": _PARAMETERS},
+                    {"type": "function", "name": "get_time", "parameters": _PARAMETERS},
+                    {"type": "mcp", "server_label": "deepwiki", "server_url": "https://d.test"},
+                    {"type": "mcp", "server_label": "other", "server_url": "https://o.test"},
+                ],
+                "tool_choice": {
+                    "type": "allowed_tools",
+                    "mode": mode,
+                    "tools": [
+                        {"type": "function", "name": "get_weather"},
+                        {"type": "mcp", "server_label": "deepwiki"},
+                    ],
+                },
+            },
+        )
+    ).request
+
+
+def test_native_responses_forwards_non_function_entries() -> None:
+    """A native route forwards the allowed MCP entry beside the function."""
+    _public, provider = route_generation_parameter_requests((_OPENAI,), _native_request("auto"))
+
+    assert dialect_stream_payload(_OPENAI, provider)["tool_choice"] == {
+        "type": "allowed_tools",
+        "mode": "auto",
+        "tools": [
+            {"type": "function", "name": "get_weather"},
+            {"type": "mcp", "server_label": "deepwiki"},
+        ],
+    }
+
+
+def test_restriction_keeps_only_the_named_native_declaration() -> None:
+    """An allowed entry names a native declaration by every field it spells."""
+    restricted = restrict_to_allowed_tools(_native_request("required"))
+
+    assert [entry.tool["server_label"] for entry in restricted.provider_native_tools] == [
+        "deepwiki"
+    ]
+    assert [tool.name for tool in restricted.tools] == ["get_weather"]
+    assert restricted.tool_choice == "required"
+
+
+def test_nothing_allowed_on_the_wire_clears_the_choice_with_disclosure() -> None:
+    """A set naming only hosted tools a foreign wire drops cannot force a call."""
+    request = _native_request("required").model_copy(
+        update={
+            "tool_choice": GatewayAllowedToolsChoice(
+                mode="required", provider_entries=({"type": "mcp", "server_label": "deepwiki"},)
+            )
+        }
+    )
+
+    public, provider = route_generation_parameter_requests((_AZURE_CHAT,), request)
+
+    assert provider.tool_choice is None
+    assert provider.tools == ()
+    assert public.ignored_parameters[-2:] == (ALLOWED_TOOLS_DISCLOSURE, ALLOWED_TOOLS_CLEARED)

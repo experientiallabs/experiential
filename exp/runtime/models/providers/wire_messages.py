@@ -812,6 +812,7 @@ def add_openai_tools(
                 else {"type": "function", "function": {"name": name}}
                 for name in request.tool_choice.names
             ]
+            allowed.extend(dict(entry) for entry in request.tool_choice.provider_entries)
             selector: JsonObject = {"mode": request.tool_choice.mode, "tools": allowed}
             payload["tool_choice"] = (
                 {"type": "allowed_tools", **selector}

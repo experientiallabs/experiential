@@ -36,6 +36,7 @@ from exp.runtime.gateway.tool_search.contracts import (
     gateway_tool_search_definition,
     gateway_tool_search_name,
 )
+from exp.runtime.models.providers.allowed_tools import restrict_with_disclosure
 
 DROPPED_NO_DEFERRED: Final = "tool_search->dropped(no_deferred_tools)"
 TOOL_CHOICE_CLEARED: Final = "tool_choice->cleared(no_serviceable_tool)"
@@ -180,6 +181,9 @@ def plan_tool_search(request: GatewayRequest, dialects: Sequence[str]) -> ToolSe
     search = request.tool_search
     if search is None or natively_served(search, dialects):
         return ToolSearchPlan(request, None, None)
+    # The gateway's search corpus and its later rounds (which rebuild tools
+    # without a selector) must only ever hold tools the caller allowed.
+    request = restrict_with_disclosure(request)
     deferred = [tool for tool in request.tools if tool.defer_loading]
     loaded = [tool for tool in request.tools if not tool.defer_loading]
     if not deferred:

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import Field
+from pydantic import Field, model_validator
 
 from exp.common.core.artifacts import ContractModel, JsonObject
 
@@ -79,10 +79,27 @@ class GatewayAllowedToolsChoice(ContractModel):
     Attributes:
         mode: ``auto`` lets the model answer without a call; ``required`` forces one.
         names: Distinct caller function names the model may call, in caller order.
+        provider_entries: Verbatim non-function Responses entries (``mcp``,
+            ``custom``, ``image_generation``...); the provider owns their schema.
     """
 
     mode: Literal["auto", "required"]
-    names: tuple[str, ...] = Field(min_length=1)
+    names: tuple[str, ...] = ()
+    provider_entries: tuple[JsonObject, ...] = ()
+
+    @model_validator(mode="after")
+    def _require_an_entry(self) -> GatewayAllowedToolsChoice:
+        """Require at least one allowed tool.
+
+        Returns:
+            The validated choice.
+
+        Raises:
+            ValueError: The selector allows nothing.
+        """
+        if not self.names and not self.provider_entries:
+            raise ValueError("an allowed-tools choice must allow at least one tool")
+        return self
 
 
 GatewayToolChoice = (
