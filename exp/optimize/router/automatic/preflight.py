@@ -233,6 +233,14 @@ def preflight_automatic_router(
             else None
         )
     tasks, traces, identity_evidence = _build_evidence(problems, project, completed)
+    if any(task.origin == "authored" for task in tasks):
+        # Refuse before consent, catalog persistence, router artifacts or judge work; the
+        # composition seam re-checks for direct compose_router callers.
+        problems.append(
+            "completed build selects authored scenarios, and router optimization replays mined "
+            "scenarios only: restore the mined set with select_authored_scenarios(project, ()) "
+            "and author the judge again"
+        )
     observed = _observed_traces(
         problems,
         tasks,

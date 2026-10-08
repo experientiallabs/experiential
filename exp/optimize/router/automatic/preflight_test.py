@@ -26,7 +26,9 @@ from exp.optimize.router.automatic.preflight import (
     preflight_automatic_router,
 )
 from exp.optimize.router.automatic.reservations import remaining_simulation_budget
+from exp.optimize.router.automatic.service_test import _completed_project
 from exp.runtime.models import RuntimeModelCatalog
+from exp.simulation.scenarios import AuthoredScenario, select_authored_scenarios
 
 
 def test_preflight_aggregates_missing_inputs_before_credentials_or_writes(
@@ -76,6 +78,37 @@ def test_preflight_aggregates_missing_inputs_before_credentials_or_writes(
     assert project.model_catalog_path.read_bytes() == before_catalog
     assert project.artifacts.list_ids() == before_artifacts
     assert project.read_review() is None
+
+
+def test_preflight_refuses_authored_scenarios_before_consent_or_writes(tmp_path: Path) -> None:
+    """A build selecting authored scenarios fails aggregate preflight, not later composition.
+
+    Args:
+        tmp_path: Isolated local EXP root.
+    """
+    project, _, state = _completed_project(tmp_path)
+    select_authored_scenarios(
+        project, (AuthoredScenario(scenario_id="refund", instruction="Refund order 42."),)
+    )
+    before_artifacts = project.artifacts.list_ids()
+    before_calls = (tuple(state.completion_calls), tuple(state.embedding_calls))
+
+    with pytest.raises(AutomaticRouterPreflightError, match="authored scenarios"):
+        preflight_automatic_router(
+            project,
+            RouterCandidateSelection(
+                candidates=("candidate-a", "candidate-b"), incumbent="candidate-a"
+            ),
+            options=AutomaticRouterOptions(
+                maximum_router_feature_tokens=2_048,
+                maximum_retrieval_query_tokens=8_192,
+                router_embedding_maximum_attempts=1,
+                completion_maximum_attempts=1,
+            ),
+        )
+
+    assert project.artifacts.list_ids() == before_artifacts
+    assert (tuple(state.completion_calls), tuple(state.embedding_calls)) == before_calls
 
 
 def test_router_embedding_reservation_is_admitted_before_other_provider_work() -> None:

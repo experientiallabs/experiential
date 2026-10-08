@@ -79,23 +79,21 @@ def reconstruct_completed_project_build(
         raise RouterCompositionError("completed project build review is invalid") from exc
     if review.trace_dataset != completed.trace_dataset or review.task_set != completed.task_set:
         raise RouterCompositionError("completed project build review names different artifacts")
-    if any(
-        task.origin == "authored"
-        for task in load_task_set(project.artifacts, completed.task_set.artifact_id).tasks
-    ):
-        raise RouterCompositionError(
-            "router optimization replays mined scenarios only, and this build selects authored "
-            "scenarios; restore the mined set with select_authored_scenarios(project, ()) first"
-        )
     try:
         trace_input = artifact_input(
             project.artifacts.read(completed.trace_dataset.artifact_id).manifest
         )
         task_input = artifact_input(project.artifacts.read(completed.task_set.artifact_id).manifest)
+        tasks = load_task_set(project.artifacts, completed.task_set.artifact_id).tasks
     except (FileNotFoundError, ValueError) as exc:
         raise RouterCompositionError("completed project build artifacts are unavailable") from exc
     if trace_input != completed.trace_dataset or task_input != completed.task_set:
         raise RouterCompositionError("completed project build artifact manifest changed")
+    if any(task.origin == "authored" for task in tasks):
+        raise RouterCompositionError(
+            "router optimization replays mined scenarios only, and this build selects authored "
+            "scenarios; restore the mined set with select_authored_scenarios(project, ()) first"
+        )
     try:
         built = build_project(
             normalized,

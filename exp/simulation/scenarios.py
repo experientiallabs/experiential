@@ -163,8 +163,12 @@ def _persist_task_set(
 
     Returns:
         Manifest input of the written or exactly replayed task set.
+
+    Raises:
+        ValueError: The base task set carries no coverage report to reuse.
     """
-    assert base.coverage_path is not None
+    if base.coverage_path is None:
+        raise ValueError("the selected task set has no coverage report; rebuild it")
     coverage_bytes = project.artifacts.read_bytes(base.task_set_id, base.coverage_path)
     coverage = CoverageReport.model_validate_json(coverage_bytes)
     (trace_dataset,) = base.inputs

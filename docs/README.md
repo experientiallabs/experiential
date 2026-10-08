@@ -12,6 +12,7 @@ results, and plans do not live here.
 | `reference/gateway-architecture.md` | Operational local gateway contracts, certified exact-model routing, ownership boundaries, and compatibility locks. |
 | `reference/gateway-media-surfaces.md` | The embeddings, images, speech, and transcription surfaces, how each lane bills, and the per-unit price card. |
 | `reference/gateway-egress.md` | Public HTTPS provider destinations, connection-time address checks, standalone defaults, and transport coverage boundaries. |
+| `reference/authored-scenarios.md` | Written and imported scenarios beside a build's mined tasks, `include_mined` replay selection, cost assumptions, and judge-only reference answers. |
 | `reference/model-chains.md` | Ordered cross-model stages, mandatory hosted authority, bounded recovery and unsupported local-chain serving. |
 | `reference/chat-logprobs.md` | Verified Chat probability admission, token records, and guardrail boundaries. |
 | `reference/responses-logprobs.md` | Native Responses probability selectors, lifecycle phases, and continuation behavior. |
