@@ -3756,9 +3756,23 @@ def test_safeguards_forward_per_anthropic_attempt_and_drop_silently_elsewhere() 
         include_usage=True,
     )
     anthropic = GatewayWireProfile(
-        dialect="anthropic_messages", url="https://anthropic.test", maximum_output_tokens=128_000
+        dialect="anthropic_messages",
+        url="https://api.anthropic.com/v1/messages",
+        maximum_output_tokens=128_000,
     )
     fallbacks = (
+        # Anthropic-compatible hosts on the same dialect: Azure AI Foundry
+        # Claude and a custom base URL may refuse the field, so they drop it.
+        GatewayWireProfile(
+            dialect="anthropic_messages",
+            url="https://x.services.ai.azure.com/anthropic/v1/messages",
+            maximum_output_tokens=128_000,
+        ),
+        GatewayWireProfile(
+            dialect="anthropic_messages",
+            url="https://claude-proxy.example.com/v1/messages",
+            maximum_output_tokens=128_000,
+        ),
         GatewayWireProfile(dialect="openai_compatible", url="https://fallback.test"),
         GatewayWireProfile(dialect="openai_responses", url="https://responses.test"),
         GatewayWireProfile(dialect="bedrock_converse_stream", url="https://bedrock.test"),

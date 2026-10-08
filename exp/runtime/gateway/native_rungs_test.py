@@ -596,6 +596,61 @@ def test_every_anthropic_fallback_freezes_us_constraint_before_dispatch() -> Non
         assert payload["inference_geo"] == "us"
 
 
+@pytest.mark.parametrize(
+    ("url", "dialect", "forwarded"),
+    [
+        ("https://api.anthropic.com/v1/messages", "anthropic_messages", True),
+        ("https://x.services.ai.azure.com/anthropic/v1/messages", "anthropic_messages", False),
+        ("https://claude-proxy.example.com/v1/messages", "anthropic_messages", False),
+        ("https://openrouter.ai/api/v1/chat/completions", "openai_compatible", False),
+    ],
+)
+def test_auto_mode_safeguards_reach_only_anthropics_own_api(
+    url: str, dialect: str, forwarded: bool
+) -> None:
+    """Safeguards and their beta ride an attempt only on api.anthropic.com.
+
+    The same ``anthropic_messages`` dialect serves Azure AI Foundry Claude and
+    custom base URLs, which may refuse the unknown field or beta; those rungs
+    drop both silently, exactly like every other dialect, decided per rung so
+    a failover onto one is covered.
+    """
+    from exp.runtime.models.providers.wire_messages import ANTHROPIC_SAFEGUARDS_BETA
+
+    deployment = _deployment("rung", "anthropic")
+    request = GatewayRequest(
+        surface=GatewayApiSurface.MESSAGES,
+        stream=True,
+        messages=(GatewayMessage(role="user", content="hi"),),
+        safeguards=({"type": "dangerous_tool_use", "classifier_context": {"v": 1}},),
+    )
+    profile = GatewayWireProfile(
+        dialect=dialect, url=url, model_id="claude-opus-5", headers={"x-api-key": "k"}
+    )
+    entry = build_rung_dispatch(
+        _route((deployment,)),
+        deployment,
+        profile,
+        _NoSigningClient(),
+        provider_request=request,
+        public_request=request,
+        authorization=_AUTHORIZATION,
+    ).wire_entry
+    payload = entry["upstream_payload"]
+    assert isinstance(payload, dict)
+    headers = entry["headers"] or {}
+    assert isinstance(headers, dict)
+    beta = str(headers.get("anthropic-beta", "")).split(",")
+    if forwarded:
+        assert payload["safeguards"] == [
+            {"type": "dangerous_tool_use", "classifier_context": {"v": 1}}
+        ]
+        assert ANTHROPIC_SAFEGUARDS_BETA in beta
+    else:
+        assert "safeguards" not in payload
+        assert ANTHROPIC_SAFEGUARDS_BETA not in beta
+
+
 @pytest.mark.parametrize("model", ("qwen3.8-max", "qwen3.8-27b", "glm-5.2", "kimi-k2.5"))
 def test_numeric_budget_freezes_each_rungs_total_reservation(model: str) -> None:
     """Split and combined ceilings never exceed the same per-rung reserved total."""

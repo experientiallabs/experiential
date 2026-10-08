@@ -320,9 +320,11 @@ them (instruction-hoisting rungs narrow out), and `thinking.display` rides the v
 config. The conditional Claude Code fields `diagnostics` and `speed` forward verbatim on
 Anthropic rungs with their required `anthropic-beta` tokens and drop with disclosure elsewhere.
 Claude Code auto mode's `safeguards` array (shallow-validated as an array of objects) forwards
-verbatim on each Anthropic attempt with the `dangerous-tool-use-2026-09-03` token the dispatch
-adds itself; the caller's copy of that token is accepted silently and never relayed on its own.
-Every other rung drops the field and the token per attempt with no disclosure, so its answer
+verbatim only on an attempt against Anthropic's own API (`api.anthropic.com`), with the
+`dangerous-tool-use-2026-09-03` token the dispatch adds itself; the caller's copy of that token is
+accepted silently and never relayed on its own. Every other rung, including Azure AI Foundry
+Claude, custom Anthropic base URLs and batch lines, drops the field and the token per attempt with
+no disclosure, so its answer
 carries no `safeguard_results` and the client reviews tool calls itself. The provider's verdicts
 (`message_delta.delta.safeguard_results`, keyed by tool_use id) relay unchanged at the same
 position on a streaming Messages reply and as a top-level `safeguard_results` on a non-streaming

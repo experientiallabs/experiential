@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from typing import Literal
+from urllib.parse import urlsplit
 
 from exp.common.core.artifacts import JsonObject
 from exp.common.models import (
@@ -15,6 +16,7 @@ from exp.common.models import (
     ToolChoice,
     Usage,
 )
+from exp.runtime.gateway.contracts import GatewayRequest
 from exp.runtime.gateway.json_object import JSON_OBJECT_SYSTEM_INSTRUCTION
 from exp.runtime.models.providers.async_transport import AsyncJsonHttpTransport
 from exp.runtime.models.providers.base import (
@@ -38,6 +40,54 @@ from exp.runtime.models.providers.transport import JsonHttpTransport, RetryPolic
 
 ANTHROPIC_BASE_URL = "https://api.anthropic.com/v1"
 ANTHROPIC_VERSION = "2023-06-01"
+
+
+def anthropic_official_origin(url: str) -> bool:
+    """Whether ``url`` is an endpoint on Anthropic's own Messages API.
+
+    The ``anthropic_messages`` dialect also serves Azure AI Foundry Claude and
+    connections with a custom base URL; this is the exact origin check that
+    tells Anthropic's own API (where provider-only betas are known to exist)
+    apart from those compatible hosts.
+
+    Args:
+        url: Full upstream endpoint URL of one wire profile.
+
+    Returns:
+        True only for an ``https`` URL on the official host and port whose
+        path lies under :data:`ANTHROPIC_BASE_URL`.
+    """
+    official = urlsplit(ANTHROPIC_BASE_URL)
+    candidate = urlsplit(url)
+    return (
+        candidate.scheme == official.scheme
+        and candidate.username is None
+        and candidate.password is None
+        and candidate.hostname == official.hostname
+        and candidate.port in (None, 443)
+        and candidate.path.startswith(f"{official.path}/")
+    )
+
+
+def safeguards_for_upstream(url: str, request: GatewayRequest) -> GatewayRequest:
+    """Drop Claude Code auto-mode ``safeguards`` unless ``url`` is Anthropic's own API.
+
+    Only the official API is known to run the server-side review behind the
+    ``dangerous-tool-use`` beta; a compatible host (Azure AI Foundry, a proxy
+    origin) may refuse the unknown field or beta. The drop is silent, so that
+    attempt answers like an ordinary turn and the caller reviews tool calls
+    itself. Applied per attempt, so a failover onto such a rung is covered.
+
+    Args:
+        url: Full upstream endpoint URL of the rung about to be dispatched.
+        request: Canonical request for that rung.
+
+    Returns:
+        ``request`` unchanged, or a copy with ``safeguards`` cleared.
+    """
+    if request.safeguards is None or anthropic_official_origin(url):
+        return request
+    return request.model_copy(update={"safeguards": None})
 
 
 def anthropic_messages_request(

@@ -128,6 +128,18 @@ def test_messages_line_travels_verbatim_under_the_provider_model() -> None:
     }
 
 
+def test_messages_line_never_forwards_auto_mode_safeguards() -> None:
+    """Safeguards are a live-session review; a batch line drops them."""
+    body: JsonObject = {
+        "messages": [{"role": "user", "content": "hi"}],
+        "max_tokens": 5,
+        "safeguards": [{"type": "dangerous_tool_use", "classifier_context": {"v": 1}}],
+    }
+    params = anthropic_line_params(_line("/v1/messages", body))
+    assert "safeguards" not in params
+    assert params["messages"] == body["messages"]
+
+
 @pytest.mark.parametrize(
     ("body", "match"),
     [

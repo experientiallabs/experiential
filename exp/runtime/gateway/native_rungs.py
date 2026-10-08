@@ -39,6 +39,7 @@ from exp.runtime.models.providers import (
     preflight_gateway_request,
     require_gateway_provider,
 )
+from exp.runtime.models.providers.anthropic import safeguards_for_upstream
 from exp.runtime.models.providers.base import GatewayWireProfile
 from exp.runtime.models.providers.errors import ProviderCapabilityError
 from exp.runtime.models.providers.generation_parameter_validation import bounded_output_request
@@ -134,6 +135,9 @@ def build_rung_dispatch(
     if rung_request.surface == GatewayApiSurface.CHAT_COMPLETIONS:
         require_chat_logprobs((profile,), rung_request)
     require_responses_logprobs((profile,), rung_request)
+    # Auto-mode safeguards ride only an attempt on Anthropic's own API; the
+    # payload and the beta header below both read this per-rung request.
+    rung_request = safeguards_for_upstream(profile.url, rung_request)
     upstream_payload = image_aware_stream_payload(
         profile, rung_request, capabilities, deployment.provider
     )

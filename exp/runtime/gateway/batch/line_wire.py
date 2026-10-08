@@ -225,8 +225,11 @@ def anthropic_line_params(line: BatchLine) -> JsonObject:
         BatchSubmitError: The line cannot be expressed on the Messages wire.
     """
     if line.surface == "/v1/messages":
-        return {**line.body, "model": line.provider_model}
-    request = _decoded_request(line)
+        # Auto-mode safeguards are a live-session review; batch never
+        # forwards them, whatever the batch target.
+        body = {key: value for key, value in line.body.items() if key != "safeguards"}
+        return {**body, "model": line.provider_model}
+    request = _decoded_request(line).model_copy(update={"safeguards": None})
     if request.maximum_output_tokens is None and line.maximum_output_tokens > 0:
         request = request.model_copy(update={"maximum_output_tokens": line.maximum_output_tokens})
     try:

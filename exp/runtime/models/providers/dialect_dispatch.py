@@ -18,6 +18,7 @@ from exp.runtime.gateway.contracts import (
     GatewayNamedToolChoice,
     GatewayRequest,
 )
+from exp.runtime.models.providers.anthropic import safeguards_for_upstream
 from exp.runtime.models.providers.anthropic_tool_compat import anthropic_rejects_forced_tool_choice
 from exp.runtime.models.providers.base import SERVICE_TIER_DIALECTS as SERVICE_TIER_DIALECTS
 from exp.runtime.models.providers.errors import ProviderCapabilityError
@@ -190,7 +191,7 @@ def dialect_stream_payload(
     if profile.dialect == "anthropic_messages":
         payload = anthropic_messages_stream_payload(
             profile.model_id,
-            provider_request,
+            safeguards_for_upstream(profile.url, provider_request),
             supports_temperature=profile.supports_temperature,
             supports_top_p=(
                 profile.supports_temperature
