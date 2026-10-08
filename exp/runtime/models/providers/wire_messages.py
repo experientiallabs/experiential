@@ -17,6 +17,7 @@ from exp.runtime.gateway.contracts import (
     GatewayRequest,
     GatewayToolDefinition,
 )
+from exp.runtime.gateway.tool_contracts import GatewayAllowedToolsChoice
 from exp.runtime.models.providers.audios import openai_chat_audio_part, reject_audio_part
 from exp.runtime.models.providers.documents import (
     anthropic_document_block,
@@ -800,6 +801,22 @@ def add_openai_tools(
                     "type": "function",
                     "function": {"name": request.tool_choice.name},
                 }
+            )
+        elif isinstance(request.tool_choice, GatewayAllowedToolsChoice):
+            # Only an allowed-tools wire receives the selector verbatim (route
+            # shaping restricts the tools for every other one); both spellings
+            # are OpenAI's own, Chat nesting the set under ``allowed_tools``.
+            allowed: list[JsonObject] = [
+                {"type": "function", "name": name}
+                if responses
+                else {"type": "function", "function": {"name": name}}
+                for name in request.tool_choice.names
+            ]
+            selector: JsonObject = {"mode": request.tool_choice.mode, "tools": allowed}
+            payload["tool_choice"] = (
+                {"type": "allowed_tools", **selector}
+                if responses
+                else {"type": "allowed_tools", "allowed_tools": selector}
             )
         else:
             payload["tool_choice"] = request.tool_choice

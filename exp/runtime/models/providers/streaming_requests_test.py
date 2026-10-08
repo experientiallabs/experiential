@@ -713,8 +713,8 @@ def test_openai_responses_stream_payload_forwards_reasoning_summary() -> None:
     assert payload["reasoning"] == {"summary": "detailed"}
 
 
-def test_route_rejects_reasoning_summary_outside_native_responses() -> None:
-    """A fallback without summary output support rejects the exact caller alias."""
+def test_route_drops_reasoning_summary_outside_native_responses() -> None:
+    """A fallback without summary output serves the turn and discloses every caller alias."""
     request = GatewayRequest(
         surface=GatewayApiSurface.RESPONSES,
         messages=(GatewayMessage(role="user", content="hello"),),
@@ -739,11 +739,72 @@ def test_route_rejects_reasoning_summary_outside_native_responses() -> None:
         ),
     )
 
-    with pytest.raises(ProviderParameterError) as raised:
-        route_generation_parameter_requests(profiles, request)
+    public_request, provider_request = route_generation_parameter_requests(profiles, request)
 
-    assert raised.value.code == "unsupported_parameter"
-    assert raised.value.param == "reasoning.generate_summary"
+    assert public_request.reasoning_summary == "concise"
+    assert provider_request.reasoning_summary is None
+    assert provider_request.reasoning_summary_parameters == ()
+    assert public_request.ignored_parameters == (
+        "reasoning.generate_summary->dropped(unsupported_by_provider)",
+        "reasoning.summary->dropped(unsupported_by_provider)",
+    )
+
+
+@pytest.mark.parametrize("parameter", ["reasoning.summary", "reasoning.generate_summary"])
+def test_reasoning_summary_drops_on_a_route_with_no_summary_channel(parameter: str) -> None:
+    """gpt-5-nano's Chat-wire lanes serve a summary request without summaries, never a 400."""
+    request = GatewayRequest(
+        surface=GatewayApiSurface.RESPONSES,
+        messages=(GatewayMessage(role="user", content="hello"),),
+        reasoning_summary="auto",
+        reasoning_summary_parameters=(parameter,),  # ty: ignore[invalid-argument-type]
+    )
+    profiles = tuple(
+        GatewayWireProfile(
+            dialect="openai_compatible",
+            url=url,
+            model_id="gpt-5-nano",
+            supports_reasoning=True,
+            reasoning_wire_format="reasoning",
+        )
+        for url in (
+            "https://azure.test/openai/v1",
+            "https://novita.test",
+            "https://openrouter.test",
+        )
+    )
+
+    assert compatible_generation_parameter_profile_indexes(profiles, request) == (0, 1, 2)
+    public_request, provider_request = route_generation_parameter_requests(profiles, request)
+
+    assert provider_request.reasoning_summary is None
+    assert public_request.ignored_parameters == (f"{parameter}->dropped(unsupported_by_provider)",)
+
+
+def test_reasoning_summary_prefers_a_native_responses_rung() -> None:
+    """A summary-capable rung outranks rungs that would serve by dropping the summary."""
+    request = GatewayRequest(
+        surface=GatewayApiSurface.RESPONSES,
+        messages=(GatewayMessage(role="user", content="hello"),),
+        reasoning_summary="detailed",
+        reasoning_summary_parameters=("reasoning.summary",),
+    )
+    profiles = (
+        GatewayWireProfile(
+            dialect="openai_compatible",
+            url="https://azure.test/openai/v1",
+            supports_reasoning=True,
+            reasoning_wire_format="reasoning",
+        ),
+        GatewayWireProfile(
+            dialect="openai_responses",
+            url="https://openai.test",
+            supports_reasoning=True,
+            reasoning_wire_format="openai_responses",
+        ),
+    )
+
+    assert compatible_generation_parameter_profile_indexes(profiles, request) == (1,)
 
 
 def _tool_image_message() -> GatewayMessage:

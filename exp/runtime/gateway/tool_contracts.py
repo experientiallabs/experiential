@@ -1,6 +1,8 @@
-"""Immutable function tools, provider-native tools, and named tool choices."""
+"""Immutable function tools, provider-native tools, and named or allowed-set tool choices."""
 
 from __future__ import annotations
+
+from typing import Literal
 
 from pydantic import Field
 
@@ -64,3 +66,35 @@ class GatewayNamedToolChoice(ContractModel):
     """
 
     name: str = Field(min_length=1, max_length=256)
+
+
+class GatewayAllowedToolsChoice(ContractModel):
+    """A request to restrict the model to a subset of the declared functions.
+
+    OpenAI's ``allowed_tools`` selector keeps the full tool list on the wire (so
+    the prompt cache survives) while limiting which functions the model may
+    call. A wire without the selector serves the same semantics by declaring
+    only the allowed functions under a plain ``auto``/``required`` choice.
+
+    Attributes:
+        mode: ``auto`` lets the model answer without a call; ``required`` forces one.
+        names: Distinct caller function names the model may call, in caller order.
+    """
+
+    mode: Literal["auto", "required"]
+    names: tuple[str, ...] = Field(min_length=1)
+
+
+GatewayToolChoice = (
+    Literal["auto", "none", "required"] | GatewayNamedToolChoice | GatewayAllowedToolsChoice | None
+)
+"""Every canonical tool-selection control a protocol decoder can produce."""
+
+
+def tool_choice_names(choice: GatewayToolChoice) -> tuple[str, ...]:
+    """Return the tool names one canonical tool choice references."""
+    if isinstance(choice, GatewayNamedToolChoice):
+        return (choice.name,)
+    if isinstance(choice, GatewayAllowedToolsChoice):
+        return choice.names
+    return ()

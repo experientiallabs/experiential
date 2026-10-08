@@ -18,6 +18,8 @@ from exp.runtime.gateway.contracts import (
     GatewayRequest,
     GatewayUsage,
 )
+from exp.runtime.gateway.tool_contracts import GatewayAllowedToolsChoice
+from exp.runtime.models.providers.allowed_tools import restrict_to_allowed_tools
 
 
 def model_request(request: GatewayRequest) -> ModelRequest:
@@ -29,6 +31,10 @@ def model_request(request: GatewayRequest) -> ModelRequest:
     Returns:
         Provider-neutral request accepted by existing model clients and selectors.
     """
+    if isinstance(request.tool_choice, GatewayAllowedToolsChoice):
+        # The model contract has no allowed-set selector: declare only the
+        # allowed tools under the selector's mode, the same constraint.
+        request = restrict_to_allowed_tools(request)
     messages: list[ModelMessage] = []
     for message in request.messages:
         role = "system" if message.role == "developer" else message.role
@@ -63,11 +69,11 @@ def model_request(request: GatewayRequest) -> ModelRequest:
         )
         for tool in request.tools
     )
-    choice = (
-        ToolChoice(name=request.tool_choice.name)
-        if isinstance(request.tool_choice, GatewayNamedToolChoice)
-        else request.tool_choice
-    )
+    choice = request.tool_choice
+    if isinstance(choice, GatewayNamedToolChoice):
+        choice = ToolChoice(name=choice.name)
+    elif isinstance(choice, GatewayAllowedToolsChoice):
+        choice = choice.mode
     return ModelRequest(
         messages=tuple(messages),
         tools=tools,

@@ -17,6 +17,7 @@ from exp.runtime.gateway.contracts import (
 )
 from exp.runtime.openai_protocol.errors import OpenAIProtocolError, public_failure_error
 from exp.runtime.openai_protocol.response_streaming_state import ResponseReasoningState
+from exp.runtime.openai_protocol.tool_choice import responses_tool_choice_echo
 
 
 def stable_public_id(prefix: str, request_id: str) -> str:
@@ -779,7 +780,7 @@ class ResponsesSseEncoder:
             "temperature": self.request.temperature,
             "top_p": self.request.top_p,
             "reasoning": _reasoning_envelope(self.request),
-            "tool_choice": _responses_tool_choice(self.request),
+            "tool_choice": responses_tool_choice_echo(self.request),
             "tools": [
                 {
                     "type": "function",
@@ -945,13 +946,3 @@ def _reasoning_envelope(request: GatewayRequest) -> JsonObject:
     if request.reasoning_context is not None:
         reasoning["context"] = request.reasoning_context
     return reasoning
-
-
-def _responses_tool_choice(request: GatewayRequest) -> JsonObject | str:
-    """Render canonical tool choice in official Responses wire form."""
-    choice = request.tool_choice
-    if choice is None:
-        return "auto"
-    if isinstance(choice, str):
-        return choice
-    return {"type": "function", "name": choice.name}

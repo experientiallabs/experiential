@@ -19,6 +19,7 @@ from pydantic import JsonValue
 
 from exp.common.core.artifacts import JsonObject, canonical_json_bytes, sha256_json
 from exp.runtime.gateway.contracts import GatewayMessage, GatewayRequest
+from exp.runtime.gateway.tool_contracts import GatewayAllowedToolsChoice
 from exp.runtime.models.providers.base import GatewayWireProfile
 from exp.runtime.models.providers.cache_policy import cache_markers
 
@@ -552,6 +553,9 @@ def _tools_match(request: GatewayRequest, payload: JsonObject) -> bool:
         return "toolConfig" not in payload
     if isinstance(choice, str):
         policy: JsonObject = {"mode": {"auto": "AUTO", "none": "NONE", "required": "ANY"}[choice]}
+    elif isinstance(choice, GatewayAllowedToolsChoice):
+        # Route shaping restricts the selector away before a Gemini payload.
+        return False
     else:
         policy = {"mode": "ANY", "allowedFunctionNames": [choice.name]}
     return payload.get("toolConfig") == {"functionCallingConfig": policy}

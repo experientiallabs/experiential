@@ -59,6 +59,7 @@ def compatible_generation_parameter_profile_indexes(
             keeps_thinking
             and _honors_requested_sampling(request, provider)
             and _carries_exposed_reasoning(profile, request)
+            and _keeps_reasoning_summary(request, provider)
         ):
             exact.append(index)
     if exact:
@@ -89,6 +90,15 @@ def _honors_requested_sampling(request: GatewayRequest, provider_request: Gatewa
     if request.top_p is not None and provider_request.top_p is None:
         return False
     return not (request.top_k is not None and provider_request.top_k is None)
+
+
+def _keeps_reasoning_summary(request: GatewayRequest, provider_request: GatewayRequest) -> bool:
+    """Return whether a rung kept a requested reasoning summary.
+
+    A rung with no summary channel serves the turn by dropping the selector
+    (a disclosed drop), so it is only a fallback behind a rung that carries it.
+    """
+    return request.reasoning_summary is None or provider_request.reasoning_summary is not None
 
 
 def _carries_exposed_reasoning(profile: GatewayWireProfile, request: GatewayRequest) -> bool:

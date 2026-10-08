@@ -87,6 +87,7 @@ from exp.runtime.gateway.tool_contracts import (
 from exp.runtime.gateway.tool_contracts import (
     GatewayProviderNativeTool as GatewayProviderNativeTool,
 )
+from exp.runtime.gateway.tool_contracts import GatewayToolChoice, tool_choice_names
 from exp.runtime.gateway.tool_contracts import (
     GatewayToolDefinition as GatewayToolDefinition,
 )
@@ -456,7 +457,7 @@ class GatewayRequest(ContractModel):
     surface: GatewayApiSurface
     messages: tuple[GatewayMessage, ...] = Field(min_length=1)
     tools: tuple[GatewayToolDefinition, ...] = ()
-    tool_choice: Literal["auto", "none", "required"] | GatewayNamedToolChoice | None = None
+    tool_choice: GatewayToolChoice = None
     parallel_tool_calls: bool | None = None
     structured_text: StructuredTextFormat | None = None
     json_object_output: bool = Field(default=False, exclude=True)
@@ -787,12 +788,11 @@ class GatewayRequest(ContractModel):
         )
         if self.tool_search is not None and any(tool.defer_loading for tool in self.tools):
             server_names = (*server_names, gateway_tool_search_name(names))
-        if (
-            isinstance(self.tool_choice, GatewayNamedToolChoice)
-            and self.tool_choice.name not in names
-            and self.tool_choice.name not in server_names
-        ):
+        choice_names = tool_choice_names(self.tool_choice)
+        if any(name not in names and name not in server_names for name in choice_names):
             raise ValueError("named gateway tool choice must name a request tool")
+        if len(set(choice_names)) != len(choice_names):
+            raise ValueError("allowed gateway tool names must not repeat")
         has_tools = bool(self.tools or self.provider_server_tools or self.provider_native_tools)
         if self.tool_choice == "required" and not has_tools:
             raise ValueError("required gateway tool choice needs at least one tool")
