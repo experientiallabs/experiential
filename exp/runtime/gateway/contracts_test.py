@@ -586,6 +586,30 @@ def test_anthropic_tool_annotations_are_digest_free_but_bind_replay_identity() -
     assert canonical_request_sha256(hinted) == canonical_request_sha256(bare)
 
 
+def test_safeguards_are_a_messages_only_carrier_that_binds_replay() -> None:
+    """Auto-mode safeguards stay out of the serialized request but change the
+    provider's answer (it gains ``safeguard_results``), so they bind replay."""
+    from exp.common.core.artifacts import sha256_json
+    from exp.runtime.gateway.replay_identity import canonical_request_sha256
+
+    messages = (GatewayMessage(role="user", content="hi"),)
+    bare = GatewayRequest(surface=GatewayApiSurface.MESSAGES, messages=messages)
+    guarded = GatewayRequest(
+        surface=GatewayApiSurface.MESSAGES,
+        messages=messages,
+        safeguards=({"type": "dangerous_tool_use", "classifier_context": {"v": 1}},),
+    )
+    assert guarded.model_dump(mode="json") == bare.model_dump(mode="json")
+    assert sha256_json(guarded) == sha256_json(bare)
+    assert canonical_request_sha256(guarded) != canonical_request_sha256(bare)
+    with pytest.raises(ValidationError, match="safeguards is valid only"):
+        GatewayRequest(
+            surface=GatewayApiSurface.CHAT_COMPLETIONS,
+            messages=messages,
+            safeguards=({"type": "dangerous_tool_use"},),
+        )
+
+
 def test_messages_only_carriers_cache_control_and_inference_geo() -> None:
     """The top-level cache marker stays identity-inert; the region binds replay."""
     from exp.common.core.artifacts import sha256_json

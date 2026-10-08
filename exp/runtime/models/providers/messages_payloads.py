@@ -283,6 +283,12 @@ def anthropic_messages_stream_payload(
         payload["diagnostics"] = request.diagnostics
     if request.speed is not None:
         payload["speed"] = request.speed
+    if request.safeguards is not None:
+        # Claude Code auto-mode safeguards forward byte-for-byte on this
+        # dialect only; the beta header joins via anthropic_request_headers.
+        # Every other dialect's builder never emits the field, so a failover
+        # onto a non-Anthropic rung drops it per attempt.
+        payload["safeguards"] = list(request.safeguards)
     if request.provider_cache_control is not None:
         # The top-level automatic caching marker forwards byte-for-byte; the
         # provider accepts it bare (verified live 2026-08-30).

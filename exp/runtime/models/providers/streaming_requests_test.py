@@ -3731,6 +3731,58 @@ def test_diagnostics_speed_and_betas_forward_on_anthropic_and_disclose_elsewhere
     assert mixed_provider.provider_beta_tokens == ()
 
 
+def test_safeguards_forward_per_anthropic_attempt_and_drop_silently_elsewhere() -> None:
+    """Claude Code auto-mode safeguards reach only an Anthropic attempt.
+
+    The route keeps the field even when a fallback rung is not Anthropic, so
+    the Anthropic attempt still gets the server-side review; each other
+    dialect's payload simply omits it, and no disclosure is recorded, so a
+    non-Anthropic answer has exactly the shape of an ordinary turn and the
+    caller falls back to reviewing tool calls itself.
+    """
+    from exp.runtime.models.providers.wire_messages import (
+        ANTHROPIC_SAFEGUARDS_BETA,
+        anthropic_request_headers,
+    )
+
+    safeguards: tuple[JsonObject, ...] = (
+        {"type": "dangerous_tool_use", "classifier_context": {"v": 1, "rules": {"allow": []}}},
+    )
+    request = GatewayRequest(
+        surface=GatewayApiSurface.MESSAGES,
+        messages=(GatewayMessage(role="user", content="go"),),
+        safeguards=safeguards,
+        stream=True,
+        include_usage=True,
+    )
+    anthropic = GatewayWireProfile(
+        dialect="anthropic_messages", url="https://anthropic.test", maximum_output_tokens=128_000
+    )
+    fallbacks = (
+        GatewayWireProfile(dialect="openai_compatible", url="https://fallback.test"),
+        GatewayWireProfile(dialect="openai_responses", url="https://responses.test"),
+        GatewayWireProfile(dialect="bedrock_converse_stream", url="https://bedrock.test"),
+        GatewayWireProfile(dialect="gemini_generate_content", url="https://gemini.test"),
+    )
+    public, provider = route_generation_parameter_requests((anthropic, *fallbacks), request)
+    assert public.ignored_parameters == ()
+    assert provider.safeguards == safeguards
+
+    payload = dialect_stream_payload(anthropic, provider)
+    assert payload["safeguards"] == list(safeguards)
+    assert json.dumps(payload["safeguards"]) == json.dumps(list(safeguards))
+    headers = anthropic_request_headers({"anthropic-beta": "operator-token"}, provider)
+    assert headers["anthropic-beta"] == f"operator-token,{ANTHROPIC_SAFEGUARDS_BETA}"
+    for fallback in fallbacks:
+        encoded = json.dumps(dialect_stream_payload(fallback, provider))
+        assert "safeguards" not in encoded
+        assert "dangerous_tool_use" not in encoded
+
+    plain = request.model_copy(update={"safeguards": None})
+    assert "safeguards" not in dialect_stream_payload(anthropic, plain)
+    assert "anthropic-beta" not in anthropic_request_headers({}, plain)
+
+
 def test_tool_annotations_and_top_carriers_forward_on_anthropic_and_disclose_elsewhere() -> None:
     """Provider-native tool annotations and inference region reach only the
     Anthropic wire; any other rung drops each with a per-field disclosure,

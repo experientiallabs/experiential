@@ -519,6 +519,9 @@ class GatewayRequest(ContractModel):
     serialization; a present value joins replay identity through
     :func:`canonical_request_sha256`.
     """
+    safeguards: tuple[JsonObject, ...] | None = Field(default=None, exclude=True)
+    """Verbatim Claude Code auto-mode ``safeguards`` (Messages only): sent on
+    Anthropic rungs, silently omitted elsewhere; joins replay identity."""
     speed: str | None = Field(default=None, max_length=64, exclude=True)
     """Verbatim caller ``speed`` selector from the Messages surface.
 
@@ -831,6 +834,8 @@ class GatewayRequest(ContractModel):
             raise ValueError("diagnostics is valid only for Messages requests")
         if self.speed is not None and self.surface != GatewayApiSurface.MESSAGES:
             raise ValueError("speed is valid only for Messages requests")
+        if self.safeguards is not None and self.surface != GatewayApiSurface.MESSAGES:
+            raise ValueError("safeguards is valid only for Messages requests")
         if self.provider_cache_control is not None and self.surface != GatewayApiSurface.MESSAGES:
             raise ValueError("provider_cache_control is valid only for Messages requests")
         if self.inference_geo is not None and self.surface != GatewayApiSurface.MESSAGES:

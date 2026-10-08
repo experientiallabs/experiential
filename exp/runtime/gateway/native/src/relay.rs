@@ -77,6 +77,8 @@ pub fn event_retained_bytes(event: &Event) -> usize {
                     .saturating_add(phase.len())
             })
             .unwrap_or(MAXIMUM_RETAINED_OUTPUT_BYTES.saturating_add(1)),
+        Event::SafeguardResults(results) => crate::dialects::records_retained_bytes(results)
+            .unwrap_or(MAXIMUM_RETAINED_OUTPUT_BYTES.saturating_add(1)),
         _ => 64,
     }
 }

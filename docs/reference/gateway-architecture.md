@@ -319,6 +319,14 @@ same caller-owned plaintext history a `reasoning_content` echo is; mid-conversat
 them (instruction-hoisting rungs narrow out), and `thinking.display` rides the verbatim thinking
 config. The conditional Claude Code fields `diagnostics` and `speed` forward verbatim on
 Anthropic rungs with their required `anthropic-beta` tokens and drop with disclosure elsewhere.
+Claude Code auto mode's `safeguards` array (shallow-validated as an array of objects) forwards
+verbatim on each Anthropic attempt with the `dangerous-tool-use-2026-09-03` token the dispatch
+adds itself; the caller's copy of that token is accepted silently and never relayed on its own.
+Every other rung drops the field and the token per attempt with no disclosure, so its answer
+carries no `safeguard_results` and the client reviews tool calls itself. The provider's verdicts
+(`message_delta.delta.safeguard_results`, keyed by tool_use id) relay unchanged at the same
+position on a streaming Messages reply and as a top-level `safeguard_results` on a non-streaming
+one, present exactly when the provider sent them and never on Chat or Responses replies.
 A caller `anthropic-beta` header forwards through an exact token allowlist (notably `context-1m-2025-08-07`, which
 activates the provider's 1M context window; without it the provider serves 200K, and `thinking-display-updates-2026-08-18`,
 which the dispatch also adds whenever `thinking.display` is `updates`, since the provider refuses that display without it); non-allowlisted tokens drop with a per-token

@@ -296,6 +296,16 @@ impl Normalizer {
                 if let Some(Value::String(reason)) = delta.get("stop_reason") {
                     self.stop_reason = Some(reason.clone());
                 }
+                // Verdicts for the caller's `safeguards` field ride this
+                // delta only. They are opaque (keyed by tool_use id, which
+                // passes through unchanged) and relayed verbatim; every other
+                // unknown delta key is ignored.
+                if let Some(results) = delta.get("safeguard_results") {
+                    let size = super::records_retained_bytes(results)
+                        .ok_or_else(|| malformed("Anthropic safeguard_results is not JSON"))?;
+                    self.reserve_tool_bytes(size)?;
+                    events.push(Event::SafeguardResults(results.clone()));
+                }
                 let usage = payload
                     .get("usage")
                     .and_then(Value::as_object)

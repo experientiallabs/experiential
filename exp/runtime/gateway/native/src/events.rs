@@ -338,6 +338,10 @@ pub enum Event {
         index: u32,
         citation: String,
     },
+    /// Anthropic `message_delta.delta.safeguard_results`: the provider's
+    /// verdicts for the caller's `safeguards` request field, opaque JSON
+    /// re-emitted unchanged only on the Messages surface.
+    SafeguardResults(Value),
     Usage(Usage),
     Completed,
     Incomplete,
@@ -697,6 +701,9 @@ pub fn simplified_event(event: &Event) -> Value {
             "index": index,
             "citation": citation,
         }),
+        Event::SafeguardResults(results) => {
+            serde_json::json!({"kind": "safeguard_results", "results": results})
+        }
         Event::Usage(usage) => {
             let mut payload = serde_json::json!({
                 "kind": "usage",
@@ -735,21 +742,6 @@ pub fn simplified_event(event: &Event) -> Value {
 mod item_metadata;
 use item_metadata::add_provider_item_metadata;
 pub use item_metadata::hosted_item_type_is_invocation;
-
-/// Validate one raw tool-argument accumulation as a single JSON object.
-///
-/// The parse-failure reason carries serde's positional description (token
-/// category and line/column, never input bytes), so an unparsable shape is
-/// diagnosable from the boundary log without ever logging payload.
-pub fn require_json_object_text(raw: &str) -> Result<(), String> {
-    match serde_json::from_str::<Value>(raw) {
-        Ok(Value::Object(_)) => Ok(()),
-        Ok(_) => Err("streamed tool arguments must decode to an object".to_string()),
-        Err(error) => Err(format!(
-            "streamed tool arguments are not valid JSON: {error}"
-        )),
-    }
-}
 
 /// Incremental scan of one JSON-argument accumulation that knows the byte at
 /// which the top-level value closed.
@@ -992,6 +984,7 @@ impl ToolAccumulator {
 }
 
 mod tool_arguments;
+pub use tool_arguments::require_json_object_text;
 mod usage;
 pub use usage::*;
 

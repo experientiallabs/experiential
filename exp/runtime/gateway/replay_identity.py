@@ -137,6 +137,7 @@ def provider_replay_authority(request: GatewayRequest) -> JsonObject | None:
         and request.context_management is None
         and request.provider_output_config is None
         and request.diagnostics is None
+        and request.safeguards is None
         and request.speed is None
         and request.inference_geo is None
         and request.service_tier is None
@@ -164,6 +165,8 @@ def provider_replay_authority(request: GatewayRequest) -> JsonObject | None:
         envelope["thinking_budget"] = request.thinking_budget
     if request.diagnostics is not None:
         envelope["diagnostics"] = request.diagnostics
+    if request.safeguards is not None:
+        envelope["safeguards"] = list(request.safeguards)
     if request.speed is not None:
         envelope["speed"] = request.speed
     if request.inference_geo is not None:

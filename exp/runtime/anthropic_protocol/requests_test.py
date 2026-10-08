@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
 from typing import cast
 
 import pytest
@@ -1215,6 +1217,60 @@ def test_display_updates_beta_reaches_the_provider_with_its_field() -> None:
 
     summarized = decode_messages(_body(thinking={"type": "adaptive", "display": "summarized"}))
     assert "anthropic-beta" not in anthropic_request_headers({"x-api-key": "k"}, summarized.request)
+
+
+_CLAUDE_CODE_SAFEGUARDS_CAPTURE = (
+    Path(__file__).parent / "testdata" / ("claude_code_request_safeguards.json")
+)
+"""Claude Code 2.1.294 auto-mode request fields (header and ``safeguards``),
+captured against api.anthropic.com on 2026-10-08 with paths anonymized."""
+
+
+def test_claude_code_safeguards_decode_verbatim_and_bind_their_beta_token() -> None:
+    """Auto mode's ``safeguards`` field decodes instead of 400ing.
+
+    Claude Code asks the provider to run its dangerous-tool-use classifier
+    server-side; rejecting the unknown field made every auto-mode session
+    fall back to separately billed classifier calls. Each entry is opaque
+    and carried byte-for-byte. The caller's ``dangerous-tool-use`` token is
+    accepted silently: the dispatch adds it itself beside the field on an
+    Anthropic rung, so it is neither forwarded alone nor disclosed.
+    """
+    from exp.runtime.models.providers.wire_messages import (
+        ANTHROPIC_SAFEGUARDS_BETA,
+        anthropic_request_headers,
+    )
+
+    capture = cast(JsonObject, json.loads(_CLAUDE_CODE_SAFEGUARDS_CAPTURE.read_text()))
+    safeguards = cast(list[JsonValue], capture["safeguards"])
+    header = cast(str, capture["anthropic-beta"])
+    decoded = decode_messages(_body(safeguards=safeguards), anthropic_beta=header).request
+    assert decoded.safeguards is not None
+    assert json.dumps(list(decoded.safeguards)) == json.dumps(safeguards)
+    assert ANTHROPIC_SAFEGUARDS_BETA not in decoded.provider_beta_tokens
+    assert f"anthropic-beta.{ANTHROPIC_SAFEGUARDS_BETA}" not in decoded.ignored_parameters
+    headers = anthropic_request_headers({"x-api-key": "k"}, decoded)
+    assert ANTHROPIC_SAFEGUARDS_BETA in headers["anthropic-beta"].split(",")
+
+    # The token without its field is a no-op: neither relayed nor disclosed.
+    bare = decode_messages(_body(), anthropic_beta=ANTHROPIC_SAFEGUARDS_BETA).request
+    assert bare.safeguards is None
+    assert bare.provider_beta_tokens == ()
+    assert bare.ignored_parameters == ()
+    assert "anthropic-beta" not in anthropic_request_headers({"x-api-key": "k"}, bare)
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["dangerous_tool_use", {"type": "dangerous_tool_use"}, ["dangerous_tool_use"], [1], [[]]],
+)
+def test_malformed_safeguards_are_refused_on_the_field(value: JsonValue) -> None:
+    """``safeguards`` must be an array of objects; the shape inside each
+    object is the provider's and stays unvalidated."""
+    with pytest.raises(OpenAIProtocolError) as raised:
+        decode_messages(_body(safeguards=value))
+    assert raised.value.detail.param is not None
+    assert raised.value.detail.param.split(".")[0] == "safeguards"
 
 
 def test_caller_beta_tokens_partition_into_allowlist_and_disclosures() -> None:

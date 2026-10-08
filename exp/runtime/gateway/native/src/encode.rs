@@ -350,6 +350,9 @@ impl ChatSseEncoder {
             // Anthropic text-block boundaries and citation metadata have no
             // Chat representation; the text itself streams through TextDelta.
             Event::TextBlockStarted { .. } | Event::CitationDelta { .. } => Ok(Vec::new()),
+            // Safeguard verdicts answer a Messages-only request field; Chat
+            // has no slot for them, so they never reach a Chat caller.
+            Event::SafeguardResults(_) => Ok(Vec::new()),
             // Server tools enter only through a Messages request, which
             // never encodes on the Chat surface.
             Event::ServerToolUseStarted { .. }

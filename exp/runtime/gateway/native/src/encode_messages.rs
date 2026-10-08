@@ -28,29 +28,6 @@ fn invalid_provider_stream(message: &str) -> PublicError {
     PublicError::new(502, "invalid_provider_stream", message, "api_error")
 }
 
-/// Map the terminal outcome to the Anthropic stop reason. Server tool use is
-/// provider-executed and deliberately never yields `tool_use`; a paused
-/// server-tool turn must keep `pause_turn` so the caller resumes it.
-pub(super) fn stop_reason(terminal: &Event, saw_tool_use: bool) -> &'static str {
-    match terminal {
-        Event::Incomplete => "max_tokens",
-        Event::PausedTurn => "pause_turn",
-        // A gateway-emulated stop cut the visible text: the caller's sequence
-        // ended the turn, exactly as Anthropic reports a native match.
-        Event::StoppedAtSequence(_) => "stop_sequence",
-        _ if saw_tool_use => "tool_use",
-        _ => "end_turn",
-    }
-}
-
-/// The matched stop sequence for the `stop_sequence` field, or null.
-pub(super) fn stop_sequence_value(terminal: &Event) -> Value {
-    match terminal {
-        Event::StoppedAtSequence(sequence) => Value::String(sequence.clone()),
-        _ => Value::Null,
-    }
-}
-
 /// Frame one named, compact, UTF-8-preserving Anthropic SSE event.
 fn event_frame(name: &str, payload: &Value) -> String {
     format!("event: {name}\ndata: {}\n\n", compact_json(payload))
@@ -163,6 +140,8 @@ pub struct MessagesSseEncoder {
     /// How many leading blocks are the gateway's own, so the empty-completion
     /// check still sees a provider that rendered nothing.
     synthetic_blocks: usize,
+    /// Provider safeguard verdicts, relayed verbatim on `message_delta`.
+    safeguard_results: Option<Value>,
 }
 
 impl MessagesSseEncoder {
@@ -207,6 +186,7 @@ impl MessagesSseEncoder {
             web_search: None,
             tool_search: None,
             synthetic_blocks: 0,
+            safeguard_results: None,
         }
     }
 
@@ -477,6 +457,10 @@ impl MessagesSseEncoder {
             // OpenAI text annotations have no Messages representation; the
             // text itself streams through its delta events.
             Event::ProviderTextAnnotation { .. } => Ok(Vec::new()),
+            Event::SafeguardResults(results) => {
+                self.safeguard_results = Some(results.clone());
+                Ok(Vec::new())
+            }
             Event::Usage(usage) => {
                 if usage.has_token_counts() {
                     self.usage = Some(usage.clone());
@@ -511,10 +495,11 @@ impl MessagesSseEncoder {
                     "message_delta",
                     &json!({
                         "type": "message_delta",
-                        "delta": {
-                            "stop_reason": stop_reason(event, self.saw_tool_use),
-                            "stop_sequence": stop_sequence_value(event),
-                        },
+                        "delta": message_delta_body(
+                            event,
+                            self.saw_tool_use,
+                            self.safeguard_results.as_ref(),
+                        ),
                         "usage": self.metered(messages_usage(self.usage.as_ref())),
                     }),
                 ));
@@ -957,6 +942,7 @@ impl MessagesSseEncoder {
 mod aggregate;
 mod display;
 mod errors;
+mod terminal;
 mod usage;
 
 pub use errors::{anthropic_error_body, refusal_failure};
@@ -964,6 +950,8 @@ pub use errors::{anthropic_error_body, refusal_failure};
 #[cfg(test)]
 pub use aggregate::completed_messages_body;
 pub use aggregate::{completed_messages_body_with_reasoning, AggregatedMessage};
+use terminal::message_delta_body;
+pub(super) use terminal::{last_safeguard_results, stop_reason, stop_sequence_value};
 pub(crate) use usage::messages_usage;
 
 /// Attach the `x-experiential-ignored-parameters` disclosure to one message
@@ -985,6 +973,8 @@ pub(super) fn disclose_ignored_parameters(message: &mut Value, ignored_parameter
 mod tests;
 #[cfg(test)]
 mod tests_claude_code;
+#[cfg(test)]
+mod tests_safeguards;
 #[cfg(test)]
 mod tests_usage;
 #[cfg(test)]
