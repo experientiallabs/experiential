@@ -28,6 +28,7 @@ from exp.runtime.gateway.contracts import (
     GatewayRequest,
     GatewayToolDefinition,
 )
+from exp.runtime.gateway.tool_contracts import GatewayAllowedToolsChoice
 from exp.runtime.gateway.tool_search.contracts import (
     MESSAGES_TOOL_SEARCH_TYPES,
     OPENROUTER_TOOL_SEARCH_TYPE,
@@ -36,7 +37,6 @@ from exp.runtime.gateway.tool_search.contracts import (
     gateway_tool_search_definition,
     gateway_tool_search_name,
 )
-from exp.runtime.models.providers.allowed_tools import restrict_with_disclosure
 
 DROPPED_NO_DEFERRED: Final = "tool_search->dropped(no_deferred_tools)"
 TOOL_CHOICE_CLEARED: Final = "tool_choice->cleared(no_serviceable_tool)"
@@ -181,11 +181,13 @@ def plan_tool_search(request: GatewayRequest, dialects: Sequence[str]) -> ToolSe
     search = request.tool_search
     if search is None or natively_served(search, dialects):
         return ToolSearchPlan(request, None, None)
-    # The gateway's search corpus and its later rounds (which rebuild tools
-    # without a selector) must only ever hold tools the caller allowed.
-    request = restrict_with_disclosure(request)
     deferred = [tool for tool in request.tools if tool.defer_loading]
     loaded = [tool for tool in request.tools if not tool.defer_loading]
+    choice = request.tool_choice
+    if isinstance(choice, GatewayAllowedToolsChoice):
+        # The search corpus and its later rounds (which rebuild tools without
+        # a selector) only ever hold functions the caller allowed.
+        deferred = [tool for tool in deferred if tool.name in choice.names]
     if not deferred:
         cleared = tuple(tool.model_copy(update={"defer_loading": None}) for tool in loaded)
         return ToolSearchPlan(
@@ -194,9 +196,17 @@ def plan_tool_search(request: GatewayRequest, dialects: Sequence[str]) -> ToolSe
             None,
         )
     tool_name = gateway_tool_search_name(tool.name for tool in request.tools)
+    updates: dict[str, object] = {}
+    if isinstance(choice, GatewayAllowedToolsChoice):
+        loaded = [tool for tool in loaded if tool.name in choice.names]
+        # The selector stays for reflection; the search tool joins its set,
+        # since it is the only way to reach the allowed deferred functions.
+        updates["tool_choice"] = choice.model_copy(
+            update={"names": (*(tool.name for tool in loaded), tool_name)}
+        )
     state = ToolSearchState(search=search, tool_name=tool_name, loaded=loaded, deferred=deferred)
     stripped = strip_search_carriers(request)
-    dispatch = stripped.model_copy(update={"tools": state.dispatch_tools()})
+    dispatch = stripped.model_copy(update={"tools": state.dispatch_tools(), **updates})
     admission: JsonObject = {
         "tool_name": tool_name,
         "max_rounds": search.max_rounds,

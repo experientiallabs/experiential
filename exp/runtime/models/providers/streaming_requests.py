@@ -11,6 +11,7 @@ from exp.runtime.gateway.contracts import (
     GatewayNamedToolChoice,
     GatewayRequest,
 )
+from exp.runtime.gateway.tool_contracts import GatewayAllowedToolsChoice
 from exp.runtime.gateway.tool_search.contracts import gateway_tool_search_name
 from exp.runtime.models.providers.allowed_tools import (
     ALLOWED_TOOLS_CLEARED,
@@ -913,7 +914,12 @@ def route_generation_parameter_requests(
                 param="tool_choice",
                 code="invalid_parameter",
             )
-        if request.tool_choice is not None:
+        if request.tool_choice is not None and not (
+            isinstance(request.tool_choice, GatewayAllowedToolsChoice)
+            and request.provider_native_tools
+        ):
+            # An allowed set over native-only declarations still selects among
+            # them; restriction below (or the native wire) owns it.
             ignore("tool_choice")
         if request.parallel_tool_calls is not None:
             ignore("parallel_tool_calls")

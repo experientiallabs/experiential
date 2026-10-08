@@ -9,7 +9,7 @@ from pydantic import JsonValue
 
 from exp.common.core.artifacts import JsonObject
 from exp.runtime.gateway.contracts import GatewayNamedToolChoice
-from exp.runtime.gateway.tool_contracts import GatewayAllowedToolsChoice
+from exp.runtime.gateway.tool_contracts import GatewayAllowedToolsChoice, GatewayProviderNativeTool
 from exp.runtime.openai_protocol.errors import OpenAIProtocolError
 from exp.runtime.openai_protocol.requests import decode_responses
 from exp.runtime.openai_protocol.tool_choice import (
@@ -164,7 +164,13 @@ def test_responses_carries_non_function_entries_verbatim() -> None:
                 {"type": "mcp", "server_label": "deepwiki"},
                 {"type": "image_generation"},
             ],
-        }
+        },
+        native_tools=(
+            GatewayProviderNativeTool(
+                index=1, tool={"type": "mcp", "server_label": "deepwiki", "server_url": "u"}
+            ),
+            GatewayProviderNativeTool(index=2, tool={"type": "image_generation"}),
+        ),
     )
 
     assert choice == GatewayAllowedToolsChoice(
@@ -175,3 +181,29 @@ def test_responses_carries_non_function_entries_verbatim() -> None:
             {"type": "image_generation"},
         ),
     )
+
+
+def test_a_native_entry_naming_no_declaration_is_refused() -> None:
+    """An allowed MCP server absent from tools is a field-scoped 400, like a function."""
+    with pytest.raises(OpenAIProtocolError) as raised:
+        responses_tool_choice(
+            {
+                "type": "allowed_tools",
+                "mode": "required",
+                "tools": [{"type": "mcp", "server_label": "missing"}],
+            },
+            native_tools=(
+                GatewayProviderNativeTool(index=0, tool={"type": "mcp", "server_label": "other"}),
+            ),
+        )
+
+    assert raised.value.detail.param == "tool_choice.tools"
+
+
+def test_an_oversized_allowed_set_is_refused_before_decoding() -> None:
+    """The set is bounded at OpenAI's tool ceiling, so decoding stays linear."""
+    tools: list[JsonValue] = [{"type": "function", "name": f"f{index}"} for index in range(129)]
+    with pytest.raises(OpenAIProtocolError) as raised:
+        responses_tool_choice({"type": "allowed_tools", "mode": "auto", "tools": tools})
+
+    assert raised.value.detail.param == "tool_choice.tools"

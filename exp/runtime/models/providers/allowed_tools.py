@@ -39,7 +39,8 @@ def restrict_to_allowed_tools(request: GatewayRequest) -> GatewayRequest:
     and OpenAI-compatible ``auto``/``required`` all follow from the mapped mode
     in each dialect's existing encoder. A Responses native entry (a Codex
     ``custom`` tool or a ``namespace``) keeps the function tools translated
-    from that declaration; hosted entries have no foreign-wire counterpart.
+    from exactly that declaration; hosted entries have no foreign-wire
+    counterpart.
     When nothing the selector allows survives on this wire, the choice is
     cleared (the caller sees ``tool_choice->cleared(no_serviceable_tool)``)
     instead of forcing a call to tools the model was told it may not use.
@@ -53,22 +54,24 @@ def restrict_to_allowed_tools(request: GatewayRequest) -> GatewayRequest:
     choice = request.tool_choice
     if not isinstance(choice, GatewayAllowedToolsChoice):
         return request
-    native_names = {
-        name for entry in choice.provider_entries if isinstance(name := entry.get("name"), str)
-    }
     origins = request.native_tool_translation or {}
 
     def allowed(name: str) -> bool:
         if name in choice.names:
             return True
         origin = origins.get(name)
-        return origin is not None and (origin[0] in native_names or origin[1] in native_names)
+        return origin is not None and any(
+            _names_origin(entry, origin) for entry in choice.provider_entries
+        )
 
     tools = tuple(tool for tool in request.tools if allowed(tool.name))
     native_tools = tuple(
         entry
         for entry in request.provider_native_tools
-        if any(_matches(entry.tool, allowed_entry) for allowed_entry in choice.provider_entries)
+        if any(
+            entry_names_declaration(entry.tool, allowed_entry)
+            for allowed_entry in choice.provider_entries
+        )
     )
     server_tools = tuple(
         entry
@@ -85,30 +88,28 @@ def restrict_to_allowed_tools(request: GatewayRequest) -> GatewayRequest:
     )
 
 
-def restrict_with_disclosure(request: GatewayRequest) -> GatewayRequest:
-    """Restrict an allowed-tools selector and disclose it on the same request.
-
-    For planning steps that rewrite the request before route shaping (gateway
-    tool search narrows its corpus to the allowed set), so the later rounds can
-    never surface a tool the caller did not allow.
-    """
-    restricted = restrict_to_allowed_tools(request)
-    if restricted is request:
-        return request
-    disclosures = (ALLOWED_TOOLS_DISCLOSURE,)
-    if restricted.tool_choice is None:
-        disclosures = (*disclosures, ALLOWED_TOOLS_CLEARED)
-    ignored = (
-        *request.ignored_parameters,
-        *(item for item in disclosures if item not in request.ignored_parameters),
-    )
-    return restricted.model_copy(update={"ignored_parameters": ignored})
-
-
-def _matches(declaration: JsonObject, allowed_entry: JsonObject) -> bool:
+def entry_names_declaration(declaration: JsonObject, allowed_entry: JsonObject) -> bool:
     """Whether a native declaration is the one an allowed entry names.
 
     An entry names a declaration when every field it spells (``type`` plus
     ``server_label`` or ``name`` where present) equals the declaration's.
     """
     return all(declaration.get(key) == value for key, value in allowed_entry.items())
+
+
+def _names_origin(entry: JsonObject, origin: tuple[str, str | None, bool]) -> bool:
+    """Whether an allowed entry names the native declaration a translated tool came from.
+
+    A ``custom`` entry names a top-level custom tool (by ``name`` when given);
+    a ``namespace`` entry names every tool translated from that namespace.
+    Kind and identity both match, so a custom ``foo`` never admits a ``foo``
+    namespace. Hosted entries have no translated counterpart.
+    """
+    name, namespace, is_custom = origin
+    kind = entry.get("type")
+    wanted = entry.get("name")
+    if kind == "custom":
+        return is_custom and namespace is None and wanted in (None, name)
+    if kind == "namespace":
+        return namespace is not None and wanted in (None, namespace)
+    return False

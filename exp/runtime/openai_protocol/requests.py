@@ -475,7 +475,7 @@ def decode_responses(
             provider_native_tools=tuple(native_tools),
             web_search=responses_web_search(native_tools, online_suffix=online_suffix),
             tool_search=responses_tool_search(native_tools),
-            tool_choice=responses_tool_choice(request.tool_choice),
+            tool_choice=responses_tool_choice(request.tool_choice, native_tools=native_tools),
             parallel_tool_calls=request.parallel_tool_calls,
             structured_text=responses_structured_text(request.text),
             ignored_parameters=(

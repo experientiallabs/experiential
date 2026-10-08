@@ -20,7 +20,6 @@ from exp.runtime.gateway.tool_search.plan import (
     strip_search_carriers,
     surface_shape,
 )
-from exp.runtime.models.providers.allowed_tools import ALLOWED_TOOLS_DISCLOSURE
 
 
 def _tool(name: str, *, deferred: bool = False) -> GatewayToolDefinition:
@@ -170,5 +169,8 @@ def test_gateway_search_corpus_holds_only_allowed_tools() -> None:
     assert plan.state is not None
     assert [tool.name for tool in plan.state.deferred] == ["deferred_a"]
     assert [tool.name for tool in plan.request.tools] == ["loaded", "tool_search"]
-    assert plan.request.tool_choice == "required"
-    assert ALLOWED_TOOLS_DISCLOSURE in plan.request.ignored_parameters
+    # The selector stays for reflection; the search tool joins the allowed set.
+    assert plan.request.tool_choice == GatewayAllowedToolsChoice(
+        mode="required", names=("loaded", "tool_search")
+    )
+    assert plan.state.loaded == [plan.request.tools[0]]

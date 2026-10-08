@@ -8,7 +8,12 @@ from typing import Literal, cast
 import pytest
 
 from exp.common.core.artifacts import JsonObject
-from exp.runtime.gateway.contracts import GatewayRequest
+from exp.runtime.gateway.contracts import (
+    GatewayApiSurface,
+    GatewayMessage,
+    GatewayRequest,
+    GatewayToolDefinition,
+)
 from exp.runtime.gateway.tool_contracts import GatewayAllowedToolsChoice
 from exp.runtime.models.providers.allowed_tools import (
     ALLOWED_TOOLS_CLEARED,
@@ -272,3 +277,72 @@ def test_nothing_allowed_on_the_wire_clears_the_choice_with_disclosure() -> None
     assert provider.tool_choice is None
     assert provider.tools == ()
     assert public.ignored_parameters[-2:] == (ALLOWED_TOOLS_DISCLOSURE, ALLOWED_TOOLS_CLEARED)
+
+
+def _translated(choice: GatewayAllowedToolsChoice) -> GatewayRequest:
+    """A foreign-wire request whose tools were translated from Codex native declarations."""
+    return GatewayRequest(
+        surface=GatewayApiSurface.RESPONSES,
+        messages=(GatewayMessage(role="user", content="hi"),),
+        tools=tuple(
+            GatewayToolDefinition(name=name, parameters={"type": "object"})
+            for name in ("foo", "foo__read", "ns__foo")
+        ),
+        native_tool_translation={
+            "foo": ("foo", None, True),
+            "foo__read": ("read", "foo", False),
+            "ns__foo": ("foo", "ns", False),
+        },
+        tool_choice=choice,
+    )
+
+
+def test_custom_and_namespace_entries_match_by_kind_and_identity() -> None:
+    """A custom ``foo`` never admits a ``foo`` namespace or a namespaced ``foo``."""
+    custom = restrict_to_allowed_tools(
+        _translated(
+            GatewayAllowedToolsChoice(
+                mode="required", provider_entries=({"type": "custom", "name": "foo"},)
+            )
+        )
+    )
+    namespace = restrict_to_allowed_tools(
+        _translated(
+            GatewayAllowedToolsChoice(
+                mode="required", provider_entries=({"type": "namespace", "name": "foo"},)
+            )
+        )
+    )
+
+    assert [tool.name for tool in custom.tools] == ["foo"]
+    assert [tool.name for tool in namespace.tools] == ["foo__read"]
+
+
+def test_native_only_declarations_keep_the_allowed_set() -> None:
+    """With no function tools, the selector still restricts the native declarations."""
+    request = decode_responses(
+        cast(
+            JsonObject,
+            {
+                "model": "gpt-5.5",
+                "input": "hi",
+                "tools": [
+                    {"type": "mcp", "server_label": "deepwiki", "server_url": "https://d.test"},
+                    {"type": "mcp", "server_label": "other", "server_url": "https://o.test"},
+                ],
+                "tool_choice": {
+                    "type": "allowed_tools",
+                    "mode": "auto",
+                    "tools": [{"type": "mcp", "server_label": "deepwiki"}],
+                },
+            },
+        )
+    ).request
+
+    _public, provider = route_generation_parameter_requests((_OPENAI,), request)
+
+    assert dialect_stream_payload(_OPENAI, provider)["tool_choice"] == {
+        "type": "allowed_tools",
+        "mode": "auto",
+        "tools": [{"type": "mcp", "server_label": "deepwiki"}],
+    }
