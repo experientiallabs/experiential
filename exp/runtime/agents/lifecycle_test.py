@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from datetime import UTC, datetime
 from types import TracebackType
 from typing import cast
@@ -218,6 +219,33 @@ def test_preflight_names_the_required_customer_adapter_change() -> None:
             _task(),
             _Model(),
         )
+
+
+def test_authored_reference_answer_never_reaches_customer_runtimes() -> None:
+    """The judge-only reference answer is projected out of both runtime boundaries."""
+    task = _authored_task()
+    session = _RecordingSession()
+    runtime = _RecordingEnvironmentRuntime(session)
+    agent = _RecordingAgent()
+
+    episode = execute_agent_episode(agent, runtime, task, _Model())
+
+    assert episode.stop_reason == StopReason.COMPLETED
+    assert len(agent.tasks) == 1
+    assert len(runtime.tasks) == 1
+    received = (*agent.tasks, *runtime.tasks)
+    for seen in received:
+        assert seen.reference_answer is None
+        assert seen.origin == "authored"
+        assert seen.instruction == task.instruction
+    payloads = (
+        *(seen.model_dump_json() for seen in received),
+        *(action.model_dump_json() for action in session.actions),
+    )
+    assert session.actions
+    assert all(_REFERENCE_ANSWER not in payload for payload in payloads)
+    # The caller-owned task is untouched: the judge resolves the answer from the task set.
+    assert task.reference_answer == _REFERENCE_ANSWER
 
 
 class _Model:
@@ -463,3 +491,65 @@ def _span(span_id: str) -> RolloutSpan:
 
 def _lifecycle_phases(episode: AgentEpisode) -> list[str]:
     return [str(event.payload["phase"]) for event in episode.events]
+
+
+_REFERENCE_ANSWER = "the expected answer is 42"
+
+
+class _RecordingAgent:
+    """Records every task it receives and echoes the task into an environment call."""
+
+    def __init__(self) -> None:
+        self.tasks: list[TaskCase] = []
+
+    def run(
+        self,
+        task: TaskCase,
+        *,
+        model: ModelClient,
+        environment: EnvironmentSession,
+    ) -> AgentEpisode:
+        self.tasks.append(task)
+        environment.execute(
+            ToolCall(call_id="call-1", name="echo", arguments={"task": task.model_dump_json()})
+        )
+        return AgentEpisode(
+            events=(_span("agent-1"),),
+            final_action=AssistantAction(content="finished"),
+            stop_reason=StopReason.COMPLETED,
+        )
+
+
+class _RecordingSession:
+    """An execute-only session that records every action payload it is sent."""
+
+    def __init__(self) -> None:
+        self.actions: list[ToolCall] = []
+
+    def execute(self, action: ToolCall) -> Observation:
+        self.actions.append(action)
+        return Observation(content="recorded")
+
+
+class _RecordingEnvironmentRuntime:
+    """Records every task the simulator opens an environment for."""
+
+    def __init__(self, session: _RecordingSession) -> None:
+        self._session = session
+        self.tasks: list[TaskCase] = []
+
+    def open(self, task: TaskCase) -> nullcontext[_RecordingSession]:
+        self.tasks.append(task)
+        return nullcontext(self._session)
+
+
+def _authored_task() -> TaskCase:
+    return TaskCase(
+        task_id="authored-1",
+        lineage_group_id="authored-lineage-1",
+        partition="fit",
+        instruction="Answer the authored question.",
+        workload_weight=1.0,
+        origin="authored",
+        reference_answer=_REFERENCE_ANSWER,
+    )
