@@ -1,8 +1,6 @@
-//! Ladder tests for throttle backoff-and-redial: a scripted python control
-//! plane and scripted local rungs drive `acquire_attempt` end to end, so the
-//! wait schedule, the `throttle_backoff` reservation flag, the commitment
-//! boundary, the ladder advance after the redial budget, and the exhaustion
-//! `Retry-After` are all observed on the real loop rather than on its parts.
+//! Ladder tests: a scripted python control plane and scripted local rungs drive
+//! `acquire_attempt` end to end (throttle backoff and redial, commitment, ladder
+//! advance, exhaustion `Retry-After`) on the real loop rather than on its parts.
 
 use std::collections::HashMap;
 use std::sync::atomic::AtomicUsize;
@@ -478,6 +476,7 @@ impl Harness {
             Instant::now(),
         );
         let context = WaterfallContext {
+            pre_first_byte_deadline: None,
             bridge: &self.bridge,
             http: &self.http,
             request_id: "request-throttle",
@@ -996,4 +995,5 @@ fn a_first_dial_reserved_on_a_failover_only_rung_fails_closed() {
 
 mod capture_logprobs_tests;
 mod logprobs_tests;
+mod pre_first_byte_tests;
 mod responses_logprobs_tests;

@@ -586,6 +586,54 @@ def test_retained_conditional_rung_cannot_discard_first_dial_routes(
         require_unrestricted_rung(remaining)
 
 
+def test_recovered_warm_rung_leads_and_keeps_its_stage_as_fallbacks() -> None:
+    """A warm rung last in rendezvous order is rotated to the front, never left alone.
+
+    2026-10-07: recovery truncated every leaf before the warm rung, so a session
+    warm on the last rung got a one-rung route and a header timeout there failed
+    the request with nowhere to fail over (GLM 5.3 on Novita).
+    """
+    route, wires = _affinity_fixture()
+    request = GatewayRequest(
+        surface=route.snapshot.authorization.surface,
+        messages=(GatewayMessage(role="system", content="stable"),),
+        prompt_cache_key="session",
+        provider_prompt_cache_key="xpl-session",
+    )
+    host = Host()
+    accounting = NativeAttemptAccounting(_RecordingLedger(), recovery_host=host)
+    accounting.recovery = SessionRecoveryRegistry(clock=Clock())
+    auth = route.snapshot.authorization
+    ordered, _, _ = stage_affinity_ordered_rungs(
+        route, wires, request, accounting=accounting, authorization=auth, continuation=None
+    )
+    assert len(ordered.deployments) > 1
+    retained = ordered.deployments[-1]
+    key = session_cache_key(InflightRequest(auth, ordered, request, time.monotonic() + 30))
+    assert key is not None
+    accounting.recovery.record_success(
+        key,
+        retained.deployment_id,
+        host.scope_for(retained, auth.organization_id),
+        cached_tokens=80,
+        cache_write_tokens=0,
+        retention_seconds=100,
+        sticky_seconds=60,
+    )
+    admitted, admitted_wires, placement = stage_affinity_ordered_rungs(
+        route, wires, request, accounting=accounting, authorization=auth, continuation=None
+    )
+    assert placement.verified_warm_deployment_id == retained.deployment_id
+    assert admitted.deployments[0].deployment_id == retained.deployment_id
+    assert sorted(d.deployment_id for d in admitted.deployments) == sorted(
+        d.deployment_id for d in ordered.deployments
+    )
+    assert tuple(d.deployment_id for d in admitted.deployments[1:]) == tuple(
+        d.deployment_id for d in ordered.deployments[:-1]
+    )
+    assert len(admitted_wires) == len(admitted.deployments)
+
+
 @pytest.mark.parametrize("trial", [False, True], ids=["retained", "trial"])
 @pytest.mark.parametrize(
     "isolation",
@@ -1263,12 +1311,19 @@ def test_final_selected_marker_profile_controls_public_omission(narrowing: str) 
     )
     payload = dialect_stream_payload(selected_wires[0][0], provider)
     omission = f"messages.content.cache_control{CACHE_CONTROL_NOT_FORWARDED_SUFFIX}"
-    assert public.ignored_parameters.count(omission) == int(narrowing != "none")
+    # Recovery rotates instead of truncating: the warm non-forwarding rung leads
+    # and the forwarding rung stays behind it as a fallback, so the route is
+    # mixed and, like an unnarrowed mixed route, discloses no blanket omission.
+    assert public.ignored_parameters.count(omission) == int(narrowing == "ordinary")
     assert "existing->disclosure" in public.ignored_parameters
     assert ("cache_control" in json.dumps(payload)) is (narrowing == "none")
     assert canonical_request_sha256(request) == original_identity
-    if narrowing != "none":
+    if narrowing == "ordinary":
         assert len(selected.deployments) == 1 and not selected_wires[0][0].preserves_cache_control
+    if narrowing == "recovery":
+        assert len(selected.deployments) == len(ordered.deployments)
+        assert not selected_wires[0][0].preserves_cache_control
+        assert any(profile.preserves_cache_control for profile, _client in selected_wires[1:])
 
 
 @pytest.mark.parametrize("other_session", [False, True])

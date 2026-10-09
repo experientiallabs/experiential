@@ -487,7 +487,9 @@ impl Failure {
             FailureClass::Authorization => (403, "model_not_granted", "permission_error"),
             FailureClass::QuotaExceeded => (429, "insufficient_quota", "insufficient_quota"),
             FailureClass::Throttled => (429, "unavailable_route", "api_error"),
-            FailureClass::Timeout => (504, "deadline_exceeded", "api_error"),
+            // A 504 is replaced at the edge by the CDN's own "origin timed out"
+            // page, hiding our body; a 503 keeps our retryable error visible.
+            FailureClass::Timeout => (503, "deadline_exceeded", "api_error"),
             FailureClass::Cancelled => (499, "request_cancelled", "api_error"),
             FailureClass::Guardrail => (400, "content_filter", "invalid_request_error"),
             // A provider refusal with no visible refusal text is the model's
@@ -534,7 +536,7 @@ impl Failure {
             // client honors never contradicts the message it reads.
             FailureClass::Throttled => Some(self.retry_after_seconds.map_or(5, |wait| wait.max(5))),
             FailureClass::QuotaExceeded => Some(3600),
-            FailureClass::Unavailable => Some(2),
+            FailureClass::Unavailable | FailureClass::Timeout => Some(2),
             _ => None,
         };
         error

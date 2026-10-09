@@ -45,6 +45,7 @@ def serve_native_gateway(
     time_to_first_byte_seconds: float = 15.0,
     time_to_first_byte_seconds_per_million_input_tokens: float = 240.0,
     time_to_first_token_seconds: float = 120.0,
+    pre_first_byte_budget_seconds: float = 90.0,
     native_usage_enabled: bool = True,
     capture: CaptureCollector | None = None,
     shutdown: ShutdownHandle | None = None,
@@ -87,6 +88,12 @@ def serve_native_gateway(
             commits, reads are paced by the deployment's own per-chunk
             timeout. A stall fails over to the next rung. Deployments may
             override the flat bound through their gateway capabilities.
+        pre_first_byte_budget_seconds: Bound on everything before the
+            caller's first byte, across every attempt and failover, from the
+            request's start. Kept under an edge proxy's origin timeout
+            (Cloudflare's is 100 s) so a chain of slow dials ends in the
+            gateway's own retryable 503 instead of the proxy's 504 page. Zero
+            disables it.
         public_upstreams_only: Restrict native provider connections to public HTTPS
             addresses, including connection-time DNS checks and proxy bypass.
             Hosted embedders accepting customer endpoints must enable this. It
@@ -128,6 +135,7 @@ def serve_native_gateway(
             time_to_first_byte_seconds_per_million_input_tokens
         ),
         "time_to_first_token_seconds": time_to_first_token_seconds,
+        "pre_first_byte_budget_seconds": pre_first_byte_budget_seconds,
         "native_usage_enabled": native_usage_enabled,
     }
     try:

@@ -466,7 +466,7 @@ pub async fn acquire_attempt(ctx: &WaterfallContext<'_>, guard: &mut AttemptGuar
                 tool_names,
             } => {
                 let possible = ctx.policy.permits(total_attempts, physical_counts[depth])
-                    && !remaining(ctx.deadline).is_zero();
+                    && !remaining(ctx.pre_commit_deadline()).is_zero();
                 if !guard
                     .settle(
                         "failed",
@@ -550,7 +550,7 @@ pub async fn acquire_attempt(ctx: &WaterfallContext<'_>, guard: &mut AttemptGuar
                     || successor_possible(
                         next_policy,
                         ctx.route,
-                        ctx.deadline,
+                        ctx.pre_commit_deadline(),
                         total_attempts,
                         counts[depth],
                         depth,

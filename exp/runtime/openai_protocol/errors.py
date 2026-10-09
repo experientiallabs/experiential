@@ -200,7 +200,9 @@ def public_failure_error(
         GatewayFailureClass.AUTHORIZATION: (403, "model_not_granted", "permission_error"),
         GatewayFailureClass.QUOTA_EXCEEDED: (429, "insufficient_quota", "insufficient_quota"),
         GatewayFailureClass.THROTTLED: (429, "unavailable_route", "api_error"),
-        GatewayFailureClass.TIMEOUT: (504, "deadline_exceeded", "api_error"),
+        # 504 is replaced at the edge by the CDN's own "origin timed out"
+        # page; a 503 keeps this retryable error visible to the caller.
+        GatewayFailureClass.TIMEOUT: (503, "deadline_exceeded", "api_error"),
         GatewayFailureClass.CANCELLED: (499, "request_cancelled", "api_error"),
         GatewayFailureClass.GUARDRAIL: (400, "content_filter", "invalid_request_error"),
         # A refusal with no visible refusal text is the model's answer to the
@@ -261,7 +263,7 @@ def public_failure_error(
             THROTTLED_RETRY_AFTER_SECONDS,
             failure.retry_after_seconds or THROTTLED_RETRY_AFTER_SECONDS,
         )
-    elif failure.failure_class is GatewayFailureClass.UNAVAILABLE:
+    elif failure.failure_class in {GatewayFailureClass.UNAVAILABLE, GatewayFailureClass.TIMEOUT}:
         retry_after_seconds = UNAVAILABLE_RETRY_AFTER_SECONDS
     elif failure.failure_class is GatewayFailureClass.QUOTA_EXCEEDED:
         moment = now if now is not None else datetime.now(UTC)

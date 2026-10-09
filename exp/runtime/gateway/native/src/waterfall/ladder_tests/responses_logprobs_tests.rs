@@ -30,6 +30,7 @@ fn responses_probability_commits_without_ttft_and_prevents_late_fallback() {
             Instant::now(),
         );
         let context = WaterfallContext {
+            pre_first_byte_deadline: None,
             bridge: &harness.bridge,
             http: &harness.http,
             request_id: "responses-probability-commit",
@@ -116,6 +117,7 @@ fn responses_empty_probability_scaffolding_does_not_escape_failed_attempt() {
             Instant::now(),
         );
         let context = WaterfallContext {
+            pre_first_byte_deadline: None,
             bridge: &harness.bridge,
             http: &harness.http,
             request_id: "responses-empty-retry",

@@ -67,9 +67,11 @@ def stage_affinity_ordered_rungs(
     """Schedule each provider segment independently, then choose one request start cursor.
 
     Recovery is evaluated exactly once against this frozen graph. Starting at a
-    sticky descendant discards every preceding leaf, rather than re-expanding that
-    model as a new root. Canonical ancestors and repeated-reference skips therefore
-    cannot resurrect a primary. No settlement changes an in-flight cursor.
+    sticky descendant discards every leaf of the preceding stages, rather than
+    re-expanding that model as a new root; leaves of the warm rung's own stage
+    that preceded it are rotated behind it as fallbacks, never dropped. Canonical
+    ancestors and repeated-reference skips therefore cannot resurrect a primary.
+    No settlement changes an in-flight cursor.
     """
     fingerprint = affinity_fingerprint(
         organization_id=authorization.organization_id,
@@ -240,9 +242,37 @@ def stage_affinity_ordered_rungs(
             i for i, d in enumerate(route.deployments) if d.deployment_id == decision.deployment_id
         )
         if start:
-            indexes = tuple(range(start, len(route.deployments)))
-            route = select_route_deployments(route, indexes)
-            wires = wires[start:]
+            # Rotate rather than truncate: the warm rung leads, and the leaves of
+            # its own stage that preceded it follow that stage as fallbacks, so a
+            # stall on the warm rung still fails over inside the same model.
+            # Leaves of EARLIER stages stay discarded (a recovered descendant
+            # never resurrects a primary across a model reference boundary).
+            stage_of = route.snapshot.stage_for_depth(start).stage_index
+            block_start = start
+            while (
+                block_start > 0
+                and route.snapshot.stage_for_depth(block_start - 1).stage_index == stage_of
+            ):
+                block_start -= 1
+            block_end = start
+            while (
+                block_end + 1 < len(route.deployments)
+                and route.snapshot.stage_for_depth(block_end + 1).stage_index == stage_of
+            ):
+                block_end += 1
+            rotation = (
+                tuple(range(block_start))
+                + tuple(range(start, block_end + 1))
+                + tuple(range(block_start, start))
+                + tuple(range(block_end + 1, len(route.deployments)))
+            )
+            route = reorder_route_deployments(route, rotation)
+            wires = tuple(wires[i] for i in rotation)
+            if block_start:
+                route = select_route_deployments(
+                    route, tuple(range(block_start, len(route.deployments)))
+                )
+                wires = wires[block_start:]
     return (
         route,
         wires,

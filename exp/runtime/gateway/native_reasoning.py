@@ -43,6 +43,14 @@ CHANGED_TURN_CARRIER_DROPPED = "messages.reasoning_content->dropped(assistant_tu
 The request is served without that turn's preserved thinking (and without any later
 carrier bound to it), exactly as if the caller had not replayed it."""
 
+SUPERSEDED_ISSUER_CARRIER_DROPPED = "messages.reasoning_content->dropped(issuing_route_superseded)"
+"""Disclosure for carriers sealed by an older issuing rung than the newest one.
+
+Ordinary failover can serve consecutive turns of one tool loop on two live rungs
+that both seal carriers. Only one rung can be pinned, so the newest issuer's
+carriers are kept and the older issuer's turns are served without their
+preserved thinking, as for an edited turn, instead of refusing the request."""
+
 
 def has_active_reasoning_content(request: GatewayRequest) -> bool:
     """Return whether post-user history still carries decrypted Fireworks state."""
@@ -207,6 +215,7 @@ def _process_reasoning_history(
     routes: dict[str, tuple[GatewayRoute, ReasoningCarrierAuthority]] = {}
     messages = list(request.messages)
     pinned: GatewayRoute | None = None
+    kept: list[tuple[int, GatewayRoute]] = []
     disclosures: set[str] = set()
     for index, message in enumerate(messages):
         if index <= last_user:
@@ -293,9 +302,21 @@ def _process_reasoning_history(
             continue
         if reveal:
             messages[index] = message.model_copy(update={"provider_reasoning": (block,)})
-        if pinned is not None and pinned.deployment != route.deployment:
-            raise ValueError("active reasoning carriers name different issuing rungs")
+        kept.append((index, route))
         pinned = route
+    if pinned is not None:
+        for index, issuer in kept:
+            if issuer.deployment != pinned.deployment:
+                # The newest carrier names the rung this continuation pins to; an
+                # older issuer's carrier cannot ride it, so its turn is served
+                # without preserved thinking rather than refusing the session.
+                messages[index] = messages[index].model_copy(update={"provider_reasoning": ()})
+                disclosures.add(SUPERSEDED_ISSUER_CARRIER_DROPPED)
+                _log_dropped_carrier(
+                    authorization,
+                    issuer.deployment.deployment_id,
+                    ValueError("superseded by a newer issuing rung"),
+                )
     if pinned is None and any(
         index > last_user
         and any(block.kind == "reasoning_content" for block in message.provider_reasoning)

@@ -216,6 +216,7 @@ impl SearchHarness {
             Instant::now(),
         );
         let context = WaterfallContext {
+            pre_first_byte_deadline: None,
             bridge: &self.bridge,
             http: &self.http,
             request_id: "request-search",

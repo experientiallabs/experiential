@@ -71,6 +71,11 @@ pub struct ServeConfig {
     /// per-million-input-tokens slope as the first-byte allowance is added.
     #[serde(default = "default_time_to_first_token_seconds")]
     pub time_to_first_token_seconds: f64,
+    /// Bound on everything before the caller's first byte, across every
+    /// attempt and failover, measured from the request's start. Kept under
+    /// the edge proxy's 100 s origin timeout; zero or negative disables it.
+    #[serde(default = "default_pre_first_byte_budget_seconds")]
+    pub pre_first_byte_budget_seconds: f64,
     #[serde(default = "default_callback_permits")]
     pub callback_permits: usize,
     #[serde(default = "default_native_usage_enabled")]
@@ -101,6 +106,12 @@ fn default_time_to_first_byte_seconds_per_million_input_tokens() -> f64 {
 /// separates "thinking" from "stalled" without cutting real work.
 fn default_time_to_first_token_seconds() -> f64 {
     120.0
+}
+
+/// Cloudflare answers its own 504 page when an origin sends no response
+/// within 100 s; stopping new attempts at 90 s keeps our retryable error.
+fn default_pre_first_byte_budget_seconds() -> f64 {
+    90.0
 }
 
 fn default_max_active_requests() -> usize {
@@ -136,6 +147,8 @@ pub(crate) struct AppState {
     /// semantic event) once the headers arrived; keepalive comments and
     /// role-only frames do not satisfy it.
     pub(crate) time_to_first_token: Duration,
+    /// The pre-first-byte budget (`None`: disabled).
+    pub(crate) pre_first_byte_budget: Option<Duration>,
     /// Settlement writes still in flight, held open through graceful shutdown.
     pub(crate) pending_settlements: Arc<AtomicUsize>,
     /// Requests handled since start; the idle reclaim loop trims the
@@ -184,6 +197,8 @@ pub async fn run(
             config.time_to_first_token_seconds,
             config.request_timeout_seconds,
         ),
+        pre_first_byte_budget: (config.pre_first_byte_budget_seconds > 0.0)
+            .then(|| Duration::from_secs_f64(config.pre_first_byte_budget_seconds)),
         pending_settlements: pending_settlements.clone(),
         handled_requests: handled_requests.clone(),
         replays: Arc::new(ReplayStore::new()),
@@ -450,4 +465,16 @@ async fn model_detail(
         },
         Err(error) => error_response(&error),
     }
+}
+
+/// The request's absolute pre-first-byte deadline: its start (the request
+/// deadline minus the request budget) plus the configured budget, never past
+/// the request deadline itself.
+pub(crate) fn pre_first_byte_deadline(
+    state: &AppState,
+    deadline: std::time::Instant,
+) -> Option<std::time::Instant> {
+    let budget = state.pre_first_byte_budget?;
+    let start = deadline.checked_sub(state.request_timeout)?;
+    Some((start + budget).min(deadline))
 }

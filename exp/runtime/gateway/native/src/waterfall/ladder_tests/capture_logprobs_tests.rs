@@ -29,6 +29,7 @@ async fn run_capture(
         Instant::now(),
     );
     let context = WaterfallContext {
+        pre_first_byte_deadline: None,
         bridge: &harness.bridge,
         http: &harness.http,
         request_id: "capture-logprobs",

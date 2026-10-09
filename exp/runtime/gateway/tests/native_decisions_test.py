@@ -934,7 +934,7 @@ def test_timeout_retains_unknown_liability_and_exhausts_budget(engine: _ServingE
     _DecisionsUpstream.stall_started.clear()
     started = time.monotonic()
     response = _post(engine, _body("timeout"))
-    assert response.status_code == 504, response.text
+    assert response.status_code == 503, response.text
     assert time.monotonic() - started < _TIMEOUT_SECONDS + 3.0
     assert _DecisionsUpstream.stall_started.is_set()
     [(request, attempts)] = _settled(engine, before)

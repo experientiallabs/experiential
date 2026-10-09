@@ -293,3 +293,91 @@ def test_payload_builder_still_rejects_a_foreign_sealed_block_and_accepts_the_st
     assert "reasoning_content" not in str(payload)
     assert messages[1]["tool_calls"]
     assert messages[2] == {"role": "tool", "tool_call_id": "call-one", "content": "done"}
+
+
+def test_mixed_issuer_carriers_keep_the_newest_issuer_instead_of_refusing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two live rungs sealing turns of one tool loop pin the newest issuer.
+
+    Production 2026-10-07 18:09Z: ordinary failover served consecutive turns of
+    one Claude Code tool loop on two rungs that both seal carriers, and admission
+    refused the session with "active reasoning carriers name different issuing
+    rungs" (a 400 no client retry repairs). The newest carrier now pins the
+    route and the older issuer's turn is served without its preserved thinking.
+    """
+    from types import SimpleNamespace
+
+    from exp.runtime.gateway import native_reasoning
+
+    alpha = _pinned_route()
+    beta = alpha.model_copy(
+        update={
+            "deployment": alpha.fallback_deployments[0],
+            "fallback_deployments": (alpha.deployment,),
+            "reasoning_pinned_deployment_id": "beta",
+        }
+    )
+    routes = {"alpha": alpha, "beta": beta}
+    components = SimpleNamespace(
+        routes=SimpleNamespace(resolve_deployment_hint=lambda _auth, hint: routes[hint]),
+        runtime_catalogs=None,
+    )
+    monkeypatch.setattr(native_reasoning, "scheme_for_carrier", lambda _carrier: "scheme")
+    monkeypatch.setattr(
+        native_reasoning, "resolve_route_profiles", lambda _catalogs, _route: ((object(), None),)
+    )
+    monkeypatch.setattr(native_reasoning, "reasoning_carrier_authority", lambda **_: object())
+    monkeypatch.setattr(
+        native_reasoning,
+        "unseal_reasoning_content",
+        lambda carrier, *_args, **_kwargs: (
+            ExposedReasoningContentBlock(content=f"thinking from {carrier.deployment_hint}"),
+            None,
+        ),
+    )
+
+    def sealed_turn(hint: str, call_id: str) -> tuple[GatewayMessage, GatewayMessage]:
+        """One assistant tool turn sealed by ``hint`` and its tool result."""
+        call = ToolCall(call_id=call_id, name="lookup", arguments={}, raw_arguments="{}")
+        return (
+            GatewayMessage(
+                role="assistant",
+                content=None,
+                tool_calls=(call,),
+                provider_reasoning=(
+                    SealedReasoningContentBlock(
+                        carrier="x-experiential-hunyuan-reasoning-v1:opaque",
+                        deployment_hint=hint,
+                    ),
+                ),
+            ),
+            GatewayMessage(role="tool", content="done", tool_call_id=call_id),
+        )
+
+    request = GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=(
+            GatewayMessage(role="user", content="fix the bug"),
+            *sealed_turn("alpha", "call-one"),
+            *sealed_turn("beta", "call-two"),
+        ),
+    )
+    auth = alpha.snapshot.authorization
+    nc = cast("NativeGatewayComponents", components)
+
+    authenticated, pinned = authenticate_reasoning_history(nc, auth, request)
+    assert pinned is beta
+    assert authenticated.messages[1].provider_reasoning == ()
+    assert authenticated.messages[3].provider_reasoning == request.messages[3].provider_reasoning
+    assert (
+        "messages.reasoning_content->dropped(issuing_route_superseded)"
+        in authenticated.ignored_parameters
+    )
+
+    unsealed, pinned = unseal_reasoning_history(nc, auth, request)
+    assert pinned is beta
+    assert unsealed.messages[1].provider_reasoning == ()
+    assert unsealed.messages[3].provider_reasoning == (
+        ExposedReasoningContentBlock(content="thinking from beta"),
+    )

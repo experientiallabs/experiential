@@ -209,6 +209,11 @@ pub struct WaterfallContext<'a> {
     pub route: &'a [DeploymentWire],
     pub policy: RoutePolicy,
     pub deadline: Instant,
+    /// Absolute bound on everything before the caller's first byte, across
+    /// every attempt and failover (`None`: the request deadline alone). Kept
+    /// under the edge proxy's origin timeout so a chain of slow dials ends in
+    /// our own retryable error instead of the proxy's 504 page.
+    pub pre_first_byte_deadline: Option<Instant>,
     /// Fail-fast flat bound on the wait for each physical attempt's first
     /// provider byte. Applied per attempt (each redial and each failover
     /// advance gets a fresh window); it bounds the connect/header/first-byte
@@ -255,6 +260,21 @@ pub struct WaterfallContext<'a> {
     pub tool_search: Option<&'a ToolSearchAdmission>,
     /// Frozen output policy execution for preambles and terminal responses.
     pub output_guardrails: Option<super::OutputGuardrailContext<'a>>,
+}
+
+impl WaterfallContext<'_> {
+    /// The deadline that governs the pre-commit phase: the request deadline,
+    /// pulled in to the pre-first-byte budget when one is configured.
+    pub(crate) fn pre_commit_deadline(&self) -> Instant {
+        self.pre_first_byte_deadline
+            .map_or(self.deadline, |budget| budget.min(self.deadline))
+    }
+
+    /// Cap one attempt's first-byte or first-token instant at the budget.
+    pub(crate) fn capped(&self, at: Instant) -> Instant {
+        self.pre_first_byte_deadline
+            .map_or(at, |budget| at.min(budget))
+    }
 }
 
 /// The bound on one dial's open (request/response-header) phase: the
