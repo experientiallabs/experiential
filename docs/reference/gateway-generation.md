@@ -71,11 +71,26 @@ keeping the full tool list for prompt caching. Any other route declares only the
 functions under the plain mode (`auto` or `required`, which each wire maps to its own `auto`,
 `any` or `ANY`) and discloses `tool_choice->translated(allowed_tools_as_restricted_tools)`. A
 `required` set on a model that cannot force tools relaxes to `auto` under the forced-choice
-policy above, keeping the set. Chat lists only functions; Responses may also list the SDK's
-non-function entries (`mcp`, `custom`, `image_generation`), forwarded verbatim on native routes
+policy above, keeping the set. Chat lists functions and custom tools; Responses may also list the
+SDK's other non-function entries (`mcp`, `image_generation`), forwarded verbatim on native routes
 and matched to the declarations they name elsewhere. When nothing the set allows survives on a
 wire, the choice is cleared with `tool_choice->cleared(no_serviceable_tool)`. Gateway-run tool
 search narrows its corpus to the allowed set before the first round.
+
+OpenAI custom (freeform) tools are accepted on both surfaces: Chat
+`{"type": "custom", "custom": {"name", "description", "format"}}` and Responses
+`{"type": "custom", "name", "description", "format"}`, with a `text` or `grammar` (`lark` or
+`regex`) format, a custom `tool_choice` (Chat `{"type": "custom", "custom": {"name"}}`, Responses
+`{"type": "custom", "name"}`), and custom calls and results in history. A native Responses rung
+receives the declarations, the selector and the history verbatim and enforces the grammar, so
+admission prefers such a rung when a custom tool declares a grammar (free-text custom input
+translates losslessly and keeps the whole route). Any other route serves each custom tool as a function with one required
+string `input` (the grammar, when declared, is stated in that property's description because no
+other wire can enforce it), names that function for a custom `tool_choice`, and maps every call
+back to the caller's custom call shape, including streamed input deltas. It discloses
+`tools.custom->translated(custom_as_function_input)` and, with a grammar,
+`tools.custom.format->translated(grammar_as_instructions)`. A custom choice that names no declared
+custom tool is a 400 on `tool_choice.name` (Responses) or `tool_choice.custom.name` (Chat).
 
 An explicit effort cannot be coerced upward. If a route needs a supported spelling, only an
 admissible lower tier may be selected, with disclosure; a reasoning-capable route with no

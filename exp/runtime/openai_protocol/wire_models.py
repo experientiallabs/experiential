@@ -30,6 +30,12 @@ from exp.runtime.gateway.request_policy import GatewayRequestPolicy
 from exp.runtime.gateway.service_tiers import ServiceTier
 from exp.runtime.models.providers.openrouter_routing import ProviderRoutingPreferences
 from exp.runtime.openai_protocol.cache_control import EphemeralCacheControl
+from exp.runtime.openai_protocol.custom_tool_wire import ChatCustomTool, ChatCustomToolCall
+from exp.runtime.openai_protocol.custom_tool_wire import CustomToolCallItem as _CustomToolCall
+from exp.runtime.openai_protocol.custom_tool_wire import (
+    CustomToolCallOutputItem as _CustomToolCallOutput,
+)
+from exp.runtime.openai_protocol.custom_tool_wire import EchoedItemStatus as _EchoedItemStatus
 from exp.runtime.openai_protocol.native_tools import NativeResponseTool
 from exp.runtime.openai_protocol.reasoning_replay import ReasoningDetail
 from exp.runtime.openai_protocol.web_search import ChatPlugin, WebSearchOptions
@@ -39,10 +45,6 @@ class _WireModel(BaseModel):
     """Strict private OpenAI wire model used only after official shape validation."""
 
     model_config = ConfigDict(extra="forbid")
-
-
-_EchoedItemStatus = Literal["in_progress", "completed", "incomplete"]
-"""Lifecycle marker carried by echoed output items; validated and dropped."""
 
 
 class _TextPart(_WireModel):
@@ -294,7 +296,7 @@ class _Message(_WireModel):
 
     role: Literal["system", "developer", "user", "assistant", "tool"]
     content: str | tuple[_ContentPart, ...] | None = None
-    tool_calls: tuple[_AssistantToolCall, ...] | None = None
+    tool_calls: tuple[_AssistantToolCall | ChatCustomToolCall, ...] | None = None
     tool_call_id: str | None = Field(
         default=None, min_length=1, max_length=MAXIMUM_TOOL_CALL_ID_CHARACTERS
     )
@@ -337,7 +339,7 @@ class _Message(_WireModel):
         return () if self.content is None or isinstance(self.content, str) else self.content
 
     @property
-    def history_tool_calls(self) -> tuple[_AssistantToolCall, ...]:
+    def history_tool_calls(self) -> tuple[_AssistantToolCall | ChatCustomToolCall, ...]:
         """Return retained assistant tool calls, treating a null list as empty."""
         return self.tool_calls or ()
 
@@ -430,26 +432,28 @@ class _FunctionDefinition(_WireModel):
 
 
 class _ChatTool(_WireModel):
-    """Chat Completions function tool wrapper.
+    """Chat Completions function or custom tool wrapper.
 
     OpenRouter's ``openrouter:tool_search`` server tool rides the same array
     without a ``function`` body; ``defer_loading`` (OpenRouter's spelling of
     Anthropic's deferred-loading marker) makes a function tool searchable
-    instead of loaded up front.
+    instead of loaded up front. An OpenAI ``custom`` (freeform) tool carries
+    its own ``custom`` body instead.
     """
 
-    type: Literal["function", "openrouter:tool_search"] = "function"
+    type: Literal["function", "custom", "openrouter:tool_search"] = "function"
     function: _FunctionDefinition | None = None
+    custom: ChatCustomTool | None = None
     defer_loading: bool | None = None
     max_results: int | None = Field(default=None, ge=1, le=10)
 
     @model_validator(mode="after")
     def _require_function_body(self) -> _ChatTool:
-        """A function tool needs its body; a server tool must not carry one."""
-        if self.type == "function" and self.function is None:
-            raise ValueError("a function tool requires a function object")
-        if self.type != "function" and self.function is not None:
-            raise ValueError("a server tool cannot carry a function object")
+        """Each tool type carries exactly its own body; a server tool carries none."""
+        if (self.type == "function") != (self.function is not None):
+            raise ValueError("a function object is required exactly on a function tool")
+        if (self.type == "custom") != (self.custom is not None):
+            raise ValueError("a custom object is required exactly on a custom tool")
         return self
 
 
@@ -817,37 +821,6 @@ class _AdditionalToolsItem(_WireModel):
     id: str | None = Field(default=None, min_length=1, max_length=256)
     role: str | None = Field(default=None, max_length=64)
     tools: tuple[JsonValue, ...]
-
-
-class _CustomToolCall(_WireModel):
-    """One freeform (custom) tool call echoed as assistant history.
-
-    ``namespace`` attributes the call to its declaring nested tool tree and
-    forwards verbatim with the rest of the raw item (the whole item replays
-    byte-for-byte on native Responses rungs), mirroring the typed
-    ``function_call`` namespace round trip.
-    """
-
-    type: Literal["custom_tool_call"]
-    id: str | None = Field(default=None, min_length=1, max_length=256)
-    status: _EchoedItemStatus | None = None
-    call_id: str = Field(min_length=1, max_length=MAXIMUM_TOOL_CALL_ID_CHARACTERS)
-    name: str = Field(min_length=1, max_length=256)
-    namespace: str | None = Field(default=None, min_length=1, max_length=256)
-    caller: JsonObject | None = None
-    """Opaque SDK 3.0 programmatic tool-calling attribution, forwarded
-    verbatim with the rest of the raw item like ``namespace``."""
-    input: str = Field(max_length=4_000_000)
-
-
-class _CustomToolCallOutput(_WireModel):
-    """One freeform tool result echoed as tool history."""
-
-    type: Literal["custom_tool_call_output"]
-    id: str | None = Field(default=None, min_length=1, max_length=256)
-    status: _EchoedItemStatus | None = None
-    call_id: str = Field(min_length=1, max_length=MAXIMUM_TOOL_CALL_ID_CHARACTERS)
-    output: JsonValue
 
 
 HOSTED_TOOL_ITEM_TYPES_ASSISTANT = frozenset(

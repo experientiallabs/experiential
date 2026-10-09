@@ -9,7 +9,11 @@ from pydantic import JsonValue
 
 from exp.common.core.artifacts import JsonObject
 from exp.runtime.gateway.contracts import GatewayNamedToolChoice
-from exp.runtime.gateway.tool_contracts import GatewayAllowedToolsChoice, GatewayProviderNativeTool
+from exp.runtime.gateway.tool_contracts import (
+    GatewayAllowedToolsChoice,
+    GatewayCustomToolChoice,
+    GatewayProviderNativeTool,
+)
 from exp.runtime.openai_protocol.errors import OpenAIProtocolError
 from exp.runtime.openai_protocol.requests import decode_responses
 from exp.runtime.openai_protocol.tool_choice import (
@@ -207,3 +211,83 @@ def test_an_oversized_allowed_set_is_refused_before_decoding() -> None:
         responses_tool_choice({"type": "allowed_tools", "mode": "auto", "tools": tools})
 
     assert raised.value.detail.param == "tool_choice.tools"
+
+
+_CUSTOM_DECLARATION = GatewayProviderNativeTool(
+    index=0, tool={"type": "custom", "name": "code_exec"}
+)
+
+
+def test_responses_decodes_and_reflects_a_custom_tool_choice() -> None:
+    """``{"type": "custom", "name"}`` selects a declared custom tool and echoes verbatim."""
+    choice = responses_tool_choice(
+        {"type": "custom", "name": "code_exec"}, native_tools=(_CUSTOM_DECLARATION,)
+    )
+
+    assert choice == GatewayCustomToolChoice(type="custom", name="code_exec")
+    request = decode_responses(
+        {
+            "model": "gpt-5-nano",
+            "input": "hi",
+            "tools": [{"type": "custom", "name": "code_exec"}],
+            "tool_choice": {"type": "custom", "name": "code_exec"},
+        }
+    ).request
+    assert responses_tool_choice_echo(request) == {"type": "custom", "name": "code_exec"}
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        {"type": "custom", "name": "missing"},
+        {"type": "custom"},
+        {"type": "custom", "name": ""},
+    ],
+)
+def test_responses_custom_choice_must_name_a_declared_custom_tool(value: JsonObject) -> None:
+    """An undeclared or absent custom name is a 400 on ``tool_choice.name``."""
+    with pytest.raises(OpenAIProtocolError) as raised:
+        responses_tool_choice(value, native_tools=(_CUSTOM_DECLARATION,))
+
+    assert raised.value.detail.param == "tool_choice.name"
+
+
+def test_a_custom_choice_never_names_a_function() -> None:
+    """A function of the same name does not satisfy a custom selector."""
+    with pytest.raises(OpenAIProtocolError):
+        chat_tool_choice({"type": "custom", "custom": {"name": "lookup"}})
+
+
+def test_chat_allowed_tools_accepts_custom_entries_in_the_flat_spelling() -> None:
+    """Chat's nested custom entry is carried as the canonical flat entry and must be declared."""
+    choice = chat_tool_choice(
+        {
+            "type": "allowed_tools",
+            "allowed_tools": {
+                "mode": "required",
+                "tools": [
+                    {"type": "function", "function": {"name": "lookup"}},
+                    {"type": "custom", "custom": {"name": "code_exec"}},
+                ],
+            },
+        },
+        native_tools=(_CUSTOM_DECLARATION,),
+    )
+
+    assert choice == GatewayAllowedToolsChoice(
+        mode="required",
+        names=("lookup",),
+        provider_entries=({"type": "custom", "name": "code_exec"},),
+    )
+    with pytest.raises(OpenAIProtocolError) as raised:
+        chat_tool_choice(
+            {
+                "type": "allowed_tools",
+                "allowed_tools": {
+                    "mode": "auto",
+                    "tools": [{"type": "custom", "custom": {"name": "missing"}}],
+                },
+            },
+            native_tools=(_CUSTOM_DECLARATION,),
+        )
+    assert raised.value.detail.param == "tool_choice.allowed_tools.tools"

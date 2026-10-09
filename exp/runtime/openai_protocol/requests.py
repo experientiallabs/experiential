@@ -37,6 +37,17 @@ from exp.runtime.openai_protocol.cache_control import (
     drop_opencode_cache_control,
     restore_chat_cache_control,
 )
+from exp.runtime.openai_protocol.custom_tool_wire import (
+    ChatCustomToolCall,
+    CustomToolCallItem,
+    CustomToolCallOutputItem,
+)
+from exp.runtime.openai_protocol.custom_tools import (
+    chat_custom_call_messages,
+    chat_custom_declaration,
+    chat_custom_output_message,
+    expand_chat_custom_calls,
+)
 from exp.runtime.openai_protocol.enable_thinking import translate_enable_thinking
 from exp.runtime.openai_protocol.errors import invalid_field, unsupported_field
 from exp.runtime.openai_protocol.manifest import (
@@ -86,8 +97,6 @@ from exp.runtime.openai_protocol.wire_models import (
     _AssistantToolCall,
     _ChatRequest,
     _ChatTool,
-    _CustomToolCall,
-    _CustomToolCallOutput,
     _FunctionCall,
     _HostedToolItemEcho,
     _Message,
@@ -285,13 +294,19 @@ def decode_chat(
     thinking = translate_enable_thinking(request)
     raw_chat_tools = payload.get("tools")
     chat_native_tools = tuple(
-        GatewayProviderNativeTool(index=index, tool=cast("JsonObject", raw_chat_tools[index]))
+        GatewayProviderNativeTool(
+            index=index,
+            tool=chat_custom_declaration(tool.custom)
+            if tool.custom is not None
+            else cast("JsonObject", raw_chat_tools[index]),
+        )
         for index, tool in enumerate(request.tools)
         if tool.type != "function" and isinstance(raw_chat_tools, list)
     )
     messages, cache_disclosures = restore_chat_cache_control(
         _messages(request.messages, "messages"), cache_payload
     )
+    messages = expand_chat_custom_calls(request.messages, messages)
     try:
         canonical = GatewayRequest(
             surface=GatewayApiSurface.CHAT_COMPLETIONS,
@@ -299,7 +314,7 @@ def decode_chat(
             tools=tuple(_chat_tool(tool) for tool in request.tools if tool.type == "function"),
             provider_native_tools=chat_native_tools,
             tool_search=chat_tool_search(chat_native_tools),
-            tool_choice=chat_tool_choice(request.tool_choice),
+            tool_choice=chat_tool_choice(request.tool_choice, native_tools=chat_native_tools),
             parallel_tool_calls=request.parallel_tool_calls,
             structured_text=chat_structured_text(request.response_format),
             json_object_output=chat_json_object_output(request.response_format),
@@ -630,11 +645,17 @@ def _validated_operation_headers(
 def _messages(messages: tuple[_Message, ...], prefix: str) -> tuple[GatewayMessage, ...]:
     """Convert ordered wire messages while retaining raw assistant arguments."""
     converted: list[GatewayMessage] = []
+    custom_call_ids: set[str] = set()
     for message_index, message in enumerate(messages):
         calls = tuple(
             _tool_call(call, f"{prefix}.{message_index}.tool_calls.{call_index}.function.arguments")
             for call_index, call in enumerate(message.history_tool_calls)
+            if not isinstance(call, ChatCustomToolCall)
         )
+        custom_calls = tuple(
+            call for call in message.history_tool_calls if isinstance(call, ChatCustomToolCall)
+        )
+        custom_call_ids.update(call.id for call in custom_calls)
         provider_reasoning: tuple[
             SealedReasoningContentBlock | ExposedReasoningContentBlock, ...
         ] = ()
@@ -690,6 +711,12 @@ def _messages(messages: tuple[_Message, ...], prefix: str) -> tuple[GatewayMessa
         content, content_parts = message_content(
             message.content, f"{prefix}.{message_index}.content"
         )
+        if custom_calls and content is None and not calls and not provider_reasoning:
+            # A turn of custom calls alone starts with its first native history
+            # item; ``expand_chat_custom_calls`` appends the rest after cache
+            # restoration, which maps wire messages one to one.
+            converted.append(chat_custom_call_messages(custom_calls[:1])[0])
+            continue
         converted.append(
             GatewayMessage(
                 role=message.role,
@@ -704,6 +731,10 @@ def _messages(messages: tuple[_Message, ...], prefix: str) -> tuple[GatewayMessa
                 provider_specific_fields=message.provider_specific_fields or None,
             )
         )
+        if message.role == "tool" and message.tool_call_id in custom_call_ids:
+            converted[-1] = chat_custom_output_message(
+                converted[-1], f"{prefix}.{message_index}.content"
+            )
     return tuple(converted)
 
 
@@ -817,15 +848,20 @@ def _response_input_messages(
     for index, item in enumerate(value):
         if isinstance(
             item,
-            (_AdditionalToolsItem, _CustomToolCall, _CustomToolCallOutput, _HostedToolItemEcho),
+            (
+                _AdditionalToolsItem,
+                CustomToolCallItem,
+                CustomToolCallOutputItem,
+                _HostedToolItemEcho,
+            ),
         ):
             # The raw caller item, not the re-serialized wire model, so the
             # native rung receives the item byte-for-byte.
             if isinstance(item, _HostedToolItemEcho):
                 native_role = "tool" if item.type in HOSTED_TOOL_ITEM_TYPES_TOOL else "assistant"
-            elif isinstance(item, _CustomToolCall):
+            elif isinstance(item, CustomToolCallItem):
                 native_role = "assistant"
-            elif isinstance(item, _CustomToolCallOutput):
+            elif isinstance(item, CustomToolCallOutputItem):
                 native_role = "tool"
             else:
                 native_role = "developer"

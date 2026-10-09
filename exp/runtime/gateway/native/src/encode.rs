@@ -1,7 +1,7 @@
 //! Public Chat Completions encoding, the Rust mirror of `ChatSseEncoder` and
 //! the chat branch of `completed_body`.
 
-use std::collections::{hash_map::Entry, HashMap};
+use std::collections::{hash_map::Entry, HashMap, HashSet};
 
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -180,6 +180,9 @@ pub struct ChatSseEncoder {
     terminal: bool,
     tool_indices: HashMap<u32, (String, String)>,
     tool_arguments: HashMap<u32, String>,
+    /// Indexes of custom (freeform) tool calls, rendered in OpenAI's Chat
+    /// `{"type": "custom", "custom": {"name", "input"}}` shape.
+    custom_tools: HashSet<u32>,
     usage: Option<Usage>,
     reasoning: ReasoningCarrierState,
     reasoning_content_carrier: Option<String>,
@@ -211,6 +214,7 @@ impl ChatSseEncoder {
             terminal: false,
             tool_indices: HashMap::new(),
             tool_arguments: HashMap::new(),
+            custom_tools: HashSet::new(),
             usage: None,
             reasoning: ReasoningCarrierState::default(),
             reasoning_content_carrier: None,
@@ -375,6 +379,7 @@ impl ChatSseEncoder {
                 index,
                 call_id,
                 name,
+                custom,
                 ..
             } => {
                 if self.tool_indices.contains_key(index) {
@@ -385,43 +390,40 @@ impl ChatSseEncoder {
                 self.tool_indices
                     .insert(*index, (call_id.clone(), name.clone()));
                 self.tool_arguments.insert(*index, String::new());
-                Ok(vec![self.chunk(
+                let call = if *custom {
+                    self.custom_tools.insert(*index);
                     json!({
-                        "tool_calls": [
-                            {
-                                "index": index,
-                                "id": call_id,
-                                "type": "function",
-                                "function": {"name": name, "arguments": ""},
-                            }
-                        ]
-                    }),
-                    None,
-                )])
+                        "index": index,
+                        "id": call_id,
+                        "type": "custom",
+                        "custom": {"name": name, "input": ""},
+                    })
+                } else {
+                    json!({
+                        "index": index,
+                        "id": call_id,
+                        "type": "function",
+                        "function": {"name": name, "arguments": ""},
+                    })
+                };
+                Ok(vec![self.chunk(json!({ "tool_calls": [call] }), None)])
             }
             Event::ToolArgumentsDelta { index, delta } => {
                 let accumulated = self.tool_arguments.get_mut(index).ok_or_else(|| {
                     invalid_provider_stream("Chat tool arguments arrived before tool-call start.")
                 })?;
                 accumulated.push_str(delta);
-                Ok(vec![self.chunk(
-                    json!({
-                        "tool_calls": [
-                            {
-                                "index": index,
-                                "function": {"arguments": delta},
-                            }
-                        ]
-                    }),
-                    None,
-                )])
+                let call = if self.custom_tools.contains(index) {
+                    json!({"index": index, "custom": {"input": delta}})
+                } else {
+                    json!({"index": index, "function": {"arguments": delta}})
+                };
+                Ok(vec![self.chunk(json!({ "tool_calls": [call] }), None)])
             }
             Event::ToolCallCompleted { index, call } => {
-                if call.custom {
-                    // Custom tools only enter through a Responses request,
-                    // which never encodes on the Chat surface.
+                if call.custom != self.custom_tools.contains(index) {
                     return Err(invalid_provider_stream(
-                        "Chat cannot represent a custom tool call.",
+                        "Chat tool completion changed its custom tool kind.",
                     ));
                 }
                 let identity = self.tool_indices.get(index).ok_or_else(|| {
@@ -721,6 +723,11 @@ pub fn completed_chat_body_with_carrier(
     let tool_calls: Vec<Value> = events
         .iter()
         .filter_map(|event| match event {
+            Event::ToolCallCompleted { call, .. } if call.custom => Some(json!({
+                "id": call.call_id,
+                "type": "custom",
+                "custom": {"name": call.name, "input": call.raw_arguments},
+            })),
             Event::ToolCallCompleted { call, .. } => Some(json!({
                 "id": call.call_id,
                 "type": "function",

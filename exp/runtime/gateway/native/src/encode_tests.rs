@@ -528,3 +528,138 @@ fn chat_aggregate_gains_annotations_and_the_usage_meter_only_when_searched() {
     assert!(!plain.contains("annotations"));
     assert!(!plain.contains("server_tool_use_details"));
 }
+
+fn custom_tool_events(custom: bool, name: &str, deltas: &[&str], raw: &str) -> Vec<Event> {
+    let mut events = vec![Event::ToolCallStarted {
+        custom,
+        namespace: None,
+        caller: None,
+        index: 0,
+        call_id: "call-custom".to_string(),
+        name: name.to_string(),
+    }];
+    events.extend(deltas.iter().map(|delta| Event::ToolArgumentsDelta {
+        index: 0,
+        delta: (*delta).to_string(),
+    }));
+    events.push(Event::ToolCallCompleted {
+        index: 0,
+        call: crate::events::CompletedToolCall {
+            namespace: None,
+            caller: None,
+            call_id: "call-custom".to_string(),
+            name: name.to_string(),
+            raw_arguments: raw.to_string(),
+            provider_item_id: None,
+            provider_status: None,
+            custom,
+        },
+    });
+    events.push(Event::Completed);
+    events
+}
+
+fn chat_stream_payloads(events: &[Event]) -> Vec<Value> {
+    let mut encoder =
+        ChatSseEncoder::new_with_ignored("request-1", "coding", 1_700_000_000, false, Vec::new());
+    let mut frames = encoder.start().expect("starts");
+    for event in events {
+        frames.extend(encoder.feed(event).expect("encodes"));
+    }
+    frames
+        .iter()
+        .filter(|frame| frame.starts_with("data: {"))
+        .map(|frame| chat_payload(frame))
+        .collect()
+}
+
+#[test]
+fn chat_stream_renders_a_custom_tool_call_in_openais_chat_shape() {
+    // Captured from api.openai.com Chat Completions (gpt-5-nano, 2026-10-09):
+    // the start carries `type: custom` with an empty input, each delta
+    // carries only `custom.input`, and the turn finishes with `tool_calls`.
+    let events = custom_tool_events(true, "code_exec", &["print", "(2+2)"], "print(2+2)");
+    let payloads = chat_stream_payloads(&events);
+    let calls: Vec<&Value> = payloads
+        .iter()
+        .filter_map(|payload| payload["choices"][0]["delta"].get("tool_calls"))
+        .collect();
+    assert_eq!(
+        calls,
+        vec![
+            &json!([{"index": 0, "id": "call-custom", "type": "custom",
+                     "custom": {"name": "code_exec", "input": ""}}]),
+            &json!([{"index": 0, "custom": {"input": "print"}}]),
+            &json!([{"index": 0, "custom": {"input": "(2+2)"}}]),
+        ]
+    );
+    let finish = payloads
+        .iter()
+        .find_map(|payload| payload["choices"][0]["finish_reason"].as_str())
+        .expect("finish chunk");
+    assert_eq!(finish, "tool_calls");
+}
+
+#[test]
+fn chat_stream_refuses_a_completion_that_changes_the_custom_kind() {
+    let mut events = custom_tool_events(false, "code_exec", &["{}"], "{}");
+    if let Event::ToolCallCompleted { call, .. } = &mut events[2] {
+        call.custom = true;
+    }
+    let mut encoder =
+        ChatSseEncoder::new_with_ignored("request-1", "coding", 1_700_000_000, false, Vec::new());
+    encoder.start().expect("starts");
+    encoder.feed(&events[0]).expect("start encodes");
+    encoder.feed(&events[1]).expect("delta encodes");
+    assert!(encoder.feed(&events[2]).is_err());
+}
+
+#[test]
+fn chat_aggregate_renders_a_custom_tool_call_in_openais_chat_shape() {
+    let events = custom_tool_events(true, "code_exec", &["print(2+2)\n"], "print(2+2)\n");
+    let completed =
+        completed_chat_body_with_ignored("request-1", "coding", 1_700_000_000, &events, &[], false)
+            .expect("completed body must encode");
+    let choice = &completed.body["choices"][0];
+    assert_eq!(
+        choice["message"]["tool_calls"],
+        json!([{"id": "call-custom", "type": "custom",
+                "custom": {"name": "code_exec", "input": "print(2+2)\n"}}])
+    );
+    assert_eq!(choice["finish_reason"], json!("tool_calls"));
+}
+
+#[test]
+fn chat_stream_unwraps_a_translated_custom_call_for_a_chat_caller() {
+    // A foreign wire served the custom tool as a function with one `input`
+    // string; the inverter restores the custom call and the Chat encoder
+    // emits the caller's custom shape with the whole freeform input at once.
+    let mut inverter = crate::codex_native_inversion::NativeToolInverter::default();
+    inverter.translation = std::collections::HashMap::from([(
+        "code_exec".to_string(),
+        ("code_exec".to_string(), None, true),
+    )]);
+    let provider = custom_tool_events(
+        false,
+        "code_exec",
+        &["{\"input\":\"print(", "2+2)\"}"],
+        "{\"input\":\"print(2+2)\"}",
+    );
+    let mut inverted = Vec::new();
+    for event in provider {
+        inverted.extend(inverter.filter(event).expect("inverts"));
+    }
+    let payloads = chat_stream_payloads(&inverted);
+    let calls: Vec<&Value> = payloads
+        .iter()
+        .filter_map(|payload| payload["choices"][0]["delta"].get("tool_calls"))
+        .collect();
+    assert_eq!(
+        calls,
+        vec![
+            &json!([{"index": 0, "id": "call-custom", "type": "custom",
+                     "custom": {"name": "code_exec", "input": ""}}]),
+            &json!([{"index": 0, "custom": {"input": "print(2+2)"}}]),
+        ]
+    );
+}

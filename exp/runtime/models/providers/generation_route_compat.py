@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 
 from exp.runtime.gateway.contracts import GatewayRequest
 from exp.runtime.models.providers.base import GatewayWireProfile
+from exp.runtime.models.providers.codex_tools import custom_grammar
 from exp.runtime.models.providers.errors import ProviderParameterError
 from exp.runtime.models.providers.generation_parameter_validation import serves_reasoning_summary
 from exp.runtime.models.providers.streaming_requests import route_generation_parameter_requests
@@ -37,12 +38,26 @@ def compatible_generation_parameter_profile_indexes(
     """
     if not profiles:
         raise ValueError("generation parameter selection requires at least one wire profile")
+    # A feature some rungs would degrade makes its carrying rungs outrank the
+    # rest, before any other preference: the route's one shaped request
+    # degrades it on every rung of a mixed route. A reasoning summary is
+    # dropped there; a custom tool's grammar is no longer enforced (a custom
+    # tool without one translates losslessly, so it keeps the whole route and
+    # its fallbacks). Rungs carrying both come first.
+    preferences: list[Callable[[GatewayWireProfile], bool]] = []
     if request.reasoning_summary is not None:
-        # A summary is best effort, but a rung that carries it outranks every
-        # rung that would serve by dropping it, before any other preference:
-        # the route's one shaped request drops the summary on a mixed route.
+        preferences.append(serves_reasoning_summary)
+    if any(
+        entry.tool.get("type") == "custom" and custom_grammar(entry.tool) is not None
+        for entry in request.provider_native_tools
+    ):
+        preferences.append(_enforces_custom_grammar)
+    attempts = [preferences, *([wanted] for wanted in preferences)] if preferences else []
+    for kept in attempts:
         carrying = tuple(
-            index for index, profile in enumerate(profiles) if serves_reasoning_summary(profile)
+            index
+            for index, profile in enumerate(profiles)
+            if all(serves(profile) for serves in kept)
         )
         if carrying:
             try:
@@ -50,10 +65,14 @@ def compatible_generation_parameter_profile_indexes(
                     tuple(profiles[index] for index in carrying), request
                 )
             except ProviderParameterError:
-                pass
-            else:
-                return tuple(carrying[index] for index in ranked)
+                continue
+            return tuple(carrying[index] for index in ranked)
     return _ranked_profile_indexes(profiles, request)
+
+
+def _enforces_custom_grammar(profile: GatewayWireProfile) -> bool:
+    """Whether a rung forwards custom tools natively, so the provider enforces the grammar."""
+    return profile.dialect == "openai_responses"
 
 
 def _ranked_profile_indexes(

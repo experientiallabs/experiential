@@ -18,7 +18,7 @@ from exp.runtime.gateway.contracts import (
     GatewayRequest,
     GatewayUsage,
 )
-from exp.runtime.gateway.tool_contracts import GatewayAllowedToolsChoice
+from exp.runtime.gateway.tool_contracts import GatewayAllowedToolsChoice, GatewayCustomToolChoice
 from exp.runtime.models.providers.allowed_tools import restrict_to_allowed_tools
 
 
@@ -74,6 +74,10 @@ def model_request(request: GatewayRequest) -> ModelRequest:
         choice = ToolChoice(name=choice.name)
     elif isinstance(choice, GatewayAllowedToolsChoice):
         choice = choice.mode
+    elif isinstance(choice, GatewayCustomToolChoice):
+        # Custom tools exist only as native declarations, which this contract
+        # cannot carry; route shaping names their translated functions first.
+        raise ValueError("custom-tool selectors must be translated before model projection")
     return ModelRequest(
         messages=tuple(messages),
         tools=tools,

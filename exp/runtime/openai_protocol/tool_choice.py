@@ -12,10 +12,12 @@ from exp.common.core.artifacts import JsonObject
 from exp.runtime.gateway.contracts import GatewayNamedToolChoice, GatewayRequest
 from exp.runtime.gateway.tool_contracts import (
     GatewayAllowedToolsChoice,
+    GatewayCustomToolChoice,
     GatewayProviderNativeTool,
     GatewayToolChoice,
 )
 from exp.runtime.models.providers.allowed_tools import entry_names_declaration
+from exp.runtime.openai_protocol.custom_tools import custom_tool_names
 from exp.runtime.openai_protocol.errors import invalid_field
 
 _MODES = {"auto", "none", "required"}
@@ -24,11 +26,15 @@ MAXIMUM_ALLOWED_TOOLS = 128
 """OpenAI's own ceiling on declared tools, so a longer allowed set names nothing more."""
 
 
-def chat_tool_choice(value: JsonValue) -> GatewayToolChoice:
-    """Normalize Chat tool-choice strings, named functions and allowed-tools sets.
+def chat_tool_choice(
+    value: JsonValue, *, native_tools: Sequence[GatewayProviderNativeTool] = ()
+) -> GatewayToolChoice:
+    """Normalize Chat tool-choice strings, named functions or custom tools, and allowed sets.
 
     Args:
         value: Raw caller ``tool_choice``.
+        native_tools: The request's non-function declarations (custom tools in
+            their canonical flat form); a custom choice must name one of them.
 
     Returns:
         The canonical tool choice.
@@ -46,6 +52,9 @@ def chat_tool_choice(value: JsonValue) -> GatewayToolChoice:
             name = function.get("name")
             if isinstance(name, str):
                 return GatewayNamedToolChoice(name=name)
+        custom = value.get("custom")
+        if value.get("type") == "custom" and isinstance(custom, dict):
+            return _custom_choice(custom.get("name"), native_tools, "tool_choice.custom.name")
         if value.get("type") == "allowed_tools":
             allowed = value.get("allowed_tools")
             if not isinstance(allowed, dict):
@@ -54,12 +63,14 @@ def chat_tool_choice(value: JsonValue) -> GatewayToolChoice:
                     "Invalid value for 'tool_choice.allowed_tools': expected an object "
                     "with 'mode' and 'tools'.",
                 )
-            return _allowed_tools(
+            choice = _allowed_tools(
                 allowed.get("mode"),
                 allowed.get("tools"),
                 param="tool_choice.allowed_tools",
                 chat=True,
             )
+            _require_declared_entries(choice, native_tools, "tool_choice.allowed_tools.tools")
+            return choice
     raise invalid_field("tool_choice")
 
 
@@ -87,18 +98,50 @@ def responses_tool_choice(
         name = value.get("name")
         if isinstance(name, str):
             return GatewayNamedToolChoice(name=name)
+    if isinstance(value, dict) and value.get("type") == "custom":
+        return _custom_choice(value.get("name"), native_tools, "tool_choice.name")
     if isinstance(value, dict) and value.get("type") == "allowed_tools":
         mode, tools = value.get("mode"), value.get("tools")
         choice = _allowed_tools(mode, tools, param="tool_choice", chat=False)
-        for entry in choice.provider_entries:
-            if not any(entry_names_declaration(tool.tool, entry) for tool in native_tools):
-                raise invalid_field(
-                    "tool_choice.tools",
-                    f"Invalid value for 'tool_choice.tools': the allowed {entry.get('type')!r} "
-                    "tool does not match any tool in 'tools'.",
-                )
+        _require_declared_entries(choice, native_tools, "tool_choice.tools")
         return choice
     raise invalid_field("tool_choice")
+
+
+def _custom_choice(
+    name: JsonValue, native_tools: Sequence[GatewayProviderNativeTool], param: str
+) -> GatewayCustomToolChoice:
+    """Decode a custom-tool choice that must name a declared custom tool.
+
+    Raises:
+        OpenAIProtocolError: The name is missing or names no declared custom tool.
+    """
+    if not isinstance(name, str) or not name:
+        raise invalid_field(param, f"Invalid value for '{param}': expected a custom tool name.")
+    if name not in custom_tool_names(native_tools):
+        raise invalid_field(
+            param,
+            f"Invalid value for '{param}': the custom tool {name!r} is not declared in 'tools'. "
+            "Declare it as {'type': 'custom', ...} or name a declared custom tool.",
+        )
+    return GatewayCustomToolChoice(type="custom", name=name)
+
+
+def _require_declared_entries(
+    choice: GatewayAllowedToolsChoice, native_tools: Sequence[GatewayProviderNativeTool], param: str
+) -> None:
+    """Refuse an allowed non-function entry that names no declared native tool.
+
+    Raises:
+        OpenAIProtocolError: An entry matches no declaration.
+    """
+    for entry in choice.provider_entries:
+        if not any(entry_names_declaration(tool.tool, entry) for tool in native_tools):
+            raise invalid_field(
+                param,
+                f"Invalid value for '{param}': the allowed {entry.get('type')!r} "
+                "tool does not match any tool in 'tools'.",
+            )
 
 
 def _allowed_tools(
@@ -106,9 +149,11 @@ def _allowed_tools(
 ) -> GatewayAllowedToolsChoice:
     """Decode one allowed-tools body: its mode, function names and native entries.
 
-    Chat allows only functions. Responses also allows the official SDK's
-    non-function entries (``mcp``, ``custom``, ``image_generation``...), carried
-    verbatim for the provider that owns their schema.
+    Chat allows functions and custom tools; a Chat custom entry
+    (``{"type": "custom", "custom": {"name": ...}}``) is carried in the flat
+    canonical spelling. Responses also allows the official SDK's other
+    non-function entries (``mcp``, ``image_generation``...), carried verbatim
+    for the provider that owns their schema.
     """
     if not isinstance(mode, str) or mode not in _ALLOWED_MODES:
         raise invalid_field(
@@ -126,7 +171,21 @@ def _allowed_tools(
     provider_entries: list[JsonObject] = []
     for index, entry in enumerate(tools):
         path = f"{param}.tools[{index}]"
-        if not chat and isinstance(entry, dict) and _native_entry(entry):
+        if chat and isinstance(entry, dict) and entry.get("type") == "custom":
+            custom = entry.get("custom")
+            name = custom.get("name") if isinstance(custom, dict) else None
+            if not isinstance(name, str) or not name:
+                raise invalid_field(
+                    path,
+                    f"Invalid value for '{path}': expected a custom tool "
+                    "({'type': 'custom', 'custom': {'name': ...}}).",
+                )
+            entry = {"type": "custom", "name": name}
+        if (
+            isinstance(entry, dict)
+            and (not chat or entry.get("type") == "custom")
+            and _native_entry(entry)
+        ):
             key = json.dumps(entry, sort_keys=True)
             if key in seen:
                 raise invalid_field(
@@ -191,4 +250,6 @@ def responses_tool_choice_echo(request: GatewayRequest) -> JsonObject | str:
                 *choice.provider_entries,
             ],
         }
+    if isinstance(choice, GatewayCustomToolChoice):
+        return {"type": "custom", "name": choice.name}
     return {"type": "function", "name": choice.name}

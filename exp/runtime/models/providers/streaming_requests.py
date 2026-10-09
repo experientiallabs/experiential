@@ -11,7 +11,6 @@ from exp.runtime.gateway.contracts import (
     GatewayNamedToolChoice,
     GatewayRequest,
 )
-from exp.runtime.gateway.tool_contracts import GatewayAllowedToolsChoice
 from exp.runtime.gateway.tool_search.contracts import gateway_tool_search_name
 from exp.runtime.models.providers.allowed_tools import (
     ALLOWED_TOOLS_CLEARED,
@@ -22,6 +21,7 @@ from exp.runtime.models.providers.allowed_tools import (
 from exp.runtime.models.providers.codex_tools import (
     convert_native_history,
     translate_native_tools,
+    translated_tool_choice,
 )
 from exp.runtime.models.providers.dialect_dispatch import (
     CACHE_CONTROL_NOT_FORWARDED_SUFFIX,
@@ -793,6 +793,9 @@ def route_generation_parameter_requests(
         if request.provider_native_tools:
             provider_updates["tools"] = translation.tools
             provider_updates["provider_native_tools"] = ()
+            provider_updates["tool_choice"] = translated_tool_choice(
+                request.tool_choice, native_mapping
+            )
             for disclosure in translation.disclosures:
                 if disclosure not in ignored:
                     ignored.append(disclosure)
@@ -903,7 +906,7 @@ def route_generation_parameter_requests(
         str(entry["name"]) for entry in request.provider_server_tools if "name" in entry
     )
     if not request.tools and not request.provider_server_tools:
-        if request.tool_choice == "required" or isinstance(
+        if (request.tool_choice == "required" and not request.provider_native_tools) or isinstance(
             request.tool_choice, GatewayNamedToolChoice
         ):
             raise ProviderParameterError(
@@ -914,14 +917,16 @@ def route_generation_parameter_requests(
                 param="tool_choice",
                 code="invalid_parameter",
             )
-        if request.tool_choice is not None and not (
-            isinstance(request.tool_choice, GatewayAllowedToolsChoice)
-            and request.provider_native_tools
-        ):
-            # An allowed set over native-only declarations still selects among
-            # them; restriction below (or the native wire) owns it.
+        # Native-only declarations are tool definitions too, while any survive
+        # on this route verbatim or translated: the selector (an allowed set,
+        # a custom choice, a plain mode) still selects among them.
+        native_served = bool(
+            provider_updates.get("provider_native_tools", request.provider_native_tools)
+            or provider_updates.get("tools")
+        )
+        if request.tool_choice is not None and not native_served:
             ignore("tool_choice")
-        if request.parallel_tool_calls is not None:
+        if request.parallel_tool_calls is not None and not native_served:
             ignore("parallel_tool_calls")
     elif (
         isinstance(request.tool_choice, GatewayNamedToolChoice)

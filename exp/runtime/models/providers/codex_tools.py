@@ -5,8 +5,8 @@ Codex CLI (0.151+) declares its tools on the Responses ``tools`` array using
 shapes that only a native OpenAI Responses route serves verbatim: ``custom``
 (freeform-grammar tools such as ``apply_patch``), ``namespace`` (a nested tool
 tree), and the hosted ``web_search`` / ``tool_search`` tools. Decode carries
-each as a :class:`GatewayProviderNativeTool` and, historically, a non-native
-route (Chat Completions / Anthropic Messages) rejected the request outright.
+each as a :class:`GatewayProviderNativeTool`; a Chat caller's ``custom`` tools
+arrive in the same flat form (see :mod:`exp.runtime.openai_protocol.custom_tools`).
 
 This module makes those requests SERVABLE on a foreign wire by translating the
 declarations into ordinary function tools the provider understands:
@@ -15,7 +15,9 @@ declarations into ordinary function tools the provider understands:
   tool with a mangled name (``"{namespace}__{name}"``);
 * a ``custom`` tool becomes a function tool with a single required ``input``
   string property (the freeform grammar cannot be enforced off the native
-  wire, so the model supplies the raw text through ``input``);
+  wire, so the model supplies the raw text through ``input`` and a declared
+  grammar is stated in that property's description), disclosed as
+  :data:`CUSTOM_TOOL_DISCLOSURE` and, with a grammar, :data:`CUSTOM_GRAMMAR_DISCLOSURE`;
 * the hosted ``web_search`` / ``tool_search`` tools have no non-native
   representation and are dropped with disclosure (mirroring the Anthropic
   server-tool drop).
@@ -24,7 +26,8 @@ A translation :class:`NativeToolMapping` rides on the provider request only
 (never the canonical/public request, so replay identity does not drift) and is
 inverted on the response path so the caller sees the tool-call shape it
 declared: a hoisted namespaced call regains its ``namespace``, and a custom
-tool's call is re-emitted as a ``custom_tool_call`` with its freeform ``input``.
+tool's call is re-emitted as a custom tool call (a Responses ``custom_tool_call``
+or a Chat ``type: "custom"`` call) with its freeform ``input``.
 """
 
 from __future__ import annotations
@@ -34,7 +37,12 @@ from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
 from exp.common.models import ToolCall
-from exp.runtime.gateway.contracts import GatewayMessage, GatewayToolDefinition
+from exp.runtime.gateway.contracts import (
+    GatewayMessage,
+    GatewayNamedToolChoice,
+    GatewayToolDefinition,
+)
+from exp.runtime.gateway.tool_contracts import GatewayCustomToolChoice, GatewayToolChoice
 from exp.runtime.gateway.tool_search.contracts import GATEWAY_TOOL_SEARCH_NAME
 from exp.runtime.models.providers.errors import ProviderParameterError
 
@@ -48,10 +56,17 @@ _HOSTED_TOOL_TYPES = frozenset({"web_search", "tool_search"})
 can run them, so they drop with disclosure."""
 
 
+CUSTOM_TOOL_DISCLOSURE = "tools.custom->translated(custom_as_function_input)"
+"""A custom tool served as a function with one string ``input``; calls map back."""
+
+CUSTOM_GRAMMAR_DISCLOSURE = "tools.custom.format->translated(grammar_as_instructions)"
+"""A custom tool's grammar is shown to the model as instructions, not enforced."""
+
+
 class TranslatedTool:
     """One translated native tool with the inverse metadata for the response."""
 
-    __slots__ = ("definition", "origin_name", "origin_namespace", "is_custom")
+    __slots__ = ("definition", "origin_name", "origin_namespace", "is_custom", "has_grammar")
 
     def __init__(
         self,
@@ -60,11 +75,13 @@ class TranslatedTool:
         origin_name: str,
         origin_namespace: str | None,
         is_custom: bool,
+        has_grammar: bool = False,
     ) -> None:
         self.definition = definition
         self.origin_name = origin_name
         self.origin_namespace = origin_namespace
         self.is_custom = is_custom
+        self.has_grammar = has_grammar
 
 
 class NativeToolMapping:
@@ -160,16 +177,31 @@ class NativeToolTranslation:
 _CUSTOM_INPUT_PROPERTY = "input"
 
 
-def _custom_parameters() -> JsonObject:
-    """The JSON Schema a freeform custom tool is presented as on a foreign wire."""
+def custom_grammar(raw: JsonObject) -> tuple[str, str] | None:
+    """Return a custom declaration's ``(syntax, definition)`` grammar, if it has one."""
+    tool_format = raw.get("format")
+    if not isinstance(tool_format, dict) or tool_format.get("type") != "grammar":
+        return None
+    syntax, definition = tool_format.get("syntax"), tool_format.get("definition")
+    if not isinstance(syntax, str) or not isinstance(definition, str) or not definition:
+        return None
+    return syntax, definition
+
+
+def _custom_parameters(grammar: tuple[str, str] | None) -> JsonObject:
+    """The JSON Schema a freeform custom tool is presented as on a foreign wire.
+
+    No foreign wire can constrain a string to a grammar, so the grammar the
+    caller declared is stated in the ``input`` description instead; the
+    model sees the same contract the native wire would enforce.
+    """
+    description = "The raw tool input (this tool was declared as a freeform tool)."
+    if grammar is not None:
+        syntax, definition = grammar
+        description += f" The input must match this {syntax} grammar:\n{definition}"
     return {
         "type": "object",
-        "properties": {
-            _CUSTOM_INPUT_PROPERTY: {
-                "type": "string",
-                "description": "The raw tool input (this tool was declared as a freeform tool).",
-            }
-        },
+        "properties": {_CUSTOM_INPUT_PROPERTY: {"type": "string", "description": description}},
         "required": [_CUSTOM_INPUT_PROPERTY],
         "additionalProperties": False,
     }
@@ -232,10 +264,11 @@ def _custom_definition(
     description = raw.get("description")
     prose = description if isinstance(description, str) else None
     mangled = _unique(mangle(namespace, name), used)
+    grammar = custom_grammar(raw)
     definition = GatewayToolDefinition(
         name=mangled,
         description=prose,
-        parameters=_custom_parameters(),
+        parameters=_custom_parameters(grammar),
         strict=False,
     )
     return TranslatedTool(
@@ -243,6 +276,7 @@ def _custom_definition(
         origin_name=name,
         origin_namespace=namespace,
         is_custom=True,
+        has_grammar=grammar is not None,
     )
 
 
@@ -316,7 +350,31 @@ def translate_native_tools(request: GatewayRequest) -> NativeToolTranslation:
             mapping.record(
                 item.definition.name, item.origin_name, item.origin_namespace, item.is_custom
             )
+            for owed, disclosure in (
+                (item.is_custom, CUSTOM_TOOL_DISCLOSURE),
+                (item.has_grammar, CUSTOM_GRAMMAR_DISCLOSURE),
+            ):
+                if owed and disclosure not in disclosures:
+                    disclosures.append(disclosure)
     return NativeToolTranslation(tools=tuple(tools), disclosures=disclosures, mapping=mapping)
+
+
+def translated_tool_choice(
+    choice: GatewayToolChoice, mapping: NativeToolMapping
+) -> GatewayToolChoice:
+    """Name the translated function for a custom-tool choice; keep any other choice.
+
+    Args:
+        choice: The caller's canonical tool choice.
+        mapping: The translation that declared every custom tool.
+
+    Returns:
+        A named function choice of the custom tool's provider-facing name, or
+        ``choice`` unchanged when it does not select a custom tool.
+    """
+    if not isinstance(choice, GatewayCustomToolChoice):
+        return choice
+    return GatewayNamedToolChoice(name=mapping.allocate(choice.name, None, True))
 
 
 def _reserve_plain_history(messages: Sequence[GatewayMessage], mapping: NativeToolMapping) -> None:

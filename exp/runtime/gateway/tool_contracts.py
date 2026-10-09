@@ -1,4 +1,4 @@
-"""Immutable function tools, provider-native tools, and named or allowed-set tool choices."""
+"""Immutable function tools, provider-native tools, and named, custom or allowed-set choices."""
 
 from __future__ import annotations
 
@@ -102,14 +102,35 @@ class GatewayAllowedToolsChoice(ContractModel):
         return self
 
 
+class GatewayCustomToolChoice(ContractModel):
+    """A request to require one named caller-defined custom (freeform) tool.
+
+    The tool itself is a ``custom`` entry in ``provider_native_tools``. A native
+    Responses wire forwards the selector as ``{"type": "custom", "name": ...}``;
+    route shaping rewrites it to a named choice of the translated function on
+    every other wire, so no other encoder ever receives it.
+
+    Attributes:
+        type: Discriminator that keeps this distinct from a named function.
+        name: Exact nonempty custom tool name, at most 256 characters.
+    """
+
+    type: Literal["custom"]
+    name: str = Field(min_length=1, max_length=256)
+
+
 GatewayToolChoice = (
-    Literal["auto", "none", "required"] | GatewayNamedToolChoice | GatewayAllowedToolsChoice | None
+    Literal["auto", "none", "required"]
+    | GatewayNamedToolChoice
+    | GatewayCustomToolChoice
+    | GatewayAllowedToolsChoice
+    | None
 )
 """Every canonical tool-selection control a protocol decoder can produce."""
 
 
 def tool_choice_names(choice: GatewayToolChoice) -> tuple[str, ...]:
-    """Return the tool names one canonical tool choice references."""
+    """Return the function tool names one canonical tool choice references."""
     if isinstance(choice, GatewayNamedToolChoice):
         return (choice.name,)
     if isinstance(choice, GatewayAllowedToolsChoice):

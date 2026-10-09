@@ -3,27 +3,39 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
+from typing import cast
+
 import pytest
+from pydantic import JsonValue
 
 from exp.common.core.artifacts import JsonObject
 from exp.runtime.gateway.contracts import (
     GatewayApiSurface,
     GatewayMessage,
+    GatewayNamedToolChoice,
     GatewayProviderNativeTool,
     GatewayRequest,
     GatewayToolDefinition,
 )
 from exp.runtime.gateway.replay_identity import canonical_request_sha256
+from exp.runtime.gateway.tool_contracts import GatewayCustomToolChoice
 from exp.runtime.models.providers.base import GatewayWireProfile
+from exp.runtime.models.providers.capability_policy import coerce_capability
 from exp.runtime.models.providers.codex_tools import (
+    CUSTOM_GRAMMAR_DISCLOSURE,
+    CUSTOM_TOOL_DISCLOSURE,
     NativeToolMapping,
     convert_native_history,
     translate_native_tools,
+    translated_tool_choice,
 )
 from exp.runtime.models.providers.dialect_dispatch import dialect_stream_payload
 from exp.runtime.models.providers.errors import ProviderParameterError
 from exp.runtime.models.providers.streaming_requests import route_generation_parameter_requests
 from exp.runtime.openai_protocol import decode_responses
+from exp.runtime.openai_protocol.model_adapter import model_request
+from exp.runtime.openai_protocol.requests import decode_chat
 
 _FUNCTION = {
     "type": "function",
@@ -597,3 +609,241 @@ def test_public_same_name_history_matches_actual_provider_payload(forced_plain: 
     if forced_plain:
         assert payload["tool_choice"] == {"type": "function", "function": {"name": "apply_patch"}}
     assert canonical_request_sha256(public) == canonical_request_sha256(request)
+
+
+_OPENAI_RESPONSES = GatewayWireProfile(
+    dialect="openai_responses", url="https://api.openai.test/v1", model_id="gpt-5-nano"
+)
+_AZURE_CHAT = GatewayWireProfile(
+    dialect="openai_compatible", url="https://azure.test/openai/v1", model_id="gpt-5-nano"
+)
+_ANTHROPIC = GatewayWireProfile(
+    dialect="anthropic_messages",
+    url="https://anthropic.test",
+    model_id="claude-sonnet-5",
+    maximum_output_tokens=64_000,
+)
+_LARK = 'start: "print(" /[0-9+]+/ ")"'
+
+
+def _custom_chat(tool_choice: JsonValue = None, *, grammar: bool = True) -> GatewayRequest:
+    """A Chat request declaring one custom tool, the drift-audit repro shape."""
+    custom: JsonObject = {"name": "code_exec", "description": "Executes python code"}
+    if grammar:
+        custom["format"] = {"type": "grammar", "grammar": {"syntax": "lark", "definition": _LARK}}
+    payload: JsonObject = {
+        "model": "gpt-5-nano",
+        "messages": [{"role": "user", "content": "print 2+2"}],
+        "tools": [{"type": "custom", "custom": custom}],
+    }
+    if tool_choice is not None:
+        payload["tool_choice"] = tool_choice
+    return decode_chat(payload).request
+
+
+def _custom_responses(tool_choice: JsonValue = None) -> GatewayRequest:
+    """The Responses spelling of the same custom tool."""
+    payload: JsonObject = {
+        "model": "gpt-5-nano",
+        "input": "print 2+2",
+        "tools": [
+            {
+                "type": "custom",
+                "name": "code_exec",
+                "description": "Executes python code",
+                "format": {"type": "grammar", "syntax": "lark", "definition": _LARK},
+            }
+        ],
+    }
+    if tool_choice is not None:
+        payload["tool_choice"] = tool_choice
+    return decode_responses(payload).request
+
+
+@pytest.mark.parametrize(
+    ("request_factory", "choice"),
+    [
+        (_custom_chat, {"type": "custom", "custom": {"name": "code_exec"}}),
+        (_custom_responses, {"type": "custom", "name": "code_exec"}),
+    ],
+)
+def test_native_responses_route_forwards_custom_tools_and_choice_verbatim(
+    request_factory: Callable[[JsonValue], GatewayRequest], choice: JsonObject
+) -> None:
+    """A native Responses rung receives the custom declaration, grammar and selector as is."""
+    request = request_factory(choice)
+    public, provider = route_generation_parameter_requests((_OPENAI_RESPONSES,), request)
+
+    payload = dialect_stream_payload(_OPENAI_RESPONSES, provider)
+
+    assert payload["tools"] == [
+        {
+            "type": "custom",
+            "name": "code_exec",
+            "description": "Executes python code",
+            "format": {"type": "grammar", "syntax": "lark", "definition": _LARK},
+        }
+    ]
+    assert payload["tool_choice"] == {"type": "custom", "name": "code_exec"}
+    assert not any("custom" in path for path in public.ignored_parameters)
+
+
+@pytest.mark.parametrize("profile", [_AZURE_CHAT, _ANTHROPIC])
+@pytest.mark.parametrize("request_factory", [_custom_chat, _custom_responses])
+def test_foreign_wires_translate_custom_tools_and_the_choice_with_disclosure(
+    profile: GatewayWireProfile, request_factory: Callable[[JsonValue], GatewayRequest]
+) -> None:
+    """Off the native wire a custom tool is a one-``input`` function, grammar stated, disclosed."""
+    request = request_factory(
+        {"type": "custom", "custom": {"name": "code_exec"}}
+        if request_factory is _custom_chat
+        else {"type": "custom", "name": "code_exec"}
+    )
+    public, provider = route_generation_parameter_requests((profile,), request)
+
+    assert CUSTOM_TOOL_DISCLOSURE in public.ignored_parameters
+    assert CUSTOM_GRAMMAR_DISCLOSURE in public.ignored_parameters
+    assert provider.tool_choice == GatewayNamedToolChoice(name="code_exec")
+    assert provider.native_tool_translation == {"code_exec": ("code_exec", None, True)}
+    (tool,) = provider.tools
+    properties = cast(JsonObject, tool.parameters["properties"])
+    assert cast(JsonObject, properties["input"])["description"] == (
+        "The raw tool input (this tool was declared as a freeform tool). "
+        f"The input must match this lark grammar:\n{_LARK}"
+    )
+    payload = dialect_stream_payload(profile, provider)
+    choice = payload["tool_choice"]
+    assert choice in (
+        {"type": "function", "function": {"name": "code_exec"}},
+        {"type": "tool", "name": "code_exec"},
+    )
+    # The public request keeps the caller's selector for reflection.
+    assert isinstance(public.tool_choice, GatewayCustomToolChoice)
+
+
+def test_a_text_custom_tool_translates_without_a_grammar_disclosure() -> None:
+    """Only a declared grammar owes the grammar disclosure."""
+    public, _provider = route_generation_parameter_requests(
+        (_AZURE_CHAT,), _custom_chat(grammar=False)
+    )
+
+    assert CUSTOM_TOOL_DISCLOSURE in public.ignored_parameters
+    assert CUSTOM_GRAMMAR_DISCLOSURE not in public.ignored_parameters
+
+
+@pytest.mark.parametrize("profile", [_OPENAI_RESPONSES, _AZURE_CHAT])
+def test_required_over_custom_tools_alone_is_kept_not_refused(profile: GatewayWireProfile) -> None:
+    """Custom declarations are tool definitions, so ``required`` and parallel controls stay."""
+    request = _custom_chat("required").model_copy(update={"parallel_tool_calls": False})
+
+    public, provider = route_generation_parameter_requests((profile,), request)
+
+    assert provider.tool_choice == "required"
+    assert provider.parallel_tool_calls is False
+    assert "tool_choice" not in public.ignored_parameters
+
+
+def test_custom_choice_relaxes_to_auto_on_a_rung_that_cannot_force_tools() -> None:
+    """The forced-choice policy treats a custom selector like any forced choice."""
+    coercion = coerce_capability(
+        "forced_tool_choice", _custom_chat({"type": "custom", "custom": {"name": "code_exec"}})
+    )
+
+    assert coercion is not None
+    assert coercion.request.tool_choice == "auto"
+
+
+def test_untranslated_custom_choice_fails_closed_in_foreign_encoders() -> None:
+    """Every foreign encoder refuses a custom selector that skipped route shaping."""
+    request = _custom_chat({"type": "custom", "custom": {"name": "code_exec"}})
+    translated_tools = translate_native_tools(request).tools
+    bypassed = request.model_copy(update={"tools": translated_tools, "provider_native_tools": ()})
+
+    with pytest.raises(ValueError, match="custom-tool"):
+        model_request(bypassed)
+    with pytest.raises(ValueError, match="custom-tool"):
+        dialect_stream_payload(_ANTHROPIC, bypassed)
+
+
+def test_translated_tool_choice_leaves_other_choices_alone() -> None:
+    """Only a custom selector is renamed; modes and named functions pass through."""
+    mapping = NativeToolMapping({"code_exec_2": ("code_exec", None, True)})
+
+    assert translated_tool_choice(
+        GatewayCustomToolChoice(type="custom", name="code_exec"), mapping
+    ) == GatewayNamedToolChoice(name="code_exec_2")
+    assert translated_tool_choice("required", mapping) == "required"
+    named = GatewayNamedToolChoice(name="lookup")
+    assert translated_tool_choice(named, mapping) is named
+
+
+def test_chat_custom_history_translates_on_a_foreign_wire() -> None:
+    """Chat custom calls and results reach a Chat wire as the translated function pair."""
+    request = decode_chat(
+        {
+            "model": "gpt-5-nano",
+            "messages": [
+                {"role": "user", "content": "go"},
+                {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {
+                            "id": "call_c",
+                            "type": "custom",
+                            "custom": {"name": "code_exec", "input": "print(1)"},
+                        }
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "call_c", "content": "1"},
+            ],
+            "tools": [{"type": "custom", "custom": {"name": "code_exec"}}],
+        }
+    ).request
+
+    _public, provider = route_generation_parameter_requests((_AZURE_CHAT,), request)
+    payload = dialect_stream_payload(_AZURE_CHAT, provider)
+
+    messages = cast(list[JsonObject], payload["messages"])
+    assert messages[1]["tool_calls"] == [
+        {
+            "id": "call_c",
+            "type": "function",
+            "function": {"name": "code_exec", "arguments": '{"input": "print(1)"}'},
+        }
+    ]
+    assert messages[2]["role"] == "tool"
+    assert messages[2]["tool_call_id"] == "call_c"
+
+
+def test_chat_custom_history_replays_verbatim_on_native_responses() -> None:
+    """On a native Responses rung the Chat history becomes the official custom items."""
+    request = decode_chat(
+        {
+            "model": "gpt-5-nano",
+            "messages": [
+                {"role": "user", "content": "go"},
+                {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {
+                            "id": "call_c",
+                            "type": "custom",
+                            "custom": {"name": "code_exec", "input": "print(1)"},
+                        }
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "call_c", "content": "1"},
+            ],
+            "tools": [{"type": "custom", "custom": {"name": "code_exec"}}],
+        }
+    ).request
+
+    _public, provider = route_generation_parameter_requests((_OPENAI_RESPONSES,), request)
+    payload = dialect_stream_payload(_OPENAI_RESPONSES, provider)
+
+    items = payload["input"]
+    assert isinstance(items, list)
+    assert items[1:] == [
+        {"type": "custom_tool_call", "call_id": "call_c", "name": "code_exec", "input": "print(1)"},
+        {"type": "custom_tool_call_output", "call_id": "call_c", "output": "1"},
+    ]

@@ -17,7 +17,7 @@ from exp.runtime.gateway.contracts import (
     GatewayRequest,
     GatewayToolDefinition,
 )
-from exp.runtime.gateway.tool_contracts import GatewayAllowedToolsChoice
+from exp.runtime.gateway.tool_contracts import GatewayAllowedToolsChoice, GatewayCustomToolChoice
 from exp.runtime.models.providers.audios import openai_chat_audio_part, reject_audio_part
 from exp.runtime.models.providers.documents import (
     anthropic_document_block,
@@ -807,6 +807,14 @@ def add_openai_tools(
                     "type": "function",
                     "function": {"name": request.tool_choice.name},
                 }
+            )
+        elif isinstance(request.tool_choice, GatewayCustomToolChoice):
+            # Both spellings are OpenAI's own; route shaping names the
+            # translated function instead on every wire without custom tools.
+            payload["tool_choice"] = (
+                {"type": "custom", "name": request.tool_choice.name}
+                if responses
+                else {"type": "custom", "custom": {"name": request.tool_choice.name}}
             )
         elif isinstance(request.tool_choice, GatewayAllowedToolsChoice):
             # Only an allowed-tools wire receives the selector verbatim (route
