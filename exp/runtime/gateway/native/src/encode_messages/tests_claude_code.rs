@@ -54,6 +54,7 @@ fn start_frame_carries_the_upstream_start_usage_when_known() {
         cache_creation_1h_input_tokens: None,
         reasoning_tokens: None,
         billed_units: None,
+        cache_writes_read_back: false,
     }));
     let frames = encoder.start().expect("starts");
     let start: Value = serde_json::from_str(
@@ -188,6 +189,7 @@ fn upstream_start_usage_outranks_the_pre_dispatch_estimate() {
         cache_creation_1h_input_tokens: None,
         reasoning_tokens: None,
         billed_units: None,
+        cache_writes_read_back: false,
     }));
     let frames = encoder.start().expect("starts");
     let start: Value = serde_json::from_str(

@@ -385,6 +385,7 @@ fn settle_argument_preserves_upstream_provider_and_cache_ttl_usage_together() {
         cache_creation_1h_input_tokens: Some(200),
         reasoning_tokens: None,
         billed_units: None,
+        cache_writes_read_back: false,
     };
     let named = settle_argument(
         "req",

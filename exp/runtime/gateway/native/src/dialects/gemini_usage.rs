@@ -114,6 +114,7 @@ impl Normalizer {
             cache_creation_1h_input_tokens: writes.map(|_| 0),
             reasoning_tokens: fields.thoughts,
             billed_units: None,
+            cache_writes_read_back: writes.is_some(),
         });
         Ok(())
     }

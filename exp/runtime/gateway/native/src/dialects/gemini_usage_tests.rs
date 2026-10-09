@@ -516,6 +516,10 @@ fn reads_of_this_attempts_own_cache_settle_as_writes_read_back() {
     // The fixed five-minute horizon is an observed zero one-hour split, so
     // settlement never leaves these writes unpriced for an unknown TTL.
     assert_eq!(usage.cache_creation_1h_input_tokens, Some(0));
+    // The writes were read back in-call, so OpenAI-shape responses report
+    // them inside `cached_tokens` (the OpenRouter convention).
+    assert!(usage.cache_writes_read_back);
+    assert_eq!(usage.reported_cached_input_tokens(), Some(10_663));
     // A later cumulative report keeps the split instead of restoring the read leg.
     normalizer
         .observe_gemini_usage(&json!({"promptTokenCount":11_933,"candidatesTokenCount":12,"cachedContentTokenCount":10_663}))
@@ -556,6 +560,7 @@ fn reads_of_this_attempts_own_cache_settle_as_writes_read_back() {
         ),
         (Some(10_663), None, None)
     );
+    assert!(!usage.cache_writes_read_back);
 
     // Other dialects ignore the Gemini-only carrier.
     let mut chat = Normalizer::new(Dialect::OpenAiCompatible);

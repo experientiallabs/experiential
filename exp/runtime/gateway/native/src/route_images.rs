@@ -414,6 +414,7 @@ fn public_images(payload: Value, admission: &ImagesAdmission) -> Result<(Value, 
         cache_creation_1h_input_tokens: None,
         reasoning_tokens: None,
         billed_units: None,
+        cache_writes_read_back: false,
     };
     Ok((Value::Object(public), usage))
 }

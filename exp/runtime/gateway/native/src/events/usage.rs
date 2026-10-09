@@ -47,6 +47,19 @@ impl Usage {
             .cache_creation_input_tokens
             .max(newer.cache_creation_input_tokens);
         self.reasoning_tokens = self.reasoning_tokens.max(newer.reasoning_tokens);
+        self.cache_writes_read_back |= newer.cache_writes_read_back;
+    }
+
+    /// The `cached_tokens` an OpenAI-shape response reports: the disjoint
+    /// read leg, plus the writes when the provider read them back in-call.
+    /// Absent stays absent; billing never reads this.
+    pub fn reported_cached_input_tokens(&self) -> Option<u64> {
+        match (self.cached_input_tokens, self.cache_creation_input_tokens) {
+            (cached, Some(written)) if self.cache_writes_read_back => {
+                Some(cached.unwrap_or(0).saturating_add(written))
+            }
+            (cached, _) => cached,
+        }
     }
 }
 
@@ -317,6 +330,7 @@ impl OpenAiUsageAccumulator {
             cache_creation_1h_input_tokens: covering_writes.and(cache_creation_1h_input_tokens),
             reasoning_tokens,
             billed_units: None,
+            cache_writes_read_back: false,
         });
         // Initial split fragments support a provisional mode until counters
         // change. A coherent raw output/reasoning/total sample may correct it;
@@ -482,6 +496,7 @@ fn separate_written_reads(usage: &mut Usage) -> Result<(), String> {
         return Ok(());
     };
     usage.cached_input_tokens = Some(reads - writes);
+    usage.cache_writes_read_back = true;
     Ok(())
 }
 
@@ -528,6 +543,7 @@ pub fn gemini_usage(value: &Value) -> Result<Usage, String> {
         cache_creation_1h_input_tokens: None,
         reasoning_tokens: Some(reasoning_tokens),
         billed_units: None,
+        cache_writes_read_back: false,
     })
 }
 
@@ -568,6 +584,7 @@ pub fn bedrock_usage(value: Option<&Value>) -> Result<Usage, String> {
         cache_creation_1h_input_tokens: bedrock_cache_hour_subset(usage, cache_write)?,
         reasoning_tokens: None,
         billed_units: None,
+        cache_writes_read_back: false,
     })
 }
 

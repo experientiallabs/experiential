@@ -41,6 +41,7 @@ fn responses_cache_ttl_survives_two_gateway_hops_without_inventing_zero() {
             cache_creation_1h_input_tokens: hour,
             reasoning_tokens: Some(5),
             billed_units: None,
+            cache_writes_read_back: false,
         };
         for _ in 0..2 {
             let wire = responses_usage(Some(&usage));
@@ -55,4 +56,27 @@ fn responses_cache_ttl_survives_two_gateway_hops_without_inventing_zero() {
             assert_eq!(usage.reasoning_tokens, Some(5));
         }
     }
+}
+
+#[test]
+fn responses_report_writes_read_back_inside_cached_tokens_like_openrouter() {
+    let read_back = Usage {
+        input_tokens: Some(11_933),
+        output_tokens: Some(9),
+        cached_input_tokens: Some(0),
+        cache_creation_input_tokens: Some(10_663),
+        cache_writes_read_back: true,
+        ..Usage::default()
+    };
+    let wire = responses_usage(Some(&read_back));
+    assert_eq!(wire["input_tokens_details"]["cached_tokens"], 10_663);
+    assert_eq!(wire["input_tokens_details"]["cache_write_tokens"], 10_663);
+    let disjoint = Usage {
+        cache_writes_read_back: false,
+        ..read_back
+    };
+    assert_eq!(
+        responses_usage(Some(&disjoint))["input_tokens_details"]["cached_tokens"],
+        0
+    );
 }

@@ -44,6 +44,7 @@ fn chat_cache_ttl_survives_two_gateway_hops_without_inventing_zero() {
             cache_creation_1h_input_tokens: hour,
             reasoning_tokens: Some(5),
             billed_units: None,
+            cache_writes_read_back: false,
         };
         for streaming in [false, true] {
             let mut current = usage.clone();
@@ -529,6 +530,7 @@ fn chat_aggregate_gains_annotations_and_the_usage_meter_only_when_searched() {
     assert!(!plain.contains("server_tool_use_details"));
 }
 
+<<<<<<< HEAD
 fn custom_tool_events(custom: bool, name: &str, deltas: &[&str], raw: &str) -> Vec<Event> {
     let mut events = vec![Event::ToolCallStarted {
         custom,
@@ -662,4 +664,64 @@ fn chat_stream_unwraps_a_translated_custom_call_for_a_chat_caller() {
             &json!([{"index": 0, "custom": {"input": "print(2+2)"}}]),
         ]
     );
+=======
+/// A Gemini automatic-cache creation read back in-call (10,663 of 11,933
+/// input tokens written, none read from an earlier cache).
+fn written_and_read_back() -> Usage {
+    Usage {
+        input_tokens: Some(11_933),
+        output_tokens: Some(9),
+        cached_input_tokens: Some(0),
+        cache_creation_input_tokens: Some(10_663),
+        cache_creation_1h_input_tokens: Some(0),
+        cache_writes_read_back: true,
+        ..Usage::default()
+    }
+}
+
+#[test]
+fn openai_shapes_report_writes_read_back_inside_cached_tokens_like_openrouter() {
+    // OpenRouter's Gemini relay reports the creating call's written tokens in
+    // `cached_tokens` too; the OpenAI-shape renderers match it.
+    let usage = written_and_read_back();
+    for wire in [
+        streaming_chat_usage(&usage),
+        completed_chat_usage(Some(&usage)),
+    ] {
+        let details = &wire["prompt_tokens_details"];
+        assert_eq!(details["cached_tokens"], 10_663);
+        assert_eq!(details["cache_write_tokens"], 10_663);
+        assert_eq!(wire["prompt_tokens"], 11_933);
+    }
+    // A reuse on the same call adds to the read-back writes.
+    let mixed = Usage {
+        cached_input_tokens: Some(500),
+        ..written_and_read_back()
+    };
+    assert_eq!(
+        completed_chat_usage(Some(&mixed))["prompt_tokens_details"]["cached_tokens"],
+        11_163
+    );
+}
+
+#[test]
+fn disjoint_writes_and_the_anthropic_shape_keep_reads_and_writes_apart() {
+    // Writes that were not read back (Anthropic, Bedrock) stay disjoint.
+    let disjoint = Usage {
+        cache_writes_read_back: false,
+        ..written_and_read_back()
+    };
+    assert_eq!(
+        completed_chat_usage(Some(&disjoint))["prompt_tokens_details"]["cached_tokens"],
+        0
+    );
+    // Anthropic clients sum the legs into the prompt size, so the Messages
+    // shape never double reports a written token as read.
+    let messages = crate::encode_messages::messages_usage(Some(&written_and_read_back()));
+    assert_eq!(messages["cache_read_input_tokens"], 0);
+    assert_eq!(messages["cache_creation_input_tokens"], 10_663);
+    assert_eq!(messages["input_tokens"], 1_270);
+    // Settlement's disjoint read leg is untouched by the reporting convention.
+    assert_eq!(written_and_read_back().cached_input_tokens, Some(0));
+>>>>>>> e6f47e0 (gateway: report Gemini cache writes read back in-call inside cached_tokens, like OpenRouter (0.7.173, native 0.3.141))
 }

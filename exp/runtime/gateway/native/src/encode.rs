@@ -585,7 +585,10 @@ fn streaming_chat_usage(usage: &Usage) -> Value {
 /// Input subsets remain unknown when absent; cache writes are never invented.
 fn chat_input_details(usage: &Usage, streaming: bool) -> Value {
     let mut details = serde_json::Map::new();
-    if let Some(cached) = usage.cached_input_tokens.or(streaming.then_some(0)) {
+    if let Some(cached) = usage
+        .reported_cached_input_tokens()
+        .or(streaming.then_some(0))
+    {
         details.insert("cached_tokens".into(), json!(cached));
     }
     if let Some(written) = usage.cache_creation_input_tokens {

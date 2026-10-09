@@ -553,6 +553,7 @@ fn parse_fixture_events(events_json: &str) -> Result<Vec<events::Event>, String>
                     .get("reasoning_tokens")
                     .and_then(serde_json::Value::as_u64),
                 billed_units: None,
+                cache_writes_read_back: false,
             }),
             "hosted_tool_item_started" => events::Event::HostedToolItemStarted {
                 output_index: object
