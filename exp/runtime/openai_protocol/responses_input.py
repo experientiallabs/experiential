@@ -180,35 +180,29 @@ def responses_input_messages(value: str | tuple[ReplayedInput, ...]) -> tuple[Ga
         Codex records items as they stream and can append a developer reminder
         after a function call it is already executing but before that turn's
         reasoning item lands, so a gateway carrier arrives separated from its
-        calls by an instruction. Only one model response can sit between two
-        boundaries (a tool output or a user message), so a run holding a carrier
-        and a function call is one assistant turn: it is rebuilt whole and the
-        interleaved instructions follow it, ahead of the tool outputs. Any other
-        run keeps every item in its original position.
+        calls by an instruction. A response that issued a function call cannot be
+        followed by another response before the call's output, so in a run that
+        holds a carrier, an instruction recorded after a function call belongs
+        inside that call's turn: the turn is rebuilt whole and the instruction
+        follows it, ahead of the tool outputs. An instruction before any call
+        still delimits two responses, and a run without a carrier keeps every
+        item in its original position.
         """
-        assistant_items = [item for item in run if not _is_instruction(item)]
         carried = any(
             isinstance(item, ReplayedReasoning) and item.block.kind == "sealed_reasoning_content"
-            for item in assistant_items
+            for item in run
         )
-        merge = (
-            len(assistant_items) != len(run)
-            and carried
-            and any(isinstance(item, ReplayedFunctionCall) for item in assistant_items)
-            and sum(isinstance(item, ReplayedMessage) for item in assistant_items) <= 1
-        )
-        if merge:
-            segment.extend(assistant_items)
-            flush_segment()
-            messages.extend(item.message for item in run if _is_instruction(item))
-        else:
-            for item in run:
-                if _is_instruction(item):
-                    flush_segment()
-                    messages.append(item.message)
-                else:
-                    segment.append(item)
-            flush_segment()
+        trailing: list[GatewayMessage] = []
+        for item in run:
+            if not _is_instruction(item):
+                segment.append(item)
+            elif carried and any(isinstance(entry, ReplayedFunctionCall) for entry in segment):
+                trailing.append(item.message)
+            else:
+                flush_segment()
+                messages.append(item.message)
+        flush_segment()
+        messages.extend(trailing)
         run.clear()
 
     for item in value:
