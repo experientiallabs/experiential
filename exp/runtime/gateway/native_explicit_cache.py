@@ -306,6 +306,16 @@ def _ready_payload(plan: GoogleCachePlan, claim: CacheReady) -> str:
     return _encoded(payload)
 
 
+def _release_unusable_lease(host: ExplicitCacheHost, operation_id: str) -> None:
+    """Report a lease that cannot be used as failed; a lost report keeps the hold."""
+    try:
+        host.record_renewal(
+            CacheRenewal(operation_id=operation_id, outcome="failed", observed_at=time.time())
+        )
+    except Exception:  # noqa: BLE001 - settlement never blocks a valid cache hit.
+        return
+
+
 def _renewal_horizon(claim: CacheReady) -> float | None:
     """The lease's whole-second horizon, or None when it would not extend the resource."""
     if claim.renew_until is None:
@@ -422,6 +432,10 @@ class NativeExplicitCacheMixin:
                     until = _renewal_horizon(claim)
                     if claim.renewal_operation_id is not None and until is not None:
                         state.renewals[claim.renewal_operation_id] = (until, claim.expires_at)
+                    elif claim.renewal_operation_id is not None:
+                        # A lease whole seconds cannot extend is settled at once so
+                        # the host releases the storage it reserved for it.
+                        _release_unusable_lease(host, claim.renewal_operation_id)
                     return _ready_payload(binding.plan, claim)
                 if not isinstance(claim, CacheCreator):
                     return _encoded({"state": "unavailable"})

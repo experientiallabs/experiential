@@ -1419,3 +1419,29 @@ def test_a_confirmed_renewal_records_the_provider_expiry(tmp_path: Path, clock: 
             expire_time=renew["expires_at"],
         )
     ]
+
+
+def test_a_lease_whole_seconds_cannot_use_is_settled_as_failed(
+    tmp_path: Path, clock: _Clock
+) -> None:
+    """A fractional lease ending within the resource's own expiry second is released."""
+
+    class _FractionalHost(_RenewingHost):
+        def claim(self, offer: CacheOffer) -> CacheClaim:
+            claim = super().claim(offer)
+            if isinstance(claim, CacheReady) and claim.renew_until is not None:
+                return replace(claim, renew_until=claim.expires_at + 0.5)
+            return claim
+
+    clock.now = 1_800_000_000.25
+    host = _FractionalHost(_authority())
+    control, key = _control(tmp_path, host)
+    first = _admission(control, key)
+    _start_first(control, first)
+    _finish(control, _finish_argument(first, _prepare(control, first)))
+    clock.now += 1
+    second = _admission(control, key, suffix="Any figs?")
+    _start_first(control, second)
+    reused = _prepare(control, second)
+    assert reused["state"] == "ready" and "renew" not in reused
+    assert [renewal.outcome for renewal in host.renewals] == ["failed"]

@@ -174,40 +174,45 @@ where
             ensure_remaining(deadline)?;
             let endpoint = bind_resource_prefix(endpoint, &resource_prefix)?;
             let overlaid = overlay(wire, payload, &resource_name, &endpoint, expires_at)?;
-            if let Some(grant) = renew {
-                // The generation reuses the resource whatever the renewal does;
-                // its current expiry already passed the safety check above.
-                let outcome = renew_resource(
-                    http,
-                    wire,
-                    &endpoint,
-                    &resource_name,
-                    &grant,
-                    expires_at,
-                    deadline,
-                )
-                .await;
-                let mut report = json!({
-                    "request_id": request_id,
-                    "deployment_id": wire.deployment_id,
-                    "operation_id": grant.operation_id,
-                    "outcome": outcome.0,
-                });
-                if let Some(expire_time) = outcome.1 {
-                    report["expire_time"] = json!(expire_time);
-                }
-                // A lost or slow acknowledgement keeps the host's storage hold:
-                // its own short bound means renewal accounting never spends the
-                // generation's deadline.
-                let report_deadline = deadline.min(Instant::now() + MAXIMUM_RENEWAL_WAIT);
-                let _ = callback(
-                    report_deadline,
-                    call("renew_explicit_cache", report.to_string()),
-                )
-                .await;
-                ensure_remaining(deadline)?;
+            let Some(grant) = renew.filter(|_| overlaid.is_some()) else {
+                return Ok(overlaid);
+            };
+            // The generation reuses the resource whatever the renewal does.
+            let (outcome, renewed) = renew_resource(
+                http,
+                wire,
+                &endpoint,
+                &resource_name,
+                &grant,
+                expires_at,
+                deadline,
+            )
+            .await;
+            let mut report = json!({
+                "request_id": request_id,
+                "deployment_id": wire.deployment_id,
+                "operation_id": grant.operation_id,
+                "outcome": outcome,
+            });
+            if let Some(expire_time) = &renewed {
+                report["expire_time"] = json!(expire_time);
             }
-            Ok(overlaid)
+            // A lost or slow acknowledgement keeps the host's storage hold: its own
+            // short bound means renewal accounting never spends the generation's
+            // deadline, and its result never fails a valid hit.
+            let report_deadline = deadline.min(Instant::now() + MAXIMUM_RENEWAL_WAIT);
+            let _ = callback(
+                report_deadline,
+                call("renew_explicit_cache", report.to_string()),
+            )
+            .await;
+            // The waits above may have spent the original expiry's margin: reuse
+            // only a resource still valid, by the renewed expiry when proven.
+            let valid_until = renewed
+                .as_deref()
+                .and_then(expiry_epoch)
+                .unwrap_or(expires_at);
+            Ok(overlaid.filter(|_| valid_until > epoch_now() + 5.0))
         }
         Preparation::Create {
             operation_id,
