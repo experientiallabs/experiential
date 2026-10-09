@@ -59,10 +59,11 @@ def _replayable_native_item(item: JsonObject) -> JsonObject | None:
     """Shape one replayed Responses item for the OpenAI wire; ``None`` drops it.
 
     Two client habits are repaired, everything else re-emits verbatim: an
-    input MESSAGE loses the output-only ``status`` OpenAI rejects on it, and
-    an item carrying a foreign ``id`` loses the id (a reasoning item with a
-    foreign id is dropped whole: without its encrypted content the provider
-    has nothing to resume from, and the id alone is refused).
+    input MESSAGE or REASONING item loses the output-only ``status`` OpenAI
+    rejects on it, and an item carrying a foreign ``id`` loses the id (a
+    reasoning item with a foreign id is dropped whole: without its encrypted
+    content the provider has nothing to resume from, and the id alone is
+    refused).
     """
     shaped = _without_probability_metadata(item)
     item_id = shaped.get("id")
@@ -70,10 +71,12 @@ def _replayable_native_item(item: JsonObject) -> JsonObject | None:
         if shaped.get("type") == "reasoning" and "encrypted_content" not in shaped:
             return None
         shaped = {key: value for key, value in shaped.items() if key != "id"}
-    if (
-        "status" in shaped
-        and shaped.get("type") in (None, "message")
-        and shaped.get("role") in _INPUT_MESSAGE_ROLES
+    if "status" in shaped and (
+        (shaped.get("type") in (None, "message") and shaped.get("role") in _INPUT_MESSAGE_ROLES)
+        # OpenAI's own id-only reasoning replay serves, but not with the
+        # status our response carried: 400 "Unknown parameter:
+        # 'input[N].status'" (probed live 2026-10-09, api.openai.com).
+        or shaped.get("type") == "reasoning"
     ):
         shaped = {key: value for key, value in shaped.items() if key != "status"}
     return shaped
@@ -94,6 +97,7 @@ def openai_responses_stream_payload(
     forwards_prompt_cache_key: bool = False,
     omits_output_token_limit: bool = False,
     requests_reasoning_summary: bool = False,
+    forwards_web_search_sources: bool = True,
 ) -> JsonObject:
     """Translate one canonical request to native streaming Responses JSON.
 
@@ -109,6 +113,10 @@ def openai_responses_stream_payload(
             reasoning summary when the caller chose none. Only host-managed
             rungs do: OpenAI rejects summaries for unverified organizations,
             so a customer's own key never receives one it did not ask for.
+        forwards_web_search_sources: Whether this origin accepts the
+            ``web_search_call.action.sources`` include selector. OpenRouter's
+            Responses endpoint relays OpenAI's web search but refuses the
+            selector ("Invalid Responses API request"), so it is left off there.
 
     Returns:
         Native Responses request with storage disabled and streaming enabled.
@@ -184,7 +192,7 @@ def openai_responses_stream_payload(
                 "This Responses route cannot preserve output text log probabilities."
             )
         include_paths.append("message.output_text.logprobs")
-    if request.include_web_search_sources:
+    if request.include_web_search_sources and forwards_web_search_sources:
         # The provider runs web search on this wire and its web_search_call
         # items relay verbatim, so the selector reaches the caller intact.
         include_paths.append("web_search_call.action.sources")

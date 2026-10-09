@@ -124,6 +124,25 @@ def fireworks_continuation_required(profile: GatewayWireProfile, request: Gatewa
     )
 
 
+WEB_SEARCH_SOURCES_DROPPED = (
+    "include.web_search_call.action.sources->dropped(unsupported_by_provider)"
+)
+"""Disclosure when the lead rung relays provider search but refuses the sources selector."""
+
+
+def responses_origin_refuses_web_search_sources(profile: GatewayWireProfile) -> bool:
+    """Return whether a Responses origin refuses the web search sources selector.
+
+    OpenRouter's Responses endpoint (a ``responses`` serving wire) relays
+    OpenAI's own ``web_search_call`` items but answers 400 "Invalid Responses
+    API request" to ``include: ["web_search_call.action.sources"]`` (probed
+    2026-10-09, gpt-6.1-sol). Every other native Responses origin forwards it.
+    """
+    return profile.dialect == "openai_responses" and (
+        (urlsplit(profile.url).hostname or "").lower() == "openrouter.ai"
+    )
+
+
 def dialect_stream_payload(
     profile: GatewayWireProfile,
     provider_request: GatewayRequest,
@@ -187,6 +206,7 @@ def dialect_stream_payload(
             forwards_prompt_cache_key=profile.forwards_prompt_cache_key,
             omits_output_token_limit=profile.omits_output_token_limit,
             requests_reasoning_summary=not profile.billing_customer_managed,
+            forwards_web_search_sources=not responses_origin_refuses_web_search_sources(profile),
         )
     if profile.dialect == "anthropic_messages":
         payload = anthropic_messages_stream_payload(

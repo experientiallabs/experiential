@@ -29,6 +29,8 @@ from exp.runtime.models.providers.dialect_dispatch import (
     THINKING_HISTORY_DROP_DISCLOSURE,
     TOOL_RESULT_IMAGE_FOLD_DIALECTS,
     TOOL_RESULT_IMAGE_FOLD_DISCLOSURE,
+    WEB_SEARCH_SOURCES_DROPPED,
+    responses_origin_refuses_web_search_sources,
 )
 from exp.runtime.models.providers.dialect_dispatch import (
     SERVICE_TIER_DIALECTS as SERVICE_TIER_DIALECTS,
@@ -865,6 +867,17 @@ def route_generation_parameter_requests(
         # web_search_call item with the sources (native web_search.rs), so
         # the provider payload simply does not carry it.
         provider_updates["include_web_search_sources"] = False
+    elif (
+        request.include_web_search_sources
+        and profiles
+        and responses_origin_refuses_web_search_sources(profiles[0])
+        and WEB_SEARCH_SOURCES_DROPPED not in ignored
+    ):
+        # The lead rung relays the provider's search but refuses the selector,
+        # so its payload omits it (per rung, in ``dialect_stream_payload``)
+        # and the caller learns the items come back without sources. A native
+        # rung later in the route still asks for them.
+        ignored.append(WEB_SEARCH_SOURCES_DROPPED)
     encrypted_reasoning_present = any(
         block.kind == "encrypted_reasoning"
         for message in request.messages

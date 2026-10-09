@@ -489,6 +489,30 @@ def test_replayed_message_strips_only_output_text_probabilities() -> None:
     assert second.get("logprobs") == {"customer": "keep"}
 
 
+def test_replayed_reasoning_loses_only_its_output_status() -> None:
+    """A replayed reasoning item keeps its id and content but not ``status``.
+
+    Production 2026-10-09 (gpt-5.6-sol): a store=false web search turn's
+    reasoning item came back with ``status: "completed"`` and no encrypted
+    content; replaying the output verbatim was refused 400 "Unknown parameter:
+    'input[1].status'". OpenAI serves the same item without the status (probed
+    live), so only that key is removed.
+    """
+    replayed = _replayable_native_item(
+        {"type": "reasoning", "id": "rs_1", "summary": [], "status": "completed"}
+    )
+    assert replayed == {"type": "reasoning", "id": "rs_1", "summary": []}
+    encrypted = _replayable_native_item(
+        {"type": "reasoning", "id": "rs_2", "summary": [], "encrypted_content": "blob=="}
+    )
+    assert encrypted == {
+        "type": "reasoning",
+        "id": "rs_2",
+        "summary": [],
+        "encrypted_content": "blob==",
+    }
+
+
 def _reasoning_request(**overrides: object) -> GatewayRequest:
     """Build one streaming Responses request for reasoning-summary checks."""
     request = GatewayRequest(

@@ -1,6 +1,7 @@
 """Tests for launch-provider streaming request payload translation."""
 
 import json
+from dataclasses import replace
 from typing import Literal, cast
 
 import pytest
@@ -37,6 +38,7 @@ from exp.runtime.models.providers.dialect_dispatch import (
     CACHE_CONTROL_NOT_FORWARDED_SUFFIX,
     THINKING_HISTORY_DROP_DISCLOSURE,
     TOOL_RESULT_IMAGE_FOLD_DISCLOSURE,
+    WEB_SEARCH_SOURCES_DROPPED,
 )
 from exp.runtime.models.providers.errors import (
     ProviderCapabilityError,
@@ -5955,6 +5957,35 @@ def test_openai_responses_stream_payload_forwards_web_search_sources() -> None:
     assert provider.include_web_search_sources is True
     payload = openai_responses_stream_payload("exact-model", provider, supports_temperature=True)
     assert "web_search_call.action.sources" in cast("list[str]", payload["include"])
+
+
+def test_openrouter_responses_rung_omits_the_sources_selector_and_discloses_it() -> None:
+    """OpenRouter's Responses endpoint refuses the sources selector; other rungs keep it.
+
+    Production 2026-10-09: gpt-6.1-sol's only house lane is OpenRouter on the
+    Responses wire, which relays OpenAI's web search but answered every
+    ``include: ["web_search_call.action.sources"]`` with 400 "Invalid Responses
+    API request". The OpenRouter payload now omits the selector and the caller
+    is told; a direct OpenAI rung on the same route still asks for sources.
+    """
+    openrouter = replace(_openai_reasoning_profile(), url="https://openrouter.ai/api/v1/responses")
+    direct = _openai_reasoning_profile()
+    public, provider = route_generation_parameter_requests(
+        (openrouter, direct), _web_search_sources_request()
+    )
+    assert provider.include_web_search_sources is True
+    assert WEB_SEARCH_SOURCES_DROPPED in public.ignored_parameters
+    assert "web_search_call.action.sources" not in cast(
+        "list[str]", dialect_stream_payload(openrouter, provider).get("include", [])
+    )
+    assert "web_search_call.action.sources" in cast(
+        "list[str]", dialect_stream_payload(direct, provider)["include"]
+    )
+    # A direct lead with an OpenRouter fallback keeps sources and discloses nothing.
+    public, _provider = route_generation_parameter_requests(
+        (direct, openrouter), _web_search_sources_request()
+    )
+    assert WEB_SEARCH_SOURCES_DROPPED not in public.ignored_parameters
 
 
 def test_web_search_sources_selector_stays_off_non_native_provider_payloads() -> None:
