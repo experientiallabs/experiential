@@ -6471,18 +6471,14 @@ def test_reasoning_content_native_rung_round_trips_preserved_thinking_off_the_te
     assert plain.get("ignored_parameters", []) == []
 
 
-def test_reasoning_content_native_rung_round_trips_a_codex_responses_tool_turn(
+def _codex_native_rung_sealed_turn(
     tmp_path: Path,
-) -> None:
-    """A Codex-shaped Responses loop keeps a native rung's thinking across a tool call.
+) -> tuple[NativeControlPlane, str, JsonObject, str, str]:
+    """Seal one Codex-shaped tool turn on a declared ``reasoning_content_native`` rung.
 
-    Codex sends ``store: false`` with ``include: ["reasoning.encrypted_content"]``
-    on every turn. On a declared ``reasoning_content_native`` rung (the
-    Experiential Cloud GLM vLLM origins) the include was refused because only a
-    native Responses or Fireworks route counted as a carrier channel; the
-    Hunyuan-scheme route is one too. The replayed reasoning item carries the
-    exposed summary text beside the sealed carrier, and the decoder must take
-    the carrier by its own scheme prefix, not only the Fireworks one.
+    Returns:
+        A fresh replica control plane, the raw key, the Codex request fields,
+        the sealed carrier, and the hidden reasoning it carries.
     """
     _manager, raw_key = _configured_gateway(
         tmp_path,
@@ -6492,6 +6488,12 @@ def test_reasoning_content_native_rung_round_trips_a_codex_responses_tool_turn(
             supports_tools=True,
             reasoning_output_exposed=True,
             reasoning_content_native=True,
+        ),
+        # Codex sends developer reminders; the Experiential Cloud GLM rungs take them.
+        gateway_capabilities=GatewayDeploymentCapabilities(
+            supports_streaming=True,
+            supports_streaming_tool_arguments=True,
+            supports_developer_messages=True,
         ),
     )
     tools: list[JsonObject] = [
@@ -6551,6 +6553,23 @@ def test_reasoning_content_native_rung_round_trips_a_codex_responses_tool_turn(
     replica = NativeControlPlane(
         load_gateway_components(tmp_path, environment={"TEST_PROVIDER_KEY": "shared-secret"})
     )
+    return replica, raw_key, codex, sealed, hidden
+
+
+def test_reasoning_content_native_rung_round_trips_a_codex_responses_tool_turn(
+    tmp_path: Path,
+) -> None:
+    """A Codex-shaped Responses loop keeps a native rung's thinking across a tool call.
+
+    Codex sends ``store: false`` with ``include: ["reasoning.encrypted_content"]``
+    on every turn. On a declared ``reasoning_content_native`` rung (the
+    Experiential Cloud GLM vLLM origins) the include was refused because only a
+    native Responses or Fireworks route counted as a carrier channel; the
+    Hunyuan-scheme route is one too. The replayed reasoning item carries the
+    exposed summary text beside the sealed carrier, and the decoder must take
+    the carrier by its own scheme prefix, not only the Fireworks one.
+    """
+    replica, raw_key, codex, sealed, hidden = _codex_native_rung_sealed_turn(tmp_path)
     continued = _admit(
         replica,
         raw_key,
@@ -6584,6 +6603,75 @@ def test_reasoning_content_native_rung_round_trips_a_codex_responses_tool_turn(
     assistant = next(message for message in messages if message.get("tool_calls"))
     assert continued["route_reason"] == "reasoning_continuation"
     assert assistant["reasoning_content"] == hidden
+
+
+@pytest.mark.parametrize(
+    "order",
+    [
+        ("function_call", "developer", "reasoning", "message"),
+        ("function_call", "reasoning", "developer", "message"),
+        ("function_call", "developer", "reasoning"),
+        ("reasoning", "function_call", "developer"),
+        ("reasoning", "developer", "function_call"),
+    ],
+)
+def test_codex_developer_reminder_inside_a_carrier_turn_keeps_the_thinking(
+    tmp_path: Path, order: tuple[str, ...]
+) -> None:
+    """A developer message Codex records inside a sealed tool turn never splits it.
+
+    Production 2026-10-09 (glm-5.3-flash-abliterated, Codex 0.160): the stream
+    finishes the function call before its reasoning item, Codex starts the tool
+    and records a developer reminder, and only then records the reasoning. The
+    replayed ``function_call, developer, reasoning, function_call_output`` was
+    refused as an inauthentic continuation because the decoder flushed the call
+    and the carrier as two turns. The carrier rejoins its own turn and keeps
+    its thinking; the reminder follows that turn, ahead of the tool output.
+    """
+    replica, raw_key, codex, sealed, hidden = _codex_native_rung_sealed_turn(tmp_path)
+    reminder: JsonObject = {"role": "developer", "content": "Use semantic search."}
+    items: dict[str, JsonObject] = {
+        "developer": reminder,
+        "reasoning": {
+            "type": "reasoning",
+            "id": "rs_glm",
+            "summary": [{"type": "summary_text", "text": hidden}],
+            "encrypted_content": sealed,
+        },
+        "function_call": {
+            "type": "function_call",
+            "call_id": "call-one",
+            "name": "lookup",
+            "arguments": "{}",
+        },
+        "message": {"type": "message", "role": "assistant", "content": ""},
+    }
+    replayed: list[JsonObject] = [{"role": "user", "content": "hi"}]
+    replayed.extend(items[name] for name in order)
+    replayed.append({"type": "function_call_output", "call_id": "call-one", "output": "done"})
+
+    continued = _admit(
+        replica,
+        raw_key,
+        json.dumps({**codex, "input": replayed}),
+        surface="responses",
+    )
+
+    assert "error" not in continued, continued
+    assert continued["route_reason"] == "reasoning_continuation"
+    assert continued.get("ignored_parameters", []) == []
+    route = cast("list[JsonObject]", continued["route"])
+    messages = cast(
+        "list[JsonObject]", cast("JsonObject", route[0]["upstream_payload"])["messages"]
+    )
+    roles = [message["role"] for message in messages]
+    assistant = roles.index("assistant")
+    assert roles.count("assistant") == 1
+    assert messages[assistant]["reasoning_content"] == hidden
+    tool_calls = cast("list[JsonObject]", messages[assistant]["tool_calls"])
+    assert [call["id"] for call in tool_calls] == ["call-one"]
+    # The reminder follows the rebuilt turn, ahead of the tool result.
+    assert roles[assistant + 1 :] in (["developer", "tool"], ["system", "tool"])
 
 
 def test_an_unflagged_self_hosted_rung_stays_stripped_with_no_carrier_route(

@@ -1560,6 +1560,52 @@ def test_responses_decoder_groups_fireworks_carrier_with_all_tool_calls(
     assert assistant.provider_reasoning[0].carrier == carrier
 
 
+def test_responses_decoder_keeps_an_instruction_between_two_responses_in_place() -> None:
+    """A developer message before any function call still delimits two responses.
+
+    Only an instruction recorded after a call is moved past the rest of that
+    call's turn; earlier assistant text from a finished response stays its own
+    turn, ahead of the instruction and the next response's carrier.
+    """
+    deployment = base64.urlsafe_b64encode(b"fireworks-rung").rstrip(b"=").decode()
+    envelope = base64.urlsafe_b64encode(b"x" * 32).rstrip(b"=").decode()
+    carrier = f"{FIREWORKS_REASONING_CONTENT_PREFIX}{deployment}:{envelope}"
+
+    decoded = decode_responses(
+        {
+            "model": "coding",
+            "store": False,
+            "include": ["reasoning.encrypted_content"],
+            "input": [
+                {"role": "user", "content": "hi"},
+                {"type": "message", "role": "assistant", "content": "Done."},
+                {"role": "developer", "content": "Keep going."},
+                {
+                    "type": "reasoning",
+                    "id": "rs_fireworks",
+                    "summary": [],
+                    "encrypted_content": carrier,
+                },
+                {"type": "function_call", "call_id": "call-1", "name": "f", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "call-1", "output": "one"},
+            ],
+        }
+    )
+
+    messages = decoded.request.messages
+    assert [message.role for message in messages] == [
+        "user",
+        "assistant",
+        "developer",
+        "assistant",
+        "tool",
+    ]
+    assert messages[1].content == "Done."
+    assert messages[1].provider_reasoning == ()
+    assert tuple(call.call_id for call in messages[3].tool_calls) == ("call-1",)
+    assert messages[3].provider_reasoning[0].kind == "sealed_reasoning_content"
+
+
 def test_responses_decoder_takes_a_hunyuan_scheme_carrier_beside_its_summary() -> None:
     """A Codex replay of a native rung's reasoning item decodes as its sealed carrier.
 
