@@ -10,6 +10,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const MAXIMUM_RESPONSE_BYTES: usize = 64 * 1024;
 const MAXIMUM_LIFETIME_SECONDS: f64 = 300.0;
+/// Longest horizon a host may grant when it renews a reused resource.
+const MAXIMUM_RENEWAL_SECONDS: f64 = 3600.0;
+/// The renewal PATCH never holds a generation longer than this.
+const MAXIMUM_RENEWAL_WAIT: Duration = Duration::from_secs(2);
 
 #[derive(Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
@@ -21,6 +25,9 @@ enum Preparation {
         resource_prefix: String,
         payload: Value,
         expires_at: f64,
+        /// Host-granted extension of this reused resource (one lease per cache).
+        #[serde(default)]
+        renew: Option<RenewGrant>,
     },
     Create {
         operation_id: String,
@@ -33,6 +40,14 @@ enum Preparation {
         #[serde(default)]
         minimum_tokens: u64,
     },
+}
+
+/// A host lease to move one reused resource's expiry to `expires_at`.
+#[derive(Deserialize)]
+struct RenewGrant {
+    operation_id: String,
+    expires_at: f64,
+    expire_time: String,
 }
 
 #[derive(Deserialize)]
@@ -154,10 +169,31 @@ where
             resource_prefix,
             payload,
             expires_at,
+            renew,
         } => {
             ensure_remaining(deadline)?;
             let endpoint = bind_resource_prefix(endpoint, &resource_prefix)?;
-            overlay(wire, payload, &resource_name, &endpoint, expires_at)
+            let overlaid = overlay(wire, payload, &resource_name, &endpoint, expires_at)?;
+            if let Some(grant) = renew {
+                // The generation reuses the resource whatever the renewal does;
+                // its current expiry already passed the safety check above.
+                let outcome =
+                    renew_resource(http, wire, &endpoint, &resource_name, &grant, deadline).await;
+                let mut report = json!({
+                    "request_id": request_id,
+                    "deployment_id": wire.deployment_id,
+                    "operation_id": grant.operation_id,
+                    "outcome": outcome.0,
+                });
+                if let Some(expire_time) = outcome.1 {
+                    report["expire_time"] = json!(expire_time);
+                }
+                // A lost acknowledgement keeps the host's storage hold: never fail
+                // the generation over renewal accounting.
+                let _ = callback(deadline, call("renew_explicit_cache", report.to_string())).await;
+                ensure_remaining(deadline)?;
+            }
+            Ok(overlaid)
         }
         Preparation::Create {
             operation_id,
@@ -558,6 +594,82 @@ async fn bounded_json(mut response: reqwest::Response) -> Option<Value> {
         body.extend_from_slice(&chunk);
     }
     serde_json::from_slice(&body).ok()
+}
+
+/// Extend one reused resource to the host-granted absolute expiry.
+///
+/// Returns the outcome the host settles: `renewed` with the provider's new
+/// expireTime, `failed` when no extension can have happened (refused before
+/// sending, or a 4xx answer), or `unknown` (timeout, transport, 5xx).
+async fn renew_resource(
+    http: &crate::upstream::UpstreamClient,
+    wire: &DeploymentWire,
+    endpoint: &CacheEndpoint,
+    resource_name: &str,
+    grant: &RenewGrant,
+    deadline: Instant,
+) -> (&'static str, Option<String>) {
+    let now = epoch_now();
+    let valid = valid_resource(endpoint, resource_name)
+        && grant.expires_at.is_finite()
+        && grant.expires_at > now + 5.0
+        && grant.expires_at <= now + MAXIMUM_RENEWAL_SECONDS
+        && expiry_epoch(&grant.expire_time).is_some_and(|absolute| absolute == grant.expires_at);
+    let budget = deadline
+        .saturating_duration_since(Instant::now())
+        .saturating_sub(Duration::from_secs(2))
+        .min(MAXIMUM_RENEWAL_WAIT);
+    let Some(url) = resource_url(endpoint, resource_name).filter(|_| valid && !budget.is_zero())
+    else {
+        return ("failed", None);
+    };
+    let Ok(request) = http.patch(url.as_str()) else {
+        return ("failed", None);
+    };
+    let request = wire_headers(request, wire).json(&json!({"expireTime": grant.expire_time}));
+    let Ok(sent) = tokio::time::timeout(budget, async {
+        let response = request.send().await.ok()?;
+        let status = response.status();
+        if status.is_client_error() {
+            return Some(Err(()));
+        }
+        if !status.is_success() {
+            return None;
+        }
+        Some(Ok(bounded_json(response).await))
+    })
+    .await
+    else {
+        return ("unknown", None);
+    };
+    match sent {
+        None => ("unknown", None),
+        Some(Err(())) => ("failed", None),
+        Some(Ok(body)) => {
+            let observed = body
+                .as_ref()
+                .and_then(|body| body.get("expireTime"))
+                .and_then(Value::as_str)
+                .filter(|value| {
+                    expiry_epoch(value)
+                        .is_some_and(|absolute| absolute > now && absolute <= grant.expires_at)
+                });
+            match observed {
+                Some(value) => ("renewed", Some(value.to_string())),
+                None => ("unknown", None),
+            }
+        }
+    }
+}
+
+/// The resource URL beside the admitted create URL, with an expireTime update mask.
+fn resource_url(endpoint: &CacheEndpoint, resource_name: &str) -> Option<Url> {
+    let mut url = endpoint.url.clone();
+    let version = url.path().strip_prefix('/')?.split('/').next()?.to_string();
+    url.set_path(&format!("/{version}/{resource_name}"));
+    url.query_pairs_mut()
+        .append_pair("updateMask", "expireTime");
+    Some(url)
 }
 
 /// Read only bounded JSON evidence. Error bodies and headers never cross the bridge.

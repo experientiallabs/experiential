@@ -25,6 +25,8 @@ from exp.runtime.models.providers.google_cache import VertexCacheProject
 
 CACHE_TTL_SECONDS = 300
 CACHE_EXPIRY_SAFETY_SECONDS = 5
+# Longest absolute horizon, from the offer, a host may extend a reused resource to.
+CACHE_RENEWAL_MAXIMUM_SECONDS = 3600
 _MAX_INT64 = (1 << 63) - 1
 _MAXIMUM_PREFIX_BYTES = 10 * 1024 * 1024
 _RESOURCE_ID = re.compile(r"[A-Za-z0-9_-]{1,256}")
@@ -105,6 +107,8 @@ class CacheOffer:
             Hosts retain uncertainty beyond this time for their clock-skew margin;
             this field is never a renewable lease or permission to steal a claim.
         ttl_seconds: Fixed 300-second pricing horizon, not caller configurable.
+        renewable: Whether this engine can extend a reused resource when the
+            host grants a renewal lease. A host must never grant one otherwise.
     """
 
     operation_id: str
@@ -122,6 +126,7 @@ class CacheOffer:
     reservation_nano_usd: int
     requested_at: float
     expires_at: float
+    renewable: bool = False
     ttl_seconds: Literal[300] = field(default=300, init=False)
 
     def __post_init__(self) -> None:
@@ -150,6 +155,8 @@ class CacheOffer:
         _timestamp(self.expires_at, "expires_at")
         if self.expires_at - self.requested_at != CACHE_TTL_SECONDS:
             raise ValueError("cache expiry must be exactly 300 seconds after the offer; requote it")
+        if type(self.renewable) is not bool:
+            raise ValueError("renewable must be a boolean capability flag")
 
 
 @dataclass(frozen=True, repr=False)
@@ -160,12 +167,18 @@ class CacheReady:
         resource_name: Provider resource to reuse after exact namespace validation.
         expires_at: Provider-confirmed absolute Unix expiration.
         token_count: Provider-measured total input tokens, never a character estimate.
+        renewal_operation_id: The cache operation a host-granted renewal lease
+            settles against, present only with renew_until.
+        renew_until: Absolute expiry this caller may extend the resource to; the
+            host has already reserved the extra storage for it.
         state: Fixed discriminator identifying a ready resource.
     """
 
     resource_name: str
     expires_at: float
     token_count: int
+    renewal_operation_id: str | None = None
+    renew_until: float | None = None
     state: Literal["ready"] = field(default="ready", init=False)
 
     def __post_init__(self) -> None:
@@ -173,6 +186,13 @@ class CacheReady:
         _scope(self.resource_name, "resource_name")
         _timestamp(self.expires_at, "expires_at")
         _integer(self.token_count, "token_count", minimum=1)
+        if (self.renewal_operation_id is None) != (self.renew_until is None):
+            raise ValueError("a renewal grant needs both its operation and its horizon")
+        if self.renewal_operation_id is not None and self.renew_until is not None:
+            _scope(self.renewal_operation_id, "renewal_operation_id")
+            _timestamp(self.renew_until, "renew_until")
+            if self.renew_until <= self.expires_at:
+                raise ValueError("a renewal must move the resource's expiry later")
 
 
 @dataclass(frozen=True, repr=False)
@@ -216,6 +236,36 @@ class CacheUnavailable:
 
 
 CacheClaim = CacheReady | CacheCreator | CacheUnavailable
+
+
+@dataclass(frozen=True, repr=False)
+class CacheRenewal:
+    """Content-free outcome of one host-granted renewal of a reused resource.
+
+    Attributes:
+        operation_id: The cache operation whose resource the lease extended.
+        outcome: Renewed carries the provider's new expiry; failed proves no
+            extension happened (refused before sending, or a 4xx answer); unknown
+            (timeout, transport, 5xx) keeps the host's whole storage hold.
+        observed_at: Finite nonnegative Unix observation time.
+        expire_time: Provider-confirmed absolute expiry, required when renewed.
+    """
+
+    operation_id: str
+    outcome: Literal["renewed", "failed", "unknown"]
+    observed_at: float
+    expire_time: float | None = None
+
+    def __post_init__(self) -> None:
+        """Require a provider expiry exactly when the renewal is confirmed."""
+        _scope(self.operation_id, "operation_id")
+        _timestamp(self.observed_at, "observed_at")
+        if self.outcome not in {"renewed", "failed", "unknown"}:
+            raise ValueError("cache renewal outcome must be renewed, failed or unknown")
+        if (self.outcome == "renewed") != (self.expire_time is not None):
+            raise ValueError("only a renewed outcome carries the provider's new expiry")
+        if self.expire_time is not None:
+            _timestamp(self.expire_time, "expire_time")
 
 
 @dataclass(frozen=True, repr=False)
@@ -452,6 +502,7 @@ def prepare_cache_offer(
     prefix_bytes: int,
     framing_tokens: int,
     requested_at: float,
+    renewable: bool = False,
 ) -> CacheOffer | None:
     """Build a content-free bounded offer without reserving funds or calling Google.
 
@@ -468,6 +519,7 @@ def prepare_cache_offer(
             plans, never opaque media or provider-side file expansions.
         framing_tokens: Conservative provider-adapter bound for hidden framing.
         requested_at: Current Unix time, used to set absolute 300-second expiry.
+        renewable: Whether the caller can extend a reused resource on a grant.
 
     Returns:
         A quoted offer, or None when disabled, oversized, empty, or definitely
@@ -505,6 +557,7 @@ def prepare_cache_offer(
         reservation_nano_usd=total,
         requested_at=requested_at,
         expires_at=requested_at + CACHE_TTL_SECONDS,
+        renewable=renewable,
     )
 
 
@@ -666,8 +719,16 @@ def _validate_claim_binding(offer: CacheOffer, claim: CacheClaim) -> None:
     elif isinstance(claim, CacheReady):
         _resource(offer, claim.resource_name)
         _measured_tokens(offer, claim.token_count)
-        if claim.expires_at > offer.expires_at:
+        # A renewing caller may reuse a resource a renewal already extended.
+        horizon = (
+            offer.requested_at + CACHE_RENEWAL_MAXIMUM_SECONDS
+            if offer.renewable
+            else offer.expires_at
+        )
+        if claim.expires_at > horizon:
             raise ValueError("cache resource exceeds the authorized expiry; do not reuse it")
+        if claim.renew_until is not None and (not offer.renewable or claim.renew_until > horizon):
+            raise ValueError("cache renewal exceeds this caller's authority; do not renew")
     else:
         raise ValueError("cache host returned an unknown claim type; skip explicit caching")
 

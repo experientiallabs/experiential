@@ -33,6 +33,7 @@ from exp.runtime.gateway.explicit_cache import (
     CacheOffer,
     CachePrefix,
     CacheReady,
+    CacheRenewal,
     CacheResult,
     ExplicitCacheHost,
     claim_cache,
@@ -89,6 +90,8 @@ class NativeCacheState:
         observed_results: Immutable first observations, including unacknowledged writes.
         recording_operations: Operations currently recording outside the execution gate.
         recorded_results: Validated results whose durable host write returned.
+        renewals: Host-granted renewal leases owned by this request, by cache
+            operation, with the absolute expiry each may extend to.
     """
 
     bindings: tuple[NativeCacheBinding | None, ...]
@@ -97,6 +100,7 @@ class NativeCacheState:
     observed_results: dict[str, CacheResult] = field(default_factory=dict)
     recording_operations: set[str] = field(default_factory=set)
     recorded_results: dict[str, CacheResult] = field(default_factory=dict)
+    renewals: dict[str, float] = field(default_factory=dict)
 
 
 def validate_explicit_cache_host(host: ExplicitCacheHost | None) -> ExplicitCacheHost | None:
@@ -207,6 +211,25 @@ class _CacheFinish(_CacheBoundary):
     total_tokens: int | None = Field(default=None, ge=1, le=2**63 - 1)
 
 
+class _CacheRenewed(_CacheBoundary):
+    """Allowlisted outcome of one renewal PATCH, never provider content.
+
+    Attributes:
+        operation_id: Cache operation whose renewal lease this settles.
+        outcome: Renewed, failed (no extension can have happened) or unknown.
+        expire_time: Provider's new absolute expiry, only when renewed.
+    """
+
+    operation_id: str = Field(min_length=1, max_length=128)
+    outcome: str = Field(pattern=r"^(renewed|failed|unknown)$")
+    expire_time: str | None = Field(default=None, max_length=64)
+
+
+def _renewable(host: ExplicitCacheHost) -> bool:
+    """A host that can settle renewals may be offered them; others never are."""
+    return callable(getattr(host, "record_renewal", None))
+
+
 class _Plane(Protocol):
     """Require request accounting and the optional durable cache host."""
 
@@ -266,15 +289,20 @@ def _with_creation_time(result: CacheResult, value: str | None) -> CacheResult:
 
 def _ready_payload(plan: GoogleCachePlan, claim: CacheReady) -> str:
     """Project a scoped reusable resource into its exact generation continuation."""
-    return _encoded(
-        {
-            "state": "ready",
-            "resource_name": claim.resource_name,
-            "resource_prefix": plan.resource_prefix,
-            "expires_at": claim.expires_at,
-            "payload": plan.apply(claim.resource_name),
+    payload: JsonObject = {
+        "state": "ready",
+        "resource_name": claim.resource_name,
+        "resource_prefix": plan.resource_prefix,
+        "expires_at": claim.expires_at,
+        "payload": plan.apply(claim.resource_name),
+    }
+    if claim.renewal_operation_id is not None and claim.renew_until is not None:
+        payload["renew"] = {
+            "operation_id": claim.renewal_operation_id,
+            "expires_at": claim.renew_until,
+            "expire_time": datetime.fromtimestamp(claim.renew_until, UTC).isoformat(),
         }
-    )
+    return _encoded(payload)
 
 
 class NativeExplicitCacheMixin:
@@ -375,12 +403,15 @@ class NativeExplicitCacheMixin:
                     # Whole-second epochs round-trip exactly through Google's
                     # RFC3339 expiration, never extending the reserved horizon.
                     requested_at=float(int(time.time())),
+                    renewable=_renewable(host),
                 )
             claim = claim_cache(host, offer, clock=time.time)
             with entry.execution_lock:
                 if offer is None or not _attempt_active(self._accounting, entry, attempt_id):
                     return _encoded({"state": "unavailable"})
                 if isinstance(claim, CacheReady):
+                    if claim.renewal_operation_id is not None and claim.renew_until is not None:
+                        state.renewals[claim.renewal_operation_id] = claim.renew_until
                     return _ready_payload(binding.plan, claim)
                 if not isinstance(claim, CacheCreator):
                     return _encoded({"state": "unavailable"})
@@ -407,6 +438,51 @@ class NativeExplicitCacheMixin:
                 # The client never asked for this cache: generate without it.
                 return _encoded({"state": "unavailable"})
             raise _boundary_failure() from None
+
+    def renew_explicit_cache(self: _Plane, argument: str) -> str:
+        """Settle one host-granted renewal lease; never gates the generation.
+
+        Only a lease this request was granted can be reported, once. A renewed
+        expiry beyond the granted horizon is recorded as unknown so the host
+        keeps its whole storage hold instead of trusting the contradiction.
+        """
+        host = self._explicit_cache
+        record = None if host is None else getattr(host, "record_renewal", None)
+        try:
+            if record is None or len(argument.encode()) > _CACHE_FINISH_LIMIT:
+                raise ValueError("cache renewal is not available")
+            selected = _CacheRenewed.model_validate_json(argument)
+            entry = self._accounting.entry(selected.request_id)
+            if entry is None or entry.explicit_cache_state is None:
+                raise ValueError("cache request is no longer retained")
+            with entry.execution_lock:
+                until = entry.explicit_cache_state.renewals.pop(selected.operation_id, None)
+            if until is None:
+                raise ValueError("renewal lease does not belong to this request")
+            observed_at = time.time()
+            renewal = CacheRenewal(
+                operation_id=selected.operation_id, outcome="unknown", observed_at=observed_at
+            )
+            if selected.outcome == "failed" and selected.expire_time is None:
+                renewal = CacheRenewal(
+                    operation_id=selected.operation_id, outcome="failed", observed_at=observed_at
+                )
+            elif selected.outcome == "renewed":
+                try:
+                    expire_time = _resource_timestamp(selected.expire_time)
+                    if observed_at < expire_time <= until:
+                        renewal = CacheRenewal(
+                            operation_id=selected.operation_id,
+                            outcome="renewed",
+                            observed_at=observed_at,
+                            expire_time=expire_time,
+                        )
+                except ValueError:
+                    pass
+            record(renewal)
+            return _encoded({"state": "recorded"})
+        except Exception:  # noqa: BLE001 - a renewal report never fails the generation.
+            return _encoded({"state": "unavailable"})
 
     def finish_explicit_cache(self: _Plane, argument: str) -> str:
         """Record a bounded provider observation before authorizing resource reuse.

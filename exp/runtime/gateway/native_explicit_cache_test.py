@@ -28,6 +28,7 @@ from exp.runtime.gateway.explicit_cache import (
     CacheOffer,
     CachePrefix,
     CacheReady,
+    CacheRenewal,
     CacheResult,
     ExplicitCacheHost,
     GoogleCacheAuthority,
@@ -1326,3 +1327,123 @@ def test_automatic_selection_skips_the_host_when_no_candidate_binds(
     _start_first(control, first)
     assert _prepare(control, first) == {"state": "unavailable"}
     assert host.selections == [] and host.claim_calls == 0
+
+
+class _RenewingHost(_Host):
+    """Grant one renewal lease on every reuse and record each settled outcome.
+
+    Attributes:
+        renewals: Every renewal outcome the engine reported, in order.
+    """
+
+    def __init__(self, authority: GoogleCacheAuthority | None) -> None:
+        """Start with no recorded renewals."""
+        super().__init__(authority)
+        self.renewals: list[CacheRenewal] = []
+
+    def claim(self, offer: CacheOffer) -> CacheClaim:
+        """Extend a reused resource to fifteen minutes after this offer."""
+        claim = super().claim(offer)
+        if isinstance(claim, CacheReady) and offer.renewable:
+            operation = next(iter(self.offers.values())).operation_id
+            return replace(
+                claim, renewal_operation_id=operation, renew_until=offer.requested_at + 900
+            )
+        return claim
+
+    def record_renewal(self, renewal: CacheRenewal) -> None:
+        """Keep the settled renewal for assertions."""
+        self.renewals.append(renewal)
+
+
+def _renew(control: NativeControlPlane, argument: JsonObject) -> JsonObject:
+    """Run the typed renewal callback without sending a provider request."""
+    return json.loads(control.renew_explicit_cache(json.dumps(argument)))
+
+
+def test_a_reused_resource_carries_one_renewal_lease_settled_by_the_engine(
+    tmp_path: Path, clock: _Clock
+) -> None:
+    """A renewing host extends a reused resource once; the report is checked against the lease."""
+    host = _RenewingHost(_authority())
+    control, key = _control(tmp_path, host)
+    first = _admission(control, key)
+    _start_first(control, first)
+    creation = _prepare(control, first)
+    assert _finish(control, _finish_argument(first, creation))["state"] == "ready"
+    offer = next(iter(host.offers.values()))
+    assert offer.renewable, "a host that settles renewals is offered them"
+    clock.now += 1
+    second = _admission(control, key, suffix="What is the inventory count now?")
+    _start_first(control, second)
+    reused = _prepare(control, second)
+    assert reused["state"] == "ready"
+    renew = reused["renew"]
+    assert isinstance(renew, dict)
+    until = clock.now + 900
+    assert renew["operation_id"] == offer.operation_id
+    assert renew["expires_at"] == until
+    assert renew["expire_time"] == datetime.fromtimestamp(until, UTC).isoformat()
+    selector = {**_selector(second), "operation_id": offer.operation_id}
+    # A renewed expiry beyond the granted horizon is never trusted as renewed.
+    assert _renew(
+        control,
+        {
+            **selector,
+            "outcome": "renewed",
+            "expire_time": datetime.fromtimestamp(until + 60, UTC).isoformat(),
+        },
+    ) == {"state": "recorded"}
+    assert host.renewals[-1].outcome == "unknown"
+    # The lease settles once: a second report has nothing to settle.
+    assert _renew(control, {**selector, "outcome": "failed"}) == {"state": "unavailable"}
+    assert len(host.renewals) == 1
+
+
+def test_a_confirmed_renewal_records_the_provider_expiry(tmp_path: Path, clock: _Clock) -> None:
+    """A provider-confirmed expiry inside the lease is recorded as renewed."""
+    host = _RenewingHost(_authority())
+    control, key = _control(tmp_path, host)
+    first = _admission(control, key)
+    _start_first(control, first)
+    _finish(control, _finish_argument(first, _prepare(control, first)))
+    clock.now += 1
+    second = _admission(control, key, suffix="Any pears?")
+    _start_first(control, second)
+    reused = _prepare(control, second)
+    renew = reused["renew"]
+    assert isinstance(renew, dict)
+    assert _renew(
+        control,
+        {
+            **_selector(second),
+            "operation_id": renew["operation_id"],
+            "outcome": "renewed",
+            "expire_time": renew["expire_time"],
+        },
+    ) == {"state": "recorded"}
+    assert host.renewals == [
+        CacheRenewal(
+            operation_id=renew["operation_id"],
+            outcome="renewed",
+            observed_at=clock.now,
+            expire_time=renew["expires_at"],
+        )
+    ]
+
+
+def test_a_host_without_renewals_is_never_offered_one(tmp_path: Path, clock: _Clock) -> None:
+    """Older hosts keep the fixed five-minute horizon and an unchanged ready payload."""
+    host = _Host(_authority())
+    control, key = _control(tmp_path, host)
+    first = _admission(control, key)
+    _start_first(control, first)
+    _finish(control, _finish_argument(first, _prepare(control, first)))
+    assert not next(iter(host.offers.values())).renewable
+    clock.now += 1
+    second = _admission(control, key, suffix="Any plums?")
+    _start_first(control, second)
+    assert "renew" not in _prepare(control, second)
+    assert _renew(
+        control, {**_selector(second), "operation_id": "cache-x", "outcome": "failed"}
+    ) == {"state": "unavailable"}

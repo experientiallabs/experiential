@@ -21,6 +21,22 @@ impl UpstreamClient {
         Self { inner, public_only }
     }
 
+    /// PATCH counterpart of [`Self::post`], under the same URL validation.
+    pub(crate) fn patch(&self, raw: &str) -> Result<reqwest::RequestBuilder, Failure> {
+        if !self.public_only {
+            return Ok(self.inner.patch(raw));
+        }
+        if raw
+            .bytes()
+            .any(|byte| byte <= 32 || byte == 127 || byte == b'\\')
+        {
+            return Err(refused());
+        }
+        let url = reqwest::Url::parse(raw).map_err(|_| refused())?;
+        validate_url(&url)?;
+        Ok(self.inner.patch(url))
+    }
+
     /// Validate the canonical URL before attaching credentials or building a request.
     pub(crate) fn post(&self, raw: &str) -> Result<reqwest::RequestBuilder, Failure> {
         // Preserve reqwest's builder errors and the existing transport detail
