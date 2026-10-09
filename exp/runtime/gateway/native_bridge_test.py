@@ -6612,6 +6612,7 @@ def test_reasoning_content_native_rung_round_trips_a_codex_responses_tool_turn(
         ("function_call", "reasoning", "developer", "message"),
         ("function_call", "developer", "reasoning"),
         ("reasoning", "function_call", "developer"),
+        ("reasoning", "developer", "function_call"),
     ],
 )
 def test_codex_developer_reminder_inside_a_carrier_turn_keeps_the_thinking(

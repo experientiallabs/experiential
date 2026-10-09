@@ -182,23 +182,33 @@ def responses_input_messages(value: str | tuple[ReplayedInput, ...]) -> tuple[Ga
         reasoning item lands, so a gateway carrier arrives separated from its
         calls by an instruction. A response that issued a function call cannot be
         followed by another response before the call's output, so in a run that
-        holds a carrier, an instruction recorded after a function call belongs
-        inside that call's turn: the turn is rebuilt whole and the instruction
-        follows it, ahead of the tool outputs. An instruction before any call
-        still delimits two responses, and a run without a carrier keeps every
-        item in its original position.
+        holds a carrier, an instruction recorded after a function call or a
+        carrier belongs inside that tool turn: the turn is rebuilt whole and the
+        instruction follows it, ahead of the tool outputs. An instruction before
+        either still delimits two responses, and a run without a carrier keeps
+        every item in its original position.
         """
         carried = any(
             isinstance(item, ReplayedReasoning) and item.block.kind == "sealed_reasoning_content"
             for item in run
         )
         trailing: list[GatewayMessage] = []
-        called = False  # tracked, not rescanned, so a long run stays linear
+        # Tracked, not rescanned, so a long run stays linear. A carrier is only
+        # ever sealed on a tool turn, so one seen before an instruction marks an
+        # unfinished tool turn exactly as a call does.
+        in_tool_turn = False
         for item in run:
             if not _is_instruction(item):
                 segment.append(item)
-                called = called or isinstance(item, ReplayedFunctionCall)
-            elif carried and called:
+                in_tool_turn = (
+                    in_tool_turn
+                    or isinstance(item, ReplayedFunctionCall)
+                    or (
+                        isinstance(item, ReplayedReasoning)
+                        and item.block.kind == "sealed_reasoning_content"
+                    )
+                )
+            elif carried and in_tool_turn:
                 trailing.append(item.message)
             else:
                 flush_segment()
