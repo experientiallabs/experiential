@@ -107,3 +107,34 @@ def test_summary_and_custom_preferences_combine() -> None:
     assert compatible_generation_parameter_profile_indexes(
         (_AZURE_CHAT, _OPENAI_RESPONSES), request
     ) == (1,)
+
+
+def test_a_namespaced_custom_grammar_also_prefers_the_native_rung() -> None:
+    """A grammar inside a namespace is translated off the native wire too, so it narrows."""
+    request = decode_responses(
+        {
+            "model": "gpt-5-nano",
+            "input": "hi",
+            "tools": [
+                {
+                    "type": "namespace",
+                    "name": "editor",
+                    "tools": [
+                        {
+                            "type": "custom",
+                            "name": "apply_patch",
+                            "format": {
+                                "type": "grammar",
+                                "syntax": "lark",
+                                "definition": "start: x",
+                            },
+                        }
+                    ],
+                }
+            ],
+        }
+    ).request
+
+    assert compatible_generation_parameter_profile_indexes(
+        (_AZURE_CHAT, _OPENAI_RESPONSES), request
+    ) == (1,)

@@ -15,6 +15,8 @@ from __future__ import annotations
 from collections.abc import Iterable, Sequence
 from typing import Protocol
 
+from pydantic import JsonValue
+
 from exp.common.core.artifacts import JsonObject
 from exp.runtime.gateway.contracts import GatewayMessage
 from exp.runtime.gateway.tool_contracts import GatewayProviderNativeTool
@@ -142,3 +144,34 @@ def chat_custom_output_message(message: GatewayMessage, param: str) -> GatewayMe
             "output": message.content or "",
         },
     )
+
+
+def custom_turn_cache_disclosures(raw_messages: JsonValue) -> tuple[str, ...]:
+    """Disclose message-level cache markers that cannot sit after a turn's custom calls.
+
+    A custom call has no cache carrier, so a marker on a turn of custom calls
+    alone is dropped, and a marker on a turn that also holds text or function
+    calls stays on that part, ahead of the custom calls that follow it.
+
+    Args:
+        raw_messages: The caller's ``messages`` array before cache markers are stripped.
+
+    Returns:
+        One disclosure per affected assistant turn, in caller order.
+    """
+    disclosures: list[str] = []
+    for index, raw in enumerate(raw_messages if isinstance(raw_messages, list) else ()):
+        if not isinstance(raw, dict) or not isinstance(raw.get("cache_control"), dict):
+            continue
+        calls = raw.get("tool_calls")
+        kinds = (
+            {call.get("type", "function") for call in calls or () if isinstance(call, dict)}
+            if isinstance(calls, list)
+            else set()
+        )
+        if "custom" not in kinds:
+            continue
+        alone = kinds == {"custom"} and not raw.get("content")
+        outcome = "dropped(custom_tool_call)" if alone else "translated(before_custom_tool_calls)"
+        disclosures.append(f"messages.{index}.cache_control->{outcome}")
+    return tuple(disclosures)

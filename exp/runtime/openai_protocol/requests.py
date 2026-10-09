@@ -46,6 +46,7 @@ from exp.runtime.openai_protocol.custom_tools import (
     chat_custom_call_messages,
     chat_custom_declaration,
     chat_custom_output_message,
+    custom_turn_cache_disclosures,
     expand_chat_custom_calls,
 )
 from exp.runtime.openai_protocol.enable_thinking import translate_enable_thinking
@@ -321,6 +322,7 @@ def decode_chat(
             ignored_parameters=(
                 *alias_disclosures,
                 *cache_disclosures,
+                *custom_turn_cache_disclosures(cache_payload.get("messages")),
                 *thinking.disclosures,
                 *_replayed_reasoning_disclosures(request.messages),
             ),

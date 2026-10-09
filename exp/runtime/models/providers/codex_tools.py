@@ -33,7 +33,7 @@ or a Chat ``type: "custom"`` call) with its freeform ``input``.
 from __future__ import annotations
 
 import json
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from typing import TYPE_CHECKING
 
 from exp.common.models import ToolCall
@@ -186,6 +186,19 @@ def custom_grammar(raw: JsonObject) -> tuple[str, str] | None:
     if not isinstance(syntax, str) or not isinstance(definition, str) or not definition:
         return None
     return syntax, definition
+
+
+def declares_custom_grammar(declarations: Iterable[JsonObject]) -> bool:
+    """Whether any custom declaration, top-level or inside a namespace, has a grammar."""
+    for declaration in declarations:
+        if declaration.get("type") == "custom" and custom_grammar(declaration) is not None:
+            return True
+        nested = declaration.get("tools") if declaration.get("type") == "namespace" else None
+        if isinstance(nested, list) and declares_custom_grammar(
+            entry for entry in nested if isinstance(entry, dict)
+        ):
+            return True
+    return False
 
 
 def _custom_parameters(grammar: tuple[str, str] | None) -> JsonObject:
@@ -458,7 +471,21 @@ def convert_native_history(
             )
             continue
         replacement, disclosure = _convert_history_item(item, mapping, tool_search_name)
-        if replacement is not None:
+        previous = converted[-1] if converted else None
+        if (
+            replacement is not None
+            and replacement.tool_calls
+            and previous is not None
+            and previous.role == "assistant"
+            and previous.provider_native_item is None
+            and previous.provider_anthropic_block is None
+        ):
+            # Calls of one assistant turn stay one message: a Chat wire
+            # requires every tool result to answer the turn right before it.
+            converted[-1] = previous.model_copy(
+                update={"tool_calls": (*previous.tool_calls, *replacement.tool_calls)}
+            )
+        elif replacement is not None:
             converted.append(replacement)
         if disclosure is not None and disclosure not in disclosures:
             disclosures.append(disclosure)

@@ -847,3 +847,70 @@ def test_chat_custom_history_replays_verbatim_on_native_responses() -> None:
         {"type": "custom_tool_call", "call_id": "call_c", "name": "code_exec", "input": "print(1)"},
         {"type": "custom_tool_call_output", "call_id": "call_c", "output": "1"},
     ]
+
+
+def test_one_chat_turn_of_parallel_custom_and_function_calls_stays_one_message() -> None:
+    """A Chat wire needs every result to answer the turn right before it."""
+    request = decode_chat(
+        {
+            "model": "gpt-5-nano",
+            "messages": [
+                {"role": "user", "content": "go"},
+                {
+                    "role": "assistant",
+                    "content": "both",
+                    "tool_calls": [
+                        {
+                            "id": "f",
+                            "type": "function",
+                            "function": {"name": "lookup", "arguments": "{}"},
+                        },
+                        {
+                            "id": "a",
+                            "type": "custom",
+                            "custom": {"name": "code_exec", "input": "1"},
+                        },
+                        {
+                            "id": "b",
+                            "type": "custom",
+                            "custom": {"name": "code_exec", "input": "2"},
+                        },
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "f", "content": "x"},
+                {"role": "tool", "tool_call_id": "a", "content": "y"},
+                {"role": "tool", "tool_call_id": "b", "content": "z"},
+            ],
+            "tools": [
+                {"type": "function", "function": {"name": "lookup", "parameters": {}}},
+                {"type": "custom", "custom": {"name": "code_exec"}},
+            ],
+        }
+    ).request
+
+    _public, provider = route_generation_parameter_requests((_AZURE_CHAT,), request)
+    messages = cast(list[JsonObject], dialect_stream_payload(_AZURE_CHAT, provider)["messages"])
+
+    assert [message["role"] for message in messages] == [
+        "user",
+        "assistant",
+        "tool",
+        "tool",
+        "tool",
+    ]
+    calls = cast(list[JsonObject], messages[1]["tool_calls"])
+    assert [call["id"] for call in calls] == ["f", "a", "b"]
+    assert messages[1]["content"] == "both"
+
+
+def test_custom_only_parallel_false_is_emulated_on_wires_without_the_control() -> None:
+    """Translated custom tools still get the per-dialect parallel-tool shaping."""
+    gemini = GatewayWireProfile(
+        dialect="gemini_generate_content", url="https://gemini.test", model_id="gemini-3-pro"
+    )
+    request = _custom_chat().model_copy(update={"parallel_tool_calls": False})
+
+    public, provider = route_generation_parameter_requests((gemini,), request)
+
+    assert "parallel_tool_calls->emulated(serialized_by_gateway)" in public.ignored_parameters
+    assert provider.serialize_tool_calls is True

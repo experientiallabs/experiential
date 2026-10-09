@@ -6,7 +6,7 @@ from collections.abc import Callable, Sequence
 
 from exp.runtime.gateway.contracts import GatewayRequest
 from exp.runtime.models.providers.base import GatewayWireProfile
-from exp.runtime.models.providers.codex_tools import custom_grammar
+from exp.runtime.models.providers.codex_tools import declares_custom_grammar
 from exp.runtime.models.providers.errors import ProviderParameterError
 from exp.runtime.models.providers.generation_parameter_validation import serves_reasoning_summary
 from exp.runtime.models.providers.streaming_requests import route_generation_parameter_requests
@@ -47,10 +47,7 @@ def compatible_generation_parameter_profile_indexes(
     preferences: list[Callable[[GatewayWireProfile], bool]] = []
     if request.reasoning_summary is not None:
         preferences.append(serves_reasoning_summary)
-    if any(
-        entry.tool.get("type") == "custom" and custom_grammar(entry.tool) is not None
-        for entry in request.provider_native_tools
-    ):
+    if declares_custom_grammar(entry.tool for entry in request.provider_native_tools):
         preferences.append(_enforces_custom_grammar)
     attempts = [preferences, *([wanted] for wanted in preferences)] if preferences else []
     for kept in attempts:

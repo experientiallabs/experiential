@@ -225,6 +225,31 @@ def test_a_cache_marked_custom_call_turn_still_maps_one_to_one() -> None:
 
     items = [message.provider_native_item for message in request.messages]
     assert [item["call_id"] if item else None for item in items] == [None, "a", "b", "a", "b", None]
+    assert "messages.1.cache_control->dropped(custom_tool_call)" in request.ignored_parameters
+
+
+def test_a_cache_marker_on_a_mixed_custom_turn_is_disclosed_as_moved_ahead() -> None:
+    """The marker stays on the turn's text, ahead of the custom calls, and says so."""
+    request = _chat(
+        messages=[
+            {"role": "user", "content": "go"},
+            {
+                "role": "assistant",
+                "content": "running",
+                "cache_control": {"type": "ephemeral"},
+                "tool_calls": [
+                    {"id": "a", "type": "custom", "custom": {"name": "code_exec", "input": "1"}}
+                ],
+            },
+            {"role": "tool", "tool_call_id": "a", "content": "x"},
+        ],
+        tools=[_custom_tool()],
+    )
+
+    assert (
+        "messages.1.cache_control->translated(before_custom_tool_calls)"
+        in request.ignored_parameters
+    )
 
 
 def test_a_custom_tool_result_with_an_image_is_a_field_scoped_400() -> None:

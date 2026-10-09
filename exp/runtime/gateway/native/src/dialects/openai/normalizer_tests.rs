@@ -48,8 +48,8 @@ fn custom_tool_call_stream_normalizes_like_a_freeform_tool_call() {
                 kind: ProviderOutputItemKind::CustomToolCall,
                 ..
             },
-            Event::ToolCallStarted { call_id, name, .. },
-        ] if call_id == "call_live" && name == "exec"
+            Event::ToolCallStarted { call_id, name, custom, .. },
+        ] if call_id == "call_live" && name == "exec" && *custom
     ));
     let delta = SseEvent {
         event: None,
