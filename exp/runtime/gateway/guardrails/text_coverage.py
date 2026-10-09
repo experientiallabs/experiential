@@ -26,6 +26,7 @@ def text_input_context(request: GatewayRequest) -> str:
     """
     if (
         request.context_management is not None
+        or request.safeguards
         or request.provider_output_config is not None
         or request.provider_thinking_config is not None
         or request.provider_native_tools

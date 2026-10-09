@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import threading
 import time
 
@@ -16,6 +17,7 @@ from exp.runtime.gateway.contracts import (
     GatewayToolDefinition,
     StructuredTextFormat,
 )
+from exp.runtime.gateway.guardrails.bounded import start_on_native_loop
 from exp.runtime.gateway.guardrails.classifiers import ClassifierRegistry, KeywordClassifier
 from exp.runtime.gateway.guardrails.client import DirectClassifierClient
 from exp.runtime.gateway.guardrails.contracts import (
@@ -51,6 +53,7 @@ UNSUPPORTED_TEXT_INPUTS = (
     "context_management",
     "provider_output_config",
     "provider_thinking_config",
+    "safeguards",
     "provider_native_tools",
     "provider_server_tools",
     "tool_caller",
@@ -170,6 +173,8 @@ def unsupported_text_request(field: str) -> GatewayRequest:
             )
         case "context_management" | "provider_output_config" | "provider_thinking_config":
             data[field] = {"private": "hidden alice@example.com"}
+        case "safeguards":
+            data[field] = ({"type": "identity", "rules": ["hidden alice@example.com"]},)
         case "provider_native_tools":
             data["surface"] = GatewayApiSurface.RESPONSES
             data[field] = (
@@ -300,6 +305,7 @@ def test_exactly_flattened_text_blocks_and_inert_metadata_remain_supported() -> 
         ),
         provider_cache_control={"type": "ephemeral"},
         diagnostics={"previous_message_id": "message-zero"},
+        safeguards=(),
     )
     assert text_input_context(request) == ""
 
@@ -310,6 +316,7 @@ def test_exactly_flattened_text_blocks_and_inert_metadata_remain_supported() -> 
     [
         ("recovered_reasoning", GuardrailOutcome.UNSUPPORTED),
         ("native_response", GuardrailOutcome.UNSUPPORTED),
+        ("safeguards", GuardrailOutcome.UNSUPPORTED),
         ("tool_error", GuardrailOutcome.FLAGGED),
     ],
 )
@@ -317,6 +324,8 @@ def test_actual_observation_records_coverage_and_tool_errors_truthfully(
     adapter: str, field: str, expected: GuardrailOutcome
 ) -> None:
     """Asynchronous inspection sees supported wire text and reports opaque coverage gaps."""
+    # Coverage assertions require accepted work; observation_test covers cold admission.
+    start_on_native_loop(asyncio.sleep(0)).result(timeout=2)
     recorded = threading.Event()
     observed: list[GuardrailOutcome] = []
     enforced: list[GuardrailAction] = []

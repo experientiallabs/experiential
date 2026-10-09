@@ -533,7 +533,7 @@ generated tool-error prefix, tool arguments, function definitions and examples,
 tool call/result identifiers, names and namespaces, structured
 output schemas, and normalized gateway web/tool-search declarations. Recovered or sealed reasoning, capture-only reasoning,
 multimodal attachments, verbatim native message blocks, context management, raw provider
-thinking/output configuration, opaque provider tool-caller objects, and provider-owned
+thinking/output configuration, nonempty Messages safeguards, opaque provider tool-caller objects, and provider-owned
 native/server tools return unsupported coverage. Regex rewrites only message text; matches in tool arguments or immutable
 tool/schema/search context are refused under modify. Exact flattened text blocks and inert
 cache/replay metadata remain supported for inspection. Cached block text is inspectable,
