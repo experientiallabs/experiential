@@ -107,8 +107,8 @@ class CacheOffer:
             Hosts retain uncertainty beyond this time for their clock-skew margin;
             this field is never a renewable lease or permission to steal a claim.
         ttl_seconds: Fixed 300-second pricing horizon, not caller configurable.
-        renewable: Whether this engine can extend a reused resource when the
-            host grants a renewal lease. A host must never grant one otherwise.
+        renewable: Whether the host may answer with a renewal lease. Engines
+            that offer it always settle the lease through record_renewal.
     """
 
     operation_id: str
@@ -383,6 +383,15 @@ class ExplicitCacheHost(Protocol):
         Ready describes resource usability, not complete billing evidence. A host
         whose published schedule requires create_time must retain its full hold
         when that optional provider fact is None, never substitute local time.
+        """
+        ...
+
+    def record_renewal(self, renewal: CacheRenewal) -> None:
+        """Durably and idempotently settle one renewal lease the claim granted.
+
+        Renewed moves the resource's known expiry and trims the storage hold to
+        the extension; failed releases it; unknown keeps the whole hold and never
+        moves the expiry. A repeated report for a settled lease changes nothing.
         """
         ...
 

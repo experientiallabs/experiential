@@ -64,12 +64,11 @@ pub struct Usage {
     /// Media units priced by the deployment's unit card; absent on token-priced attempts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub billed_units: Option<BilledUnits>,
-    /// The provider read this call's cache writes back in the same call (Google
-    /// explicit caching: the creating request is served from the cache it just
-    /// wrote). Settlement keeps reads and writes disjoint; the OpenAI-shape
-    /// renderers report those written tokens inside `cached_tokens` as well,
-    /// the convention OpenRouter's Gemini relay uses.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    /// The provider read this call's cache writes back in-call (Google explicit
+    /// caching). Settlement stays disjoint; Chat reports the writes inside
+    /// `cached_tokens` too, as OpenRouter's Gemini relay does. A rendering fact
+    /// only, never serialized.
+    #[serde(skip)]
     pub cache_writes_read_back: bool,
 }
 

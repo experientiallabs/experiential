@@ -177,8 +177,16 @@ where
             if let Some(grant) = renew {
                 // The generation reuses the resource whatever the renewal does;
                 // its current expiry already passed the safety check above.
-                let outcome =
-                    renew_resource(http, wire, &endpoint, &resource_name, &grant, deadline).await;
+                let outcome = renew_resource(
+                    http,
+                    wire,
+                    &endpoint,
+                    &resource_name,
+                    &grant,
+                    expires_at,
+                    deadline,
+                )
+                .await;
                 let mut report = json!({
                     "request_id": request_id,
                     "deployment_id": wire.deployment_id,
@@ -188,9 +196,15 @@ where
                 if let Some(expire_time) = outcome.1 {
                     report["expire_time"] = json!(expire_time);
                 }
-                // A lost acknowledgement keeps the host's storage hold: never fail
-                // the generation over renewal accounting.
-                let _ = callback(deadline, call("renew_explicit_cache", report.to_string())).await;
+                // A lost or slow acknowledgement keeps the host's storage hold:
+                // its own short bound means renewal accounting never spends the
+                // generation's deadline.
+                let report_deadline = deadline.min(Instant::now() + MAXIMUM_RENEWAL_WAIT);
+                let _ = callback(
+                    report_deadline,
+                    call("renew_explicit_cache", report.to_string()),
+                )
+                .await;
                 ensure_remaining(deadline)?;
             }
             Ok(overlaid)
@@ -607,6 +621,7 @@ async fn renew_resource(
     endpoint: &CacheEndpoint,
     resource_name: &str,
     grant: &RenewGrant,
+    current_expiry: f64,
     deadline: Instant,
 ) -> (&'static str, Option<String>) {
     let now = epoch_now();
@@ -650,9 +665,11 @@ async fn renew_resource(
                 .as_ref()
                 .and_then(|body| body.get("expireTime"))
                 .and_then(Value::as_str)
+                // Only a later expiry proves an extension happened.
                 .filter(|value| {
-                    expiry_epoch(value)
-                        .is_some_and(|absolute| absolute > now && absolute <= grant.expires_at)
+                    expiry_epoch(value).is_some_and(|absolute| {
+                        absolute > now.max(current_expiry) && absolute <= grant.expires_at
+                    })
                 });
             match observed {
                 Some(value) => ("renewed", Some(value.to_string())),
@@ -813,3 +830,7 @@ mod bridge_tests;
 #[cfg(test)]
 #[path = "google_cache_scope_tests.rs"]
 mod scope_tests;
+
+#[cfg(test)]
+#[path = "google_cache_renewal_tests.rs"]
+mod renewal_tests;

@@ -316,14 +316,16 @@ def _assert_private(value: str) -> None:
         assert secret not in value
 
 
-@pytest.mark.parametrize("method", ["authority", "claim", "record"])
+@pytest.mark.parametrize("method", ["authority", "claim", "record", "record_renewal"])
 @pytest.mark.parametrize("malformation", ["missing", "noncallable"])
 def test_invalid_host_contract_is_refused_before_admission(
     tmp_path: Path, method: str, malformation: str
 ) -> None:
     """Incomplete cache hosts cannot start a control plane that might later dispatch HTTP."""
     control, _key = _control(tmp_path)
-    invalid = SimpleNamespace(authority=mock.Mock(), claim=mock.Mock(), record=mock.Mock())
+    invalid = SimpleNamespace(
+        authority=mock.Mock(), claim=mock.Mock(), record=mock.Mock(), record_renewal=mock.Mock()
+    )
     if malformation == "missing":
         delattr(invalid, method)
     else:
@@ -337,7 +339,7 @@ def test_invalid_host_contract_is_refused_before_admission(
         NativeControlPlane(control._components, explicit_cache=cast("ExplicitCacheHost", invalid))
     _assert_private(str(error.value) + repr(error.value))
     accept.assert_not_called()
-    for candidate in ("authority", "claim", "record"):
+    for candidate in ("authority", "claim", "record", "record_renewal"):
         retained = getattr(invalid, candidate, None)
         if isinstance(retained, mock.Mock):
             retained.assert_not_called()
@@ -1330,16 +1332,7 @@ def test_automatic_selection_skips_the_host_when_no_candidate_binds(
 
 
 class _RenewingHost(_Host):
-    """Grant one renewal lease on every reuse and record each settled outcome.
-
-    Attributes:
-        renewals: Every renewal outcome the engine reported, in order.
-    """
-
-    def __init__(self, authority: GoogleCacheAuthority | None) -> None:
-        """Start with no recorded renewals."""
-        super().__init__(authority)
-        self.renewals: list[CacheRenewal] = []
+    """Grant one renewal lease on every reuse; settled outcomes land in ``renewals``."""
 
     def claim(self, offer: CacheOffer) -> CacheClaim:
         """Extend a reused resource to fifteen minutes after this offer."""
@@ -1350,10 +1343,6 @@ class _RenewingHost(_Host):
                 claim, renewal_operation_id=operation, renew_until=offer.requested_at + 900
             )
         return claim
-
-    def record_renewal(self, renewal: CacheRenewal) -> None:
-        """Keep the settled renewal for assertions."""
-        self.renewals.append(renewal)
 
 
 def _renew(control: NativeControlPlane, argument: JsonObject) -> JsonObject:
@@ -1430,20 +1419,3 @@ def test_a_confirmed_renewal_records_the_provider_expiry(tmp_path: Path, clock: 
             expire_time=renew["expires_at"],
         )
     ]
-
-
-def test_a_host_without_renewals_is_never_offered_one(tmp_path: Path, clock: _Clock) -> None:
-    """Older hosts keep the fixed five-minute horizon and an unchanged ready payload."""
-    host = _Host(_authority())
-    control, key = _control(tmp_path, host)
-    first = _admission(control, key)
-    _start_first(control, first)
-    _finish(control, _finish_argument(first, _prepare(control, first)))
-    assert not next(iter(host.offers.values())).renewable
-    clock.now += 1
-    second = _admission(control, key, suffix="Any plums?")
-    _start_first(control, second)
-    assert "renew" not in _prepare(control, second)
-    assert _renew(
-        control, {**_selector(second), "operation_id": "cache-x", "outcome": "failed"}
-    ) == {"state": "unavailable"}

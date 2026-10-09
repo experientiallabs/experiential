@@ -59,7 +59,9 @@ fn responses_cache_ttl_survives_two_gateway_hops_without_inventing_zero() {
 }
 
 #[test]
-fn responses_report_writes_read_back_inside_cached_tokens_like_openrouter() {
+fn responses_keep_writes_read_back_disjoint_for_two_gateway_hops() {
+    // Responses parsers have no overlapping mode, so a gateway hop must see
+    // disjoint legs; only Chat folds read-back writes into cached_tokens.
     let read_back = Usage {
         input_tokens: Some(11_933),
         output_tokens: Some(9),
@@ -69,14 +71,8 @@ fn responses_report_writes_read_back_inside_cached_tokens_like_openrouter() {
         ..Usage::default()
     };
     let wire = responses_usage(Some(&read_back));
-    assert_eq!(wire["input_tokens_details"]["cached_tokens"], 10_663);
+    assert_eq!(wire["input_tokens_details"]["cached_tokens"], 0);
     assert_eq!(wire["input_tokens_details"]["cache_write_tokens"], 10_663);
-    let disjoint = Usage {
-        cache_writes_read_back: false,
-        ..read_back
-    };
-    assert_eq!(
-        responses_usage(Some(&disjoint))["input_tokens_details"]["cached_tokens"],
-        0
-    );
+    let parsed = crate::events::openai_usage(Some(&wire)).unwrap().unwrap();
+    assert_eq!(parsed.cache_creation_input_tokens, Some(10_663));
 }

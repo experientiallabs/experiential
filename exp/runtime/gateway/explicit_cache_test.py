@@ -18,6 +18,7 @@ from exp.runtime.gateway.explicit_cache import (
     CacheCreator,
     CacheOffer,
     CacheReady,
+    CacheRenewal,
     CacheResult,
     CacheUnavailable,
     GoogleCacheAuthority,
@@ -60,6 +61,7 @@ class AtomicHost:
         self.results: dict[str, CacheResult] = {}
         self.claim_calls = 0
         self.record_calls = 0
+        self.renewals: list[CacheRenewal] = []
         self.lock = threading.Lock()
 
     def authority(
@@ -99,6 +101,11 @@ class AtomicHost:
             self.offers[offer.cache_key] = offer
             self.reserved += offer.reservation_nano_usd
             return CacheCreator(offer.operation_id, offer.expires_at)
+
+    def record_renewal(self, renewal: CacheRenewal) -> None:
+        """Keep each settled renewal; the fake has no storage hold to adjust."""
+        with self.lock:
+            self.renewals.append(renewal)
 
     def record(self, result: CacheResult) -> None:
         """Record idempotently while retaining pending and unknown cost reservations."""

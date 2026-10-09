@@ -530,7 +530,6 @@ fn chat_aggregate_gains_annotations_and_the_usage_meter_only_when_searched() {
     assert!(!plain.contains("server_tool_use_details"));
 }
 
-<<<<<<< HEAD
 fn custom_tool_events(custom: bool, name: &str, deltas: &[&str], raw: &str) -> Vec<Event> {
     let mut events = vec![Event::ToolCallStarted {
         custom,
@@ -664,7 +663,8 @@ fn chat_stream_unwraps_a_translated_custom_call_for_a_chat_caller() {
             &json!([{"index": 0, "custom": {"input": "print(2+2)"}}]),
         ]
     );
-=======
+}
+
 /// A Gemini automatic-cache creation read back in-call (10,663 of 11,933
 /// input tokens written, none read from an earlier cache).
 fn written_and_read_back() -> Usage {
@@ -723,5 +723,4 @@ fn disjoint_writes_and_the_anthropic_shape_keep_reads_and_writes_apart() {
     assert_eq!(messages["input_tokens"], 1_270);
     // Settlement's disjoint read leg is untouched by the reporting convention.
     assert_eq!(written_and_read_back().cached_input_tokens, Some(0));
->>>>>>> e6f47e0 (gateway: report Gemini cache writes read back in-call inside cached_tokens, like OpenRouter (0.7.173, native 0.3.141))
 }
