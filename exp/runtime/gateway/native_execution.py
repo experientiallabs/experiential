@@ -858,6 +858,7 @@ def deployment_wire_entry(
     throttle_redial_budget: int = 0,
     zdr_constrained: bool = False,
     native_tool_translation: Mapping[str, tuple[str, str | None, bool]] | None = None,
+    capture_logprobs: bool = False,
 ) -> JsonObject:
     """Build one deployment's wire configuration for the admitted route.
 
@@ -891,6 +892,8 @@ def deployment_wire_entry(
         zdr_constrained: The payload was tightened to OpenRouter's ZDR routing
             constraint (``snapshot.zdr_constrained_deployment_ids``); the data
             plane echoes ``x-gateway-zdr-constrained: true`` when it serves.
+        capture_logprobs: ``capture_logprobs_eligible``: the data plane may ask this
+            rung for capture-only probabilities when the collector enables them.
 
     Returns:
         The JSON-compatible wire entry consumed by the data plane.
@@ -963,6 +966,7 @@ def deployment_wire_entry(
             None if capabilities.failover_only_on is None else list(capabilities.failover_only_on)
         ),
         "zdr_constrained": zdr_constrained,
+        "capture_logprobs": capture_logprobs,
     }
 
 

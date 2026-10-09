@@ -103,6 +103,20 @@ pub(crate) struct Observer {
 }
 
 impl Observer {
+    /// The winning dial requested probabilities the caller did not ask for.
+    pub(crate) fn logprobs_injected(&self) {
+        self.collector.logprobs_injected(&self.request_id);
+    }
+
+    /// Retain the winning attempt's capture-only probabilities.
+    pub(crate) fn logprobs(
+        &self,
+        deltas: Vec<crate::logprobs::ChoiceLogprobsDelta>,
+        truncated: bool,
+    ) {
+        self.collector.logprobs(&self.request_id, deltas, truncated);
+    }
+
     pub(crate) fn observe(&self, event: &Event) {
         match event {
             Event::GeminiThoughtPart(part) => {

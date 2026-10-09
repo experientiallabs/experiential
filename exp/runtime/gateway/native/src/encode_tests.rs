@@ -43,6 +43,7 @@ fn chat_cache_ttl_survives_two_gateway_hops_without_inventing_zero() {
             cache_creation_input_tokens: Some(100),
             cache_creation_1h_input_tokens: hour,
             reasoning_tokens: Some(5),
+            billed_units: None,
         };
         for streaming in [false, true] {
             let mut current = usage.clone();

@@ -69,6 +69,48 @@ def require_chat_logprobs(profiles: Sequence[GatewayWireProfile], request: Gatew
             )
 
 
+def capture_logprobs_eligible(
+    profile: GatewayWireProfile, request: GatewayRequest, *, caller: GatewayRequest | None = None
+) -> bool:
+    """Whether a rung may return Chat probabilities the caller did not request.
+
+    The host's capture may then ask for them on this rung and keep them out of
+    the caller's answer. The rung must satisfy exactly what an explicit Chat
+    probability request would need, on the platform's own credential, and the
+    caller must not have asked for probabilities on any surface (their own
+    request already returns them in the captured response).
+
+    Args:
+        profile: The rung's wire profile.
+        request: The effective rung request (capability and effort checks).
+        caller: The caller's public request, whose probability selectors decide
+            (an explicit ``logprobs: false`` is cleared from the rung request).
+
+    Returns:
+        Whether capture may request probabilities on this rung.
+    """
+    selectors = request if caller is None else caller
+    if (
+        selectors.logprobs is not None
+        or selectors.top_logprobs is not None
+        or selectors.include_output_text_logprobs
+        or profile.billing_customer_managed
+        or profile.dialect != "openai_compatible"
+        or profile.supports_logprobs is not True
+        or thinking_budget_value(request) is not None
+        or emulated_stop_sequences(profile.dialect, request)
+    ):
+        return False
+    if profile.supports_reasoning:
+        effort = (
+            request.reasoning_effort
+            if request.reasoning_effort is not None
+            else profile.reasoning_effort
+        )
+        return effort in profile.logprobs_reasoning_efforts
+    return True
+
+
 def require_responses_logprobs(
     profiles: Sequence[GatewayWireProfile], request: GatewayRequest
 ) -> None:

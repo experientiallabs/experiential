@@ -387,6 +387,9 @@ impl ResponsesSseEncoder {
             // Anthropic text-block boundaries and citation metadata have no
             // Responses representation; the text itself streams as deltas.
             Event::TextBlockStarted { .. } | Event::CitationDelta { .. } => Ok(Vec::new()),
+            // Safeguard verdicts answer a Messages-only request field and
+            // never reach a Responses caller.
+            Event::SafeguardResults(_) => Ok(Vec::new()),
             // Server tools enter only through a Messages request, which
             // never encodes on the Responses surface.
             Event::ServerToolUseStarted { .. }

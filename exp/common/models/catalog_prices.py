@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+from enum import StrEnum
 from typing import Annotated
 
-from pydantic import Field
+from pydantic import Field, field_validator
 
 from exp.common.core.artifacts import ContractModel
 
@@ -61,6 +62,84 @@ class GatewayServiceTierPrices(ContractModel):
     long_context: GatewayLongContextTier | None = None
 
 
+MAXIMUM_RATE_NANO_USD_PER_UNIT = 1_000_000_000_000
+"""Upper bound on one authored per-unit rate: $1,000 per billed unit in nano-USD.
+
+The priciest published media unit today is a second of 4K video at well under
+$1 (1e9 nano-USD), so this bound only rejects authoring mistakes. A request's
+unit ceiling multiplies it by a bounded quantity and is checked against the
+signed 64-bit ledger column like every other reservation.
+"""
+
+MAXIMUM_UNIT_VARIANT_CHARACTERS = 64
+
+
+class BilledUnitKind(StrEnum):
+    """What one non-token billed unit measures.
+
+    Media models are priced by what they produce or consume rather than by
+    tokens: speech synthesis by input character, transcription by second of
+    input audio, video generation by second of output video, and per-image
+    priced image models by image.
+    """
+
+    CHARACTER = "character"
+    AUDIO_SECOND = "audio_second"
+    VIDEO_SECOND = "video_second"
+    IMAGE = "image"
+
+
+class GatewayUnitPrices(ContractModel):
+    """Per-unit rates for a deployment priced in billed units instead of (or beside) tokens.
+
+    ``rates`` maps a variant to integer nano-USD per unit. The empty variant
+    ``""`` is the flat rate; named variants price provider SKUs that differ by
+    output shape (``"720p"``, ``"1080p/audio"``, ``"hd/1024x1024"``). A request
+    whose variant has no rate falls back to the flat rate when one exists and
+    is otherwise unpriced (fail-closed: never billed at an invented rate).
+
+    Attributes:
+        kind: What one billed unit measures.
+        rates: Variant to integer nano-USD per unit; at least one entry.
+    """
+
+    kind: BilledUnitKind
+    rates: dict[str, int] = Field(min_length=1)
+
+    @field_validator("rates")
+    @classmethod
+    def _bounded_rates(cls, value: dict[str, int]) -> dict[str, int]:
+        """Reject an out-of-range rate or an unbounded variant name."""
+        for variant, rate in value.items():
+            if len(variant) > MAXIMUM_UNIT_VARIANT_CHARACTERS:
+                msg = (
+                    f"unit variant {variant[:16]!r}... exceeds "
+                    f"{MAXIMUM_UNIT_VARIANT_CHARACTERS} characters"
+                )
+                raise ValueError(msg)
+            if rate < 0 or rate > MAXIMUM_RATE_NANO_USD_PER_UNIT:
+                msg = (
+                    f"unit rate for variant {variant!r} must be within "
+                    f"0..{MAXIMUM_RATE_NANO_USD_PER_UNIT}"
+                )
+                raise ValueError(msg)
+        return value
+
+    def rate_for(self, variant: str) -> int | None:
+        """Return the rate for one variant, falling back to the flat rate.
+
+        Args:
+            variant: The request's priced variant; ``""`` asks for the flat rate.
+
+        Returns:
+            Integer nano-USD per unit, or None when neither the variant nor a
+            flat rate is authored.
+        """
+        if variant in self.rates:
+            return self.rates[variant]
+        return self.rates.get("")
+
+
 class GatewayTokenPrices(ContractModel):
     """Integer gateway attribution rates for one provider deployment.
 
@@ -73,6 +152,20 @@ class GatewayTokenPrices(ContractModel):
     unqualified rate prices the remainder after observed 1-hour writes; missing
     TTL evidence leaves write cost unknown unless both authored write rates are equal, never
     inferred from requested TTL or provider name.
+
+    Attributes:
+        input_nano_usd_per_million_tokens: Fresh input tokens.
+        cached_input_nano_usd_per_million_tokens: Cache-read tokens inside the input.
+        cache_creation_input_nano_usd_per_million_tokens: Five-minute cache writes.
+        cache_creation_1h_input_nano_usd_per_million_tokens: One-hour cache writes.
+        output_nano_usd_per_million_tokens: Output tokens.
+        reasoning_nano_usd_per_million_tokens: Reasoning tokens inside the output.
+        long_context: Whole-request premium schedule for long-context input, or None.
+        flex: Pass-through rates for ``service_tier='flex'``, or None.
+        priority: Pass-through rates for ``service_tier='priority'``, or None.
+        units: Per-unit rates for media billed by character, second, or image;
+            None (the default) on every token-priced deployment, so a token
+            card's snapshot identity is unchanged by the field's existence.
     """
 
     input_nano_usd_per_million_tokens: NanoUsdRatePerMillionTokens = None
@@ -94,6 +187,7 @@ class GatewayTokenPrices(ContractModel):
     """Pass-through rates when the caller requests ``service_tier='flex'``."""
     priority: GatewayServiceTierPrices | None = None
     """Pass-through rates when the caller requests ``service_tier='priority'``."""
+    units: GatewayUnitPrices | None = None
 
     def service_tier(self, tier: str | None) -> GatewayServiceTierPrices | None:
         """Find the pass-through card for a requested processing tier.
@@ -131,4 +225,6 @@ class GatewayTokenPrices(ContractModel):
             output_nano_usd_per_million_tokens=card.output_nano_usd_per_million_tokens,
             reasoning_nano_usd_per_million_tokens=card.reasoning_nano_usd_per_million_tokens,
             long_context=card.long_context,
+            # Processing tiers reprice tokens only; a unit card is tier-independent.
+            units=self.units,
         )

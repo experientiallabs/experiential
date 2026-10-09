@@ -35,6 +35,7 @@ from typing import Final
 from exp.common.core.artifacts import JsonObject
 from exp.runtime.gateway.contracts import GatewayMessage, GatewayNamedToolChoice, GatewayRequest
 from exp.runtime.gateway.guardrails.bounded import run_on_native_loop
+from exp.runtime.gateway.tool_contracts import GatewayAllowedToolsChoice
 from exp.runtime.gateway.web_search.backend import WebSearchBackend, WebSearchBackendError
 from exp.runtime.gateway.web_search.contracts import GatewayWebSearch, GatewayWebSearchResult
 
@@ -60,6 +61,7 @@ DROPPED_UNAVAILABLE: Final = "web_search->dropped(search_unavailable)"
 DROPPED_FAILED: Final = "web_search->dropped(search_failed)"
 DROPPED_NO_QUERY: Final = "web_search->dropped(no_query)"
 TOOL_CHOICE_CLEARED: Final = "tool_choice->cleared(no_serviceable_tool)"
+DROPPED_NOT_ALLOWED: Final = "web_search->dropped(not_in_allowed_tools)"
 
 _WHITESPACE = re.compile(r"\s+")
 _CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
@@ -300,6 +302,18 @@ def plan_web_search(
     search = request.web_search
     if search is None or natively_served(search, dialects):
         return WebSearchPlan(request, None)
+    choice = request.tool_choice
+    if (
+        search.declared_as == "responses_tool"
+        and isinstance(choice, GatewayAllowedToolsChoice)
+        and not any(
+            entry.get("type") in RESPONSES_WEB_SEARCH_TOOL_TYPES
+            for entry in choice.provider_entries
+        )
+    ):
+        # The caller declared the search tool but did not allow it this turn:
+        # the gateway must not search on its behalf.
+        return _disclosed(request, DROPPED_NOT_ALLOWED)
     if backend is None:
         return _disclosed(request, DROPPED_UNAVAILABLE)
     query = derive_query(request)

@@ -58,6 +58,25 @@ only after all eligible routes decline the forced choice and discloses `tool_cho
 This does not guarantee a tool call. See the provider's
 [Opus 5.5 contract](https://platform.claude.com/docs/en/models/opus-5-5/migration-guide).
 
+A Responses `reasoning.summary` (or its deprecated alias `reasoning.generate_summary`) is
+best effort, as on OpenAI's own API. Admission prefers a rung whose wire carries summary parts over every other preference
+(native Responses, or Anthropic thinking projected onto them). A route with no such rung (for
+example gpt-5-nano's Azure Chat, Novita and OpenRouter lanes) serves the turn without summaries
+and discloses `reasoning.summary->dropped(unsupported_by_provider)` under the caller's spelling.
+
+An OpenAI `allowed_tools` tool choice (Chat `{"type": "allowed_tools", "allowed_tools": {...}}`
+or Responses `{"type": "allowed_tools", "mode": ..., "tools": [...]}`) restricts the model to
+the listed functions. A route whose every rung is native Responses forwards the selector verbatim,
+keeping the full tool list for prompt caching. Any other route declares only the allowed
+functions under the plain mode (`auto` or `required`, which each wire maps to its own `auto`,
+`any` or `ANY`) and discloses `tool_choice->translated(allowed_tools_as_restricted_tools)`. A
+`required` set on a model that cannot force tools relaxes to `auto` under the forced-choice
+policy above, keeping the set. Chat lists only functions; Responses may also list the SDK's
+non-function entries (`mcp`, `custom`, `image_generation`), forwarded verbatim on native routes
+and matched to the declarations they name elsewhere. When nothing the set allows survives on a
+wire, the choice is cleared with `tool_choice->cleared(no_serviceable_tool)`. Gateway-run tool
+search narrows its corpus to the allowed set before the first round.
+
 An explicit effort cannot be coerced upward. If a route needs a supported spelling, only an
 admissible lower tier may be selected, with disclosure; a reasoning-capable route with no
 admissible setting is refused. A genuinely non-reasoning route retains its existing disclosed

@@ -17,6 +17,7 @@ from exp.runtime.gateway.contracts import (
     GatewayRequest,
     GatewayToolDefinition,
 )
+from exp.runtime.gateway.tool_contracts import GatewayAllowedToolsChoice
 from exp.runtime.models.providers.audios import openai_chat_audio_part, reject_audio_part
 from exp.runtime.models.providers.documents import (
     anthropic_document_block,
@@ -525,6 +526,10 @@ ANTHROPIC_FAST_MODE_BETA = "fast-mode-2026-02-01"
 """Beta token Anthropic requires before it accepts ``speed``
 (verified live 2026-08-30)."""
 
+ANTHROPIC_SAFEGUARDS_BETA = "dangerous-tool-use-2026-09-03"
+"""Beta token Anthropic requires before it accepts ``safeguards`` (Claude
+Code auto mode sends both together; captured live 2026-10-08)."""
+
 ANTHROPIC_FILES_API_BETA = "files-api-2025-04-14"
 """Beta token Anthropic requires before a ``file`` source resolves an uploaded file."""
 
@@ -540,7 +545,7 @@ def anthropic_request_headers(
 ) -> dict[str, str]:
     """Return the per-request Anthropic headers for one dispatch.
 
-    ``context_management``, ``diagnostics``, ``speed`` and the
+    ``context_management``, ``diagnostics``, ``speed``, ``safeguards`` and the
     ``thinking.display: "updates"`` mode are each served behind an
     ``anthropic-beta`` token (each verified live: the bare field
     is "Extra inputs are not permitted"), so their tokens join the
@@ -566,6 +571,8 @@ def anthropic_request_headers(
         required.append(ANTHROPIC_DIAGNOSTICS_BETA)
     if request.speed is not None:
         required.append(ANTHROPIC_FAST_MODE_BETA)
+    if request.safeguards is not None:
+        required.append(ANTHROPIC_SAFEGUARDS_BETA)
     thinking = request.provider_thinking_config
     if isinstance(thinking, dict) and thinking.get("display") == "updates":
         required.append(ANTHROPIC_THINKING_DISPLAY_UPDATES_BETA)
@@ -800,6 +807,23 @@ def add_openai_tools(
                     "type": "function",
                     "function": {"name": request.tool_choice.name},
                 }
+            )
+        elif isinstance(request.tool_choice, GatewayAllowedToolsChoice):
+            # Only an allowed-tools wire receives the selector verbatim (route
+            # shaping restricts the tools for every other one); both spellings
+            # are OpenAI's own, Chat nesting the set under ``allowed_tools``.
+            allowed: list[JsonObject] = [
+                {"type": "function", "name": name}
+                if responses
+                else {"type": "function", "function": {"name": name}}
+                for name in request.tool_choice.names
+            ]
+            allowed.extend(dict(entry) for entry in request.tool_choice.provider_entries)
+            selector: JsonObject = {"mode": request.tool_choice.mode, "tools": allowed}
+            payload["tool_choice"] = (
+                {"type": "allowed_tools", **selector}
+                if responses
+                else {"type": "allowed_tools", "allowed_tools": selector}
             )
         else:
             payload["tool_choice"] = request.tool_choice

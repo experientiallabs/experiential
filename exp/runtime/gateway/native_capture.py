@@ -18,6 +18,7 @@ from exp.runtime.gateway.contracts import (
     GatewayFailureClass,
     GatewayRequest,
 )
+from exp.runtime.gateway.stream_contracts import TokenLogprob
 
 if TYPE_CHECKING:
     from exp_gateway_native import CaptureCollector
@@ -74,6 +75,11 @@ class CaptureConfiguration(ContractModel):
             rung that withholds reasoning display, or a guardrailed request) as
             ``provider_reasoning``, false by default. Displayed reasoning is
             retained in the captured response frames either way.
+        capture_logprobs: Ask eligible OpenAI-compatible rungs of captured requests
+            for Chat token probabilities the caller did not request and retain
+            them as ``provider_logprobs``, false by default. The caller's answer,
+            usage and settlement are unchanged; a rung that refuses the field is
+            re-dialed without it and never asked again by this worker.
     """
 
     delivery: CaptureDeliveryLimits = Field(default_factory=CaptureDeliveryLimits)
@@ -91,6 +97,7 @@ class CaptureConfiguration(ContractModel):
     relay_metadata: bool = False
     truncate_request: bool = False
     capture_hidden_reasoning: bool = False
+    capture_logprobs: bool = False
 
     @model_validator(mode="after")
     def _validate_pending_budget(self) -> CaptureConfiguration:
@@ -210,6 +217,25 @@ class CaptureMetrics(ContractModel):
     usage_complete: bool
 
 
+class CaptureProviderLogprobs(ContractModel):
+    """Gateway-requested Chat probabilities of the winning attempt.
+
+    Attributes:
+        logprobs_injected: Always true: the caller did not request them.
+        truncated: A retention bound stopped them before the response ended.
+        content: Probabilities of the answer text, in order (the native parser's
+            strict ``TokenLogprob`` contract; NUL in token text is U+FFFD).
+        refusal: Probabilities of refusal text, in order.
+        nul_replaced: A token text carried NUL and was stored with U+FFFD.
+    """
+
+    logprobs_injected: Literal[True]
+    truncated: bool = Field(strict=True)
+    content: tuple[TokenLogprob, ...]
+    refusal: tuple[TokenLogprob, ...]
+    nul_replaced: bool = Field(default=False, strict=True)
+
+
 class CaptureRecord(ContractModel):
     """One idempotent update delivered to a local or hosted persistence adapter.
 
@@ -226,6 +252,9 @@ class CaptureRecord(ContractModel):
         gemini_thought_parts: Ordered provider summary and signature evidence, not full CoT.
         gemini_thought_parts_source_json: Exact exceptional parts, otherwise None.
         transport: Optional outer-relay headers, timing and redacted wire input.
+        provider_logprobs: Gateway-requested Chat probabilities of the winning
+            attempt (``logprobs_injected``, ``truncated``, ``content``, ``refusal``),
+            present only when the gateway asked for them; otherwise absent.
     """
 
     schema_version: Literal[1]
@@ -242,6 +271,7 @@ class CaptureRecord(ContractModel):
     gemini_thought_parts: tuple[JsonObject, ...]
     gemini_thought_parts_source_json: str | None
     transport: JsonObject | None = None
+    provider_logprobs: CaptureProviderLogprobs | None = None
 
 
 class CaptureController:

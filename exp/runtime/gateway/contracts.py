@@ -38,9 +38,7 @@ from exp.runtime.gateway.reasoning_blocks import (
 from exp.runtime.gateway.reasoning_blocks import (
     ProviderReasoningBlock as ProviderReasoningBlock,
 )
-from exp.runtime.gateway.reasoning_blocks import (
-    RedactedThinkingBlock as RedactedThinkingBlock,
-)
+from exp.runtime.gateway.reasoning_blocks import RedactedThinkingBlock as RedactedThinkingBlock
 from exp.runtime.gateway.reasoning_blocks import (
     SealedReasoningContentBlock as SealedReasoningContentBlock,
 )
@@ -89,6 +87,7 @@ from exp.runtime.gateway.tool_contracts import (
 from exp.runtime.gateway.tool_contracts import (
     GatewayProviderNativeTool as GatewayProviderNativeTool,
 )
+from exp.runtime.gateway.tool_contracts import GatewayToolChoice, tool_choice_names
 from exp.runtime.gateway.tool_contracts import (
     GatewayToolDefinition as GatewayToolDefinition,
 )
@@ -134,6 +133,8 @@ class GatewayApiSurface(StrEnum):
     EMBEDDINGS = "embeddings"
     IMAGES = "images"
     DECISIONS = "decisions"
+    SPEECH = "speech"
+    TRANSCRIPTION = "transcription"
 
 
 class StructuredTextFormat(ContractModel):
@@ -456,7 +457,7 @@ class GatewayRequest(ContractModel):
     surface: GatewayApiSurface
     messages: tuple[GatewayMessage, ...] = Field(min_length=1)
     tools: tuple[GatewayToolDefinition, ...] = ()
-    tool_choice: Literal["auto", "none", "required"] | GatewayNamedToolChoice | None = None
+    tool_choice: GatewayToolChoice = None
     parallel_tool_calls: bool | None = None
     structured_text: StructuredTextFormat | None = None
     json_object_output: bool = Field(default=False, exclude=True)
@@ -518,6 +519,9 @@ class GatewayRequest(ContractModel):
     serialization; a present value joins replay identity through
     :func:`canonical_request_sha256`.
     """
+    safeguards: tuple[JsonObject, ...] | None = Field(default=None, exclude=True)
+    """Verbatim Claude Code auto-mode ``safeguards`` (Messages only): sent on
+    Anthropic rungs, silently omitted elsewhere; joins replay identity."""
     speed: str | None = Field(default=None, max_length=64, exclude=True)
     """Verbatim caller ``speed`` selector from the Messages surface.
 
@@ -787,12 +791,11 @@ class GatewayRequest(ContractModel):
         )
         if self.tool_search is not None and any(tool.defer_loading for tool in self.tools):
             server_names = (*server_names, gateway_tool_search_name(names))
-        if (
-            isinstance(self.tool_choice, GatewayNamedToolChoice)
-            and self.tool_choice.name not in names
-            and self.tool_choice.name not in server_names
-        ):
+        choice_names = tool_choice_names(self.tool_choice)
+        if any(name not in names and name not in server_names for name in choice_names):
             raise ValueError("named gateway tool choice must name a request tool")
+        if len(set(choice_names)) != len(choice_names):
+            raise ValueError("allowed gateway tool names must not repeat")
         has_tools = bool(self.tools or self.provider_server_tools or self.provider_native_tools)
         if self.tool_choice == "required" and not has_tools:
             raise ValueError("required gateway tool choice needs at least one tool")
@@ -831,6 +834,8 @@ class GatewayRequest(ContractModel):
             raise ValueError("diagnostics is valid only for Messages requests")
         if self.speed is not None and self.surface != GatewayApiSurface.MESSAGES:
             raise ValueError("speed is valid only for Messages requests")
+        if self.safeguards is not None and self.surface != GatewayApiSurface.MESSAGES:
+            raise ValueError("safeguards is valid only for Messages requests")
         if self.provider_cache_control is not None and self.surface != GatewayApiSurface.MESSAGES:
             raise ValueError("provider_cache_control is valid only for Messages requests")
         if self.inference_geo is not None and self.surface != GatewayApiSurface.MESSAGES:

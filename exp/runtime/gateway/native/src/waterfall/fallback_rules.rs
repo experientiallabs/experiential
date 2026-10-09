@@ -186,6 +186,7 @@ mod tests {
             throttle_redial: None,
             failover_only_on: tokens.map(|set| set.iter().map(|t| t.to_string()).collect()),
             zdr_constrained: false,
+            capture_logprobs: false,
         }
     }
 

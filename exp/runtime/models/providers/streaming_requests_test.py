@@ -713,8 +713,8 @@ def test_openai_responses_stream_payload_forwards_reasoning_summary() -> None:
     assert payload["reasoning"] == {"summary": "detailed"}
 
 
-def test_route_rejects_reasoning_summary_outside_native_responses() -> None:
-    """A fallback without summary output support rejects the exact caller alias."""
+def test_route_drops_reasoning_summary_outside_native_responses() -> None:
+    """A fallback without summary output serves the turn and discloses every caller alias."""
     request = GatewayRequest(
         surface=GatewayApiSurface.RESPONSES,
         messages=(GatewayMessage(role="user", content="hello"),),
@@ -739,11 +739,106 @@ def test_route_rejects_reasoning_summary_outside_native_responses() -> None:
         ),
     )
 
-    with pytest.raises(ProviderParameterError) as raised:
-        route_generation_parameter_requests(profiles, request)
+    public_request, provider_request = route_generation_parameter_requests(profiles, request)
 
-    assert raised.value.code == "unsupported_parameter"
-    assert raised.value.param == "reasoning.generate_summary"
+    assert public_request.reasoning_summary == "concise"
+    assert provider_request.reasoning_summary is None
+    assert provider_request.reasoning_summary_parameters == ()
+    assert public_request.ignored_parameters == (
+        "reasoning.generate_summary->dropped(unsupported_by_provider)",
+        "reasoning.summary->dropped(unsupported_by_provider)",
+    )
+
+
+@pytest.mark.parametrize("parameter", ["reasoning.summary", "reasoning.generate_summary"])
+def test_reasoning_summary_drops_on_a_route_with_no_summary_channel(parameter: str) -> None:
+    """gpt-5-nano's Chat-wire lanes serve a summary request without summaries, never a 400."""
+    request = GatewayRequest(
+        surface=GatewayApiSurface.RESPONSES,
+        messages=(GatewayMessage(role="user", content="hello"),),
+        reasoning_summary="auto",
+        reasoning_summary_parameters=(parameter,),  # ty: ignore[invalid-argument-type]
+    )
+    profiles = tuple(
+        GatewayWireProfile(
+            dialect="openai_compatible",
+            url=url,
+            model_id="gpt-5-nano",
+            supports_reasoning=True,
+            reasoning_wire_format="reasoning",
+        )
+        for url in (
+            "https://azure.test/openai/v1",
+            "https://novita.test",
+            "https://openrouter.test",
+        )
+    )
+
+    assert compatible_generation_parameter_profile_indexes(profiles, request) == (0, 1, 2)
+    public_request, provider_request = route_generation_parameter_requests(profiles, request)
+
+    assert provider_request.reasoning_summary is None
+    assert public_request.ignored_parameters == (f"{parameter}->dropped(unsupported_by_provider)",)
+
+
+def test_reasoning_summary_prefers_a_native_responses_rung() -> None:
+    """A summary-capable rung outranks rungs that would serve by dropping the summary."""
+    request = GatewayRequest(
+        surface=GatewayApiSurface.RESPONSES,
+        messages=(GatewayMessage(role="user", content="hello"),),
+        reasoning_summary="detailed",
+        reasoning_summary_parameters=("reasoning.summary",),
+    )
+    profiles = (
+        GatewayWireProfile(
+            dialect="openai_compatible",
+            url="https://azure.test/openai/v1",
+            supports_reasoning=True,
+            reasoning_wire_format="reasoning",
+        ),
+        GatewayWireProfile(
+            dialect="openai_responses",
+            url="https://openai.test",
+            supports_reasoning=True,
+            reasoning_wire_format="openai_responses",
+        ),
+    )
+
+    assert compatible_generation_parameter_profile_indexes(profiles, request) == (1,)
+
+
+def test_reasoning_summary_outranks_sampling_preference() -> None:
+    """A summary rung that drops temperature still beats a Chat rung that honors it.
+
+    Keeping both would mix the route, and its one shaped request would then drop
+    the summary on the rung that can carry it (Bugbot on #1251).
+    """
+    request = GatewayRequest(
+        surface=GatewayApiSurface.RESPONSES,
+        messages=(GatewayMessage(role="user", content="hello"),),
+        temperature=0.2,
+        reasoning_summary="auto",
+        reasoning_summary_parameters=("reasoning.summary",),
+    )
+    profiles = (
+        GatewayWireProfile(
+            dialect="openai_compatible",
+            url="https://azure.test/openai/v1",
+            supports_reasoning=True,
+            reasoning_wire_format="reasoning",
+        ),
+        GatewayWireProfile(
+            dialect="openai_responses",
+            url="https://openai.test",
+            supports_temperature=False,
+            supports_reasoning=True,
+            reasoning_wire_format="openai_responses",
+        ),
+    )
+
+    assert compatible_generation_parameter_profile_indexes(profiles, request) == (1,)
+    _public, provider = route_generation_parameter_requests((profiles[1],), request)
+    assert provider.reasoning_summary == "auto"
 
 
 def _tool_image_message() -> GatewayMessage:
@@ -3634,6 +3729,72 @@ def test_diagnostics_speed_and_betas_forward_on_anthropic_and_disclose_elsewhere
     assert mixed_provider.diagnostics is None
     assert mixed_provider.speed is None
     assert mixed_provider.provider_beta_tokens == ()
+
+
+def test_safeguards_forward_per_anthropic_attempt_and_drop_silently_elsewhere() -> None:
+    """Claude Code auto-mode safeguards reach only an Anthropic attempt.
+
+    The route keeps the field even when a fallback rung is not Anthropic, so
+    the Anthropic attempt still gets the server-side review; each other
+    dialect's payload simply omits it, and no disclosure is recorded, so a
+    non-Anthropic answer has exactly the shape of an ordinary turn and the
+    caller falls back to reviewing tool calls itself.
+    """
+    from exp.runtime.models.providers.wire_messages import (
+        ANTHROPIC_SAFEGUARDS_BETA,
+        anthropic_request_headers,
+    )
+
+    safeguards: tuple[JsonObject, ...] = (
+        {"type": "dangerous_tool_use", "classifier_context": {"v": 1, "rules": {"allow": []}}},
+    )
+    request = GatewayRequest(
+        surface=GatewayApiSurface.MESSAGES,
+        messages=(GatewayMessage(role="user", content="go"),),
+        safeguards=safeguards,
+        stream=True,
+        include_usage=True,
+    )
+    anthropic = GatewayWireProfile(
+        dialect="anthropic_messages",
+        url="https://api.anthropic.com/v1/messages",
+        maximum_output_tokens=128_000,
+    )
+    fallbacks = (
+        # Anthropic-compatible hosts on the same dialect: Azure AI Foundry
+        # Claude and a custom base URL may refuse the field, so they drop it.
+        GatewayWireProfile(
+            dialect="anthropic_messages",
+            url="https://x.services.ai.azure.com/anthropic/v1/messages",
+            maximum_output_tokens=128_000,
+        ),
+        GatewayWireProfile(
+            dialect="anthropic_messages",
+            url="https://claude-proxy.example.com/v1/messages",
+            maximum_output_tokens=128_000,
+        ),
+        GatewayWireProfile(dialect="openai_compatible", url="https://fallback.test"),
+        GatewayWireProfile(dialect="openai_responses", url="https://responses.test"),
+        GatewayWireProfile(dialect="bedrock_converse_stream", url="https://bedrock.test"),
+        GatewayWireProfile(dialect="gemini_generate_content", url="https://gemini.test"),
+    )
+    public, provider = route_generation_parameter_requests((anthropic, *fallbacks), request)
+    assert public.ignored_parameters == ()
+    assert provider.safeguards == safeguards
+
+    payload = dialect_stream_payload(anthropic, provider)
+    assert payload["safeguards"] == list(safeguards)
+    assert json.dumps(payload["safeguards"]) == json.dumps(list(safeguards))
+    headers = anthropic_request_headers({"anthropic-beta": "operator-token"}, provider)
+    assert headers["anthropic-beta"] == f"operator-token,{ANTHROPIC_SAFEGUARDS_BETA}"
+    for fallback in fallbacks:
+        encoded = json.dumps(dialect_stream_payload(fallback, provider))
+        assert "safeguards" not in encoded
+        assert "dangerous_tool_use" not in encoded
+
+    plain = request.model_copy(update={"safeguards": None})
+    assert "safeguards" not in dialect_stream_payload(anthropic, plain)
+    assert "anthropic-beta" not in anthropic_request_headers({}, plain)
 
 
 def test_tool_annotations_and_top_carriers_forward_on_anthropic_and_disclose_elsewhere() -> None:

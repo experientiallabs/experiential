@@ -150,6 +150,10 @@ pub(crate) struct Record<R = Response> {
     pub gemini_thought_parts: Vec<Arc<Value>>,
     pub gemini_thought_parts_source_json: Option<String>,
     pub captured_at: f64,
+    /// Gateway-requested token probabilities of the winning attempt, present
+    /// only when the dial injected them (see `super::logprobs`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_logprobs: Option<super::logprobs::Captured>,
 }
 
 /// Borrow ordinary reasoning; materialize a lossless projection only for NUL text.
@@ -269,6 +273,13 @@ impl<R: Serialize> Record<R> {
         record.serialize_field("gemini_thought_parts", &parts)?;
         record.serialize_field("gemini_thought_parts_source_json", &parts_source)?;
         record.serialize_field("captured_at", &self.captured_at)?;
+        if let Some(logprobs) = self
+            .provider_logprobs
+            .as_ref()
+            .filter(|l| l.logprobs_injected)
+        {
+            record.serialize_field("provider_logprobs", logprobs)?;
+        }
         record.end()
     }
 }
@@ -335,6 +346,10 @@ impl Record {
             + self.request.heap_bytes()
             + self.response.as_ref().map_or(0, Response::heap_bytes)
             + self.transport.as_ref().map_or(0, budget::heap_bytes)
+            + self
+                .provider_logprobs
+                .as_ref()
+                .map_or(0, super::logprobs::Captured::heap_bytes)
             + self.provider_reasoning.as_ref().map_or(0, String::capacity)
             + self
                 .provider_reasoning_source_json

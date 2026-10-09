@@ -195,8 +195,23 @@ fn run_worker<S: Sink>(
                             record.provider_reasoning = None;
                             record.provider_tool_calls_json = None;
                         }
+                        let _ = super::logprobs::align_with_response(record, false);
                     }
                     entry.value = sink.prepare(record, maximum_record_bytes).ok();
+                    if entry.value.is_none() && record.provider_logprobs.is_some() {
+                        // Probabilities are the one optional sidecar. A failure
+                        // that repeats with them and clears without them (the
+                        // sink's own size limit, whatever its payload shape)
+                        // drops them; any other failure keeps the record whole.
+                        entry.value = sink.prepare(record, maximum_record_bytes).ok();
+                        if entry.value.is_none() {
+                            let sidecar = record.provider_logprobs.take();
+                            entry.value = sink.prepare(record, maximum_record_bytes).ok();
+                            if entry.value.is_none() {
+                                record.provider_logprobs = sidecar;
+                            }
+                        }
+                    }
                     if let Some(value) = &entry.value {
                         bytes += sink.prepared_bytes(value);
                         // The prepared payload owns all retry evidence now. Free

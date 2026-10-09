@@ -18,7 +18,6 @@ from exp.runtime.gateway.contracts import (
     ExposedReasoningContentBlock,
     GatewayApiSurface,
     GatewayMessage,
-    GatewayNamedToolChoice,
     GatewayProviderNativeTool,
     GatewayRequest,
     GatewayToolDefinition,
@@ -73,6 +72,7 @@ from exp.runtime.openai_protocol.structured_text import (
     chat_structured_text,
     responses_structured_text,
 )
+from exp.runtime.openai_protocol.tool_choice import chat_tool_choice, responses_tool_choice
 from exp.runtime.openai_protocol.tool_search import chat_tool_search, responses_tool_search
 from exp.runtime.openai_protocol.validation_errors import validation_protocol_error
 from exp.runtime.openai_protocol.web_search import (
@@ -299,7 +299,7 @@ def decode_chat(
             tools=tuple(_chat_tool(tool) for tool in request.tools if tool.type == "function"),
             provider_native_tools=chat_native_tools,
             tool_search=chat_tool_search(chat_native_tools),
-            tool_choice=_chat_tool_choice(request.tool_choice),
+            tool_choice=chat_tool_choice(request.tool_choice),
             parallel_tool_calls=request.parallel_tool_calls,
             structured_text=chat_structured_text(request.response_format),
             json_object_output=chat_json_object_output(request.response_format),
@@ -475,7 +475,7 @@ def decode_responses(
             provider_native_tools=tuple(native_tools),
             web_search=responses_web_search(native_tools, online_suffix=online_suffix),
             tool_search=responses_tool_search(native_tools),
-            tool_choice=_responses_tool_choice(request.tool_choice),
+            tool_choice=responses_tool_choice(request.tool_choice, native_tools=native_tools),
             parallel_tool_calls=request.parallel_tool_calls,
             structured_text=responses_structured_text(request.text),
             ignored_parameters=(
@@ -773,38 +773,6 @@ def _response_tool(tool: _ResponseTool) -> GatewayToolDefinition:
         strict=bool(tool.strict),
         defer_loading=tool.defer_loading,
     )
-
-
-def _chat_tool_choice(
-    value: JsonValue,
-) -> Literal["auto", "none", "required"] | GatewayNamedToolChoice | None:
-    """Normalize Chat tool-choice strings and named-function objects."""
-    if value is None:
-        return None
-    if isinstance(value, str) and value in {"auto", "none", "required"}:
-        return cast(Literal["auto", "none", "required"], value)
-    if isinstance(value, dict):
-        function = value.get("function")
-        if value.get("type") == "function" and isinstance(function, dict):
-            name = function.get("name")
-            if isinstance(name, str):
-                return GatewayNamedToolChoice(name=name)
-    raise invalid_field("tool_choice")
-
-
-def _responses_tool_choice(
-    value: JsonValue,
-) -> Literal["auto", "none", "required"] | GatewayNamedToolChoice | None:
-    """Normalize Responses tool-choice strings and named-function objects."""
-    if value is None:
-        return None
-    if isinstance(value, str) and value in {"auto", "none", "required"}:
-        return cast(Literal["auto", "none", "required"], value)
-    if isinstance(value, dict) and value.get("type") == "function":
-        name = value.get("name")
-        if isinstance(name, str):
-            return GatewayNamedToolChoice(name=name)
-    raise invalid_field("tool_choice")
 
 
 def _responses_include_options(include: tuple[str, ...] | None) -> tuple[bool, bool, bool]:

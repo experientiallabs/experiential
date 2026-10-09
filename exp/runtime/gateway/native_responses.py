@@ -37,10 +37,8 @@ from exp.runtime.openai_protocol.state import (
     ProtocolNamespace,
     episode_namespace,
 )
-from exp.runtime.openai_protocol.streaming import (
-    _responses_tool_choice,  # noqa: PLC2701 - the encoder's envelope rendering is shared.
-    stable_public_id,
-)
+from exp.runtime.openai_protocol.streaming import stable_public_id
+from exp.runtime.openai_protocol.tool_choice import responses_tool_choice_echo
 
 ProviderStatus = Literal["in_progress", "completed", "incomplete"]
 ProviderPhase = Literal["commentary", "final_answer"]
@@ -549,7 +547,7 @@ def responses_envelope(request: GatewayRequest) -> JsonObject:
         "top_p": request.top_p,
         "reasoning": reasoning,
         "ignored_parameters": list(request.ignored_parameters),
-        "tool_choice": _responses_tool_choice(request),
+        "tool_choice": responses_tool_choice_echo(request),
         "tools": [
             {
                 "type": "function",

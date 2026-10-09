@@ -205,11 +205,18 @@ pub(super) struct Rung {
     pub(super) url: String,
     pub(super) accepted: Arc<Mutex<Vec<Instant>>>,
     pub(super) bodies: Arc<Mutex<Vec<String>>>,
+    /// Each request's `Idempotency-Key` header, when it carried one.
+    pub(super) keys: Arc<Mutex<Vec<Option<String>>>>,
 }
 
 /// Read one whole HTTP/1.1 request (headers, then `content-length` bytes of
 /// body) and return the body text.
 pub(super) async fn read_request_body(socket: &mut tokio::net::TcpStream) -> String {
+    read_request(socket).await.1
+}
+
+/// Read one whole HTTP/1.1 request; return its `Idempotency-Key` and body.
+pub(super) async fn read_request(socket: &mut tokio::net::TcpStream) -> (Option<String>, String) {
     let mut received: Vec<u8> = Vec::new();
     let mut chunk = [0u8; 16_384];
     loop {
@@ -225,13 +232,22 @@ pub(super) async fn read_request_body(socket: &mut tokio::net::TcpStream) -> Str
                 .and_then(|value| value.trim().parse::<usize>().ok())
                 .unwrap_or(0);
             if received.len() >= header_end + content_length {
-                return String::from_utf8_lossy(&received[header_end..header_end + content_length])
-                    .into_owned();
+                let key = String::from_utf8_lossy(&received[..header_end])
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("idempotency-key")
+                            .then(|| value.trim().to_string())
+                    });
+                let body =
+                    String::from_utf8_lossy(&received[header_end..header_end + content_length])
+                        .into_owned();
+                return (key, body);
             }
         }
         let read = socket.read(&mut chunk).await.unwrap_or(0);
         if read == 0 {
-            return String::new();
+            return (None, String::new());
         }
         received.extend_from_slice(&chunk[..read]);
     }
@@ -244,14 +260,17 @@ pub(super) async fn spawn_rung(script: Vec<Answer>) -> Rung {
     let address = listener.local_addr().expect("address");
     let accepted = Arc::new(Mutex::new(Vec::new()));
     let bodies = Arc::new(Mutex::new(Vec::new()));
+    let keys = Arc::new(Mutex::new(Vec::new()));
     let recorder = accepted.clone();
     let body_recorder = bodies.clone();
+    let key_recorder = keys.clone();
     tokio::spawn(async move {
         for answer in script {
             let (mut socket, _) = listener.accept().await.expect("accept");
             recorder.lock().expect("lock").push(Instant::now());
-            let body = read_request_body(&mut socket).await;
+            let (key, body) = read_request(&mut socket).await;
             body_recorder.lock().expect("lock").push(body);
+            key_recorder.lock().expect("lock").push(key);
             socket
                 .write_all(render(&answer).as_bytes())
                 .await
@@ -263,6 +282,7 @@ pub(super) async fn spawn_rung(script: Vec<Answer>) -> Rung {
         url: format!("http://{address}/v1/chat/completions"),
         accepted,
         bodies,
+        keys,
     }
 }
 
@@ -303,6 +323,7 @@ pub(super) fn wire(deployment_id: &str, url: &str, throttle_redial_budget: u32) 
         throttle_redial: None,
         failover_only_on: None,
         zdr_constrained: false,
+        capture_logprobs: false,
     }
 }
 
@@ -470,6 +491,7 @@ impl Harness {
             time_to_first_token: Duration::from_secs(120),
             approximate_input_tokens: 10.0,
             chat_logprobs: false,
+            capture_logprobs: false,
             output_less_retention: None,
             output_token_cap: None,
             tool_search: None,
@@ -794,6 +816,7 @@ fn rule_wire(deployment_id: &str, url: &str, tokens: &[&str]) -> DeploymentWire 
         billing_customer_managed: true,
         failover_only_on: Some(tokens.iter().map(|token| token.to_string()).collect()),
         zdr_constrained: false,
+        capture_logprobs: false,
         ..wire(deployment_id, url, 0)
     }
 }
@@ -971,5 +994,6 @@ fn a_first_dial_reserved_on_a_failover_only_rung_fails_closed() {
     });
 }
 
+mod capture_logprobs_tests;
 mod logprobs_tests;
 mod responses_logprobs_tests;

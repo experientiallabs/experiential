@@ -28,12 +28,16 @@ from exp.runtime.gateway.tool_search.round import WithheldSearchCall, parse_call
 
 
 class _Registry(Protocol):
+    """Resolve the admitted request whose withheld search is ready to execute."""
+
     def entry(self, request_id: str) -> InflightRequest | None:
         """Return the in-flight request, or ``None``."""
         ...
 
 
 class _Plane(Protocol):
+    """Expose the request registry required by the native tool-search callback."""
+
     _accounting: _Registry
 
 

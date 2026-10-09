@@ -29,6 +29,7 @@ from exp.runtime.gateway.contracts import (
     GatewayRequest,
     GatewayToolDefinition,
 )
+from exp.runtime.gateway.tool_contracts import GatewayAllowedToolsChoice
 from exp.runtime.models.providers.errors import (
     ProviderCapabilityError,
     ProviderParameterError,
@@ -699,12 +700,15 @@ def coerce_capability(capability: str, request: GatewayRequest) -> RequestCoerci
             disclosures=(SERVICE_TIER_DROP_DISCLOSURE,),
         )
     if capability == "forced_tool_choice":
-        if request.tool_choice != "required" and not isinstance(
-            request.tool_choice, GatewayNamedToolChoice
-        ):
+        choice = request.tool_choice
+        if isinstance(choice, GatewayAllowedToolsChoice) and choice.mode == "required":
+            relaxed: object = choice.model_copy(update={"mode": "auto"})
+        elif choice == "required" or isinstance(choice, GatewayNamedToolChoice):
+            relaxed = "auto"
+        else:
             return None
         return RequestCoercion(
-            request=request.model_copy(update={"tool_choice": "auto"}),
+            request=request.model_copy(update={"tool_choice": relaxed}),
             disclosures=(FORCED_TOOL_CHOICE_DISCLOSURE,),
         )
     if capability != "strict_tools" or not any(tool.strict for tool in request.tools):

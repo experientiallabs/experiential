@@ -407,3 +407,52 @@ def validate_manifest(payload: JsonObject, manifest: CompatibilityManifest) -> N
         disposition = decisions.get(field)
         if disposition is None or disposition == CompatibilityDisposition.UNSUPPORTED:
             raise unsupported_field(field)
+
+
+SPEECH_MANIFEST = CompatibilityManifest(
+    schema_version=1,
+    surface=GatewayApiSurface.SPEECH,
+    fields=(
+        *(
+            _field(path, CompatibilityDisposition.SUPPORTED)
+            for path in ("model", "input", "voice", "instructions", "response_format", "speed")
+        ),
+        # The gateway answers the whole audio file; the provider's SSE format is
+        # the gateway's own metering transport, never the caller's.
+        _field("stream_format", CompatibilityDisposition.UNSUPPORTED),
+    ),
+)
+
+TRANSCRIPTION_MANIFEST = CompatibilityManifest(
+    schema_version=1,
+    surface=GatewayApiSurface.TRANSCRIPTION,
+    fields=(
+        *(
+            _field(path, CompatibilityDisposition.SUPPORTED)
+            for path in (
+                "model",
+                "file",
+                "language",
+                "prompt",
+                "response_format",
+                "temperature",
+                "timestamp_granularities",
+            )
+        ),
+        # Streamed transcript deltas, server-side chunking, logprob includes,
+        # and speaker diarization references are not carried by the buffered
+        # surface; each is refused by name rather than silently dropped.
+        *(
+            _field(path, CompatibilityDisposition.UNSUPPORTED)
+            for path in (
+                "stream",
+                "chunking_strategy",
+                "include",
+                "keywords",
+                "known_speaker_names",
+                "known_speaker_references",
+                "languages",
+            )
+        ),
+    ),
+)

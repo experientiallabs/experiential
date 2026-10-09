@@ -37,6 +37,7 @@ fn wire(base: Option<f64>, slope: Option<f64>) -> DeploymentWire {
         throttle_redial: None,
         failover_only_on: None,
         zdr_constrained: false,
+        capture_logprobs: false,
     }
 }
 
@@ -249,6 +250,7 @@ fn usage(output_tokens: Option<u64>, reasoning_tokens: Option<u64>) -> Usage {
         cache_creation_input_tokens: None,
         cache_creation_1h_input_tokens: None,
         reasoning_tokens,
+        billed_units: None,
     }
 }
 

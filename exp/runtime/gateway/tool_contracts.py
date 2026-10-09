@@ -1,8 +1,10 @@
-"""Immutable function tools, provider-native tools, and named tool choices."""
+"""Immutable function tools, provider-native tools, and named or allowed-set tool choices."""
 
 from __future__ import annotations
 
-from pydantic import Field
+from typing import Literal
+
+from pydantic import Field, model_validator
 
 from exp.common.core.artifacts import ContractModel, JsonObject
 
@@ -64,3 +66,52 @@ class GatewayNamedToolChoice(ContractModel):
     """
 
     name: str = Field(min_length=1, max_length=256)
+
+
+class GatewayAllowedToolsChoice(ContractModel):
+    """A request to restrict the model to a subset of the declared functions.
+
+    OpenAI's ``allowed_tools`` selector keeps the full tool list on the wire (so
+    the prompt cache survives) while limiting which functions the model may
+    call. A wire without the selector serves the same semantics by declaring
+    only the allowed functions under a plain ``auto``/``required`` choice.
+
+    Attributes:
+        mode: ``auto`` lets the model answer without a call; ``required`` forces one.
+        names: Distinct caller function names the model may call, in caller order.
+        provider_entries: Verbatim non-function Responses entries (``mcp``,
+            ``custom``, ``image_generation``...); the provider owns their schema.
+    """
+
+    mode: Literal["auto", "required"]
+    names: tuple[str, ...] = ()
+    provider_entries: tuple[JsonObject, ...] = ()
+
+    @model_validator(mode="after")
+    def _require_an_entry(self) -> GatewayAllowedToolsChoice:
+        """Require at least one allowed tool.
+
+        Returns:
+            The validated choice.
+
+        Raises:
+            ValueError: The selector allows nothing.
+        """
+        if not self.names and not self.provider_entries:
+            raise ValueError("an allowed-tools choice must allow at least one tool")
+        return self
+
+
+GatewayToolChoice = (
+    Literal["auto", "none", "required"] | GatewayNamedToolChoice | GatewayAllowedToolsChoice | None
+)
+"""Every canonical tool-selection control a protocol decoder can produce."""
+
+
+def tool_choice_names(choice: GatewayToolChoice) -> tuple[str, ...]:
+    """Return the tool names one canonical tool choice references."""
+    if isinstance(choice, GatewayNamedToolChoice):
+        return (choice.name,)
+    if isinstance(choice, GatewayAllowedToolsChoice):
+        return choice.names
+    return ()

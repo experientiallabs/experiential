@@ -152,6 +152,14 @@ pub struct DeploymentWire {
     /// behaves exactly as before.
     #[serde(default)]
     pub failover_only_on: Option<Vec<String>>,
+    /// The control plane judged this rung able to return Chat probabilities
+    /// the caller did not request (an OpenAI-compatible wire whose model
+    /// verifiably supports them, on the platform's own credential). The data
+    /// plane injects them only when the collector also captures this request
+    /// with `capture_logprobs` on. An omitted flag is the off state, never a
+    /// widening (the same convention as the other per-rung flags here).
+    #[serde(default)]
+    pub capture_logprobs: bool,
 }
 
 /// The frozen retry-policy facts returned by admission.
@@ -222,6 +230,9 @@ pub struct WaterfallContext<'a> {
     /// quantity.
     pub approximate_input_tokens: f64,
     pub chat_logprobs: bool,
+    /// The collector captures this request and the host enabled gateway-requested
+    /// probabilities; eligible rungs then dial with `logprobs: true` for capture only.
+    pub capture_logprobs: bool,
     /// The bridge `remember` argument retaining an output-less turn: a
     /// successful terminal reached before any semantic output still answers
     /// the caller with a response id, and a response id the caller received

@@ -13,6 +13,7 @@ from exp.runtime.models.providers.generation_route_compat import (
     compatible_generation_parameter_profile_indexes,
 )
 from exp.runtime.models.providers.logprobs import (
+    capture_logprobs_eligible,
     require_chat_logprobs,
     require_unmodified_probability_output,
 )
@@ -198,3 +199,44 @@ def test_responses_probability_intent_uses_existing_optional_replay_authority() 
     assert selected.model_dump() == plain.model_dump()
     assert provider_replay_authority(plain) is None
     assert canonical_request_sha256(plain) != canonical_request_sha256(selected)
+
+
+def test_capture_eligibility_matches_explicit_support_without_a_caller_request() -> None:
+    """Only a verified, platform-funded Chat wire is asked for probabilities nobody requested."""
+    request = _chat_request()
+    assert capture_logprobs_eligible(_profile(), request)
+    assert not capture_logprobs_eligible(replace(_profile(), supports_logprobs=False), request)
+    assert not capture_logprobs_eligible(
+        replace(_profile(), billing_customer_managed=True), request
+    )
+    assert not capture_logprobs_eligible(
+        replace(_profile(), dialect="openai_responses", supports_responses_logprobs=True), request
+    )
+    for update in ({"logprobs": True}, {"logprobs": False}, {"top_logprobs": 0}):
+        assert not capture_logprobs_eligible(_profile(), request.model_copy(update=update))
+
+
+def test_capture_eligibility_respects_qualified_reasoning_efforts() -> None:
+    """A reasoning rung qualifies only at an effort its probabilities were verified for."""
+    profile = replace(
+        _profile(),
+        supports_reasoning=True,
+        reasoning_wire_format="reasoning",
+        reasoning_effort="low",
+        supported_reasoning_efforts=("none", "low"),
+    )
+    request = _chat_request()
+    assert not capture_logprobs_eligible(profile, request)
+    assert capture_logprobs_eligible(replace(profile, logprobs_reasoning_efforts=("low",)), request)
+    assert not capture_logprobs_eligible(
+        replace(profile, logprobs_reasoning_efforts=("low",)),
+        request.model_copy(update={"reasoning_effort": "none"}),
+    )
+
+
+def test_capture_eligibility_honors_the_callers_explicit_false() -> None:
+    """A cleared ``logprobs: false`` on the rung request still declines via the caller's."""
+    rung_request = _chat_request()
+    caller = rung_request.model_copy(update={"logprobs": False})
+    assert capture_logprobs_eligible(_profile(), rung_request)
+    assert not capture_logprobs_eligible(_profile(), rung_request, caller=caller)

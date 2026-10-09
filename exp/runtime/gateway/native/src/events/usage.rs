@@ -316,6 +316,7 @@ impl OpenAiUsageAccumulator {
             cache_creation_input_tokens,
             cache_creation_1h_input_tokens: covering_writes.and(cache_creation_1h_input_tokens),
             reasoning_tokens,
+            billed_units: None,
         });
         // Initial split fragments support a provisional mode until counters
         // change. A coherent raw output/reasoning/total sample may correct it;
@@ -526,6 +527,7 @@ pub fn gemini_usage(value: &Value) -> Result<Usage, String> {
         cache_creation_input_tokens: None,
         cache_creation_1h_input_tokens: None,
         reasoning_tokens: Some(reasoning_tokens),
+        billed_units: None,
     })
 }
 
@@ -565,6 +567,7 @@ pub fn bedrock_usage(value: Option<&Value>) -> Result<Usage, String> {
         )?,
         cache_creation_1h_input_tokens: bedrock_cache_hour_subset(usage, cache_write)?,
         reasoning_tokens: None,
+        billed_units: None,
     })
 }
 

@@ -15,10 +15,12 @@ from exp.runtime.gateway.tests.web_search_backend_fixture_test import (
     FailingWebSearchBackend,
     StaticWebSearchBackend,
 )
+from exp.runtime.gateway.tool_contracts import GatewayAllowedToolsChoice
 from exp.runtime.gateway.web_search.contracts import GatewayWebSearch, GatewayWebSearchResult
 from exp.runtime.gateway.web_search.plan import (
     DROPPED_FAILED,
     DROPPED_NO_QUERY,
+    DROPPED_NOT_ALLOWED,
     DROPPED_UNAVAILABLE,
     TOOL_CHOICE_CLEARED,
     derive_query,
@@ -269,3 +271,30 @@ def test_admission_carries_the_callers_sources_selector() -> None:
     )
     assert plan.admission is not None
     assert plan.admission["include_sources"] is True
+
+
+def test_a_declared_search_outside_the_allowed_set_never_searches() -> None:
+    """Declaring web_search for a stable tool list does not let the gateway search."""
+    backend = StaticWebSearchBackend(_HITS)
+    request = GatewayRequest(
+        surface=GatewayApiSurface.RESPONSES,
+        messages=(GatewayMessage(role="user", content="What is the latest Rust release?"),),
+        tools=(GatewayToolDefinition(name="lookup", parameters={"type": "object"}),),
+        provider_native_tools=(GatewayProviderNativeTool(index=1, tool={"type": "web_search"}),),
+        web_search=GatewayWebSearch(declared_as="responses_tool"),
+        tool_choice=GatewayAllowedToolsChoice(mode="auto", names=("lookup",)),
+    )
+    plan = plan_web_search(request, ["openai_compatible"], backend, deadline_monotonic=_deadline())
+    assert backend.queries == []
+    assert plan.admission is None
+    assert DROPPED_NOT_ALLOWED in plan.request.ignored_parameters
+
+    allowed = request.model_copy(
+        update={
+            "tool_choice": GatewayAllowedToolsChoice(
+                mode="auto", names=("lookup",), provider_entries=({"type": "web_search"},)
+            )
+        }
+    )
+    plan_web_search(allowed, ["openai_compatible"], backend, deadline_monotonic=_deadline())
+    assert backend.queries == ["What is the latest Rust release?"]

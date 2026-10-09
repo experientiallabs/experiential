@@ -13,6 +13,7 @@ from exp.runtime.gateway.contracts import (
     GatewayRequest,
 )
 from exp.runtime.gateway.json_object import JSON_OBJECT_SYSTEM_INSTRUCTION
+from exp.runtime.gateway.tool_contracts import GatewayAllowedToolsChoice
 from exp.runtime.models.providers.anthropic_tool_compat import (
     anthropic_input_schema,
     anthropic_rejects_forced_tool_choice,
@@ -245,6 +246,9 @@ def anthropic_messages_stream_payload(
     if request.tool_choice is not None:
         if isinstance(request.tool_choice, GatewayNamedToolChoice):
             tool_choice = {"type": "tool", "name": request.tool_choice.name}
+        elif isinstance(request.tool_choice, GatewayAllowedToolsChoice):
+            # Route shaping restricts the tools and maps the mode first.
+            raise ValueError("allowed-tools selectors must be restricted before Messages encoding")
         else:
             mapping = {"auto": "auto", "none": "none", "required": "any"}
             tool_choice = {"type": mapping[request.tool_choice]}
@@ -279,6 +283,12 @@ def anthropic_messages_stream_payload(
         payload["diagnostics"] = request.diagnostics
     if request.speed is not None:
         payload["speed"] = request.speed
+    if request.safeguards is not None:
+        # Claude Code auto-mode safeguards forward byte-for-byte on this
+        # dialect only; the beta header joins via anthropic_request_headers.
+        # Every other dialect's builder never emits the field, so a failover
+        # onto a non-Anthropic rung drops it per attempt.
+        payload["safeguards"] = list(request.safeguards)
     if request.provider_cache_control is not None:
         # The top-level automatic caching marker forwards byte-for-byte; the
         # provider accepts it bare (verified live 2026-08-30).

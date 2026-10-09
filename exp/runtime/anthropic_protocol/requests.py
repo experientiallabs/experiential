@@ -42,6 +42,7 @@ from exp.runtime.anthropic_protocol.gateway_reasoning import (
     merge_exposed_reasoning,
 )
 from exp.runtime.anthropic_protocol.manifest import (
+    MESSAGES_BETA_TOKENS_FIELD_BOUND,
     MESSAGES_BETA_TOKENS_FORWARDED,
     MESSAGES_MANIFEST,
 )
@@ -298,6 +299,8 @@ class _MessagesRequest(AnthropicWireModel):
     rungs, and dropped with disclosure elsewhere: a cache hint changes
     cost, not semantics."""
     inference_geo: str | None = Field(default=None, min_length=1, max_length=64)
+    # Claude Code auto mode: opaque objects, carried verbatim from the payload.
+    safeguards: tuple[JsonObject, ...] | None = None
     provider: ProviderRoutingPreferences | None = None
     gateway: GatewayRequestPolicy | None = None
     """The gateway's cross-surface ZDR demand / OpenRouter routing preferences."""
@@ -458,6 +461,7 @@ def _decode(
             provider_thinking_config=channels.thinking_config,
             context_management=_context_management(payload),
             diagnostics=_diagnostics(payload),
+            safeguards=_safeguards(payload),
             speed=request.speed,
             # Raw payload value, mirroring thinking: the provider receives the
             # caller's cache marker byte-for-byte on Anthropic rungs.
@@ -520,13 +524,32 @@ def _diagnostics(payload: JsonObject) -> JsonObject | None:
     return cast(JsonObject, value)
 
 
+def _safeguards(payload: JsonObject) -> tuple[JsonObject, ...] | None:
+    """Validate Claude Code's auto-mode safeguards as an array of objects.
+
+    Each entry is an evolving provider object forwarded byte-for-byte on
+    Anthropic rungs, so validation stays shallow.
+
+    Raises:
+        OpenAIProtocolError: The field is present but not an array of objects.
+    """
+    value = payload.get("safeguards")
+    if value is None:
+        return None
+    if not isinstance(value, list) or not all(isinstance(entry, dict) for entry in value):
+        raise invalid_field("safeguards", "safeguards must be an array of JSON objects.")
+    return tuple(cast(JsonObject, entry) for entry in value)
+
+
 def _beta_tokens(header: str | None) -> tuple[tuple[str, ...], tuple[str, ...]]:
     """Partition a caller ``anthropic-beta`` header into forward and drop sets.
 
     Forwarding is an exact allowlist (:data:`MESSAGES_BETA_TOKENS_FORWARDED`):
     a caller header is operator-trust surface and is never blind-forwarded.
     Dropped tokens are disclosed per token, never rejected, because the
-    provider itself tolerates unknown beta tokens.
+    provider itself tolerates unknown beta tokens. Field-bound tokens
+    (:data:`MESSAGES_BETA_TOKENS_FIELD_BOUND`) land in neither set: the
+    gateway injects them itself beside their field.
 
     Args:
         header: Raw comma-separated header value, or ``None``.
@@ -546,6 +569,8 @@ def _beta_tokens(header: str | None) -> tuple[tuple[str, ...], tuple[str, ...]]:
     for raw_token in header.split(","):
         token = raw_token.strip()
         if not token:
+            continue
+        if token in MESSAGES_BETA_TOKENS_FIELD_BOUND:
             continue
         if token in MESSAGES_BETA_TOKENS_FORWARDED:
             if token not in forwarded:

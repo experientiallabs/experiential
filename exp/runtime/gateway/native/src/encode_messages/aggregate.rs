@@ -11,7 +11,7 @@ use crate::errors::{Failure, PublicError};
 use crate::events::{Event, Usage};
 use crate::reasoning_display::{unsigned_thinking_delta, DisplayJoiner, ReasoningOutput};
 
-use super::{messages_usage, refusal_failure, stop_reason};
+use super::{last_safeguard_results, messages_usage, refusal_failure, stop_reason};
 
 /// The terminal outcome aggregated from one Messages event stream.
 pub struct AggregatedMessage {
@@ -296,6 +296,11 @@ pub fn completed_messages_body_with_reasoning(
         "stop_sequence": super::stop_sequence_value(terminal),
         "usage": messages_usage(usage.as_ref()),
     });
+    if let Some(results) = last_safeguard_results(events) {
+        // Anthropic's non-streaming message carries the verdicts top-level;
+        // present only when the provider sent them.
+        body["safeguard_results"] = results.clone();
+    }
     super::disclose_ignored_parameters(&mut body, ignored_parameters);
     Ok(AggregatedMessage {
         body,

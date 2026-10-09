@@ -41,6 +41,7 @@ impl Normalizer {
                 .filter(|_| self.cache_write.is_some_and(|count| count > 0)),
             // Thinking is billed inside output with no reported subset.
             reasoning_tokens: None,
+            billed_units: None,
         })
     }
 
@@ -294,6 +295,16 @@ impl Normalizer {
                     .ok_or_else(|| malformed("Anthropic message delta must be an object"))?;
                 if let Some(Value::String(reason)) = delta.get("stop_reason") {
                     self.stop_reason = Some(reason.clone());
+                }
+                // Verdicts for the caller's `safeguards` field ride this
+                // delta only. They are opaque (keyed by tool_use id, which
+                // passes through unchanged) and relayed verbatim; every other
+                // unknown delta key is ignored.
+                if let Some(results) = delta.get("safeguard_results") {
+                    let size = super::records_retained_bytes(results)
+                        .ok_or_else(|| malformed("Anthropic safeguard_results is not JSON"))?;
+                    self.reserve_tool_bytes(size)?;
+                    events.push(Event::SafeguardResults(results.clone()));
                 }
                 let usage = payload
                     .get("usage")

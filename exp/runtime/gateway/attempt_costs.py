@@ -4,8 +4,16 @@ from __future__ import annotations
 
 from typing import assert_never
 
+from exp.common.models.catalog_prices import BilledUnitKind
 from exp.common.models.gateway_catalog import ExactModelDeployment
 from exp.runtime.gateway.attempt_tokens import worst_case_input_tokens, worst_case_output_tokens
+from exp.runtime.gateway.audio_billing import audio_token_rates, flat_unit_rate
+from exp.runtime.gateway.audio_contracts import (
+    SpeechRequest,
+    TranscriptionRequest,
+    speech_ceiling_nano_usd,
+    transcription_ceiling_nano_usd,
+)
 from exp.runtime.gateway.cache_write import requests_hour_cache
 from exp.runtime.gateway.contracts import GatewayRequest
 from exp.runtime.gateway.decisions_contracts import DecisionRequest
@@ -60,6 +68,36 @@ def maximum_attempt_cost_nano_usd(
                 input_tokens=input_tokens,
                 input_rate=deployment.gateway.prices.input_nano_usd_per_million_tokens,
                 output_rate=deployment.gateway.prices.output_nano_usd_per_million_tokens,
+            )
+        case SpeechRequest():
+            prices = deployment.gateway.prices
+            input_rate, output_rate = audio_token_rates(prices)
+            return speech_ceiling_nano_usd(
+                request,
+                unit_rate=flat_unit_rate(prices, BilledUnitKind.CHARACTER),
+                input_tokens=input_tokens,
+                input_rate=input_rate,
+                output_rate=output_rate,
+                maximum_output_tokens=(
+                    None
+                    if deployment.capabilities is None
+                    else deployment.capabilities.maximum_output_tokens
+                ),
+            )
+        case TranscriptionRequest():
+            prices = deployment.gateway.prices
+            input_rate, output_rate = audio_token_rates(prices)
+            return transcription_ceiling_nano_usd(
+                request,
+                unit_rate=flat_unit_rate(prices, BilledUnitKind.AUDIO_SECOND),
+                input_tokens=input_tokens,
+                input_rate=input_rate,
+                output_rate=output_rate,
+                maximum_output_tokens=(
+                    None
+                    if deployment.capabilities is None
+                    else deployment.capabilities.maximum_output_tokens
+                ),
             )
         case GatewayRequest() | DecisionRequest():
             return _token_attempt_cost_nano_usd(request, deployment, input_tokens)

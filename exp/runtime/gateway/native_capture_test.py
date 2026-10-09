@@ -12,6 +12,7 @@ from unittest.mock import patch
 
 import httpx
 import pytest
+from pydantic import ValidationError
 from websockets.sync.client import ClientConnection, connect
 
 from exp.common.core.artifacts import JsonObject
@@ -1138,3 +1139,64 @@ def test_pending_checkpoint_does_not_pin_transport_or_settlement(
         provider.server_close()
         provider_thread.join(3)
     assert not errors
+
+
+def test_capture_logprobs_ships_off_and_reaches_the_native_collector() -> None:
+    """Gateway-requested probabilities are opt-in, and the switch crosses the boundary."""
+    assert CaptureConfiguration().capture_logprobs is False
+    assert json.loads(CaptureConfiguration(capture_logprobs=True).model_dump_json())[
+        "capture_logprobs"
+    ]
+    records: list[str] = []
+    native.CaptureCollector(
+        CaptureConfiguration(capture_logprobs=True).model_dump_json(), records.append
+    ).close(1)
+
+
+def test_capture_records_accept_marked_provider_logprobs() -> None:
+    """A record carrying injected probabilities validates; one without them is unchanged."""
+    base = {
+        "schema_version": 1,
+        "request": json.loads(_request_json()),
+        "response": None,
+        "deployment_id": None,
+        "captured_at": 1.0,
+        "metrics": None,
+        "gemini_thought_parts": [],
+        "gemini_thought_parts_source_json": None,
+    }
+    assert CaptureRecord.model_validate(base).provider_logprobs is None
+    marked = CaptureRecord.model_validate(
+        {
+            **base,
+            "provider_logprobs": {
+                "logprobs_injected": True,
+                "truncated": False,
+                "content": [{"token": "a", "logprob": -0.5, "bytes": [97], "top_logprobs": []}],
+                "refusal": [],
+            },
+        }
+    )
+    assert marked.provider_logprobs is not None
+    assert marked.provider_logprobs.logprobs_injected is True
+    assert marked.provider_logprobs.content[0].token == "a"
+    for malformed in (
+        {"truncated": "no"},
+        {"logprobs_injected": False},
+        {"content": [{"token": "a", "logprob": "x", "bytes": None, "top_logprobs": []}]},
+        {"content": [{"token": "a", "logprob": "-1", "bytes": None, "top_logprobs": []}]},
+        {"content": [{"token": "a", "logprob": -1.0, "bytes": [256], "top_logprobs": []}]},
+        {
+            "content": [
+                {
+                    "token": "a",
+                    "logprob": -1.0,
+                    "bytes": None,
+                    "top_logprobs": [{"token": "b", "logprob": -2.0, "bytes": None}] * 21,
+                }
+            ]
+        },
+    ):
+        evidence = {**marked.provider_logprobs.model_dump(mode="json"), **malformed}
+        with pytest.raises(ValidationError):
+            CaptureRecord.model_validate({**base, "provider_logprobs": evidence})

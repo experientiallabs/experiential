@@ -68,6 +68,50 @@ argument text even when Messages presents the arguments as a parsed input object
 Chat tool turns on exposure-enabled routes return plaintext without appending
 an opaque token to the same delta field; private routes retain authenticated tokens.
 
+With `CaptureConfiguration(capture_logprobs=True)` (off by default), an eligible
+rung of a captured request is asked for Chat token probabilities the caller did
+not request. Eligible means the control plane marked the wire `capture_logprobs`:
+an `openai_compatible` dialect whose model verifiably supports Chat logprobs (and,
+for a reasoning model, at the effective effort), on the platform's own credential,
+for a caller who set none of `logprobs`, `top_logprobs` or the Responses logprobs
+include. Only `logprobs: true` is added, never `top_logprobs`. The provider's
+probabilities are parsed into a side buffer, never into the event stream the
+caller's answer is encoded from, so the caller's bytes, usage and settlement are
+the same as without the request. The winning attempt's probabilities land in
+`provider_logprobs` (`logprobs_injected: true`, `truncated`, `content`,
+`refusal`); a record without injection carries no such key. A request with an
+output guardrail is never injected (the guardrail may rewrite the text the
+probabilities describe), and a response the host declines to retain drops its
+probabilities too. Retention is bounded at 4 MiB per attempt, by the collector's
+response and pending budgets, and by the destination's record ceiling after the
+request and the largest admissible response; an overflow sets `truncated` and
+keeps the exchange. A token text carrying NUL is stored with U+FFFD and flags
+`nul_replaced` (the token's `bytes` keep it exactly). A malformed probability
+channel, or a frame whose answer text (not typed thinking or reference parts)
+its records do not reproduce exactly (by their bytes, else their token text),
+is never a
+failure: it ends retention before that frame and marks the prefix `truncated`.
+Refusal text is not rendered on every surface, so a refusal frame ends
+retention the same way. The record's
+sidecar is reserved when injection is decided, so a dial is injected only when
+its probabilities have room; a reserved sidecar that is never used is not
+serialized. Probabilities are retained only from a
+committed winning attempt: a turn settled before any output committed (an
+exhausted refusal flush, an empty completion) carries none. An encoded record
+that would exceed the destination ceiling only because of its probabilities
+drops the `provider_logprobs` sidecar rather than the exchange: a preparation
+failure that repeats with the sidecar and clears without it (the sink's own
+limit, whatever its payload shape) drops it; any other failure retries the
+record whole.
+Probabilities are kept only beside a complete captured response: a truncated
+prefix, or a stream the client left early, drops them. A rung that refuses the field (a request-shaped
+4xx, or the same failure as a pre-output stream error under HTTP 200) is re-dialed once without it inside the same physical attempt (fresh
+per-dial first-byte and first-token allowances, its own Idempotency-Key); when that
+plain dial then yields anything but the same refusal, this worker never injects
+on the rung again. The discarded dial's open, first token and rate-limit headers
+are not the attempt's. A request the
+provider refuses either way answers exactly as it would have without injection.
+
 Postgres cannot represent NUL or lone UTF-16 surrogates. Affected request contexts
 and responses include `source_json`, an escaped JSON string containing the exact
 source value alongside the normalized query projection. Consumers recover the

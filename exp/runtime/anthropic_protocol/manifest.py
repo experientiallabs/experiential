@@ -71,6 +71,16 @@ MESSAGES_MANIFEST = CompatibilityManifest(
             CompatibilityDisposition.CONDITIONALLY_SUPPORTED,
             "fast_mode",
         ),
+        # Claude Code auto mode asks the provider to run its dangerous-tool-use
+        # classifier server-side. Forwarded verbatim on Anthropic rungs and
+        # silently dropped elsewhere (the caller then reviews tool calls
+        # itself), so the provider's ``safeguard_results`` reach the caller
+        # only from a rung that actually ran the review.
+        _field(
+            "safeguards",
+            CompatibilityDisposition.CONDITIONALLY_SUPPORTED,
+            "safeguards",
+        ),
         _field(
             "cache_control",
             CompatibilityDisposition.CONDITIONALLY_SUPPORTED,
@@ -261,4 +271,19 @@ rejected and never blind-forwarded; notable deliberate drops are
 swap would falsify this gateway's committed route identity and billing)
 and ``claude-code-20250219`` (an umbrella product token with an
 unenumerated behavior surface).
+"""
+
+
+MESSAGES_BETA_TOKENS_FIELD_BOUND = frozenset({"dangerous-tool-use-2026-09-03"})
+"""Caller ``anthropic-beta`` tokens accepted silently and never relayed as sent.
+
+Each token here only gates one request field, and the gateway injects it
+itself exactly when that field dispatches to an Anthropic rung (see
+``anthropic_request_headers``). Claude Code sends
+``dangerous-tool-use-2026-09-03`` beside its auto-mode ``safeguards`` field;
+the caller copy is neither forwarded (a bare token without its field, or on
+a non-Anthropic rung, would change nothing a caller can observe) nor
+disclosed as dropped, so a route that cannot run the server-side review
+answers exactly as if the caller had never asked, and the caller falls back
+to reviewing tool calls itself.
 """

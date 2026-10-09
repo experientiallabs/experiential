@@ -99,6 +99,12 @@ def test_both_published_v22_layouts_preserve_attempt_evidence(
         added = ({"upstream_provider"} if cache_layout else set(CACHE_WRITE_COLUMNS)) | {
             "service_tier_admission",
             "service_tier_settlement",
+            # v29: the frozen unit card and billed media units.
+            "unit_prices",
+            "billed_unit_kind",
+            "billed_unit_variant",
+            "billed_quantity_milli",
+            "billed_unit_rate",
         }
         assert after.keys() - before.keys() == added
         assert all(after[column] is None for column in added)

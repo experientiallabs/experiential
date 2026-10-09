@@ -20,12 +20,14 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::sync::Semaphore;
 
+use crate::audio_upload::transcription_body_limit;
 use crate::bridge::Bridge;
 use crate::encode::compact_json;
 use crate::errors::PublicError;
 use crate::guardrails::plan::DetectorMap;
 use crate::replay::ReplayStore;
 use crate::respond::{bearer_key, error_response, json_response, unknown_route_error};
+use crate::route_audio::{speech, transcriptions};
 use crate::route_batches::{
     batches_cancel, batches_create, batches_list, batches_retrieve, files_body_limit,
     files_content, files_create, files_retrieve,
@@ -202,6 +204,11 @@ pub async fn run(
         .route("/v1/systemone", post(decisions))
         .route("/v1/decisions", post(openai_decisions))
         .route("/v1/images/generations", post(images))
+        .route("/v1/audio/speech", post(speech))
+        .route(
+            "/v1/audio/transcriptions",
+            post(transcriptions).layer(transcription_body_limit()),
+        )
         .route("/v1/responses", post(responses).get(responses_ws))
         .route("/v1/messages", post(messages))
         .route("/v1/messages/count_tokens", post(messages_count_tokens))

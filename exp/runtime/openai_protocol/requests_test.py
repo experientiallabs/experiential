@@ -15,6 +15,7 @@ from exp.common.models.content import (
     GEMINI_FILE_URI_PREFIX,
     MAXIMUM_DOCUMENTS_PER_REQUEST,
     AudioContentPart,
+    ImageContentPart,
     MediaHandle,
     VideoContentPart,
 )
@@ -3873,6 +3874,75 @@ def test_a_list_valued_function_output_maps_onto_canonical_tool_parts() -> None:
     assert output_value[0] == {"type": "input_text", "text": "screenshot:"}
     assert output_value[1]["type"] == "input_image"
     assert output_value[1]["image_url"] == image_url
+
+
+def test_an_image_only_function_output_keeps_its_detail_and_list_shape() -> None:
+    """One image tool result stays a typed list, including its detail hint.
+
+    Codex serializes a single text tool result as a string and every other
+    body, including one ``input_image``, as an array. Detail ``high`` is the
+    level Codex sends when the model cannot request ``original``. The list
+    decodes onto the canonical tool message and re-emits with the same part
+    and detail, beside an ordinary string result from an earlier shell call.
+    """
+    image_url = "data:image/png;base64,aGk="
+    decoded = decode_responses(
+        {
+            "model": "gpt-6-astra",
+            "stream": True,
+            "store": False,
+            "tool_choice": "auto",
+            "include": ["reasoning.encrypted_content"],
+            "reasoning": {"effort": "xhigh"},
+            "instructions": "You are a coding agent.",
+            "input": [
+                {"role": "user", "content": "Inspect the screenshot."},
+                {
+                    "type": "function_call",
+                    "call_id": "call_shell",
+                    "name": "exec_command",
+                    "arguments": "{}",
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_shell",
+                    "output": "exit 0",
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "call_image",
+                    "name": "view_image",
+                    "arguments": '{"path":"shot.png"}',
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_image",
+                    "output": [
+                        {"type": "input_image", "image_url": image_url, "detail": "high"},
+                    ],
+                },
+            ],
+        }
+    )
+    image_message = decoded.request.messages[-1]
+    assert image_message.content == ""
+    image_part = image_message.content_parts[0]
+    assert isinstance(image_part, ImageContentPart)
+    assert image_part.detail == "high"
+    assert image_part.data_url() == image_url
+    assert decoded.request.reasoning_effort == "xhigh"
+
+    payload = openai_responses_stream_payload(
+        "gpt-6-astra", decoded.request, supports_temperature=False
+    )
+    payload_input = cast(list[JsonObject], payload["input"])
+    outputs = [
+        item["output"] for item in payload_input if item.get("type") == "function_call_output"
+    ]
+    assert outputs[0] == "exit 0"
+    assert outputs[1] == [
+        {"type": "input_image", "image_url": image_url, "detail": "high"},
+    ]
 
 
 def test_an_all_text_list_function_output_flattens_to_the_plain_string_form() -> None:

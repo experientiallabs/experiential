@@ -12,6 +12,7 @@ from typing import Annotated, Literal
 from pydantic import Field, TypeAdapter, model_validator
 
 from exp.common.core.artifacts import ContractModel, JsonObject
+from exp.common.models.catalog_prices import MAXIMUM_UNIT_VARIANT_CHARACTERS, BilledUnitKind
 from exp.common.models.model import MAXIMUM_TOOL_CALL_ID_CHARACTERS, ToolCall
 
 ByteValue = Annotated[int, Field(strict=True, ge=0, le=255)]
@@ -69,6 +70,26 @@ class ChoiceLogprobsDelta(ContractModel):
     logprobs: ChoiceLogprobs | None
 
 
+class BilledUnits(ContractModel):
+    """Non-token units one attempt consumed or produced, priced by a unit card.
+
+    ``quantity_milli`` counts thousandths of a unit so fractional seconds of
+    audio or video stay exact integers (12.5 s is ``12_500``); characters and
+    images are whole units times 1000. ``variant`` selects the priced SKU on
+    the deployment's :class:`~exp.common.models.catalog_prices.GatewayUnitPrices`
+    (``""`` for the flat rate).
+
+    Attributes:
+        kind: What one billed unit measures.
+        variant: The priced SKU on the deployment's unit card.
+        quantity_milli: Thousandths of a unit consumed or produced.
+    """
+
+    kind: BilledUnitKind
+    variant: str = Field(default="", max_length=MAXIMUM_UNIT_VARIANT_CHARACTERS)
+    quantity_milli: int = Field(ge=0)
+
+
 class GatewayUsage(ContractModel):
     """Normalized token counts and invoked tool names from one provider attempt.
 
@@ -79,13 +100,28 @@ class GatewayUsage(ContractModel):
     surcharge leg; it is disjoint from ``cached_input_tokens`` inside
     ``input_tokens``, so ``fresh = input - cached - cache_creation``.
 
-    A terminal event may carry partial token totals or only ``tool_names``.
+    A terminal event may carry partial token totals, only ``tool_names``, or
+    only ``billed_units`` (a per-character or per-second media call).
     Missing totals remain unknown, never zero. Live usage events require both
     totals; terminal accounting retains an observed leg without pricing the
     missing leg or treating a partial report as a final meter.
 
     ``web_search_requests`` and ``tool_search_requests`` ride along with either shape but never
     make usage on their own: a count with neither token totals nor tool names is still rejected.
+
+    Attributes:
+        input_tokens: Total input tokens, or None when unreported.
+        output_tokens: Total output tokens, or None when unreported.
+        cached_input_tokens: Cache-read subset of the input.
+        cache_creation_input_tokens: Cache-write subset of the input.
+        cache_creation_1h_input_tokens: One-hour subset of the cache writes.
+        reasoning_tokens: Reasoning subset of the output.
+        tool_names: Invoked tool names in first-use order.
+        web_search_requests: Gateway-executed web searches billed to the attempt.
+        tool_search_requests: Gateway-executed tool-search rounds billed to the attempt.
+        billed_units: Media units priced by the deployment's unit card (characters,
+            audio or video seconds, images), beside or instead of tokens; None on
+            every token-priced attempt.
     """
 
     input_tokens: int | None = Field(default=None, ge=0)
@@ -110,6 +146,7 @@ class GatewayUsage(ContractModel):
     provider meter and not a subset of any token total. Zero on every attempt
     that ran no tool search, including every attempt settled by an engine
     predating it."""
+    billed_units: BilledUnits | None = None
 
     @model_validator(mode="after")
     def _require_complete_tokens_or_tool_names(self) -> GatewayUsage:
@@ -119,11 +156,12 @@ class GatewayUsage(ContractModel):
             This validated token or tool-only usage record.
 
         Raises:
-            ValueError: No token or tool was observed, or a subset contradicts its total.
+            ValueError: No token, billed unit, or tool was observed, or a subset
+                contradicts its total.
         """
         totals = (self.input_tokens, self.output_tokens)
-        if totals == (None, None) and not self.tool_names:
-            raise ValueError("usage requires token totals or invoked tool names")
+        if totals == (None, None) and not self.tool_names and self.billed_units is None:
+            raise ValueError("usage requires token totals, billed units, or invoked tool names")
         if self.cache_creation_1h_input_tokens is not None and (
             self.cache_creation_input_tokens is None
             or self.cache_creation_1h_input_tokens > self.cache_creation_input_tokens

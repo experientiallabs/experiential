@@ -367,6 +367,9 @@ fn classify(event: &Event) -> StreamAdmission {
         | Event::StoppedAtSequence(_)
         | Event::PausedTurn
         | Event::GeminiThoughtPart(_)
+        // Provider verdicts on the caller's tool calls: tool-use ids and
+        // outcome flags, never model-generated text.
+        | Event::SafeguardResults(_)
         // Display-only reasoning never renders on a guardrailed request
         // (display is off whenever an output chain runs), so it carries no
         // caller-visible text to judge.

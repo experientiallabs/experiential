@@ -477,7 +477,7 @@ pub struct Normalizer {
     // only (bounded, printable ASCII), never content.
     upstream_provider: Option<String>,
     pub(crate) service_tier: crate::service_tier::ServiceTierObservation,
-    chat_logprobs: bool,
+    chat_logprobs: crate::capture::logprobs::ChatProbabilities,
     responses_logprobs: bool,
 }
 
@@ -526,7 +526,7 @@ impl Normalizer {
             dropped_cut_call: false,
             upstream_provider: None,
             service_tier: crate::service_tier::ServiceTierObservation::default(),
-            chat_logprobs: false,
+            chat_logprobs: Default::default(),
             responses_logprobs: false,
         }
     }
@@ -536,7 +536,7 @@ impl Normalizer {
     }
 
     pub fn enable_chat_logprobs(&mut self, enabled: bool) {
-        self.chat_logprobs = enabled;
+        self.chat_logprobs = crate::capture::logprobs::ChatProbabilities::requested(enabled);
     }
 
     /// The upstream an aggregator named as serving this stream, if any chunk said.

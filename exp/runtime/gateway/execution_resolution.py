@@ -6,6 +6,7 @@ from dataclasses import replace
 
 from exp.common.models.gateway_catalog import ExactModelDeployment, NormalizedGatewayCatalog
 from exp.common.models.model import BillingSource
+from exp.runtime.gateway.audio_billing import AudioSurface, billing_mode
 from exp.runtime.models import ResolvedModel, RuntimeModelCatalog
 from exp.runtime.models.providers.base import GatewayWireProfile
 from exp.runtime.models.providers.errors import ProviderCapabilityError
@@ -182,7 +183,7 @@ def alias_native_blockers(
             reasons.append(f"provider {deployment.provider!r} has no native wire profile")
             continue
         try:
-            _resolved_wire_profile(deployment, resolved)
+            profile = _resolved_wire_profile(deployment, resolved)
         except ProviderCapabilityError as exc:
             if exc.capability != "native_data_plane":
                 raise
@@ -191,4 +192,38 @@ def alias_native_blockers(
             reasons.append(
                 f"deployment {deployment.deployment_id!r} has an invalid reasoning wire contract"
             )
+        else:
+            reasons.extend(_audio_claim_blockers(deployment, profile))
     return tuple(dict.fromkeys(reasons))
+
+
+def _audio_claim_blockers(
+    deployment: ExactModelDeployment, profile: GatewayWireProfile
+) -> tuple[str, ...]:
+    """Name each audio surface a deployment claims but cannot serve or bill.
+
+    A claimed surface without its OpenAI-wire endpoint, or whose price card
+    names no single valid meter (``audio_billing.billing_mode``), could only
+    fail after a request was durably accepted, so the alias is excluded at
+    startup instead.
+    """
+    capabilities = deployment.gateway.capabilities
+    claims: tuple[tuple[AudioSurface, bool, str | None], ...] = (
+        ("speech", capabilities.supports_speech, profile.speech_url),
+        ("transcription", capabilities.supports_transcription, profile.transcriptions_url),
+    )
+    reasons: list[str] = []
+    for surface, claimed, url in claims:
+        if not claimed:
+            continue
+        if url is None:
+            reasons.append(
+                f"deployment {deployment.deployment_id!r} claims {surface} without a "
+                f"{surface} endpoint"
+            )
+        elif billing_mode(deployment, surface) is None:
+            reasons.append(
+                f"deployment {deployment.deployment_id!r} claims {surface} without a "
+                "single billable meter"
+            )
+    return tuple(reasons)

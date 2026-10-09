@@ -1,10 +1,12 @@
 """Focused tests for SQLite platform row conversion and replay checks."""
 
+import sqlite3
 from pathlib import Path
 
 import pytest
 
 from exp.common.models.catalog import GatewayLongContextTier, GatewayTokenPrices
+from exp.common.models.catalog_prices import BilledUnitKind
 from exp.runtime.gateway.budgets import BudgetScope, BudgetScopeKind, SQLiteBudgetStore
 from exp.runtime.gateway.contracts import GatewayEvent, GatewayEventKind, GatewayUsage
 from exp.runtime.gateway.ledger_test import (
@@ -21,6 +23,8 @@ from exp.runtime.gateway.platform import (
     AttemptUsageSource,
 )
 from exp.runtime.gateway.sqlite.platform import SQLiteGatewayPlatform
+from exp.runtime.gateway.sqlite.platform_records import usage_record
+from exp.runtime.gateway.stream_contracts import BilledUnits
 
 
 @pytest.mark.parametrize(
@@ -223,3 +227,21 @@ def test_reservation_replay_rejects_changed_frozen_cache_write_rate(
     with pytest.raises(ValueError, match="differs from durable accounting input"):
         platform.reserve_attempt(request.model_copy(update={"deployment": altered}))
     assert platform.reserve_attempt(request) == first
+
+
+def test_usage_record_restores_unit_only_media_usage() -> None:
+    """A settled speech attempt rereads its billed units, not ``None``."""
+    connection = sqlite3.connect(":memory:")
+    connection.row_factory = sqlite3.Row
+    row = connection.execute(
+        "SELECT NULL AS input_tokens, NULL AS output_tokens, NULL AS cached_input_tokens, "
+        "NULL AS cache_creation_input_tokens, NULL AS cache_creation_1h_input_tokens, "
+        "NULL AS reasoning_tokens, 'character' AS billed_unit_kind, '' AS billed_unit_variant, "
+        "1200000 AS billed_quantity_milli"
+    ).fetchone()
+    usage = usage_record(row)
+    assert usage is not None
+    assert usage.billed_units == BilledUnits(
+        kind=BilledUnitKind.CHARACTER, variant="", quantity_milli=1_200_000
+    )
+    assert usage.input_tokens is None

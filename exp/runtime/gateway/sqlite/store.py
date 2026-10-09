@@ -10,7 +10,6 @@ from collections.abc import Iterator
 from contextlib import contextmanager, nullcontext
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import assert_never
 
 from exp.common.core.artifacts import Sha256, sha256_json
 from exp.common.sqlite.connection import persistent_connection
@@ -30,9 +29,7 @@ from exp.runtime.gateway.contracts import (
     GatewayTarget,
     ProjectTarget,
 )
-from exp.runtime.gateway.decisions_contracts import DecisionRequest
-from exp.runtime.gateway.embeddings_contracts import EmbeddingsRequest, ServingRequest
-from exp.runtime.gateway.images_contracts import ImagesRequest
+from exp.runtime.gateway.embeddings_contracts import ServingRequest
 from exp.runtime.gateway.interfaces import GatewayClock
 from exp.runtime.gateway.model_chain_authority import (
     LocalSnapshotMemoOwner,
@@ -721,23 +718,20 @@ class SQLiteGatewayStore(ProviderConnectionStoreMixin, LocalSnapshotMemoOwner):
                 activation_ref=str(row["activation_ref"]),
                 catalog_sha256=str(row["catalog_sha256"]),
             )
-        match request:
-            case EmbeddingsRequest() | ImagesRequest() | DecisionRequest():
-                # These native surfaces carry no idempotency key and never
-                # claim a caller-operation scope.
-                caller_operation = None
-            case GatewayRequest():
-                caller_operation = _caller_operation_sha256(request)
-                if request.zdr_requested:
-                    # This gateway publishes no provider data-retention
-                    # postures, so a zero-data-retention demand cannot be
-                    # judged; refusing is the only honest answer.
-                    raise ZdrRoutingUnavailableError(
-                        "provider.zdr demands zero-data-retention routing, which this "
-                        "gateway cannot judge: it publishes no provider data-retention postures"
-                    )
-            case _:  # pragma: no cover - exhaustive over the ServingRequest union.
-                assert_never(request)
+        # Only the chat-family surfaces carry an idempotency key; every other
+        # native surface (embeddings, images, decisions, speech, transcription)
+        # never claims a caller-operation scope.
+        caller_operation = None
+        if isinstance(request, GatewayRequest):
+            caller_operation = _caller_operation_sha256(request)
+            if request.zdr_requested:
+                # This gateway publishes no provider data-retention postures, so a
+                # zero-data-retention demand cannot be judged; refusing is the
+                # only honest answer.
+                raise ZdrRoutingUnavailableError(
+                    "provider.zdr demands zero-data-retention routing, which this "
+                    "gateway cannot judge: it publishes no provider data-retention postures"
+                )
         return AuthorizationSnapshot(
             request_id=request_id,
             organization_id=organization_id,

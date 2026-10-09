@@ -236,6 +236,7 @@ impl SearchHarness {
             time_to_first_token: Duration::from_secs(120),
             approximate_input_tokens: 10.0,
             chat_logprobs: false,
+            capture_logprobs: false,
             output_less_retention: None,
             output_token_cap: None,
             tool_search: Some(tool_search),

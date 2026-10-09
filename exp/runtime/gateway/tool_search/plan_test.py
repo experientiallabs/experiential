@@ -10,6 +10,7 @@ from exp.runtime.gateway.contracts import (
     GatewayRequest,
     GatewayToolDefinition,
 )
+from exp.runtime.gateway.tool_contracts import GatewayAllowedToolsChoice
 from exp.runtime.gateway.tool_search.contracts import GatewayToolSearch
 from exp.runtime.gateway.tool_search.plan import (
     DROPPED_NO_DEFERRED,
@@ -148,3 +149,28 @@ def test_gateway_tool_name_skips_every_taken_variant() -> None:
     assert (
         gateway_tool_search_name(["tool_search", "gateway_tool_search"]) == "gateway_tool_search_2"
     )
+
+
+def test_gateway_search_corpus_holds_only_allowed_tools() -> None:
+    """An allowed-tools selector narrows the corpus before later rounds can surface tools."""
+    request = GatewayRequest(
+        surface=GatewayApiSurface.RESPONSES,
+        messages=(GatewayMessage(role="user", content="hi"),),
+        tools=(
+            _tool("loaded"),
+            _tool("blocked"),
+            _tool("deferred_a", deferred=True),
+            _tool("deferred_b", deferred=True),
+        ),
+        tool_choice=GatewayAllowedToolsChoice(mode="required", names=("loaded", "deferred_a")),
+        tool_search=GatewayToolSearch(declared_as="responses_tool", tool_type="tool_search"),
+    )
+    plan = plan_tool_search(request, ["openai_compatible"])
+    assert plan.state is not None
+    assert [tool.name for tool in plan.state.deferred] == ["deferred_a"]
+    assert [tool.name for tool in plan.request.tools] == ["loaded", "tool_search"]
+    # The selector stays for reflection; the search tool joins the allowed set.
+    assert plan.request.tool_choice == GatewayAllowedToolsChoice(
+        mode="required", names=("loaded", "tool_search")
+    )
+    assert plan.state.loaded == [plan.request.tools[0]]

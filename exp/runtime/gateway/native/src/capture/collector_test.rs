@@ -23,7 +23,7 @@ impl Sink for MemorySink {
     }
 }
 
-fn config() -> Configuration {
+pub(super) fn config() -> Configuration {
     Configuration {
         delivery: Limits {
             maximum_records: 8,
@@ -40,10 +40,11 @@ fn config() -> Configuration {
         truncate_request: false,
         asynchronous_delivery: true,
         capture_hidden_reasoning: true,
+        capture_logprobs: false,
     }
 }
 
-fn request(id: &str) -> Request {
+pub(super) fn request(id: &str) -> Request {
     Request {
         request_id: id.to_owned(),
         scope: Scope {
@@ -59,7 +60,7 @@ fn request(id: &str) -> Request {
     }
 }
 
-fn response() -> Response {
+pub(super) fn response() -> Response {
     Response::Json {
         status: 200,
         body: json!({"id":"completion","choices":[]}),
@@ -67,7 +68,7 @@ fn response() -> Response {
     }
 }
 
-fn collector(config: Configuration) -> (Arc<Collector>, mpsc::Receiver<Record>) {
+pub(super) fn collector(config: Configuration) -> (Arc<Collector>, mpsc::Receiver<Record>) {
     let (sender, receiver) = mpsc::channel();
     (
         Arc::new(Collector::new(config, MemorySink(sender)).unwrap()),
@@ -75,7 +76,7 @@ fn collector(config: Configuration) -> (Arc<Collector>, mpsc::Receiver<Record>) 
     )
 }
 
-fn drain(collector: &Collector, receiver: mpsc::Receiver<Record>) -> Vec<Record> {
+pub(super) fn drain(collector: &Collector, receiver: mpsc::Receiver<Record>) -> Vec<Record> {
     assert!(collector.close_until(Instant::now() + Duration::from_secs(1)));
     receiver.try_iter().collect()
 }

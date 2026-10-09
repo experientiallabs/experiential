@@ -98,3 +98,29 @@ fn episode_uses_explicit_body_identity_then_optional_session_header() {
     let actual: Value = serde_json::from_str(&payload).unwrap();
     assert!(actual["episode_id"].is_null());
 }
+
+#[test]
+fn local_payload_persists_injected_probabilities_only_when_present() {
+    let mut record = record();
+    let response = super::super::projection::CapturedResponse::completed_record(&record)
+        .unwrap()
+        .into_owned();
+    let plain: Value =
+        serde_json::from_str(&encode(&record, &response, "experience-id", 8192).unwrap()).unwrap();
+    assert!(plain["request"]["exp_capture_output"]
+        .get("provider_logprobs")
+        .is_none());
+    let mut captured = super::super::logprobs::Captured::injected();
+    captured.content.push(crate::logprobs::TokenLogprob {
+        token: "a".into(),
+        logprob: -0.5,
+        bytes: Some(vec![97]),
+        top_logprobs: Vec::new(),
+    });
+    record.provider_logprobs = Some(captured);
+    let marked: Value =
+        serde_json::from_str(&encode(&record, &response, "experience-id", 8192).unwrap()).unwrap();
+    let stored = &marked["request"]["exp_capture_output"]["provider_logprobs"];
+    assert_eq!(stored["logprobs_injected"], json!(true));
+    assert_eq!(stored["content"][0]["token"], json!("a"));
+}

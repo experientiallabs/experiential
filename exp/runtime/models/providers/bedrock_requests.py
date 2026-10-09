@@ -23,6 +23,7 @@ from exp.runtime.gateway.contracts import (
     GatewayToolDefinition,
 )
 from exp.runtime.gateway.json_object import JSON_OBJECT_SYSTEM_INSTRUCTION
+from exp.runtime.gateway.tool_contracts import GatewayAllowedToolsChoice
 from exp.runtime.models.providers.anthropic_tool_compat import anthropic_input_schema
 from exp.runtime.models.providers.audios import reject_audio_part
 from exp.runtime.models.providers.documents import bedrock_document_block
@@ -465,6 +466,9 @@ def _tool_config(
             tool_spec["strict"] = True
         tools.append({"toolSpec": tool_spec})
     config: JsonObject = {"tools": tools}
+    if isinstance(request.tool_choice, GatewayAllowedToolsChoice):
+        # Route shaping restricts the tools and maps the mode first.
+        raise ValueError("allowed-tools selectors must be restricted before Converse encoding")
     if request.tool_choice == "required":
         config["toolChoice"] = {"any": {}}
     elif isinstance(request.tool_choice, (ToolChoice, GatewayNamedToolChoice)):

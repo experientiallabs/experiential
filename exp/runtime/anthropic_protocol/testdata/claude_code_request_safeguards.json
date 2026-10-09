@@ -1,0 +1,79 @@
+{
+  "anthropic-beta": "claude-code-20250219,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,per-turn-control-2026-07-01,mid-conversation-tool-changes-2026-07-01,inline-tools-2026-09-15,advisor-tool-2026-03-01,effort-2025-11-24,dangerous-tool-use-2026-09-03,afk-mode-2026-01-31",
+  "safeguards": [
+    {
+      "type": "dangerous_tool_use",
+      "classifier_context": {
+        "v": 1,
+        "permission_mode": "auto",
+        "platform": "macos",
+        "live_cwd": "/home/dev/project",
+        "home_dir": "/home/dev",
+        "rule_roots": {
+          "userSettings": "/home/dev/.claude",
+          "projectSettings": "/home/dev/project",
+          "localSettings": "/home/dev/project",
+          "flagSettings": "/home/dev/project",
+          "policySettings": "/home/dev/project",
+          "cliArg": "/home/dev/project",
+          "command": "/home/dev/project",
+          "session": "/home/dev/project",
+          "toolsNarrowing": "/home/dev/project",
+          "mcpServerPolicy": "/home/dev/project",
+          "hostCredential": "/home/dev/project"
+        },
+        "trusted_directories": {
+          "primary": {
+            "path": "/home/dev/project",
+            "resolved": [
+              "/home/dev/project"
+            ]
+          },
+          "additional": [
+            {
+              "path": "/workspace/project",
+              "resolved": [
+                "/workspace/project",
+                "/home/dev/project"
+              ],
+              "source": "session"
+            }
+          ],
+          "network": [],
+          "block_reads_outside_working_directories": false
+        },
+        "rules": {
+          "allow": [],
+          "deny": [],
+          "ask": []
+        },
+        "auto_mode": {
+          "allow": [],
+          "soft_deny": [],
+          "hard_deny": [],
+          "environment": []
+        },
+        "artifact_consent_holdback": true,
+        "case_insensitive_paths": false,
+        "restricted": false,
+        "is_remote_mode": false,
+        "classify_all_shell": false,
+        "user_identity": "dev",
+        "git_state": {
+          "cwd": "/home/dev/project",
+          "root": null,
+          "branch": null,
+          "default_branch": null,
+          "status": null,
+          "visibility": {
+            "origin": null,
+            "push_remote": null,
+            "remotes": [],
+            "visibility_cache": []
+          },
+          "error": "not_a_repo"
+        }
+      }
+    }
+  ]
+}

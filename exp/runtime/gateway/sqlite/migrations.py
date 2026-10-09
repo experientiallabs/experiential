@@ -16,7 +16,7 @@ from exp.runtime.gateway.sqlite.nano_usd_migration import (
     migrate_money_to_nano_usd,
 )
 
-SCHEMA_VERSION = 28
+SCHEMA_VERSION = 29
 
 
 class GatewaySchemaError(RuntimeError):
@@ -752,6 +752,27 @@ _MIGRATIONS: dict[int, tuple[MigrationStep, ...]] = {
     28: (
         "ALTER TABLE gateway_requests ADD COLUMN web_search_requests INTEGER NOT NULL "
         "DEFAULT 0 CHECK (web_search_requests >= 0)",
+    ),
+    29: (  # media surfaces and the per-unit billing ledger (catalog_prices.GatewayUnitPrices)
+        "PRAGMA writable_schema = ON",
+        "UPDATE sqlite_master SET sql = replace(sql, "
+        "'''images'', ''decisions'')', "
+        "'''images'', ''decisions'', ''speech'', ''transcription'')') "
+        "WHERE type = 'table' AND name = 'gateway_requests'",
+        "PRAGMA writable_schema = RESET",
+        "CREATE TABLE gateway_schema_refresh_v29 (noop INTEGER) STRICT",
+        "DROP TABLE gateway_schema_refresh_v29",
+        # The unit card frozen at reservation (JSON, as authored), so settlement
+        # prices observed units against the rates the reservation was sized on.
+        "ALTER TABLE gateway_attempts ADD COLUMN unit_prices TEXT",
+        "ALTER TABLE gateway_attempts ADD COLUMN billed_unit_kind TEXT CHECK ("
+        "billed_unit_kind IS NULL OR billed_unit_kind IN "
+        "('character', 'audio_second', 'video_second', 'image'))",
+        "ALTER TABLE gateway_attempts ADD COLUMN billed_unit_variant TEXT",
+        "ALTER TABLE gateway_attempts ADD COLUMN billed_quantity_milli INTEGER CHECK ("
+        "billed_quantity_milli IS NULL OR billed_quantity_milli >= 0)",
+        "ALTER TABLE gateway_attempts ADD COLUMN billed_unit_rate INTEGER CHECK ("
+        "billed_unit_rate IS NULL OR billed_unit_rate >= 0)",
     ),
     24: (  # plan sign-in kind: part of the connection identity digest, so it rides the revision
         "ALTER TABLE provider_connection_revisions ADD COLUMN subscription TEXT "

@@ -34,6 +34,10 @@ pub(crate) struct Configuration {
     /// reasoning is already retained in the captured response frames.
     #[serde(default)]
     pub capture_hidden_reasoning: bool,
+    /// Request Chat token probabilities on eligible rungs of captured requests
+    /// and retain them as `provider_logprobs`, stripped from the caller's answer.
+    #[serde(default)]
+    pub capture_logprobs: bool,
 }
 
 impl Configuration {
@@ -207,6 +211,10 @@ fn expire_pending(pending: &mut Pending, skipped: &AtomicU64) {
     });
 }
 
+// Capture-only token probabilities (`super::logprobs`), kept beside the collector.
+#[path = "collector_logprobs.rs"]
+mod logprobs_sidecar;
+
 pub(crate) struct Collector {
     pub config: Configuration,
     delivery: Delivery,
@@ -260,6 +268,7 @@ impl Collector {
             metrics: None,
             gemini_thought_parts: Vec::new(),
             gemini_thought_parts_source_json: None,
+            provider_logprobs: None,
             captured_at: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map(|duration| duration.as_secs_f64())
@@ -412,6 +421,7 @@ impl Collector {
             metrics: None,
             gemini_thought_parts: Vec::new(),
             gemini_thought_parts_source_json: None,
+            provider_logprobs: None,
             captured_at: entry.record.captured_at,
         };
         // The context Arc is shared; charge the copied identifiers and receipt/queue nodes.
@@ -471,6 +481,7 @@ impl Collector {
             entry.record.provider_tool_calls_json = None;
             entry.record.metrics = None;
             entry.record.gemini_thought_parts.clear();
+            entry.bytes -= super::logprobs::release(&mut entry.record.provider_logprobs);
             entry._admission.handoff(entry.bytes);
             drop(pending);
             self.emit_entry(entry);
@@ -548,6 +559,8 @@ impl Collector {
             entry.record.provider_tool_calls_json = None;
             entry.record.gemini_thought_parts.clear();
         }
+        entry.bytes -=
+            super::logprobs::align_with_response(&mut entry.record, entry.wire.is_some());
         entry.record.deployment_id = deployment_id;
         entry.record.metrics = if entry.record.response.is_some() || entry.wire.is_some() {
             entry

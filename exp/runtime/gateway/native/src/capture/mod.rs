@@ -7,6 +7,7 @@ pub(crate) mod delivery;
 mod local;
 mod local_payload;
 mod local_store;
+pub(crate) mod logprobs;
 mod messages;
 pub(crate) mod metrics;
 mod projection;

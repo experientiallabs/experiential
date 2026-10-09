@@ -11,7 +11,14 @@ from exp.runtime.gateway.contracts import (
     GatewayNamedToolChoice,
     GatewayRequest,
 )
+from exp.runtime.gateway.tool_contracts import GatewayAllowedToolsChoice
 from exp.runtime.gateway.tool_search.contracts import gateway_tool_search_name
+from exp.runtime.models.providers.allowed_tools import (
+    ALLOWED_TOOLS_CLEARED,
+    ALLOWED_TOOLS_DISCLOSURE,
+    needs_allowed_tools_translation,
+    restrict_to_allowed_tools,
+)
 from exp.runtime.models.providers.codex_tools import (
     convert_native_history,
     translate_native_tools,
@@ -400,21 +407,18 @@ def route_generation_parameter_requests(
     # Stop sequences on a native Responses rung: the Responses API has no stop
     # field, so the data plane emulates them (the wire entry carries the exact
     # sequences and the stream is cut at the first match). Nothing to reject.
+    # A reasoning summary is best effort on OpenAI's own wire (a model may
+    # return none), so a route with no rung that carries summary parts serves
+    # without them and discloses the drop. Per-rung narrowing still prefers a
+    # summary-capable rung (``generation_route_compat``), so the drop applies
+    # only when none survives (gpt-5-nano's Azure Chat, Novita and OpenRouter
+    # lanes 400'd every summary request, 2026-10-08).
     if request.reasoning_summary is not None and not all(
         serves_reasoning_summary(profile) for profile in profiles
     ):
-        path = next(
-            iter(request.reasoning_summary_parameters),
-            "reasoning.summary",
-        )
-        raise ProviderParameterError(
-            message=(
-                f"The parameter {path!r} is not supported by this model route. "
-                "Remove the field or choose a different model."
-            ),
-            param=path,
-            code="unsupported_parameter",
-        )
+        for path in request.reasoning_summary_parameters or ("reasoning.summary",):
+            ignore("reasoning_summary", f"{path}->dropped(unsupported_by_provider)")
+        provider_updates["reasoning_summary_parameters"] = ()
     if request.reasoning_context is not None and not all(
         profile.dialect == "openai_responses" and profile.supports_reasoning for profile in profiles
     ):
@@ -910,7 +914,12 @@ def route_generation_parameter_requests(
                 param="tool_choice",
                 code="invalid_parameter",
             )
-        if request.tool_choice is not None:
+        if request.tool_choice is not None and not (
+            isinstance(request.tool_choice, GatewayAllowedToolsChoice)
+            and request.provider_native_tools
+        ):
+            # An allowed set over native-only declarations still selects among
+            # them; restriction below (or the native wire) owns it.
             ignore("tool_choice")
         if request.parallel_tool_calls is not None:
             ignore("parallel_tool_calls")
@@ -945,7 +954,16 @@ def route_generation_parameter_requests(
     if request.logprobs is False:
         ignore("logprobs")
 
+    restricted: GatewayRequest | None = None
+    if needs_allowed_tools_translation(profiles, request):
+        restricted = restrict_to_allowed_tools(request.model_copy(update=provider_updates))
+        disclosures = (ALLOWED_TOOLS_DISCLOSURE,)
+        if restricted.tool_choice is None:
+            disclosures = (*disclosures, ALLOWED_TOOLS_CLEARED)
+        ignored.extend(item for item in disclosures if item not in ignored)
     ignored_parameters = tuple(ignored)
     public_request = request.model_copy(update={"ignored_parameters": ignored_parameters})
     provider_request = public_request.model_copy(update=provider_updates)
+    if restricted is not None:
+        provider_request = restrict_to_allowed_tools(provider_request)
     return public_request, provider_request

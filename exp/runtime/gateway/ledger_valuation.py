@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import sqlite3
 
+from exp.common.models.catalog_prices import GatewayUnitPrices
 from exp.common.models.token_cost import token_cost_nano_usd
 from exp.runtime.gateway.contracts import (
     GatewayApiSurface,
@@ -21,6 +22,7 @@ from exp.runtime.gateway.contracts import (
     GatewayUsage,
 )
 from exp.runtime.gateway.ledger_errors import GatewayLedgerError
+from exp.runtime.gateway.stream_contracts import BilledUnits
 
 MAXIMUM_NANO_USD = 9_223_372_036_854_775_807
 """Largest nano-USD amount the signed 64-bit ledger columns (SQLite INTEGER,
@@ -113,6 +115,68 @@ def estimated_cost_nano_usd(
         reasoning_rate=reasoning_rate,
     )
     return None if cost is None else require_representable_nano_usd(cost, what="attempt cost")
+
+
+def unit_rate_nano_usd(billed: BilledUnits, card: GatewayUnitPrices | None) -> int | None:
+    """Return the per-unit rate that prices ``billed`` on a frozen unit card.
+
+    Fail-closed: a missing card, a card of another unit kind, or a variant with
+    neither its own nor a flat rate leaves the units unpriced (``None``).
+
+    Args:
+        billed: The units one attempt consumed or produced.
+        card: The unit card frozen at reservation, or None.
+
+    Returns:
+        Integer nano-USD per unit, or None when the units cannot be priced.
+    """
+    if card is None or card.kind != billed.kind:
+        return None
+    return card.rate_for(billed.variant)
+
+
+def unit_cost_nano_usd(billed: BilledUnits, rate: int | None) -> int | None:
+    """Price billed units at one rate: thousandths of a unit, rounded half-up.
+
+    Args:
+        billed: The units one attempt consumed or produced.
+        rate: Integer nano-USD per whole unit, or None when unpriced.
+
+    Returns:
+        Rounded nano-USD, or None when the rate is unknown.
+
+    Raises:
+        NanoUsdOverflowError: The cost does not fit the signed 64-bit ledger column.
+    """
+    if rate is None:
+        return None
+    cost = (billed.quantity_milli * rate + 500) // 1000
+    return require_representable_nano_usd(cost, what="unit cost")
+
+
+def frozen_unit_card(row: sqlite3.Row) -> GatewayUnitPrices | None:
+    """Read the unit card an attempt froze at reservation, if any."""
+    raw = row["unit_prices"]
+    return None if raw is None else GatewayUnitPrices.model_validate_json(str(raw))
+
+
+def billed_unit_columns(
+    row: sqlite3.Row, usage: GatewayUsage | None
+) -> tuple[str | None, str | None, int | None, int | None]:
+    """The billed-unit kind, variant, quantity, and pricing rate an attempt persists.
+
+    Args:
+        row: Attempt row carrying the unit card frozen at reservation.
+        usage: Settled usage, or None.
+
+    Returns:
+        All four as None for a token-priced or unmetered attempt.
+    """
+    billed = None if usage is None else usage.billed_units
+    if billed is None:
+        return None, None, None, None
+    rate = unit_rate_nano_usd(billed, frozen_unit_card(row))
+    return billed.kind.value, billed.variant, billed.quantity_milli, rate
 
 
 def terminal_values(
@@ -223,6 +287,10 @@ def frozen_usage_cost(
 ) -> int | None:
     """Price usage with a frozen base, long-context, or preferred schedule.
 
+    Billed media units are priced on the attempt's frozen unit card and added
+    to the token cost; a unit-only attempt (speech by character, transcription
+    by second) costs its units alone. Any unpriced leg leaves the cost unknown.
+
     Args:
         row: Attempt row containing every rate of the selected schedule.
         usage: Provider-observed usage, or None when not reported.
@@ -231,7 +299,7 @@ def frozen_usage_cost(
     Returns:
         Attributed nano-USD, or None when evidence or a required rate is missing.
     """
-    return estimated_cost_nano_usd(
+    token_cost = estimated_cost_nano_usd(
         usage,
         input_rate=optional_int(row[f"{prefix}input_rate"]),
         cached_input_rate=optional_int(row[f"{prefix}cached_input_rate"]),
@@ -240,3 +308,21 @@ def frozen_usage_cost(
         output_rate=optional_int(row[f"{prefix}output_rate"]),
         reasoning_rate=optional_int(row[f"{prefix}reasoning_rate"]),
     )
+    if usage is None or usage.billed_units is None:
+        return token_cost
+    if prefix == "preferred_":
+        # Only the dispatched rung's unit card is frozen; a counterfactual
+        # price for units stays unknown rather than borrowing that card.
+        return None
+    unit_cost = unit_cost_nano_usd(
+        usage.billed_units, unit_rate_nano_usd(usage.billed_units, frozen_unit_card(row))
+    )
+    if unit_cost is None:
+        return None
+    if usage.input_tokens is None and usage.output_tokens is None:
+        return unit_cost
+    # Any token evidence beside the units must be priced too; a partial report
+    # (one total missing) leaves the combined cost unknown, never units-only.
+    if token_cost is None:
+        return None
+    return require_representable_nano_usd(token_cost + unit_cost, what="attempt cost")

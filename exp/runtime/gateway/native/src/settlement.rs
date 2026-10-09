@@ -163,6 +163,11 @@ fn settle_argument(
     if finalize && tool_search_requests > 0 {
         argument["tool_search_requests"] = json!(tool_search_requests);
     }
+    // Media units ride the usage object only when metered, so token-priced
+    // settlements keep exactly the bytes they always did.
+    if let Some(billed) = usage.and_then(|usage| usage.billed_units.as_ref()) {
+        argument["usage"]["billed_units"] = json!(billed);
+    }
     compact_json(&argument)
 }
 
@@ -382,6 +387,15 @@ impl AttemptGuard {
 
     /// Record the allowlisted rate-limit headers of the active attempt's
     /// opened provider response, for settlement.
+    /// Forget an opened dial the attempt discarded (a capture-only probability
+    /// refusal re-dialed plain): its open, first token and headers are not the
+    /// attempt's. Dispatch stays marked; the attempt still holds its reservation.
+    pub(crate) fn forget_discarded_dial(&mut self) {
+        self.opened = false;
+        self.first_token_at = None;
+        self.rate_limit_headers = None;
+    }
+
     pub fn record_rate_limit_headers(&mut self, headers: Option<serde_json::Map<String, Value>>) {
         self.rate_limit_headers = headers;
     }

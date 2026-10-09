@@ -51,6 +51,8 @@ from exp.runtime.gateway.prompt_size import MAXIMUM_BYTES_PER_TOKEN
 from exp.runtime.gateway.recovery import SessionRecoveryRegistry
 from exp.runtime.gateway.routing import GatewayRoute
 from exp.runtime.gateway.sticky_affinity import StickySpillRegistry
+from exp.runtime.gateway.tool_contracts import GatewayAllowedToolsChoice
+from exp.runtime.models.providers.allowed_tools import ALLOWED_TOOLS_DISCLOSURE
 from exp.runtime.models.providers.base import GatewayWireProfile
 from exp.runtime.models.providers.dialect_dispatch import dialect_stream_payload
 from exp.runtime.models.providers.errors import ProviderCapabilityError, ProviderParameterError
@@ -2389,3 +2391,80 @@ def test_chat_nested_budget_refuses_routes_that_cannot_preserve_it(
         )
     assert error.value.param == "thinking.budget_tokens"
     assert accounting.recorded == 0
+
+
+def test_allowed_tools_required_relaxes_to_auto_on_a_rung_that_cannot_force() -> None:
+    """An allowed-tools ``required`` selector keeps its set and relaxes only the mode."""
+    deployments = (_deployment("native", provider="anthropic", gateway=_TOOL_CAPABLE),)
+    surface = GatewayApiSurface.CHAT_COMPLETIONS
+    route = _mixed_route("maximize_availability", deployments, surface)
+    accounting = _CoercionCounter()
+    request = _forced_choice_request(surface, "required").model_copy(
+        update={
+            "tools": (
+                GatewayToolDefinition(name="lookup", parameters={"type": "object"}),
+                GatewayToolDefinition(name="clock", parameters={"type": "object"}),
+            ),
+            "tool_choice": GatewayAllowedToolsChoice(mode="required", names=("lookup",)),
+        }
+    )
+    narrowed, _wires_out, public, provider, _placement = admitted_route_requests(
+        route,
+        _fable_and_shim_wires()[:1],
+        request,
+        accounting=cast(NativeAttemptAccounting, accounting),
+        authorization=route.snapshot.authorization,
+    )
+    assert tuple(item.deployment_id for item in narrowed.deployments) == ("native",)
+    assert provider.tool_choice == "auto"
+    assert [tool.name for tool in provider.tools] == ["lookup"]
+    assert public.tool_choice == GatewayAllowedToolsChoice(mode="auto", names=("lookup",))
+    assert public.ignored_parameters == (ALLOWED_TOOLS_DISCLOSURE, "tool_choice->auto")
+
+
+def test_reasoning_summary_serves_without_summaries_on_chat_wire_lanes() -> None:
+    """gpt-5-nano's Azure Chat, Novita and OpenRouter lanes admit a summary request.
+
+    None of the three wires carries Responses summary parts, so the summary is
+    dropped with disclosure instead of the pre-dispatch 400 seen 2026-10-08.
+    """
+    deployments = tuple(
+        _deployment(name, gateway=_TOOL_CAPABLE) for name in ("azure", "novita", "openrouter")
+    )
+    route = _mixed_route("maximize_availability", deployments, GatewayApiSurface.RESPONSES)
+    client = cast(NativeWireClient, object())
+    wires = tuple(
+        (
+            GatewayWireProfile(
+                dialect="openai_compatible",
+                url=f"https://{name}.test",
+                model_id="gpt-5-nano",
+                supports_reasoning=True,
+                reasoning_wire_format="reasoning_effort",
+            ),
+            client,
+        )
+        for name in ("azure", "novita", "openrouter")
+    )
+    request = GatewayRequest(
+        surface=GatewayApiSurface.RESPONSES,
+        messages=(GatewayMessage(role="user", content="2+2?"),),
+        reasoning_summary="auto",
+        reasoning_summary_parameters=("reasoning.generate_summary",),
+        stream=True,
+        include_usage=True,
+    )
+    accounting = _CoercionCounter()
+    narrowed, _wires_out, public, provider, _placement = admitted_route_requests(
+        route,
+        wires,
+        request,
+        accounting=cast(NativeAttemptAccounting, accounting),
+        authorization=route.snapshot.authorization,
+    )
+    assert len(narrowed.deployments) == 3
+    assert provider.reasoning_summary is None
+    assert public.reasoning_summary == "auto"
+    assert public.ignored_parameters == (
+        "reasoning.generate_summary->dropped(unsupported_by_provider)",
+    )

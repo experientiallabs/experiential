@@ -29,6 +29,15 @@ def test_historical_zero_attempt_failure_migrates_without_a_certificate(tmp_path
     ledger.finish_request(authorization=original, failure=failure)
     close_idle_connections()
     with sqlite3.connect(tmp_path / "gateway.db") as connection:
+        # v29's billed-unit columns (its surface CHECK rewrite is a no-op re-run).
+        for column in (
+            "unit_prices",
+            "billed_unit_kind",
+            "billed_unit_variant",
+            "billed_quantity_milli",
+            "billed_unit_rate",
+        ):
+            connection.execute(f"ALTER TABLE gateway_attempts DROP COLUMN {column}")
         connection.execute("ALTER TABLE gateway_requests DROP COLUMN web_search_requests")
         connection.execute("ALTER TABLE gateway_requests DROP COLUMN user_agent")
         connection.execute("ALTER TABLE gateway_requests DROP COLUMN client_app")

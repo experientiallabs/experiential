@@ -109,6 +109,20 @@ fn frame_key_names(payload: &serde_json::Map<String, Value>) -> String {
 }
 
 impl Normalizer {
+    /// Parse gateway-requested Chat probabilities into the capture side buffer
+    /// only, never into events (see `crate::capture::logprobs`).
+    pub(crate) fn enable_logprobs_capture(&mut self) {
+        self.chat_logprobs =
+            crate::capture::logprobs::ChatProbabilities::Capture(Default::default());
+    }
+
+    /// Hand over the capture-only probabilities parsed since the last call.
+    pub(crate) fn take_captured_logprobs(
+        &mut self,
+    ) -> Option<(Vec<crate::logprobs::ChoiceLogprobsDelta>, bool)> {
+        self.chat_logprobs.take()
+    }
+
     pub(in crate::dialects) fn feed_openai_compatible(
         &mut self,
         frame: &crate::sse::SseEvent,
@@ -207,17 +221,37 @@ impl Normalizer {
             .as_object()
             .ok_or_else(|| malformed("OpenAI-compatible choice must be an object"))?;
         let choice_index = choice.get("index").and_then(Value::as_u64).unwrap_or(0);
-        if self.chat_logprobs
+        if self.chat_logprobs.requested_by_caller()
             && (choice_index != 0 || choice.get("index").is_some_and(|value| !value.is_u64()))
         {
             return Err(malformed("OpenAI-compatible stream choice index must be 0"));
         }
-        if self.chat_logprobs {
+        if self.chat_logprobs.requested_by_caller() {
             if let Some(event) =
                 crate::logprobs::parse(choice.get("logprobs"), choice_index as u32)?
             {
                 events.push(Event::ChoiceLogprobsDelta(event));
             }
+        } else if self.chat_logprobs.captures() {
+            // Capture-only probabilities never fail or shape the caller's answer.
+            // Answer text per channel: typed thinking or reference parts carry none.
+            let text = |key: &str| -> String {
+                match choice.get("delta").and_then(|delta| delta.get(key)) {
+                    Some(Value::String(text)) => text.clone(),
+                    Some(Value::Array(parts)) => parts
+                        .iter()
+                        .filter(|part| part.get("type").and_then(Value::as_str) == Some("text"))
+                        .filter_map(|part| part.get("text").and_then(Value::as_str))
+                        .collect(),
+                    _ => String::new(),
+                }
+            };
+            let output = crate::capture::logprobs::FrameOutput {
+                content: text("content"),
+                refusal: text("refusal"),
+            };
+            self.chat_logprobs
+                .retain(choice.get("logprobs"), choice_index as u32, &output);
         }
         // Azure asynchronous content-filter annotations carry no delta. Treat
         // their metadata-only choice as an empty delta, then still process the

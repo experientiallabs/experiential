@@ -139,9 +139,8 @@ that would apply under enforcement. Policy IDs and revisions identify rollout st
 subject text, replacements, and detector diagnostics never enter either recorder.
 An outcome reports the configured adapter's verdict for its declared input projection,
 not an independent certification that every in-memory field was inspected. Complete-context
-policies must bind an adapter with explicit coverage checks, such as Platform's dedicated
-criminal-abuse adapter on this same engine. Hosts must count observation outcomes separately
-from actual customer blocks.
+policies must bind an adapter with explicit coverage checks through the shared engine.
+Hosts must count observation outcomes separately from actual customer blocks.
 An outcome with `check=None` records incomplete observation admission or coverage,
 not a classifier verdict. Keep these coverage counts separate from per-check verdict
 denominators; they do not count every distinct missed subject.
@@ -550,8 +549,8 @@ and tool examples, are intentionally absent. A hosted modifier may rewrite the v
 subject while the gateway restores unchanged hidden replay authority; that restoration
 does not inspect the hidden content. An `allow` verdict covers the transmitted projection
 only. Generic `http_json` cannot implement mandatory complete-context criminal inspection
-when private carriers matter; Platform uses its dedicated coverage-aware adapter through
-the same engine. This release does not expand the HTTP wire contract.
+when private carriers matter. Bind a coverage-aware adapter through the same engine for
+that requirement. This release does not expand the HTTP wire contract.
 
 The response
 must validate as `ClassifierVerdict`. A non-`modify` check must not return a
