@@ -174,9 +174,26 @@ where
             ensure_remaining(deadline)?;
             let endpoint = bind_resource_prefix(endpoint, &resource_prefix)?;
             let overlaid = overlay(wire, payload, &resource_name, &endpoint, expires_at)?;
-            let Some(grant) = renew.filter(|_| overlaid.is_some()) else {
+            let Some(grant) = renew else {
                 return Ok(overlaid);
             };
+            if overlaid.is_none() {
+                // The resource went stale before reuse: nothing is extended, so
+                // the host releases the lease's storage hold.
+                let report = json!({
+                    "request_id": request_id,
+                    "deployment_id": wire.deployment_id,
+                    "operation_id": grant.operation_id,
+                    "outcome": "failed",
+                });
+                let report_deadline = deadline.min(Instant::now() + MAXIMUM_RENEWAL_WAIT);
+                let _ = callback(
+                    report_deadline,
+                    call("renew_explicit_cache", report.to_string()),
+                )
+                .await;
+                return Ok(None);
+            }
             // The generation reuses the resource whatever the renewal does.
             let (outcome, renewed) = renew_resource(
                 http,

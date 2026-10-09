@@ -119,3 +119,20 @@ async fn an_answer_that_does_not_move_the_expiry_later_is_unknown() {
     assert_eq!(host.calls()[1].1["outcome"], "unknown");
     assert_eq!(task.await.unwrap().len(), 1);
 }
+
+#[tokio::test]
+async fn a_lease_on_a_resource_that_went_stale_is_reported_failed_without_a_patch() {
+    // No server: a PATCH would fail the test by finding nothing to connect to.
+    let until = timestamp(epoch_now().floor() as u64 + 900);
+    let original =
+        wire("http://127.0.0.1:9/v1beta/models/gemini-test:streamGenerateContent?alt=sse");
+    let mut stale = ready_with_renewal("cachedContents/reused", &until);
+    stale["expires_at"] = json!(epoch_now() + 2.0);
+    let host = Host::new(vec![stale, json!({"state": "recorded"})]);
+    let result = execute_test(&original, &host, EndpointPolicy::Loopback)
+        .await
+        .unwrap();
+    assert!(result.is_none(), "a stale resource is never reused");
+    assert_eq!(host.calls()[1].0, "renew_explicit_cache");
+    assert_eq!(host.calls()[1].1["outcome"], "failed");
+}

@@ -425,36 +425,45 @@ class NativeExplicitCacheMixin:
                     renewable=True,
                 )
             claim = claim_cache(host, offer, clock=time.time)
-            with entry.execution_lock:
-                if offer is None or not _attempt_active(self._accounting, entry, attempt_id):
-                    return _encoded({"state": "unavailable"})
-                if isinstance(claim, CacheReady):
-                    until = _renewal_horizon(claim)
-                    if claim.renewal_operation_id is not None and until is not None:
-                        state.renewals[claim.renewal_operation_id] = (until, claim.expires_at)
-                    elif claim.renewal_operation_id is not None:
-                        # A lease whole seconds cannot extend is settled at once so
-                        # the host releases the storage it reserved for it.
-                        _release_unusable_lease(host, claim.renewal_operation_id)
-                    return _ready_payload(binding.plan, claim)
-                if not isinstance(claim, CacheCreator):
-                    return _encoded({"state": "unavailable"})
-                state.offers[claim.operation_id] = (attempt_id, offer, binding)
-                payload = binding.plan.create_payload
-                payload.pop("ttl", None)
-                payload["expireTime"] = datetime.fromtimestamp(offer.expires_at, UTC).isoformat()
-                return _encoded(
-                    {
-                        "state": "create",
-                        "operation_id": claim.operation_id,
-                        "resource_prefix": binding.plan.resource_prefix,
-                        "url": binding.plan.create_url,
-                        "payload": payload,
-                        "expires_at": offer.expires_at,
-                        "measure_tokens": bool(binding.automatic_plans),
-                        "minimum_tokens": authority.minimum_input_tokens,
-                    }
-                )
+            release: str | None = None
+            try:
+                with entry.execution_lock:
+                    # A lease this request cannot use (attempt gone, or a horizon
+                    # whole seconds cannot extend) is settled as failed after the
+                    # gate is released, so abandonment never waits on host I/O.
+                    if isinstance(claim, CacheReady):
+                        release = claim.renewal_operation_id
+                    if offer is None or not _attempt_active(self._accounting, entry, attempt_id):
+                        return _encoded({"state": "unavailable"})
+                    if isinstance(claim, CacheReady):
+                        until = _renewal_horizon(claim)
+                        if claim.renewal_operation_id is not None and until is not None:
+                            state.renewals[claim.renewal_operation_id] = (until, claim.expires_at)
+                            release = None
+                        return _ready_payload(binding.plan, claim)
+                    if not isinstance(claim, CacheCreator):
+                        return _encoded({"state": "unavailable"})
+                    state.offers[claim.operation_id] = (attempt_id, offer, binding)
+                    payload = binding.plan.create_payload
+                    payload.pop("ttl", None)
+                    payload["expireTime"] = datetime.fromtimestamp(
+                        offer.expires_at, UTC
+                    ).isoformat()
+                    return _encoded(
+                        {
+                            "state": "create",
+                            "operation_id": claim.operation_id,
+                            "resource_prefix": binding.plan.resource_prefix,
+                            "url": binding.plan.create_url,
+                            "payload": payload,
+                            "expires_at": offer.expires_at,
+                            "measure_tokens": bool(binding.automatic_plans),
+                            "minimum_tokens": authority.minimum_input_tokens,
+                        }
+                    )
+            finally:
+                if release is not None:
+                    _release_unusable_lease(host, release)
         except Exception:  # noqa: BLE001 - sanitize host failures without releasing reservations.
             # A host exception or failed serialization after claim must never
             # trigger another create. The durable host retains the reservation.

@@ -190,6 +190,9 @@ class CacheReady:
             raise ValueError("a renewal grant needs both its operation and its horizon")
         if self.renewal_operation_id is not None and self.renew_until is not None:
             _scope(self.renewal_operation_id, "renewal_operation_id")
+            # The native renewal report carries at most 128 characters.
+            if len(self.renewal_operation_id) > 128:
+                raise ValueError("renewal_operation_id must be at most 128 characters")
             _timestamp(self.renew_until, "renew_until")
             if self.renew_until <= self.expires_at:
                 raise ValueError("a renewal must move the resource's expiry later")
