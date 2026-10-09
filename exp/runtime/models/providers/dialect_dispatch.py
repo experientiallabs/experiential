@@ -129,6 +129,14 @@ WEB_SEARCH_SOURCES_DROPPED = (
 )
 """Disclosure when the lead rung relays provider search but refuses the sources selector."""
 
+WEB_SEARCH_SOURCES_DROPPED_ON_FALLBACK = (
+    "include.web_search_call.action.sources->dropped(unsupported_by_fallback_provider)"
+)
+"""Disclosure when only a fallback rung refuses the selector: a failover may omit sources.
+
+Disclosures are fixed at admission for the whole route, so a route whose
+fallback could serve without sources says so up front rather than never."""
+
 
 def responses_origin_refuses_web_search_sources(profile: GatewayWireProfile) -> bool:
     """Return whether a Responses origin refuses the web search sources selector.

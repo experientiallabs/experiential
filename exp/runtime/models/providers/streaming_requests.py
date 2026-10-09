@@ -30,6 +30,7 @@ from exp.runtime.models.providers.dialect_dispatch import (
     TOOL_RESULT_IMAGE_FOLD_DIALECTS,
     TOOL_RESULT_IMAGE_FOLD_DISCLOSURE,
     WEB_SEARCH_SOURCES_DROPPED,
+    WEB_SEARCH_SOURCES_DROPPED_ON_FALLBACK,
     responses_origin_refuses_web_search_sources,
 )
 from exp.runtime.models.providers.dialect_dispatch import (
@@ -867,17 +868,17 @@ def route_generation_parameter_requests(
         # web_search_call item with the sources (native web_search.rs), so
         # the provider payload simply does not carry it.
         provider_updates["include_web_search_sources"] = False
-    elif (
-        request.include_web_search_sources
-        and profiles
-        and responses_origin_refuses_web_search_sources(profiles[0])
-        and WEB_SEARCH_SOURCES_DROPPED not in ignored
+    elif request.include_web_search_sources and any(
+        responses_origin_refuses_web_search_sources(profile) for profile in profiles
     ):
-        # The lead rung relays the provider's search but refuses the selector,
-        # so its payload omits it (per rung, in ``dialect_stream_payload``)
-        # and the caller learns the items come back without sources. A native
-        # rung later in the route still asks for them.
-        ignored.append(WEB_SEARCH_SOURCES_DROPPED)
+        # A rung that relays the provider's search but refuses the selector
+        # omits it from its own payload (``dialect_stream_payload``); direct
+        # rungs still ask. Disclosure is route-level, so it names whether the
+        # lead or only a fallback can serve without sources.
+        lead_refuses = responses_origin_refuses_web_search_sources(profiles[0])
+        ignored.append(
+            WEB_SEARCH_SOURCES_DROPPED if lead_refuses else WEB_SEARCH_SOURCES_DROPPED_ON_FALLBACK
+        )
     encrypted_reasoning_present = any(
         block.kind == "encrypted_reasoning"
         for message in request.messages

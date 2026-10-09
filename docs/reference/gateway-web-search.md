@@ -59,8 +59,9 @@ exclusive (the provider's rule) and are forwarded to the vendor as include/exclu
   `action.sources` (`{"type": "url", "url"}` per injected result). On a native Responses route
   the selector is forwarded and the provider's relayed item carries its sources, except on
   OpenRouter's Responses endpoint, which relays OpenAI's search but refuses the selector: that
-  rung's payload omits it, and when it leads the route the response discloses
-  `include.web_search_call.action.sources->dropped(unsupported_by_provider)`. A replayed
+  rung's payload omits it, and the response discloses
+  `include.web_search_call.action.sources->dropped(unsupported_by_provider)` when it leads the
+  route, or `...->dropped(unsupported_by_fallback_provider)` when only a fallback could omit them. A replayed
   `wsgw_` item is the gateway's own output, so the decoder drops it before validation on every
   route; a provider's replayed `web_search_call` is never judged against the SDK's action enum
   (Codex echoes action types the SDK does not list) and forwards byte-for-byte to a native
