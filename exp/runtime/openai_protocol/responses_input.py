@@ -193,10 +193,12 @@ def responses_input_messages(value: str | tuple[ReplayedInput, ...]) -> tuple[Ga
             for item in run
         )
         trailing: list[GatewayMessage] = []
+        called = False  # tracked, not rescanned, so a long run stays linear
         for item in run:
             if not _is_instruction(item):
                 segment.append(item)
-            elif carried and any(isinstance(entry, ReplayedFunctionCall) for entry in segment):
+                called = called or isinstance(item, ReplayedFunctionCall)
+            elif carried and called:
                 trailing.append(item.message)
             else:
                 flush_segment()
