@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal
+from typing import Literal, TypeGuard
 
 from exp.common.core.artifacts import JsonObject
 from exp.common.models import ToolCall
@@ -170,17 +170,60 @@ def responses_input_messages(value: str | tuple[ReplayedInput, ...]) -> tuple[Ga
             messages.append(GatewayMessage(role="assistant", provider_reasoning=tuple(pending)))
         segment.clear()
 
+    # Assistant output items of the current run, with any developer or system
+    # instructions a client recorded between them (see ``flush_run``).
+    run: list[ReplayedReasoning | ReplayedMessage | ReplayedFunctionCall] = []
+
+    def flush_run() -> None:
+        """Emit one assistant output run, keeping a carrier with its own tool turn.
+
+        Codex records items as they stream and can append a developer reminder
+        after a function call it is already executing but before that turn's
+        reasoning item lands, so a gateway carrier arrives separated from its
+        calls by an instruction. Only one model response can sit between two
+        boundaries (a tool output or a user message), so a run holding a carrier
+        and a function call is one assistant turn: it is rebuilt whole and the
+        interleaved instructions follow it, ahead of the tool outputs. Any other
+        run keeps every item in its original position.
+        """
+        assistant_items = [item for item in run if not _is_instruction(item)]
+        carried = any(
+            isinstance(item, ReplayedReasoning) and item.block.kind == "sealed_reasoning_content"
+            for item in assistant_items
+        )
+        merge = (
+            len(assistant_items) != len(run)
+            and carried
+            and any(isinstance(item, ReplayedFunctionCall) for item in assistant_items)
+            and sum(isinstance(item, ReplayedMessage) for item in assistant_items) <= 1
+        )
+        if merge:
+            segment.extend(assistant_items)
+            flush_segment()
+            messages.extend(item.message for item in run if _is_instruction(item))
+        else:
+            for item in run:
+                if _is_instruction(item):
+                    flush_segment()
+                    messages.append(item.message)
+                else:
+                    segment.append(item)
+            flush_segment()
+        run.clear()
+
     for item in value:
         if isinstance(item, ReplayedNativeItem):
             # Native items break the assistant segment and keep their exact
             # position; the payload builder re-emits them verbatim.
-            flush_segment()
+            flush_run()
             messages.append(GatewayMessage(role=item.role, provider_native_item=item.item))
+        elif isinstance(item, ReplayedMessage) and _is_instruction(item) and run:
+            run.append(item)
         elif isinstance(item, ReplayedMessage) and item.message.role != "assistant":
-            flush_segment()
+            flush_run()
             messages.append(item.message)
         elif isinstance(item, ReplayedFunctionOutput):
-            flush_segment()
+            flush_run()
             messages.append(
                 GatewayMessage(
                     role="tool",
@@ -193,6 +236,13 @@ def responses_input_messages(value: str | tuple[ReplayedInput, ...]) -> tuple[Ga
                 )
             )
         else:
-            segment.append(item)
-    flush_segment()
+            run.append(item)
+    flush_run()
     return tuple(messages)
+
+
+def _is_instruction(
+    item: ReplayedReasoning | ReplayedMessage | ReplayedFunctionCall,
+) -> TypeGuard[ReplayedMessage]:
+    """Return whether a replayed item is a developer or system instruction message."""
+    return isinstance(item, ReplayedMessage) and item.message.role in {"developer", "system"}
