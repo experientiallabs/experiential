@@ -16,6 +16,7 @@ the response, which the data plane records per attempt as the settlement's
 
 from __future__ import annotations
 
+import re
 from typing import Final, Literal
 
 from pydantic import BaseModel, ConfigDict, StrictBool
@@ -49,6 +50,15 @@ PROVIDER_PREFERENCE_NOT_FORWARDED_SUFFIX: Final = (
 ``provider.order`` and ``provider.only`` read like a way to choose this
 gateway's provider, but they only steer OpenRouter's own upstream selection.
 The disclosure names the gateway's control for pinning a route instead."""
+
+PROVIDER_PREFERENCE_DISCLOSURE_LIMIT: Final = 16
+"""Most ``provider`` keys disclosed by name; the rest share ``provider.*``.
+
+A stream repeats its disclosures on every chunk, so caller-chosen key names
+are echoed only when short and plain, and only this many of them."""
+
+_DISCLOSABLE_PROVIDER_KEY: Final = re.compile(r"[A-Za-z0-9_]{1,64}")
+"""A key name short and plain enough to echo back verbatim."""
 
 
 class ProviderRoutingPreferences(BaseModel):
@@ -105,16 +115,20 @@ def unforwarded_provider_preferences(
 
     Returns:
         One ``provider.<key>`` disclosure per key in the caller's order,
-        skipping the gateway-owned ``zdr``. Empty when the caller sent no
-        object or the rung receives it.
+        skipping the gateway-owned ``zdr``. Keys that are not short and
+        plain, and any beyond :data:`PROVIDER_PREFERENCE_DISCLOSURE_LIMIT`,
+        share one trailing ``provider.*`` disclosure. Empty when the caller
+        sent no object or the rung receives it.
     """
     if preferences is None or forwarded:
         return ()
-    return tuple(
-        f"provider.{key}{PROVIDER_PREFERENCE_NOT_FORWARDED_SUFFIX}"
-        for key in preferences
-        if key not in GATEWAY_PROVIDER_PREFERENCES
-    )
+    keys = [key for key in preferences if key not in GATEWAY_PROVIDER_PREFERENCES]
+    named = [key for key in keys if _DISCLOSABLE_PROVIDER_KEY.fullmatch(key)]
+    named = named[:PROVIDER_PREFERENCE_DISCLOSURE_LIMIT]
+    paths = [f"provider.{key}" for key in named]
+    if len(named) < len(keys):
+        paths.append("provider.*")
+    return tuple(f"{path}{PROVIDER_PREFERENCE_NOT_FORWARDED_SUFFIX}" for path in paths)
 
 
 def constrain_openrouter_zero_data_retention(payload: JsonObject) -> JsonObject:
