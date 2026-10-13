@@ -1,6 +1,6 @@
 [project]
 name = "experiential"
-version = "0.7.185"
+version = "0.7.186"
 description = "Build simulations and optimize model routing from agent traces."
 readme = "README.md"
 license = { file = "LICENSE" }

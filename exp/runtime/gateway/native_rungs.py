@@ -53,6 +53,7 @@ from exp.runtime.models.providers.openrouter_routing import (
     forward_provider_preferences,
     openrouter_chat_wire,
     openrouter_metadata_headers,
+    unforwarded_provider_preferences,
 )
 from exp.runtime.models.providers.protocol import GatewayDispatchSigner, NativeWireClient
 from exp.runtime.models.providers.wire_messages import anthropic_request_headers
@@ -73,7 +74,7 @@ first and, when KV runs out, preempts the highest value first.
 
 @dataclass(frozen=True, slots=True)
 class RungDispatch:
-    """One deployment's frozen dispatch material plus its shaping disclosure."""
+    """One deployment's frozen dispatch material plus its shaping disclosures."""
 
     wire_entry: JsonObject
     signer: GatewayDispatchSigner | None
@@ -82,6 +83,19 @@ class RungDispatch:
     parallel_disclosure: str | None
     output_disclosure: str | None
     reserved_output_tokens: int
+    provider_preference_disclosures: tuple[str, ...] = ()
+
+    @property
+    def disclosures(self) -> tuple[str, ...]:
+        """Every caller field this rung's shaping changed or did not forward."""
+        return (
+            *(
+                disclosure
+                for disclosure in (self.parallel_disclosure, self.output_disclosure)
+                if disclosure is not None
+            ),
+            *self.provider_preference_disclosures,
+        )
 
 
 def build_rung_dispatch(
@@ -141,14 +155,16 @@ def build_rung_dispatch(
     upstream_payload = image_aware_stream_payload(
         profile, rung_request, capabilities, deployment.provider
     )
-    if rung_request.provider_preferences is not None and openrouter_chat_wire(
-        deployment.provider, profile.dialect
-    ):
+    forwards_preferences = openrouter_chat_wire(deployment.provider, profile.dialect)
+    if rung_request.provider_preferences is not None and forwards_preferences:
         # The caller's routing preferences reach the one wire that defines
         # them; every other dialect's builder never emits the field.
         upstream_payload = forward_provider_preferences(
             upstream_payload, rung_request.provider_preferences
         )
+    preference_disclosures = unforwarded_provider_preferences(
+        rung_request.provider_preferences, forwarded=forwards_preferences
+    )
     dispatch_policy = deployment.gateway.dispatch
     if (
         dispatch_policy is not None
@@ -217,6 +233,7 @@ def build_rung_dispatch(
         parallel_disclosure=parallel_disclosure,
         output_disclosure=output_disclosure,
         reserved_output_tokens=output_bound,
+        provider_preference_disclosures=preference_disclosures,
     )
 
 

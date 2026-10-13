@@ -41,7 +41,10 @@ from exp.runtime.gateway.native_rungs import (
 from exp.runtime.gateway.routing import GatewayRoute
 from exp.runtime.models.providers.base import GatewayWireProfile
 from exp.runtime.models.providers.errors import ProviderCapabilityError, ProviderParameterError
-from exp.runtime.models.providers.openrouter_routing import OPENROUTER_METADATA_HEADER
+from exp.runtime.models.providers.openrouter_routing import (
+    OPENROUTER_METADATA_HEADER,
+    PROVIDER_PREFERENCE_NOT_FORWARDED_SUFFIX,
+)
 from exp.runtime.models.providers.protocol import NativeWireClient
 from exp.runtime.models.providers.streaming_requests import route_generation_parameter_requests
 
@@ -351,9 +354,11 @@ def test_caller_provider_preferences_forward_to_openrouter_and_tighten_under_the
         "order": ["Azure"],
     }
 
-    plain = _dispatch(_route((rung,)), rung, preferences).wire_entry
+    plain_dispatch = _dispatch(_route((rung,)), rung, preferences)
+    plain = plain_dispatch.wire_entry
     tight = _dispatch(_route((rung,), constrained=("or-rung",)), rung, preferences).wire_entry
 
+    assert plain_dispatch.disclosures == ()
     plain_payload = plain["upstream_payload"]
     assert isinstance(plain_payload, dict)
     assert plain_payload["provider"] == preferences
@@ -367,12 +372,20 @@ def test_caller_provider_preferences_forward_to_openrouter_and_tighten_under_the
 
 
 def test_caller_provider_preferences_are_dropped_on_wires_without_the_field() -> None:
-    """A non-OpenRouter compatible rung never sees the object; other dialects have no field."""
+    """A non-OpenRouter rung never sees the object, and every dropped key is disclosed.
+
+    ``zdr`` is the gateway's own key, honored on every wire, so it is not disclosed.
+    """
     rung = _deployment("fw-rung", "fireworks")
-    entry = _dispatch(_route((rung,)), rung, {"zdr": True, "order": ["Azure"]}).wire_entry
-    payload = entry["upstream_payload"]
+    preferences: JsonObject = {"zdr": True, "order": ["bedrock"], "allow_fallbacks": False}
+    dispatch = _dispatch(_route((rung,)), rung, preferences)
+    payload = dispatch.wire_entry["upstream_payload"]
     assert isinstance(payload, dict)
     assert "provider" not in payload
+    assert dispatch.disclosures == (
+        f"provider.order{PROVIDER_PREFERENCE_NOT_FORWARDED_SUFFIX}",
+        f"provider.allow_fallbacks{PROVIDER_PREFERENCE_NOT_FORWARDED_SUFFIX}",
+    )
 
 
 @pytest.mark.parametrize("maximum", (2_048, 128_000))

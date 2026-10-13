@@ -633,7 +633,7 @@ class GatewayRequest(ContractModel):
     # refuses with the same 403 when no rung qualifies. Part of identity.
     zdr_requested: bool = False
     # Verbatim caller `provider` object: forwarded to OpenRouter rungs (tightened
-    # when the rung is constrained), dropped on every other wire.
+    # when the rung is constrained), dropped with disclosure on every other wire.
     provider_preferences: JsonObject | None = Field(default=None, exclude=True)
     gateway: GatewayRequestPolicy | None = Field(default=None, exclude=True)
     stream: bool = False

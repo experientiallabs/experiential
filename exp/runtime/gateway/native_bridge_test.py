@@ -94,6 +94,9 @@ from exp.runtime.models.providers.instruction_turns import (
     SYSTEM_FOLD_DISCLOSURE,
 )
 from exp.runtime.models.providers.openai_compatible import OpenAICompatibleClient
+from exp.runtime.models.providers.openrouter_routing import (
+    PROVIDER_PREFERENCE_NOT_FORWARDED_SUFFIX,
+)
 from exp.runtime.models.providers.streaming_requests import openai_compatible_stream_payload
 from exp.runtime.openai_protocol.errors import OpenAIProtocolError, public_failure_error
 from exp.runtime.openai_protocol.requests import decode_chat, decode_responses
@@ -418,6 +421,26 @@ def test_omitted_cap_admission_freezes_provider_maximum_without_public_rewrite(
     assert isinstance(entry.request, GatewayRequest)
     assert entry.request.maximum_output_tokens is None
     assert "attempt_id" in _start_first(control, admission)
+
+
+def test_provider_preferences_a_route_cannot_receive_are_disclosed(tmp_path: Path) -> None:
+    """OpenRouter routing keys sent to a non-OpenRouter route are named, never dropped silently."""
+    _manager, key = _configured_gateway(tmp_path)
+    control = NativeControlPlane(
+        load_gateway_components(tmp_path, environment={"TEST_PROVIDER_KEY": "local-test-key"})
+    )
+    body = json.loads(_chat_body())
+    body["provider"] = {"order": ["no_such_host"], "allow_fallbacks": False}
+    admission = _admit(control, key, json.dumps(body))
+    route = admission["route"]
+    assert isinstance(route, list) and isinstance(route[0], dict)
+    payload = route[0]["upstream_payload"]
+    assert isinstance(payload, dict)
+    assert "provider" not in payload
+    assert admission["ignored_parameters"] == [
+        f"provider.allow_fallbacks{PROVIDER_PREFERENCE_NOT_FORWARDED_SUFFIX}",
+        f"provider.order{PROVIDER_PREFERENCE_NOT_FORWARDED_SUFFIX}",
+    ]
 
 
 @pytest.mark.parametrize("provider", ("anthropic", "openai-compatible"))

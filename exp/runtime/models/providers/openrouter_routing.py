@@ -38,6 +38,18 @@ ordinary disjoint cache accounting, so it keeps the default contract."""
 ZDR_PROVIDER_PREFERENCES: Final[JsonObject] = {"zdr": True, "data_collection": "deny"}
 """The strict values the constraint forces onto ``payload["provider"]``."""
 
+GATEWAY_PROVIDER_PREFERENCES: Final = frozenset({"zdr"})
+"""``provider`` keys the gateway acts on itself, whichever wire serves."""
+
+PROVIDER_PREFERENCE_NOT_FORWARDED_SUFFIX: Final = (
+    "->not_forwarded(openrouter_routing_preference; pin a route with gateway.routing.route_id)"
+)
+"""Suffix for a ``provider`` key a non-OpenRouter rung never receives.
+
+``provider.order`` and ``provider.only`` read like a way to choose this
+gateway's provider, but they only steer OpenRouter's own upstream selection.
+The disclosure names the gateway's control for pinning a route instead."""
+
 
 class ProviderRoutingPreferences(BaseModel):
     """The caller's top-level ``provider`` object, OpenRouter's routing-preference shape.
@@ -50,7 +62,8 @@ class ProviderRoutingPreferences(BaseModel):
     Every other key (``data_collection``, ``order``, ``only``, ...) is
     forwarded to OpenRouter rungs verbatim, tightened by the constraint when
     the route is constrained, and dropped on every other wire, which has no
-    such field.
+    such field. Each dropped key is disclosed in ``ignored_parameters``
+    (:func:`unforwarded_provider_preferences`).
     """
 
     model_config = ConfigDict(extra="allow", frozen=True)
@@ -78,6 +91,30 @@ def forward_provider_preferences(payload: JsonObject, preferences: JsonObject) -
     """
     forwarded: JsonValue = dict(preferences)
     return {**payload, "provider": forwarded}
+
+
+def unforwarded_provider_preferences(
+    preferences: JsonObject | None, *, forwarded: bool
+) -> tuple[str, ...]:
+    """Disclose the caller's ``provider`` keys that one rung does not receive.
+
+    Args:
+        preferences: The caller's ``provider`` object, or None when absent.
+        forwarded: Whether the rung receives the object (an OpenRouter Chat
+            Completions wire).
+
+    Returns:
+        One ``provider.<key>`` disclosure per key in the caller's order,
+        skipping the gateway-owned ``zdr``. Empty when the caller sent no
+        object or the rung receives it.
+    """
+    if preferences is None or forwarded:
+        return ()
+    return tuple(
+        f"provider.{key}{PROVIDER_PREFERENCE_NOT_FORWARDED_SUFFIX}"
+        for key in preferences
+        if key not in GATEWAY_PROVIDER_PREFERENCES
+    )
 
 
 def constrain_openrouter_zero_data_retention(payload: JsonObject) -> JsonObject:
