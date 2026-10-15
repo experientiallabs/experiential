@@ -227,3 +227,39 @@ def test_chat_stream_with_an_index_the_assembler_rejects_is_rejected(index: Json
     ]
     with pytest.raises(ValueError, match="terminal state"):
         completed_response("chat_completions", _sse(frames))
+
+
+def test_custom_call_repair_joins_function_name_fragments() -> None:
+    """Rebuilt function calls keep their full streamed name."""
+    frames: list[JsonValue] = [
+        _chunk(
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "index": 0,
+                        "id": "c1",
+                        "type": "custom",
+                        "custom": {"name": "apply_patch", "input": "*** A"},
+                    },
+                    {
+                        "index": 1,
+                        "id": "f1",
+                        "type": "function",
+                        "function": {"name": "get_", "arguments": ""},
+                    },
+                ],
+            }
+        ),
+        _chunk({"tool_calls": [{"index": 1, "function": {"name": "weather", "arguments": "{}"}}]}),
+        _chunk({}, "tool_calls"),
+        "[DONE]",
+    ]
+    choices = completed_response("chat_completions", _sse(frames))["choices"]
+    assert isinstance(choices, list) and isinstance(choices[0], dict)
+    message = choices[0]["message"]
+    assert isinstance(message, dict) and isinstance(calls := message["tool_calls"], list)
+    assert isinstance(calls[1], dict) and calls[1]["function"] == {
+        "name": "get_weather",
+        "arguments": "{}",
+    }

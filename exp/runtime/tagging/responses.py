@@ -90,8 +90,9 @@ def _merge_custom_calls(body: JsonObject, frames: Sequence[JsonValue]) -> None:
     """Rebuild tool calls of Chat streams that carry custom calls.
 
     The assembler cannot merge custom call deltas and stops reading a choice at the first one,
-    so every tool call and the text of such a choice are rebuilt from the stream: function
-    arguments, custom inputs, content and refusal text are joined in order, and the choice
+    so every tool call and the text of such a choice are rebuilt from the stream: tool names,
+    function arguments, custom inputs, content and refusal text are joined in order, and the
+    choice
     takes the finish reason the stream reported.
 
     Args:
@@ -123,7 +124,8 @@ def _merge_custom_calls(body: JsonObject, frames: Sequence[JsonValue]) -> None:
                     if not isinstance(part, dict):
                         continue
                     merged["kind"] = kind
-                    merged["name"] = merged["name"] or part.get("name")
+                    if isinstance(fragment := part.get("name"), str):
+                        merged["name"] = f"{merged['name'] or ''}{fragment}"
                     if isinstance(piece := part.get(field), str):
                         merged["text"] = f"{merged['text']}{piece}"
                     if kind == "custom":

@@ -1135,8 +1135,16 @@ def test_gateway_searches_and_call_images_are_kept() -> None:
             },
         ),
         ("messages", {"type": "message", "stop_reason": "max_tokens", "content": []}),
+        (
+            "messages",
+            {
+                "type": "message",
+                "stop_reason": "max_tokens",
+                "content": [{"type": "text", "text": ""}],
+            },
+        ),
     ],
-    ids=["responses", "messages"],
+    ids=["responses", "messages", "messages-empty-text"],
 )
 def test_empty_replies_at_the_length_limit_are_tagged(
     protocol: CaptureProtocol, body: JsonObject

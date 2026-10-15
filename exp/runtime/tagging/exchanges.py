@@ -244,6 +244,11 @@ def _from_parts(
     if not request_turns:
         raise ValueError("the request has no readable messages")
     readable, partial = readable_responses(body) if protocol == "responses" else (body, {})
+    if protocol == "messages" and isinstance(blocks := readable.get("content"), list):
+        # An empty text block (a reply cut off before its first word) carries nothing, and
+        # the output decoder rejects it.
+        empty_text = {"type": "text", "text": ""}
+        readable = {**readable, "content": [block for block in blocks if block != empty_text]}
     # A reply that hit its limit before producing anything is a valid, empty terminal turn,
     # which the output decoder would reject as missing output.
     field = {"responses": "output", "messages": "content"}.get(protocol)
