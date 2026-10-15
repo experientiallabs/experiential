@@ -1,0 +1,614 @@
+"""Tests for building tagging exchanges from local captures and capture record parts.
+
+Requests go through the real protocol decoders and ``capture_context_document``, so the
+contexts match what the gateway stores. Response frames follow the native collector tests:
+Chat chunks ending in ``[DONE]``, Messages block lifecycles, and the Responses terminal event.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Callable
+from datetime import UTC, datetime
+
+import pytest
+from pydantic import JsonValue
+
+from exp.common.core.artifacts import JsonObject
+from exp.common.tags import opening_key, tag_facts, turn_windows
+from exp.runtime.anthropic_protocol.requests import decode_messages
+from exp.runtime.gateway.capture_context import capture_context_document
+from exp.runtime.gateway.contracts import GatewayRequest
+from exp.runtime.gateway.ingest.conversion import CaptureProtocol
+from exp.runtime.gateway.local_capture_contracts import (
+    CapturedExchange,
+    CaptureProvenance,
+    LocalCaptureScope,
+)
+from exp.runtime.gateway.native_capture import CaptureRecord
+from exp.runtime.openai_protocol.requests import decode_chat, decode_responses
+from exp.runtime.tagging.exchanges import (
+    TagExchangeError,
+    completed_response,
+    exchange_from_capture_parts,
+    exchange_from_capture_record,
+    exchange_from_captured,
+)
+
+LOOKUP_TOOL: JsonObject = {
+    "type": "function",
+    "function": {
+        "name": "lookup",
+        "description": "Lookup the record",
+        "parameters": {"type": "object", "properties": {"id": {"type": "string"}}},
+    },
+}
+
+
+def _chat_request(**extra: JsonValue) -> GatewayRequest:
+    """Decode a tool-using Chat request with an image.
+
+    Args:
+        **extra: Additional Chat body fields.
+
+    Returns:
+        The effective gateway request.
+    """
+    return decode_chat(
+        {
+            "model": "coding",
+            "messages": [
+                {"role": "system", "content": "You look up records."},
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "Find record A"},
+                        {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+                    ],
+                },
+                {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {
+                            "id": "call-1",
+                            "type": "function",
+                            "function": {"name": "lookup", "arguments": '{"id":"A"}'},
+                        }
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "call-1", "content": "not found"},
+            ],
+            "tools": [LOOKUP_TOOL],
+            **extra,
+        }
+    ).request
+
+
+def _experience(
+    protocol: CaptureProtocol,
+    request: GatewayRequest,
+    response: JsonObject,
+    *,
+    session_id: str | None = None,
+) -> CapturedExchange:
+    """Build a local capture the way the gateway capture store writes it.
+
+    Args:
+        protocol: Public surface.
+        request: Effective request.
+        response: Complete response body.
+        session_id: Optional caller session label.
+
+    Returns:
+        The local capture.
+    """
+    return CapturedExchange(
+        experience_id="experience-1",
+        response_id="response-1",
+        episode_id=session_id,
+        scope=LocalCaptureScope(user_id="developer", application_id="gateway"),
+        protocol=protocol,
+        captured_at=datetime.now(UTC),
+        request={"exp_context": capture_context_document(request, session_id=session_id)},
+        response=response,
+        provenance=CaptureProvenance(source_id="request-1", model_id="worker"),
+    )
+
+
+def _record(
+    protocol: CaptureProtocol, request: GatewayRequest, response: JsonObject, **context: str
+) -> CaptureRecord:
+    """Build a complete native collector record.
+
+    Args:
+        protocol: Public surface.
+        request: Effective request.
+        response: Response document.
+        **context: Capture context options such as ``session_id``.
+
+    Returns:
+        The validated record.
+    """
+    return CaptureRecord.model_validate(
+        {
+            "schema_version": 1,
+            "request": {
+                "request_id": "request-1",
+                "scope": {
+                    "organization_id": "organization",
+                    "identity_id": "identity",
+                    "application_id": "application",
+                },
+                "protocol": protocol,
+                "model_id": "worker",
+                "context": capture_context_document(request, **context),
+            },
+            "response": response,
+            "deployment_id": None,
+            "captured_at": 1.0,
+            "metrics": None,
+            "gemini_thought_parts": [],
+            "gemini_thought_parts_source_json": None,
+        }
+    )
+
+
+def _chunk(delta: JsonObject, finish: str | None = None) -> JsonObject:
+    """Build one Chat stream chunk.
+
+    Args:
+        delta: Choice delta.
+        finish: Finish reason, or None mid-stream.
+
+    Returns:
+        The chunk.
+    """
+    return {
+        "id": "chatcmpl-1",
+        "object": "chat.completion.chunk",
+        "model": "worker",
+        "created": 1,
+        "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
+    }
+
+
+CHAT_FRAMES: list[JsonValue] = [
+    _chunk({"role": "assistant", "content": "Record A "}),
+    _chunk({"content": "is missing."}),
+    _chunk(
+        {
+            "tool_calls": [
+                {
+                    "index": 0,
+                    "id": "call-2",
+                    "type": "function",
+                    "function": {"name": "lookup", "arguments": '{"id":'},
+                }
+            ]
+        }
+    ),
+    _chunk({"tool_calls": [{"index": 0, "function": {"arguments": '"B"}'}}]}, "tool_calls"),
+    "[DONE]",
+]
+CHAT_BODY: JsonObject = {
+    "id": "chatcmpl-1",
+    "object": "chat.completion",
+    "choices": [
+        {
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": "Record A is missing.",
+                "tool_calls": [
+                    {
+                        "id": "call-2",
+                        "type": "function",
+                        "function": {"name": "lookup", "arguments": '{"id":"B"}'},
+                    }
+                ],
+            },
+            "finish_reason": "tool_calls",
+        }
+    ],
+}
+MESSAGES_FRAMES: list[JsonValue] = [
+    {
+        "type": "message_start",
+        "message": {
+            "type": "message",
+            "id": "msg",
+            "role": "assistant",
+            "content": [],
+            "usage": {"input_tokens": 2},
+            "stop_reason": None,
+        },
+    },
+    {
+        "type": "content_block_start",
+        "index": 0,
+        "content_block": {"type": "thinking", "thinking": "", "signature": ""},
+    },
+    {
+        "type": "content_block_delta",
+        "index": 0,
+        "delta": {"type": "thinking_delta", "thinking": "x"},
+    },
+    {
+        "type": "content_block_delta",
+        "index": 0,
+        "delta": {"type": "signature_delta", "signature": "s"},
+    },
+    {"type": "content_block_stop", "index": 0},
+    {
+        "type": "content_block_start",
+        "index": 1,
+        "content_block": {"type": "tool_use", "id": "toolu_1", "name": "bash", "input": {}},
+    },
+    {
+        "type": "content_block_delta",
+        "index": 1,
+        "delta": {"type": "input_json_delta", "partial_json": '{"cmd":'},
+    },
+    {
+        "type": "content_block_delta",
+        "index": 1,
+        "delta": {"type": "input_json_delta", "partial_json": '"ls"}'},
+    },
+    {"type": "content_block_stop", "index": 1},
+    {"type": "message_delta", "delta": {"stop_reason": "tool_use"}, "usage": {"output_tokens": 3}},
+    {"type": "message_stop"},
+]
+RESPONSES_BODY: JsonObject = {
+    "id": "resp_1",
+    "object": "response",
+    "status": "incomplete",
+    "incomplete_details": {"reason": "max_output_tokens"},
+    "error": None,
+    "output": [
+        {"type": "reasoning", "id": "rs_1", "summary": []},
+        {
+            "type": "message",
+            "id": "msg_1",
+            "role": "assistant",
+            "status": "incomplete",
+            "content": [{"type": "output_text", "text": "Partial forecast", "annotations": []}],
+        },
+    ],
+}
+
+
+def _messages_request() -> GatewayRequest:
+    """Decode a Messages request whose last tool result failed.
+
+    Returns:
+        The effective gateway request.
+    """
+    return decode_messages(
+        {
+            "model": "coding",
+            "max_tokens": 256,
+            "system": "You run commands.",
+            "messages": [
+                {"role": "user", "content": "List files"},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_0",
+                            "name": "bash",
+                            "input": {"cmd": "ls x"},
+                        }
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_0",
+                            "content": "No such file",
+                            "is_error": True,
+                        }
+                    ],
+                },
+            ],
+            "tools": [{"name": "bash", "description": "Run", "input_schema": {"type": "object"}}],
+        }
+    ).request
+
+
+def _responses_request() -> GatewayRequest:
+    """Decode a Responses request with instructions and a JSON schema format.
+
+    Returns:
+        The effective gateway request.
+    """
+    return decode_responses(
+        {
+            "model": "coding",
+            "instructions": "Answer as JSON.",
+            "input": "Forecast for SF",
+            "text": {"format": {"type": "json_schema", "name": "f", "schema": {"type": "object"}}},
+        }
+    ).request
+
+
+def test_local_chat_capture_keeps_tools_images_and_tool_results() -> None:
+    """A local Chat capture becomes chat-form messages with facts and rendered windows."""
+    exchange = exchange_from_captured(
+        _experience("chat_completions", _chat_request(), CHAT_BODY, session_id="session-7")
+    )
+    assert exchange.exchange_id == "experience-1"
+    assert exchange.conversation_key == "session-7"
+    assert [tool.name for tool in exchange.tools] == ["lookup"]
+    assert [message.role for message in exchange.messages] == [
+        "system",
+        "user",
+        "assistant",
+        "tool",
+    ]
+    user = exchange.messages[1]
+    assert user.text() == "Find record A [image]"
+    assert "AAAA" not in exchange.model_dump_json()
+    assert exchange.response[0].tool_calls[0].function.arguments == '{"id":"B"}'
+    facts = tag_facts(exchange)
+    assert (facts.tool_calls, facts.turns, facts.has_images) == (1, 1, True)
+    assert not facts.truncated and not facts.structured_output
+    (window,) = turn_windows(exchange)
+    assert window.text.splitlines() == [
+        "[task] Find record A [image]",
+        "[tool_result lookup] not found",
+        "[assistant] Record A is missing.",
+        '[tool_call lookup] {"id":"B"}',
+    ]
+
+
+def test_local_messages_capture_marks_failed_tool_results_and_drops_thinking() -> None:
+    """Anthropic tool errors keep their failure flag and thinking blocks are omitted."""
+    body: JsonObject = {
+        "id": "msg",
+        "type": "message",
+        "role": "assistant",
+        "stop_reason": "max_tokens",
+        "content": [
+            {"type": "thinking", "thinking": "private", "signature": "sig"},
+            {"type": "text", "text": "The path does not exist."},
+        ],
+    }
+    exchange = exchange_from_captured(_experience("messages", _messages_request(), body))
+    assert exchange.messages[-1].text() == "[tool error] No such file"
+    assert "private" not in exchange.model_dump_json()
+    assert exchange.response[0].text() == "The path does not exist."
+    assert tag_facts(exchange).truncated
+
+
+def test_local_responses_capture_reads_length_limit_and_structured_output() -> None:
+    """An incomplete Response at its token limit is tagged and marked truncated."""
+    exchange = exchange_from_captured(
+        _experience("responses", _responses_request(), RESPONSES_BODY)
+    )
+    assert [message.role for message in exchange.messages] == ["developer", "user"]
+    assert [message.text() for message in exchange.response] == ["Partial forecast"]
+    facts = tag_facts(exchange)
+    assert facts.truncated and facts.structured_output
+
+
+def test_chat_refusal_text_is_kept_as_the_reply() -> None:
+    """A Chat refusal with no content stays readable for the refusal tag."""
+    body: JsonObject = {
+        "choices": [
+            {
+                "index": 0,
+                "message": {"role": "assistant", "content": None, "refusal": "I can't help."},
+                "finish_reason": "stop",
+            }
+        ]
+    }
+    exchange = exchange_from_captured(_experience("chat_completions", _chat_request(), body))
+    assert exchange.response[0].text() == "I can't help."
+
+
+def test_json_object_output_counts_as_structured_output() -> None:
+    """The provider-internal JSON mode flag is a structured output request."""
+    request = _chat_request(response_format={"type": "json_object"})
+    exchange = exchange_from_captured(_experience("chat_completions", request, CHAT_BODY))
+    assert exchange.structured_output
+
+
+def test_local_capture_without_context_is_rejected_with_guidance() -> None:
+    """A capture missing its effective request says how to recover."""
+    experience = _experience("chat_completions", _chat_request(), CHAT_BODY).model_copy(
+        update={"request": {}}
+    )
+    with pytest.raises(TagExchangeError, match="experience-1 cannot be tagged.*capture enabled"):
+        exchange_from_captured(experience)
+
+
+@pytest.mark.parametrize(
+    ("protocol", "request_builder", "frames", "expected"),
+    [
+        (
+            "chat_completions",
+            _chat_request,
+            CHAT_FRAMES,
+            ['[assistant] Record A is missing.\n[tool_call lookup] {"id":"B"}'],
+        ),
+        ("messages", _messages_request, MESSAGES_FRAMES, ['[tool_call bash] {"cmd":"ls"}']),
+        (
+            "responses",
+            _responses_request,
+            [
+                {"type": "response.created", "response": {"id": "resp_1", "status": "in_progress"}},
+                {"type": "response.incomplete", "response": RESPONSES_BODY},
+            ],
+            ["[assistant] Partial forecast"],
+        ),
+    ],
+)
+def test_streamed_records_reassemble_through_the_native_collector(
+    protocol: CaptureProtocol,
+    request_builder: Callable[[], GatewayRequest],
+    frames: list[JsonValue],
+    expected: list[str],
+) -> None:
+    """SSE frames from a record reassemble into the same response turns for every surface.
+
+    Args:
+        protocol: Public surface.
+        request_builder: Builds the effective request.
+        frames: Stored SSE data payloads.
+        expected: Rendered response turns.
+    """
+    record = _record(
+        protocol,
+        request_builder(),
+        {
+            "kind": "sse",
+            "status": 200,
+            "frames": frames,
+            "truncated": False,
+            "client_disconnected": False,
+        },
+    )
+    exchange = exchange_from_capture_record(record)
+    window = turn_windows(exchange)[-1]
+    assert window.text.endswith(expected[0])
+    assert exchange.exchange_id == "request-1"
+
+
+@pytest.mark.parametrize(
+    ("protocol", "request_builder", "frames"),
+    [
+        ("chat_completions", _chat_request, CHAT_FRAMES),
+        ("messages", _messages_request, MESSAGES_FRAMES),
+    ],
+    ids=["chat", "messages"],
+)
+def test_record_and_local_capture_of_the_same_traffic_agree(
+    protocol: CaptureProtocol,
+    request_builder: Callable[[], GatewayRequest],
+    frames: list[JsonValue],
+) -> None:
+    """A collector record and the local store's copy of it yield the same exchange.
+
+    The local store keeps the collector's reassembled body, so the local capture here is
+    built from the same frames.
+
+    Args:
+        protocol: Public surface.
+        request_builder: Builds the effective request.
+        frames: Stored SSE data payloads.
+    """
+    request = request_builder()
+    document: JsonObject = {
+        "kind": "sse",
+        "status": 200,
+        "frames": frames,
+        "truncated": False,
+        "client_disconnected": False,
+    }
+    local = exchange_from_captured(
+        _experience(
+            protocol, request, completed_response(protocol, document), session_id="session-7"
+        )
+    )
+    from_record = exchange_from_capture_record(
+        _record(protocol, request, document, session_id="session-7")
+    )
+    assert from_record.model_copy(update={"exchange_id": local.exchange_id}) == local
+    assert from_record.conversation_key == "session-7"
+    assert opening_key(from_record) == opening_key(local)
+    if protocol == "messages":
+        assert from_record.messages[-1].text() == "[tool error] No such file"
+
+
+def test_parts_without_an_envelope_still_tag_the_messages() -> None:
+    """A store that kept only messages and the response still yields an exchange."""
+    context = capture_context_document(_chat_request())
+    effective = context["request"]
+    assert isinstance(effective, dict)
+    messages = effective["messages"]
+    assert isinstance(messages, list)
+    exchange = exchange_from_capture_parts(
+        exchange_id="request-9",
+        protocol="chat_completions",
+        messages=[
+            {"role": "system", "truncated": True, "content": "[3 messages not captured]"},
+            *messages,
+        ],
+        request=None,
+        response={"kind": "json", "status": 200, "body": CHAT_BODY, "received_at": 1.0},
+        conversation_key="ledger-conversation",
+    )
+    assert exchange.tools == ()
+    assert exchange.conversation_key == "ledger-conversation"
+    assert exchange.messages[0].text() == "[3 messages not captured]"
+
+
+@pytest.mark.parametrize(
+    ("document", "message"),
+    [
+        ({"kind": "json", "status": 500, "body": CHAT_BODY}, "status is 500"),
+        (
+            {
+                "kind": "sse",
+                "status": 200,
+                "frames": CHAT_FRAMES,
+                "truncated": True,
+                "client_disconnected": False,
+            },
+            "cut short",
+        ),
+        (
+            {
+                "kind": "sse",
+                "status": 200,
+                "frames": CHAT_FRAMES,
+                "truncated": False,
+                "client_disconnected": True,
+            },
+            "cut short",
+        ),
+        (
+            {
+                "kind": "sse",
+                "status": 200,
+                "frames": CHAT_FRAMES[:-1],
+                "truncated": False,
+                "client_disconnected": False,
+            },
+            "terminal state",
+        ),
+        (
+            {
+                "kind": "sse",
+                "status": 200,
+                "frames": [*CHAT_FRAMES[:2], {"error": {"message": "x"}}],
+                "truncated": False,
+                "client_disconnected": False,
+            },
+            "reports an error",
+        ),
+        ({"kind": "json", "status": 200, "body": {"choices": [], "error": None}}, "terminal"),
+        ({"kind": "wire", "status": 200}, "unknown response kind"),
+    ],
+)
+def test_incomplete_or_failed_responses_are_not_tagged(document: JsonObject, message: str) -> None:
+    """Failed, cut-short, unterminated or erroring responses are rejected with a reason.
+
+    Args:
+        document: Stored response document.
+        message: Expected reason fragment.
+    """
+    with pytest.raises(ValueError, match=message):
+        completed_response("chat_completions", document)
+
+
+def test_record_without_a_response_is_rejected() -> None:
+    """A prompt checkpoint with no response yet cannot be tagged."""
+    record = _record(
+        "chat_completions", _chat_request(), {"kind": "json", "status": 200, "body": CHAT_BODY}
+    )
+    pending = record.model_copy(update={"response": None})
+    with pytest.raises(TagExchangeError, match="no response yet"):
+        exchange_from_capture_record(pending)
