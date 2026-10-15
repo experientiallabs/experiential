@@ -175,3 +175,10 @@ def test_image_markers_are_spaced_from_adjacent_text() -> None:
         role="user", content=(TagTextPart(text="Weather?"), TagImagePart(), TagTextPart(text="ok"))
     )
     assert message.text() == "Weather? [image] ok"
+
+
+def test_opening_key_covers_every_message_the_opening_shows() -> None:
+    """Messages before the first user message, of any role, are part of the opening."""
+    greeting_a = _exchange((TagMessage(role="assistant", content="A"), FIRST_USER))
+    greeting_b = _exchange((TagMessage(role="assistant", content="B"), FIRST_USER))
+    assert opening_key(greeting_a) != opening_key(greeting_b)

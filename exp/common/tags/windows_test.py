@@ -303,7 +303,7 @@ def test_unrenderable_arguments_fall_back_to_their_text(arguments: str) -> None:
 
 
 def test_opening_with_more_blocks_than_characters_stays_bounded() -> None:
-    """Thousands of tiny instruction messages still fit one opening window."""
+    """Thousands of tiny instruction messages fit one opening that keeps its request."""
     exchange = TagExchange(
         exchange_id="req",
         messages=(
@@ -315,6 +315,10 @@ def test_opening_with_more_blocks_than_characters_stays_bounded() -> None:
     window = opening_window(exchange, SMALL)
     assert len(window.text) <= SMALL.window_chars
     assert window.end_message == 2_002
+    lines = window.text.splitlines()
+    assert lines[0] == "[system] x"
+    assert lines[-1] == "[user] Go"
+    assert any(line.startswith("[... ") and "messages omitted" in line for line in lines)
 
 
 def test_control_characters_never_inflate_the_json_size() -> None:
