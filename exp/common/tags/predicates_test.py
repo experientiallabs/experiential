@@ -78,7 +78,9 @@ def _matches(rule: str, summary: TagSummary, conversation: tuple[float, ...] | N
     Returns:
         Whether the rule matches.
     """
-    return evaluate_rule(parse_rule(rule), summary, conversation)
+    return evaluate_rule(
+        parse_rule(rule), summary.model_copy(update={"conversation": conversation})
+    )
 
 
 def test_bare_tag_defaults_to_max_at_least_half() -> None:
@@ -169,7 +171,7 @@ def test_conversation_tags_read_the_opening_scores() -> None:
 
 def test_conversation_tag_without_opening_scores_fails_even_when_short_circuited() -> None:
     """A rule using a conversation tag always needs the opening scores."""
-    with pytest.raises(TagRuleError, match="no conversation scores"):
+    with pytest.raises(TagRuleError, match="has no conversation scores"):
         _matches("tool_error OR coding", _summary({"tool_error": 1.0}), None)
 
 
@@ -279,7 +281,7 @@ def test_evaluation_rejects_scores_from_another_bank() -> None:
     rule = parse_rule("tool_error", other)
     assert (rule.bank_id, rule.bank_version) == ("custom", 2)
     with pytest.raises(TagRuleError, match="parse the rule against that bank"):
-        evaluate_rule(rule, _summary(), None)
+        evaluate_rule(rule, _summary())
 
 
 def test_evaluation_rejects_edited_banks_under_the_same_version() -> None:
@@ -287,7 +289,7 @@ def test_evaluation_rejects_edited_banks_under_the_same_version() -> None:
     rule = parse_rule("tool_error")
     edited = _summary().model_copy(update={"bank_digest": "0" * 64})
     with pytest.raises(TagRuleError, match="different experiential-default v1 wording or order"):
-        evaluate_rule(rule, edited, None)
+        evaluate_rule(rule, edited)
 
 
 def test_evaluation_requires_one_score_per_tag() -> None:
@@ -296,4 +298,4 @@ def test_evaluation_requires_one_score_per_tag() -> None:
         _matches("tool_error", _summary(), (0.0, 0.0))
     short = _summary().model_copy(update={"turn_max": (0.9,), "turn_min": (0.9,)})
     with pytest.raises(TagRuleError, match="expected 10 turn scores.*got 1"):
-        evaluate_rule(parse_rule("tool_error"), short, None)
+        evaluate_rule(parse_rule("tool_error"), short)

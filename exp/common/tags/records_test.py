@@ -195,3 +195,23 @@ def test_identifiers_accept_capture_length_ids() -> None:
     assert ExchangeTags.model_validate(long_ids.model_dump()) == long_ids
     with pytest.raises(ValidationError):
         ExchangeTags.model_validate({**record.model_dump(), "exchange_id": "r" * 513})
+
+
+def test_summarize_reads_opening_scores_from_the_tagged_opening() -> None:
+    """A later exchange borrows its conversation's opening scores only from the same bank."""
+    turn = (WindowScores(window_index=0, start_message=4, end_message=6, scores=(0.4,)),)
+    opening_window = WindowScores(window_index=0, start_message=0, end_message=2, scores=(0.9,))
+    first = _record(turn=turn, conversation=opening_window)
+    later = _record(turn=turn, conversation=None)
+    assert summarize(first).conversation == (0.9,)
+    assert summarize(later).conversation is None
+    assert summarize(later, first).conversation == (0.9,)
+    own = _record(
+        turn=turn,
+        conversation=opening_window.model_copy(update={"scores": (0.1,)}),
+    )
+    assert summarize(own, first).conversation == (0.1,)
+    with pytest.raises(ValueError, match="different bank"):
+        summarize(later, first.model_copy(update={"bank_digest": "0" * 64}))
+    with pytest.raises(ValueError, match="another conversation"):
+        summarize(later, first.model_copy(update={"conversation_key": "other"}))

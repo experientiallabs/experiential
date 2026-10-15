@@ -14,7 +14,7 @@ its lowest (true in every window). A tag with no comparison means ``>= 0.5``. Co
 have a single opening window, so both forms read the same score. Example::
 
     rule = parse_rule("coding AND (tool_error OR all(model_mistake) > 0.8) AND NOT model_refused")
-    matched = evaluate_rule(rule, summarize(tags), conversation_scores)
+    matched = evaluate_rule(rule, summarize(tags, opening))
 
 The parsed ``TagRule`` names each tag's scope and score index, so another engine can compile it
 to a query without reparsing the text.
@@ -501,15 +501,12 @@ def parse_rule(source: str, bank: TagBank = DEFAULT_TAG_BANK) -> TagRule:
     )
 
 
-def _score_array(
-    condition: TagCondition, summary: TagSummary, conversation: Sequence[float] | None
-) -> Sequence[float]:
+def _score_array(condition: TagCondition, summary: TagSummary) -> Sequence[float]:
     """Select the score array one condition reads.
 
     Args:
         condition: The tag condition.
-        summary: The exchange's turn summary.
-        conversation: The conversation's opening scores, if known.
+        summary: The exchange's summary.
 
     Returns:
         The conversation scores or the turn maximum or minimum array.
@@ -518,43 +515,40 @@ def _score_array(
         TagRuleError: A conversation tag is used without conversation scores.
     """
     if condition.scope is TagScope.CONVERSATION:
-        if conversation is None:
+        if summary.conversation is None:
             raise TagRuleError(
-                f"the rule reads conversation tag {condition.tag!r} but no conversation scores "
-                "were given; pass the opening scores stored for this conversation"
+                f"the rule reads conversation tag {condition.tag!r} but the summary has no "
+                "conversation scores; summarize with the exchange that tagged the opening"
             )
-        return conversation
+        return summary.conversation
     return summary.turn_max if condition.aggregate == "max" else summary.turn_min
 
 
-def _evaluate(node: RuleNode, summary: TagSummary, conversation: Sequence[float] | None) -> bool:
+def _evaluate(node: RuleNode, summary: TagSummary) -> bool:
     """Evaluate one node.
 
     Args:
         node: The rule node.
-        summary: The exchange's turn summary.
-        conversation: The conversation's opening scores, if known.
+        summary: The exchange's summary.
 
     Returns:
         Whether the node holds.
     """
     if isinstance(node, TagCondition):
-        score = _score_array(node, summary, conversation)[node.index]
-        return _COMPARE[node.op](score, node.threshold)
+        return _COMPARE[node.op](_score_array(node, summary)[node.index], node.threshold)
     if isinstance(node, NotRule):
-        return not _evaluate(node.operand, summary, conversation)
-    results = (_evaluate(operand, summary, conversation) for operand in node.operands)
+        return not _evaluate(node.operand, summary)
+    results = (_evaluate(operand, summary) for operand in node.operands)
     return all(results) if isinstance(node, AndRule) else any(results)
 
 
-def evaluate_rule(rule: TagRule, summary: TagSummary, conversation: Sequence[float] | None) -> bool:
+def evaluate_rule(rule: TagRule, summary: TagSummary) -> bool:
     """Decide whether one exchange matches a rule.
 
     Args:
         rule: A rule from ``parse_rule``.
-        summary: The exchange's turn summary from ``summarize``.
-        conversation: The opening scores of the exchange's conversation, in bank conversation
-            order, or None when unknown. Required when the rule uses a conversation tag.
+        summary: The exchange's summary from ``summarize``; it must carry conversation scores
+            when the rule uses a conversation tag.
 
     Returns:
         True when the exchange matches.
@@ -576,15 +570,15 @@ def evaluate_rule(rule: TagRule, summary: TagSummary, conversation: Sequence[flo
         )
     for name, scores, expected in (
         ("turn", summary.turn_max, rule.turn_tags),
-        ("conversation", conversation, rule.conversation_tags),
+        ("conversation", summary.conversation, rule.conversation_tags),
     ):
         if scores is not None and len(scores) != expected:
             raise TagRuleError(
                 f"expected {expected} {name} scores, one per {name} tag, but got {len(scores)}"
             )
     for condition in rule.conditions():
-        _score_array(condition, summary, conversation)
-    return _evaluate(rule.root, summary, conversation)
+        _score_array(condition, summary)
+    return _evaluate(rule.root, summary)
 
 
 __all__ = [
