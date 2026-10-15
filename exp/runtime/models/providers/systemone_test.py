@@ -280,6 +280,8 @@ def test_malformed_answers_raise_typed_errors(
         b'{"model": "\\ud800"}',
         b"not json",
         b'{"model": "\xff"}',
+        '{"model": "m"}'.encode("utf-16"),
+        b'\xef\xbb\xbf{"model": "m"}',
     ],
 )
 def test_responses_must_be_strict_json(content: bytes) -> None:
@@ -520,6 +522,8 @@ def test_invalid_requests_fail_before_any_network_work() -> None:
         ("http://user:pw@127.0.0.1/v1", "http or https API root"),
         ("http://127.0.0.1/v1?key=secret", "http or https API root"),
         ("/v1", "http or https API root"),
+        ("http://127.0.0.1:99999/v1", "valid port"),
+        ("http://127.0.0.1:port/v1", "valid port"),
         ("http://10.0.0.5:30000/v1", "plain http to a non-loopback host"),
     ],
 )
