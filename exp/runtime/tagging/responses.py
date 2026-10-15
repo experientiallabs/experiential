@@ -148,51 +148,122 @@ def _dicts(value: JsonValue) -> list[JsonObject]:
 def _lifecycle(protocol: CaptureProtocol, frames: Sequence[JsonValue]) -> bool:
     """Apply the collector's stream validity rules for Chat and Messages streams.
 
+    These mirror the native assemblers' validity checks, which the native binding does not
+    report: Chat in ``_chat_valid`` and Messages in ``_messages_lifecycle``.
+
     Args:
         protocol: Chat Completions or Messages.
         frames: Stored ``data`` payloads in order.
 
     Returns:
-        For Chat, every chunk carries choices that each name their index (as does every tool
-        call delta), the stream ends
-        with ``[DONE]`` and its first chunk names an id and a model. Messages streams replay
-        the block lifecycle in ``_messages_lifecycle``.
+        True when the assembler would accept the stream as complete.
     """
     if protocol == "chat_completions":
-        chunks = frames[:-1]
-        first = chunks[0] if chunks else None
-        return (
-            frames[-1:] == ["[DONE]"]
-            and isinstance(first, dict)
-            and first.get("id") is not None
-            and first.get("model") is not None
-            and all(
-                isinstance(chunk, dict)
-                and isinstance(choices := chunk.get("choices"), list)
-                and all(_chat_choice_valid(choice) for choice in choices)
-                for chunk in chunks
-            )
-        )
+        return _chat_valid(frames)
     return _messages_lifecycle(frames)
 
 
-def _chat_choice_valid(choice: JsonValue) -> bool:
-    """Report whether one streamed Chat choice is one the assembler can merge.
+def _chat_valid(frames: Sequence[JsonValue]) -> bool:
+    """Replay the Chat assembler's merge rules over a stream.
 
     Args:
-        choice: One entry of a chunk's ``choices``.
+        frames: Stored ``data`` payloads in order.
 
     Returns:
-        True when the choice names its index and every tool call delta names its own.
+        True when the stream ends with ``[DONE]``, its first chunk names an id and a model, and
+        every choice and tool call delta names its index and merges into what came before:
+        text joins text, lists extend lists, and any other value must repeat exactly. Custom
+        call deltas are exempt because ``_merge_custom_calls`` rebuilds them.
     """
-    if not isinstance(choice, dict) or not isinstance(choice.get("index"), int):
+    chunks = frames[:-1]
+    first = chunks[0] if chunks else None
+    if frames[-1:] != ["[DONE]"] or not isinstance(first, dict):
         return False
-    delta = choice.get("delta")
-    calls = delta.get("tool_calls") if isinstance(delta, dict) else None
-    return calls is None or (
-        isinstance(calls, list)
-        and all(isinstance(call, dict) and isinstance(call.get("index"), int) for call in calls)
-    )
+    if first.get("id") is None or first.get("model") is None:
+        return False
+    merged: dict[str, JsonValue] = {}
+    for chunk in chunks:
+        if not isinstance(chunk, dict) or not isinstance(chunk.get("choices"), list):
+            return False
+        for choice in _list_of(chunk.get("choices")):
+            if not isinstance(choice, dict) or not isinstance(index := choice.get("index"), int):
+                return False
+            delta = choice.get("delta")
+            for key, value in delta.items() if isinstance(delta, dict) else ():
+                if key == "tool_calls":
+                    if not _tool_deltas_valid(merged, index, value):
+                        return False
+                elif key != "role" and not _merges(merged, f"{index}/{key}", value):
+                    return False
+    return True
+
+
+def _tool_deltas_valid(merged: dict[str, JsonValue], choice: int, value: JsonValue) -> bool:
+    """Check one delta's tool calls against the Chat assembler's merge rules.
+
+    Args:
+        merged: Values merged so far, by path.
+        choice: The choice index.
+        value: The delta's ``tool_calls``.
+
+    Returns:
+        True when every call delta names its index and its fields merge.
+    """
+    if not isinstance(value, list):
+        return False
+    for call in value:
+        if not isinstance(call, dict) or not isinstance(index := call.get("index"), int):
+            return False
+        for key, field in call.items():
+            path = f"{choice}/tool/{index}/{key}"
+            if key in ("index", "type", "id", "custom"):
+                continue
+            if key == "function":
+                if not isinstance(field, dict) or not all(
+                    _merges(merged, f"{path}/{name}", part) for name, part in field.items()
+                ):
+                    return False
+            elif not _merges(merged, path, field):
+                return False
+    return True
+
+
+def _merges(merged: dict[str, JsonValue], path: str, value: JsonValue) -> bool:
+    """Merge one streamed value the way the assembler appends it.
+
+    Args:
+        merged: Values merged so far, by path; updated in place.
+        path: Location of the value.
+        value: The new value; null adds nothing.
+
+    Returns:
+        False when the value cannot follow what is already there.
+    """
+    if value is None:
+        return True
+    current = merged.get(path)
+    if current is None:
+        merged[path] = value
+    elif isinstance(current, str) and isinstance(value, str):
+        merged[path] = current + value
+    elif isinstance(current, list) and isinstance(value, list):
+        merged[path] = [*current, *value]
+    elif current != value:
+        return False
+    return True
+
+
+def _list_of(value: JsonValue) -> list[JsonValue]:
+    """Return a JSON list, or an empty list for any other value."""
+    return value if isinstance(value, list) else []
+
+
+_MESSAGES_DELTA_FIELDS: Final = {
+    "text_delta": "text",
+    "thinking_delta": "thinking",
+    "signature_delta": "signature",
+    "input_json_delta": "partial_json",
+}
 
 
 def _messages_lifecycle(frames: Sequence[JsonValue]) -> bool:
@@ -202,8 +273,9 @@ def _messages_lifecycle(frames: Sequence[JsonValue]) -> bool:
         frames: Stored ``data`` payloads in order.
 
     Returns:
-        True when one ``message_start`` comes first, blocks start in index order and receive
-        deltas only while open, every block closes, and nothing follows ``message_stop``.
+        True when one ``message_start`` with an empty message comes first, blocks start in
+        index order and receive well-formed deltas only while open, every block closes, and
+        nothing follows ``message_stop``.
     """
     started = stopped = False
     opened: list[JsonValue] = []
@@ -215,7 +287,10 @@ def _messages_lifecycle(frames: Sequence[JsonValue]) -> bool:
         index = frame.get("index")
         key = json.dumps(index)
         if kind == "message_start":
-            if started:
+            message = frame.get("message")
+            if started or not isinstance(message, dict) or message.get("type") != "message":
+                return False
+            if message.get("content") != []:
                 return False
             started = True
         elif kind == "content_block_start":
@@ -227,6 +302,8 @@ def _messages_lifecycle(frames: Sequence[JsonValue]) -> bool:
                 return False
             if kind == "content_block_stop":
                 closed.add(key)
+            elif not _messages_delta_valid(frame.get("delta")):
+                return False
         elif kind == "message_delta":
             if not started or not isinstance(frame.get("delta"), dict):
                 return False
@@ -235,6 +312,25 @@ def _messages_lifecycle(frames: Sequence[JsonValue]) -> bool:
         elif kind != "ping":
             return False
     return started and stopped and len(closed) == len(opened)
+
+
+def _messages_delta_valid(delta: JsonValue) -> bool:
+    """Report whether a Messages block delta has a known type and its text field.
+
+    Args:
+        delta: The ``delta`` of a ``content_block_delta`` event.
+
+    Returns:
+        True for a text, thinking, signature or input JSON delta carrying its text, or a
+        citations delta carrying a citation.
+    """
+    if not isinstance(delta, dict):
+        return False
+    kind = delta.get("type")
+    if kind == "citations_delta":
+        return "citation" in delta
+    field = _MESSAGES_DELTA_FIELDS.get(str(kind))
+    return field is not None and isinstance(delta.get(field), str)
 
 
 def readable_responses(body: JsonObject) -> tuple[JsonObject, dict[str, str]]:

@@ -15,7 +15,7 @@ from pydantic import JsonValue
 
 from exp.common.core.artifacts import JsonObject
 from exp.common.tags import opening_key, tag_facts, turn_windows
-from exp.common.tags.exchange import TagMessage
+from exp.common.tags.exchange import TagExchange, TagMessage
 from exp.runtime.anthropic_protocol.requests import decode_messages
 from exp.runtime.gateway.capture_context import capture_context_document
 from exp.runtime.gateway.contracts import GatewayRequest
@@ -1151,6 +1151,56 @@ def test_empty_replies_at_the_length_limit_are_tagged(
     exchange = exchange_from_captured(_experience(protocol, request, body))
     assert exchange.response == (TagMessage(role="assistant"),)
     assert tag_facts(exchange).truncated
+
+
+def test_tools_declared_by_input_items_are_offered_tools() -> None:
+    """Tools a request declares in an additional_tools item join the tool list and key."""
+
+    def declaring(name: str) -> TagExchange:
+        """Build an exchange whose request declares one namespaced tool inline.
+
+        Args:
+            name: The declared function name.
+
+        Returns:
+            The exchange.
+        """
+        request = decode_responses(
+            {
+                "model": "coding",
+                "input": [
+                    {
+                        "type": "additional_tools",
+                        "id": "at_1",
+                        "role": "developer",
+                        "tools": [
+                            {
+                                "type": "namespace",
+                                "name": "files",
+                                "description": "File tools",
+                                "tools": [
+                                    {
+                                        "type": "function",
+                                        "name": name,
+                                        "parameters": {"type": "object"},
+                                    }
+                                ],
+                            }
+                        ],
+                    },
+                    {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "Go"}],
+                    },
+                ],
+            }
+        ).request
+        return exchange_from_captured(_experience("responses", request, RESPONSES_BODY))
+
+    reading, deleting = declaring("read"), declaring("delete")
+    assert [tool.name for tool in reading.tools] == ["files.read"]
+    assert opening_key(reading) != opening_key(deleting)
 
 
 def test_record_without_a_response_is_rejected() -> None:

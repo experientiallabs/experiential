@@ -137,3 +137,42 @@ def test_chat_stream_with_an_unindexed_tool_delta_is_rejected() -> None:
     }
     with pytest.raises(ValueError, match="terminal state"):
         completed_response("chat_completions", document)
+
+
+def _sse(frames: list[JsonValue]) -> JsonObject:
+    """Wrap frames in a complete stored stream document.
+
+    Args:
+        frames: Stored ``data`` payloads.
+
+    Returns:
+        The response document.
+    """
+    return {
+        "kind": "sse",
+        "status": 200,
+        "frames": frames,
+        "truncated": False,
+        "client_disconnected": False,
+    }
+
+
+def test_chat_stream_whose_deltas_cannot_merge_is_rejected() -> None:
+    """Text content followed by list content fails the assembler's merge and is not tagged."""
+    frames: list[JsonValue] = [
+        _chunk({"role": "assistant", "content": "Hello"}),
+        _chunk({"content": [{"type": "text", "text": "world"}]}),
+        _chunk({}, "stop"),
+        "[DONE]",
+    ]
+    with pytest.raises(ValueError, match="terminal state"):
+        completed_response("chat_completions", _sse(frames))
+    assert completed_response("chat_completions", _sse(CHAT_FRAMES))["choices"]
+
+
+def test_messages_stream_with_an_unknown_delta_is_rejected() -> None:
+    """A block delta of unknown type fails the assembler and is not tagged."""
+    frames = list(MESSAGES_FRAMES)
+    frames[2] = {"type": "content_block_delta", "index": 0, "delta": {"type": "mystery_delta"}}
+    with pytest.raises(ValueError, match="terminal state"):
+        completed_response("messages", _sse(frames))

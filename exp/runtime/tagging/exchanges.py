@@ -268,7 +268,8 @@ def _from_parts(
             envelope.get("tools"),
             internal.get("provider_native_tools"),
             internal.get("provider_server_tools"),
-        ),
+        )
+        + tuple(tool for message in canonical for tool in _declared_tools(message)),
         messages=request_turns,
         response=response_turns or (TagMessage(role="assistant"),),
         truncated=finished_by_length(protocol, body),
@@ -328,6 +329,26 @@ def _tools(value: JsonValue, native: JsonValue, server: JsonValue) -> tuple[TagT
         tools.extend(rest)
     tools.extend(_tool(tool) for tool in _list(server) if isinstance(tool, dict))
     return tuple(tool for tool in tools if tool is not None)
+
+
+def _declared_tools(message: JsonObject) -> list[TagTool]:
+    """Read tools a request declares inline through an ``additional_tools`` input item.
+
+    Args:
+        message: A canonical request message, possibly carrying a native item.
+
+    Returns:
+        The declared tools, with namespaces expanded; empty for any other message.
+    """
+    item = message.get("provider_native_item")
+    if not isinstance(item, dict) or item.get("type") != "additional_tools":
+        return []
+    return [
+        tool
+        for entry in _list(item.get("tools"))
+        if isinstance(entry, dict)
+        for tool in _native_tools(entry)
+    ]
 
 
 def _tool(tool: JsonObject, prefix: str = "") -> TagTool | None:
