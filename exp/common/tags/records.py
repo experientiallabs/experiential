@@ -102,6 +102,7 @@ class TagSummary(ContractModel):
     Attributes:
         bank_id: Bank that produced the scores.
         bank_version: Version of that bank.
+        bank_digest: ``TagBank.digest`` of the exact bank used.
         turn_max: Highest score per turn tag across windows.
         turn_min: Lowest score per turn tag across windows.
         turn_windows: Number of turn windows reduced.
@@ -109,6 +110,7 @@ class TagSummary(ContractModel):
 
     bank_id: ArtifactId
     bank_version: int = Field(ge=1)
+    bank_digest: Sha256
     turn_max: tuple[float, ...]
     turn_min: tuple[float, ...]
     turn_windows: int = Field(ge=1)
@@ -207,6 +209,7 @@ def summarize(tags: ExchangeTags) -> TagSummary:
     return TagSummary(
         bank_id=tags.bank_id,
         bank_version=tags.bank_version,
+        bank_digest=tags.bank_digest,
         turn_max=tuple(max(column) for column in columns),
         turn_min=tuple(min(column) for column in columns),
         turn_windows=len(tags.turn),

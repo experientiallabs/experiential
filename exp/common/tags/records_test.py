@@ -137,6 +137,7 @@ def test_summarize_takes_per_tag_max_and_min() -> None:
     assert summary == TagSummary(
         bank_id=DEFAULT_TAG_BANK.bank_id,
         bank_version=1,
+        bank_digest=DEFAULT_TAG_BANK.digest,
         turn_max=(0.7, 0.9, 1.0),
         turn_min=(0.2, 0.4, 0.0),
         turn_windows=3,
@@ -154,10 +155,22 @@ def test_summarize_single_window_has_equal_bounds() -> None:
 def test_summary_rejects_inverted_or_misaligned_bounds() -> None:
     """A minimum above its maximum or arrays of different lengths are rejected."""
     with pytest.raises(ValidationError, match="cannot exceed"):
-        TagSummary(bank_id="b", bank_version=1, turn_max=(0.1,), turn_min=(0.2,), turn_windows=1)
+        TagSummary(
+            bank_id="b",
+            bank_version=1,
+            bank_digest="0" * 64,
+            turn_max=(0.1,),
+            turn_min=(0.2,),
+            turn_windows=1,
+        )
     with pytest.raises(ValidationError, match="one score per turn tag"):
         TagSummary(
-            bank_id="b", bank_version=1, turn_max=(0.1, 0.2), turn_min=(0.1,), turn_windows=1
+            bank_id="b",
+            bank_version=1,
+            bank_digest="0" * 64,
+            turn_max=(0.1, 0.2),
+            turn_min=(0.1,),
+            turn_windows=1,
         )
 
 

@@ -45,6 +45,7 @@ def _summary(
     return TagSummary(
         bank_id=DEFAULT_TAG_BANK.bank_id,
         bank_version=DEFAULT_TAG_BANK.version,
+        bank_digest=DEFAULT_TAG_BANK.digest,
         turn_max=tuple(turn_max),
         turn_min=tuple(turn_min),
         turn_windows=2,
@@ -281,7 +282,18 @@ def test_evaluation_rejects_scores_from_another_bank() -> None:
         evaluate_rule(rule, _summary(), None)
 
 
-def test_evaluation_rejects_short_score_arrays() -> None:
-    """Score arrays shorter than the bank are reported instead of indexing past the end."""
-    with pytest.raises(TagRuleError, match="only 2 scores were given"):
-        _matches("autonomous_agent", _summary(), (0.0, 0.0))
+def test_evaluation_rejects_edited_banks_under_the_same_version() -> None:
+    """Scores from reordered or reworded tags under one id and version are rejected."""
+    rule = parse_rule("tool_error")
+    edited = _summary().model_copy(update={"bank_digest": "0" * 64})
+    with pytest.raises(TagRuleError, match="different experiential-default v1 wording or order"):
+        evaluate_rule(rule, edited, None)
+
+
+def test_evaluation_requires_one_score_per_tag() -> None:
+    """Short or long score arrays are rejected before any index is read."""
+    with pytest.raises(TagRuleError, match="expected 15 conversation scores.*got 2"):
+        _matches("tool_error", _summary(), (0.0, 0.0))
+    short = _summary().model_copy(update={"turn_max": (0.9,), "turn_min": (0.9,)})
+    with pytest.raises(TagRuleError, match="expected 10 turn scores.*got 1"):
+        evaluate_rule(parse_rule("tool_error"), short, None)
