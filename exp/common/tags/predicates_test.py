@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import pytest
+from pydantic import ValidationError
 
 from exp.common.tags.bank import DEFAULT_TAG_BANK, TagBank, TagDefinition, TagScope
 from exp.common.tags.predicates import (
@@ -299,3 +300,11 @@ def test_evaluation_requires_one_score_per_tag() -> None:
     short = _summary().model_copy(update={"turn_max": (0.9,), "turn_min": (0.9,)})
     with pytest.raises(TagRuleError, match="expected 10 turn scores.*got 1"):
         evaluate_rule(parse_rule("tool_error"), short)
+
+
+def test_rule_json_rejects_indexes_outside_the_bank() -> None:
+    """A rule tree read from JSON cannot index past its scope's score count."""
+    payload = parse_rule("tool_error").model_dump(mode="json")
+    payload["root"]["index"] = TURN_COUNT
+    with pytest.raises(ValidationError, match="turn index 10 but the bank has 10 turn tags"):
+        TagRule.model_validate(payload)
