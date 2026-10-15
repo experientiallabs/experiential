@@ -30,14 +30,16 @@ from exp.common.tags.exchange import TagExchange, TagMessage, TagTool, first_use
 # Conservative characters per token: English prose averages about four, code and JSON about
 # three. Mostly non-Latin text runs lower and needs a smaller budget than for_input_tokens gives.
 CONSERVATIVE_CHARS_PER_TOKEN = 3
-# Largest window: even at four UTF-8 bytes per character, a window plus 32 questions stays
-# inside a 256 KiB decision request.
+# Largest window. Rendering replaces the control characters JSON would escape as six bytes,
+# so each character costs at most four bytes of JSON text and a window plus 32 questions
+# stays inside a 256 KiB decision request.
 MAX_WINDOW_CHARS = 48_000
 TOOL_DESCRIPTION_CHARS = 160
 
 _MARKER = "\n[... {omitted} characters omitted ...]\n"
 _BLANK_RUNS = re.compile(r"\n{3,}")
 _SURROGATE = re.compile("[\ud800-\udfff]")
+_CONTROL = re.compile("[\x00-\x08\x0b-\x1f]")
 
 
 class TagWindowBudget(ContractModel):
@@ -138,6 +140,18 @@ def clip_text(text: str, limit: int) -> str:
     head = keep - tail
     omitted = len(text) - head - tail
     return text[:head] + _MARKER.format(omitted=omitted) + (text[-tail:] if tail else "")
+
+
+def _visible(text: str) -> str:
+    """Replace control characters other than newline and tab with spaces.
+
+    Args:
+        text: Rendered window text.
+
+    Returns:
+        Text of the same length whose JSON encoding needs no six-byte escapes.
+    """
+    return _CONTROL.sub(" ", text)
 
 
 def _compact(text: str) -> str:
@@ -305,7 +319,7 @@ def opening_window(exchange: TagExchange, budget: TagWindowBudget | None = None)
         start_message=0,
         end_message=end,
         # Many tiny blocks can leave no room even for their separators; clip the joined text.
-        text=clip_text("\n".join(_fit(blocks, budget.window_chars)), budget.window_chars),
+        text=_visible(clip_text("\n".join(_fit(blocks, budget.window_chars)), budget.window_chars)),
     )
 
 
@@ -379,7 +393,7 @@ def turn_windows(
                 index=len(windows),
                 start_message=start + first,
                 end_message=start + last,
-                text="\n".join((header, *blocks[first:last])),
+                text=_visible("\n".join((header, *blocks[first:last]))),
             )
         )
         if last == len(blocks):

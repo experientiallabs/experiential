@@ -8,6 +8,7 @@ copied: an image part keeps at most its media type and a remote URL.
 
 from __future__ import annotations
 
+import json
 from typing import Annotated, Literal
 
 from pydantic import Field, model_validator
@@ -190,7 +191,8 @@ def opening_key(exchange: TagExchange) -> Sha256:
     """Derive a conversation key from what every turn of a conversation repeats.
 
     The key covers the system and developer messages before the first user message, every
-    tool's name and schema (sorted by name), and the first user message. Later turns of the
+    tool's name, description and schema (in a canonical order), and the first user message:
+    everything the opening window shows. Later turns of the
     same conversation resend that opening, so they share the key; instructions inserted later
     in the conversation do not change it.
 
@@ -208,8 +210,8 @@ def opening_key(exchange: TagExchange) -> Sha256:
         if message.role in ("system", "developer")
     ]
     tools = sorted(
-        ({"name": tool.name, "parameters": tool.parameters} for tool in exchange.tools),
-        key=lambda tool: str(tool["name"]),
+        (tool.model_dump(mode="json") for tool in exchange.tools),
+        key=lambda tool: json.dumps(tool, sort_keys=True),
     )
     user = None if first is None else exchange.messages[first].model_dump(mode="json")
     return sha256_json({"instructions": instructions, "tools": tools, "first_user": user})
