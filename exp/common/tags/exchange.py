@@ -105,7 +105,7 @@ class TagMessage(ContractModel):
         return self
 
     def text(self) -> str:
-        """Return the message text with each image replaced by an ``[image]`` marker.
+        """Return the message text with each image shown as a space-separated ``[image]``.
 
         Returns:
             The text, or an empty string when the message has none.
@@ -114,9 +114,14 @@ class TagMessage(ContractModel):
             return ""
         if isinstance(self.content, str):
             return self.content
-        return "".join(
-            part.text if isinstance(part, TagTextPart) else "[image]" for part in self.content
-        )
+        text = ""
+        for part in self.content:
+            piece = part.text if isinstance(part, TagTextPart) else "[image]"
+            marker = isinstance(part, TagImagePart) or text.endswith("[image]")
+            if marker and text and piece and not (text[-1].isspace() or piece[0].isspace()):
+                text += " "
+            text += piece
+        return text
 
     def has_image(self) -> bool:
         """Report whether any content part is an image."""
@@ -146,8 +151,9 @@ class TagExchange(ContractModel):
     ``messages[i]`` is position ``i`` and ``response[j]`` is ``len(messages) + j``.
 
     Attributes:
-        exchange_id: Identifier of the captured exchange.
-        conversation_key: Caller or store conversation key; None to derive ``opening_key``.
+        exchange_id: Identifier of the captured exchange, at most 512 characters.
+        conversation_key: Caller or store conversation key of at most 512 characters; None
+            to derive ``opening_key``.
         tools: Tools offered in the request.
         messages: Request messages, in order; at least one.
         response: Response turns, in order; at least one.
@@ -155,8 +161,8 @@ class TagExchange(ContractModel):
         structured_output: Whether the request asked for JSON or schema-constrained output.
     """
 
-    exchange_id: str = Field(min_length=1, max_length=256)
-    conversation_key: str | None = Field(default=None, min_length=1, max_length=256)
+    exchange_id: str = Field(min_length=1, max_length=512)
+    conversation_key: str | None = Field(default=None, min_length=1, max_length=512)
     tools: tuple[TagTool, ...] = ()
     messages: tuple[TagMessage, ...] = Field(min_length=1)
     response: tuple[TagMessage, ...] = Field(min_length=1)

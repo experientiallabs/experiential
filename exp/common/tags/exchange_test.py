@@ -163,3 +163,11 @@ def test_exchange_requires_messages_and_a_response_and_round_trips() -> None:
         (SYSTEM, TagMessage(role="user", content=(TagTextPart(text="hi"), TagImagePart())))
     )
     assert TagExchange.model_validate_json(exchange.model_dump_json()) == exchange
+
+
+def test_image_markers_are_spaced_from_adjacent_text() -> None:
+    """An image next to text without whitespace still reads as a separate token."""
+    message = TagMessage(
+        role="user", content=(TagTextPart(text="Weather?"), TagImagePart(), TagTextPart(text="ok"))
+    )
+    assert message.text() == "Weather? [image] ok"
