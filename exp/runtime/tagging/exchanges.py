@@ -469,13 +469,8 @@ def _message(value: JsonObject) -> TagMessage | None:
     if native is not None:
         return _native(role, native)
     content = _content(value)
-    if role == "tool" and isinstance(content, str):
-        # Tool results can carry media as a data URL or inside serialized structured content.
-        projected, found = _readable(content)
-        text = projected if isinstance(projected, str) else _compact_json(projected)
-        content = (
-            (TagTextPart(text=text), *(TagImagePart() for _ in range(found))) if found else text
-        )
+    if role == "tool" and content is not None:
+        content = _tool_content(content)
     images = value.get("images")
     if role == "assistant" and isinstance(images, list) and images:
         text = content if isinstance(content, str) else ""
@@ -510,6 +505,31 @@ def _message(value: JsonObject) -> TagMessage | None:
     )
 
 
+def _tool_content(
+    content: str | tuple[TagContentPart, ...],
+) -> str | tuple[TagContentPart, ...]:
+    """Project tool result text, which can carry media as a data URL or serialized JSON.
+
+    Args:
+        content: The result's text, or its ordered parts when it carries images.
+
+    Returns:
+        Text when the result is text holding no media, otherwise the ordered parts with each
+        text projected and an image marker after the text that held it.
+    """
+    parts: list[TagContentPart] = []
+    for part in (TagTextPart(text=content),) if isinstance(content, str) else content:
+        if not isinstance(part, TagTextPart):
+            parts.append(part)
+            continue
+        readable, images = _readable(part.text)
+        text = readable if isinstance(readable, str) else _compact_json(readable)
+        parts.extend((TagTextPart(text=text), *(TagImagePart() for _ in range(images))))
+    if isinstance(content, str) and len(parts) == 1 and isinstance(parts[0], TagTextPart):
+        return parts[0].text
+    return tuple(parts)
+
+
 def _native(role: MessageRole, item: JsonValue) -> TagMessage | None:
     """Keep what a tag question can read from a provider-native item.
 
@@ -541,7 +561,7 @@ def _native(role: MessageRole, item: JsonValue) -> TagMessage | None:
         if key not in _IDENTITY_FIELDS and not (key == "status" and field == "completed")
     }
     if role == "tool" or kind.endswith(("_output", "_result")):
-        readable, images = _readable(_sole(fields, ("output", "content")))
+        readable, images = _readable(_sole(fields, ("output", "content")), native=True)
         text = readable if isinstance(readable, str) else _compact_json(readable)
         return TagMessage(
             role="tool",
@@ -556,7 +576,7 @@ def _native(role: MessageRole, item: JsonValue) -> TagMessage | None:
     if generated:
         # The result of an image generation call is the image itself, never readable text.
         fields["result"] = "[image]"
-    readable, images = _readable(_sole(fields, ("input", "arguments")))
+    readable, images = _readable(_sole(fields, ("input", "arguments")), native=True)
     images += generated
     markers = tuple(TagImagePart() for _ in range(images))
     if not kind.endswith(("_call", "tool_use")):
@@ -595,23 +615,26 @@ def _sole(fields: JsonObject, names: tuple[str, ...]) -> JsonValue:
     return fields
 
 
-def _readable(value: JsonValue) -> tuple[JsonValue, int]:
-    """Project a native value onto what a reader can use.
+def _readable(value: JsonValue, *, native: bool = False) -> tuple[JsonValue, int]:
+    """Project a tool payload or native value onto what a reader can use.
 
     Args:
-        value: Any JSON value from a native item.
+        value: Any JSON value from a tool payload or a native item.
+        native: The value comes from a provider-native item, whose encrypted fields and
+            signatures are opaque; a caller's own tool payload keeps fields of those names.
 
     Returns:
-        The value without encrypted fields or signatures, with base64 data URLs and base64
-        sources shown as ``[binary]`` and image parts as ``[image]``, and the number of images
-        found. Binary content is recognized by its field shape, never by how a string looks.
+        The value with base64 data URLs and base64 sources shown as ``[binary]`` and image
+        parts as ``[image]`` (and, for a native value, without encrypted fields or signatures),
+        and the number of images found. Binary content is recognized by its field shape, never
+        by how a string looks.
     """
     if isinstance(value, str):
         if _DATA_URL.match(value):
             return ("[image]", 1) if value.startswith("data:image/") else ("[binary]", 0)
-        return _readable_serialized(value)
+        return _readable_serialized(value, native=native)
     if isinstance(value, list):
-        items = [_readable(item) for item in value]
+        items = [_readable(item, native=native) for item in value]
         return [item for item, _ in items], sum(count for _, count in items)
     if not isinstance(value, dict):
         return value, 0
@@ -628,18 +651,19 @@ def _readable(value: JsonValue) -> tuple[JsonValue, int]:
     projected: JsonObject = {}
     images = 0
     for key, field in value.items():
-        if key in _OPAQUE_FIELDS:
+        if native and key in _OPAQUE_FIELDS:
             continue
-        projected[key], count = _readable(field)
+        projected[key], count = _readable(field, native=native)
         images += count
     return projected, images
 
 
-def _readable_serialized(text: str) -> tuple[JsonValue, int]:
+def _readable_serialized(text: str, *, native: bool) -> tuple[JsonValue, int]:
     """Project text that serializes a JSON structure, such as an MCP tool result.
 
     Args:
-        text: A string field of a native item.
+        text: A tool payload string or a string field of a native item.
+        native: The text comes from a provider-native item.
 
     Returns:
         The text unchanged unless it is a JSON object or array holding images or binary
@@ -651,7 +675,7 @@ def _readable_serialized(text: str) -> tuple[JsonValue, int]:
         parsed = json.loads(text)
     except (ValueError, RecursionError):
         return text, 0
-    projected, images = _readable(parsed)
+    projected, images = _readable(parsed, native=native)
     if images or projected != parsed:
         return _compact_json(projected), images
     return text, 0

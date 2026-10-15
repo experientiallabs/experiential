@@ -1417,3 +1417,55 @@ def test_record_without_a_response_is_rejected() -> None:
     pending = record.model_copy(update={"response": None})
     with pytest.raises(TagExchangeError, match="no response yet"):
         exchange_from_capture_record(pending)
+
+
+def test_caller_tool_payloads_keep_fields_named_like_opaque_native_fields() -> None:
+    """A caller's own tool arguments and results keep signature and encrypted fields."""
+    exchange = exchange_from_capture_parts(
+        exchange_id="request-15",
+        protocol="chat_completions",
+        messages=[
+            {"role": "user", "content": "Verify"},
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {"call_id": "v1", "name": "verify", "arguments": {"signature": "0xab"}}
+                ],
+            },
+            {"role": "tool", "tool_call_id": "v1", "content": '{"signature":"0xab","ok":true}'},
+        ],
+        request=None,
+        response={"kind": "json", "status": 200, "body": CHAT_BODY},
+    )
+    assert exchange.messages[1].tool_calls[0].function.arguments == '{"signature":"0xab"}'
+    assert exchange.messages[2].text() == '{"signature":"0xab","ok":true}'
+
+
+def test_tool_result_parts_project_their_media_text() -> None:
+    """A tool result sent as parts keeps no bytes from a data URL inside its text."""
+    request = decode_responses(
+        {
+            "model": "coding",
+            "input": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "Go"}],
+                },
+                {"type": "function_call", "call_id": "s1", "name": "shot", "arguments": "{}"},
+                {
+                    "type": "function_call_output",
+                    "call_id": "s1",
+                    "output": [
+                        {"type": "input_text", "text": '{"raw":"data:image/png;base64,QUJDRA=="}'},
+                        {"type": "input_image", "image_url": "data:image/png;base64,QUJDRA=="},
+                    ],
+                },
+            ],
+        }
+    ).request
+    exchange = exchange_from_captured(_experience("responses", request, RESPONSES_BODY))
+    result = exchange.messages[-1]
+    assert "QUJDRA" not in exchange.model_dump_json()
+    assert result.text().startswith('{"raw":"[image]"}')
+    assert isinstance(result.content, tuple) and len(result.content) == 3
