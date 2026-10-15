@@ -395,7 +395,7 @@ def _native_tools(tool: JsonObject) -> list[TagTool]:
 def _message(value: JsonObject) -> TagMessage | None:
     """Convert one canonical or chat-form message, dropping provider-native items.
 
-    A Chat refusal becomes the assistant's text, generated Chat ``images`` become image
+    A Chat refusal joins the assistant's text, generated Chat ``images`` become image
     markers, and a failed tool result keeps the gateway's ``[tool error]`` prefix, so all stay
     visible to tag questions.
 
@@ -417,8 +417,11 @@ def _message(value: JsonObject) -> TagMessage | None:
         text = content if isinstance(content, str) else ""
         content = (TagTextPart(text=text), *(TagImagePart() for _ in images))
     refusal = value.get("refusal")
-    if role == "assistant" and not content and isinstance(refusal, str):
-        content = refusal
+    if role == "assistant" and isinstance(refusal, str) and refusal:
+        if isinstance(content, tuple):
+            content = (*content, TagTextPart(text=f"\n{refusal}"))
+        else:
+            content = f"{content}\n{refusal}" if content else refusal
     if role == "tool" and value.get("tool_is_error") is True:
         if isinstance(content, tuple):
             content = (TagTextPart(text=TOOL_ERROR_TEXT_PREFIX), *content)
@@ -426,6 +429,9 @@ def _message(value: JsonObject) -> TagMessage | None:
             content = f"{TOOL_ERROR_TEXT_PREFIX}{content or ''}"
     call_id = value.get("tool_call_id")
     name = value.get("name", value.get("provider_tool_name"))
+    namespace = value.get("provider_tool_namespace")
+    if isinstance(name, str) and name and isinstance(namespace, str) and namespace:
+        name = f"{namespace}.{name}"
     return TagMessage(
         role=role,
         content=content,

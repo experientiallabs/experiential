@@ -90,15 +90,16 @@ def _merge_custom_calls(body: JsonObject, frames: Sequence[JsonValue]) -> None:
     """Rebuild tool calls of Chat streams that carry custom calls.
 
     The assembler cannot merge custom call deltas and stops reading a choice at the first one,
-    so every tool call of such a choice is rebuilt from the stream: function arguments and
-    custom inputs are joined in order, and the choice takes the finish reason the stream
-    reported.
+    so every tool call and the text of such a choice are rebuilt from the stream: function
+    arguments, custom inputs, content and refusal text are joined in order, and the choice
+    takes the finish reason the stream reported.
 
     Args:
         body: The assembled Chat body, updated in place.
         frames: Stored stream chunks.
     """
     calls: dict[str, dict[str, JsonObject]] = {}
+    texts: dict[str, dict[str, str]] = {}
     finishes: dict[str, JsonValue] = {}
     custom_choices: set[str] = set()
     for chunk in _dicts(list(frames)):
@@ -107,6 +108,10 @@ def _merge_custom_calls(body: JsonObject, frames: Sequence[JsonValue]) -> None:
             if choice.get("finish_reason") is not None:
                 finishes[index] = choice.get("finish_reason")
             delta = choice.get("delta")
+            for key, piece in delta.items() if isinstance(delta, dict) else ():
+                if key in ("content", "refusal") and isinstance(piece, str):
+                    joined = texts.setdefault(index, {})
+                    joined[key] = joined.get(key, "") + piece
             for call in _dicts(delta.get("tool_calls") if isinstance(delta, dict) else None):
                 merged = calls.setdefault(index, {}).setdefault(
                     json.dumps(call.get("index")),
@@ -136,6 +141,7 @@ def _merge_custom_calls(body: JsonObject, frames: Sequence[JsonValue]) -> None:
                 {"id": merged["id"], "type": merged["kind"], str(merged["kind"]): payload}
             )
         message["tool_calls"] = rebuilt
+        message.update(texts.get(index, {}))
         if choice.get("finish_reason") is None:
             choice["finish_reason"] = finishes.get(index)
 
@@ -294,7 +300,11 @@ def _messages_lifecycle(frames: Sequence[JsonValue]) -> bool:
                 return False
             started = True
         elif kind == "content_block_start":
-            if not started or index != len(opened):
+            if (
+                not started
+                or index != len(opened)
+                or not isinstance(frame.get("content_block"), dict)
+            ):
                 return False
             opened.append(index)
         elif kind in ("content_block_delta", "content_block_stop"):

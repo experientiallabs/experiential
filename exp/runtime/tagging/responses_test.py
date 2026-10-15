@@ -176,3 +176,37 @@ def test_messages_stream_with_an_unknown_delta_is_rejected() -> None:
     frames[2] = {"type": "content_block_delta", "index": 0, "delta": {"type": "mystery_delta"}}
     with pytest.raises(ValueError, match="terminal state"):
         completed_response("messages", _sse(frames))
+
+
+def test_messages_block_start_without_a_block_is_rejected() -> None:
+    """A block start that carries no block fails the assembler and is not tagged."""
+    frames = list(MESSAGES_FRAMES)
+    frames[1] = {"type": "content_block_start", "index": 0}
+    with pytest.raises(ValueError, match="terminal state"):
+        completed_response("messages", _sse(frames))
+
+
+def test_custom_call_repair_keeps_text_in_the_same_delta() -> None:
+    """Text arriving in a delta after a custom call continuation is kept."""
+    frames: list[JsonValue] = [
+        _chunk(
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "index": 0,
+                        "id": "c1",
+                        "type": "custom",
+                        "custom": {"name": "apply_patch", "input": "*** A"},
+                    }
+                ],
+            }
+        ),
+        _chunk({"tool_calls": [{"index": 0, "custom": {"input": "B"}}], "content": "Patched."}),
+        _chunk({}, "tool_calls"),
+        "[DONE]",
+    ]
+    choices = completed_response("chat_completions", _sse(frames))["choices"]
+    assert isinstance(choices, list) and isinstance(choices[0], dict)
+    message = choices[0]["message"]
+    assert isinstance(message, dict) and message["content"] == "Patched."

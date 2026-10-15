@@ -1203,6 +1203,42 @@ def test_tools_declared_by_input_items_are_offered_tools() -> None:
     assert opening_key(reading) != opening_key(deleting)
 
 
+def test_chat_refusals_keep_the_text_beside_them() -> None:
+    """A reply with both text and a refusal keeps both."""
+    body: JsonObject = {
+        "choices": [
+            {
+                "index": 0,
+                "message": {"role": "assistant", "content": "Let me check.", "refusal": "I can't."},
+                "finish_reason": "stop",
+            }
+        ]
+    }
+    exchange = exchange_from_captured(_experience("chat_completions", _chat_request(), body))
+    assert exchange.response[0].text() == "Let me check.\nI can't."
+
+
+def test_namespaced_tool_results_keep_their_namespace() -> None:
+    """A result whose call is not in view keeps its namespace-qualified name."""
+    exchange = exchange_from_capture_parts(
+        exchange_id="request-8",
+        protocol="chat_completions",
+        messages=[
+            {"role": "user", "content": "Read it"},
+            {
+                "role": "tool",
+                "tool_call_id": "c1",
+                "content": "data",
+                "provider_tool_name": "read",
+                "provider_tool_namespace": "files",
+            },
+        ],
+        request=None,
+        response={"kind": "json", "status": 200, "body": CHAT_BODY},
+    )
+    assert exchange.messages[1].name == "files.read"
+
+
 def test_record_without_a_response_is_rejected() -> None:
     """A prompt checkpoint with no response yet cannot be tagged."""
     record = _record(
