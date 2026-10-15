@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 import pytest
 from pydantic import ValidationError
 
@@ -17,6 +19,7 @@ from exp.common.tags.exchange import (
 )
 from exp.common.tags.windows import (
     CONSERVATIVE_CHARS_PER_TOKEN,
+    MAX_WINDOW_CHARS,
     TagWindowBudget,
     clip_text,
     opening_window,
@@ -312,3 +315,19 @@ def test_opening_with_more_blocks_than_characters_stays_bounded() -> None:
     window = opening_window(exchange, SMALL)
     assert len(window.text) <= SMALL.window_chars
     assert window.end_message == 2_002
+
+
+def test_control_characters_never_inflate_the_json_size() -> None:
+    """Control characters render as spaces, so JSON costs at most four bytes per character."""
+    budget = TagWindowBudget(window_chars=MAX_WINDOW_CHARS)
+    exchange = TagExchange(
+        exchange_id="req",
+        messages=(TagMessage(role="system", content="\x00\x1b" * 40_000),),
+        response=(TagMessage(role="assistant", content="a\tb\x07c"),),
+    )
+    windows = (opening_window(exchange, budget), *turn_windows(exchange, budget))
+    for window in windows:
+        encoded = json.dumps(window.text, ensure_ascii=False).encode("utf-8")
+        assert len(encoded) <= 4 * len(window.text) + 2
+        assert "\x00" not in window.text and "\x1b" not in window.text
+    assert windows[-1].text.endswith("[assistant] a\tb c")
