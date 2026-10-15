@@ -14,6 +14,7 @@ from typing import Protocol, runtime_checkable
 from uuid import uuid4
 
 import httpx
+from pydantic import JsonValue
 
 from exp.common.core.artifacts import JsonObject
 from exp.runtime.models.providers.transport import (
@@ -260,6 +261,7 @@ class HttpxAsyncJsonTransport:
         client: httpx.AsyncClient | None = None,
         *,
         trusted_admission_origin: str | None = None,
+        json_loads: Callable[[bytes], JsonValue] | None = None,
     ) -> None:
         """Use a caller-owned client or the shared per-event-loop pooled client.
 
@@ -269,9 +271,12 @@ class HttpxAsyncJsonTransport:
                 per event loop so connections and the TLS context are reused.
             trusted_admission_origin: Explicit HTTPS origin whose authenticated pre-dispatch
                 refusal receipts may release billing reservations. Defaults to no trust.
+            json_loads: Optional stricter decoder for response bytes, such as one that rejects
+                duplicate keys. A ValueError marks the body as non-JSON. Defaults to HTTPX's.
         """
         self._client = client
         self._trusted_admission_origin = validated_admission_origin(trusted_admission_origin)
+        self._json_loads = json_loads
 
     async def get(
         self,
@@ -304,7 +309,9 @@ class HttpxAsyncJsonTransport:
             raise ProviderTransportError(transport_error_message(exc)) from exc
         except httpx.TransportError as exc:
             raise ProviderTransportError(transport_error_message(exc)) from exc
-        return _decoded_response(response, trusted_origin=self._trusted_admission_origin)
+        return _decoded_response(
+            response, trusted_origin=self._trusted_admission_origin, json_loads=self._json_loads
+        )
 
     async def post(
         self,
@@ -340,7 +347,9 @@ class HttpxAsyncJsonTransport:
             raise ProviderTransportError(transport_error_message(exc)) from exc
         except httpx.TransportError as exc:
             raise ProviderTransportError(transport_error_message(exc)) from exc
-        return _decoded_response(response, trusted_origin=self._trusted_admission_origin)
+        return _decoded_response(
+            response, trusted_origin=self._trusted_admission_origin, json_loads=self._json_loads
+        )
 
 
 class SyncJsonTransportAdapter:
@@ -642,13 +651,16 @@ def as_async_transport(
 
 
 def _decoded_response(
-    response: httpx.Response, *, trusted_origin: httpx.URL | None = None
+    response: httpx.Response,
+    *,
+    trusted_origin: httpx.URL | None = None,
+    json_loads: Callable[[bytes], JsonValue] | None = None,
 ) -> JsonHttpResponse:
     """Decode one HTTPX response without retaining provider content in errors."""
     retry_after = parse_retry_after(response.headers.get("Retry-After"))
     known_unbilled = certified_admission_refusal(response, trusted_origin)
     try:
-        body = response.json()
+        body = response.json() if json_loads is None else json_loads(response.content)
     except ValueError as exc:
         raise ProviderTransportError(
             f"provider returned non-JSON HTTP {response.status_code}",
