@@ -183,3 +183,33 @@ def test_bank_requires_a_tag_and_a_positive_version() -> None:
         TagBank(bank_id="b", version=1, tags=())
     with pytest.raises(ValidationError):
         TagBank(bank_id="b", version=0, tags=(_definition("a"),))
+
+
+@pytest.mark.parametrize(
+    ("tag_id", "fragment"),
+    [
+        ("cybersecurity", "whether defensive, authorized or malicious"),
+        ("cybersecurity", "Whether the request is legitimate does not matter"),
+        ("math_science", "Other topics may apply too"),
+        ("research", "more than one source or step"),
+        ("research", "A single lookup"),
+        ("web_lookup", "search or browse the web"),
+        ("tutoring", "even in a school subject"),
+        ("positive_feedback", "thanks in advance"),
+        ("positive_feedback", "thanking someone else"),
+        ("took_external_action", "files in its local workspace or repository"),
+        ("took_external_action", "drafting something for the user to send"),
+        ("claimed_success_without_evidence", "can finish the task and still be true"),
+        ("task_finished", "whether or not anything confirms it worked"),
+        ("user_frustrated", "a boss, a vendor or a situation"),
+    ],
+)
+def test_default_wording_keeps_the_labeling_rules(tag_id: str, fragment: str) -> None:
+    """Default wording states the boundary cases the labeled test set settled.
+
+    Args:
+        tag_id: Tag whose wording is checked.
+        fragment: Text the question or criteria must contain.
+    """
+    tag = DEFAULT_TAG_BANK.get(tag_id)
+    assert fragment in f"{tag.question} {tag.true_when} {tag.false_when}"
