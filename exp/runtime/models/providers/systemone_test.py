@@ -436,6 +436,19 @@ def test_server_and_connection_failures_retry_only_under_an_explicit_policy() ->
         _decide(_client(http_client, retry_policy=_RETRY_THREE), _NOUL_QUESTIONS)
 
 
+def test_a_caller_handling_a_timeout_keeps_http_classification_and_retries() -> None:
+    """An unrelated timeout being handled by the caller never turns into this call's timeout."""
+    unauthorized, _ = _replay(httpx.Response(401, json={}))
+    recovering, seen = _replay(httpx.Response(503, json={}), _ok(_noul_body()))
+    try:
+        raise TimeoutError("caller's own timeout")
+    except TimeoutError:
+        with pytest.raises(SystemOneHttpError, match="check api_key"):
+            _decide(_client(unauthorized), _NOUL_QUESTIONS)
+        assert _decide(_client(recovering, retry_policy=_RETRY_THREE), _NOUL_QUESTIONS).noul
+    assert len(seen) == 2
+
+
 def test_timeouts_are_typed_and_never_retried() -> None:
     """A slow endpoint and an HTTPX read timeout both raise SystemOneTimeoutError once."""
 

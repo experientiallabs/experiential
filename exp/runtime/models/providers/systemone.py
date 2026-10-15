@@ -432,14 +432,18 @@ def _loopback(hostname: str) -> bool:
 
 
 def _timed_out(error: BaseException) -> bool:
-    """Return whether a failure, or any exception it was raised from, is a timeout."""
+    """Return whether a failure, or an exception it was explicitly raised from, is a timeout.
+
+    Only ``__cause__`` is followed: implicit ``__context__`` can name an unrelated timeout
+    the caller was handling when it called ``decide``.
+    """
     current: BaseException | None = error
     seen: set[int] = set()
     while current is not None and id(current) not in seen:
         seen.add(id(current))
         if isinstance(current, (TimeoutError, httpx.TimeoutException)):
             return True
-        current = current.__cause__ or current.__context__
+        current = current.__cause__
     return False
 
 
