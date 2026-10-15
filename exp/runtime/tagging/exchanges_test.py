@@ -15,6 +15,7 @@ from pydantic import JsonValue
 
 from exp.common.core.artifacts import JsonObject
 from exp.common.tags import opening_key, tag_facts, turn_windows
+from exp.common.tags.exchange import TagMessage
 from exp.runtime.anthropic_protocol.requests import decode_messages
 from exp.runtime.gateway.capture_context import capture_context_document
 from exp.runtime.gateway.contracts import GatewayRequest
@@ -665,7 +666,7 @@ def test_responses_refusals_and_server_tools_stay_readable() -> None:
 
 
 def test_cited_anthropic_text_and_server_tool_use_stay_readable() -> None:
-    """Text carried with citations keeps its text; encrypted search results are dropped."""
+    """Cited text keeps its text and server tool results keep their readable fields."""
     body: JsonObject = {
         "type": "message",
         "stop_reason": "end_turn",
@@ -704,25 +705,48 @@ def test_cited_anthropic_text_and_server_tool_use_stay_readable() -> None:
         ],
     }
     exchange = exchange_from_captured(_experience("messages", _messages_request(), body))
-    assert [message.text() for message in exchange.response] == ["", "Paris is the capital."]
-    assert exchange.response[0].tool_calls[0].function.arguments == '{"query":"q"}'
+    (window,) = turn_windows(exchange)
+    assert window.text.splitlines()[-3:] == [
+        '[tool_call web_search] {"query":"q"}',
+        '[tool_result web_search] [{"type":"web_search_result","url":"https://a.example",'
+        '"title":"A"}]',
+        "[assistant] Paris is the capital.",
+    ]
     assert "opaque" not in exchange.model_dump_json()
 
 
-def test_messages_stream_with_an_unclosed_block_is_rejected() -> None:
-    """A stream whose content block never stopped is not a complete capture."""
-    frames = [frame for index, frame in enumerate(MESSAGES_FRAMES) if index != 8]
-    with pytest.raises(ValueError, match="terminal state"):
-        completed_response(
-            "messages",
+@pytest.mark.parametrize(
+    "frames",
+    [
+        [frame for index, frame in enumerate(MESSAGES_FRAMES) if index != 8],
+        [
+            *MESSAGES_FRAMES[:9],
             {
-                "kind": "sse",
-                "status": 200,
-                "frames": frames,
-                "truncated": False,
-                "client_disconnected": False,
+                "type": "content_block_delta",
+                "index": 1,
+                "delta": {"type": "input_json_delta", "partial_json": "x"},
             },
-        )
+            *MESSAGES_FRAMES[9:],
+        ],
+        [*MESSAGES_FRAMES, {"type": "ping"}],
+    ],
+    ids=["unclosed-block", "delta-after-stop", "frame-after-stop"],
+)
+def test_messages_streams_with_broken_lifecycles_are_rejected(frames: list[JsonValue]) -> None:
+    """Streams the collector's assembler would mark invalid are not complete captures.
+
+    Args:
+        frames: Stored frames with one lifecycle violation.
+    """
+    document: JsonObject = {
+        "kind": "sse",
+        "status": 200,
+        "frames": frames,
+        "truncated": False,
+        "client_disconnected": False,
+    }
+    with pytest.raises(ValueError, match="terminal state"):
+        completed_response("messages", document)
 
 
 def test_long_non_ascii_conversation_labels_fall_back_like_the_local_store() -> None:
@@ -818,7 +842,7 @@ def test_custom_tools_native_declarations_and_results_stay_readable() -> None:
                 "type": "image_generation_call",
                 "id": "ig",
                 "status": "completed",
-                "result": "QUJDRA==",
+                "result": "iVBORw0KGgo" + "QUJDRA" * 60,
                 "revised_prompt": "a diagram",
             },
         ],
@@ -829,7 +853,7 @@ def test_custom_tools_native_declarations_and_results_stay_readable() -> None:
     assert window.text.splitlines()[1:] == [
         "[tool_result apply_patch] Patch failed: file not found",
         "[tool_call apply_patch] *** retry",
-        '[tool_call image_generation] {"revised_prompt":"a diagram"}',
+        '[tool_call image_generation] {"result":"[binary]","revised_prompt":"a diagram"}',
     ]
     assert "QUJDRA" not in exchange.model_dump_json()
 
@@ -877,6 +901,117 @@ def test_messages_schema_output_and_context_exhaustion_are_facts() -> None:
     }
     facts = tag_facts(exchange_from_captured(_experience("messages", request, body)))
     assert facts.structured_output and facts.truncated
+
+
+def test_native_results_server_errors_namespaces_and_server_tools_are_read() -> None:
+    """Shell output, screenshots, server tool errors and namespaced calls stay readable."""
+    request = decode_responses(
+        {
+            "model": "coding",
+            "input": [
+                {"role": "user", "content": "Run the tests"},
+                {
+                    "type": "function_call",
+                    "call_id": "c1",
+                    "name": "read",
+                    "namespace": "files",
+                    "arguments": "{}",
+                },
+                {"type": "function_call_output", "call_id": "c1", "output": "data"},
+            ],
+            "tools": [
+                {
+                    "type": "namespace",
+                    "name": "files",
+                    "description": "File tools",
+                    "tools": [
+                        {"type": "function", "name": "read", "parameters": {"type": "object"}}
+                    ],
+                }
+            ],
+        }
+    ).request
+    body: JsonObject = {
+        "status": "completed",
+        "output": [
+            {
+                "type": "message",
+                "id": "m",
+                "role": "assistant",
+                "status": "completed",
+                "content": [{"type": "output_text", "text": "Read it.", "annotations": []}],
+            }
+        ],
+    }
+    exchange = exchange_from_captured(_experience("responses", request, body))
+    assert exchange.messages[1].tool_calls[0].function.name == "files.read"
+    assert turn_windows(exchange)[0].text.splitlines()[1] == "[tool_result files.read] data"
+    shell = _native_message(
+        "tool",
+        {
+            "type": "shell_call_output",
+            "call_id": "s1",
+            "output": [{"stdout": "", "stderr": "AssertionError", "outcome": {"exit_code": 1}}],
+        },
+    )
+    assert shell.text() == '[{"stdout":"","stderr":"AssertionError","outcome":{"exit_code":1}}]'
+    screen = _native_message(
+        "tool",
+        {
+            "type": "computer_call_output",
+            "call_id": "k1",
+            "output": {"type": "computer_screenshot", "image_url": "data:image/png;base64,AAAA"},
+        },
+    )
+    assert screen.has_image() and "AAAA" not in screen.model_dump_json()
+    error = _native_message(
+        "assistant",
+        {
+            "type": "web_search_tool_result",
+            "tool_use_id": "srv_1",
+            "content": {"type": "web_search_tool_result_error", "error_code": "max_uses_exceeded"},
+        },
+    )
+    assert (error.role, error.tool_call_id) == ("tool", "srv_1")
+    assert "max_uses_exceeded" in error.text()
+
+
+def test_messages_server_tool_declarations_are_offered_tools() -> None:
+    """Anthropic server tools such as web search join the tool list."""
+    request = decode_messages(
+        {
+            "model": "coding",
+            "max_tokens": 64,
+            "messages": [{"role": "user", "content": "Search"}],
+            "tools": [{"type": "web_search_20250305", "name": "web_search", "max_uses": 3}],
+        }
+    ).request
+    body: JsonObject = {
+        "type": "message",
+        "stop_reason": "end_turn",
+        "content": [{"type": "text", "text": "ok"}],
+    }
+    exchange = exchange_from_captured(_experience("messages", request, body))
+    assert [tool.name for tool in exchange.tools] == ["web_search"]
+
+
+def _native_message(role: str, item: JsonObject) -> TagMessage:
+    """Convert one native item carried by a canonical request message.
+
+    Args:
+        role: Carrying message role.
+        item: The native item.
+
+    Returns:
+        The converted message.
+    """
+    return exchange_from_capture_parts(
+        exchange_id="request-3",
+        protocol="chat_completions",
+        messages=[{"role": "user", "content": "go"}, {"role": role, "provider_native_item": item}],
+        request=None,
+        response={"kind": "json", "status": 200, "body": CHAT_BODY},
+    ).messages[1]
 
 
 def test_record_without_a_response_is_rejected() -> None:
