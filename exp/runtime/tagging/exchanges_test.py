@@ -604,6 +604,146 @@ def test_incomplete_or_failed_responses_are_not_tagged(document: JsonObject, mes
         completed_response("chat_completions", document)
 
 
+def test_streamed_tool_input_with_a_wide_integer_decodes() -> None:
+    """A Messages tool input beyond 64-bit range reassembles and decodes exactly."""
+    frames = [dict(frame) if isinstance(frame, dict) else frame for frame in MESSAGES_FRAMES]
+    frames[7] = {
+        "type": "content_block_delta",
+        "index": 1,
+        "delta": {"type": "input_json_delta", "partial_json": "18446744073709551617}"},
+    }
+    body = completed_response(
+        "messages",
+        {
+            "kind": "sse",
+            "status": 200,
+            "frames": frames,
+            "truncated": False,
+            "client_disconnected": False,
+        },
+    )
+    content = body["content"]
+    assert isinstance(content, list) and isinstance(content[1], dict)
+    assert content[1]["input"] == {"cmd": 18446744073709551617}
+    assert "capture_input_source_json" not in content[1]
+    exchange = exchange_from_capture_parts(
+        exchange_id="request-2",
+        protocol="messages",
+        messages=[{"role": "user", "content": "go"}],
+        request=None,
+        response={"kind": "json", "status": 200, "body": body},
+    )
+    assert exchange.response[0].tool_calls[0].function.arguments == '{"cmd":18446744073709551617}'
+
+
+def test_responses_refusals_and_server_tools_stay_readable() -> None:
+    """Refusal parts keep their text and server-side tool calls render as tool calls."""
+    body: JsonObject = {
+        "status": "completed",
+        "output": [
+            {
+                "type": "web_search_call",
+                "id": "ws_1",
+                "status": "completed",
+                "action": {"type": "search", "query": "forecast"},
+            },
+            {
+                "type": "message",
+                "id": "msg_1",
+                "role": "assistant",
+                "status": "completed",
+                "content": [{"type": "refusal", "refusal": "I can't share that."}],
+            },
+        ],
+    }
+    exchange = exchange_from_captured(_experience("responses", _responses_request(), body))
+    (window,) = turn_windows(exchange)
+    assert window.text.endswith(
+        '[tool_call web_search] {"action":{"type":"search","query":"forecast"}}\n'
+        "[assistant] I can't share that."
+    )
+
+
+def test_cited_anthropic_text_and_server_tool_use_stay_readable() -> None:
+    """Text carried with citations keeps its text; encrypted search results are dropped."""
+    body: JsonObject = {
+        "type": "message",
+        "stop_reason": "end_turn",
+        "content": [
+            {
+                "type": "server_tool_use",
+                "id": "srv_1",
+                "name": "web_search",
+                "input": {"query": "q"},
+            },
+            {
+                "type": "web_search_tool_result",
+                "tool_use_id": "srv_1",
+                "content": [
+                    {
+                        "type": "web_search_result",
+                        "url": "https://a.example",
+                        "title": "A",
+                        "encrypted_content": "opaque",
+                    }
+                ],
+            },
+            {
+                "type": "text",
+                "text": "Paris is the capital.",
+                "citations": [
+                    {
+                        "type": "web_search_result_location",
+                        "url": "https://a.example",
+                        "title": "A",
+                        "encrypted_index": "e",
+                        "cited_text": "Paris",
+                    }
+                ],
+            },
+        ],
+    }
+    exchange = exchange_from_captured(_experience("messages", _messages_request(), body))
+    assert [message.text() for message in exchange.response] == ["", "Paris is the capital."]
+    assert exchange.response[0].tool_calls[0].function.arguments == '{"query":"q"}'
+    assert "opaque" not in exchange.model_dump_json()
+
+
+def test_messages_stream_with_an_unclosed_block_is_rejected() -> None:
+    """A stream whose content block never stopped is not a complete capture."""
+    frames = [frame for index, frame in enumerate(MESSAGES_FRAMES) if index != 8]
+    with pytest.raises(ValueError, match="terminal state"):
+        completed_response(
+            "messages",
+            {
+                "kind": "sse",
+                "status": 200,
+                "frames": frames,
+                "truncated": False,
+                "client_disconnected": False,
+            },
+        )
+
+
+def test_long_non_ascii_conversation_labels_fall_back_like_the_local_store() -> None:
+    """A label over 512 UTF-8 bytes is ignored in favor of the session id."""
+    request = _chat_request(metadata={"conversation_id": "\u96ea" * 200})
+    record = _record(
+        "chat_completions",
+        request,
+        {"kind": "json", "status": 200, "body": CHAT_BODY},
+        session_id="session-7",
+    )
+    assert exchange_from_capture_record(record).conversation_key == "session-7"
+    short = _record(
+        "chat_completions",
+        _chat_request(metadata={"conversation_id": "\u96ea" * 100}),
+        {"kind": "json", "status": 200, "body": CHAT_BODY},
+        session_id="session-7",
+    )
+    assert exchange_from_capture_record(short).conversation_key == "\u96ea" * 100
+
+
 def test_record_without_a_response_is_rejected() -> None:
     """A prompt checkpoint with no response yet cannot be tagged."""
     record = _record(
