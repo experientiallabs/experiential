@@ -197,8 +197,14 @@ class SystemOneClient:
             ValueError: The URL, model, credential, timeout, or concurrency is unusable.
         """
         parsed = urlsplit(base_url)
+        try:
+            # Reading the port validates it; an unusable one would otherwise fail inside HTTPX.
+            valid_port = parsed.port is None or parsed.port > 0
+        except ValueError:
+            valid_port = False
         if (
-            parsed.scheme not in {"http", "https"}
+            not valid_port
+            or parsed.scheme not in {"http", "https"}
             or not parsed.hostname
             or parsed.username is not None
             or parsed.password is not None
@@ -206,8 +212,8 @@ class SystemOneClient:
             or parsed.fragment
         ):
             raise ValueError(
-                "SystemOne base_url must be an http or https API root without credentials, "
-                "query, or fragment, for example http://127.0.0.1:30000/v1"
+                "SystemOne base_url must be an http or https API root with a valid port and no "
+                "credentials, query, or fragment, for example http://127.0.0.1:30000/v1"
             )
         if api_key is not None and not api_key.get_secret_value():
             raise ValueError("SystemOne api_key is empty; pass None for an endpoint without auth")
@@ -407,17 +413,19 @@ def _strict_json(content: bytes) -> JsonValue:
         return value
 
     try:
+        # Decode as strict UTF-8 first: bytes input would let json.loads accept UTF-16,
+        # UTF-32, or a byte order mark, which the gateway's decoder refuses.
         decoded = json.loads(
-            content,
+            content.decode("utf-8"),
             object_pairs_hook=unique,
             parse_constant=non_finite,
             parse_float=finite_float,
             parse_int=bounded_int,
         )
+        # Escaped unpaired surrogates decode to text that is not valid Unicode; encoding fails.
+        json.dumps(decoded, ensure_ascii=False).encode("utf-8")
     except RecursionError as error:
         raise ValueError("JSON nesting exceeds the decoder limit") from error
-    # Escaped unpaired surrogates decode to text that is not valid Unicode; encoding fails.
-    json.dumps(decoded, ensure_ascii=False).encode("utf-8")
     return decoded
 
 
