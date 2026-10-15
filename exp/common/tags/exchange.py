@@ -187,14 +187,46 @@ def first_user_index(messages: tuple[TagMessage, ...]) -> int | None:
     return next((i for i, message in enumerate(messages) if message.role == "user"), None)
 
 
+def leading_instructions(messages: tuple[TagMessage, ...]) -> int:
+    """Count the system and developer messages that open a request.
+
+    Args:
+        messages: Request messages.
+
+    Returns:
+        The length of the leading run of system and developer messages.
+    """
+    count = 0
+    for message in messages:
+        if message.role not in ("system", "developer"):
+            break
+        count += 1
+    return count
+
+
+def opening_end(messages: tuple[TagMessage, ...]) -> int:
+    """Return one past the last message of a conversation's opening.
+
+    The opening runs through the first user message; without one it is the leading
+    instructions, or the first message when there are none.
+
+    Args:
+        messages: Request messages.
+
+    Returns:
+        The exclusive end position of the opening.
+    """
+    first = first_user_index(messages)
+    return first + 1 if first is not None else max(leading_instructions(messages), 1)
+
+
 def opening_key(exchange: TagExchange) -> Sha256:
     """Derive a conversation key from what every turn of a conversation repeats.
 
-    The key covers the system and developer messages before the first user message, every
-    tool's name, description and schema (in a canonical order), and the first user message:
-    everything the opening window shows. Later turns of the
-    same conversation resend that opening, so they share the key; instructions inserted later
-    in the conversation do not change it.
+    The key covers every message of the opening (``opening_end``) and every tool's name,
+    description and schema in a canonical order: everything the opening window shows. Later
+    turns of the same conversation resend that opening, so they share the key; instructions
+    inserted later in the conversation do not change it.
 
     Args:
         exchange: Any exchange of the conversation.
@@ -202,19 +234,14 @@ def opening_key(exchange: TagExchange) -> Sha256:
     Returns:
         A SHA-256 hex digest.
     """
-    first = first_user_index(exchange.messages)
-    leading = exchange.messages if first is None else exchange.messages[:first]
-    instructions = [
-        message.model_dump(mode="json")
-        for message in leading
-        if message.role in ("system", "developer")
-    ]
+    opening = exchange.messages[: opening_end(exchange.messages)]
     tools = sorted(
         (tool.model_dump(mode="json") for tool in exchange.tools),
         key=lambda tool: json.dumps(tool, sort_keys=True),
     )
-    user = None if first is None else exchange.messages[first].model_dump(mode="json")
-    return sha256_json({"instructions": instructions, "tools": tools, "first_user": user})
+    return sha256_json(
+        {"opening": [message.model_dump(mode="json") for message in opening], "tools": tools}
+    )
 
 
 def tag_facts(exchange: TagExchange) -> TagFacts:
@@ -247,6 +274,8 @@ __all__ = [
     "TagTool",
     "TagToolCall",
     "first_user_index",
+    "leading_instructions",
+    "opening_end",
     "opening_key",
     "tag_facts",
 ]

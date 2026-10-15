@@ -215,7 +215,8 @@ def _tag(
 _C = TagScope.CONVERSATION
 _T = TagScope.TURN
 
-# The built-in bank: 15 conversation tags followed by 10 turn tags, in score order.
+# The built-in bank: 15 conversation tags followed by 10 turn tags, in score order. Topic
+# tags are multi-label and judge subject matter only; harmful_request is the one legitimacy tag.
 DEFAULT_TAG_BANK = TagBank(
     bank_id="experiential-default",
     version=1,
@@ -223,23 +224,26 @@ DEFAULT_TAG_BANK = TagBank(
         _tag(
             "coding",
             _C,
-            "Is this conversation about writing, changing, debugging, reviewing or explaining "
-            "software code?",
+            "Does this conversation substantially involve writing, changing, debugging, reviewing "
+            "or explaining software code?",
             "The request is for code, scripts, SQL, configuration or shell commands, or for help "
-            "with a program, codebase, build, test, error message, API or developer tool.",
-            "Code is not the subject: prose, analysis, advice or chat with no program to write, "
-            "fix or explain. Naming a software product or calling tools through JSON is not "
-            "enough.",
+            "with a program, codebase, build, test, error message, API or developer tool. Other "
+            "topics may apply too.",
+            "Code is not a substantial part: prose, analysis, advice or chat with no program to "
+            "write, fix or explain. Naming a software product or calling tools through JSON is "
+            "not enough.",
         ),
         _tag(
             "cybersecurity",
             _C,
-            "Is this conversation about computer or network security?",
-            "It involves security testing, exploits, malware, vulnerabilities, penetration "
-            "testing, threat detection, incident response, hardening or attacking or defending "
-            "systems, accounts or networks.",
+            "Does this conversation substantially involve computer or network security, whether "
+            "defensive, authorized or malicious?",
+            "Any security topic: security testing, exploits, malware, vulnerabilities, threat "
+            "detection, incident response, hardening, or attacking or defending systems, "
+            "accounts or networks. A request to write malware for an intrusion counts.",
             "Security is absent or incidental, such as ordinary login code, a privacy notice, or "
-            "physical safety with no computer or network security work.",
+            "physical safety. Whether the request is legitimate does not matter for this "
+            "question.",
         ),
         _tag(
             "customer_support",
@@ -266,37 +270,38 @@ DEFAULT_TAG_BANK = TagBank(
         _tag(
             "research",
             _C,
-            "Is the assistant asked to gather information and combine it into an answer?",
-            "The task is to look up, read, compare or synthesize facts from several documents, "
-            "search results, papers or datasets, such as a literature review, market scan, due "
-            "diligence or fact check.",
-            "No information gathering is needed: a direct reply from memory, rewriting text the "
-            "user supplied, coding, casual chat, or one simple fact.",
+            "Does the assistant gather information from more than one source or step and combine "
+            "it into an answer?",
+            "The task needs several lookups, documents, search results, papers or datasets read "
+            "and compared or synthesized, such as a literature review, market scan, due diligence "
+            "or multi-source fact check.",
+            "A single lookup, a summary of one supplied source, a reply from memory, rewriting "
+            "the user's text, coding, or casual chat.",
         ),
         _tag(
             "web_lookup",
             _C,
-            "Does the request call for searching or browsing the web?",
-            "The user asks to search online, open or read a web page or URL, or find current "
-            "information from the internet, or the assistant's main job is web search or browsing.",
-            "Nothing needs to be looked up online. Web tools that are merely available among "
-            "others, or links that are only mentioned, do not count.",
+            "Does this conversation search or browse the web?",
+            "A web search, browser or URL fetch tool is called, or the user asks for web search "
+            "results, the contents of a web page, or current information from the internet.",
+            "No web search or browsing happens or is asked for. Web tools that are only "
+            "available, or links that are only mentioned, do not count.",
         ),
         _tag(
             "data_analysis",
             _C,
-            "Is this conversation about analyzing data, such as tables, SQL, spreadsheets or "
-            "statistics?",
+            "Does this conversation substantially involve analyzing data, such as tables, SQL, "
+            "spreadsheets or statistics?",
             "The user wants data queried, cleaned, aggregated, charted, modeled or interpreted, "
             "such as SQL queries, CSV or spreadsheet work, dataframes, dashboards, metrics or "
-            "statistical tests.",
+            "statistical tests. Other topics may apply too.",
             "No dataset is analyzed: general coding, prose, or questions that mention numbers "
             "without analyzing them.",
         ),
         _tag(
             "writing_editing",
             _C,
-            "Is this conversation about drafting or revising prose?",
+            "Does this conversation substantially involve drafting or revising prose?",
             "The user asks for natural-language text to be written, rewritten, edited, "
             "proofread, shortened or restyled, such as emails, essays, articles, posts, "
             "marketing copy, documentation or stories.",
@@ -306,12 +311,13 @@ DEFAULT_TAG_BANK = TagBank(
         _tag(
             "tutoring",
             _C,
-            "Is the assistant teaching or explaining a subject to someone who wants to learn it?",
-            "The user wants to understand or practice something, such as homework help, "
-            "step-by-step explanations, practice problems or quizzes, or the system prompt sets "
-            "the assistant up as a tutor.",
-            "The user wants a task done rather than to learn, such as code written, a document "
-            "drafted or an action taken, with no teaching intent.",
+            "Is the assistant teaching the user so that they learn, rather than only solving a "
+            "problem for them?",
+            "Explanations aimed at the user's understanding, hints instead of answers, practice "
+            "problems or quizzes, or checking what the user understood, or the system prompt "
+            "sets the assistant up as a tutor.",
+            "The assistant just does the task, even in a school subject: it answers a homework "
+            "problem, writes code or drafts a document with no intent to teach.",
         ),
         _tag(
             "roleplay_companion",
@@ -325,27 +331,30 @@ DEFAULT_TAG_BANK = TagBank(
         _tag(
             "math_science",
             _C,
-            "Is this conversation about mathematics or natural science?",
-            "It involves math problems, proofs, calculations or quantitative reasoning, or "
-            "physics, chemistry, biology, astronomy, earth science or similar scientific content.",
+            "Does this conversation substantially involve mathematics or natural science?",
+            "Math problems, proofs, calculations or quantitative reasoning, including applied "
+            "math in another field such as loan interest or drug doses, or physics, chemistry, "
+            "biology, astronomy or earth science. Other topics may apply too.",
             "Math or science is absent or trivial, such as simple arithmetic inside an unrelated "
             "task, or the subject is software, business, the arts or everyday life.",
         ),
         _tag(
             "finance_legal_compliance",
             _C,
-            "Is this conversation about finance, law or regulatory compliance?",
-            "It involves investing, accounting, banking, taxes, payments, KYC, fraud, "
-            "underwriting, insurance, contracts, legal questions or regulatory rules.",
+            "Does this conversation substantially involve finance, law or regulatory compliance?",
+            "Investing, accounting, banking, lending, taxes, payments, KYC, fraud, underwriting, "
+            "insurance, contracts, legal questions or regulatory rules. Other topics, such as "
+            "math for a mortgage, may apply too.",
             "Finance and law are absent or incidental, such as a price mentioned in passing or a "
             "software license header, with no financial, legal or compliance task.",
         ),
         _tag(
             "health_medical",
             _C,
-            "Is this conversation about health, medicine or clinical care?",
-            "It involves symptoms, diagnoses, treatments, medications, mental health, nutrition "
-            "or fitness for health, medical records, clinical notes or healthcare operations.",
+            "Does this conversation substantially involve health, medicine or clinical care?",
+            "Symptoms, diagnoses, treatments, medications, mental health, nutrition or fitness "
+            "for health, medical records, clinical notes or healthcare operations. Other topics "
+            "may apply too.",
             "Health is absent or incidental, such as a passing mention of feeling tired, or "
             "software and business work unrelated to healthcare.",
         ),
@@ -363,7 +372,7 @@ DEFAULT_TAG_BANK = TagBank(
         _tag(
             "harmful_request",
             _C,
-            "Does the user ask for illegal, abusive or dangerous content?",
+            "Does the user ask for help that is illegal, abusive or dangerous?",
             "The request seeks real help with serious harm: weapons, violent attacks, sexual "
             "content involving minors, harassment or hate, self-harm methods, illegal drugs, "
             "fraud, or breaking into systems without permission.",
@@ -382,22 +391,23 @@ DEFAULT_TAG_BANK = TagBank(
         _tag(
             "user_frustrated",
             _T,
-            "Does the user show annoyance, impatience or anger at the assistant in this turn?",
-            "The new user message complains about the assistant, repeats a request with "
-            "irritation, uses angry words, all caps or profanity aimed at it, or says it keeps "
-            "failing or wasting time.",
-            "The user is neutral, polite or pleased, or is upset about something other than the "
-            "assistant, or the turn has no new user message.",
+            "Does the user show annoyance, impatience or anger at the assistant or its work in "
+            "this turn?",
+            "The new user message complains about the assistant or its work, repeats a request "
+            "with irritation, uses angry words, all caps or profanity aimed at it, or says it "
+            "keeps failing or wasting time.",
+            "The user is neutral, polite or pleased, is frustrated with someone or something "
+            "else such as a boss, a vendor or a situation, or the turn has no new user message.",
         ),
         _tag(
             "positive_feedback",
             _T,
-            "Does the user thank, praise or approve of the assistant's work in this turn?",
-            "The new user message says thanks, great, perfect, that works, looks good, or "
-            "otherwise approves of what the assistant did or said.",
-            "The user only gives instructions, asks questions, corrects or criticizes the "
-            "assistant, or there is no new user message. A polite please in a request does not "
-            "count.",
+            "Does the user thank or approve of the assistant for work it delivered, in this turn?",
+            "The new user message thanks, praises or approves what the assistant already did or "
+            "said: thanks, great, perfect, that works, looks good.",
+            "No approval of delivered work: thanks in advance, thanks followed by a correction "
+            "such as thanks but that's wrong, thanking someone else, a polite please, or no new "
+            "user message.",
         ),
         _tag(
             "user_corrected_model",
@@ -443,30 +453,33 @@ DEFAULT_TAG_BANK = TagBank(
             "Does the assistant's reply in this turn deliver the final answer or say the task is "
             "done?",
             "The reply gives the complete answer the user asked for, or reports that the "
-            "requested work is finished, with no tool calls or further steps pending.",
+            "requested work is finished, with no tool calls or further steps pending, whether or "
+            "not anything confirms it worked.",
             "The reply only calls tools, gives a progress update, asks a question, refuses, or "
             "says more work remains.",
         ),
         _tag(
             "claimed_success_without_evidence",
             _T,
-            "Does the assistant claim the task is done or fixed without anything in this turn "
-            "confirming it?",
+            "Does the assistant claim the task is done or fixed while nothing in this turn "
+            "confirms it?",
             "The reply says something is fixed, working, passing, sent or complete, but no tool "
-            "result in the turn shows it, or the results shown contradict the claim.",
+            "result in the turn shows it, or the results contradict the claim. A reply can "
+            "finish the task and still be true here.",
             "The reply makes no success claim, or a tool result in the turn, such as passing "
-            "tests, a success status or the expected output, backs the claim up.",
+            "tests, a success status or the expected output, confirms the claim.",
         ),
         _tag(
             "took_external_action",
             _T,
-            "Does the assistant call a tool in this turn that changes something outside the "
-            "conversation?",
-            "A tool call in the reply sends a message, pays or buys, deletes, writes or moves "
-            "files or records, deploys, merges, posts, books, or otherwise changes an outside "
-            "system.",
-            "The reply makes no tool calls, or only reads: search, fetch, list, view, or "
-            "commands that inspect without changing anything.",
+            "Does an assistant tool call in this turn change something beyond its own working "
+            "files?",
+            "A tool call sends a message or email, pays or buys, deletes or modifies records in "
+            "an external system, deploys, creates a ticket, posts, books, or otherwise changes an "
+            "outside system.",
+            "No tool calls, only read-only calls such as search, fetch, list or view, edits to "
+            "files in its local workspace or repository, or drafting something for the user to "
+            "send.",
         ),
     ),
 )

@@ -25,7 +25,14 @@ from pydantic import Field, model_validator
 
 from exp.common.core.artifacts import ContractModel
 from exp.common.tags.bank import TagScope
-from exp.common.tags.exchange import TagExchange, TagMessage, TagTool, first_user_index
+from exp.common.tags.exchange import (
+    TagExchange,
+    TagMessage,
+    TagTool,
+    first_user_index,
+    leading_instructions,
+    opening_end,
+)
 
 # Conservative characters per token: English prose averages about four, code and JSON about
 # three. Mostly non-Latin text runs lower and needs a smaller budget than for_input_tokens gives.
@@ -35,6 +42,8 @@ CONSERVATIVE_CHARS_PER_TOKEN = 3
 # stays inside a 256 KiB decision request.
 MAX_WINDOW_CHARS = 48_000
 TOOL_DESCRIPTION_CHARS = 160
+# Fewest characters each opening block keeps before middle blocks are collapsed.
+MIN_BLOCK_CHARS = 80
 
 _MARKER = "\n[... {omitted} characters omitted ...]\n"
 _BLANK_RUNS = re.compile(r"\n{3,}")
@@ -250,7 +259,8 @@ def _fit(blocks: list[str], budget: int) -> list[str]:
     """Shorten the largest blocks equally until the joined blocks fit the budget.
 
     Blocks smaller than their fair share keep their full text; the rest are clipped to one
-    shared cap.
+    shared cap. When there are too many blocks for each to keep ``MIN_BLOCK_CHARS``, the
+    middle ones collapse into one omission line, keeping the first and last blocks.
 
     Args:
         blocks: Rendered blocks, joined with newlines.
@@ -259,6 +269,12 @@ def _fit(blocks: list[str], budget: int) -> list[str]:
     Returns:
         Blocks in their original order whose newline-joined length fits the budget.
     """
+    most = max(budget // MIN_BLOCK_CHARS, 3)
+    if len(blocks) > most:
+        head = (most - 1) // 2
+        tail = most - 1 - head
+        omitted = len(blocks) - head - tail
+        blocks = [*blocks[:head], f"[... {omitted} messages omitted ...]", *blocks[-tail:]]
     available = max(budget - (len(blocks) - 1), 0)
     if sum(len(block) for block in blocks) <= available:
         return blocks
@@ -272,23 +288,6 @@ def _fit(blocks: list[str], budget: int) -> list[str]:
             break
         remaining -= length
     return [clip_text(block, cap) if len(block) > cap else block for block in blocks]
-
-
-def _leading_instructions(messages: Sequence[TagMessage]) -> int:
-    """Count the system and developer messages that open a request.
-
-    Args:
-        messages: Request messages.
-
-    Returns:
-        The length of the leading run of system and developer messages.
-    """
-    count = 0
-    for message in messages:
-        if message.role not in ("system", "developer"):
-            break
-        count += 1
-    return count
 
 
 def opening_window(exchange: TagExchange, budget: TagWindowBudget | None = None) -> TagWindow:
@@ -307,7 +306,7 @@ def opening_window(exchange: TagExchange, budget: TagWindowBudget | None = None)
     """
     budget = budget or TagWindowBudget()
     first = first_user_index(exchange.messages)
-    end = first + 1 if first is not None else max(_leading_instructions(exchange.messages), 1)
+    end = opening_end(exchange.messages)
     blocks = _render_all(exchange.messages[:end])
     if exchange.tools:
         blocks.insert(
@@ -318,7 +317,6 @@ def opening_window(exchange: TagExchange, budget: TagWindowBudget | None = None)
         index=0,
         start_message=0,
         end_message=end,
-        # Many tiny blocks can leave no room even for their separators; clip the joined text.
         text=_visible(clip_text("\n".join(_fit(blocks, budget.window_chars)), budget.window_chars)),
     )
 
@@ -339,7 +337,7 @@ def turn_start(exchange: TagExchange) -> int:
         (i for i, message in enumerate(exchange.messages) if message.role == "assistant"),
         default=-1,
     )
-    return max(last_assistant + 1, _leading_instructions(exchange.messages))
+    return max(last_assistant + 1, leading_instructions(exchange.messages))
 
 
 def _task_header(exchange: TagExchange, limit: int) -> str:
