@@ -351,8 +351,8 @@ class SystemOneClient:
         if 200 <= status < 300:
             return SystemOneResponseError(
                 f"SystemOne endpoint {self._url} returned HTTP {status} without one strict JSON "
-                "object (invalid JSON, duplicate keys, or NaN); check that base_url points at a "
-                "SystemOne server"
+                "object (invalid JSON or text, duplicate keys, or non-finite numbers); check "
+                "that base_url points at a SystemOne server"
             )
         hint = _STATUS_HINTS.get(status) or (
             "the server failed; check its logs, or pass a retry_policy to retry server errors"
@@ -366,7 +366,18 @@ class SystemOneClient:
 
 
 def _strict_json(content: bytes) -> JsonValue:
-    """Decode a response like the gateway does: duplicate keys and NaN are ValueErrors."""
+    """Decode a response like the gateway: duplicate keys, bad text, and overflow are errors.
+
+    Args:
+        content: Raw response bytes.
+
+    Returns:
+        The decoded JSON value.
+
+    Raises:
+        ValueError: The bytes are not UTF-8 JSON, repeat a key, hold NaN or Infinity, hold a
+            number beyond double range, hold an unpaired surrogate, or nest too deeply.
+    """
 
     def unique(pairs: list[tuple[str, JsonValue]]) -> JsonObject:
         """Refuse a repeated key instead of silently keeping its last value."""
@@ -381,10 +392,33 @@ def _strict_json(content: bytes) -> JsonValue:
         """Refuse JSON's nonstandard NaN and Infinity literals."""
         raise ValueError(f"non-finite JSON value {constant}")
 
+    def finite_float(text: str) -> float:
+        """Refuse a number literal that overflows to infinity."""
+        value = float(text)
+        if not math.isfinite(value):
+            raise ValueError("JSON number exceeds double range")
+        return value
+
+    def bounded_int(text: str) -> int:
+        """Refuse an integer literal beyond double range, which the gateway cannot read."""
+        value = int(text)
+        if abs(value) > sys.float_info.max:
+            raise ValueError("JSON number exceeds double range")
+        return value
+
     try:
-        return json.loads(content, object_pairs_hook=unique, parse_constant=non_finite)
+        decoded = json.loads(
+            content,
+            object_pairs_hook=unique,
+            parse_constant=non_finite,
+            parse_float=finite_float,
+            parse_int=bounded_int,
+        )
     except RecursionError as error:
         raise ValueError("JSON nesting exceeds the decoder limit") from error
+    # Escaped unpaired surrogates decode to text that is not valid Unicode; encoding fails.
+    json.dumps(decoded, ensure_ascii=False).encode("utf-8")
+    return decoded
 
 
 def _loopback(hostname: str) -> bool:

@@ -232,7 +232,7 @@ def test_choice_and_score_answers_are_returned_typed() -> None:
         (("answers", "coding", "noul"), 1.2, "'coding' noul must be a finite number"),
         (("answers", "coding", "noul"), True, "'coding' noul must be a finite number"),
         (("answers", "coding", "noul"), "0.9", "'coding' noul must be a finite number"),
-        (("answers", "coding", "noul"), 10**400, "'coding' noul must be a finite number"),
+        (("answers", "coding", "noul"), 10**400, "without one strict JSON object"),
         (("answers", "coding", "noul"), float("nan"), "without one strict JSON object"),
         (("usage", "extra"), float("inf"), "without one strict JSON object"),
         (("answers", "coding", "type"), "choice", "'coding' is not a noul answer"),
@@ -250,7 +250,8 @@ def test_choice_and_score_answers_are_returned_typed() -> None:
         (("answers", "department", "choice"), "marketing", "not a requested category"),
         (("answers", "department", "confidence"), 2.0, "confidence must be a finite"),
         (("answers", "quantity", "score"), "1.0", "score is not numeric data"),
-        (("answers", "quantity", "score"), 10**400, "score does not match"),
+        (("answers", "quantity", "score"), 10**400, "without one strict JSON object"),
+        (("model",), "\ud800", "without one strict JSON object"),
         (("answers", "quantity", "legend"), {"0": "None"}, "legend does not match"),
         (("usage",), {"input_tokens": 0, "output_tokens": 0}, "usage reports no tokens"),
         (("usage",), {"input_tokens": 1.0, "output_tokens": 2}, "usage.input_tokens is not"),
@@ -275,12 +276,15 @@ def test_malformed_answers_raise_typed_errors(
         b'"coding": {"type": "noul", "noul": 0.9}}, "usage": {"input_tokens": 1}}',
         b'{"model": "m", "model": "n", "answers": {}, "usage": {}}',
         b"[" * 100_000 + b"]" * 100_000,
+        b'{"model": "m", "usage": {"extra": 1e999}}',
+        b'{"model": "\\ud800"}',
         b"not json",
+        b'{"model": "\xff"}',
     ],
 )
 def test_responses_must_be_strict_json(content: bytes) -> None:
     """Duplicate keys and undecodable bodies are rejected as the gateway rejects them."""
-    with pytest.raises(SystemOneResponseError, match="duplicate keys, or NaN"):
+    with pytest.raises(SystemOneResponseError, match="duplicate keys, or non-finite"):
         _answered(_NOUL_QUESTIONS, httpx.Response(200, content=content))
 
 
