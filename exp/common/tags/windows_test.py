@@ -260,3 +260,55 @@ def test_budget_validation_and_token_sizing() -> None:
     assert TagWindowBudget.for_input_tokens(200_000).window_chars == 48_000
     with pytest.raises(ValueError, match="larger context"):
         TagWindowBudget.for_input_tokens(2_500)
+
+
+def test_reused_call_ids_keep_the_name_of_the_earlier_call() -> None:
+    """A later call reusing an id does not relabel an earlier tool result."""
+    exchange = TagExchange(
+        exchange_id="req",
+        messages=(
+            TagMessage(role="user", content="Copy the file"),
+            TagMessage(role="assistant", tool_calls=(_call("call_1", "read_file", "{}"),)),
+            TagMessage(role="tool", tool_call_id="call_1", content="contents"),
+        ),
+        response=(TagMessage(role="assistant", tool_calls=(_call("call_1", "write_file", "{}"),)),),
+    )
+    (window,) = turn_windows(exchange)
+    assert "[tool_result read_file] contents" in window.text
+    assert window.text.endswith("[tool_call write_file] {}")
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    ['{"text":"\\ud800"}', "[" * 10_000, '{"unterminated": "va'],
+    ids=["escaped-surrogate", "deep-nesting", "cut-short"],
+)
+def test_unrenderable_arguments_fall_back_to_their_text(arguments: str) -> None:
+    """Arguments that cannot be re-encoded safely render as their original text.
+
+    Args:
+        arguments: Argument text with an escaped lone surrogate, deep nesting or a cut end.
+    """
+    exchange = TagExchange(
+        exchange_id="req",
+        messages=(TagMessage(role="user", content="Go"),),
+        response=(TagMessage(role="assistant", tool_calls=(_call("c", "write", arguments),)),),
+    )
+    windows = turn_windows(exchange, SMALL)
+    assert all(len(window.text) <= SMALL.window_chars for window in windows)
+    assert windows[-1].text.split("[tool_call write] ")[1].startswith(arguments[:20])
+
+
+def test_opening_with_more_blocks_than_characters_stays_bounded() -> None:
+    """Thousands of tiny instruction messages still fit one opening window."""
+    exchange = TagExchange(
+        exchange_id="req",
+        messages=(
+            *(TagMessage(role="system", content="x") for _ in range(2_001)),
+            TagMessage(role="user", content="Go"),
+        ),
+        response=(TagMessage(role="assistant", content="ok"),),
+    )
+    window = opening_window(exchange, SMALL)
+    assert len(window.text) <= SMALL.window_chars
+    assert window.end_message == 2_002
