@@ -8,9 +8,9 @@ plus provider-internal settings) and the response document (``{"kind": "json", .
 Chat Completions, Responses and Messages traffic all become the same ``TagExchange``.
 
 Only complete, successful responses are tagged, matching what the local store retains. The
-adapters read the stored, queryable projection rather than its exact ``source_json`` sidecar:
-tagging needs readable text, and the projection has already replaced the code points (NUL,
-lone surrogates) that cannot be stored or sent as JSON text.
+request side is read from the capture context's queryable projection rather than its exact
+``source_json`` sidecar: tagging needs readable text, and the projection has already replaced
+the code points (NUL, lone surrogates) that cannot be stored or sent as JSON text.
 """
 
 from __future__ import annotations
@@ -61,8 +61,11 @@ _IDENTITY_FIELDS: Final = frozenset({"type", "id", "call_id", "tool_use_id", "na
 _REASONING_TYPES: Final = frozenset({"reasoning", "thinking", "redacted_thinking", "compaction"})
 _OPAQUE_FIELDS: Final = frozenset({"encrypted_content", "encrypted_index", "signature"})
 _IMAGE_TYPES: Final = frozenset({"image", "input_image", "computer_screenshot"})
-# Long runs of base64 characters with no spaces are binary payloads, not readable text.
-_BINARY: Final = re.compile(r"[A-Za-z0-9+/_=-]{256,}")
+# Messages block fields only responses carry, which the request schema rejects.
+_BLOCK_OUTPUT_FIELDS: Final = frozenset({"caller", "capture_partial_input"})
+# Fields that carry an image itself; an image-typed object without one is ordinary data.
+_MEDIA_FIELDS: Final = frozenset({"data", "image_url", "url", "source", "file_id"})
+_SURROGATE: Final = re.compile("[\ud800-\udfff]")
 _DATA_URL: Final = re.compile(r"data:[\w.+-]+/[\w.+-]+(?:;[\w.+-]+=[\w.+-]+)*;base64,")
 _TEXT_PARTS: Final = frozenset({"text", "input_text", "output_text"})
 _IMAGE_PARTS: Final = frozenset({"image", "image_url", "input_image"})
@@ -84,7 +87,8 @@ def exchange_from_captured(experience: CapturedExchange) -> TagExchange:
         The exchange.
 
     Raises:
-        TagExchangeError: The capture lacks its effective request or a complete response.
+        TagExchangeError: The capture lacks its effective request or a complete response, or
+            a payload nests too deeply to read.
     """
     try:
         context = experience.request.get("exp_context")
@@ -108,6 +112,10 @@ def exchange_from_captured(experience: CapturedExchange) -> TagExchange:
         raise TagExchangeError(
             f"capture {experience.experience_id} cannot be tagged: {exc}. Collect fresh traffic "
             "with capture enabled."
+        ) from exc
+    except RecursionError as exc:
+        raise TagExchangeError(
+            f"capture {experience.experience_id} cannot be tagged: a payload nests too deeply"
         ) from exc
 
 
@@ -143,7 +151,8 @@ def exchange_from_capture_parts(
         The exchange.
 
     Raises:
-        TagExchangeError: The response failed or is incomplete, or no message can be read.
+        TagExchangeError: The response failed or is incomplete, no message can be read, or a
+            payload nests too deeply to read.
     """
     try:
         return _from_parts(
@@ -158,6 +167,10 @@ def exchange_from_capture_parts(
         )
     except ValueError as exc:
         raise TagExchangeError(f"capture {exchange_id} cannot be tagged: {exc}") from exc
+    except RecursionError as exc:
+        raise TagExchangeError(
+            f"capture {exchange_id} cannot be tagged: a payload nests too deeply"
+        ) from exc
 
 
 def exchange_from_capture_record(
@@ -246,16 +259,10 @@ def _from_parts(
         raise ValueError("the request has no readable messages")
     readable, partial = readable_responses(body) if protocol == "responses" else (body, {})
     if protocol == "messages" and isinstance(blocks := readable.get("content"), list):
-        # An empty text block (a reply cut off before its first word) carries nothing, and
-        # the output decoder rejects it.
-        kept = [
-            block
-            for block in blocks
-            if not (
-                isinstance(block, dict) and block.get("type") == "text" and block.get("text") == ""
-            )
-        ]
-        readable = {**readable, "content": kept}
+        # Thinking is never tagged, and an empty text block (a reply cut off before its
+        # first word) carries nothing; the output decoder rejects a reply made only of them.
+        kept = [block for block in blocks if not _unread_block(block)]
+        readable = {**readable, "content": [_decodable_block(block, partial) for block in kept]}
     # A reply that hit its limit before producing anything is a valid, empty terminal turn,
     # which the output decoder would reject as missing output.
     field = {"responses": "output", "messages": "content"}.get(protocol)
@@ -269,6 +276,9 @@ def _from_parts(
                 raw := partial.get(str(call.get("call_id"))), str
             ):
                 call["arguments"] = raw
+        native = message.get("provider_anthropic_block")
+        if isinstance(native, dict) and isinstance(raw := partial.get(str(native.get("id"))), str):
+            native["input"] = raw
     response_turns = tuple(turn for turn in map(_message, output) if turn is not None)
     internal = capture_context.get("provider_internal")
     internal = internal if isinstance(internal, dict) else {}
@@ -293,6 +303,45 @@ def _from_parts(
         truncated=finished_by_length(protocol, body),
         structured_output=structured,
     )
+
+
+def _decodable_block(block: JsonValue, partial: dict[str, str]) -> JsonValue:
+    """Prepare a Messages content block for the output decoder, which reuses the request schema.
+
+    Response-only metadata (``caller``) is dropped. A tool use cut off mid-input, whose text
+    the collector keeps in ``capture_partial_input``, decodes with empty input and its text is
+    kept for restoring afterwards.
+
+    Args:
+        block: One Messages content block.
+        partial: Cut-off argument text by call id, updated in place.
+
+    Returns:
+        The block, copied without those fields when it had any.
+    """
+    if not isinstance(block, dict) or not _BLOCK_OUTPUT_FIELDS & block.keys():
+        return block
+    text = block.get("capture_partial_input")
+    decodable = {key: value for key, value in block.items() if key not in _BLOCK_OUTPUT_FIELDS}
+    if isinstance(text, str):
+        partial[str(block.get("id"))] = text
+        decodable["input"] = {}
+    return decodable
+
+
+def _unread_block(block: JsonValue) -> bool:
+    """Report whether a Messages content block is thinking or empty text.
+
+    Args:
+        block: One content block of a complete Messages body.
+
+    Returns:
+        True for thinking, redacted thinking and empty text blocks.
+    """
+    if not isinstance(block, dict):
+        return False
+    kind = block.get("type")
+    return kind in ("thinking", "redacted_thinking") or (kind == "text" and block.get("text") == "")
 
 
 def _caller_conversation(envelope: JsonObject, capture_context: JsonObject) -> str | None:
@@ -430,6 +479,8 @@ def _message(value: JsonObject) -> TagMessage | None:
     if native is not None:
         return _native(role, native)
     content = _content(value)
+    if role == "tool" and content is not None:
+        content = _tool_content(content)
     images = value.get("images")
     if role == "assistant" and isinstance(images, list) and images:
         text = content if isinstance(content, str) else ""
@@ -450,13 +501,43 @@ def _message(value: JsonObject) -> TagMessage | None:
     namespace = value.get("provider_tool_namespace")
     if isinstance(name, str) and name and isinstance(namespace, str) and namespace:
         name = f"{namespace}.{name}"
+    calls, found = _tool_calls(value.get("tool_calls")) if role == "assistant" else ((), 0)
+    if found:
+        # Media inside call arguments shows as markers on the message, never as bytes.
+        parts = content if isinstance(content, tuple) else (TagTextPart(text=content or ""),)
+        content = (*parts, *(TagImagePart() for _ in range(found)))
     return TagMessage(
         role=role,
         content=content,
-        tool_calls=_tool_calls(value.get("tool_calls")) if role == "assistant" else (),
+        tool_calls=calls,
         tool_call_id=call_id if role == "tool" and isinstance(call_id, str) else None,
         name=name if isinstance(name, str) and name else None,
     )
+
+
+def _tool_content(
+    content: str | tuple[TagContentPart, ...],
+) -> str | tuple[TagContentPart, ...]:
+    """Project tool result text, which can carry media as a data URL or serialized JSON.
+
+    Args:
+        content: The result's text, or its ordered parts when it carries images.
+
+    Returns:
+        Text when the result is text holding no media, otherwise the ordered parts with each
+        text projected and an image marker after the text that held it.
+    """
+    parts: list[TagContentPart] = []
+    for part in (TagTextPart(text=content),) if isinstance(content, str) else content:
+        if not isinstance(part, TagTextPart):
+            parts.append(part)
+            continue
+        readable, images = _readable(part.text)
+        text = readable if isinstance(readable, str) else _compact_json(readable)
+        parts.extend((TagTextPart(text=text), *(TagImagePart() for _ in range(images))))
+    if isinstance(content, str) and len(parts) == 1 and isinstance(parts[0], TagTextPart):
+        return parts[0].text
+    return tuple(parts)
 
 
 def _native(role: MessageRole, item: JsonValue) -> TagMessage | None:
@@ -465,8 +546,9 @@ def _native(role: MessageRole, item: JsonValue) -> TagMessage | None:
     Items are read by shape, not by name. Cited text keeps its text. A result item (role
     ``tool``, or a type ending in ``_output`` or ``_result``) becomes a tool result, and any
     other assistant item except reasoning becomes a tool call named after the item. Both carry
-    every readable field (outputs, errors, failed statuses, executed code), while encrypted
-    fields, signatures and binary payloads are dropped and images become markers.
+    every readable field (outputs, errors, failed statuses, executed code), while binary
+    payloads are dropped, images become markers, and items the provider produced also drop
+    their encrypted text fields and signatures.
 
     Args:
         role: The carrying message's role.
@@ -490,7 +572,9 @@ def _native(role: MessageRole, item: JsonValue) -> TagMessage | None:
         if key not in _IDENTITY_FIELDS and not (key == "status" and field == "completed")
     }
     if role == "tool" or kind.endswith(("_output", "_result")):
-        readable, images = _readable(_sole(fields, ("output", "content")))
+        # A result the caller sent is its own payload; only provider results carry opaque text.
+        provider = role == "assistant"
+        readable, images = _readable(_sole(fields, ("output", "content")), native=provider)
         text = readable if isinstance(readable, str) else _compact_json(readable)
         return TagMessage(
             role="tool",
@@ -501,9 +585,12 @@ def _native(role: MessageRole, item: JsonValue) -> TagMessage | None:
         )
     if role != "assistant" or kind in _REASONING_TYPES or not fields:
         return None
-    readable, images = _readable(_sole(fields, ("input", "arguments")))
-    if kind == "image_generation_call" and item.get("result"):
-        images += 1
+    generated = kind == "image_generation_call" and bool(fields.get("result"))
+    if generated:
+        # The result of an image generation call is the image itself, never readable text.
+        fields["result"] = "[image]"
+    readable, images = _readable(_sole(fields, ("input", "arguments")), native=True)
+    images += generated
     markers = tuple(TagImagePart() for _ in range(images))
     if not kind.endswith(("_call", "tool_use")):
         # Listings, approval requests and other non-invocation items stay readable as text
@@ -520,7 +607,7 @@ def _native(role: MessageRole, item: JsonValue) -> TagMessage | None:
         "namespace": item.get("namespace"),
         "arguments": readable,
     }
-    calls = _tool_calls([call])
+    calls, _ = _tool_calls([call])
     if not calls:
         return None
     return TagMessage(role="assistant", content=markers or None, tool_calls=calls)
@@ -541,39 +628,77 @@ def _sole(fields: JsonObject, names: tuple[str, ...]) -> JsonValue:
     return fields
 
 
-def _readable(value: JsonValue) -> tuple[JsonValue, int]:
-    """Project a native value onto what a reader can use.
+def _readable(value: JsonValue, *, native: bool = False) -> tuple[JsonValue, int]:
+    """Project a tool payload or native value onto what a reader can use.
 
     Args:
-        value: Any JSON value from a native item.
+        value: Any JSON value from a tool payload or a native item.
+        native: The value is a provider-native item's structure, whose encrypted text fields
+            and signatures are opaque. Caller payloads keep fields of those names, including
+            the serialized JSON text a native item carries (custom tool and MCP payloads).
 
     Returns:
-        The value without encrypted fields or signatures, with binary strings shown as
-        ``[binary]`` and images as ``[image]``, and the number of images found.
+        The value with base64 data URLs and base64 sources shown as ``[binary]`` and image
+        parts as ``[image]`` (and, for a native structure, without encrypted text fields or
+        signatures), and the number of images found. Binary content is recognized by its field
+        shape, never by how a string looks.
     """
     if isinstance(value, str):
-        binary = _DATA_URL.match(value) is not None or _BINARY.fullmatch(value) is not None
-        return ("[binary]", 0) if binary else (value, 0)
+        if _DATA_URL.match(value):
+            return ("[image]", 1) if value.startswith("data:image/") else ("[binary]", 0)
+        return _readable_serialized(value)
     if isinstance(value, list):
-        items = [_readable(item) for item in value]
+        items = [_readable(item, native=native) for item in value]
         return [item for item, _ in items], sum(count for _, count in items)
     if not isinstance(value, dict):
         return value, 0
-    if str(value.get("type")) in _IMAGE_TYPES:
+    if str(value.get("type")) in _IMAGE_TYPES and _MEDIA_FIELDS & value.keys():
         return "[image]", 1
+    if value.get("type") == "audio" and "data" in value:
+        return "[audio]", 0
+    if isinstance(value.get("blob"), str) and isinstance(value.get("uri"), str):
+        # An embedded MCP blob resource carries its bytes in blob beside its uri.
+        image = str(value.get("mimeType", "")).startswith("image/")
+        return ("[image]", 1) if image else ("[binary]", 0)
+    if value.get("type") == "base64":
+        return "[binary]", 0
     projected: JsonObject = {}
     images = 0
     for key, field in value.items():
-        if key in _OPAQUE_FIELDS:
+        if native and key in _OPAQUE_FIELDS and isinstance(field, str):
             continue
-        projected[key], count = _readable(field)
+        projected[key], count = _readable(field, native=native)
         images += count
     return projected, images
 
 
+def _readable_serialized(text: str) -> tuple[JsonValue, int]:
+    """Project text that serializes a JSON structure, such as an MCP tool result.
+
+    Serialized text is the caller's own payload, so every field is kept.
+
+    Args:
+        text: A tool payload string or a string field of a native item.
+
+    Returns:
+        The text unchanged unless it is a JSON object or array holding images or binary
+        sources, in which case its projection as compact JSON, with the images found.
+    """
+    if not text.lstrip().startswith(("{", "[")):
+        return text, 0
+    try:
+        parsed = json.loads(text)
+    except (ValueError, RecursionError):
+        return text, 0
+    projected, images = _readable(parsed)
+    if images or projected != parsed:
+        return _compact_json(projected), images
+    return text, 0
+
+
 def _compact_json(value: JsonValue) -> str:
-    """Render a JSON value compactly for a window."""
-    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    """Render a JSON value compactly for a window, replacing lone surrogates with U+FFFD."""
+    return _SURROGATE.sub("\ufffd", json.dumps(value, ensure_ascii=False, separators=(",", ":")))
 
 
 def _content(value: JsonObject) -> str | tuple[TagContentPart, ...] | None:
@@ -631,18 +756,20 @@ def _image(part: JsonObject) -> TagImagePart:
     )
 
 
-def _tool_calls(value: JsonValue) -> tuple[TagToolCall, ...]:
+def _tool_calls(value: JsonValue) -> tuple[tuple[TagToolCall, ...], int]:
     """Read assistant tool calls in canonical or chat form, function or custom.
 
     Args:
         value: The message's ``tool_calls`` list.
 
     Returns:
-        The calls with a tool name; arguments become JSON text.
+        The calls with a tool name, their arguments as JSON text with inline media replaced by
+        markers, and the number of images found in the arguments.
     """
     if not isinstance(value, list):
-        return ()
+        return (), 0
     calls: list[TagToolCall] = []
+    images = 0
     for call in value:
         if not isinstance(call, dict):
             continue
@@ -655,9 +782,10 @@ def _tool_calls(value: JsonValue) -> tuple[TagToolCall, ...]:
         name = source.get("name")
         if not isinstance(name, str) or not name:
             continue
-        arguments = source.get("arguments", source.get("input"))
+        arguments, found = _readable(source.get("arguments", source.get("input")))
+        images += found
         if not isinstance(arguments, str):
-            arguments = json.dumps(arguments or {}, ensure_ascii=False, separators=(",", ":"))
+            arguments = _compact_json(arguments or {})
         call_id = call.get("id", call.get("call_id"))
         provider = call.get("provider_context")
         namespace = call.get(
@@ -671,7 +799,7 @@ def _tool_calls(value: JsonValue) -> tuple[TagToolCall, ...]:
                 function=TagFunction(name=name, arguments=arguments),
             )
         )
-    return tuple(calls)
+    return tuple(calls), images
 
 
 __all__ = [
