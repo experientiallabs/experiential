@@ -1315,6 +1315,29 @@ def test_text_that_only_starts_with_data_is_kept() -> None:
     assert call.tool_calls[0].function.arguments == 'data: dict[str, int] = {"port": 443}'
 
 
+def test_approval_requests_name_their_tool_and_capture_evidence_is_unchanged() -> None:
+    """Approval text names the tool, and tagging never edits the capture it reads."""
+    approval = _native_message(
+        "assistant",
+        {
+            "type": "mcp_approval_request",
+            "id": "ap_1",
+            "name": "delete_customer",
+            "server_label": "crm",
+            "arguments": "{}",
+        },
+    )
+    assert not approval.tool_calls
+    assert approval.text().startswith("[mcp_approval_request delete_customer] ")
+    experience = _experience("chat_completions", _chat_request(), CHAT_BODY)
+    request = dict(experience.request)
+    request["exp_capture_output"] = {"provider_reasoning": "private thoughts"}
+    experience = experience.model_copy(update={"request": request})
+    before = experience.model_dump_json()
+    exchange_from_captured(experience)
+    assert experience.model_dump_json() == before
+
+
 def test_record_without_a_response_is_rejected() -> None:
     """A prompt checkpoint with no response yet cannot be tagged."""
     record = _record(

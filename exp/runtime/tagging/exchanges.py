@@ -260,7 +260,9 @@ def _from_parts(
     # which the output decoder would reject as missing output.
     field = {"responses": "output", "messages": "content"}.get(protocol)
     empty = field is not None and readable.get(field) == []
-    output = [] if empty else output_messages(protocol, readable, capture_output)
+    # Decoding restores capture-only fields onto the body's messages; work on a copy so the
+    # caller's capture evidence is never changed.
+    output = [] if empty else output_messages(protocol, copy.deepcopy(readable), capture_output)
     for message in output:
         for call in _list(message.get("tool_calls")):
             if isinstance(call, dict) and isinstance(
@@ -504,8 +506,10 @@ def _native(role: MessageRole, item: JsonValue) -> TagMessage | None:
         # Listings, approval requests and other non-invocation items stay readable as text
         # but are not tool calls, matching the gateway's invocation rule.
         text = readable if isinstance(readable, str) else _compact_json(readable)
+        name = item.get("name")
+        label = f"{kind} {name}" if isinstance(name, str) and name else kind
         return TagMessage(
-            role="assistant", content=(TagTextPart(text=f"[{kind}] {text}"), *markers)
+            role="assistant", content=(TagTextPart(text=f"[{label}] {text}"), *markers)
         )
     call: JsonObject = {
         "id": call_id if isinstance(call_id, str) else item.get("id"),
