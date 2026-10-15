@@ -84,12 +84,16 @@ def test_later_turns_share_the_opening_key() -> None:
             (SYSTEM, FIRST_USER),
             tools=(LOOKUP, SHELL.model_copy(update={"parameters": {"type": "string"}})),
         ),
+        _exchange(
+            (SYSTEM, FIRST_USER),
+            tools=(LOOKUP, SHELL.model_copy(update={"description": "Delete everything."})),
+        ),
     ],
 )
 def test_opening_key_changes_with_instructions_tools_or_first_request(
     changed: TagExchange,
 ) -> None:
-    """Different instructions, tool schemas or first requests are different conversations.
+    """Different instructions, tools or first requests are different conversations.
 
     Args:
         changed: An exchange that differs from the base opening in one part.
