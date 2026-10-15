@@ -16,6 +16,7 @@ from exp.common.tags.exchange import (
     TagTextPart,
     TagTool,
     TagToolCall,
+    opening_key,
 )
 from exp.common.tags.windows import (
     CONSERVATIVE_CHARS_PER_TOKEN,
@@ -350,3 +351,30 @@ def test_many_short_opening_messages_that_fit_are_all_kept() -> None:
     )
     lines = opening_window(exchange, SMALL).text.splitlines()
     assert lines == [*(f"[system] rule {i}" for i in range(25)), "[user] Go"]
+
+
+def test_tool_results_fall_back_to_their_own_name() -> None:
+    """A chat tool result naming its tool is labeled even when its call is not in view."""
+    result = TagMessage.model_validate(
+        {"role": "tool", "tool_call_id": "call_9", "name": "kb_search", "content": "3 articles"}
+    )
+    assert result.name == "kb_search"
+    assert render_message(result, {}) == "[tool_result kb_search] 3 articles"
+    assert render_message(result, {"call_9": "search_v2"}) == "[tool_result search_v2] 3 articles"
+    named_user = TagMessage.model_validate({"role": "user", "name": "alice", "content": "hi"})
+    assert render_message(named_user, {}) == "[user] hi"
+    assert TagMessage.model_validate_json(result.model_dump_json()) == result
+
+
+def test_opening_lists_tools_in_canonical_order() -> None:
+    """Caller tool order changes neither the rendered opening nor its key."""
+    tools = tuple(TagTool(name=f"tool_{i:02d}", description="d" * 150) for i in range(25))
+    forward = TagExchange(
+        exchange_id="req",
+        tools=tools,
+        messages=(TagMessage(role="user", content="Go"),),
+        response=(TagMessage(role="assistant", content="ok"),),
+    )
+    backward = forward.model_copy(update={"tools": tools[::-1]})
+    assert opening_window(forward, SMALL).text == opening_window(backward, SMALL).text
+    assert opening_key(forward) == opening_key(backward)

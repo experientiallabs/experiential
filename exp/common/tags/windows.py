@@ -29,6 +29,7 @@ from exp.common.tags.exchange import (
     TagExchange,
     TagMessage,
     TagTool,
+    canonical_tools,
     first_user_index,
     leading_instructions,
     opening_end,
@@ -200,7 +201,8 @@ def render_message(message: TagMessage, names: Mapping[str, str]) -> str:
 
     Args:
         message: The message.
-        names: Tool names by call id, for labeling tool results.
+        names: Tool names by call id, for labeling tool results; a result whose call is not
+            found falls back to its own ``name``.
 
     Returns:
         ``[role] text`` for ordinary messages, ``[tool_result name] text`` for tool results and
@@ -209,7 +211,7 @@ def render_message(message: TagMessage, names: Mapping[str, str]) -> str:
     text = _compact(message.text())
     lines: list[str] = []
     if message.role == "tool":
-        name = names.get(message.tool_call_id or "")
+        name = names.get(message.tool_call_id or "") or message.name
         lines.append(f"{f'[tool_result {name}]' if name else '[tool_result]'} {text or '(empty)'}")
     elif text or not message.tool_calls:
         lines.append(f"[{message.role}] {text or '(empty)'}")
@@ -316,7 +318,8 @@ def opening_window(exchange: TagExchange, budget: TagWindowBudget | None = None)
     blocks = _render_all(exchange.messages[:end])
     if exchange.tools:
         blocks.insert(
-            len(blocks) - 1 if first is not None else len(blocks), _tool_lines(exchange.tools)
+            len(blocks) - 1 if first is not None else len(blocks),
+            _tool_lines(canonical_tools(exchange.tools)),
         )
     return TagWindow(
         scope=TagScope.CONVERSATION,

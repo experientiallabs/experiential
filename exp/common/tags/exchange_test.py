@@ -182,3 +182,10 @@ def test_opening_key_covers_every_message_the_opening_shows() -> None:
     greeting_a = _exchange((TagMessage(role="assistant", content="A"), FIRST_USER))
     greeting_b = _exchange((TagMessage(role="assistant", content="B"), FIRST_USER))
     assert opening_key(greeting_a) != opening_key(greeting_b)
+
+
+def test_image_parts_never_hold_inline_data() -> None:
+    """Only remote URLs are kept; inline image data is rejected."""
+    assert TagImagePart(url="https://example.com/a.png").url == "https://example.com/a.png"
+    with pytest.raises(ValidationError, match="remote http"):
+        TagImagePart(url="data:image/png;base64,AAAA")
