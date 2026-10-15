@@ -252,13 +252,14 @@ def test_task_header_is_clipped_to_its_budget() -> None:
 
 
 def test_budget_validation_and_token_sizing() -> None:
-    """Budgets keep room for new content and convert token limits conservatively."""
+    """Budgets keep room for new content and size windows at one token per character."""
     with pytest.raises(ValidationError, match="at most half"):
         TagWindowBudget(window_chars=2_000, overlap_chars=900, header_chars=200)
     with pytest.raises(ValidationError):
         TagWindowBudget(window_chars=100_000)
     budget = TagWindowBudget.for_input_tokens(8_192)
-    assert budget.window_chars == (8_192 - 2_048) * CONSERVATIVE_CHARS_PER_TOKEN
+    assert CONSERVATIVE_CHARS_PER_TOKEN == 1
+    assert budget.window_chars == 8_192 - 2_048
     assert budget.overlap_chars == budget.window_chars // 12
     assert TagWindowBudget.for_input_tokens(200_000).window_chars == 32_000
     with pytest.raises(ValueError, match="larger context"):

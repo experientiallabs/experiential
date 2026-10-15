@@ -34,9 +34,11 @@ from exp.common.tags.exchange import (
     opening_end,
 )
 
-# Conservative characters per token: English prose averages about four, code and JSON about
-# three. Mostly non-Latin text runs lower and needs a smaller budget than for_input_tokens gives.
-CONSERVATIVE_CHARS_PER_TOKEN = 3
+# Characters per token that sizing assumes. Averages (about four for prose, three for code)
+# overflow on dense text such as digit-heavy JSON, so sizing assumes one token per character,
+# which a byte-level tokenizer never exceeds on ASCII text. Text dominated by rare non-Latin
+# characters can still need more and should use a smaller explicit budget.
+CONSERVATIVE_CHARS_PER_TOKEN = 1
 # Largest window. Rendering replaces the control characters JSON would escape as six bytes,
 # so a window costs at most 4 bytes of JSON text per character (128,000 bytes here), and even
 # a full bank of 32 questions with 300-character, 4-byte texts (about 116,000 bytes) still
