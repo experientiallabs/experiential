@@ -546,65 +546,6 @@ def test_parts_without_an_envelope_still_tag_the_messages() -> None:
     assert exchange.messages[0].text() == "[3 messages not captured]"
 
 
-@pytest.mark.parametrize(
-    ("document", "message"),
-    [
-        ({"kind": "json", "status": 500, "body": CHAT_BODY}, "status is 500"),
-        (
-            {
-                "kind": "sse",
-                "status": 200,
-                "frames": CHAT_FRAMES,
-                "truncated": True,
-                "client_disconnected": False,
-            },
-            "cut short",
-        ),
-        (
-            {
-                "kind": "sse",
-                "status": 200,
-                "frames": CHAT_FRAMES,
-                "truncated": False,
-                "client_disconnected": True,
-            },
-            "cut short",
-        ),
-        (
-            {
-                "kind": "sse",
-                "status": 200,
-                "frames": CHAT_FRAMES[:-1],
-                "truncated": False,
-                "client_disconnected": False,
-            },
-            "terminal state",
-        ),
-        (
-            {
-                "kind": "sse",
-                "status": 200,
-                "frames": [*CHAT_FRAMES[:2], {"error": {"message": "x"}}],
-                "truncated": False,
-                "client_disconnected": False,
-            },
-            "reports an error",
-        ),
-        ({"kind": "json", "status": 200, "body": {"choices": [], "error": None}}, "terminal"),
-        ({"kind": "wire", "status": 200}, "unknown response kind"),
-    ],
-)
-def test_incomplete_or_failed_responses_are_not_tagged(document: JsonObject, message: str) -> None:
-    """Failed, cut-short, unterminated or erroring responses are rejected with a reason.
-
-    Args:
-        document: Stored response document.
-        message: Expected reason fragment.
-    """
-    with pytest.raises(ValueError, match=message):
-        completed_response("chat_completions", document)
-
-
 def test_streamed_tool_input_with_a_wide_integer_decodes() -> None:
     """A Messages tool input beyond 64-bit range reassembles and decodes exactly."""
     frames = [dict(frame) if isinstance(frame, dict) else frame for frame in MESSAGES_FRAMES]
@@ -713,40 +654,6 @@ def test_cited_anthropic_text_and_server_tool_use_stay_readable() -> None:
         "[assistant] Paris is the capital.",
     ]
     assert "opaque" not in exchange.model_dump_json()
-
-
-@pytest.mark.parametrize(
-    "frames",
-    [
-        [frame for index, frame in enumerate(MESSAGES_FRAMES) if index != 8],
-        [
-            *MESSAGES_FRAMES[:9],
-            {
-                "type": "content_block_delta",
-                "index": 1,
-                "delta": {"type": "input_json_delta", "partial_json": "x"},
-            },
-            *MESSAGES_FRAMES[9:],
-        ],
-        [*MESSAGES_FRAMES, {"type": "ping"}],
-    ],
-    ids=["unclosed-block", "delta-after-stop", "frame-after-stop"],
-)
-def test_messages_streams_with_broken_lifecycles_are_rejected(frames: list[JsonValue]) -> None:
-    """Streams the collector's assembler would mark invalid are not complete captures.
-
-    Args:
-        frames: Stored frames with one lifecycle violation.
-    """
-    document: JsonObject = {
-        "kind": "sse",
-        "status": 200,
-        "frames": frames,
-        "truncated": False,
-        "client_disconnected": False,
-    }
-    with pytest.raises(ValueError, match="terminal state"):
-        completed_response("messages", document)
 
 
 def test_long_non_ascii_conversation_labels_fall_back_like_the_local_store() -> None:
@@ -1125,6 +1032,95 @@ def test_chat_tool_result_names_survive_without_their_call() -> None:
     )
     assert exchange.messages[1].name == "kb_search"
     assert "[tool_result kb_search] Policy A" in turn_windows(exchange)[0].text
+
+
+def test_mixed_custom_and_function_stream_deltas_are_both_rebuilt() -> None:
+    """A chunk continuing a custom call and a function call keeps both complete."""
+    frames: list[JsonValue] = [
+        _chunk(
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "index": 0,
+                        "id": "c1",
+                        "type": "custom",
+                        "custom": {"name": "apply_patch", "input": "*** A"},
+                    },
+                    {
+                        "index": 1,
+                        "id": "f1",
+                        "type": "function",
+                        "function": {"name": "lookup", "arguments": '{"id":'},
+                    },
+                ],
+            }
+        ),
+        _chunk(
+            {
+                "tool_calls": [
+                    {"index": 0, "custom": {"input": "B"}},
+                    {"index": 1, "function": {"arguments": '"Z"}'}},
+                ]
+            },
+            "tool_calls",
+        ),
+        "[DONE]",
+    ]
+    document: JsonObject = {
+        "kind": "sse",
+        "status": 200,
+        "frames": frames,
+        "truncated": False,
+        "client_disconnected": False,
+    }
+    exchange = exchange_from_capture_parts(
+        exchange_id="request-7",
+        protocol="chat_completions",
+        messages=[{"role": "user", "content": "Do both"}],
+        request=None,
+        response=document,
+    )
+    assert [
+        (call.function.name, call.function.arguments) for call in exchange.response[0].tool_calls
+    ] == [
+        ("apply_patch", "*** AB"),
+        ("lookup", '{"id":"Z"}'),
+    ]
+
+
+def test_gateway_searches_and_call_images_are_kept() -> None:
+    """Searches the gateway ran stay in the reply, and images inside calls count as images."""
+    body: JsonObject = {
+        "status": "completed",
+        "output": [
+            {
+                "type": "web_search_call",
+                "id": "wsgw_" + "0" * 32,
+                "status": "completed",
+                "action": {"type": "search", "query": "rates"},
+            },
+            {
+                "type": "message",
+                "id": "m",
+                "role": "assistant",
+                "status": "completed",
+                "content": [{"type": "output_text", "text": "Rates rose.", "annotations": []}],
+            },
+        ],
+    }
+    exchange = exchange_from_captured(_experience("responses", _responses_request(), body))
+    assert exchange.response[0].tool_calls[0].function.name == "web_search"
+    chart = _native_message(
+        "assistant",
+        {
+            "type": "code_interpreter_call",
+            "id": "ci_1",
+            "code": "plot()",
+            "outputs": [{"type": "image", "url": "data:image/png;base64,AAAA"}],
+        },
+    )
+    assert chart.has_image() and chart.tool_calls[0].function.name == "code_interpreter"
 
 
 def test_record_without_a_response_is_rejected() -> None:

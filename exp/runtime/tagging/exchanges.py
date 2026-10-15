@@ -21,7 +21,6 @@ import re
 from collections.abc import Sequence
 from typing import Final
 
-from exp_gateway_native import CaptureResponse
 from pydantic import JsonValue
 
 from exp.common.core.artifacts import JsonObject
@@ -44,6 +43,11 @@ from exp.runtime.gateway.ingest.conversion import (
 )
 from exp.runtime.gateway.local_capture_contracts import CapturedExchange
 from exp.runtime.gateway.native_capture import CaptureRecord
+from exp.runtime.tagging.responses import (
+    completed_response,
+    finished_by_length,
+    readable_responses,
+)
 
 _ROLES: Final[dict[str, MessageRole]] = {
     "system": "system",
@@ -61,11 +65,6 @@ _IMAGE_TYPES: Final = frozenset({"image", "input_image", "computer_screenshot"})
 _BINARY: Final = re.compile(r"[A-Za-z0-9+/_=-]{256,}")
 _TEXT_PARTS: Final = frozenset({"text", "input_text", "output_text"})
 _IMAGE_PARTS: Final = frozenset({"image", "image_url", "input_image"})
-_NATIVE_PROTOCOL: Final[dict[CaptureProtocol, str]] = {
-    "chat_completions": "chat",
-    "responses": "responses",
-    "messages": "messages",
-}
 
 
 class TagExchangeError(ValueError):
@@ -240,7 +239,7 @@ def _from_parts(
     request_turns = tuple(turn for turn in map(_message, canonical) if turn is not None)
     if not request_turns:
         raise ValueError("the request has no readable messages")
-    readable, partial = _readable_responses(body) if protocol == "responses" else (body, {})
+    readable, partial = readable_responses(body) if protocol == "responses" else (body, {})
     output = output_messages(protocol, readable, capture_output)
     for message in output:
         for call in _list(message.get("tool_calls")):
@@ -268,7 +267,7 @@ def _from_parts(
         ),
         messages=request_turns,
         response=response_turns or (TagMessage(role="assistant"),),
-        truncated=_finished_by_length(protocol, body),
+        truncated=finished_by_length(protocol, body),
         structured_output=structured,
     )
 
@@ -290,311 +289,6 @@ def _caller_conversation(envelope: JsonObject, capture_context: JsonObject) -> s
         return label
     session = capture_context.get("session_id")
     return session if isinstance(session, str) and session else None
-
-
-def completed_response(protocol: CaptureProtocol, document: JsonObject) -> JsonObject:
-    """Return the complete response body of a stored response document.
-
-    Streams are reassembled by the native collector's own frame assembly. A response counts
-    as complete when it has a 2xx status, reached a terminal state with no error, and (for a
-    stream) lost no frames and was not disconnected.
-
-    Args:
-        protocol: The record's public surface.
-        document: The record's response document.
-
-    Returns:
-        The response body.
-
-    Raises:
-        ValueError: The response failed, is incomplete, or is not a JSON object.
-    """
-    status = document.get("status")
-    if not isinstance(status, int) or not 200 <= status < 300:
-        raise ValueError(f"the response status is {status}; only successful responses are tagged")
-    kind = document.get("kind")
-    if kind == "json":
-        body = document.get("body")
-        complete = True
-    elif kind == "sse":
-        if document.get("truncated") is not False or document.get("client_disconnected"):
-            raise ValueError("the stream was cut short before it completed")
-        frames = document.get("frames")
-        if not isinstance(frames, list) or any(_has_error(frame) for frame in frames):
-            raise ValueError("the stream has no frames or reports an error")
-        captured = CaptureResponse(_NATIVE_PROTOCOL[protocol], _sse_bytes(frames), True)
-        body = json.loads(captured.body_json)
-        # A Responses stream body is its terminal event's response, so the terminal check
-        # below also accepts an incomplete (length-limited) response. Chat and Messages
-        # streams must also have reached their end-of-stream event with a valid lifecycle.
-        complete = protocol == "responses" or (captured.completed and _lifecycle(protocol, frames))
-        if protocol == "chat_completions" and isinstance(body, dict):
-            _merge_custom_calls(body, frames)
-        content = body.get("content") if isinstance(body, dict) and complete else None
-        for block in content if isinstance(content, list) else ():
-            if isinstance(block, dict) and "capture_partial_input" in block:
-                raise ValueError("a streamed tool input is not complete JSON")
-            # The assembler keeps a tool input with integers beyond 64 bits as exact source
-            # text beside a rounded copy; restore the exact input, as Messages carries it.
-            if isinstance(block, dict) and isinstance(
-                source := block.pop("capture_input_source_json", None), str
-            ):
-                block["input"] = json.loads(source)
-    else:
-        raise ValueError(f"unknown response kind {kind!r}")
-    if not isinstance(body, dict) or not complete or not _terminal(protocol, body):
-        raise ValueError("the response did not reach a terminal state")
-    if _has_error(body):
-        raise ValueError("the response reports an error")
-    return body
-
-
-def _merge_custom_calls(body: JsonObject, frames: Sequence[JsonValue]) -> None:
-    """Join streamed Chat custom tool calls, whose input deltas the assembler does not merge.
-
-    Each joined call replaces the assembler's partial copy, and a choice whose finish reason
-    the assembler missed takes the one the stream reported.
-
-    Args:
-        body: The assembled Chat body, updated in place.
-        frames: Stored stream chunks.
-    """
-    customs: dict[tuple[str, str], JsonObject] = {}
-    finishes: dict[str, JsonValue] = {}
-    for chunk in _dicts(list(frames)):
-        for choice in _dicts(chunk.get("choices")):
-            if choice.get("finish_reason") is not None:
-                finishes[json.dumps(choice.get("index"))] = choice.get("finish_reason")
-            delta = choice.get("delta")
-            for call in _dicts(delta.get("tool_calls") if isinstance(delta, dict) else None):
-                custom = call.get("custom")
-                if not isinstance(custom, dict):
-                    continue
-                key = (json.dumps(choice.get("index")), json.dumps(call.get("index")))
-                merged = customs.setdefault(key, {"id": None, "name": None, "input": ""})
-                merged["id"] = merged["id"] or call.get("id")
-                merged["name"] = merged["name"] or custom.get("name")
-                if isinstance(piece := custom.get("input"), str):
-                    merged["input"] = f"{merged['input']}{piece}"
-    for (choice_index, _), merged in customs.items():
-        for choice in _dicts(body.get("choices")):
-            message = choice.get("message")
-            if not isinstance(message, dict) or json.dumps(choice.get("index")) != choice_index:
-                continue
-            calls: list[JsonValue] = [
-                call
-                for call in _list(message.get("tool_calls"))
-                if not (isinstance(call, dict) and call.get("id") == merged["id"])
-            ]
-            custom: JsonObject = {"name": merged["name"], "input": merged["input"]}
-            calls.append({"id": merged["id"], "type": "custom", "custom": custom})
-            message["tool_calls"] = calls
-            # The assembler stops reading a choice at the delta it could not merge, so its
-            # finish reason comes from the stream itself.
-            if choice.get("finish_reason") is None:
-                choice["finish_reason"] = finishes.get(choice_index)
-
-
-def _dicts(value: JsonValue) -> list[JsonObject]:
-    """Return the objects of a JSON list, or an empty list for any other value."""
-    return [item for item in value if isinstance(item, dict)] if isinstance(value, list) else []
-
-
-def _lifecycle(protocol: CaptureProtocol, frames: Sequence[JsonValue]) -> bool:
-    """Apply the collector's stream validity rules for Chat and Messages streams.
-
-    Args:
-        protocol: Chat Completions or Messages.
-        frames: Stored ``data`` payloads in order.
-
-    Returns:
-        For Chat, every chunk carries choices, the stream ends with ``[DONE]`` and its first
-        chunk names an id and a model. For Messages, every frame is a known event, one
-        ``message_start`` opens the stream, ``message_stop`` ends it, and every content block
-        that started (in index order) also stopped.
-    """
-    if protocol == "chat_completions":
-        chunks = frames[:-1]
-        first = chunks[0] if chunks else None
-        return (
-            frames[-1:] == ["[DONE]"]
-            and isinstance(first, dict)
-            and first.get("id") is not None
-            and first.get("model") is not None
-            and all(
-                isinstance(chunk, dict) and isinstance(chunk.get("choices"), list)
-                for chunk in chunks
-            )
-        )
-    return _messages_lifecycle(frames)
-
-
-def _messages_lifecycle(frames: Sequence[JsonValue]) -> bool:
-    """Replay a Messages stream's block lifecycle the way the collector's assembler does.
-
-    Args:
-        frames: Stored ``data`` payloads in order.
-
-    Returns:
-        True when one ``message_start`` comes first, blocks start in index order and receive
-        deltas only while open, every block closes, and nothing follows ``message_stop``.
-    """
-    started = stopped = False
-    opened: list[JsonValue] = []
-    closed: set[str] = set()
-    for frame in frames:
-        if not isinstance(frame, dict) or stopped:
-            return False
-        kind = frame.get("type")
-        index = frame.get("index")
-        key = json.dumps(index)
-        if kind == "message_start":
-            if started:
-                return False
-            started = True
-        elif kind == "content_block_start":
-            if not started or index != len(opened):
-                return False
-            opened.append(index)
-        elif kind in ("content_block_delta", "content_block_stop"):
-            if index not in opened or key in closed:
-                return False
-            if kind == "content_block_stop":
-                closed.add(key)
-        elif kind == "message_delta":
-            if not started or not isinstance(frame.get("delta"), dict):
-                return False
-        elif kind == "message_stop":
-            stopped = True
-        elif kind != "ping":
-            return False
-    return started and stopped and len(closed) == len(opened)
-
-
-def _readable_responses(body: JsonObject) -> tuple[JsonObject, dict[str, str]]:
-    """Prepare Responses output for the output decoder, which reuses the request schema.
-
-    Refusal parts become output text, since the request schema has no refusal part. A
-    function call whose arguments are not a JSON object (a call cut off by the length limit)
-    decodes with empty arguments, and its exact text is returned for restoring afterwards.
-
-    Args:
-        body: A complete Responses body.
-
-    Returns:
-        A copied body the decoder accepts, and the cut-off argument text by call id.
-    """
-    output = body.get("output")
-    if not isinstance(output, list):
-        return body, {}
-    partial: dict[str, str] = {}
-    items: list[JsonValue] = []
-    for item in output:
-        if isinstance(item, dict) and isinstance(content := item.get("content"), list):
-            parts: list[JsonValue] = [
-                {"type": "output_text", "text": part.get("refusal"), "annotations": []}
-                if isinstance(part, dict) and part.get("type") == "refusal"
-                else part
-                for part in content
-            ]
-            item = {**item, "content": parts}
-        if (
-            isinstance(item, dict)
-            and item.get("type") == "function_call"
-            and isinstance(arguments := item.get("arguments"), str)
-            and not _json_object(arguments)
-        ):
-            partial[str(item.get("call_id"))] = arguments
-            item = {**item, "arguments": "{}"}
-        items.append(item)
-    return {**body, "output": items}, partial
-
-
-def _json_object(text: str) -> bool:
-    """Report whether text parses as a JSON object."""
-    try:
-        return isinstance(json.loads(text), dict)
-    except (ValueError, RecursionError):
-        return False
-
-
-def _sse_bytes(frames: Sequence[JsonValue]) -> bytes:
-    """Encode stored frames back into the event-stream text they were parsed from.
-
-    Args:
-        frames: Stored ``data`` payloads; JSON values, or text for non-JSON payloads.
-
-    Returns:
-        UTF-8 event-stream bytes.
-    """
-    events: list[str] = []
-    for frame in frames:
-        payload = frame if isinstance(frame, str) else json.dumps(frame, ensure_ascii=False)
-        events.append("".join(f"data: {line}\n" for line in payload.split("\n")) + "\n")
-    return "".join(events).encode("utf-8")
-
-
-def _terminal(protocol: CaptureProtocol, body: JsonObject) -> bool:
-    """Report whether a response body reached a terminal state.
-
-    Args:
-        protocol: The public surface.
-        body: The response body.
-
-    Returns:
-        True for a completed or incomplete Response, a Message with a stop reason, or Chat
-        choices that all carry a finish reason.
-    """
-    if protocol == "responses":
-        return body.get("status") in ("completed", "incomplete")
-    if protocol == "messages":
-        return (
-            body.get("type") == "message"
-            and isinstance(body.get("content"), list)
-            and isinstance(body.get("stop_reason"), str)
-        )
-    choices = body.get("choices")
-    return (
-        isinstance(choices, list)
-        and bool(choices)
-        and all(isinstance(choice, dict) and choice.get("finish_reason") for choice in choices)
-    )
-
-
-def _has_error(value: JsonValue) -> bool:
-    """Report whether a body or frame carries a provider error.
-
-    Args:
-        value: A response body or stream frame.
-
-    Returns:
-        True for a non-null ``error`` or an error or failed event.
-    """
-    return isinstance(value, dict) and (
-        value.get("error") is not None or value.get("type") in ("error", "response.failed")
-    )
-
-
-def _finished_by_length(protocol: CaptureProtocol, body: JsonObject) -> bool:
-    """Report whether the response stopped at its output length limit.
-
-    Args:
-        protocol: The public surface.
-        body: The complete response body.
-
-    Returns:
-        True for a ``length`` finish, an incomplete Response over ``max_output_tokens`` or a
-        Message that stopped at ``max_tokens`` or at the model's context window.
-    """
-    if protocol == "responses":
-        details = body.get("incomplete_details")
-        return isinstance(details, dict) and details.get("reason") == "max_output_tokens"
-    if protocol == "messages":
-        return body.get("stop_reason") in ("max_tokens", "model_context_window_exceeded")
-    choices = body.get("choices")
-    return isinstance(choices, list) and any(
-        isinstance(choice, dict) and choice.get("finish_reason") == "length" for choice in choices
-    )
 
 
 def _tools(value: JsonValue, native: JsonValue, server: JsonValue) -> tuple[TagTool, ...]:
@@ -755,7 +449,7 @@ def _native(role: MessageRole, item: JsonValue) -> TagMessage | None:
         )
     if role != "assistant" or kind in _REASONING_TYPES or not fields:
         return None
-    readable, _ = _readable(_sole(fields, ("input", "arguments")))
+    readable, images = _readable(_sole(fields, ("input", "arguments")))
     call: JsonObject = {
         "id": call_id if isinstance(call_id, str) else item.get("id"),
         "name": item.get("name", kind.removesuffix("_call")),
@@ -763,7 +457,10 @@ def _native(role: MessageRole, item: JsonValue) -> TagMessage | None:
         "arguments": readable,
     }
     calls = _tool_calls([call])
-    return TagMessage(role="assistant", tool_calls=calls) if calls else None
+    if not calls:
+        return None
+    markers = tuple(TagImagePart() for _ in range(images))
+    return TagMessage(role="assistant", content=markers or None, tool_calls=calls)
 
 
 def _sole(fields: JsonObject, names: tuple[str, ...]) -> JsonValue:
@@ -916,7 +613,6 @@ def _tool_calls(value: JsonValue) -> tuple[TagToolCall, ...]:
 
 __all__ = [
     "TagExchangeError",
-    "completed_response",
     "exchange_from_capture_parts",
     "exchange_from_capture_record",
     "exchange_from_captured",
