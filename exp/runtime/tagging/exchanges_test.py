@@ -1489,3 +1489,55 @@ def test_custom_tool_payloads_keep_fields_named_like_opaque_native_fields() -> N
     exchange = exchange_from_capture_record(record)
     assert exchange.messages[1].tool_calls[0].function.arguments == payload
     assert exchange.messages[2].text() == payload
+
+
+def test_caller_sent_native_results_keep_every_field() -> None:
+    """A structured custom tool output the caller sent keeps fields named like opaque ones."""
+    request = decode_responses(
+        {
+            "model": "coding",
+            "input": [
+                {"role": "user", "content": "Verify the signed payload"},
+                {"type": "custom_tool_call", "call_id": "c1", "name": "verify", "input": "x"},
+                {
+                    "type": "custom_tool_call_output",
+                    "call_id": "c1",
+                    "output": {"signature": "0xab", "ok": False},
+                },
+            ],
+        }
+    ).request
+    record = _record("responses", request, {"kind": "json", "status": 200, "body": RESPONSES_BODY})
+    exchange = exchange_from_capture_record(record)
+    assert json.loads(exchange.messages[2].text()) == {"signature": "0xab", "ok": False}
+
+
+def test_blob_fields_outside_mcp_resources_stay_readable() -> None:
+    """Only an MCP blob resource (uri plus blob) becomes a binary marker."""
+    exchange = exchange_from_capture_parts(
+        exchange_id="request-16",
+        protocol="chat_completions",
+        messages=[
+            {"role": "user", "content": "Fetch it"},
+            {"role": "tool", "tool_call_id": "b1", "content": '{"blob":"a1","error":"not found"}'},
+        ],
+        request=None,
+        response={"kind": "json", "status": 200, "body": CHAT_BODY},
+    )
+    assert exchange.messages[1].text() == '{"blob":"a1","error":"not found"}'
+
+
+def test_deeply_nested_tool_payloads_are_rejected_with_a_reason() -> None:
+    """A payload nested past the projection's depth is a TagExchangeError, not a crash."""
+    nested = "[" * 1000 + "0" + "]" * 1000
+    with pytest.raises(TagExchangeError, match="nests too deeply"):
+        exchange_from_capture_parts(
+            exchange_id="request-17",
+            protocol="chat_completions",
+            messages=[
+                {"role": "user", "content": "Read it"},
+                {"role": "tool", "tool_call_id": "d1", "content": nested},
+            ],
+            request=None,
+            response={"kind": "json", "status": 200, "body": CHAT_BODY},
+        )

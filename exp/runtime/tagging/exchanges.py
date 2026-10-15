@@ -87,7 +87,8 @@ def exchange_from_captured(experience: CapturedExchange) -> TagExchange:
         The exchange.
 
     Raises:
-        TagExchangeError: The capture lacks its effective request or a complete response.
+        TagExchangeError: The capture lacks its effective request or a complete response, or
+            a payload nests too deeply to read.
     """
     try:
         context = experience.request.get("exp_context")
@@ -111,6 +112,10 @@ def exchange_from_captured(experience: CapturedExchange) -> TagExchange:
         raise TagExchangeError(
             f"capture {experience.experience_id} cannot be tagged: {exc}. Collect fresh traffic "
             "with capture enabled."
+        ) from exc
+    except RecursionError as exc:
+        raise TagExchangeError(
+            f"capture {experience.experience_id} cannot be tagged: a payload nests too deeply"
         ) from exc
 
 
@@ -146,7 +151,8 @@ def exchange_from_capture_parts(
         The exchange.
 
     Raises:
-        TagExchangeError: The response failed or is incomplete, or no message can be read.
+        TagExchangeError: The response failed or is incomplete, no message can be read, or a
+            payload nests too deeply to read.
     """
     try:
         return _from_parts(
@@ -161,6 +167,10 @@ def exchange_from_capture_parts(
         )
     except ValueError as exc:
         raise TagExchangeError(f"capture {exchange_id} cannot be tagged: {exc}") from exc
+    except RecursionError as exc:
+        raise TagExchangeError(
+            f"capture {exchange_id} cannot be tagged: a payload nests too deeply"
+        ) from exc
 
 
 def exchange_from_capture_record(
@@ -536,8 +546,9 @@ def _native(role: MessageRole, item: JsonValue) -> TagMessage | None:
     Items are read by shape, not by name. Cited text keeps its text. A result item (role
     ``tool``, or a type ending in ``_output`` or ``_result``) becomes a tool result, and any
     other assistant item except reasoning becomes a tool call named after the item. Both carry
-    every readable field (outputs, errors, failed statuses, executed code), while encrypted
-    fields, signatures and binary payloads are dropped and images become markers.
+    every readable field (outputs, errors, failed statuses, executed code), while binary
+    payloads are dropped, images become markers, and items the provider produced also drop
+    their encrypted text fields and signatures.
 
     Args:
         role: The carrying message's role.
@@ -561,7 +572,9 @@ def _native(role: MessageRole, item: JsonValue) -> TagMessage | None:
         if key not in _IDENTITY_FIELDS and not (key == "status" and field == "completed")
     }
     if role == "tool" or kind.endswith(("_output", "_result")):
-        readable, images = _readable(_sole(fields, ("output", "content")), native=True)
+        # A result the caller sent is its own payload; only provider results carry opaque text.
+        provider = role == "assistant"
+        readable, images = _readable(_sole(fields, ("output", "content")), native=provider)
         text = readable if isinstance(readable, str) else _compact_json(readable)
         return TagMessage(
             role="tool",
@@ -643,8 +656,8 @@ def _readable(value: JsonValue, *, native: bool = False) -> tuple[JsonValue, int
         return "[image]", 1
     if value.get("type") == "audio" and "data" in value:
         return "[audio]", 0
-    if isinstance(value.get("blob"), str):
-        # An embedded MCP resource carries its bytes in blob.
+    if isinstance(value.get("blob"), str) and isinstance(value.get("uri"), str):
+        # An embedded MCP blob resource carries its bytes in blob beside its uri.
         image = str(value.get("mimeType", "")).startswith("image/")
         return ("[image]", 1) if image else ("[binary]", 0)
     if value.get("type") == "base64":
