@@ -37,6 +37,7 @@ TOOL_DESCRIPTION_CHARS = 160
 
 _MARKER = "\n[... {omitted} characters omitted ...]\n"
 _BLANK_RUNS = re.compile(r"\n{3,}")
+_SURROGATE = re.compile("[\ud800-\udfff]")
 
 
 class TagWindowBudget(ContractModel):
@@ -132,7 +133,7 @@ def clip_text(text: str, limit: int) -> str:
     marker_bound = len(_MARKER.format(omitted=len(text)))
     keep = limit - marker_bound
     if keep <= 0:
-        return text[:limit]
+        return text[: max(limit, 0)]
     tail = keep // 2
     head = keep - tail
     omitted = len(text) - head - tail
@@ -158,25 +159,14 @@ def _arguments(text: str) -> str:
         text: Arguments as emitted.
 
     Returns:
-        Compact JSON, or the compacted original text when it is not JSON.
+        Compact JSON, or the compacted original text when it is not JSON, nests too deeply to
+        parse, or escapes a lone surrogate that cannot appear in rendered text.
     """
     try:
-        value = json.loads(text)
-    except ValueError:
+        compact = json.dumps(json.loads(text), ensure_ascii=False, separators=(",", ":"))
+    except (ValueError, RecursionError):
         return _compact(text)
-    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
-
-
-def tool_names(messages: Sequence[TagMessage]) -> dict[str, str]:
-    """Map each tool call id to the name of the tool it called.
-
-    Args:
-        messages: Every message of the exchange, so results can name calls made earlier.
-
-    Returns:
-        Tool names by call id.
-    """
-    return {call.id: call.function.name for message in messages for call in message.tool_calls}
+    return _compact(text) if _SURROGATE.search(compact) else compact
 
 
 def render_message(message: TagMessage, names: Mapping[str, str]) -> str:
@@ -202,6 +192,26 @@ def render_message(message: TagMessage, names: Mapping[str, str]) -> str:
         for call in message.tool_calls
     )
     return "\n".join(lines)
+
+
+def _render_all(messages: Sequence[TagMessage]) -> list[str]:
+    """Render messages in order, naming each tool result after the latest earlier call.
+
+    Resolving names in message order keeps a later call that reuses a call id from relabeling
+    an earlier result.
+
+    Args:
+        messages: Messages in position order, starting at position 0.
+
+    Returns:
+        One rendered block per message.
+    """
+    names: dict[str, str] = {}
+    blocks: list[str] = []
+    for message in messages:
+        blocks.append(render_message(message, names))
+        names.update((call.id, call.function.name) for call in message.tool_calls)
+    return blocks
 
 
 def _tool_lines(tools: Sequence[TagTool]) -> str:
@@ -235,7 +245,7 @@ def _fit(blocks: list[str], budget: int) -> list[str]:
     Returns:
         Blocks in their original order whose newline-joined length fits the budget.
     """
-    available = budget - (len(blocks) - 1)
+    available = max(budget - (len(blocks) - 1), 0)
     if sum(len(block) for block in blocks) <= available:
         return blocks
     remaining = available
@@ -284,8 +294,7 @@ def opening_window(exchange: TagExchange, budget: TagWindowBudget | None = None)
     budget = budget or TagWindowBudget()
     first = first_user_index(exchange.messages)
     end = first + 1 if first is not None else max(_leading_instructions(exchange.messages), 1)
-    names = tool_names(exchange.all_messages())
-    blocks = [render_message(message, names) for message in exchange.messages[:end]]
+    blocks = _render_all(exchange.messages[:end])
     if exchange.tools:
         blocks.insert(
             len(blocks) - 1 if first is not None else len(blocks), _tool_lines(exchange.tools)
@@ -295,7 +304,8 @@ def opening_window(exchange: TagExchange, budget: TagWindowBudget | None = None)
         index=0,
         start_message=0,
         end_message=end,
-        text="\n".join(_fit(blocks, budget.window_chars)),
+        # Many tiny blocks can leave no room even for their separators; clip the joined text.
+        text=clip_text("\n".join(_fit(blocks, budget.window_chars)), budget.window_chars),
     )
 
 
@@ -352,13 +362,9 @@ def turn_windows(
     """
     budget = budget or TagWindowBudget()
     start = turn_start(exchange)
-    names = tool_names(exchange.all_messages())
     header = _task_header(exchange, budget.header_chars)
     body = budget.window_chars - len(header) - 1
-    blocks = [
-        clip_text(render_message(message, names), body)
-        for message in exchange.all_messages()[start:]
-    ]
+    blocks = [clip_text(block, body) for block in _render_all(exchange.all_messages())[start:]]
     windows: list[TagWindow] = []
     first = 0
     while True:
@@ -398,7 +404,6 @@ __all__ = [
     "clip_text",
     "opening_window",
     "render_message",
-    "tool_names",
     "turn_start",
     "turn_windows",
 ]
