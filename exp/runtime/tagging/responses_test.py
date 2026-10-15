@@ -210,3 +210,20 @@ def test_custom_call_repair_keeps_text_in_the_same_delta() -> None:
     assert isinstance(choices, list) and isinstance(choices[0], dict)
     message = choices[0]["message"]
     assert isinstance(message, dict) and message["content"] == "Patched."
+
+
+@pytest.mark.parametrize("index", [-1, True, 2**64], ids=["negative", "boolean", "too-large"])
+def test_chat_stream_with_an_index_the_assembler_rejects_is_rejected(index: JsonValue) -> None:
+    """Choice indexes outside unsigned 64-bit range fail as they do in the assembler.
+
+    Args:
+        index: An invalid choice index.
+    """
+    late: JsonObject = {"choices": [{"index": index, "delta": {"content": "more"}}]}
+    frames: list[JsonValue] = [
+        _chunk({"role": "assistant", "content": "done"}, "stop"),
+        late,
+        "[DONE]",
+    ]
+    with pytest.raises(ValueError, match="terminal state"):
+        completed_response("chat_completions", _sse(frames))

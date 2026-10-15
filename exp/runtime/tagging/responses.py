@@ -12,7 +12,7 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import Sequence
-from typing import Final
+from typing import Final, TypeGuard
 
 from exp_gateway_native import CaptureResponse
 from pydantic import JsonValue
@@ -192,7 +192,7 @@ def _chat_valid(frames: Sequence[JsonValue]) -> bool:
         if not isinstance(chunk, dict) or not isinstance(chunk.get("choices"), list):
             return False
         for choice in _list_of(chunk.get("choices")):
-            if not isinstance(choice, dict) or not isinstance(index := choice.get("index"), int):
+            if not isinstance(choice, dict) or not _u64(index := choice.get("index")):
                 return False
             delta = choice.get("delta")
             for key, value in delta.items() if isinstance(delta, dict) else ():
@@ -218,7 +218,7 @@ def _tool_deltas_valid(merged: dict[str, JsonValue], choice: int, value: JsonVal
     if not isinstance(value, list):
         return False
     for call in value:
-        if not isinstance(call, dict) or not isinstance(index := call.get("index"), int):
+        if not isinstance(call, dict) or not _u64(index := call.get("index")):
             return False
         for key, field in call.items():
             path = f"{choice}/tool/{index}/{key}"
@@ -232,6 +232,11 @@ def _tool_deltas_valid(merged: dict[str, JsonValue], choice: int, value: JsonVal
             elif not _merges(merged, path, field):
                 return False
     return True
+
+
+def _u64(value: JsonValue) -> TypeGuard[int]:
+    """Report whether a stream index is an unsigned 64-bit integer, as the assembler requires."""
+    return isinstance(value, int) and not isinstance(value, bool) and 0 <= value < 2**64
 
 
 def _merges(merged: dict[str, JsonValue], path: str, value: JsonValue) -> bool:

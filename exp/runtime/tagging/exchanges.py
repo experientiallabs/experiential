@@ -232,9 +232,13 @@ def _from_parts(
         ValueError: The provider context does not match the messages, the response has no
             output, or no request message can be read.
     """
+    limits = capture_context.get("capture_limits", envelope.get("capture_limits"))
+    dropped = isinstance(limits, dict) and bool(limits.get("messages_dropped"))
+    # A capture that replaced its oversized history with one marker keeps replay entries
+    # indexed to the original messages; they no longer apply.
     canonical = restore_provider_context(
         [copy.deepcopy(message) for message in messages if isinstance(message, dict)],
-        capture_context.get("provider_context"),
+        None if dropped else capture_context.get("provider_context"),
     )
     request_turns = tuple(turn for turn in map(_message, canonical) if turn is not None)
     if not request_turns:

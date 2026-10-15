@@ -1239,6 +1239,33 @@ def test_namespaced_tool_results_keep_their_namespace() -> None:
     assert exchange.messages[1].name == "files.read"
 
 
+def test_dropped_history_ignores_replay_entries_for_the_original_messages() -> None:
+    """A capture whose history was replaced by a marker still tags with its marker."""
+    exchange = exchange_from_capture_parts(
+        exchange_id="request-9",
+        protocol="chat_completions",
+        messages=[{"role": "system", "truncated": True, "content": "[1101 messages not captured]"}],
+        request=None,
+        response={"kind": "json", "status": 200, "body": CHAT_BODY},
+        capture_context={
+            "provider_context": {
+                "provider_replay": [{"message_index": 1100, "tool_is_error": True}]
+            },
+            "capture_limits": {"messages_truncated": True, "messages_dropped": 1101},
+        },
+    )
+    assert exchange.messages[0].text() == "[1101 messages not captured]"
+    with pytest.raises(TagExchangeError, match="invalid provider message index"):
+        exchange_from_capture_parts(
+            exchange_id="request-9",
+            protocol="chat_completions",
+            messages=[{"role": "user", "content": "go"}],
+            request=None,
+            response={"kind": "json", "status": 200, "body": CHAT_BODY},
+            capture_context={"provider_context": {"provider_replay": [{"message_index": 5}]}},
+        )
+
+
 def test_record_without_a_response_is_rejected() -> None:
     """A prompt checkpoint with no response yet cannot be tagged."""
     record = _record(
