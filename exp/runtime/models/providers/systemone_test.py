@@ -22,10 +22,6 @@ from exp.runtime.gateway.decisions_contracts import (
     NoulQuestion,
     ScoreQuestion,
 )
-from exp.runtime.models.providers.async_transport import (
-    HttpxAsyncJsonTransport,
-    ScriptedAsyncJsonTransport,
-)
 from exp.runtime.models.providers.systemone import (
     ChoiceAnswer,
     DecisionResult,
@@ -37,11 +33,7 @@ from exp.runtime.models.providers.systemone import (
     SystemOneResponseError,
     SystemOneTimeoutError,
 )
-from exp.runtime.models.providers.transport import (
-    JsonHttpResponse,
-    ProviderTransportError,
-    RetryPolicy,
-)
+from exp.runtime.models.providers.transport import RetryPolicy
 from exp.runtime.models.providers.typesafe import TYPESAFE_BASE_URL, TypeSafeClient
 
 _BASE_URL = "http://127.0.0.1:30000/v1"
@@ -100,16 +92,39 @@ def _mixed_body() -> JsonObject:
     }
 
 
+def _ok(body: JsonObject) -> httpx.Response:
+    """Return a 200 response whose bytes are the body's JSON, NaN literals included."""
+    return httpx.Response(200, content=json.dumps(body).encode())
+
+
+def _replay(*answers: httpx.Response | Exception) -> tuple[httpx.AsyncClient, list[httpx.Request]]:
+    """Return an HTTPX client that serves answers in order and records every request."""
+    pending = list(answers)
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        """Serve the next answer, failing the test on an unexpected request."""
+        seen.append(request)
+        if not pending:
+            raise AssertionError("test made an unexpected SystemOne request")
+        answer = pending.pop(0)
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
+
+    return httpx.AsyncClient(transport=httpx.MockTransport(handler)), seen
+
+
 def _client(
-    transport: ScriptedAsyncJsonTransport, *, retry_policy: RetryPolicy = _ONE_ATTEMPT
+    http_client: httpx.AsyncClient, *, retry_policy: RetryPolicy = _ONE_ATTEMPT
 ) -> SystemOneClient:
-    """Build an authenticated loopback client over a scripted transport."""
+    """Build an authenticated loopback client over a mock HTTPX client."""
     return SystemOneClient(
         _BASE_URL,
         "clef-27b",
         api_key=SecretStr("secret-canary"),
         retry_policy=retry_policy,
-        transport=transport,
+        http_client=http_client,
     )
 
 
@@ -119,14 +134,11 @@ def _decide(client: SystemOneClient, questions: Mapping[str, SystemOneQuestion])
 
 
 def _answered(
-    questions: Mapping[str, SystemOneQuestion],
-    body: JsonObject,
-    *,
-    retry_policy: RetryPolicy = _ONE_ATTEMPT,
+    questions: Mapping[str, SystemOneQuestion], response: httpx.Response
 ) -> DecisionResult:
-    """Decide against a transport scripted with one successful body."""
-    transport = ScriptedAsyncJsonTransport([JsonHttpResponse(200, body)])
-    return _decide(_client(transport, retry_policy=retry_policy), questions)
+    """Decide against an endpoint that answers once with the given response."""
+    http_client, _ = _replay(response)
+    return _decide(_client(http_client), questions)
 
 
 def _set(body: JsonObject, path: tuple[str, ...], value: JsonValue) -> JsonObject:
@@ -145,33 +157,19 @@ def _accepts(question: SystemOneQuestion, answer: JsonObject) -> bool:
     """Return whether the client accepts one answer to a single-question request."""
     usage: JsonObject = {"input_tokens": 1, "output_tokens": 1}
     try:
-        _answered({"q": question}, {"model": "m", "answers": {"q": answer}, "usage": usage})
+        _answered({"q": question}, _ok({"model": "m", "answers": {"q": answer}, "usage": usage}))
     except SystemOneResponseError:
         return False
     return True
 
 
 def test_decide_posts_the_exact_wire_body_and_returns_probabilities() -> None:
-    """A real HTTPX request carries only model, state, and questions plus bearer auth."""
-    seen: list[httpx.Request] = []
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        """Record the request and answer like a SystemOne server."""
-        seen.append(request)
-        return httpx.Response(200, json=_noul_body())
-
-    async def scenario() -> DecisionResult:
-        """Drive the production HTTPX transport with no network."""
-        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
-            client = SystemOneClient(
-                f"{_BASE_URL}/",
-                "clef-27b",
-                api_key=SecretStr("secret-canary"),
-                transport=HttpxAsyncJsonTransport(http),
-            )
-            return await client.decide(_STATE, _NOUL_QUESTIONS)
-
-    assert asyncio.run(scenario()) == DecisionResult(
+    """The request carries only model, state, and questions plus bearer auth."""
+    http_client, seen = _replay(_ok(_noul_body()))
+    client = SystemOneClient(
+        f"{_BASE_URL}/", "clef-27b", api_key=SecretStr("secret-canary"), http_client=http_client
+    )
+    assert _decide(client, _NOUL_QUESTIONS) == DecisionResult(
         served_model="clef-27b",
         noul={"coding": 0.93, "refused": 0.02},
         choice={},
@@ -208,14 +206,15 @@ def test_endpoint_roots_share_the_systemone_route_and_optional_auth() -> None:
     assert SystemOneClient(TYPESAFE_BASE_URL, "systemone").url == profile.decisions_url
     gateway = SystemOneClient("http://localhost:8080/v1/", "tagger")
     assert gateway.url == "http://localhost:8080/v1/systemone"
-    transport = ScriptedAsyncJsonTransport([JsonHttpResponse(200, _noul_body())])
-    _decide(SystemOneClient("http://10.0.0.5:30000/v1", "m", transport=transport), _NOUL_QUESTIONS)
-    assert transport.requests[0].headers == {"Content-Type": "application/json"}
+    http_client, seen = _replay(_ok(_noul_body()))
+    unauthenticated = SystemOneClient("http://10.0.0.5:30000/v1", "m", http_client=http_client)
+    _decide(unauthenticated, _NOUL_QUESTIONS)
+    assert "authorization" not in seen[0].headers
 
 
 def test_choice_and_score_answers_are_returned_typed() -> None:
     """A rounded near tie and a rounded weighted score pass exactly as the gateway allows."""
-    result = _answered(_MIXED_QUESTIONS, _mixed_body())
+    result = _answered(_MIXED_QUESTIONS, _ok(_mixed_body()))
     assert (result.served_model, result.noul) == ("jev-1.13.0", {"coding": 1.0})
     assert result.choice["department"] == ChoiceAnswer(
         choice="technical",
@@ -233,6 +232,9 @@ def test_choice_and_score_answers_are_returned_typed() -> None:
         (("answers", "coding", "noul"), 1.2, "'coding' noul must be a finite number"),
         (("answers", "coding", "noul"), True, "'coding' noul must be a finite number"),
         (("answers", "coding", "noul"), "0.9", "'coding' noul must be a finite number"),
+        (("answers", "coding", "noul"), 10**400, "'coding' noul must be a finite number"),
+        (("answers", "coding", "noul"), float("nan"), "without one strict JSON object"),
+        (("usage", "extra"), float("inf"), "without one strict JSON object"),
         (("answers", "coding", "type"), "choice", "'coding' is not a noul answer"),
         (("answers", "coding"), 0.9, "'coding' is not a noul answer"),
         (
@@ -247,7 +249,8 @@ def test_choice_and_score_answers_are_returned_typed() -> None:
         ),
         (("answers", "department", "choice"), "marketing", "not a requested category"),
         (("answers", "department", "confidence"), 2.0, "confidence must be a finite"),
-        (("answers", "quantity", "score"), float("nan"), "score is not finite numeric"),
+        (("answers", "quantity", "score"), "1.0", "score is not numeric data"),
+        (("answers", "quantity", "score"), 10**400, "score does not match"),
         (("answers", "quantity", "legend"), {"0": "None"}, "legend does not match"),
         (("usage",), {"input_tokens": 0, "output_tokens": 0}, "usage reports no tokens"),
         (("usage",), {"input_tokens": 1.0, "output_tokens": 2}, "usage.input_tokens is not"),
@@ -261,8 +264,24 @@ def test_malformed_answers_raise_typed_errors(
 ) -> None:
     """Every answer check fails loudly with a fix instead of yielding a default."""
     with pytest.raises(SystemOneResponseError, match=reason) as raised:
-        _answered(_MIXED_QUESTIONS, _set(_mixed_body(), path, value))
+        _answered(_MIXED_QUESTIONS, _ok(_set(_mixed_body(), path, value)))
     assert "check that base_url points at a SystemOne server" in str(raised.value)
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        b'{"model": "m", "answers": {"coding": {"type": "noul", "noul": 0.1}, '
+        b'"coding": {"type": "noul", "noul": 0.9}}, "usage": {"input_tokens": 1}}',
+        b'{"model": "m", "model": "n", "answers": {}, "usage": {}}',
+        b"[" * 100_000 + b"]" * 100_000,
+        b"not json",
+    ],
+)
+def test_responses_must_be_strict_json(content: bytes) -> None:
+    """Duplicate keys and undecodable bodies are rejected as the gateway rejects them."""
+    with pytest.raises(SystemOneResponseError, match="duplicate keys, or NaN"):
+        _answered(_NOUL_QUESTIONS, httpx.Response(200, content=content))
 
 
 @pytest.mark.parametrize(
@@ -343,6 +362,22 @@ def test_score_validation_matches_the_gateway_vectors(
     assert _accepts(ScoreQuestion(instructions="Rate", criteria=levels), answer) is valid
 
 
+def test_structured_score_legends_compare_as_strict_json() -> None:
+    """A legend that turns true into 1 is a different legend, as the gateway decides."""
+    question = ScoreQuestion(
+        instructions="Approved?", criteria=({"approved": True}, {"approved": False})
+    )
+    answer: JsonObject = {
+        "type": "score",
+        "score": 0.9,
+        "confidence": 0.9,
+        "legend": {"0": {"approved": True}, "1": {"approved": False}},
+        "probabilities": {"0": 0.1, "1": 0.9},
+    }
+    assert _accepts(question, answer)
+    assert not _accepts(question, _set(answer, ("legend", "0", "approved"), 1))
+
+
 @pytest.mark.parametrize(
     ("answers", "reason"),
     [
@@ -360,7 +395,7 @@ def test_score_validation_matches_the_gateway_vectors(
 def test_missing_and_extra_answers_are_rejected(answers: JsonObject, reason: str) -> None:
     """The response must answer exactly the questions that were asked."""
     with pytest.raises(SystemOneResponseError, match=reason):
-        _answered(_NOUL_QUESTIONS, _set(_noul_body(), ("answers",), answers))
+        _answered(_NOUL_QUESTIONS, _ok(_set(_noul_body(), ("answers",), answers)))
 
 
 @pytest.mark.parametrize(
@@ -369,61 +404,51 @@ def test_missing_and_extra_answers_are_rejected(answers: JsonObject, reason: str
 )
 def test_http_client_errors_are_typed_and_never_retried(status: int, hint: str) -> None:
     """A 4xx raises once with its status and a fix, even with retries enabled."""
-    transport = ScriptedAsyncJsonTransport([JsonHttpResponse(status, {"error": "state-canary"})])
+    http_client, seen = _replay(httpx.Response(status, json={"error": "state-canary"}))
     with pytest.raises(SystemOneHttpError, match=hint) as raised:
-        _decide(_client(transport, retry_policy=_RETRY_THREE), _NOUL_QUESTIONS)
+        _decide(_client(http_client, retry_policy=_RETRY_THREE), _NOUL_QUESTIONS)
     assert raised.value.status_code == status
-    assert len(transport.requests) == 1
+    assert len(seen) == 1
     assert "secret-canary" not in str(raised.value)
     assert "state-canary" not in str(raised.value)
 
 
 def test_server_and_connection_failures_retry_only_under_an_explicit_policy() -> None:
     """HTTP 5xx and refused connections are terminal by default and bounded when allowed."""
+    http_client, _ = _replay(httpx.Response(503, json={}))
     with pytest.raises(SystemOneHttpError, match="pass a retry_policy") as raised:
-        _decide(_client(ScriptedAsyncJsonTransport([JsonHttpResponse(503, {})])), _NOUL_QUESTIONS)
+        _decide(_client(http_client), _NOUL_QUESTIONS)
     assert raised.value.status_code == 503
-    refused = ProviderTransportError("provider connection failed (ConnectError)")
+    http_client, _ = _replay(httpx.ConnectError("refused"))
     with pytest.raises(SystemOneConnectionError, match="check that the server is running"):
-        _decide(_client(ScriptedAsyncJsonTransport([refused])), _NOUL_QUESTIONS)
-    recovering = ScriptedAsyncJsonTransport(
-        [JsonHttpResponse(503, {}), refused, JsonHttpResponse(200, _noul_body())]
+        _decide(_client(http_client), _NOUL_QUESTIONS)
+    http_client, seen = _replay(
+        httpx.Response(503, json={}), httpx.ConnectError("refused"), _ok(_noul_body())
     )
-    result = _decide(_client(recovering, retry_policy=_RETRY_THREE), _NOUL_QUESTIONS)
-    assert (result.noul["coding"], len(recovering.requests)) == (0.93, 3)
-    failing = ScriptedAsyncJsonTransport([JsonHttpResponse(500, {})] * 3)
+    result = _decide(_client(http_client, retry_policy=_RETRY_THREE), _NOUL_QUESTIONS)
+    assert (result.noul["coding"], len(seen)) == (0.93, 3)
+    http_client, _ = _replay(*(httpx.Response(500, json={}) for _ in range(3)))
     with pytest.raises(SystemOneHttpError, match="HTTP 500 after 3 attempts"):
-        _decide(_client(failing, retry_policy=_RETRY_THREE), _NOUL_QUESTIONS)
+        _decide(_client(http_client, retry_policy=_RETRY_THREE), _NOUL_QUESTIONS)
 
 
 def test_timeouts_are_typed_and_never_retried() -> None:
     """A slow endpoint and an HTTPX read timeout both raise SystemOneTimeoutError once."""
 
-    class SlowTransport(ScriptedAsyncJsonTransport):
-        """Transport whose POST outlives any short client timeout."""
+    async def slow(request: httpx.Request) -> httpx.Response:
+        """Answer only after the client deadline has passed."""
+        del request
+        await asyncio.sleep(10)
+        raise AssertionError("the client timeout should have fired")
 
-        async def post(
-            self,
-            url: str,
-            *,
-            headers: Mapping[str, str],
-            payload: JsonObject,
-            timeout_seconds: float,
-        ) -> JsonHttpResponse:
-            """Sleep past the client deadline; reaching the end is a test failure."""
-            del url, headers, payload, timeout_seconds
-            await asyncio.sleep(10)
-            raise AssertionError("the client timeout should have fired")
-
-    slow = SystemOneClient(_BASE_URL, "clef-27b", timeout=0.05, transport=SlowTransport())
+    slow_client = httpx.AsyncClient(transport=httpx.MockTransport(slow))
+    client = SystemOneClient(_BASE_URL, "clef-27b", timeout=0.05, http_client=slow_client)
     with pytest.raises(SystemOneTimeoutError, match="did not finish within 0.05s"):
-        _decide(slow, _NOUL_QUESTIONS)
-    read_timeout = ProviderTransportError("provider request timed out")
-    read_timeout.__cause__ = httpx.ReadTimeout("timed out")
-    transport = ScriptedAsyncJsonTransport([read_timeout])
+        _decide(client, _NOUL_QUESTIONS)
+    http_client, seen = _replay(httpx.ReadTimeout("timed out"))
     with pytest.raises(SystemOneTimeoutError, match="raise timeout"):
-        _decide(_client(transport, retry_policy=_RETRY_THREE), _NOUL_QUESTIONS)
-    assert len(transport.requests) == 1
+        _decide(_client(http_client, retry_policy=_RETRY_THREE), _NOUL_QUESTIONS)
+    assert len(seen) == 1
 
 
 def test_max_concurrency_bounds_requests_in_flight() -> None:
@@ -431,27 +456,18 @@ def test_max_concurrency_bounds_requests_in_flight() -> None:
     in_flight = 0
     peak = 0
 
-    class GatedTransport(ScriptedAsyncJsonTransport):
-        """Transport that measures overlapping POSTs."""
+    async def gated(request: httpx.Request) -> httpx.Response:
+        """Hold each request open briefly while counting overlap."""
+        del request
+        nonlocal in_flight, peak
+        in_flight += 1
+        peak = max(peak, in_flight)
+        await asyncio.sleep(0.01)
+        in_flight -= 1
+        return _ok(_noul_body())
 
-        async def post(
-            self,
-            url: str,
-            *,
-            headers: Mapping[str, str],
-            payload: JsonObject,
-            timeout_seconds: float,
-        ) -> JsonHttpResponse:
-            """Hold each request open briefly while counting overlap."""
-            del url, headers, payload, timeout_seconds
-            nonlocal in_flight, peak
-            in_flight += 1
-            peak = max(peak, in_flight)
-            await asyncio.sleep(0.01)
-            in_flight -= 1
-            return JsonHttpResponse(200, _noul_body())
-
-    client = SystemOneClient(_BASE_URL, "clef-27b", max_concurrency=3, transport=GatedTransport())
+    http_client = httpx.AsyncClient(transport=httpx.MockTransport(gated))
+    client = SystemOneClient(_BASE_URL, "m", max_concurrency=3, http_client=http_client)
 
     async def scenario() -> list[DecisionResult]:
         """Start every decision at once."""
@@ -463,7 +479,8 @@ def test_max_concurrency_bounds_requests_in_flight() -> None:
 
 def test_invalid_requests_fail_before_any_network_work() -> None:
     """Question counts and request size are enforced locally without echoing content."""
-    client = _client(ScriptedAsyncJsonTransport())
+    http_client, seen = _replay()
+    client = _client(http_client)
     too_many = {f"q{index}": NoulQuestion(instructions="?") for index in range(33)}
     for questions in ({}, too_many):
         with pytest.raises(SystemOneRequestError, match="send 1 through 32 questions"):
@@ -473,9 +490,10 @@ def test_invalid_requests_fail_before_any_network_work() -> None:
     assert "xxxx" not in str(raised.value)
     contract = DecisionRequest(state="", questions=_NOUL_QUESTIONS).model_dump(mode="json")
     state = "x" * (MAX_DECISION_INPUT_BYTES - len(json.dumps(contract).encode()))
-    long_model = SystemOneClient(_BASE_URL, "m" * 500, transport=ScriptedAsyncJsonTransport())
+    long_model = SystemOneClient(_BASE_URL, "m" * 500, http_client=http_client)
     with pytest.raises(SystemOneRequestError, match="send a shorter state"):
         asyncio.run(long_model.decide(state, _NOUL_QUESTIONS))
+    assert seen == []
 
 
 @pytest.mark.parametrize(

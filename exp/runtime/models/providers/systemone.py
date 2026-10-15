@@ -9,11 +9,12 @@ one JSON ``POST {base_url}/systemone`` whose body is exactly ``{"model", "state"
 Experiential gateway's ``/v1/systemone`` route.
 
 Requests are validated with the gateway's decision contract before any network work.
-Answers are checked the way the gateway checks provider answers: every question answered
-exactly once with its own type, probabilities in ``[0, 1]`` that sum to one (allowing only
-the rounding envelope of hundredth-valued bins), a choice that can be the most probable
-category, and a score equal to its probability-weighted level. Any violation raises a typed
-error instead of producing a default value.
+Responses are decoded as strict JSON (no duplicate keys, NaN, or Infinity) and checked the
+way the gateway checks provider answers: every question answered exactly once with its type,
+probabilities in ``[0, 1]`` that sum to one (allowing only the rounding envelope of
+hundredth-valued bins), a choice that can be the most probable category, and a score equal
+to its probability-weighted level. Any violation raises a typed error instead of producing a
+default value.
 """
 
 from __future__ import annotations
@@ -40,7 +41,6 @@ from exp.runtime.gateway.decisions_contracts import (
     ScoreQuestion,
 )
 from exp.runtime.models.providers.async_transport import (
-    AsyncJsonHttpTransport,
     HttpxAsyncJsonTransport,
     RequestDeadline,
     run_with_retry_async,
@@ -178,7 +178,7 @@ class SystemOneClient:
         timeout: float = 60.0,
         max_concurrency: int = 8,
         retry_policy: RetryPolicy = _SINGLE_ATTEMPT,
-        transport: AsyncJsonHttpTransport | None = None,
+        http_client: httpx.AsyncClient | None = None,
     ) -> None:
         """Bind one endpoint without network work.
 
@@ -190,7 +190,8 @@ class SystemOneClient:
             max_concurrency: Maximum requests this client keeps in flight at once.
             retry_policy: Attempt bound for connection failures and HTTP 5xx. The default
                 makes one attempt; other failures are never retried.
-            transport: Async JSON transport; defaults to the shared pooled HTTPX client.
+            http_client: Caller-owned HTTPX client; defaults to the shared pooled client.
+                Responses are always decoded as strict JSON, like the gateway decodes them.
 
         Raises:
             ValueError: The URL, model, credential, timeout, or concurrency is unusable.
@@ -226,7 +227,7 @@ class SystemOneClient:
         self._timeout = timeout
         self._max_concurrency = max_concurrency
         self._retry_policy = retry_policy
-        self._transport = transport if transport is not None else HttpxAsyncJsonTransport()
+        self._transport = HttpxAsyncJsonTransport(http_client, json_loads=_strict_json)
         self._headers = {"Content-Type": "application/json"}
         if api_key is not None:
             self._headers["Authorization"] = f"Bearer {api_key.get_secret_value()}"
@@ -349,8 +350,9 @@ class SystemOneClient:
             )
         if 200 <= status < 300:
             return SystemOneResponseError(
-                f"SystemOne endpoint {self._url} returned HTTP {status} without a JSON object "
-                "body; check that base_url points at a SystemOne server"
+                f"SystemOne endpoint {self._url} returned HTTP {status} without one strict JSON "
+                "object (invalid JSON, duplicate keys, or NaN); check that base_url points at a "
+                "SystemOne server"
             )
         hint = _STATUS_HINTS.get(status) or (
             "the server failed; check its logs, or pass a retry_policy to retry server errors"
@@ -361,6 +363,28 @@ class SystemOneClient:
             f"SystemOne endpoint {self._url} returned HTTP {status}{tried}: {hint}",
             status_code=status,
         )
+
+
+def _strict_json(content: bytes) -> JsonValue:
+    """Decode a response like the gateway does: duplicate keys and NaN are ValueErrors."""
+
+    def unique(pairs: list[tuple[str, JsonValue]]) -> JsonObject:
+        """Refuse a repeated key instead of silently keeping its last value."""
+        result: JsonObject = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("duplicate JSON key")
+            result[key] = value
+        return result
+
+    def non_finite(constant: str) -> JsonValue:
+        """Refuse JSON's nonstandard NaN and Infinity literals."""
+        raise ValueError(f"non-finite JSON value {constant}")
+
+    try:
+        return json.loads(content, object_pairs_hook=unique, parse_constant=non_finite)
+    except RecursionError as error:
+        raise ValueError("JSON nesting exceeds the decoder limit") from error
 
 
 def _loopback(hostname: str) -> bool:
@@ -488,13 +512,14 @@ def _score_answer(answer: JsonObject, question: ScoreQuestion, where: str) -> Sc
     """Validate a score answer's legend, distribution, confidence, and weighted score."""
     criteria = list(question.criteria)
     legend: JsonObject = {str(index): level for index, level in enumerate(criteria)}
-    if answer.get("legend") != legend:
+    # Compare canonical JSON so true never equals 1 and 1 never equals 1.0, as on the gateway.
+    if json.dumps(answer.get("legend"), sort_keys=True) != json.dumps(legend, sort_keys=True):
         raise _MalformedAnswer(f"{where} legend does not match the requested criteria")
     probabilities = _distribution(answer.get("probabilities"), list(legend), where)
     confidence = _probability(answer.get("confidence"), f"{where} confidence")
     value = answer.get("score")
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
-        raise _MalformedAnswer(f"{where} score is not finite numeric data")
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise _MalformedAnswer(f"{where} score is not numeric data")
     if not 0 <= value <= len(criteria) - 1 or not _score_matches(float(value), probabilities):
         raise _MalformedAnswer(f"{where} score does not match its probability distribution")
     return ScoreAnswer(
@@ -519,13 +544,8 @@ def _usage(body: JsonObject) -> DecisionUsage:
 
 
 def _probability(value: JsonValue, what: str) -> float:
-    """Return a finite probability in ``[0, 1]``, rejecting booleans and text."""
-    if (
-        isinstance(value, bool)
-        or not isinstance(value, (int, float))
-        or not math.isfinite(value)
-        or not 0 <= value <= 1
-    ):
+    """Return a probability in ``[0, 1]``; the range check also rejects NaN and infinity."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0 <= value <= 1:
         raise _MalformedAnswer(f"{what} must be a finite number between 0 and 1")
     return float(value)
 
