@@ -10,6 +10,7 @@ newline is cut off before anything is appended, so its exchange is tagged again.
 
 from __future__ import annotations
 
+import itertools
 import logging
 import os
 from collections.abc import Iterator
@@ -153,9 +154,18 @@ async def tag_jsonl(
         How many exchanges were tagged, failed and skipped.
 
     Raises:
-        ValueError: An input or output line is invalid, or the output holds records from a
-            different bank. Records written before the error stay in the output.
+        ValueError: Two of the paths name the same file, an input or output line is invalid,
+            or the output holds records from a different bank. Records written before the
+            error stay in the output.
     """
+    for first, second in itertools.combinations((exchanges, output, failures), 2):
+        if first.resolve() == second.resolve() or (
+            first.exists() and second.exists() and first.samefile(second)
+        ):
+            raise ValueError(
+                f"{first} and {second} are the same file; pass distinct exchanges, output and "
+                "failures files"
+            )
     for path in (output, failures):
         _drop_unterminated_tail(path)
     done, opened = _completed(output, tagger.bank.digest)

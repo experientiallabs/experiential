@@ -101,12 +101,23 @@ def test_an_interrupted_last_line_is_dropped_and_tagged_again(tmp_path: Path) ->
 
 
 def test_invalid_lines_and_foreign_banks_stop_the_run(tmp_path: Path) -> None:
-    """Bad input names its line without echoing it; another bank's output is refused."""
+    """Bad input names its line without echoing it; aliased paths and other banks are refused."""
     (tmp_path / "exchanges.jsonl").write_text(_exchange("e1", "a") + '{"secret": "canary"}\n')
     with pytest.raises(ValueError, match=r"exchanges.jsonl:2 is not a valid TagExchange") as bad:
         _run(_tagger(set(), []), tmp_path)
     assert "canary" not in str(bad.value)
     assert [record.exchange_id for record in _records(tmp_path / "tags.jsonl")] == ["e1"]
+
+    source = tmp_path / "exchanges.jsonl"
+    before = source.read_bytes()
+    (tmp_path / "alias.jsonl").symlink_to(source)
+    with pytest.raises(ValueError, match="same file"):
+        asyncio.run(
+            tag_jsonl(
+                _tagger(set(), []), source, output=tmp_path / "o", failures=tmp_path / "alias.jsonl"
+            )
+        )
+    assert source.read_bytes() == before
 
     other = TagBank(bank_id="other", version=2, tags=DEFAULT_TAG_BANK.tags)
     client = _tagger(set(), []).client
