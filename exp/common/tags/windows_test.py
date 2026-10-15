@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 
 import pytest
 from pydantic import ValidationError
 
+from exp.common.tags import windows as windows_module
 from exp.common.tags.bank import TagScope
 from exp.common.tags.exchange import (
     TagExchange,
@@ -378,3 +380,31 @@ def test_opening_lists_tools_in_canonical_order() -> None:
     backward = forward.model_copy(update={"tools": tools[::-1]})
     assert opening_window(forward, SMALL).text == opening_window(backward, SMALL).text
     assert opening_key(forward) == opening_key(backward)
+
+
+def test_turn_windows_never_render_earlier_history(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Only the new slice is rendered; earlier messages only name their calls.
+
+    Args:
+        monkeypatch: Replaces the renderer to record which messages it renders.
+    """
+    rendered: list[TagMessage] = []
+    original = windows_module.render_message
+
+    def recording(message: TagMessage, names: Mapping[str, str]) -> str:
+        """Record and render one message.
+
+        Args:
+            message: Message to render.
+            names: Tool names by call id.
+
+        Returns:
+            The rendered message.
+        """
+        rendered.append(message)
+        return original(message, names)
+
+    monkeypatch.setattr(windows_module, "render_message", recording)
+    exchange = _agent_exchange(results=2)
+    turn_windows(exchange)
+    assert rendered == list(exchange.all_messages()[turn_start(exchange) :])

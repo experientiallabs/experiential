@@ -222,22 +222,25 @@ def render_message(message: TagMessage, names: Mapping[str, str]) -> str:
     return "\n".join(lines)
 
 
-def _render_all(messages: Sequence[TagMessage]) -> list[str]:
-    """Render messages in order, naming each tool result after the latest earlier call.
+def _render_all(messages: Sequence[TagMessage], start: int = 0) -> list[str]:
+    """Render messages from ``start``, naming each tool result after the latest earlier call.
 
+    Earlier messages only contribute call names, so long histories are never rendered.
     Resolving names in message order keeps a later call that reuses a call id from relabeling
     an earlier result.
 
     Args:
         messages: Messages in position order, starting at position 0.
+        start: First position to render.
 
     Returns:
-        One rendered block per message.
+        One rendered block per message from ``start`` on.
     """
     names: dict[str, str] = {}
     blocks: list[str] = []
-    for message in messages:
-        blocks.append(render_message(message, names))
+    for position, message in enumerate(messages):
+        if position >= start:
+            blocks.append(render_message(message, names))
         names.update((call.id, call.function.name) for call in message.tool_calls)
     return blocks
 
@@ -385,7 +388,7 @@ def turn_windows(
     start = turn_start(exchange)
     header = _task_header(exchange, budget.header_chars)
     body = budget.window_chars - len(header) - 1
-    blocks = [clip_text(block, body) for block in _render_all(exchange.all_messages())[start:]]
+    blocks = [clip_text(block, body) for block in _render_all(exchange.all_messages(), start)]
     windows: list[TagWindow] = []
     first = 0
     while True:
