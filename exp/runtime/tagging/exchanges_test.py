@@ -1123,6 +1123,36 @@ def test_gateway_searches_and_call_images_are_kept() -> None:
     assert chart.has_image() and chart.tool_calls[0].function.name == "code_interpreter"
 
 
+@pytest.mark.parametrize(
+    ("protocol", "body"),
+    [
+        (
+            "responses",
+            {
+                "status": "incomplete",
+                "incomplete_details": {"reason": "max_output_tokens"},
+                "output": [],
+            },
+        ),
+        ("messages", {"type": "message", "stop_reason": "max_tokens", "content": []}),
+    ],
+    ids=["responses", "messages"],
+)
+def test_empty_replies_at_the_length_limit_are_tagged(
+    protocol: CaptureProtocol, body: JsonObject
+) -> None:
+    """A reply that hit its limit before any output is an empty, truncated turn.
+
+    Args:
+        protocol: Public surface.
+        body: Terminal body with no output.
+    """
+    request = _responses_request() if protocol == "responses" else _messages_request()
+    exchange = exchange_from_captured(_experience(protocol, request, body))
+    assert exchange.response == (TagMessage(role="assistant"),)
+    assert tag_facts(exchange).truncated
+
+
 def test_record_without_a_response_is_rejected() -> None:
     """A prompt checkpoint with no response yet cannot be tagged."""
     record = _record(

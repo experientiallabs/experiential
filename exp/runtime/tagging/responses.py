@@ -153,7 +153,8 @@ def _lifecycle(protocol: CaptureProtocol, frames: Sequence[JsonValue]) -> bool:
         frames: Stored ``data`` payloads in order.
 
     Returns:
-        For Chat, every chunk carries choices that each name their index, the stream ends
+        For Chat, every chunk carries choices that each name their index (as does every tool
+        call delta), the stream ends
         with ``[DONE]`` and its first chunk names an id and a model. Messages streams replay
         the block lifecycle in ``_messages_lifecycle``.
     """
@@ -168,14 +169,30 @@ def _lifecycle(protocol: CaptureProtocol, frames: Sequence[JsonValue]) -> bool:
             and all(
                 isinstance(chunk, dict)
                 and isinstance(choices := chunk.get("choices"), list)
-                and all(
-                    isinstance(choice, dict) and isinstance(choice.get("index"), int)
-                    for choice in choices
-                )
+                and all(_chat_choice_valid(choice) for choice in choices)
                 for chunk in chunks
             )
         )
     return _messages_lifecycle(frames)
+
+
+def _chat_choice_valid(choice: JsonValue) -> bool:
+    """Report whether one streamed Chat choice is one the assembler can merge.
+
+    Args:
+        choice: One entry of a chunk's ``choices``.
+
+    Returns:
+        True when the choice names its index and every tool call delta names its own.
+    """
+    if not isinstance(choice, dict) or not isinstance(choice.get("index"), int):
+        return False
+    delta = choice.get("delta")
+    calls = delta.get("tool_calls") if isinstance(delta, dict) else None
+    return calls is None or (
+        isinstance(calls, list)
+        and all(isinstance(call, dict) and isinstance(call.get("index"), int) for call in calls)
+    )
 
 
 def _messages_lifecycle(frames: Sequence[JsonValue]) -> bool:

@@ -119,3 +119,21 @@ def test_chat_stream_with_an_unindexed_choice_is_rejected() -> None:
     }
     with pytest.raises(ValueError, match="terminal state"):
         completed_response("chat_completions", document)
+
+
+def test_chat_stream_with_an_unindexed_tool_delta_is_rejected() -> None:
+    """A tool call delta without its index fails the assembler and is not tagged."""
+    frames: list[JsonValue] = [
+        _chunk({"role": "assistant", "tool_calls": [{"id": "c1", "function": {"name": "f"}}]}),
+        _chunk({"content": "done"}, "stop"),
+        "[DONE]",
+    ]
+    document: JsonObject = {
+        "kind": "sse",
+        "status": 200,
+        "frames": frames,
+        "truncated": False,
+        "client_disconnected": False,
+    }
+    with pytest.raises(ValueError, match="terminal state"):
+        completed_response("chat_completions", document)

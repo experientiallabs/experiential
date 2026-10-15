@@ -240,7 +240,11 @@ def _from_parts(
     if not request_turns:
         raise ValueError("the request has no readable messages")
     readable, partial = readable_responses(body) if protocol == "responses" else (body, {})
-    output = output_messages(protocol, readable, capture_output)
+    # A reply that hit its limit before producing anything is a valid, empty terminal turn,
+    # which the output decoder would reject as missing output.
+    field = {"responses": "output", "messages": "content"}.get(protocol)
+    empty = field is not None and readable.get(field) == []
+    output = [] if empty else output_messages(protocol, readable, capture_output)
     for message in output:
         for call in _list(message.get("tool_calls")):
             if isinstance(call, dict) and isinstance(
