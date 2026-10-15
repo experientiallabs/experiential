@@ -2,12 +2,12 @@
 
 from exp.runtime.tagging.exchanges import (
     TagExchangeError,
-    completed_response,
     exchange_from_capture_parts,
     exchange_from_capture_record,
     exchange_from_captured,
 )
 from exp.runtime.tagging.jsonl import TagFailure, TagJsonlReport, tag_jsonl
+from exp.runtime.tagging.responses import completed_response
 from exp.runtime.tagging.sweep import (
     ConcurrencySweep,
     ConcurrencySweepError,

@@ -29,14 +29,17 @@ from exp.common.tags.exchange import (
     TagExchange,
     TagMessage,
     TagTool,
+    canonical_tools,
     first_user_index,
     leading_instructions,
     opening_end,
 )
 
-# Conservative characters per token: English prose averages about four, code and JSON about
-# three. Mostly non-Latin text runs lower and needs a smaller budget than for_input_tokens gives.
-CONSERVATIVE_CHARS_PER_TOKEN = 3
+# Characters per token that sizing assumes. Averages (about four for prose, three for code)
+# overflow on dense text such as digit-heavy JSON, so sizing assumes one token per character,
+# which a byte-level tokenizer never exceeds on ASCII text. Text dominated by rare non-Latin
+# characters can still need more and should use a smaller explicit budget.
+CONSERVATIVE_CHARS_PER_TOKEN = 1
 # Largest window. Rendering replaces the control characters JSON would escape as six bytes,
 # so a window costs at most 4 bytes of JSON text per character (128,000 bytes here), and even
 # a full bank of 32 questions with 300-character, 4-byte texts (about 116,000 bytes) still
@@ -198,7 +201,8 @@ def render_message(message: TagMessage, names: Mapping[str, str]) -> str:
 
     Args:
         message: The message.
-        names: Tool names by call id, for labeling tool results.
+        names: Tool names by call id, for labeling tool results; a result whose call is not
+            found falls back to its own ``name``.
 
     Returns:
         ``[role] text`` for ordinary messages, ``[tool_result name] text`` for tool results and
@@ -207,7 +211,7 @@ def render_message(message: TagMessage, names: Mapping[str, str]) -> str:
     text = _compact(message.text())
     lines: list[str] = []
     if message.role == "tool":
-        name = names.get(message.tool_call_id or "")
+        name = names.get(message.tool_call_id or "") or message.name
         lines.append(f"{f'[tool_result {name}]' if name else '[tool_result]'} {text or '(empty)'}")
     elif text or not message.tool_calls:
         lines.append(f"[{message.role}] {text or '(empty)'}")
@@ -218,22 +222,25 @@ def render_message(message: TagMessage, names: Mapping[str, str]) -> str:
     return "\n".join(lines)
 
 
-def _render_all(messages: Sequence[TagMessage]) -> list[str]:
-    """Render messages in order, naming each tool result after the latest earlier call.
+def _render_all(messages: Sequence[TagMessage], start: int = 0) -> list[str]:
+    """Render messages from ``start``, naming each tool result after the latest earlier call.
 
+    Earlier messages only contribute call names, so long histories are never rendered.
     Resolving names in message order keeps a later call that reuses a call id from relabeling
     an earlier result.
 
     Args:
         messages: Messages in position order, starting at position 0.
+        start: First position to render.
 
     Returns:
-        One rendered block per message.
+        One rendered block per message from ``start`` on.
     """
     names: dict[str, str] = {}
     blocks: list[str] = []
-    for message in messages:
-        blocks.append(render_message(message, names))
+    for position, message in enumerate(messages):
+        if position >= start:
+            blocks.append(render_message(message, names))
         names.update((call.id, call.function.name) for call in message.tool_calls)
     return blocks
 
@@ -314,7 +321,8 @@ def opening_window(exchange: TagExchange, budget: TagWindowBudget | None = None)
     blocks = _render_all(exchange.messages[:end])
     if exchange.tools:
         blocks.insert(
-            len(blocks) - 1 if first is not None else len(blocks), _tool_lines(exchange.tools)
+            len(blocks) - 1 if first is not None else len(blocks),
+            _tool_lines(canonical_tools(exchange.tools)),
         )
     return TagWindow(
         scope=TagScope.CONVERSATION,
@@ -380,7 +388,7 @@ def turn_windows(
     start = turn_start(exchange)
     header = _task_header(exchange, budget.header_chars)
     body = budget.window_chars - len(header) - 1
-    blocks = [clip_text(block, body) for block in _render_all(exchange.all_messages())[start:]]
+    blocks = [clip_text(block, body) for block in _render_all(exchange.all_messages(), start)]
     windows: list[TagWindow] = []
     first = 0
     while True:

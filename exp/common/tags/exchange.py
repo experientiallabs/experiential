@@ -11,7 +11,7 @@ from __future__ import annotations
 import json
 from typing import Annotated, Literal
 
-from pydantic import Field, model_validator
+from pydantic import Field, field_validator, model_validator
 
 from exp.common.core.artifacts import ContractModel, JsonObject, Sha256, sha256_json
 from exp.common.tags.records import TagFacts
@@ -37,12 +37,31 @@ class TagImagePart(ContractModel):
     Attributes:
         type: Part discriminator, always ``image``.
         media_type: Declared media type, when known.
-        url: Remote URL of the image, or None for inline data.
+        url: Remote ``http`` or ``https`` URL of the image, or None for inline data, which is
+            never kept.
     """
 
     type: Literal["image"] = "image"
     media_type: str | None = None
     url: str | None = None
+
+    @field_validator("url")
+    @classmethod
+    def _remote_only(cls, value: str | None) -> str | None:
+        """Keep image bytes out of tag records.
+
+        Args:
+            value: Candidate URL.
+
+        Returns:
+            The unchanged URL.
+
+        Raises:
+            ValueError: The URL is not a remote http(s) URL, such as an inline data URL.
+        """
+        if value is not None and not value.startswith(("http://", "https://")):
+            raise ValueError("image url must be a remote http(s) URL; leave inline images as None")
+        return value
 
 
 TagContentPart = Annotated[TagTextPart | TagImagePart, Field(discriminator="type")]
@@ -82,12 +101,15 @@ class TagMessage(ContractModel):
         content: Text, ordered parts for a message with images, or None.
         tool_calls: Assistant tool calls, in order.
         tool_call_id: For a tool result, the call it answers.
+        name: Optional participant name from the chat message; for a tool result, the tool
+            name, used when no earlier call matches ``tool_call_id``.
     """
 
     role: MessageRole
     content: str | tuple[TagContentPart, ...] | None = None
     tool_calls: tuple[TagToolCall, ...] = ()
     tool_call_id: str | None = None
+    name: str | None = None
 
     @model_validator(mode="after")
     def _role_fields(self) -> TagMessage:
@@ -224,7 +246,7 @@ def opening_key(exchange: TagExchange) -> Sha256:
     """Derive a conversation key from what every turn of a conversation repeats.
 
     The key covers every message of the opening (``opening_end``) and every tool's name,
-    description and schema in a canonical order: everything the opening window shows. Later
+    description and schema in ``canonical_tools`` order: everything the opening window shows. Later
     turns of the same conversation resend that opening, so they share the key; instructions
     inserted later in the conversation do not change it.
 
@@ -235,12 +257,31 @@ def opening_key(exchange: TagExchange) -> Sha256:
         A SHA-256 hex digest.
     """
     opening = exchange.messages[: opening_end(exchange.messages)]
-    tools = sorted(
-        (tool.model_dump(mode="json") for tool in exchange.tools),
-        key=lambda tool: json.dumps(tool, sort_keys=True),
-    )
     return sha256_json(
-        {"opening": [message.model_dump(mode="json") for message in opening], "tools": tools}
+        {
+            "opening": [message.model_dump(mode="json") for message in opening],
+            "tools": [tool.model_dump(mode="json") for tool in canonical_tools(exchange.tools)],
+        }
+    )
+
+
+def canonical_tools(tools: tuple[TagTool, ...]) -> tuple[TagTool, ...]:
+    """Order tools by name, then by full definition, so caller order never matters.
+
+    The opening window lists tools in this order and the opening key hashes them in it, so the
+    tools that survive clipping are the same for every exchange with the same key.
+
+    Args:
+        tools: Offered tools in caller order.
+
+    Returns:
+        The tools in canonical order.
+    """
+    return tuple(
+        sorted(
+            tools,
+            key=lambda tool: (tool.name, json.dumps(tool.model_dump(mode="json"), sort_keys=True)),
+        )
     )
 
 
@@ -273,6 +314,7 @@ __all__ = [
     "TagTextPart",
     "TagTool",
     "TagToolCall",
+    "canonical_tools",
     "first_user_index",
     "leading_instructions",
     "opening_end",

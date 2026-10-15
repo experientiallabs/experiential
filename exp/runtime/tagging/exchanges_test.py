@@ -15,7 +15,7 @@ from pydantic import JsonValue
 
 from exp.common.core.artifacts import JsonObject
 from exp.common.tags import opening_key, tag_facts, turn_windows
-from exp.common.tags.exchange import TagMessage
+from exp.common.tags.exchange import TagExchange, TagMessage
 from exp.runtime.anthropic_protocol.requests import decode_messages
 from exp.runtime.gateway.capture_context import capture_context_document
 from exp.runtime.gateway.contracts import GatewayRequest
@@ -546,65 +546,6 @@ def test_parts_without_an_envelope_still_tag_the_messages() -> None:
     assert exchange.messages[0].text() == "[3 messages not captured]"
 
 
-@pytest.mark.parametrize(
-    ("document", "message"),
-    [
-        ({"kind": "json", "status": 500, "body": CHAT_BODY}, "status is 500"),
-        (
-            {
-                "kind": "sse",
-                "status": 200,
-                "frames": CHAT_FRAMES,
-                "truncated": True,
-                "client_disconnected": False,
-            },
-            "cut short",
-        ),
-        (
-            {
-                "kind": "sse",
-                "status": 200,
-                "frames": CHAT_FRAMES,
-                "truncated": False,
-                "client_disconnected": True,
-            },
-            "cut short",
-        ),
-        (
-            {
-                "kind": "sse",
-                "status": 200,
-                "frames": CHAT_FRAMES[:-1],
-                "truncated": False,
-                "client_disconnected": False,
-            },
-            "terminal state",
-        ),
-        (
-            {
-                "kind": "sse",
-                "status": 200,
-                "frames": [*CHAT_FRAMES[:2], {"error": {"message": "x"}}],
-                "truncated": False,
-                "client_disconnected": False,
-            },
-            "reports an error",
-        ),
-        ({"kind": "json", "status": 200, "body": {"choices": [], "error": None}}, "terminal"),
-        ({"kind": "wire", "status": 200}, "unknown response kind"),
-    ],
-)
-def test_incomplete_or_failed_responses_are_not_tagged(document: JsonObject, message: str) -> None:
-    """Failed, cut-short, unterminated or erroring responses are rejected with a reason.
-
-    Args:
-        document: Stored response document.
-        message: Expected reason fragment.
-    """
-    with pytest.raises(ValueError, match=message):
-        completed_response("chat_completions", document)
-
-
 def test_streamed_tool_input_with_a_wide_integer_decodes() -> None:
     """A Messages tool input beyond 64-bit range reassembles and decodes exactly."""
     frames = [dict(frame) if isinstance(frame, dict) else frame for frame in MESSAGES_FRAMES]
@@ -715,40 +656,6 @@ def test_cited_anthropic_text_and_server_tool_use_stay_readable() -> None:
     assert "opaque" not in exchange.model_dump_json()
 
 
-@pytest.mark.parametrize(
-    "frames",
-    [
-        [frame for index, frame in enumerate(MESSAGES_FRAMES) if index != 8],
-        [
-            *MESSAGES_FRAMES[:9],
-            {
-                "type": "content_block_delta",
-                "index": 1,
-                "delta": {"type": "input_json_delta", "partial_json": "x"},
-            },
-            *MESSAGES_FRAMES[9:],
-        ],
-        [*MESSAGES_FRAMES, {"type": "ping"}],
-    ],
-    ids=["unclosed-block", "delta-after-stop", "frame-after-stop"],
-)
-def test_messages_streams_with_broken_lifecycles_are_rejected(frames: list[JsonValue]) -> None:
-    """Streams the collector's assembler would mark invalid are not complete captures.
-
-    Args:
-        frames: Stored frames with one lifecycle violation.
-    """
-    document: JsonObject = {
-        "kind": "sse",
-        "status": 200,
-        "frames": frames,
-        "truncated": False,
-        "client_disconnected": False,
-    }
-    with pytest.raises(ValueError, match="terminal state"):
-        completed_response("messages", document)
-
-
 def test_long_non_ascii_conversation_labels_fall_back_like_the_local_store() -> None:
     """A label over 512 UTF-8 bytes is ignored in favor of the session id."""
     request = _chat_request(metadata={"conversation_id": "\u96ea" * 200})
@@ -853,9 +760,11 @@ def test_custom_tools_native_declarations_and_results_stay_readable() -> None:
     assert window.text.splitlines()[1:] == [
         "[tool_result apply_patch] Patch failed: file not found",
         "[tool_call apply_patch] *** retry",
+        "[assistant] [image]",
         '[tool_call image_generation] {"result":"[binary]","revised_prompt":"a diagram"}',
     ]
     assert "QUJDRA" not in exchange.model_dump_json()
+    assert exchange.response[1].has_image()
 
 
 def test_chat_custom_tool_calls_count_as_tool_calls() -> None:
@@ -1012,6 +921,453 @@ def _native_message(role: str, item: JsonObject) -> TagMessage:
         request=None,
         response={"kind": "json", "status": 200, "body": CHAT_BODY},
     ).messages[1]
+
+
+def test_native_items_keep_errors_statuses_results_and_code() -> None:
+    """Every readable field of a native call or result reaches the window."""
+    mcp = _native_message(
+        "assistant",
+        {
+            "type": "mcp_call",
+            "id": "mcp_1",
+            "name": "delete_row",
+            "server_label": "crm",
+            "arguments": '{"id":7}',
+            "error": "Permission denied",
+            "status": "failed",
+        },
+    )
+    arguments = mcp.tool_calls[0].function.arguments
+    assert "Permission denied" in arguments and '"status":"failed"' in arguments
+    program = _native_message(
+        "assistant", {"type": "program", "id": "p1", "code": "console.log(fs.readdirSync('.'))"}
+    )
+    assert not program.tool_calls and "readdirSync" in program.text()
+    result = _native_message(
+        "tool", {"type": "program_output", "call_id": "p1", "result": "TypeError: x is undefined"}
+    )
+    assert "TypeError" in result.text()
+    patch = _native_message(
+        "tool", {"type": "apply_patch_call_output", "call_id": "a1", "status": "failed"}
+    )
+    assert patch.text() == '{"status":"failed"}'
+    reasoning = exchange_from_capture_parts(
+        exchange_id="request-5",
+        protocol="chat_completions",
+        messages=[
+            {"role": "user", "content": "go"},
+            {"role": "assistant", "provider_native_item": {"type": "reasoning", "summary": []}},
+        ],
+        request=None,
+        response={"kind": "json", "status": 200, "body": CHAT_BODY},
+    )
+    assert len(reasoning.messages) == 1
+
+
+def test_streamed_chat_custom_calls_and_generated_images_are_kept() -> None:
+    """Custom call input split across chunks is joined; generated images become markers."""
+    frames: list[JsonValue] = [
+        _chunk({"role": "assistant", "content": None}),
+        _chunk(
+            {
+                "tool_calls": [
+                    {
+                        "index": 0,
+                        "id": "c9",
+                        "type": "custom",
+                        "custom": {"name": "apply_patch", "input": "*** Begin"},
+                    }
+                ]
+            }
+        ),
+        _chunk({"tool_calls": [{"index": 0, "custom": {"input": " Patch"}}]}, "tool_calls"),
+        "[DONE]",
+    ]
+    document: JsonObject = {
+        "kind": "sse",
+        "status": 200,
+        "frames": frames,
+        "truncated": False,
+        "client_disconnected": False,
+    }
+    exchange = exchange_from_capture_parts(
+        exchange_id="request-4",
+        protocol="chat_completions",
+        messages=[{"role": "user", "content": "Patch it"}],
+        request=None,
+        response=document,
+    )
+    call = exchange.response[0].tool_calls[0]
+    assert (call.function.name, call.function.arguments) == ("apply_patch", "*** Begin Patch")
+    body: JsonObject = {
+        "choices": [
+            {
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "Here it is.",
+                    "images": [
+                        {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA"}}
+                    ],
+                },
+                "finish_reason": "stop",
+            }
+        ]
+    }
+    drawn = exchange_from_captured(_experience("chat_completions", _chat_request(), body))
+    assert drawn.response[0].text() == "Here it is. [image]"
+    assert "base64" not in drawn.model_dump_json()
+
+
+def test_chat_tool_result_names_survive_without_their_call() -> None:
+    """A tool result naming its tool keeps that name when its call is outside the request."""
+    exchange = exchange_from_capture_parts(
+        exchange_id="request-6",
+        protocol="chat_completions",
+        messages=[
+            {"role": "user", "content": "Find the refund policy"},
+            {"role": "tool", "tool_call_id": "call_0", "name": "kb_search", "content": "Policy A"},
+        ],
+        request=None,
+        response={"kind": "json", "status": 200, "body": CHAT_BODY},
+    )
+    assert exchange.messages[1].name == "kb_search"
+    assert "[tool_result kb_search] Policy A" in turn_windows(exchange)[0].text
+
+
+def test_mixed_custom_and_function_stream_deltas_are_both_rebuilt() -> None:
+    """A chunk continuing a custom call and a function call keeps both complete."""
+    frames: list[JsonValue] = [
+        _chunk(
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "index": 0,
+                        "id": "c1",
+                        "type": "custom",
+                        "custom": {"name": "apply_patch", "input": "*** A"},
+                    },
+                    {
+                        "index": 1,
+                        "id": "f1",
+                        "type": "function",
+                        "function": {"name": "lookup", "arguments": '{"id":'},
+                    },
+                ],
+            }
+        ),
+        _chunk(
+            {
+                "tool_calls": [
+                    {"index": 0, "custom": {"input": "B"}},
+                    {"index": 1, "function": {"arguments": '"Z"}'}},
+                ]
+            },
+            "tool_calls",
+        ),
+        "[DONE]",
+    ]
+    document: JsonObject = {
+        "kind": "sse",
+        "status": 200,
+        "frames": frames,
+        "truncated": False,
+        "client_disconnected": False,
+    }
+    exchange = exchange_from_capture_parts(
+        exchange_id="request-7",
+        protocol="chat_completions",
+        messages=[{"role": "user", "content": "Do both"}],
+        request=None,
+        response=document,
+    )
+    assert [
+        (call.function.name, call.function.arguments) for call in exchange.response[0].tool_calls
+    ] == [
+        ("apply_patch", "*** AB"),
+        ("lookup", '{"id":"Z"}'),
+    ]
+
+
+def test_gateway_searches_and_call_images_are_kept() -> None:
+    """Searches the gateway ran stay in the reply, and images inside calls count as images."""
+    body: JsonObject = {
+        "status": "completed",
+        "output": [
+            {
+                "type": "web_search_call",
+                "id": "wsgw_" + "0" * 32,
+                "status": "completed",
+                "action": {"type": "search", "query": "rates"},
+            },
+            {
+                "type": "message",
+                "id": "m",
+                "role": "assistant",
+                "status": "completed",
+                "content": [{"type": "output_text", "text": "Rates rose.", "annotations": []}],
+            },
+        ],
+    }
+    exchange = exchange_from_captured(_experience("responses", _responses_request(), body))
+    assert exchange.response[0].tool_calls[0].function.name == "web_search"
+    chart = _native_message(
+        "assistant",
+        {
+            "type": "code_interpreter_call",
+            "id": "ci_1",
+            "code": "plot()",
+            "outputs": [{"type": "image", "url": "data:image/png;base64,AAAA"}],
+        },
+    )
+    assert chart.has_image() and chart.tool_calls[0].function.name == "code_interpreter"
+
+
+@pytest.mark.parametrize(
+    ("protocol", "body"),
+    [
+        (
+            "responses",
+            {
+                "status": "incomplete",
+                "incomplete_details": {"reason": "max_output_tokens"},
+                "output": [],
+            },
+        ),
+        ("messages", {"type": "message", "stop_reason": "max_tokens", "content": []}),
+        (
+            "messages",
+            {
+                "type": "message",
+                "stop_reason": "max_tokens",
+                "content": [{"type": "text", "text": "", "citations": None}],
+            },
+        ),
+    ],
+    ids=["responses", "messages", "messages-empty-text"],
+)
+def test_empty_replies_at_the_length_limit_are_tagged(
+    protocol: CaptureProtocol, body: JsonObject
+) -> None:
+    """A reply that hit its limit before any output is an empty, truncated turn.
+
+    Args:
+        protocol: Public surface.
+        body: Terminal body with no output.
+    """
+    request = _responses_request() if protocol == "responses" else _messages_request()
+    exchange = exchange_from_captured(_experience(protocol, request, body))
+    assert exchange.response == (TagMessage(role="assistant"),)
+    assert tag_facts(exchange).truncated
+
+
+def test_tools_declared_by_input_items_are_offered_tools() -> None:
+    """Tools a request declares in an additional_tools item join the tool list and key."""
+
+    def declaring(name: str) -> TagExchange:
+        """Build an exchange whose request declares one namespaced tool inline.
+
+        Args:
+            name: The declared function name.
+
+        Returns:
+            The exchange.
+        """
+        request = decode_responses(
+            {
+                "model": "coding",
+                "input": [
+                    {
+                        "type": "additional_tools",
+                        "id": "at_1",
+                        "role": "developer",
+                        "tools": [
+                            {
+                                "type": "namespace",
+                                "name": "files",
+                                "description": "File tools",
+                                "tools": [
+                                    {
+                                        "type": "function",
+                                        "name": name,
+                                        "parameters": {"type": "object"},
+                                    }
+                                ],
+                            }
+                        ],
+                    },
+                    {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "Go"}],
+                    },
+                ],
+            }
+        ).request
+        return exchange_from_captured(_experience("responses", request, RESPONSES_BODY))
+
+    reading, deleting = declaring("read"), declaring("delete")
+    assert [tool.name for tool in reading.tools] == ["files.read"]
+    assert opening_key(reading) != opening_key(deleting)
+
+
+def test_chat_refusals_keep_the_text_beside_them() -> None:
+    """A reply with both text and a refusal keeps both."""
+    body: JsonObject = {
+        "choices": [
+            {
+                "index": 0,
+                "message": {"role": "assistant", "content": "Let me check.", "refusal": "I can't."},
+                "finish_reason": "stop",
+            }
+        ]
+    }
+    exchange = exchange_from_captured(_experience("chat_completions", _chat_request(), body))
+    assert exchange.response[0].text() == "Let me check.\nI can't."
+
+
+def test_namespaced_tool_results_keep_their_namespace() -> None:
+    """A result whose call is not in view keeps its namespace-qualified name."""
+    exchange = exchange_from_capture_parts(
+        exchange_id="request-8",
+        protocol="chat_completions",
+        messages=[
+            {"role": "user", "content": "Read it"},
+            {
+                "role": "tool",
+                "tool_call_id": "c1",
+                "content": "data",
+                "provider_tool_name": "read",
+                "provider_tool_namespace": "files",
+            },
+        ],
+        request=None,
+        response={"kind": "json", "status": 200, "body": CHAT_BODY},
+    )
+    assert exchange.messages[1].name == "files.read"
+
+
+def test_dropped_history_ignores_replay_entries_for_the_original_messages() -> None:
+    """A capture whose history was replaced by a marker still tags with its marker."""
+    exchange = exchange_from_capture_parts(
+        exchange_id="request-9",
+        protocol="chat_completions",
+        messages=[{"role": "system", "truncated": True, "content": "[1101 messages not captured]"}],
+        request=None,
+        response={"kind": "json", "status": 200, "body": CHAT_BODY},
+        capture_context={
+            "provider_context": {
+                "provider_replay": [{"message_index": 1100, "tool_is_error": True}]
+            },
+            "capture_limits": {"messages_truncated": True, "messages_dropped": 1101},
+        },
+    )
+    assert exchange.messages[0].text() == "[1101 messages not captured]"
+    with pytest.raises(TagExchangeError, match="invalid provider message index"):
+        exchange_from_capture_parts(
+            exchange_id="request-9",
+            protocol="chat_completions",
+            messages=[{"role": "user", "content": "go"}],
+            request=None,
+            response={"kind": "json", "status": 200, "body": CHAT_BODY},
+            capture_context={"provider_context": {"provider_replay": [{"message_index": 5}]}},
+        )
+
+
+def test_mcp_listings_are_readable_but_not_tool_calls() -> None:
+    """Only invocation items count as tool calls; listings and approvals stay as text."""
+    body: JsonObject = {
+        "status": "completed",
+        "output": [
+            {
+                "type": "mcp_list_tools",
+                "id": "ml_1",
+                "server_label": "crm",
+                "tools": [{"name": "delete_row", "input_schema": {"type": "object"}}],
+            },
+            {
+                "type": "mcp_call",
+                "id": "mc_1",
+                "name": "delete_row",
+                "server_label": "crm",
+                "arguments": "{}",
+                "output": "deleted",
+            },
+        ],
+    }
+    exchange = exchange_from_captured(_experience("responses", _responses_request(), body))
+    assert tag_facts(exchange).tool_calls == 1
+    assert exchange.response[0].text().startswith('[mcp_list_tools] {"server_label":"crm"')
+
+
+def test_text_that_only_starts_with_data_is_kept() -> None:
+    """Readable text beginning with data: is not mistaken for an inline payload."""
+    call = _native_message(
+        "assistant",
+        {
+            "type": "custom_tool_call",
+            "call_id": "c1",
+            "name": "edit",
+            "input": 'data: dict[str, int] = {"port": 443}',
+        },
+    )
+    assert call.tool_calls[0].function.arguments == 'data: dict[str, int] = {"port": 443}'
+
+
+def test_approval_requests_name_their_tool_and_capture_evidence_is_unchanged() -> None:
+    """Approval text names the tool, and tagging never edits the capture it reads."""
+    approval = _native_message(
+        "assistant",
+        {
+            "type": "mcp_approval_request",
+            "id": "ap_1",
+            "name": "delete_customer",
+            "server_label": "crm",
+            "arguments": "{}",
+        },
+    )
+    assert not approval.tool_calls
+    assert approval.text().startswith("[mcp_approval_request delete_customer] ")
+    experience = _experience("chat_completions", _chat_request(), CHAT_BODY)
+    request = dict(experience.request)
+    request["exp_capture_output"] = {"provider_reasoning": "private thoughts"}
+    experience = experience.model_copy(update={"request": request})
+    before = experience.model_dump_json()
+    exchange_from_captured(experience)
+    assert experience.model_dump_json() == before
+
+
+def test_local_shell_output_links_to_its_call() -> None:
+    """A local shell output links to its call through its id."""
+    exchange = exchange_from_capture_parts(
+        exchange_id="request-10",
+        protocol="chat_completions",
+        messages=[
+            {"role": "user", "content": "List files"},
+            {
+                "role": "assistant",
+                "provider_native_item": {
+                    "type": "local_shell_call",
+                    "id": "lsh_1",
+                    "call_id": "call_1",
+                    "action": {"type": "exec", "command": ["ls"]},
+                },
+            },
+            {
+                "role": "tool",
+                "provider_native_item": {
+                    "type": "local_shell_call_output",
+                    "id": "call_1",
+                    "output": "README.md",
+                },
+            },
+        ],
+        request=None,
+        response={"kind": "json", "status": 200, "body": CHAT_BODY},
+    )
+    assert exchange.messages[2].tool_call_id == "call_1"
+    assert "[tool_result local_shell] README.md" in turn_windows(exchange)[0].text
 
 
 def test_record_without_a_response_is_rejected() -> None:
