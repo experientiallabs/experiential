@@ -1014,6 +1014,119 @@ def _native_message(role: str, item: JsonObject) -> TagMessage:
     ).messages[1]
 
 
+def test_native_items_keep_errors_statuses_results_and_code() -> None:
+    """Every readable field of a native call or result reaches the window."""
+    mcp = _native_message(
+        "assistant",
+        {
+            "type": "mcp_call",
+            "id": "mcp_1",
+            "name": "delete_row",
+            "server_label": "crm",
+            "arguments": '{"id":7}',
+            "error": "Permission denied",
+            "status": "failed",
+        },
+    )
+    arguments = mcp.tool_calls[0].function.arguments
+    assert "Permission denied" in arguments and '"status":"failed"' in arguments
+    program = _native_message(
+        "assistant", {"type": "program", "id": "p1", "code": "console.log(fs.readdirSync('.'))"}
+    )
+    assert program.tool_calls[0].function.name == "program"
+    assert "readdirSync" in program.tool_calls[0].function.arguments
+    result = _native_message(
+        "tool", {"type": "program_output", "call_id": "p1", "result": "TypeError: x is undefined"}
+    )
+    assert "TypeError" in result.text()
+    patch = _native_message(
+        "tool", {"type": "apply_patch_call_output", "call_id": "a1", "status": "failed"}
+    )
+    assert patch.text() == '{"status":"failed"}'
+    reasoning = exchange_from_capture_parts(
+        exchange_id="request-5",
+        protocol="chat_completions",
+        messages=[
+            {"role": "user", "content": "go"},
+            {"role": "assistant", "provider_native_item": {"type": "reasoning", "summary": []}},
+        ],
+        request=None,
+        response={"kind": "json", "status": 200, "body": CHAT_BODY},
+    )
+    assert len(reasoning.messages) == 1
+
+
+def test_streamed_chat_custom_calls_and_generated_images_are_kept() -> None:
+    """Custom call input split across chunks is joined; generated images become markers."""
+    frames: list[JsonValue] = [
+        _chunk({"role": "assistant", "content": None}),
+        _chunk(
+            {
+                "tool_calls": [
+                    {
+                        "index": 0,
+                        "id": "c9",
+                        "type": "custom",
+                        "custom": {"name": "apply_patch", "input": "*** Begin"},
+                    }
+                ]
+            }
+        ),
+        _chunk({"tool_calls": [{"index": 0, "custom": {"input": " Patch"}}]}, "tool_calls"),
+        "[DONE]",
+    ]
+    document: JsonObject = {
+        "kind": "sse",
+        "status": 200,
+        "frames": frames,
+        "truncated": False,
+        "client_disconnected": False,
+    }
+    exchange = exchange_from_capture_parts(
+        exchange_id="request-4",
+        protocol="chat_completions",
+        messages=[{"role": "user", "content": "Patch it"}],
+        request=None,
+        response=document,
+    )
+    call = exchange.response[0].tool_calls[0]
+    assert (call.function.name, call.function.arguments) == ("apply_patch", "*** Begin Patch")
+    body: JsonObject = {
+        "choices": [
+            {
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "Here it is.",
+                    "images": [
+                        {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA"}}
+                    ],
+                },
+                "finish_reason": "stop",
+            }
+        ]
+    }
+    drawn = exchange_from_captured(_experience("chat_completions", _chat_request(), body))
+    assert drawn.response[0].text() == "Here it is. [image]"
+    assert "base64" not in drawn.model_dump_json()
+
+
+def test_chat_tool_result_names_survive_without_their_call() -> None:
+    """A tool result naming its tool keeps that name when its call is outside the request."""
+    exchange = exchange_from_capture_parts(
+        exchange_id="request-6",
+        protocol="chat_completions",
+        messages=[
+            {"role": "user", "content": "Find the refund policy"},
+            {"role": "tool", "tool_call_id": "call_0", "name": "kb_search", "content": "Policy A"},
+        ],
+        request=None,
+        response={"kind": "json", "status": 200, "body": CHAT_BODY},
+    )
+    assert exchange.messages[1].name == "kb_search"
+    assert "[tool_result kb_search] Policy A" in turn_windows(exchange)[0].text
+
+
 def test_record_without_a_response_is_rejected() -> None:
     """A prompt checkpoint with no response yet cannot be tagged."""
     record = _record(
