@@ -14,7 +14,7 @@ its lowest (true in every window). A tag with no comparison means ``>= 0.5``. Co
 have a single opening window, so both forms read the same score. Example::
 
     rule = parse_rule("coding AND (tool_error OR all(model_mistake) > 0.8) AND NOT model_refused")
-    matched = evaluate_rule(rule, summarize(tags), conversation_scores)
+    matched = evaluate_rule(rule, summarize(tags, opening))
 
 The parsed ``TagRule`` names each tag's scope and score index, so another engine can compile it
 to a query without reparsing the text.
@@ -31,7 +31,7 @@ from typing import Annotated, Literal
 
 from pydantic import Field
 
-from exp.common.core.artifacts import ArtifactId, ContractModel
+from exp.common.core.artifacts import ArtifactId, ContractModel, Sha256
 from exp.common.tags.bank import DEFAULT_TAG_BANK, TagBank, TagId, TagScope
 from exp.common.tags.records import TagSummary
 
@@ -134,12 +134,19 @@ class TagRule(ContractModel):
         source: The rule text as written.
         bank_id: Bank the tag indexes refer to.
         bank_version: Version of that bank.
+        bank_digest: ``TagBank.digest`` of that bank, so scores from edited wording or order
+            under the same version are rejected.
+        conversation_tags: Number of conversation tags, the exact conversation score count.
+        turn_tags: Number of turn tags, the exact turn score count.
         root: The rule tree.
     """
 
     source: str = Field(min_length=1, max_length=MAX_RULE_CHARS)
     bank_id: ArtifactId
     bank_version: int = Field(ge=1)
+    bank_digest: Sha256
+    conversation_tags: int = Field(ge=0)
+    turn_tags: int = Field(ge=0)
     root: RuleNode
 
     def conditions(self) -> tuple[TagCondition, ...]:
@@ -483,18 +490,23 @@ def parse_rule(source: str, bank: TagBank = DEFAULT_TAG_BANK) -> TagRule:
     if len(source) > MAX_RULE_CHARS:
         raise TagRuleError(f"a rule may hold at most {MAX_RULE_CHARS} characters")
     root = _Parser(source, bank).parse()
-    return TagRule(source=source, bank_id=bank.bank_id, bank_version=bank.version, root=root)
+    return TagRule(
+        source=source,
+        bank_id=bank.bank_id,
+        bank_version=bank.version,
+        bank_digest=bank.digest,
+        conversation_tags=len(bank.for_scope(TagScope.CONVERSATION)),
+        turn_tags=len(bank.for_scope(TagScope.TURN)),
+        root=root,
+    )
 
 
-def _score_array(
-    condition: TagCondition, summary: TagSummary, conversation: Sequence[float] | None
-) -> Sequence[float]:
+def _score_array(condition: TagCondition, summary: TagSummary) -> Sequence[float]:
     """Select the score array one condition reads.
 
     Args:
         condition: The tag condition.
-        summary: The exchange's turn summary.
-        conversation: The conversation's opening scores, if known.
+        summary: The exchange's summary.
 
     Returns:
         The conversation scores or the turn maximum or minimum array.
@@ -503,64 +515,70 @@ def _score_array(
         TagRuleError: A conversation tag is used without conversation scores.
     """
     if condition.scope is TagScope.CONVERSATION:
-        if conversation is None:
+        if summary.conversation is None:
             raise TagRuleError(
-                f"the rule reads conversation tag {condition.tag!r} but no conversation scores "
-                "were given; pass the opening scores stored for this conversation"
+                f"the rule reads conversation tag {condition.tag!r} but the summary has no "
+                "conversation scores; summarize with the exchange that tagged the opening"
             )
-        return conversation
+        return summary.conversation
     return summary.turn_max if condition.aggregate == "max" else summary.turn_min
 
 
-def _evaluate(node: RuleNode, summary: TagSummary, conversation: Sequence[float] | None) -> bool:
+def _evaluate(node: RuleNode, summary: TagSummary) -> bool:
     """Evaluate one node.
 
     Args:
         node: The rule node.
-        summary: The exchange's turn summary.
-        conversation: The conversation's opening scores, if known.
+        summary: The exchange's summary.
 
     Returns:
         Whether the node holds.
     """
     if isinstance(node, TagCondition):
-        score = _score_array(node, summary, conversation)[node.index]
-        return _COMPARE[node.op](score, node.threshold)
+        return _COMPARE[node.op](_score_array(node, summary)[node.index], node.threshold)
     if isinstance(node, NotRule):
-        return not _evaluate(node.operand, summary, conversation)
-    results = (_evaluate(operand, summary, conversation) for operand in node.operands)
+        return not _evaluate(node.operand, summary)
+    results = (_evaluate(operand, summary) for operand in node.operands)
     return all(results) if isinstance(node, AndRule) else any(results)
 
 
-def evaluate_rule(rule: TagRule, summary: TagSummary, conversation: Sequence[float] | None) -> bool:
+def evaluate_rule(rule: TagRule, summary: TagSummary) -> bool:
     """Decide whether one exchange matches a rule.
 
     Args:
         rule: A rule from ``parse_rule``.
-        summary: The exchange's turn summary from ``summarize``.
-        conversation: The opening scores of the exchange's conversation, in bank conversation
-            order, or None when unknown. Required when the rule uses a conversation tag.
+        summary: The exchange's summary from ``summarize``; it must carry conversation scores
+            when the rule uses a conversation tag.
 
     Returns:
         True when the exchange matches.
 
     Raises:
-        TagRuleError: The rule was parsed for another bank or version, a conversation tag has no
-            conversation scores, or a score array is shorter than the bank.
+        TagRuleError: The rule was parsed for another bank, version or bank content, a score
+            array does not hold exactly one score per tag of its scope, or a conversation tag
+            has no conversation scores.
     """
     if (rule.bank_id, rule.bank_version) != (summary.bank_id, summary.bank_version):
         raise TagRuleError(
             f"rule was parsed for {rule.bank_id} v{rule.bank_version} but the scores come from "
             f"{summary.bank_id} v{summary.bank_version}; parse the rule against that bank"
         )
-    for condition in rule.conditions():
-        scores = _score_array(condition, summary, conversation)
-        if condition.index >= len(scores):
+    if rule.bank_digest != summary.bank_digest:
+        raise TagRuleError(
+            f"the scores come from different {rule.bank_id} v{rule.bank_version} wording or "
+            "order than the rule was parsed for; parse the rule against the bank that tagged them"
+        )
+    for name, scores, expected in (
+        ("turn", summary.turn_max, rule.turn_tags),
+        ("conversation", summary.conversation, rule.conversation_tags),
+    ):
+        if scores is not None and len(scores) != expected:
             raise TagRuleError(
-                f"tag {condition.tag!r} reads {condition.scope.value} score {condition.index} "
-                f"but only {len(scores)} scores were given"
+                f"expected {expected} {name} scores, one per {name} tag, but got {len(scores)}"
             )
-    return _evaluate(rule.root, summary, conversation)
+    for condition in rule.conditions():
+        _score_array(condition, summary)
+    return _evaluate(rule.root, summary)
 
 
 __all__ = [

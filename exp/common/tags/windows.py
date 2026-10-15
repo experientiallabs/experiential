@@ -38,9 +38,10 @@ from exp.common.tags.exchange import (
 # three. Mostly non-Latin text runs lower and needs a smaller budget than for_input_tokens gives.
 CONSERVATIVE_CHARS_PER_TOKEN = 3
 # Largest window. Rendering replaces the control characters JSON would escape as six bytes,
-# so each character costs at most four bytes of JSON text and a window plus 32 questions
-# stays inside a 256 KiB decision request.
-MAX_WINDOW_CHARS = 48_000
+# so a window costs at most 4 bytes of JSON text per character (128,000 bytes here), and even
+# a full bank of 32 questions with 300-character, 4-byte texts (about 116,000 bytes) still
+# fits a 262,144-byte decision request.
+MAX_WINDOW_CHARS = 32_000
 TOOL_DESCRIPTION_CHARS = 160
 # Fewest characters each opening block keeps before middle blocks are collapsed.
 MIN_BLOCK_CHARS = 80
@@ -55,7 +56,7 @@ class TagWindowBudget(ContractModel):
     """Character limits for rendered windows.
 
     Attributes:
-        window_chars: Most characters in one window, header included; 2,000 through 48,000,
+        window_chars: Most characters in one window, header included; 2,000 through 32,000,
             default 24,000.
         overlap_chars: Most characters of trailing messages repeated at the start of the next
             turn window, default 2,000.
@@ -259,8 +260,9 @@ def _fit(blocks: list[str], budget: int) -> list[str]:
     """Shorten the largest blocks equally until the joined blocks fit the budget.
 
     Blocks smaller than their fair share keep their full text; the rest are clipped to one
-    shared cap. When there are too many blocks for each to keep ``MIN_BLOCK_CHARS``, the
-    middle ones collapse into one omission line, keeping the first and last blocks.
+    shared cap. When the blocks do not fit and there are too many for each to keep
+    ``MIN_BLOCK_CHARS``, the middle ones collapse into one omission line, keeping the first and
+    last blocks.
 
     Args:
         blocks: Rendered blocks, joined with newlines.
@@ -269,6 +271,8 @@ def _fit(blocks: list[str], budget: int) -> list[str]:
     Returns:
         Blocks in their original order whose newline-joined length fits the budget.
     """
+    if sum(len(block) for block in blocks) + len(blocks) - 1 <= budget:
+        return blocks
     most = max(budget // MIN_BLOCK_CHARS, 3)
     if len(blocks) > most:
         head = (most - 1) // 2

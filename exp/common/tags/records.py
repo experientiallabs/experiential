@@ -97,11 +97,13 @@ class TagFacts(ContractModel):
 
 
 class TagSummary(ContractModel):
-    """Per-tag reduction of an exchange's turn windows, the form searches read.
+    """Per-tag reduction of an exchange's tag results, the form searches read.
 
     Attributes:
-        bank_id: Bank that produced the scores.
+        bank_id: Bank that produced every score here.
         bank_version: Version of that bank.
+        bank_digest: ``TagBank.digest`` of the exact bank used.
+        conversation: Opening scores of the exchange's conversation, or None when unknown.
         turn_max: Highest score per turn tag across windows.
         turn_min: Lowest score per turn tag across windows.
         turn_windows: Number of turn windows reduced.
@@ -109,9 +111,26 @@ class TagSummary(ContractModel):
 
     bank_id: ArtifactId
     bank_version: int = Field(ge=1)
+    bank_digest: Sha256
+    conversation: tuple[float, ...] | None = None
     turn_max: tuple[float, ...]
     turn_min: tuple[float, ...]
     turn_windows: int = Field(ge=1)
+
+    @field_validator("conversation")
+    @classmethod
+    def _conversation_probabilities(
+        cls, value: tuple[float, ...] | None
+    ) -> tuple[float, ...] | None:
+        """Reject opening scores outside ``[0, 1]``.
+
+        Args:
+            value: Candidate opening scores.
+
+        Returns:
+            The unchanged scores.
+        """
+        return None if value is None else _check_probabilities(value)
 
     @field_validator("turn_max", "turn_min")
     @classmethod
@@ -191,22 +210,46 @@ class ExchangeTags(ContractModel):
         return self
 
 
-def summarize(tags: ExchangeTags) -> TagSummary:
-    """Reduce an exchange's turn windows to per-tag maximum and minimum scores.
+def summarize(tags: ExchangeTags, opening: ExchangeTags | None = None) -> TagSummary:
+    """Reduce an exchange's tag results to the scores rules read.
 
-    A bare tag in a rule reads the maximum (true in any window); ``all(tag)`` reads the
-    minimum (true in every window).
+    Turn windows reduce to per-tag maximum (a bare tag in a rule, true in any window) and
+    minimum (``all(tag)``, true in every window). The conversation scores come from the
+    exchange's own opening window or, when its opening was tagged earlier, from ``opening``,
+    the earlier exchange whose results hold them.
 
     Args:
         tags: The exchange's tag results.
+        opening: The conversation's earlier tagged exchange, used only when ``tags`` has no
+            opening scores.
 
     Returns:
-        The summary for the exchange's turn tags.
+        The summary.
+
+    Raises:
+        ValueError: ``opening`` comes from another conversation or another bank, wording or
+            version, so its scores cannot be read with this exchange's tag order.
     """
+    conversation = tags.conversation
+    if conversation is None and opening is not None:
+        if opening.conversation_key != tags.conversation_key:
+            raise ValueError("the opening results belong to another conversation")
+        if (opening.bank_id, opening.bank_version, opening.bank_digest) != (
+            tags.bank_id,
+            tags.bank_version,
+            tags.bank_digest,
+        ):
+            raise ValueError(
+                "the opening was tagged with a different bank; tag the opening again with "
+                f"{tags.bank_id} v{tags.bank_version}"
+            )
+        conversation = opening.conversation
     columns = tuple(zip(*(window.scores for window in tags.turn), strict=True))
     return TagSummary(
         bank_id=tags.bank_id,
         bank_version=tags.bank_version,
+        bank_digest=tags.bank_digest,
+        conversation=None if conversation is None else conversation.scores,
         turn_max=tuple(max(column) for column in columns),
         turn_min=tuple(min(column) for column in columns),
         turn_windows=len(tags.turn),

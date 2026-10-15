@@ -260,7 +260,7 @@ def test_budget_validation_and_token_sizing() -> None:
     budget = TagWindowBudget.for_input_tokens(8_192)
     assert budget.window_chars == (8_192 - 2_048) * CONSERVATIVE_CHARS_PER_TOKEN
     assert budget.overlap_chars == budget.window_chars // 12
-    assert TagWindowBudget.for_input_tokens(200_000).window_chars == 48_000
+    assert TagWindowBudget.for_input_tokens(200_000).window_chars == 32_000
     with pytest.raises(ValueError, match="larger context"):
         TagWindowBudget.for_input_tokens(2_500)
 
@@ -335,3 +335,17 @@ def test_control_characters_never_inflate_the_json_size() -> None:
         assert len(encoded) <= 4 * len(window.text) + 2
         assert "\x00" not in window.text and "\x1b" not in window.text
     assert windows[-1].text.endswith("[assistant] a\tb c")
+
+
+def test_many_short_opening_messages_that_fit_are_all_kept() -> None:
+    """Openings are only collapsed when their full text does not fit."""
+    exchange = TagExchange(
+        exchange_id="req",
+        messages=(
+            *(TagMessage(role="system", content=f"rule {i}") for i in range(25)),
+            TagMessage(role="user", content="Go"),
+        ),
+        response=(TagMessage(role="assistant", content="ok"),),
+    )
+    lines = opening_window(exchange, SMALL).text.splitlines()
+    assert lines == [*(f"[system] rule {i}" for i in range(25)), "[user] Go"]
