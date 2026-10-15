@@ -147,8 +147,9 @@ class ExchangeTags(ContractModel):
     """Every tag result for one exchange, the wire format a tagging run returns.
 
     Attributes:
-        exchange_id: Identifier of the tagged exchange, from 1 through 256 characters.
-        conversation_key: Key grouping the exchange with the rest of its conversation.
+        exchange_id: Identifier of the tagged exchange, from 1 through 512 characters.
+        conversation_key: Key grouping the exchange with the rest of its conversation, from 1
+            through 512 characters.
         bank_id: Bank that produced the scores.
         bank_version: Version of that bank.
         bank_digest: ``TagBank.digest`` of the exact bank used.
@@ -159,8 +160,8 @@ class ExchangeTags(ContractModel):
         facts: Facts read directly from the exchange.
     """
 
-    exchange_id: str = Field(min_length=1, max_length=256)
-    conversation_key: str = Field(min_length=1, max_length=256)
+    exchange_id: str = Field(min_length=1, max_length=512)
+    conversation_key: str = Field(min_length=1, max_length=512)
     bank_id: ArtifactId
     bank_version: int = Field(ge=1)
     bank_digest: Sha256

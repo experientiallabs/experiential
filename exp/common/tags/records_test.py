@@ -172,3 +172,13 @@ def test_facts_reject_negative_counts() -> None:
         "has_images": True,
         "structured_output": False,
     }
+
+
+def test_identifiers_accept_capture_length_ids() -> None:
+    """Exchange ids and conversation keys accept the 512 characters captures allow."""
+    window = WindowScores(window_index=0, start_message=0, end_message=1, scores=())
+    record = _record(turn=(window,), conversation=None)
+    long_ids = record.model_copy(update={"exchange_id": "r" * 512, "conversation_key": "c" * 512})
+    assert ExchangeTags.model_validate(long_ids.model_dump()) == long_ids
+    with pytest.raises(ValidationError):
+        ExchangeTags.model_validate({**record.model_dump(), "exchange_id": "r" * 513})
