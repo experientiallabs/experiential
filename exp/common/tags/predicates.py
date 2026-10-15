@@ -29,7 +29,7 @@ from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
 from typing import Annotated, Literal
 
-from pydantic import Field
+from pydantic import Field, model_validator
 
 from exp.common.core.artifacts import ArtifactId, ContractModel, Sha256
 from exp.common.tags.bank import DEFAULT_TAG_BANK, TagBank, TagId, TagScope
@@ -148,6 +148,32 @@ class TagRule(ContractModel):
     conversation_tags: int = Field(ge=0)
     turn_tags: int = Field(ge=0)
     root: RuleNode
+
+    @model_validator(mode="after")
+    def _indexes_in_range(self) -> TagRule:
+        """Require every condition to index inside its scope's score array.
+
+        A rule read back from JSON skips the parser, so this keeps a hand-edited or foreign
+        tree from reading past the scores at evaluation time.
+
+        Returns:
+            The validated rule.
+
+        Raises:
+            ValueError: A condition's index is not below its scope's tag count.
+        """
+        for condition in self.conditions():
+            count = (
+                self.conversation_tags
+                if condition.scope is TagScope.CONVERSATION
+                else self.turn_tags
+            )
+            if condition.index >= count:
+                raise ValueError(
+                    f"tag {condition.tag!r} has {condition.scope.value} index {condition.index} "
+                    f"but the bank has {count} {condition.scope.value} tags; parse the rule again"
+                )
+        return self
 
     def conditions(self) -> tuple[TagCondition, ...]:
         """Return every tag condition in source order.
