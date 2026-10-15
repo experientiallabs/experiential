@@ -247,8 +247,14 @@ def _from_parts(
     if protocol == "messages" and isinstance(blocks := readable.get("content"), list):
         # An empty text block (a reply cut off before its first word) carries nothing, and
         # the output decoder rejects it.
-        empty_text = {"type": "text", "text": ""}
-        readable = {**readable, "content": [block for block in blocks if block != empty_text]}
+        kept = [
+            block
+            for block in blocks
+            if not (
+                isinstance(block, dict) and block.get("type") == "text" and block.get("text") == ""
+            )
+        ]
+        readable = {**readable, "content": kept}
     # A reply that hit its limit before producing anything is a valid, empty terminal turn,
     # which the output decoder would reject as missing output.
     field = {"responses": "output", "messages": "content"}.get(protocol)
@@ -490,6 +496,8 @@ def _native(role: MessageRole, item: JsonValue) -> TagMessage | None:
     if role != "assistant" or kind in _REASONING_TYPES or not fields:
         return None
     readable, images = _readable(_sole(fields, ("input", "arguments")))
+    if kind == "image_generation_call" and item.get("result"):
+        images += 1
     call: JsonObject = {
         "id": call_id if isinstance(call_id, str) else item.get("id"),
         "name": item.get("name", kind.removesuffix("_call")),

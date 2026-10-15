@@ -136,7 +136,7 @@ def _merge_custom_calls(body: JsonObject, frames: Sequence[JsonValue]) -> None:
         if index not in custom_choices or not isinstance(message, dict):
             continue
         rebuilt: list[JsonValue] = []
-        for merged in calls[index].values():
+        for _, merged in sorted(calls[index].items(), key=lambda entry: json.loads(entry[0])):
             field = "arguments" if merged["kind"] == "function" else "input"
             payload: JsonObject = {"name": merged["name"], field: merged["text"]}
             rebuilt.append(
@@ -309,13 +309,14 @@ def _messages_lifecycle(frames: Sequence[JsonValue]) -> bool:
         elif kind == "content_block_start":
             if (
                 not started
+                or not _u64(index)
                 or index != len(opened)
                 or not isinstance(frame.get("content_block"), dict)
             ):
                 return False
             opened.append(index)
         elif kind in ("content_block_delta", "content_block_stop"):
-            if index not in opened or key in closed:
+            if not _u64(index) or index not in opened or key in closed:
                 return False
             if kind == "content_block_stop":
                 closed.add(key)

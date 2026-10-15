@@ -760,9 +760,11 @@ def test_custom_tools_native_declarations_and_results_stay_readable() -> None:
     assert window.text.splitlines()[1:] == [
         "[tool_result apply_patch] Patch failed: file not found",
         "[tool_call apply_patch] *** retry",
+        "[assistant] [image]",
         '[tool_call image_generation] {"result":"[binary]","revised_prompt":"a diagram"}',
     ]
     assert "QUJDRA" not in exchange.model_dump_json()
+    assert exchange.response[1].has_image()
 
 
 def test_chat_custom_tool_calls_count_as_tool_calls() -> None:
@@ -1140,7 +1142,7 @@ def test_gateway_searches_and_call_images_are_kept() -> None:
             {
                 "type": "message",
                 "stop_reason": "max_tokens",
-                "content": [{"type": "text", "text": ""}],
+                "content": [{"type": "text", "text": "", "citations": None}],
             },
         ),
     ],

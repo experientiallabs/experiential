@@ -263,3 +263,45 @@ def test_custom_call_repair_joins_function_name_fragments() -> None:
         "name": "get_weather",
         "arguments": "{}",
     }
+
+
+def test_messages_block_indexes_must_be_unsigned_integers() -> None:
+    """A block index the assembler rejects (such as true for 1) fails the stream."""
+    frames = [
+        {**frame, "index": True} if isinstance(frame, dict) and frame.get("index") == 1 else frame
+        for frame in MESSAGES_FRAMES
+    ]
+    with pytest.raises(ValueError, match="terminal state"):
+        completed_response("messages", _sse(frames))
+
+
+def test_custom_call_repair_orders_calls_by_index() -> None:
+    """Rebuilt calls follow their numeric index, not their arrival order."""
+    frames: list[JsonValue] = [
+        _chunk(
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "index": 1,
+                        "id": "f1",
+                        "type": "function",
+                        "function": {"name": "lookup", "arguments": "{}"},
+                    },
+                    {
+                        "index": 0,
+                        "id": "c1",
+                        "type": "custom",
+                        "custom": {"name": "apply_patch", "input": "*** A"},
+                    },
+                ],
+            }
+        ),
+        _chunk({}, "tool_calls"),
+        "[DONE]",
+    ]
+    choices = completed_response("chat_completions", _sse(frames))["choices"]
+    assert isinstance(choices, list) and isinstance(choices[0], dict)
+    message = choices[0]["message"]
+    assert isinstance(message, dict) and isinstance(calls := message["tool_calls"], list)
+    assert [call["id"] for call in calls if isinstance(call, dict)] == ["c1", "f1"]
