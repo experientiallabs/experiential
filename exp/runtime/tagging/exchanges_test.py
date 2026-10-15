@@ -1469,3 +1469,23 @@ def test_tool_result_parts_project_their_media_text() -> None:
     assert "QUJDRA" not in exchange.model_dump_json()
     assert result.text().startswith('{"raw":"[image]"}')
     assert isinstance(result.content, tuple) and len(result.content) == 3
+
+
+def test_custom_tool_payloads_keep_fields_named_like_opaque_native_fields() -> None:
+    """Serialized caller payloads carried by native items keep every field."""
+    payload = '{"signature":"0xab","encrypted_content":"client payload"}'
+    request = decode_responses(
+        {
+            "model": "coding",
+            "input": [
+                {"role": "user", "content": "Verify the signed payload"},
+                {"type": "custom_tool_call", "call_id": "c1", "name": "verify", "input": payload},
+                {"type": "custom_tool_call_output", "call_id": "c1", "output": payload},
+            ],
+            "tools": [{"type": "custom", "name": "verify", "description": "Verify a payload"}],
+        }
+    ).request
+    record = _record("responses", request, {"kind": "json", "status": 200, "body": RESPONSES_BODY})
+    exchange = exchange_from_capture_record(record)
+    assert exchange.messages[1].tool_calls[0].function.arguments == payload
+    assert exchange.messages[2].text() == payload

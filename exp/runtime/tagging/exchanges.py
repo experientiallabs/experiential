@@ -620,19 +620,20 @@ def _readable(value: JsonValue, *, native: bool = False) -> tuple[JsonValue, int
 
     Args:
         value: Any JSON value from a tool payload or a native item.
-        native: The value comes from a provider-native item, whose encrypted fields and
-            signatures are opaque; a caller's own tool payload keeps fields of those names.
+        native: The value is a provider-native item's structure, whose encrypted text fields
+            and signatures are opaque. Caller payloads keep fields of those names, including
+            the serialized JSON text a native item carries (custom tool and MCP payloads).
 
     Returns:
         The value with base64 data URLs and base64 sources shown as ``[binary]`` and image
-        parts as ``[image]`` (and, for a native value, without encrypted fields or signatures),
-        and the number of images found. Binary content is recognized by its field shape, never
-        by how a string looks.
+        parts as ``[image]`` (and, for a native structure, without encrypted text fields or
+        signatures), and the number of images found. Binary content is recognized by its field
+        shape, never by how a string looks.
     """
     if isinstance(value, str):
         if _DATA_URL.match(value):
             return ("[image]", 1) if value.startswith("data:image/") else ("[binary]", 0)
-        return _readable_serialized(value, native=native)
+        return _readable_serialized(value)
     if isinstance(value, list):
         items = [_readable(item, native=native) for item in value]
         return [item for item, _ in items], sum(count for _, count in items)
@@ -651,19 +652,20 @@ def _readable(value: JsonValue, *, native: bool = False) -> tuple[JsonValue, int
     projected: JsonObject = {}
     images = 0
     for key, field in value.items():
-        if native and key in _OPAQUE_FIELDS:
+        if native and key in _OPAQUE_FIELDS and isinstance(field, str):
             continue
         projected[key], count = _readable(field, native=native)
         images += count
     return projected, images
 
 
-def _readable_serialized(text: str, *, native: bool) -> tuple[JsonValue, int]:
+def _readable_serialized(text: str) -> tuple[JsonValue, int]:
     """Project text that serializes a JSON structure, such as an MCP tool result.
+
+    Serialized text is the caller's own payload, so every field is kept.
 
     Args:
         text: A tool payload string or a string field of a native item.
-        native: The text comes from a provider-native item.
 
     Returns:
         The text unchanged unless it is a JSON object or array holding images or binary
@@ -675,7 +677,7 @@ def _readable_serialized(text: str, *, native: bool) -> tuple[JsonValue, int]:
         parsed = json.loads(text)
     except (ValueError, RecursionError):
         return text, 0
-    projected, images = _readable(parsed, native=native)
+    projected, images = _readable(parsed)
     if images or projected != parsed:
         return _compact_json(projected), images
     return text, 0
