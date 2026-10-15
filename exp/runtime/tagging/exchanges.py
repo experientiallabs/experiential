@@ -63,6 +63,7 @@ _OPAQUE_FIELDS: Final = frozenset({"encrypted_content", "encrypted_index", "sign
 _IMAGE_TYPES: Final = frozenset({"image", "input_image", "computer_screenshot"})
 # Long runs of base64 characters with no spaces are binary payloads, not readable text.
 _BINARY: Final = re.compile(r"[A-Za-z0-9+/_=-]{256,}")
+_DATA_URL: Final = re.compile(r"data:[\w.+-]+/[\w.+-]+(?:;[\w.+-]+=[\w.+-]+)*;base64,")
 _TEXT_PARTS: Final = frozenset({"text", "input_text", "output_text"})
 _IMAGE_PARTS: Final = frozenset({"image", "image_url", "input_image"})
 
@@ -498,6 +499,14 @@ def _native(role: MessageRole, item: JsonValue) -> TagMessage | None:
     readable, images = _readable(_sole(fields, ("input", "arguments")))
     if kind == "image_generation_call" and item.get("result"):
         images += 1
+    markers = tuple(TagImagePart() for _ in range(images))
+    if not kind.endswith(("_call", "tool_use")):
+        # Listings, approval requests and other non-invocation items stay readable as text
+        # but are not tool calls, matching the gateway's invocation rule.
+        text = readable if isinstance(readable, str) else _compact_json(readable)
+        return TagMessage(
+            role="assistant", content=(TagTextPart(text=f"[{kind}] {text}"), *markers)
+        )
     call: JsonObject = {
         "id": call_id if isinstance(call_id, str) else item.get("id"),
         "name": item.get("name", kind.removesuffix("_call")),
@@ -507,7 +516,6 @@ def _native(role: MessageRole, item: JsonValue) -> TagMessage | None:
     calls = _tool_calls([call])
     if not calls:
         return None
-    markers = tuple(TagImagePart() for _ in range(images))
     return TagMessage(role="assistant", content=markers or None, tool_calls=calls)
 
 
@@ -537,7 +545,7 @@ def _readable(value: JsonValue) -> tuple[JsonValue, int]:
         ``[binary]`` and images as ``[image]``, and the number of images found.
     """
     if isinstance(value, str):
-        binary = value.startswith("data:") or _BINARY.fullmatch(value) is not None
+        binary = _DATA_URL.match(value) is not None or _BINARY.fullmatch(value) is not None
         return ("[binary]", 0) if binary else (value, 0)
     if isinstance(value, list):
         items = [_readable(item) for item in value]

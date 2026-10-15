@@ -71,6 +71,12 @@ def completed_response(protocol: CaptureProtocol, document: JsonObject) -> JsonO
         for block in content if isinstance(content, list) else ():
             if isinstance(block, dict) and "capture_partial_input" in block:
                 raise ValueError("a streamed tool input is not complete JSON")
+            if (
+                isinstance(block, dict)
+                and "input" in block
+                and not isinstance(block["input"], dict)
+            ):
+                raise ValueError("a streamed tool input is not a JSON object")
             # The assembler keeps a tool input with integers beyond 64 bits as exact source
             # text beside a rounded copy; restore the exact input, as Messages carries it.
             if isinstance(block, dict) and isinstance(

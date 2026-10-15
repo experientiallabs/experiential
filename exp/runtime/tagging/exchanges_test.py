@@ -942,8 +942,7 @@ def test_native_items_keep_errors_statuses_results_and_code() -> None:
     program = _native_message(
         "assistant", {"type": "program", "id": "p1", "code": "console.log(fs.readdirSync('.'))"}
     )
-    assert program.tool_calls[0].function.name == "program"
-    assert "readdirSync" in program.tool_calls[0].function.arguments
+    assert not program.tool_calls and "readdirSync" in program.text()
     result = _native_message(
         "tool", {"type": "program_output", "call_id": "p1", "result": "TypeError: x is undefined"}
     )
@@ -1274,6 +1273,46 @@ def test_dropped_history_ignores_replay_entries_for_the_original_messages() -> N
             response={"kind": "json", "status": 200, "body": CHAT_BODY},
             capture_context={"provider_context": {"provider_replay": [{"message_index": 5}]}},
         )
+
+
+def test_mcp_listings_are_readable_but_not_tool_calls() -> None:
+    """Only invocation items count as tool calls; listings and approvals stay as text."""
+    body: JsonObject = {
+        "status": "completed",
+        "output": [
+            {
+                "type": "mcp_list_tools",
+                "id": "ml_1",
+                "server_label": "crm",
+                "tools": [{"name": "delete_row", "input_schema": {"type": "object"}}],
+            },
+            {
+                "type": "mcp_call",
+                "id": "mc_1",
+                "name": "delete_row",
+                "server_label": "crm",
+                "arguments": "{}",
+                "output": "deleted",
+            },
+        ],
+    }
+    exchange = exchange_from_captured(_experience("responses", _responses_request(), body))
+    assert tag_facts(exchange).tool_calls == 1
+    assert exchange.response[0].text().startswith('[mcp_list_tools] {"server_label":"crm"')
+
+
+def test_text_that_only_starts_with_data_is_kept() -> None:
+    """Readable text beginning with data: is not mistaken for an inline payload."""
+    call = _native_message(
+        "assistant",
+        {
+            "type": "custom_tool_call",
+            "call_id": "c1",
+            "name": "edit",
+            "input": 'data: dict[str, int] = {"port": 443}',
+        },
+    )
+    assert call.tool_calls[0].function.arguments == 'data: dict[str, int] = {"port": 443}'
 
 
 def test_record_without_a_response_is_rejected() -> None:

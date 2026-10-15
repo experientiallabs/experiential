@@ -305,3 +305,20 @@ def test_custom_call_repair_orders_calls_by_index() -> None:
     message = choices[0]["message"]
     assert isinstance(message, dict) and isinstance(calls := message["tool_calls"], list)
     assert [call["id"] for call in calls if isinstance(call, dict)] == ["c1", "f1"]
+
+
+def test_messages_tool_input_that_is_not_an_object_is_rejected() -> None:
+    """Streamed tool input must assemble to a JSON object, as the assembler requires."""
+    frames = list(MESSAGES_FRAMES)
+    frames[6] = {
+        "type": "content_block_delta",
+        "index": 1,
+        "delta": {"type": "input_json_delta", "partial_json": "["},
+    }
+    frames[7] = {
+        "type": "content_block_delta",
+        "index": 1,
+        "delta": {"type": "input_json_delta", "partial_json": "]"},
+    }
+    with pytest.raises(ValueError, match="not a JSON object"):
+        completed_response("messages", _sse(frames))
