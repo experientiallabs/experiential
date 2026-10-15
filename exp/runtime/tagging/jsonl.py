@@ -4,12 +4,14 @@ The input holds one ``TagExchange`` per line. Each tagged exchange is appended t
 one ``ExchangeTags`` line and each failed exchange to the failures file as one ``TagFailure``
 line, flushed as soon as it is ready. Running again with the same output skips exchanges the
 output already holds and retries everything else, including earlier failures; the failures file
-is an append-only log of every failed attempt.
+is an append-only log of every failed attempt. A last line an interrupted write left without its
+newline is cut off before anything is appended, so its exchange is tagged again.
 """
 
 from __future__ import annotations
 
 import logging
+import os
 from collections.abc import Iterator
 from contextlib import aclosing
 from pathlib import Path
@@ -69,11 +71,31 @@ def _invalid(path: Path, number: int, kind: str, error: ValidationError) -> Valu
     )
 
 
+def _drop_unterminated_tail(path: Path) -> None:
+    """Cut a last line an interrupted write left without its newline, so appends stay valid.
+
+    Args:
+        path: A JSONL file, which may not exist yet.
+    """
+    if not path.exists():
+        return
+    with path.open("r+b") as handle:
+        end = cut = handle.seek(0, os.SEEK_END)
+        while cut > 0:
+            start = max(cut - 65_536, 0)
+            handle.seek(start)
+            newline = handle.read(cut - start).rfind(b"\n")
+            if newline >= 0:
+                cut = start + newline + 1
+                break
+            cut = start
+        if cut != end:
+            logger.warning("dropping an unterminated last line of %s", path)
+            handle.truncate(cut)
+
+
 def _completed(output: Path, digest: str) -> tuple[set[str], set[str]]:
     """Read the exchange ids and tagged openings an existing output already holds.
-
-    An unterminated last line, left by an interrupted write, is cut off so the next record
-    starts on its own line; its exchange is tagged again.
 
     Args:
         output: The output file, which may not exist yet.
@@ -90,12 +112,8 @@ def _completed(output: Path, digest: str) -> tuple[set[str], set[str]]:
     opened: set[str] = set()
     if not output.exists():
         return ids, opened
-    kept = 0
     with output.open("rb") as handle:
         for number, line in enumerate(handle, 1):
-            if not line.endswith(b"\n"):
-                break
-            kept += len(line)
             if not line.strip():
                 continue
             try:
@@ -111,10 +129,6 @@ def _completed(output: Path, digest: str) -> tuple[set[str], set[str]]:
             ids.add(record.exchange_id)
             if record.conversation is not None:
                 opened.add(record.conversation_key)
-    if kept != output.stat().st_size:
-        logger.warning("dropping an unterminated last line of %s; it is tagged again", output)
-        with output.open("r+b") as handle:
-            handle.truncate(kept)
     return ids, opened
 
 
@@ -142,6 +156,8 @@ async def tag_jsonl(
         ValueError: An input or output line is invalid, or the output holds records from a
             different bank. Records written before the error stay in the output.
     """
+    for path in (output, failures):
+        _drop_unterminated_tail(path)
     done, opened = _completed(output, tagger.bank.digest)
     skipped = 0
 

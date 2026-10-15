@@ -87,14 +87,17 @@ def test_tag_jsonl_writes_results_and_failures_then_resumes(tmp_path: Path) -> N
 
 
 def test_an_interrupted_last_line_is_dropped_and_tagged_again(tmp_path: Path) -> None:
-    """An unterminated record left by a crash never merges with the next one."""
+    """Unterminated output and failure lines left by a crash never merge with the next one."""
     (tmp_path / "exchanges.jsonl").write_text(_exchange("e1", "a") + _exchange("e2", "b", "k2"))
     _run(_tagger(set(), []), tmp_path)
     output = tmp_path / "tags.jsonl"
     complete, interrupted = output.read_text().splitlines()
     output.write_text(complete + "\n" + interrupted[:40])
-    assert _run(_tagger(set(), []), tmp_path) == TagJsonlReport(tagged=1, failed=0, skipped=1)
-    assert [record.exchange_id for record in _records(output)] == ["e1", "e2"]
+    (tmp_path / "failures.jsonl").write_text('{"exchange_id": "e2", "sco')
+    assert _run(_tagger({"b"}, []), tmp_path) == TagJsonlReport(tagged=0, failed=1, skipped=1)
+    assert [record.exchange_id for record in _records(output)] == ["e1"]
+    (failure,) = (tmp_path / "failures.jsonl").read_text().splitlines()
+    assert TagFailure.model_validate_json(failure).exchange_id == "e2"
 
 
 def test_invalid_lines_and_foreign_banks_stop_the_run(tmp_path: Path) -> None:

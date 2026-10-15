@@ -216,11 +216,13 @@ def test_failed_opener_hands_the_opening_to_the_next_exchange() -> None:
         calls += 1
         return httpx.Response(500) if calls == 1 else None
 
-    tagger = Tagger(_client(seen, fail_first), budget=_BUDGET, max_in_flight=1)
-    results = _run_many(tagger, [_exchange("x1", key="k"), _exchange("x2", key="k")])
+    tagger = Tagger(_client(seen, fail_first), budget=_BUDGET, max_in_flight=4)
+    exchanges = [_exchange("x1", key="k"), _exchange("x2", key="k"), _exchange("x3", key="k")]
+    results = _run_many(tagger, exchanges)
     assert isinstance(results["x1"], TaggingError)
-    second = results["x2"]
+    second, third = results["x2"], results["x3"]
     assert isinstance(second, ExchangeTags) and second.conversation is not None
+    assert isinstance(third, ExchangeTags) and third.conversation is None
 
 
 def test_decisions_in_flight_never_exceed_the_bound() -> None:

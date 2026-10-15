@@ -281,10 +281,12 @@ class Tagger:
     ) -> AsyncGenerator[ExchangeTags | TaggingError, None]:
         """Tag a stream of exchanges, yielding each result as soon as it is ready.
 
-        Exchanges are read lazily, at most ``max_in_flight`` at a time. The first exchange of
-        each conversation key (``conversation_key``) not in ``opening_tagged_keys`` also tags the
-        opening; later exchanges with that key skip it. When that exchange fails, the next one
-        read with the same key tags the opening instead.
+        Exchanges are read lazily; at most ``max_in_flight`` are being tagged or held at once.
+        The first exchange of each conversation key (``conversation_key``) not in
+        ``opening_tagged_keys`` also tags the opening. Later exchanges with that key are held
+        until it finishes, then skip the opening; if it failed, the first held exchange asks
+        the opening instead, so a conversation keeps its opening whenever any of its exchanges
+        is tagged.
 
         Args:
             exchanges: Exchanges to tag, in order.
@@ -299,35 +301,44 @@ class Tagger:
             Exception: Any failure other than a decision error, such as reading the exchanges.
         """
         tagged = set(opening_tagged_keys)
-        source = iter(exchanges)
+        # Keys whose opening is being asked, with the exchanges held until it finishes.
+        held: dict[str, list[TagExchange]] = {}
         pending: dict[asyncio.Task[ExchangeTags], str | None] = {}
+        source = iter(exchanges)
+
+        def start(exchange: TagExchange, key: str) -> None:
+            """Hold the exchange behind an opening in flight, or start tagging it."""
+            if key in held:
+                held[key].append(exchange)
+                return
+            claimed = key not in tagged
+            if claimed:
+                tagged.add(key)
+                held[key] = []
+            task = asyncio.create_task(self.tag(exchange, opening_already_tagged=not claimed))
+            pending[task] = key if claimed else None
+
         try:
             while True:
-                while len(pending) < self._max_in_flight:
+                while len(pending) + sum(map(len, held.values())) < self._max_in_flight:
                     exchange = next(source, None)
                     if exchange is None:
                         break
-                    key = conversation_key(exchange)
-                    claimed = key not in tagged
-                    tagged.add(key)
-                    task = asyncio.create_task(
-                        self.tag(exchange, opening_already_tagged=not claimed)
-                    )
-                    pending[task] = key if claimed else None
+                    start(exchange, conversation_key(exchange))
                 if not pending:
                     return
                 done, _ = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
                 for task in [task for task in pending if task in done]:
                     claimed_key = pending.pop(task)
                     error = task.exception()
-                    if isinstance(error, TaggingError):
-                        if claimed_key is not None:
-                            tagged.discard(claimed_key)
-                        yield error
-                    elif error is not None:
+                    if error is not None and not isinstance(error, TaggingError):
                         raise error
-                    else:
-                        yield task.result()
+                    if claimed_key is not None:
+                        if error is not None:
+                            tagged.discard(claimed_key)
+                        for exchange in held.pop(claimed_key):
+                            start(exchange, claimed_key)
+                    yield error if isinstance(error, TaggingError) else task.result()
         finally:
             for task in pending:
                 task.cancel()
