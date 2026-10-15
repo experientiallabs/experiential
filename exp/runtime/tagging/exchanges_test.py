@@ -1338,6 +1338,38 @@ def test_approval_requests_name_their_tool_and_capture_evidence_is_unchanged() -
     assert experience.model_dump_json() == before
 
 
+def test_local_shell_output_links_to_its_call() -> None:
+    """A local shell output links to its call through its id."""
+    exchange = exchange_from_capture_parts(
+        exchange_id="request-10",
+        protocol="chat_completions",
+        messages=[
+            {"role": "user", "content": "List files"},
+            {
+                "role": "assistant",
+                "provider_native_item": {
+                    "type": "local_shell_call",
+                    "id": "lsh_1",
+                    "call_id": "call_1",
+                    "action": {"type": "exec", "command": ["ls"]},
+                },
+            },
+            {
+                "role": "tool",
+                "provider_native_item": {
+                    "type": "local_shell_call_output",
+                    "id": "call_1",
+                    "output": "README.md",
+                },
+            },
+        ],
+        request=None,
+        response={"kind": "json", "status": 200, "body": CHAT_BODY},
+    )
+    assert exchange.messages[2].tool_call_id == "call_1"
+    assert "[tool_result local_shell] README.md" in turn_windows(exchange)[0].text
+
+
 def test_record_without_a_response_is_rejected() -> None:
     """A prompt checkpoint with no response yet cannot be tagged."""
     record = _record(

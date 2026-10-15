@@ -481,6 +481,9 @@ def _native(role: MessageRole, item: JsonValue) -> TagMessage | None:
     if kind == "text" and isinstance(text := item.get("text"), str):
         return TagMessage(role="assistant", content=text) if role == "assistant" else None
     call_id = item.get("call_id", item.get("tool_use_id"))
+    if call_id is None and kind == "local_shell_call_output":
+        # This output names its originating call through its own id.
+        call_id = item.get("id")
     fields = {
         key: field
         for key, field in item.items()
