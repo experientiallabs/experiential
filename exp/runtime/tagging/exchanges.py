@@ -62,6 +62,12 @@ _MESSAGES_EVENTS: Final = frozenset(
         "message_stop",
     }
 )
+# Item fields that identify an item or hold bytes no tag question can read.
+_OPAQUE_FIELDS: Final = frozenset(
+    {"type", "id", "call_id", "name", "status", "result", "encrypted_content"}
+)
+_TEXT_PARTS: Final = frozenset({"text", "input_text", "output_text"})
+_IMAGE_PARTS: Final = frozenset({"image", "image_url", "input_image"})
 _NATIVE_PROTOCOL: Final[dict[CaptureProtocol, str]] = {
     "chat_completions": "chat",
     "responses": "responses",
@@ -241,18 +247,28 @@ def _from_parts(
     request_turns = tuple(turn for turn in map(_message, canonical) if turn is not None)
     if not request_turns:
         raise ValueError("the request has no readable messages")
-    output = output_messages(
-        protocol, _refusals_as_text(body) if protocol == "responses" else body, capture_output
-    )
+    readable, partial = _readable_responses(body) if protocol == "responses" else (body, {})
+    output = output_messages(protocol, readable, capture_output)
+    for message in output:
+        for call in _list(message.get("tool_calls")):
+            if isinstance(call, dict) and isinstance(
+                raw := partial.get(str(call.get("call_id"))), str
+            ):
+                call["arguments"] = raw
     response_turns = tuple(turn for turn in map(_message, output) if turn is not None)
     internal = capture_context.get("provider_internal")
-    structured = envelope.get("structured_text") is not None or (
-        isinstance(internal, dict) and internal.get("json_object_output") is True
+    internal = internal if isinstance(internal, dict) else {}
+    output_config = internal.get("provider_output_config")
+    output_format = output_config.get("format") if isinstance(output_config, dict) else None
+    structured = (
+        envelope.get("structured_text") is not None
+        or internal.get("json_object_output") is True
+        or (isinstance(output_format, dict) and output_format.get("type") == "json_schema")
     )
     return TagExchange(
         exchange_id=exchange_id,
         conversation_key=conversation_key or _caller_conversation(envelope, capture_context),
-        tools=_tools(envelope.get("tools")),
+        tools=_tools(envelope.get("tools"), internal.get("provider_native_tools")),
         messages=request_turns,
         response=response_turns or (TagMessage(role="assistant"),),
         truncated=_finished_by_length(protocol, body),
@@ -376,25 +392,26 @@ def _lifecycle(protocol: CaptureProtocol, frames: Sequence[JsonValue]) -> bool:
     )
 
 
-def _refusals_as_text(body: JsonObject) -> JsonObject:
-    """Turn Responses refusal parts into output text the output decoder accepts.
+def _readable_responses(body: JsonObject) -> tuple[JsonObject, dict[str, str]]:
+    """Prepare Responses output for the output decoder, which reuses the request schema.
 
-    The output decoder reuses the request schema, which has no refusal part; the refusal text
-    is what a tag question needs to see.
+    Refusal parts become output text, since the request schema has no refusal part. A
+    function call whose arguments are not a JSON object (a call cut off by the length limit)
+    decodes with empty arguments, and its exact text is returned for restoring afterwards.
 
     Args:
         body: A complete Responses body.
 
     Returns:
-        The body, copied with each refusal part rewritten when it has any.
+        A copied body the decoder accepts, and the cut-off argument text by call id.
     """
     output = body.get("output")
     if not isinstance(output, list):
-        return body
+        return body, {}
+    partial: dict[str, str] = {}
     items: list[JsonValue] = []
     for item in output:
-        content = item.get("content") if isinstance(item, dict) else None
-        if isinstance(item, dict) and isinstance(content, list):
+        if isinstance(item, dict) and isinstance(content := item.get("content"), list):
             parts: list[JsonValue] = [
                 {"type": "output_text", "text": part.get("refusal"), "annotations": []}
                 if isinstance(part, dict) and part.get("type") == "refusal"
@@ -402,8 +419,24 @@ def _refusals_as_text(body: JsonObject) -> JsonObject:
                 for part in content
             ]
             item = {**item, "content": parts}
+        if (
+            isinstance(item, dict)
+            and item.get("type") == "function_call"
+            and isinstance(arguments := item.get("arguments"), str)
+            and not _json_object(arguments)
+        ):
+            partial[str(item.get("call_id"))] = arguments
+            item = {**item, "arguments": "{}"}
         items.append(item)
-    return {**body, "output": items}
+    return {**body, "output": items}, partial
+
+
+def _json_object(text: str) -> bool:
+    """Report whether text parses as a JSON object."""
+    try:
+        return isinstance(json.loads(text), dict)
+    except (ValueError, RecursionError):
+        return False
 
 
 def _sse_bytes(frames: Sequence[JsonValue]) -> bytes:
@@ -472,44 +505,90 @@ def _finished_by_length(protocol: CaptureProtocol, body: JsonObject) -> bool:
 
     Returns:
         True for a ``length`` finish, an incomplete Response over ``max_output_tokens`` or a
-        Message that stopped at ``max_tokens``.
+        Message that stopped at ``max_tokens`` or at the model's context window.
     """
     if protocol == "responses":
         details = body.get("incomplete_details")
         return isinstance(details, dict) and details.get("reason") == "max_output_tokens"
     if protocol == "messages":
-        return body.get("stop_reason") == "max_tokens"
+        return body.get("stop_reason") in ("max_tokens", "model_context_window_exceeded")
     choices = body.get("choices")
     return isinstance(choices, list) and any(
         isinstance(choice, dict) and choice.get("finish_reason") == "length" for choice in choices
     )
 
 
-def _tools(value: JsonValue) -> tuple[TagTool, ...]:
-    """Read the offered tool definitions.
+def _tools(value: JsonValue, native: JsonValue) -> tuple[TagTool, ...]:
+    """Read the offered tools in caller order, including provider-native declarations.
 
     Args:
         value: The envelope's ``tools`` list, in canonical form.
+        native: The captured ``provider_native_tools`` entries (caller position plus
+            declaration), or None.
 
     Returns:
-        The tools with a name.
+        Every tool with a name; a namespace contributes its functions as ``namespace.name``.
     """
-    if not isinstance(value, list):
-        return ()
-    tools: list[TagTool] = []
-    for tool in value:
-        if not isinstance(tool, dict) or not isinstance(name := tool.get("name"), str) or not name:
-            continue
-        description = tool.get("description")
-        parameters = tool.get("parameters")
-        tools.append(
-            TagTool(
-                name=name,
-                description=description if isinstance(description, str) else None,
-                parameters=parameters if isinstance(parameters, dict) else {},
+    ordinary = [_tool(tool) for tool in _list(value) if isinstance(tool, dict)]
+    placed: dict[int, list[TagTool]] = {}
+    for entry in _list(native):
+        if isinstance(entry, dict) and isinstance(tool := entry.get("tool"), dict):
+            index = entry.get("index")
+            placed.setdefault(index if isinstance(index, int) else 1 << 30, []).extend(
+                _native_tools(tool)
             )
-        )
-    return tuple(tools)
+    tools: list[TagTool | None] = []
+    remaining = iter(ordinary)
+    for position in range(len(ordinary) + len(placed)):
+        if position in placed:
+            tools.extend(placed.pop(position))
+        else:
+            tools.append(next(remaining, None))
+    tools.extend(remaining)
+    for rest in placed.values():
+        tools.extend(rest)
+    return tuple(tool for tool in tools if tool is not None)
+
+
+def _tool(tool: JsonObject, prefix: str = "") -> TagTool | None:
+    """Read one function-like tool declaration.
+
+    Args:
+        tool: A declaration with ``name``, ``description`` and ``parameters``.
+        prefix: Namespace prefix for nested functions.
+
+    Returns:
+        The tool, or None when it has no name.
+    """
+    name = tool.get("name", tool.get("server_label", tool.get("type")))
+    if not isinstance(name, str) or not name:
+        return None
+    description = tool.get("description")
+    parameters = tool.get("parameters")
+    return TagTool(
+        name=f"{prefix}{name}",
+        description=description if isinstance(description, str) else None,
+        parameters=parameters if isinstance(parameters, dict) else {},
+    )
+
+
+def _native_tools(tool: JsonObject) -> list[TagTool]:
+    """Read one provider-native declaration, expanding a namespace into its functions.
+
+    Args:
+        tool: The native declaration.
+
+    Returns:
+        The tools it offers.
+    """
+    if tool.get("type") == "namespace" and isinstance(tool.get("tools"), list):
+        prefix = f"{tool.get('name')}."
+        nested = [
+            _tool(item, prefix) for item in _list(tool.get("tools")) if isinstance(item, dict)
+        ]
+        return [item for item in nested if item is not None]
+    single = _tool(tool)
+    return [single] if single is not None else []
 
 
 def _message(value: JsonObject) -> TagMessage | None:
@@ -549,11 +628,11 @@ def _message(value: JsonObject) -> TagMessage | None:
 
 
 def _native(role: MessageRole, item: JsonValue) -> TagMessage | None:
-    """Keep what a tag question can read from a provider-native output item.
+    """Keep what a tag question can read from a provider-native item.
 
-    Cited text keeps its text, and server-side tool use (a Responses ``*_call`` item or an
-    Anthropic ``server_tool_use`` block) becomes a tool call. Reasoning, encrypted results and
-    other opaque items are dropped.
+    Cited text keeps its text; server-side and custom tool use (Responses ``*_call`` items,
+    Anthropic ``server_tool_use``) becomes a tool call under its own name; a native tool
+    result keeps its output. Binary results, encrypted content and reasoning are dropped.
 
     Args:
         role: The carrying message's role.
@@ -562,9 +641,19 @@ def _native(role: MessageRole, item: JsonValue) -> TagMessage | None:
     Returns:
         The readable message, or None when nothing in the item is readable.
     """
-    if not isinstance(item, dict) or role != "assistant":
+    if not isinstance(item, dict):
         return None
     kind = str(item.get("type"))
+    if role == "tool" and "output" in item:
+        call_id = item.get("call_id")
+        content = _content({"content": item.get("output")})
+        return TagMessage(
+            role="tool",
+            content=content,
+            tool_call_id=call_id if isinstance(call_id, str) else None,
+        )
+    if role != "assistant":
+        return None
     if kind == "text" and isinstance(text := item.get("text"), str):
         return TagMessage(role=role, content=text)
     if kind == "server_tool_use":
@@ -573,9 +662,15 @@ def _native(role: MessageRole, item: JsonValue) -> TagMessage | None:
             "name": item.get("name"),
             "arguments": item.get("input"),
         }
+    elif kind == "custom_tool_call":
+        call = {"id": item.get("call_id"), "name": item.get("name"), "arguments": item.get("input")}
     elif kind.endswith("_call") and kind != "function_call":
-        details = {key: field for key, field in item.items() if key not in ("type", "id", "status")}
-        call = {"id": item.get("id"), "name": kind.removesuffix("_call"), "arguments": details}
+        details = {key: field for key, field in item.items() if key not in _OPAQUE_FIELDS}
+        call = {
+            "id": item.get("call_id", item.get("id")),
+            "name": item.get("name", kind.removesuffix("_call")),
+            "arguments": details,
+        }
     else:
         return None
     calls = _tool_calls([call])
@@ -602,9 +697,9 @@ def _content(value: JsonObject) -> str | tuple[TagContentPart, ...] | None:
         if not isinstance(part, dict):
             continue
         kind = part.get("kind", part.get("type"))
-        if kind == "text" and isinstance(text := part.get("text"), str):
+        if kind in _TEXT_PARTS and isinstance(text := part.get("text"), str):
             converted.append(TagTextPart(text=text))
-        elif kind in ("image", "image_url"):
+        elif kind in _IMAGE_PARTS:
             converted.append(_image(part))
         elif isinstance(kind, str):
             converted.append(TagTextPart(text=f"[{kind}]"))
@@ -617,7 +712,8 @@ def _image(part: JsonObject) -> TagImagePart:
     """Record an image part by media type and remote URL only.
 
     Args:
-        part: A canonical image part or a chat ``image_url`` part.
+        part: A canonical image part, a Chat ``image_url`` part or a Responses
+            ``input_image`` part.
 
     Returns:
         The image marker; inline data is never copied.
@@ -626,6 +722,8 @@ def _image(part: JsonObject) -> TagImagePart:
     nested = part.get("image_url")
     if isinstance(nested, dict):
         url = nested.get("url")
+    elif isinstance(nested, str):
+        url = nested
     media_type = part.get("media_type")
     remote = isinstance(url, str) and url.startswith(("http://", "https://"))
     return TagImagePart(
@@ -635,7 +733,7 @@ def _image(part: JsonObject) -> TagImagePart:
 
 
 def _tool_calls(value: JsonValue) -> tuple[TagToolCall, ...]:
-    """Read assistant tool calls in canonical or chat form.
+    """Read assistant tool calls in canonical or chat form, function or custom.
 
     Args:
         value: The message's ``tool_calls`` list.
@@ -649,12 +747,12 @@ def _tool_calls(value: JsonValue) -> tuple[TagToolCall, ...]:
     for call in value:
         if not isinstance(call, dict):
             continue
-        function = call.get("function")
-        source = function if isinstance(function, dict) else call
+        nested = call.get("function", call.get("custom"))
+        source = nested if isinstance(nested, dict) else call
         name = source.get("name")
         if not isinstance(name, str) or not name:
             continue
-        arguments = source.get("arguments")
+        arguments = source.get("arguments", source.get("input"))
         if not isinstance(arguments, str):
             arguments = json.dumps(arguments or {}, ensure_ascii=False, separators=(",", ":"))
         call_id = call.get("id", call.get("call_id"))
