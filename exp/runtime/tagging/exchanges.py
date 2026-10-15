@@ -51,6 +51,17 @@ _ROLES: Final[dict[str, MessageRole]] = {
     "assistant": "assistant",
     "tool": "tool",
 }
+_MESSAGES_EVENTS: Final = frozenset(
+    {
+        "ping",
+        "message_start",
+        "content_block_start",
+        "content_block_delta",
+        "content_block_stop",
+        "message_delta",
+        "message_stop",
+    }
+)
 _NATIVE_PROTOCOL: Final[dict[CaptureProtocol, str]] = {
     "chat_completions": "chat",
     "responses": "responses",
@@ -230,7 +241,9 @@ def _from_parts(
     request_turns = tuple(turn for turn in map(_message, canonical) if turn is not None)
     if not request_turns:
         raise ValueError("the request has no readable messages")
-    output = output_messages(protocol, body, capture_output)
+    output = output_messages(
+        protocol, _refusals_as_text(body) if protocol == "responses" else body, capture_output
+    )
     response_turns = tuple(turn for turn in map(_message, output) if turn is not None)
     internal = capture_context.get("provider_internal")
     structured = envelope.get("structured_text") is not None or (
@@ -255,12 +268,12 @@ def _caller_conversation(envelope: JsonObject, capture_context: JsonObject) -> s
         capture_context: Capture context.
 
     Returns:
-        A non-blank ``metadata.conversation_id`` of at most 512 characters, else the session
+        A non-blank ``metadata.conversation_id`` of at most 512 UTF-8 bytes, else the session
         id, else None.
     """
     metadata = envelope.get("metadata")
     label = metadata.get("conversation_id") if isinstance(metadata, dict) else None
-    if isinstance(label, str) and label.strip() and len(label) <= 512:
+    if isinstance(label, str) and label.strip() and len(label.encode("utf-8")) <= 512:
         return label
     session = capture_context.get("session_id")
     return session if isinstance(session, str) and session else None
@@ -298,10 +311,18 @@ def completed_response(protocol: CaptureProtocol, document: JsonObject) -> JsonO
             raise ValueError("the stream has no frames or reports an error")
         captured = CaptureResponse(_NATIVE_PROTOCOL[protocol], _sse_bytes(frames), True)
         body = json.loads(captured.body_json)
+        content = body.get("content") if isinstance(body, dict) else None
+        for block in content if isinstance(content, list) else ():
+            # The assembler keeps a tool input with integers beyond 64 bits as exact source
+            # text beside a rounded copy; restore the exact input, as Messages carries it.
+            if isinstance(block, dict) and isinstance(
+                source := block.pop("capture_input_source_json", None), str
+            ):
+                block["input"] = json.loads(source)
         # A Responses stream body is its terminal event's response, so the terminal check
         # below also accepts an incomplete (length-limited) response. Chat and Messages
         # streams must also have reached their end-of-stream event.
-        complete = protocol == "responses" or captured.completed
+        complete = protocol == "responses" or (captured.completed and _lifecycle(protocol, frames))
     else:
         raise ValueError(f"unknown response kind {kind!r}")
     if not isinstance(body, dict) or not complete or not _terminal(protocol, body):
@@ -309,6 +330,80 @@ def completed_response(protocol: CaptureProtocol, document: JsonObject) -> JsonO
     if _has_error(body):
         raise ValueError("the response reports an error")
     return body
+
+
+def _lifecycle(protocol: CaptureProtocol, frames: Sequence[JsonValue]) -> bool:
+    """Apply the collector's stream validity rules for Chat and Messages streams.
+
+    Args:
+        protocol: Chat Completions or Messages.
+        frames: Stored ``data`` payloads in order.
+
+    Returns:
+        For Chat, every chunk carries choices, the stream ends with ``[DONE]`` and its first
+        chunk names an id and a model. For Messages, every frame is a known event, one
+        ``message_start`` opens the stream, ``message_stop`` ends it, and every content block
+        that started (in index order) also stopped.
+    """
+    if protocol == "chat_completions":
+        chunks = frames[:-1]
+        first = chunks[0] if chunks else None
+        return (
+            frames[-1:] == ["[DONE]"]
+            and isinstance(first, dict)
+            and first.get("id") is not None
+            and first.get("model") is not None
+            and all(
+                isinstance(chunk, dict) and isinstance(chunk.get("choices"), list)
+                for chunk in chunks
+            )
+        )
+    if not all(
+        isinstance(frame, dict) and frame.get("type") in _MESSAGES_EVENTS for frame in frames
+    ):
+        return False
+    events = [frame for frame in frames if isinstance(frame, dict) and frame.get("type") != "ping"]
+    kinds = [event.get("type") for event in events]
+    started = [event.get("index") for event in events if event.get("type") == "content_block_start"]
+    stopped = {event.get("index") for event in events if event.get("type") == "content_block_stop"}
+    return (
+        kinds[:1] == ["message_start"]
+        and kinds.count("message_start") == 1
+        and kinds[-1:] == ["message_stop"]
+        and kinds.count("message_stop") == 1
+        and started == list(range(len(started)))
+        and stopped == set(started)
+    )
+
+
+def _refusals_as_text(body: JsonObject) -> JsonObject:
+    """Turn Responses refusal parts into output text the output decoder accepts.
+
+    The output decoder reuses the request schema, which has no refusal part; the refusal text
+    is what a tag question needs to see.
+
+    Args:
+        body: A complete Responses body.
+
+    Returns:
+        The body, copied with each refusal part rewritten when it has any.
+    """
+    output = body.get("output")
+    if not isinstance(output, list):
+        return body
+    items: list[JsonValue] = []
+    for item in output:
+        content = item.get("content") if isinstance(item, dict) else None
+        if isinstance(item, dict) and isinstance(content, list):
+            parts: list[JsonValue] = [
+                {"type": "output_text", "text": part.get("refusal"), "annotations": []}
+                if isinstance(part, dict) and part.get("type") == "refusal"
+                else part
+                for part in content
+            ]
+            item = {**item, "content": parts}
+        items.append(item)
+    return {**body, "output": items}
 
 
 def _sse_bytes(frames: Sequence[JsonValue]) -> bytes:
@@ -430,10 +525,11 @@ def _message(value: JsonObject) -> TagMessage | None:
         The message, or None for a native item or an unknown role.
     """
     role = _ROLES.get(str(value.get("role")))
-    if role is None or value.get("provider_native_item") is not None:
+    if role is None:
         return None
-    if value.get("provider_anthropic_block") is not None:
-        return None
+    native = value.get("provider_native_item", value.get("provider_anthropic_block"))
+    if native is not None:
+        return _native(role, native)
     content = _content(value)
     refusal = value.get("refusal")
     if role == "assistant" and not content and isinstance(refusal, str):
@@ -450,6 +546,40 @@ def _message(value: JsonObject) -> TagMessage | None:
         tool_calls=_tool_calls(value.get("tool_calls")) if role == "assistant" else (),
         tool_call_id=call_id if role == "tool" and isinstance(call_id, str) else None,
     )
+
+
+def _native(role: MessageRole, item: JsonValue) -> TagMessage | None:
+    """Keep what a tag question can read from a provider-native output item.
+
+    Cited text keeps its text, and server-side tool use (a Responses ``*_call`` item or an
+    Anthropic ``server_tool_use`` block) becomes a tool call. Reasoning, encrypted results and
+    other opaque items are dropped.
+
+    Args:
+        role: The carrying message's role.
+        item: The native item or block.
+
+    Returns:
+        The readable message, or None when nothing in the item is readable.
+    """
+    if not isinstance(item, dict) or role != "assistant":
+        return None
+    kind = str(item.get("type"))
+    if kind == "text" and isinstance(text := item.get("text"), str):
+        return TagMessage(role=role, content=text)
+    if kind == "server_tool_use":
+        call: JsonObject = {
+            "id": item.get("id"),
+            "name": item.get("name"),
+            "arguments": item.get("input"),
+        }
+    elif kind.endswith("_call") and kind != "function_call":
+        details = {key: field for key, field in item.items() if key not in ("type", "id", "status")}
+        call = {"id": item.get("id"), "name": kind.removesuffix("_call"), "arguments": details}
+    else:
+        return None
+    calls = _tool_calls([call])
+    return TagMessage(role=role, tool_calls=calls) if calls else None
 
 
 def _content(value: JsonObject) -> str | tuple[TagContentPart, ...] | None:
