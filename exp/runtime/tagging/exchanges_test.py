@@ -744,6 +744,141 @@ def test_long_non_ascii_conversation_labels_fall_back_like_the_local_store() -> 
     assert exchange_from_capture_record(short).conversation_key == "\u96ea" * 100
 
 
+def test_cut_off_responses_tool_arguments_keep_their_text() -> None:
+    """A call cut off by the length limit keeps its partial arguments and marks truncation."""
+    body: JsonObject = {
+        "status": "incomplete",
+        "incomplete_details": {"reason": "max_output_tokens"},
+        "output": [
+            {
+                "type": "function_call",
+                "id": "fc_1",
+                "call_id": "call_9",
+                "name": "search",
+                "arguments": '{"query":',
+                "status": "incomplete",
+            }
+        ],
+    }
+    exchange = exchange_from_captured(_experience("responses", _responses_request(), body))
+    assert exchange.response[0].tool_calls[0].function.arguments == '{"query":'
+    assert tag_facts(exchange).truncated
+
+
+def test_custom_tools_native_declarations_and_results_stay_readable() -> None:
+    """Custom calls, their native results and native tool declarations reach the windows."""
+    request = decode_responses(
+        {
+            "model": "coding",
+            "input": [
+                {"role": "user", "content": "Patch the file"},
+                {
+                    "type": "custom_tool_call",
+                    "call_id": "c1",
+                    "name": "apply_patch",
+                    "input": "*** p",
+                },
+                {
+                    "type": "custom_tool_call_output",
+                    "call_id": "c1",
+                    "output": "Patch failed: file not found",
+                },
+            ],
+            "tools": [
+                {
+                    "type": "namespace",
+                    "name": "files",
+                    "description": "File tools",
+                    "tools": [
+                        {
+                            "type": "function",
+                            "name": "read",
+                            "description": "Read a file",
+                            "parameters": {"type": "object"},
+                        }
+                    ],
+                },
+                {"type": "custom", "name": "apply_patch", "description": "Apply a patch"},
+                {"type": "web_search"},
+            ],
+        }
+    ).request
+    body: JsonObject = {
+        "status": "completed",
+        "output": [
+            {
+                "type": "custom_tool_call",
+                "id": "ct",
+                "call_id": "c2",
+                "name": "apply_patch",
+                "input": "*** retry",
+                "status": "completed",
+            },
+            {
+                "type": "image_generation_call",
+                "id": "ig",
+                "status": "completed",
+                "result": "QUJDRA==",
+                "revised_prompt": "a diagram",
+            },
+        ],
+    }
+    exchange = exchange_from_captured(_experience("responses", request, body))
+    assert [tool.name for tool in exchange.tools] == ["files.read", "apply_patch", "web_search"]
+    (window,) = turn_windows(exchange)
+    assert window.text.splitlines()[1:] == [
+        "[tool_result apply_patch] Patch failed: file not found",
+        "[tool_call apply_patch] *** retry",
+        '[tool_call image_generation] {"revised_prompt":"a diagram"}',
+    ]
+    assert "QUJDRA" not in exchange.model_dump_json()
+
+
+def test_chat_custom_tool_calls_count_as_tool_calls() -> None:
+    """A Chat custom tool call keeps its name and input."""
+    body: JsonObject = {
+        "choices": [
+            {
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "c3",
+                            "type": "custom",
+                            "custom": {"name": "apply_patch", "input": "*** p"},
+                        }
+                    ],
+                },
+                "finish_reason": "tool_calls",
+            }
+        ]
+    }
+    exchange = exchange_from_captured(_experience("chat_completions", _chat_request(), body))
+    assert tag_facts(exchange).tool_calls == 1
+    assert exchange.response[0].tool_calls[0].function.arguments == "*** p"
+
+
+def test_messages_schema_output_and_context_exhaustion_are_facts() -> None:
+    """A Messages JSON schema format is structured output; context exhaustion is truncation."""
+    request = decode_messages(
+        {
+            "model": "coding",
+            "max_tokens": 64,
+            "messages": [{"role": "user", "content": "List files as JSON"}],
+            "output_config": {"format": {"type": "json_schema", "schema": {"type": "object"}}},
+        }
+    ).request
+    body: JsonObject = {
+        "type": "message",
+        "stop_reason": "model_context_window_exceeded",
+        "content": [{"type": "text", "text": '{"files": ['}],
+    }
+    facts = tag_facts(exchange_from_captured(_experience("messages", request, body)))
+    assert facts.structured_output and facts.truncated
+
+
 def test_record_without_a_response_is_rejected() -> None:
     """A prompt checkpoint with no response yet cannot be tagged."""
     record = _record(
