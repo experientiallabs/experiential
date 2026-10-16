@@ -507,6 +507,53 @@ final checkpoint. It prints one aggregate line (replies exact, reply fields matc
 mean), how often the judge's per-turn verdict agrees with exact reproduction (a check on the
 judge, not a score), and the learning curve.
 
+A held-out lineage stays independent only while nobody has read its per-trace results, or the
+results of anything grouped with it. That fact is kept in one exposure ledger at the `.exp` root
+(`<root>/exposure-ledger/`), shared by every project on the machine, so it survives reimports,
+rebuilds and regrouping:
+
+- Nodes are content fingerprints of normalized traces (task text, recorded actions, recorded
+  replies) under a versioned scheme (`trace-content-v1`), with the source trace ID and any
+  declared task identity (`task_lineage`) kept as attributes. Project-local lineage IDs are not
+  used, because they change on reimport and regrouping.
+- Edges are grouping relationships that every `exp build` records, exposed or not: traces that
+  declare the same task identity, and the build's own exact or semantic near-duplicate unions
+  with their similarity. Each names the project and build that produced it. Nothing weaker (a
+  shared customer, conversation or time bucket) is an edge.
+- Exposures mark content a person saw, with the panel, receipt and report that showed it.
+  `--verbose` shows per-trace detail, so it exposes every member trace of the audited lineages.
+
+A held-out lineage is exposed when any member trace shares a connected component with exposed
+content. This is transitive and ignores order: if exposed A was grouped with B and a later build
+groups C only with B, C is exposed even after A disappears from imports, and edges recorded
+before an exposure still carry it. Records are written once and never deleted. The ledger
+directory can be copied to another machine and merged (records are content-addressed files);
+independence is only relative to the ledger a decision used. A build made before the ledger
+existed is refused until `exp build` is rerun on the same import to record its grouping.
+
+Every `--audit` run saves an immutable audit receipt (`held-out-audit-receipt`)
+before it shows anything: the panel identity (a hash over the sorted selected case IDs and each
+case's content-addressed run ID, which already covers the simulator, memory checkpoint and recall
+policy, every prompt sent and the judge configuration), the code revision (not part of run IDs),
+the lineages, traces and runs, the memory checkpoint, whether results and per-trace detail were
+shown, the fingerprint scheme, the ledger snapshot identity, and for each exposed lineage its
+component size and the edge path to exposed content, so an over-long chain is visible. Its status
+is exactly one of `independent` (the first fresh evaluation of a panel with no exposed case),
+`replay` (the same panel identity and code revision as an earlier reported receipt, all results
+already saved; it names that original receipt, which keeps its status), or
+`development-re-audit` (anything else: a fresh evaluation touching exposed cases, a repeat under
+another code revision, or saved results never reported before).
+
+By default an audit selects only unexposed held-out lineages and says how many it skipped and
+why. `--include-inspected` re-runs exposed lineages too; the report then labels the panel
+"Re-audit on inspected cases (development)" and never independent. When every held-out lineage
+is exposed, the command refuses before any provider call: an independent audit needs fresh
+traces, a new import with new content. Dry runs and audits
+stopped before reporting leave a receipt that shows nothing and exposes nothing. Every report
+states the ledger's limits: an unmerged ledger on another machine cannot show its exposure,
+paraphrased or regenerated variants that near-duplicate grouping misses are not caught, and
+knowledge a person carries over by hand is not tracked.
+
 The audit stays independent only while nobody tunes the simulator on its cases. Held-out traces
 are selected deterministically, so a second audit replays the same ones. Once anyone inspects a
 held-out trace's per-trace results (`--verbose`, the per-trace table or its transcript) and

@@ -38,6 +38,13 @@ AUDIT_OPTION = typer.Option(
     help="Independently audit the simulator on N held-out traces it never learned.",
 )
 
+INCLUDE_INSPECTED_OPTION = typer.Option(
+    False,
+    "--include-inspected",
+    help="With --audit, also re-run held-out lineages an earlier --verbose audit showed; "
+    "reported as a development re-audit, never independent.",
+)
+
 VERBOSE_OPTION = typer.Option(
     False,
     "--verbose",
@@ -71,6 +78,7 @@ def evaluate(
     fidelity: Path | None = FIDELITY_OPTION,
     audit: int | None = AUDIT_OPTION,
     retry_incomplete: bool = RETRY_INCOMPLETE_OPTION,
+    include_inspected: bool = INCLUDE_INSPECTED_OPTION,
     verbose: bool = VERBOSE_OPTION,
     trace_analysis: Path | None = TRACE_ANALYSIS_OPTION,
     refine_task: Path | None = REFINE_TASK_OPTION,
@@ -94,6 +102,7 @@ def evaluate(
         fidelity: Explicit reconstruction workload, separate from worker-model evaluation.
         audit: Number of held-out traces replayed on a separately learned fit-only memory.
         retry_incomplete: Replace interrupted audit runs, buying their calls again.
+        include_inspected: Re-run held-out lineages an earlier audit showed in detail.
         verbose: Plain per-turn fidelity detail, for agents and logs.
         trace_analysis: Simulator-only actor council and read-only evaluation refinement.
         refine_task: Bounded task refinement with independent qualification checks.
@@ -120,6 +129,7 @@ def evaluate(
             )
             or verbose
             or retry_incomplete
+            or include_inspected
         ):
             raise typer.BadParameter(
                 "--calibrate requires PROJECT and cannot combine with other modes "
@@ -214,6 +224,8 @@ def evaluate(
         return
     if retry_incomplete and audit is None:
         raise typer.BadParameter("--retry-incomplete applies only with --audit")
+    if include_inspected and audit is None:
+        raise typer.BadParameter("--include-inspected applies only with --audit")
     if verbose and fidelity is None and audit is None:
         raise typer.BadParameter("--verbose applies only with --fidelity or --audit")
     if audit is not None:
@@ -241,6 +253,7 @@ def evaluate(
             dry_run=dry_run,
             verbose=verbose,
             retry_incomplete=retry_incomplete,
+            include_inspected=include_inspected,
         )
         return
     if fidelity is not None:

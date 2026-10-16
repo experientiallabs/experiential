@@ -46,6 +46,7 @@ from exp.simulation.mining.bindings import (
     task_set_content_id,
 )
 from exp.simulation.mining.descriptors import DescriptorEmbedder, HashingDescriptorEmbedder
+from exp.simulation.mining.exposure_ledger import ExposureLedger
 from exp.simulation.mining.service import MiningSpec, TaskMiningResult, mine_tasks, persist_task_set
 
 _BUILD_SCOPED_REVIEW_KEYS = (
@@ -394,6 +395,14 @@ def build_project(
         code_revision=code_revision,
         mining_spec=resolved_spec,
         embedder=resolved_embedder,
+    )
+    # Every build records its content and grouping at the root, exposed or not, so exposure
+    # found later in any project propagates through it.
+    ExposureLedger(store.paths.root).record_build(
+        project=store.paths.project_id,
+        build=artifacts.task_set.task_set_id,
+        traces=artifacts.trace_dataset.traces,
+        near_duplicates=artifacts.mining.analysis.edges,
     )
     trace_stored = store.artifacts.read(artifacts.trace_dataset.dataset.dataset_id)
     task_stored = store.artifacts.read(artifacts.task_set.task_set_id)
