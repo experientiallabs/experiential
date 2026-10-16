@@ -60,7 +60,10 @@ that read; it does not establish that all entities are shipped or explain why E 
 Set transferable true only for a rule about how this environment behaves that a later
 prediction could apply from what it can see: the tool, its arguments, and visible state or
 history. Then name that visible condition in observable_cue and phrase the hypothesis in those
-terms, never in this instance's values. Set transferable false, with observable_cue "", when
+terms, never in this instance's values. Recorded replies in causal_history are feedback for
+this investigation only; a prediction that would apply the rule sees its own earlier predicted
+replies and state, so an observable_cue must not depend on a recorded reply.
+Set transferable false, with observable_cue "", when
 the miss came from information the simulator could not see (unshown records, hidden state)
 or only describes this instance; say why in uncertainty. Abstain rather than guess.
 Return the required structured investigation, with supersedes:[] if nothing is disproved.
