@@ -299,15 +299,14 @@ def test_a_world_model_without_tools_is_refused_before_any_call(
     assert len(provider.requests) == sent
 
 
+@pytest.mark.parametrize("prompt", ["MEMORY_CONTEXT_GUIDANCE", "INVESTIGATION_PROMPT"])
 def test_editing_a_sent_prompt_addresses_a_new_run(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, prompt: str
 ) -> None:
     """Saved results never replay under a system prompt they were not produced with."""
     _, base = memory_project(tmp_path)
     before = trace_replay.content_run_id(base, "held-out", "trace")
-    monkeypatch.setattr(
-        trace_replay, "MEMORY_CONTEXT_GUIDANCE", trace_replay.MEMORY_CONTEXT_GUIDANCE + " Edited."
-    )
+    monkeypatch.setattr(trace_replay, prompt, getattr(trace_replay, prompt) + " Edited.")
     assert trace_replay.content_run_id(base, "held-out", "trace") != before
 
 

@@ -462,6 +462,14 @@ toward that limit too. Later misses are recorded as raw feedback without one, an
 still learned. Concurrent investigations share one session lease, preventing another feedback
 batch or prediction from changing the session while their receipts settle.
 
+Each investigation sees the causal history of its trace: every step up to and including the
+investigated one, with the public action, the simulator's predicted reply and committed state
+edits, and the recorded reply disclosed for that step. Recorded replies are labelled native
+observations and predictions are labelled the simulator's own belief, so a readback miss can be
+attributed to the earlier write that explains it. Later steps and other traces never enter the
+history. When a long trace exceeds the history budget, the oldest whole steps are dropped and the
+request states how many were omitted; no step is cut partway.
+
 A memory version always shows the predictor the same overview: the first read of a version
 records which compressed summaries existed, and every later read of that version uses exactly
 those, even after more compression completes.
