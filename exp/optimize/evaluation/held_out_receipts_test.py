@@ -33,10 +33,9 @@ from exp.optimize.evaluation.held_out_receipts import (
 )
 from exp.optimize.evaluation.trace_learning import learning_plan
 from exp.simulation.mining.exposure_ledger import (
-    FINGERPRINT_SCHEME,
     ExposureLedger,
-    trace_fingerprint,
 )
+from exp.simulation.mining.fingerprint import TRACE_CONTENT
 from exp.simulation.world_model.experience_memory import memory_head
 
 
@@ -65,7 +64,7 @@ def test_reports_append_to_the_receipt_and_detail_exposes_its_lineages(
     exposure = held_out_exposure(store, owner=receipt.receipt_id)
     [exposed] = exposure.exposed
     assert exposed.lineage == receipt.lineages[0] and exposed.kind == "exposed"
-    assert exposed.path.by and exposed.path.path == ()
+    assert exposed.path is not None and exposed.path.by and exposed.path.path == ()
 
     with audit(store) as moved:
         assert moved.receipt != receipt and moved.receipt.basis == "independent"
@@ -122,7 +121,7 @@ def test_exposure_follows_content_across_projects_imports_and_regrouping(
     exposed_trace = traces[receipt.cases[0].trace_id]
     customer = str(exposed_trace.initial_context["task_lineage"])
     index = int(customer.removeprefix("user_"))
-    a = trace_fingerprint(exposed_trace)
+    a = vertex(exposed_trace)
 
     # The exposed trace A is either the original or the follow-up; B is the other one.
     originals = {"original": episode(index), "follow-up": follow_ups[index]}
@@ -137,13 +136,13 @@ def test_exposure_follows_content_across_projects_imports_and_regrouping(
         tmp_path, monkeypatch, provider, episodes=[*others, b_again, c], project="second"
     )
     snapshot = ExposureLedger(two.paths.root).snapshot()
-    by_content = {trace_fingerprint(t): t for t in _traces(two)}
+    by_content = {vertex(t): t for t in _traces(two)}
     c_trace = next(
         t
         for t in by_content.values()
         if t.initial_context["task_lineage"] == "regrouped" and "#W1013" in t.task
     )
-    found = snapshot.exposure((trace_fingerprint(c_trace),))
+    found = snapshot.exposure((vertex(c_trace),))
     assert found is not None and found.exposed_node == a
     assert found.path[0].reason == "declared-task-identity"
     assert (found.path[0].task_lineage, found.path[0].project) == ("regrouped", "second")
@@ -152,13 +151,13 @@ def test_exposure_follows_content_across_projects_imports_and_regrouping(
     assert a not in by_content, "A left the later import"
     neighbour = f"user_{(index + 1) % USERS:02d}"
     unrelated = next(t for t in _traces(two) if t.initial_context["task_lineage"] == neighbour)
-    assert snapshot.exposure((trace_fingerprint(unrelated),)) is None
+    assert snapshot.exposure((vertex(unrelated),)) is None
     # A third import carries A's content again under a new trace ID: exposed itself, no path.
     a_again: JsonObject = {**originals[exposed_kind], "repeat": "reimport"}
     _, three, _ = build_project(
         tmp_path, monkeypatch, provider, episodes=[*others, a_again], project="third"
     )
-    assert a in {trace_fingerprint(t) for t in _traces(three)}
+    assert a in {vertex(t) for t in _traces(three)}
     direct = ExposureLedger(three.paths.root).snapshot().exposure((a,))
     assert direct is not None and direct.path == ()
 
@@ -193,7 +192,9 @@ def test_held_out_command_reports_receipts_checkpoint_and_exposure(
     )
     assert audit_receipts(store) == (receipt,), "the dry run's receipt is resumed"
     assert f"Audit receipt #1 {receipt.receipt_id}: independent · this run: evaluation" in output
-    assert f"Exposure ledger {receipt.ledger} ({FINGERPRINT_SCHEME})" in output
+    scheme = TRACE_CONTENT.identity
+    assert f"Exposure ledger {receipt.ledger} ({scheme.name} v{scheme.version} definition" in output
+    assert receipt.schemes == (scheme,)
     assert "Limit: Knowledge a person carries over by hand is not tracked." in output
     assert "Limit: Reservations and panel leases are atomic only for runs sharing" in output
     assert "Held-out fidelity 3/3" in output and "now development data" in output
@@ -202,7 +203,7 @@ def test_held_out_command_reports_receipts_checkpoint_and_exposure(
     assert held_out_exposure(store).lineages == set(receipt.lineages)
 
     following = held_out_command(root, 1)
-    assert "Skipped 1 held-out lineage exposed or reserved" in following
+    assert "Skipped 1 held-out lineage exposed, reserved or unresolved" in following
     assert f"{receipt.lineages[0]} (exposed, skipped): component of" in following
     second = audit_receipts(store)[-1]
     assert second.sequence == 2 and second.lineages != receipt.lineages
@@ -253,6 +254,11 @@ def test_a_trace_reattempt_qualifies_the_headline_and_reports_both_subsets(
     assert f"re-attempt of {child.trace_id}: {child.retired_run} -> {child.replacement_run}" in (
         held_out_command(root, 2)
     )
+
+
+def vertex(trace: Trace) -> str:
+    """The trace's vertex under the current scheme."""
+    return f"{TRACE_CONTENT.identity.key}:{TRACE_CONTENT.compute(trace)}"
 
 
 def _dataset(store: ProjectStore) -> str:

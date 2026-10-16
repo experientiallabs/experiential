@@ -512,25 +512,51 @@ results of anything grouped with it. That fact is kept in one exposure ledger at
 (`<root>/exposure-ledger/ledger.sqlite`), shared by every project on the machine, so it survives
 reimports, rebuilds and regrouping:
 
-- Nodes are content fingerprints of normalized traces (task text, recorded actions, recorded
-  replies) under a versioned scheme (`trace-content-v1`), with the source trace ID and any
-  declared task identity (`task_lineage`) kept as attributes. Project-local lineage IDs are not
+- Nodes are traces fingerprinted under a scheme, each pointing at its immutable verified source
+  record (project, trace dataset, trace ID and the record's SHA-256) and keeping the source
+  trace ID and any declared task identity (`task_lineage`). Project-local lineage IDs are not
   used, because they change on reimport and regrouping.
 - Edges are grouping relationships that every `exp build` records, exposed or not: traces that
   declare the same task identity, and the build's own exact or semantic near-duplicate unions
   with their similarity. Each names the project and build that produced it. Nothing weaker (a
   shared customer, conversation or time bucket) is an edge.
+- Equivalence links join one source's nodes under every scheme that fingerprinted it, for
+  unexposed traces too.
 - Exposures mark content a person saw, with the panel, receipt and report that showed it.
   `--verbose` shows per-trace detail, so it exposes every member trace of the audited lineages.
 - Reservations claim a panel's content for one audit receipt before any of its runs exists.
 
-A held-out lineage is exposed when any member trace shares a connected component with exposed
-content, and reserved when it shares one with content another receipt holds. This is transitive
+The fingerprint (`trace-content` v1) hashes only the task instruction and the multiset of paired
+exchanges (tool name, canonical arguments, paired recorded reply) over the whole recorded trace,
+public prefix included, with duplicates counted. Calls and results are paired by
+`gen_ai.tool.call.id`, never by position; a missing, repeated or colliding call ID leaves the
+trace unresolved (no fingerprint), though grouping edges still reach it. IDs, timestamps, import
+and exporter metadata, request-context keys (including `replay_from`) and call order never change
+it, and content is kept verbatim. Ignoring order makes it conservative exposure matching: two
+different execution sequences of the same exchanges match, which errs in the safe direction. A
+scheme's identity is its name, version and the digest of its written specification; any change
+to that specification needs a new version even if its golden vectors still pass. Golden vectors
+must reproduce before a scheme computes or matches. Candidates are matched under every
+computable scheme. A ledger recording the same name and version with a different definition is
+refused, and so is such a scheme on `merge()`, whose nodes then stay as unknown-scheme nodes.
+
+A held-out lineage is not independent when any member trace shares a connected component with
+exposed content, shares one with content another receipt holds, or cannot be fingerprinted (the
+whole group is ineligible, even if its selected trace is fingerprintable). Exposure is transitive
 and ignores order: if exposed A was grouped with B and a later build groups C only with B, C is
 exposed even after A disappears from imports, and edges recorded before an exposure still carry
-it. Every table is append-only. Independence is only relative to the ledger a decision used;
+it. Nodes under a scheme this machine cannot compute block every independent audit until an
+equivalence resolves them (re-fingerprinting their source record when it is still available
+and unchanged); the refusal reports their count and scheme, and development re-audits proceed.
+Every table is append-only. Independence is only relative to the ledger a decision used;
 `ExposureLedger.export()` and `merge()` share one between machines. A build made before the
 ledger existed is refused until `exp build` is rerun on the same import to record its grouping.
+
+Grouping links recorded after a reservation are reassessed whenever its receipt is resumed or
+reports. If they reveal exposure that predates the receipt, an undispatched reservation is
+released and the audit refuses to run independently; once execution began, an invalidation
+notice is appended instead. The receipt and its snapshot are never rewritten, and exposure that
+happens only after the receipt was minted never invalidates it.
 
 An audit runs in a fixed order: reserve, register, claim a dispatch slot, call. Selection reads
 the ledger, then the panel's exclusive lease (an OS file lock, `panel in use` for any second
@@ -544,8 +570,9 @@ unreliable.
 Every audit has one immutable receipt (`held-out-audit-receipt`): the panel identity (a hash over
 the sorted selected case IDs and each case's first-generation content-addressed run ID, which
 covers the simulator, memory checkpoint and recall policy, every prompt sent and the judge
-configuration), the code revision (not part of run IDs), the cases, the memory checkpoint, the
-fingerprint scheme, the ledger snapshot it reserved against, and for each exposed or reserved
+configuration), the code revision (not part of run IDs), the cases, the memory checkpoint (lineage,
+version, scope, fit traces learned and simulator artifact), every fingerprint scheme's full
+identity (name, version, definition and vector digests), the ledger snapshot it reserved against, and for each exposed or reserved
 lineage its component size and edge path, so an over-long chain is visible. Its basis is
 `independent` when no audited lineage was exposed or reserved by another receipt and no run had
 a saved result, otherwise `development-re-audit`. Everything later is appended beside it: a
@@ -564,14 +591,14 @@ frozen configuration changes, an unused reservation is released by its owner und
 (after recounting every claimed slot) and a new receipt is minted; after any dispatch the old
 reservation stays and the new receipt over those cases is a development re-audit.
 
-By default an audit selects only unexposed, unreserved held-out lineages and says how many it
-skipped and why. `--include-inspected` re-runs them too; the report then labels the panel
+By default an audit selects only unexposed, unreserved, resolved held-out lineages and says how
+many it skipped and why. `--include-inspected` re-runs them too; the report then labels the panel
 "Re-audit on inspected cases (development)" and never independent. When none remain, the
 command refuses before any provider call: an independent audit needs fresh traces, a new import
 with new content. Every report states the ledger's limits: an
 unmerged ledger on another machine cannot show its exposure, paraphrased or regenerated variants
 that near-duplicate grouping misses are not caught, knowledge a person carries over by hand is
-not tracked, and atomicity is same-host only.
+not tracked, atomicity is same-host only, and matching ignores call order.
 
 The audit stays independent only while nobody tunes the simulator on its cases. Held-out traces
 are selected deterministically, so a second audit replays the same ones. Once anyone inspects a

@@ -28,10 +28,12 @@ from exp.common.project import ProjectStore
 from exp.optimize.evaluation.held_out_exposure import LineageExposure, held_out_members
 from exp.optimize.evaluation.held_out_fidelity import AuditCheckpoint, HeldOutPanel, Profile
 from exp.simulation.mining.exposure_ledger import ExposureLedger, LedgerExposure
+from exp.simulation.mining.fingerprint import SchemeIdentity
 
 RECEIPT_TYPE = "held-out-audit-receipt"
 ATTEMPT_TYPE = "held-out-audit-attempt"
 REPORT_TYPE = "held-out-audit-report"
+NOTICE_TYPE = "held-out-audit-notice"
 DETAIL_REPORT = "exp eval --held-out-fidelity --verbose (per-trace detail)"
 QUALIFIED = "independent, qualified: trace re-attempts"
 Basis = Literal["independent", "development-re-audit"]
@@ -82,7 +84,7 @@ class AuditReceipt(ContractModel):
         world_model: Simulator every run is bound to.
         checkpoint: Frozen memory checkpoint read, for the memory profile.
         cases: Audited cases, in panel order.
-        scheme: Content fingerprint scheme and version of the exposure decision.
+        schemes: Full identity of every fingerprint scheme the exposure match used.
         ledger: Ledger snapshot identity the reservation was decided and committed against.
         exposed: Every exposed or reserved held-out lineage at decision time, with its
             component size and the edge path to marked content.
@@ -102,7 +104,7 @@ class AuditReceipt(ContractModel):
     world_model: ArtifactInput
     checkpoint: AuditCheckpoint | None = None
     cases: tuple[AuditCase, ...] = Field(min_length=1)
-    scheme: str
+    schemes: tuple[SchemeIdentity, ...] = Field(min_length=1)
     ledger: str
     exposed: tuple[LineageExposure, ...] = ()
     reaudited: tuple[str, ...] = ()
@@ -180,6 +182,24 @@ class AuditReport(ContractModel):
     detail_shown: bool = False
 
 
+class AuditNotice(ContractModel):
+    """Exposure predating the reservation, found through links recorded after it.
+
+    Appended once execution began; the receipt and its snapshot are never rewritten.
+
+    Attributes:
+        receipt: Receipt invalidated.
+        at: When the reassessment found it.
+        ledger: Snapshot identity of the reassessment.
+        exposed: Audited lineages with their path to the predating exposure.
+    """
+
+    receipt: str
+    at: AwareDatetime
+    ledger: str
+    exposed: tuple[LineageExposure, ...] = Field(min_length=1)
+
+
 class ReceiptView(ContractModel):
     """A receipt with every child appended so far.
 
@@ -187,11 +207,13 @@ class ReceiptView(ContractModel):
         receipt: The immutable root record.
         attempts: Replaced registrations, in time order.
         reports: Invocations, in time order.
+        notices: Invalidation notices, in time order.
     """
 
     receipt: AuditReceipt
     attempts: tuple[AuditAttempt, ...] = ()
     reports: tuple[AuditReport, ...] = ()
+    notices: tuple[AuditNotice, ...] = ()
 
     @property
     def reattempts(self) -> tuple[AuditAttempt, ...]:
@@ -250,8 +272,15 @@ def receipt_view(project: ProjectStore, receipt: AuditReceipt) -> ReceiptView:
         AuditReport.model_validate_json(project.artifacts.read_bytes(identity, "record.json"))
         for identity in project.artifacts.list_ids(artifact_type=REPORT_TYPE)
     ]
+    notices = [
+        AuditNotice.model_validate_json(project.artifacts.read_bytes(identity, "record.json"))
+        for identity in project.artifacts.list_ids(artifact_type=NOTICE_TYPE)
+    ]
     receipt_id = receipt.receipt_id
     return ReceiptView(
+        notices=tuple(
+            sorted((item for item in notices if item.receipt == receipt_id), key=lambda n: n.at)
+        ),
         receipt=receipt,
         attempts=tuple(
             sorted(
@@ -317,6 +346,25 @@ def record_attempts(
     return tuple(attempts)
 
 
+def record_notice(project: ProjectStore, receipt: AuditReceipt, notice: AuditNotice) -> bool:
+    """Append an invalidation notice unless the same exposure was already noticed.
+
+    Args:
+        project: Project audited.
+        receipt: Receipt invalidated.
+        notice: What the reassessment found.
+
+    Returns:
+        Whether a new notice was appended.
+    """
+    marks = sorted((item.lineage, *(item.path.by if item.path else ())) for item in notice.exposed)
+    identity = stable_id(NOTICE_TYPE, {"receipt": receipt.receipt_id, "marks": marks})
+    if project.artifacts.exists(identity):
+        return False
+    _write(project, NOTICE_TYPE, identity, "record.json", notice, receipt)
+    return True
+
+
 def record_report(
     project: ProjectStore,
     receipt: AuditReceipt,
@@ -354,12 +402,12 @@ def record_report(
         members = held_out_members(project)
         ExposureLedger(project.paths.root).record_exposure(
             LedgerExposure(
-                fingerprints=tuple(
+                vertices=tuple(
                     sorted(
                         {
-                            fingerprint
+                            vertex
                             for lineage in receipt.lineages
-                            for fingerprint in members[lineage]
+                            for vertex in members[lineage].vertices
                         }
                     )
                 ),

@@ -3,15 +3,18 @@
 Held-out evidence is independent only while nobody has read its per-trace results. Project-local
 leakage lineage IDs cannot carry that fact across builds: they change on reimport and when
 grouping changes. The ledger therefore lives at the ``.exp`` root, above any one project, in one
-SQLite file, and keys everything on content:
+SQLite file, and keys everything on content (:mod:`exp.simulation.mining.fingerprint`):
 
-- Nodes are fingerprints of normalized traces (task text, recorded actions, recorded replies)
-  under a versioned scheme, with the source trace ID and any declared task identity
-  (``task_lineage``) kept as attributes.
+- Nodes are traces fingerprinted under a scheme, each with a pointer to its immutable verified
+  source record (project, trace dataset, trace ID and the record's SHA-256), the source trace ID
+  and any declared task identity (``task_lineage``). A trace a scheme cannot fingerprint is an
+  unresolved node, still linked by grouping edges.
 - Edges are grouping relationships recorded for every build, whether or not anything is exposed:
   two traces that declare the same task identity, or the build's own near-duplicate union with
   its similarity. Each edge names the project and build that produced it. Nothing weaker (a
   shared customer, conversation or time bucket) is an edge.
+- Equivalence links join the nodes of one verified source under every scheme that fingerprinted
+  it, for unexposed traces too, so edges recorded under any scheme stay valid.
 - Exposures mark nodes a person has seen, with the panel, receipt and report that showed them.
 - Reservations claim content for one audit receipt before any of its runs is registered; a
   release by that receipt's owner frees an unused reservation.
@@ -23,6 +26,11 @@ exposed trace leaves every later import. Every table is append-only (SQL trigger
 and deletions), so a snapshot identity names exactly the rows a decision used, and independence
 is only relative to that ledger.
 
+A scheme recorded in the ledger with the same name and version as a scheme this code implements,
+but a different definition or vector set, is a specification changed without a version bump:
+recording under it is refused. On import, such a scheme is refused and its nodes stay as
+unknown-scheme nodes, which block independence wherever no verified equivalence resolves them.
+
 Atomicity holds for processes that share this one ledger file on one host; SQLite and OS file
 locks over network filesystems are unreliable. A panel lease is an exclusive OS file lock, so it
 dies with its process and a crash leaves no stale lease.
@@ -31,24 +39,22 @@ dies with its process and a crash leaves no stale lease.
 import json
 import sqlite3
 from collections import defaultdict, deque
-from collections.abc import Iterable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
+from datetime import datetime
 from pathlib import Path
 from typing import Final, Literal, Self
 
 from filelock import FileLock, Timeout
-from pydantic import AwareDatetime, BaseModel, Field, JsonValue, model_validator
+from pydantic import AwareDatetime, BaseModel, Field, model_validator
 
-from exp.common.core.artifacts import ContractModel, sha256_json
-from exp.common.core.text import normalize_durable_text
+from exp.common.core.artifacts import ArtifactInput, ContractModel, Sha256, sha256_json
 from exp.common.core.union_find import UnionFind
 from exp.common.sqlite.connection import connect_database
 from exp.common.traces import Trace
 from exp.simulation.mining.deduplicate import DuplicateEdge
-from exp.simulation.retrieval.contracts import RAGLineageBinding
-from exp.simulation.retrieval.transitions import extract_real_transitions
+from exp.simulation.mining.fingerprint import SCHEMES, Scheme, SchemeIdentity
 
-FINGERPRINT_SCHEME = "trace-content-v1"
 LEDGER_DIRECTORY = "exposure-ledger"
 LEDGER_FILE = "ledger.sqlite"
 SCHEMA_VERSION: Final = 1
@@ -57,10 +63,9 @@ SAME_HOST_LIMIT = (
     "Reservations and panel leases are atomic only for runs sharing one ledger file on one host; "
     "SQLite and file locks over network filesystems are unreliable."
 )
-_FINGERPRINT_LINEAGE = "lineage-fingerprint"  # placeholder binding; never part of the content
-Fingerprint = str
 EdgeReason = Literal["declared-task-identity", "near-duplicate"]
-RecordKind = Literal["build", "node", "edge", "exposure"]
+RecordKind = Literal["build", "node", "edge", "exposure", "equivalence", "scheme"]
+Vertex = str
 
 
 class PanelInUseError(RuntimeError):
@@ -71,32 +76,55 @@ class LedgerSchemaError(RuntimeError):
     """The file is not an exposure ledger of this schema; it is refused, never migrated."""
 
 
-class LedgerNode(ContractModel):
-    """One observation of trace content in one build.
+class SchemeConflictError(ValueError):
+    """A scheme's name and version are already recorded with a different definition."""
+
+
+class SourceRecord(ContractModel):
+    """Pointer to the immutable verified record a node was fingerprinted from.
 
     Attributes:
-        fingerprint: Content fingerprint under ``scheme``.
-        scheme: Fingerprint scheme and version.
-        trace_id: Source trace ID of this observation.
+        project: Project holding the trace dataset.
+        dataset: Trace dataset artifact.
+        trace_id: Trace ID inside it.
+        record_sha256: SHA-256 of the trace record's canonical JSON.
+    """
+
+    project: str = Field(min_length=1)
+    dataset: ArtifactInput
+    trace_id: str = Field(min_length=1)
+    record_sha256: Sha256
+
+
+class LedgerNode(ContractModel):
+    """One trace fingerprinted under one scheme in one build.
+
+    Attributes:
+        scheme: Full scheme identity.
+        fingerprint: Content fingerprint, or None when the scheme cannot pair its calls.
+        source: Verified source record.
         task_lineage: Declared task identity from the trace's request context, if any.
-        project: Project whose build observed the trace.
         build: Build (task-set artifact) that observed the trace.
     """
 
-    fingerprint: Fingerprint = Field(pattern=r"^[0-9a-f]{64}$")
-    scheme: str = Field(min_length=1)
-    trace_id: str = Field(min_length=1)
+    scheme: SchemeIdentity
+    fingerprint: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    source: SourceRecord
     task_lineage: str | None = None
-    project: str = Field(min_length=1)
     build: str = Field(min_length=1)
+
+    @property
+    def vertex(self) -> Vertex:
+        """Graph vertex: the scheme-qualified fingerprint, or the unresolved source."""
+        return node_vertex(self.scheme, self.fingerprint, self.source)
 
 
 class LedgerEdge(ContractModel):
-    """One grouping relationship between two fingerprints, never deleted.
+    """One grouping relationship between two vertices, never deleted.
 
     Attributes:
-        left: Lexically smaller fingerprint.
-        right: Lexically larger fingerprint.
+        left: Lexically smaller vertex.
+        right: Lexically larger vertex.
         reason: ``declared-task-identity`` or the build's ``near-duplicate`` union.
         task_lineage: The shared declared task identity, for ``declared-task-identity``.
         duplicate_kind: Exact or semantic evidence, for ``near-duplicate``.
@@ -105,8 +133,8 @@ class LedgerEdge(ContractModel):
         build: Build (task-set artifact) that produced the edge.
     """
 
-    left: Fingerprint = Field(pattern=r"^[0-9a-f]{64}$")
-    right: Fingerprint = Field(pattern=r"^[0-9a-f]{64}$")
+    left: Vertex = Field(min_length=1)
+    right: Vertex = Field(min_length=1)
     reason: EdgeReason
     task_lineage: str | None = None
     duplicate_kind: Literal["exact", "semantic"] | None = None
@@ -128,25 +156,37 @@ class LedgerEdge(ContractModel):
         return self
 
 
+class LedgerEquivalence(ContractModel):
+    """One verified source fingerprinted under several schemes.
+
+    Attributes:
+        source_sha256: The source record's SHA-256.
+        vertices: Its vertex under each scheme, sorted.
+    """
+
+    source_sha256: Sha256
+    vertices: tuple[Vertex, ...] = Field(min_length=2)
+
+
 class LedgerBuild(ContractModel):
     """Marker that one build recorded its complete grouping in the ledger.
 
     Attributes:
         project: Project that built.
         build: Build (task-set artifact).
-        scheme: Fingerprint scheme its nodes and edges use.
+        schemes: Schemes its nodes were recorded under; edges use the last.
     """
 
     project: str = Field(min_length=1)
     build: str = Field(min_length=1)
-    scheme: str = Field(min_length=1)
+    schemes: tuple[SchemeIdentity, ...] = Field(min_length=1)
 
 
 class LedgerExposure(ContractModel):
-    """Fingerprints a person saw, and how.
+    """Vertices a person saw, and how.
 
     Attributes:
-        fingerprints: Exposed content, sorted.
+        vertices: Exposed content, sorted.
         how: ``inspected`` for an independent audit, ``re-audited`` for a development re-audit.
         panel: Identity of the panel shown.
         receipt: Audit receipt recording the report.
@@ -155,7 +195,7 @@ class LedgerExposure(ContractModel):
         at: When the report was recorded.
     """
 
-    fingerprints: tuple[Fingerprint, ...] = Field(min_length=1)
+    vertices: tuple[Vertex, ...] = Field(min_length=1)
     how: Literal["inspected", "re-audited"]
     panel: str = Field(min_length=1)
     receipt: str = Field(min_length=1)
@@ -178,7 +218,7 @@ class LedgerReservation(ContractModel):
         panel: Panel identity the receipt audits.
         project: Project of the receipt.
         lineages: The build's held-out lineages the panel covers.
-        fingerprints: Member content of those lineages, sorted.
+        vertices: Member content of those lineages, sorted.
         snapshot: Ledger snapshot identity the reservation was decided against.
         at: When it was committed.
     """
@@ -187,7 +227,7 @@ class LedgerReservation(ContractModel):
     panel: str = Field(min_length=1)
     project: str = Field(min_length=1)
     lineages: tuple[str, ...] = Field(min_length=1)
-    fingerprints: tuple[Fingerprint, ...] = Field(min_length=1)
+    vertices: tuple[Vertex, ...] = Field(min_length=1)
     snapshot: str = Field(min_length=1)
     at: AwareDatetime
 
@@ -208,16 +248,29 @@ class ExposurePath(ContractModel):
     """Why some content counts as exposed or taken under one ledger snapshot.
 
     Attributes:
-        exposed_node: Nearest marked fingerprint in the component.
-        component_size: Fingerprints in the connected component, so over-long chains show.
-        path: Edges from the queried content to ``exposed_node``; empty when it is marked itself.
+        exposed_node: Nearest marked vertex in the component.
+        component_size: Vertices in the connected component, so over-long chains show.
+        path: Edges from the queried content to ``exposed_node``; empty when it is marked
+            itself or reached only through equivalence links.
         by: Exposure records, or reserving receipts, that mark ``exposed_node``.
     """
 
-    exposed_node: Fingerprint
+    exposed_node: Vertex
     component_size: int = Field(ge=1)
     path: tuple[LedgerEdge, ...] = ()
     by: tuple[str, ...] = Field(min_length=1)
+
+
+class UnknownScheme(ContractModel):
+    """Nodes recorded under a scheme this machine cannot compute, with no verified equivalence.
+
+    Attributes:
+        scheme: The scheme's identity as recorded.
+        nodes: Unresolved node count.
+    """
+
+    scheme: SchemeIdentity
+    nodes: int = Field(ge=1)
 
 
 class LedgerExport(ContractModel):
@@ -225,20 +278,22 @@ class LedgerExport(ContractModel):
 
     Attributes:
         identity: Snapshot identity of exactly these rows.
-        scheme: Fingerprint scheme this code writes.
+        schemes: Scheme identities recorded.
         builds: Builds that recorded their grouping.
-        nodes: Content observations.
+        nodes: Fingerprinted traces.
         edges: Grouping relationships.
+        equivalences: Cross-scheme links of one source.
         exposures: Exposure records.
         reservations: Content claimed by audit receipts.
         releases: Reservations their owners released.
     """
 
     identity: str
-    scheme: str
+    schemes: tuple[SchemeIdentity, ...] = ()
     builds: tuple[LedgerBuild, ...] = ()
     nodes: tuple[LedgerNode, ...] = ()
     edges: tuple[LedgerEdge, ...] = ()
+    equivalences: tuple[LedgerEquivalence, ...] = ()
     exposures: tuple[LedgerExposure, ...] = ()
     reservations: tuple[LedgerReservation, ...] = ()
     releases: tuple[LedgerRelease, ...] = ()
@@ -258,29 +313,33 @@ class LedgerSnapshot:
         self._builds = {(build.project, build.build) for build in export.builds}
         self.reservations = {item.receipt: item for item in export.reservations}
         self.released = frozenset(item.receipt for item in export.releases)
-        self._union = UnionFind(node.fingerprint for node in export.nodes)
-        self._adjacent: dict[Fingerprint, list[tuple[Fingerprint, LedgerEdge]]] = defaultdict(list)
+        self._union = UnionFind(node.vertex for node in export.nodes)
+        self._adjacent: dict[Vertex, list[tuple[Vertex, LedgerEdge | None]]] = defaultdict(list)
         for edge in export.edges:
-            self._union.union(edge.left, edge.right)
-            self._adjacent[edge.left].append((edge.right, edge))
-            self._adjacent[edge.right].append((edge.left, edge))
-        self._exposed: dict[Fingerprint, list[str]] = defaultdict(list)
-        for exposure in export.exposures:
-            for fingerprint in exposure.fingerprints:
-                self._exposed[fingerprint].append(exposure.record_id)
-        self._reserved: dict[Fingerprint, list[str]] = defaultdict(list)
+            self._link(edge.left, edge.right, edge)
+        for equivalence in export.equivalences:
+            first, *rest = equivalence.vertices
+            for vertex in rest:
+                self._link(first, vertex, None)
+        self._reserved: dict[Vertex, list[str]] = defaultdict(list)
         for reservation in export.reservations:
             if reservation.receipt not in self.released:
-                for fingerprint in reservation.fingerprints:
-                    self._reserved[fingerprint].append(reservation.receipt)
+                for vertex in reservation.vertices:
+                    self._reserved[vertex].append(reservation.receipt)
         self._sizes: dict[str, int] = defaultdict(int)
-        for fingerprint in {
-            *(node.fingerprint for node in export.nodes),
+        for vertex in {
+            *(node.vertex for node in export.nodes),
             *self._adjacent,
-            *self._exposed,
+            *(vertex for item in export.exposures for vertex in item.vertices),
             *self._reserved,
         }:
-            self._sizes[self._union.find(fingerprint)] += 1
+            self._sizes[self._union.find(vertex)] += 1
+
+    def _link(self, left: Vertex, right: Vertex, edge: LedgerEdge | None) -> None:
+        """Join two vertices by a grouping edge or an equivalence link (``None``)."""
+        self._union.union(left, right)
+        self._adjacent[left].append((right, edge))
+        self._adjacent[right].append((left, edge))
 
     def has_build(self, project: str, build: str) -> bool:
         """Whether this build recorded its grouping in the ledger."""
@@ -290,39 +349,74 @@ class LedgerSnapshot:
         """Whether ``receipt`` holds a reservation that was not released."""
         return receipt in self.reservations and receipt not in self.released
 
-    def exposure(self, fingerprints: Iterable[Fingerprint]) -> ExposurePath | None:
-        """The shortest path from any of ``fingerprints`` to exposed content, if one exists.
+    def exposure(
+        self, vertices: Iterable[Vertex], *, before: datetime | None = None
+    ) -> ExposurePath | None:
+        """The shortest path from any of ``vertices`` to exposed content, if one exists.
 
         Args:
-            fingerprints: Content of one lineage's member traces.
+            vertices: Content of one lineage's member traces, under every computable scheme.
+            before: Count only exposures recorded before this time.
 
         Returns:
             The path, or None when no member shares a component with exposed content.
         """
-        return self._nearest(fingerprints, self._exposed)
+        marked: dict[Vertex, list[str]] = defaultdict(list)
+        for item in self.records.exposures:
+            if before is None or item.at < before:
+                for vertex in item.vertices:
+                    marked[vertex].append(item.record_id)
+        return self._nearest(vertices, marked)
 
-    def taken(self, fingerprints: Iterable[Fingerprint], owner: str | None) -> ExposurePath | None:
+    def taken(self, vertices: Iterable[Vertex], owner: str | None) -> ExposurePath | None:
         """The shortest path to content another receipt reserved and did not release.
 
         Args:
-            fingerprints: Content of one lineage's member traces.
+            vertices: Content of one lineage's member traces.
             owner: Receipt whose own reservation does not count; None counts every one.
 
         Returns:
             The path, or None when no member shares a component with another reservation.
         """
         others = {
-            fingerprint: [receipt for receipt in receipts if receipt != owner]
-            for fingerprint, receipts in self._reserved.items()
+            vertex: [receipt for receipt in receipts if receipt != owner]
+            for vertex, receipts in self._reserved.items()
         }
-        return self._nearest(fingerprints, {key: value for key, value in others.items() if value})
+        return self._nearest(vertices, {key: value for key, value in others.items() if value})
+
+    def unknown_schemes(self, computable: Sequence[SchemeIdentity]) -> tuple[UnknownScheme, ...]:
+        """Nodes under schemes not computable here, with no equivalence to a computable one.
+
+        Args:
+            computable: Identities of the schemes that pass their vectors on this machine.
+
+        Returns:
+            Unresolved node counts per unknown scheme.
+        """
+        known = set(computable)
+        resolved = {node.vertex for node in self.records.nodes if node.scheme in known}
+        # Only a verified equivalence resolves a node; a shared grouping edge never does.
+        linked = {
+            vertex
+            for equivalence in self.records.equivalences
+            if any(item in resolved for item in equivalence.vertices)
+            for vertex in equivalence.vertices
+        }
+        counts: dict[SchemeIdentity, int] = defaultdict(int)
+        for node in self.records.nodes:
+            if node.scheme not in known and node.vertex not in linked:
+                counts[node.scheme] += 1
+        return tuple(
+            UnknownScheme(scheme=scheme, nodes=count)
+            for scheme, count in sorted(counts.items(), key=lambda item: item[0].key)
+        )
 
     def _nearest(
-        self, fingerprints: Iterable[Fingerprint], marked: Mapping[Fingerprint, list[str]]
+        self, vertices: Iterable[Vertex], marked: Mapping[Vertex, list[str]]
     ) -> ExposurePath | None:
-        """Breadth-first search from ``fingerprints`` to the nearest marked fingerprint."""
-        starts = sorted(set(fingerprints))
-        previous: dict[Fingerprint, tuple[Fingerprint, LedgerEdge] | None] = dict.fromkeys(starts)
+        """Breadth-first search from ``vertices`` to the nearest marked vertex."""
+        starts = sorted(set(vertices))
+        previous: dict[Vertex, tuple[Vertex, LedgerEdge | None] | None] = dict.fromkeys(starts)
         queue = deque(starts)
         while queue:
             current = queue.popleft()
@@ -330,7 +424,8 @@ class LedgerSnapshot:
                 path: list[LedgerEdge] = []
                 step = previous[current]
                 while step is not None:
-                    path.append(step[1])
+                    if step[1] is not None:
+                        path.append(step[1])
                     step = previous[step[0]]
                 return ExposurePath(
                     exposed_node=current,
@@ -339,7 +434,8 @@ class LedgerSnapshot:
                     by=tuple(sorted(set(marked[current]))),
                 )
             for neighbour, edge in sorted(
-                self._adjacent.get(current, ()), key=lambda item: _record_id(item[1])
+                self._adjacent.get(current, ()),
+                key=lambda item: (item[1] is not None, _record_id(item[1]) if item[1] else ""),
             ):
                 if neighbour not in previous:
                     previous[neighbour] = (current, edge)
@@ -365,6 +461,23 @@ class LedgerTransaction:
             (kind, _record_id(record), _body(record)),
         )
 
+    def record_scheme(self, scheme: SchemeIdentity) -> None:
+        """Record a scheme this code computes under, refusing a changed spec without a bump.
+
+        Raises:
+            SchemeConflictError: The ledger records this name and version differently.
+        """
+        for recorded in self.snapshot().records.schemes:
+            if recorded.conflicts(scheme):
+                raise SchemeConflictError(
+                    f"scheme {scheme.name} v{scheme.version} is recorded with definition "
+                    f"{recorded.definition_sha256[:12]} and vectors "
+                    f"{recorded.vectors_sha256[:12]}, but this code defines "
+                    f"{scheme.definition_sha256[:12]} and {scheme.vectors_sha256[:12]}; a "
+                    "changed specification needs a new scheme version"
+                )
+        self.record("scheme", scheme)
+
     def reserve(self, reservation: LedgerReservation) -> None:
         """Claim content for one receipt; a receipt reserves at most once."""
         self._connection.execute(
@@ -383,14 +496,21 @@ class LedgerTransaction:
 class ExposureLedger:
     """The append-only exposure ledger of one ``.exp`` root."""
 
-    def __init__(self, root: Path) -> None:
+    def __init__(self, root: Path, schemes: Sequence[Scheme] = SCHEMES) -> None:
         """Bind the ledger of one ``.exp`` root without touching the file.
 
         Args:
             root: The ``.exp`` root shared by every project.
+            schemes: Scheme implementations, newest last.
         """
         self.directory = Path(root) / LEDGER_DIRECTORY
         self.path = self.directory / LEDGER_FILE
+        self.schemes = tuple(schemes)
+
+    @property
+    def computable(self) -> tuple[Scheme, ...]:
+        """Schemes whose golden vectors reproduce on this machine, newest last."""
+        return tuple(scheme for scheme in self.schemes if scheme.computable)
 
     @contextmanager
     def transaction(self) -> Iterator[LedgerTransaction]:
@@ -432,42 +552,50 @@ class ExposureLedger:
         finally:
             lock.release()
 
+    def vertices(self, trace: Trace) -> dict[SchemeIdentity, str | None]:
+        """A trace's fingerprint under every computable scheme (None when unresolved)."""
+        return {scheme.identity: scheme.compute(trace) for scheme in self.computable}
+
     def record_build(
         self,
         *,
         project: str,
         build: str,
+        dataset: ArtifactInput,
         traces: Sequence[Trace],
         near_duplicates: Sequence[DuplicateEdge],
     ) -> LedgerBuild:
-        """Record one build's content nodes and grouping edges, idempotently.
+        """Record one build's nodes, equivalences and grouping edges, idempotently.
+
+        Every trace is fingerprinted under every computable scheme; edges use the newest.
 
         Args:
             project: Project that built.
             build: Build (task-set artifact) identity.
+            dataset: Trace dataset the traces come from.
             traces: Every trace the build mined.
             near_duplicates: The build's exact and semantic duplicate unions.
 
         Returns:
             The build marker.
+
+        Raises:
+            SchemeConflictError: A scheme's specification changed without a version bump.
+            ValueError: No scheme is computable on this machine.
         """
-        fingerprints = {trace.trace_id: trace_fingerprint(trace) for trace in traces}
-        nodes = tuple(
-            LedgerNode(
-                fingerprint=fingerprints[trace.trace_id],
-                scheme=FINGERPRINT_SCHEME,
-                trace_id=trace.trace_id,
-                task_lineage=declared_task_identity(trace),
-                project=project,
-                build=build,
+        if not self.computable:
+            raise ValueError(
+                "no fingerprint scheme reproduces its golden vectors on this machine, so the "
+                "build cannot be recorded in the exposure ledger"
             )
-            for trace in traces
-        )
+        primary = self.computable[-1].identity
+        nodes = _nodes(self, project, build, dataset, traces)
+        by_trace = {node.source.trace_id: node for node in nodes if node.scheme == primary}
         edges: list[LedgerEdge] = []
-        declared: dict[str, set[Fingerprint]] = defaultdict(set)
-        for item in nodes:
-            if item.task_lineage is not None:
-                declared[item.task_lineage].add(item.fingerprint)
+        declared: dict[str, set[Vertex]] = defaultdict(set)
+        for node in by_trace.values():
+            if node.task_lineage is not None:
+                declared[node.task_lineage].add(node.vertex)
         for task_lineage, members in sorted(declared.items()):
             chain = sorted(members)
             edges.extend(
@@ -483,7 +611,10 @@ class ExposureLedger:
             )
         for duplicate in near_duplicates:
             ends = sorted(
-                {fingerprints[duplicate.left_trace_id], fingerprints[duplicate.right_trace_id]}
+                {
+                    by_trace[duplicate.left_trace_id].vertex,
+                    by_trace[duplicate.right_trace_id].vertex,
+                }
             )
             if len(ends) == 2:
                 edges.append(
@@ -497,26 +628,63 @@ class ExposureLedger:
                         build=build,
                     )
                 )
-        marker = LedgerBuild(project=project, build=build, scheme=FINGERPRINT_SCHEME)
-        self.record_grouping(marker, nodes=nodes, edges=edges)
-        return marker
-
-    def record_grouping(
-        self, marker: LedgerBuild, *, nodes: Sequence[LedgerNode], edges: Sequence[LedgerEdge]
-    ) -> None:
-        """Write a build's nodes, edges and marker in one transaction.
-
-        Args:
-            marker: The build that produced them.
-            nodes: Content observations.
-            edges: Grouping relationships.
-        """
+        marker = LedgerBuild(
+            project=project,
+            build=build,
+            schemes=tuple(scheme.identity for scheme in self.computable),
+        )
         with self.transaction() as transaction:
-            for item in nodes:
-                transaction.record("node", item)
+            for scheme in self.computable:
+                transaction.record_scheme(scheme.identity)
+            _write_nodes(transaction, nodes)
             for edge in edges:
                 transaction.record("edge", edge)
             transaction.record("build", marker)
+        return marker
+
+    def record_nodes(
+        self, *, project: str, build: str, dataset: ArtifactInput, traces: Sequence[Trace]
+    ) -> None:
+        """Fingerprint traces under every computable scheme and link their equivalences.
+
+        A scheme added after a build only adds nodes and links; earlier edges stay valid.
+
+        Raises:
+            SchemeConflictError: A scheme's specification changed without a version bump.
+        """
+        nodes = _nodes(self, project, build, dataset, traces)
+        with self.transaction() as transaction:
+            for scheme in self.computable:
+                transaction.record_scheme(scheme.identity)
+            _write_nodes(transaction, nodes)
+
+    def resolve_sources(self, load: Callable[[SourceRecord], Trace | None]) -> int:
+        """Re-fingerprint unknown-scheme nodes from their verified sources where available.
+
+        Args:
+            load: The trace a source record points to, or None when it is unavailable. The
+                record is used only when its canonical JSON still has the recorded SHA-256.
+
+        Returns:
+            Nodes resolved by a new equivalence link.
+        """
+        computable = [scheme.identity for scheme in self.computable]
+        snapshot = self.snapshot()
+        if not snapshot.unknown_schemes(computable):
+            return 0
+        resolved = 0
+        linked = {vertex for item in snapshot.records.equivalences for vertex in item.vertices}
+        for node in snapshot.records.nodes:
+            if node.scheme in computable or node.vertex in linked:
+                continue
+            trace = load(node.source)
+            if trace is None or record_sha256(trace) != node.source.record_sha256:
+                continue
+            fresh = _nodes(self, node.source.project, node.build, node.source.dataset, (trace,))
+            with self.transaction() as transaction:
+                _write_nodes(transaction, fresh, extra={node.source.record_sha256: node.vertex})
+            resolved += 1
+        return resolved
 
     def record_exposure(self, exposure: LedgerExposure) -> None:
         """Mark content exposed; the row is permanent.
@@ -538,17 +706,32 @@ class ExposureLedger:
         with self.transaction() as transaction:
             return transaction.snapshot().records
 
-    def merge(self, export: LedgerExport) -> None:
+    def merge(self, export: LedgerExport) -> tuple[SchemeIdentity, ...]:
         """Add every row of another ledger's export; nothing is replaced or removed.
+
+        A scheme with the same name and version as one recorded here or implemented by this
+        code, but a different definition or vector set, is refused: its scheme row is not
+        imported, and its nodes stay as unknown-scheme nodes until an equivalence resolves them.
 
         Args:
             export: Rows from another ledger.
+
+        Returns:
+            The refused scheme identities.
         """
+        refused: list[SchemeIdentity] = []
         with self.transaction() as transaction:
             snapshot = transaction.snapshot()
+            local = [*snapshot.records.schemes, *(scheme.identity for scheme in self.schemes)]
+            for scheme in export.schemes:
+                if any(scheme.conflicts(known) for known in local):
+                    refused.append(scheme)
+                else:
+                    transaction.record("scheme", scheme)
             for kind, records in (
                 ("node", export.nodes),
                 ("edge", export.edges),
+                ("equivalence", export.equivalences),
                 ("exposure", export.exposures),
                 ("build", export.builds),
             ):
@@ -560,62 +743,72 @@ class ExposureLedger:
             for release in export.releases:
                 if release.receipt not in snapshot.released:
                     transaction.release(release)
+        return tuple(refused)
 
 
-def trace_fingerprint(trace: Trace) -> Fingerprint:
-    """Fingerprint a trace's content, independent of IDs, timestamps and source records.
+def node_vertex(scheme: SchemeIdentity, fingerprint: str | None, source: SourceRecord) -> Vertex:
+    """Graph vertex of one fingerprinted trace, or of its unresolved source."""
+    if fingerprint is None:
+        return f"unresolved:{scheme.key}:{source.record_sha256}"
+    return f"{scheme.key}:{fingerprint}"
 
-    The content is the normalized task text and every recorded action with the observation that
-    followed it, in recorded order. Trace and span IDs, times, source identity and request
-    context are excluded, so a reimport of the same content has the same fingerprint.
 
-    Args:
-        trace: One normalized trace.
-
-    Returns:
-        A SHA-256 hex digest under :data:`FINGERPRINT_SCHEME`.
-    """
-    transitions = extract_real_transitions(
-        (trace,),
-        (
-            RAGLineageBinding(
-                trace_id=trace.trace_id, lineage_id=_FINGERPRINT_LINEAGE, partition="fit"
-            ),
-        ),
-        included_partitions=frozenset({"fit"}),
-    )
-    started = {span.span_id: span.started_at for span in trace.spans}
-    steps = [
-        {
-            "action": transition.action.model_dump(mode="json"),
-            "observation": {
-                "kind": transition.observation.kind,
-                "content": _decoded(transition.observation.content),
-            },
-        }
-        for transition in transitions
-    ]
-    order = [started[transition.action_span_id] for transition in transitions]
-    ordered = [
-        step
-        for _, step in sorted(
-            zip(order, steps, strict=True),
-            key=lambda item: (item[0], json.dumps(item[1], sort_keys=True)),
-        )
-    ]
-    return sha256_json(
-        {
-            "scheme": FINGERPRINT_SCHEME,
-            "task": normalize_durable_text(trace.task.strip()),
-            "steps": ordered,
-        }
-    )
+def record_sha256(trace: Trace) -> str:
+    """SHA-256 of a trace record's canonical JSON."""
+    return sha256_json(trace.model_dump(mode="json"))
 
 
 def declared_task_identity(trace: Trace) -> str | None:
     """The task identity a trace declares in its request context, if any."""
     value = trace.initial_context.get(TASK_LINEAGE_KEY)
     return value if isinstance(value, str) and value else None
+
+
+def _nodes(
+    ledger: ExposureLedger,
+    project: str,
+    build: str,
+    dataset: ArtifactInput,
+    traces: Sequence[Trace],
+) -> tuple[LedgerNode, ...]:
+    """Every trace under every computable scheme."""
+    return tuple(
+        LedgerNode(
+            scheme=scheme.identity,
+            fingerprint=scheme.compute(trace),
+            source=SourceRecord(
+                project=project,
+                dataset=dataset,
+                trace_id=trace.trace_id,
+                record_sha256=record_sha256(trace),
+            ),
+            task_lineage=declared_task_identity(trace),
+            build=build,
+        )
+        for trace in traces
+        for scheme in ledger.computable
+    )
+
+
+def _write_nodes(
+    transaction: LedgerTransaction,
+    nodes: Sequence[LedgerNode],
+    *,
+    extra: Mapping[str, Vertex] | None = None,
+) -> None:
+    """Write nodes and link every source fingerprinted under more than one scheme."""
+    by_source: dict[str, set[Vertex]] = defaultdict(set)
+    for node in nodes:
+        transaction.record("node", node)
+        by_source[node.source.record_sha256].add(node.vertex)
+    for source, vertex in (extra or {}).items():
+        by_source[source].add(vertex)
+    for source, vertices in sorted(by_source.items()):
+        if len(vertices) > 1:
+            transaction.record(
+                "equivalence",
+                LedgerEquivalence(source_sha256=source, vertices=tuple(sorted(vertices))),
+            )
 
 
 def _require_schema(connection: sqlite3.Connection) -> None:
@@ -634,7 +827,9 @@ def _require_schema(connection: sqlite3.Connection) -> None:
         )
     connection.execute(
         """CREATE TABLE records (
-            kind TEXT NOT NULL CHECK (kind IN ('build', 'node', 'edge', 'exposure')),
+            kind TEXT NOT NULL CHECK (
+                kind IN ('build', 'node', 'edge', 'exposure', 'equivalence', 'scheme')
+            ),
             record_id TEXT NOT NULL,
             body TEXT NOT NULL,
             PRIMARY KEY (kind, record_id)
@@ -676,10 +871,11 @@ def _export(connection: sqlite3.Connection | None) -> LedgerExport:
                 keys.append(f"{table}/{receipt}/{sha256_json(body)[:16]}")
     return LedgerExport(
         identity="ledger-" + sha256_json(sorted(keys))[:20],
-        scheme=FINGERPRINT_SCHEME,
+        schemes=_parse(rows["scheme"], SchemeIdentity),
         builds=_parse(rows["build"], LedgerBuild),
         nodes=_parse(rows["node"], LedgerNode),
         edges=_parse(rows["edge"], LedgerEdge),
+        equivalences=_parse(rows["equivalence"], LedgerEquivalence),
         exposures=_parse(rows["exposure"], LedgerExposure),
         reservations=_parse(rows["reservations"], LedgerReservation),
         releases=_parse(rows["releases"], LedgerRelease),
@@ -694,14 +890,6 @@ def _parse[Row: BaseModel](bodies: list[str], model: type[Row]) -> tuple[Row, ..
 def _body(record: BaseModel) -> str:
     """Canonical JSON text of one row."""
     return json.dumps(record.model_dump(mode="json"), sort_keys=True)
-
-
-def _decoded(content: str) -> JsonValue:
-    """Recorded text as JSON when it is JSON, so encoding whitespace never changes content."""
-    try:
-        return json.loads(content)
-    except ValueError:
-        return content
 
 
 def _record_id(record: BaseModel) -> str:
