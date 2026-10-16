@@ -471,14 +471,22 @@ class SessionResearch:
                 plans.append(ValueError("feedback requires one single-tool prediction"))
                 continue
             matched = strict_equal(replies[0], observed_reply)
-            investigate = (
+            # An intent without a record already spent its budget unit; only an explicit
+            # resumption settles it again (replaying a saved response, or re-dispatching a lost
+            # one as a recorded unknown-outcome retry), and never spends a second unit.
+            resumed = (
+                self._resumption is not None
+                and identity in claimed
+                and not self._artifacts.exists(identity)
+            )
+            investigate = resumed or (
                 not matched
                 and policy.generate_hypotheses
                 and budget > 0
                 and identity not in claimed
                 and not self._artifacts.exists(identity)
             )
-            if investigate:
+            if investigate and not resumed:
                 budget -= 1
             record: JsonObject = {
                 "id": identity,

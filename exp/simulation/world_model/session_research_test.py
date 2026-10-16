@@ -9,6 +9,7 @@ from filelock import Timeout
 
 from exp.common.core.artifacts import JsonObject
 from exp.common.models import ToolCall
+from exp.common.models.unknown_outcome import DispatchOutcomeUnknown
 from exp.common.project import ArtifactStore, ProjectPaths
 from exp.optimize.evaluation import fidelity
 from exp.optimize.evaluation.fidelity import (
@@ -18,16 +19,49 @@ from exp.optimize.evaluation.fidelity import (
 from exp.optimize.evaluation.fidelity_test import source_project, transition_reply
 from exp.runtime.gateway.decisions_contracts import DecisionRequest
 from exp.runtime.models.providers.transport import JsonHttpResponse, ScriptedJsonTransport
-from exp.runtime.sessions.store import SessionBinding, SessionStore
+from exp.runtime.sessions.store import SessionBinding, SessionNotFoundError, SessionStore
 from exp.simulation.engines.transition import Completion
 from exp.simulation.retrieval.jev import JEVCueSelector, JEVPolicy
 from exp.simulation.retrieval.selection import AllOriginals, SelectionQuery
+from exp.simulation.world_model.resumption import Resumption
 from exp.simulation.world_model.session_research import OnlineResearchPolicy, SessionResearch
 
 
-def deferred_research(tmp_path: Path, complete: Completion) -> SessionResearch:
-    """Open a real durable research owner with two completed single-tool predictions."""
+def deferred_research(
+    tmp_path: Path, complete: Completion, resumption: Resumption | None = None
+) -> SessionResearch:
+    """Open a real durable research owner with two completed single-tool predictions.
+
+    Reopening the same directory reuses the saved session; ``resumption`` makes the owner an
+    explicit continuation of an interrupted run.
+    """
     store = SessionStore(tmp_path / "sessions.sqlite")
+    try:
+        store.read_session("session-a")
+    except SessionNotFoundError:
+        _create_session(store)
+    selector = AllOriginals()
+    return SessionResearch(
+        session_id="session-a",
+        policy=OnlineResearchPolicy(
+            feedback_source="native",
+            selection_policy_sha256=selector.identity,
+            maximum_updates=1,
+            notes_reach_predictions=False,
+        ),
+        store=store,
+        artifacts=ArtifactStore(ProjectPaths(tmp_path, "research")),
+        complete=complete,
+        lock_path=tmp_path / "session.lock",
+        clock=lambda: datetime.now(UTC),
+        code_revision="fixture",
+        selection=selector,
+        resumption=resumption,
+    )
+
+
+def _create_session(store: SessionStore) -> None:
+    """Save two committed single-tool predictions that both missed."""
     store.create_session(
         "session-a",
         SessionBinding(
@@ -45,23 +79,6 @@ def deferred_research(tmp_path: Path, complete: Completion) -> SessionResearch:
                 for step in ("step-0", "step-1")
             ]
         },
-    )
-    selector = AllOriginals()
-    return SessionResearch(
-        session_id="session-a",
-        policy=OnlineResearchPolicy(
-            feedback_source="native",
-            selection_policy_sha256=selector.identity,
-            maximum_updates=1,
-            notes_reach_predictions=False,
-        ),
-        store=store,
-        artifacts=ArtifactStore(ProjectPaths(tmp_path, "research")),
-        complete=complete,
-        lock_path=tmp_path / "session.lock",
-        clock=lambda: datetime.now(UTC),
-        code_revision="fixture",
-        selection=selector,
     )
 
 
@@ -101,6 +118,46 @@ def test_deferred_budget_is_session_wide_even_after_failed_intent(
     assert second[0]["investigation_skipped"] == "session investigation budget exhausted"
     assert research.observe_all([("step-1", "observed")], "native") == second
     assert len(calls) == 1
+
+
+def test_a_resumption_retries_a_failed_intent_without_a_second_budget_unit(
+    tmp_path: Path,
+) -> None:
+    """A lost investigation is flagged and sent again; its unit is not spent twice."""
+    calls: list[str] = []
+
+    def lost(body: JsonObject, identity: str) -> JsonObject:
+        """The first dispatch's outcome is unknown."""
+        calls.append(identity)
+        raise KeyboardInterrupt("process killed with the investigation in flight")
+
+    with pytest.raises(KeyboardInterrupt):
+        deferred_research(tmp_path, lost).observe_all([("step-0", "observed")], "native")
+
+    def ledger(body: JsonObject, identity: str) -> JsonObject:
+        """The request ledger refuses to replay the lost dispatch; a re-dispatch answers."""
+        calls.append(identity)
+        if not identity.endswith("-retry-1"):
+            raise DispatchOutcomeUnknown("saved provider dispatch has unresolved spend")
+        return investigation_reply()
+
+    plain = deferred_research(tmp_path, ledger).observe_all([("step-0", "observed")], "native")
+    assert isinstance(plain[0], ValueError) and "--retry-incomplete" in str(plain[0])
+    assert len(calls) == 1, "without a resumption nothing is sent"
+    retried: list[tuple[str, str, str]] = []
+    resumption = Resumption(
+        window=datetime.now(UTC) + timedelta(hours=3),
+        retried=lambda stage, operation, logical: retried.append((stage, operation, logical)),
+    )
+    settled = deferred_research(tmp_path, ledger, resumption).observe_all(
+        [("step-0", "observed"), ("step-1", "observed")], "native"
+    )
+    assert isinstance(settled[0], dict) and settled[0]["investigation"] == investigation_reply()
+    assert [(stage, operation) for stage, operation, _ in retried] == [("investigation", "step-0")]
+    assert retried[0][2].endswith("-investigate-retry-1")
+    assert isinstance(settled[1], dict)
+    assert settled[1]["investigation_skipped"] == "session investigation budget exhausted"
+    assert len(calls) == 3, "the lost one, its ledger refusal, and one re-dispatch"
 
 
 def test_deferred_feedback_holds_session_lease_during_provider_call(tmp_path: Path) -> None:
