@@ -230,12 +230,14 @@ class GroundedTransitionEngine:
                 "grounded_transition_ids": [
                     match.transition.transition_id for match in prepared.matches
                 ],
+                # A digest, never keys or values: this evidence reaches investigations, which
+                # must not learn instance facts into memory other traces read.
                 **(
                     {}
                     if conditioning is None
                     else {
                         "instance_facts_version": conditioning.state_version,
-                        "instance_fact_keys": [fact.key for fact in conditioning.facts],
+                        "instance_facts_sha256": sha256_json(conditioning.rendered()),
                     }
                 ),
             },

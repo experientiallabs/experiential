@@ -117,8 +117,11 @@ def test_every_replay_conditions_on_its_own_facts_and_nothing_else(
         if "submit_transition" not in json.dumps(request.payload.get("tool_choice"))
     ]
     assert others
+    keys = [f"orders/user_{i:02d}/" for i in range(USERS)]
     for request in others:
-        assert not any(marker in json.dumps(request.payload) for marker in MARKERS)
+        payload = json.dumps(request.payload)
+        assert not any(marker in payload for marker in MARKERS)
+        assert not any(key in payload for key in keys), "fact keys never reach investigations"
     consumed = store.artifacts.list_ids(artifact_type="consumed-trajectory")
     assert consumed
     for identity in consumed:
