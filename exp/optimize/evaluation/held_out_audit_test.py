@@ -45,6 +45,7 @@ from exp.optimize.evaluation.held_out_receipts import (
     receipt_view,
     record_report,
 )
+from exp.optimize.evaluation.trace_replay import DEADLINE
 from exp.runtime.models.providers.transport import JsonHttpResponse
 from exp.runtime.sessions.dispatch_ledger import DispatchLedger
 from exp.simulation.mining.exposure_ledger import (
@@ -67,7 +68,6 @@ def audit(
     count: int = 1,
     *,
     revision: str = REVISION,
-    retry_incomplete: bool = False,
     include_inspected: bool = False,
 ) -> AbstractContextManager[HeldOutAudit]:
     """Open a source-RAG held-out audit."""
@@ -77,15 +77,19 @@ def audit(
         profile="source-rag",
         code_revision=revision,
         clock=clock,
-        retry_incomplete=retry_incomplete,
         include_inspected=include_inspected,
     )
 
 
-def run(store: ProjectStore, opened: HeldOutAudit) -> None:
-    """Execute every registered run under the audit's guard."""
+def run(store: ProjectStore, opened: HeldOutAudit, *, resume: bool = False) -> None:
+    """Execute every registered run under the audit's guard; ``resume`` is --retry-incomplete."""
     for prepared in opened.panel.prepared:
-        execute_fidelity_evaluation(store, prepared, dispatch_guard=opened.guard)
+        execute_fidelity_evaluation(
+            store,
+            prepared,
+            dispatch_guard=opened.guard,
+            resume_until=clock() + DEADLINE if resume else None,
+        )
 
 
 class FailingOnce(SimulatedProvider):
@@ -135,18 +139,11 @@ def test_content_is_reserved_before_any_run_is_registered(
         *,
         code_revision: str,
         clock: Callable[[], datetime],
-        retry_incomplete: bool = False,
     ) -> HeldOutPanel:
         """Record whether the newest receipt's reservation was committed before registering."""
         receipts = audit_receipts(store)
         seen.append(bool(receipts) and ledger.snapshot().active(receipts[-1].receipt_id))
-        return register(
-            project,
-            planned,
-            code_revision=code_revision,
-            clock=clock,
-            retry_incomplete=retry_incomplete,
-        )
+        return register(project, planned, code_revision=code_revision, clock=clock)
 
     monkeypatch.setattr(held_out_audit, "register_planned_panel", checked)
     with audit(store) as opened:
@@ -250,29 +247,33 @@ def test_a_claimed_slot_makes_the_reservation_permanent_after_a_crash(
     # Without --retry-incomplete the owner resumes but never buys the stopped run again.
     with audit(store) as resumed:
         assert resumed.receipt == receipt and not resumed.panel.retirements
-        with pytest.raises(ValueError, match="incomplete fidelity run"):
+        with pytest.raises(ValueError, match="--retry-incomplete"):
             run(store, resumed)
     # Any other evaluation of those cases is a development re-audit with its own receipt.
     with audit(store, include_inspected=True) as other:
         assert other.receipt != receipt and other.receipt.basis == "development-re-audit"
         assert other.receipt.reaudited == receipt.lineages
-    # The owner completes it with --retry-incomplete: a child, never a new receipt.
-    with audit(store, retry_incomplete=True) as completed:
-        assert completed.receipt == receipt
-        run(store, completed)
+    # The owner completes it with --retry-incomplete: the same run resumes in place, and the
+    # lost request sent again is an in-place re-attempt child, never a new receipt.
+    with audit(store) as completed:
+        assert completed.receipt == receipt and not completed.panel.retirements
+        run(store, completed, resume=True)
         view = completed.view
         [child] = view.attempts
-        assert child.reason == "re-attempt" and child.claimed_slots >= 1
+        assert child.reason == "re-attempt" and child.claimed_slots >= 1 and child.in_place
         assert child.original_run == receipt.cases[0].base_run
-        assert child.retired_run == receipt.cases[0].base_run
-        assert child.replacement_run == receipt.cases[0].base_run + "-r2"
+        assert child.retired_run == child.replacement_run == receipt.cases[0].base_run
+        assert [(row.stage, row.step, row.attempts) for row in child.redispatched] == [
+            ("prediction", 0, 2)
+        ]
+        assert view.redispatched["prediction"] == 1
         assert view.headline == QUALIFIED and view.affected_traces == {receipt.cases[0].trace_id}
-    # A plain resume follows the replacement chain to the completed attempt and replays it.
+    # A plain rerun replays the completed run under the same qualified receipt.
     with audit(store) as replayed:
         assert replayed.panel.prepared[0].spec.run_id == child.replacement_run
         assert not replayed.panel.retirements
         run(store, replayed)
-        assert replayed.view.headline == QUALIFIED
+        assert replayed.view.headline == QUALIFIED and len(replayed.view.attempts) == 1
     assert len(audit_receipts(store)) == 2
 
 
@@ -441,8 +442,8 @@ def test_locks_are_always_taken_in_one_order(
 
     with audit(store) as opened:
         run(store, opened)
-    with audit(store, retry_incomplete=True) as resumed:
-        run(store, resumed)
+    with audit(store) as resumed:
+        run(store, resumed, resume=True)
     with audit(store, 2) as other:
         pass
     release_held_out_audit(store, other.receipt, clock=clock)

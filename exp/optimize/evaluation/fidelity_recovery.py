@@ -4,14 +4,17 @@ A fidelity run interrupted mid-execution resumes in place with ``--retry-incompl
 work replays; a request that left the process without a saved response has an unknown outcome
 and is sent again. The lost response may have been seen (a gateway log, a terminal), so such a
 retry is transparent but not provably uninfluenced. Each one is recorded here, durably and
-before it is sent, and every report that includes one is qualified in its headline: the
-status, counts by stage and affected traces, and the score with and without those traces.
-Nothing is dropped by default.
+before it is sent. A trace with one is a trace re-attempt: every report that includes it is
+qualified in its headline with the held-out audit's label (``qualified: trace re-attempts``),
+names the re-dispatches by stage and the affected traces, keeps every trace in the primary
+score, and adds the score over unaffected traces only and over affected traces only, each with
+its denominator. Nothing is dropped by default. Held-out audits record the same retries as
+children of their receipt (:mod:`exp.optimize.evaluation.held_out_receipts`).
 """
 
 import json
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Iterable, Mapping
 from datetime import datetime
 
 from pydantic import Field
@@ -21,7 +24,7 @@ from exp.common.models import ToolCall
 from exp.common.project import ProjectStore
 from exp.simulation.world_model.resumption import RecoveryStage
 
-STATUS = "qualified: unknown-outcome retries"
+QUALIFICATION = "qualified: trace re-attempts"
 JUDGE_OPERATION = "judge"
 STAGE_ORDER: tuple[RecoveryStage, ...] = ("prediction", "judge", "investigation", "retrieval")
 _TYPE = "fidelity-unknown-outcome"
@@ -51,7 +54,7 @@ class UnknownOutcome(ContractModel):
 
 
 class Qualification(ContractModel):
-    """Headline qualification of a report that includes unknown-outcome retries.
+    """Headline qualification of a report whose traces include unknown-outcome retries.
 
     Attributes:
         prediction: Re-dispatched prediction steps.
@@ -59,11 +62,11 @@ class Qualification(ContractModel):
         investigation: Re-dispatched investigations.
         retrieval: Steps whose interrupted preparation was prepared again.
         affected: Traces with at least one retry.
-        traces: Traces in the report.
-        exact: Exact replies over every trace.
-        steps: Measured steps over every trace.
-        exact_without: Exact replies without the affected traces.
-        steps_without: Measured steps without the affected traces.
+        traces: Traces in the report; the primary score keeps all of them.
+        exact_unaffected: Exact replies over unaffected traces only.
+        steps_unaffected: Measured steps over unaffected traces only.
+        exact_affected: Exact replies over affected traces only.
+        steps_affected: Measured steps over affected traces only.
     """
 
     prediction: int = Field(ge=0)
@@ -72,26 +75,62 @@ class Qualification(ContractModel):
     retrieval: int = Field(ge=0)
     affected: int = Field(ge=1)
     traces: int = Field(ge=1)
-    exact: int = Field(ge=0)
-    steps: int = Field(ge=0)
-    exact_without: int = Field(ge=0)
-    steps_without: int = Field(ge=0)
+    exact_unaffected: int = Field(ge=0)
+    steps_unaffected: int = Field(ge=0)
+    exact_affected: int = Field(ge=0)
+    steps_affected: int = Field(ge=0)
 
     def lines(self) -> tuple[str, ...]:
-        """Counts by stage and affected traces, then the sensitivity line."""
-        stages = (
-            f"prediction {self.prediction} · judge {self.judge} · "
-            f"investigation {self.investigation}"
-        )
-        if self.retrieval:
-            stages += f" · retrieval {self.retrieval}"
+        """The re-dispatches by stage, then both sensitivity figures with their denominators."""
+        unaffected = self.traces - self.affected
         return (
-            f"  unknown-outcome retries  {stages} · {self.affected} of {self.traces} traces "
-            "affected (a lost response may have been seen)",
-            f"  sensitivity  with them {self.exact}/{self.steps} replies exact "
-            f"({_share(self.exact, self.steps)}) · without them {self.exact_without}/"
-            f"{self.steps_without} ({_share(self.exact_without, self.steps_without)})",
+            stage_line(
+                {
+                    "prediction": self.prediction,
+                    "judge": self.judge,
+                    "investigation": self.investigation,
+                    "retrieval": self.retrieval,
+                },
+                self.affected,
+                self.traces,
+            ),
+            f"  Unaffected traces only  {self.exact_unaffected}/{self.steps_unaffected} replies "
+            f"exact ({_share(self.exact_unaffected, self.steps_unaffected)}) · "
+            f"{unaffected}/{unaffected} traces",
+            f"  Re-attempted traces only  {self.exact_affected}/{self.steps_affected} replies "
+            f"exact ({_share(self.exact_affected, self.steps_affected)}) · "
+            f"{self.affected}/{self.affected} traces",
         )
+
+
+def stage_counts(rows: Iterable[UnknownOutcome]) -> dict[RecoveryStage, int]:
+    """Re-dispatched steps per stage, every stage present."""
+    counts: dict[RecoveryStage, int] = {stage: 0 for stage in STAGE_ORDER}
+    for row in rows:
+        counts[row.stage] += 1
+    return counts
+
+
+def stage_line(counts: Mapping[RecoveryStage, int], affected: int, traces: int) -> str:
+    """One line naming the re-dispatches by stage and the affected traces.
+
+    Args:
+        counts: Re-dispatched steps per stage.
+        affected: Traces with at least one re-dispatch.
+        traces: Traces in the report.
+
+    Returns:
+        The line; retrieval appears only when an interrupted preparation was repeated.
+    """
+    stages = " · ".join(
+        f"{stage} {counts.get(stage, 0)}"
+        for stage in STAGE_ORDER
+        if stage != "retrieval" or counts.get(stage, 0)
+    )
+    return (
+        f"  re-dispatched after an unknown outcome  {stages} · {affected} of {traces} traces "
+        "affected (a lost response may have been seen)"
+    )
 
 
 def qualify(
@@ -109,10 +148,7 @@ def qualify(
     if not affected:
         return None
     clean = [row for row in traces if not row[0]]
-    counts = {stage: 0 for stage in STAGE_ORDER}
-    for retries, _, _ in affected:
-        for retry in retries:
-            counts[retry.stage] += 1
+    counts = stage_counts(retry for retries, _, _ in affected for retry in retries)
     return Qualification(
         prediction=counts["prediction"],
         judge=counts["judge"],
@@ -120,10 +156,10 @@ def qualify(
         retrieval=counts["retrieval"],
         affected=len(affected),
         traces=len(traces),
-        exact=sum(exact for _, exact, _ in traces),
-        steps=sum(steps for *_, steps in traces),
-        exact_without=sum(exact for _, exact, _ in clean),
-        steps_without=sum(steps for *_, steps in clean),
+        exact_unaffected=sum(exact for _, exact, _ in clean),
+        steps_unaffected=sum(steps for *_, steps in clean),
+        exact_affected=sum(exact for _, exact, _ in affected),
+        steps_affected=sum(steps for *_, steps in affected),
     )
 
 

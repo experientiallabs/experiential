@@ -61,7 +61,7 @@ from exp.optimize.evaluation.fidelity import (
     unknown_outcomes,
 )
 from exp.optimize.evaluation.fidelity_memory import INCOMPLETE, saved_memory_receipt
-from exp.optimize.evaluation.fidelity_recovery import Qualification, UnknownOutcome, qualify
+from exp.optimize.evaluation.fidelity_recovery import UnknownOutcome
 from exp.runtime.models import RuntimeModelCatalog
 from exp.runtime.models.providers.transport import RetryPolicy
 from exp.runtime.sessions.dispatch_ledger import DispatchLedger
@@ -170,8 +170,6 @@ class ReplayAggregate(ContractModel):
         judge_turns: Turns with a per-turn response score and a recorded reply.
         judge_agreements: Of those, turns where the judge's verdict (response score 4 or 5)
             agrees with exact reproduction; a calibration check on the judge, not a score.
-        qualification: Present when any trace includes unknown-outcome retries; its status
-            belongs in the headline, never only in per-step detail.
     """
 
     traces: int
@@ -182,7 +180,6 @@ class ReplayAggregate(ContractModel):
     judge_mean: float | None
     judge_turns: int = 0
     judge_agreements: int = 0
-    qualification: Qualification | None = None
 
 
 def replay_boundary(trace: Trace, exchanges: int) -> int:
@@ -596,9 +593,6 @@ def aggregate(results: Sequence[ReplayResult]) -> ReplayAggregate:
         judge_mean=sum(scores) / len(scores) if scores else None,
         judge_turns=len(judged),
         judge_agreements=sum(verdict == exact for verdict, exact in judged),
-        qualification=qualify(
-            [(result.unknown_outcomes, result.exact, result.steps) for result in results]
-        ),
     )
 
 

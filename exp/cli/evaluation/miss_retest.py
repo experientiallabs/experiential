@@ -24,6 +24,7 @@ from exp.common.progress import ProgressHook
 from exp.common.project import ProjectStore
 from exp.common.release_revision import installed_release_revision
 from exp.optimize.evaluation.fidelity import execute_fidelity_evaluation, saved_fidelity_report
+from exp.optimize.evaluation.fidelity_recovery import QUALIFICATION, Qualification, qualify
 from exp.optimize.evaluation.miss_retest import (
     TurnChanges,
     register_miss_retest,
@@ -42,11 +43,13 @@ class RetestOutcome:
         total: Sums over the retested traces.
         planned: Traces in the retest panel.
         changes: Turns fixed and regressed against their first measurement.
+        qualification: Present when any retested trace resumed with unknown-outcome retries.
     """
 
     total: ReplayAggregate
     planned: int
     changes: TurnChanges
+    qualification: Qualification | None = None
 
 
 def run_miss_retest(
@@ -148,7 +151,11 @@ def run_miss_retest(
             render_traces(console, store, panel.prepared, results, "Retested trace")
         console.print()
         total, changes = aggregate(results), turn_changes(panel, results)
-        console.print(Text(aggregate_line(total, len(panel.cases), "Miss retest")))
+        qualification = qualify([(row.unknown_outcomes, row.exact, row.steps) for row in results])
+        label = "Miss retest" if qualification is None else f"Miss retest ({QUALIFICATION})"
+        console.print(Text(aggregate_line(total, len(panel.cases), label)))
+        for line in qualification.lines() if qualification is not None else ():
+            console.print(Text(line))
         console.print(Text(changes_line(changes)))
         curve = learning_curve(store, "all")
         if curve is not None:
@@ -160,7 +167,9 @@ def run_miss_retest(
                 style="dim",
             )
         )
-    return RetestOutcome(total=total, planned=len(panel.cases), changes=changes)
+    return RetestOutcome(
+        total=total, planned=len(panel.cases), changes=changes, qualification=qualification
+    )
 
 
 def changes_line(changes: TurnChanges) -> str:
