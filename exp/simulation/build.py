@@ -396,15 +396,16 @@ def build_project(
         mining_spec=resolved_spec,
         embedder=resolved_embedder,
     )
+    trace_stored = store.artifacts.read(artifacts.trace_dataset.dataset.dataset_id)
     # Every build records its content and grouping at the root, exposed or not, so exposure
     # found later in any project propagates through it.
     ExposureLedger(store.paths.root).record_build(
         project=store.paths.project_id,
         build=artifacts.task_set.task_set_id,
+        dataset=artifact_input(trace_stored.manifest),
         traces=artifacts.trace_dataset.traces,
         near_duplicates=artifacts.mining.analysis.edges,
     )
-    trace_stored = store.artifacts.read(artifacts.trace_dataset.dataset.dataset_id)
     task_stored = store.artifacts.read(artifacts.task_set.task_set_id)
     if trace_stored.manifest != artifacts.trace_dataset.manifest:
         raise ValueError("loaded trace dataset manifest differs from the completed build")

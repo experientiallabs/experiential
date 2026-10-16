@@ -4,11 +4,13 @@ Builds run offline through the routed fake of :mod:`held_out_fidelity_test`; aud
 source-RAG profile so no learning pass is needed.
 """
 
+import multiprocessing
 import os
 import threading
 from collections.abc import Callable, Collection, Iterator, Mapping
 from contextlib import AbstractContextManager, contextmanager
 from datetime import UTC, datetime
+from multiprocessing.synchronize import Event
 from pathlib import Path
 
 import pytest
@@ -29,6 +31,7 @@ from exp.optimize.evaluation.held_out_audit import (
 from exp.optimize.evaluation.held_out_exposure import held_out_members
 from exp.optimize.evaluation.held_out_fidelity import HeldOutPanel, PlannedPanel, Profile
 from exp.optimize.evaluation.held_out_fidelity_test import (
+    PROJECT,
     REVISION,
     USERS,
     SimulatedProvider,
@@ -40,14 +43,18 @@ from exp.optimize.evaluation.held_out_receipts import (
     RECEIPT_TYPE,
     audit_receipts,
     receipt_view,
+    record_report,
 )
 from exp.runtime.models.providers.transport import JsonHttpResponse
 from exp.runtime.sessions.dispatch_ledger import DispatchLedger
 from exp.simulation.mining.exposure_ledger import (
     ExposureLedger,
+    LedgerEdge,
+    LedgerExposure,
     LedgerReservation,
     PanelInUseError,
 )
+from exp.simulation.mining.fingerprint import TRACE_CONTENT
 
 
 def clock() -> datetime:
@@ -210,7 +217,7 @@ def test_a_reservation_committed_between_selection_and_commit_is_respected(
                         panel="held-out-panel-elsewhere",
                         project="elsewhere",
                         lineages=(lineage,),
-                        fingerprints=held_out_members(store)[lineage],
+                        vertices=held_out_members(store)[lineage].vertices,
                         snapshot=transaction.snapshot().identity,
                         at=clock(),
                     )
@@ -446,3 +453,116 @@ def test_locks_are_always_taken_in_one_order(
         assert all(RANKS[earlier] < RANKS[name] for earlier in before), (name, before)
     first = {name: kinds.index(name) for name in RANKS}
     assert first["lease"] < first["run"] < first["dispatch"]
+
+
+OUTSIDE = f"{TRACE_CONTENT.identity.key}:{'e' * 64}"
+
+
+def expose_outside(store: ProjectStore) -> None:
+    """Expose content no held-out lineage is linked to yet."""
+    ExposureLedger(store.paths.root).record_exposure(
+        LedgerExposure(
+            vertices=(OUTSIDE,),
+            how="inspected",
+            panel="held-out-panel-elsewhere",
+            receipt="held-out-audit-receipt-elsewhere",
+            report="exp eval --held-out-fidelity --verbose",
+            project="elsewhere",
+            at=clock(),
+        )
+    )
+
+
+def link_late(store: ProjectStore, lineage: str) -> None:
+    """A later build records a grouping link from the lineage to the exposed content."""
+    member = held_out_members(store)[lineage].vertices[0]
+    with ExposureLedger(store.paths.root).transaction() as transaction:
+        transaction.record(
+            "edge",
+            LedgerEdge(
+                left=min(member, OUTSIDE),
+                right=max(member, OUTSIDE),
+                reason="declared-task-identity",
+                task_lineage="late",
+                project="later",
+                build="task-set-later",
+            ),
+        )
+
+
+def test_late_links_to_predating_exposure_block_before_dispatch(
+    built: tuple[ProjectStore, FailingOnce],
+) -> None:
+    """A6: exposure older than the reservation, linked later, blocks an undispatched panel."""
+    store, _ = built
+    expose_outside(store)
+    with audit(store) as opened:
+        receipt = opened.receipt
+        assert receipt.basis == "independent"
+    link_late(store, receipt.lineages[0])
+    with pytest.raises(ValueError, match="can no longer run as an independent audit"), audit(store):
+        pass
+    assert reservation_state(store, receipt) == "released"
+    with audit(store) as moved:
+        assert moved.receipt.lineages != receipt.lineages
+
+
+def test_late_links_after_dispatch_append_a_notice_and_later_exposure_never_does(
+    built: tuple[ProjectStore, FailingOnce],
+) -> None:
+    """A6: after dispatch a notice is appended; exposure after the audit invalidates nothing."""
+    store, _ = built
+    expose_outside(store)
+    with audit(store) as opened:
+        run(store, opened)
+        assert not opened.reassess(clock)
+        # Exposure after the receipt was minted never invalidates it retroactively.
+        record_report(
+            store, opened.receipt, opened.panel, kind="evaluation", detail_shown=True, clock=clock
+        )
+        assert not opened.reassess(clock) and opened.view.notices == ()
+    stored = store.artifacts.read_bytes(opened.receipt.receipt_id, "receipt.json")
+    with audit(store, 2) as second:
+        run(store, second)
+        link_late(store, second.receipt.lineages[0])
+        assert second.reassess(clock)
+        assert not second.reassess(clock), "one notice per discovered exposure"
+        [notice] = second.view.notices
+        assert [item.lineage for item in notice.exposed] == [second.receipt.lineages[0]]
+        assert notice.exposed[0].path is not None
+        assert notice.exposed[0].path.exposed_node == OUTSIDE
+    with audit(store, 2) as resumed:
+        assert resumed.receipt == second.receipt and len(resumed.view.notices) == 1
+    assert store.artifacts.read_bytes(opened.receipt.receipt_id, "receipt.json") == stored
+
+
+def _resume_and_hold(root: str, holding: Event, done: Event) -> None:
+    """Child process: resume the audit and hold its lease, as an execution would."""
+    store = ProjectStore(Path(root), PROJECT)
+    with audit(store):
+        holding.set()
+        done.wait(120)
+
+
+def test_a_second_process_resuming_blocks_release_with_panel_in_use(
+    built: tuple[ProjectStore, FailingOnce],
+) -> None:
+    """A8: while another process holds the panel, release fails at once and changes nothing."""
+    store, _ = built
+    with audit(store) as opened:
+        receipt = opened.receipt
+    context = multiprocessing.get_context("spawn")
+    holding, done = context.Event(), context.Event()
+    holder = context.Process(target=_resume_and_hold, args=(str(store.paths.root), holding, done))
+    holder.start()
+    try:
+        assert holding.wait(120)
+        with pytest.raises(PanelInUseError, match="in use"):
+            release_held_out_audit(store, receipt, clock=clock)
+        assert reservation_state(store, receipt) == "active"
+    finally:
+        done.set()
+        holder.join(120)
+    assert holder.exitcode == 0
+    release_held_out_audit(store, receipt, clock=clock)
+    assert reservation_state(store, receipt) == "released"

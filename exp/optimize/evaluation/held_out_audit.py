@@ -36,8 +36,11 @@ from exp.common.project import ProjectStore
 from exp.optimize.evaluation.fidelity import saved_fidelity_report
 from exp.optimize.evaluation.held_out_exposure import (
     HeldOutExposure,
+    LineageExposure,
     held_out_exposure,
     held_out_members,
+    refresh_ledger,
+    unknown_scheme_refusal,
 )
 from exp.optimize.evaluation.held_out_fidelity import (
     HeldOutPanel,
@@ -49,12 +52,14 @@ from exp.optimize.evaluation.held_out_fidelity import (
 )
 from exp.optimize.evaluation.held_out_receipts import (
     AuditCase,
+    AuditNotice,
     AuditReceipt,
     AuditRequest,
     ReceiptView,
     audit_receipts,
     receipt_view,
     record_attempts,
+    record_notice,
     save_receipt,
 )
 from exp.simulation.mining.exposure_ledger import (
@@ -107,6 +112,25 @@ class HeldOutAudit:
         """The receipt with every child appended so far."""
         return receipt_view(self.project, self.receipt)
 
+    def reassess(self, clock: Callable[[], datetime]) -> bool:
+        """Append an invalidation notice if links recorded since reservation reveal exposure.
+
+        Only exposure recorded before the receipt was minted counts; exposure after it never
+        invalidates the audit. Before any dispatch the next opening blocks instead.
+
+        Args:
+            clock: Aware clock.
+
+        Returns:
+            Whether a new notice was appended.
+        """
+        ledger = ExposureLedger(self.project.paths.root)
+        snapshot = ledger.snapshot()
+        blocked = late_exposure(self.project, ledger, snapshot, self.receipt)
+        if not blocked or not panel_slots(self.project, self.receipt.base_runs):
+            return False
+        return _notice(self.project, self.receipt, blocked, snapshot.identity, clock)
+
     def guard(self) -> None:
         """Refuse a slot claim unless this process still holds the lease.
 
@@ -154,31 +178,52 @@ def open_held_out_audit(
     """
     ledger = ExposureLedger(project.paths.root)
     request = AuditRequest(profile=profile, count=count, include_inspected=include_inspected)
+    refresh_ledger(project, ledger)
     for _ in range(SELECTION_ROUNDS):
         snapshot = ledger.snapshot()
         owner = _open_receipt(project, request, snapshot)
+        if owner is not None and any(
+            report.detail_shown for report in receipt_view(project, owner).reports
+        ):
+            owner = None  # it showed per-trace detail; the request moves on to fresh content
         exposure = held_out_exposure(project, snapshot, owner.receipt_id if owner else None)
-        # Reservations made after the owner's never block its own cases; exposure always does.
+        if exposure.unknown and not include_inspected:
+            raise ValueError(unknown_scheme_refusal(exposure.unknown))
+        # The owner keeps its own cases, so later links are reassessed under its lease.
         own = frozenset(owner.lineages) if owner else frozenset()
         excluded = (
             frozenset()
             if include_inspected
-            else frozenset(
-                item.lineage
-                for item in exposure.exposed
-                if item.kind == "exposed" or item.lineage not in own
-            )
+            else frozenset(item.lineage for item in exposure.exposed if item.lineage not in own)
         )
         planned = plan_held_out_panel(
             project, count, profile=profile, clock=clock, excluded=excluded
         )
+        if owner is not None and planned.lineages != owner.lineages:
+            # Selection no longer lands on the owner's cases: a new receipt, around its hold.
+            owner = None
+            exposure = held_out_exposure(project, snapshot)
+            excluded = frozenset() if include_inspected else exposure.lineages
+            planned = plan_held_out_panel(
+                project, count, profile=profile, clock=clock, excluded=excluded
+            )
         follows: tuple[AuditReceipt, Literal["released-unused", "dispatched"]] | None = None
-        if owner is not None and planned.lineages == owner.lineages:
+        if owner is not None:
             if planned.identity == owner.panel and code_revision == owner.code_revision:
                 with ledger.lease(owner.panel) as lease:
+                    blocked: tuple[LineageExposure, ...] = ()
                     with ledger.transaction() as transaction:
-                        if not transaction.snapshot().active(owner.receipt_id):
+                        current = transaction.snapshot()
+                        if not current.active(owner.receipt_id):
                             continue
+                        blocked = late_exposure(project, ledger, current, owner)
+                        dispatched = bool(blocked) and bool(panel_slots(project, owner.base_runs))
+                        if blocked and not dispatched:
+                            transaction.release(LedgerRelease(receipt=owner.receipt_id, at=clock()))
+                    if blocked and not dispatched:
+                        raise ValueError(_blocked(owner, blocked))
+                    if blocked:
+                        _notice(project, owner, blocked, current.identity, clock)
                     panel = register_planned_panel(
                         project,
                         planned,
@@ -266,6 +311,61 @@ def outcome_unknown(project: ProjectStore, audit: HeldOutAudit) -> bool:
     )
 
 
+def late_exposure(
+    project: ProjectStore,
+    ledger: ExposureLedger,
+    snapshot: LedgerSnapshot,
+    receipt: AuditReceipt,
+) -> tuple[LineageExposure, ...]:
+    """Audited lineages now linked to exposure that predates an independent receipt.
+
+    Args:
+        project: Project of the receipt.
+        ledger: Ledger whose schemes to use.
+        snapshot: Current ledger snapshot.
+        receipt: Receipt to reassess.
+
+    Returns:
+        The affected lineages with their paths; empty for a development re-audit.
+    """
+    if receipt.basis != "independent":
+        return ()
+    exposure = held_out_exposure(
+        project, snapshot, receipt.receipt_id, ledger=ledger, before=receipt.opened_at
+    )
+    return tuple(
+        item
+        for item in exposure.exposed
+        if item.kind == "exposed" and item.lineage in receipt.lineages
+    )
+
+
+def _blocked(receipt: AuditReceipt, blocked: tuple[LineageExposure, ...]) -> str:
+    """Why an undispatched receipt can no longer run independently."""
+    return (
+        f"links recorded after receipt {receipt.receipt_id} reserved its panel reveal exposure "
+        f"that predates it on {len(blocked)} audited "
+        f"{'lineage' if len(blocked) == 1 else 'lineages'}, so it can no longer run as an "
+        "independent audit; its unused reservation was released. Run the command again to "
+        "select unexposed lineages, or add --include-inspected for a development re-audit"
+    )
+
+
+def _notice(
+    project: ProjectStore,
+    receipt: AuditReceipt,
+    blocked: tuple[LineageExposure, ...],
+    ledger: str,
+    clock: Callable[[], datetime],
+) -> bool:
+    """Append an invalidation notice to a receipt whose execution already began."""
+    return record_notice(
+        project,
+        receipt,
+        AuditNotice(receipt=receipt.receipt_id, at=clock(), ledger=ledger, exposed=blocked),
+    )
+
+
 def _open_receipt(
     project: ProjectStore, request: AuditRequest, snapshot: LedgerSnapshot
 ) -> AuditReceipt | None:
@@ -321,7 +421,9 @@ def _reserve(
             opened_at=clock(),
             project=project.paths.project_id,
             request=request,
-            basis="development-re-audit" if touched or saved else "independent",
+            basis=(
+                "development-re-audit" if touched or saved or exposure.unknown else "independent"
+            ),
             panel=planned.identity,
             code_revision=code_revision,
             world_model=planned.world_model,
@@ -335,7 +437,7 @@ def _reserve(
                 )
                 for case, run in zip(planned.cases, planned.base_runs, strict=True)
             ),
-            scheme=exposure.scheme,
+            schemes=exposure.schemes,
             ledger=snapshot.identity,
             exposed=exposure.exposed,
             reaudited=touched,
@@ -349,8 +451,14 @@ def _reserve(
                 panel=receipt.panel,
                 project=receipt.project,
                 lineages=receipt.lineages,
-                fingerprints=tuple(
-                    sorted({item for lineage in receipt.lineages for item in members[lineage]})
+                vertices=tuple(
+                    sorted(
+                        {
+                            vertex
+                            for lineage in receipt.lineages
+                            for vertex in members[lineage].vertices
+                        }
+                    )
                 ),
                 snapshot=snapshot.identity,
                 at=receipt.opened_at,

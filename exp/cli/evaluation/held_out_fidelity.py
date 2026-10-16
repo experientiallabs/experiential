@@ -33,6 +33,7 @@ from exp.optimize.evaluation.held_out_exposure import LIMITS, LineageExposure
 from exp.optimize.evaluation.held_out_fidelity import AuditCheckpoint, saved_held_out_results
 from exp.optimize.evaluation.held_out_receipts import (
     QUALIFIED,
+    AuditReceipt,
     AuditReport,
     ReceiptView,
     ReportKind,
@@ -140,7 +141,7 @@ def _run_audit(
     console.print(
         Text(
             f"panel {receipt.panel} · receipt #{receipt.sequence} {receipt.receipt_id} · "
-            f"exposure ledger {receipt.ledger} ({receipt.scheme})",
+            f"exposure ledger {receipt.ledger} ({schemes_label(receipt)})",
             style="dim",
         )
     )
@@ -190,6 +191,7 @@ def _run_audit(
             record("stopped")
             raise
     results = saved_held_out_results(store, panel)
+    audit.reassess(clock)
     kind: ReportKind = "replay" if not pending and prior.reported else "evaluation"
     record(kind, detail=verbose)
     view = audit.view
@@ -240,12 +242,13 @@ def attempt_lines(view: ReceiptView) -> tuple[str, ...]:
 
 
 def skipped_line(excluded: int) -> str:
-    """Why the default panel left out exposed or reserved held-out lineages."""
+    """Why the default panel left out exposed, reserved or unresolved held-out lineages."""
     noun, pronoun = ("lineage", "it is") if excluded == 1 else ("lineages", "they are")
     return (
-        f"Skipped {excluded} held-out {noun} exposed or reserved in the exposure ledger (shown "
-        f"in detail by an earlier audit, grouped with content that was, or held by another "
-        f"audit); {pronoun} not independent (--include-inspected re-runs them)"
+        f"Skipped {excluded} held-out {noun} exposed, reserved or unresolved in the exposure "
+        "ledger (shown in detail by an earlier audit, grouped with content that was, held by "
+        f"another audit, or not fingerprintable); {pronoun} not independent "
+        "(--include-inspected re-runs them)"
     )
 
 
@@ -261,9 +264,24 @@ def receipt_line(view: ReceiptView) -> str:
     )
 
 
+def schemes_label(receipt: AuditReceipt) -> str:
+    """Every fingerprint scheme the match used, with its definition and vector digests."""
+    return ", ".join(
+        f"{scheme.name} v{scheme.version} definition {scheme.definition_sha256[:12]} "
+        f"vectors {scheme.vectors_sha256[:12]}"
+        for scheme in receipt.schemes
+    )
+
+
 def exposure_line(item: LineageExposure, audit: HeldOutAudit) -> str:
-    """One exposed or reserved lineage: whether audited, its component size, and the path."""
+    """One excluded lineage: whether audited, its component size and path, or why unresolved."""
     where = "in this panel" if item.lineage in audit.receipt.lineages else "skipped"
+    if item.path is None:
+        return (
+            f"  {item.lineage} ({item.kind}, {where}): members "
+            f"{', '.join(item.unresolved)} cannot be fingerprinted, so its exposure history is "
+            "unresolved"
+        )
     hops = [
         (
             f"same task {edge.task_lineage}"
@@ -303,14 +321,22 @@ def render_exposure(
     exposed = receipt.exposed
     console.print(
         Text(
-            f"Exposure ledger {receipt.ledger} ({receipt.scheme}): {len(exposed)} held-out "
-            f"{'lineage' if len(exposed) == 1 else 'lineages'} exposed or reserved; "
+            f"Exposure ledger {receipt.ledger} ({schemes_label(receipt)}): {len(exposed)} "
+            f"held-out {'lineage' if len(exposed) == 1 else 'lineages'} exposed, reserved or "
+            "unresolved; "
             "independence holds only relative to this ledger.",
             style="dim",
         )
     )
     for item in exposed:
         console.print(Text(exposure_line(item, audit), style="dim"))
+    for notice in view.notices:
+        console.print(
+            f"[yellow]warning[/yellow] invalidation notice: links recorded after this receipt "
+            f"reserved its panel reach exposure that predates it on {len(notice.exposed)} "
+            f"audited {'lineage' if len(notice.exposed) == 1 else 'lineages'} "
+            f"(ledger {notice.ledger}); the receipt and its snapshot are unchanged"
+        )
     for limit in LIMITS:
         console.print(Text(f"Limit: {limit}", style="dim"))
     if receipt.reaudited:
