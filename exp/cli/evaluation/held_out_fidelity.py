@@ -1,5 +1,6 @@
 """Held-out simulation fidelity in the existing evaluation terminal conventions."""
 
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 from pathlib import Path
@@ -23,23 +24,27 @@ from exp.optimize.evaluation.fidelity import (
     execute_fidelity_evaluation,
     saved_fidelity_report,
 )
-from exp.optimize.evaluation.held_out_exposure import LIMITS, LineageExposure
-from exp.optimize.evaluation.held_out_fidelity import (
-    AuditCheckpoint,
-    HeldOutPanel,
-    register_held_out_fidelity,
-    saved_held_out_results,
+from exp.optimize.evaluation.held_out_audit import (
+    HeldOutAudit,
+    open_held_out_audit,
+    outcome_unknown,
 )
+from exp.optimize.evaluation.held_out_exposure import LIMITS, LineageExposure
+from exp.optimize.evaluation.held_out_fidelity import AuditCheckpoint, saved_held_out_results
 from exp.optimize.evaluation.held_out_receipts import (
-    AuditReceipt,
-    audit_receipts,
-    record_audit_receipt,
+    QUALIFIED,
+    AuditReport,
+    ReceiptView,
+    ReportKind,
+    record_report,
 )
 from exp.optimize.evaluation.trace_learning import fit_cases, learning_curve
 from exp.optimize.evaluation.trace_replay import ReplayAggregate, ReplayResult, aggregate
 from exp.runtime.models.providers.transport import ProviderTransportError
+from exp.simulation.mining.exposure_ledger import PanelInUseError
 
 PANEL_CONCURRENCY = 4  # traces of a frozen panel replayed at once
+REAUDIT_TITLE = "Re-audit on inspected cases (development)"
 
 
 def run_held_out_fidelity(
@@ -57,9 +62,10 @@ def run_held_out_fidelity(
     """Measure the learned simulator on held-out traces it never learned, or replay the result.
 
     Uses the hybrid profile: the memory learned with ``--hold-out`` at its final checkpoint,
-    with every held-out lineage reserved, plus recorded facts from the fit-only index. Every
-    run saves an audit receipt before reporting; ``--verbose`` shows per-trace detail, which
-    makes the audited lineages development data that later audits skip.
+    with every held-out lineage reserved, plus recorded facts from the fit-only index. The
+    panel's content is reserved for its audit receipt before any run is registered, and every
+    invocation appends a report to that receipt before showing anything; ``--verbose`` shows
+    per-trace detail, which exposes the audited lineages so later audits skip them.
 
     Args:
         project: Existing project with a completed build.
@@ -67,159 +73,197 @@ def run_held_out_fidelity(
         root: Existing project and artifact root.
         yes: Explicit authorization after the undefined-cost warning.
         non_interactive: Disable terminal questions.
-        dry_run: Register the runs and stop before credentials or provider calls.
+        dry_run: Reserve and register the runs and stop before credentials or provider calls.
         verbose: Also print every trace, every turn, and every criterion.
-        retry_incomplete: Replace interrupted runs, buying their calls again.
-        include_inspected: Also re-run lineages an earlier audit showed in detail, reported as
-            a development re-audit.
+        retry_incomplete: Let the receipt's owner replace interrupted runs, buying them again.
+        include_inspected: Also re-run exposed or reserved lineages, as a development re-audit.
     """
     console = Console(theme=EXP_THEME)
-    with usage_error(OSError, ValueError):
+    with usage_error(OSError, ValueError, PanelInUseError):
         store = ProjectStore(root, project)
-        revision = installed_release_revision()
-        panel = register_held_out_fidelity(
+        clock = lambda: datetime.now(UTC)  # noqa: E731 - one shared aware clock
+        with open_held_out_audit(
             store,
             count,
             profile="memory",
-            code_revision=revision,
-            clock=lambda: datetime.now(UTC),
+            code_revision=installed_release_revision(),
+            clock=clock,
             retry_incomplete=retry_incomplete,
             include_inspected=include_inspected,
-        )
-
-        pending = [p for p in panel.prepared if saved_fidelity_report(store, p) is None]
-
-        def record(*, results_shown: bool) -> AuditReceipt:
-            """Save this audit's receipt, and any exposure, before anything it covers is shown."""
-            return record_audit_receipt(
-                store,
-                panel,
-                fresh=bool(pending),
-                results_shown=results_shown,
-                detail_shown=results_shown and verbose,
-                code_revision=revision,
-                clock=lambda: datetime.now(UTC),
-            )
-
-        heading(console, project, "Held-out simulation fidelity")
-        judge = panel.prepared[0].spec.judge_alias
-        steps = sum(len(case.steps) for case in panel.cases)
-        version = panel.checkpoint.version if panel.checkpoint else None
-        console.print(
-            Text(
-                f"{len(panel.cases)} held-out traces · {steps} turns · hybrid simulator "
-                f"{panel.world_model.artifact_id} · memory v{version} · judge {judge}",
-                style="dim",
-            )
-        )
-        console.print(
-            Text(
-                f"panel {panel.identity} · exposure ledger {panel.exposure.ledger} "
-                f"({panel.exposure.scheme})",
-                style="dim",
-            )
-        )
-        if panel.excluded:
-            console.print(Text(skipped_line(panel.excluded), style="dim"))
-        if panel.retired:
-            console.print(
-                Text(
-                    f"{len(panel.retired)} earlier attempts could not complete; "
-                    "registered fresh attempts",
-                    style="dim",
-                )
-            )
-        fit = len(fit_cases(store))
-        if version is not None and version < fit:
-            console.print(
-                f"[yellow]warning[/yellow] memory v{version} learned "
-                f"{version} of {fit} fit traces; finish `exp build --learn` "
-                "to measure the fully learned simulator"
-            )
-        if dry_run:
-            console.print(Text(receipt_line(record(results_shown=False), store), style="dim"))
-            for prepared in panel.prepared:
-                console.print(Text(f"  {prepared.spec.run_id}"))
-            console.print(
-                "Prepared without provider calls. Run the same command without --dry-run."
-            )
-            return
-        if not pending:
-            console.print(Text("Saved results. No provider calls.", style="dim"))
-            # The lifecycle owner replays each report and completes any interrupted publication.
-            for prepared in panel.prepared:
-                execute_fidelity_evaluation(store, prepared)
-        else:
-            interactive = not non_interactive and can_prompt(console)
-            if not require_spend_consent(
+        ) as audit:
+            _run_audit(
                 console,
+                store,
+                audit,
+                command=f"exp eval {project} --held-out-fidelity {count}",
                 root=root,
                 yes=yes,
-                estimated_cost_usd=None,
-                cost_is_upper_bound=False,
-                command=f"exp eval {project} --held-out-fidelity {count}",
-                non_interactive=not interactive,
-            ):
-                record(results_shown=False)
-                return
-            try:
-                execute_runs(console, store, panel.prepared)
-            except typer.Exit:
-                record(results_shown=False)
-                raise
-        results = saved_held_out_results(store, panel)
-        receipt = record(results_shown=True)
-        if verbose:
-            render_traces(console, store, panel.prepared, results, "Held-out trace")
-        console.print()
-        console.print(
-            Text(aggregate_line(aggregate(results), len(panel.cases), title(panel, receipt)))
+                non_interactive=non_interactive,
+                dry_run=dry_run,
+                verbose=verbose,
+                clock=clock,
+            )
+
+
+def _run_audit(
+    console: Console,
+    store: ProjectStore,
+    audit: HeldOutAudit,
+    *,
+    command: str,
+    root: Path,
+    yes: bool,
+    non_interactive: bool,
+    dry_run: bool,
+    verbose: bool,
+    clock: Callable[[], datetime],
+) -> None:
+    """Execute or replay an open audit, recording its report before showing anything."""
+    panel, receipt = audit.panel, audit.receipt
+    prior = audit.view
+
+    def record(kind: ReportKind, *, detail: bool = False) -> AuditReport:
+        """Append this invocation's report, and any exposure, before anything it covers shows."""
+        return record_report(store, receipt, panel, kind=kind, detail_shown=detail, clock=clock)
+
+    heading(console, store.paths.project_id, "Held-out simulation fidelity")
+    judge = panel.prepared[0].spec.judge_alias
+    steps = sum(len(case.steps) for case in panel.cases)
+    version = panel.checkpoint.version if panel.checkpoint else None
+    console.print(
+        Text(
+            f"{len(panel.cases)} held-out traces · {steps} turns · hybrid simulator "
+            f"{panel.world_model.artifact_id} · memory v{version} · judge {judge}",
+            style="dim",
         )
-        curve = learning_curve(store, "fit")
-        if curve is not None:
-            console.print(Text(curve.line()))
-        render_exposure(console, store, panel, receipt, verbose=verbose)
+    )
+    console.print(
+        Text(
+            f"panel {receipt.panel} · receipt #{receipt.sequence} {receipt.receipt_id} · "
+            f"exposure ledger {receipt.ledger} ({receipt.scheme})",
+            style="dim",
+        )
+    )
+    if audit.excluded:
+        console.print(Text(skipped_line(audit.excluded), style="dim"))
+    for line in attempt_lines(prior):
+        console.print(Text(line, style="dim"))
+    if outcome_unknown(store, audit):
+        console.print(
+            "[yellow]warning[/yellow] dispatched, outcome unknown: a run claimed provider "
+            "slots and stopped; only this receipt can complete it, with --retry-incomplete"
+        )
+    fit = len(fit_cases(store))
+    if version is not None and version < fit:
+        console.print(
+            f"[yellow]warning[/yellow] memory v{version} learned {version} of {fit} fit "
+            "traces; finish `exp build --learn` to measure the fully learned simulator"
+        )
+    if dry_run:
+        record("prepared")
+        for prepared in panel.prepared:
+            console.print(Text(f"  {prepared.spec.run_id}"))
+        console.print("Prepared without provider calls. Run the same command without --dry-run.")
+        return
+    pending = [p for p in panel.prepared if saved_fidelity_report(store, p) is None]
+    if not pending:
+        console.print(Text("Saved results. No provider calls.", style="dim"))
+        # The lifecycle owner replays each report and completes any interrupted publication.
+        for prepared in panel.prepared:
+            execute_fidelity_evaluation(store, prepared)
+    else:
+        interactive = not non_interactive and can_prompt(console)
+        if not require_spend_consent(
+            console,
+            root=root,
+            yes=yes,
+            estimated_cost_usd=None,
+            cost_is_upper_bound=False,
+            command=command,
+            non_interactive=not interactive,
+        ):
+            record("stopped")
+            return
+        try:
+            execute_runs(console, store, panel.prepared, guard=audit.guard)
+        except BaseException:
+            record("stopped")
+            raise
+    results = saved_held_out_results(store, panel)
+    kind: ReportKind = "replay" if not pending and prior.reported else "evaluation"
+    record(kind, detail=verbose)
+    view = audit.view
+    if verbose:
+        render_traces(console, store, panel.prepared, results, "Held-out trace")
+    console.print()
+    console.print(Text(aggregate_line(aggregate(results), len(panel.cases), title(audit, view))))
+    for line in sensitivity_lines(view, results):
+        console.print(Text(line))
+    curve = learning_curve(store, "fit")
+    if curve is not None:
+        console.print(Text(curve.line()))
+    render_exposure(console, audit, view, verbose=verbose)
 
 
-REAUDIT_TITLE = "Re-audit on inspected cases (development)"
-
-
-def title(panel: HeldOutPanel, receipt: AuditReceipt) -> str:
-    """The aggregate's label: never independent once a case is exposed or results repeat."""
-    if not panel.independent:
+def title(audit: HeldOutAudit, view: ReceiptView) -> str:
+    """The aggregate's label: never plain independent once exposed, re-audited or re-attempted."""
+    if audit.receipt.reaudited:
         return REAUDIT_TITLE
-    if receipt.status == "development-re-audit":
+    if view.receipt.basis == "development-re-audit":
         return "Held-out re-audit (development)"
-    if receipt.status == "replay":
-        return "Held-out fidelity (replay)"
+    if view.headline == QUALIFIED:
+        return "Held-out fidelity (independent, qualified: trace re-attempts)"
     return "Held-out fidelity"
 
 
+def sensitivity_lines(view: ReceiptView, results: tuple[ReplayResult, ...]) -> tuple[str, ...]:
+    """With re-attempted traces, the score over unaffected traces and over affected ones."""
+    affected = view.affected_traces
+    if not affected:
+        return ()
+    planned = len(view.receipt.cases)
+    unaffected = tuple(result for result in results if result.trace_id not in affected)
+    touched = tuple(result for result in results if result.trace_id in affected)
+    return (
+        aggregate_line(aggregate(unaffected), planned - len(affected), "  Unaffected traces only"),
+        aggregate_line(aggregate(touched), len(affected), "  Re-attempted traces only"),
+    )
+
+
+def attempt_lines(view: ReceiptView) -> tuple[str, ...]:
+    """Every replaced registration of the receipt, with its reason and claimed slots."""
+    return tuple(
+        f"{attempt.reason} of {attempt.trace_id}: {attempt.retired_run} -> "
+        f"{attempt.replacement_run} ({attempt.claimed_slots} claimed slots)"
+        for attempt in view.attempts
+    )
+
+
 def skipped_line(excluded: int) -> str:
-    """Why the default panel left out exposed held-out lineages."""
+    """Why the default panel left out exposed or reserved held-out lineages."""
     noun, pronoun = ("lineage", "it is") if excluded == 1 else ("lineages", "they are")
     return (
-        f"Skipped {excluded} held-out {noun} exposed in the exposure ledger (shown in detail by "
-        f"an earlier audit, or grouped with content that was); {pronoun} development data now "
-        "(--include-inspected re-runs exposed cases)"
+        f"Skipped {excluded} held-out {noun} exposed or reserved in the exposure ledger (shown "
+        f"in detail by an earlier audit, grouped with content that was, or held by another "
+        f"audit); {pronoun} not independent (--include-inspected re-runs them)"
     )
 
 
-def receipt_line(receipt: AuditReceipt, store: ProjectStore) -> str:
-    """The receipt's sequence, ID and status, naming the original for a replay."""
-    status = receipt.status
-    if receipt.replays is not None:
-        original = next(r for r in audit_receipts(store) if r.receipt_id == receipt.replays)
-        status = f"replay of receipt #{original.sequence} ({original.status})"
+def receipt_line(view: ReceiptView) -> str:
+    """The receipt's sequence, ID and headline, and what this invocation was."""
+    receipt = view.receipt
+    last = view.reports[-1].kind if view.reports else "opened"
+    status = f"replay ({view.headline})" if last == "replay" else view.headline
+    follows = f" · follows {receipt.follows} ({receipt.follow_reason})" if receipt.follows else ""
     return (
         f"Audit receipt #{receipt.sequence} {receipt.receipt_id}: {status} · "
-        f"code {receipt.code_revision[:12]}"
+        f"this run: {last} · code {receipt.code_revision[:12]}{follows}"
     )
 
 
-def exposure_line(item: LineageExposure, panel: HeldOutPanel) -> str:
-    """One exposed lineage: whether it was audited, its component size, and the path."""
-    where = "in this panel" if item.lineage in panel.inspected else "skipped"
+def exposure_line(item: LineageExposure, audit: HeldOutAudit) -> str:
+    """One exposed or reserved lineage: whether audited, its component size, and the path."""
+    where = "in this panel" if item.lineage in audit.receipt.lineages else "skipped"
     hops = [
         (
             f"same task {edge.task_lineage}"
@@ -229,50 +273,53 @@ def exposure_line(item: LineageExposure, panel: HeldOutPanel) -> str:
         + f" ({edge.project}/{edge.build})"
         for edge in item.path.path
     ]
-    route = " → ".join(hops) if hops else "its own content was shown"
+    route = " → ".join(hops) if hops else "its own content"
     return (
-        f"  {item.lineage} ({where}): component of {item.path.component_size} · "
-        f"{route} · exposed {item.path.exposed_node[:12]}"
+        f"  {item.lineage} ({item.kind}, {where}): component of {item.path.component_size} · "
+        f"{route} · marked {item.path.exposed_node[:12]}"
     )
 
 
-def checkpoint_lines(checkpoint: AuditCheckpoint) -> tuple[str, str]:
+def checkpoint_lines(checkpoint: AuditCheckpoint, simulator: str) -> tuple[str, str]:
     """The audited checkpoint, and that an all-traces build is a different one."""
     return (
         f"Audited checkpoint: memory {checkpoint.lineage} v{checkpoint.version}, "
-        f"scope {checkpoint.scope} (held-out lineages reserved before learning)",
+        f"scope {checkpoint.scope}, {checkpoint.fit_traces_learned} fit traces learned, "
+        f"simulator {simulator} (held-out lineages reserved before learning)",
         "An all-traces build (exp build --learn without --hold-out) is a different checkpoint "
         "and was not independently evaluated.",
     )
 
 
 def render_exposure(
-    console: Console,
-    store: ProjectStore,
-    panel: HeldOutPanel,
-    receipt: AuditReceipt,
-    *,
-    verbose: bool,
+    console: Console, audit: HeldOutAudit, view: ReceiptView, *, verbose: bool
 ) -> None:
-    """What was audited, its status, the exposure decision and its limits, and what was shown."""
-    if panel.checkpoint is not None:
-        for line in checkpoint_lines(panel.checkpoint):
+    """What was audited, the receipt, the exposure decision and its limits, and what was shown."""
+    receipt = view.receipt
+    if receipt.checkpoint is not None:
+        for line in checkpoint_lines(receipt.checkpoint, receipt.world_model.artifact_id):
             console.print(Text(line, style="dim"))
-    console.print(Text(receipt_line(receipt, store), style="dim"))
-    exposed = panel.exposure.exposed
+    console.print(Text(receipt_line(view), style="dim"))
+    exposed = receipt.exposed
     console.print(
         Text(
-            f"Exposure ledger {panel.exposure.ledger} ({panel.exposure.scheme}): "
-            f"{len(exposed)} held-out {'lineage' if len(exposed) == 1 else 'lineages'} exposed; "
+            f"Exposure ledger {receipt.ledger} ({receipt.scheme}): {len(exposed)} held-out "
+            f"{'lineage' if len(exposed) == 1 else 'lineages'} exposed or reserved; "
             "independence holds only relative to this ledger.",
             style="dim",
         )
     )
     for item in exposed:
-        console.print(Text(exposure_line(item, panel), style="dim"))
+        console.print(Text(exposure_line(item, audit), style="dim"))
     for limit in LIMITS:
         console.print(Text(f"Limit: {limit}", style="dim"))
-    if panel.independent:
+    if receipt.reaudited:
+        console.print(
+            f"[yellow]warning[/yellow] {len(receipt.reaudited)} of {len(receipt.cases)} traces "
+            "belong to exposed or reserved lineages; this is a development re-audit, not an "
+            "independent measurement"
+        )
+    else:
         console.print(
             Text(
                 "Held-out lineages were reserved before learning; recorded facts come only "
@@ -280,15 +327,11 @@ def render_exposure(
                 style="dim",
             )
         )
-    else:
-        console.print(
-            f"[yellow]warning[/yellow] {len(panel.inspected)} of {len(panel.cases)} traces "
-            "belong to exposed lineages; this is a development re-audit, not an independent "
-            "measurement"
-        )
     if verbose:
         audited = (
-            "this lineage is" if len(panel.cases) == 1 else f"these {len(panel.cases)} lineages are"
+            "this lineage is"
+            if len(receipt.cases) == 1
+            else f"these {len(receipt.cases)} lineages are"
         )
         console.print(
             Text(
@@ -300,7 +343,11 @@ def render_exposure(
 
 
 def execute_runs(
-    console: Console, store: ProjectStore, registrations: tuple[PreparedFidelity, ...]
+    console: Console,
+    store: ProjectStore,
+    registrations: tuple[PreparedFidelity, ...],
+    *,
+    guard: Callable[[], None] | None = None,
 ) -> None:
     """Run the registered traces concurrently through the fidelity owner.
 
@@ -316,6 +363,7 @@ def execute_runs(
                     store,
                     prepared,
                     progress=qualified(progress, f"trace {index}/{total}"),
+                    dispatch_guard=guard,
                 )
                 for index, prepared in enumerate(registrations, start=1)
             ]

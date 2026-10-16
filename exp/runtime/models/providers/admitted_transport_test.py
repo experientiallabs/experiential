@@ -129,3 +129,34 @@ def test_intent_persistence_cannot_extend_dispatch_deadline(
         transport.post("https://fixture.invalid", headers={}, payload={}, timeout_seconds=30)
     assert ledger.used() == 1 and not inner.requests
     assert any(name.endswith("-not-dispatched") for name in project.artifacts.list_ids())
+
+
+def test_a_refusing_guard_runs_before_every_claim_and_stops_the_send(tmp_path: Path) -> None:
+    """The guard sees each claim first; once it refuses, no slot is claimed and nothing is sent."""
+    project = ProjectStore(tmp_path, "attempt")
+    project.initialize(ProjectConfig(project_id="attempt"))
+    body: JsonObject = {"choices": []}
+    inner = ScriptedJsonTransport([JsonHttpResponse(status_code=200, body=body)] * 2)
+    ledger = DispatchLedger(tmp_path / "physical.sqlite", 5, "a" * 64)
+    allowed = [True]
+    checks: list[int] = []
+
+    def guard() -> None:
+        """Record the check and refuse once dispatch is no longer allowed."""
+        checks.append(ledger.used())
+        if not allowed[0]:
+            raise RuntimeError("reservation released")
+
+    transport = AdmittedJsonTransport(
+        inner,
+        ledger=ledger,
+        artifacts=project.artifacts,
+        code_revision="fixture",
+        deadline=datetime.now(UTC) + timedelta(minutes=1),
+        before_claim=guard,
+    )
+    transport.post("https://fixture.invalid", headers={}, payload={}, timeout_seconds=30)
+    allowed[0] = False
+    with pytest.raises(RuntimeError, match="reservation released"):
+        transport.post("https://fixture.invalid", headers={}, payload={}, timeout_seconds=30)
+    assert checks == [0, 1] and ledger.used() == 1 and len(inner.requests) == 1

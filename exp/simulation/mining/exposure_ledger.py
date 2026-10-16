@@ -2,8 +2,8 @@
 
 Held-out evidence is independent only while nobody has read its per-trace results. Project-local
 leakage lineage IDs cannot carry that fact across builds: they change on reimport and when
-grouping changes. The ledger therefore lives at the ``.exp`` root, above any one project, and
-keys everything on content:
+grouping changes. The ledger therefore lives at the ``.exp`` root, above any one project, in one
+SQLite file, and keys everything on content:
 
 - Nodes are fingerprints of normalized traces (task text, recorded actions, recorded replies)
   under a versioned scheme, with the source trace ID and any declared task identity
@@ -13,27 +13,36 @@ keys everything on content:
   its similarity. Each edge names the project and build that produced it. Nothing weaker (a
   shared customer, conversation or time bucket) is an edge.
 - Exposures mark nodes a person has seen, with the panel, receipt and report that showed them.
+- Reservations claim content for one audit receipt before any of its runs is registered; a
+  release by that receipt's owner frees an unused reservation.
 
-Content is exposed when it shares a connected component with an exposed node. The relation is
-transitive and ignores time: an edge recorded before or after the exposure propagates it, and it
-keeps propagating after the exposed trace leaves every later import. Records are content-addressed
-files that are written once and never removed, so a ledger only grows; a snapshot identity names
-exactly the records a decision used, and independence is only relative to that ledger.
+Content is exposed when it shares a connected component with an exposed node, and taken when it
+shares one with content another receipt reserved. Both relations are transitive and ignore time:
+an edge recorded before or after the exposure propagates it, and it keeps propagating after the
+exposed trace leaves every later import. Every table is append-only (SQL triggers refuse edits
+and deletions), so a snapshot identity names exactly the rows a decision used, and independence
+is only relative to that ledger.
+
+Atomicity holds for processes that share this one ledger file on one host; SQLite and OS file
+locks over network filesystems are unreliable. A panel lease is an exclusive OS file lock, so it
+dies with its process and a crash leaves no stale lease.
 """
 
 import json
-import os
-import tempfile
+import sqlite3
 from collections import defaultdict, deque
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Literal, Self, TypeVar
+from typing import Final, Literal, Self
 
+from filelock import FileLock, Timeout
 from pydantic import AwareDatetime, BaseModel, Field, JsonValue, model_validator
 
 from exp.common.core.artifacts import ContractModel, sha256_json
 from exp.common.core.text import normalize_durable_text
 from exp.common.core.union_find import UnionFind
+from exp.common.sqlite.connection import connect_database
 from exp.common.traces import Trace
 from exp.simulation.mining.deduplicate import DuplicateEdge
 from exp.simulation.retrieval.contracts import RAGLineageBinding
@@ -41,11 +50,25 @@ from exp.simulation.retrieval.transitions import extract_real_transitions
 
 FINGERPRINT_SCHEME = "trace-content-v1"
 LEDGER_DIRECTORY = "exposure-ledger"
+LEDGER_FILE = "ledger.sqlite"
+SCHEMA_VERSION: Final = 1
 TASK_LINEAGE_KEY = "task_lineage"
+SAME_HOST_LIMIT = (
+    "Reservations and panel leases are atomic only for runs sharing one ledger file on one host; "
+    "SQLite and file locks over network filesystems are unreliable."
+)
 _FINGERPRINT_LINEAGE = "lineage-fingerprint"  # placeholder binding; never part of the content
 Fingerprint = str
 EdgeReason = Literal["declared-task-identity", "near-duplicate"]
-_Record = TypeVar("_Record", bound=BaseModel)
+RecordKind = Literal["build", "node", "edge", "exposure"]
+
+
+class PanelInUseError(RuntimeError):
+    """Another process holds the panel's lease."""
+
+
+class LedgerSchemaError(RuntimeError):
+    """The file is not an exposure ledger of this schema; it is refused, never migrated."""
 
 
 class LedgerNode(ContractModel):
@@ -124,7 +147,7 @@ class LedgerExposure(ContractModel):
 
     Attributes:
         fingerprints: Exposed content, sorted.
-        how: ``inspected`` for an audit's own panel, ``re-audited`` for a development re-audit.
+        how: ``inspected`` for an independent audit, ``re-audited`` for a development re-audit.
         panel: Identity of the panel shown.
         receipt: Audit receipt recording the report.
         report: Report that showed per-trace results.
@@ -146,32 +169,69 @@ class LedgerExposure(ContractModel):
         return _record_id(self)
 
 
-class ExposurePath(ContractModel):
-    """Why some content counts as exposed under one ledger snapshot.
+class LedgerReservation(ContractModel):
+    """Content one audit receipt claimed before registering any run.
 
     Attributes:
-        exposed_node: Nearest exposed fingerprint in the component.
+        receipt: Owning audit receipt; only its owner may evaluate the panel independently or
+            release the reservation.
+        panel: Panel identity the receipt audits.
+        project: Project of the receipt.
+        lineages: The build's held-out lineages the panel covers.
+        fingerprints: Member content of those lineages, sorted.
+        snapshot: Ledger snapshot identity the reservation was decided against.
+        at: When it was committed.
+    """
+
+    receipt: str = Field(min_length=1)
+    panel: str = Field(min_length=1)
+    project: str = Field(min_length=1)
+    lineages: tuple[str, ...] = Field(min_length=1)
+    fingerprints: tuple[Fingerprint, ...] = Field(min_length=1)
+    snapshot: str = Field(min_length=1)
+    at: AwareDatetime
+
+
+class LedgerRelease(ContractModel):
+    """The owner released an unused reservation; its content is free again.
+
+    Attributes:
+        receipt: Receipt whose reservation was released.
+        at: When the release committed.
+    """
+
+    receipt: str = Field(min_length=1)
+    at: AwareDatetime
+
+
+class ExposurePath(ContractModel):
+    """Why some content counts as exposed or taken under one ledger snapshot.
+
+    Attributes:
+        exposed_node: Nearest marked fingerprint in the component.
         component_size: Fingerprints in the connected component, so over-long chains show.
-        path: Edges from the queried content to ``exposed_node``; empty when it is exposed itself.
-        exposures: Exposure records that marked ``exposed_node``.
+        path: Edges from the queried content to ``exposed_node``; empty when it is marked itself.
+        by: Exposure records, or reserving receipts, that mark ``exposed_node``.
     """
 
     exposed_node: Fingerprint
     component_size: int = Field(ge=1)
     path: tuple[LedgerEdge, ...] = ()
-    exposures: tuple[str, ...] = Field(min_length=1)
+    by: tuple[str, ...] = Field(min_length=1)
 
 
 class LedgerExport(ContractModel):
-    """Every record of a ledger, for sharing or audit.
+    """Every row of a ledger, for sharing or audit.
 
     Attributes:
-        identity: Snapshot identity of exactly these records.
+        identity: Snapshot identity of exactly these rows.
         scheme: Fingerprint scheme this code writes.
         builds: Builds that recorded their grouping.
         nodes: Content observations.
         edges: Grouping relationships.
         exposures: Exposure records.
+        reservations: Content claimed by audit receipts.
+        releases: Reservations their owners released.
     """
 
     identity: str
@@ -180,20 +240,24 @@ class LedgerExport(ContractModel):
     nodes: tuple[LedgerNode, ...] = ()
     edges: tuple[LedgerEdge, ...] = ()
     exposures: tuple[LedgerExposure, ...] = ()
+    reservations: tuple[LedgerReservation, ...] = ()
+    releases: tuple[LedgerRelease, ...] = ()
 
 
 class LedgerSnapshot:
     """An immutable view of the ledger used for one decision."""
 
     def __init__(self, export: LedgerExport) -> None:
-        """Index the records for component and path queries.
+        """Index the rows for component and path queries.
 
         Args:
-            export: Every record of the snapshot.
+            export: Every row of the snapshot.
         """
         self.records = export
         self.identity = export.identity
         self._builds = {(build.project, build.build) for build in export.builds}
+        self.reservations = {item.receipt: item for item in export.reservations}
+        self.released = frozenset(item.receipt for item in export.releases)
         self._union = UnionFind(node.fingerprint for node in export.nodes)
         self._adjacent: dict[Fingerprint, list[tuple[Fingerprint, LedgerEdge]]] = defaultdict(list)
         for edge in export.edges:
@@ -203,19 +267,28 @@ class LedgerSnapshot:
         self._exposed: dict[Fingerprint, list[str]] = defaultdict(list)
         for exposure in export.exposures:
             for fingerprint in exposure.fingerprints:
-                self._union.add(fingerprint)
                 self._exposed[fingerprint].append(exposure.record_id)
+        self._reserved: dict[Fingerprint, list[str]] = defaultdict(list)
+        for reservation in export.reservations:
+            if reservation.receipt not in self.released:
+                for fingerprint in reservation.fingerprints:
+                    self._reserved[fingerprint].append(reservation.receipt)
         self._sizes: dict[str, int] = defaultdict(int)
         for fingerprint in {
             *(node.fingerprint for node in export.nodes),
             *self._adjacent,
             *self._exposed,
+            *self._reserved,
         }:
             self._sizes[self._union.find(fingerprint)] += 1
 
     def has_build(self, project: str, build: str) -> bool:
         """Whether this build recorded its grouping in the ledger."""
         return (project, build) in self._builds
+
+    def active(self, receipt: str) -> bool:
+        """Whether ``receipt`` holds a reservation that was not released."""
+        return receipt in self.reservations and receipt not in self.released
 
     def exposure(self, fingerprints: Iterable[Fingerprint]) -> ExposurePath | None:
         """The shortest path from any of ``fingerprints`` to exposed content, if one exists.
@@ -226,12 +299,34 @@ class LedgerSnapshot:
         Returns:
             The path, or None when no member shares a component with exposed content.
         """
+        return self._nearest(fingerprints, self._exposed)
+
+    def taken(self, fingerprints: Iterable[Fingerprint], owner: str | None) -> ExposurePath | None:
+        """The shortest path to content another receipt reserved and did not release.
+
+        Args:
+            fingerprints: Content of one lineage's member traces.
+            owner: Receipt whose own reservation does not count; None counts every one.
+
+        Returns:
+            The path, or None when no member shares a component with another reservation.
+        """
+        others = {
+            fingerprint: [receipt for receipt in receipts if receipt != owner]
+            for fingerprint, receipts in self._reserved.items()
+        }
+        return self._nearest(fingerprints, {key: value for key, value in others.items() if value})
+
+    def _nearest(
+        self, fingerprints: Iterable[Fingerprint], marked: Mapping[Fingerprint, list[str]]
+    ) -> ExposurePath | None:
+        """Breadth-first search from ``fingerprints`` to the nearest marked fingerprint."""
         starts = sorted(set(fingerprints))
         previous: dict[Fingerprint, tuple[Fingerprint, LedgerEdge] | None] = dict.fromkeys(starts)
         queue = deque(starts)
         while queue:
             current = queue.popleft()
-            if current in self._exposed:
+            if current in marked:
                 path: list[LedgerEdge] = []
                 step = previous[current]
                 while step is not None:
@@ -239,9 +334,9 @@ class LedgerSnapshot:
                     step = previous[step[0]]
                 return ExposurePath(
                     exposed_node=current,
-                    component_size=self._sizes[self._union.find(current)],
+                    component_size=max(1, self._sizes[self._union.find(current)]),
                     path=tuple(reversed(path)),
-                    exposures=tuple(sorted(self._exposed[current])),
+                    by=tuple(sorted(set(marked[current]))),
                 )
             for neighbour, edge in sorted(
                 self._adjacent.get(current, ()), key=lambda item: _record_id(item[1])
@@ -252,16 +347,90 @@ class LedgerSnapshot:
         return None
 
 
+class LedgerTransaction:
+    """One ``BEGIN IMMEDIATE`` transaction: reads see a stable ledger, writes commit together."""
+
+    def __init__(self, connection: sqlite3.Connection) -> None:
+        """Bind an open connection inside its transaction."""
+        self._connection = connection
+
+    def snapshot(self) -> LedgerSnapshot:
+        """Every row as of now, inside this transaction."""
+        return LedgerSnapshot(_export(self._connection))
+
+    def record(self, kind: RecordKind, record: BaseModel) -> None:
+        """Add one content-addressed record unless it is already present."""
+        self._connection.execute(
+            "INSERT OR IGNORE INTO records (kind, record_id, body) VALUES (?, ?, ?)",
+            (kind, _record_id(record), _body(record)),
+        )
+
+    def reserve(self, reservation: LedgerReservation) -> None:
+        """Claim content for one receipt; a receipt reserves at most once."""
+        self._connection.execute(
+            "INSERT INTO reservations (receipt, body) VALUES (?, ?)",
+            (reservation.receipt, _body(reservation)),
+        )
+
+    def release(self, release: LedgerRelease) -> None:
+        """Free a reservation; its owner must have checked that no slot was claimed."""
+        self._connection.execute(
+            "INSERT INTO releases (receipt, body) VALUES (?, ?)",
+            (release.receipt, _body(release)),
+        )
+
+
 class ExposureLedger:
-    """Append-only, content-addressed ledger files under ``<root>/exposure-ledger``."""
+    """The append-only exposure ledger of one ``.exp`` root."""
 
     def __init__(self, root: Path) -> None:
-        """Bind the ledger of one ``.exp`` root without writing anything.
+        """Bind the ledger of one ``.exp`` root without touching the file.
 
         Args:
             root: The ``.exp`` root shared by every project.
         """
         self.directory = Path(root) / LEDGER_DIRECTORY
+        self.path = self.directory / LEDGER_FILE
+
+    @contextmanager
+    def transaction(self) -> Iterator[LedgerTransaction]:
+        """Hold the ledger's write lock: read, decide and write, then commit or roll back."""
+        self.directory.mkdir(parents=True, exist_ok=True)
+        connection = connect_database(self.path)
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            _require_schema(connection)
+            yield LedgerTransaction(connection)
+            connection.execute("COMMIT")
+        except BaseException:
+            connection.execute("ROLLBACK")
+            raise
+        finally:
+            connection.close()
+
+    @contextmanager
+    def lease(self, panel: str) -> Iterator[FileLock]:
+        """Hold the exclusive cross-process lease of one panel, or fail at once.
+
+        Yields:
+            The held lock; ``is_locked`` tells a guard the lease is still held.
+
+        Raises:
+            PanelInUseError: Another process holds it.
+        """
+        directory = self.directory / "leases"
+        directory.mkdir(parents=True, exist_ok=True)
+        lock = FileLock(directory / f"panel-{panel}.lock", timeout=0, thread_local=False)
+        try:
+            lock.acquire()
+        except Timeout:
+            raise PanelInUseError(
+                f"panel {panel} in use: another process is executing, resuming or releasing it"
+            ) from None
+        try:
+            yield lock
+        finally:
+            lock.release()
 
     def record_build(
         self,
@@ -335,97 +504,62 @@ class ExposureLedger:
     def record_grouping(
         self, marker: LedgerBuild, *, nodes: Sequence[LedgerNode], edges: Sequence[LedgerEdge]
     ) -> None:
-        """Write a build's nodes and edges, then its marker, skipping records already present.
+        """Write a build's nodes, edges and marker in one transaction.
 
         Args:
             marker: The build that produced them.
             nodes: Content observations.
             edges: Grouping relationships.
         """
-        for item in nodes:
-            self._write("nodes", item)
-        for edge in edges:
-            self._write("edges", edge)
-        self._write("builds", marker)
+        with self.transaction() as transaction:
+            for item in nodes:
+                transaction.record("node", item)
+            for edge in edges:
+                transaction.record("edge", edge)
+            transaction.record("build", marker)
 
     def record_exposure(self, exposure: LedgerExposure) -> None:
-        """Mark content exposed; the record is permanent.
+        """Mark content exposed; the row is permanent.
 
         Args:
             exposure: What was shown, and how.
         """
-        self._write("exposures", exposure)
+        with self.transaction() as transaction:
+            transaction.record("exposure", exposure)
 
     def snapshot(self) -> LedgerSnapshot:
-        """Every record now in the ledger, as one queryable snapshot."""
+        """Every row now in the ledger, as one queryable snapshot."""
         return LedgerSnapshot(self.export())
 
     def export(self) -> LedgerExport:
-        """Every record now in the ledger, with its snapshot identity."""
-        builds = self._read("builds", LedgerBuild)
-        nodes = self._read("nodes", LedgerNode)
-        edges = self._read("edges", LedgerEdge)
-        exposures = self._read("exposures", LedgerExposure)
-        identity = (
-            "ledger-"
-            + sha256_json(
-                sorted(
-                    f"{kind}/{_record_id(record)}"
-                    for kind, records in (
-                        ("builds", builds),
-                        ("nodes", nodes),
-                        ("edges", edges),
-                        ("exposures", exposures),
-                    )
-                    for record in records
-                )
-            )[:20]
-        )
-        return LedgerExport(
-            identity=identity,
-            scheme=FINGERPRINT_SCHEME,
-            builds=builds,
-            nodes=nodes,
-            edges=edges,
-            exposures=exposures,
-        )
+        """Every row now in the ledger, with its snapshot identity."""
+        if not self.path.exists():
+            return _export(None)
+        with self.transaction() as transaction:
+            return transaction.snapshot().records
 
     def merge(self, export: LedgerExport) -> None:
-        """Add every record of another ledger's export; nothing is replaced or removed.
+        """Add every row of another ledger's export; nothing is replaced or removed.
 
         Args:
-            export: Records from another ledger.
+            export: Rows from another ledger.
         """
-        for kind, records in (
-            ("nodes", export.nodes),
-            ("edges", export.edges),
-            ("exposures", export.exposures),
-            ("builds", export.builds),
-        ):
-            for record in records:
-                self._write(kind, record)
-
-    def _write(self, kind: str, record: BaseModel) -> None:
-        """Write one content-addressed record once, atomically."""
-        directory = self.directory / kind
-        target = directory / f"{_record_id(record)}.json"
-        if target.exists():
-            return
-        directory.mkdir(parents=True, exist_ok=True)
-        payload = json.dumps(record.model_dump(mode="json"), sort_keys=True)
-        with tempfile.NamedTemporaryFile("w", dir=directory, delete=False, suffix=".tmp") as file:
-            file.write(payload)
-            temporary = Path(file.name)
-        os.replace(temporary, target)
-
-    def _read(self, kind: str, model: type[_Record]) -> tuple[_Record, ...]:
-        """Every record of one kind, in content-address order."""
-        directory = self.directory / kind
-        if not directory.is_dir():
-            return ()
-        return tuple(
-            model.model_validate_json(path.read_text()) for path in sorted(directory.glob("*.json"))
-        )
+        with self.transaction() as transaction:
+            snapshot = transaction.snapshot()
+            for kind, records in (
+                ("node", export.nodes),
+                ("edge", export.edges),
+                ("exposure", export.exposures),
+                ("build", export.builds),
+            ):
+                for record in records:
+                    transaction.record(kind, record)
+            for reservation in export.reservations:
+                if reservation.receipt not in snapshot.reservations:
+                    transaction.reserve(reservation)
+            for release in export.releases:
+                if release.receipt not in snapshot.released:
+                    transaction.release(release)
 
 
 def trace_fingerprint(trace: Trace) -> Fingerprint:
@@ -482,6 +616,84 @@ def declared_task_identity(trace: Trace) -> str | None:
     """The task identity a trace declares in its request context, if any."""
     value = trace.initial_context.get(TASK_LINEAGE_KEY)
     return value if isinstance(value, str) and value else None
+
+
+def _require_schema(connection: sqlite3.Connection) -> None:
+    """Create the append-only schema in an empty file, or refuse any other schema."""
+    version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+    if version == SCHEMA_VERSION:
+        return
+    if (
+        version != 0
+        or connection.execute(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
+        ).fetchone()[0]
+    ):
+        raise LedgerSchemaError(
+            f"exposure ledger schema {version} is not {SCHEMA_VERSION}; it is never migrated"
+        )
+    connection.execute(
+        """CREATE TABLE records (
+            kind TEXT NOT NULL CHECK (kind IN ('build', 'node', 'edge', 'exposure')),
+            record_id TEXT NOT NULL,
+            body TEXT NOT NULL,
+            PRIMARY KEY (kind, record_id)
+        ) STRICT"""
+    )
+    connection.execute(
+        "CREATE TABLE reservations (receipt TEXT PRIMARY KEY, body TEXT NOT NULL) STRICT"
+    )
+    connection.execute(
+        """CREATE TABLE releases (
+            receipt TEXT PRIMARY KEY REFERENCES reservations (receipt),
+            body TEXT NOT NULL
+        ) STRICT"""
+    )
+    for table in ("records", "reservations", "releases"):
+        for action in ("UPDATE", "DELETE"):
+            connection.execute(
+                f"""CREATE TRIGGER {table}_no_{action.lower()} BEFORE {action} ON {table}
+                BEGIN SELECT RAISE(ABORT, 'exposure ledger rows are append-only'); END"""
+            )
+    connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+
+
+def _export(connection: sqlite3.Connection | None) -> LedgerExport:
+    """Every row, parsed, with the snapshot identity over their keys."""
+    rows: dict[str, list[str]] = defaultdict(list)
+    keys: list[str] = []
+    if connection is not None:
+        for kind, record_id, body in connection.execute(
+            "SELECT kind, record_id, body FROM records ORDER BY kind, record_id"
+        ):
+            rows[kind].append(body)
+            keys.append(f"{kind}/{record_id}")
+        for table in ("reservations", "releases"):
+            for receipt, body in connection.execute(
+                f"SELECT receipt, body FROM {table} ORDER BY receipt"
+            ):
+                rows[table].append(body)
+                keys.append(f"{table}/{receipt}/{sha256_json(body)[:16]}")
+    return LedgerExport(
+        identity="ledger-" + sha256_json(sorted(keys))[:20],
+        scheme=FINGERPRINT_SCHEME,
+        builds=_parse(rows["build"], LedgerBuild),
+        nodes=_parse(rows["node"], LedgerNode),
+        edges=_parse(rows["edge"], LedgerEdge),
+        exposures=_parse(rows["exposure"], LedgerExposure),
+        reservations=_parse(rows["reservations"], LedgerReservation),
+        releases=_parse(rows["releases"], LedgerRelease),
+    )
+
+
+def _parse[Row: BaseModel](bodies: list[str], model: type[Row]) -> tuple[Row, ...]:
+    """Validate stored JSON rows."""
+    return tuple(model.model_validate_json(body) for body in bodies)
+
+
+def _body(record: BaseModel) -> str:
+    """Canonical JSON text of one row."""
+    return json.dumps(record.model_dump(mode="json"), sort_keys=True)
 
 
 def _decoded(content: str) -> JsonValue:

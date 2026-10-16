@@ -1,17 +1,20 @@
-"""Immutable held-out audit receipts, their status, and the exposure they record.
+"""Immutable held-out audit receipts, their child attempts and reports, and the derived headline.
 
-Every ``exp eval PROJECT --held-out-fidelity N`` run saves one receipt in the project before it
-shows anything. Its status is exactly one of:
+One receipt is minted per audit, before any of its runs is registered, and it owns the panel's
+reservation in the root exposure ledger. It is never rewritten. What happens later is appended
+beside it as immutable children:
 
-- ``independent``: the first fresh evaluation of a panel with no exposed case, reported for the
-  first time.
-- ``replay``: the same panel identity and code revision as an earlier reported receipt, with every
-  result already saved; it names that original receipt, which keeps its own status.
-- ``development-re-audit``: any other evaluation, including one that touches exposed cases, a
-  repeat under a different code revision, or results that were saved but never reported.
+- an attempt record for every replaced registration: a ``re-attempt`` when the retired attempt
+  had claimed physical slots (the trace is bought again), a ``re-registration`` when it had
+  claimed none (for example after a catalog-identity change);
+- a report record for every invocation: whether it prepared, stopped, evaluated, or replayed,
+  and whether per-trace detail was shown.
 
-Showing per-trace detail exposes every member trace of the audited lineages in the root exposure
-ledger, so the receipt is written first and the exposure next, before the detail is printed.
+The receipt's basis is fixed when it is minted: ``independent`` when no audited lineage was
+exposed or reserved by another receipt and no run already had a saved result, otherwise
+``development-re-audit``. The headline is derived from the basis and every child: any
+re-attempt makes an independent receipt "independent, qualified: trace re-attempts". A replay
+of a fully saved receipt keeps the receipt's headline.
 """
 
 from collections.abc import Callable
@@ -27,163 +30,326 @@ from exp.optimize.evaluation.held_out_fidelity import AuditCheckpoint, HeldOutPa
 from exp.simulation.mining.exposure_ledger import ExposureLedger, LedgerExposure
 
 RECEIPT_TYPE = "held-out-audit-receipt"
+ATTEMPT_TYPE = "held-out-audit-attempt"
+REPORT_TYPE = "held-out-audit-report"
 DETAIL_REPORT = "exp eval --held-out-fidelity --verbose (per-trace detail)"
-AuditStatus = Literal["independent", "replay", "development-re-audit"]
+QUALIFIED = "independent, qualified: trace re-attempts"
+Basis = Literal["independent", "development-re-audit"]
+ReportKind = Literal["prepared", "stopped", "evaluation", "replay"]
+
+
+class AuditRequest(ContractModel):
+    """What an invocation asked for; a request resumes its latest active receipt.
+
+    Attributes:
+        profile: Simulator profile.
+        count: Maximum held-out traces.
+        include_inspected: Whether exposed or reserved lineages may be selected.
+    """
+
+    profile: Profile
+    count: int = Field(ge=1)
+    include_inspected: bool = False
+
+
+class AuditCase(ContractModel):
+    """One audited case, frozen in the receipt.
+
+    Attributes:
+        task_id: Held-out task.
+        trace_id: Replayed trace.
+        lineage: The build's leakage lineage.
+        base_run: First-generation content-addressed run ID.
+    """
+
+    task_id: str
+    trace_id: str
+    lineage: str
+    base_run: str
 
 
 class AuditReceipt(ContractModel):
-    """Immutable record of one held-out audit and what it showed.
+    """The immutable root record of one held-out audit.
 
     Attributes:
-        sequence: Position in the project's audit ledger, from 1.
-        audited_at: When the audit recorded its receipt.
-        status: ``independent``, ``replay`` or ``development-re-audit``.
-        replays: Receipt ID of the original audit, for a replay.
-        panel: Panel identity over the selected cases and their content-addressed runs.
-        code_revision: Implementation that ran the audit; not part of the run IDs.
-        profile: Simulator profile measured.
-        world_model: Simulator every run was bound to.
+        sequence: Position among the project's receipts, from 1.
+        opened_at: When the receipt and its reservation were committed.
+        project: Project audited.
+        request: What the minting invocation asked for.
+        basis: ``independent`` or ``development-re-audit``, fixed at minting.
+        panel: Panel identity over the cases and their first-generation runs.
+        code_revision: Implementation of the frozen configuration; not part of run IDs.
+        world_model: Simulator every run is bound to.
         checkpoint: Frozen memory checkpoint read, for the memory profile.
-        lineages: Task lineages audited, in panel order.
-        traces: Recorded traces replayed, in panel order.
-        runs: Fidelity run IDs, in panel order.
-        fresh: Whether any run had no saved result when the audit started.
+        cases: Audited cases, in panel order.
         scheme: Content fingerprint scheme and version of the exposure decision.
-        ledger: Snapshot identity of the exposure ledger the decision used.
-        exposed: Every exposed held-out lineage of the build at decision time, with its
-            component size and the edge path to exposed content.
-        reaudited: Audited lineages that were already exposed.
-        results_shown: Whether results were reported; false for a dry run or stopped audit.
-        detail_shown: Whether per-trace detail was shown, which exposes every audited lineage.
+        ledger: Ledger snapshot identity the reservation was decided and committed against.
+        exposed: Every exposed or reserved held-out lineage at decision time, with its
+            component size and the edge path to marked content.
+        reaudited: Audited lineages that were exposed or reserved by another receipt.
+        follows: An earlier receipt over the same cases whose configuration differed.
+        follow_reason: ``released-unused`` when that receipt had claimed no slot and was
+            released, ``dispatched`` when its claimed slots keep its reservation permanent.
     """
 
     sequence: int = Field(ge=1)
-    audited_at: AwareDatetime
-    status: AuditStatus
-    replays: str | None = None
+    opened_at: AwareDatetime
+    project: str
+    request: AuditRequest
+    basis: Basis
     panel: str
     code_revision: str = Field(min_length=1)
-    profile: Profile
     world_model: ArtifactInput
     checkpoint: AuditCheckpoint | None = None
-    lineages: tuple[str, ...] = Field(min_length=1)
-    traces: tuple[str, ...] = Field(min_length=1)
-    runs: tuple[str, ...] = Field(min_length=1)
-    fresh: bool
+    cases: tuple[AuditCase, ...] = Field(min_length=1)
     scheme: str
     ledger: str
     exposed: tuple[LineageExposure, ...] = ()
     reaudited: tuple[str, ...] = ()
-    results_shown: bool
-    detail_shown: bool
+    follows: str | None = None
+    follow_reason: Literal["released-unused", "dispatched"] | None = None
 
     @property
     def receipt_id(self) -> str:
-        """Artifact ID of this receipt."""
-        return stable_id(RECEIPT_TYPE, self)
+        """Artifact ID of this receipt, fixed when it is minted."""
+        return stable_id(
+            RECEIPT_TYPE,
+            {
+                "project": self.project,
+                "panel": self.panel,
+                "code_revision": self.code_revision,
+                "opened_at": self.opened_at.isoformat(),
+            },
+        )
+
+    @property
+    def lineages(self) -> tuple[str, ...]:
+        """Audited lineages, in panel order."""
+        return tuple(case.lineage for case in self.cases)
+
+    @property
+    def base_runs(self) -> tuple[str, ...]:
+        """First-generation run IDs, in panel order."""
+        return tuple(case.base_run for case in self.cases)
+
+
+class AuditAttempt(ContractModel):
+    """A replaced registration of one case, recorded as a child of its receipt.
+
+    Attributes:
+        receipt: Owning receipt.
+        task_id: Case whose run was replaced.
+        trace_id: Its trace.
+        original_run: The case's first-generation run ID.
+        retired_run: Attempt retired.
+        replacement_run: Attempt registered in its place.
+        reason: ``re-attempt`` when the retired attempt had claimed slots, otherwise
+            ``re-registration``.
+        claimed_slots: Physical slots the retired attempt had claimed.
+        at: When the replacement was registered.
+    """
+
+    receipt: str
+    task_id: str
+    trace_id: str
+    original_run: str
+    retired_run: str
+    replacement_run: str
+    reason: Literal["re-attempt", "re-registration"]
+    claimed_slots: int = Field(ge=0)
+    at: AwareDatetime
+
+
+class AuditReport(ContractModel):
+    """What one invocation of a receipt did and showed.
+
+    Attributes:
+        receipt: Receipt reported.
+        at: When the report was recorded, before anything it covers was shown.
+        kind: ``prepared`` (dry run), ``stopped`` (declined or failed before results),
+            ``evaluation`` (results reported after fresh runs), or ``replay`` (every result
+            was already saved and reported before).
+        runs: Current attempt of every case, in panel order.
+        detail_shown: Whether per-trace detail was shown.
+    """
+
+    receipt: str
+    at: AwareDatetime
+    kind: ReportKind
+    runs: tuple[str, ...]
+    detail_shown: bool = False
+
+
+class ReceiptView(ContractModel):
+    """A receipt with every child appended so far.
+
+    Attributes:
+        receipt: The immutable root record.
+        attempts: Replaced registrations, in time order.
+        reports: Invocations, in time order.
+    """
+
+    receipt: AuditReceipt
+    attempts: tuple[AuditAttempt, ...] = ()
+    reports: tuple[AuditReport, ...] = ()
+
+    @property
+    def reattempts(self) -> tuple[AuditAttempt, ...]:
+        """Replacements that bought a trace again."""
+        return tuple(item for item in self.attempts if item.reason == "re-attempt")
+
+    @property
+    def affected_traces(self) -> frozenset[str]:
+        """Traces with at least one re-attempt."""
+        return frozenset(item.trace_id for item in self.reattempts)
+
+    @property
+    def headline(self) -> str:
+        """``independent``, the qualified form after any re-attempt, or the re-audit basis."""
+        if self.receipt.basis == "development-re-audit":
+            return "development re-audit"
+        return QUALIFIED if self.reattempts else "independent"
+
+    @property
+    def reported(self) -> bool:
+        """Whether results were reported before."""
+        return any(report.kind in ("evaluation", "replay") for report in self.reports)
 
 
 def audit_receipts(project: ProjectStore) -> tuple[AuditReceipt, ...]:
-    """Every saved held-out audit receipt of the project, in ledger order.
+    """Every receipt of the project, in sequence order.
 
     Args:
         project: Project holding the receipts.
 
     Returns:
-        Receipts ordered by sequence, then time.
+        Root receipts ordered by sequence, then time.
     """
     receipts = (
         AuditReceipt.model_validate_json(project.artifacts.read_bytes(identity, "receipt.json"))
         for identity in project.artifacts.list_ids(artifact_type=RECEIPT_TYPE)
     )
-    return tuple(sorted(receipts, key=lambda receipt: (receipt.sequence, receipt.audited_at)))
+    return tuple(sorted(receipts, key=lambda receipt: (receipt.sequence, receipt.opened_at)))
 
 
-def audit_status(
-    project: ProjectStore, panel: HeldOutPanel, *, fresh: bool, code_revision: str
-) -> tuple[AuditStatus, AuditReceipt | None]:
-    """Classify an audit of ``panel`` against the project's earlier receipts.
+def receipt_view(project: ProjectStore, receipt: AuditReceipt) -> ReceiptView:
+    """A receipt with its children.
 
     Args:
-        project: Project holding the receipts.
-        panel: Registered panel.
-        fresh: Whether any run had no saved result when the audit started.
-        code_revision: Implementation running the audit.
+        project: Project holding the records.
+        receipt: Root receipt.
 
     Returns:
-        The status, and the original receipt for a replay.
+        The receipt, its attempts and its reports, each in time order.
     """
-    reported = [
-        receipt
-        for receipt in audit_receipts(project)
-        if receipt.panel == panel.identity and receipt.results_shown
+    attempts = [
+        AuditAttempt.model_validate_json(project.artifacts.read_bytes(identity, "record.json"))
+        for identity in project.artifacts.list_ids(artifact_type=ATTEMPT_TYPE)
     ]
-    same_code = [receipt for receipt in reported if receipt.code_revision == code_revision]
-    if not fresh and same_code:
-        return "replay", same_code[0]
-    if panel.inspected or reported or not fresh:
-        return "development-re-audit", None
-    return "independent", None
+    reports = [
+        AuditReport.model_validate_json(project.artifacts.read_bytes(identity, "record.json"))
+        for identity in project.artifacts.list_ids(artifact_type=REPORT_TYPE)
+    ]
+    receipt_id = receipt.receipt_id
+    return ReceiptView(
+        receipt=receipt,
+        attempts=tuple(
+            sorted(
+                (item for item in attempts if item.receipt == receipt_id),
+                key=lambda item: (item.at, item.retired_run),
+            )
+        ),
+        reports=tuple(
+            sorted((item for item in reports if item.receipt == receipt_id), key=lambda r: r.at)
+        ),
+    )
 
 
-def record_audit_receipt(
+def save_receipt(project: ProjectStore, receipt: AuditReceipt) -> None:
+    """Write a newly minted receipt once.
+
+    Args:
+        project: Project audited.
+        receipt: Root receipt.
+    """
+    _write(project, RECEIPT_TYPE, receipt.receipt_id, "receipt.json", receipt, receipt)
+
+
+def record_attempts(
     project: ProjectStore,
+    receipt: AuditReceipt,
     panel: HeldOutPanel,
     *,
-    fresh: bool,
-    results_shown: bool,
-    detail_shown: bool,
-    code_revision: str,
     clock: Callable[[], datetime],
-) -> AuditReceipt:
-    """Save an immutable receipt, and the exposure it causes, before showing anything.
+) -> tuple[AuditAttempt, ...]:
+    """Append a child for every registration the panel's owner replaced.
+
+    The caller holds the panel lease and has checked that ``receipt`` owns an active or
+    dispatched reservation for exactly this frozen configuration.
 
     Args:
-        project: Project the panel belongs to.
-        panel: Registered panel.
-        fresh: Whether any run had no saved result when the audit started.
-        results_shown: Whether the audit reports results.
-        detail_shown: Whether the audit shows per-trace detail; every member trace of the
-            audited lineages is then exposed in the root ledger.
-        code_revision: Exact producing implementation identity.
-        clock: Aware clock for the receipt time.
+        project: Project audited.
+        receipt: Owning receipt.
+        panel: The panel as just registered.
+        clock: Aware clock.
 
     Returns:
-        The saved receipt.
+        The appended attempts.
     """
-    status, original = audit_status(project, panel, fresh=fresh, code_revision=code_revision)
-    receipt = AuditReceipt(
-        sequence=len(project.artifacts.list_ids(artifact_type=RECEIPT_TYPE)) + 1,
-        audited_at=clock(),
-        status=status,
-        replays=original.receipt_id if original else None,
-        panel=panel.identity,
-        code_revision=code_revision,
-        profile=panel.profile,
-        world_model=panel.world_model,
-        checkpoint=panel.checkpoint,
-        lineages=tuple(case.task.lineage_group_id for case in panel.cases),
-        traces=tuple(case.trace_id for case in panel.cases),
+    now = clock()
+    attempts = []
+    for item in panel.retirements:
+        case = receipt.cases[item.case]
+        attempt = AuditAttempt(
+            receipt=receipt.receipt_id,
+            task_id=case.task_id,
+            trace_id=case.trace_id,
+            original_run=case.base_run,
+            retired_run=item.retired,
+            replacement_run=item.replacement,
+            reason="re-attempt" if item.claimed_slots else "re-registration",
+            claimed_slots=item.claimed_slots,
+            at=now,
+        )
+        identity = stable_id(ATTEMPT_TYPE, {"retired_run": item.retired})
+        _write(project, ATTEMPT_TYPE, identity, "record.json", attempt, receipt)
+        attempts.append(attempt)
+    return tuple(attempts)
+
+
+def record_report(
+    project: ProjectStore,
+    receipt: AuditReceipt,
+    panel: HeldOutPanel,
+    *,
+    kind: ReportKind,
+    detail_shown: bool,
+    clock: Callable[[], datetime],
+) -> AuditReport:
+    """Append what this invocation did, and expose what it will show, before showing it.
+
+    Per-trace detail exposes every member trace of the audited lineages in the root ledger.
+
+    Args:
+        project: Project audited.
+        receipt: Owning receipt.
+        panel: The panel as registered.
+        kind: What the invocation did.
+        detail_shown: Whether per-trace detail will be shown.
+        clock: Aware clock.
+
+    Returns:
+        The appended report.
+    """
+    report = AuditReport(
+        receipt=receipt.receipt_id,
+        at=clock(),
+        kind=kind,
         runs=tuple(prepared.spec.run_id for prepared in panel.prepared),
-        fresh=fresh,
-        scheme=panel.exposure.scheme,
-        ledger=panel.exposure.ledger,
-        exposed=panel.exposure.exposed,
-        reaudited=panel.inspected,
-        results_shown=results_shown,
         detail_shown=detail_shown,
     )
-    project.artifacts.write_json(
-        artifact_id=receipt.receipt_id,
-        artifact_type=RECEIPT_TYPE,
-        envelope=ArtifactEnvelope(
-            schema_version=1,
-            created_at=receipt.audited_at,
-            code_revision=code_revision,
-            inputs=(panel.world_model,),
-        ),
-        files={"receipt.json": receipt.model_dump(mode="json")},
-    )
+    identity = stable_id(REPORT_TYPE, report)
+    _write(project, REPORT_TYPE, identity, "record.json", report, receipt)
     if detail_shown:
         members = held_out_members(project)
         ExposureLedger(project.paths.root).record_exposure(
@@ -197,12 +363,36 @@ def record_audit_receipt(
                         }
                     )
                 ),
-                how="re-audited" if panel.inspected else "inspected",
-                panel=panel.identity,
+                how="inspected" if receipt.basis == "independent" else "re-audited",
+                panel=receipt.panel,
                 receipt=receipt.receipt_id,
                 report=DETAIL_REPORT,
                 project=project.paths.project_id,
-                at=receipt.audited_at,
+                at=report.at,
             )
         )
-    return receipt
+    return report
+
+
+def _write(
+    project: ProjectStore,
+    artifact_type: str,
+    identity: str,
+    path: str,
+    record: ContractModel,
+    receipt: AuditReceipt,
+) -> None:
+    """Write one immutable record unless it already exists."""
+    if project.artifacts.exists(identity):
+        return
+    project.artifacts.write_json(
+        artifact_id=identity,
+        artifact_type=artifact_type,
+        envelope=ArtifactEnvelope(
+            schema_version=1,
+            created_at=receipt.opened_at,
+            code_revision=receipt.code_revision,
+            inputs=(receipt.world_model,),
+        ),
+        files={path: record.model_dump(mode="json")},
+    )

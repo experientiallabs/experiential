@@ -675,7 +675,8 @@ def test_run_ids_follow_content_and_retire_attempts_that_cannot_finish(
     with pytest.raises(KeyboardInterrupt):
         execute_fidelity_evaluation(store, expired.prepared[0])
     resumed = register(later)
-    assert resumed.retired == (run_id, run_id + "-r2")
+    # Generation one was already replaced; only the newly retired attempt is reported.
+    assert resumed.retired == (run_id + "-r2",)
     assert resumed.prepared[0].spec.run_id == run_id + "-r3"
 
     # Changed inputs (here the judge's output allowance) address a new run, never a refusal.

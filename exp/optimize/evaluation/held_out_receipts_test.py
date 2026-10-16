@@ -1,22 +1,23 @@
-"""Held-out audit receipts, their status, and exposure across projects, imports and grouping.
+"""Held-out audit receipts and reports: headline, exposure, exhaustion, and the CLI report.
 
 Builds run offline through the routed fake of :mod:`held_out_fidelity_test`; every project
 shares one ``.exp`` root, so its exposure ledger is shared too.
 """
 
-from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
+from typer.testing import CliRunner
 
+from exp.cli.app import app
 from exp.common.core.artifacts import JsonObject
 from exp.common.project import ProjectStore
 from exp.common.traces import Trace
 from exp.common.traces.store import load_trace_dataset
+from exp.optimize.evaluation.held_out_audit_test import FailingOnce, audit, clock, run
 from exp.optimize.evaluation.held_out_exposure import held_out_exposure
-from exp.optimize.evaluation.held_out_fidelity import HeldOutPanel, register_held_out_fidelity
 from exp.optimize.evaluation.held_out_fidelity_test import (
-    REVISION,
+    PROJECT,
     USERS,
     SimulatedProvider,
     build_project,
@@ -25,10 +26,10 @@ from exp.optimize.evaluation.held_out_fidelity_test import (
     held_out_lineages,
 )
 from exp.optimize.evaluation.held_out_receipts import (
-    RECEIPT_TYPE,
-    AuditReceipt,
+    QUALIFIED,
     audit_receipts,
-    record_audit_receipt,
+    receipt_view,
+    record_report,
 )
 from exp.optimize.evaluation.trace_learning import learning_plan
 from exp.simulation.mining.exposure_ledger import (
@@ -38,113 +39,59 @@ from exp.simulation.mining.exposure_ledger import (
 )
 from exp.simulation.world_model.experience_memory import memory_head
 
-NOW = datetime(2026, 10, 16, 12, tzinfo=UTC)
 
-
-def register(
-    store: ProjectStore, count: int = 1, *, include_inspected: bool = False
-) -> HeldOutPanel:
-    """Register a source-RAG held-out panel without provider calls."""
-    return register_held_out_fidelity(
-        store,
-        count,
-        profile="source-rag",
-        code_revision=REVISION,
-        clock=lambda: NOW,
-        include_inspected=include_inspected,
-    )
-
-
-def record(
-    store: ProjectStore,
-    panel: HeldOutPanel,
-    *,
-    fresh: bool,
-    detail: bool = False,
-    revision: str = REVISION,
-    at: datetime = NOW,
-) -> AuditReceipt:
-    """Record a reported audit of ``panel``."""
-    return record_audit_receipt(
-        store,
-        panel,
-        fresh=fresh,
-        results_shown=True,
-        detail_shown=detail,
-        code_revision=revision,
-        clock=lambda: at,
-    )
-
-
-def test_receipt_status_is_independent_replay_or_development_reaudit(
+def test_reports_append_to_the_receipt_and_detail_exposes_its_lineages(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The first fresh report is independent; repeats replay it or re-audit for development."""
+    """Reports never rewrite the receipt; per-trace detail exposes, and selection moves on."""
     provider = SimulatedProvider([episode(i) for i in range(USERS)])
     _, store, _ = build_project(tmp_path, monkeypatch, provider)
-    panel = register(store)
-    lineage = panel.cases[0].task.lineage_group_id
-    assert panel.identity == register(store).identity, "identity follows cases and runs only"
-    assert panel.identity != register(store, 2).identity
-
-    first = record(store, panel, fresh=True)
-    assert (first.status, first.replays, first.sequence) == ("independent", None, 1)
-    assert first.panel == panel.identity and first.code_revision == REVISION
-    assert first.lineages == (lineage,) and first.runs == (panel.prepared[0].spec.run_id,)
-    assert first.scheme == FINGERPRINT_SCHEME
-    assert first.ledger == ExposureLedger(store.paths.root).snapshot().identity
-    assert first.exposed == () and not first.detail_shown
-
-    replay = record(store, panel, fresh=False, at=NOW + timedelta(seconds=1))
-    assert (replay.status, replay.replays) == ("replay", first.receipt_id)
-    other_code = record(store, panel, fresh=False, revision="d" * 40, at=NOW + timedelta(2))
-    assert other_code.status == "development-re-audit", "a code-revision change is no replay"
-    assert held_out_exposure(store).exposed == (), "aggregates expose nothing"
-
-    # Saved results that no receipt ever reported are not a fresh evaluation.
-    unreported = register(store, 2)
-    assert record(store, unreported, fresh=False).status == "development-re-audit"
-
-    # Per-trace detail exposes the lineage at the root; the default panel moves past it.
-    detail = record(store, panel, fresh=False, detail=True, at=NOW + timedelta(3))
-    assert detail.status == "replay" and detail.detail_shown
-    exposure = held_out_exposure(store)
-    assert exposure.lineages == {lineage} and exposure.ledger != first.ledger
+    with audit(store) as opened:
+        receipt = opened.receipt
+        record_report(
+            store, receipt, opened.panel, kind="prepared", detail_shown=False, clock=clock
+        )
+        run(store, opened)
+        record_report(
+            store, receipt, opened.panel, kind="evaluation", detail_shown=False, clock=clock
+        )
+        reserved = held_out_exposure(store).exposed
+        assert [item.kind for item in reserved] == ["reserved"], "aggregates expose nothing"
+        record_report(store, receipt, opened.panel, kind="replay", detail_shown=True, clock=clock)
+    view = receipt_view(store, receipt)
+    assert [report.kind for report in view.reports] == ["prepared", "evaluation", "replay"]
+    assert view.headline == "independent" and view.reported
+    assert view.reports[-1].runs == (receipt.cases[0].base_run,)
+    exposure = held_out_exposure(store, owner=receipt.receipt_id)
     [exposed] = exposure.exposed
-    assert exposed.path.path == () and exposed.path.component_size >= 1
-    moved = register(store)
-    assert moved.cases[0].task.lineage_group_id != lineage
-    assert moved.excluded == 1 and moved.independent
-    assert record(store, moved, fresh=True).status == "independent"
+    assert exposed.lineage == receipt.lineages[0] and exposed.kind == "exposed"
+    assert exposed.path.by and exposed.path.path == ()
 
-    # A fresh evaluation that touches exposed cases is a development re-audit.
-    touched = register(store, 3, include_inspected=True)
-    assert touched.inspected == (lineage,) and not touched.independent
-    reaudit = record(store, touched, fresh=True)
-    assert reaudit.status == "development-re-audit" and reaudit.reaudited == (lineage,)
-    assert [item.lineage for item in reaudit.exposed] == [lineage]
-
-    # Receipts are immutable artifacts: later audits add receipts and change none.
-    receipts = audit_receipts(store)
-    assert receipts[0] == first and [r.sequence for r in receipts] == list(range(1, 8))
-    assert len(store.artifacts.list_ids(artifact_type=RECEIPT_TYPE)) == 7
+    with audit(store) as moved:
+        assert moved.receipt != receipt and moved.receipt.basis == "independent"
+        assert moved.excluded == 1 and moved.receipt.lineages != receipt.lineages
+    with audit(store, include_inspected=True) as reaudit:
+        assert reaudit.receipt.basis == "development-re-audit"
+        assert receipt.lineages[0] in reaudit.receipt.reaudited
+        assert receipt_view(store, reaudit.receipt).headline == "development re-audit"
+    assert [r.sequence for r in audit_receipts(store)] == [1, 2, 3]
 
 
 def test_exhausted_held_out_panel_refuses_without_provider_calls(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Once every held-out lineage is exposed, an independent audit needs fresh traces."""
+    """Once every held-out lineage is exposed or reserved, an audit needs fresh traces."""
     provider = SimulatedProvider([episode(i) for i in range(USERS)])
     _, store, _ = build_project(tmp_path, monkeypatch, provider)
-    panel = register(store, USERS)
-    assert {case.task.lineage_group_id for case in panel.cases} == held_out_lineages(store)
-    record(store, panel, fresh=True, detail=True)
+    with audit(store, USERS) as opened:
+        assert set(opened.receipt.lineages) == held_out_lineages(store)
     purchased = len(provider.requests)
-    with pytest.raises(ValueError, match="fresh traces") as refusal:
-        register(store)
+    with pytest.raises(ValueError, match="fresh traces") as refusal, audit(store):
+        pass
     assert "new lineages" in str(refusal.value) and "--include-inspected" in str(refusal.value)
     assert len(provider.requests) == purchased
-    assert not register(store, include_inspected=True).independent
+    with audit(store, include_inspected=True) as reaudit:
+        assert reaudit.receipt.basis == "development-re-audit"
 
 
 def test_exposure_follows_content_across_projects_imports_and_regrouping(
@@ -166,33 +113,35 @@ def test_exposure_follows_content_across_projects_imports_and_regrouping(
     _, one, _ = build_project(
         tmp_path, monkeypatch, provider, episodes=[episode(i) for i in range(USERS)] + follow_ups
     )
-    panel = register(one)
-    receipt = record(one, panel, fresh=True, detail=True)
+    with audit(one) as opened:
+        record_report(
+            one, opened.receipt, opened.panel, kind="replay", detail_shown=True, clock=clock
+        )
+        receipt = opened.receipt
     traces = {t.trace_id: t for t in load_trace_dataset(one.artifacts, _dataset(one)).traces}
-    exposed_trace = traces[receipt.traces[0]]
+    exposed_trace = traces[receipt.cases[0].trace_id]
     customer = str(exposed_trace.initial_context["task_lineage"])
     index = int(customer.removeprefix("user_"))
     a = trace_fingerprint(exposed_trace)
 
+    # The exposed trace A is either the original or the follow-up; B is the other one.
+    originals = {"original": episode(index), "follow-up": follow_ups[index]}
+    exposed_kind = "follow-up" if "Also" in exposed_trace.task else "original"
+    other = originals["original" if exposed_kind == "follow-up" else "follow-up"]
     # A later import drops A. B arrives with the same content but a new trace ID and a new
-    # declared identity, which only C shares; A' is A's content under a new trace ID.
-    b_again: JsonObject = {**follow_ups[index], "lineage": "regrouped", "repeat": "again"}
+    # declared identity, which only C shares.
+    b_again: JsonObject = {**other, "lineage": "regrouped", "repeat": "again"}
     c: JsonObject = {**episode(USERS + 1), "lineage": "regrouped", "conversation": "fresh"}
-    a_again: JsonObject = {**episode(index), "repeat": "reimport"}
     others = [episode(i) for i in range(USERS) if i != index]
     _, two, _ = build_project(
-        tmp_path,
-        monkeypatch,
-        provider,
-        episodes=[*others, b_again, c, a_again],
-        project="second",
+        tmp_path, monkeypatch, provider, episodes=[*others, b_again, c], project="second"
     )
     snapshot = ExposureLedger(two.paths.root).snapshot()
     by_content = {trace_fingerprint(t): t for t in _traces(two)}
     c_trace = next(
         t
         for t in by_content.values()
-        if t.initial_context["task_lineage"] == "regrouped" and "Also" not in t.task
+        if t.initial_context["task_lineage"] == "regrouped" and "#W1013" in t.task
     )
     found = snapshot.exposure((trace_fingerprint(c_trace),))
     assert found is not None and found.exposed_node == a
@@ -200,18 +149,24 @@ def test_exposure_follows_content_across_projects_imports_and_regrouping(
     assert (found.path[0].task_lineage, found.path[0].project) == ("regrouped", "second")
     assert found.path[-1].project == "retail" and len(found.path) == 2
     assert found.component_size >= 3
-    # Reimported content is exposed itself, with no path; another customer's trace is not.
-    direct = snapshot.exposure((a,))
-    assert a in by_content and direct is not None and direct.path == ()
+    assert a not in by_content, "A left the later import"
     neighbour = f"user_{(index + 1) % USERS:02d}"
     unrelated = next(t for t in _traces(two) if t.initial_context["task_lineage"] == neighbour)
     assert snapshot.exposure((trace_fingerprint(unrelated),)) is None
+    # A third import carries A's content again under a new trace ID: exposed itself, no path.
+    a_again: JsonObject = {**originals[exposed_kind], "repeat": "reimport"}
+    _, three, _ = build_project(
+        tmp_path, monkeypatch, provider, episodes=[*others, a_again], project="third"
+    )
+    assert a in {trace_fingerprint(t) for t in _traces(three)}
+    direct = ExposureLedger(three.paths.root).snapshot().exposure((a,))
+    assert direct is not None and direct.path == ()
 
 
 def test_held_out_command_reports_receipts_checkpoint_and_exposure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The CLI names its checkpoint and ledger, classifies receipts, and refuses when spent."""
+    """The CLI names its checkpoint, ledger and receipt, labels re-audits, refuses when spent."""
     provider = SimulatedProvider([episode(i) for i in range(USERS)])
     root, store, _ = build_project(
         tmp_path, monkeypatch, provider, "--learn", "--hold-out", "--memory-recall", "jev"
@@ -223,53 +178,81 @@ def test_held_out_command_reports_receipts_checkpoint_and_exposure(
     assert len(held) >= 3
 
     dry = held_out_command(root, 1, "--dry-run", "--verbose")
-    [prepared] = audit_receipts(store)
-    assert not prepared.results_shown and not prepared.detail_shown
-    assert "Prepared without provider calls" in dry and "Audit receipt #1" in dry
+    [receipt] = audit_receipts(store)
+    assert "Prepared without provider calls" in dry and receipt.receipt_id in dry
 
     output = held_out_command(root, 1, "--verbose")
     assert (
-        f"Audited checkpoint: memory {plan.lineage} v{head.version}, scope fit "
+        f"Audited checkpoint: memory {plan.lineage} v{head.version}, scope fit, "
+        f"{head.version} fit traces learned, simulator {receipt.world_model.artifact_id} "
         "(held-out lineages reserved before learning)" in output
     )
     assert (
         "An all-traces build (exp build --learn without --hold-out) is a different checkpoint "
         "and was not independently evaluated" in output
     )
-    receipt = audit_receipts(store)[-1]
-    assert f"Audit receipt #2 {receipt.receipt_id}: independent" in output
+    assert audit_receipts(store) == (receipt,), "the dry run's receipt is resumed"
+    assert f"Audit receipt #1 {receipt.receipt_id}: independent · this run: evaluation" in output
     assert f"Exposure ledger {receipt.ledger} ({FINGERPRINT_SCHEME})" in output
     assert "Limit: Knowledge a person carries over by hand is not tracked." in output
+    assert "Limit: Reservations and panel leases are atomic only for runs sharing" in output
     assert "Held-out fidelity 3/3" in output and "now development data" in output
-    assert receipt.detail_shown and receipt.checkpoint is not None
+    assert receipt.checkpoint is not None
     assert (receipt.checkpoint.lineage, receipt.checkpoint.version) == (plan.lineage, head.version)
-    [inspected] = receipt.lineages
-    assert held_out_exposure(store).lineages == {inspected}
+    assert held_out_exposure(store).lineages == set(receipt.lineages)
 
     following = held_out_command(root, 1)
-    assert "Skipped 1 held-out lineage exposed in the exposure ledger" in following
-    assert f"{inspected} (skipped): component of" in following
-    fresh = audit_receipts(store)[-1]
-    assert fresh.status == "independent" and fresh.lineages != (inspected,)
+    assert "Skipped 1 held-out lineage exposed or reserved" in following
+    assert f"{receipt.lineages[0]} (exposed, skipped): component of" in following
+    second = audit_receipts(store)[-1]
+    assert second.sequence == 2 and second.lineages != receipt.lineages
     replay = held_out_command(root, 1)
-    assert "Held-out fidelity (replay)" in replay
-    assert f"replay of receipt #{fresh.sequence} (independent)" in replay
+    assert "Held-out fidelity 3/3" in replay and "this run: replay" in replay
+    assert f"Audit receipt #2 {second.receipt_id}: replay (independent)" in replay
 
     reaudit = held_out_command(root, len(held), "--include-inspected")
     assert "Re-audit on inspected cases (development)" in reaudit
     assert "not an independent measurement" in reaudit
-    assert f"{inspected} (in this panel)" in reaudit
-    assert audit_receipts(store)[-1].status == "development-re-audit"
+    third = audit_receipts(store)[-1]
+    assert f"Audit receipt #3 {third.receipt_id}: development re-audit · this run" in reaudit
 
-    # Every remaining result was computed by the re-audit, so this is no fresh evaluation.
-    rest = held_out_command(root, len(held), "--verbose")
-    assert "Held-out re-audit (development)" in rest
-    assert held_out_exposure(store).lineages == held
     purchased = len(provider.requests)
     receipts = len(audit_receipts(store))
-    refusal = held_out_command(root, 1, exit_code=2)
+    refusal = held_out_command(root, 2, exit_code=2)
     assert "independent audit needs fresh traces" in refusal
     assert len(provider.requests) == purchased and len(audit_receipts(store)) == receipts
+
+
+def test_a_trace_reattempt_qualifies_the_headline_and_reports_both_subsets(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """After a crash, --retry-incomplete re-attempts the trace under the same receipt."""
+    provider = FailingOnce([episode(i) for i in range(USERS)])
+    root, store, _ = build_project(
+        tmp_path, monkeypatch, provider, "--learn", "--hold-out", "--memory-recall", "jev"
+    )
+    provider.armed = True
+    crashed = CliRunner().invoke(
+        app,
+        ["eval", PROJECT, "--root", str(root), "--held-out-fidelity", "2"]
+        + ["--yes", "--non-interactive"],
+    )
+    assert crashed.exit_code == 130, crashed.output  # interrupted after a claimed slot
+    stopped = held_out_command(root, 2, "--dry-run")
+    assert "dispatched, outcome unknown" in stopped
+    output = held_out_command(root, 2, "--retry-incomplete")
+    [receipt] = audit_receipts(store)
+    view = receipt_view(store, receipt)
+    [child] = view.reattempts
+    assert view.headline == QUALIFIED
+    assert f"Audit receipt #1 {receipt.receipt_id}: {QUALIFIED}" in output
+    assert "Held-out fidelity (independent, qualified: trace re-attempts) 6/6 replies" in output
+    assert "Unaffected traces only 3/3 replies exact (100%)" in output
+    assert "Re-attempted traces only 3/3 replies exact (100%)" in output
+    assert output.count("· 1/1 traces") == 2, "each subset states its own denominator"
+    assert f"re-attempt of {child.trace_id}: {child.retired_run} -> {child.replacement_run}" in (
+        held_out_command(root, 2)
+    )
 
 
 def _dataset(store: ProjectStore) -> str:

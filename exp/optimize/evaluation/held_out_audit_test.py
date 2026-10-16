@@ -1,0 +1,448 @@
+"""Held-out audit lifecycle: reserve before register, leases, permanence after dispatch, children.
+
+Builds run offline through the routed fake of :mod:`held_out_fidelity_test`; audits use the
+source-RAG profile so no learning pass is needed.
+"""
+
+import os
+import threading
+from collections.abc import Callable, Collection, Iterator, Mapping
+from contextlib import AbstractContextManager, contextmanager
+from datetime import UTC, datetime
+from pathlib import Path
+
+import pytest
+
+from exp.common.core.artifacts import JsonObject
+from exp.common.models import load_model_catalog, write_model_catalog
+from exp.common.project import ProjectStore
+from exp.optimize.evaluation import fidelity, held_out_audit, trace_replay
+from exp.optimize.evaluation.fidelity import execute_fidelity_evaluation
+from exp.optimize.evaluation.held_out_audit import (
+    HeldOutAudit,
+    ReservationInactiveError,
+    open_held_out_audit,
+    outcome_unknown,
+    release_held_out_audit,
+    reservation_state,
+)
+from exp.optimize.evaluation.held_out_exposure import held_out_members
+from exp.optimize.evaluation.held_out_fidelity import HeldOutPanel, PlannedPanel, Profile
+from exp.optimize.evaluation.held_out_fidelity_test import (
+    REVISION,
+    USERS,
+    SimulatedProvider,
+    build_project,
+    episode,
+)
+from exp.optimize.evaluation.held_out_receipts import (
+    QUALIFIED,
+    RECEIPT_TYPE,
+    audit_receipts,
+    receipt_view,
+)
+from exp.runtime.models.providers.transport import JsonHttpResponse
+from exp.runtime.sessions.dispatch_ledger import DispatchLedger
+from exp.simulation.mining.exposure_ledger import (
+    ExposureLedger,
+    LedgerReservation,
+    PanelInUseError,
+)
+
+
+def clock() -> datetime:
+    """Aware wall-clock time."""
+    return datetime.now(UTC)
+
+
+def audit(
+    store: ProjectStore,
+    count: int = 1,
+    *,
+    revision: str = REVISION,
+    retry_incomplete: bool = False,
+    include_inspected: bool = False,
+) -> AbstractContextManager[HeldOutAudit]:
+    """Open a source-RAG held-out audit."""
+    return open_held_out_audit(
+        store,
+        count,
+        profile="source-rag",
+        code_revision=revision,
+        clock=clock,
+        retry_incomplete=retry_incomplete,
+        include_inspected=include_inspected,
+    )
+
+
+def run(store: ProjectStore, opened: HeldOutAudit) -> None:
+    """Execute every registered run under the audit's guard."""
+    for prepared in opened.panel.prepared:
+        execute_fidelity_evaluation(store, prepared, dispatch_guard=opened.guard)
+
+
+class FailingOnce(SimulatedProvider):
+    """Crash on the first simulator request after its slot was claimed, then answer normally."""
+
+    def __init__(self, episodes: list[JsonObject]) -> None:
+        """Arm one failure."""
+        super().__init__(episodes)
+        self.armed = False
+
+    def post(
+        self,
+        url: str,
+        *,
+        headers: Mapping[str, str],
+        payload: JsonObject,
+        timeout_seconds: float,
+    ) -> JsonHttpResponse:
+        """Stop the process once, for a simulator turn while armed."""
+        tool = payload.get("tool_choice")
+        if self.armed and isinstance(tool, dict) and url.endswith("/chat/completions"):
+            self.armed = False
+            raise KeyboardInterrupt
+        return super().post(url, headers=headers, payload=payload, timeout_seconds=timeout_seconds)
+
+
+@pytest.fixture(name="built")
+def _built(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[ProjectStore, FailingOnce]:
+    """A built project whose provider can fail once after a slot is claimed."""
+    provider = FailingOnce([episode(i) for i in range(USERS)])
+    _, store, _ = build_project(tmp_path, monkeypatch, provider)
+    return store, provider
+
+
+def test_content_is_reserved_before_any_run_is_registered(
+    built: tuple[ProjectStore, FailingOnce], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Reserve, then register: registration only ever sees an active reservation."""
+    store, _ = built
+    ledger = ExposureLedger(store.paths.root)
+    seen: list[bool] = []
+    register = held_out_audit.register_planned_panel
+
+    def checked(
+        project: ProjectStore,
+        planned: PlannedPanel,
+        *,
+        code_revision: str,
+        clock: Callable[[], datetime],
+        retry_incomplete: bool = False,
+    ) -> HeldOutPanel:
+        """Record whether the newest receipt's reservation was committed before registering."""
+        receipts = audit_receipts(store)
+        seen.append(bool(receipts) and ledger.snapshot().active(receipts[-1].receipt_id))
+        return register(
+            project,
+            planned,
+            code_revision=code_revision,
+            clock=clock,
+            retry_incomplete=retry_incomplete,
+        )
+
+    monkeypatch.setattr(held_out_audit, "register_planned_panel", checked)
+    with audit(store) as opened:
+        receipt = opened.receipt
+        reservation = ledger.snapshot().reservations[receipt.receipt_id]
+        assert reservation.panel == receipt.panel and reservation.snapshot == receipt.ledger
+        assert set(reservation.lineages) == set(receipt.lineages)
+        assert receipt.basis == "independent" and reservation_state(store, receipt) == "active"
+    with audit(store) as again:
+        assert again.receipt == receipt, "the same request resumes its receipt"
+    assert seen == [True, True]
+    assert len(store.artifacts.list_ids(artifact_type=RECEIPT_TYPE)) == 1
+
+
+def test_concurrent_audits_never_share_content(built: tuple[ProjectStore, FailingOnce]) -> None:
+    """A second process sees the first's reservation: same panel is in use, others pick around."""
+    store, _ = built
+    holding, done = threading.Event(), threading.Event()
+    first: list[HeldOutAudit] = []
+
+    def hold() -> None:
+        """Keep one audit open until the main thread is finished."""
+        with audit(store) as opened:
+            first.append(opened)
+            holding.set()
+            done.wait(30)
+
+    worker = threading.Thread(target=hold)
+    worker.start()
+    assert holding.wait(30)
+    try:
+        with pytest.raises(PanelInUseError, match="in use"), audit(store):
+            pass
+        with audit(store, 2) as second:
+            assert not set(second.receipt.lineages) & set(first[0].receipt.lineages)
+            assert second.receipt.basis == "independent" and second.excluded == 1
+    finally:
+        done.set()
+        worker.join()
+
+
+def test_a_reservation_committed_between_selection_and_commit_is_respected(
+    built: tuple[ProjectStore, FailingOnce], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The graph is re-read inside the transaction; content taken meanwhile is never reserved."""
+    store, _ = built
+    ledger = ExposureLedger(store.paths.root)
+    plan = held_out_audit.plan_held_out_panel
+    stolen: list[str] = []
+
+    def racing(
+        project: ProjectStore,
+        count: int,
+        *,
+        profile: Profile,
+        clock: Callable[[], datetime],
+        excluded: Collection[str] = frozenset(),
+    ) -> PlannedPanel:
+        """Plan, then let another receipt reserve the planned lineage before the commit."""
+        planned = plan(project, count, profile=profile, clock=clock, excluded=excluded)
+        if not stolen:
+            lineage = planned.lineages[0]
+            stolen.append(lineage)
+            with ledger.transaction() as transaction:
+                transaction.reserve(
+                    LedgerReservation(
+                        receipt="held-out-audit-receipt-elsewhere",
+                        panel="held-out-panel-elsewhere",
+                        project="elsewhere",
+                        lineages=(lineage,),
+                        fingerprints=held_out_members(store)[lineage],
+                        snapshot=transaction.snapshot().identity,
+                        at=clock(),
+                    )
+                )
+        return planned
+
+    monkeypatch.setattr(held_out_audit, "plan_held_out_panel", racing)
+    with audit(store) as opened:
+        assert opened.receipt.lineages != tuple(stolen)
+        assert opened.receipt.basis == "independent"
+        snapshot = ledger.snapshot()
+        assert opened.receipt.ledger != snapshot.identity or len(snapshot.reservations) == 2
+
+
+def test_a_claimed_slot_makes_the_reservation_permanent_after_a_crash(
+    built: tuple[ProjectStore, FailingOnce],
+) -> None:
+    """Dispatched, outcome unknown: only the same receipt completes it, as a qualified child."""
+    store, provider = built
+    with audit(store) as opened:
+        receipt = opened.receipt
+        provider.armed = True
+        with pytest.raises(KeyboardInterrupt):
+            run(store, opened)
+        assert outcome_unknown(store, opened)
+    assert reservation_state(store, receipt) == "dispatched"
+    with pytest.raises(ValueError, match="permanent"):
+        release_held_out_audit(store, receipt, clock=clock)
+
+    # Without --retry-incomplete the owner resumes but never buys the stopped run again.
+    with audit(store) as resumed:
+        assert resumed.receipt == receipt and not resumed.panel.retirements
+        with pytest.raises(ValueError, match="incomplete fidelity run"):
+            run(store, resumed)
+    # Any other evaluation of those cases is a development re-audit with its own receipt.
+    with audit(store, include_inspected=True) as other:
+        assert other.receipt != receipt and other.receipt.basis == "development-re-audit"
+        assert other.receipt.reaudited == receipt.lineages
+    # The owner completes it with --retry-incomplete: a child, never a new receipt.
+    with audit(store, retry_incomplete=True) as completed:
+        assert completed.receipt == receipt
+        run(store, completed)
+        view = completed.view
+        [child] = view.attempts
+        assert child.reason == "re-attempt" and child.claimed_slots >= 1
+        assert child.original_run == receipt.cases[0].base_run
+        assert child.retired_run == receipt.cases[0].base_run
+        assert child.replacement_run == receipt.cases[0].base_run + "-r2"
+        assert view.headline == QUALIFIED and view.affected_traces == {receipt.cases[0].trace_id}
+    # A plain resume follows the replacement chain to the completed attempt and replays it.
+    with audit(store) as replayed:
+        assert replayed.panel.prepared[0].spec.run_id == child.replacement_run
+        assert not replayed.panel.retirements
+        run(store, replayed)
+        assert replayed.view.headline == QUALIFIED
+    assert len(audit_receipts(store)) == 2
+
+
+def test_a_reregistration_before_dispatch_does_not_qualify_the_headline(
+    built: tuple[ProjectStore, FailingOnce],
+) -> None:
+    """A registration retired with zero claimed slots is recorded, but is not a re-attempt."""
+    store, _ = built
+    with audit(store) as opened:
+        receipt = opened.receipt
+    catalog = load_model_catalog(store.model_catalog_path)
+    extra = catalog.models["world"].model_copy(update={"model": "world-v2"})
+    write_model_catalog(
+        store.model_catalog_path,
+        catalog.model_copy(update={"models": {**catalog.models, "spare": extra}}),
+    )
+    with audit(store) as again:
+        assert again.receipt == receipt
+        [child] = again.view.attempts
+        assert child.reason == "re-registration" and child.claimed_slots == 0
+        assert again.view.headline == "independent"
+
+
+def test_a_configuration_change_with_zero_slots_releases_and_mints_a_new_receipt(
+    built: tuple[ProjectStore, FailingOnce],
+) -> None:
+    """The unused reservation is released; the original receipt is never rewritten."""
+    store, _ = built
+    with audit(store) as opened:
+        original = opened.receipt
+    stored = store.artifacts.read_bytes(original.receipt_id, "receipt.json")
+    with audit(store, revision="d" * 40) as changed:
+        assert changed.receipt.receipt_id != original.receipt_id
+        assert changed.receipt.code_revision == "d" * 40
+        assert (changed.receipt.follows, changed.receipt.follow_reason) == (
+            original.receipt_id,
+            "released-unused",
+        )
+        assert changed.receipt.basis == "independent"
+        assert changed.receipt.lineages == original.lineages
+    assert reservation_state(store, original) == "released"
+    assert store.artifacts.read_bytes(original.receipt_id, "receipt.json") == stored
+
+
+def test_a_configuration_change_after_dispatch_is_a_development_reaudit(
+    built: tuple[ProjectStore, FailingOnce],
+) -> None:
+    """A code-revision mismatch is detected; the dispatched reservation stays permanent."""
+    store, _ = built
+    with audit(store) as opened:
+        original = opened.receipt
+        run(store, opened)
+    with audit(store, revision="d" * 40) as changed:
+        assert changed.receipt.follow_reason == "dispatched"
+        assert changed.receipt.basis == "development-re-audit"
+        assert changed.receipt.reaudited == original.lineages
+    assert reservation_state(store, original) == "dispatched"
+    assert receipt_view(store, original).headline == "independent"
+
+
+def test_release_and_resume_never_leave_a_released_reservation_with_claims(
+    built: tuple[ProjectStore, FailingOnce],
+) -> None:
+    """While a resume holds the lease, release fails; once a slot is claimed, it never succeeds."""
+    store, _ = built
+    with audit(store) as opened:
+        receipt = opened.receipt
+        with pytest.raises(PanelInUseError, match="in use"):
+            release_held_out_audit(store, receipt, clock=clock)
+        run(store, opened)
+    with pytest.raises(ValueError, match="permanent"):
+        release_held_out_audit(store, receipt, clock=clock)
+    assert reservation_state(store, receipt) == "dispatched"
+    with pytest.raises(ReservationInactiveError):
+        opened.guard()
+
+    # The converse order: an unused reservation is released first, so it cannot be resumed.
+    with audit(store, 2) as fresh:
+        unused = fresh.receipt
+    release_held_out_audit(store, unused, clock=clock)
+    with audit(store, 2) as after:
+        assert after.receipt.receipt_id != unused.receipt_id
+    assert reservation_state(store, unused) == "released"
+
+
+RANKS = {"lease": 0, "ledger": 1, "run": 2, "dispatch": 3}
+
+
+def test_locks_are_always_taken_in_one_order(
+    built: tuple[ProjectStore, FailingOnce], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Panel lease, then ledger transaction, then run lock, then dispatch claim; never backwards."""
+    store, _ = built
+    events: list[tuple[str, tuple[str, ...]]] = []
+    held = threading.local()
+
+    @contextmanager
+    def tracked(name: str) -> Iterator[None]:
+        """Record acquisition of ``name`` with the locks this thread already holds."""
+        stack: list[str] = getattr(held, "stack", [])
+        held.stack = stack
+        events.append((name, tuple(stack)))
+        stack.append(name)
+        try:
+            yield
+        finally:
+            stack.pop()
+
+    lease, transaction = ExposureLedger.lease, ExposureLedger.transaction
+
+    @contextmanager
+    def tracked_lease(self: ExposureLedger, panel: str) -> Iterator[object]:
+        """Track the panel lease."""
+        with tracked("lease"), lease(self, panel) as lock:
+            yield lock
+
+    @contextmanager
+    def tracked_transaction(self: ExposureLedger) -> Iterator[object]:
+        """Track the ledger transaction."""
+        with tracked("ledger"), transaction(self) as handle:
+            yield handle
+
+    class TrackedFileLock:
+        """Track a run's execution lock."""
+
+        def __init__(self, path: str | os.PathLike[str], timeout: float = -1) -> None:
+            """Wrap the real lock."""
+            self._lock = fidelity_lock(path, timeout=timeout)
+            self._context: AbstractContextManager[None] | None = None
+
+        def __enter__(self) -> "TrackedFileLock":
+            """Acquire and record."""
+            self._context = tracked("run")
+            self._context.__enter__()
+            self._lock.acquire()
+            return self
+
+        def __exit__(self, *exc: object) -> None:
+            """Release."""
+            self._lock.release()
+            assert self._context is not None
+            self._context.__exit__(None, None, None)
+
+        def acquire(self, timeout: float = -1) -> None:
+            """Acquire without tracking a scope (retirement probe)."""
+            events.append(("run", tuple(getattr(held, "stack", []))))
+            self._lock.acquire(timeout=timeout)
+
+        def release(self) -> None:
+            """Release a probe."""
+            self._lock.release()
+
+    claim = DispatchLedger.claim
+
+    def tracked_claim(self: DispatchLedger, claimed_at: str) -> tuple[int, str]:
+        """Track a dispatch slot claim."""
+        with tracked("dispatch"):
+            return claim(self, claimed_at)
+
+    fidelity_lock = fidelity.FileLock
+    monkeypatch.setattr(ExposureLedger, "lease", tracked_lease)
+    monkeypatch.setattr(ExposureLedger, "transaction", tracked_transaction)
+    monkeypatch.setattr(fidelity, "FileLock", TrackedFileLock)
+    monkeypatch.setattr(trace_replay, "FileLock", TrackedFileLock)
+    monkeypatch.setattr(DispatchLedger, "claim", tracked_claim)
+
+    with audit(store) as opened:
+        run(store, opened)
+    with audit(store, retry_incomplete=True) as resumed:
+        run(store, resumed)
+    with audit(store, 2) as other:
+        pass
+    release_held_out_audit(store, other.receipt, clock=clock)
+
+    kinds = [name for name, _ in events]
+    assert {"lease", "ledger", "run", "dispatch"} <= set(kinds)
+    for name, before in events:
+        assert all(RANKS[earlier] < RANKS[name] for earlier in before), (name, before)
+    first = {name: kinds.index(name) for name in RANKS}
+    assert first["lease"] < first["run"] < first["dispatch"]
