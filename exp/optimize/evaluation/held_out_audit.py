@@ -60,6 +60,7 @@ from exp.optimize.evaluation.held_out_receipts import (
     receipt_view,
     record_attempts,
     record_notice,
+    record_redispatches,
     save_receipt,
 )
 from exp.simulation.mining.exposure_ledger import (
@@ -89,6 +90,7 @@ class HeldOutAudit:
         lease: FileLock,
         *,
         excluded: int,
+        clock: Callable[[], datetime],
     ) -> None:
         """Bind an audit whose reservation was confirmed active under ``lease``.
 
@@ -99,6 +101,7 @@ class HeldOutAudit:
             exposure: Exposure decision the selection used.
             lease: The held panel lease.
             excluded: Exposed or reserved lineages selection left out.
+            clock: Aware clock for appended children.
         """
         self.project = project
         self.receipt = receipt
@@ -106,10 +109,16 @@ class HeldOutAudit:
         self.exposure = exposure
         self.excluded = excluded
         self._lease = lease
+        self._clock = clock
 
     @property
     def view(self) -> ReceiptView:
-        """The receipt with every child appended so far."""
+        """The receipt with every child, after appending in-place re-attempts under the lease.
+
+        A run resumed with ``--retry-incomplete`` that sent a lost request again becomes an
+        in-place re-attempt child here, before anything about it is shown.
+        """
+        record_redispatches(self.project, self.receipt, self.panel, clock=self._clock)
         return receipt_view(self.project, self.receipt)
 
     def reassess(self, clock: Callable[[], datetime]) -> bool:
@@ -230,7 +239,7 @@ def open_held_out_audit(
                     )
                     record_attempts(project, owner, panel, clock=clock)
                     yield HeldOutAudit(
-                        project, owner, panel, exposure, lease, excluded=len(excluded)
+                        project, owner, panel, exposure, lease, excluded=len(excluded), clock=clock
                     )
                     return
             follows = (
@@ -256,7 +265,9 @@ def open_held_out_audit(
                 clock=clock,
             )
             record_attempts(project, receipt, panel, clock=clock)
-            yield HeldOutAudit(project, receipt, panel, exposure, lease, excluded=len(excluded))
+            yield HeldOutAudit(
+                project, receipt, panel, exposure, lease, excluded=len(excluded), clock=clock
+            )
             return
     raise ValueError(
         "other audits kept reserving the selected held-out content; run the command again"

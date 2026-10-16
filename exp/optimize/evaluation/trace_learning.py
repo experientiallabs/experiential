@@ -51,7 +51,7 @@ from exp.optimize.evaluation.fidelity import (
     saved_fidelity_report,
 )
 from exp.optimize.evaluation.fidelity_memory import DUPLICATE, INCOMPLETE, saved_memory_receipt
-from exp.optimize.evaluation.fidelity_recovery import STATUS, Qualification, qualify
+from exp.optimize.evaluation.fidelity_recovery import QUALIFICATION, Qualification, qualify
 from exp.optimize.evaluation.trace_replay import (
     DEADLINE,
     ReplayCase,
@@ -176,8 +176,9 @@ class LearningCurve(ContractModel):
         count. Claims about the final simulator on unseen traces come from ``--hold-out`` and
         ``--held-out-fidelity``. Recorded actions are replayed over the simulator's own
         history, so errors carry forward. Traces whose learning failed remain scored and are
-        counted separately. Unknown-outcome retries qualify the headline itself, with counts
-        by stage, affected traces, and the score with and without those traces.
+        counted separately. A trace re-attempt (a lost request sent again on resumption)
+        qualifies the headline itself; the total keeps every trace, and the lines below name
+        the re-dispatches by stage and give unaffected-only and affected-only scores.
         """
         exact = sum(p.exact for p in self.points)
         steps = sum(p.steps for p in self.points)
@@ -191,7 +192,7 @@ class LearningCurve(ContractModel):
         if self.incomplete:
             line += f" · {self.incomplete} trace(s) not learned"
         if self.qualification is not None:
-            line += f" · {STATUS}\n" + "\n".join(self.qualification.lines())
+            line += f" · {QUALIFICATION}\n" + "\n".join(self.qualification.lines())
         if self.quarters:
             last = self.quarters[-1]
             count = last.last - last.first + 1

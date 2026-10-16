@@ -227,7 +227,7 @@ def test_held_out_command_reports_receipts_checkpoint_and_exposure(
 def test_a_trace_reattempt_qualifies_the_headline_and_reports_both_subsets(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """After a crash, --retry-incomplete re-attempts the trace under the same receipt."""
+    """After a crash, --retry-incomplete resumes the trace in place under the same receipt."""
     provider = FailingOnce([episode(i) for i in range(USERS)])
     root, store, _ = build_project(
         tmp_path, monkeypatch, provider, "--learn", "--hold-out", "--memory-recall", "jev"
@@ -251,9 +251,16 @@ def test_a_trace_reattempt_qualifies_the_headline_and_reports_both_subsets(
     assert "Unaffected traces only 3/3 replies exact (100%)" in output
     assert "Re-attempted traces only 3/3 replies exact (100%)" in output
     assert output.count("· 1/1 traces") == 2, "each subset states its own denominator"
-    assert f"re-attempt of {child.trace_id}: {child.retired_run} -> {child.replacement_run}" in (
-        held_out_command(root, 2)
-    )
+    assert (
+        "re-dispatched after an unknown outcome prediction 1 · judge 0 · investigation 0 · "
+        "1 of 2 traces affected"
+    ) in output
+    assert child.in_place and child.retired_run == child.replacement_run
+    assert (
+        f"re-attempt of {child.trace_id}: {child.retired_run} resumed in place "
+        f"({child.claimed_slots} claimed slots); step 1 re-dispatched after an unknown outcome "
+        "(prediction, 2 attempts)"
+    ) in held_out_command(root, 2)
 
 
 def vertex(trace: Trace) -> str:

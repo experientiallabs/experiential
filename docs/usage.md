@@ -557,10 +557,12 @@ its receipt when the cases, panel identity and code revision all match.
 
 A run that claimed even one slot makes the reservation permanent, since its output may have
 reached logs or screens; after a crash the receipt reports "dispatched, outcome unknown", and
-only that receipt can complete it with `--retry-incomplete`. The replacement is a `re-attempt`
-child, and the headline becomes "independent, qualified: trace re-attempts": the primary score
-keeps every trace, and the report adds the score over unaffected traces and over re-attempted
-traces, each with its own denominator. A registration retired before any dispatch (for example
+only that receipt can complete it with `--retry-incomplete`, which resumes the same run in
+place (below). A run that sent a lost request again becomes an in-place `re-attempt` child that
+names each re-dispatched step by stage, and the headline becomes "independent, qualified: trace
+re-attempts": the primary score keeps every trace, the report counts the re-dispatches by stage
+(prediction, judge, investigation) and the affected traces, and it adds the score over
+unaffected traces only and over re-attempted traces only, each with its own denominator. A registration retired before any dispatch (for example
 after a catalog change) is a `re-registration` child and does not qualify the headline. When the
 frozen configuration changes, an unused reservation is released by its owner under the lease
 (after recounting every claimed slot) and a new receipt is minted; after any dispatch the old
@@ -595,12 +597,14 @@ investigations, a saved judge response and finished panel traces replay without 
 if only the judge is missing, only the judge runs. A request that left the process without a
 saved response has an unknown outcome: it may have been answered, billed and seen (in a gateway
 log or a terminal). It is sent again and reported as `step k re-dispatched after an unknown
-outcome` (k counts turns from 1) with its attempt count, so the retry is transparent but not provably uninfluenced. A
-step whose interrupted preparation (query embeddings, memory-recall decisions) must be prepared
-again is reported the same way, at stage `retrieval`. Any learning or audit report that includes
-such a retry says so in its headline (`qualified: unknown-outcome retries`), with counts by stage
-(prediction, judge, investigation), the affected traces, and the score with and without them;
-the affected traces are never dropped by default. A learning trace that saves a result but is
+outcome` (k counts turns from 1) with its attempt count, so the retry is transparent but not
+provably uninfluenced. A step whose interrupted preparation (query embeddings, memory-recall
+decisions) must be prepared again is reported the same way, at stage `retrieval`. Such a trace is
+a trace re-attempt: any learning, retest or audit report that includes one says
+`qualified: trace re-attempts` in its headline, keeps every trace in the primary score, counts
+the re-dispatches by stage and the affected traces, and adds the score over unaffected traces
+only and over re-attempted traces only, each with its denominator; nothing is dropped by
+default. A learning trace that saves a result but is
 not learned (for example after a failed investigation) is retried up to three times in the same
 pass; any trace still not learned is reported separately.
 Every trace is predicted whole before any of its replies is disclosed;

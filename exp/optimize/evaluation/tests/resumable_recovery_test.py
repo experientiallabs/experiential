@@ -3,8 +3,9 @@
 Every test kills the process (``KeyboardInterrupt``) at one point of a run, then continues it
 with ``--retry-incomplete`` semantics. The same run identity continues from its first
 uncommitted step; nothing with a saved response is requested again; a request that left the
-process without a saved response is re-dispatched and reported, in the headline, as an
-unknown-outcome retry.
+process without a saved response is re-dispatched, and the trace is a trace re-attempt: the
+headline is qualified with the held-out audit's label, names the re-dispatches by stage, and adds
+unaffected-only and affected-only scores with their denominators.
 """
 
 import threading
@@ -16,7 +17,6 @@ import pytest
 from typer.testing import CliRunner
 
 from exp.cli.app import app
-from exp.cli.evaluation.held_out_fidelity import aggregate_line
 from exp.common.core.artifacts import JsonObject
 from exp.common.models import ToolCall
 from exp.common.project import ProjectStore
@@ -26,6 +26,7 @@ from exp.optimize.evaluation.fidelity import (
     saved_fidelity_report,
     unknown_outcomes,
 )
+from exp.optimize.evaluation.fidelity_recovery import qualify
 from exp.optimize.evaluation.held_out_fidelity import (
     HeldOutPanel,
     register_held_out_fidelity,
@@ -47,7 +48,7 @@ from exp.optimize.evaluation.trace_learning import (
     learning_plan,
     learning_progress,
 )
-from exp.optimize.evaluation.trace_replay import DEADLINE, aggregate
+from exp.optimize.evaluation.trace_replay import DEADLINE, ReplayResult
 from exp.runtime.environments import Observation
 from exp.runtime.models.providers.transport import JsonHttpResponse, RecordedRequest
 from exp.runtime.sessions.store import SessionStore, StepClaim
@@ -122,6 +123,13 @@ def panel(store: ProjectStore, count: int, clock: Callable[[], datetime] = now) 
     return register_held_out_fidelity(
         store, count, profile="source-rag", code_revision=REVISION, clock=clock
     )
+
+
+def qualified(results: tuple[ReplayResult, ...]) -> tuple[str, ...]:
+    """The qualification lines of a report over ``results``; it must be qualified."""
+    qualification = qualify([(row.unknown_outcomes, row.exact, row.steps) for row in results])
+    assert qualification is not None
+    return qualification.lines()
 
 
 def kill_before_operation(monkeypatch: pytest.MonkeyPatch, ordinal: int) -> None:
@@ -245,16 +253,12 @@ def test_a_claimed_prediction_without_a_response_is_retried_and_flagged(
 
     results = saved_held_out_results(store, resumed)
     assert results[1].unknown_outcomes == retries
-    line = aggregate_line(aggregate(results), len(resumed.cases))
-    headline, *rest = line.splitlines()
-    assert "qualified: unknown-outcome retries" in headline
-    detail = "\n".join(rest)
-    assert "prediction 1 · judge 0 · investigation 0" in detail
-    assert "1 of 2 traces affected" in detail
-    clean = results[0]
-    assert f"without them {clean.exact}/{clean.steps}" in detail, "drops the affected trace"
-    total = sum(row.exact for row in results)
-    assert f"with them {total}/{2 * steps}" in detail
+    stages, unaffected, affected = qualified(results)
+    assert "prediction 1 · judge 0 · investigation 0 · 1 of 2 traces affected" in stages
+    clean, lost = results
+    assert f"Unaffected traces only  {clean.exact}/{clean.steps} replies exact" in unaffected
+    assert f"Re-attempted traces only  {lost.exact}/{lost.steps} replies exact" in affected
+    assert unaffected.endswith("· 1/1 traces") and affected.endswith("· 1/1 traces")
     assert "step 2 re-dispatched after an unknown outcome (prediction, 2 attempts)" in "\n".join(
         results[1].recovery_lines()
     )
@@ -277,9 +281,8 @@ def test_only_the_missing_judge_runs_on_resume(
     assert [stage_of(row.url, row.payload) for row in provider.requests[start:]] == ["judge"]
     retries = unknown_outcomes(store, resumed.prepared[0])
     assert [(row.stage, row.step, row.attempts) for row in retries] == [("judge", None, 2)]
-    headline = aggregate_line(aggregate(saved_held_out_results(store, resumed)), 1)
-    assert "qualified: unknown-outcome retries" in headline.splitlines()[0]
-    assert "prediction 0 · judge 1 · investigation 0" in headline
+    stages, *_ = qualified(saved_held_out_results(store, resumed))
+    assert "prediction 0 · judge 1 · investigation 0 · 1 of 1 traces affected" in stages
 
 
 def test_a_panel_resumes_trace_by_trace(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -308,7 +311,7 @@ def test_a_panel_resumes_trace_by_trace(tmp_path: Path, monkeypatch: pytest.Monk
     assert [len(unknown_outcomes(store, p)) for p in resumed.prepared] == [0, 1, 0]
     results = saved_held_out_results(store, resumed)
     assert len(results) == 3
-    assert "1 of 3 traces affected" in aggregate_line(aggregate(results), 3)
+    assert "1 of 3 traces affected" in qualified(results)[0]
 
 
 def test_a_missing_investigation_receipt_is_retried_and_saved_ones_replay(
@@ -354,11 +357,11 @@ def test_a_missing_investigation_receipt_is_retried_and_saved_ones_replay(
     assert scored[0][2].unknown_outcomes == retries
     curve = learning_curve(store)
     assert curve is not None
-    headline = curve.headline()
-    assert "qualified: unknown-outcome retries" in headline.splitlines()[0]
-    assert "prediction 0 · judge 0 · investigation 1" in headline
-    assert "1 of 4 traces affected" in headline
-    assert "without them" in headline
+    headline, stages, unaffected, affected, *_ = curve.headline().splitlines()
+    assert headline.endswith("· 4 traces · qualified: trace re-attempts")
+    assert "prediction 0 · judge 0 · investigation 1 · 1 of 4 traces affected" in stages
+    assert "Unaffected traces only" in unaffected and unaffected.endswith("· 3/3 traces")
+    assert "Re-attempted traces only" in affected and affected.endswith("· 1/1 traces")
 
 
 def test_the_cli_resumes_only_with_retry_incomplete_and_qualifies_its_headline(
@@ -379,12 +382,26 @@ def test_the_cli_resumes_only_with_retry_incomplete_and_qualifies_its_headline(
     assert refused.exit_code != 0 and "--retry-incomplete" in " ".join(refused.output.split())
     assert "cost of this command" not in refused.output, "refused before any spend consent"
     assert len(provider.requests) == sent, "the plain command buys nothing"
-    resumed = CliRunner().invoke(app, [*command, "--retry-incomplete", "--verbose"])
+    resumed = CliRunner().invoke(app, [*command, "--retry-incomplete"])
     assert resumed.exit_code == 0, resumed.output
     output = " ".join(resumed.output.split())
     assert "1 interrupted trace(s) resume in place" in output
-    assert "re-dispatched after an unknown outcome (prediction, 2 attempts)" in output
-    # The status ends the headline itself, right after the trace count.
-    assert "judge 4.0/5 · 3/3 traces · qualified: unknown-outcome retries" in output
-    assert "1 of 3 traces affected" in output and "without them" in output
     assert provider.sent("prediction", sent) == 2, "only the lost step and the one after it"
+    # A11 by stage: the receipt's qualified headline over every trace, the re-dispatches by
+    # stage, then the unaffected-only and affected-only scores with their denominators.
+    assert "Held-out fidelity (independent, qualified: trace re-attempts) 9/9 replies" in output
+    assert "· judge 4.0/5 · 3/3 traces" in output
+    assert (
+        "re-dispatched after an unknown outcome prediction 1 · judge 0 · investigation 0 · "
+        "1 of 3 traces affected"
+    ) in output
+    assert "Unaffected traces only 6/6 replies exact (100%)" in output
+    assert "Re-attempted traces only 3/3 replies exact (100%)" in output
+    assert "· 2/2 traces" in output and "· 1/1 traces" in output
+    assert "independent, qualified: trace re-attempts · this run: evaluation" in output
+    # The receipt's attempt tree holds the in-place re-attempt; the detail names the step.
+    shown = " ".join(CliRunner().invoke(app, [*command, "--verbose"]).output.split())
+    assert "Saved results. No provider calls." in shown
+    assert "resumed in place" in shown
+    assert "re-dispatched after an unknown outcome (prediction, 2 attempts)" in shown
+    assert "Held-out fidelity (independent, qualified: trace re-attempts) 9/9 replies" in shown

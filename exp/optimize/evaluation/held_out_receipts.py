@@ -7,6 +7,9 @@ beside it as immutable children:
 - an attempt record for every replaced registration: a ``re-attempt`` when the retired attempt
   had claimed physical slots (the trace is bought again), a ``re-registration`` when it had
   claimed none (for example after a catalog-identity change);
+- an in-place ``re-attempt`` for every run that ``--retry-incomplete`` resumed and that sent a
+  lost request again: the run keeps its ID, and the record names each step re-dispatched after
+  an unknown outcome, by stage, with its attempt count;
 - a report record for every invocation: whether it prepared, stopped, evaluated, or replayed,
   and whether per-trace detail was shown.
 
@@ -25,17 +28,29 @@ from pydantic import AwareDatetime, Field
 
 from exp.common.core.artifacts import ArtifactEnvelope, ArtifactInput, ContractModel, stable_id
 from exp.common.project import ProjectStore
+from exp.optimize.evaluation.fidelity import unknown_outcomes
+from exp.optimize.evaluation.fidelity_recovery import (
+    QUALIFICATION,
+    UnknownOutcome,
+    stage_counts,
+)
 from exp.optimize.evaluation.held_out_exposure import LineageExposure, held_out_members
-from exp.optimize.evaluation.held_out_fidelity import AuditCheckpoint, HeldOutPanel, Profile
+from exp.optimize.evaluation.held_out_fidelity import (
+    AuditCheckpoint,
+    HeldOutPanel,
+    Profile,
+    run_slots,
+)
 from exp.simulation.mining.exposure_ledger import ExposureLedger, LedgerExposure
 from exp.simulation.mining.fingerprint import SchemeIdentity
+from exp.simulation.world_model.resumption import RecoveryStage
 
 RECEIPT_TYPE = "held-out-audit-receipt"
 ATTEMPT_TYPE = "held-out-audit-attempt"
 REPORT_TYPE = "held-out-audit-report"
 NOTICE_TYPE = "held-out-audit-notice"
 DETAIL_REPORT = "exp eval --held-out-fidelity --verbose (per-trace detail)"
-QUALIFIED = "independent, qualified: trace re-attempts"
+QUALIFIED = "independent, " + QUALIFICATION
 Basis = Literal["independent", "development-re-audit"]
 ReportKind = Literal["prepared", "stopped", "evaluation", "replay"]
 
@@ -143,12 +158,14 @@ class AuditAttempt(ContractModel):
         task_id: Case whose run was replaced.
         trace_id: Its trace.
         original_run: The case's first-generation run ID.
-        retired_run: Attempt retired.
-        replacement_run: Attempt registered in its place.
-        reason: ``re-attempt`` when the retired attempt had claimed slots, otherwise
-            ``re-registration``.
-        claimed_slots: Physical slots the retired attempt had claimed.
-        at: When the replacement was registered.
+        retired_run: Attempt retired; for an in-place re-attempt, the resumed run itself.
+        replacement_run: Attempt registered in its place; the same run when resumed in place.
+        reason: ``re-attempt`` when the retired attempt had claimed slots, or when a resumed
+            run sent a lost request again; otherwise ``re-registration``.
+        claimed_slots: Physical slots the retired (or resumed) attempt had claimed.
+        at: When the replacement was registered, or the re-dispatch recorded.
+        redispatched: For an in-place re-attempt, every step re-dispatched after an unknown
+            outcome, by stage, with its attempt count; empty for a replaced registration.
     """
 
     receipt: str
@@ -160,6 +177,12 @@ class AuditAttempt(ContractModel):
     reason: Literal["re-attempt", "re-registration"]
     claimed_slots: int = Field(ge=0)
     at: AwareDatetime
+    redispatched: tuple[UnknownOutcome, ...] = Field(default=(), exclude_if=lambda rows: not rows)
+
+    @property
+    def in_place(self) -> bool:
+        """Whether the run was resumed in place rather than replaced."""
+        return self.retired_run == self.replacement_run
 
 
 class AuditReport(ContractModel):
@@ -224,6 +247,19 @@ class ReceiptView(ContractModel):
     def affected_traces(self) -> frozenset[str]:
         """Traces with at least one re-attempt."""
         return frozenset(item.trace_id for item in self.reattempts)
+
+    @property
+    def redispatched(self) -> dict[RecoveryStage, int]:
+        """Steps re-dispatched after an unknown outcome, by stage, over the current runs.
+
+        A run resumed more than once has one in-place child per resumption that grew its
+        retries; only its latest child counts.
+        """
+        latest: dict[str, AuditAttempt] = {}
+        for attempt in self.reattempts:
+            if attempt.redispatched:
+                latest[attempt.replacement_run] = attempt
+        return stage_counts(row for attempt in latest.values() for row in attempt.redispatched)
 
     @property
     def headline(self) -> str:
@@ -363,6 +399,58 @@ def record_notice(project: ProjectStore, receipt: AuditReceipt, notice: AuditNot
         return False
     _write(project, NOTICE_TYPE, identity, "record.json", notice, receipt)
     return True
+
+
+def record_redispatches(
+    project: ProjectStore,
+    receipt: AuditReceipt,
+    panel: HeldOutPanel,
+    *,
+    clock: Callable[[], datetime],
+) -> tuple[AuditAttempt, ...]:
+    """Append an in-place re-attempt for every run that re-dispatched a lost request.
+
+    The caller holds the panel lease. Each run's retries are read from its durable recovery
+    log, so a retry recorded by an invocation that stopped before reporting is still appended.
+    A run whose retries grew since its last child gets a new child; nothing is rewritten.
+
+    Args:
+        project: Project audited.
+        receipt: Owning receipt.
+        panel: The panel as registered.
+        clock: Aware clock.
+
+    Returns:
+        The appended attempts.
+    """
+    attempts = []
+    for index, prepared in enumerate(panel.prepared):
+        rows = unknown_outcomes(project, prepared)
+        if not rows:
+            continue
+        run = prepared.spec.run_id
+        identity = stable_id(
+            ATTEMPT_TYPE,
+            {"resumed_run": run, "redispatched": [row.model_dump(mode="json") for row in rows]},
+        )
+        if project.artifacts.exists(identity):
+            continue
+        case = receipt.cases[index]
+        attempt = AuditAttempt(
+            receipt=receipt.receipt_id,
+            task_id=case.task_id,
+            trace_id=case.trace_id,
+            original_run=case.base_run,
+            retired_run=run,
+            replacement_run=run,
+            reason="re-attempt",
+            claimed_slots=run_slots(project, run),
+            at=clock(),
+            redispatched=rows,
+        )
+        _write(project, ATTEMPT_TYPE, identity, "record.json", attempt, receipt)
+        attempts.append(attempt)
+    return tuple(attempts)
 
 
 def record_report(

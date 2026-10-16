@@ -24,7 +24,7 @@ from exp.optimize.evaluation.fidelity import (
     execute_fidelity_evaluation,
     saved_fidelity_report,
 )
-from exp.optimize.evaluation.fidelity_recovery import STATUS
+from exp.optimize.evaluation.fidelity_recovery import stage_line
 from exp.optimize.evaluation.held_out_audit import (
     HeldOutAudit,
     open_held_out_audit,
@@ -217,6 +217,10 @@ def _run_audit(
         render_traces(console, store, panel.prepared, results, "Held-out trace")
     console.print()
     console.print(Text(aggregate_line(aggregate(results), len(panel.cases), title(audit, view))))
+    if any(view.redispatched.values()):
+        console.print(
+            Text(stage_line(view.redispatched, len(view.affected_traces), len(panel.cases)))
+        )
     for line in sensitivity_lines(view, results):
         console.print(Text(line))
     curve = learning_curve(store, "fit")
@@ -251,9 +255,13 @@ def sensitivity_lines(view: ReceiptView, results: tuple[ReplayResult, ...]) -> t
 
 
 def attempt_lines(view: ReceiptView) -> tuple[str, ...]:
-    """Every replaced registration of the receipt, with its reason and claimed slots."""
+    """Every replaced or resumed registration of the receipt, its reason and claimed slots."""
     return tuple(
-        f"{attempt.reason} of {attempt.trace_id}: {attempt.retired_run} -> "
+        f"{attempt.reason} of {attempt.trace_id}: {attempt.retired_run} resumed in place "
+        f"({attempt.claimed_slots} claimed slots); "
+        + "; ".join(row.line() for row in attempt.redispatched)
+        if attempt.in_place
+        else f"{attempt.reason} of {attempt.trace_id}: {attempt.retired_run} -> "
         f"{attempt.replacement_run} ({attempt.claimed_slots} claimed slots)"
         for attempt in view.attempts
     )
@@ -473,8 +481,6 @@ def aggregate_line(total: ReplayAggregate, planned: int, title: str = "Held-out 
     )
     judge = "judge -" if total.judge_mean is None else f"judge {total.judge_mean:.1f}/5"
     line = f"{title}  {exact} · {fields} · {judge} · {total.traces}/{planned} traces"
-    if total.qualification is not None:
-        line += f" · {STATUS}\n" + "\n".join(total.qualification.lines())
     if total.judge_turns:
         line += (
             f"\n  judge agrees with exact replies on {total.judge_agreements}/{total.judge_turns} "

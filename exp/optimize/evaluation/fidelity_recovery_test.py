@@ -38,15 +38,17 @@ def test_a_repeated_record_counts_once_and_rows_number_steps(tmp_path: Path) -> 
     assert recorded_outcomes(store, "another-run", actions) == ()
 
 
-def test_qualification_counts_stages_and_shows_sensitivity() -> None:
-    """Counts by stage, affected traces, and the score with and without them."""
+def test_qualification_counts_stages_and_shows_both_sensitivity_figures() -> None:
+    """Counts by stage, affected traces, and each subset's score with its denominator."""
     retry = UnknownOutcome(stage="prediction", step=1, attempts=2)
     lost = UnknownOutcome(stage="retrieval", step=0, attempts=2)
     assert qualify([((), 3, 3), ((), 1, 3)]) is None
-    qualification = qualify([((retry, lost), 1, 3), ((), 3, 3)])
+    qualification = qualify([((retry, lost), 1, 3), ((), 3, 3), ((), 2, 3)])
     assert qualification is not None
-    stages, sensitivity = qualification.lines()
-    assert "prediction 1 · judge 0 · investigation 0 · retrieval 1" in stages
-    assert "1 of 2 traces affected" in stages
-    assert "with them 4/6 replies exact (67%)" in sensitivity
-    assert "without them 3/3 (100%)" in sensitivity
+    stages, unaffected, affected = qualification.lines()
+    assert stages == (
+        "  re-dispatched after an unknown outcome  prediction 1 · judge 0 · investigation 0 · "
+        "retrieval 1 · 1 of 3 traces affected (a lost response may have been seen)"
+    )
+    assert unaffected == "  Unaffected traces only  5/6 replies exact (83%) · 2/2 traces"
+    assert affected == "  Re-attempted traces only  1/3 replies exact (33%) · 1/1 traces"

@@ -20,6 +20,7 @@ from exp.cli.shared.theme import EXP_THEME
 from exp.common.project import ProjectStore
 from exp.common.release_revision import installed_release_revision
 from exp.optimize.evaluation.fidelity import execute_fidelity_evaluation, saved_fidelity_report
+from exp.optimize.evaluation.fidelity_recovery import QUALIFICATION, qualify
 from exp.optimize.evaluation.miss_retest import (
     TurnChanges,
     register_miss_retest,
@@ -112,7 +113,11 @@ def run_miss_retest(
         if verbose:
             render_traces(console, store, panel.prepared, results, "Retested trace")
         console.print()
-        console.print(Text(aggregate_line(aggregate(results), len(panel.cases), "Miss retest")))
+        qualification = qualify([(row.unknown_outcomes, row.exact, row.steps) for row in results])
+        label = "Miss retest" if qualification is None else f"Miss retest ({QUALIFICATION})"
+        console.print(Text(aggregate_line(aggregate(results), len(panel.cases), label)))
+        for line in qualification.lines() if qualification is not None else ():
+            console.print(Text(line))
         console.print(Text(changes_line(turn_changes(panel, results))))
         curve = learning_curve(store)
         if curve is not None:
