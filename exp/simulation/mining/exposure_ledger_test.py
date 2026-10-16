@@ -1,5 +1,6 @@
 """The root exposure ledger: content nodes, grouping edges, exposures, and component queries."""
 
+import threading
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -13,6 +14,9 @@ from exp.simulation.mining.exposure_ledger import (
     LedgerEdge,
     LedgerExposure,
     LedgerNode,
+    LedgerRelease,
+    LedgerReservation,
+    PanelInUseError,
 )
 
 A, B, C, D = ("a" * 64, "b" * 64, "c" * 64, "d" * 64)
@@ -100,7 +104,7 @@ def test_exposure_flows_transitively_and_backward_through_recorded_grouping(
         ("near-duplicate", "task-set-2"),
         ("declared-task-identity", "task-set-1"),
     ]
-    assert found.exposures == (exposure.record_id,)
+    assert found.by == (exposure.record_id,)
     # The same content seen anywhere is itself exposed, with no path.
     direct = snapshot.exposure((A,))
     assert direct is not None and direct.path == () and direct.component_size == 3
@@ -146,3 +150,96 @@ def test_only_the_two_grouping_reasons_exist() -> None:
         LedgerEdge.model_validate(
             {**declared(A, B, "one", "b").model_dump(), "left": B, "right": A}
         )
+
+
+def reservation(receipt: str, *fingerprints: str, snapshot: str = "ledger-x") -> LedgerReservation:
+    """A reservation of ``fingerprints`` by one receipt."""
+    return LedgerReservation(
+        receipt=receipt,
+        panel=f"panel-{receipt}",
+        project="one",
+        lineages=("lineage-a",),
+        fingerprints=tuple(sorted(fingerprints)),
+        snapshot=snapshot,
+        at=AT,
+    )
+
+
+def claim(ledger: ExposureLedger, receipt: str, *fingerprints: str) -> bool:
+    """Reserve ``fingerprints`` for ``receipt`` unless another receipt holds their component."""
+    with ledger.transaction() as transaction:
+        snapshot = transaction.snapshot()
+        if snapshot.taken(fingerprints, receipt) is not None:
+            return False
+        transaction.reserve(reservation(receipt, *fingerprints, snapshot=snapshot.identity))
+        return True
+
+
+def test_reservations_take_components_until_their_owner_releases(tmp_path: Path) -> None:
+    """A reserved component is taken for every other receipt, never for its owner."""
+    ledger = ExposureLedger(tmp_path)
+    ledger.record_grouping(
+        LedgerBuild(project="one", build="task-set-1", scheme=FINGERPRINT_SCHEME),
+        nodes=(node(A, "one", "task-set-1"), node(B, "one", "task-set-1")),
+        edges=(declared(A, B, "one", "task-set-1"),),
+    )
+    assert claim(ledger, "receipt-1", A)
+    snapshot = ledger.snapshot()
+    assert snapshot.active("receipt-1") and snapshot.taken((A,), "receipt-1") is None
+    taken = snapshot.taken((B,), "receipt-2")
+    assert taken is not None and taken.by == ("receipt-1",) and len(taken.path) == 1
+    assert snapshot.exposure((B,)) is None, "a reservation is not an exposure"
+    assert not claim(ledger, "receipt-2", B)
+
+    with ledger.transaction() as transaction:
+        transaction.release(LedgerRelease(receipt="receipt-1", at=AT))
+    released = ledger.snapshot()
+    assert not released.active("receipt-1") and released.taken((B,), "receipt-2") is None
+    assert claim(ledger, "receipt-2", B)
+    with pytest.raises(Exception, match="UNIQUE"):
+        with ledger.transaction() as transaction:
+            transaction.release(LedgerRelease(receipt="receipt-1", at=AT))
+    with pytest.raises(Exception, match="append-only"):
+        with ledger.transaction() as transaction:
+            transaction._connection.execute("DELETE FROM reservations")  # noqa: SLF001
+
+
+def test_concurrent_claims_on_one_component_admit_exactly_one(tmp_path: Path) -> None:
+    """Racing reservations serialize on the ledger's write lock: one wins, the rest refuse."""
+    ledger = ExposureLedger(tmp_path)
+    ledger.record_grouping(
+        LedgerBuild(project="one", build="task-set-1", scheme=FINGERPRINT_SCHEME),
+        nodes=tuple(node(item, "one", "task-set-1") for item in (A, B, C)),
+        edges=(declared(A, B, "one", "task-set-1"), near(B, C, "one", "task-set-1")),
+    )
+    start = threading.Barrier(6)
+    outcomes: dict[str, bool] = {}
+
+    def contend(receipt: str, fingerprint: str) -> None:
+        """Wait for every contender, then try to reserve."""
+        start.wait()
+        outcomes[receipt] = claim(ledger, receipt, fingerprint)
+
+    threads = [
+        threading.Thread(target=contend, args=(f"receipt-{index}", (A, B, C)[index % 3]))
+        for index in range(6)
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert sum(outcomes.values()) == 1
+    assert len(ledger.snapshot().reservations) == 1
+
+
+def test_panel_lease_is_exclusive_and_dies_with_its_holder(tmp_path: Path) -> None:
+    """A second holder fails at once with "panel in use"; release frees the lease."""
+    ledger = ExposureLedger(tmp_path)
+    with ledger.lease("panel-1"):
+        with pytest.raises(PanelInUseError, match="in use"):
+            with ExposureLedger(tmp_path).lease("panel-1"):
+                pass
+        with ledger.lease("panel-2"):
+            pass
+    with ledger.lease("panel-1"):
+        pass

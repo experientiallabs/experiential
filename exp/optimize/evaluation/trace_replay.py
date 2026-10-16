@@ -489,6 +489,10 @@ def register_replay(
         saved = PreparedFidelity.model_validate_json(
             project.artifacts.read_bytes(plan_id, "plan.json")
         )
+        successor = content_run_id(spec, label, trace, generation + 1)
+        if project.artifacts.exists(stable_id("fidelity", {"run_id": successor})):
+            generation += 1  # replaced by an earlier registration; follow the chain
+            continue
         if not _retired(project, saved, now, generation, retry_incomplete):
             return saved, tuple(retired)
         retired.append(saved.spec.run_id)

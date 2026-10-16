@@ -24,11 +24,17 @@ class AdmittedJsonTransport(JsonHttpTransport):
         code_revision: str,
         deadline: datetime,
         clock: Callable[[], datetime] | None = None,
+        before_claim: Callable[[], None] | None = None,
     ) -> None:
-        """Bind physical capacity, immutable receipts and an aware global deadline."""
+        """Bind physical capacity, immutable receipts and an aware global deadline.
+
+        ``before_claim`` runs before every slot claim and refuses by raising, so a caller can
+        recheck that it is still allowed to dispatch; nothing is claimed or sent after a refusal.
+        """
         if deadline.tzinfo is None:
             raise ValueError("transport deadline must be timezone-aware")
         self._inner, self._ledger, self._deadline = inner, ledger, deadline
+        self._before_claim = before_claim
         self._artifacts, self._revision = artifacts, code_revision
         self._clock = clock or _utc_now
 
@@ -64,6 +70,8 @@ class AdmittedJsonTransport(JsonHttpTransport):
         remaining = (self._deadline - now).total_seconds()
         if remaining <= 0:
             raise TimeoutError("transport deadline reached before physical dispatch")
+        if self._before_claim is not None:
+            self._before_claim()
         sequence, attempt = self._ledger.claim(now.isoformat())
         base = "provider-attempt-" + attempt
         intent = self._record(

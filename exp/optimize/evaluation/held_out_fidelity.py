@@ -15,10 +15,9 @@ Held-out traces are selected deterministically and replayed through the shared t
 path and the existing fidelity owner; see :mod:`exp.optimize.evaluation.trace_replay` for the
 trace-context convention and content-addressed run identities.
 
-Held-out independence is decided against the root exposure ledger
-(:mod:`exp.optimize.evaluation.held_out_exposure`): selection skips exposed lineages unless asked
-to include them, a panel that includes them is a development re-audit, and when every held-out
-lineage is exposed an independent audit needs fresh traces with new content. Receipts and their
+This module plans and registers panels. Audits go through
+:mod:`exp.optimize.evaluation.held_out_audit`, which decides independence against the root
+exposure ledger and reserves a panel's content before registering any run; receipts and their
 status live in :mod:`exp.optimize.evaluation.held_out_receipts`.
 """
 
@@ -33,11 +32,11 @@ from exp.common.project import ProjectBuildArtifacts, ProjectStore
 from exp.common.tasks import TaskCase
 from exp.common.tasks.store import load_task_set
 from exp.common.traces.store import load_trace_dataset
-from exp.optimize.evaluation.fidelity import FidelityMemory, PreparedFidelity
-from exp.optimize.evaluation.held_out_exposure import HeldOutExposure, held_out_exposure
+from exp.optimize.evaluation.fidelity import FidelityMemory, FidelitySpec, PreparedFidelity
 from exp.optimize.evaluation.trace_learning import (
     Scope,
     fit_calls,
+    learned_runs,
     learning_plan,
     recorded_plan,
 )
@@ -45,6 +44,8 @@ from exp.optimize.evaluation.trace_replay import (
     DEADLINE,
     ReplayCase,
     ReplayResult,
+    attempts_used,
+    content_run_id,
     register_replay,
     replay_case,
     replay_spec,
@@ -64,61 +65,96 @@ class AuditCheckpoint(ContractModel):
     """The frozen memory checkpoint a held-out audit reads.
 
     Attributes:
-        lineage: Memory lineage learned by ``exp build --learn --hold-out``.
+        lineage: Fit-only memory lineage the audit learned.
         version: Memory version read, frozen for every run of the panel.
         scope: Traces that memory learned; ``fit`` reserves every held-out lineage. An
             all-traces build learns into a different lineage, which this checkpoint is not.
+        fit_traces_learned: Fit traces consumed into memory when the audit was planned.
     """
 
     lineage: str
     version: int = Field(ge=1)
     scope: Scope
+    fit_traces_learned: int = Field(ge=0)
 
 
-class HeldOutPanel(ContractModel):
-    """Registered held-out fidelity runs, ready for execution or exact replay.
+class PlannedPanel(ContractModel):
+    """Selected held-out cases and their derived specs, before anything is registered.
 
     Attributes:
         profile: Simulator profile measured.
         world_model: Simulator every run is bound to.
         checkpoint: Frozen memory checkpoint read, for the memory profile.
         cases: Selected held-out traces in selection order.
-        prepared: One saved fidelity registration per case, in the same order.
-        retired: Earlier attempts that could not complete and were replaced.
-        exposure: Exposed held-out lineages of the build, and the ledger snapshot that decided.
-        inspected: Exposed lineages in this panel, in panel order; any makes the panel a
-            development re-audit.
-        excluded: Exposed held-out lineages left out of selection.
+        specs: One derived fidelity spec per case, in the same order.
     """
 
     profile: Profile
     world_model: ArtifactInput
     checkpoint: AuditCheckpoint | None = None
-    cases: tuple[ReplayCase, ...]
-    prepared: tuple[PreparedFidelity, ...]
-    retired: tuple[str, ...] = ()
-    exposure: HeldOutExposure
-    inspected: tuple[str, ...] = ()
-    excluded: int = Field(default=0, ge=0)
+    cases: tuple[ReplayCase, ...] = Field(min_length=1)
+    specs: tuple[FidelitySpec, ...] = Field(min_length=1)
 
     @property
-    def independent(self) -> bool:
-        """Whether no audited lineage is exposed, so the panel is unexposed."""
-        return not self.inspected
+    def base_runs(self) -> tuple[str, ...]:
+        """First-generation content-addressed run ID of every case, in panel order."""
+        return tuple(
+            content_run_id(spec, LABEL, case.trace_id)
+            for case, spec in zip(self.cases, self.specs, strict=True)
+        )
 
     @property
     def identity(self) -> str:
         """Panel identity: the sorted selected case IDs with each one's content-addressed run.
 
         Run IDs already cover the simulator, memory checkpoint and recall policy, every prompt
-        sent, and the judge configuration. The code revision is deliberately not part of them
-        and is recorded beside this identity on each receipt.
+        sent, and the judge configuration. Replacement attempts share their first-generation
+        run ID, so they keep the panel identity. The code revision is deliberately not part of
+        run IDs and is compared beside this identity.
         """
         pairs = sorted(
-            [case.task.task_id, prepared.spec.run_id]
-            for case, prepared in zip(self.cases, self.prepared, strict=True)
+            [case.task.task_id, run] for case, run in zip(self.cases, self.base_runs, strict=True)
         )
         return stable_id("held-out-panel", pairs)
+
+    @property
+    def lineages(self) -> tuple[str, ...]:
+        """Audited task lineages, in panel order."""
+        return tuple(case.task.lineage_group_id for case in self.cases)
+
+
+class Retirement(ContractModel):
+    """One earlier attempt registration retired and replaced.
+
+    Attributes:
+        case: Index of the case in the panel.
+        retired: Retired run ID.
+        replacement: Run ID that replaced it.
+        claimed_slots: Physical slots the retired attempt had claimed; zero is a
+            re-registration, anything else a re-attempt that re-buys the trace.
+    """
+
+    case: int = Field(ge=0)
+    retired: str
+    replacement: str
+    claimed_slots: int = Field(ge=0)
+
+
+class HeldOutPanel(PlannedPanel):
+    """Registered held-out fidelity runs, ready for execution or exact replay.
+
+    Attributes:
+        prepared: One saved fidelity registration per case, in the same order.
+        retirements: Earlier attempts that could not complete and were replaced.
+    """
+
+    prepared: tuple[PreparedFidelity, ...] = Field(min_length=1)
+    retirements: tuple[Retirement, ...] = ()
+
+    @property
+    def retired(self) -> tuple[str, ...]:
+        """Retired run IDs."""
+        return tuple(item.retired for item in self.retirements)
 
 
 def held_out_cases(
@@ -165,11 +201,12 @@ def held_out_cases(
             cases.append(case)
     if not cases and exhausted:
         raise ValueError(
-            "every held-out lineage of this build is exposed in the exposure ledger (its "
-            "per-trace results, or content grouped with them, were shown by an earlier audit), "
-            "so none counts as independent any more. An independent audit needs fresh traces: "
+            "every held-out lineage of this build is exposed or reserved in the exposure ledger "
+            "(its per-trace results, or content grouped with them, were shown by an earlier "
+            "audit, or another audit holds it), so none can be audited independently. An "
+            "independent audit needs fresh traces: "
             "import a trace package with new lineages, whose content no audit has exposed, and "
-            "run exp build PROJECT --traces FILE --learn --hold-out --memory-recall ALIAS. To "
+            "run exp build PROJECT --traces FILE, then exp eval PROJECT --audit N. To "
             "re-run exposed cases as development data, add --include-inspected"
         )
     if not cases:
@@ -216,40 +253,30 @@ def held_out_council_inputs(
     return world_model, tuple(case.task for case in cases)
 
 
-def register_held_out_fidelity(
+def plan_held_out_panel(
     project: ProjectStore,
     count: int,
     *,
     profile: Profile,
-    code_revision: str,
     clock: Callable[[], datetime],
-    retry_incomplete: bool = False,
-    include_inspected: bool = False,
-) -> HeldOutPanel:
-    """Register up to ``count`` held-out fidelity runs without provider calls or credentials.
+    excluded: Collection[str] = frozenset(),
+) -> PlannedPanel:
+    """Select up to ``count`` held-out cases and derive their specs, registering nothing.
 
     Args:
         project: Project with a completed build (and, for ``memory``, a learning pass).
         count: Maximum number of held-out traces.
         profile: ``memory`` reads the final learned checkpoint with held-out lineages
             reserved; ``source-rag`` retrieves from the fit-only index.
-        code_revision: Exact producing implementation identity.
-        clock: Aware clock for deadlines and attempt retirement.
-        retry_incomplete: Replace interrupted runs that already bought calls, buying them again.
-        include_inspected: Also select exposed lineages; the panel is then a development
-            re-audit, never independent.
+        clock: Aware clock for deadlines.
+        excluded: Lineages never selected.
 
     Returns:
-        The panel; unchanged completed runs are their saved registrations.
+        The planned panel.
 
     Raises:
-        ValueError: No learned memory for the memory profile, the build never recorded its
-            grouping in the exposure ledger, no unexposed held-out lineage remains, or
-            validation fails.
+        ValueError: No learned memory for the memory profile, or no selectable lineage.
     """
-    now = clock()
-    exposure = held_out_exposure(project)
-    excluded = frozenset() if include_inspected else exposure.lineages
     memory: FidelityMemory | None = None
     checkpoint: AuditCheckpoint | None = None
     if profile == "memory":
@@ -268,7 +295,12 @@ def register_held_out_fidelity(
                 "PROJECT --audit N to learn it"
             )
         world_model = plan.world_model
-        checkpoint = AuditCheckpoint(lineage=plan.lineage, version=head.version, scope=plan.scope)
+        checkpoint = AuditCheckpoint(
+            lineage=plan.lineage,
+            version=head.version,
+            scope=plan.scope,
+            fit_traces_learned=len(learned_runs(project, plan)),
+        )
         cases = held_out_cases(project, count, fit_calls(project), excluded=excluded)
         memory = FidelityMemory(
             lineage=plan.lineage, mode="frozen", checkpoint=head.version, reserved=True
@@ -277,19 +309,49 @@ def register_held_out_fidelity(
     else:
         world_model, cases = source_rag_inputs(project, count, excluded=excluded)
         retrieval = None
-    prepared: list[PreparedFidelity] = []
-    retired: list[str] = []
-    for case in cases:
-        spec = replay_spec(
+    deadline = clock() + DEADLINE
+    specs = tuple(
+        replay_spec(
             project,
             world_model,
             case,
-            deadline=now + DEADLINE,
+            deadline=deadline,
             label=LABEL,
             memory=memory,
             retrieval=retrieval,
             judge_effort=PANEL_JUDGE_EFFORT,
         )
+        for case in cases
+    )
+    return PlannedPanel(
+        profile=profile, world_model=world_model, checkpoint=checkpoint, cases=cases, specs=specs
+    )
+
+
+def register_planned_panel(
+    project: ProjectStore,
+    planned: PlannedPanel,
+    *,
+    code_revision: str,
+    clock: Callable[[], datetime],
+    retry_incomplete: bool = False,
+) -> HeldOutPanel:
+    """Register a planned panel's runs without provider calls or credentials.
+
+    Args:
+        project: Project owning the registrations.
+        planned: Planned panel.
+        code_revision: Exact producing implementation identity.
+        clock: Aware clock for attempt retirement.
+        retry_incomplete: Replace interrupted runs that already bought calls, buying them again.
+
+    Returns:
+        The panel; unchanged completed runs are their saved registrations.
+    """
+    now = clock()
+    prepared: list[PreparedFidelity] = []
+    retirements: list[Retirement] = []
+    for index, (case, spec) in enumerate(zip(planned.cases, planned.specs, strict=True)):
         registration, replaced = register_replay(
             project,
             spec,
@@ -300,22 +362,95 @@ def register_held_out_fidelity(
             retry_incomplete=retry_incomplete,
         )
         prepared.append(registration)
-        retired.extend(replaced)
+        successors = [*replaced[1:], registration.spec.run_id] if replaced else []
+        retirements.extend(
+            Retirement(
+                case=index,
+                retired=retired,
+                replacement=successor,
+                claimed_slots=run_slots(project, retired),
+            )
+            for retired, successor in zip(replaced, successors, strict=True)
+        )
     return HeldOutPanel(
-        profile=profile,
-        world_model=world_model,
-        checkpoint=checkpoint,
-        cases=cases,
-        prepared=tuple(prepared),
-        retired=tuple(retired),
-        exposure=exposure,
-        inspected=tuple(
-            case.task.lineage_group_id
-            for case in cases
-            if case.task.lineage_group_id in exposure.lineages
-        ),
-        excluded=len(excluded),
+        **planned.model_dump(), prepared=tuple(prepared), retirements=tuple(retirements)
     )
+
+
+def register_held_out_fidelity(
+    project: ProjectStore,
+    count: int,
+    *,
+    profile: Profile,
+    code_revision: str,
+    clock: Callable[[], datetime],
+    retry_incomplete: bool = False,
+    excluded: Collection[str] = frozenset(),
+) -> HeldOutPanel:
+    """Plan and register a panel directly, outside any audit receipt or reservation.
+
+    Audits go through :func:`exp.optimize.evaluation.held_out_audit.open_held_out_audit`,
+    which reserves the panel's content before registering; this is the bare primitive.
+
+    Args:
+        project: Project with a completed build (and, for ``memory``, a learning pass).
+        count: Maximum number of held-out traces.
+        profile: Simulator profile.
+        code_revision: Exact producing implementation identity.
+        clock: Aware clock for deadlines and attempt retirement.
+        retry_incomplete: Replace interrupted runs that already bought calls, buying them again.
+        excluded: Lineages never selected.
+
+    Returns:
+        The registered panel.
+    """
+    planned = plan_held_out_panel(project, count, profile=profile, clock=clock, excluded=excluded)
+    return register_planned_panel(
+        project,
+        planned,
+        code_revision=code_revision,
+        clock=clock,
+        retry_incomplete=retry_incomplete,
+    )
+
+
+def run_slots(project: ProjectStore, run_id: str) -> int:
+    """Physical slots one registered run has claimed, from its dispatch ledger.
+
+    Args:
+        project: Project holding the run.
+        run_id: Registered run ID.
+
+    Returns:
+        Claimed slots; 0 when the run never dispatched or is not registered.
+    """
+    plan_id = stable_id("fidelity", {"run_id": run_id})
+    if not project.artifacts.exists(plan_id):
+        return 0
+    saved = PreparedFidelity.model_validate_json(project.artifacts.read_bytes(plan_id, "plan.json"))
+    return attempts_used(project, saved)
+
+
+def panel_slots(project: ProjectStore, base_runs: Sequence[str]) -> int:
+    """Physical slots claimed by every generation of every run of a panel.
+
+    Args:
+        project: Project holding the runs.
+        base_runs: First-generation run IDs.
+
+    Returns:
+        Total claimed slots across all attempts.
+    """
+    total = 0
+    for base in base_runs:
+        generation = 1
+        while True:
+            run_id = base if generation == 1 else f"{base}-r{generation}"
+            if not project.artifacts.exists(stable_id("fidelity", {"run_id": run_id})):
+                break
+            total += run_slots(project, run_id)
+            generation += 1
+    return total
 
 
 def saved_held_out_results(project: ProjectStore, panel: HeldOutPanel) -> tuple[ReplayResult, ...]:

@@ -509,8 +509,8 @@ judge, not a score), and the learning curve.
 
 A held-out lineage stays independent only while nobody has read its per-trace results, or the
 results of anything grouped with it. That fact is kept in one exposure ledger at the `.exp` root
-(`<root>/exposure-ledger/`), shared by every project on the machine, so it survives reimports,
-rebuilds and regrouping:
+(`<root>/exposure-ledger/ledger.sqlite`), shared by every project on the machine, so it survives
+reimports, rebuilds and regrouping:
 
 - Nodes are content fingerprints of normalized traces (task text, recorded actions, recorded
   replies) under a versioned scheme (`trace-content-v1`), with the source trace ID and any
@@ -522,37 +522,56 @@ rebuilds and regrouping:
   shared customer, conversation or time bucket) is an edge.
 - Exposures mark content a person saw, with the panel, receipt and report that showed it.
   `--verbose` shows per-trace detail, so it exposes every member trace of the audited lineages.
+- Reservations claim a panel's content for one audit receipt before any of its runs exists.
 
 A held-out lineage is exposed when any member trace shares a connected component with exposed
-content. This is transitive and ignores order: if exposed A was grouped with B and a later build
-groups C only with B, C is exposed even after A disappears from imports, and edges recorded
-before an exposure still carry it. Records are written once and never deleted. The ledger
-directory can be copied to another machine and merged (records are content-addressed files);
-independence is only relative to the ledger a decision used. A build made before the ledger
-existed is refused until `exp build` is rerun on the same import to record its grouping.
+content, and reserved when it shares one with content another receipt holds. This is transitive
+and ignores order: if exposed A was grouped with B and a later build groups C only with B, C is
+exposed even after A disappears from imports, and edges recorded before an exposure still carry
+it. Every table is append-only. Independence is only relative to the ledger a decision used;
+`ExposureLedger.export()` and `merge()` share one between machines. A build made before the
+ledger existed is refused until `exp build` is rerun on the same import to record its grouping.
 
-Every `--audit` run saves an immutable audit receipt (`held-out-audit-receipt`)
-before it shows anything: the panel identity (a hash over the sorted selected case IDs and each
-case's content-addressed run ID, which already covers the simulator, memory checkpoint and recall
-policy, every prompt sent and the judge configuration), the code revision (not part of run IDs),
-the lineages, traces and runs, the memory checkpoint, whether results and per-trace detail were
-shown, the fingerprint scheme, the ledger snapshot identity, and for each exposed lineage its
-component size and the edge path to exposed content, so an over-long chain is visible. Its status
-is exactly one of `independent` (the first fresh evaluation of a panel with no exposed case),
-`replay` (the same panel identity and code revision as an earlier reported receipt, all results
-already saved; it names that original receipt, which keeps its status), or
-`development-re-audit` (anything else: a fresh evaluation touching exposed cases, a repeat under
-another code revision, or saved results never reported before).
+An audit runs in a fixed order: reserve, register, claim a dispatch slot, call. Selection reads
+the ledger, then the panel's exclusive lease (an OS file lock, `panel in use` for any second
+process) is taken and, in one ledger transaction, the graph is read again and the reservation
+committed; content another audit took meanwhile is never reserved. The lease is held through
+execution, every slot claim first checks it, and locks are always taken in one order: panel
+lease, ledger transaction, a run's execution lock, its dispatch ledger. Atomicity holds only for
+runs sharing one ledger file on one host; SQLite and file locks over network filesystems are
+unreliable.
 
-By default an audit selects only unexposed held-out lineages and says how many it skipped and
-why. `--include-inspected` re-runs exposed lineages too; the report then labels the panel
-"Re-audit on inspected cases (development)" and never independent. When every held-out lineage
-is exposed, the command refuses before any provider call: an independent audit needs fresh
-traces, a new import with new content. Dry runs and audits
-stopped before reporting leave a receipt that shows nothing and exposes nothing. Every report
-states the ledger's limits: an unmerged ledger on another machine cannot show its exposure,
-paraphrased or regenerated variants that near-duplicate grouping misses are not caught, and
-knowledge a person carries over by hand is not tracked.
+Every audit has one immutable receipt (`held-out-audit-receipt`): the panel identity (a hash over
+the sorted selected case IDs and each case's first-generation content-addressed run ID, which
+covers the simulator, memory checkpoint and recall policy, every prompt sent and the judge
+configuration), the code revision (not part of run IDs), the cases, the memory checkpoint, the
+fingerprint scheme, the ledger snapshot it reserved against, and for each exposed or reserved
+lineage its component size and edge path, so an over-long chain is visible. Its basis is
+`independent` when no audited lineage was exposed or reserved by another receipt and no run had
+a saved result, otherwise `development-re-audit`. Everything later is appended beside it: a
+report per invocation (prepared, stopped, evaluation, or replay of fully saved results, which
+keeps the receipt's headline) and a child per replaced registration. The same command resumes
+its receipt when the cases, panel identity and code revision all match.
+
+A run that claimed even one slot makes the reservation permanent, since its output may have
+reached logs or screens; after a crash the receipt reports "dispatched, outcome unknown", and
+only that receipt can complete it with `--retry-incomplete`. The replacement is a `re-attempt`
+child, and the headline becomes "independent, qualified: trace re-attempts": the primary score
+keeps every trace, and the report adds the score over unaffected traces and over re-attempted
+traces, each with its own denominator. A registration retired before any dispatch (for example
+after a catalog change) is a `re-registration` child and does not qualify the headline. When the
+frozen configuration changes, an unused reservation is released by its owner under the lease
+(after recounting every claimed slot) and a new receipt is minted; after any dispatch the old
+reservation stays and the new receipt over those cases is a development re-audit.
+
+By default an audit selects only unexposed, unreserved held-out lineages and says how many it
+skipped and why. `--include-inspected` re-runs them too; the report then labels the panel
+"Re-audit on inspected cases (development)" and never independent. When none remain, the
+command refuses before any provider call: an independent audit needs fresh traces, a new import
+with new content. Every report states the ledger's limits: an
+unmerged ledger on another machine cannot show its exposure, paraphrased or regenerated variants
+that near-duplicate grouping misses are not caught, knowledge a person carries over by hand is
+not tracked, and atomicity is same-host only.
 
 The audit stays independent only while nobody tunes the simulator on its cases. Held-out traces
 are selected deterministically, so a second audit replays the same ones. Once anyone inspects a

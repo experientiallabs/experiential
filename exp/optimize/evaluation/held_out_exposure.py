@@ -3,11 +3,14 @@
 A lineage here is the build's own leakage group. Its members are every source trace the build
 bound to it, and each member is identified by its content fingerprint, so exposure recorded in
 another project, another import, or under another grouping still applies. A held-out lineage is
-exposed when any member shares a connected component of the ledger with exposed content; see
+exposed when any member shares a connected component of the ledger with exposed content, and
+reserved when it shares one with content another audit receipt reserved and did not release;
+either way it is not independent for anyone but that receipt. See
 :mod:`exp.simulation.mining.exposure_ledger`.
 """
 
 from collections import defaultdict
+from typing import Literal
 
 from pydantic import Field
 
@@ -17,6 +20,7 @@ from exp.common.traces.store import load_trace_dataset
 from exp.simulation.mining.bindings import load_task_set_lineage_bindings
 from exp.simulation.mining.exposure_ledger import (
     FINGERPRINT_SCHEME,
+    SAME_HOST_LIMIT,
     ExposureLedger,
     ExposurePath,
     LedgerSnapshot,
@@ -27,6 +31,7 @@ LIMITS = (
     "A ledger on another machine that was never merged here cannot show its exposure.",
     "Paraphrased or regenerated variants that near-duplicate grouping misses are not caught.",
     "Knowledge a person carries over by hand is not tracked.",
+    SAME_HOST_LIMIT,
 )
 
 
@@ -35,10 +40,12 @@ class LineageExposure(ContractModel):
 
     Attributes:
         lineage: The build's leakage lineage.
-        path: Nearest exposed content, the component size, and the edges leading there.
+        kind: ``exposed`` (content was shown) or ``reserved`` (another receipt holds it).
+        path: Nearest marked content, the component size, and the edges leading there.
     """
 
     lineage: str
+    kind: Literal["exposed", "reserved"] = "exposed"
     path: ExposurePath
 
 
@@ -48,7 +55,7 @@ class HeldOutExposure(ContractModel):
     Attributes:
         scheme: Fingerprint scheme and version.
         ledger: Snapshot identity of the ledger the decision used.
-        exposed: Exposed held-out lineages, in lineage order.
+        exposed: Exposed or reserved held-out lineages, in lineage order.
     """
 
     scheme: str = FINGERPRINT_SCHEME
@@ -85,13 +92,14 @@ def held_out_members(project: ProjectStore) -> dict[str, tuple[str, ...]]:
 
 
 def held_out_exposure(
-    project: ProjectStore, snapshot: LedgerSnapshot | None = None
+    project: ProjectStore, snapshot: LedgerSnapshot | None = None, owner: str | None = None
 ) -> HeldOutExposure:
-    """Decide which held-out lineages of the build are exposed.
+    """Decide which held-out lineages of the build are exposed or reserved by another receipt.
 
     Args:
         project: Project with a completed build.
         snapshot: Ledger snapshot to decide with; the current root ledger when omitted.
+        owner: Receipt whose own reservation does not count against it.
 
     Returns:
         The decision with the snapshot identity it used.
@@ -111,7 +119,11 @@ def held_out_exposure(
     for lineage, fingerprints in held_out_members(project).items():
         path = snapshot.exposure(fingerprints)
         if path is not None:
-            exposed.append(LineageExposure(lineage=lineage, path=path))
+            exposed.append(LineageExposure(lineage=lineage, kind="exposed", path=path))
+            continue
+        taken = snapshot.taken(fingerprints, owner)
+        if taken is not None:
+            exposed.append(LineageExposure(lineage=lineage, kind="reserved", path=taken))
     return HeldOutExposure(ledger=snapshot.identity, exposed=tuple(exposed))
 
 

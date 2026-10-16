@@ -439,6 +439,7 @@ def execute_fidelity_evaluation(
     progress: ProgressHook | None = None,
     research_selection: EvidencePolicy | None = None,
     clock: Callable[[], datetime] | None = None,
+    dispatch_guard: Callable[[], None] | None = None,
 ) -> DualReport:
     """Run after explicit spend consent, or replay a completed evaluation exactly.
 
@@ -449,6 +450,7 @@ def execute_fidelity_evaluation(
         progress: Existing observational progress hook shared with the CLI.
         research_selection: Injected session-only selector for specs without retrieval.
         clock: Optional aware clock for qualification.
+        dispatch_guard: Runs before every physical slot claim and refuses by raising.
 
     Returns:
         Separate mechanical and mandatory judge results. Incomplete earlier dispatches
@@ -506,6 +508,7 @@ def execute_fidelity_evaluation(
             code_revision=prepared.code_revision,
             deadline=spec.deadline,
             clock=now,
+            before_claim=dispatch_guard,
         )
         catalog = load_model_catalog(project.model_catalog_path)
         if sha256_json(catalog.model_dump(mode="json")) != prepared.catalog_sha256:
