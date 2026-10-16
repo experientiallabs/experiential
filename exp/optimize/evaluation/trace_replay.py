@@ -12,6 +12,11 @@ Trace-context convention: a trace's request context (``exp.request.context``, no
 replies as initial observations, and measurement starts at the next call. Absent, it is 0 and
 every recorded exchange is measured.
 
+Instance facts: a trace package may supply the trace's validated instance facts (its starting
+world) in the request context under ``instance_facts``. A replay conditions on them through
+their own request channel, and they are part of the spec and therefore of the run ID. An
+environment adapter can supply them instead through ``replay_case(..., facts=provider)``.
+
 Run identities are content-addressed: the run ID is derived from the complete spec except its
 deadline, so changed inputs (a rebuilt simulator, another judge, a new tool inventory, a new
 memory checkpoint) register a new run automatically, and an unchanged run replays its saved
@@ -48,7 +53,9 @@ from exp.common.evaluations.reconstruction import (
 from exp.common.models import ModelCapabilities, ReasoningEffort, ToolCall, load_model_catalog
 from exp.common.project import ProjectStore
 from exp.common.tasks import TaskCase
+from exp.common.tasks.facts import InstanceFacts, InstanceFactsProvider
 from exp.common.traces import Trace
+from exp.common.traces.facts import TracePackageFacts
 from exp.optimize.evaluation.fidelity import (
     FidelityMemory,
     FidelityRetrieval,
@@ -62,10 +69,12 @@ from exp.optimize.evaluation.fidelity import (
 )
 from exp.optimize.evaluation.fidelity_memory import INCOMPLETE, saved_memory_receipt
 from exp.optimize.evaluation.fidelity_recovery import UnknownOutcome
+from exp.optimize.evaluation.instance_facts import ReplayFacts
 from exp.runtime.models import RuntimeModelCatalog
 from exp.runtime.models.providers.transport import RetryPolicy
 from exp.runtime.sessions.dispatch_ledger import DispatchLedger
 from exp.simulation.engines.text.prompt import (
+    INSTANCE_FACTS_GUIDANCE,
     MEMORY_CONTEXT_GUIDANCE,
     RECONSTRUCTED_JSON_TOOL_SYSTEM_PROMPT,
     RECONSTRUCTED_TEXT_SYSTEM_PROMPT,
@@ -109,12 +118,15 @@ class ReplayCase(ContractModel):
         trace_id: Recorded trace being replayed.
         prefix: Number of leading exchanges disclosed as public observations.
         steps: Measured exchanges; their replies are evaluator-only references.
+        facts: Validated instance facts of the trace's instance, kept out of the public
+            task; omitted when the trace supplies none.
     """
 
     task: TaskCase
     trace_id: str
     prefix: int = Field(ge=0)
     steps: tuple[RecordedExchange, ...] = Field(min_length=1)
+    facts: InstanceFacts | None = Field(default=None, exclude_if=lambda value: value is None)
 
 
 MAX_LEARNING_ATTEMPTS = 3
@@ -249,7 +261,11 @@ def recorded_exchanges(trace: Trace, lineage_id: str) -> tuple[RecordedExchange,
 
 
 def replay_case(
-    task: TaskCase, trace: Trace, visible_calls: Sequence[tuple[str, JsonValue]]
+    task: TaskCase,
+    trace: Trace,
+    visible_calls: Sequence[tuple[str, JsonValue]],
+    *,
+    facts: InstanceFactsProvider | None = None,
 ) -> ReplayCase | None:
     """Make one trace's public replay case, or None when nothing follows its prefix.
 
@@ -260,12 +276,15 @@ def replay_case(
             The trace's own calls are added too, including later ones: every replayed action
             must be declared, so their names and argument keys (never values or replies) are
             visible from the first turn.
+        facts: Environment adapter supplying the instance's facts; by default, the facts the
+            trace package supplies with the trace.
 
     Returns:
         The case, or None when the public prefix covers every recorded exchange.
 
     Raises:
         ValueError: The trace calls a tool its published tool list does not declare.
+        InstanceFactsError: The supplied facts are malformed or not validated.
     """
     exchanges = recorded_exchanges(trace, task.lineage_group_id)
     start = replay_boundary(trace, len(exchanges))
@@ -291,7 +310,14 @@ def replay_case(
             },
         }
     )
-    return ReplayCase(task=public, trace_id=trace.trace_id, prefix=start, steps=exchanges[start:])
+    provider = TracePackageFacts(trace) if facts is None else facts
+    return ReplayCase(
+        task=public,
+        trace_id=trace.trace_id,
+        prefix=start,
+        steps=exchanges[start:],
+        facts=provider.initial_facts(task),
+    )
 
 
 def replay_spec(
@@ -385,6 +411,9 @@ def replay_spec(
             update={"per_turn": per_turn and judged}
         ),
         judged=judged,
+        facts=None
+        if case.facts is None
+        else ReplayFacts(facts=case.facts, first_version=case.prefix),
         judge_alias=judge_alias,
         deadline=deadline,
         maximum_physical_attempts=RetryPolicy().maximum_attempts * (per_step * len(actions) + tail),
@@ -425,8 +454,10 @@ def protocol_prompts_sha256() -> str:
 def content_run_id(spec: FidelitySpec, label: str, trace: str, generation: int = 1) -> str:
     """Address a fidelity run by its complete inputs except the run ID and deadline.
 
-    The inputs include every system prompt the run can send (``protocol_prompts_sha256``),
-    so editing a prompt addresses a new run instead of replaying a result it never produced.
+    The inputs include every system prompt the run can send (``protocol_prompts_sha256``, plus
+    the instance-facts guidance when the spec carries facts), so editing a prompt addresses a
+    new run instead of replaying a result it never produced. Facts are part of the spec, so
+    changing any fact addresses a new run.
 
     Args:
         spec: Complete spec; its current run ID and deadline are ignored.
@@ -441,6 +472,8 @@ def content_run_id(spec: FidelitySpec, label: str, trace: str, generation: int =
         {
             "spec": spec.model_dump(mode="json", exclude={"run_id", "deadline"}),
             "prompts": protocol_prompts_sha256(),
+            # Only runs that deliver facts send the facts guidance; fact-free IDs are unchanged.
+            **({} if spec.facts is None else {"facts_prompt": INSTANCE_FACTS_GUIDANCE}),
         }
     )[:12]
     slug = re.sub(r"[^a-z0-9]+", "-", trace.casefold()).strip("-")[:40] or "trace"

@@ -42,6 +42,7 @@ from exp.optimize.evaluation.fidelity_recovery import (
     UnknownOutcome,
     recorded_outcomes,
 )
+from exp.optimize.evaluation.instance_facts import ReplayFacts, require_fact_scope
 from exp.optimize.evaluation.knowledge_exposure import require_unexposed_task
 from exp.optimize.evaluation.retrieval_binding import (
     bind_index_embedder,
@@ -205,6 +206,8 @@ class FidelitySpec(ContractModel):
             reason, within the same turn; refused output is never repaired.
         judged: False skips the judge; the report records it as not run. Learning uses it:
             its score is exact replies, so a judge call per trace would buy nothing.
+        facts: Validated instance facts of the replayed instance, delivered to predictions in
+            their own channel by state version; part of the run identity.
     """
 
     run_id: str = Field(pattern=r"^[a-z][a-z0-9-]{0,79}$")
@@ -230,6 +233,7 @@ class FidelitySpec(ContractModel):
     roles: RoleBudgets | None = Field(default=None, exclude_if=lambda value: value is None)
     proposal_reasks: int = Field(default=0, ge=0, le=3, strict=True, exclude_if=lambda v: not v)
     judged: bool = Field(default=True, strict=True, exclude_if=lambda value: value)
+    facts: ReplayFacts | None = Field(default=None, exclude_if=lambda value: value is None)
 
     @model_validator(mode="after")
     def separate_references(self) -> "FidelitySpec":
@@ -807,6 +811,8 @@ def execute_fidelity_evaluation(
             resumption=resumption,
             preparation_dispatches=prepared.embedder_alias is not None
             or spec.retrieval is not None,
+            facts=None if spec.facts is None else spec.facts.facts,
+            facts_version=0 if spec.facts is None else spec.facts.first_version,
         )
 
         def judge_call(body: JsonObject, logical_id: str) -> JsonObject:
@@ -906,6 +912,9 @@ def _require_unexposed(
     """
     require_unindexed_held_out_task(project, artifact, spec.task)
     require_unexposed_task(project, artifact, spec.task)
+    require_fact_scope(
+        project, spec.task, spec.facts, None if spec.memory is None else spec.memory.lineage
+    )
 
 
 def role_model(
