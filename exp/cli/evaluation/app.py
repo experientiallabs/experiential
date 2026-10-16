@@ -27,7 +27,8 @@ FIDELITY_OPTION = typer.Option(
 RETRY_INCOMPLETE_OPTION = typer.Option(
     False,
     "--retry-incomplete",
-    help="With --audit, buy again the calls of runs that stopped incomplete.",
+    help="With --audit, resume interrupted runs in place: saved steps replay, and a request "
+    "lost in flight is sent again and reported.",
 )
 
 AUDIT_OPTION = typer.Option(
@@ -101,7 +102,7 @@ def evaluate(
         non_interactive: Disable terminal questions.
         fidelity: Explicit reconstruction workload, separate from worker-model evaluation.
         audit: Number of held-out traces replayed on a separately learned fit-only memory.
-        retry_incomplete: Replace interrupted audit runs, buying their calls again.
+        retry_incomplete: Resume interrupted audit runs in place.
         include_inspected: Re-run held-out lineages an earlier audit showed in detail.
         verbose: Plain per-turn fidelity detail, for agents and logs.
         trace_analysis: Simulator-only actor council and read-only evaluation refinement.

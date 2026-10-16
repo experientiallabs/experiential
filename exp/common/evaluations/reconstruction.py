@@ -766,6 +766,7 @@ def _evaluate_locked(
     artifact_id: str,
     clock: Callable[[], datetime],
     code_revision: str,
+    resume: bool = False,
 ) -> DualReport:
     """Retain a mechanical result and mandatory judge outcome with immutable evidence.
 
@@ -847,7 +848,7 @@ def _evaluate_locked(
         if artifacts.exists(artifact_id + "-response"):
             raw = json.loads(artifacts.read_bytes(artifact_id + "-response", "response.json"))
         else:
-            if intent_exists:
+            if intent_exists and not resume:
                 raise JudgeDispatchUnknown(
                     "prior judge dispatch has no saved response; billing unknown"
                 )
@@ -955,12 +956,15 @@ def evaluate(
     artifact_id: str,
     clock: Callable[[], datetime],
     code_revision: str,
+    resume: bool = False,
 ) -> DualReport:
     """Evaluate or replay identical saved inputs without purchasing a judge twice.
 
     A live caller owns a nonblocking project lease. Completed reports and saved responses
     replay exactly. An interrupted intent without a response remains explicitly undispatched
-    or ambiguous, never permission to repeat an externally billed request.
+    or ambiguous, never permission to repeat an externally billed request. Only ``resume``,
+    an explicit continuation of the interrupted run, hands such an intent back to
+    ``complete``, which replays a saved response or owns any re-dispatch and its disclosure.
     """
     validate_artifact_id(artifact_id)
     lock = artifacts.project_directory.resolve() / ("evaluation-" + artifact_id + ".lock")
@@ -975,6 +979,7 @@ def evaluate(
             artifact_id=artifact_id,
             clock=clock,
             code_revision=code_revision,
+            resume=resume,
         )
 
 

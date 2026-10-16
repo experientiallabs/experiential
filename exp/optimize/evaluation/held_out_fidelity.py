@@ -334,16 +334,17 @@ def register_planned_panel(
     *,
     code_revision: str,
     clock: Callable[[], datetime],
-    retry_incomplete: bool = False,
 ) -> HeldOutPanel:
     """Register a planned panel's runs without provider calls or credentials.
+
+    A run interrupted after it claimed slots is never replaced here; execution resumes it in
+    place with ``--retry-incomplete``. Only attempts that claimed no slot are re-registered.
 
     Args:
         project: Project owning the registrations.
         planned: Planned panel.
         code_revision: Exact producing implementation identity.
         clock: Aware clock for attempt retirement.
-        retry_incomplete: Replace interrupted runs that already bought calls, buying them again.
 
     Returns:
         The panel; unchanged completed runs are their saved registrations.
@@ -359,7 +360,6 @@ def register_planned_panel(
             trace=case.trace_id,
             code_revision=code_revision,
             now=now,
-            retry_incomplete=retry_incomplete,
         )
         prepared.append(registration)
         successors = [*replaced[1:], registration.spec.run_id] if replaced else []
@@ -384,7 +384,6 @@ def register_held_out_fidelity(
     profile: Profile,
     code_revision: str,
     clock: Callable[[], datetime],
-    retry_incomplete: bool = False,
     excluded: Collection[str] = frozenset(),
 ) -> HeldOutPanel:
     """Plan and register a panel directly, outside any audit receipt or reservation.
@@ -398,20 +397,13 @@ def register_held_out_fidelity(
         profile: Simulator profile.
         code_revision: Exact producing implementation identity.
         clock: Aware clock for deadlines and attempt retirement.
-        retry_incomplete: Replace interrupted runs that already bought calls, buying them again.
         excluded: Lineages never selected.
 
     Returns:
         The registered panel.
     """
     planned = plan_held_out_panel(project, count, profile=profile, clock=clock, excluded=excluded)
-    return register_planned_panel(
-        project,
-        planned,
-        code_revision=code_revision,
-        clock=clock,
-        retry_incomplete=retry_incomplete,
-    )
+    return register_planned_panel(project, planned, code_revision=code_revision, clock=clock)
 
 
 def run_slots(project: ProjectStore, run_id: str) -> int:

@@ -13,6 +13,7 @@ from exp.cli.evaluation.held_out_fidelity import (
     aggregate_line,
     execute_runs,
     render_traces,
+    require_resumable,
     share,
 )
 from exp.cli.evaluation.view import heading
@@ -74,7 +75,8 @@ def run_miss_retest(
         non_interactive: Disable terminal questions.
         dry_run: Register the runs and stop before credentials or provider calls.
         verbose: Also print every trace, every turn, and every criterion.
-        retry_incomplete: Replace interrupted runs, buying their calls again.
+        retry_incomplete: Resume interrupted runs in place: saved work replays, and a request
+            lost in flight is sent again and reported as an unknown-outcome retry.
         details: Where the full retest output is written; defaults to the terminal.
         terminal: The user's terminal, for the spend question and errors.
         progress: The calling command's single progress line; without it, the retest owns one.
@@ -93,7 +95,6 @@ def run_miss_retest(
             count,
             code_revision=installed_release_revision(),
             clock=lambda: datetime.now(UTC),
-            retry_incomplete=retry_incomplete,
         )
         heading(console, project, "Miss retest")
         judge = panel.prepared[0].spec.judge_alias
@@ -127,6 +128,7 @@ def run_miss_retest(
             for prepared in panel.prepared:
                 execute_fidelity_evaluation(store, prepared)
         else:
+            require_resumable(store, panel.prepared, resume=retry_incomplete)
             interactive = not non_interactive and can_prompt(screen)
             with pause() if pause is not None else nullcontext():
                 consented = require_spend_consent(
@@ -140,7 +142,7 @@ def run_miss_retest(
                 )
             if not consented:
                 return None
-            execute_runs(screen, store, panel.prepared, progress)
+            execute_runs(screen, store, panel.prepared, progress, resume=retry_incomplete)
         results = saved_retest_results(store, panel)
         if verbose:
             render_traces(console, store, panel.prepared, results, "Retested trace")

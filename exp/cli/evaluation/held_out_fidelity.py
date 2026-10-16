@@ -35,6 +35,7 @@ from exp.optimize.evaluation.fidelity import (
     execute_fidelity_evaluation,
     saved_fidelity_report,
 )
+from exp.optimize.evaluation.fidelity_recovery import STATUS
 from exp.optimize.evaluation.held_out_audit import (
     HeldOutAudit,
     open_held_out_audit,
@@ -57,7 +58,13 @@ from exp.optimize.evaluation.trace_learning import (
     learning_plan,
     recorded_plan,
 )
-from exp.optimize.evaluation.trace_replay import ReplayAggregate, ReplayResult, aggregate
+from exp.optimize.evaluation.trace_replay import (
+    DEADLINE,
+    ReplayAggregate,
+    ReplayResult,
+    aggregate,
+    interrupted,
+)
 from exp.runtime.models.providers.transport import ProviderTransportError
 from exp.runtime.models.structured_completion import CompletionNotDispatched
 from exp.simulation.mining.exposure_ledger import PanelInUseError
@@ -104,7 +111,8 @@ def run_held_out_fidelity(
         non_interactive: Disable terminal questions.
         dry_run: Reserve and register the runs and stop before credentials or provider calls.
         verbose: Also print every trace, every turn, and every criterion.
-        retry_incomplete: Let the receipt's owner replace interrupted runs, buying them again.
+        retry_incomplete: Resume interrupted runs in place: saved work replays, and a request
+            lost in flight is sent again and reported as an unknown-outcome retry.
         include_inspected: Also re-run exposed or reserved lineages, as a development re-audit.
         details: Where the panel's description and notes are written; defaults to the terminal.
         terminal: The user's terminal, for results, warnings, the spend question and errors.
@@ -122,7 +130,6 @@ def run_held_out_fidelity(
             profile="memory",
             code_revision=installed_release_revision(),
             clock=clock,
-            retry_incomplete=retry_incomplete,
             include_inspected=include_inspected,
         ) as audit:
             _run_audit(
@@ -136,6 +143,7 @@ def run_held_out_fidelity(
                 non_interactive=non_interactive,
                 dry_run=dry_run,
                 verbose=verbose,
+                resume=retry_incomplete,
                 clock=clock,
                 progress=progress,
                 pause=pause,
@@ -154,15 +162,17 @@ def _run_audit(
     non_interactive: bool,
     dry_run: bool,
     verbose: bool,
+    resume: bool,
     clock: Callable[[], datetime],
     progress: ProgressHook | None,
     pause: Callable[[], AbstractContextManager[None]] | None,
 ) -> None:
     """Execute or replay an open audit, recording its report before showing anything.
 
-    ``screen`` receives the result, warnings, the spend question and errors; ``console``
-    receives the panel's description and notes (the same terminal when the panel runs on its
-    own).
+    An interrupted trace is refused before spend consent unless ``resume`` continues it in
+    place under this same receipt. ``screen`` receives the result, warnings, the spend question
+    and errors; ``console`` receives the panel's description and notes (the same terminal when
+    the panel runs on its own).
     """
     panel, receipt = audit.panel, audit.receipt
     prior = audit.view
@@ -224,6 +234,11 @@ def _run_audit(
         for prepared in panel.prepared:
             execute_fidelity_evaluation(store, prepared)
     else:
+        try:
+            require_resumable(store, panel.prepared, resume=resume)
+        except ValueError:
+            record("stopped")
+            raise
         interactive = not non_interactive and can_prompt(screen)
         with pause() if pause is not None else nullcontext():
             consented = require_spend_consent(
@@ -239,7 +254,7 @@ def _run_audit(
             record("stopped")
             return
         try:
-            execute_runs(screen, store, panel.prepared, progress, guard=audit.guard)
+            execute_runs(screen, store, panel.prepared, progress, guard=audit.guard, resume=resume)
         except BaseException:
             record("stopped")
             raise
@@ -390,7 +405,7 @@ def render_exposure(
     for item in exposed:
         console.print(Text(exposure_line(item, audit), style="dim"))
     for notice in view.notices:
-        console.print(
+        screen.print(
             f"[yellow]warning[/yellow] invalidation notice: links recorded after this receipt "
             f"reserved its panel reach exposure that predates it on {len(notice.exposed)} "
             f"audited {'lineage' if len(notice.exposed) == 1 else 'lineages'} "
@@ -434,16 +449,32 @@ def execute_runs(
     progress: ProgressHook | None = None,
     *,
     guard: Callable[[], None] | None = None,
+    resume: bool = False,
 ) -> None:
     """Run the registered traces concurrently through the fidelity owner.
 
     Panel traces read frozen memory and never publish, so they are independent; each keeps its
     own ledger and session. ``progress`` receives every trace's events qualified by ``trace
     i/n``, plus ``Replaying traces k/n`` as traces finish; without it, the panel owns a display.
+    Finished traces replay untouched; with ``resume``, each interrupted trace continues in place
+    from its first uncommitted step.
+
+    Raises:
+        ValueError: A trace was interrupted and ``resume`` was not given; nothing is sent.
     """
     total = len(registrations)
     # Once any trace fails or the user interrupts, no further trace starts; running ones finish.
     stopped = Event()
+    resumed = require_resumable(store, registrations, resume=resume)
+    if resumed:
+        console.print(
+            Text(
+                f"{resumed} interrupted trace(s) resume in place; saved steps replay "
+                "without provider calls",
+                style="dim",
+            )
+        )
+    window = datetime.now(UTC) + DEADLINE if resume else None
     try:
         with (
             nullcontext(progress) if progress is not None else progress_display(console) as hook,
@@ -460,6 +491,7 @@ def execute_runs(
                         prepared,
                         progress=qualified(hook, f"trace {index}/{total}"),
                         dispatch_guard=guard,
+                        resume_until=window,
                     )
                 except BaseException:
                     stopped.set()
@@ -483,9 +515,26 @@ def execute_runs(
         console.print(f"[red]error[/red] a provider request failed: {exc}")
         console.print(
             "Completed traces are saved. The stopped trace is never bought again silently: "
-            "run the same command with --retry-incomplete to replace it."
+            "run the same command with --retry-incomplete to resume it."
         )
         raise typer.Exit(code=1) from exc
+
+
+def require_resumable(
+    store: ProjectStore, registrations: tuple[PreparedFidelity, ...], *, resume: bool
+) -> int:
+    """Count interrupted traces, refusing them before any consent or call without ``resume``.
+
+    Raises:
+        ValueError: A trace was interrupted and ``resume`` was not given.
+    """
+    stopped = sum(interrupted(store, prepared) for prepared in registrations)
+    if stopped and not resume:
+        raise ValueError(
+            f"{stopped} trace(s) were interrupted before saving a result; run the same "
+            "command with --retry-incomplete to resume them in place"
+        )
+    return stopped
 
 
 def aggregate_line(total: ReplayAggregate, planned: int, title: str = "Held-out fidelity") -> str:
@@ -506,6 +555,8 @@ def aggregate_line(total: ReplayAggregate, planned: int, title: str = "Held-out 
     )
     judge = "judge -" if total.judge_mean is None else f"judge {total.judge_mean:.1f}/5"
     line = f"{title}  {exact} · {fields} · {judge} · {total.traces}/{planned} traces"
+    if total.qualification is not None:
+        line += f" · {STATUS}\n" + "\n".join(total.qualification.lines())
     if total.judge_turns:
         line += (
             f"\n  judge agrees with exact replies on {total.judge_agreements}/{total.judge_turns} "
@@ -540,6 +591,8 @@ def render_traces(
         registration = prepared[result.run_id]
         console.print()
         console.print(Text(f"{result.trace_id} · {result.run_id}", style="bold"))
+        for disclosure in result.recovery_lines():
+            console.print(Text(f"  {disclosure}", style="yellow"))
         render_turns(console, store, registration, result.report, registration.spec.judge)
         render_fidelity(console, result.report, registration.spec.judge)
 

@@ -8,7 +8,9 @@ existing learn-mode lifecycle of :func:`execute_fidelity_evaluation`: every step
 from the task, the visible history and the current memory, the recorded reply is disclosed only
 after the prediction commits, mismatches are investigated, the completed trajectory is
 published as one memory version, and maintenance compresses the memory log. No second runner
-exists. A rerun replays completed traces without provider calls and continues where it stopped.
+exists. A rerun replays completed traces without provider calls and continues where it stopped;
+a trace interrupted mid-run resumes in place with ``retry_incomplete``, so its first saved
+measurement is still the one scored.
 
 Measurement is test-then-train: each trace is predicted whole on the memory pinned before it,
 with none of its own feedback or investigations, and with memory from earlier traces of the
@@ -56,6 +58,7 @@ from exp.optimize.evaluation.fidelity_memory import (
     saved_memory_receipt,
     trajectory_record,
 )
+from exp.optimize.evaluation.fidelity_recovery import STATUS, Qualification, qualify
 from exp.optimize.evaluation.trace_replay import (
     DEADLINE,
     INVESTIGATION_TOKENS,
@@ -171,12 +174,14 @@ class LearningCurve(ContractModel):
         quarters: Four windows of scored traces in export order.
         halves: First and second half of scored traces, independent of learning success.
         incomplete: Traces not learned into memory (scored when their predictions completed).
+        qualification: Present when any scored trace resumed with unknown-outcome retries.
     """
 
     points: tuple[ReplayResult, ...]
     quarters: tuple[CurveWindow, ...]
     halves: tuple[CurveWindow, ...]
     incomplete: int = 0
+    qualification: Qualification | None = None
 
     def headline(self) -> str:
         """Learning progress over every scored trace, then the latest unseen-task estimate.
@@ -188,7 +193,8 @@ class LearningCurve(ContractModel):
         count. Claims about the final simulator on unseen traces come from ``exp eval
         --audit``. Recorded actions are replayed over the simulator's own
         history, so errors carry forward. Traces whose learning failed remain scored and are
-        counted separately.
+        counted separately. Unknown-outcome retries qualify the headline itself, with counts
+        by stage, affected traces, and the score with and without those traces.
         """
         exact = sum(p.exact for p in self.points)
         steps = sum(p.steps for p in self.points)
@@ -201,6 +207,8 @@ class LearningCurve(ContractModel):
         )
         if self.incomplete:
             line += f" · {self.incomplete} trace(s) not learned"
+        if self.qualification is not None:
+            line += f" · {STATUS}\n" + "\n".join(self.qualification.lines())
         if self.quarters:
             last = self.quarters[-1]
             count = last.last - last.first + 1
@@ -519,7 +527,8 @@ def learn_from_traces(
         code_revision: Exact producing implementation identity.
         clock: Aware clock for deadlines.
         progress: Shared progress display; reports ``Learning from traces k/n``.
-        retry_incomplete: Replace an interrupted trace that already bought calls.
+        retry_incomplete: Resume a trace that was interrupted mid-run: saved work replays,
+            and a request lost in flight is sent again and reported.
 
     Returns:
         The outcome; ``stopped`` explains an early stop.
@@ -543,7 +552,6 @@ def learn_from_traces(
                 trace=case.trace_id,
                 code_revision=code_revision,
                 now=now,
-                retry_incomplete=retry_incomplete,
             )
             if prepared.id in attempted:
                 break  # attempts exhausted: the latest one stays the trace's result
@@ -556,10 +564,15 @@ def learn_from_traces(
                         "run again with a larger budget to continue"
                     )
                     break
+                before = attempts_used(project, prepared)
                 execute_fidelity_evaluation(
-                    project, prepared, clock=clock, progress=_inside(progress, index, cases)
+                    project,
+                    prepared,
+                    clock=clock,
+                    resume_until=now + DEADLINE if retry_incomplete else None,
+                    progress=_inside(progress, index, cases),
                 )
-                used += attempts_used(project, prepared)
+                used += attempts_used(project, prepared) - before
             else:
                 # Replay completes any interrupted publication without provider calls.
                 execute_fidelity_evaluation(project, prepared, clock=clock)
@@ -607,6 +620,7 @@ def learning_curve(project: ProjectStore, scope: Scope | None = None) -> Learnin
         quarters=_windows(points, 4),
         halves=_windows(points, 2) if len(points) > 1 else (),
         incomplete=sum(not learned for *_, learned in runs) + len(unscored),
+        qualification=qualify([(row.unknown_outcomes, row.exact, row.steps) for row in points]),
     )
 
 
