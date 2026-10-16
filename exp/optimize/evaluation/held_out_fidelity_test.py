@@ -98,7 +98,8 @@ def package_rows(episodes: list[JsonObject]) -> list[JsonObject]:
 
     Each trace has a ``chat`` span with the customer request and the request context
     ``{"task_lineage": USER, "replay_from": N}``, then one call and one result span per
-    recorded tool exchange, paired by ``gen_ai.tool.call.id``.
+    recorded tool exchange, paired by ``gen_ai.tool.call.id``. An episode may override its
+    declared task identity (``lineage``) and conversation (``conversation``).
     """
     rows: list[JsonObject] = []
     start = datetime(2026, 10, 15, tzinfo=UTC)
@@ -107,7 +108,7 @@ def package_rows(episodes: list[JsonObject]) -> list[JsonObject]:
         # A repeat of the same task (same user) is a different trace with its own identity.
         key = user + str(item.get("repeat", ""))
         trace_id = hashlib.sha256(key.encode()).hexdigest()[:32]
-        context = {"task_lineage": user, "replay_from": item["prefix"]}
+        context = {"task_lineage": item.get("lineage", user), "replay_from": item["prefix"]}
         rows.append(
             {
                 "trace_id": trace_id,
@@ -120,7 +121,7 @@ def package_rows(episodes: list[JsonObject]) -> list[JsonObject]:
                     "gen_ai.provider.name": "recording",
                     "gen_ai.request.model": "recorded-agent",
                     "gen_ai.prompt": item["instruction"],
-                    "exp.conversation.id": user,
+                    "exp.conversation.id": item.get("conversation", user),
                     "exp.request.context": json.dumps(context),
                 },
             }
@@ -447,13 +448,18 @@ def build_project(
     provider: SimulatedProvider,
     *flags: str,
     episodes: list[JsonObject] | None = None,
+    project: str = PROJECT,
 ) -> tuple[Path, ProjectStore, str]:
-    """Run ``exp build`` on the package through the routed fake and return its output."""
+    """Run ``exp build`` on the package through the routed fake and return its output.
+
+    Every project shares one ``.exp`` root under ``tmp_path``, as projects on one machine do.
+    """
     root = tmp_path / ".exp"
-    root.mkdir()
-    write_catalog(root)
+    if not root.exists():
+        root.mkdir()
+        write_catalog(root)
     episodes = episodes or [episode(i) for i in range(USERS)]
-    package = tmp_path / "package.jsonl"
+    package = tmp_path / f"{project}.jsonl"
     package.write_text("".join(json.dumps(row) + "\n" for row in package_rows(episodes)))
     monkeypatch.setenv("HELD_OUT_TEST_KEY", "fixture-only")
     monkeypatch.setenv("EXP_RELEASE_REVISION", REVISION)
@@ -467,7 +473,7 @@ def build_project(
         app,
         [
             "build",
-            PROJECT,
+            project,
             "--traces",
             str(package),
             "--source",
@@ -480,17 +486,17 @@ def build_project(
         ],
     )
     assert result.exit_code == 0, result.output
-    return root, ProjectStore(root, PROJECT), " ".join(result.output.split())
+    return root, ProjectStore(root, project), " ".join(result.output.split())
 
 
-def held_out_command(root: Path, count: int, *flags: str) -> str:
+def held_out_command(root: Path, count: int, *flags: str, exit_code: int = 0) -> str:
     """Invoke ``exp eval PROJECT --held-out-fidelity N`` and return its output."""
     result = CliRunner().invoke(
         app,
         ["eval", PROJECT, "--root", str(root), "--held-out-fidelity", str(count)]
         + ["--yes", "--non-interactive", *flags],
     )
-    assert result.exit_code == 0, result.output
+    assert result.exit_code == exit_code, result.output
     return " ".join(result.output.split())
 
 

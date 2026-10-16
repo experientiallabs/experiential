@@ -33,6 +33,13 @@ HELD_OUT_FIDELITY_OPTION = typer.Option(
     help="Measure the simulator learned with --hold-out on N held-out traces it never saw.",
 )
 
+INCLUDE_INSPECTED_OPTION = typer.Option(
+    False,
+    "--include-inspected",
+    help="With --held-out-fidelity, also re-run held-out lineages an earlier --verbose audit "
+    "showed; reported as a development re-audit, never independent.",
+)
+
 VERBOSE_OPTION = typer.Option(
     False,
     "--verbose",
@@ -68,6 +75,7 @@ def evaluate(
     held_out_fidelity: int | None = HELD_OUT_FIDELITY_OPTION,
     retest_misses: int | None = RETEST_MISSES_OPTION,
     retry_incomplete: bool = RETRY_INCOMPLETE_OPTION,
+    include_inspected: bool = INCLUDE_INSPECTED_OPTION,
     verbose: bool = VERBOSE_OPTION,
 ) -> None:
     """Evaluate models against a project's simulated scenarios and configured judge.
@@ -89,6 +97,7 @@ def evaluate(
         held_out_fidelity: Number of held-out build traces replayed on the fit-only simulator.
         retest_misses: Number of missed learned traces replayed on the final memory.
         retry_incomplete: Replace interrupted held-out or retest runs, buying their calls again.
+        include_inspected: Re-run held-out lineages an earlier audit showed in detail.
         verbose: Plain per-turn fidelity detail, for agents and logs.
     """
     replay = held_out_fidelity if held_out_fidelity is not None else retest_misses
@@ -96,6 +105,8 @@ def evaluate(
         raise typer.BadParameter(
             "--retry-incomplete applies only with --held-out-fidelity or --retest-misses"
         )
+    if include_inspected and held_out_fidelity is None:
+        raise typer.BadParameter("--include-inspected applies only with --held-out-fidelity")
     if verbose and fidelity is None and replay is None:
         raise typer.BadParameter(
             "--verbose applies only with --fidelity, --held-out-fidelity or --retest-misses"
@@ -154,6 +165,7 @@ def evaluate(
             dry_run=dry_run,
             verbose=verbose,
             retry_incomplete=retry_incomplete,
+            include_inspected=include_inspected,
         )
         return
     if fidelity is not None:
