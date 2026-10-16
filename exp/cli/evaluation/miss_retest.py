@@ -10,6 +10,7 @@ from exp.cli.evaluation.held_out_fidelity import (
     aggregate_line,
     execute_runs,
     render_traces,
+    require_resumable,
     share,
 )
 from exp.cli.evaluation.view import heading
@@ -50,7 +51,8 @@ def run_miss_retest(
         non_interactive: Disable terminal questions.
         dry_run: Register the runs and stop before credentials or provider calls.
         verbose: Also print every trace, every turn, and every criterion.
-        retry_incomplete: Replace interrupted runs, buying their calls again.
+        retry_incomplete: Resume interrupted runs in place: saved work replays, and a request
+            lost in flight is sent again and reported as an unknown-outcome retry.
     """
     console = Console(theme=EXP_THEME)
     with usage_error(OSError, ValueError):
@@ -60,7 +62,6 @@ def run_miss_retest(
             count,
             code_revision=installed_release_revision(),
             clock=lambda: datetime.now(UTC),
-            retry_incomplete=retry_incomplete,
         )
         heading(console, project, "Miss retest")
         judge = panel.prepared[0].spec.judge_alias
@@ -94,6 +95,7 @@ def run_miss_retest(
             for prepared in panel.prepared:
                 execute_fidelity_evaluation(store, prepared)
         else:
+            require_resumable(store, panel.prepared, resume=retry_incomplete)
             interactive = not non_interactive and can_prompt(console)
             if not require_spend_consent(
                 console,
@@ -105,7 +107,7 @@ def run_miss_retest(
                 non_interactive=not interactive,
             ):
                 return
-            execute_runs(console, store, panel.prepared)
+            execute_runs(console, store, panel.prepared, resume=retry_incomplete)
         results = saved_retest_results(store, panel)
         if verbose:
             render_traces(console, store, panel.prepared, results, "Retested trace")

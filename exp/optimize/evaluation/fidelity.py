@@ -1,7 +1,9 @@
 """Prepare and execute simulation fidelity through existing durable runtime owners."""
 
+import json
 from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
+from functools import partial
 from typing import Literal
 
 from filelock import FileLock
@@ -23,6 +25,7 @@ from exp.common.evaluations.reconstruction import (
 )
 from exp.common.models import ModelCapabilities, ModelCatalog, load_model_catalog
 from exp.common.models.model import ReasoningEffort
+from exp.common.models.unknown_outcome import resume_unknown
 from exp.common.progress import ProgressHook, report
 from exp.common.project import ProjectStore, artifact_input
 from exp.common.tasks import TaskCase
@@ -32,6 +35,12 @@ from exp.optimize.evaluation.fidelity_memory import (
     consume_trajectory,
     maintain_memory,
     trajectory_record,
+)
+from exp.optimize.evaluation.fidelity_recovery import (
+    JUDGE_OPERATION,
+    RecoveryLog,
+    UnknownOutcome,
+    recorded_outcomes,
 )
 from exp.optimize.evaluation.knowledge_exposure import require_unexposed_task
 from exp.optimize.evaluation.retrieval_binding import (
@@ -78,6 +87,7 @@ from exp.simulation.world_model.memory_tree import (
     overview_sources,
 )
 from exp.simulation.world_model.overview_pin import pinned_summaries
+from exp.simulation.world_model.resumption import Resumption
 from exp.simulation.world_model.runtime import (
     load_grounded_world_model,
     load_grounded_world_model_artifact,
@@ -418,6 +428,28 @@ def _establish_reservation(project: ProjectStore, spec: FidelitySpec, code_revis
     )
 
 
+INTERRUPTED = (
+    "this fidelity run was interrupted before it saved a result; run the same command with "
+    "--retry-incomplete to resume it. Saved steps replay without provider calls; a request "
+    "lost in flight is sent again and reported as an unknown-outcome retry"
+)
+
+
+def unknown_outcomes(
+    project: ProjectStore, prepared: PreparedFidelity
+) -> tuple[UnknownOutcome, ...]:
+    """Steps of one run re-dispatched after an unknown outcome, read without provider calls.
+
+    Args:
+        project: Project owning the run.
+        prepared: The run's registration.
+
+    Returns:
+        One row per step and stage; empty for a run that never resumed a lost request.
+    """
+    return recorded_outcomes(project, prepared.id, prepared.spec.workload.actions)
+
+
 def saved_fidelity_report(project: ProjectStore, prepared: PreparedFidelity) -> DualReport | None:
     """Read completed evidence without credentials, provider calls, or a live deadline."""
     identity = prepared.id + "-report"
@@ -434,8 +466,15 @@ def execute_fidelity_evaluation(
     research_selection: EvidencePolicy | None = None,
     clock: Callable[[], datetime] | None = None,
     dispatch_guard: Callable[[], None] | None = None,
+    resume_until: datetime | None = None,
 ) -> DualReport:
     """Run after explicit spend consent, or replay a completed evaluation exactly.
+
+    An interrupted run (its execution started, no result saved) continues only with
+    ``resume_until``: the same run resumes from its first uncommitted step on the memory it
+    pinned when it started, committed steps and saved responses replay without provider
+    calls, and a request that may have reached the provider without a saved response is sent
+    again only after it is recorded as an unknown-outcome retry.
 
     Args:
         project: Owner of the verified registration and durable execution artifacts.
@@ -445,10 +484,14 @@ def execute_fidelity_evaluation(
         research_selection: Injected session-only selector for specs without retrieval.
         clock: Optional aware clock for qualification.
         dispatch_guard: Runs before every physical slot claim and refuses by raising.
+        resume_until: Deadline of a new execution window authorizing an interrupted run to
+            resume (``--retry-incomplete``). It extends, never shortens, the registered
+            deadline, and every saved identity keeps the registered one. Unused by a run
+            that never started or already finished.
 
     Returns:
-        Separate mechanical and mandatory judge results. Incomplete earlier dispatches
-        stop visibly rather than authorizing an automatic repurchase.
+        Separate mechanical and mandatory judge results. Without ``resume_until``, an
+        interrupted run stops visibly rather than authorizing any dispatch.
     """
     now = clock or (lambda: datetime.now(UTC))
     saved = PreparedFidelity.model_validate_json(
@@ -456,6 +499,8 @@ def execute_fidelity_evaluation(
     )
     if saved != prepared:
         raise ValueError("execution differs from the saved fidelity registration")
+    # Execute from the saved bytes, so a resumed run rebuilds byte-identical requests.
+    prepared = saved
     directory = project.artifacts.project_directory
     with FileLock(directory / (prepared.id + ".lock"), timeout=0):
         previous = saved_fidelity_report(project, prepared)
@@ -464,11 +509,10 @@ def execute_fidelity_evaluation(
             report(progress, "Saved fidelity result")
             consume_trajectory(project, prepared, now())
             return previous
-        if project.artifacts.exists(intent):
-            raise ValueError(
-                "incomplete fidelity run; inspect saved operations before new dispatch "
-                "(a derived held-out or learning run is bought again only with --retry-incomplete)"
-            )
+        resuming = project.artifacts.exists(intent)
+        if resuming and resume_until is None:
+            raise ValueError(INTERRUPTED)
+        started = _execution_record(project, intent) if resuming else None
         spec = prepared.spec
         _require_unexposed(
             project, load_grounded_world_model_artifact(project.artifacts, spec.world_model), spec
@@ -487,9 +531,26 @@ def execute_fidelity_evaluation(
             and (research_selection.identity != spec.online_research.selection_policy_sha256)
         ):
             raise ValueError("memory selector differs from the registered fidelity spec")
-        if now() >= spec.deadline:
+        window = (
+            max(spec.deadline, resume_until)
+            if started is not None and resume_until is not None
+            else spec.deadline
+        )
+        if now() >= window:
             raise ValueError("fidelity deadline expired before dispatch")
         identity = sha256_json(prepared.model_dump(mode="json"))
+        if started is not None and started.get("plan_sha256") != identity:
+            raise ValueError("the interrupted execution belongs to a different registration")
+        resumption = (
+            Resumption(
+                window=window,
+                retried=RecoveryLog(
+                    project, prepared.id, code_revision=prepared.code_revision, clock=now
+                ).record,
+            )
+            if started is not None
+            else None
+        )
         ledger = DispatchLedger(
             directory / (prepared.id + "-physical.sqlite"),
             spec.maximum_physical_attempts,
@@ -500,7 +561,7 @@ def execute_fidelity_evaluation(
             ledger=ledger,
             artifacts=project.artifacts,
             code_revision=prepared.code_revision,
-            deadline=spec.deadline,
+            deadline=window,
             clock=now,
             before_claim=dispatch_guard,
         )
@@ -522,7 +583,7 @@ def execute_fidelity_evaluation(
         overview_sources_of: Callable[[Sequence[JsonObject]], Sequence[ArtifactInput]] | None = None
         if spec.retrieval is not None:
             decide = decision_caller(
-                registry.resolve(spec.retrieval.jev_alias), transport, spec.deadline, now
+                registry.resolve(spec.retrieval.jev_alias), transport, window, now
             )
             record = _receipt_recorder(project, prepared, now)
             if artifact.selection_policy_sha256 is not None:
@@ -536,7 +597,9 @@ def execute_fidelity_evaluation(
                 )
         if spec.memory is not None:
             prior = (
-                memory_head(project.artifacts, spec.memory.lineage)
+                _pinned_version(project, spec.memory.lineage, started)
+                if started is not None
+                else memory_head(project.artifacts, spec.memory.lineage)
                 if spec.memory.checkpoint is None
                 else read_memory_version(
                     project.artifacts, spec.memory.lineage, spec.memory.checkpoint
@@ -636,6 +699,13 @@ def execute_fidelity_evaluation(
                 "retired": view.retired,
                 "overview_sha256": sha256_json(prior_overview),
             }
+        if started is not None and sha256_json(started.get("memory")) != sha256_json(
+            prior_identity
+        ):
+            raise ValueError(
+                "the memory view this run pinned when it started can no longer be reproduced "
+                "(its lineage reservations or sources changed); it cannot resume"
+            )
 
         def completion(
             resolved: ResolvedModel,
@@ -658,6 +728,7 @@ def execute_fidelity_evaluation(
                 budget=budget,
                 artifacts=project.artifacts,
                 clock=now,
+                window=window,
             )
 
         prediction = completion(predictor, structured=False, role="prediction")
@@ -673,26 +744,34 @@ def execute_fidelity_evaluation(
             client=predictor.client,
             capabilities=predictor.capabilities,
             embedder=bind_index_embedder(
-                registry, prepared.embedder_alias, artifact, project, budget
+                registry,
+                prepared.embedder_alias,
+                artifact,
+                project,
+                budget,
+                resuming=resumption is not None,
             ),
             evidence_selector=originals,
         )
-        project.artifacts.write_json(
-            artifact_id=intent,
-            artifact_type="fidelity-execution",
-            envelope=ArtifactEnvelope(
-                schema_version=1,
-                created_at=now(),
-                code_revision=prepared.code_revision,
-                inputs=(artifact_input(project.artifacts.read(prepared.id).manifest),),
-            ),
-            files={
-                "execution.json": {
-                    "plan_sha256": identity,
-                    **({"memory": prior_identity} if prior_identity is not None else {}),
-                }
-            },
-        )
+        if started is None:
+            project.artifacts.write_json(
+                artifact_id=intent,
+                artifact_type="fidelity-execution",
+                envelope=ArtifactEnvelope(
+                    schema_version=1,
+                    created_at=now(),
+                    code_revision=prepared.code_revision,
+                    inputs=(artifact_input(project.artifacts.read(prepared.id).manifest),),
+                ),
+                files={
+                    "execution.json": {
+                        "plan_sha256": identity,
+                        **({"memory": prior_identity} if prior_identity is not None else {}),
+                    }
+                },
+            )
+        else:
+            _record_resumption(project, prepared, intent, window, now())
         report(progress, "Loading simulator and memory")
         session = open_grounded_session(
             runtime=runtime,
@@ -725,14 +804,18 @@ def execute_fidelity_evaluation(
             research_overview_sources_of=overview_sources_of,
             research_prior_identity=prior_identity,
             clock=now,
+            resumption=resumption,
+            preparation_dispatches=prepared.embedder_alias is not None
+            or spec.retrieval is not None,
         )
 
         def judge_call(body: JsonObject, logical_id: str) -> JsonObject:
-            """Expose the real judging stage without adding a retry or scoring loop."""
+            """Expose the real judging stage; only a resumption re-dispatches a lost judge."""
             if not spec.judged:
                 raise JudgeNotRun("judging is skipped for this run; it is scored by exact replies")
             report(progress, "Judging")
-            return judging(body, logical_id)
+            retried = None if resumption is None else resumption.recorder("judge", JUDGE_OPERATION)
+            return resume_unknown(partial(judging, body), logical_id, retried)
 
         result = evaluate_workflow(
             session,
@@ -750,6 +833,7 @@ def execute_fidelity_evaluation(
             progress=progress,
             feedback_after_predictions=spec.online_research is not None
             and not spec.online_research.notes_reach_predictions,
+            resume=resumption is not None,
         )
         learning = spec.memory is not None and spec.memory.mode == "learn"
         if learning:
@@ -764,6 +848,52 @@ def execute_fidelity_evaluation(
                 now(),
             )
         return result
+
+
+def _execution_record(project: ProjectStore, intent: str) -> JsonObject:
+    """What an interrupted execution recorded when it started: its plan and pinned memory."""
+    record = json.loads(project.artifacts.read_bytes(intent, "execution.json"))
+    if not isinstance(record, dict):
+        raise ValueError("the interrupted execution record is not an object")
+    return record
+
+
+def _pinned_version(
+    project: ProjectStore, lineage: str, started: JsonObject
+) -> MemoryVersion | None:
+    """The memory version an interrupted run pinned when it started, never the current head."""
+    memory = started.get("memory")
+    version = memory.get("version") if isinstance(memory, dict) else None
+    if not isinstance(version, int) or isinstance(version, bool):
+        raise ValueError("the interrupted execution did not record its pinned memory version")
+    return None if version == 0 else read_memory_version(project.artifacts, lineage, version)
+
+
+def _record_resumption(
+    project: ProjectStore,
+    prepared: PreparedFidelity,
+    intent: str,
+    window: datetime,
+    resumed_at: datetime,
+) -> None:
+    """Keep an immutable receipt of each resumption and the window it was granted."""
+    number = 1
+    while project.artifacts.exists(identity := f"{intent}-resume-{number}"):
+        number += 1
+    project.artifacts.write_json(
+        artifact_id=identity,
+        artifact_type="fidelity-resumption",
+        envelope=ArtifactEnvelope(
+            schema_version=1, created_at=resumed_at, code_revision=prepared.code_revision
+        ),
+        files={
+            "resumption.json": {
+                "run": prepared.id,
+                "window": window.isoformat(),
+                "resumed_at": resumed_at.isoformat(),
+            }
+        },
+    )
 
 
 def _require_unexposed(

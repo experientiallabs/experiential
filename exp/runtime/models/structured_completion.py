@@ -95,8 +95,20 @@ class StructuredCompletion:
         budget: RequestBudget,
         artifacts: ArtifactStore,
         clock: Callable[[], datetime] | None = None,
+        window: datetime | None = None,
     ) -> None:
-        """Bind already configured provider, budget, physical counter and artifacts."""
+        """Bind already configured provider, budget, physical counter and artifacts.
+
+        Args:
+            client: Configured provider client.
+            plan: Frozen limits; its deadline is part of every request fingerprint.
+            budget: Shared request ledger with exact response replay.
+            artifacts: Immutable call-intent owner.
+            clock: Aware dispatch and admission clock.
+            window: Deadline of an explicitly resumed execution window. It extends, never
+                shortens, admission past the plan's deadline; the plan, and so every saved
+                request's replay identity, keeps the registered deadline.
+        """
         if plan.capabilities.identity_sha256() != plan.model.capabilities_sha256:
             raise ValueError("completion capabilities differ from the model snapshot")
         if plan.json_object_output and not plan.capabilities.supports_structured_output:
@@ -108,6 +120,7 @@ class StructuredCompletion:
         self.plan = plan
         self._client, self._budget = client, budget
         self._artifacts, self._clock = artifacts, clock or _utc_now
+        self._deadline = plan.deadline if window is None else max(plan.deadline, window)
 
     def __call__(self, body: JsonObject, logical_id: str) -> JsonObject:
         """Dispatch one structured request or return its exact saved proposal.
@@ -224,7 +237,7 @@ class StructuredCompletion:
             )
         if caps.maximum_output_tokens is not None and requested_output > caps.maximum_output_tokens:
             raise RequestCapacityExceeded("output reservation exceeds the declared route capacity")
-        if self._clock() >= self.plan.deadline:
+        if self._clock() >= self._deadline:
             raise CompletionNotDispatched("completion deadline reached before dispatch")
 
     def complete_request(self, request: ModelRequest, logical_id: str) -> ModelResponse:
@@ -242,7 +255,7 @@ class StructuredCompletion:
 
         def operation() -> ModelResponse:
             """Claim physical capacity and retain intent before using the injected client."""
-            if self._clock() >= self.plan.deadline:
+            if self._clock() >= self._deadline:
                 raise TimeoutError("completion deadline reached during admission")
             identity = stable_id(
                 "structured-intent", {"logical_id": logical_id, "fingerprint": fingerprint}
@@ -278,7 +291,7 @@ class StructuredCompletion:
             )
         if response.model != self.plan.model:
             raise ValueError("model identity differs; raw response retained")
-        if self._clock() >= self.plan.deadline:
+        if self._clock() >= self._deadline:
             raise TimeoutError("late model response retained without admission")
         return response
 

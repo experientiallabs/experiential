@@ -24,6 +24,7 @@ from exp.optimize.evaluation.fidelity import (
     execute_fidelity_evaluation,
     saved_fidelity_report,
 )
+from exp.optimize.evaluation.fidelity_recovery import STATUS
 from exp.optimize.evaluation.held_out_audit import (
     HeldOutAudit,
     open_held_out_audit,
@@ -40,7 +41,13 @@ from exp.optimize.evaluation.held_out_receipts import (
     record_report,
 )
 from exp.optimize.evaluation.trace_learning import fit_cases, learning_curve
-from exp.optimize.evaluation.trace_replay import ReplayAggregate, ReplayResult, aggregate
+from exp.optimize.evaluation.trace_replay import (
+    DEADLINE,
+    ReplayAggregate,
+    ReplayResult,
+    aggregate,
+    interrupted,
+)
 from exp.runtime.models.providers.transport import ProviderTransportError
 from exp.simulation.mining.exposure_ledger import PanelInUseError
 
@@ -76,7 +83,8 @@ def run_held_out_fidelity(
         non_interactive: Disable terminal questions.
         dry_run: Reserve and register the runs and stop before credentials or provider calls.
         verbose: Also print every trace, every turn, and every criterion.
-        retry_incomplete: Let the receipt's owner replace interrupted runs, buying them again.
+        retry_incomplete: Resume interrupted runs in place: saved work replays, and a request
+            lost in flight is sent again and reported as an unknown-outcome retry.
         include_inspected: Also re-run exposed or reserved lineages, as a development re-audit.
     """
     console = Console(theme=EXP_THEME)
@@ -89,7 +97,6 @@ def run_held_out_fidelity(
             profile="memory",
             code_revision=installed_release_revision(),
             clock=clock,
-            retry_incomplete=retry_incomplete,
             include_inspected=include_inspected,
         ) as audit:
             _run_audit(
@@ -102,6 +109,7 @@ def run_held_out_fidelity(
                 non_interactive=non_interactive,
                 dry_run=dry_run,
                 verbose=verbose,
+                resume=retry_incomplete,
                 clock=clock,
             )
 
@@ -117,9 +125,14 @@ def _run_audit(
     non_interactive: bool,
     dry_run: bool,
     verbose: bool,
+    resume: bool,
     clock: Callable[[], datetime],
 ) -> None:
-    """Execute or replay an open audit, recording its report before showing anything."""
+    """Execute or replay an open audit, recording its report before showing anything.
+
+    An interrupted trace is refused before spend consent unless ``resume`` continues it in
+    place under this same receipt.
+    """
     panel, receipt = audit.panel, audit.receipt
     prior = audit.view
 
@@ -173,6 +186,11 @@ def _run_audit(
         for prepared in panel.prepared:
             execute_fidelity_evaluation(store, prepared)
     else:
+        try:
+            require_resumable(store, panel.prepared, resume=resume)
+        except ValueError:
+            record("stopped")
+            raise
         interactive = not non_interactive and can_prompt(console)
         if not require_spend_consent(
             console,
@@ -186,7 +204,7 @@ def _run_audit(
             record("stopped")
             return
         try:
-            execute_runs(console, store, panel.prepared, guard=audit.guard)
+            execute_runs(console, store, panel.prepared, guard=audit.guard, resume=resume)
         except BaseException:
             record("stopped")
             raise
@@ -374,13 +392,28 @@ def execute_runs(
     registrations: tuple[PreparedFidelity, ...],
     *,
     guard: Callable[[], None] | None = None,
+    resume: bool = False,
 ) -> None:
     """Run the registered traces concurrently through the fidelity owner.
 
     Panel traces read frozen memory and never publish, so they are independent; each keeps its
-    own ledger, session and progress row.
+    own ledger, session and progress row. Finished traces replay untouched; with ``resume``,
+    each interrupted trace continues in place from its first uncommitted step.
+
+    Raises:
+        ValueError: A trace was interrupted and ``resume`` was not given; nothing is sent.
     """
     total = len(registrations)
+    stopped = require_resumable(store, registrations, resume=resume)
+    if stopped:
+        console.print(
+            Text(
+                f"{stopped} interrupted trace(s) resume in place; saved steps replay "
+                "without provider calls",
+                style="dim",
+            )
+        )
+    window = datetime.now(UTC) + DEADLINE if resume else None
     try:
         with progress_display(console) as progress, ThreadPoolExecutor(PANEL_CONCURRENCY) as pool:
             futures = [
@@ -390,6 +423,7 @@ def execute_runs(
                     prepared,
                     progress=qualified(progress, f"trace {index}/{total}"),
                     dispatch_guard=guard,
+                    resume_until=window,
                 )
                 for index, prepared in enumerate(registrations, start=1)
             ]
@@ -398,10 +432,27 @@ def execute_runs(
     except ProviderTransportError as exc:
         console.print(f"[red]error[/red] a provider request failed: {exc}")
         console.print(
-            "Completed traces are saved. Run the same command again to continue; "
-            "the stopped trace starts a fresh attempt."
+            "Completed traces are saved. Run the same command again to continue; add "
+            "--retry-incomplete to resume a trace that stopped before saving its result."
         )
         raise typer.Exit(code=1) from exc
+
+
+def require_resumable(
+    store: ProjectStore, registrations: tuple[PreparedFidelity, ...], *, resume: bool
+) -> int:
+    """Count interrupted traces, refusing them before any consent or call without ``resume``.
+
+    Raises:
+        ValueError: A trace was interrupted and ``resume`` was not given.
+    """
+    stopped = sum(interrupted(store, prepared) for prepared in registrations)
+    if stopped and not resume:
+        raise ValueError(
+            f"{stopped} trace(s) were interrupted before saving a result; run the same "
+            "command with --retry-incomplete to resume them in place"
+        )
+    return stopped
 
 
 def aggregate_line(total: ReplayAggregate, planned: int, title: str = "Held-out fidelity") -> str:
@@ -422,6 +473,8 @@ def aggregate_line(total: ReplayAggregate, planned: int, title: str = "Held-out 
     )
     judge = "judge -" if total.judge_mean is None else f"judge {total.judge_mean:.1f}/5"
     line = f"{title}  {exact} · {fields} · {judge} · {total.traces}/{planned} traces"
+    if total.qualification is not None:
+        line += f" · {STATUS}\n" + "\n".join(total.qualification.lines())
     if total.judge_turns:
         line += (
             f"\n  judge agrees with exact replies on {total.judge_agreements}/{total.judge_turns} "
@@ -456,6 +509,8 @@ def render_traces(
         registration = prepared[result.run_id]
         console.print()
         console.print(Text(f"{result.trace_id} · {result.run_id}", style="bold"))
+        for disclosure in result.recovery_lines():
+            console.print(Text(f"  {disclosure}", style="yellow"))
         render_turns(console, store, registration, result.report, registration.spec.judge)
         render_fidelity(console, result.report, registration.spec.judge)
 

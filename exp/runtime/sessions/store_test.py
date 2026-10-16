@@ -535,3 +535,58 @@ def test_late_result_is_retained_and_terminal_without_mutation(tmp_path: Path) -
     assert reopened.proposal("s1", "op") == proposal
     with pytest.raises(StepRejectedError):
         reopened.begin_step("s1", "op", _digest("late"), 0, binding)
+
+
+def test_an_explicit_resumption_reclaims_an_interrupted_step(tmp_path: Path) -> None:
+    """A never-started claim reopens as claimed; a started one stays counted and dispatched."""
+    from exp.runtime.sessions.store import StepStatus
+
+    store = _store(tmp_path)
+    claim = store.begin_step("s1", "step-1", _digest("a"), 0, binding=BINDING).claim
+    assert claim is not None
+    restarted = SessionStore(tmp_path / "sessions.sqlite")
+    reclaimed, left = restarted.reclaim_step("s1", "step-1", _digest("a"), BINDING)
+    assert left is StepStatus.CLAIMED and reclaimed.claim_token != claim.claim_token
+    with pytest.raises(ClaimLostError):
+        store.mark_provider_started(claim, 100)  # the stopped process's claim is gone
+    restarted.mark_provider_started(reclaimed, 1)
+    restarted.recover()
+    again, left = restarted.reclaim_step("s1", "step-1", _digest("a"), BINDING)
+    assert left is StepStatus.AMBIGUOUS
+    # The dispatch already counted: no second provider start, so a budget of one suffices.
+    restarted.record_proposal(again, {"reply": "ok"})
+    restarted.complete_step(again, {"orders": {}}, {"reply": "ok"})
+    assert restarted.read_session("s1").version == 1
+
+
+def test_a_reclaim_refuses_finished_or_different_steps(tmp_path: Path) -> None:
+    """Only the same request, still open, can be taken over."""
+    store = _store(tmp_path)
+    claim = store.begin_step("s1", "step-1", _digest("a"), 0, binding=BINDING).claim
+    assert claim is not None
+    with pytest.raises(StepConflictError, match="different request"):
+        store.reclaim_step("s1", "step-1", _digest("b"), BINDING)
+    store.mark_provider_started(claim, 1)
+    store.record_proposal(claim, {"reply": "ok"})
+    store.complete_step(claim, {"orders": {}}, {"reply": "ok"})
+    with pytest.raises(StepConflictError, match="not an interrupted open step"):
+        store.reclaim_step("s1", "step-1", _digest("a"), BINDING)
+    with pytest.raises(StepConflictError):
+        store.reclaim_step("s1", "never", _digest("a"), BINDING)
+
+
+def test_a_resumption_window_extends_the_commit_deadline(tmp_path: Path) -> None:
+    """The binding keeps its deadline; an explicit later window admits the commit."""
+    deadline = datetime(2030, 1, 2, tzinfo=UTC)
+    clock = [deadline]
+    binding = BINDING.model_copy(update={"deadline": deadline})
+    store = SessionStore(tmp_path / "window.sqlite", clock=lambda: clock[0])
+    store.create_session("s1", binding, {"items": []})
+    claim = store.begin_step("s1", "op", _digest("resumed"), 0, binding).claim
+    assert claim is not None
+    store.mark_provider_started(claim, 1)
+    store.record_proposal(claim, {"items": ["new"]})
+    committed = store.complete_step(
+        claim, {"items": ["new"]}, {"reply": "ok"}, window=datetime(2030, 1, 3, tzinfo=UTC)
+    )
+    assert committed.version == 1 and committed.binding.deadline == deadline

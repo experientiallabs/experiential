@@ -48,7 +48,8 @@ def run_learning(
         yes: Explicit authorization of the undefined-cost warning.
         non_interactive: Disable terminal questions.
         code_revision: Exact producing implementation identity.
-        retry_incomplete: Replace an interrupted trace, buying its calls again.
+        retry_incomplete: Resume an interrupted trace in place: saved work replays, and a
+            request lost in flight is sent again and reported as an unknown-outcome retry.
         hold_out: Learn fit traces only, keeping held-out traces for an independent panel.
 
     Raises:
@@ -102,8 +103,8 @@ def run_learning(
     except ProviderTransportError as exc:
         console.print(f"[red]error[/red] a provider request failed: {exc}")
         console.print(
-            "Learned traces are saved. Run the same command again to continue; "
-            "the stopped trace starts a fresh attempt."
+            "Learned traces are saved. Run the same command again to continue; add "
+            "--retry-incomplete to resume a trace that stopped before saving its result."
         )
         raise typer.Exit(code=1) from exc
     console.print(

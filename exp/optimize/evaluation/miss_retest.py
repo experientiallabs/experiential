@@ -80,7 +80,6 @@ def register_miss_retest(
     *,
     code_revision: str,
     clock: Callable[[], datetime],
-    retry_incomplete: bool = False,
 ) -> RetestPanel:
     """Register retests of up to ``count`` missed traces without provider calls or credentials.
 
@@ -89,7 +88,6 @@ def register_miss_retest(
         count: Maximum traces, the earliest misses in trace order first.
         code_revision: Exact producing implementation identity.
         clock: Aware clock for deadlines and attempt retirement.
-        retry_incomplete: Replace interrupted runs that already bought calls, buying them again.
 
     Returns:
         The panel; unchanged completed runs are their saved registrations.
@@ -134,7 +132,6 @@ def register_miss_retest(
             trace=case.trace_id,
             code_revision=code_revision,
             now=now,
-            retry_incomplete=retry_incomplete,
         )
         prepared.append(registration)
         retired.extend(replaced)

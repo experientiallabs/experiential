@@ -177,7 +177,8 @@ def build(
     retry_incomplete: bool = typer.Option(
         False,
         "--retry-incomplete",
-        help="With --learn, buy again the calls of a trace that stopped incomplete.",
+        help="With --learn, resume an interrupted trace in place: saved steps replay, and a "
+        "request lost in flight is sent again and reported.",
     ),
     hold_out: bool = typer.Option(
         False,
@@ -214,7 +215,7 @@ def build(
         provider: Repeatable provider names that skip the opening list during setup.
         learn: After the build, run the sequential learning pass over every trace.
         memory_recall: Native decision alias for memory recall; required with ``--learn``.
-        retry_incomplete: With ``--learn``, replace an interrupted trace, buying it again.
+        retry_incomplete: With ``--learn``, resume an interrupted trace in place.
         hold_out: With ``--learn``, learn fit traces only and reserve held-out lineages.
         maximum_learning_attempts: Learning's physical-attempt budget; omitted allows every
             trace's full ceiling.

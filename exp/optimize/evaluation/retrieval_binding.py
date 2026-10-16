@@ -12,9 +12,11 @@ contains the task's source traces or lineage.
 """
 
 from collections.abc import Sequence
+from functools import partial
 
 from exp.common.core.artifacts import sha256_json
 from exp.common.models import Embedding, EmbeddingClient, EmbeddingCostReservation, ModelCatalog
+from exp.common.models.unknown_outcome import resume_unknown
 from exp.common.project import ProjectStore
 from exp.common.tasks import TaskCase
 from exp.optimize.evaluation.spending import BudgetedEmbedding
@@ -75,6 +77,8 @@ def bind_index_embedder(
     artifact: GroundedWorldModelArtifact,
     project: ProjectStore,
     budget: RequestBudget,
+    *,
+    resuming: bool = False,
 ) -> RAGEmbedderBinding | None:
     """Resolve the registered embedder and meter its query calls in the evaluation budget.
 
@@ -85,6 +89,9 @@ def bind_index_embedder(
         artifact: Simulator whose serving index the queries search.
         project: Project holding the index.
         budget: The evaluation's request budget; each query batch is one replayable request.
+        resuming: The run is an explicit resumption, so a query batch whose earlier dispatch
+            saved no response is sent again; the step whose preparation sends it is recorded
+            as a retrieval retry by the session.
 
     Returns:
         Binding for a semantic index, or None for the local hashing index.
@@ -109,7 +116,9 @@ def bind_index_embedder(
     )
     return RAGEmbedderBinding(
         client=ScopedQueryEmbedding(
-            BudgetedEmbedding(resolved.embedding_client, budget, reservation), budget
+            BudgetedEmbedding(resolved.embedding_client, budget, reservation),
+            budget,
+            resuming=resuming,
         ),
         snapshot=resolved.snapshot,
         maximum_attempts=attempts,
@@ -126,15 +135,19 @@ class ScopedQueryEmbedding:
     a resumed or repeated identical query replays its saved vectors without a provider call.
     """
 
-    def __init__(self, inner: EmbeddingClient, budget: RequestBudget) -> None:
+    def __init__(
+        self, inner: EmbeddingClient, budget: RequestBudget, *, resuming: bool = False
+    ) -> None:
         """Wrap a budgeted embedding client.
 
         Args:
             inner: Client that records each call in ``budget``.
             budget: Request budget whose scope is set around each call.
+            resuming: Re-dispatch a batch whose earlier dispatch has an unknown outcome.
         """
         self._inner = inner
         self._budget = budget
+        self._resuming = resuming
 
     def embed(self, texts: Sequence[str]) -> tuple[Embedding, ...]:
         """Embed one query batch inside its content-addressed scope.
@@ -145,7 +158,15 @@ class ScopedQueryEmbedding:
         Returns:
             New or replayed embeddings in input order.
         """
-        with self._budget.scope("retrieval-query:" + sha256_json(list(texts))):
+        return resume_unknown(
+            partial(self._embed, texts),
+            "retrieval-query:" + sha256_json(list(texts)),
+            (lambda _: None) if self._resuming else None,
+        )
+
+    def _embed(self, texts: Sequence[str], scope: str) -> tuple[Embedding, ...]:
+        """Embed one batch inside one request-budget scope."""
+        with self._budget.scope(scope):
             return self._inner.embed(texts)
 
 

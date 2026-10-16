@@ -155,7 +155,6 @@ def open_held_out_audit(
     profile: Profile,
     code_revision: str,
     clock: Callable[[], datetime],
-    retry_incomplete: bool = False,
     include_inspected: bool = False,
 ) -> Iterator[HeldOutAudit]:
     """Reserve and register a held-out audit, or resume the request's receipt, under its lease.
@@ -166,7 +165,6 @@ def open_held_out_audit(
         profile: Simulator profile.
         code_revision: Exact running implementation.
         clock: Aware clock.
-        retry_incomplete: Let the owner replace interrupted runs that already bought calls.
         include_inspected: Also select exposed or reserved lineages, as a development re-audit.
 
     Yields:
@@ -229,7 +227,6 @@ def open_held_out_audit(
                         planned,
                         code_revision=code_revision,
                         clock=clock,
-                        retry_incomplete=retry_incomplete,
                     )
                     record_attempts(project, owner, panel, clock=clock)
                     yield HeldOutAudit(
@@ -257,7 +254,6 @@ def open_held_out_audit(
                 planned,
                 code_revision=code_revision,
                 clock=clock,
-                retry_incomplete=retry_incomplete,
             )
             record_attempts(project, receipt, panel, clock=clock)
             yield HeldOutAudit(project, receipt, panel, exposure, lease, excluded=len(excluded))

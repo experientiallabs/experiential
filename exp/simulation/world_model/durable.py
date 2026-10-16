@@ -4,6 +4,7 @@ import copy
 import json
 from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
+from functools import partial
 from operator import not_
 from pathlib import Path
 
@@ -22,6 +23,7 @@ from exp.common.core.artifacts import (
 )
 from exp.common.models import ToolCall
 from exp.common.models.client import StructuredRequestPreflight
+from exp.common.models.unknown_outcome import resume_unknown
 from exp.common.project import ArtifactStore, artifact_input
 from exp.runtime.environments import Observation
 from exp.runtime.sessions.store import (
@@ -30,15 +32,19 @@ from exp.runtime.sessions.store import (
     SessionNotFoundError,
     SessionRecord,
     SessionStore,
+    StepAmbiguousError,
+    StepInFlightError,
+    StepStatus,
 )
 from exp.simulation.engines.reconstructed import InformationChannels, ReconstructedTextEngine
-from exp.simulation.engines.transition import Completion, TransitionEngine
+from exp.simulation.engines.transition import Completion, PreparedPrediction, TransitionEngine
 from exp.simulation.reconstruction.models import (
     InitializationArtifact,
     ReconstructionBundle,
     validate_state,
 )
 from exp.simulation.retrieval.selection import EvidencePolicy
+from exp.simulation.world_model.resumption import Resumption
 from exp.simulation.world_model.session_research import SessionResearch
 
 
@@ -98,12 +104,22 @@ class DurableWorldModelSession:
         clock: Callable[[], datetime] | None = None,
         evaluation_context: JsonObject | None = None,
         research: SessionResearch | None = None,
+        resumption: Resumption | None = None,
+        preparation_dispatches: bool = True,
     ) -> None:
-        """Create or reopen the exact same world; no reference state is accepted."""
+        """Create or reopen the exact same world; no reference state is accepted.
+
+        ``resumption`` is the explicit authority to continue a step a stopped process left
+        open; without it such a step blocks the session. ``preparation_dispatches`` says
+        whether preparing a step can send requests (query embeddings or memory-recall
+        decisions), so re-preparing an interrupted step is recorded as a retrieval retry.
+        """
         if binding.deadline != policy.deadline:
             raise ValueError("session binding and policy deadline differ")
         self._engine, self._store, self._artifacts = engine, store, artifacts
         self._research = research
+        self._resumption = resumption
+        self._preparation_dispatches = preparation_dispatches
         self._evaluation_context = copy.deepcopy(evaluation_context or {})
         self._engine_identity = engine.identity
         self._binding, self._policy, self._complete = binding, policy, complete
@@ -191,6 +207,11 @@ class DurableWorldModelSession:
     def step(self, actions: tuple[ToolCall, ...], *, operation_id: str) -> tuple[Observation, ...]:
         """Prepare, persist, dispatch, validate and publish at most one revision.
 
+        With a resumption, a step a stopped process left open continues: its saved input and
+        every saved proposal are reused without a provider call, refused proposals keep the
+        bounded re-ask rule, and a request without a saved response is re-dispatched only
+        after it is recorded as an unknown-outcome retry.
+
         Args:
             actions: Ordered tool calls; each engine declares supported batch semantics.
             operation_id: Stable logical identity. Identical actions with new IDs are new work.
@@ -210,56 +231,86 @@ class DurableWorldModelSession:
         )
         with self._lock:
             current = self._store.read_session(self.session_id)
-            decision = self._store.begin_step(
-                self.session_id, operation_id, fingerprint, current.version, self._binding
-            )
-            if decision.completed is not None:
-                return _observations(decision.completed.response)
-            claim = decision.claim
-            assert claim is not None
+            left: StepStatus | None = None
+            try:
+                decision = self._store.begin_step(
+                    self.session_id, operation_id, fingerprint, current.version, self._binding
+                )
+            except (StepInFlightError, StepAmbiguousError):
+                if self._resumption is None:
+                    raise
+                claim, left = self._store.reclaim_step(
+                    self.session_id, operation_id, fingerprint, self._binding
+                )
+            else:
+                if decision.completed is not None:
+                    return _observations(decision.completed.response)
+                assert decision.claim is not None
+                claim = decision.claim
             snapshot = SessionSnapshot.model_validate(current.state)
             state, history = snapshot.business_state, snapshot.history
-            try:
-                if self._clock() >= self._policy.deadline:
-                    raise TimeoutError("session deadline reached before preparation")
-                prepared = self._engine.prepare(copy.deepcopy(state), tuple(history), actions)
-                if isinstance(self._complete, StructuredRequestPreflight):
-                    self._complete.preflight(prepared.body)
-                scope = stable_id(
-                    "world-operation",
-                    {
-                        "session": self.session_id,
-                        "operation": operation_id,
-                        "binding": self._binding.model_dump(mode="json"),
-                    },
-                )
-                intent = self._save(
-                    scope + "-input",
-                    {
-                        "prepared": prepared.model_dump(mode="json"),
-                        "base_revision": current.version,
-                        "logical_scope": scope,
-                    },
-                )
-                if self._clock() >= self._policy.deadline:
-                    raise TimeoutError("session deadline reached during preparation")
-            except Exception:  # noqa: BLE001 - preparation failure consumes no provider call.
-                self._store.reject_step(claim, "preparation_refused")
-                raise
-            try:
-                self._store.mark_provider_started(claim, self._policy.maximum_operations)
-            except ProviderBudgetExhaustedError:
-                self._store.release_step(claim)
-                raise
+            scope = stable_id(
+                "world-operation",
+                {
+                    "session": self.session_id,
+                    "operation": operation_id,
+                    "binding": self._binding.model_dump(mode="json"),
+                },
+            )
+            saved_input = None if left is None else self._saved(scope + "-input")
+            if saved_input is not None:
+                prepared = PreparedPrediction.model_validate(saved_input[0]["prepared"])
+                intent = saved_input[1]
+            else:
+                if left not in (None, StepStatus.CLAIMED):
+                    raise ValueError("an interrupted dispatched step has no saved input")
+                if left is not None and self._resumption and self._preparation_dispatches:
+                    self._resumption.retried("retrieval", operation_id, scope + "-preparation")
+                try:
+                    if self._clock() >= self._deadline():
+                        raise TimeoutError("session deadline reached before preparation")
+                    prepared = self._engine.prepare(copy.deepcopy(state), tuple(history), actions)
+                    if isinstance(self._complete, StructuredRequestPreflight):
+                        self._complete.preflight(prepared.body)
+                    intent = self._save(
+                        scope + "-input",
+                        {
+                            "prepared": prepared.model_dump(mode="json"),
+                            "base_revision": current.version,
+                            "logical_scope": scope,
+                        },
+                    )
+                    if self._clock() >= self._deadline():
+                        raise TimeoutError("session deadline reached during preparation")
+                except Exception:  # noqa: BLE001 - preparation failure consumes no provider call.
+                    self._store.reject_step(claim, "preparation_refused")
+                    raise
+            if left in (None, StepStatus.CLAIMED):
+                try:
+                    self._store.mark_provider_started(claim, self._policy.maximum_operations)
+                except ProviderBudgetExhaustedError:
+                    self._store.release_step(claim)
+                    raise
+            retried = (
+                None
+                if self._resumption is None
+                else self._resumption.recorder("prediction", operation_id)
+            )
             body, logical, refusals = prepared.body, scope, []
             while True:
-                try:
-                    raw = self._complete(body, logical)
-                except Exception as error:  # noqa: BLE001 - dispatched failures remain ambiguous.
-                    self._store.mark_ambiguous(claim, type(error).__name__)
-                    raise
-                self._store.record_proposal(claim, raw)
-                proposal_input = self._save(logical + "-proposal", {"proposal": raw}, (intent,))
+                saved = None if left is None else self._saved(logical + "-proposal")
+                if saved is not None:
+                    raw = _proposal(saved[0])
+                    proposal_input = saved[1]
+                    self._store.record_proposal(claim, raw)
+                else:
+                    try:
+                        raw = resume_unknown(partial(self._complete, body), logical, retried)
+                    except Exception as error:  # noqa: BLE001 - dispatched failures remain ambiguous.
+                        self._store.mark_ambiguous(claim, type(error).__name__)
+                        raise
+                    self._store.record_proposal(claim, raw)
+                    proposal_input = self._save(logical + "-proposal", {"proposal": raw}, (intent,))
                 try:
                     proposal = self._engine.parse(raw, actions, current_state=copy.deepcopy(state))
                     next_state = proposal.next_state(state)
@@ -331,13 +382,37 @@ class DurableWorldModelSession:
                     "transitions": [*snapshot.transitions, transition],
                 },
                 response,
+                window=None if self._resumption is None else self._resumption.window,
             )
             return tuple(observations)
+
+    def _deadline(self) -> datetime:
+        """The registered deadline, extended by an explicit resumption window."""
+        if self._resumption is None:
+            return self._policy.deadline
+        return self._resumption.deadline(self._policy.deadline)
+
+    def _saved(self, identity: str) -> tuple[JsonObject, ArtifactInput] | None:
+        """A saved operation record and its reference, when an earlier attempt wrote it."""
+        if not self._artifacts.exists(identity):
+            return None
+        record = json.loads(self._artifacts.read_bytes(identity, "record.json"))
+        if not isinstance(record, dict):
+            raise ValueError(f"saved operation record {identity} is not an object")
+        return record, artifact_input(self._artifacts.read(identity).manifest)
 
     def _save(
         self, identity: str, payload: JsonObject, inputs: tuple[ArtifactInput, ...] = ()
     ) -> ArtifactInput:
-        """Publish immutable evidence before referring to it from a state transaction."""
+        """Publish immutable evidence before referring to it from a state transaction.
+
+        A resumed step reuses the identical record an earlier attempt saved; a different one
+        means the step's inputs changed, and the step stops instead of overwriting history.
+        """
+        if self._resumption is not None and (saved := self._saved(identity)) is not None:
+            if sha256_json(saved[0]) != sha256_json(payload):
+                raise ValueError(f"saved {identity} differs from the resumed step's input")
+            return saved[1]
         self._artifacts.write_json(
             artifact_id=identity,
             artifact_type="world-operation",
@@ -377,6 +452,14 @@ def _reask(body: JsonObject, raw: JsonObject, reason: str) -> JsonObject:
             },
         ],
     }
+
+
+def _proposal(record: JsonObject) -> JsonObject:
+    """The raw simulator output an earlier attempt saved for one logical request."""
+    raw = record.get("proposal")
+    if not isinstance(raw, dict):
+        raise ValueError("saved simulator proposal is not an object")
+    return raw
 
 
 def _observations(response: JsonObject) -> tuple[Observation, ...]:

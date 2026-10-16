@@ -53,6 +53,7 @@ def evaluate_workflow(
     reply_feedback_source: str | None = None,
     progress: ProgressHook | None = None,
     feedback_after_predictions: bool = False,
+    resume: bool = False,
 ) -> DualReport:
     """Run without native rescue; retain blocked slots and a separate receipt identity.
 
@@ -64,9 +65,18 @@ def evaluate_workflow(
     evaluation IDs for their immutable request and result artifacts. ``progress`` observes
     each simulated turn as an exact completed/total count; after a hard stop it reports
     the turns actually simulated, qualified as stopped, never the blocked remainder.
+
+    ``resume`` continues an interrupted evaluation of the same workload: the session's
+    committed steps must be a prefix of the workload, and they replay from the session; an
+    interrupted judge intent is completed instead of being reported as unknown.
     """
-    if session.transitions:
+    committed = session.transitions
+    if committed and not resume:
         raise ValueError("a scored workflow requires a fresh initialized session")
+    if [row.get("operation_id") for row in committed] != [
+        action.call_id for action in workload.actions[: len(committed)]
+    ]:
+        raise ValueError("resumed session steps differ from the workload's leading actions")
     judge = JudgeConfig.model_validate(judge.model_dump(mode="json"))
     if len({action.call_id for action in workload.actions}) != len(workload.actions):
         raise ValueError("workflow actions need distinct logical call identities")
@@ -85,7 +95,9 @@ def evaluate_workflow(
         or any(not row.reply_available for row in references.steps)
     ):
         raise ValueError("online feedback requires a disclosed reply for every supplied action")
-    initial = session.state
+    initial = committed[0]["before"] if committed else session.state
+    if not isinstance(initial, dict):
+        raise ValueError("committed transition lacks its prior state")
     steps = []
     stopped = False
     feedback_receipts: list[JsonObject] = []
@@ -124,18 +136,20 @@ def evaluate_workflow(
                 )
             )
         else:
-            transition = session.transitions[-1]
+            transition = _transition(session, action.call_id)
             replies = transition["replies"]
             if not isinstance(replies, list) or len(replies) != 1:
                 raise ValueError("fixed single-tool workflow received a different reply inventory")
             steps.append(
-                WorkflowStep(
-                    step=index,
-                    action=actions[index],
-                    status="valid",
-                    before=before,
-                    reply=replies[0],
-                    after=session.state,
+                WorkflowStep.model_validate(
+                    {
+                        "step": index,
+                        "action": actions[index],
+                        "status": "valid",
+                        "before": transition["before"],
+                        "reply": replies[0],
+                        "after": transition["after"],
+                    }
                 )
             )
             if reply_feedback_source is not None and not feedback_after_predictions:
@@ -215,4 +229,13 @@ def evaluate_workflow(
         artifact_id=evaluation_id or workload.id + "-evaluation",
         clock=clock,
         code_revision=code_revision,
+        resume=resume,
     )
+
+
+def _transition(session: DurableWorldModelSession, operation_id: str) -> JsonObject:
+    """The committed transition of one operation, replayed or new."""
+    for row in reversed(session.transitions):
+        if row.get("operation_id") == operation_id:
+            return row
+    raise ValueError(f"operation {operation_id} has no committed transition")

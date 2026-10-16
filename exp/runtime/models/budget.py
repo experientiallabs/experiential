@@ -9,6 +9,7 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 
 from exp.common.core.artifacts import sha256_json
+from exp.common.models.unknown_outcome import DispatchOutcomeUnknown
 from exp.common.project import ProjectStore
 from exp.common.project.request_budget import RequestBudgetStore, RequestReceipt
 from exp.runtime.models.providers.transport import (
@@ -150,6 +151,7 @@ class RequestBudget:
 
         Raises:
             SpendLimitReached: No in-flight request can release enough allowance.
+            DispatchOutcomeUnknown: An earlier dispatch of this coordinate saved no response.
             ValueError: A saved coordinate drifted, previously failed, or violates its bound.
             Exception: The provider failed. Unknown dispatch retains its full reservation;
                 certified wholly unpaid refusal retains a zero-charge failed receipt.
@@ -222,7 +224,8 @@ class RequestBudget:
 
         Raises:
             SpendLimitReached: Settled spend leaves insufficient room for this request.
-            ValueError: Replay identity changed or an earlier dispatch has unknown results.
+            DispatchOutcomeUnknown: An earlier dispatch has no saved response.
+            ValueError: Replay identity changed.
         """
         with self._condition:
             while True:
@@ -247,7 +250,7 @@ class RequestBudget:
                         if row.state != "complete" and not (
                             row.state == "unknown" and row.response is not None
                         ):
-                            raise ValueError(
+                            raise DispatchOutcomeUnknown(
                                 "saved provider dispatch has unresolved spend; not replayed"
                             )
                         return self._store.response(row)

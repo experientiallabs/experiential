@@ -40,6 +40,7 @@ from exp.simulation.retrieval.contracts import RAGTransition
 from exp.simulation.retrieval.selection import EvidencePolicy
 from exp.simulation.world_model.durable import DurableWorldModelSession, SessionPolicy
 from exp.simulation.world_model.experience_memory import retrieved_source
+from exp.simulation.world_model.resumption import Resumption
 from exp.simulation.world_model.runtime import GroundedWorldModel
 from exp.simulation.world_model.session_research import (
     OnlineResearchPolicy,
@@ -271,6 +272,8 @@ def open_grounded_session(
     research_overview_view: Callable[[frozenset[str]], list[JsonObject]] | None = None,
     research_overview_sources_of: Callable[[Sequence[JsonObject]], Sequence[ArtifactInput]]
     | None = None,
+    resumption: Resumption | None = None,
+    preparation_dispatches: bool = True,
 ) -> DurableWorldModelSession:
     """Open one candidate world using public context and the existing guarded store.
 
@@ -297,6 +300,9 @@ def open_grounded_session(
         research_overview_sources: Source trajectories behind the overview rows.
         research_overview_view: Re-renders the overview minus this session's retired notes.
         research_overview_sources_of: Resolves sources behind each delivered overview.
+        resumption: Explicit authority to continue a session a stopped process left open.
+        preparation_dispatches: Whether preparing a step can send requests (query embeddings
+            or memory-recall decisions).
 
     Returns:
         Durable session; no reference state or tool outcomes are used to initialize it.
@@ -356,6 +362,7 @@ def open_grounded_session(
             overview_view=research_overview_view,
             overview_sources_of=research_overview_sources_of,
             retrieved_sources_of=retrieved_sources_of,
+            resumption=resumption,
         )
         engine = ResearchTransitionEngine(engine, research)
     binding = SessionBinding(
@@ -386,6 +393,8 @@ def open_grounded_session(
         lock_path=lock_path,
         validate=validate,
         clock=clock,
+        resumption=resumption,
+        preparation_dispatches=preparation_dispatches,
         evaluation_context={
             "task_context": task.initial_context,
             "sources": {

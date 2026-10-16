@@ -23,8 +23,9 @@ from exp.common.core.artifacts import (
 )
 from exp.common.evaluations.reconstruction import strict_equal
 from exp.common.models import ToolCall
+from exp.common.models.unknown_outcome import resume_unknown
 from exp.common.project import ArtifactStore
-from exp.runtime.sessions.store import SessionStore
+from exp.runtime.sessions.store import SessionRecord, SessionStore
 from exp.simulation.engines.text.prompt import MEMORY_CONTEXT_GUIDANCE, MemoryContext
 from exp.simulation.engines.transition import (
     Completion,
@@ -33,6 +34,7 @@ from exp.simulation.engines.transition import (
     TransitionEngine,
 )
 from exp.simulation.retrieval.selection import EvidencePolicy, SelectionQuery, selected_evidence
+from exp.simulation.world_model.resumption import Resumption
 
 _INVESTIGATE = """Investigate one completed simulator prediction using only this input.
 The disclosed observation is feedback about this past action, not a future answer or full
@@ -55,6 +57,10 @@ or only describes this instance; say why in uncertainty. Abstain rather than gue
 Return the required structured investigation, with supersedes:[] if nothing is disproved.
 """
 INVESTIGATION_PROMPT = _INVESTIGATE
+_UNFINISHED = (
+    "an unfinished investigation has an unknown outcome; run the same command with "
+    "--retry-incomplete to resume it"
+)
 
 
 class OnlineResearchPolicy(ContractModel):
@@ -125,8 +131,10 @@ class SessionResearch:
     """Retain append-only feedback and revisions without mutating candidate state.
 
     The same session lock serializes prediction and feedback. Immutable intents prevent
-    an interrupted investigation from being silently purchased again after restart.
-    Prior records come from a frozen memory version and are never edited by this session.
+    an interrupted investigation from being silently purchased again after restart: only an
+    explicit resumption continues it, from its saved proposal when there is one, and records
+    a lost request before re-dispatching it. Prior records come from a frozen memory version
+    and are never edited by this session.
     """
 
     def __init__(
@@ -150,6 +158,7 @@ class SessionResearch:
         overview_sources_of: Callable[[Sequence[JsonObject]], Sequence[ArtifactInput]]
         | None = None,
         retrieved_sources_of: Callable[[Sequence[str]], Sequence[ArtifactInput]] | None = None,
+        resumption: Resumption | None = None,
     ) -> None:
         """Bind feedback policy, metered investigator and an optional frozen prior memory.
 
@@ -174,6 +183,8 @@ class SessionResearch:
             retrieved_sources_of: Resolves retrieved transition identities to the recorded
                 traces they came from, so research written after seeing retrieved evidence
                 depends on those traces' lineages.
+            resumption: Explicit authority to continue investigations a stopped process left
+                unfinished; without it an unfinished investigation stops the session.
         """
         if (policy is None) != (complete is None):
             raise ValueError("feedback learning requires both policy and investigator")
@@ -194,6 +205,7 @@ class SessionResearch:
         self._store, self._artifacts, self._complete = store, artifacts, complete
         self._lock = FileLock(lock_path, timeout=0)
         self._clock, self._code_revision = clock, code_revision
+        self._resumption = resumption
 
     @property
     def identity(self) -> Sha256:
@@ -224,8 +236,13 @@ class SessionResearch:
             },
         )
 
-    def _records(self, transitions: list[JsonValue]) -> list[JsonObject]:
-        """Load only feedback attached to already committed operations in this session."""
+    def _records(
+        self, transitions: list[JsonValue], resuming: str | None = None
+    ) -> list[JsonObject]:
+        """Load only feedback attached to already committed operations in this session.
+
+        ``resuming`` names the one operation whose unfinished investigation is being resumed.
+        """
         records: list[JsonObject] = []
         if self.policy is None:
             return records
@@ -237,8 +254,11 @@ class SessionResearch:
             identity = self._record_id(str(transition["operation_id"]))
             if self._artifacts.exists(identity):
                 records.append(json.loads(self._artifacts.read_bytes(identity, "record.json")))
-            elif self._artifacts.exists(identity + "-intent"):
-                raise ValueError("unfinished research update requires explicit recovery")
+            elif (
+                self._artifacts.exists(identity + "-intent")
+                and transition["operation_id"] != resuming
+            ):
+                raise ValueError(_UNFINISHED)
         return records
 
     def _prior_research(self, records: list[JsonObject]) -> list[JsonObject]:
@@ -289,8 +309,9 @@ class SessionResearch:
                 if not strict_equal(saved["observed_reply"], observed_reply):
                     raise ValueError("feedback replay changed the disclosed observation")
                 return saved
-            if self._artifacts.exists(identity + "-intent"):
-                raise ValueError("unfinished research update requires explicit recovery")
+            unfinished = self._artifacts.exists(identity + "-intent")
+            if unfinished and self._resumption is None:
+                raise ValueError(_UNFINISHED)
             transitions = current.state.get("transitions")
             if not isinstance(transitions, list) or not transitions:
                 raise ValueError("feedback requires a completed prediction")
@@ -300,9 +321,9 @@ class SessionResearch:
             replies = latest.get("replies")
             if not isinstance(replies, list) or len(replies) != 1:
                 raise ValueError("reply feedback requires a single-tool prediction")
-            if self._clock() >= current.binding.deadline:
+            if self._clock() >= self._deadline(current):
                 raise TimeoutError("session deadline reached before investigation")
-            records = self._records(transitions)
+            records = self._records(transitions, operation_id if unfinished else None)
             matched = strict_equal(replies[0], observed_reply)
             record: JsonObject = {
                 "id": identity,
@@ -350,16 +371,14 @@ class SessionResearch:
                     ],
                     "response_schema": investigation_schema(),
                 }
-                self._save(identity + "-intent", {"request": body})
-                proposal = complete(body, identity + "-investigate")
-                self._save(identity + "-proposal", {"proposal": proposal})
+                proposal = self._investigate(complete, identity, operation_id, body)
                 update = Investigation.model_validate(proposal)
                 available = {str(row["id"]) for row in (*active, *prior)}
                 if len(set(update.supersedes)) != len(update.supersedes) or not set(
                     update.supersedes
                 ).issubset(available):
                     raise ValueError("investigation can supersede only supplied active notes")
-                if self._clock() >= current.binding.deadline:
+                if self._clock() >= self._deadline(current):
                     raise TimeoutError("late investigation retained but not activated")
                 record["investigation"] = update.model_dump(mode="json")
             record["depends_on"] = self._dependencies(
@@ -488,9 +507,10 @@ class SessionResearch:
                 if not strict_equal(saved["observed_reply"], record["observed_reply"]):
                     raise ValueError("feedback replay changed the disclosed observation")
                 return saved
-            if self._artifacts.exists(identity + "-intent"):
-                raise ValueError("unfinished research update requires explicit recovery")
-            if self._clock() >= current.binding.deadline:
+            unfinished = self._artifacts.exists(identity + "-intent")
+            if unfinished and (self._resumption is None or not investigate):
+                raise ValueError(_UNFINISHED)
+            if self._clock() >= self._deadline(current):
                 raise TimeoutError("session deadline reached before investigation")
             if investigate:
                 body: JsonObject = {
@@ -516,16 +536,14 @@ class SessionResearch:
                     ],
                     "response_schema": investigation_schema(),
                 }
-                self._save(identity + "-intent", {"request": body})
-                proposal = complete(body, identity + "-investigate")
-                self._save(identity + "-proposal", {"proposal": proposal})
+                proposal = self._investigate(complete, identity, str(record["operation_id"]), body)
                 update = Investigation.model_validate(proposal)
                 available = {str(row["id"]) for row in prior}
                 if len(set(update.supersedes)) != len(update.supersedes) or not set(
                     update.supersedes
                 ).issubset(available):
                     raise ValueError("investigation can supersede only supplied prior notes")
-                if self._clock() >= current.binding.deadline:
+                if self._clock() >= self._deadline(current):
                     raise TimeoutError("late investigation retained but not activated")
                 record = {**record, "investigation": update.model_dump(mode="json")}
             self._save(identity, record)
@@ -543,6 +561,47 @@ class SessionResearch:
                 except Exception as error:  # noqa: BLE001 - one failure stays with its receipt.
                     results[index] = error
         return [row for row in results if row is not None]
+
+    def _deadline(self, current: SessionRecord) -> datetime:
+        """The session's registered deadline, extended by an explicit resumption window."""
+        if self._resumption is None:
+            return current.binding.deadline
+        return self._resumption.deadline(current.binding.deadline)
+
+    def _investigate(
+        self, complete: Completion, identity: str, operation_id: str, body: JsonObject
+    ) -> JsonObject:
+        """Save the intent, then send, replay, or (resuming) re-dispatch one investigation.
+
+        A saved proposal is reused without a provider call. A resumed intent must carry the
+        same request. A request whose earlier dispatch saved no response is re-dispatched only
+        under a resumption, after it is recorded as an unknown-outcome retry.
+        """
+        intent = identity + "-intent"
+        if self._artifacts.exists(intent):
+            saved = json.loads(self._artifacts.read_bytes(intent, "record.json"))
+            if sha256_json(saved.get("request")) != sha256_json(body):
+                raise ValueError("an unfinished investigation's request differs on resumption")
+            if self._artifacts.exists(identity + "-proposal"):
+                record = json.loads(
+                    self._artifacts.read_bytes(identity + "-proposal", "record.json")
+                )
+                proposal = record.get("proposal")
+                if not isinstance(proposal, dict):
+                    raise ValueError("saved investigation proposal is not an object")
+                return proposal
+        else:
+            self._save(intent, {"request": body})
+        retried = (
+            None
+            if self._resumption is None
+            else self._resumption.recorder("investigation", operation_id)
+        )
+        proposal = resume_unknown(
+            lambda logical: complete(body, logical), identity + "-investigate", retried
+        )
+        self._save(identity + "-proposal", {"proposal": proposal})
+        return proposal
 
     def _retrieved(self, transitions: list[JsonValue]) -> Sequence[ArtifactInput]:
         """Recorded traces behind every retrieved transition this session's predictions saw."""

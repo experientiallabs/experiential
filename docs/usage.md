@@ -586,10 +586,23 @@ inspected, which in practice means new traces from a new import.
 In every replay, turns the simulator never answered count as not reproduced, and `--verbose`
 adds every trace and turn. Run IDs are derived from the run's inputs, including the prompts the
 simulator sends, so a changed input starts a new run and an unchanged one replays without provider
-calls. A run that stopped after buying calls is never bought again silently: rerun with
-`--retry-incomplete` (on `exp build --learn`, `exp eval --retest-misses` or
-`exp eval --held-out-fidelity`) to replace it. A learning trace that stops before completing is
-retried up to three times in the same pass; any trace still not learned is reported separately.
+calls. A run interrupted before it saved a result (a killed process, a lost connection) is never
+bought again silently: the plain command stops on it, and `--retry-incomplete` (on
+`exp build --learn`, `exp eval --retest-misses` or `exp eval --held-out-fidelity`) resumes it in
+place. The same run continues from its first uncommitted step, with the same run ID and the
+memory it pinned when it started, in a fresh three-hour window. Committed steps, saved
+investigations, a saved judge response and finished panel traces replay without provider calls;
+if only the judge is missing, only the judge runs. A request that left the process without a
+saved response has an unknown outcome: it may have been answered, billed and seen (in a gateway
+log or a terminal). It is sent again and reported as `step k re-dispatched after an unknown
+outcome` (k counts turns from 1) with its attempt count, so the retry is transparent but not provably uninfluenced. A
+step whose interrupted preparation (query embeddings, memory-recall decisions) must be prepared
+again is reported the same way, at stage `retrieval`. Any learning or audit report that includes
+such a retry says so in its headline (`qualified: unknown-outcome retries`), with counts by stage
+(prediction, judge, investigation), the affected traces, and the score with and without them;
+the affected traces are never dropped by default. A learning trace that saves a result but is
+not learned (for example after a failed investigation) is retried up to three times in the same
+pass; any trace still not learned is reported separately.
 Every trace is predicted whole before any of its replies is disclosed;
 investigations of its misses then run together, so a failed investigation never prevents a
 prediction. A trace's first saved measurement fixes its score, including unanswered turns as

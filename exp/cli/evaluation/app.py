@@ -13,8 +13,8 @@ FIDELITY_OPTION = typer.Option(
 RETRY_INCOMPLETE_OPTION = typer.Option(
     False,
     "--retry-incomplete",
-    help="With --held-out-fidelity or --retest-misses, buy again the calls of runs that "
-    "stopped incomplete.",
+    help="With --held-out-fidelity or --retest-misses, resume interrupted runs in place: saved "
+    "steps replay, and a request lost in flight is sent again and reported.",
 )
 
 RETEST_MISSES_OPTION = typer.Option(
@@ -96,7 +96,7 @@ def evaluate(
         fidelity: Explicit reconstruction workload, separate from worker-model evaluation.
         held_out_fidelity: Number of held-out build traces replayed on the fit-only simulator.
         retest_misses: Number of missed learned traces replayed on the final memory.
-        retry_incomplete: Replace interrupted held-out or retest runs, buying their calls again.
+        retry_incomplete: Resume interrupted held-out or retest runs in place.
         include_inspected: Re-run held-out lineages an earlier audit showed in detail.
         verbose: Plain per-turn fidelity detail, for agents and logs.
     """

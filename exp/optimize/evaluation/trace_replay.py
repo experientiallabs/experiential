@@ -15,9 +15,11 @@ every recorded exchange is measured.
 Run identities are content-addressed: the run ID is derived from the complete spec except its
 deadline, so changed inputs (a rebuilt simulator, another judge, a new tool inventory, a new
 memory checkpoint) register a new run automatically, and an unchanged run replays its saved
-result without provider calls. An earlier attempt that can never complete (its deadline passed,
-or its execution stopped with no process holding it) is retired and the next attempt gets a
-fresh generation suffix.
+result without provider calls. An earlier attempt that never bought a call and can never
+complete (its deadline passed, or its execution stopped with no process holding it) is retired
+and the next attempt gets a fresh generation suffix. An interrupted attempt that bought calls
+is never replaced: it stops visibly, and ``--retry-incomplete`` resumes it in place (see
+:mod:`exp.optimize.evaluation.fidelity_recovery`).
 """
 
 import json
@@ -56,8 +58,10 @@ from exp.optimize.evaluation.fidelity import (
     RoleBudgets,
     prepare_fidelity_evaluation,
     saved_fidelity_report,
+    unknown_outcomes,
 )
 from exp.optimize.evaluation.fidelity_memory import INCOMPLETE, saved_memory_receipt
+from exp.optimize.evaluation.fidelity_recovery import Qualification, UnknownOutcome, qualify
 from exp.runtime.models import RuntimeModelCatalog
 from exp.runtime.models.providers.transport import RetryPolicy
 from exp.runtime.sessions.dispatch_ledger import DispatchLedger
@@ -132,6 +136,8 @@ class ReplayResult(ContractModel):
         judge_status: Saved judge outcome.
         turns: Per-turn outcomes recomputed from the saved evaluation inputs.
         report: The saved dual report.
+        unknown_outcomes: Steps re-dispatched after an unknown outcome when the run resumed;
+            empty for a run that never resent a lost request.
     """
 
     trace_id: str
@@ -144,6 +150,11 @@ class ReplayResult(ContractModel):
     judge_status: str
     turns: tuple[TurnOutcome, ...]
     report: DualReport
+    unknown_outcomes: tuple[UnknownOutcome, ...] = ()
+
+    def recovery_lines(self) -> tuple[str, ...]:
+        """Per-step disclosure of every unknown-outcome retry, for trace detail views."""
+        return tuple(row.line() for row in self.unknown_outcomes)
 
 
 class ReplayAggregate(ContractModel):
@@ -159,6 +170,8 @@ class ReplayAggregate(ContractModel):
         judge_turns: Turns with a per-turn response score and a recorded reply.
         judge_agreements: Of those, turns where the judge's verdict (response score 4 or 5)
             agrees with exact reproduction; a calibration check on the judge, not a score.
+        qualification: Present when any trace includes unknown-outcome retries; its status
+            belongs in the headline, never only in per-step detail.
     """
 
     traces: int
@@ -169,6 +182,7 @@ class ReplayAggregate(ContractModel):
     judge_mean: float | None
     judge_turns: int = 0
     judge_agreements: int = 0
+    qualification: Qualification | None = None
 
 
 def replay_boundary(trace: Trace, exchanges: int) -> int:
@@ -445,12 +459,12 @@ def register_replay(
     trace: str,
     code_revision: str,
     now: datetime,
-    retry_incomplete: bool = False,
 ) -> tuple[PreparedFidelity, tuple[str, ...]]:
     """Register a derived spec under its content address, retiring attempts that cannot finish.
 
-    An attempt that already claimed physical attempts is replaced only with
-    ``retry_incomplete``, because replacing it buys those calls again.
+    An interrupted attempt that already claimed physical attempts is never replaced: replacing
+    it would buy those calls again and start a second first measurement. It is returned, and
+    the executor resumes it only when the caller passes ``resume_until``.
 
     Args:
         project: Project owning the registration.
@@ -479,7 +493,7 @@ def register_replay(
         if project.artifacts.exists(stable_id("fidelity", {"run_id": successor})):
             generation += 1  # replaced by an earlier registration; follow the chain
             continue
-        if not _retired(project, saved, now, generation, retry_incomplete):
+        if not _retired(project, saved, now, generation):
             return saved, tuple(retired)
         retired.append(saved.spec.run_id)
         generation += 1
@@ -516,6 +530,7 @@ def replay_result(
         judge_scores=tuple(axis.score for axis in report.axes if axis.score is not None),
         judge_status=report.judge_status,
         report=report,
+        unknown_outcomes=unknown_outcomes(project, prepared),
     )
 
 
@@ -567,6 +582,25 @@ def aggregate(results: Sequence[ReplayResult]) -> ReplayAggregate:
         judge_mean=sum(scores) / len(scores) if scores else None,
         judge_turns=len(judged),
         judge_agreements=sum(verdict == exact for verdict, exact in judged),
+        qualification=qualify(
+            [(result.unknown_outcomes, result.exact, result.steps) for result in results]
+        ),
+    )
+
+
+def interrupted(project: ProjectStore, prepared: PreparedFidelity) -> bool:
+    """Whether a run started executing and stopped before it saved a result.
+
+    Args:
+        project: Project owning the run.
+        prepared: Exact registration.
+
+    Returns:
+        True when only ``--retry-incomplete`` can continue it.
+    """
+    return (
+        project.artifacts.exists(prepared.id + "-execution")
+        and saved_fidelity_report(project, prepared) is None
     )
 
 
@@ -596,7 +630,6 @@ def _retired(
     saved: PreparedFidelity,
     now: datetime,
     generation: int,
-    retry_incomplete: bool = False,
 ) -> bool:
     """Whether an earlier attempt can never complete and may be replaced.
 
@@ -606,9 +639,9 @@ def _retired(
 
     An attempt without a report is replaced when it never executed and the model catalog has
     since changed (the executor would refuse it), or when it can no longer finish (past its
-    deadline, or stopped with no live lock holder). Replacing one that already claimed
-    physical attempts would buy those calls again, so that needs ``retry_incomplete``;
-    otherwise it stays registered and the executor stops visibly on it.
+    deadline, or stopped with no live lock holder) and never claimed a physical attempt.
+    Replacing one that claimed attempts would buy those calls again, so it stays registered:
+    the executor stops visibly on it, or resumes it with ``--retry-incomplete``.
     """
     if saved_fidelity_report(project, saved) is not None:
         receipt = saved_memory_receipt(project, saved)
@@ -630,7 +663,7 @@ def _retired(
         except Timeout:
             return False
         lock.release()
-    return retry_incomplete or attempts_used(project, saved) == 0
+    return attempts_used(project, saved) == 0
 
 
 def _allowance(default: int, capabilities: ModelCapabilities) -> int:
