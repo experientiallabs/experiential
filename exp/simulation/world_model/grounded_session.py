@@ -19,6 +19,7 @@ from exp.common.models import (
 )
 from exp.common.project import ArtifactStore
 from exp.common.tasks import TaskCase, ToolSchema
+from exp.common.tasks.facts import InstanceFacts
 from exp.runtime.environments import Observation
 from exp.runtime.sessions.store import SessionBinding, SessionStore
 from exp.simulation.engines.text.prompt import (
@@ -104,6 +105,10 @@ class GroundedTransitionEngine:
         json_object_output: Explicit structured-output treatment, false for plain text calls.
         output_protocol: Plain JSON text or one typed transition proposal.
         served_model_id: Catalog pin for the provider-reported ID of the frozen model.
+        facts: Validated instance facts; each prediction receives only the conditioning facts
+            whose state version is not later than the state it predicts from.
+        facts_version: State version of the session's first action: the recorded actions
+            applied before it, such as a disclosed public prefix.
     """
 
     def __init__(
@@ -115,6 +120,8 @@ class GroundedTransitionEngine:
         json_object_output: bool = False,
         output_protocol: Literal["text", "json-tool"] = "text",
         served_model_id: str | None = None,
+        facts: InstanceFacts | None = None,
+        facts_version: int = 0,
     ) -> None:
         """Bind an existing predictor to a single public fixed-action task."""
         if maximum_output_tokens <= 0 or task.reference_answer is not None:
@@ -134,6 +141,10 @@ class GroundedTransitionEngine:
             self._models.append(
                 runtime.artifact.model.model_copy(update={"model_id": served_model_id})
             )
+        if facts_version < 0:
+            raise ValueError("the facts state version of the first action cannot be negative")
+        self.facts = None if facts is None else facts.require_validated("this session")
+        self.facts_version = facts_version
 
     @property
     def identity(self) -> Sha256:
@@ -150,6 +161,15 @@ class GroundedTransitionEngine:
                 "json_object_output": self.json_object_output,
                 "output_protocol": self.output_protocol,
                 "protocol": "grounded-typed-response-v3",
+                # Recorded only when present, so fact-free identities stay unchanged.
+                **(
+                    {}
+                    if self.facts is None
+                    else {
+                        "facts": self.facts.model_dump(mode="json"),
+                        "facts_version": self.facts_version,
+                    }
+                ),
             }
         )
 
@@ -170,11 +190,13 @@ class GroundedTransitionEngine:
         if not actions or any(action.name not in names for action in actions):
             raise ValueError("declare every supplied action in the public task tools")
         visible: list[ModelMessage] = []
+        applied = 0
         for turn in history:
             calls, observations = turn.get("actions"), turn.get("observations")
             if not isinstance(calls, list) or not isinstance(observations, list):
                 raise ValueError("stored grounded history requires actions and observations")
             prior = tuple(ToolCall.model_validate(call) for call in calls)
+            applied += len(prior)
             decoded = tuple(Observation.model_validate(value) for value in observations)
             if len(prior) != len(decoded):
                 raise ValueError("stored grounded history has a different result inventory")
@@ -189,6 +211,9 @@ class GroundedTransitionEngine:
                         role="tool", content=observation.content, tool_call_id=call.call_id
                     )
                 )
+        conditioning = (
+            None if self.facts is None else self.facts.conditioning(self.facts_version + applied)
+        )
         prepared = self.runtime.prepare_turn(
             task=self.task,
             visible_messages=visible,
@@ -198,6 +223,7 @@ class GroundedTransitionEngine:
             state=state,
             memory=memory,
             output_protocol=self.output_protocol,
+            facts=conditioning,
         ).fit_context(self.runtime.capabilities, self.runtime.token_counter)
         framed = frame_grounded_output(
             prepared.request,
@@ -212,6 +238,14 @@ class GroundedTransitionEngine:
                 "grounded_transition_ids": [
                     match.transition.transition_id for match in prepared.matches
                 ],
+                **(
+                    {}
+                    if conditioning is None
+                    else {
+                        "instance_facts_version": conditioning.state_version,
+                        "instance_fact_keys": [fact.key for fact in conditioning.facts],
+                    }
+                ),
             },
         )
 
@@ -284,6 +318,8 @@ def open_grounded_session(
     | None = None,
     resumption: Resumption | None = None,
     preparation_dispatches: bool = True,
+    facts: InstanceFacts | None = None,
+    facts_version: int = 0,
 ) -> DurableWorldModelSession:
     """Open one candidate world using public context and the existing guarded store.
 
@@ -315,6 +351,8 @@ def open_grounded_session(
         resumption: Explicit authority to continue a session a stopped process left open.
         preparation_dispatches: Whether preparing a step can send requests (query embeddings
             or memory-recall decisions).
+        facts: Validated instance facts, delivered in their own channel by state version.
+        facts_version: State version of the session's first action.
 
     Returns:
         Durable session; no reference state or tool outcomes are used to initialize it.
@@ -343,6 +381,8 @@ def open_grounded_session(
         json_object_output=json_object_output,
         output_protocol=output_protocol,
         served_model_id=served_model_id,
+        facts=facts,
+        facts_version=facts_version,
     )
     research = None
     if research_selection is not None:

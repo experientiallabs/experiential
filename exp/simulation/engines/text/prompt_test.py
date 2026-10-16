@@ -5,10 +5,14 @@ import json
 import pytest
 
 from exp.common.core.artifacts import sha256_json
-from exp.common.models import AssistantAction, ModelMessage
+from exp.common.models import AssistantAction, ModelMessage, ModelRequest
 from exp.common.tasks import TaskCase
+from exp.common.tasks.facts import ConditioningFacts, parse_instance_facts
+from exp.common.tasks.facts_test import fact
 from exp.simulation.engines.text.prompt import (
+    INSTANCE_FACTS_GUIDANCE,
     WORLD_MODEL_TEXT_PROMPT_VERSION,
+    MemoryContext,
     TextWorldModelProtocolError,
     build_world_model_request,
     candidate_rag_actions,
@@ -182,3 +186,37 @@ def test_context_identity_preserves_exact_values_and_first_use_order() -> None:
     ]
     assert examples[0]["context_ref"] == examples[2]["context_ref"]
     assert examples[0]["context_ref"] != examples[3]["context_ref"]
+
+
+def test_instance_facts_have_their_own_channel_separate_from_memory() -> None:
+    """Facts render as ``instance_facts`` with their guidance, never inside memory channels."""
+    facts = parse_instance_facts(
+        {"facts": [fact("input.xlsx/Sheet1/A2", "FACT-PQTW1")]}, "fixture"
+    ).conditioning(0)
+    memory = MemoryContext(observations=({"id": "o", "reply": "MEMORY-ONLY"},))
+
+    def request(supplied: ConditioningFacts | None) -> ModelRequest:
+        """The same prediction request, with or without facts."""
+        return build_world_model_request(
+            _task(),
+            visible_messages=(ModelMessage(role="user", content="Read the workbook."),),
+            candidate_response=AssistantAction(content="Reading."),
+            grounded_examples=(),
+            maximum_output_tokens=1_000,
+            memory=memory,
+            facts=supplied,
+        )
+
+    with_facts, without = request(facts), request(None)
+    evidence = json.loads(with_facts.messages[1].content or "")
+    assert evidence["instance_facts"]["facts"][0]["value"] == "FACT-PQTW1"
+    assert evidence["instance_facts"]["state_version"] == 0
+    for channel in ("memory_observations", "research_history", "task", "environment_state"):
+        assert "FACT-PQTW1" not in json.dumps(evidence[channel])
+    assert INSTANCE_FACTS_GUIDANCE in (with_facts.messages[0].content or "")
+    # Without facts the request is unchanged: no channel and no guidance.
+    plain = json.loads(without.messages[1].content or "")
+    assert "instance_facts" not in plain
+    assert without.messages[0] == with_facts.messages[0].model_copy(
+        update={"content": (with_facts.messages[0].content or "")[: -len(INSTANCE_FACTS_GUIDANCE)]}
+    )

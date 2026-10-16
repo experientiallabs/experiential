@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Literal, cast
 
 from pydantic import AwareDatetime, Field, field_validator, model_validator
 
@@ -18,6 +18,7 @@ from exp.common.core.artifacts import (
 )
 from exp.common.models import ModelSnapshot, Usage
 from exp.common.tasks import ToolSchema
+from exp.common.tasks.facts import INSTANCE_FACTS_CONTEXT_KEY
 
 
 class TraceSource(ContractModel):
@@ -62,7 +63,23 @@ class TraceSpan(ContractModel):
 
 
 class Trace(ContractModel):
-    """One normalized customer agent trace with source provenance."""
+    """One normalized customer agent trace with source provenance.
+
+    Attributes:
+        trace_id: Source trace identity.
+        conversation_id: Optional conversation identity.
+        task: Initial request text.
+        initial_context: Request-visible context. A request context's ``instance_facts``
+            entry is moved to ``instance_facts`` on construction, so instance facts never
+            become request-visible context, retrieval grounding, mined task context, or
+            memory of other traces.
+        tools: Declared tools.
+        spans: Ordered normalized spans.
+        outcome: Captured terminal outcome, if any.
+        source: Source provenance.
+        instance_facts: Raw instance facts the trace package supplied for this trace's
+            instance; validated by the consumer before use. Omitted when absent.
+    """
 
     trace_id: str = Field(min_length=1, max_length=512)
     conversation_id: str | None = Field(default=None, max_length=512)
@@ -72,6 +89,35 @@ class Trace(ContractModel):
     spans: tuple[TraceSpan, ...]
     outcome: TraceOutcome | None = None
     source: TraceSource
+    instance_facts: JsonObject | None = Field(default=None, exclude_if=lambda value: value is None)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _separate_instance_facts(cls, value: object) -> object:
+        """Move a request context's instance facts into their own channel."""
+        if not isinstance(value, dict):
+            return value
+        context: object = value.get("initial_context")
+        if not isinstance(context, dict):
+            return value
+        context = cast(JsonObject, context)
+        if INSTANCE_FACTS_CONTEXT_KEY not in context:
+            return value
+        if value.get("instance_facts") is not None:
+            raise ValueError(
+                "a trace supplies instance facts both in its request context and separately; "
+                "supply them once"
+            )
+        facts = context[INSTANCE_FACTS_CONTEXT_KEY]
+        if not isinstance(facts, dict):
+            raise ValueError(
+                f"request context entry {INSTANCE_FACTS_CONTEXT_KEY!r} must be a JSON object of "
+                "instance facts"
+            )
+        remaining = {
+            key: item for key, item in context.items() if key != INSTANCE_FACTS_CONTEXT_KEY
+        }
+        return {**value, "initial_context": remaining, "instance_facts": facts}
 
     @field_validator("spans")
     @classmethod

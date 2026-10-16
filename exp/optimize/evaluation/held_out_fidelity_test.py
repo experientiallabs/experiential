@@ -108,8 +108,8 @@ def package_rows(episodes: list[JsonObject]) -> list[JsonObject]:
     Each trace has a ``chat`` span with the customer request and the request context
     ``{"task_lineage": USER, "replay_from": N}``, then one call and one result span per
     recorded tool exchange, paired by ``gen_ai.tool.call.id``. An episode may override its
-    declared task identity (``lineage``) and conversation (``conversation``), or omit call IDs
-    (``no_call_ids``).
+    declared task identity (``lineage``) and conversation (``conversation``), omit call IDs
+    (``no_call_ids``), or supply instance facts in the request context (``facts``).
     """
     rows: list[JsonObject] = []
     start = datetime(2026, 10, 15, tzinfo=UTC)
@@ -119,6 +119,8 @@ def package_rows(episodes: list[JsonObject]) -> list[JsonObject]:
         key = user + str(item.get("repeat", ""))
         trace_id = hashlib.sha256(key.encode()).hexdigest()[:32]
         context = {"task_lineage": item.get("lineage", user), "replay_from": item["prefix"]}
+        if "facts" in item:
+            context["instance_facts"] = item["facts"]
         rows.append(
             {
                 "trace_id": trace_id,
