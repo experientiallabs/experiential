@@ -10,14 +10,12 @@ from exp.common.evaluations.reconstruction import (
     DualReport,
     EvaluationReferences,
     JudgeConfig,
-    JudgeNotRun,
     WorkflowEvidence,
     WorkflowStep,
     evaluate,
     strict_equal,
 )
 from exp.common.models import ToolCall
-from exp.common.models.client import RequestCapacityExceeded
 from exp.common.progress import ProgressHook, report
 from exp.common.project import ArtifactStore
 from exp.runtime.models.budget import SpendLimitReached
@@ -199,18 +197,12 @@ def evaluate_workflow(
         }
     )
 
-    def judge_call(body: JsonObject, identity: str) -> JsonObject:
-        """Distinguish an undispatched budget stop from failed or unassessable judging."""
-        try:
-            return judge_complete(body, identity)
-        except (SpendLimitReached, RequestCapacityExceeded) as error:
-            raise JudgeNotRun("judge refused before dispatch: " + type(error).__name__) from error
-
+    report(progress, "Judging")
     return evaluate(
         evidence,
         references,
         judge=judge,
-        complete=judge_call,
+        complete=judge_complete,
         artifacts=artifacts,
         artifact_id=evaluation_id or workload.id + "-evaluation",
         clock=clock,

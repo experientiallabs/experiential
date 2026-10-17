@@ -346,8 +346,15 @@ def replay_spec(
     learning = memory is not None and memory.mode == "learn"
     retrieves = artifact.original_evidence != "none"
     # Per turn: the prediction, a query embedding when it retrieves recorded facts, a memory
-    # recall decision, an investigation while learning, and the allowed re-asks.
-    per_step = 1 + retrieves + (memory is not None) + learning + PROPOSAL_REASKS
+    # evidence-selection decision, memory recall, an investigation while learning, and re-asks.
+    per_step = (
+        1
+        + retrieves
+        + (retrieves and retrieval is not None)
+        + (memory is not None)
+        + learning
+        + PROPOSAL_REASKS
+    )
     tail = judged + (memory.maximum_compressions if memory is not None and learning else 0)
     prediction = _allowance(PREDICTION_TOKENS, predictor)
     spec = FidelitySpec(

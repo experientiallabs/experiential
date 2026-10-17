@@ -18,6 +18,7 @@ from exp.common.models import (
     ModelCatalog,
     ModelRecord,
     ToolCall,
+    load_model_catalog,
     write_model_catalog,
 )
 from exp.common.project import ProjectConfig, ProjectStore, artifact_input
@@ -220,6 +221,7 @@ def transition_reply(proposal: JsonObject) -> JsonHttpResponse:
     )
 
 
+@pytest.mark.parametrize("judge_output_protocol", ["tool", "json"])
 @pytest.mark.parametrize(
     ("json_output", "output_protocol"),
     [(False, "text"), (True, "text"), (False, "json-tool")],
@@ -229,14 +231,30 @@ def test_predictions_references_and_completed_replay(
     monkeypatch: pytest.MonkeyPatch,
     json_output: bool,
     output_protocol: str,
+    judge_output_protocol: str,
 ) -> None:
     """Two real grounded calls carry state; the judge alone receives reference outcomes."""
     project, spec = source_project(tmp_path)
+    if judge_output_protocol == "json":
+        catalog = load_model_catalog(project.model_catalog_path)
+        record = catalog.models["model"]
+        assert record.capabilities is not None
+        judge_record = record.model_copy(
+            update={
+                "capabilities": record.capabilities.model_copy(update={"supports_tools": False})
+            }
+        )
+        write_model_catalog(
+            project.model_catalog_path,
+            catalog.model_copy(update={"models": {**catalog.models, "json-judge": judge_record}}),
+        )
+        spec = spec.model_copy(update={"judge_alias": "json-judge"})
     spec = FidelitySpec.model_validate(
         {
             **spec.model_dump(mode="json"),
             "json_object_output": json_output,
             "output_protocol": output_protocol,
+            "judge_output_protocol": judge_output_protocol,
         }
     )
     axes = {
@@ -293,33 +311,37 @@ def test_predictions_references_and_completed_replay(
         ]
     wire = ScriptedJsonTransport(
         predictions
-        + [
-            JsonHttpResponse(
-                status_code=200,
-                body={
-                    "model": "fixture-v1",
-                    "choices": [
-                        {
-                            "finish_reason": "tool_calls",
-                            "message": {
-                                "role": "assistant",
-                                "content": None,
-                                "tool_calls": [
-                                    {
-                                        "id": "judge",
-                                        "type": "function",
-                                        "function": {
-                                            "name": "submit_proposal",
-                                            "arguments": json.dumps({"axes": axes}),
-                                        },
-                                    }
-                                ],
-                            },
-                        }
-                    ],
-                },
-            )
-        ]
+        + (
+            [reply(json.dumps({"axes": axes}))]
+            if judge_output_protocol == "json"
+            else [
+                JsonHttpResponse(
+                    status_code=200,
+                    body={
+                        "model": "fixture-v1",
+                        "choices": [
+                            {
+                                "finish_reason": "tool_calls",
+                                "message": {
+                                    "role": "assistant",
+                                    "content": None,
+                                    "tool_calls": [
+                                        {
+                                            "id": "judge",
+                                            "type": "function",
+                                            "function": {
+                                                "name": "submit_proposal",
+                                                "arguments": json.dumps({"axes": axes}),
+                                            },
+                                        }
+                                    ],
+                                },
+                            }
+                        ],
+                    },
+                )
+            ]
+        )
     )
     monkeypatch.setattr(fidelity, "HttpxJsonTransport", lambda: wire)
     monkeypatch.setenv("FIDELITY_TEST_KEY", "fixture-only")
@@ -329,6 +351,8 @@ def test_predictions_references_and_completed_replay(
     assert result.judge_status == "completed" and result.planned_steps == 2
     assert result.mechanical["valid_steps"] == 2
     assert len(wire.requests) == 3
+    assert ("tools" in wire.requests[-1].payload) == (judge_output_protocol == "tool")
+    assert result.judge_completion_sha256 is not None
     assert wire.requests[0].payload.get("response_format") == (
         {"type": "json_object"} if json_output else None
     )

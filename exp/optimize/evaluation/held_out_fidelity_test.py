@@ -18,6 +18,7 @@ from typer.testing import CliRunner
 
 from exp.cli.app import app
 from exp.common.core.artifacts import JsonObject, JsonValue
+from exp.common.evaluations.reconstruction import default_judge
 from exp.common.models import (
     BillingSource,
     ConnectionConfig,
@@ -33,9 +34,15 @@ from exp.common.tasks.store import load_task_set
 from exp.optimize.evaluation import fidelity
 from exp.optimize.evaluation.fidelity import execute_fidelity_evaluation
 from exp.optimize.evaluation.held_out_fidelity import (
+    held_out_council_inputs,
     register_held_out_fidelity,
     saved_held_out_results,
     source_rag_inputs,
+)
+from exp.optimize.evaluation.trace_council import (
+    CouncilActor,
+    TraceCouncilSpec,
+    prepare_trace_council,
 )
 from exp.optimize.evaluation.trace_learning import learning_curve, learning_plan
 from exp.optimize.evaluation.trace_replay import DEADLINE, aggregate
@@ -601,10 +608,10 @@ def _import_id(store: ProjectStore) -> str:
     return import_id
 
 
-def test_source_rag_profile_measures_held_out_offline(
+def test_source_rag_profile_measures_held_out_and_feeds_the_council_offline(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The source-RAG profile: fit-only semantic retrieval and metered embeddings."""
+    """The source-RAG profile: fit-only semantic retrieval, metered embeddings, council inputs."""
     episodes = [episode(i) for i in range(USERS)]
     provider = SimulatedProvider(episodes, wrong=frozenset({"get_user_details"}))
     _, store, _ = build_project(tmp_path, monkeypatch, provider)
@@ -635,6 +642,29 @@ def test_source_rag_profile_measures_held_out_offline(
             "get_order_details",
             "get_user_details",
         }
+
+    world_model, tasks = held_out_council_inputs(store, 2)
+    assert world_model == panel.world_model
+    assert tasks == tuple(case.task for case in panel.cases[:2])
+    spec = TraceCouncilSpec(
+        run_id="held-out-council",
+        world_model=world_model,
+        tasks=tasks,
+        actors=(
+            CouncilActor(alias="world", tier="fixture-a"),
+            CouncilActor(alias="judge", tier="fixture-b"),
+        ),
+        analysts=("judge",),
+        judge_alias="judge",
+        judge=default_judge("judge-v1", protocol="keyed-v3"),
+        deadline=datetime.now(UTC) + timedelta(hours=1),
+        maximum_physical_attempts=40,
+        simulator_output_tokens=8_192,
+    )
+    purchased = len(provider.requests)
+    prepared = prepare_trace_council(store, spec, code_revision=REVISION)
+    assert _at(prepared.definition, "tasks", 0, "initial_context", "public_prefix")
+    assert len(provider.requests) == purchased
 
 
 def test_fit_only_simulator_cannot_retrieve_any_held_out_trace(

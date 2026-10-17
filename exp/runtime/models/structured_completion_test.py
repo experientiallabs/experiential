@@ -179,3 +179,22 @@ def test_named_tool_output_uses_actual_schema_and_validates_response(tmp_path: P
     with pytest.raises(ReturnedOutputRejected) as refused:
         complete(body, "tool-invalid")
     assert isinstance(refused.value.__cause__, ValidationError)
+
+
+def test_completion_profile_pins_inference_settings_not_scheduling(tmp_path: Path) -> None:
+    """A rubric cannot reuse qualification across different output protocols or allowances."""
+    complete, _, _ = setup(tmp_path, AssistantAction(content="{}"))
+    original = complete.completion_profile_sha256
+    complete.plan = complete.plan.model_copy(
+        update={"deadline": complete.plan.deadline + timedelta(hours=1), "maximum_cost_per_call": 2}
+    )
+    assert complete.completion_profile_sha256 == original
+    for update in (
+        {"output_tokens": 500},
+        {"output_protocol": "tool"},
+        {"json_object_output": True},
+    ):
+        plan = complete.plan
+        complete.plan = plan.model_copy(update=update)
+        assert complete.completion_profile_sha256 != original
+        complete.plan = plan

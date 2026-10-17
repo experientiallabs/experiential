@@ -284,7 +284,11 @@ class ProjectRouterReportArtifacts(ContractModel):
 
 
 class ProjectConfig(ContractModel):
-    """Project-local configuration that names no provider credentials or secret references."""
+    """Project-local configuration that names no provider credentials or secret references.
+
+    Attributes:
+        evaluation_tasks: Explicit immutable evaluation roots retained by normal Project export.
+    """
 
     schema_version: int = Field(default=4, ge=1)
     project_id: ArtifactId
@@ -306,6 +310,7 @@ class ProjectConfig(ContractModel):
     router_report: ProjectRouterReportArtifacts | None = None
     agent: AgentConfiguration | None = None
     model_optimization_config: ArtifactInput | None = None
+    evaluation_tasks: tuple[ArtifactInput, ...] = ()
     redacted_field_names: tuple[str, ...] = ()
 
     @model_validator(mode="before")
