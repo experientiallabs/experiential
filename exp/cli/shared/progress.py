@@ -234,33 +234,6 @@ def progress_display(console: Console) -> Iterator[ProgressHook]:
         yield display.phase(_ONLY)
 
 
-def qualified(hook: ProgressHook | None, detail: str) -> ProgressHook | None:
-    """Re-emit a service's events under one distinguishing qualifier.
-
-    Args:
-        hook: Downstream observer, or ``None`` when nobody is watching.
-        detail: Short qualifier separating repeated stages, such as an index name.
-
-    Returns:
-        A forwarding hook carrying the qualifier, or ``None`` when the observer is absent.
-    """
-    if hook is None:
-        return None
-
-    def forward(event: ProgressEvent) -> None:
-        """Forward one event with the owning command's qualifier attached."""
-        hook(
-            ProgressEvent(
-                stage=event.stage,
-                completed=event.completed,
-                total=event.total,
-                detail=event.detail or detail,
-            )
-        )
-
-    return forward
-
-
 def _key(event: ProgressEvent) -> tuple[str, str | None]:
     """Return the identity that separates one stage row from the next."""
     return (event.stage, event.detail)

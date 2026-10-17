@@ -14,9 +14,8 @@ from exp.cli.shared.progress import (
     ProgressDisplay,
     progress_display,
     progress_phases,
-    qualified,
 )
-from exp.common.progress import ProgressEvent
+from exp.common.progress import ProgressEvent, qualified
 from exp.simulation.retrieval.contracts import RAGAction
 from exp.simulation.retrieval.embedding import (
     RAGEmbeddingCache,
