@@ -16,7 +16,7 @@ from exp.common.models import (
     ModelSnapshot,
     ToolCall,
 )
-from exp.common.project import ProjectConfig, ProjectStore
+from exp.common.project import ArtifactStore, ProjectConfig, ProjectStore
 from exp.runtime.models.budget import RequestBudget
 from exp.runtime.models.structured_completion import (
     CompletionPlan,
@@ -198,3 +198,38 @@ def test_completion_profile_pins_inference_settings_not_scheduling(tmp_path: Pat
         complete.plan = plan.model_copy(update=update)
         assert complete.completion_profile_sha256 != original
         complete.plan = plan
+
+
+def test_a_resumption_window_admits_past_the_plan_deadline_and_still_replays(
+    tmp_path: Path,
+) -> None:
+    """The window extends admission; the plan, so the replay fingerprint, is unchanged."""
+    complete, client, budget = setup(tmp_path, AssistantAction(content='{"a": 1}'))
+    body: JsonObject = {"messages": [{"role": "user", "content": "return JSON"}]}
+    assert complete(body, "answered") == {"a": 1}
+    later = complete.plan.deadline + timedelta(hours=4)
+    with pytest.raises(TimeoutError):
+        StructuredCompletion(
+            client=client,
+            plan=complete.plan,
+            budget=budget,
+            artifacts=budget_artifacts(tmp_path),
+            clock=lambda: later,
+        )(body, "answered")
+    resumed = StructuredCompletion(
+        client=client,
+        plan=complete.plan,
+        budget=budget,
+        artifacts=budget_artifacts(tmp_path),
+        clock=lambda: later,
+        window=later + timedelta(hours=3),
+    )
+    assert resumed(body, "answered") == {"a": 1}
+    assert len(client.requests) == 1, "the saved answer replays without a provider call"
+    assert resumed(body, "new") == {"a": 1}
+    assert len(client.requests) == 2
+
+
+def budget_artifacts(root: Path) -> ArtifactStore:
+    """The fixture project's artifact store."""
+    return ProjectStore(root, "completion").artifacts

@@ -175,7 +175,8 @@ def build(
     retry_incomplete: bool = typer.Option(
         False,
         "--retry-incomplete",
-        help="Buy again the calls of a learning trace that stopped incomplete.",
+        help="Resume an interrupted learning trace in place: saved steps replay, and a "
+        "request lost in flight is sent again and reported.",
     ),
 ) -> None:
     """Build a reusable grounded world model and immutable fit evidence.
@@ -204,7 +205,7 @@ def build(
         dry_run: Print the complete preflight and stop before credentials or selection.
         no_interactive: Disable inline setup and cost questions even at a terminal.
         provider: Repeatable provider names that skip the opening list during setup.
-        retry_incomplete: Replace an interrupted learning trace, buying it again.
+        retry_incomplete: Resume an interrupted learning trace in place.
 
     Raises:
         typer.BadParameter: Input, setup, role, cost, project, or artifact validation fails.

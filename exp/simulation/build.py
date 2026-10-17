@@ -46,6 +46,7 @@ from exp.simulation.mining.bindings import (
     task_set_content_id,
 )
 from exp.simulation.mining.descriptors import DescriptorEmbedder, HashingDescriptorEmbedder
+from exp.simulation.mining.exposure_ledger import ExposureLedger
 from exp.simulation.mining.service import MiningSpec, TaskMiningResult, mine_tasks, persist_task_set
 
 _BUILD_SCOPED_REVIEW_KEYS = (
@@ -396,6 +397,15 @@ def build_project(
         embedder=resolved_embedder,
     )
     trace_stored = store.artifacts.read(artifacts.trace_dataset.dataset.dataset_id)
+    # Every build records its content and grouping at the root, exposed or not, so exposure
+    # found later in any project propagates through it.
+    ExposureLedger(store.paths.root).record_build(
+        project=store.paths.project_id,
+        build=artifacts.task_set.task_set_id,
+        dataset=artifact_input(trace_stored.manifest),
+        traces=artifacts.trace_dataset.traces,
+        near_duplicates=artifacts.mining.analysis.edges,
+    )
     task_stored = store.artifacts.read(artifacts.task_set.task_set_id)
     if trace_stored.manifest != artifacts.trace_dataset.manifest:
         raise ValueError("loaded trace dataset manifest differs from the completed build")

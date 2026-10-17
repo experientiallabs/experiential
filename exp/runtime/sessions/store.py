@@ -519,6 +519,64 @@ class SessionStore:
             _audit(connection, session_id, step_id, "step_claimed", {"request": request_sha256})
         return StepDecision(kind="claimed", claim=claim)
 
+    def reclaim_step(
+        self, session_id: str, step_id: str, request_sha256: Sha256, binding: SessionBinding
+    ) -> tuple[StepClaim, StepStatus]:
+        """Take over a step a stopped process left open, for an explicit resumption only.
+
+        A claim that never reached the provider reopens as claimed. One that may have reached
+        it stays ``provider_started`` (its dispatch is already counted) and is never released:
+        the caller replays its saved output or re-dispatches it as an unknown outcome.
+
+        Args:
+            session_id: Session of the step.
+            step_id: Interrupted step.
+            request_sha256: The caller's request digest; it must equal the saved one.
+            binding: The caller's binding; it must equal the session's.
+
+        Returns:
+            A fresh claim on the step, and the status the step was left in.
+
+        Raises:
+            SessionNotFoundError: If the session does not exist.
+            SessionBindingMismatchError: If the binding differs.
+            StepConflictError: If the step is not open or was opened for another request.
+            VersionConflictError: If the session advanced past the step's base version.
+        """
+        with self._transaction() as connection:
+            session = connection.execute(
+                "SELECT version, binding_json FROM sessions WHERE session_id = ?", (session_id,)
+            ).fetchone()
+            if session is None:
+                raise SessionNotFoundError(f"session {session_id!r} does not exist")
+            if SessionBinding.model_validate_json(session["binding_json"]) != binding:
+                raise SessionBindingMismatchError(f"binding differs from session {session_id!r}")
+            row = connection.execute(
+                "SELECT request_sha256, status, base_version FROM steps"
+                " WHERE session_id = ? AND step_id = ?",
+                (session_id, step_id),
+            ).fetchone()
+            if row is None or row["status"] not in _OPEN_STATUSES:
+                raise StepConflictError(f"step {step_id!r} is not an interrupted open step")
+            if row["request_sha256"] != request_sha256:
+                raise StepConflictError(f"step {step_id!r} was opened for a different request")
+            if session["version"] != row["base_version"]:
+                raise VersionConflictError(f"step {step_id!r} is based on a stale version")
+            left = StepStatus(row["status"])
+            status = "claimed" if left is StepStatus.CLAIMED else "provider_started"
+            claim = StepClaim(
+                session_id=session_id,
+                step_id=step_id,
+                claim_token=uuid4().hex,
+                base_version=row["base_version"],
+            )
+            connection.execute(
+                "UPDATE steps SET status = ?, claim_token = ? WHERE session_id = ? AND step_id = ?",
+                (status, claim.claim_token, session_id, step_id),
+            )
+            _audit(connection, session_id, step_id, "step_reclaimed", {"from": left.value})
+        return claim, left
+
     def record_request_preflight(self, claim: StepClaim, receipt: RequestPreflightReceipt) -> None:
         """Persist the digest of a typed preflight receipt for a still-claimed step.
 
@@ -625,7 +683,12 @@ class SessionStore:
         return _object(row["proposal_json"])
 
     def complete_step(
-        self, claim: StepClaim, next_state: JsonObject, response: JsonObject
+        self,
+        claim: StepClaim,
+        next_state: JsonObject,
+        response: JsonObject,
+        *,
+        window: datetime | None = None,
     ) -> SessionRecord:
         """Publish one state revision or durably reject a late proposal.
 
@@ -633,6 +696,8 @@ class SessionStore:
             claim: Current provider-started owner of the logical operation.
             next_state: Fully validated candidate state, serialized before locking.
             response: Ordered observations to replay with the committed state.
+            window: Deadline of an explicitly resumed execution window; it extends, never
+                shortens, the binding's commit deadline. The binding itself is unchanged.
 
         Returns:
             Session at the newly committed revision.
@@ -662,7 +727,7 @@ class SessionStore:
             now = self._clock()
             if now.tzinfo is None:
                 raise ValueError("commit clock must return an aware datetime")
-            expired = now >= binding.deadline
+            expired = now >= max(binding.deadline, window or binding.deadline)
             if expired:
                 connection.execute(
                     "UPDATE steps SET status = 'rejected', response_json = ? "

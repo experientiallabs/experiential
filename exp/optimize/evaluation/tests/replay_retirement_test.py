@@ -123,7 +123,7 @@ def test_a_learning_pass_continues_after_a_catalog_edit(
 def test_an_interrupted_run_that_bought_calls_is_not_bought_again_silently(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Without --retry-incomplete the run stays and stops visibly; with it, a fresh attempt."""
+    """Without --retry-incomplete the run stays and stops visibly; with it, the run resumes."""
     provider = Interrupting([episode(i) for i in range(USERS)])
     _, store, _ = build_project(tmp_path, monkeypatch, provider)
     panel = register_held_out_fidelity(
@@ -140,16 +140,10 @@ def test_an_interrupted_run_that_bought_calls_is_not_bought_again_silently(
     with pytest.raises(ValueError, match="--retry-incomplete"):
         execute_fidelity_evaluation(store, kept.prepared[0])
     assert len(provider.requests) == sent
-    retried = register_held_out_fidelity(
-        store,
-        1,
-        profile="source-rag",
-        code_revision=REVISION,
-        clock=now,
-        retry_incomplete=True,
+    resumed = execute_fidelity_evaluation(
+        store, kept.prepared[0], resume_until=now() + trace_replay.DEADLINE
     )
-    assert retried.retired == (panel.prepared[0].spec.run_id,)
-    assert execute_fidelity_evaluation(store, retried.prepared[0]).planned_steps > 0
+    assert resumed.planned_steps > 0
 
 
 class FlakyInvestigator(SimulatedProvider):

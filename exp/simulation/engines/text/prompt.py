@@ -16,6 +16,7 @@ from exp.common.models import (
     structured_json_text,
 )
 from exp.common.tasks import TaskCase
+from exp.common.tasks.facts import ConditioningFacts
 from exp.simulation.engines.text.knowledge import SimulationKnowledge
 from exp.simulation.retrieval import RAGAction, RAGMatch
 from exp.simulation.retrieval.contracts import RAG_KEY_SCHEMA_VERSION
@@ -159,6 +160,18 @@ normal transition protocol; never claim an automatic state correction occurred.
 """
 
 
+INSTANCE_FACTS_GUIDANCE = """
+instance_facts, when present, is its own channel with its own authority: validated facts about
+this instance's world, each read from a named source by a named adapter and checked by the
+stated method. state_version counts applied actions: 0 is this instance's starting state, and
+instance_facts.state_version is the version this prediction starts from. A fact holds at its
+own state_version; later actions in visible_conversation and environment_state may have changed
+it since. These facts are not learned behavior, rules, or examples from other instances, and
+memory, research history, and grounded examples never override them for the values they state.
+A key absent from instance_facts is unknown, not empty; a null value is an observed empty value.
+"""
+
+
 class MemoryContext(ContractModel):
     """Cross-trajectory memory for one prediction, already selected and split by authority.
 
@@ -187,6 +200,7 @@ def build_world_model_request(
     knowledge: SimulationKnowledge | None = None,
     memory: MemoryContext | None = None,
     output_protocol: Literal["text", "json-tool"] = "text",
+    facts: ConditioningFacts | None = None,
 ) -> ModelRequest:
     """Frame a simulated environment transition without enabling provider tools.
 
@@ -200,6 +214,8 @@ def build_world_model_request(
         knowledge: Frozen behavioral and investigation context, empty for the baseline.
         memory: Cross-trajectory memory, rendered into the declared authority channels.
         output_protocol: Text transition or typed-proposal system instructions.
+        facts: Validated instance facts admissible for this prediction, rendered as the
+            separate ``instance_facts`` channel; never mixed into memory or research history.
 
     Returns:
         A text-only provider request with the pinned prompt and no candidate hidden state.
@@ -256,6 +272,9 @@ def build_world_model_request(
             "prior_trajectories": list(memory.prior_trajectories),
             "memory_overview": list(memory.overview),
         }
+    if facts is not None:
+        system_prompt += INSTANCE_FACTS_GUIDANCE
+        evidence["instance_facts"] = facts.rendered()
     return ModelRequest(
         messages=(
             ModelMessage(role="system", content=system_prompt),
