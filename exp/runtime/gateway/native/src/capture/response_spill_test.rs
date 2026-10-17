@@ -94,6 +94,7 @@ fn spill_collector(
             .into_owned(),
         maximum_bytes: maximum_spill_bytes,
         maximum_queued_bytes: 64 * 1024 * 1024,
+        maximum_inflight_bytes: 256 * 1024 * 1024,
         part_threshold_bytes: 64 * 1024,
     };
     let store = SpillStore::new(&spill_config).unwrap();
@@ -420,4 +421,169 @@ async fn spill_memory_stays_bounded_under_twenty_large_streams() {
         "resident memory grew by {} MB during the streams",
         streams_peak.saturating_sub(baseline) >> 20
     );
+}
+
+/// Paced like the stress preview's slow callers: about 3 MB/s per stream.
+fn slow_sse_body(frames: usize, frame_bytes: usize) -> Body {
+    let padding = Arc::new("p".repeat(frame_bytes));
+    let stream = futures_util::stream::unfold(0usize, move |index| {
+        let padding = padding.clone();
+        async move {
+            if index > frames {
+                return None;
+            }
+            if index % 8 == 0 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            Some((
+                Ok::<_, std::convert::Infallible>(sse_frame(index, frames, &padding)),
+                index + 1,
+            ))
+        }
+    });
+    Body::from_stream(stream)
+}
+
+/// The bounds the platform derives from a 256 MiB capture memory budget:
+/// B/16 pending (and B/16 windows), B/8 delivery, spill queue and request writers.
+fn budgeted_collector(name: &str) -> (Arc<Collector>, mpsc::Receiver<Delivered>) {
+    let spill_config = spill::Configuration {
+        directory: spill::tests::temporary_directory(name)
+            .to_string_lossy()
+            .into_owned(),
+        maximum_bytes: 16 << 30,
+        maximum_queued_bytes: 32 << 20,
+        maximum_inflight_bytes: 32 << 20,
+        part_threshold_bytes: 1 << 20,
+    };
+    let store = SpillStore::new(&spill_config).unwrap();
+    let (sender, receiver) = mpsc::channel();
+    let collector = Collector::with_spill(
+        Configuration {
+            delivery: Limits {
+                maximum_records: 2000,
+                maximum_bytes: 32 << 20,
+                maximum_record_bytes: 1 << 20,
+            },
+            maximum_pending_records: 2048,
+            maximum_pending_bytes: 16 << 20,
+            maximum_request_bytes: 128 << 20,
+            maximum_response_bytes: 1 << 20,
+            ttl_seconds: 600,
+            settlement_required: false,
+            relay_metadata: false,
+            truncate_request: false,
+            asynchronous_delivery: true,
+            capture_hidden_reasoning: true,
+            capture_logprobs: false,
+            spill: Some(spill_config),
+        },
+        SplitSink {
+            store: store.clone(),
+            delivered: sender,
+            reassemble: false,
+        },
+        Some(store),
+    )
+    .unwrap();
+    (Arc::new(collector), receiver)
+}
+
+/// The stress preview's failing shape: 24 concurrent 64 MB streams at about
+/// 3 MB/s each. Run once per mode, each in its own process, and compare:
+/// `EXP_CAPTURE_STRESS=control` (no capture) and `EXP_CAPTURE_STRESS=capture`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "about a minute and 1.5 GB through the disk; run by hand"]
+async fn stress_shape_capture_memory_stays_under_budget() {
+    let capture = std::env::var("EXP_CAPTURE_STRESS").as_deref() != Ok("control");
+    let (collector, delivered) = budgeted_collector("tap-stress");
+    let baseline = resident_bytes();
+    let peak = Arc::new(std::sync::atomic::AtomicU64::new(baseline));
+    let sampling = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let sampler = {
+        let (peak, sampling) = (peak.clone(), sampling.clone());
+        std::thread::spawn(move || {
+            while sampling.load(Ordering::Acquire) {
+                peak.fetch_max(resident_bytes(), Ordering::AcqRel);
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        })
+    };
+    let started = Instant::now();
+    let streams = 24;
+    // 8,192 frames of ~8 KB: about 64 MB per stream.
+    let frames = 8192;
+    let mut tasks = Vec::new();
+    for index in 0..streams {
+        let id = format!("stream-{index}");
+        if capture {
+            assert!(begin(
+                &collector,
+                &id,
+                json!({"schema_version": 1, "request": {"messages": [{"role": "user", "content": "go"}]}})
+            ));
+        }
+        let owner = capture.then(|| collector.clone());
+        tasks.push(tokio::spawn(async move {
+            let mut body =
+                capture_response(owner, &id, sse_response_from(slow_sse_body(frames, 8000)))
+                    .into_body()
+                    .into_data_stream();
+            let mut hasher = <sha2::Sha256 as sha2::Digest>::new();
+            let mut forwarded = 0usize;
+            while let Some(chunk) = futures_util::StreamExt::next(&mut body).await {
+                let chunk = chunk.unwrap();
+                sha2::Digest::update(&mut hasher, &chunk);
+                forwarded += chunk.len();
+            }
+            (forwarded, sha2::Digest::finalize(hasher).to_vec())
+        }));
+    }
+    let mut digests = std::collections::HashSet::new();
+    let mut forwarded = 0usize;
+    for task in tasks {
+        let (bytes, digest) = task.await.unwrap();
+        forwarded += bytes;
+        digests.insert(digest);
+    }
+    assert!(collector.close_until(Instant::now() + Duration::from_secs(600)));
+    sampling.store(false, Ordering::Release);
+    sampler.join().unwrap();
+    let rows: Vec<Delivered> = delivered.try_iter().collect();
+    let whole = rows
+        .iter()
+        .filter(|row| {
+            row.skeleton.as_ref().is_some_and(|skeleton| {
+                skeleton["response"]["truncated"] == false
+                    && row.parts.iter().any(|(kind, _, lines)| {
+                        *kind == PartKind::Frames && *lines == Some(frames + 1)
+                    })
+            })
+        })
+        .count();
+    let peak = peak.load(Ordering::Acquire);
+    eprintln!(
+        "capture stress ({}): forwarded {} MB in {:?}; baseline RSS {} MB, peak {} MB, \
+         delta {} MB; {} of {} captured whole; counts {:?}",
+        if capture { "capture" } else { "control" },
+        forwarded >> 20,
+        started.elapsed(),
+        baseline >> 20,
+        peak >> 20,
+        peak.saturating_sub(baseline) >> 20,
+        whole,
+        streams,
+        collector.counts(),
+    );
+    // Every caller received identical bytes.
+    assert_eq!(digests.len(), 1);
+    if capture {
+        assert_eq!(whole, streams);
+        // Capture memory is bounded by its budget whatever the stream sizes.
+        assert!(
+            peak.saturating_sub(baseline) < 256 << 20,
+            "resident memory grew by {} MB",
+            peak.saturating_sub(baseline) >> 20
+        );
+    }
 }

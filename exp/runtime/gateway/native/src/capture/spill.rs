@@ -32,8 +32,10 @@ pub(crate) struct Configuration {
     pub directory: String,
     /// Bytes of capture files held on disk at once.
     pub maximum_bytes: u64,
-    /// Relay bytes queued for the writer thread at once.
+    /// Relay bytes queued for the writer threads at once.
     pub maximum_queued_bytes: usize,
+    /// Parsed request memory background part writers may hold at once.
+    pub maximum_inflight_bytes: usize,
     /// String values at least this long leave the record skeleton as their own part.
     pub part_threshold_bytes: usize,
 }
@@ -43,6 +45,7 @@ impl Configuration {
         if self.directory.trim().is_empty()
             || self.maximum_bytes < 1024 * 1024
             || !(64 * 1024..=1024 * 1024 * 1024).contains(&self.maximum_queued_bytes)
+            || self.maximum_inflight_bytes > 1024 * 1024 * 1024
             || !(4 * 1024..=64 * 1024 * 1024).contains(&self.part_threshold_bytes)
         {
             return Err("invalid capture spill bounds");
@@ -184,7 +187,8 @@ pub(crate) struct SpillStore {
     pub(crate) part_threshold_bytes: usize,
     /// Parsed request memory background writers may hold at once. Each job
     /// holds the capture's copy of one request's messages only until they are
-    /// written (about a tenth of a second for 64 MiB), then frees it.
+    /// written (about a tenth of a second for 64 MiB), then frees it. A
+    /// request that does not fit falls back to the pending budget.
     maximum_inflight_bytes: usize,
 }
 
@@ -247,7 +251,7 @@ impl SpillStore {
             senders,
             jobs,
             part_threshold_bytes: config.part_threshold_bytes,
-            maximum_inflight_bytes: config.maximum_queued_bytes.saturating_mul(4),
+            maximum_inflight_bytes: config.maximum_inflight_bytes,
         }))
     }
 

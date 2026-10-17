@@ -25,6 +25,7 @@ pub(crate) fn store(name: &str, maximum_bytes: u64) -> Arc<SpillStore> {
         directory: temporary_directory(name).to_string_lossy().into_owned(),
         maximum_bytes,
         maximum_queued_bytes: 4 * 1024 * 1024,
+        maximum_inflight_bytes: 256 * 1024 * 1024,
         part_threshold_bytes: 4096,
     })
     .unwrap()
@@ -80,6 +81,7 @@ fn the_queue_budget_refuses_bytes_without_blocking_the_caller() {
         directory: temporary_directory("queue").to_string_lossy().into_owned(),
         maximum_bytes: 1024 * 1024 * 1024,
         maximum_queued_bytes: 64 * 1024,
+        maximum_inflight_bytes: 256 * 1024 * 1024,
         part_threshold_bytes: 4096,
     })
     .unwrap();
@@ -130,6 +132,7 @@ fn synchronous_parts_are_charged_and_complete() {
             .into_owned(),
         maximum_bytes: 1024 * 1024,
         maximum_queued_bytes: 64 * 1024,
+        maximum_inflight_bytes: 256 * 1024 * 1024,
         part_threshold_bytes: 4096,
     })
     .unwrap();
@@ -148,6 +151,7 @@ fn a_new_store_removes_only_its_own_stale_files() {
         directory: directory.to_string_lossy().into_owned(),
         maximum_bytes: 1024 * 1024,
         maximum_queued_bytes: 64 * 1024,
+        maximum_inflight_bytes: 256 * 1024 * 1024,
         part_threshold_bytes: 4096,
     })
     .unwrap();

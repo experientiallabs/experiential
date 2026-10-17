@@ -60,7 +60,9 @@ impl Configuration {
         if !(1..=4096).contains(&self.maximum_pending_records)
             || !(1..=maximum_request).contains(&self.maximum_request_bytes)
             || !(1..=4 * 1024 * 1024).contains(&self.maximum_response_bytes)
-            || self.maximum_pending_bytes < self.maximum_request_bytes
+            // With spill a large request goes to a background writer, so the
+            // pending budget need not hold one whole.
+            || (self.spill.is_none() && self.maximum_pending_bytes < self.maximum_request_bytes)
             || self.maximum_pending_bytes < self.maximum_response_bytes
             || self.maximum_pending_bytes > 256 * 1024 * 1024
             || !(1..=3600).contains(&self.ttl_seconds)
@@ -674,6 +676,17 @@ impl Collector {
             pending.bytes += entry.map_bytes();
             pending.entries.insert(request_id.to_owned(), entry);
             return false;
+        }
+        let mut relay = relay;
+        if self
+            .retained_bytes(&pending)
+            .saturating_add(entry.map_bytes())
+            .saturating_add(relay.heap_bytes())
+            > self.config.maximum_pending_bytes
+        {
+            // The caller body alone would cross the capture budget: keep the
+            // capture and the wire facts, drop the body.
+            relay.drop_body();
         }
         entry.bytes += relay.heap_bytes();
         entry.relay = Some(relay);

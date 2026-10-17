@@ -5,6 +5,9 @@ use serde_json::{json, Value};
 
 use super::budget;
 
+/// Marks a body dropped for memory until decode renders its kind.
+const DROPPED: &str = "body_dropped_for_memory";
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct Metadata {
@@ -21,6 +24,20 @@ pub(super) struct Relay {
 }
 
 impl Relay {
+    /// Keep the facts but not the body: capture memory had no room for it.
+    pub(super) fn drop_body(&mut self) {
+        self.body = Vec::new();
+        if let Some(wire) = self
+            .metadata
+            .wire_request
+            .as_mut()
+            .and_then(Value::as_object_mut)
+        {
+            wire.insert("truncated".into(), Value::Bool(true));
+            wire.insert(DROPPED.into(), Value::Bool(true));
+        }
+    }
+
     pub(super) fn heap_bytes(&self) -> usize {
         std::mem::size_of::<Self>()
             + self.body.capacity()
@@ -75,6 +92,8 @@ impl Relay {
                     Value::String(String::from_utf8_lossy(&self.body).into_owned()),
                 )
             };
+            let dropped = wire.remove(DROPPED).is_some();
+            let kind = if dropped { "dropped" } else { kind };
             wire.insert("body_kind".into(), Value::String(kind.into()));
             wire.insert("body".into(), body);
         }

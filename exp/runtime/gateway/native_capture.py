@@ -70,6 +70,9 @@ class CaptureSpillConfiguration(ContractModel):
             A capture that would cross it is marked truncated rather than trimmed.
         maximum_queued_bytes: Relay bytes queued for the spill writer, defaulting
             to 64 MiB. The relay never waits; a full queue marks that capture truncated.
+        maximum_inflight_bytes: Parsed request memory background part writers
+            may hold at once, defaulting to 64 MiB. A request that does not fit
+            falls back to the pending budget, which may skip it (counted).
         part_threshold_bytes: Strings at least this long leave the skeleton as
             their own part, defaulting to 1 MiB.
     """
@@ -79,6 +82,7 @@ class CaptureSpillConfiguration(ContractModel):
     maximum_queued_bytes: int = Field(
         default=64 * 1024 * 1024, strict=True, ge=64 * 1024, le=1024**3
     )
+    maximum_inflight_bytes: int = Field(default=64 * 1024 * 1024, strict=True, ge=0, le=1024**3)
     part_threshold_bytes: int = Field(
         default=1024 * 1024, strict=True, ge=4 * 1024, le=64 * 1024 * 1024
     )
@@ -144,9 +148,12 @@ class CaptureConfiguration(ContractModel):
         """Require room for one complete input and one reserved response buffer."""
         if self.spill is None and self.maximum_request_bytes > 8 * 1024 * 1024:
             raise ValueError("a request above 8 MiB needs a spilling collector")
-        if self.maximum_pending_bytes < max(
-            self.maximum_request_bytes, self.maximum_response_bytes
-        ):
+        # A spilling collector writes large requests to disk in the background,
+        # so its pending budget need not hold one whole.
+        largest = self.maximum_response_bytes
+        if self.spill is None:
+            largest = max(largest, self.maximum_request_bytes)
+        if self.maximum_pending_bytes < largest:
             raise ValueError("capture pending budget must fit one request or response")
         return self
 

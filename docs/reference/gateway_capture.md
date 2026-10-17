@@ -326,6 +326,19 @@ destination (`CaptureCollector.batched`); every other constructor refuses it.
   back to the in-memory accounting, which may skip the capture; that is counted.
 - **Restart.** A new collector removes the `exp-capture-*` files a previous
   process left in `directory`.
+- **Memory.** Every capture buffer is bounded independently of capture size:
+  - response windows and pending entries by `maximum_pending_bytes`;
+  - the delivery queue by `delivery.maximum_bytes`;
+  - relay chunks awaiting the writers by `maximum_queued_bytes`;
+  - background request writers by `maximum_inflight_bytes`.
+
+  A caller body that would cross the pending budget is dropped from the
+  capture (`body_kind: "dropped"`, marked truncated) rather than skipping the
+  capture. `CaptureRelay(wire_budget_bytes=...)` bounds the wire bodies all
+  in-flight requests retain together. A host sets these so they sum within its
+  capture memory budget. With bounds from a 256 MiB budget, 24 concurrent
+  64 MB streams at about 3 MB/s grew resident memory by 85 MB more than the
+  same streams uncaptured (`stress_shape_capture_memory_stays_under_budget`).
 
 Leaving `spill` unset keeps every bound above unchanged, so it doubles as the
 kill switch.
