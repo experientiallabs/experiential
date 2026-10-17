@@ -620,6 +620,33 @@ class ProjectStore(HostedProjectStoreMixin):
                 raise ProjectStoreError(f"cannot bind completed build: {exc}") from exc
             return updated
 
+    def select_evaluation_task(self, reference: ArtifactInput) -> ProjectConfig:
+        """Select a verified evaluation artifact for the normal Project bundle closure.
+
+        Args:
+            reference: Exact immutable task artifact manifest.
+
+        Returns:
+            Updated project configuration; selecting the same artifact is idempotent.
+        """
+        self._require_mutable_config()
+        with project_connection(self.paths.root, write=True):
+            manifest = self.artifacts.read(reference.artifact_id).manifest
+            if artifact_input(manifest) != reference:
+                raise ProjectStoreError("evaluation task manifest digest differs")
+            current = load_project_config(self.paths)
+            existing = {item.artifact_id: item for item in current.evaluation_tasks}
+            if reference.artifact_id in existing and existing[reference.artifact_id] != reference:
+                raise ProjectStoreError(
+                    "evaluation task identity conflicts with its selected digest"
+                )
+            existing[reference.artifact_id] = reference
+            updated = current.model_copy(
+                update={"evaluation_tasks": tuple(existing[key] for key in sorted(existing))}
+            )
+            write_project_config(self.paths, updated)
+            return updated
+
     def bind_model_optimization_config(
         self, config: ArtifactInput, *, artifact_type: str
     ) -> ProjectConfig:

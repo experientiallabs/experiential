@@ -24,6 +24,7 @@ from pydantic import JsonValue
 
 from exp.common.core.artifacts import ArtifactInput, ContractModel
 from exp.common.project import ProjectBuildArtifacts, ProjectStore
+from exp.common.tasks import TaskCase
 from exp.common.tasks.store import load_task_set
 from exp.common.traces.store import load_trace_dataset
 from exp.optimize.evaluation.fidelity import FidelityMemory, PreparedFidelity
@@ -127,6 +128,25 @@ def source_rag_inputs(
     world_model = persist_fit_only_world_model(project.artifacts, build.world_model, build.fit_rag)
     fit = load_rag_index(project.artifacts, build.fit_rag.artifact_id)
     return world_model, held_out_cases(project, count, observed_calls(fit.transitions))
+
+
+def held_out_council_inputs(
+    project: ProjectStore, count: int
+) -> tuple[ArtifactInput, tuple[TaskCase, ...]]:
+    """Public held-out tasks and the fit-only simulator, for a source-RAG trace council.
+
+    The tasks are the same public tasks held-out fidelity replays: published or observed tools,
+    the request context, and the public prefix. Recorded replies after the prefix stay out.
+
+    Args:
+        project: Project with a completed build.
+        count: Maximum number of held-out tasks.
+
+    Returns:
+        The fit-only simulator and up to ``count`` public tasks.
+    """
+    world_model, cases = source_rag_inputs(project, count)
+    return world_model, tuple(case.task for case in cases)
 
 
 def register_held_out_fidelity(

@@ -194,3 +194,22 @@ def test_response_under_the_catalog_served_model_id_is_admitted(tmp_path: Path) 
     complete.plan = complete.plan.model_copy(update={"served_model_id": "another-model"})
     with pytest.raises(ValueError, match="model identity differs"):
         complete(body, "other-pin")
+
+
+def test_completion_profile_pins_inference_settings_not_scheduling(tmp_path: Path) -> None:
+    """A rubric cannot reuse qualification across different output protocols or allowances."""
+    complete, _, _ = setup(tmp_path, AssistantAction(content="{}"))
+    original = complete.completion_profile_sha256
+    complete.plan = complete.plan.model_copy(
+        update={"deadline": complete.plan.deadline + timedelta(hours=1), "maximum_cost_per_call": 2}
+    )
+    assert complete.completion_profile_sha256 == original
+    for update in (
+        {"output_tokens": 500},
+        {"output_protocol": "tool"},
+        {"json_object_output": True},
+    ):
+        plan = complete.plan
+        complete.plan = plan.model_copy(update=update)
+        assert complete.completion_profile_sha256 != original
+        complete.plan = plan

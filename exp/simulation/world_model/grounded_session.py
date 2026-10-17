@@ -38,6 +38,7 @@ from exp.simulation.engines.transition import (
 from exp.simulation.retrieval import load_rag_index
 from exp.simulation.retrieval.contracts import RAGTransition
 from exp.simulation.retrieval.selection import EvidencePolicy
+from exp.simulation.world_model.checkpoints import WorldCheckpoint, load_world_checkpoint
 from exp.simulation.world_model.durable import DurableWorldModelSession, SessionPolicy
 from exp.simulation.world_model.experience_memory import retrieved_source
 from exp.simulation.world_model.runtime import GroundedWorldModel
@@ -268,6 +269,7 @@ def open_grounded_session(
     output_protocol: Literal["text", "json-tool"] = "text",
     served_model_id: str | None = None,
     clock: Callable[[], datetime] | None = None,
+    checkpoint: WorldCheckpoint | None = None,
     research_policy: OnlineResearchPolicy | None = None,
     research_complete: Completion | None = None,
     research_selection: EvidencePolicy | None = None,
@@ -296,6 +298,7 @@ def open_grounded_session(
         output_protocol: Freeze text framing or typed native-value proposals.
         served_model_id: Catalog pin for the provider-reported ID of the frozen model.
         clock: Optional aware clock for deterministic deadline qualification.
+        checkpoint: Verified candidate checkpoint with exactly matching world and public context.
         research_policy: Explicit opt-in to past-reply feedback and provisional memory.
         research_complete: Separately metered investigator, required with research policy.
         research_selection: Exact registered query-dependent selector for session notes.
@@ -310,6 +313,17 @@ def open_grounded_session(
     Returns:
         Durable session; no reference state or tool outcomes are used to initialize it.
     """
+    if checkpoint is not None:
+        reference = ArtifactInput(
+            artifact_id=checkpoint.artifact_id,
+            sha256=sha256_json(artifacts.read(checkpoint.artifact_id).manifest),
+        )
+        if load_world_checkpoint(artifacts, reference) != checkpoint:
+            raise ValueError("checkpoint differs from its persisted source")
+        if checkpoint.world_model != runtime.artifact_input:
+            raise ValueError("checkpoint belongs to a different simulator artifact")
+        if checkpoint.public_context != task.initial_context:
+            raise ValueError("checkpoint public context differs from the selected task")
     if (research_policy is None) != (research_complete is None):
         raise ValueError("online research requires both policy and metered investigator")
     if (research_selection is None) != (
@@ -371,7 +385,15 @@ def open_grounded_session(
     binding = SessionBinding(
         deadline=policy.deadline,
         target_id="grounded@text",
-        initialization_receipt_sha256=sha256_json(task.initial_context),
+        initialization_receipt_sha256=sha256_json(task.initial_context)
+        if checkpoint is None
+        else sha256_json(
+            {
+                "public_context": task.initial_context,
+                "checkpoint": checkpoint.artifact_id,
+                "state": checkpoint.current.model_dump(mode="json"),
+            }
+        ),
         knowledge_sha256=sha256_json(runtime.artifact.model_dump(mode="json")),
         corpus_sha256=runtime.artifact.serving_rag.sha256,
         representation_sha256=engine.identity,
@@ -389,8 +411,8 @@ def open_grounded_session(
         artifacts=artifacts,
         session_id=session_id,
         binding=binding,
-        initial_state={},
-        public_prefix=(),
+        initial_state={} if checkpoint is None else checkpoint.current.business_state,
+        public_prefix=() if checkpoint is None else checkpoint.current.history,
         policy=policy,
         complete=complete,
         lock_path=lock_path,
@@ -399,6 +421,32 @@ def open_grounded_session(
         evaluation_context={
             "task_context": task.initial_context,
             "sources": {
+                "frozen_profile_sha256": sha256_json(
+                    {
+                        "world_model": runtime.artifact_input.model_dump(mode="json"),
+                        "task": task.model_dump(mode="json", exclude={"task_id"}),
+                        "checkpoint": None if checkpoint is None else checkpoint.artifact_id,
+                        "output_protocol": output_protocol,
+                        "output_tokens": maximum_output_tokens,
+                        "selection": None
+                        if runtime.evidence_selector is None
+                        else runtime.evidence_selector.policy.identity,
+                        "prior_memory": research_prior_identity,
+                        "prior_records": research_prior,
+                        "overview": research_overview,
+                        "memory_selection": None
+                        if research_selection is None
+                        else research_selection.identity,
+                        "research_policy": None
+                        if research_policy is None
+                        else research_policy.model_dump(mode="json"),
+                    }
+                ),
+                **(
+                    {"candidate_checkpoint": checkpoint.artifact_id}
+                    if checkpoint is not None
+                    else {}
+                ),
                 **(
                     {"online_research_policy": research_policy.model_dump(mode="json")}
                     if research_policy is not None

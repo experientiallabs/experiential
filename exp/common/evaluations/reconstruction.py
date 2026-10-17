@@ -6,7 +6,7 @@ from collections.abc import Callable
 from datetime import datetime
 from operator import not_
 from pathlib import Path
-from typing import Annotated, Literal, Self
+from typing import Annotated, Literal, Protocol, Self, runtime_checkable
 
 from filelock import FileLock
 from pydantic import Field, model_validator
@@ -21,7 +21,7 @@ from exp.common.core.artifacts import (
     validate_artifact_id,
 )
 from exp.common.judging.definition import JudgeDefinition
-from exp.common.models.client import RequestCapacityExceeded
+from exp.common.models.client import RequestAdmissionRefused, RequestCapacityExceeded
 from exp.common.project import ArtifactStore, artifact_input
 
 
@@ -278,6 +278,25 @@ class TurnOutcome(ContractModel):
         return 1 - self.fields_matched / self.fields_total
 
 
+@runtime_checkable
+class ProfiledCompletion(Protocol):
+    """Structured evaluation completion with its inference configuration identity."""
+
+    @property
+    def model_identity(self) -> str:
+        """Return the actual configured completion model."""
+        ...
+
+    @property
+    def completion_profile_sha256(self) -> Sha256:
+        """Return the model, capability, output-framing and allowance identity."""
+        ...
+
+    def __call__(self, body: JsonObject, logical_id: str) -> JsonObject:
+        """Complete the exact framed request through the configured owner."""
+        ...
+
+
 class DualReport(ContractModel):
     """Independent mechanical truth and a mandatory, explicit judge outcome.
 
@@ -287,6 +306,7 @@ class DualReport(ContractModel):
         evidence_sha256: Actual chronology content identity.
         reference_sha256: Independent reference content identity.
         judge_config_sha256: Exact model, prompt and rubric identity.
+        judge_completion_sha256: Actual completion settings; absent results are unqualified.
         planned_steps: Complete planned denominator, including blocked suffixes.
         judge_status: Completed, failed, or not dispatched.
         judge_failure: Explicit unavailable/failure explanation.
@@ -299,6 +319,7 @@ class DualReport(ContractModel):
     evidence_sha256: str
     reference_sha256: str
     judge_config_sha256: str
+    judge_completion_sha256: Sha256 | None = Field(default=None, exclude_if=lambda v: v is None)
     planned_steps: int
     judge_status: Literal["completed", "failed", "unknown", "not_run"]
     judge_failure: str | None = None
@@ -791,10 +812,20 @@ def _evaluate_locked(
         "judge.json": judge.model_dump(mode="json"),
         "request.json": body,
     }
+    completion_profile = (
+        complete.completion_profile_sha256 if isinstance(complete, ProfiledCompletion) else None
+    )
+    if isinstance(complete, ProfiledCompletion) and complete.model_identity != judge.model_identity:
+        raise ValueError("judge model differs from completion; register the matching configuration")
+    if completion_profile is not None:
+        intent_files["completion.json"] = {"profile_sha256": completion_profile}
     intent_exists = artifacts.exists(artifact_id + "-intent")
     if intent_exists:
         intent = artifacts.read(artifact_id + "-intent")
-        if intent.manifest.code_revision != code_revision or any(
+        if (
+            {file.path for file in intent.manifest.files} != set(intent_files)
+            or intent.manifest.code_revision != code_revision
+        ) or any(
             sha256_json(json.loads(artifacts.read_bytes(artifact_id + "-intent", name)))
             != sha256_json(value)
             for name, value in intent_files.items()
@@ -861,7 +892,7 @@ def _evaluate_locked(
             AxisOutcome(dimension_id=a.dimension_id, status="judge_unknown", rationale=failure)
             for a in judge.definition.dimensions
         )
-    except (JudgeNotRun, RequestCapacityExceeded) as error:
+    except (JudgeNotRun, RequestAdmissionRefused, RequestCapacityExceeded) as error:
         judged = None
         status, failure = "not_run", str(error)
         axes = tuple(
@@ -881,6 +912,7 @@ def _evaluate_locked(
         evidence_sha256=sha256_json(evidence.model_dump(mode="json")),
         reference_sha256=sha256_json(references.model_dump(mode="json")),
         judge_config_sha256=sha256_json(judge.model_dump(mode="json")),
+        judge_completion_sha256=completion_profile,
         planned_steps=len(evidence.steps),
         judge_status=status,
         judge_failure=failure,

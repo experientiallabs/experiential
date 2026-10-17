@@ -565,3 +565,83 @@ def test_difference_paths_are_unambiguous_and_sorted_numerically() -> None:
     ]
     container = next(row for row in rows if row["path"] == "x")
     assert container["actual"] == {"y": None} and not container["actual_missing"]
+
+
+def test_evaluation_binds_actual_completion_profile_and_refuses_changed_replay(
+    tmp_path: Path,
+) -> None:
+    """Changing output mode must not replay a differently configured judge under one identity."""
+    project = ProjectStore(tmp_path, "profile")
+    project.initialize(ProjectConfig(project_id="profile"))
+    judge = default_judge("fixture")
+
+    class Completion:
+        """Return explicit unavailable ratings with a registered fixture profile.
+
+        Attributes:
+            model_identity: Configured fixture model used for completion.
+            completion_profile_sha256: Serving settings supplied by the completion owner.
+            calls: Number of invoked fixture completions.
+        """
+
+        model_identity: str = "fixture"
+        completion_profile_sha256: str = "7" * 64
+        calls: int = 0
+
+        def __call__(self, body: JsonObject, identity: str) -> JsonObject:
+            """Return only declared rubric keys; no provider or native environment is used."""
+            self.calls += 1
+            return {
+                "axes": [
+                    {
+                        "dimension_id": axis.dimension_id,
+                        "status": "unassessable",
+                        "score": None,
+                        "rationale": "Fixture",
+                        "evidence_refs": [],
+                        "critical_flags": [],
+                    }
+                    for axis in judge.definition.dimensions
+                ]
+            }
+
+    complete = Completion()
+    result = evaluate(
+        evidence(),
+        references(),
+        judge=judge,
+        complete=complete,
+        artifacts=project.artifacts,
+        artifact_id="profile-check",
+        clock=lambda: NOW,
+        code_revision="fixture",
+    )
+    assert result.judge_completion_sha256 == "7" * 64
+    complete.completion_profile_sha256 = "8" * 64
+    with pytest.raises(ValueError, match="saved evaluation identity"):
+        evaluate(
+            evidence(),
+            references(),
+            judge=judge,
+            complete=complete,
+            artifacts=project.artifacts,
+            artifact_id="profile-check",
+            clock=lambda: NOW,
+            code_revision="fixture",
+        )
+    assert complete.calls == 1
+    complete.completion_profile_sha256 = "7" * 64
+    complete.model_identity = "another-model"
+    with pytest.raises(ValueError, match="judge model differs"):
+        evaluate(
+            evidence(),
+            references(),
+            judge=judge,
+            complete=complete,
+            artifacts=project.artifacts,
+            artifact_id="wrong-model",
+            clock=lambda: NOW,
+            code_revision="fixture",
+        )
+    assert complete.calls == 1
+    assert not project.artifacts.exists("wrong-model-intent")
