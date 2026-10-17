@@ -106,3 +106,14 @@ def test_definition_binds_tool_source_and_refuses_sourceless_tools() -> None:
         _factory(RecordTool(access=items, run=_builtin_run()))
     with pytest.raises(ValueError, match="database part"):
         _factory().restore(_factory().create(_task()).capture().model_copy(update={"parts": {}}))
+
+
+def test_equal_histories_give_identical_images_after_restore() -> None:
+    """An original and a restored database driven by the same calls serialize identically."""
+    original = _factory().create(_task())
+    original.execute(_add("first"), _context())
+    restored = _factory().restore(original.capture())
+    for world in (original, restored):
+        world.execute(_add("second"), _context())
+        world.execute(_add("third", reject=True), _context())
+    assert original.capture() == restored.capture()
