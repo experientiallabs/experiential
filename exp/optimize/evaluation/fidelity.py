@@ -3,7 +3,6 @@
 import json
 from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
-from functools import partial
 from typing import Literal
 
 from filelock import FileLock
@@ -14,7 +13,6 @@ from exp.common.core.artifacts import (
     ArtifactInput,
     ContractModel,
     JsonObject,
-    Sha256,
     sha256_json,
     stable_id,
 )
@@ -26,7 +24,6 @@ from exp.common.evaluations.reconstruction import (
 )
 from exp.common.models import ModelCapabilities, ModelCatalog, load_model_catalog
 from exp.common.models.model import ReasoningEffort
-from exp.common.models.unknown_outcome import resume_unknown
 from exp.common.progress import ProgressHook, report
 from exp.common.project import ProjectStore, artifact_input
 from exp.common.tasks import TaskCase
@@ -45,6 +42,7 @@ from exp.optimize.evaluation.fidelity_recovery import (
 )
 from exp.optimize.evaluation.instance_facts import ReplayFacts, require_fact_scope
 from exp.optimize.evaluation.knowledge_exposure import require_unexposed_task
+from exp.optimize.evaluation.resumable_judge import ResumableJudge
 from exp.optimize.evaluation.retrieval_binding import (
     bind_index_embedder,
     index_embedder_alias,
@@ -829,7 +827,7 @@ def execute_fidelity_evaluation(
             del body, logical_id
             raise JudgeNotRun("judging is skipped for this run; it is scored by exact replies")
 
-        resumable_judge = _ResumableJudge(
+        resumable_judge = ResumableJudge(
             judging,
             None if resumption is None else resumption.recorder("judge", JUDGE_OPERATION),
             lambda: report(progress, "Judging"),
@@ -988,35 +986,3 @@ def _receipt_recorder(
             )
 
     return record
-
-
-class _ResumableJudge:
-    """The profiled judge, re-dispatched after an unknown outcome only under resumption.
-
-    It keeps the judge's model and completion-profile identity, so the evaluator still
-    records which inference configuration produced the judgment.
-    """
-
-    def __init__(
-        self,
-        inner: StructuredCompletion,
-        retried: Callable[[str], None] | None,
-        started: Callable[[], None],
-    ) -> None:
-        """Wrap one profiled judge completion, its resumption recorder and progress."""
-        self._inner, self._retried, self._started = inner, retried, started
-
-    @property
-    def model_identity(self) -> str:
-        """The judge's configured completion model."""
-        return self._inner.model_identity
-
-    @property
-    def completion_profile_sha256(self) -> Sha256:
-        """The judge's inference configuration identity."""
-        return self._inner.completion_profile_sha256
-
-    def __call__(self, body: JsonObject, logical_id: str) -> JsonObject:
-        """Send or replay the judgment; a lost one is re-sent only when resuming."""
-        self._started()
-        return resume_unknown(partial(self._inner, body), logical_id, self._retried)
