@@ -9,7 +9,7 @@ from exp.cli.shared.options import usage_error
 from exp.cli.shared.theme import EXP_THEME
 from exp.common.project import ProjectStore
 from exp.common.release_revision import installed_release_revision
-from exp.optimize.evaluation.calibration import CalibrationSpec, execute_calibration
+from exp.optimize.evaluation.tasks.calibration import CalibrationSpec, execute_calibration
 
 
 def run_calibration(project: str, spec_path: Path, *, root: Path, dry_run: bool) -> None:

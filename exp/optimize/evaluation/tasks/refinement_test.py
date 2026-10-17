@@ -10,10 +10,11 @@ from typer.testing import CliRunner
 from exp.cli.app import app
 from exp.common.core.artifacts import ArtifactEnvelope, ArtifactInput, JsonObject
 from exp.common.project import ProjectStore, artifact_input
-from exp.optimize.evaluation import task_refinement, trace_council
+from exp.optimize.evaluation.council import runner as trace_council
+from exp.optimize.evaluation.council.runner_test import sequence, spec_project
 from exp.optimize.evaluation.fidelity.runner import FidelitySpec
+from exp.optimize.evaluation.tasks import refinement as task_refinement
 from exp.optimize.evaluation.tests.fidelity_memory_test import structured_reply
-from exp.optimize.evaluation.trace_council_test import sequence, spec_project
 from exp.runtime.models.providers.transport import ScriptedJsonTransport
 from exp.simulation.evaluation_tasks import (
     OutcomeRule,

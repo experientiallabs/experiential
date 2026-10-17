@@ -18,13 +18,13 @@ from exp.common.core.artifacts import (
 from exp.common.models import load_model_catalog
 from exp.common.progress import ProgressHook, report
 from exp.common.project import ProjectStore, artifact_input
-from exp.optimize.evaluation.evidence_admission import require_refinement_admission
-from exp.optimize.evaluation.trace_council import (
+from exp.optimize.evaluation.council.runner import (
     PreparedCouncil,
     TraceCouncilSpec,
     execute_trace_council,
     prepare_trace_council,
 )
+from exp.optimize.evaluation.tasks.admission import require_refinement_admission
 from exp.runtime.models import RuntimeModelCatalog
 from exp.runtime.models.budget import RequestBudget
 from exp.runtime.models.providers.admitted_transport import AdmittedJsonTransport

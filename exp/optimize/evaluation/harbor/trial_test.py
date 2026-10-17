@@ -24,9 +24,9 @@ from exp.common.models import (
 )
 from exp.common.project import artifact_input
 from exp.optimize.evaluation.fidelity.runner_test import source_project
-from exp.optimize.evaluation.harbor_bridge import serve_harbor_trial
-from exp.optimize.evaluation.harbor_export import export_harbor_task, verify_harbor_export
-from exp.optimize.evaluation.harbor_trial import HarborTrial
+from exp.optimize.evaluation.harbor.bridge import serve_harbor_trial
+from exp.optimize.evaluation.harbor.export import export_harbor_task, verify_harbor_export
+from exp.optimize.evaluation.harbor.trial import HarborTrial
 from exp.runtime.models import RuntimeModelCatalog
 from exp.runtime.sessions.store import SessionStore
 from exp.simulation.evaluation_tasks import (
@@ -244,7 +244,7 @@ def test_real_session_http_replay_export_and_private_boundaries(tmp_path: Path) 
         subprocess.run(
             [
                 sys.executable,
-                str(Path(__file__).with_name("harbor_client.py")),
+                str(Path(__file__).with_name("client.py")),
                 "call",
                 "--body",
                 action.model_dump_json(),

@@ -21,10 +21,10 @@ from exp.common.models import (
 from exp.common.project import ProjectStore, artifact_input
 from exp.common.tasks import TaskCase
 from exp.optimize.evaluation.fidelity.runner_test import source_project
-from exp.optimize.evaluation.harbor_bridge import serve_harbor_trial
-from exp.optimize.evaluation.harbor_export import export_harbor_task
-from exp.optimize.evaluation.harbor_trial import HarborTrial
-from exp.optimize.evaluation.harbor_trial_test import UnusedModel
+from exp.optimize.evaluation.harbor.bridge import serve_harbor_trial
+from exp.optimize.evaluation.harbor.export import export_harbor_task
+from exp.optimize.evaluation.harbor.trial import HarborTrial
+from exp.optimize.evaluation.harbor.trial_test import UnusedModel
 from exp.optimize.evaluation.native_artifacts import (
     NativeMaterializationSpec,
     export_native_artifacts,
@@ -319,7 +319,7 @@ def test_harbor_delivers_only_native_declared_bytes(tmp_path: Path) -> None:
     trial.call(ToolCall(call_id="call", name="inspect", arguments={"key": "current"}))
     trial.submit({"completed": True})
     with serve_harbor_trial(trial) as endpoint:
-        client = Path(__file__).with_name("harbor_client.py")
+        client = Path(__file__).parent / "harbor" / "client.py"
         for index in range(2):
             destination = tmp_path / f"actor-files-{index}"
             subprocess.run(

@@ -30,7 +30,7 @@ def run_task_refinement(
         non_interactive: Disable terminal authorization questions.
         dry_run: Prepare without provider calls or credentials.
     """
-    from exp.optimize.evaluation.task_refinement import (
+    from exp.optimize.evaluation.tasks.refinement import (
         TaskRefinementSpec,
         execute_task_refinement,
         prepare_task_refinement,

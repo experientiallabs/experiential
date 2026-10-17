@@ -10,7 +10,7 @@ from threading import Thread
 
 from exp.common.core.artifacts import JsonObject
 from exp.common.models import ToolCall
-from exp.optimize.evaluation.harbor_trial import HarborTrial
+from exp.optimize.evaluation.harbor.trial import HarborTrial
 
 
 @dataclass(frozen=True)
