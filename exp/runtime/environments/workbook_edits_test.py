@@ -136,3 +136,12 @@ def test_deletion_past_last_row_is_refused() -> None:
     )
     with pytest.raises(ValueError, match="beyond existing rows"):
         WorkbookEditAdapter().apply({"input.xlsx": workbook_bytes()}, (action,), ("output.xlsx",))
+
+
+def test_access_resolves_source_and_destination_without_applying() -> None:
+    """The adapter names the workbook an edit reads and the workbook it writes."""
+    access = WorkbookEditAdapter().access(edit(destination="input.xlsx"))
+    assert access.reads == frozenset({"input.xlsx"})
+    assert access.writes == frozenset({"input.xlsx"})
+    with pytest.raises(ValueError, match="edit_workbook"):
+        WorkbookEditAdapter().access(edit(name="Bash"))
