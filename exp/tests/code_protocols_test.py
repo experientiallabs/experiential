@@ -39,19 +39,19 @@ class Protocol:
 
 PROTOCOLS = (
     Protocol(
-        "exp.optimize.evaluation.calibration:CALIBRATION_PROTOCOL",
+        "exp.optimize.evaluation.tasks.calibration:CALIBRATION_PROTOCOL",
         "task-calibration-v1",
         (
-            "exp.optimize.evaluation.calibration",
-            "exp.optimize.evaluation.evidence_admission",
+            "exp.optimize.evaluation.tasks.calibration",
+            "exp.optimize.evaluation.tasks.admission",
             "exp.simulation.evaluation_calibration",
             "exp.simulation.evaluation_tasks",
             "exp.simulation.evidence_admission",
         ),
-        "a3a33aad70552eb045b67600929f029c1e6792cb80a32c18cec1a96ad074828c",
+        "f7c7cd04b73687d79e5e4ba283239e353a035e6169de353d5568001aaddaa945",
     ),
     Protocol(
-        "exp.optimize.evaluation.trace_council:COUNCIL_HARNESS_PROTOCOL",
+        "exp.optimize.evaluation.council.runner:COUNCIL_HARNESS_PROTOCOL",
         "council-harness-v1",
         (
             "exp.runtime.agents.chat:ChatAgentRuntime",
@@ -61,10 +61,10 @@ PROTOCOLS = (
         "93891ff0c5a1f259909011e1782035ff98d5abea85a10c93703976aecc04a2d2",
     ),
     Protocol(
-        "exp.optimize.evaluation.task_refinement:REFINEMENT_REQUEST_PROTOCOL",
+        "exp.optimize.evaluation.tasks.refinement:REFINEMENT_REQUEST_PROTOCOL",
         "task-refinement-request-v1",
-        ("exp.optimize.evaluation.task_refinement:_request",),
-        "f27fea8f4fcd44132e8d0974433b013231db8cd3420055d0b9f5980c8b2aa940",
+        ("exp.optimize.evaluation.tasks.refinement:_request",),
+        "7d532742e7fcd847233cf7af439fbb476d9dc5fde965ebee1ebf407fa4c70fa8",
     ),
     Protocol(
         "exp.runtime.environments.workbook_edits:XLSX_ROW_EDITS_PROTOCOL",

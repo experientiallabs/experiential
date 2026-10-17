@@ -4,7 +4,7 @@ import json
 from datetime import UTC, datetime
 from pathlib import Path
 
-from exp.optimize.evaluation.council_memory import CouncilMemory, read_council_memory
+from exp.optimize.evaluation.council.memory import CouncilMemory, read_council_memory
 from exp.optimize.evaluation.tests.fidelity_memory_test import memory_project
 from exp.simulation.world_model.experience_memory import memory_head, publish_trajectory
 

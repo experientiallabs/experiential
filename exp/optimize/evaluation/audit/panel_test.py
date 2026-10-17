@@ -39,15 +39,15 @@ from exp.optimize.evaluation.audit.panel import (
     saved_held_out_results,
     source_rag_inputs,
 )
-from exp.optimize.evaluation.fidelity import runner as fidelity
-from exp.optimize.evaluation.fidelity.replay import DEADLINE, aggregate
-from exp.optimize.evaluation.fidelity.runner import execute_fidelity_evaluation
-from exp.optimize.evaluation.learning.traces import learning_curve, learning_plan
-from exp.optimize.evaluation.trace_council import (
+from exp.optimize.evaluation.council.runner import (
     CouncilActor,
     TraceCouncilSpec,
     prepare_trace_council,
 )
+from exp.optimize.evaluation.fidelity import runner as fidelity
+from exp.optimize.evaluation.fidelity.replay import DEADLINE, aggregate
+from exp.optimize.evaluation.fidelity.runner import execute_fidelity_evaluation
+from exp.optimize.evaluation.learning.traces import learning_curve, learning_plan
 from exp.runtime.models import RuntimeModelCatalog
 from exp.runtime.models.providers.transport import (
     JsonHttpResponse,

@@ -20,14 +20,14 @@ from exp.optimize.evaluation.audit.panel_test import (
     episode,
     held_out_lineages,
 )
-from exp.optimize.evaluation.calibration import CalibrationSpec, execute_calibration
-from exp.optimize.evaluation.evidence_admission import (
+from exp.optimize.evaluation.native_artifacts import materialize_native_artifacts
+from exp.optimize.evaluation.native_artifacts_test import native_fixture
+from exp.optimize.evaluation.tasks.admission import (
     admit_calibration_evidence,
     knowledge_refusals,
     require_refinement_admission,
 )
-from exp.optimize.evaluation.native_artifacts import materialize_native_artifacts
-from exp.optimize.evaluation.native_artifacts_test import native_fixture
+from exp.optimize.evaluation.tasks.calibration import CalibrationSpec, execute_calibration
 from exp.optimize.evaluation.tests.knowledge_exposure_test import OWN, bound
 from exp.simulation.engines.text.knowledge import SimulationKnowledge
 from exp.simulation.evaluation_calibration import CalibrationCase, CalibrationPack

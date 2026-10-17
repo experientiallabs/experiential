@@ -14,7 +14,7 @@ from exp.cli.shared.theme import EXP_THEME
 from exp.common.core.artifacts import JsonObject
 from exp.common.project import ProjectStore
 from exp.common.release_revision import installed_release_revision
-from exp.optimize.evaluation.trace_council import (
+from exp.optimize.evaluation.council.runner import (
     TraceCouncilSpec,
     execute_trace_council,
     prepare_trace_council,

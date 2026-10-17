@@ -15,7 +15,7 @@ from exp.cli.shared.theme import EXP_THEME
 from exp.common.core.artifacts import stable_id
 from exp.common.project import ProjectStore
 from exp.common.release_revision import installed_release_revision
-from exp.optimize.evaluation.built_council import (
+from exp.optimize.evaluation.council.built import (
     execute_built_council,
     prepare_built_council,
 )

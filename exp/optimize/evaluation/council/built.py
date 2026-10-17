@@ -16,19 +16,19 @@ from exp.common.progress import ProgressHook, report
 from exp.common.project import ProjectStore, artifact_input
 from exp.common.tasks.store import load_task_set
 from exp.optimize.evaluation.audit.panel import source_rag_inputs
+from exp.optimize.evaluation.council.runner import (
+    CouncilActor,
+    TraceCouncilSpec,
+    execute_trace_council,
+    prepare_trace_council,
+    validate_council_models,
+)
 from exp.optimize.evaluation.fidelity.replay import DEADLINE, replay_spec
 from exp.optimize.evaluation.fidelity.runner import (
     FidelityRetrieval,
     PreparedFidelity,
     execute_fidelity_evaluation,
     prepare_fidelity_evaluation,
-)
-from exp.optimize.evaluation.trace_council import (
-    CouncilActor,
-    TraceCouncilSpec,
-    execute_trace_council,
-    prepare_trace_council,
-    validate_council_models,
 )
 from exp.runtime.models.providers.transport import RetryPolicy
 from exp.simulation.retrieval.jev import JEVPolicy

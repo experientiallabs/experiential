@@ -72,7 +72,7 @@ def export_harbor_task(
         environment, tests = staging / "environment", staging / "tests"
         environment.mkdir()
         tests.mkdir()
-        client = Path(__file__).with_name("harbor_client.py")
+        client = Path(__file__).with_name("client.py")
         shutil.copyfile(client, environment / "tools.py")
         shutil.copyfile(client, tests / "tools.py")
         (environment / "Dockerfile").write_text(

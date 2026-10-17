@@ -29,8 +29,8 @@ from exp.common.models import ModelCatalog, load_model_catalog
 from exp.common.progress import ProgressHook, report
 from exp.common.project import ProjectStore, artifact_input
 from exp.common.tasks import TaskCase
-from exp.optimize.evaluation.council_fidelity import load_tool_fidelity
-from exp.optimize.evaluation.council_memory import CouncilMemory, read_council_memory
+from exp.optimize.evaluation.council.fidelity import load_tool_fidelity
+from exp.optimize.evaluation.council.memory import CouncilMemory, read_council_memory
 from exp.optimize.evaluation.fidelity.decision_access import decision_caller
 from exp.optimize.evaluation.fidelity.retrieval_binding import (
     bind_index_embedder,

@@ -14,7 +14,7 @@ from exp.common.core.artifacts import ArtifactEnvelope, JsonObject
 from exp.common.models import load_model_catalog, write_model_catalog
 from exp.common.project import ProjectStore, artifact_input
 from exp.common.release_revision import installed_release_revision
-from exp.optimize.evaluation import trace_council
+from exp.optimize.evaluation.council import runner as trace_council
 from exp.optimize.evaluation.fidelity import runner as fidelity_owner
 from exp.optimize.evaluation.fidelity.runner import (
     FidelitySpec,

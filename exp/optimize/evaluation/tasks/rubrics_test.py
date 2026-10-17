@@ -8,7 +8,7 @@ import pytest
 from exp.common.core.artifacts import ArtifactInput, JsonObject, sha256_json
 from exp.common.evaluations.actor_rubric import actor_judge
 from exp.common.evaluations.reconstruction import AxisOutcome, JudgeConfig
-from exp.optimize.evaluation.rubric_refinement import RubricEdit, refine_rubric
+from exp.optimize.evaluation.tasks.rubrics import RubricEdit, refine_rubric
 from exp.simulation.evaluation_calibration import (
     CalibrationCase,
     CalibrationJudgment,

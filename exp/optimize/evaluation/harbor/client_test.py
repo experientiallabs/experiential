@@ -11,7 +11,7 @@ from urllib.request import Request
 
 import pytest
 
-from exp.optimize.evaluation import harbor_client
+from exp.optimize.evaluation.harbor import client as harbor_client
 
 
 @pytest.mark.parametrize("failure", ["incomplete", "malformed", "transport", "credential"])

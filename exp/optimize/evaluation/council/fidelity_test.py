@@ -15,7 +15,7 @@ from exp.common.evaluations.reconstruction import (
     mechanical_checks,
 )
 from exp.common.project import ProjectStore, artifact_input
-from exp.optimize.evaluation.council_fidelity import load_tool_fidelity
+from exp.optimize.evaluation.council.fidelity import load_tool_fidelity
 from exp.optimize.evaluation.fidelity import runner as fidelity
 from exp.optimize.evaluation.fidelity.runner import (
     FidelitySpec,
