@@ -26,10 +26,8 @@ from exp.common.models import (
 )
 from exp.common.project import ProjectStore
 from exp.common.tasks.store import load_task_set
-from exp.optimize.evaluation import held_out_fidelity_test, learned_memory
-from exp.optimize.evaluation.contracts import EvaluationBudget
-from exp.optimize.evaluation.fidelity import FidelityRetrieval
-from exp.optimize.evaluation.held_out_fidelity_test import (
+from exp.optimize.evaluation.audit import panel_test as held_out_fidelity_test
+from exp.optimize.evaluation.audit.panel_test import (
     PROJECT,
     REVISION,
     USERS,
@@ -41,7 +39,11 @@ from exp.optimize.evaluation.held_out_fidelity_test import (
     build_project,
     episode,
 )
-from exp.optimize.evaluation.learned_memory import NO_MEMORY_NOTE, EvaluationMemory
+from exp.optimize.evaluation.contracts import EvaluationBudget
+from exp.optimize.evaluation.fidelity.runner import FidelityRetrieval
+from exp.optimize.evaluation.learning import profile as learned_memory
+from exp.optimize.evaluation.learning.profile import NO_MEMORY_NOTE, EvaluationMemory
+from exp.optimize.evaluation.learning.traces import learning_plan
 from exp.optimize.evaluation.prepare import ModelEvaluationOptions
 from exp.optimize.evaluation.runs import (
     EvaluationDefaults,
@@ -54,7 +56,6 @@ from exp.optimize.evaluation.runs import (
 )
 from exp.optimize.evaluation.runtime import run_prepared_model_evaluation
 from exp.optimize.evaluation.tests.fidelity_memory_test import memory_project
-from exp.optimize.evaluation.trace_learning import learning_plan
 from exp.optimize.router.automatic.provisional import prepare_hosted_provisional_judge
 from exp.runtime.gateway.decisions_contracts import DecisionRequest
 from exp.runtime.models import RuntimeModelCatalog

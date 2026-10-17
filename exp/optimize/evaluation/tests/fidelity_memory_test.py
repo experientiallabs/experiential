@@ -21,17 +21,17 @@ from exp.common.models import (
     write_model_catalog,
 )
 from exp.common.project import ArtifactStore, ProjectStore, artifact_input
-from exp.optimize.evaluation import fidelity
-from exp.optimize.evaluation.fidelity import (
+from exp.optimize.evaluation.fidelity import runner as fidelity
+from exp.optimize.evaluation.fidelity.memory import (
+    saved_memory_receipt,
+)
+from exp.optimize.evaluation.fidelity.runner import (
     FidelityRetrieval,
     FidelitySpec,
     execute_fidelity_evaluation,
     prepare_fidelity_evaluation,
 )
-from exp.optimize.evaluation.fidelity_memory import (
-    saved_memory_receipt,
-)
-from exp.optimize.evaluation.fidelity_test import source_project, transition_reply
+from exp.optimize.evaluation.fidelity.runner_test import source_project, transition_reply
 from exp.runtime.models.providers.transport import JsonHttpResponse, ScriptedJsonTransport
 from exp.simulation.engines.text.knowledge import SimulationKnowledge
 from exp.simulation.evaluation import FixedWorkflow

@@ -8,16 +8,16 @@ import pytest
 from exp.common.core.artifacts import JsonObject
 from exp.common.tasks.store import load_task_set
 from exp.common.traces.store import load_trace_dataset
-from exp.optimize.evaluation.held_out_audit_test import audit
-from exp.optimize.evaluation.held_out_exposure import held_out_exposure, held_out_members
-from exp.optimize.evaluation.held_out_fidelity_test import (
+from exp.optimize.evaluation.audit.exposure import held_out_exposure, held_out_members
+from exp.optimize.evaluation.audit.lifecycle_test import audit
+from exp.optimize.evaluation.audit.panel_test import (
     USERS,
     SimulatedProvider,
     build_project,
     episode,
     held_out_lineages,
 )
-from exp.optimize.evaluation.held_out_receipts_test import _dataset
+from exp.optimize.evaluation.audit.receipts_test import _dataset
 from exp.simulation.mining.exposure_ledger import ExposureLedger
 from exp.simulation.mining.exposure_ledger_test import DATASET, EDITED, trace
 from exp.simulation.mining.fingerprint import TRACE_CONTENT

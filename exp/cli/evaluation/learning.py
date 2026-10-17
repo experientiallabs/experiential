@@ -18,7 +18,8 @@ from exp.cli.shared.consent import can_prompt, require_spend_consent
 from exp.cli.shared.progress import progress_display
 from exp.common.progress import ProgressHook
 from exp.common.project import ProjectStore
-from exp.optimize.evaluation.trace_learning import (
+from exp.optimize.evaluation.fidelity.replay import DEADLINE
+from exp.optimize.evaluation.learning.traces import (
     LearningOutcome,
     Scope,
     learn_from_traces,
@@ -28,7 +29,6 @@ from exp.optimize.evaluation.trace_learning import (
     learning_progress,
     learning_spec,
 )
-from exp.optimize.evaluation.trace_replay import DEADLINE
 from exp.runtime.models.providers.transport import ProviderTransportError
 from exp.runtime.models.structured_completion import CompletionNotDispatched
 

@@ -14,9 +14,8 @@ from exp.cli.app import app
 from exp.common.core.artifacts import JsonObject
 from exp.common.models import load_model_catalog, write_model_catalog
 from exp.common.project import ProjectStore
-from exp.optimize.evaluation import held_out_fidelity_test, trace_learning, trace_replay
-from exp.optimize.evaluation.fidelity import FidelityMemory, FidelitySpec
-from exp.optimize.evaluation.held_out_fidelity_test import (
+from exp.optimize.evaluation.audit import panel_test as held_out_fidelity_test
+from exp.optimize.evaluation.audit.panel_test import (
     PROJECT,
     REVISION,
     USERS,
@@ -30,7 +29,10 @@ from exp.optimize.evaluation.held_out_fidelity_test import (
     package_rows,
     write_catalog,
 )
-from exp.optimize.evaluation.trace_learning import (
+from exp.optimize.evaluation.fidelity import replay as trace_replay
+from exp.optimize.evaluation.fidelity.runner import FidelityMemory, FidelitySpec
+from exp.optimize.evaluation.learning import traces as trace_learning
+from exp.optimize.evaluation.learning.traces import (
     learn_from_traces,
     learning_cases,
     learning_curve,

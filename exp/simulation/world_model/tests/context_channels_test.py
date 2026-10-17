@@ -9,8 +9,8 @@ import pytest
 from exp.common.core.artifacts import JsonObject, sha256_json
 from exp.common.models import AssistantAction, ToolCall
 from exp.common.tasks import TaskCase, ToolSchema
-from exp.optimize.evaluation import fidelity
-from exp.optimize.evaluation.fidelity import (
+from exp.optimize.evaluation.fidelity import runner as fidelity
+from exp.optimize.evaluation.fidelity.runner import (
     execute_fidelity_evaluation,
     prepare_fidelity_evaluation,
 )

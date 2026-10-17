@@ -14,9 +14,9 @@ from exp.common.core.artifacts import JsonObject
 from exp.common.project import ProjectStore
 from exp.common.traces import Trace
 from exp.common.traces.store import load_trace_dataset
-from exp.optimize.evaluation.held_out_audit_test import FailingOnce, audit, clock, run
-from exp.optimize.evaluation.held_out_exposure import LineageExposure, held_out_exposure
-from exp.optimize.evaluation.held_out_fidelity_test import (
+from exp.optimize.evaluation.audit.exposure import LineageExposure, held_out_exposure
+from exp.optimize.evaluation.audit.lifecycle_test import FailingOnce, audit, clock, run
+from exp.optimize.evaluation.audit.panel_test import (
     PROJECT,
     USERS,
     SimulatedProvider,
@@ -27,7 +27,7 @@ from exp.optimize.evaluation.held_out_fidelity_test import (
     held_out_lineages,
     learn_fit,
 )
-from exp.optimize.evaluation.held_out_receipts import (
+from exp.optimize.evaluation.audit.receipts import (
     QUALIFIED,
     AuditNotice,
     audit_receipts,
@@ -35,7 +35,7 @@ from exp.optimize.evaluation.held_out_receipts import (
     record_notice,
     record_report,
 )
-from exp.optimize.evaluation.trace_learning import learning_plan, recorded_plan
+from exp.optimize.evaluation.learning.traces import learning_plan, recorded_plan
 from exp.simulation.mining.exposure_ledger import (
     ExposureLedger,
 )

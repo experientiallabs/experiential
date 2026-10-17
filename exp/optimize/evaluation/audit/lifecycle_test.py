@@ -20,9 +20,9 @@ from exp.cli.evaluation.held_out_fidelity import title
 from exp.common.core.artifacts import JsonObject
 from exp.common.models import load_model_catalog, write_model_catalog
 from exp.common.project import ProjectStore
-from exp.optimize.evaluation import fidelity, held_out_audit, trace_replay
-from exp.optimize.evaluation.fidelity import execute_fidelity_evaluation, saved_fidelity_report
-from exp.optimize.evaluation.held_out_audit import (
+from exp.optimize.evaluation.audit import lifecycle as held_out_audit
+from exp.optimize.evaluation.audit.exposure import held_out_members
+from exp.optimize.evaluation.audit.lifecycle import (
     HeldOutAudit,
     ReservationInactiveError,
     open_held_out_audit,
@@ -30,9 +30,8 @@ from exp.optimize.evaluation.held_out_audit import (
     release_held_out_audit,
     reservation_state,
 )
-from exp.optimize.evaluation.held_out_exposure import held_out_members
-from exp.optimize.evaluation.held_out_fidelity import HeldOutPanel, PlannedPanel, Profile
-from exp.optimize.evaluation.held_out_fidelity_test import (
+from exp.optimize.evaluation.audit.panel import HeldOutPanel, PlannedPanel, Profile
+from exp.optimize.evaluation.audit.panel_test import (
     PROJECT,
     REVISION,
     USERS,
@@ -40,7 +39,7 @@ from exp.optimize.evaluation.held_out_fidelity_test import (
     build_project,
     episode,
 )
-from exp.optimize.evaluation.held_out_receipts import (
+from exp.optimize.evaluation.audit.receipts import (
     QUALIFIED,
     RECEIPT_TYPE,
     audit_receipts,
@@ -48,7 +47,13 @@ from exp.optimize.evaluation.held_out_receipts import (
     receipt_view,
     record_report,
 )
-from exp.optimize.evaluation.trace_replay import DEADLINE
+from exp.optimize.evaluation.fidelity import replay as trace_replay
+from exp.optimize.evaluation.fidelity import runner as fidelity
+from exp.optimize.evaluation.fidelity.replay import DEADLINE
+from exp.optimize.evaluation.fidelity.runner import (
+    execute_fidelity_evaluation,
+    saved_fidelity_report,
+)
 from exp.runtime.models.providers.transport import JsonHttpResponse
 from exp.runtime.sessions.dispatch_ledger import DispatchLedger
 from exp.simulation.mining.exposure_ledger import (

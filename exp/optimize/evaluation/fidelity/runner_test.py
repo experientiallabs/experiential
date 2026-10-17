@@ -24,8 +24,8 @@ from exp.common.models import (
 from exp.common.project import ProjectConfig, ProjectStore, artifact_input
 from exp.common.tasks import TaskCase
 from exp.common.traces import Trace, TraceDataset, TraceSource, TraceSpan
-from exp.optimize.evaluation import fidelity
-from exp.optimize.evaluation.fidelity import (
+from exp.optimize.evaluation.fidelity import runner as fidelity
+from exp.optimize.evaluation.fidelity.runner import (
     FidelitySpec,
     execute_fidelity_evaluation,
     prepare_fidelity_evaluation,

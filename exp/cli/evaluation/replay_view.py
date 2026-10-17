@@ -13,9 +13,9 @@ from exp.cli.evaluation.fidelity_turns import render_turns, turn_marks
 from exp.cli.shared.progress import progress_display
 from exp.common.progress import ProgressHook
 from exp.common.project import ProjectStore
-from exp.optimize.evaluation.fidelity import PreparedFidelity
-from exp.optimize.evaluation.replay_panel import execute_panel, require_resumable
-from exp.optimize.evaluation.trace_replay import ReplayAggregate, ReplayResult
+from exp.optimize.evaluation.fidelity.panel import execute_panel, require_resumable
+from exp.optimize.evaluation.fidelity.replay import ReplayAggregate, ReplayResult
+from exp.optimize.evaluation.fidelity.runner import PreparedFidelity
 from exp.runtime.models.providers.transport import ProviderTransportError
 from exp.runtime.models.structured_completion import CompletionNotDispatched
 

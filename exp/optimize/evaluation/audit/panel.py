@@ -12,13 +12,13 @@ reproduces held-out traces, in one of two explicit profiles:
   index also holds held-out traces and is never used here.
 
 Held-out traces are selected deterministically and replayed through the shared trace-replay
-path and the existing fidelity owner; see :mod:`exp.optimize.evaluation.trace_replay` for the
+path and the existing fidelity owner; see :mod:`exp.optimize.evaluation.fidelity.replay` for the
 trace-context convention and content-addressed run identities.
 
 This module plans and registers panels. Audits go through
-:mod:`exp.optimize.evaluation.held_out_audit`, which decides independence against the root
+:mod:`exp.optimize.evaluation.audit.lifecycle`, which decides independence against the root
 exposure ledger and reserves a panel's content before registering any run; receipts and their
-status live in :mod:`exp.optimize.evaluation.held_out_receipts`.
+status live in :mod:`exp.optimize.evaluation.audit.receipts`.
 """
 
 from collections.abc import Callable, Collection, Sequence
@@ -32,15 +32,7 @@ from exp.common.project import ProjectBuildArtifacts, ProjectStore
 from exp.common.tasks import TaskCase
 from exp.common.tasks.store import load_task_set
 from exp.common.traces.store import load_trace_dataset
-from exp.optimize.evaluation.fidelity import FidelityMemory, FidelitySpec, PreparedFidelity
-from exp.optimize.evaluation.trace_learning import (
-    Scope,
-    fit_calls,
-    learned_runs,
-    learning_plan,
-    recorded_plan,
-)
-from exp.optimize.evaluation.trace_replay import (
+from exp.optimize.evaluation.fidelity.replay import (
     DEADLINE,
     ReplayCase,
     ReplayResult,
@@ -50,6 +42,14 @@ from exp.optimize.evaluation.trace_replay import (
     replay_case,
     replay_spec,
     saved_results,
+)
+from exp.optimize.evaluation.fidelity.runner import FidelityMemory, FidelitySpec, PreparedFidelity
+from exp.optimize.evaluation.learning.traces import (
+    Scope,
+    fit_calls,
+    learned_runs,
+    learning_plan,
+    recorded_plan,
 )
 from exp.simulation.retrieval import load_rag_index
 from exp.simulation.world_model.experience_memory import memory_head
@@ -388,7 +388,7 @@ def register_held_out_fidelity(
 ) -> HeldOutPanel:
     """Plan and register a panel directly, outside any audit receipt or reservation.
 
-    Audits go through :func:`exp.optimize.evaluation.held_out_audit.open_held_out_audit`,
+    Audits go through :func:`exp.optimize.evaluation.audit.lifecycle.open_held_out_audit`,
     which reserves the panel's content before registering; this is the bare primitive.
 
     Args:

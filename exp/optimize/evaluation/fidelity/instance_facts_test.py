@@ -15,10 +15,7 @@ from exp.cli.app import app
 from exp.common.core.artifacts import JsonObject
 from exp.common.tasks.facts import InstanceFacts, InstanceFactsError
 from exp.common.tasks.facts_test import fact
-from exp.optimize.evaluation.fidelity import FidelitySpec, prepare_fidelity_evaluation
-from exp.optimize.evaluation.fidelity_memory import trajectory_record
-from exp.optimize.evaluation.fidelity_test import source_project
-from exp.optimize.evaluation.held_out_fidelity_test import (
+from exp.optimize.evaluation.audit.panel_test import (
     PROJECT,
     REVISION,
     USERS,
@@ -31,9 +28,12 @@ from exp.optimize.evaluation.held_out_fidelity_test import (
     episode,
     held_out_command,
 )
-from exp.optimize.evaluation.instance_facts import ReplayFacts
-from exp.optimize.evaluation.trace_learning import learning_cases, learning_plan, learning_spec
-from exp.optimize.evaluation.trace_replay import DEADLINE, content_run_id
+from exp.optimize.evaluation.fidelity.instance_facts import ReplayFacts
+from exp.optimize.evaluation.fidelity.memory import trajectory_record
+from exp.optimize.evaluation.fidelity.replay import DEADLINE, content_run_id
+from exp.optimize.evaluation.fidelity.runner import FidelitySpec, prepare_fidelity_evaluation
+from exp.optimize.evaluation.fidelity.runner_test import source_project
+from exp.optimize.evaluation.learning.traces import learning_cases, learning_plan, learning_spec
 from exp.simulation.retrieval.build_inputs import load_completed_build_rag_lineage_bindings
 
 MARKERS = ("FACT-", "LATE-", "PRIVATE-")

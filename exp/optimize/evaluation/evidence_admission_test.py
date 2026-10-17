@@ -11,20 +11,20 @@ from exp.common.project import ProjectStore, artifact_input
 from exp.common.project.database import project_connection
 from exp.common.tasks import TaskCase
 from exp.common.tasks.store import load_task_set
-from exp.optimize.evaluation.calibration import CalibrationSpec, execute_calibration
-from exp.optimize.evaluation.evidence_admission import (
-    admit_calibration_evidence,
-    knowledge_refusals,
-    require_refinement_admission,
-)
-from exp.optimize.evaluation.held_out_audit_test import audit
-from exp.optimize.evaluation.held_out_exposure import held_out_members
-from exp.optimize.evaluation.held_out_fidelity_test import (
+from exp.optimize.evaluation.audit.exposure import held_out_members
+from exp.optimize.evaluation.audit.lifecycle_test import audit
+from exp.optimize.evaluation.audit.panel_test import (
     USERS,
     SimulatedProvider,
     build_project,
     episode,
     held_out_lineages,
+)
+from exp.optimize.evaluation.calibration import CalibrationSpec, execute_calibration
+from exp.optimize.evaluation.evidence_admission import (
+    admit_calibration_evidence,
+    knowledge_refusals,
+    require_refinement_admission,
 )
 from exp.optimize.evaluation.native_artifacts import materialize_native_artifacts
 from exp.optimize.evaluation.native_artifacts_test import TextAdapter, native_fixture
