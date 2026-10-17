@@ -34,6 +34,7 @@ from exp.simulation.engines.transition import (
     TransitionEngine,
 )
 from exp.simulation.retrieval.selection import EvidencePolicy, SelectionQuery, selected_evidence
+from exp.simulation.world_model.causal_history import CAUSAL_HISTORY_BUDGET, causal_history
 from exp.simulation.world_model.resumption import Resumption
 
 _INVESTIGATE = """Investigate one completed simulator prediction using only this input.
@@ -45,13 +46,24 @@ hidden values. Do not rewrite the world, change past scores, or promote a global
 You may supersede IDs from previous_investigations or prior_trajectory_investigations only
 when the supplied feedback contradicts them; superseded notes stay in the audit archive.
 Preserve uncertainty when several explanations fit.
+causal_history lists this trajectory's own steps in order, ending at the investigated step;
+later steps are never shown. Each step gives the public actions, the simulator_prediction
+(its predicted replies and committed state edits: what the simulator believed, not evidence)
+and the recorded_reply (a native observation, when disclosed). Before explaining a miss, check
+whether an earlier step explains it, such as a read of content an earlier action wrote or
+changed, and attribute the cause to that step by its number. Treat recorded replies as what
+happened; a predicted reply or state edit shows only the simulator's belief. An undisclosed
+reply or omitted earlier steps are unknown, not evidence that an event did not happen.
 Fictional example: predicted {"status":"pending"}, observed {"status":"shipped"} for a
 read of entity E. A supported note says the candidate's status belief about E was wrong at
 that read; it does not establish that all entities are shipped or explain why E changed.
 Set transferable true only for a rule about how this environment behaves that a later
 prediction could apply from what it can see: the tool, its arguments, and visible state or
 history. Then name that visible condition in observable_cue and phrase the hypothesis in those
-terms, never in this instance's values. Set transferable false, with observable_cue "", when
+terms, never in this instance's values. Recorded replies in causal_history are feedback for
+this investigation only; a prediction that would apply the rule sees its own earlier predicted
+replies and state, so an observable_cue must not depend on a recorded reply.
+Set transferable false, with observable_cue "", when
 the miss came from information the simulator could not see (unshown records, hidden state)
 or only describes this instance; say why in uncertainty. Abstain rather than guess.
 Return the required structured investigation, with supersedes:[] if nothing is disproved.
@@ -218,6 +230,7 @@ class SessionResearch:
                 "prior": self._prior_identity,
                 "overview": sha256_json(self.overview),
                 "investigate": _INVESTIGATE,
+                "causal_history_budget": CAUSAL_HISTORY_BUDGET,
                 "use": MEMORY_CONTEXT_GUIDANCE,
                 "schema": investigation_schema(),
             }
@@ -293,8 +306,9 @@ class SessionResearch:
         """Learn from the latest completed single-tool reply, never from future actions.
 
         This API accepts explicitly disclosed reply feedback, not reference states or
-        private implementations. The caller owns the source's authenticity. Replaying
-        identical feedback returns the saved record without another model call.
+        private implementations. The caller owns the source's authenticity. The investigation
+        sees the trajectory's earlier steps with the replies their saved receipts disclosed.
+        Replaying identical feedback returns the saved record without another model call.
         """
         policy, complete = self.policy, self._complete
         if policy is None or complete is None:
@@ -361,6 +375,11 @@ class SessionResearch:
                                 {
                                     "feedback": record,
                                     "candidate_transition": latest,
+                                    "causal_history": causal_history(
+                                        transitions,
+                                        operation_id,
+                                        {**_disclosed(records), operation_id: observed_reply},
+                                    ),
                                     "previous_investigations": active,
                                     "prior_trajectory_investigations": prior,
                                 },
@@ -399,12 +418,13 @@ class SessionResearch:
         """Disclose every reply after the whole trajectory is predicted; investigate concurrently.
 
         Only for pinned delivery, where no investigation can inform a prediction. Each
-        investigation sees the disclosed reply, its own predicted transition and the pinned
-        prior research, never another investigation of this session, so the outcome does not
-        depend on completion order. At most ``maximum_updates`` misses across all batches
-        are investigated, in supplied step order; later misses are recorded as raw feedback.
-        Failed investigation intents consume budget too. One failed investigation affects
-        only its own receipt. The session lease is held until every worker settles.
+        investigation sees the disclosed reply, its own predicted transition, the trajectory's
+        causal history up to that step and the pinned prior research, never another
+        investigation of this session, so the outcome does not depend on completion order.
+        At most ``maximum_updates`` misses across all batches are investigated, in supplied
+        step order; later misses are recorded as raw feedback. Failed investigation intents
+        consume budget too. One failed investigation affects only its own receipt. The
+        session lease is held until every worker settles.
 
         Args:
             feedback: ``(operation_id, disclosed reply)`` for each predicted step, in order.
@@ -457,6 +477,18 @@ class SessionResearch:
             if self._artifacts.exists(identity + "-intent")
         }
         budget = max(0, policy.maximum_updates - len(claimed))
+        # Saved receipts are earlier, immutable disclosures; this batch fills the rest. Both are
+        # fixed before any worker starts, so each history is independent of settlement order.
+        disclosed = {
+            **{key: value for key, value in feedback if key in by_operation},
+            **_disclosed(
+                [
+                    json.loads(self._artifacts.read_bytes(identity, "record.json"))
+                    for identity in identities.values()
+                    if self._artifacts.exists(identity)
+                ]
+            ),
+        }
         plans: list[tuple[str, JsonObject, bool] | Exception] = []
         for operation_id, observed_reply in feedback:
             identity = identities.get(operation_id)
@@ -534,6 +566,9 @@ class SessionResearch:
                                     "candidate_transition": by_operation[
                                         str(record["operation_id"])
                                     ],
+                                    "causal_history": causal_history(
+                                        transitions, str(record["operation_id"]), disclosed
+                                    ),
                                     "previous_investigations": [],
                                     "prior_trajectory_investigations": prior,
                                 },
@@ -806,6 +841,15 @@ def _superseded(records: list[JsonObject]) -> set[str]:
         if isinstance(raw, dict):
             retired.update(Investigation.model_validate(raw).supersedes)
     return retired
+
+
+def _disclosed(records: Sequence[JsonValue]) -> dict[str, JsonValue]:
+    """Recorded replies this session's saved feedback receipts disclosed, by operation."""
+    return {
+        str(row["operation_id"]): row["observed_reply"]
+        for row in records
+        if isinstance(row, dict) and "observed_reply" in row
+    }
 
 
 def _recorded_overview_sources(transitions: list[JsonValue]) -> list[ArtifactInput]:
