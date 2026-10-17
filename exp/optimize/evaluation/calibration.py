@@ -18,9 +18,13 @@ from exp.common.evaluations.reconstruction import DualReport, WorkflowEvidence
 from exp.common.project import ProjectStore, artifact_input
 from exp.optimize.evaluation.evidence_admission import admit_calibration_evidence
 from exp.optimize.evaluation.harbor_export import export_harbor_task, verify_harbor_export
-from exp.simulation import evaluation_calibration, evaluation_tasks, evidence_admission
 from exp.simulation.evaluation_calibration import CalibrationJudgment, CalibrationPack, calibrate
 from exp.simulation.evaluation_tasks import load_evaluation_task, normalized_outcome
+
+# Identity of the code that decides this artifact's behavior, in place of its source text.
+# Bump it when behavior changes. exp/tests/code_protocols_test.py fails when the covered
+# source changes until it is bumped or, for a pure refactor, its digest is updated.
+CALIBRATION_PROTOCOL = "task-calibration-v1"
 
 
 class SavedCalibrationJudge(ContractModel):
@@ -158,15 +162,8 @@ def execute_calibration(
         )
     if dry_run:
         return None
-    implementation = sha256_json(
-        {
-            "application": Path(__file__).read_text(),
-            "calibration": Path(evaluation_calibration.__file__).read_text(),
-            "predicates": Path(evaluation_tasks.__file__).read_text(),
-            "admission": Path(evidence_admission.__file__).read_text(),
-        }
-    )
-    result["implementation_sha256"] = implementation
+    implementation = CALIBRATION_PROTOCOL
+    result["implementation_protocol"] = implementation
     identity = stable_id(
         "task-calibration",
         {

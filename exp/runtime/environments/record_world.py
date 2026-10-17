@@ -14,13 +14,17 @@ import json
 import sqlite3
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from pathlib import Path
 
 from exp.common.core.artifacts import JsonObject, JsonValue, Sha256, sha256_json
 from exp.common.models import ToolCall
 from exp.common.tasks import TaskCase
 from exp.runtime.environments.interface import Observation
 from exp.runtime.environments.worlds import NativeImage, WorldAccess, WorldContext, digest_bytes
+
+# Identity of the code that decides this artifact's behavior, in place of its source text.
+# Bump it when behavior changes. exp/tests/code_protocols_test.py fails when the covered
+# source changes until it is bumped or, for a pure refactor, its digest is updated.
+RECORD_WORLD_PROTOCOL = "sqlite-record-world-v1"
 
 _DATABASE_PART = "database"
 
@@ -63,8 +67,7 @@ class RecordWorldFactory:
         self._schema = schema
         self._tools = dict(tools)
         self._definition: JsonObject = {
-            "name": "sqlite-record-world-v1",
-            "source_sha256": digest_bytes(Path(__file__).read_bytes()),
+            "name": RECORD_WORLD_PROTOCOL,
             "sqlite": sqlite3.sqlite_version,
             "service": service,
             "schema_sha256": digest_bytes(schema.encode()),

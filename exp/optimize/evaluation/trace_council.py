@@ -79,6 +79,11 @@ from exp.simulation.world_model.runtime import (
     load_grounded_world_model_artifact,
 )
 
+# Identity of the code that decides this artifact's behavior, in place of its source text.
+# Bump it when behavior changes. exp/tests/code_protocols_test.py fails when the covered
+# source changes until it is bumped or, for a pure refactor, its digest is updated.
+COUNCIL_HARNESS_PROTOCOL = "council-harness-v1"
+
 
 class CouncilActor(ContractModel):
     """A configured actor with an explicitly operator-declared capability label.
@@ -321,9 +326,7 @@ def prepare_trace_council(
         },
         "harness": {
             "agent": "exp.runtime.agents.chat.ChatAgentRuntime",
-            "agent_source": inspect.getsource(ChatAgentRuntime),
-            "capture_source": inspect.getsource(run_actor_workflow),
-            "session_setup_source": inspect.getsource(open_grounded_session),
+            "protocol": COUNCIL_HARNESS_PROTOCOL,
             "capture": "exp.simulation.actor.run_actor_workflow",
             "session": "exp.simulation.world_model.durable.DurableWorldModelSession",
             "maximum_actor_turns": spec.maximum_actor_turns,

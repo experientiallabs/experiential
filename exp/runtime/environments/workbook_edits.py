@@ -1,6 +1,5 @@
 """Bounded XLSX row edits that preserve typed cells and refuse unsupported dependencies."""
 
-import hashlib
 import io
 import re
 import sys
@@ -8,7 +7,6 @@ import zlib
 from collections.abc import Mapping
 from datetime import date, datetime, time
 from importlib.metadata import version
-from pathlib import Path
 from typing import Self
 from xml.dom import minidom
 from xml.etree import ElementTree
@@ -27,6 +25,11 @@ from exp.common.core.artifacts import (
 from exp.common.models import ToolCall
 from exp.runtime.environments.artifact_edits import MAX_ARTIFACT_BYTES, NativeArtifactOutput
 from exp.runtime.environments.worlds import WorldAccess
+
+# Identity of the code that decides this artifact's behavior, in place of its source text.
+# Bump it when behavior changes. exp/tests/code_protocols_test.py fails when the covered
+# source changes until it is bumped or, for a pure refactor, its digest is updated.
+XLSX_ROW_EDITS_PROTOCOL = "xlsx-row-edits-v1"
 
 _ALLOWED_PART = re.compile(
     r"(?:\[Content_Types\]\.xml|_rels/\.rels|docProps/(?:app|core)\.xml|"
@@ -76,10 +79,9 @@ class WorkbookEditAdapter:
 
     @property
     def definition(self) -> JsonObject:
-        """Bind the exact adapter source, dependencies and supported operation schema."""
+        """Bind the adapter protocol, dependencies and supported operation schema."""
         return {
-            "name": "xlsx-row-edits-v1",
-            "source_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+            "name": XLSX_ROW_EDITS_PROTOCOL,
             "python": sys.version,
             "zlib": zlib.ZLIB_RUNTIME_VERSION,
             "dependencies": {name: version(name) for name in ("openpyxl", "et-xmlfile")},

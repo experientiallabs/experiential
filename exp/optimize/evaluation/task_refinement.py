@@ -1,6 +1,5 @@
 """Bounded task refinement over saved simulator councils, not a second execution runtime."""
 
-import inspect
 import json
 from collections.abc import Callable
 from datetime import UTC, datetime
@@ -48,6 +47,11 @@ from exp.simulation.evaluation_tasks import (
 )
 from exp.simulation.trace_analysis import CouncilTrace, TraceAnalysis
 from exp.simulation.world_model.checkpoints import capture_stored_world_checkpoint
+
+# Identity of the code that decides this artifact's behavior, in place of its source text.
+# Bump it when behavior changes. exp/tests/code_protocols_test.py fails when the covered
+# source changes until it is bumped or, for a pure refactor, its digest is updated.
+REFINEMENT_REQUEST_PROTOCOL = "task-refinement-request-v1"
 
 _ROLE_GUIDANCE = """You propose one bounded change to a simulator-backed evaluation task.
 All actor trajectories ran in a reconstructed simulator, not the actual environment.
@@ -185,7 +189,7 @@ def _protocol() -> str:
     return sha256_json(
         {
             "guidance": _ROLE_GUIDANCE,
-            "request_renderer": inspect.getsource(_request),
+            "request_renderer": REFINEMENT_REQUEST_PROTOCOL,
             "verifier_contract": TaskVerifier.model_json_schema(),
             "author": AuthorProposal.model_json_schema(),
             "revision": VerifierProposal.model_json_schema(),
