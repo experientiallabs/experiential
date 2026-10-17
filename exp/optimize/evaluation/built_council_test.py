@@ -9,11 +9,9 @@ import pytest
 
 from exp.common.core.artifacts import JsonObject
 from exp.common.models import load_model_catalog, write_model_catalog
-from exp.optimize.evaluation import built_council, fidelity, trace_council
-from exp.optimize.evaluation.built_council import DEFAULT_ACTOR_MODELS, prepare_built_council
-from exp.optimize.evaluation.fidelity import execute_fidelity_evaluation
-from exp.optimize.evaluation.held_out_fidelity import source_rag_inputs
-from exp.optimize.evaluation.held_out_fidelity_test import (
+from exp.optimize.evaluation import built_council, trace_council
+from exp.optimize.evaluation.audit.panel import source_rag_inputs
+from exp.optimize.evaluation.audit.panel_test import (
     USERS,
     SimulatedProvider,
     _judgement,
@@ -21,6 +19,9 @@ from exp.optimize.evaluation.held_out_fidelity_test import (
     build_project,
     episode,
 )
+from exp.optimize.evaluation.built_council import DEFAULT_ACTOR_MODELS, prepare_built_council
+from exp.optimize.evaluation.fidelity import runner as fidelity
+from exp.optimize.evaluation.fidelity.runner import execute_fidelity_evaluation
 from exp.runtime.models.providers.transport import JsonHttpResponse, RecordedRequest
 
 

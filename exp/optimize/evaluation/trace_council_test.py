@@ -14,14 +14,14 @@ from exp.common.core.artifacts import ArtifactEnvelope, JsonObject
 from exp.common.models import load_model_catalog, write_model_catalog
 from exp.common.project import ProjectStore, artifact_input
 from exp.common.release_revision import installed_release_revision
-from exp.optimize.evaluation import fidelity as fidelity_owner
 from exp.optimize.evaluation import trace_council
-from exp.optimize.evaluation.fidelity import (
+from exp.optimize.evaluation.fidelity import runner as fidelity_owner
+from exp.optimize.evaluation.fidelity.runner import (
     FidelitySpec,
     execute_fidelity_evaluation,
     prepare_fidelity_evaluation,
 )
-from exp.optimize.evaluation.fidelity_test import reply, source_project, transition_reply
+from exp.optimize.evaluation.fidelity.runner_test import reply, source_project, transition_reply
 from exp.optimize.evaluation.tests.fidelity_memory_test import (
     RoutedTransport,
     investigation,

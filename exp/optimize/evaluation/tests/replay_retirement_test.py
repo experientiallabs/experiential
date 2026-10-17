@@ -16,11 +16,8 @@ from exp.common.models import (
     write_model_catalog,
 )
 from exp.common.project import ProjectStore
-from exp.optimize.evaluation import trace_learning, trace_replay
-from exp.optimize.evaluation.fidelity import execute_fidelity_evaluation
-from exp.optimize.evaluation.fidelity_memory import DUPLICATE, saved_memory_receipt
-from exp.optimize.evaluation.held_out_fidelity import register_held_out_fidelity
-from exp.optimize.evaluation.held_out_fidelity_test import (
+from exp.optimize.evaluation.audit.panel import register_held_out_fidelity
+from exp.optimize.evaluation.audit.panel_test import (
     REVISION,
     USERS,
     SimulatedProvider,
@@ -31,15 +28,19 @@ from exp.optimize.evaluation.held_out_fidelity_test import (
     build_project,
     episode,
 )
-from exp.optimize.evaluation.miss_retest import register_miss_retest
-from exp.optimize.evaluation.tests.fidelity_memory_test import memory_project
-from exp.optimize.evaluation.trace_learning import (
+from exp.optimize.evaluation.fidelity import replay as trace_replay
+from exp.optimize.evaluation.fidelity.memory import DUPLICATE, saved_memory_receipt
+from exp.optimize.evaluation.fidelity.runner import execute_fidelity_evaluation
+from exp.optimize.evaluation.learning import traces as trace_learning
+from exp.optimize.evaluation.learning.retest import register_miss_retest
+from exp.optimize.evaluation.learning.traces import (
     fit_calls,
     learn_from_traces,
     learning_curve,
     learning_plan,
     learning_progress,
 )
+from exp.optimize.evaluation.tests.fidelity_memory_test import memory_project
 from exp.runtime.models.providers.transport import JsonHttpResponse
 from exp.simulation.retrieval import load_rag_index
 from exp.simulation.world_model.observed_tools import observed_calls

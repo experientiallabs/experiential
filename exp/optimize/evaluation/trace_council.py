@@ -31,13 +31,13 @@ from exp.common.project import ProjectStore, artifact_input
 from exp.common.tasks import TaskCase
 from exp.optimize.evaluation.council_fidelity import load_tool_fidelity
 from exp.optimize.evaluation.council_memory import CouncilMemory, read_council_memory
-from exp.optimize.evaluation.decision_access import decision_caller
-from exp.optimize.evaluation.fidelity import FidelityRetrieval
-from exp.optimize.evaluation.retrieval_binding import (
+from exp.optimize.evaluation.fidelity.decision_access import decision_caller
+from exp.optimize.evaluation.fidelity.retrieval_binding import (
     bind_index_embedder,
     index_embedder_alias,
     require_unindexed_held_out_task,
 )
+from exp.optimize.evaluation.fidelity.runner import FidelityRetrieval
 from exp.runtime.agents.chat import ChatAgentRuntime
 from exp.runtime.models import RuntimeModelCatalog
 from exp.runtime.models.budget import RequestBudget

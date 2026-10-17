@@ -10,8 +10,7 @@ from typer.testing import CliRunner
 
 from exp.cli.app import app
 from exp.common.core.artifacts import JsonObject
-from exp.optimize.evaluation.fidelity import FidelityMemory
-from exp.optimize.evaluation.held_out_fidelity_test import (
+from exp.optimize.evaluation.audit.panel_test import (
     PROJECT,
     REVISION,
     USERS,
@@ -23,7 +22,8 @@ from exp.optimize.evaluation.held_out_fidelity_test import (
     episode,
     held_out_lineages,
 )
-from exp.optimize.evaluation.trace_learning import (
+from exp.optimize.evaluation.fidelity.runner import FidelityMemory
+from exp.optimize.evaluation.learning.traces import (
     learn_from_traces,
     learning_cases,
     learning_curve,

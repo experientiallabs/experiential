@@ -7,9 +7,13 @@ import pytest
 
 from exp.common.core.artifacts import JsonObject, JsonValue, SourceIdentity
 from exp.common.traces import Trace, TraceSource, TraceSpan
-from exp.optimize.evaluation import trace_replay
-from exp.optimize.evaluation.fidelity_test import source_project
-from exp.optimize.evaluation.trace_replay import content_run_id, recorded_exchanges, replay_boundary
+from exp.optimize.evaluation.fidelity import replay as trace_replay
+from exp.optimize.evaluation.fidelity.replay import (
+    content_run_id,
+    recorded_exchanges,
+    replay_boundary,
+)
+from exp.optimize.evaluation.fidelity.runner_test import source_project
 
 NOW = datetime(2026, 10, 15, tzinfo=UTC)
 

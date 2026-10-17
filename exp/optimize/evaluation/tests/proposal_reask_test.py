@@ -8,8 +8,8 @@ import pytest
 from exp.common.core.artifacts import JsonObject
 from exp.common.evaluations.reconstruction import DualReport
 from exp.common.project import ProjectStore
-from exp.optimize.evaluation import fidelity
-from exp.optimize.evaluation.fidelity import (
+from exp.optimize.evaluation.fidelity import runner as fidelity
+from exp.optimize.evaluation.fidelity.runner import (
     FidelitySpec,
     execute_fidelity_evaluation,
     prepare_fidelity_evaluation,

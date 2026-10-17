@@ -1,7 +1,7 @@
 """The learning stage of ``exp build``: memory grown trace by trace from the traces.
 
 Learning is the build's default pipeline. It needs a native decision model to recall memory
-(:func:`exp.optimize.evaluation.trace_learning.resolve_memory_recall`); the learning and retest
+(:func:`exp.optimize.evaluation.learning.traces.resolve_memory_recall`); the learning and retest
 presentation it composes is shared with ``exp eval`` and lives there.
 """
 
@@ -15,7 +15,7 @@ from exp.cli.evaluation.miss_retest import run_miss_retest
 from exp.cli.shared.progress import ProgressDisplay
 from exp.common.models import load_model_catalog
 from exp.common.project import ProjectStore
-from exp.optimize.evaluation.trace_learning import (
+from exp.optimize.evaluation.learning.traces import (
     learned_runs,
     learning_curve,
     learning_plan,

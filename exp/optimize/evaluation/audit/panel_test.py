@@ -33,21 +33,21 @@ from exp.common.models import (
 from exp.common.models.catalog_roles import ModelRoles
 from exp.common.project import ProjectStore
 from exp.common.tasks.store import load_task_set
-from exp.optimize.evaluation import fidelity
-from exp.optimize.evaluation.fidelity import execute_fidelity_evaluation
-from exp.optimize.evaluation.held_out_fidelity import (
+from exp.optimize.evaluation.audit.panel import (
     held_out_council_inputs,
     register_held_out_fidelity,
     saved_held_out_results,
     source_rag_inputs,
 )
+from exp.optimize.evaluation.fidelity import runner as fidelity
+from exp.optimize.evaluation.fidelity.replay import DEADLINE, aggregate
+from exp.optimize.evaluation.fidelity.runner import execute_fidelity_evaluation
+from exp.optimize.evaluation.learning.traces import learning_curve, learning_plan
 from exp.optimize.evaluation.trace_council import (
     CouncilActor,
     TraceCouncilSpec,
     prepare_trace_council,
 )
-from exp.optimize.evaluation.trace_learning import learning_curve, learning_plan
-from exp.optimize.evaluation.trace_replay import DEADLINE, aggregate
 from exp.runtime.models import RuntimeModelCatalog
 from exp.runtime.models.providers.transport import (
     JsonHttpResponse,

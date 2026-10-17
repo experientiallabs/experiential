@@ -13,8 +13,8 @@ from pydantic import ValidationError
 from exp.common.core.artifacts import ArtifactInput, sha256_json
 from exp.common.project import ArtifactStore, ArtifactStoreError, ProjectStore
 from exp.common.tasks import TaskCase
-from exp.optimize.evaluation.held_out_exposure import held_out_exposure
-from exp.optimize.evaluation.knowledge_exposure import require_unexposed_task
+from exp.optimize.evaluation.audit.exposure import held_out_exposure
+from exp.optimize.evaluation.fidelity.knowledge_exposure import require_unexposed_task
 from exp.simulation.evaluation_calibration import CalibrationCase, CalibrationPack
 from exp.simulation.evaluation_tasks import (
     WITNESSED_AUTHORITIES,

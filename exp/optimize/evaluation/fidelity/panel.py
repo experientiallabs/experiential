@@ -1,7 +1,7 @@
 """Run a registered replay panel: the interrupted-run policy and concurrent execution.
 
 The held-out audit and the build's miss retest both run a frozen panel of registered replays
-(:mod:`exp.optimize.evaluation.trace_replay`). This module is their one execution path: it
+(:mod:`exp.optimize.evaluation.fidelity.replay`). This module is their one execution path: it
 refuses interrupted runs unless resumption was asked for, then runs every trace through
 :func:`execute_fidelity_evaluation`. Consent and terminal presentation stay with the commands.
 """
@@ -12,8 +12,8 @@ from datetime import UTC, datetime
 
 from exp.common.progress import ProgressHook, qualified, report
 from exp.common.project import ProjectStore
-from exp.optimize.evaluation.fidelity import PreparedFidelity, execute_fidelity_evaluation
-from exp.optimize.evaluation.trace_replay import DEADLINE, interrupted
+from exp.optimize.evaluation.fidelity.replay import DEADLINE, interrupted
+from exp.optimize.evaluation.fidelity.runner import PreparedFidelity, execute_fidelity_evaluation
 
 PANEL_CONCURRENCY = 4  # traces of a frozen panel replayed at once
 PANEL_STAGE = "Replaying traces"  # counts finished panel traces

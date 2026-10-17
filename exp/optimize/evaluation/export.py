@@ -15,7 +15,7 @@ from exp.common.evaluations.model_report import ModelEvaluationReport
 from exp.common.project import ProjectStore
 from exp.common.rollouts import RolloutArtifact
 from exp.common.tasks import TaskCase, load_task_set
-from exp.optimize.evaluation.learned_memory import NO_MEMORY_NOTE, EvaluationMemory
+from exp.optimize.evaluation.learning.profile import NO_MEMORY_NOTE, EvaluationMemory
 from exp.optimize.evaluation.runs import EvaluationRun, run_directory
 from exp.simulation.engines.text.resume import load_rollout
 

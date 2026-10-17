@@ -20,7 +20,7 @@ from exp.common.models import (
 )
 from exp.common.project import ProjectStore, artifact_input
 from exp.common.tasks import TaskCase
-from exp.optimize.evaluation.fidelity_test import source_project
+from exp.optimize.evaluation.fidelity.runner_test import source_project
 from exp.optimize.evaluation.harbor_bridge import serve_harbor_trial
 from exp.optimize.evaluation.harbor_export import export_harbor_task
 from exp.optimize.evaluation.harbor_trial import HarborTrial

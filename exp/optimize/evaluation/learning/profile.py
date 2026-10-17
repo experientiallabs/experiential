@@ -30,8 +30,8 @@ from exp.common.core.artifacts import (
 from exp.common.models import ModelCatalog, ModelSnapshot
 from exp.common.project import ArtifactAlreadyExistsError, ProjectStore
 from exp.common.tasks import TaskCase
-from exp.optimize.evaluation.fidelity import FidelityRetrieval
-from exp.optimize.evaluation.trace_learning import learning_plan, recorded_plan
+from exp.optimize.evaluation.fidelity.runner import FidelityRetrieval
+from exp.optimize.evaluation.learning.traces import learning_plan, recorded_plan
 from exp.optimize.router.evaluation.build import completed_project_build
 from exp.runtime.gateway.decisions_contracts import DecisionRequest
 from exp.runtime.models import RuntimeModelCatalog

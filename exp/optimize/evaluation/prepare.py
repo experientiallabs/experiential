@@ -31,7 +31,7 @@ from exp.common.tasks import load_task_set
 from exp.common.traces import load_trace_dataset
 from exp.optimize.evaluation.contracts import EvaluationSetup
 from exp.optimize.evaluation.judge_selection import select_judge_model
-from exp.optimize.evaluation.learned_memory import EvaluationMemory, learned_evaluation_memory
+from exp.optimize.evaluation.learning.profile import EvaluationMemory, learned_evaluation_memory
 from exp.optimize.evaluation.planning import EvaluationCostPlan, estimate_model_evaluation
 from exp.optimize.router.automatic.provisional import (
     _judge_request_reservation,

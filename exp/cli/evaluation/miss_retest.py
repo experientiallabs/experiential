@@ -17,17 +17,20 @@ from exp.cli.shared.theme import EXP_THEME
 from exp.common.progress import ProgressHook
 from exp.common.project import ProjectStore
 from exp.common.release_revision import installed_release_revision
-from exp.optimize.evaluation.fidelity import execute_fidelity_evaluation, saved_fidelity_report
-from exp.optimize.evaluation.fidelity_recovery import QUALIFICATION, Qualification, qualify
-from exp.optimize.evaluation.miss_retest import (
+from exp.optimize.evaluation.fidelity.panel import require_resumable
+from exp.optimize.evaluation.fidelity.recovery import QUALIFICATION, Qualification, qualify
+from exp.optimize.evaluation.fidelity.replay import ReplayAggregate, aggregate
+from exp.optimize.evaluation.fidelity.runner import (
+    execute_fidelity_evaluation,
+    saved_fidelity_report,
+)
+from exp.optimize.evaluation.learning.retest import (
     TurnChanges,
     register_miss_retest,
     saved_retest_results,
     turn_changes,
 )
-from exp.optimize.evaluation.replay_panel import require_resumable
-from exp.optimize.evaluation.trace_learning import learning_curve
-from exp.optimize.evaluation.trace_replay import ReplayAggregate, aggregate
+from exp.optimize.evaluation.learning.traces import learning_curve
 
 
 @dataclass(frozen=True)

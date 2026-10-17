@@ -9,7 +9,7 @@ qualified in its headline with the held-out audit's label (``qualified: trace re
 names the re-dispatches by stage and the affected traces, keeps every trace in the primary
 score, and adds the score over unaffected traces only and over affected traces only, each with
 its denominator. Nothing is dropped by default. Held-out audits record the same retries as
-children of their receipt (:mod:`exp.optimize.evaluation.held_out_receipts`).
+children of their receipt (:mod:`exp.optimize.evaluation.audit.receipts`).
 """
 
 import json

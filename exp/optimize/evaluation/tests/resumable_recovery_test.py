@@ -20,19 +20,12 @@ from exp.cli.app import app
 from exp.common.core.artifacts import JsonObject
 from exp.common.models import ToolCall
 from exp.common.project import ProjectStore
-from exp.optimize.evaluation import trace_learning
-from exp.optimize.evaluation.fidelity import (
-    execute_fidelity_evaluation,
-    saved_fidelity_report,
-    unknown_outcomes,
-)
-from exp.optimize.evaluation.fidelity_recovery import qualify
-from exp.optimize.evaluation.held_out_fidelity import (
+from exp.optimize.evaluation.audit.panel import (
     HeldOutPanel,
     register_held_out_fidelity,
     saved_held_out_results,
 )
-from exp.optimize.evaluation.held_out_fidelity_test import (
+from exp.optimize.evaluation.audit.panel_test import (
     PROJECT,
     REVISION,
     USERS,
@@ -44,13 +37,20 @@ from exp.optimize.evaluation.held_out_fidelity_test import (
     episode,
     learn_fit,
 )
-from exp.optimize.evaluation.trace_learning import (
+from exp.optimize.evaluation.fidelity.recovery import qualify
+from exp.optimize.evaluation.fidelity.replay import DEADLINE, ReplayResult
+from exp.optimize.evaluation.fidelity.runner import (
+    execute_fidelity_evaluation,
+    saved_fidelity_report,
+    unknown_outcomes,
+)
+from exp.optimize.evaluation.learning import traces as trace_learning
+from exp.optimize.evaluation.learning.traces import (
     learn_from_traces,
     learning_curve,
     learning_plan,
     learning_progress,
 )
-from exp.optimize.evaluation.trace_replay import DEADLINE, ReplayResult
 from exp.runtime.environments import Observation
 from exp.runtime.models.providers.transport import JsonHttpResponse, RecordedRequest
 from exp.runtime.sessions.store import SessionStore, StepClaim
