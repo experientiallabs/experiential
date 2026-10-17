@@ -19,6 +19,7 @@ from exp.simulation.evidence_admission import (
     EvaluationSpecification,
     EvidenceAdmission,
     EvidenceAdmissionError,
+    LabelWitness,
     adequacy_refusals,
     persist_specification,
     record_label_witness,
@@ -241,3 +242,39 @@ def test_admission_binds_the_exact_challenge_not_its_identifier(tmp_path: Path) 
     assert admission.verified_ids((label,)) == {"done"}
     edited = label.model_copy(update={"rationale": "Changed after verification."})
     assert admission.verified_ids((edited,)) == frozenset()
+
+
+def test_a_hand_written_witness_verdict_is_regraded(tmp_path: Path) -> None:
+    """A saved witness claiming a verdict its specification does not produce is refused."""
+    store = ProjectStore(tmp_path, "admission")
+    spec = specification(store)
+    forged = LabelWitness(
+        kind="specification_check",
+        specification=spec,
+        outcome_sha256=sha256_json(outcome("pending")),
+        observation=outcome("pending"),
+        verdict="pass",
+        reason="Asserted, not graded.",
+    )
+    witness = artifact_input(
+        store.artifacts.write_json(
+            artifact_id="forged-witness",
+            artifact_type="label-witness",
+            envelope=ArtifactEnvelope(
+                schema_version=1, created_at=NOW, inputs=(spec,), code_revision="test"
+            ),
+            files={"witness.json": forged.model_dump(mode="json")},
+        )
+    )
+    label = VerifierChallenge(
+        id="pending",
+        outcome=outcome("pending"),
+        expected="pass",
+        authority="synthetic_specification",
+        rationale="Claimed by a forged witness.",
+        witness=witness,
+    )
+    refusal = verify_label_witness(store.artifacts, label, label="pass", compared=())
+    assert refusal is not None
+    assert refusal.reason == "unverifiable_witness"
+    assert "re-grades to another verdict" in refusal.detail
