@@ -307,18 +307,26 @@ def test_snapshot_mutate_restore_is_byte_and_state_equal(case: WorldCase) -> Non
 
 
 def test_fork_effects_never_reach_parent_or_siblings(case: WorldCase) -> None:
-    """Forks share a starting point and nothing else."""
+    """Forks share a starting point and nothing else, even when restored from one checkpoint."""
     with case.runtime.open(case.task) as parent:
         parent.execute(case.first)
         start = parent.checkpoint()
-        with parent.fork() as left, parent.fork() as right:
+        persisted = start.model_dump_json()
+        with (
+            case.runtime.restore(case.task, start) as left,
+            case.runtime.restore(case.task, start) as right,
+            parent.fork() as child,
+        ):
             left.execute(case.second)
             assert parent.checkpoint() == start
             assert right.checkpoint() == start
+            assert child.checkpoint() == start
             right.advance(4)
             assert left.checkpoint().clock == start.clock + 1
             assert parent.checkpoint() == start
+            assert child.checkpoint() == start
             assert left.domain_digests() != right.domain_digests()
+        assert start.model_dump_json() == persisted
 
 
 def test_clock_and_pending_events_resume_after_restore(case: WorldCase) -> None:
