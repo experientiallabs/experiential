@@ -333,19 +333,25 @@ def test_clock_and_pending_events_resume_after_restore(case: WorldCase) -> None:
     """A restored world resumes its clock, queue and outage, then replays identically."""
     with case.runtime.open(case.task) as world:
         world.execute(case.first)
+        assert [event.status for event in world.advance(3)] == ["applied"]
         saved = world.checkpoint()
-        assert saved.clock == 1
-        assert saved.pending
+        assert saved.clock == 4
+        assert [event.event_id for event in saved.pending] == ["outage"]
         with case.runtime.restore(case.task, saved) as restored:
             assert restored.clock == saved.clock
             assert restored.pending == saved.pending
-            original = world.advance(5)
-            replayed = restored.advance(5)
+            original = world.advance(2)
+            replayed = restored.advance(2)
             assert original == replayed
-            assert any(event.event_id == "outage" for event in replayed)
+            assert [event.event_id for event in replayed] == ["outage"]
+            during = world.checkpoint()
             assert world.execute(case.first).is_error
             assert restored.execute(case.first).is_error
             assert world.checkpoint() == restored.checkpoint()
+        with case.runtime.restore(case.task, during) as resumed:
+            reply = resumed.execute(case.first)
+            assert reply.is_error and "unavailable until t=8" in reply.content
+            assert resumed.checkpoint() == world.checkpoint()
 
 
 def test_replay_from_a_checkpoint_is_deterministic(case: WorldCase) -> None:
