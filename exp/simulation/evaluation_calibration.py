@@ -13,7 +13,18 @@ from exp.common.core.artifacts import (
     stable_id,
 )
 from exp.common.evaluations.reconstruction import AxisOutcome, JudgeConfig, WorkflowEvidence
-from exp.simulation.evaluation_tasks import TaskVerifier, Verdict, VerifierChallenge, grade
+from exp.simulation.evaluation_tasks import (
+    TaskVerifier,
+    Verdict,
+    VerifierChallenge,
+    grade,
+    label_admitted,
+)
+from exp.simulation.evidence_admission import (
+    AdmissionRefusal,
+    EvidenceAdmission,
+    adequacy_refusals,
+)
 
 
 class CalibrationCase(ContractModel):
@@ -44,7 +55,12 @@ class CalibrationCase(ContractModel):
 
     @model_validator(mode="after")
     def independent_scores(self) -> Self:
-        """Keep expert rubric labels separate from synthetic outcome specifications."""
+        """Keep expert rubric labels separate from synthetic outcome specifications.
+
+        Ordinal expert scores are the one deliberate human-only label: a native or
+        specification witness establishes a verdict, not a 1 to 5 rubric anchor. Witnessed
+        verdicts qualify through the task-correctness path instead.
+        """
         if self.expert_scores and (
             not self.challenge.approved or self.challenge.authority != "human"
         ):
@@ -53,9 +69,31 @@ class CalibrationCase(ContractModel):
             self.expected_unassessable
         ) & set(self.expert_scores):
             raise ValueError("a criterion needs exactly one assessment expectation")
-        if self.expected_unassessable and not self.challenge.approved:
+        if self.expected_unassessable and not (
+            self.challenge.approved or self.challenge.witness is not None
+        ):
             raise ValueError("assessment expectations need an independently admitted witness")
+        if (
+            self.challenge.witness is not None
+            and self.expected_task is not None
+            and self.expected_task != self.challenge.expected
+        ):
+            raise ValueError(
+                "a witness establishes one verdict: a witnessed case's task label must equal "
+                "its verifier label"
+            )
         return self
+
+    @property
+    def label(self) -> Verdict:
+        """The primary label: task correctness when declared, else the verifier verdict."""
+        return self.expected_task or self.challenge.expected
+
+    def covered_axes(self, required: tuple[str, ...]) -> frozenset[str]:
+        """Rubric criteria this case's labels speak to."""
+        if self.expected_task is not None:
+            return frozenset(required)
+        return frozenset(self.expert_scores) | frozenset(self.expected_unassessable)
 
 
 class CalibrationPack(ContractModel):
@@ -166,6 +204,7 @@ def calibrate(
     judgments: tuple[CalibrationJudgment, ...] = (),
     *,
     allow_confirmation: bool = True,
+    admission: EvidenceAdmission | None = None,
 ) -> JsonObject:
     """Compare frozen predicates and judge outputs against admitted independent labels.
 
@@ -173,6 +212,8 @@ def calibrate(
         pack: Immutable cases, candidate and predeclared comparison allowances.
         judgments: Saved evidence, never generated labels or provider callbacks.
         allow_confirmation: Open reserved cases only after the caller freezes selection.
+        admission: Store-verified witnesses and contamination refusals. Without it, witnessed
+            labels stay unadmitted and the result cannot qualify.
 
     Returns:
         Counts, per-case errors and scoped statuses. No reward is supplied to an actor.
@@ -181,18 +222,28 @@ def calibrate(
     index = {judgment.case_id: judgment for judgment in judgments}
     if len(index) != len(judgments) or set(index) - {c.challenge.id for c in pack.cases}:
         raise ValueError("judge results contain duplicate or unknown case IDs")
-    development_ready = _partition_ready(pack, "development", index)
+    verified = (
+        frozenset()
+        if admission is None
+        else admission.verified_ids(case.challenge for case in pack.cases)
+    )
+    development_ready = _partition_ready(pack, "development", index, verified)
     has_selection = any(case.partition == "selection" for case in pack.cases)
-    selection_ready = _partition_ready(pack, "selection", index) if has_selection else True
+    selection_ready = (
+        _partition_ready(pack, "selection", index, verified) if has_selection else True
+    )
     has_confirmation = any(case.partition == "confirmation" for case in pack.cases)
     confirmation_open = allow_confirmation and development_ready and selection_ready
-    confirmation_ready = confirmation_open and _partition_ready(pack, "confirmation", index)
+    confirmation_ready = confirmation_open and _partition_ready(
+        pack, "confirmation", index, verified
+    )
+    refusals = _qualification_refusals(pack, admission, verified)
     for case in pack.cases:
         challenge = case.challenge
         opened = case.partition != "confirmation" or confirmation_open
         parent = grade(pack.parent, challenge.outcome) if opened else None
         candidate = grade(pack.candidate, challenge.outcome) if opened else None
-        admitted = challenge.approved and challenge.authority != "generated_hypothesis"
+        admitted = label_admitted(challenge, verified)
         judgment = index.get(challenge.id)
         task_status = (
             task_decision(candidate.status, _bound_axes(pack, case, judgment), pack.minimum_scores)
@@ -290,6 +341,9 @@ def calibrate(
             for authority in sorted({case.challenge.authority for case in pack.cases})
         },
         "independent": sum(bool(row["independent"]) for row in rows),
+        "witnessed_verified": len(verified),
+        "qualification_refusals": [row.model_dump(mode="json") for row in refusals],
+        "exposure_ledger": None if admission is None else admission.ledger,
         "false_acceptances": sum(bool(row["false_acceptance"]) for row in rows),
         "false_rejections": sum(bool(row["false_rejection"]) for row in rows),
         "judge_criterion_disagreements": sum(
@@ -324,7 +378,7 @@ def calibrate(
         and profile_bound
         and bool(pack.minimum_scores)
         and ((judge_ready and all_required_judged) or (task_agreement and task_coverage))
-        and all(case.challenge.authority != "synthetic_specification" for case in pack.cases)
+        and not refusals
         and all(case.task_label_scope == "task_correctness" for case in pack.cases)
         else "diagnostic_only",
         "rows": rows,
@@ -335,16 +389,53 @@ def calibrate(
     }
 
 
+def _qualification_refusals(
+    pack: CalibrationPack, admission: EvidenceAdmission | None, verified: frozenset[str]
+) -> tuple[AdmissionRefusal, ...]:
+    """Every named reason the pack cannot qualify: admission refusals and thin evidence."""
+    missing = (
+        AdmissionRefusal(
+            reason="unverifiable_witness",
+            subject="evidence admission",
+            detail=(
+                "witnesses, exposure and partitions were not checked against the artifact "
+                "store; calibrate through exp eval PROJECT --calibrate"
+            ),
+        ),
+    )
+    partitions = tuple(
+        name
+        for name in ("development", "selection", "confirmation")
+        if name != "selection" or any(case.partition == name for case in pack.cases)
+    )
+    return (missing if admission is None else admission.refusals) + adequacy_refusals(
+        (
+            (
+                case.partition,
+                case.label,
+                label_admitted(case.challenge, verified),
+                case.covered_axes(pack.required_dimensions),
+            )
+            for case in pack.cases
+        ),
+        partitions=partitions,
+        axes=pack.required_dimensions,
+    )
+
+
 def _partition_ready(
-    pack: CalibrationPack, partition: str, judgments: dict[str, CalibrationJudgment]
+    pack: CalibrationPack,
+    partition: str,
+    judgments: dict[str, CalibrationJudgment],
+    verified: frozenset[str],
 ) -> bool:
     """Require independently admitted positive and negative cases with correct decisions."""
     cases = [case for case in pack.cases if case.partition == partition]
-    admitted = [case for case in cases if case.challenge.approved]
+    admitted = [case for case in cases if label_admitted(case.challenge, verified)]
     return (
         bool(cases)
         and len(admitted) == len(cases)
-        and {"pass", "fail"} <= {case.expected_task or case.challenge.expected for case in admitted}
+        and {"pass", "fail"} <= {case.label for case in admitted}
         and all(
             grade(pack.candidate, case.challenge.outcome).status == case.challenge.expected
             and (

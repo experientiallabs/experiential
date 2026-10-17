@@ -1,6 +1,6 @@
 """Immutable evaluation tasks and independently qualified data-only verifiers."""
 
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from datetime import datetime
 from operator import not_
 from typing import Literal, Self
@@ -25,6 +25,19 @@ from exp.simulation.actor_context import ActorContextFragment
 from exp.simulation.reconstruction.models import check_schema, path_parts, resolve
 
 Verdict = Literal["pass", "fail", "unassessable"]
+LabelAuthority = Literal[
+    "human",
+    "recorded_reference",
+    "native_execution",
+    "synthetic_specification",
+    "generated_hypothesis",
+]
+# Labels admitted by a caller's attestation over digest-checked source references.
+ATTESTED_AUTHORITIES: frozenset[LabelAuthority] = frozenset({"human", "recorded_reference"})
+# Labels admitted only after their saved witness is re-derived from the artifact store.
+WITNESSED_AUTHORITIES: frozenset[LabelAuthority] = frozenset(
+    {"native_execution", "synthetic_specification"}
+)
 
 
 class OutcomeRule(ContractModel):
@@ -202,29 +215,63 @@ class VerifierChallenge(ContractModel):
         outcome: Recorded workflow or its explicit normalized JSON projection.
         expected: Independently declared expected verdict, or a diagnostic hypothesis.
         authority: Source of the label; a generated hypothesis cannot approve itself.
-        approved: Whether the independent label was explicitly admitted by the caller.
+            ``native_execution`` and ``synthetic_specification`` labels are admitted only by
+            re-verifying ``witness``; ``human`` and ``recorded_reference`` labels by ``approved``.
+        approved: Caller attestation admitting a human or recorded-reference label. Witnessed
+            authorities leave it false: verification, not approval, admits them.
         rationale: Why the expected verdict follows from the declared specification.
-        source_refs: Immutable witnesses for the label, required for approval.
+        source_refs: Immutable witnesses for an attested label, required for approval.
+        witness: Saved ``label-witness`` artifact re-derived at admission; required for a
+            native-execution label and the only admission path for a specification label.
     """
 
     id: str = Field(min_length=1)
     outcome: WorkflowEvidence | JsonObject
     expected: Verdict
-    authority: Literal[
-        "human", "recorded_reference", "synthetic_specification", "generated_hypothesis"
-    ]
+    authority: LabelAuthority
     approved: bool = Field(default=False, strict=True)
     rationale: str = Field(min_length=1)
     source_refs: tuple[ArtifactInput, ...] = ()
+    witness: ArtifactInput | None = Field(default=None, exclude_if=lambda value: value is None)
 
     @model_validator(mode="after")
     def independent_approval(self) -> Self:
-        """Refuse model-generated admission and approval without a witness."""
+        """Refuse model-generated admission, approval without a witness and asserted witnesses."""
         if self.approved and self.authority == "generated_hypothesis":
             raise ValueError("a generated hypothesis cannot independently approve its label")
+        if self.approved and self.authority in WITNESSED_AUTHORITIES:
+            raise ValueError(
+                f"{self.authority} labels are admitted by re-verifying their witness, not by "
+                "approval; set approved=false and reference a saved label witness"
+            )
         if self.approved and not self.source_refs:
             raise ValueError("approved verifier labels require immutable source witnesses")
+        if self.witness is not None and self.authority not in WITNESSED_AUTHORITIES:
+            raise ValueError(
+                "only native_execution or synthetic_specification labels carry a label witness"
+            )
+        if self.authority == "native_execution" and self.witness is None:
+            raise ValueError("a native_execution label requires a saved native label witness")
         return self
+
+
+def label_admitted(challenge: VerifierChallenge, verified: Collection[str]) -> bool:
+    """Whether one label is independent evidence: attested, or witnessed and re-verified.
+
+    Args:
+        challenge: Label to admit.
+        verified: Challenge IDs whose saved witness was re-derived from the artifact store.
+
+    Returns:
+        True for an approved attested label or a witnessed label in ``verified``.
+    """
+    if challenge.authority in ATTESTED_AUTHORITIES:
+        return challenge.approved
+    return (
+        challenge.authority in WITNESSED_AUTHORITIES
+        and challenge.witness is not None
+        and challenge.id in verified
+    )
 
 
 class ChallengeComparison(ContractModel):
@@ -232,7 +279,7 @@ class ChallengeComparison(ContractModel):
 
     Attributes:
         id: Challenge identity.
-        independent: Whether an explicitly approved external label is available.
+        independent: Whether an attested or re-verified witnessed label is available.
         expected: Declared expected verdict.
         parent: Mechanical parent verdict.
         child: Mechanical child verdict.
@@ -456,14 +503,20 @@ def _rule_matches(rule: OutcomeRule, observed: JsonValue) -> bool:
 
 
 def qualify_verifier(
-    parent: TaskVerifier, child: TaskVerifier, challenges: Sequence[VerifierChallenge]
+    parent: TaskVerifier,
+    child: TaskVerifier,
+    challenges: Sequence[VerifierChallenge],
+    *,
+    verified: Collection[str] = frozenset(),
 ) -> VerifierQualification:
-    """Select one development child only on independently approved positive and negative labels.
+    """Select one development child only on independently admitted positive and negative labels.
 
     Args:
         parent: Frozen current verifier.
         child: Proposed replacement predicate.
         challenges: Same protected observations and labels for both verifiers.
+        verified: Challenge IDs whose saved witness was re-verified; other witnessed labels
+            remain diagnostics.
 
     Returns:
         Gains, losses and a disposition; generated hypotheses cannot establish acceptance.
@@ -473,7 +526,7 @@ def qualify_verifier(
     comparisons = tuple(
         ChallengeComparison(
             id=case.id,
-            independent=case.approved and case.authority != "generated_hypothesis",
+            independent=label_admitted(case, verified),
             expected=case.expected,
             parent=grade(parent, case.outcome),
             child=grade(child, case.outcome),
@@ -541,6 +594,7 @@ def _references(task: EvaluationTask) -> tuple[ArtifactInput, ...]:
     if task.parent is not None:
         refs.append(task.parent)
     refs.extend(reference for case in task.challenges for reference in case.source_refs)
+    refs.extend(case.witness for case in task.challenges if case.witness is not None)
     found: dict[str, ArtifactInput] = {}
     for reference in refs:
         if reference.artifact_id in found and found[reference.artifact_id] != reference:

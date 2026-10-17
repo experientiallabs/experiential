@@ -19,6 +19,7 @@ from exp.common.core.artifacts import (
 from exp.common.models import load_model_catalog
 from exp.common.progress import ProgressHook, report
 from exp.common.project import ProjectStore, artifact_input
+from exp.optimize.evaluation.evidence_admission import require_refinement_admission
 from exp.optimize.evaluation.trace_council import (
     PreparedCouncil,
     TraceCouncilSpec,
@@ -70,7 +71,7 @@ class TaskRefinementSpec(ContractModel):
         intent: Capability this task is intended to exercise.
         prior_proposals: Explicit saved report supplying unchanged author/verifier proposals.
         verifier: Parent data-only outcome verifier.
-        development_challenges: Approved development labels and explicitly provisional cases.
+        development_challenges: Admitted development labels and explicitly provisional cases.
         confirmation_challenges: Untouched labels withheld from every proposing role.
         author_alias: Configured prompt-author model.
         verifier_alias: Configured verifier-author model.
@@ -292,6 +293,7 @@ def prepare_task_refinement(
     catalog = load_model_catalog(project.model_catalog_path)
     _prior_proposals(project, spec, sha256_json(catalog))
     source, result = _source(project, spec.source_council)
+    _admit(project, spec, source)
     trace_rows = result.get("traces", [])
     if not isinstance(trace_rows, list):
         raise ValueError("source council trace inventory is invalid")
@@ -385,6 +387,20 @@ def prepare_task_refinement(
         tuple(sorted(dependencies, key=lambda ref: ref.artifact_id)),
     )
     return prepared
+
+
+def _admit(
+    project: ProjectStore, spec: TaskRefinementSpec, source: PreparedCouncil
+) -> frozenset[str]:
+    """Refuse an unqualifiable cycle before credentials, roles or child actors."""
+    return require_refinement_admission(
+        project,
+        verifier=spec.verifier,
+        development=spec.development_challenges,
+        confirmation=spec.confirmation_challenges,
+        world_model=source.spec.world_model,
+        task=source.spec.tasks[0],
+    )
 
 
 def saved_task_refinement(
@@ -522,6 +538,7 @@ def execute_task_refinement(
             raise ValueError("refinement catalog changed or deadline expired before dispatch")
         spec = prepared.spec
         source, baseline = _source(project, spec.source_council)
+        verified = _admit(project, spec, source)
         parent = load_evaluation_task(project.artifacts, prepared.parent)
         ledger = DispatchLedger(
             project.artifacts.project_directory / (prepared.id + "-physical.sqlite"),
@@ -555,7 +572,10 @@ def execute_task_refinement(
         allowed.update(
             reference.artifact_id
             for challenge in spec.development_challenges
-            for reference in challenge.source_refs
+            for reference in (
+                *challenge.source_refs,
+                *(() if challenge.witness is None else (challenge.witness,)),
+            )
         )
         allowed.add("task:" + parent.task.task_id)
 
@@ -768,7 +788,7 @@ def execute_task_refinement(
             isinstance(attack_grade, dict) and attack_grade.get("status") == "pass"
         )
         qualification = qualify_verifier(
-            parent.verifier, candidate.verifier, spec.development_challenges
+            parent.verifier, candidate.verifier, spec.development_challenges, verified=verified
         )
         child_spec = source.spec.model_copy(
             update={
@@ -843,6 +863,7 @@ def execute_task_refinement(
             parent.verifier,
             candidate.verifier,
             spec.confirmation_challenges if confirmation_ready else (),
+            verified=verified,
         )
         confirmation_rows = tuple(row for row in confirmation.comparisons if row.independent)
         confirmation_status = (
@@ -861,7 +882,7 @@ def execute_task_refinement(
             "reused_proposals_from": None
             if spec.prior_proposals is None
             else spec.prior_proposals.model_dump(mode="json"),
-            "admission_policy": "declared-development-source-refs",
+            "admission_policy": "verified-witnesses-or-attested-source-refs",
             "parent_artifact_id": prepared.parent.artifact_id,
             "child_artifact_id": child.artifact_id,
             "planned_actor_cells": len(source.spec.actors),

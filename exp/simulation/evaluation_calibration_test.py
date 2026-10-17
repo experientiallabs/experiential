@@ -3,7 +3,7 @@
 import pytest
 from pydantic import ValidationError
 
-from exp.common.core.artifacts import ArtifactInput, JsonObject, sha256_json
+from exp.common.core.artifacts import ArtifactInput, JsonObject, canonical_json_bytes, sha256_json
 from exp.common.evaluations.actor_rubric import actor_judge
 from exp.common.evaluations.reconstruction import AxisOutcome, WorkflowEvidence, WorkflowStep
 from exp.simulation.evaluation_calibration import (
@@ -15,35 +15,39 @@ from exp.simulation.evaluation_calibration import (
     task_decision,
 )
 from exp.simulation.evaluation_tasks import FieldRelation, TaskVerifier, VerifierChallenge
+from exp.simulation.evidence_admission import AdmissionRefusal, EvidenceAdmission
 
 
-def pack() -> CalibrationPack:
-    """Declare four independent synthetic specification cases for software checks only."""
+def pack(*, variants: int = 1) -> CalibrationPack:
+    """Declare attested recorded-reference cases for software checks only."""
     witness = ArtifactInput(artifact_id="declared-specification", sha256="1" * 64)
     cases = []
     for partition in ("development", "confirmation"):
         for correct in (True, False):
-            value: JsonObject = {
-                "source_instance": partition,
-                "final_answer": {"status": "pending" if correct else "delivered"},
-                "observed": {"status": "pending"},
-                "stop_reason": "completed",
-            }
-            cases.append(
-                CalibrationCase(
-                    challenge=VerifierChallenge(
-                        id=f"{partition}-{correct}",
-                        outcome=value,
-                        expected="pass" if correct else "fail",
-                        authority="synthetic_specification",
-                        approved=True,
-                        rationale="Declared report must agree with its observation",
-                        source_refs=(witness,),
-                    ),
-                    lineage=partition,
-                    partition=partition,
+            for variant in range(variants):
+                value: JsonObject = {
+                    "source_instance": partition,
+                    "final_answer": {"status": "pending" if correct else "delivered"},
+                    "observed": {"status": "pending"},
+                    "stop_reason": "completed",
+                }
+                if variant:
+                    value["variant"] = variant
+                cases.append(
+                    CalibrationCase(
+                        challenge=VerifierChallenge(
+                            id=f"{partition}-{correct}" + (f"-{variant}" if variant else ""),
+                            outcome=value,
+                            expected="pass" if correct else "fail",
+                            authority="recorded_reference",
+                            approved=True,
+                            rationale="Declared report must agree with its observation",
+                            source_refs=(witness,),
+                        ),
+                        lineage=partition,
+                        partition=partition,
+                    )
                 )
-            )
     return CalibrationPack(
         task=ArtifactInput(artifact_id="evaluation-task", sha256="2" * 64),
         parent=TaskVerifier(description="Weak", outcome_schema={"type": "object"}),
@@ -56,9 +60,9 @@ def pack() -> CalibrationPack:
     )
 
 
-def test_synthetic_specification_does_not_self_certify_the_judge() -> None:
+def test_mechanical_agreement_does_not_self_certify_the_judge() -> None:
     """Mechanical agreement is useful but not evidence of expert rubric agreement."""
-    report = calibrate(pack())
+    report = calibrate(pack(), admission=EvidenceAdmission())
     assert report["development_status"] == "passed"
     assert report["confirmation_status"] == "passed"
     assert report["rubric_status"] == "provisional"
@@ -115,9 +119,9 @@ def test_expert_scores_cannot_coerce_boolean_text_or_out_of_range_values(score: 
         CalibrationCase.model_validate(data)
 
 
-def task_pack() -> CalibrationPack:
+def task_pack(*, variants: int = 1) -> CalibrationPack:
     """Separate component validity from task truth in declared software fixtures."""
-    original = pack()
+    original = pack(variants=variants)
     cases = []
     for case in original.cases:
         data = case.model_dump()
@@ -309,7 +313,7 @@ def test_source_outcome_labels_remain_explicit() -> None:
 
 def test_source_reward_scope_prevents_an_otherwise_qualified_fixture() -> None:
     """Exercise qualification mechanics with fixtures, not claimed native reference evidence."""
-    original = task_pack()
+    original = task_pack(variants=2)
     cases = []
     for case in original.cases:
         assert isinstance(case.challenge.outcome, dict)
@@ -345,9 +349,16 @@ def test_source_reward_scope_prevents_an_otherwise_qualified_fixture() -> None:
             "judge_completion_sha256": "7" * 64,
         }
     )
-    assert calibrate(bound, task_judgments(bound))["qualification"] == "qualified_in_scope"
+    admitted = EvidenceAdmission()
+    assert (
+        calibrate(bound, task_judgments(bound), admission=admitted)["qualification"]
+        == "qualified_in_scope"
+    )
     unbound = bound.model_copy(update={"judge_completion_sha256": None})
-    assert calibrate(unbound, task_judgments(unbound))["qualification"] == "diagnostic_only"
+    assert (
+        calibrate(unbound, task_judgments(unbound), admission=admitted)["qualification"]
+        == "diagnostic_only"
+    )
     source_only = bound.model_copy(
         update={
             "cases": tuple(
@@ -356,7 +367,10 @@ def test_source_reward_scope_prevents_an_otherwise_qualified_fixture() -> None:
             )
         }
     )
-    assert calibrate(source_only, task_judgments(source_only))["qualification"] == "diagnostic_only"
+    assert (
+        calibrate(source_only, task_judgments(source_only), admission=admitted)["qualification"]
+        == "diagnostic_only"
+    )
 
 
 def test_unavailable_judge_and_withheld_cases_remain_in_task_denominator() -> None:
@@ -456,3 +470,144 @@ def test_bound_judge_cannot_reuse_scores_from_another_completion_profile() -> No
     )
     with pytest.raises(ValueError, match="completion profile"):
         calibrate(bound, task_judgments(original))
+
+
+def bound_pack(*, witnessed: bool = False, variants: int = 2) -> CalibrationPack:
+    """A profile-bound task pack whose labels are attested or carry saved witnesses."""
+    original = task_pack(variants=variants)
+    cases = []
+    for case in original.cases:
+        assert isinstance(case.challenge.outcome, dict)
+        evidence = WorkflowEvidence(
+            workflow_id=case.challenge.id,
+            task="Report the observed status",
+            initial_state={},
+            steps=(
+                WorkflowStep(
+                    step=0, action={"name": "read"}, status="valid", reply={"status": "pending"}
+                ),
+            ),
+            final_answer=case.challenge.outcome["final_answer"],
+            sources={"frozen_profile_sha256": "4" * 64},
+            stop_reason="completed",
+        )
+        challenge = case.challenge.model_dump(mode="json") | {
+            "outcome": evidence.model_dump(mode="json"),
+            "authority": "recorded_reference",
+        }
+        if witnessed:
+            challenge |= {
+                "authority": "synthetic_specification",
+                "approved": False,
+                "source_refs": [],
+                "expected": case.expected_task,
+                "witness": {
+                    "artifact_id": "witness-" + case.challenge.id.lower(),
+                    "sha256": "5" * 64,
+                },
+            }
+        cases.append({**case.model_dump(mode="json"), "challenge": challenge})
+    # JSON parsing, as the CLI does, keeps each outcome a typed WorkflowEvidence.
+    return CalibrationPack.model_validate_json(
+        canonical_json_bytes(
+            {
+                **original.model_dump(mode="json"),
+                "cases": cases,
+                "candidate": TaskVerifier(
+                    description="Answer agrees with the observed reply",
+                    outcome_schema={"type": "object"},
+                    relations=(
+                        FieldRelation(left="/final_answer/status", right="/steps/0/reply/status"),
+                    ),
+                ).model_dump(mode="json"),
+                "frozen_profile_sha256": "4" * 64,
+                "judge_completion_sha256": "7" * 64,
+            }
+        )
+    )
+
+
+def verified(pack: CalibrationPack, *refusals: AdmissionRefusal) -> EvidenceAdmission:
+    """Stand in for store admission that re-verified every witnessed label."""
+    return EvidenceAdmission(
+        verified={
+            case.challenge.id: sha256_json(case.challenge)
+            for case in pack.cases
+            if case.challenge.witness is not None
+        },
+        refusals=refusals,
+    )
+
+
+def refusals(report: JsonObject) -> list[AdmissionRefusal]:
+    """The report's named qualification refusals."""
+    rows = report["qualification_refusals"]
+    assert isinstance(rows, list)
+    return [AdmissionRefusal.model_validate(row) for row in rows]
+
+
+def test_witnessed_labels_qualify_without_any_approval_step() -> None:
+    """Verified specification witnesses replace the human approval dependency entirely."""
+    pack = bound_pack(witnessed=True)
+    assert not any(case.challenge.approved for case in pack.cases)
+    report = calibrate(pack, task_judgments(pack), admission=verified(pack))
+    assert report["witnessed_verified"] == len(pack.cases)
+    assert report["qualification_refusals"] == []
+    assert report["qualification"] == "qualified_in_scope"
+
+
+def test_unverified_witnesses_admit_nothing_and_name_inadequate_evidence() -> None:
+    """A witness reference that admission did not re-derive is not a label."""
+    pack = bound_pack(witnessed=True)
+    report = calibrate(pack, task_judgments(pack), admission=EvidenceAdmission())
+    assert report["independent"] == 0
+    assert report["development_status"] == "incomplete_or_incorrect"
+    assert report["qualification"] == "diagnostic_only"
+    assert {row.reason for row in refusals(report)} == {"inadequate_evidence"}
+
+
+def test_too_few_witnessed_cases_per_partition_block_qualification() -> None:
+    """Correct decisions on one case per side are inadequate evidence, not qualification."""
+    pack = bound_pack(witnessed=True, variants=1)
+    report = calibrate(pack, task_judgments(pack), admission=verified(pack))
+    assert report["development_status"] == "passed"
+    assert report["confirmation_status"] == "passed"
+    assert report["qualification"] == "diagnostic_only"
+    subjects = {row.subject for row in refusals(report) if row.reason == "inadequate_evidence"}
+    assert subjects == {
+        "development",
+        "development on axis outcome",
+        "confirmation",
+        "confirmation on axis outcome",
+    }
+
+
+@pytest.mark.parametrize(
+    "reason", ["contaminated_lineage", "sealed_partition_breach", "self_approval"]
+)
+def test_any_admission_refusal_blocks_an_otherwise_qualified_pack(reason: str) -> None:
+    """Contamination, partition breaches and self-approval each block qualification by name."""
+    pack = bound_pack(witnessed=True)
+    refusal = AdmissionRefusal.model_validate(
+        {"reason": reason, "subject": "lineage", "detail": "named by store admission"}
+    )
+    report = calibrate(pack, task_judgments(pack), admission=verified(pack, refusal))
+    assert report["qualification"] == "diagnostic_only"
+    assert report["qualification_refusals"] == [refusal.model_dump(mode="json")]
+
+
+def test_qualification_needs_store_admission_even_for_attested_labels() -> None:
+    """Without store admission, contamination is undecided, so nothing qualifies."""
+    pack = bound_pack()
+    report = calibrate(pack, task_judgments(pack))
+    assert report["qualification"] == "diagnostic_only"
+    assert [row.subject for row in refusals(report)] == ["evidence admission"]
+
+
+def test_a_witness_establishes_one_verdict() -> None:
+    """A witnessed case cannot carry a task label its witness does not establish."""
+    case = bound_pack(witnessed=True).cases[0]
+    data = case.model_dump(mode="json")
+    data["expected_task"] = "fail" if case.challenge.expected == "pass" else "pass"
+    with pytest.raises(ValidationError, match="one verdict"):
+        CalibrationCase.model_validate(data)
