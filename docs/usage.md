@@ -659,8 +659,8 @@ A trace may also supply its instance facts, the starting world memory cannot kno
 cells, orders, tickets), under `instance_facts` in the same request context:
 `{"facts": [{"key": "input.xlsx/Sheet1/A2", "value": "PQTW1", "visibility": "conditioning",
 "provenance": {"adapter": "...", "source": "...", "validation": {"status": "validated",
-"method": "..."}, "state_version": 0}}]}`. `exp build --learn`, `exp eval --retest-misses` and
-`exp eval --held-out-fidelity` then deliver that trace's facts to its own predictions in a
+"method": "..."}, "state_version": 0}}]}`. `exp build` (learning and its retest) and
+`exp eval --audit` then deliver that trace's facts to its own predictions in a
 separate `instance_facts` request channel, apart from memory and research history, and the
 facts are part of the content-addressed run ID. Facts are moved out of the request context on
 import, so they never reach retrieval grounding, mined tasks, recorded fingerprints or the

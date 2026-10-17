@@ -92,7 +92,7 @@ def expose(ledger: ExposureLedger, *vertices: str, at: datetime = AT) -> LedgerE
         how="inspected",
         panel="panel-1",
         receipt="held-out-audit-receipt-1",
-        report="exp eval --held-out-fidelity --verbose",
+        report="exp eval --audit --verbose",
         project="one",
         at=at,
     )

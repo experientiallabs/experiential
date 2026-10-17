@@ -27,6 +27,7 @@ from exp.optimize.evaluation.held_out_fidelity_test import (
     _import_id,
     _obj,
     build_project,
+    build_report,
     episode,
     held_out_command,
 )
@@ -56,21 +57,10 @@ def with_facts(index: int) -> JsonObject:
     return item
 
 
-def retest_command(root: Path, count: int) -> str:
-    """Invoke ``exp eval PROJECT --retest-misses N`` and return its output."""
-    result = CliRunner().invoke(
-        app,
-        ["eval", PROJECT, "--root", str(root), "--retest-misses", str(count)]
-        + ["--yes", "--non-interactive"],
-    )
-    assert result.exit_code == 0, result.output
-    return " ".join(result.output.split())
-
-
 def test_every_replay_conditions_on_its_own_facts_and_nothing_else(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Learning, held-out audit and retest each see their own trace's admissible facts only.
+    """The build's learning and retest, and the audit, see only their own trace's facts.
 
     Facts reach predictions in the ``instance_facts`` channel; a fact read after an action never
     conditions that action's prediction; verifier-private facts reach no request at all; and no
@@ -81,15 +71,12 @@ def test_every_replay_conditions_on_its_own_facts_and_nothing_else(
         tmp_path,
         monkeypatch,
         provider,
-        "--learn",
-        "--hold-out",
-        "--memory-recall",
-        "jev",
         episodes=[with_facts(i) for i in range(USERS)],
+        learn=True,
     )
     assert "learned" in output
+    assert "Miss retest" in build_report(store)
     held_out_command(root, 3)
-    retest_command(root, 1)
 
     predictions = provider.predictions()
     assert predictions
@@ -141,7 +128,7 @@ def test_unvalidated_package_facts_stop_learning_with_a_clear_error(
     result = CliRunner().invoke(
         app,
         ["build", PROJECT, "--import-id", _import_id(store), "--root", str(root)]
-        + ["--yes", "--non-interactive", "--learn", "--memory-recall", "jev"],
+        + ["--yes", "--non-interactive"],
     )
     assert result.exit_code != 0
     message = " ".join(result.output.replace("│", " ").split())

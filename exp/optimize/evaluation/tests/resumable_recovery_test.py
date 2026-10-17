@@ -39,8 +39,10 @@ from exp.optimize.evaluation.held_out_fidelity_test import (
     SimulatedProvider,
     _at,
     _obj,
+    audit_report,
     build_project,
     episode,
+    learn_fit,
 )
 from exp.optimize.evaluation.trace_learning import (
     learn_from_traces,
@@ -367,12 +369,11 @@ def test_a_missing_investigation_receipt_is_retried_and_saved_ones_replay(
 def test_the_cli_resumes_only_with_retry_incomplete_and_qualifies_its_headline(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """``exp eval --held-out-fidelity`` refuses an interrupted panel, then resumes it in place."""
+    """``exp eval --audit`` refuses an interrupted panel, then resumes it in place."""
     provider = Killing([episode(i) for i in range(USERS)], learnable=True)
-    root, store, _ = build_project(
-        tmp_path, monkeypatch, provider, "--learn", "--hold-out", "--memory-recall", "jev"
-    )
-    command = ["eval", PROJECT, "--root", str(root), "--held-out-fidelity", "3"]
+    root, store, _ = build_project(tmp_path, monkeypatch, provider)
+    learn_fit(root, store)
+    command = ["eval", PROJECT, "--root", str(root), "--audit", "3"]
     command += ["--yes", "--non-interactive"]
     provider.kill, provider.after_predictions = "prediction", provider.sent("prediction") + 4
     killed = CliRunner().invoke(app, command)
@@ -384,7 +385,7 @@ def test_the_cli_resumes_only_with_retry_incomplete_and_qualifies_its_headline(
     assert len(provider.requests) == sent, "the plain command buys nothing"
     resumed = CliRunner().invoke(app, [*command, "--retry-incomplete"])
     assert resumed.exit_code == 0, resumed.output
-    output = " ".join(resumed.output.split())
+    output = " ".join(resumed.output.split()) + " " + audit_report(store)
     assert "1 interrupted trace(s) resume in place" in output
     assert provider.sent("prediction", sent) == 2, "only the lost step and the one after it"
     # A11 by stage: the receipt's qualified headline over every trace, the re-dispatches by
@@ -401,6 +402,7 @@ def test_the_cli_resumes_only_with_retry_incomplete_and_qualifies_its_headline(
     assert "independent, qualified: trace re-attempts · this run: evaluation" in output
     # The receipt's attempt tree holds the in-place re-attempt; the detail names the step.
     shown = " ".join(CliRunner().invoke(app, [*command, "--verbose"]).output.split())
+    shown += " " + audit_report(store)
     assert "Saved results. No provider calls." in shown
     assert "resumed in place" in shown
     assert "re-dispatched after an unknown outcome (prediction, 2 attempts)" in shown

@@ -20,10 +20,12 @@ from exp.optimize.evaluation.held_out_fidelity_test import (
     PROJECT,
     USERS,
     SimulatedProvider,
+    audit_report,
     build_project,
     episode,
     held_out_command,
     held_out_lineages,
+    learn_fit,
 )
 from exp.optimize.evaluation.held_out_receipts import (
     QUALIFIED,
@@ -167,9 +169,8 @@ def test_held_out_command_reports_receipts_checkpoint_and_exposure(
 ) -> None:
     """The CLI names its checkpoint, ledger and receipt, labels re-audits, refuses when spent."""
     provider = SimulatedProvider([episode(i) for i in range(USERS)])
-    root, store, _ = build_project(
-        tmp_path, monkeypatch, provider, "--learn", "--hold-out", "--memory-recall", "jev"
-    )
+    root, store, _ = build_project(tmp_path, monkeypatch, provider)
+    learn_fit(root, store)
     plan = learning_plan(store, scope="fit")
     head = memory_head(store.artifacts, plan.lineage)
     assert head is not None
@@ -181,13 +182,15 @@ def test_held_out_command_reports_receipts_checkpoint_and_exposure(
     assert "Prepared without provider calls" in dry and receipt.receipt_id in dry
 
     output = held_out_command(root, 1, "--verbose")
+    assert "Held-out fidelity 3/3" in output and "now development data" in output
+    output = audit_report(store)  # the receipt, checkpoint and exposure detail
     assert (
         f"Audited checkpoint: memory {plan.lineage} v{head.version}, scope fit, "
         f"{head.version} fit traces learned, simulator {receipt.world_model.artifact_id} "
         "(held-out lineages reserved before learning)" in output
     )
     assert (
-        "An all-traces build (exp build --learn without --hold-out) is a different checkpoint "
+        "The build's all-traces memory is a different checkpoint "
         "and was not independently evaluated" in output
     )
     assert audit_receipts(store) == (receipt,), "the dry run's receipt is resumed"
@@ -197,21 +200,21 @@ def test_held_out_command_reports_receipts_checkpoint_and_exposure(
     assert receipt.schemes == (scheme,)
     assert "Limit: Knowledge a person carries over by hand is not tracked." in output
     assert "Limit: Reservations and panel leases are atomic only for runs sharing" in output
-    assert "Held-out fidelity 3/3" in output and "now development data" in output
+    assert "Held-out fidelity 3/3" in output
     assert receipt.checkpoint is not None
     assert (receipt.checkpoint.lineage, receipt.checkpoint.version) == (plan.lineage, head.version)
     assert held_out_exposure(store).lineages == set(receipt.lineages)
 
-    following = held_out_command(root, 1)
+    following = held_out_command(root, 1) + " " + audit_report(store)
     assert "Skipped 1 held-out lineage exposed, reserved or unresolved" in following
     assert f"{receipt.lineages[0]} (exposed, skipped): component of" in following
     second = audit_receipts(store)[-1]
     assert second.sequence == 2 and second.lineages != receipt.lineages
-    replay = held_out_command(root, 1)
+    replay = held_out_command(root, 1) + " " + audit_report(store)
     assert "Held-out fidelity 3/3" in replay and "this run: replay" in replay
     assert f"Audit receipt #2 {second.receipt_id}: replay (independent)" in replay
 
-    reaudit = held_out_command(root, len(held), "--include-inspected")
+    reaudit = held_out_command(root, len(held), "--include-inspected") + " " + audit_report(store)
     assert "Re-audit on inspected cases (development)" in reaudit
     assert "not an independent measurement" in reaudit
     third = audit_receipts(store)[-1]
@@ -229,19 +232,18 @@ def test_a_trace_reattempt_qualifies_the_headline_and_reports_both_subsets(
 ) -> None:
     """After a crash, --retry-incomplete resumes the trace in place under the same receipt."""
     provider = FailingOnce([episode(i) for i in range(USERS)])
-    root, store, _ = build_project(
-        tmp_path, monkeypatch, provider, "--learn", "--hold-out", "--memory-recall", "jev"
-    )
+    root, store, _ = build_project(tmp_path, monkeypatch, provider)
+    learn_fit(root, store)
     provider.armed = True
     crashed = CliRunner().invoke(
         app,
-        ["eval", PROJECT, "--root", str(root), "--held-out-fidelity", "2"]
-        + ["--yes", "--non-interactive"],
+        ["eval", PROJECT, "--root", str(root), "--audit", "2"] + ["--yes", "--non-interactive"],
     )
     assert crashed.exit_code == 130, crashed.output  # interrupted after a claimed slot
     stopped = held_out_command(root, 2, "--dry-run")
     assert "dispatched, outcome unknown" in stopped
-    output = held_out_command(root, 2, "--retry-incomplete")
+    terminal = held_out_command(root, 2, "--retry-incomplete")
+    output = terminal + " " + audit_report(store)
     [receipt] = audit_receipts(store)
     view = receipt_view(store, receipt)
     [child] = view.reattempts
@@ -250,7 +252,7 @@ def test_a_trace_reattempt_qualifies_the_headline_and_reports_both_subsets(
     assert "Held-out fidelity (independent, qualified: trace re-attempts) 6/6 replies" in output
     assert "Unaffected traces only 3/3 replies exact (100%)" in output
     assert "Re-attempted traces only 3/3 replies exact (100%)" in output
-    assert output.count("· 1/1 traces") == 2, "each subset states its own denominator"
+    assert terminal.count("· 1/1 traces") == 2, "each subset states its own denominator"
     assert (
         "re-dispatched after an unknown outcome prediction 1 · judge 0 · investigation 0 · "
         "1 of 2 traces affected"
@@ -260,7 +262,7 @@ def test_a_trace_reattempt_qualifies_the_headline_and_reports_both_subsets(
         f"re-attempt of {child.trace_id}: {child.retired_run} resumed in place "
         f"({child.claimed_slots} claimed slots); step 1 re-dispatched after an unknown outcome "
         "(prediction, 2 attempts)"
-    ) in held_out_command(root, 2)
+    ) in held_out_command(root, 2) + " " + audit_report(store)
 
 
 def vertex(trace: Trace) -> str:

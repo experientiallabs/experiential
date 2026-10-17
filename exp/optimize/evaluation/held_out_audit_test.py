@@ -467,7 +467,7 @@ def expose_outside(store: ProjectStore) -> None:
             how="inspected",
             panel="held-out-panel-elsewhere",
             receipt="held-out-audit-receipt-elsewhere",
-            report="exp eval --held-out-fidelity --verbose",
+            report="exp eval --audit --verbose",
             project="elsewhere",
             at=clock(),
         )
