@@ -20,13 +20,14 @@ from exp.cli.build.checkpoints import (
 )
 from exp.cli.build.providers import configure_build_providers
 from exp.cli.build.source import load_stored_build_import, project_for_build
-from exp.cli.build.summary import render_completed_build, save_details
+from exp.cli.build.summary import render_completed_build
 from exp.cli.build.traces import load_build_traces
+from exp.cli.evaluation.learning_summary import save_details
 from exp.cli.providers.provider_picker import resolve_setup_providers
 from exp.cli.providers.setup import provider_setup_json_examples
 from exp.cli.shared.consent import SpendBudget, can_prompt, require_spend_consent
 from exp.cli.shared.options import ROOT_OPTION, usage_error
-from exp.cli.shared.progress import Phase, ProgressDisplay, progress_display, qualified
+from exp.cli.shared.progress import Phase, ProgressDisplay, progress_display
 from exp.cli.shared.theme import EXP_THEME
 from exp.common.core.money import exact_usd
 from exp.common.models import (
@@ -37,7 +38,7 @@ from exp.common.models import (
     load_model_catalog,
 )
 from exp.common.observability.telemetry import BuildTelemetryStats, capture_build_completed
-from exp.common.progress import ProgressHook, report
+from exp.common.progress import ProgressHook, qualified, report
 from exp.common.project import (
     ArtifactStoreError,
     ProjectBudgetConfiguration,

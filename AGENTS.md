@@ -367,7 +367,7 @@ uv run pytest -q
     | --- | --- | --- |
     | Progress of a long-running command | `exp/cli/shared/progress.py` | `progress_display` for one phase, `progress_phases` for several; services report through `exp/common/progress.py` `report` |
     | Spend consent and cost warnings | `exp/cli/shared/consent.py` | `require_spend_consent` |
-    | Command results and saved detail | `exp/optimize/evaluation/export.py`, `exp/cli/build/summary.py` | A short summary on the terminal; the full output saved atomically beside the saved run under the project's runtime directory (`export_report`, `save_details`), then a `Report: <path>` line |
+    | Command results and saved detail | `exp/optimize/evaluation/export.py`, `exp/cli/evaluation/learning_summary.py` | A short summary on the terminal; the full output saved atomically beside the saved run under the project's runtime directory (`export_report`, `save_details`), then a `Report: <path>` line |
     | Usage errors | `exp/cli/shared/options.py` | `usage_error` |
     | Interactive choices | `exp/cli/shared/picker.py` | `choose_one` |
     | Terminal styling | `exp/cli/shared/theme.py` | `EXP_THEME` |

@@ -1,6 +1,6 @@
 """The held-out aggregate line states every denominator."""
 
-from exp.cli.evaluation.held_out_fidelity import aggregate_line
+from exp.cli.evaluation.replay_view import aggregate_line
 from exp.optimize.evaluation.trace_replay import ReplayAggregate
 
 

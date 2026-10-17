@@ -9,13 +9,7 @@ from pathlib import Path
 from rich.console import Console
 from rich.text import Text
 
-from exp.cli.evaluation.held_out_fidelity import (
-    aggregate_line,
-    execute_runs,
-    render_traces,
-    require_resumable,
-    share,
-)
+from exp.cli.evaluation.replay_view import aggregate_line, render_traces, run_panel, share
 from exp.cli.evaluation.view import heading
 from exp.cli.shared.consent import can_prompt, require_spend_consent
 from exp.cli.shared.options import usage_error
@@ -31,6 +25,7 @@ from exp.optimize.evaluation.miss_retest import (
     saved_retest_results,
     turn_changes,
 )
+from exp.optimize.evaluation.replay_panel import require_resumable
 from exp.optimize.evaluation.trace_learning import learning_curve
 from exp.optimize.evaluation.trace_replay import ReplayAggregate, aggregate
 
@@ -143,7 +138,7 @@ def run_miss_retest(
                 )
             if not consented:
                 return None
-            execute_runs(screen, store, panel.prepared, progress, resume=retry_incomplete)
+            run_panel(screen, store, panel.prepared, progress, resume=retry_incomplete)
         results = saved_retest_results(store, panel)
         if verbose:
             render_traces(console, store, panel.prepared, results, "Retested trace")

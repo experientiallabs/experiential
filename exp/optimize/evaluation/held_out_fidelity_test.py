@@ -532,7 +532,7 @@ def learn_fit(root: Path, store: ProjectStore) -> None:
     ``exp eval --audit`` runs this same learning first; once it is saved, the audit's own learning
     step replays without provider calls.
     """
-    from exp.cli.build.learning import run_learning
+    from exp.cli.evaluation.learning import run_learning
 
     run_learning(
         Console(theme=EXP_THEME),

@@ -2,35 +2,27 @@
 
 import io
 from collections.abc import Callable
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import AbstractContextManager, nullcontext
 from datetime import UTC, datetime
 from pathlib import Path
 from time import monotonic
 
-import typer
 from rich.console import Console
-from rich.table import Table
 from rich.text import Text
 
-from exp.cli.evaluation.fidelity import render_fidelity
-from exp.cli.evaluation.fidelity_turns import render_turns, turn_marks
+from exp.cli.evaluation.learning import run_learning
+from exp.cli.evaluation.learning_summary import LearningSummary, learning_lines, save_details
+from exp.cli.evaluation.replay_view import aggregate_line, render_traces, run_panel
 from exp.cli.evaluation.view import heading
 from exp.cli.shared.consent import can_prompt, require_spend_consent
 from exp.cli.shared.options import usage_error
-from exp.cli.shared.progress import (
-    Phase,
-    duration_text,
-    progress_display,
-    progress_phases,
-    qualified,
-)
+from exp.cli.shared.progress import Phase, duration_text, progress_phases
 from exp.cli.shared.theme import EXP_THEME
-from exp.common.progress import ProgressHook, report
+from exp.common.models import load_model_catalog
+from exp.common.progress import ProgressHook
 from exp.common.project import ProjectStore
 from exp.common.release_revision import installed_release_revision
 from exp.optimize.evaluation.fidelity import (
-    PreparedFidelity,
     execute_fidelity_evaluation,
     saved_fidelity_report,
 )
@@ -50,19 +42,20 @@ from exp.optimize.evaluation.held_out_receipts import (
     ReportKind,
     record_report,
 )
-from exp.optimize.evaluation.trace_learning import fit_cases, learning_curve
+from exp.optimize.evaluation.replay_panel import PANEL_STAGE, require_resumable
+from exp.optimize.evaluation.trace_learning import (
+    fit_cases,
+    learning_curve,
+    recorded_plan,
+    resolve_memory_recall,
+)
 from exp.optimize.evaluation.trace_replay import (
-    DEADLINE,
-    ReplayAggregate,
     ReplayResult,
     aggregate,
-    interrupted,
 )
-from exp.runtime.models.providers.transport import ProviderTransportError
 from exp.simulation.mining.exposure_ledger import PanelInUseError
 
 PANEL_CONCURRENCY = 4  # traces of a frozen panel replayed at once
-PANEL_STAGE = "Replaying traces"  # counts finished panel traces
 # The audit's single progress line: fit-only learning, then the held-out panel.
 AUDIT_PHASES = (
     Phase("learning", "Learning fit traces", 0.6, driver="Learning from traces", unit="traces"),
@@ -240,7 +233,7 @@ def _run_audit(
             record("stopped")
             return
         try:
-            execute_runs(screen, store, panel.prepared, progress, guard=audit.guard, resume=resume)
+            run_panel(screen, store, panel.prepared, progress, guard=audit.guard, resume=resume)
         except BaseException:
             record("stopped")
             raise
@@ -434,153 +427,6 @@ def render_exposure(
         )
 
 
-def execute_runs(
-    console: Console,
-    store: ProjectStore,
-    registrations: tuple[PreparedFidelity, ...],
-    progress: ProgressHook | None = None,
-    *,
-    guard: Callable[[], None] | None = None,
-    resume: bool = False,
-) -> None:
-    """Run the registered traces concurrently through the fidelity owner.
-
-    Panel traces read frozen memory and never publish, so they are independent; each keeps its
-    own ledger and session. ``progress`` receives every trace's events qualified by ``trace
-    i/n``, plus ``Replaying traces k/n`` as traces finish; without it, the panel owns a display.
-    Finished traces replay untouched; with ``resume``, each interrupted trace continues in place
-    from its first uncommitted step.
-
-    Raises:
-        ValueError: A trace was interrupted and ``resume`` was not given; nothing is sent.
-    """
-    total = len(registrations)
-    stopped = require_resumable(store, registrations, resume=resume)
-    if stopped:
-        console.print(
-            Text(
-                f"{stopped} interrupted trace(s) resume in place; saved steps replay "
-                "without provider calls",
-                style="dim",
-            )
-        )
-    window = datetime.now(UTC) + DEADLINE if resume else None
-    try:
-        with (
-            nullcontext(progress) if progress is not None else progress_display(console) as hook,
-            ThreadPoolExecutor(PANEL_CONCURRENCY) as pool,
-        ):
-            report(hook, PANEL_STAGE, completed=0, total=total)
-            futures = [
-                pool.submit(
-                    execute_fidelity_evaluation,
-                    store,
-                    prepared,
-                    progress=qualified(hook, f"trace {index}/{total}"),
-                    dispatch_guard=guard,
-                    resume_until=window,
-                )
-                for index, prepared in enumerate(registrations, start=1)
-            ]
-            for finished, future in enumerate(as_completed(futures), start=1):
-                future.result()
-                report(hook, PANEL_STAGE, completed=finished, total=total)
-    except ProviderTransportError as exc:
-        console.print(f"[red]error[/red] a provider request failed: {exc}")
-        console.print(
-            "Completed traces are saved. Run the same command again to continue; add "
-            "--retry-incomplete to resume a trace that stopped before saving its result."
-        )
-        raise typer.Exit(code=1) from exc
-
-
-def require_resumable(
-    store: ProjectStore, registrations: tuple[PreparedFidelity, ...], *, resume: bool
-) -> int:
-    """Count interrupted traces, refusing them before any consent or call without ``resume``.
-
-    Raises:
-        ValueError: A trace was interrupted and ``resume`` was not given.
-    """
-    stopped = sum(interrupted(store, prepared) for prepared in registrations)
-    if stopped and not resume:
-        raise ValueError(
-            f"{stopped} trace(s) were interrupted before saving a result; run the same "
-            "command with --retry-incomplete to resume them in place"
-        )
-    return stopped
-
-
-def aggregate_line(total: ReplayAggregate, planned: int, title: str = "Held-out fidelity") -> str:
-    """One line: replies exact, reply-field agreement, and the judge mean.
-
-    Args:
-        total: Sums over completed traces.
-        planned: Traces in the panel, including any without a saved report.
-        title: Leading label naming what was measured.
-
-    Returns:
-        Plain summary text with explicit denominators.
-    """
-    exact = f"{total.exact}/{total.steps} replies exact ({share(total.exact, total.steps)})"
-    fields = (
-        f"{share(total.fields_matched, total.fields_total)} reply fields match "
-        f"({total.fields_matched}/{total.fields_total})"
-    )
-    judge = "judge -" if total.judge_mean is None else f"judge {total.judge_mean:.1f}/5"
-    line = f"{title}  {exact} · {fields} · {judge} · {total.traces}/{planned} traces"
-    if total.judge_turns:
-        line += (
-            f"\n  judge agrees with exact replies on {total.judge_agreements}/{total.judge_turns} "
-            f"turns ({share(total.judge_agreements, total.judge_turns)})"
-        )
-    return line
-
-
-def render_traces(
-    console: Console,
-    store: ProjectStore,
-    registrations: tuple[PreparedFidelity, ...],
-    results: tuple[ReplayResult, ...],
-    label: str,
-) -> None:
-    """Per-trace rows, then every turn and criterion of each trace."""
-    table = Table(box=None, padding=(0, 2))
-    for column in (label, "Replies exact", "Field match", "Judge", "Turns"):
-        table.add_column(column)
-    for result in results:
-        table.add_row(
-            Text(result.trace_id),
-            f"{result.exact}/{result.steps}",
-            share(result.fields_matched, result.fields_total),
-            _judge(result),
-            turn_marks(result.turns),
-        )
-    console.print()
-    console.print(table)
-    prepared = {p.spec.run_id: p for p in registrations}
-    for result in results:
-        registration = prepared[result.run_id]
-        console.print()
-        console.print(Text(f"{result.trace_id} · {result.run_id}", style="bold"))
-        for disclosure in result.recovery_lines():
-            console.print(Text(f"  {disclosure}", style="yellow"))
-        render_turns(console, store, registration, result.report, registration.spec.judge)
-        render_fidelity(console, result.report, registration.spec.judge)
-
-
-def _judge(result: ReplayResult) -> str:
-    """Mean assessed score of one trace, or its judge status."""
-    if not result.judge_scores:
-        return "-" if result.judge_status == "completed" else result.judge_status
-    return f"{sum(result.judge_scores) / len(result.judge_scores):.1f}"
-
-
-def share(part: int, whole: int) -> str:
-    """A whole-number percentage, or a dash without a denominator."""
-    return f"{part / whole:.0%}" if whole else "-"
-
-
 def run_audit(
     project: str,
     count: int,
@@ -610,12 +456,6 @@ def run_audit(
         retry_incomplete: Resume interrupted runs in place.
         include_inspected: Also re-run exposed or reserved lineages, as a development re-audit.
     """
-    # Deferred: learning loads the fidelity lifecycle.
-    from exp.cli.build.learning import BuildLearning, resolve_memory_recall, run_learning
-    from exp.cli.build.summary import learning_lines, save_details
-    from exp.common.models import load_model_catalog
-    from exp.optimize.evaluation.trace_learning import learning_curve, recorded_plan
-
     started = monotonic()
     console = Console(theme=EXP_THEME)
     with usage_error(OSError, ValueError):
@@ -670,7 +510,7 @@ def run_audit(
         if outcome is None or not recorded_plan(store, "fit"):
             return
         pipeline.complete("learning")
-        learned = BuildLearning(recall, outcome, learning_curve(store, "fit"))
+        learned = LearningSummary(recall, outcome, learning_curve(store, "fit"))
         for line in learning_lines(learned, "fit traces"):
             console.print(line)
         run_held_out_fidelity(
