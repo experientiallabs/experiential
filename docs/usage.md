@@ -706,6 +706,37 @@ of OpenAI user or tool messages, and `terminal`. Tool observations are nontermin
 consume them before producing its final answer. World-model artifacts pin the current prompt; rebuild
 projects created with a different prompt before running them.
 
+### Materialize declared native outputs
+
+`exp eval PROJECT --materialize SPEC.json --root .exp` materializes an explicit native edit plan
+from an audited simulator checkpoint. Install the `artifact-edits` extra for the XLSX adapter.
+The specification is a `NativeMaterializationSpec`: an exact `checkpoint` artifact reference,
+a `NativeArtifactBinding`, and an optional new `destination` directory. `--dry-run` validates
+frozen bindings without executing the adapter. It does not validate or execute individual edits.
+
+Freeze `native_artifact_binding` in the task's initial context before simulation. The binding
+names the immutable initial files, adapter definition digest, declared output paths and state key.
+Supply the adapter's operation schema and initial native facts as public task context. The model
+predicts the original environment's responses and separately records cumulative typed native
+edits at the binding's state key. Capture the committed session with `capture_world_checkpoint`
+or `capture_stored_world_checkpoint`, then pass its exact artifact reference to materialization.
+A binding cannot be attached retroactively to an existing prediction.
+
+The current CLI adapter applies ordered row deletions to initial XLSX bytes. It preserves native
+cell values, types and number formats, and refuses formulas and other unsupported row dependencies.
+It does not execute predicted Bash or Python commands. A native plan contains `input_sha256`,
+`operations` and `expected_projection`; its operations start from the registered initial files.
+The selected adapter executes these declarations and compares its actual projection with the
+prediction. A mismatch persists a diagnostic receipt and refuses output delivery. It never repairs
+the simulator state. Saved receipts reuse the same bytes without model calls or edit reexecution.
+
+Harbor tasks with this binding expose `outputs --directory NEW_DIRECTORY` after submission and
+declare those files for Harbor artifact collection. Such packages remain **diagnostic only**:
+a matching prediction is not an independent task verifier, a solvability demonstration, or actor
+tier calibration. Native verifier calibration is required before qualification. The XLSX adapter
+is a bounded artifact transformer; general executable applications still need their own selected
+`EnvironmentRuntime` and sandbox.
+
 ### Build scenarios from traces
 
 ```bash

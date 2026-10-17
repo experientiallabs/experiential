@@ -10,8 +10,9 @@ from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 import pytest
+from filelock import FileLock, Timeout
 
-from exp.common.core.artifacts import ArtifactEnvelope, JsonObject, sha256_json
+from exp.common.core.artifacts import ArtifactEnvelope, JsonObject, sha256_json, stable_id
 from exp.common.evaluations.reconstruction import AxisOutcome, DualReport, WorkflowEvidence
 from exp.common.models import (
     AssistantAction,
@@ -214,6 +215,15 @@ def test_real_session_http_replay_export_and_private_boundaries(tmp_path: Path) 
         )
 
     first, second = trial(1), trial(2)
+    duplicate = trial(1)
+    identity = stable_id(
+        "harbor-trial", {"task": task_ref.model_dump(mode="json"), "session": "trial-1"}
+    )
+    with FileLock(project.artifacts.project_directory / (identity + ".lock"), timeout=0):
+        with pytest.raises(Timeout):
+            duplicate.submit({"status": "pending"})
+    with pytest.raises(ValueError, match="binding changed"):
+        HarborTrial(project.artifacts, task_ref, first.session, "another-code-revision")
     with serve_harbor_trial(first) as endpoint:
         with urlopen(
             Request(
@@ -250,6 +260,8 @@ def test_real_session_http_replay_export_and_private_boundaries(tmp_path: Path) 
         assert len(calls) == 1
         assert not second.session.transitions
         first.submit({"status": "delivered"})
+        with pytest.raises(ValueError, match="trial is closed"):
+            duplicate.call(action)
         request = Request(
             endpoint.url + "/grade",
             data=b"{}",
@@ -276,12 +288,20 @@ def test_real_session_http_replay_export_and_private_boundaries(tmp_path: Path) 
     accepted = trial(3, bound=True)
     accepted.call(action)
     accepted.submit({"status": "pending"})
+    accepted_result = accepted.result()
+    assert accepted_result["reward"] == 1
+    accepted_result["reward"] = 0
     assert accepted.result()["reward"] == 1
     mismatched = trial(4, bound=True, threshold=3)
     mismatched.call(action)
     mismatched.submit({"status": "pending"})
     with pytest.raises(ValueError, match="calibration differs"):
         mismatched.result()
+    outside = trial(7)
+    outside.submit({"status": "pending"})
+    outside.session.step((action,), operation_id=action.call_id)
+    with pytest.raises(ValueError, match="submitted trial state changed"):
+        outside.result()
     for index, profile in ((5, "6" * 64), (6, None)):
         changed = trial(index, bound=True, completion_profile=profile)
         changed.call(action)
