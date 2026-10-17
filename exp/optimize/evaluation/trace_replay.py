@@ -76,6 +76,7 @@ from exp.runtime.sessions.dispatch_ledger import DispatchLedger
 from exp.simulation.engines.text.prompt import (
     INSTANCE_FACTS_GUIDANCE,
     MEMORY_CONTEXT_GUIDANCE,
+    NATIVE_ARTIFACT_PLAN_GUIDANCE,
     RECONSTRUCTED_JSON_TOOL_SYSTEM_PROMPT,
     RECONSTRUCTED_TEXT_SYSTEM_PROMPT,
 )
@@ -445,11 +446,12 @@ def replay_spec(
     return spec.model_copy(update={"run_id": content_run_id(spec, label, case.trace_id)})
 
 
-def protocol_prompts_sha256() -> str:
+def protocol_prompts_sha256(*, native_artifacts: bool = False) -> str:
     """Identity of every system prompt a replay can send beyond its artifact's own prompt."""
     return sha256_json(
         {
             "json_tool": RECONSTRUCTED_JSON_TOOL_SYSTEM_PROMPT,
+            **({"native_artifacts": NATIVE_ARTIFACT_PLAN_GUIDANCE} if native_artifacts else {}),
             "text": RECONSTRUCTED_TEXT_SYSTEM_PROMPT,
             "memory": MEMORY_CONTEXT_GUIDANCE,
             "investigation": INVESTIGATION_PROMPT,
@@ -478,7 +480,10 @@ def content_run_id(spec: FidelitySpec, label: str, trace: str, generation: int =
     digest = sha256_json(
         {
             "spec": spec.model_dump(mode="json", exclude={"run_id", "deadline"}),
-            "prompts": protocol_prompts_sha256(),
+            "prompts": protocol_prompts_sha256(
+                native_artifacts=spec.task.initial_context.get("native_artifact_binding")
+                is not None
+            ),
             # Only runs that deliver facts send the facts guidance; fact-free IDs are unchanged.
             **({} if spec.facts is None else {"facts_prompt": INSTANCE_FACTS_GUIDANCE}),
         }

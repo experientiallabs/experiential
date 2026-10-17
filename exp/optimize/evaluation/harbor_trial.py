@@ -1,11 +1,16 @@
 """Actor-scoped Harbor access to one frozen durable simulator session."""
 
+import base64
+import hashlib
 import json
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from threading import RLock
+
+from filelock import FileLock
 
 from exp.common.core.artifacts import (
     ArtifactEnvelope,
@@ -22,9 +27,18 @@ from exp.common.evaluations.reconstruction import (
 )
 from exp.common.models import ToolCall
 from exp.common.project import ArtifactStore, artifact_input
+from exp.optimize.evaluation.native_artifacts import (
+    NativeMaterializationSpec,
+    materialize_native_artifacts,
+)
+from exp.runtime.environments.artifact_edits import ArtifactEditAdapter, NativeArtifactBinding
 from exp.simulation.evaluation_calibration import task_decision
 from exp.simulation.evaluation_tasks import EvaluationTask, grade, load_evaluation_task
-from exp.simulation.world_model.checkpoints import load_world_checkpoint, state_at
+from exp.simulation.world_model.checkpoints import (
+    capture_world_checkpoint,
+    load_world_checkpoint,
+    state_at,
+)
 from exp.simulation.world_model.durable import DurableWorldModelSession
 from exp.simulation.world_model.runtime import load_grounded_world_model_artifact
 
@@ -41,6 +55,7 @@ class HarborTrial:
         evaluate: Existing dual-evaluator callback using the shared provider owner.
         minimum_scores: Explicit task criterion thresholds, never inferred from ratings.
         calibration: Optional qualified calibration report; absent keeps trials diagnostic.
+        native_adapter: Explicit pure transformer matching the public frozen native binding.
     """
 
     artifacts: ArtifactStore
@@ -50,18 +65,33 @@ class HarborTrial:
     evaluate: Callable[[WorkflowEvidence], DualReport] | None = None
     minimum_scores: dict[str, int] = field(default_factory=dict)
     calibration: ArtifactInput | None = None
+    native_adapter: ArtifactEditAdapter | None = None
+    _native_binding: NativeArtifactBinding | None = field(default=None, init=False)
     _task: EvaluationTask = field(init=False)
     _initial: JsonObject = field(init=False)
     _answer: JsonObject | None = field(default=None, init=False)
     _failed: str | None = field(default=None, init=False)
     _result: JsonObject | None = field(default=None, init=False)
     _lock: RLock = field(default_factory=RLock, init=False)
+    _lease: FileLock = field(init=False)
+    _submitted_state_sha256: str | None = field(default=None, init=False)
     _identity: str = field(init=False)
     _profile: str = field(init=False)
 
     def __post_init__(self) -> None:
         """Require an actual frozen fork before exposing any actor operation."""
         self._task = load_evaluation_task(self.artifacts, self.task_ref)
+        declared_native = self._task.task.initial_context.get("native_artifact_binding")
+        if declared_native is not None:
+            self._native_binding = NativeArtifactBinding.model_validate(declared_native)
+            if (
+                self.native_adapter is None
+                or sha256_json(self.native_adapter.definition)
+                != self._native_binding.adapter_sha256
+            ):
+                raise ValueError("native task requires its exact registered artifact adapter")
+        elif self.native_adapter is not None:
+            raise ValueError("native adapter requires a binding frozen in the public task")
         checkpoint = load_world_checkpoint(self.artifacts, self._task.checkpoint)
         record = self.session.committed_record()
         snapshot = state_at(record, 0)
@@ -92,7 +122,13 @@ class HarborTrial:
             "harbor-trial",
             {"task": self.task_ref.model_dump(mode="json"), "session": record.session_id},
         )
+        self._lease = FileLock(
+            self.artifacts.project_directory / (self._identity + ".lock"), timeout=0
+        )
         binding: JsonObject = {
+            "format_version": 2,
+            "code_revision": self.code_revision,
+            "frozen_profile_sha256": self._profile,
             "task": self.task_ref.model_dump(mode="json"),
             "session_binding": record.binding.model_dump(mode="json"),
             "minimum_scores": self.minimum_scores,
@@ -100,21 +136,40 @@ class HarborTrial:
             if self.calibration is None
             else self.calibration.model_dump(mode="json"),
         }
-        if self.artifacts.exists(self._identity):
-            if json.loads(self.artifacts.read_bytes(self._identity, "record.json")) != binding:
-                raise ValueError("Harbor trial binding changed; open a new trial")
-        else:
-            self._save(self._identity, binding)
+        with self._lock, self._lease:
+            if self.artifacts.exists(self._identity):
+                if json.loads(self.artifacts.read_bytes(self._identity, "record.json")) != binding:
+                    raise ValueError("Harbor trial binding changed; open a new trial")
+            else:
+                self._save(self._identity, binding)
+            self._refresh()
+
+    def _refresh(self) -> None:
+        """Read durable terminal records while holding the cross-process trial lease."""
+        self._answer, self._result, self._failed = None, None, None
+        self._submitted_state_sha256 = None
         for suffix in ("answer", "result", "failure"):
             identity = self._identity + "-" + suffix
             if self.artifacts.exists(identity):
                 value = json.loads(self.artifacts.read_bytes(identity, "record.json"))
                 if suffix == "answer":
-                    self._answer = value
+                    self._answer = value["answer"]
+                    self._submitted_state_sha256 = value["session_state_sha256"]
                 elif suffix == "result":
                     self._result = value
                 else:
                     self._failed = value["error_type"]
+        if self._submitted_state_sha256 is not None and self._submitted_state_sha256 != sha256_json(
+            self.session.committed_record().state
+        ):
+            raise ValueError("submitted trial state changed; refuse grading and open a new trial")
+
+    @contextmanager
+    def _guarded(self) -> Iterator[None]:
+        """Serialize bridge owners, then refresh closure before dispatch or grading."""
+        with self._lock, self._lease:
+            self._refresh()
+            yield
 
     def _save(self, identity: str, value: JsonObject) -> None:
         """Persist through the immutable project owner without storing capabilities."""
@@ -136,7 +191,7 @@ class HarborTrial:
 
     def call(self, action: ToolCall) -> JsonObject:
         """Use the durable session's operation identity, admission and atomic commit."""
-        with self._lock:
+        with self._guarded():
             if self._answer is not None or self._failed is not None:
                 raise ValueError("trial is closed")
             if action.name not in {tool.name for tool in self._task.task.tools}:
@@ -151,13 +206,60 @@ class HarborTrial:
 
     def submit(self, answer: JsonObject) -> JsonObject:
         """Freeze actor-authored output without accepting actor-authored evidence."""
-        with self._lock:
+        with self._guarded():
             if self._answer is not None and not strict_equal(self._answer, answer):
                 raise ValueError("trial already has a different final answer")
             if self._answer is None:
-                self._save(self._identity + "-answer", answer)
+                state_sha256 = sha256_json(self.session.committed_record().state)
+                self._save(
+                    self._identity + "-answer",
+                    {"answer": answer, "session_state_sha256": state_sha256},
+                )
+                self._submitted_state_sha256 = state_sha256
             self._answer = deepcopy(answer)
             return {"submitted": True}
+
+    def output_files(self) -> JsonObject:
+        """Return only matched declared output bytes, never private state or oracle evidence."""
+        with self._guarded():
+            if self._answer is None or self._failed is not None:
+                raise ValueError("submit a completed trial before retrieving native outputs")
+            if self._native_binding is None or self.native_adapter is None:
+                raise ValueError("this task has no native artifact contract")
+            checkpoint = capture_world_checkpoint(
+                self.session,
+                self._task.world_model,
+                self.artifacts,
+                parent_checkpoint=self._task.checkpoint,
+                created_at=datetime.now(UTC),
+                code_revision=self.code_revision,
+            )
+            reference = materialize_native_artifacts(
+                self.artifacts,
+                NativeMaterializationSpec(
+                    checkpoint=artifact_input(self.artifacts.read(checkpoint.artifact_id).manifest),
+                    binding=self._native_binding,
+                ),
+                self.native_adapter,
+                code_revision=self.code_revision,
+            )
+            assert reference is not None
+            receipt = json.loads(self.artifacts.read_bytes(reference.artifact_id, "receipt.json"))
+            if receipt["status"] != "matched":
+                raise ValueError(
+                    "native output contradicts the candidate; inspect private divergence evidence"
+                )
+            files = []
+            for path in self._native_binding.output_paths:
+                payload = self.artifacts.read_bytes(reference.artifact_id, "outputs/" + path)
+                files.append(
+                    {
+                        "path": path,
+                        "sha256": hashlib.sha256(payload).hexdigest(),
+                        "content_base64": base64.b64encode(payload).decode("ascii"),
+                    }
+                )
+            return {"files": files}
 
     def evidence(self) -> WorkflowEvidence:
         """Build evaluator-only evidence from the durable owner's committed history."""
@@ -204,9 +306,9 @@ class HarborTrial:
 
     def result(self) -> JsonObject:
         """Compute private grading once, refusing unsupported positive rewards."""
-        with self._lock:
+        with self._guarded():
             if self._result is not None:
-                return self._result
+                return deepcopy(self._result)
             evidence = self.evidence()
             mechanical = grade(self._task.verifier, evidence)
             result: JsonObject = {
@@ -271,6 +373,13 @@ class HarborTrial:
                             reward=int(passed),
                             qualification="qualified_in_scope",
                         )
-            self._result = result
+            if self._native_binding is not None:
+                result.update(
+                    status="incomplete",
+                    reward=None,
+                    qualification="diagnostic_only",
+                    qualification_blocker="Native artifact verifier calibration is required",
+                )
             self._save(self._identity + "-result", result)
+            self._result = deepcopy(result)
             return result

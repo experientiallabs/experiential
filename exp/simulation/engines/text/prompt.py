@@ -17,6 +17,7 @@ from exp.common.models import (
 )
 from exp.common.tasks import TaskCase
 from exp.common.tasks.facts import ConditioningFacts
+from exp.runtime.environments.artifact_edits import NativeArtifactBinding, NativeArtifactPlan
 from exp.simulation.engines.text.knowledge import SimulationKnowledge
 from exp.simulation.retrieval import RAGAction, RAGMatch
 from exp.simulation.retrieval.contracts import RAG_KEY_SCHEMA_VERSION
@@ -96,6 +97,30 @@ Use actual call IDs, observed formats and current facts, not these fictional fie
 """
     + _RECONSTRUCTED_CONTEXT
 )
+
+
+NATIVE_ARTIFACT_PLAN_GUIDANCE = """
+A registered native_artifact_binding is an additional OUTPUT materialization contract.
+It is not an access restriction on simulated tools and must not change their success or error
+semantics. Continue predicting the supplied original tool action, including script tools, normally.
+The native adapter will later execute only your declared artifact edits, never the supplied script.
+Plan operations use ONLY the tool name declared in native_adapter.tool, with arguments conforming
+to native_adapter.arguments_schema. Translate the script's artifact effects into those typed edits.
+Do not copy candidate_response.tool_calls into plan.operations. A Bash or Python action remains a
+simulated action; it is never itself a native edit operation. Each native edit needs its own \
+call_id.
+When an action writes a declared output and its effects are expressible by the native adapter,
+set the complete NativeArtifactPlan at the registered plan_key in the ROOT of environment_state,
+with an edit whose path is [plan_key]. Do not nest it under environment_state,
+visible_conversation or tool_binding keys: those are input framing, not the world state. The
+plan's operations start from the registered initial input artifact and describe the full
+cumulative transformation. Its
+expected_projection is your prediction of the actual output facts using the supplied adapter's
+projection schema. Preserve input cell types and formats where applicable. Retain the plan during
+later read-only actions. If a native transformation cannot represent an action, keep predicting the
+original environment honestly; native materialization remains unavailable. Do not invent an
+original tool refusal just because the native adapter cannot execute that tool directly.
+"""
 
 
 class SimulatedToolResult(ContractModel):
@@ -262,6 +287,10 @@ def build_world_model_request(
         evidence["research_history"] = knowledge.research_context()
     if output_protocol == "json-tool":
         system_prompt = RECONSTRUCTED_JSON_TOOL_SYSTEM_PROMPT
+    if task.initial_context.get("native_artifact_binding") is not None:
+        NativeArtifactBinding.model_validate(task.initial_context["native_artifact_binding"])
+        system_prompt += NATIVE_ARTIFACT_PLAN_GUIDANCE
+        evidence["native_artifact_plan_schema"] = NativeArtifactPlan.model_json_schema()
     if memory is not None:
         system_prompt += MEMORY_CONTEXT_GUIDANCE
         evidence["memory_observations"] = list(memory.observations)
