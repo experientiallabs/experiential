@@ -29,6 +29,7 @@ from exp.runtime.models.providers.async_transport import ProviderDeadlineExceede
 from exp.runtime.openai_protocol.errors import OpenAIProtocolError, public_failure_error
 
 _DRAINING_RETRY_AFTER_SECONDS = 10
+_AUTHORITY_RETRY_AFTER_SECONDS = 5
 _LOGGER = logging.getLogger(__name__)
 
 
@@ -154,10 +155,11 @@ def boundary_protocol_error(exception: BaseException) -> OpenAIProtocolError:
             code="gateway_authority_unavailable",
             message=(
                 "The gateway could not confirm serving authority for this request. "
-                "Retry after a short delay; if this persists, ask the gateway operator "
-                "to check the gateway logs."
+                "Retry after the delay in the Retry-After header; if this persists, "
+                "ask the gateway operator to check the gateway logs."
             ),
             error_type="api_error",
+            retry_after_seconds=_AUTHORITY_RETRY_AFTER_SECONDS,
         )
     elif isinstance(exception, asyncio.CancelledError):
         error = OpenAIProtocolError(

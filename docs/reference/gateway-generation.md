@@ -120,8 +120,9 @@ its original position; `store=false` means the provider resolves nothing by ID.
   (`media_type: "text/plain"`) joins the turn as the caller's text, title first. A content
   block of a type the surface does not define is refused naming that type.
 - A control-store refusal that names no caller field (for example a model-chain release
-  crossing) answers a retryable 503 `gateway_authority_unavailable`, with the store's reason in
-  the worker log, instead of an unnamed 400.
+  crossing) answers a retryable 503 `gateway_authority_unavailable` with `Retry-After: 5`
+  (`overloaded_error` on the Messages surface), with the store's reason in the worker log,
+  instead of an unnamed 400.
 - `service_tier: "priority"` (Codex Fast mode) on a route with no priority-capable
   rung dispatches at the standard tier, disclosed as
   `service_tier->default(priority_unavailable)`. Standard never costs more. `flex`

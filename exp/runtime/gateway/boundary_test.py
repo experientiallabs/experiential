@@ -94,6 +94,7 @@ def test_bare_store_refusal_is_a_retryable_503_not_an_unnamed_400(
     assert error.status_code == 503
     assert error.detail.code == "gateway_authority_unavailable"
     assert error.detail.type == "api_error"
+    assert error.retry_after_seconds == 5
     assert "release or process generation" not in error.detail.message
     assert "release or process generation" in caplog.text
 
