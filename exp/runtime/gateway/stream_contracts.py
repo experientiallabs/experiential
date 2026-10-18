@@ -238,14 +238,23 @@ class GatewayEvent(ContractModel):
     estimate. Neither policy treats the partial meter as a final provider bill.
     This marker never joins public serialized events or replay identity.
     """
-    usage_estimated: bool = Field(default=False, exclude=True, strict=True)
-    """The usage on a cancelled disconnect is the gateway's own tokenizer estimate.
+    usage_unreported_truncation: bool = Field(default=False, exclude=True, strict=True)
+    """Trusted evidence that a capped request's budget truncation arrived without a usage meter.
 
-    Set only by the accounting registry after a dispatched, opened attempt lost
-    its caller before the provider's final meter: the prompt count and the
-    generated text observed so far replace the legs the provider never
-    reported, so the work the provider billed settles at its estimated cost
-    instead of an unknown one. Observed legs are kept; never a public field.
+    The provider generated the whole output budget yet sent no usage report
+    (a usage-less ``stop`` the data plane read as ``length``), so the meter is
+    estimated at no less than that budget rather than settled as unknown.
+    This marker never joins public serialized events or replay identity.
+    """
+    usage_estimated: bool = Field(default=False, exclude=True, strict=True)
+    """The usage is the gateway's own tokenizer estimate of an unreported meter.
+
+    Set only by the accounting registry, after a dispatched, opened attempt
+    lost its caller before the provider's final meter, or truncated at its
+    output budget without one: the prompt count and the generated text observed replace the legs
+    the provider never reported, so the work the provider billed settles at
+    its estimated cost instead of an unknown one. Observed legs are kept;
+    never a public field.
     """
     decision_provider_rejected: bool = Field(default=False, exclude=True, strict=True)
     """Internal decision settlement evidence that an HTTP rejection preceded execution.
@@ -280,12 +289,14 @@ class GatewayEvent(ContractModel):
             or self.failure.failure_class is not GatewayFailureClass.CANCELLED
         ):
             raise ValueError("incomplete disconnect usage requires a cancelled terminal")
+        if self.usage_unreported_truncation and self.kind is not GatewayEventKind.INCOMPLETE:
+            raise ValueError("an unreported truncation requires an incomplete terminal")
         if self.usage_estimated and (
-            not self.usage_incomplete_due_to_disconnect
+            not (self.usage_incomplete_due_to_disconnect or self.usage_unreported_truncation)
             or self.usage is None
             or not self.usage.has_token_counts
         ):
-            raise ValueError("estimated usage requires a disconnect with both token totals")
+            raise ValueError("estimated usage requires an unreported meter with both token totals")
         if self.kind in {GatewayEventKind.TEXT_DELTA, GatewayEventKind.REFUSAL_DELTA}:
             if self.text_delta is None:
                 raise ValueError("text and refusal deltas require text_delta")

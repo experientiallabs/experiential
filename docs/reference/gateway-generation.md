@@ -290,9 +290,16 @@ releasing the rest of the reserved bound; the local gateway's monthly allocation
 figure. A disconnect the provider never answered (not opened), or one on a DECISIONS request,
 keeps the conservative policy: the full reserved bound consumes local budget, the provider cost
 stays unknown, observed partial counts remain available, and hosted accounting retains unresolved
-authorization separately from settled spend. An observed terminal with missing usage retains the
-host's unknown-terminal policy; neither marker broadens it. Stopping generation is not evidence
-that its unreported usage was free, and an estimate is never reported as observed.
+authorization separately from settled spend. On a capped request, an OpenAI-compatible `stop`
+with no usage report is read as a budget truncation: the caller sees `length`, and the dispatched
+incomplete terminal carries the internal `usage_unreported_truncation` signal with the same
+`streamed_output`. An opened one is completed by the same estimate, with output metered at no less
+than the output budget the attempt dispatched with, because the provider generated and billed the
+whole budget, unstreamed reasoning included. Meta's muse lanes end a stream that hit `max_tokens`
+with `finish_reason: stop` and no usage frame (2026-10-17), and those turns had settled at $0. Any
+other observed terminal with missing usage retains the host's unknown-terminal policy.
+Stopping generation is not evidence that its unreported usage was free, and an estimate is never
+reported as observed.
 
 Meter parsing follows the provider's wire contract. Missing primary counts on partial
 OpenAI, Anthropic, or Bedrock reports remain unknown. Gemini's present `usageMetadata` uses

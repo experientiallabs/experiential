@@ -275,6 +275,67 @@ async fn dispatched_cancellation_carries_streamed_output_only_without_a_terminal
     assert!(writes[1].get("streamed_output").is_none());
 }
 
+#[tokio::test]
+async fn usage_less_truncation_carries_its_streamed_output_for_an_estimate() {
+    Python::initialize();
+    let plane = Python::attach(|py| {
+        pyo3::types::PyModule::from_code(py, c"import json\nclass Plane:\n def __init__(self): self.writes = []\n def settle(self, argument):\n  self.writes.append(json.loads(argument))\n  return '{}'\n def close_thread_resources(self, argument): return '{}'\n", c"unreported_plane.py", c"unreported_plane")
+            .unwrap().getattr("Plane").unwrap().call0().unwrap().unbind()
+    });
+    let bridge = Arc::new(Bridge::new(Python::attach(|py| plane.clone_ref(py)), 1).unwrap());
+    for (name, terminal, reported) in [
+        ("truncated", Event::Incomplete, false),
+        ("unreported", Event::Completed, false),
+        ("reported", Event::Completed, true),
+    ] {
+        let mut guard = AttemptGuard::new(
+            bridge.clone(),
+            Arc::new(AtomicUsize::new(0)),
+            name.into(),
+            Instant::now(),
+        );
+        guard.rebind(name.into());
+        guard.mark_dispatched();
+        guard.mark_opened();
+        let observation = guard.begin_dial_observation();
+        observation.record(&Event::TextDelta("Packet 1470 of the".into()));
+        if reported {
+            observation.record(&Event::Usage(Usage {
+                input_tokens: Some(15),
+                output_tokens: Some(54),
+                ..Usage::default()
+            }));
+        }
+        if matches!(terminal, Event::Incomplete) {
+            observation.mark_unreported_truncation();
+        }
+        observation.record(&terminal);
+        let outcome = if matches!(terminal, Event::Incomplete) {
+            "incomplete"
+        } else {
+            "completed"
+        };
+        assert!(guard.settle(outcome, None, &[], None, true).await);
+    }
+    let writes: String = Python::attach(|py| {
+        py.import("json")
+            .unwrap()
+            .call_method1("dumps", (plane.bind(py).getattr("writes").unwrap(),))
+            .unwrap()
+            .extract()
+            .unwrap()
+    });
+    let writes: Value = serde_json::from_str(&writes).unwrap();
+    assert_eq!(writes[0]["usage_unreported_truncation"], true);
+    assert_eq!(writes[0]["streamed_output"]["text"], "Packet 1470 of the");
+    // Any other usage-less ending keeps the unknown-meter policy, and a
+    // reported meter is the provider's bill: nothing to estimate either way.
+    for write in [&writes[1], &writes[2]] {
+        assert!(write.get("usage_unreported_truncation").is_none());
+        assert!(write.get("streamed_output").is_none());
+    }
+}
+
 #[test]
 fn rfc3339_formats_epoch_seconds_and_millis_in_utc() {
     assert_eq!(

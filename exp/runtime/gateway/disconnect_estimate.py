@@ -1,4 +1,4 @@
-"""Estimate the meter of a dispatched attempt whose caller left before the provider's final usage.
+"""Estimate the meter of a dispatched attempt that never received the provider's final usage.
 
 Most OpenAI-shaped wires report token usage only in the stream's final frame.
 When the caller disconnects first, the data plane closes the upstream and the
@@ -8,6 +8,14 @@ uncharged. The gateway already tokenizes every prompt for its reservation and
 already saw every generated delta, so it can price the work with its own
 tokenizer: observed legs win, estimated legs fill the holes, and the result is
 labelled ``estimated`` (never ``observed``) wherever it lands.
+
+The same estimate fills a capped request's budget truncation that the
+provider sent without any usage report. Meta's muse lanes end a stream that
+hit ``max_tokens`` with ``finish_reason: stop`` and no usage frame
+(2026-10-17); the data plane reads that capped stop as a truncation, metered
+at no less than the output budget the attempt dispatched with, because the
+provider generated (and billed) the whole budget even when its reasoning was
+never streamed.
 """
 
 from __future__ import annotations
@@ -15,7 +23,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from exp.common.core.artifacts import JsonObject
-from exp.runtime.gateway.attempt_tokens import counted_input_tokens
+from exp.runtime.gateway.attempt_tokens import counted_input_tokens, worst_case_output_tokens
 from exp.runtime.gateway.contracts import GatewayApiSurface, GatewayFailure, GatewayRequest
 from exp.runtime.gateway.embeddings_contracts import ServingRequest
 from exp.runtime.gateway.native_execution import rung_load_key
@@ -73,6 +81,15 @@ def settled_terminal(
         streamed=streamed_output_from_settlement(data),
         cached_fraction=_frozen_cached_fraction(data, loads, entry),
     )
+    terminal = estimate_unreported_truncation_usage(
+        terminal,
+        request=entry.request,
+        surface=entry.authorization.surface,
+        opened=data.get("opened") is True,
+        streamed=streamed_output_from_settlement(data),
+        cached_fraction=_frozen_cached_fraction(data, loads, entry),
+        output_budget=_truncated_output_budget(terminal, data, entry),
+    )
     if terminal.usage_estimated and terminal.usage is not None:
         terminal = terminal.model_copy(
             update={
@@ -102,6 +119,34 @@ def _frozen_cached_fraction(
     observed = _recent_cached_fraction(loads, entry, attempt_id)
     with entry.execution_lock:
         return entry.estimated_cache_fractions.setdefault(attempt_id, observed)
+
+
+def _truncated_output_budget(
+    terminal: GatewayEvent, data: JsonObject, entry: InflightRequest
+) -> int | None:
+    """The output budget the attempt dispatched with, for an unreported truncation only.
+
+    Recomputed exactly as the attempt's reservation sized it (the frozen
+    per-depth bound when one was frozen), so the floor is the ``max_tokens``
+    the provider generated up to. An uncapped request has no budget to floor at.
+    """
+    attempt_id = data.get("attempt_id")
+    if not terminal.usage_unreported_truncation or not isinstance(attempt_id, str):
+        return None
+    depth = entry.attempt_depths.get(attempt_id)
+    request = entry.request
+    if (
+        depth is None
+        or depth >= len(entry.route.deployments)
+        or not isinstance(request, GatewayRequest)
+        or request.maximum_output_tokens is None
+    ):
+        return None
+    if depth < len(entry.reserved_output_tokens_by_depth):
+        request = request.model_copy(
+            update={"maximum_output_tokens": entry.reserved_output_tokens_by_depth[depth]}
+        )
+    return worst_case_output_tokens(request, entry.route.deployments[depth])
 
 
 def _recent_cached_fraction(
@@ -152,9 +197,60 @@ def estimate_disconnect_usage(
     Returns:
         The terminal with an ``estimated`` usage, or the terminal unchanged.
     """
+    if not terminal.usage_incomplete_due_to_disconnect:
+        return terminal
+    return _estimated(terminal, request, surface, opened, streamed, cached_fraction, 0)
+
+
+def estimate_unreported_truncation_usage(
+    terminal: GatewayEvent,
+    *,
+    request: ServingRequest,
+    surface: GatewayApiSurface | None,
+    opened: bool,
+    streamed: StreamedOutput | None,
+    cached_fraction: float = 0.0,
+    output_budget: int | None = None,
+) -> GatewayEvent:
+    """Fill a budget truncation's missing meter from gateway evidence.
+
+    Applies only to the trusted ``usage_unreported_truncation`` marker, under
+    the same evidence rules as a disconnect estimate. Output is metered at no
+    less than ``output_budget``: the provider generated the whole budget,
+    reasoning it never streamed included.
+
+    Args:
+        terminal: The normalized incomplete terminal.
+        request: The admitted request, whose prompt the gateway tokenizes.
+        surface: The frozen request surface.
+        opened: Whether the provider's response headers arrived.
+        streamed: Generated text the data plane observed.
+        cached_fraction: The organization's recent cached share of input on this rung.
+        output_budget: The dispatched output budget, or None when the
+            request carried no cap to floor at.
+
+    Returns:
+        The terminal with an ``estimated`` usage, or the terminal unchanged.
+    """
+    if not terminal.usage_unreported_truncation:
+        return terminal
+    return _estimated(
+        terminal, request, surface, opened, streamed, cached_fraction, output_budget or 0
+    )
+
+
+def _estimated(
+    terminal: GatewayEvent,
+    request: ServingRequest,
+    surface: GatewayApiSurface | None,
+    opened: bool,
+    streamed: StreamedOutput | None,
+    cached_fraction: float,
+    output_floor: int,
+) -> GatewayEvent:
+    """Estimate one unreported meter, observed legs kept, output at least ``output_floor``."""
     if (
-        not terminal.usage_incomplete_due_to_disconnect
-        or not opened
+        not opened
         or surface is GatewayApiSurface.DECISIONS
         or not isinstance(request, GatewayRequest)
         or streamed is None
@@ -182,6 +278,7 @@ def estimate_disconnect_usage(
     )
     if reasoning_tokens is not None and reasoning_tokens > output_tokens:
         output_tokens = reasoning_tokens
+    output_tokens = max(output_tokens, output_floor)
     # Every observed cache leg is kept as reported, whether or not the
     # provider also reported the input total. When the total is estimated it
     # is raised to hold the observed subsets, and an unreported read leg is

@@ -512,6 +512,15 @@ impl AttemptGuard {
                     .is_some_and(|failure| failure.failure_class == FailureClass::Cancelled),
             &observed.streamed_output,
         );
+        let argument = unreported_truncation_provenance(
+            argument,
+            self.dispatched
+                && meter_failure.is_none()
+                && outcome == "incomplete"
+                && observed.unreported_truncation
+                && !usage.is_some_and(Usage::has_token_counts),
+            &observed,
+        );
         if finalize {
             let cancelled = failure.map(|failure| failure.failure_class == FailureClass::Cancelled)
                 == Some(true);
@@ -638,6 +647,34 @@ fn disconnect_provenance(
             "images": streamed.images,
         });
     }
+    compact_json(&payload)
+}
+
+/// Stamp a capped request's budget truncation the provider reported without
+/// a usage meter (a usage-less `stop` read as `length`, or an output-less one).
+///
+/// The generated output observed rides along so the control plane meters the
+/// whole output budget the provider billed, with its own tokenizer for the
+/// prompt, instead of settling provider work as an unknown $0.
+fn unreported_truncation_provenance(
+    argument: String,
+    unreported: bool,
+    observed: &observation::Observed,
+) -> String {
+    if !unreported {
+        return argument;
+    }
+    let mut payload: Value =
+        serde_json::from_str(&argument).expect("settlement JSON was encoded locally");
+    let streamed = &observed.streamed_output;
+    payload["usage_unreported_truncation"] = json!(true);
+    payload["streamed_output"] = json!({
+        "text": streamed.text,
+        "reasoning": streamed.reasoning,
+        "text_overflow_chars": streamed.text_overflow_chars,
+        "reasoning_overflow_chars": streamed.reasoning_overflow_chars,
+        "images": streamed.images,
+    });
     compact_json(&payload)
 }
 

@@ -524,6 +524,7 @@ impl Normalizer {
         // (finish_open_tools_relay): that cut call is dropped and the turn
         // settles Incomplete too; a syntax error inside the arguments
         // keeps the strict contract and stays malformed.
+        let unreported = self.usage.is_none();
         let (mut events, cut_mid_fragment) = if finish == Some("length") {
             (finish_open_tools_truncated(&mut self.tools)?, false)
         } else {
@@ -543,6 +544,20 @@ impl Normalizer {
             };
             events.push(Event::Failed(Failure::refusal(reason)));
         } else if finish == Some("length") || cut_mid_fragment {
+            events.push(Event::Incomplete);
+        } else if finish == Some("stop") && unreported && self.output_token_cap.is_some() {
+            // A capped `stop` with no usage report is the provider's budget
+            // truncation mislabelled: Meta's muse lanes end a stream that hit
+            // `max_tokens` with `finish_reason: stop` and no usage frame
+            // (2026-10-17), while every natural stop reports usage. Settle it
+            // as `length` so the caller sees the cut and the control plane
+            // meters the budget instead of an unknown $0.
+            self.unreported_stop_read_as_length = true;
+            let line = serde_json::json!({
+                "event": "unreported_stop_read_as_length",
+                "output_token_cap": self.output_token_cap,
+            });
+            eprintln!("exp-gateway-native: {line}");
             events.push(Event::Incomplete);
         } else {
             events.push(Event::Completed);

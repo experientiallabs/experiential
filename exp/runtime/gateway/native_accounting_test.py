@@ -55,7 +55,11 @@ from exp.runtime.gateway.native_execution import (
 )
 from exp.runtime.gateway.native_recovery import record_session_outcome, session_cache_key
 from exp.runtime.gateway.native_recovery_test import RecoveryHostFake, recovery_entry
-from exp.runtime.gateway.native_settlement import failure_from_boundary_payload, ledger_failure
+from exp.runtime.gateway.native_settlement import (
+    failure_from_boundary_payload,
+    ledger_failure,
+    terminal_from_settlement,
+)
 from exp.runtime.gateway.recovery import (
     FrozenRecoveryBinding,
     RecoveryLease,
@@ -553,6 +557,58 @@ def test_opened_disconnect_estimates_cache_reads_from_the_organizations_settled_
     assert terminal.usage.input_tokens == counted
     assert terminal.usage.cached_input_tokens == int(counted * 0.9)
     assert len(ledger.finished) == 1
+
+
+@pytest.mark.parametrize(("cap", "expected_output"), [(500, 500), (None, None)])
+def test_unreported_truncation_settles_its_budget_as_an_estimate_not_unknown(
+    cap: int | None, expected_output: int | None
+) -> None:
+    """A usage-less capped stop (Meta muse, 2026-10-17) bills the dispatched output budget."""
+    registry, ledger, entry = _registry()
+    entry.request = entry.request.model_copy(update={"maximum_output_tokens": cap})
+    started = _start(registry, ordinal=0)
+    registry.settle(
+        json.dumps(
+            {
+                "request_id": entry.authorization.request_id,
+                "attempt_id": started["attempt_id"],
+                "outcome": "incomplete",
+                "usage": None,
+                "tool_names": [],
+                "failure": None,
+                "finalize": True,
+                "opened": True,
+                "dispatched": True,
+                "usage_unreported_truncation": True,
+                "streamed_output": {"text": "visible output"},
+            }
+        )
+    )
+    terminal = ledger.terminal_events[-1]
+    assert terminal is not None and terminal.usage is not None
+    assert terminal.usage_estimated is True
+    assert terminal.usage.input_tokens == counted_input_tokens(entry.request)
+    streamed = len(reservation_encoder().encode_ordinary("visible output"))
+    assert terminal.usage.output_tokens == (expected_output or streamed)
+
+
+def test_unreported_truncation_marker_rejects_inconsistent_evidence() -> None:
+    """Failed, completed, or undispatched work cannot claim an unreported truncation."""
+    base: JsonObject = {
+        "attempt_id": "attempt-one",
+        "outcome": "incomplete",
+        "usage": None,
+        "opened": True,
+        "dispatched": True,
+        "usage_unreported_truncation": True,
+    }
+    for patch in (
+        {"dispatched": False},
+        {"outcome": "completed"},
+        {"outcome": "failed", "failure": {"failure_class": "timeout", "safe_message": "slow"}},
+    ):
+        with pytest.raises(ValueError, match="unreported truncation"):
+            terminal_from_settlement({**base, **patch})
 
 
 @pytest.mark.parametrize("first_fraction", [0.0, 0.9])

@@ -102,6 +102,10 @@ pub(crate) struct Observed {
     pub first_token_at: Option<SystemTime>,
     pub streamed_output: StreamedOutput,
     pub service_tier: crate::service_tier::ServiceTierObservation,
+    /// The terminal is a capped request's budget truncation the provider
+    /// reported without usage (a usage-less `stop` read as `length`, or an
+    /// output-less one): the provider billed the whole output budget.
+    pub unreported_truncation: bool,
 }
 
 impl Default for Observed {
@@ -117,6 +121,7 @@ impl Default for Observed {
             first_token_at: None,
             streamed_output: StreamedOutput::default(),
             service_tier: crate::service_tier::ServiceTierObservation::default(),
+            unreported_truncation: false,
         }
     }
 }
@@ -211,6 +216,14 @@ impl Observation {
         if observed.first_token_at.is_none() {
             observed.first_token_at = at;
         }
+    }
+
+    /// Record that the terminal is a budget truncation reported without usage.
+    pub(crate) fn mark_unreported_truncation(&self) {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .unreported_truncation = true;
     }
 
     /// Retain the normalizer's cumulative tier verdict before delivery can suspend.

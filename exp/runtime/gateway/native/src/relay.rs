@@ -381,6 +381,9 @@ impl UpstreamRelay {
                     _ => {}
                 }
             }
+            if self.normalizer.unreported_stop_read_as_length() {
+                observation.mark_unreported_truncation();
+            }
         }
         self.pending.extend(events);
     }
@@ -453,6 +456,11 @@ impl UpstreamRelay {
         S: Into<String>,
     {
         self.normalizer.set_request_words(words);
+    }
+
+    /// Carry the caller's output cap into terminal classification.
+    pub fn set_output_token_cap(&mut self, cap: Option<u64>) {
+        self.normalizer.set_output_token_cap(cap);
     }
 
     /// Carry the rung's cache-write accounting into usage normalization.

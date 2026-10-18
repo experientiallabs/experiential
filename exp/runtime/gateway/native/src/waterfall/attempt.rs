@@ -239,6 +239,7 @@ pub(super) async fn run_attempt(
         }
         relay.set_observation(observation);
         relay.set_stop_sequences(wire.stop_sequences.iter().cloned());
+        relay.set_output_token_cap(ctx.output_token_cap);
         relay.set_probability_output(ctx.chat_logprobs, &wire.upstream_payload);
         if logprobs_injected {
             relay.enable_logprobs_capture();
@@ -527,7 +528,9 @@ pub(super) async fn run_attempt(
                             // plain stop (Meta muse-spark under a small
                             // `max_tokens`, 2026-09-15). Answer `Incomplete` so
                             // the caller sees `length` and raises the cap,
-                            // instead of an empty completed answer.
+                            // instead of an empty completed answer, and
+                            // meter the budget the provider billed.
+                            guard.capture_observation().mark_unreported_truncation();
                             return settle_output_less(
                                 ctx,
                                 guard,
