@@ -52,6 +52,7 @@ from exp.runtime.models.providers.streaming_requests import (
     route_generation_parameter_requests,
     strip_tool_result_images,
 )
+from exp.runtime.models.providers.thinking_budget_coercion import coerce_budget_to_effort
 
 if TYPE_CHECKING:
     from exp.runtime.models.providers.base import GatewayWireProfile
@@ -564,6 +565,9 @@ def _coerce_generation_semantics(
         or request.top_logprobs is not None
     ):
         return None
+    budgeted = coerce_budget_to_effort(profiles, request, admits=admits)
+    if budgeted is not None:
+        return RequestCoercion(request=budgeted[0], disclosures=(budgeted[1],))
     if (
         request.provider_thinking_config is not None
         and request.provider_thinking_config.get("type") == "between_tools"

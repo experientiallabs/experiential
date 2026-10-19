@@ -851,11 +851,16 @@ def _openai_reasoning_profile(
 
 @pytest.mark.parametrize("extension", (False, True))
 @pytest.mark.parametrize("effort", (None, "high"))
-def test_public_messages_numeric_budget_never_becomes_advisory_effort(
+def test_public_messages_numeric_budget_snaps_onto_the_effort_ladder_disclosed(
     extension: bool,
     effort: ReasoningEffort | None,
 ) -> None:
-    """A public 1024-token budget cannot become high or a default-on request."""
+    """A budget no rung carries verbatim serves at the nearest route tier.
+
+    Owner decision 2026-10-19 (qwen3.8-flash-next-uncensored refused 27 budgets
+    in two hours): the 1024-token budget asks for ``low``, the route serves only
+    ``high``, so it serves at ``high`` and says so, instead of refusing.
+    """
     body: JsonObject = {
         "model": "reasoner",
         "messages": [{"role": "user", "content": "Solve this."}],
@@ -872,7 +877,17 @@ def test_public_messages_numeric_budget_never_becomes_advisory_effort(
     profile = _openai_reasoning_profile(efforts=("high",))
     with pytest.raises(ProviderParameterError):
         route_generation_parameter_requests((profile,), request)
-    assert coerce_generation_parameters((profile,), request) is None
+    coercion = coerce_generation_parameters((profile,), request)
+    if request.reasoning_effort is not None or (request.provider_output_config or {}).get("effort"):
+        # Two depth controls at once stay the caller's contradiction to resolve.
+        assert coercion is None
+        return
+    assert coercion is not None
+    assert coercion.request.reasoning_effort == "high"
+    assert coercion.request.provider_thinking_config is None
+    assert coercion.disclosures == (
+        "thinking.budget_tokens->reasoning_effort:high(route_effort_ladder)",
+    )
 
 
 def test_a_thinking_config_translates_to_an_effort_on_an_openai_route() -> None:

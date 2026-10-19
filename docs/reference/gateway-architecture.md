@@ -301,22 +301,19 @@ call, visible text or prefix; OpenCode echoes a schema-invalid call as its `inva
 unrevealed, disclosed as `messages.reasoning_content->dropped(assistant_turn_changed)`, as does one
 whose issuing rung left the route (a lane closed on exhausted credit): `issuing_route_unavailable`.
 A later carrier sealed over a dropped turn fails its prefix binding and drops too; an earlier intact
-one still pins. Authentication or authority failures (tamper, rotation) are still refused. A
-turn holding a custom (freeform) tool call, such as Codex's `apply_patch`, is never sealed: the call
-returns as an opaque `custom_tool_call` item that cannot bind a carrier, so the turn serves without
-preserved reasoning, as a failover would.
+one still pins. Tamper or rotation failures are still refused; a custom tool call turn serves unsealed.
 
 First-party CLI compatibility is capture-driven: the fields real Claude Code and Codex send by
 default are accepted and preserved. On the Messages surface, `output_config` forwards verbatim on
 Anthropic rungs (a canonical `effort` also rides `reasoning_effort`, caller keys always win over
 engine-derived ones); OpenRouter's `reasoning` object supplies an alternate effort or enable
 channel. On Messages, a numeric `max_tokens` reasoning budget becomes an exact budgeted
-`thinking` configuration on budget-capable wires; it cannot become an advisory effort or
-replace another explicit numeric budget. Unsupported hard constraints are refused before
-dispatch. `exclude` retains its disclosed omission policy. The Chat surface accepts effort
-and enable controls beside `thinking`, `chat_template_kwargs`, and DashScope's top-level
-`enable_thinking`; numeric budgets travel unchanged on qualified Anthropic, Gemini 2.5 and Qwen Cloud
-routes. Unsupported budgets are refused; see [generation controls](gateway-generation.md). Chat also
+`thinking` configuration on budget-capable wires and never replaces another explicit numeric
+budget. Unsupported hard constraints are refused before dispatch. `exclude` retains its disclosed
+omission policy. The Chat surface accepts effort and enable controls beside `thinking`,
+`chat_template_kwargs`, and DashScope's top-level `enable_thinking`; numeric budgets travel
+unchanged on qualified Anthropic, Gemini 2.5 and Qwen Cloud routes, and elsewhere snap to the route's
+nearest effort tier (`route_effort_ladder`, see [generation controls](gateway-generation.md)). Chat also
 replays OpenRouter's `reasoning` / `reasoning_details` (the `reasoning.text` blocks) as the
 same caller-owned plaintext history a `reasoning_content` echo is; mid-conversation `system` turns keep their position on wires that express
 them (instruction-hoisting rungs narrow out), and `thinking.display` rides the verbatim thinking
@@ -555,8 +552,8 @@ opaque provider-reasoning carrier with byte-exact signatures, and a caller `thin
 configuration is forwarded verbatim on models that honor it, overriding the catalog's
 adaptive default. Budgeted-thinking support and support for disabling thinking are separate
 model capabilities: a valid explicit off setting is preserved, and an unsupported off setting
-is refused before dispatch. A numeric thinking budget is never silently replaced with an
-advisory effort. A bare `{type: enabled}` without a numeric budget can use a disclosed derived
+is refused before dispatch. A numeric thinking budget no rung carries takes the disclosed
+`route_effort_ladder` snap. A bare `{type: enabled}` without a numeric budget can use a disclosed derived
 budget that fits the effective per-rung output cap, or an admissible effort on an effort wire;
 an impossible requested configuration is refused instead of disabling thinking. An explicit
 budget at or above `max_tokens` is refused on `thinking.budget_tokens`. See
@@ -822,10 +819,7 @@ is what keeps agent loops alive; stamped, the caller replays the real text and t
 covers turns minted elsewhere.
 
 Route admission preserves caller capabilities in three verbatim-preference layers before any
-coercion: operationally dead rungs are skipped (`dispatchable_route_profiles`; when every rung is
-dead the route resolves once more against the catalogs as they stand now, since a refresh swaps
-them mid-admission, and a route still dead answers the retryable 503 `unavailable_route` with an
-`unavailable` ledger row and an `admission_dead_route` operator log naming each rung's cause), generation
+coercion: operationally dead rungs are skipped (`dispatchable_route_profiles`; all-dead re-resolves once), generation
 controls narrow the waterfall to the rungs that preserve every exact value
 (`compatible_generation_parameter_profile_indexes`), falling back to the rungs that can serve the
 request only through a disclosed drop when no rung preserves it, and each remaining deployment
@@ -905,9 +899,9 @@ unrelated to the coerced field), admission carries the unprobed coercion forward
 that actually refuses names the caller's remedy: an image on a text-only reasoning route is
 refused on `messages`, never as an unsupported `thinking` field that merely rode along.
 Thinking disclosures name an applied translation, not consent to drop a cost constraint.
-A numeric thinking budget and an explicit off setting must be enforceable on the selected
-wire; otherwise admission refuses the named field before dispatch. A budget-less enable can
-translate onto an admissible effort ladder with a `thinking->reasoning_effort` disclosure.
+An explicit off setting must be enforceable on the selected wire; otherwise admission refuses
+the named field before dispatch. A budget-less enable can translate onto an admissible effort
+ladder with a `thinking->reasoning_effort` disclosure.
 A valid native thinking configuration is kept by narrowing the route before considering a
 translation. A route that offers reasoning but cannot honor the requested control is not
 silently served at its default depth. See [generation controls](gateway-generation.md).

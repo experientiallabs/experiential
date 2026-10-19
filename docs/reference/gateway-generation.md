@@ -197,14 +197,19 @@ an authored setting. A model name appearing inside a system message is not an AP
 A caller that explicitly requests budgeted thinking without a budget receives a derived
 budget that must fit the effective per-provider output ceiling. An explicit budget is not
 rewritten to fit. An impossible combination is refused before provider dispatch. Numeric
-Messages budgets are forwarded only to budget-capable wires, never converted into advisory
-effort or adaptive thinking.
+Messages budgets are forwarded verbatim to budget-capable wires. On a route with no
+budget-capable rung, the budget snaps to the nearest tier the route's effort ladder serves
+(under 2k tokens `low`, under 8k `medium`, under 24k `high`, above that `xhigh`; `0` asks for
+off and `-1` for the lane's default depth), disclosed as
+`thinking.budget_tokens->reasoning_effort:<tier>(route_effort_ladder)`. Only a route with no
+reasoning tier refuses it, and a budget beside an explicit effort stays refused.
 
 The Chat field `thinking_budget` preserves the caller's numeric control on qualified
 Anthropic, Gemini 2.5, and native Qwen Cloud routes. Use it as an OpenAI SDK `extra_body`
 field (or a top-level field in HTTP JSON). It is not combined with `reasoning_effort`.
 The gateway translates the field name for the selected provider and discloses that
-translation; it does not replace the number with an effort tier.
+translation. On a route with no qualified rung it snaps onto the effort ladder like a
+Messages budget, disclosed as `thinking_budget->reasoning_effort:<tier>(route_effort_ladder)`.
 
 | Native provider route | Models | Provider control and constraints |
 | --- | --- | --- |

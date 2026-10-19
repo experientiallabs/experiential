@@ -1018,8 +1018,9 @@ def test_a_chat_tool_screenshot_is_admitted_and_folded_on_a_vision_chat_route(st
     assert accounting.recorded == 0
 
 
-def test_an_explicit_thinking_budget_is_not_replaced_with_advisory_effort() -> None:
-    """The full admit loop refuses a budget an OpenAI effort dial cannot enforce."""
+def test_an_explicit_thinking_budget_snaps_onto_an_effort_dial_disclosed() -> None:
+    """The full admit loop serves a budget an OpenAI effort dial cannot carry at the
+    nearest tier, disclosed (owner decision 2026-10-19: refusing it ended sessions)."""
     from exp.runtime.gateway.native_accounting import NativeAttemptAccounting
 
     request = GatewayRequest(
@@ -1052,17 +1053,18 @@ def test_an_explicit_thinking_budget_is_not_replaced_with_advisory_effort() -> N
             client,
         ),
     )
-    with pytest.raises(ProviderParameterError) as rejected:
-        admitted_route_requests(
-            route,
-            wires,
-            request,
-            accounting=cast(NativeAttemptAccounting, accounting),
-            authorization=route.snapshot.authorization,
-        )
-    assert rejected.value.param == "thinking.budget_tokens"
-    assert request.provider_thinking_config == {"type": "enabled", "budget_tokens": 8192}
-    assert accounting.recorded == 0
+    _route, _wires, public, provider, _placement = admitted_route_requests(
+        route,
+        wires,
+        request,
+        accounting=cast(NativeAttemptAccounting, accounting),
+        authorization=route.snapshot.authorization,
+    )
+    assert provider.reasoning_effort == "high"
+    assert provider.provider_thinking_config is None
+    assert "thinking.budget_tokens->reasoning_effort:high(route_effort_ladder)" in (
+        public.ignored_parameters
+    )
 
 
 def test_named_processing_tier_fails_closed_when_no_rung_offers_it() -> None:
@@ -2488,7 +2490,6 @@ def test_chat_nested_budget_narrows_to_budget_capable_anthropic_rung(stream: boo
     "dialect,model,reasoning",
     (
         ("openai_compatible", "kimi-k2-thinking", True),
-        ("anthropic_messages", "claude-sonnet-5", True),
         ("anthropic_messages", "claude-haiku-3-5", False),
     ),
 )
