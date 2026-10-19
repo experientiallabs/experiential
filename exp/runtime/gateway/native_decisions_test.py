@@ -14,6 +14,7 @@ import pytest
 
 from exp.common.core.artifacts import JsonObject, sha256_json
 from exp.common.models import (
+    BillingSource,
     ConnectionConfig,
     GatewayDeploymentCapabilities,
     GatewayEquivalenceCertification,
@@ -43,6 +44,11 @@ from exp.runtime.gateway.management import GatewayManagement
 from exp.runtime.gateway.native_accounting import NativeBridgeError
 from exp.runtime.gateway.native_bridge import NativeControlPlane
 from exp.runtime.gateway.native_decisions import _admit_accepted
+from exp.runtime.gateway.organization_tag import (
+    ORGANIZATION_TAG_HEADER,
+    organization_tag,
+    organization_tag_key,
+)
 from exp.runtime.gateway.tests.certified_pool_fixture_test import upsert_certified_pool
 from exp.runtime.gateway.tests.chain_authority_fixture_test import (
     chain_components,
@@ -64,6 +70,8 @@ def _control_plane(
     supports_decisions: bool = True,
     prices: GatewayTokenPrices = _PRICES,
     rungs: int = 1,
+    base_url: str | None = None,
+    billing_source: BillingSource = BillingSource.CUSTOMER_MANAGED,
 ) -> tuple[NativeControlPlane, str]:
     """Create real authority and ledger state with a certified native decision pool."""
     manager = GatewayManagement(root)
@@ -71,7 +79,12 @@ def _control_plane(
     upsert_connection(
         root,
         name="provider-main",
-        connection=ConnectionConfig(provider="typesafe", api_key_env="TEST_PROVIDER_KEY"),
+        connection=ConnectionConfig(
+            provider="typesafe",
+            api_key_env="TEST_PROVIDER_KEY",
+            base_url=base_url,
+            trusted_custom_origin=base_url is not None,
+        ),
         replace=False,
     )
     for index in range(rungs):
@@ -88,6 +101,7 @@ def _control_plane(
             ),
             prices=prices,
             pricing_source="test-fixture",
+            billing_source=billing_source,
             replace=False,
         )
     assert rungs > 0
@@ -502,3 +516,41 @@ def test_admit_decisions_attributes_the_calling_app(tmp_path: Path) -> None:
             "select client_app, user_agent from gateway_requests order by rowid"
         ).fetchall()
     assert rows == [("openai_sdk", "OpenAI/Python 2.8.1"), ("hermes", "node")]
+
+
+def test_self_hosted_house_rung_receives_the_organization_tag(tmp_path: Path) -> None:
+    """A house-funded self-hosted origin gets an opaque tag, never the organization id."""
+    control, raw_key = _control_plane(
+        tmp_path,
+        base_url="https://clef.example.test/v1",
+        billing_source=BillingSource.HOST_MANAGED,
+    )
+    admitted = _admit(control, raw_key)
+    route = admitted["route"]
+    assert isinstance(route, list)
+    wire = route[0]
+    assert isinstance(wire, dict)
+    assert wire["url"] == "https://clef.example.test/v1/systemone"
+    entry = control._accounting.entry(str(admitted["request_id"]))  # noqa: SLF001
+    assert entry is not None
+    organization_id = str(entry.authorization.organization_id)
+    expected = organization_tag(organization_tag_key("provider-secret-canary"), organization_id)
+    assert wire["headers"] == {
+        "Authorization": "Bearer provider-secret-canary",
+        "Content-Type": "application/json",
+        ORGANIZATION_TAG_HEADER: expected,
+    }
+    assert organization_id not in json.dumps(wire)
+
+
+def test_customer_credential_on_a_self_hosted_origin_gets_no_tag(tmp_path: Path) -> None:
+    """A BYOK rung keeps exactly its static headers even on a non-official origin."""
+    control, raw_key = _control_plane(tmp_path, base_url="https://clef.example.test/v1")
+    route = _admit(control, raw_key)["route"]
+    assert isinstance(route, list)
+    wire = route[0]
+    assert isinstance(wire, dict)
+    assert wire["headers"] == {
+        "Authorization": "Bearer provider-secret-canary",
+        "Content-Type": "application/json",
+    }

@@ -122,6 +122,11 @@ class GatewayWireProfile:
             None when the connection speaks no speech wire.
         transcriptions_url: Full OpenAI-wire ``/audio/transcriptions`` endpoint
             sharing ``headers``; None when the connection speaks no transcription wire.
+        organization_tag_key: Private HMAC key for the opaque per-organization
+            scheduling tag a self-hosted SystemOne origin receives
+            (``exp.runtime.gateway.organization_tag``); None sends no tag. Excluded
+            from diagnostics. The tag is only ever attached on a host-funded,
+            non-tenant rung, whatever this field holds.
     """
 
     dialect: str
@@ -342,6 +347,8 @@ class GatewayWireProfile:
 
     decisions_url: str | None = None
     """Full TypeSafe SystemOne endpoint, absent on non-decision connections."""
+
+    organization_tag_key: bytes | None = field(default=None, repr=False)
 
     openai_decisions_url: str | None = None
     """Full OpenAI Decisions API ``/decisions`` endpoint, present only on direct

@@ -42,6 +42,7 @@ from exp.runtime.gateway.native_execution import (
     select_route_deployments,
 )
 from exp.runtime.gateway.native_settlement import gateway_updating_failure, optional_text
+from exp.runtime.gateway.organization_tag import tagged_headers
 from exp.runtime.gateway.routing import GatewayRoutingError
 from exp.runtime.models.providers.base import GatewayWireProfile
 from exp.runtime.openai_protocol.errors import OpenAIProtocolError, invalid_field
@@ -245,6 +246,13 @@ def _admit_accepted(
                 deployment,
                 replace(profile, url=decisions_url),
                 request.provider_body(profile.model_id),
+                headers=tagged_headers(
+                    dict(profile.headers),
+                    profile.organization_tag_key,
+                    str(authorization.organization_id),
+                    billing_customer_managed=profile.billing_customer_managed,
+                    tenant_origin=profile.tenant_origin,
+                ),
             )
         )
     depth = len(route.deployments)
