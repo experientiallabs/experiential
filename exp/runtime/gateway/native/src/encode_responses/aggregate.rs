@@ -31,6 +31,7 @@ pub(super) fn responses_usage(usage: Option<&Usage>) -> Value {
         "output_tokens_details": {"reasoning_tokens": usage.reasoning_tokens.unwrap_or(0)},
         "total_tokens": input + output,
     });
+    crate::encode::annotate_image_tokens(&mut wire["output_tokens_details"], usage);
     let unreported = usage.unreported_token_details();
     if !unreported.is_empty() {
         wire["unreported_token_details"] = json!(unreported);

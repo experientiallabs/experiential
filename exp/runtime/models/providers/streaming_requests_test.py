@@ -2342,7 +2342,8 @@ def test_reasoning_effort_uses_each_provider_native_wire_shape() -> None:
 @pytest.mark.parametrize(
     ("effort", "thinking_config"),
     (
-        ("none", {"includeThoughts": True, "thinkingBudget": 0}),
+        # Thinking off carries no includeThoughts: Vertex refuses the pair.
+        ("none", {"thinkingBudget": 0}),
         ("low", {"includeThoughts": True, "thinkingLevel": "LOW"}),
         ("medium", {"includeThoughts": True, "thinkingLevel": "MEDIUM"}),
         ("high", {"includeThoughts": True, "thinkingLevel": "HIGH"}),

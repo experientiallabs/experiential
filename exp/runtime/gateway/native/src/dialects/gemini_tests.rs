@@ -728,3 +728,70 @@ fn a_non_text_function_call_signature_is_malformed() {
         assert!(failure.is_some(), "{signature}");
     }
 }
+
+#[test]
+fn a_signed_image_past_one_megabyte_of_signature_is_served_not_overflowed() {
+    // Gemini image models sign each generated image; the signature alone
+    // measured 0.9 to 1.1 MB live (gemini-3.1-flash-image, 2026-10-19).
+    use base64::Engine;
+    let png = base64::engine::general_purpose::STANDARD
+        .decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC")
+        .unwrap();
+    let data = base64::engine::general_purpose::STANDARD.encode(&png);
+    let signature = "A".repeat(1_200_000);
+    let part = json!({
+        "inlineData": {"mimeType": "image/png", "data": data},
+        "thoughtSignature": signature,
+    });
+    let chunk = sse(&json!({"candidates":[{"content":{"parts":[part]},"finishReason":"STOP"}]}));
+    let (events, failure) = run_stream(Dialect::GeminiGenerateContent, &[chunk.as_slice()]);
+    assert!(failure.is_none(), "{failure:?}");
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event["kind"] == "image")
+            .count(),
+        1
+    );
+    let retained =
+        Event::GeminiThoughtPart(std::sync::Arc::new(json!({"thoughtSignature": signature})));
+    assert!(crate::relay::event_retained_bytes(&retained) > 1_200_000);
+}
+
+#[test]
+fn malformed_function_call_and_response_finishes_redial_then_fail_over() {
+    for reason in ["MALFORMED_FUNCTION_CALL", "MALFORMED_RESPONSE"] {
+        let mut normalizer = super::super::Normalizer::new(Dialect::GeminiGenerateContent);
+        let frame = crate::sse::SseEvent {
+            event: None,
+            data: json!({"candidates":[{"finishReason": reason}]}).to_string(),
+        };
+        normalizer.feed(&frame).unwrap();
+        let events = normalizer.finish_metadata_drain();
+        let Some(Event::Failed(failure)) = events.last() else {
+            panic!("{reason} must end the stream failed: {events:?}");
+        };
+        assert_eq!(
+            failure.failure_class,
+            FailureClass::MalformedResponse,
+            "{reason}"
+        );
+        assert!(
+            failure.retryable_same_deployment && failure.failover_eligible,
+            "{reason}"
+        );
+    }
+}
+
+#[test]
+fn a_blocked_image_turn_with_part_less_content_is_a_refusal() {
+    // gemini-3-pro-image, live 2026-10-19: `"content": {}` beside IMAGE_RECITATION.
+    for reason in ["IMAGE_RECITATION", "IMAGE_PROHIBITED_CONTENT"] {
+        let chunk = sse(&json!({"candidates":[{"content":{},"finishReason":reason}]}));
+        let (events, failure) = run_stream(Dialect::GeminiGenerateContent, &[chunk.as_slice()]);
+        assert!(failure.is_none(), "{reason}: {failure:?}");
+        let last = events.last().unwrap();
+        assert_eq!(last["kind"], "failed", "{reason}");
+        assert_eq!(last["failure_class"], "refusal", "{reason}");
+    }
+}

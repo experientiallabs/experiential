@@ -23,6 +23,16 @@ pub(crate) fn records_are_bounded(records: &Value, optional_alternatives: bool) 
             .all(|record| valid_record(record, optional_alternatives))
 }
 
+/// Count one value's JSON bytes without allocating a serialized copy or
+/// applying the probability-record bound; callers charge the count to their
+/// own retention budget.
+pub(crate) fn json_retained_bytes(value: &Value) -> usize {
+    let mut counter = ByteCounter { size: 0 };
+    // Serializing a `Value` into a counter cannot fail.
+    let _ = serde_json::to_writer(&mut counter, value);
+    counter.size
+}
+
 /// Count JSON bytes without allocating a serialized copy.
 pub(crate) fn records_retained_bytes(records: &Value) -> Option<usize> {
     let mut counter = ByteCounter { size: 0 };

@@ -13,7 +13,7 @@ pub(in crate::dialects) use relay_finish::{
 mod gemini;
 mod openai;
 mod responses_logprobs;
-pub(crate) use responses_logprobs::records_retained_bytes;
+pub(crate) use responses_logprobs::{json_retained_bytes, records_retained_bytes};
 
 use std::collections::{BTreeMap, BTreeSet};
 

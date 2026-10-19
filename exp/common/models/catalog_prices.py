@@ -41,6 +41,7 @@ class GatewayLongContextTier(ContractModel):
     cache_creation_1h_input_nano_usd_per_million_tokens: NanoUsdRatePerMillionTokens = None
     output_nano_usd_per_million_tokens: NanoUsdRatePerMillionTokens = None
     reasoning_nano_usd_per_million_tokens: NanoUsdRatePerMillionTokens = None
+    image_output_nano_usd_per_million_tokens: NanoUsdRatePerMillionTokens = None
 
 
 class GatewayServiceTierPrices(ContractModel):
@@ -59,6 +60,7 @@ class GatewayServiceTierPrices(ContractModel):
     cache_creation_1h_input_nano_usd_per_million_tokens: NanoUsdRatePerMillionTokens = None
     output_nano_usd_per_million_tokens: NanoUsdRatePerMillionTokens = None
     reasoning_nano_usd_per_million_tokens: NanoUsdRatePerMillionTokens = None
+    image_output_nano_usd_per_million_tokens: NanoUsdRatePerMillionTokens = None
     long_context: GatewayLongContextTier | None = None
 
 
@@ -160,6 +162,9 @@ class GatewayTokenPrices(ContractModel):
         cache_creation_1h_input_nano_usd_per_million_tokens: One-hour cache writes.
         output_nano_usd_per_million_tokens: Output tokens.
         reasoning_nano_usd_per_million_tokens: Reasoning tokens inside the output.
+        image_output_nano_usd_per_million_tokens: Generated-image tokens inside the
+            output. None (the default) prices them at the output rate, the behavior of
+            every card without it; it is excluded from identity while None.
         long_context: Whole-request premium schedule for long-context input, or None.
         flex: Pass-through rates for ``service_tier='flex'``, or None.
         priority: Pass-through rates for ``service_tier='priority'``, or None.
@@ -174,6 +179,7 @@ class GatewayTokenPrices(ContractModel):
     cache_creation_1h_input_nano_usd_per_million_tokens: NanoUsdRatePerMillionTokens = None
     output_nano_usd_per_million_tokens: NanoUsdRatePerMillionTokens = None
     reasoning_nano_usd_per_million_tokens: NanoUsdRatePerMillionTokens = None
+    image_output_nano_usd_per_million_tokens: NanoUsdRatePerMillionTokens = None
     long_context: GatewayLongContextTier | None = None
     """Whole-request premium schedule for long-context input, when one exists.
 
@@ -224,6 +230,7 @@ class GatewayTokenPrices(ContractModel):
             cache_creation_1h_input_nano_usd_per_million_tokens=card.cache_creation_1h_input_nano_usd_per_million_tokens,
             output_nano_usd_per_million_tokens=card.output_nano_usd_per_million_tokens,
             reasoning_nano_usd_per_million_tokens=card.reasoning_nano_usd_per_million_tokens,
+            image_output_nano_usd_per_million_tokens=card.image_output_nano_usd_per_million_tokens,
             long_context=card.long_context,
             # Processing tiers reprice tokens only; a unit card is tier-independent.
             units=self.units,

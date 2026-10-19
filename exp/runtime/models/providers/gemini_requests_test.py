@@ -7,6 +7,7 @@ import pytest
 from exp.common.core.artifacts import JsonObject
 from exp.common.models import AssistantAction, ModelMessage, ModelRequest, ToolCall, ToolChoice
 from exp.common.models.content import DocumentContentPart, ImageContentPart, TextContentPart
+from exp.common.models.model import ReasoningEffort
 from exp.common.tasks import ToolSchema
 from exp.runtime.models.providers.gemini_requests import (
     GEMINI_MISSING_TOOL_RESULT,
@@ -459,3 +460,68 @@ def test_the_display_kill_switch_stops_asking_for_thoughts(
         default_maximum_output_tokens=None,
     )
     assert "thinkingConfig" not in cast("JsonObject", payload["generationConfig"])
+
+
+def _thinking_config(model_id: str, effort: str | None) -> object:
+    """The thinkingConfig one Gemini model receives for one caller effort."""
+    request = ModelRequest(
+        messages=(ModelMessage(role="user", content="hi"),),
+        reasoning_effort=cast("ReasoningEffort | None", effort),
+    )
+    payload = gemini_generate_request(model_id, request, supports_reasoning=True)
+    generation = payload["generationConfig"]
+    assert isinstance(generation, dict)
+    return generation.get("thinkingConfig")
+
+
+@pytest.mark.parametrize(
+    ("model_id", "effort", "expected"),
+    [
+        # Gemini 2.5 has no thinkingLevel (both AI Studio and Vertex answer
+        # 400), so every effort rides Google's OpenAI-compatible budgets.
+        ("gemini-2.5-pro", "low", {"thinkingBudget": 1024, "includeThoughts": True}),
+        ("gemini-2.5-pro", "medium", {"thinkingBudget": 8192, "includeThoughts": True}),
+        ("gemini-2.5-pro", "high", {"thinkingBudget": 24576, "includeThoughts": True}),
+        ("gemini-2.5-pro", None, {"includeThoughts": True}),
+        ("gemini-2.5-flash", "none", {"thinkingBudget": 0}),
+        ("gemini-2.5-flash", "low", {"thinkingBudget": 1024, "includeThoughts": True}),
+        ("gemini-2.5-flash", None, {"includeThoughts": True}),
+        # Flash-Lite thinks only when budgeted; Vertex refuses includeThoughts
+        # on a request that leaves thinking off.
+        ("gemini-2.5-flash-lite", None, None),
+        ("gemini-2.5-flash-lite", "none", {"thinkingBudget": 0}),
+        ("gemini-2.5-flash-lite", "low", {"thinkingBudget": 1024, "includeThoughts": True}),
+        (
+            "publishers/google/models/gemini-2.5-flash-lite",
+            "high",
+            {
+                "thinkingBudget": 24576,
+                "includeThoughts": True,
+            },
+        ),
+        # Later families keep thinkingLevel; a zero budget only switches off.
+        ("gemini-3-flash-preview", "low", {"thinkingLevel": "LOW", "includeThoughts": True}),
+        ("gemini-3-flash-preview", None, {"includeThoughts": True}),
+        ("gemini-4-argon", "none", {"thinkingBudget": 0}),
+    ],
+)
+def test_gemini_thinking_controls_follow_each_family(
+    model_id: str, effort: str | None, expected: object
+) -> None:
+    """Each family gets the one thinking control it accepts, live-probed 2026-10-19."""
+    assert _thinking_config(model_id, effort) == expected
+
+
+def test_gemini_2_5_pro_refuses_thinking_off() -> None:
+    """2.5 Pro only works in thinking mode, so ``none`` fails before dispatch."""
+    with pytest.raises(ValueError, match="none"):
+        _thinking_config("gemini-2.5-pro", "none")
+
+
+def test_no_thought_summaries_are_requested_when_display_is_off(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The reasoning display kill switch leaves only the thinking control."""
+    monkeypatch.setenv("EXP_GATEWAY_REASONING_DISPLAY", "0")
+    assert _thinking_config("gemini-2.5-flash", "medium") == {"thinkingBudget": 8192}
+    assert _thinking_config("gemini-2.5-flash", None) is None

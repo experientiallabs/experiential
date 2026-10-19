@@ -812,3 +812,21 @@ def test_settle_payload_carries_billed_units_with_or_without_tokens() -> None:
     )
     # Zero tokens beside billed units is the per-unit shape, not a missing meter.
     assert _credible_usage(GatewayEventKind.COMPLETED, both) == both
+
+
+def test_settlement_usage_carries_the_image_output_subset() -> None:
+    """The native meter's image subset reaches the typed settlement usage."""
+    usage = _usage_from_payload(
+        {"input_tokens": 17, "output_tokens": 1126, "image_output_tokens": 1120}, []
+    )
+    assert usage is not None and usage.image_output_tokens == 1120
+    plain = _usage_from_payload({"input_tokens": 17, "output_tokens": 6}, [])
+    assert plain is not None and plain.image_output_tokens is None
+
+
+def test_a_reported_zero_image_count_survives_settlement_parsing() -> None:
+    """A provider's explicit 0 stays 0 (text-rate output), distinct from unknown."""
+    usage = _usage_from_payload(
+        {"input_tokens": 10, "output_tokens": 3, "image_output_tokens": 0}, []
+    )
+    assert usage is not None and usage.image_output_tokens == 0

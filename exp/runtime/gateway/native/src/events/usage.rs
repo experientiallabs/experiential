@@ -9,6 +9,10 @@ use cache_subsets::{cache_subsets, separate_written_reads, validate_cache_subset
 
 #[path = "usage/cache_subsets.rs"]
 mod cache_subsets;
+#[path = "usage/gemini_modalities.rs"]
+mod gemini_modalities;
+use gemini_modalities::gemini_image_candidates;
+pub use gemini_modalities::gemini_output_covering_image;
 
 impl Usage {
     /// Mark unknown subsets that an OpenAI-compatible shape represents as zero.
@@ -51,6 +55,7 @@ impl Usage {
             .cache_creation_input_tokens
             .max(newer.cache_creation_input_tokens);
         self.reasoning_tokens = self.reasoning_tokens.max(newer.reasoning_tokens);
+        self.image_output_tokens = self.image_output_tokens.max(newer.image_output_tokens);
         self.cache_writes_read_back |= newer.cache_writes_read_back;
     }
 
@@ -292,6 +297,15 @@ impl OpenAiUsageAccumulator {
         let reasoning_tokens = nested_reasoning
             .or(top_level_reasoning)
             .filter(|_| !unreported[3]);
+        // OpenRouter reports generated-image tokens inside the completion
+        // total. A reported 0 is a real count (a text answer billed at the
+        // text rate); only an absent key leaves the subset unknown.
+        let image_output_tokens = optional_usage_detail(
+            object,
+            output_details,
+            "image_tokens",
+            "OpenAI image_tokens",
+        )?;
         let total_tokens = count_if_present(object, "total_tokens", "OpenAI usage")?;
         let (cached_input_tokens, cache_creation_input_tokens) = cache_subsets(
             object,
@@ -347,6 +361,7 @@ impl OpenAiUsageAccumulator {
             reasoning_tokens,
             billed_units: None,
             cache_writes_read_back: false,
+            image_output_tokens,
         });
         // Initial split fragments support a provisional mode until counters
         // change. A coherent raw output/reasoning/total sample may correct it;
@@ -484,8 +499,11 @@ pub fn gemini_usage(value: &Value) -> Result<Usage, String> {
         "candidatesTokenCount",
         "Gemini candidatesTokenCount",
     )?;
-    let output_tokens =
-        bounded_ledger_sum(&[candidates_tokens, reasoning_tokens], "Gemini output")?;
+    let image_output_tokens = gemini_image_candidates(object)?;
+    let output_tokens = gemini_output_covering_image(
+        bounded_ledger_sum(&[candidates_tokens, reasoning_tokens], "Gemini output")?,
+        image_output_tokens,
+    )?;
     Ok(Usage {
         input_tokens: Some(count_or_zero(
             object,
@@ -503,6 +521,7 @@ pub fn gemini_usage(value: &Value) -> Result<Usage, String> {
         reasoning_tokens: Some(reasoning_tokens),
         billed_units: None,
         cache_writes_read_back: false,
+        image_output_tokens,
     })
 }
 
@@ -544,6 +563,7 @@ pub fn bedrock_usage(value: Option<&Value>) -> Result<Usage, String> {
         reasoning_tokens: None,
         billed_units: None,
         cache_writes_read_back: false,
+        image_output_tokens: None,
     })
 }
 

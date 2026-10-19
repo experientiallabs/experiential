@@ -101,12 +101,17 @@ impl Normalizer {
         match candidate.get("content") {
             None | Some(Value::Null) => {}
             Some(content) => {
-                let parts = content
+                // A blocked image turn ends with `"content": {}` (no parts at
+                // all) beside its IMAGE_RECITATION finish: nothing to emit.
+                let parts = match content
                     .as_object()
                     .ok_or_else(|| malformed("Gemini candidate content must be an object"))?
                     .get("parts")
-                    .and_then(Value::as_array)
-                    .ok_or_else(|| malformed("Gemini candidate parts must be an array"))?;
+                {
+                    None | Some(Value::Null) => &Vec::new(),
+                    Some(Value::Array(parts)) => parts,
+                    Some(_) => return Err(malformed("Gemini candidate parts must be an array")),
+                };
                 for raw_part in parts {
                     let part = raw_part
                         .as_object()
@@ -130,9 +135,11 @@ impl Normalizer {
                         // image budget and delivered as the image below, so
                         // retaining them here too would hold a multi-MiB image
                         // against the 1 MiB evidence bound and fail the stream.
+                        // Its signature alone can pass 1 MB (an image model
+                        // signs each image), so it is charged to the stream's
+                        // whole retained-output budget, not a per-part bound.
                         let retained = gemini_part_without_inline_data(raw_part);
-                        let bytes = crate::dialects::records_retained_bytes(&retained)
-                            .ok_or_else(|| malformed(super::OUTPUT_OVERFLOW_MESSAGE))?;
+                        let bytes = crate::dialects::json_retained_bytes(&retained);
                         self.reserve_summary_bytes(bytes.max(64))?;
                         events.push(Event::GeminiThoughtPart(std::sync::Arc::new(retained)));
                     }
@@ -210,10 +217,28 @@ impl Normalizer {
             // and sensitive-information stops are content-free refusals. The
             // finish token names the category (RECITATION, SPII, SAFETY), so
             // the caller sees which policy declined without any provider prose.
-            "SAFETY" | "PROHIBITED_CONTENT" | "BLOCKLIST" | "RECITATION" | "SPII"
-            | "IMAGE_SAFETY" => Event::Failed(Failure::refusal(
+            "SAFETY"
+            | "PROHIBITED_CONTENT"
+            | "BLOCKLIST"
+            | "RECITATION"
+            | "SPII"
+            | "IMAGE_SAFETY"
+            | "IMAGE_PROHIBITED_CONTENT"
+            | "IMAGE_RECITATION" => Event::Failed(Failure::refusal(
                 crate::stream_errors::refusal_reason(Some(&finish_reason), None),
             )),
+            // The model produced an unparsable call or answer. It is a
+            // sampling failure, not a verdict on the request: Gemini 3.1 Pro
+            // ends about half of fresh tool prompts this way when called
+            // directly (live 2026-10-18), and the same request succeeds on a
+            // fresh sample. So it re-dials the rung, then fails over.
+            "MALFORMED_FUNCTION_CALL" | "MALFORMED_RESPONSE" => Event::Failed(
+                Failure::new(
+                    FailureClass::MalformedResponse,
+                    "provider ended the stream with a malformed answer",
+                )
+                .with_retry(true, true),
+            ),
             _ => Event::Failed(Failure::new(
                 FailureClass::ProviderInternal,
                 "provider ended the stream unexpectedly",

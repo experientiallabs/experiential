@@ -599,11 +599,20 @@ fn streaming_chat_usage(usage: &Usage) -> Value {
         "prompt_tokens_details": chat_input_details(usage, true),
         "completion_tokens_details": {"reasoning_tokens": usage.reasoning_tokens.unwrap_or(0)},
     });
+    annotate_image_tokens(&mut wire["completion_tokens_details"], usage);
     let unreported = usage.unreported_token_details();
     if !unreported.is_empty() {
         wire["unreported_token_details"] = json!(unreported);
     }
     wire
+}
+
+/// Name the generated-image subset of the output as `image_tokens`
+/// (OpenRouter's field) inside an output-details object, when one was reported.
+pub(crate) fn annotate_image_tokens(details: &mut Value, usage: &Usage) {
+    if let (Some(image), Some(details)) = (usage.image_output_tokens, details.as_object_mut()) {
+        details.insert("image_tokens".to_string(), json!(image));
+    }
 }
 
 /// Input subsets remain unknown when absent; cache writes are never invented.
@@ -637,10 +646,12 @@ fn completed_chat_usage(usage: Option<&Usage>) -> Value {
     let input = usage.input_tokens.unwrap_or(0);
     let output = usage.output_tokens.unwrap_or(0);
     let details = chat_input_details(usage, false);
-    let output_details = match usage.reasoning_tokens {
+    let mut output_details = match usage.reasoning_tokens {
         Some(reasoning) => json!({"reasoning_tokens": reasoning}),
+        None if usage.image_output_tokens.is_some() => json!({}),
         None => Value::Null,
     };
+    annotate_image_tokens(&mut output_details, usage);
     json!({
         "prompt_tokens": input,
         "completion_tokens": output,

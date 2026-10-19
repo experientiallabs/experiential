@@ -869,3 +869,62 @@ fn cache_subsets_cannot_exceed_openai_total_input() {
     assert_eq!(usage.cached_input_tokens, Some(6));
     assert_eq!(usage.cache_creation_input_tokens, Some(4));
 }
+
+#[test]
+fn image_output_tokens_are_read_from_gemini_modalities_and_openrouter_details() {
+    // Gemini: the IMAGE modality inside candidatesTokenCount (gemini-3.1-flash-image, live).
+    let gemini = gemini_usage(&json!({
+        "promptTokenCount": 17,
+        "candidatesTokenCount": 1278,
+        "candidatesTokensDetails": [
+            {"modality": "TEXT", "tokenCount": 158},
+            {"modality": "IMAGE", "tokenCount": 1120},
+        ],
+    }))
+    .unwrap();
+    assert_eq!(gemini.output_tokens, Some(1278));
+    assert_eq!(gemini.image_output_tokens, Some(1120));
+    // No breakdown leaves the subset unknown; a text-only breakdown is a real 0.
+    let unreported = json!({"promptTokenCount": 3, "candidatesTokenCount": 4});
+    assert_eq!(gemini_usage(&unreported).unwrap().image_output_tokens, None);
+    let text = json!({"candidatesTokenCount": 4, "candidatesTokensDetails": [{"modality": "TEXT", "tokenCount": 4}]});
+    assert_eq!(gemini_usage(&text).unwrap().image_output_tokens, Some(0));
+    // A malformed breakdown fails the meter.
+    assert!(gemini_usage(&json!({"candidatesTokensDetails": "IMAGE"})).is_err());
+
+    // OpenRouter: completion_tokens_details.image_tokens; a reported 0 is a
+    // real count (billed at the text rate), an absent key is unknown.
+    let routed = openai_compatible_usage(&json!({
+        "prompt_tokens": 10,
+        "completion_tokens": 1300,
+        "completion_tokens_details": {"reasoning_tokens": 0, "image_tokens": 1290},
+    }))
+    .unwrap();
+    assert_eq!(routed.image_output_tokens, Some(1290));
+    let text_only = openai_compatible_usage(&json!({
+        "prompt_tokens": 10,
+        "completion_tokens": 3,
+        "completion_tokens_details": {"image_tokens": 0},
+    }))
+    .unwrap();
+    assert_eq!(text_only.image_output_tokens, Some(0));
+    let absent =
+        openai_compatible_usage(&json!({"prompt_tokens": 10, "completion_tokens": 3})).unwrap();
+    assert_eq!(absent.image_output_tokens, None);
+}
+
+#[test]
+fn an_image_reported_outside_the_gemini_totals_joins_the_output() {
+    // Gemini 3 Pro Image: IMAGE 1120 beside candidates 55 and thoughts 100.
+    // The image is added so the subset stays inside the output and is billed.
+    let usage = gemini_usage(&json!({
+        "promptTokenCount": 9,
+        "candidatesTokenCount": 55,
+        "thoughtsTokenCount": 100,
+        "candidatesTokensDetails": [{"modality": "IMAGE", "tokenCount": 1120}],
+    }))
+    .unwrap();
+    assert_eq!(usage.output_tokens, Some(1275));
+    assert_eq!(usage.image_output_tokens, Some(1120));
+    assert_eq!(usage.reasoning_tokens, Some(100));
+}

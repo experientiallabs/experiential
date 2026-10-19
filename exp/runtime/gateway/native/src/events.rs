@@ -62,6 +62,11 @@ pub struct Usage {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_creation_1h_input_tokens: Option<u64>,
     pub reasoning_tokens: Option<u64>,
+    /// Image-modality subset of `output_tokens` (generated images, never
+    /// thinking), present only when the provider reported a nonzero count.
+    /// Settlement prices it at the lane's image-output rate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_output_tokens: Option<u64>,
     /// Media units priced by the deployment's unit card; absent on token-priced attempts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub billed_units: Option<BilledUnits>,
@@ -739,6 +744,9 @@ pub fn simplified_event(event: &Event) -> Value {
             }
             if let Some(hour) = usage.cache_creation_1h_input_tokens {
                 payload["cache_creation_1h_input_tokens"] = serde_json::json!(hour);
+            }
+            if let Some(image) = usage.image_output_tokens {
+                payload["image_output_tokens"] = serde_json::json!(image);
             }
             payload
         }

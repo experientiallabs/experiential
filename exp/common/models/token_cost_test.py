@@ -11,6 +11,7 @@ from exp.common.models.model import Usage
 from exp.common.models.token_cost import (
     schedule_maximum_cost_nano_usd,
     schedule_usage_cost_nano_usd,
+    token_cost_nano_usd,
 )
 
 
@@ -135,3 +136,78 @@ def test_invalid_subsets_are_not_silently_underpriced(field: str) -> None:
     """Report valuation refuses impossible usage instead of clamping away paid evidence."""
     usage = Usage(input_tokens=10, output_tokens=10).model_copy(update={field: 11})
     assert schedule_usage_cost_nano_usd(prices(), usage) is None
+
+
+def _image_cost(
+    image_output_tokens: int | None, image_output_rate: int | None, reasoning_tokens: int = 0
+) -> int | None:
+    """Price 1,334 output tokens (Gemini 3 Pro Image's shape) under one image rule."""
+    return token_cost_nano_usd(
+        input_tokens=0,
+        output_tokens=1_334,
+        cached_input_tokens=0,
+        cache_write_input_tokens=0,
+        cache_write_1h_input_tokens=0,
+        reasoning_tokens=reasoning_tokens,
+        input_rate=0,
+        cached_input_rate=0,
+        cache_creation_input_rate=0,
+        cache_creation_1h_input_rate=0,
+        output_rate=12_000_000_000,
+        reasoning_rate=12_000_000_000,
+        image_output_tokens=image_output_tokens,
+        image_output_rate=image_output_rate,
+    )
+
+
+def test_image_output_tokens_price_at_their_own_rate_carved_before_reasoning() -> None:
+    """Image tokens leave the output first; reasoning is clamped to what remains."""
+    # 1,120 image tokens at $120/M plus 214 text/thinking tokens at $12/M.
+    expected = (1_120 * 120_000_000_000 + 214 * 12_000_000_000 + 500_000) // 1_000_000
+    assert _image_cost(1_120, 120_000_000_000, reasoning_tokens=1_263) == expected
+    assert _image_cost(1_120, 120_000_000_000) == expected
+
+
+def test_an_unset_image_rate_keeps_todays_output_pricing() -> None:
+    """No image rate: image tokens stay ordinary output, counted or not."""
+    plain = (1_334 * 12_000_000_000 + 500_000) // 1_000_000
+    assert _image_cost(1_120, None) == plain
+    assert _image_cost(None, None) == plain
+
+
+def test_a_distinct_image_rate_without_an_image_count_is_unknown() -> None:
+    """Every text/image split prices differently, so the cost stays unknown."""
+    assert _image_cost(None, 120_000_000_000) is None
+    # A rate equal to the output rate prices every split the same.
+    assert _image_cost(None, 12_000_000_000) == (1_334 * 12_000_000_000 + 500_000) // 1_000_000
+
+
+def test_a_model_client_usage_cannot_value_a_card_with_a_distinct_image_rate() -> None:
+    """Model-client usage has no image subset, so such a card's output is unknown."""
+    prices = GatewayTokenPrices(
+        input_nano_usd_per_million_tokens=1,
+        cached_input_nano_usd_per_million_tokens=1,
+        cache_creation_input_nano_usd_per_million_tokens=1,
+        cache_creation_1h_input_nano_usd_per_million_tokens=1,
+        output_nano_usd_per_million_tokens=12,
+        reasoning_nano_usd_per_million_tokens=12,
+        image_output_nano_usd_per_million_tokens=120,
+    )
+    usage = Usage(input_tokens=1, output_tokens=1, cached_input_tokens=0, reasoning_tokens=0)
+    assert schedule_usage_cost_nano_usd(prices, usage) is None
+    assert schedule_maximum_cost_nano_usd(prices, input_tokens=0, output_tokens=1_000_000) == 120
+
+
+def test_an_unset_image_rate_leaves_the_card_identity_unchanged() -> None:
+    """The new rate is omitted while unset, so existing catalog digests hold."""
+    card = GatewayTokenPrices(output_nano_usd_per_million_tokens=1)
+    assert "image_output_nano_usd_per_million_tokens" not in card.model_dump(exclude_defaults=True)
+    flex = GatewayTokenPrices(
+        flex=GatewayServiceTierPrices(image_output_nano_usd_per_million_tokens=7)
+    ).for_service_tier("flex")
+    assert flex.image_output_nano_usd_per_million_tokens == 7
+
+
+def test_a_reported_zero_image_count_prices_all_output_at_the_output_rate() -> None:
+    """A text answer on an image lane is billed as text, never at the image rate."""
+    assert _image_cost(0, 120_000_000_000) == (1_334 * 12_000_000_000 + 500_000) // 1_000_000

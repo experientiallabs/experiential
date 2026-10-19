@@ -567,6 +567,9 @@ fn parse_fixture_events(events_json: &str) -> Result<Vec<events::Event>, String>
                     .and_then(serde_json::Value::as_u64),
                 billed_units: None,
                 cache_writes_read_back: false,
+                image_output_tokens: object
+                    .get("image_output_tokens")
+                    .and_then(serde_json::Value::as_u64),
             }),
             "hosted_tool_item_started" => events::Event::HostedToolItemStarted {
                 output_index: object

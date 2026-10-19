@@ -185,6 +185,8 @@ def _token_attempt_cost_nano_usd(
         for rate in (
             schedule.output_nano_usd_per_million_tokens,
             schedule.reasoning_nano_usd_per_million_tokens,
+            # An image lane may spend its whole output on images.
+            schedule.image_output_nano_usd_per_million_tokens,
         )
         if rate is not None
     )

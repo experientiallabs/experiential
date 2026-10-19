@@ -336,13 +336,64 @@ def gemini_thinking_level(model_id: str, effort: str) -> str:
     return _require_exact_effort(model_id, effort, _gemini_supported_efforts(model_id))
 
 
-def _gemini_supported_efforts(model_id: str) -> Collection[str]:
-    """Return documented native thinking levels for one Gemini family."""
-    normalized = (
+_GEMINI_2_5_THINKING_BUDGETS = {"none": 0, "low": 1_024, "medium": 8_192, "high": 24_576}
+"""Gemini 2.5 effort budgets, the values Google's OpenAI-compatible endpoint maps.
+
+Every value sits inside each 2.5 family's documented budget range (Pro
+128-32,768, Flash 0-24,576, Flash-Lite 0 or 512-24,576); probed live on AI
+Studio and Vertex 2026-10-19.
+"""
+
+
+def gemini_thinking_budget(model_id: str, level: str) -> int | None:
+    """Return the ``thinkingBudget`` carrying one validated effort, or None.
+
+    Gemini 2.5 has no ``thinkingLevel`` (both AI Studio and Vertex answer 400
+    "thinking_level is not supported"), so every 2.5 effort rides a budget.
+    Later families take ``thinkingLevel`` and use a budget only to switch
+    thinking off (``none`` is a zero budget; the field has no off value).
+
+    Args:
+        model_id: Exact Gemini model identifier.
+        level: An effort already validated by :func:`gemini_thinking_level`.
+
+    Returns:
+        The budget to send, or None when the effort rides ``thinkingLevel``.
+    """
+    if _gemini_family(model_id).startswith("gemini-2-5-"):
+        return _GEMINI_2_5_THINKING_BUDGETS[level]
+    return 0 if level == "none" else None
+
+
+def gemini_thinks_by_default(model_id: str) -> bool:
+    """Whether a Gemini model thinks when the request sets no thinking control.
+
+    Gemini 2.5 Flash-Lite thinks only when given a budget; Vertex refuses
+    ``includeThoughts`` on a request that leaves thinking off ("include_thoughts
+    is only enabled when thinking is enabled"). Every other family thinks by
+    default.
+
+    Args:
+        model_id: Exact Gemini model identifier.
+
+    Returns:
+        False only for a family whose thinking is off unless budgeted.
+    """
+    return not _gemini_family(model_id).startswith("gemini-2-5-flash-lite")
+
+
+def _gemini_family(model_id: str) -> str:
+    """Normalize a Gemini model id to the bare family form the tables match."""
+    return (
         _normalized_model(model_id)
         .removeprefix("publishers/google/models/")
         .removeprefix("models/")
     )
+
+
+def _gemini_supported_efforts(model_id: str) -> Collection[str]:
+    """Return documented native thinking levels for one Gemini family."""
+    normalized = _gemini_family(model_id)
     if "gemini-4-argon" in normalized:
         # Live on AI Studio 2026-10-13: LOW, MEDIUM and HIGH are accepted and
         # think measurably differently (0 / ~150-400 / ~1000-1350 thought
@@ -366,8 +417,11 @@ def _gemini_supported_efforts(model_id: str) -> Collection[str]:
         )
     ):
         supported = ("minimal", "low", "medium", "high")
-    elif normalized.startswith("gemini-2-5-"):
+    elif normalized.startswith("gemini-2-5-pro"):
+        # 2.5 Pro only works in thinking mode: a zero budget answers 400.
         supported = ("low", "medium", "high")
+    elif normalized.startswith("gemini-2-5-"):
+        supported = ("none", "low", "medium", "high")
     else:
         # New Gemini 3 variants remain callable while discovery catches up.
         # HIGH is the only level documented across every current family.

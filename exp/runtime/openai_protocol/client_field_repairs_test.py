@@ -167,6 +167,23 @@ def test_chat_output_config_with_unknown_effort_is_dropped() -> None:
     assert disclosures == (OUTPUT_CONFIG_DROPPED,)
 
 
+@pytest.mark.parametrize("modalities", (["image", "text"], ["text"], ["image"], None))
+def test_chat_text_and_image_modalities_serve(modalities: list[str] | None) -> None:
+    """OpenRouter-style image clients' ``modalities`` never 400; the route decides output."""
+    decoded = decode_chat({**_CHAT_BASE, "modalities": cast(JsonValue, modalities)})
+    assert decoded.request.ignored_parameters == ()
+
+
+@pytest.mark.parametrize(
+    "modalities", (["text", "audio"], ["image", "image"], [], "image", [{"type": "image"}])
+)
+def test_chat_audio_or_malformed_modalities_keep_their_refusal(modalities: JsonValue) -> None:
+    """Audio output, repeats, and malformed lists keep the named unsupported-field refusal."""
+    with pytest.raises(OpenAIProtocolError) as raised:
+        decode_chat({**_CHAT_BASE, "modalities": modalities})
+    assert raised.value.detail.param == "modalities"
+
+
 @pytest.mark.parametrize("stream", (False, None))
 def test_chat_stream_options_without_streaming_are_ignored(stream: bool | None) -> None:
     """``stream_options`` on a non-streaming Chat call serves, disclosed."""

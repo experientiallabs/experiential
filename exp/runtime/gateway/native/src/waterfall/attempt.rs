@@ -337,7 +337,14 @@ pub(super) async fn run_attempt(
             if matches!(event, Event::GeminiThoughtPart(_))
                 || crate::logprobs::withhold_before_commit(&event, refusal_failover)
             {
-                let event_bytes = crate::relay::event_retained_bytes(&event);
+                // Gemini thought evidence is already charged to the normalizer's
+                // retained-output and worker budgets; an image model signs each
+                // image with 1 to 2 MB (live 2026-10-19), far past the
+                // refusal-delta byte bound. The event-count bound still applies.
+                let event_bytes = match event {
+                    Event::GeminiThoughtPart(_) => 0,
+                    _ => crate::relay::event_retained_bytes(&event),
+                };
                 if withheld_bytes.saturating_add(event_bytes) > MAXIMUM_WITHHELD_REFUSAL_BYTES
                     || withheld.len() + 1 > MAXIMUM_WITHHELD_REFUSAL_EVENTS
                 {

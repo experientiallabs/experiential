@@ -43,6 +43,7 @@ impl Normalizer {
             reasoning_tokens: None,
             billed_units: None,
             cache_writes_read_back: false,
+            image_output_tokens: None,
         })
     }
 

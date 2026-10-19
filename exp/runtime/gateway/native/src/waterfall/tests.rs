@@ -253,6 +253,7 @@ fn usage(output_tokens: Option<u64>, reasoning_tokens: Option<u64>) -> Usage {
         reasoning_tokens,
         billed_units: None,
         cache_writes_read_back: false,
+        image_output_tokens: None,
     }
 }
 

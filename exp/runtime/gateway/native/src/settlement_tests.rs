@@ -447,6 +447,7 @@ fn settle_argument_preserves_upstream_provider_and_cache_ttl_usage_together() {
         reasoning_tokens: None,
         billed_units: None,
         cache_writes_read_back: false,
+        image_output_tokens: None,
     };
     let named = settle_argument(
         "req",
@@ -697,4 +698,39 @@ fn retry_after_fills_only_throttled_failures_and_never_overwrites() {
     let internal =
         crate::upstream::transport_failure(Some(500)).with_rate_limit_facts(None, Some(30));
     assert_eq!(internal.retry_after_seconds, None);
+}
+
+#[test]
+fn settle_argument_keeps_a_reported_zero_image_count_and_omits_an_unreported_one() {
+    // A reported 0 bills the output at the text rate; absence is unknown.
+    let settle = |image: Option<u64>| -> Value {
+        let usage = Usage {
+            input_tokens: Some(10),
+            output_tokens: Some(3),
+            image_output_tokens: image,
+            ..Usage::default()
+        };
+        let argument = settle_argument(
+            "req",
+            "att",
+            "completed",
+            Some(&usage),
+            &[],
+            None,
+            true,
+            true,
+            None,
+            None,
+            None,
+            0,
+            0,
+        );
+        serde_json::from_str(&argument).expect("valid json")
+    };
+    assert_eq!(settle(Some(0))["usage"]["image_output_tokens"], json!(0));
+    assert_eq!(
+        settle(Some(1_120))["usage"]["image_output_tokens"],
+        json!(1_120)
+    );
+    assert!(settle(None)["usage"].get("image_output_tokens").is_none());
 }

@@ -231,3 +231,12 @@ def test_responses_probability_boundary_rejects_invalid_shape(change: JsonObject
                 **change,
             }
         )
+
+
+def test_image_output_tokens_are_an_output_subset() -> None:
+    """Generated-image tokens live inside the output total, never beside it."""
+    usage = GatewayUsage(input_tokens=17, output_tokens=1126, image_output_tokens=1120)
+    assert usage.image_output_tokens == 1120
+    for output in (None, 1000):
+        with pytest.raises(ValidationError):
+            GatewayUsage(input_tokens=17, output_tokens=output, image_output_tokens=1120)

@@ -116,6 +116,8 @@ class GatewayUsage(ContractModel):
         cache_creation_input_tokens: Cache-write subset of the input.
         cache_creation_1h_input_tokens: One-hour subset of the cache writes.
         reasoning_tokens: Reasoning subset of the output.
+        image_output_tokens: Generated-image subset of the output (Gemini's IMAGE
+            modality count, OpenRouter's ``image_tokens``), or None when unreported.
         tool_names: Invoked tool names in first-use order.
         web_search_requests: Gateway-executed web searches billed to the attempt.
         tool_search_requests: Gateway-executed tool-search rounds billed to the attempt.
@@ -135,6 +137,7 @@ class GatewayUsage(ContractModel):
     """Observed 1-hour subset of cache writes; zero proves all writes use 5m.
     None means no complete TTL breakdown was reported, so write cost is unknown."""
     reasoning_tokens: int | None = Field(default=None, ge=0)
+    image_output_tokens: int | None = Field(default=None, ge=0)
     tool_names: tuple[str, ...] = ()
     """Invoked tool names in first-use order, names only and never arguments."""
     web_search_requests: int = Field(default=0, ge=0)
@@ -167,6 +170,10 @@ class GatewayUsage(ContractModel):
             or self.cache_creation_1h_input_tokens > self.cache_creation_input_tokens
         ):
             raise ValueError("1-hour cache writes require a covering cache-creation total")
+        if self.image_output_tokens is not None and (
+            self.output_tokens is None or self.image_output_tokens > self.output_tokens
+        ):
+            raise ValueError("image output tokens require a covering output total")
         return self
 
     @property

@@ -675,6 +675,7 @@ def _usage_from_payload(
             payload.get("cache_creation_1h_input_tokens")
         ),
         reasoning_tokens=_optional_count(payload.get("reasoning_tokens")),
+        image_output_tokens=_optional_count(payload.get("image_output_tokens")),
         tool_names=names,
         web_search_requests=web_search_requests,
         tool_search_requests=tool_search_requests,

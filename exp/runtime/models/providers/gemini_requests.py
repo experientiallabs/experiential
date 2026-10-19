@@ -22,7 +22,9 @@ from exp.runtime.models.providers.instruction_turns import (
     fold_instruction_turns_after_the_leading_run,
 )
 from exp.runtime.models.providers.reasoning_compat import (
+    gemini_thinking_budget,
     gemini_thinking_level,
+    gemini_thinks_by_default,
     reasoning_display_enabled,
 )
 from exp.runtime.models.providers.videos import gemini_video_part
@@ -155,20 +157,22 @@ def gemini_generate_request(
         generation["responseMimeType"] = "application/json"
     effective_reasoning_effort = request.reasoning_effort or reasoning_effort
     if supports_reasoning:
-        # Thought summaries are the readable reasoning Google returns; without
-        # includeThoughts a thinking model streams only opaque signatures.
-        thinking_config: JsonObject = (
-            {"includeThoughts": True} if reasoning_display_enabled() else {}
-        )
+        thinking_config: JsonObject = {}
+        budget: int | None = None
         if effective_reasoning_effort is not None:
             level = gemini_thinking_level(model_id, effective_reasoning_effort)
-            if level == "none":
-                # thinkingLevel has no off value; the families whose table
-                # admits "none" switch thinking off with a zero budget, and
-                # Google rejects a request that sets both fields.
-                thinking_config["thinkingBudget"] = 0
+            budget = gemini_thinking_budget(model_id, level)
+            # Google rejects a request that sets both fields.
+            if budget is not None:
+                thinking_config["thinkingBudget"] = budget
             else:
                 thinking_config["thinkingLevel"] = level.upper()
+        thinking = budget != 0 and (budget is not None or gemini_thinks_by_default(model_id))
+        # Thought summaries are the readable reasoning Google returns; without
+        # includeThoughts a thinking model streams only opaque signatures.
+        # Vertex refuses includeThoughts on a request whose thinking is off.
+        if thinking and reasoning_display_enabled():
+            thinking_config["includeThoughts"] = True
         if thinking_config:
             generation["thinkingConfig"] = thinking_config
     # The normalized gateway response has no logprob representation. Keep the

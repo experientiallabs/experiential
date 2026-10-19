@@ -33,8 +33,7 @@ pub fn collection_public_error(failure: &Failure) -> PublicError {
 /// again after streamed deltas, matching the Python bounded aggregator.
 pub fn event_retained_bytes(event: &Event) -> usize {
     match event {
-        Event::GeminiThoughtPart(part) => crate::dialects::records_retained_bytes(part)
-            .unwrap_or(MAXIMUM_RETAINED_OUTPUT_BYTES.saturating_add(1)),
+        Event::GeminiThoughtPart(part) => crate::dialects::json_retained_bytes(part),
         Event::TextDelta(text) | Event::RefusalDelta(text) | Event::Image(text) => text.len(),
         Event::ProviderTextDelta { delta, .. } | Event::ProviderRefusalDelta { delta, .. } => {
             delta.len()

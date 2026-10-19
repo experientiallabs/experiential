@@ -104,14 +104,21 @@ fn settle_argument(
         "request_id": request_id,
         "attempt_id": attempt_id,
         "outcome": outcome,
-        "usage": usage.map(|usage| json!({
-            "input_tokens": usage.input_tokens,
-            "output_tokens": usage.output_tokens,
-            "cached_input_tokens": usage.cached_input_tokens,
-            "cache_creation_input_tokens": usage.cache_creation_input_tokens,
-            "cache_creation_1h_input_tokens": usage.cache_creation_1h_input_tokens,
-            "reasoning_tokens": usage.reasoning_tokens,
-        })),
+        "usage": usage.map(|usage| {
+            let mut wire = json!({
+                "input_tokens": usage.input_tokens,
+                "output_tokens": usage.output_tokens,
+                "cached_input_tokens": usage.cached_input_tokens,
+                "cache_creation_input_tokens": usage.cache_creation_input_tokens,
+                "cache_creation_1h_input_tokens": usage.cache_creation_1h_input_tokens,
+                "reasoning_tokens": usage.reasoning_tokens,
+            });
+            // The generated-image subset joins only when the provider reported one.
+            if let Some(image) = usage.image_output_tokens {
+                wire["image_output_tokens"] = json!(image);
+            }
+            wire
+        }),
         "tool_names": tool_names,
         "failure": failure.map(|failure| json!({
             "failure_class": failure.failure_class.as_str(),

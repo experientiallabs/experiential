@@ -20,6 +20,8 @@ def token_cost_nano_usd(
     cache_creation_1h_input_rate: int | None,
     output_rate: int | None,
     reasoning_rate: int | None,
+    image_output_tokens: int | None = None,
+    image_output_rate: int | None = None,
 ) -> int | None:
     """Price disjoint input/output subsets with half-up nano-USD rounding.
 
@@ -27,6 +29,12 @@ def token_cost_nano_usd(
     without its one-hour split is priceable only when both write rates are known
     and equal. Missing rates for positive dimensions preserve unknown cost.
     Gateway-normalized counts are clamped to their containing totals.
+
+    With an image-output rate, generated-image tokens are carved out of the
+    output first and the reasoning subset is clamped to what remains (Gemini 3
+    Pro Image counts its image inside its thoughts). Without one, image tokens
+    stay in the output exactly as before the rate existed. A rate that differs
+    from the output rate with no reported image count leaves cost unknown.
     """
     cached = min(cached_input_tokens or 0, input_tokens)
     written = min(cache_write_input_tokens or 0, input_tokens - cached)
@@ -40,14 +48,24 @@ def token_cost_nano_usd(
     ):
         return None
     hour = min(cache_write_1h_input_tokens or 0, written)
-    reasoning = min(reasoning_tokens or 0, output_tokens)
+    if (
+        image_output_tokens is None
+        and output_tokens > 0
+        and image_output_rate is not None
+        and image_output_rate != output_rate
+    ):
+        # Every split of the output between text and image prices differently.
+        return None
+    image = min(image_output_tokens or 0, output_tokens) if image_output_rate is not None else 0
+    reasoning = min(reasoning_tokens or 0, output_tokens - image)
     dimensions = (
         (input_tokens - cached - written, input_rate),
         (cached, cached_input_rate),
         (written - hour, cache_creation_input_rate),
         (hour, cache_creation_1h_input_rate),
-        (output_tokens - reasoning, output_rate),
+        (output_tokens - image - reasoning, output_rate),
         (reasoning, reasoning_rate),
+        (image, image_output_rate),
     )
     if any(tokens > 0 and rate is None for tokens, rate in dimensions):
         return None
@@ -104,6 +122,15 @@ def schedule_usage_cost_nano_usd(prices: GatewayTokenPrices, usage: Usage) -> in
         usage.reasoning_tokens is None
         and usage.output_tokens > 0
         and schedule.reasoning_nano_usd_per_million_tokens
+        != schedule.output_nano_usd_per_million_tokens
+    ):
+        return None
+    # The model-client usage carries no image subset, so a card that prices
+    # images apart from text cannot value any output.
+    if (
+        usage.output_tokens > 0
+        and schedule.image_output_nano_usd_per_million_tokens is not None
+        and schedule.image_output_nano_usd_per_million_tokens
         != schedule.output_nano_usd_per_million_tokens
     ):
         return None
@@ -164,6 +191,7 @@ def schedule_maximum_cost_nano_usd(
                 for rate in (
                     schedule.output_nano_usd_per_million_tokens,
                     schedule.reasoning_nano_usd_per_million_tokens,
+                    schedule.image_output_nano_usd_per_million_tokens,
                 )
                 if rate is not None
             ),
