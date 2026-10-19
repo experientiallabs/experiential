@@ -154,3 +154,97 @@ fn bedrock_summarized_thinking_estimates_like_the_messages_wire() {
         Some(289)
     );
 }
+
+#[test]
+fn a_zero_published_beside_readable_thinking_is_estimated() {
+    // A chat-completions passthrough of Claude bills thinking inside
+    // `completion_tokens` and may fill `reasoning_tokens: 0` it never measured.
+    let readable = ReasoningEstimate::from_events(&thinking_then_answer("No."));
+    assert_eq!(readable.estimate(&usage(30, Some(0))), Some(29));
+    let mut wire =
+        json!({"completion_tokens": 30, "completion_tokens_details": {"reasoning_tokens": 0}});
+    readable.annotate(
+        &mut wire,
+        Some(&usage(30, Some(0))),
+        "completion_tokens_details",
+    );
+    assert_eq!(wire["completion_tokens_details"]["reasoning_tokens"], 29);
+    assert_eq!(wire["estimated_token_details"], json!(["reasoning_tokens"]));
+
+    // A zero beside signature-only thinking, or no thinking, stands.
+    let signed = ReasoningEstimate::from_events(&[
+        Event::ThinkingSignature {
+            index: 0,
+            signature: "sig".into(),
+        },
+        Event::TextDelta("ok".into()),
+    ]);
+    assert_eq!(signed.estimate(&usage(30, Some(0))), None);
+    let plain = ReasoningEstimate::from_events(&[Event::TextDelta("ok".into())]);
+    assert_eq!(plain.estimate(&usage(30, Some(0))), None);
+    // Empty reasoning deltas are not readable thinking.
+    let empty = ReasoningEstimate::from_events(&[
+        Event::ReasoningTextDelta(String::new()),
+        Event::TextDelta("ok".into()),
+    ]);
+    assert_eq!(empty.estimate(&usage(30, Some(0))), None);
+}
+
+#[test]
+fn novita_claude_reasoning_content_surfaces_as_reasoning_text_and_estimates() {
+    // The Novita Claude passthrough (pa/claude-opus-4-8-hs) streams the
+    // summarized thinking as `reasoning_content` deltas when it is asked with
+    // Anthropic's adaptive thinking fields, then the answer as `content`.
+    use crate::dialects::{Dialect, Normalizer};
+    use crate::sse::SseEvent;
+
+    let frames = [
+        json!({"choices": [{"index": 0, "delta": {"role": "assistant", "reasoning_content": "Two trains: the gap closes at 24 km/h."}}]}),
+        json!({"choices": [{"index": 0, "delta": {"reasoning_content": " 60 km takes 2.5 h."}}]}),
+        json!({"choices": [{"index": 0, "delta": {"content": "6:35pm"}}]}),
+        json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}),
+        json!({"choices": [], "usage": {"prompt_tokens": 48, "completion_tokens": 289, "total_tokens": 337, "completion_tokens_details": {"reasoning_tokens": 0}}}),
+    ];
+    let mut normalizer = Normalizer::new(Dialect::OpenAiCompatible);
+    let mut events = Vec::new();
+    for frame in frames {
+        events.extend(
+            normalizer
+                .feed(&SseEvent {
+                    event: None,
+                    data: frame.to_string(),
+                })
+                .expect("Novita frame decodes"),
+        );
+    }
+    events.extend(
+        normalizer
+            .feed(&SseEvent {
+                event: None,
+                data: "[DONE]".into(),
+            })
+            .expect("terminal decodes"),
+    );
+    let reasoning: String = events
+        .iter()
+        .filter_map(|event| match event {
+            Event::ReasoningTextDelta(text) => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        reasoning,
+        "Two trains: the gap closes at 24 km/h. 60 km takes 2.5 h."
+    );
+    assert_eq!(
+        crate::reasoning_display::flattened(&events, false).as_deref(),
+        Some("Two trains: the gap closes at 24 km/h. 60 km takes 2.5 h.")
+    );
+    let usage = normalizer.observed_usage().expect("usage decoded");
+    assert_eq!(usage.output_tokens, Some(289));
+    // "6:35pm" is 6 bytes -> 2 visible tokens.
+    assert_eq!(
+        ReasoningEstimate::from_events(&events).estimate(usage),
+        Some(287)
+    );
+}

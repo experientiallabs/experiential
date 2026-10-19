@@ -36,6 +36,7 @@ const BYTES_PER_TOKEN: u64 = 4;
 pub struct ReasoningEstimate {
     visible_bytes: u64,
     thinking: bool,
+    readable_thinking: bool,
 }
 
 impl ReasoningEstimate {
@@ -58,6 +59,15 @@ impl ReasoningEstimate {
             // Thinking in any provider form: readable, summarized, plaintext,
             // signed, redacted or encrypted. Only the turn's evidence that it
             // reasoned matters; its text is never counted as visible.
+            Event::ThinkingDelta { delta, .. }
+            | Event::ReasoningSummaryDelta { delta, .. }
+            | Event::ReasoningContentDelta { delta, .. }
+            | Event::ReasoningTextDelta(delta)
+                if !delta.is_empty() =>
+            {
+                self.thinking = true;
+                self.readable_thinking = true;
+            }
             Event::ThinkingDelta { .. }
             | Event::ThinkingSignature { .. }
             | Event::RedactedThinking { .. }
@@ -76,8 +86,21 @@ impl ReasoningEstimate {
 
     /// The estimated reasoning count, or `None` when the provider published
     /// one, no thinking ran, or the output total is unknown.
+    ///
+    /// A published `0` beside readable reasoning text is not a count: the
+    /// stream itself shows tokens were spent thinking. OpenAI-compatible
+    /// relays of models that bill thinking inside the completion total
+    /// (Claude through a chat-completions passthrough) fill the details object
+    /// with a zero they never measured, so such a turn is estimated like one
+    /// that published nothing. A zero beside signature-only or no thinking
+    /// stands.
     pub fn estimate(&self, usage: &Usage) -> Option<u64> {
-        if usage.reasoning_tokens.is_some() || !self.thinking {
+        let published = match usage.reasoning_tokens {
+            Some(0) => !self.readable_thinking,
+            Some(_) => true,
+            None => false,
+        };
+        if published || !self.thinking {
             return None;
         }
         let visible = self.visible_bytes.div_ceil(BYTES_PER_TOKEN);
