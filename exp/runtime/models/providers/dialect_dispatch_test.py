@@ -483,3 +483,149 @@ def test_deepseek_origin_declines_a_forced_tool_choice_while_thinking(choice: st
         dialect="openai_compatible", url="https://openrouter.test/v1", model_id="deepseek/flash"
     )
     assert dialect_stream_payload(relay, request)["tool_choice"] is not None
+
+
+_NOVITA_URL = "https://api.novita.ai/v3/openai/chat/completions"
+
+
+def _novita_profile(model_id: str = "pa/claude-opus-4-8-hs") -> GatewayWireProfile:
+    """One Novita Claude passthrough rung declaring the adaptive effort ladder."""
+    return GatewayWireProfile(
+        dialect="openai_compatible",
+        url=_NOVITA_URL,
+        model_id=model_id,
+        supports_reasoning=True,
+        reasoning_wire_format="reasoning_effort",
+    )
+
+
+@pytest.mark.parametrize(
+    ("model_id", "effort"),
+    [
+        ("pa/claude-opus-4-8-hs", "high"),
+        ("pa/claude-opus-4-8-hs", "xhigh"),
+        ("pa/claude-opus-4-7-hs", "max"),
+        ("pa/claude-opus-4-6-hs", "low"),
+        ("PA/Claude-Sonnet-4-6-HS", "medium"),
+    ],
+)
+def test_novita_claude_effort_sends_anthropic_adaptive_thinking(
+    model_id: str, effort: ReasoningEffort
+) -> None:
+    """An effort reaches a Novita Claude lane as Anthropic's own thinking fields.
+
+    Novita ignores reasoning_effort, and reasoning {effort} thinks but streams
+    only signatures; thinking {type: adaptive, display: summarized} with
+    output_config.effort streams the thinking as reasoning_content
+    (pa/claude-opus-4-8-hs, probed 2026-10-19).
+    """
+    payload = dialect_stream_payload(_novita_profile(model_id), _effort_request(effort))
+    assert payload["thinking"] == {"type": "adaptive", "display": "summarized"}
+    assert payload["output_config"] == {"effort": effort}
+    assert "reasoning_effort" not in payload
+    assert "reasoning" not in payload
+
+
+def test_novita_claude_without_effort_or_at_none_sends_no_thinking() -> None:
+    """No effort, or none, keeps today's exact body: these models do not think without a config."""
+    profile = _novita_profile()
+    for request in (_chat(), _effort_request("none")):
+        payload = dialect_stream_payload(profile, request)
+        assert "thinking" not in payload
+        assert "output_config" not in payload
+        assert "reasoning_effort" not in payload
+
+
+def test_novita_claude_effort_outside_the_model_ladder_is_refused_before_dispatch() -> None:
+    """Opus 4.6 has no xhigh; the effort is refused by name, never sent to fail upstream."""
+    from exp.runtime.models.providers.errors import ProviderParameterError
+
+    with pytest.raises(ProviderParameterError):
+        dialect_stream_payload(_novita_profile("pa/claude-opus-4-6-hs"), _effort_request("xhigh"))
+
+
+def test_novita_claude_display_follows_the_kill_switch(monkeypatch: pytest.MonkeyPatch) -> None:
+    """With display withheld the effort still applies at the provider's default display."""
+    monkeypatch.setenv("EXP_GATEWAY_REASONING_DISPLAY", "0")
+    payload = dialect_stream_payload(_novita_profile(), _effort_request("high"))
+    assert payload["thinking"] == {"type": "adaptive"}
+    assert payload["output_config"] == {"effort": "high"}
+
+
+def test_novita_claude_open_tool_loop_keeps_thinking_off() -> None:
+    """After a tool call in the current user turn the chat history cannot carry the signed
+    thinking Anthropic requires before that call, so the follow-up turn sends no thinking;
+    the next user turn reasons again."""
+    from exp.common.models.model import ToolCall
+
+    call = GatewayMessage(
+        role="assistant",
+        tool_calls=(ToolCall(call_id="call_1", name="lookup", arguments={"q": "x"}),),
+    )
+    result = GatewayMessage(role="tool", content="42", tool_call_id="call_1")
+    loop = GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=(GatewayMessage(role="user", content="go"), call, result),
+        tools=(GatewayToolDefinition(name="lookup", parameters={"type": "object"}),),
+        reasoning_effort="high",
+    )
+    in_loop = dialect_stream_payload(_novita_profile(), loop)
+    assert "thinking" not in in_loop
+    assert "output_config" not in in_loop
+    next_turn = loop.model_copy(
+        update={
+            "messages": (
+                *loop.messages,
+                GatewayMessage(role="assistant", content="It is 42."),
+                GatewayMessage(role="user", content="and again?"),
+            )
+        }
+    )
+    assert dialect_stream_payload(_novita_profile(), next_turn)["thinking"] == {
+        "type": "adaptive",
+        "display": "summarized",
+    }
+
+
+@pytest.mark.parametrize(
+    ("url", "model_id"),
+    [
+        # Novita's budgeted 4.5 Claude releases, a Novita id without the -hs suffix,
+        # and non-Claude Novita models.
+        (_NOVITA_URL, "pa/claude-sonnet-4-5-20250929-hs"),
+        (_NOVITA_URL, "pa/claude-haiku-4-5-20251001-hs"),
+        (_NOVITA_URL, "pa/claude-opus-4-5-20251101-hs"),
+        (_NOVITA_URL, "pa/claude-fable-5"),
+        (_NOVITA_URL, "pa/gpt-5.6-luna"),
+        (_NOVITA_URL, "deepseek/deepseek-v4"),
+        # The same id on another host.
+        ("https://openrouter.ai/api/v1/chat/completions", "pa/claude-opus-4-8-hs"),
+        ("https://api.novita.ai.example.org/v3/openai/chat/completions", "pa/claude-opus-4-8-hs"),
+    ],
+)
+def test_novita_claude_thinking_rule_is_scoped_to_novita_adaptive_claude(
+    url: str, model_id: str
+) -> None:
+    """Every other lane keeps reasoning_effort exactly as before."""
+    payload = dialect_stream_payload(_maas_profile(url, model_id), _effort_request("high"))
+    assert "thinking" not in payload
+    assert "output_config" not in payload
+    assert payload["reasoning_effort"] == "high"
+
+
+@pytest.mark.parametrize(
+    "sampling",
+    [{"temperature": 0.2}, {"top_k": 40}, {"top_p": 0.5}],
+)
+def test_novita_claude_sampling_anthropic_forbids_beside_thinking_keeps_thinking_off(
+    sampling: dict[str, float | int],
+) -> None:
+    """Anthropic refuses temperature other than 1, top_k, or top_p below 0.95 with thinking on;
+    such a request keeps today's body (sampling honored, no thinking) instead of failing."""
+    payload = dialect_stream_payload(_novita_profile(), _chat("high", **sampling))
+    assert "thinking" not in payload
+    assert "output_config" not in payload
+    compatible = dialect_stream_payload(
+        _novita_profile(), _chat("high", temperature=1.0, top_p=0.95)
+    )
+    assert compatible["thinking"] == {"type": "adaptive", "display": "summarized"}

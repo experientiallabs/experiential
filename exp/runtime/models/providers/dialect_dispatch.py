@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING
 from urllib.parse import urlsplit
 
 from exp.common.core.artifacts import JsonObject
+from exp.common.models.known_models import known_model_metadata
 from exp.runtime.gateway.contracts import (
     GatewayApiSurface,
     GatewayMessage,
@@ -283,6 +284,49 @@ def reasoning_off_via_thinking_disabled(profile: GatewayWireProfile) -> bool:
     return _huawei_maas(profile) and profile.model_id.lower().startswith("deepseek-v4")
 
 
+_NOVITA_HOST = "api.novita.ai"
+# Novita's Anthropic passthrough ids: ``pa/<anthropic model id>-hs``.
+_NOVITA_CLAUDE_PREFIX = "pa/claude-"
+_NOVITA_CLAUDE_SUFFIX = "-hs"
+
+
+def novita_claude_thinking_model(profile: GatewayWireProfile) -> str | None:
+    """Return the Anthropic model behind a Novita Claude lane that takes Anthropic thinking fields.
+
+    Novita serves Claude over its OpenAI-compatible chat API under
+    ``pa/<anthropic id>-hs`` ids. It ignores ``reasoning_effort``; with
+    ``reasoning: {effort}`` the model thinks but the stream carries only
+    signatures, never text; with Anthropic's own fields, ``thinking: {type:
+    adaptive, display: summarized}`` and ``output_config.effort``, it streams
+    the summarized thinking as ``reasoning_content`` (pa/claude-opus-4-8-hs,
+    probed 2026-10-19). Only the adaptive generation qualifies (Anthropic
+    metadata ``supports_reasoning_effort``: opus-4-6, opus-4-7, opus-4-8,
+    sonnet-4-6): the 4.5 releases take a token budget instead, unprobed on
+    this host. Scoped to the Novita host and those ids so no other origin or
+    model changes its wire.
+
+    Args:
+        profile: The resolved connection's wire profile.
+
+    Returns:
+        The Anthropic model id to validate efforts against, or ``None``.
+    """
+    host = (urlsplit(profile.url).hostname or "").lower()
+    model = profile.model_id.strip().lower()
+    if (
+        profile.dialect != "openai_compatible"
+        or host != _NOVITA_HOST
+        or not model.startswith(_NOVITA_CLAUDE_PREFIX)
+        or not model.endswith(_NOVITA_CLAUDE_SUFFIX)
+    ):
+        return None
+    anthropic_model = model.removeprefix("pa/").removesuffix(_NOVITA_CLAUDE_SUFFIX)
+    known = known_model_metadata("anthropic", anthropic_model)
+    if known is None or not known.supports_reasoning_effort:
+        return None
+    return anthropic_model
+
+
 def _forces_tool_choice(request: GatewayRequest) -> bool:
     """Whether the request forces a tool call: required, a named tool, or required allowed tools."""
     choice = request.tool_choice
@@ -459,6 +503,7 @@ def dialect_stream_payload(
             reasoning_off_via_chat_template=reasoning_off_via_chat_template(profile),
             reasoning_via_thinking_toggle=reasoning_via_zai_thinking(profile),
             reasoning_off_via_thinking_disabled=reasoning_off_via_thinking_disabled(profile),
+            anthropic_thinking_model=novita_claude_thinking_model(profile),
         )
         qwen_budget_payload(profile, provider_request, payload)
         return payload

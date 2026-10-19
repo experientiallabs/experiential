@@ -8,9 +8,11 @@ OpenAI-compatible Chat builders live here; ``dialect_stream_payload`` in
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+
 from exp.common.core.artifacts import JsonObject, JsonValue
 from exp.common.models import ChatMaxTokensField
-from exp.runtime.gateway.contracts import GatewayRequest
+from exp.runtime.gateway.contracts import GatewayMessage, GatewayRequest
 from exp.runtime.gateway.json_object import JSON_OBJECT_SYSTEM_INSTRUCTION
 from exp.runtime.models.providers.deepseek import is_deepseek_model_id
 from exp.runtime.models.providers.errors import (
@@ -23,6 +25,7 @@ from exp.runtime.models.providers.instruction_turns import (
 )
 from exp.runtime.models.providers.openai_item_ids import openai_issued_item_id
 from exp.runtime.models.providers.reasoning_compat import (
+    anthropic_reasoning_effort,
     openai_reasoning_effort,
     reasoning_display_enabled,
     require_sampling_reasoning_compatibility,
@@ -313,6 +316,7 @@ def openai_compatible_stream_payload(
     reasoning_off_via_chat_template: bool = False,
     reasoning_via_thinking_toggle: bool = False,
     reasoning_off_via_thinking_disabled: bool = False,
+    anthropic_thinking_model: str | None = None,
 ) -> JsonObject:
     """Translate one canonical request to streaming Chat Completions JSON.
 
@@ -338,6 +342,13 @@ def openai_compatible_stream_payload(
             off with ``thinking: {"type": "disabled"}`` while its other efforts
             stay ``reasoning_effort`` (Huawei MaaS DeepSeek-V4), so effort
             ``none`` is sent as that switch and no ``reasoning_effort`` field.
+        anthropic_thinking_model: The Anthropic model id when this origin is a
+            Claude passthrough that takes Anthropic's own thinking fields
+            (Novita ``pa/claude-*-hs``): an effort other than ``none`` is sent as
+            ``thinking: {type: adaptive}`` (with ``display: summarized`` unless
+            the display kill switch is off) and ``output_config.effort``, and
+            no ``reasoning_effort`` field. See ``anthropic_thinking_fields`` for
+            the requests that keep thinking off.
         reasoning_output_exposed: Whether this rung replays the caller's plaintext
             ``reasoning_content`` history verbatim (exposure-gated Tencent/DeepSeek rung).
         deepseek_reasoning_history: Whether this rung is DeepSeek's own origin,
@@ -457,6 +468,12 @@ def openai_compatible_stream_payload(
                 **(template_kwargs if isinstance(template_kwargs, dict) else {}),
                 "enable_thinking": False,
             }
+        elif anthropic_thinking_model is not None:
+            payload.update(
+                anthropic_thinking_fields(
+                    anthropic_thinking_model, effective_reasoning_effort, request
+                )
+            )
         elif reasoning_wire_format == "reasoning":
             payload["reasoning"] = {"effort": effective_reasoning_effort}
         elif reasoning_wire_format == "reasoning_effort":
@@ -464,6 +481,64 @@ def openai_compatible_stream_payload(
                 model_id, effective_reasoning_effort
             )
     return payload
+
+
+def anthropic_thinking_fields(model_id: str, effort: str, request: GatewayRequest) -> JsonObject:
+    """Return the Anthropic thinking fields one Claude-passthrough chat request carries.
+
+    ``none`` sends nothing: the adaptive generations served this way run
+    without thinking when no config is sent. Any other effort turns adaptive
+    thinking on at that effort, validated against the model's own ladder.
+
+    Two requests keep today's shape (no thinking) rather than fail, because
+    Anthropic refuses them with thinking on and the provider error is not one
+    a failover recovers from:
+
+    * an open tool loop: Anthropic requires the signed thinking block that
+      preceded a tool call on the last assistant turn, and a chat history has
+      no place to carry it back to this host, so the turns after the first
+      tool call of a user turn send no thinking;
+    * sampling Anthropic forbids beside thinking: ``temperature`` other than
+      1, any ``top_k``, or ``top_p`` below 0.95.
+
+    Args:
+        model_id: Exact Anthropic model identifier behind the lane.
+        effort: The effective canonical effort.
+        request: The canonical request.
+
+    Returns:
+        The top-level fields to merge into the chat payload, possibly empty.
+    """
+    if (
+        effort == "none"
+        or _in_open_tool_loop(request.messages)
+        or _sampling_forbids_thinking(request)
+    ):
+        return {}
+    display = {"display": "summarized"} if reasoning_display_enabled() else {}
+    return {
+        "thinking": {"type": "adaptive", **display},
+        "output_config": {"effort": anthropic_reasoning_effort(model_id, effort)},
+    }
+
+
+def _sampling_forbids_thinking(request: GatewayRequest) -> bool:
+    """Whether the request samples in a way Anthropic refuses beside thinking."""
+    return (
+        (request.temperature is not None and request.temperature != 1)
+        or request.top_k is not None
+        or (request.top_p is not None and request.top_p < 0.95)
+    )
+
+
+def _in_open_tool_loop(messages: Sequence[GatewayMessage]) -> bool:
+    """Whether an assistant tool call follows the conversation's last user message."""
+    for message in reversed(messages):
+        if message.role == "user":
+            return False
+        if message.role == "assistant" and message.tool_calls:
+            return True
+    return False
 
 
 def _instruct_json_object(messages: list[JsonObject]) -> None:
