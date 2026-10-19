@@ -124,6 +124,18 @@ impl Normalizer {
                         .filter(|text| thought && !text.is_empty());
                     let retained_whole = part.contains_key("thoughtSignature")
                         || (thought && thought_text.is_none());
+                    // A visible image is delivered before its signature evidence,
+                    // so it commits the turn on arrival instead of waiting behind
+                    // a signature that runs near a MiB on image models.
+                    let image = match part.get("inlineData") {
+                        Some(image) if !thought => {
+                            let url = crate::image_output::gemini_inline_image(image)?;
+                            self.reserve_image_bytes(url.len())?;
+                            events.push(Event::Image(url));
+                            true
+                        }
+                        _ => false,
+                    };
                     if retained_whole {
                         // A signed generated image keeps its signature and media
                         // type as evidence; its inline bytes are charged to the
@@ -155,21 +167,7 @@ impl Normalizer {
                             continue;
                         }
                     }
-                    if let Some(image) = part.get("inlineData") {
-                        let media_type =
-                            image
-                                .get("mimeType")
-                                .and_then(Value::as_str)
-                                .ok_or_else(|| {
-                                    malformed("Gemini image requires a media type")
-                                        .with_retry(false, false)
-                                })?;
-                        let data = image.get("data").and_then(Value::as_str).ok_or_else(|| {
-                            malformed("Gemini image requires base64 data").with_retry(false, false)
-                        })?;
-                        let url = crate::image_output::inline_image(media_type, data)?;
-                        self.reserve_image_bytes(url.len())?;
-                        events.push(Event::Image(url));
+                    if image {
                         continue;
                     }
                     match part.get("text") {

@@ -246,17 +246,21 @@ pub fn withheld_overflow_failure() -> Failure {
 
 /// The settle-shaped usage object (`null` without a provider report).
 pub(crate) fn usage_json(usage: Option<&Usage>) -> Value {
-    match usage {
-        Some(usage) => json!({
-            "input_tokens": usage.input_tokens,
-            "output_tokens": usage.output_tokens,
-            "cached_input_tokens": usage.cached_input_tokens,
-            "cache_creation_input_tokens": usage.cache_creation_input_tokens,
-            "cache_creation_1h_input_tokens": usage.cache_creation_1h_input_tokens,
-            "reasoning_tokens": usage.reasoning_tokens,
-        }),
-        None => Value::Null,
+    let Some(usage) = usage else {
+        return Value::Null;
+    };
+    let mut wire = json!({
+        "input_tokens": usage.input_tokens,
+        "output_tokens": usage.output_tokens,
+        "cached_input_tokens": usage.cached_input_tokens,
+        "cache_creation_input_tokens": usage.cache_creation_input_tokens,
+        "cache_creation_1h_input_tokens": usage.cache_creation_1h_input_tokens,
+        "reasoning_tokens": usage.reasoning_tokens,
+    });
+    if let Some(image) = usage.image_output_tokens {
+        wire["image_output_tokens"] = json!(image);
     }
+    wire
 }
 
 /// The `tool_search_round` bridge argument: which rung and round, the

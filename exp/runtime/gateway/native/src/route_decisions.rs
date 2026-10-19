@@ -658,6 +658,7 @@ fn decision_usage(payload: &Value) -> Result<Usage, Failure> {
         cache_creation_input_tokens: None,
         cache_creation_1h_input_tokens: None,
         reasoning_tokens: None,
+        image_output_tokens: None,
         billed_units: None,
         cache_writes_read_back: false,
     })

@@ -130,6 +130,20 @@ def test_web_search_requests_ride_on_usage_but_never_make_usage_alone() -> None:
         GatewayUsage(input_tokens=1, output_tokens=1, web_search_requests=-1)
 
 
+def test_image_output_tokens_are_optional_and_carried_as_reported() -> None:
+    """Generated-image tokens stay unknown by default and a reported count is never rejected.
+
+    Gemini 3 thinking image models report more IMAGE tokens than candidate tokens in their
+    final meter; settlement must still accept the delivered image's usage.
+    """
+    assert GatewayUsage(input_tokens=1, output_tokens=1).image_output_tokens is None
+    usage = GatewayUsage(input_tokens=9, output_tokens=1206, image_output_tokens=1120)
+    assert usage.image_output_tokens == 1120
+    assert GatewayUsage(input_tokens=9, output_tokens=155, image_output_tokens=1120)
+    with pytest.raises(ValidationError):
+        GatewayUsage(input_tokens=9, output_tokens=10, image_output_tokens=-1)
+
+
 def test_tool_search_requests_ride_on_usage_but_never_make_usage_alone() -> None:
     """The gateway-executed tool-search count mirrors ``web_search_requests`` exactly.
 

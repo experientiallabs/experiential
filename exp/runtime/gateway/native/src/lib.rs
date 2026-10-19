@@ -557,6 +557,9 @@ fn parse_fixture_events(events_json: &str) -> Result<Vec<events::Event>, String>
                 reasoning_tokens: object
                     .get("reasoning_tokens")
                     .and_then(serde_json::Value::as_u64),
+                image_output_tokens: object
+                    .get("image_output_tokens")
+                    .and_then(serde_json::Value::as_u64),
                 billed_units: None,
                 cache_writes_read_back: false,
             }),

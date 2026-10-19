@@ -2,13 +2,27 @@
 //! ledger counts, the OpenAI/Gemini/Bedrock usage mappers, and the reasoning
 //! subset-folding rules documented on `crate::events`.
 
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use super::Usage;
 use cache_subsets::{cache_subsets, separate_written_reads, validate_cache_subsets};
+use image_tokens::{gemini_image_output_tokens, openai_image_output_tokens};
 
 #[path = "usage/cache_subsets.rs"]
 mod cache_subsets;
+#[path = "usage/image_tokens.rs"]
+mod image_tokens;
+
+/// Media units one attempt consumed or produced (mirrors python `BilledUnits`;
+/// `quantity_milli` is thousandths of a unit, `variant` the priced SKU).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BilledUnits {
+    pub kind: String,
+    #[serde(default)]
+    pub variant: String,
+    pub quantity_milli: u64,
+}
 
 impl Usage {
     /// Mark unknown subsets that an OpenAI-compatible shape represents as zero.
@@ -51,6 +65,7 @@ impl Usage {
             .cache_creation_input_tokens
             .max(newer.cache_creation_input_tokens);
         self.reasoning_tokens = self.reasoning_tokens.max(newer.reasoning_tokens);
+        self.image_output_tokens = self.image_output_tokens.max(newer.image_output_tokens);
         self.cache_writes_read_back |= newer.cache_writes_read_back;
     }
 
@@ -292,6 +307,7 @@ impl OpenAiUsageAccumulator {
         let reasoning_tokens = nested_reasoning
             .or(top_level_reasoning)
             .filter(|_| !unreported[3]);
+        let image_output_tokens = openai_image_output_tokens(object, output_details)?;
         let total_tokens = count_if_present(object, "total_tokens", "OpenAI usage")?;
         let (cached_input_tokens, cache_creation_input_tokens) = cache_subsets(
             object,
@@ -345,6 +361,7 @@ impl OpenAiUsageAccumulator {
             cache_creation_input_tokens,
             cache_creation_1h_input_tokens: covering_writes.and(cache_creation_1h_input_tokens),
             reasoning_tokens,
+            image_output_tokens,
             billed_units: None,
             cache_writes_read_back: false,
         });
@@ -501,6 +518,7 @@ pub fn gemini_usage(value: &Value) -> Result<Usage, String> {
         cache_creation_input_tokens: None,
         cache_creation_1h_input_tokens: None,
         reasoning_tokens: Some(reasoning_tokens),
+        image_output_tokens: gemini_image_output_tokens(object)?,
         billed_units: None,
         cache_writes_read_back: false,
     })
@@ -542,6 +560,7 @@ pub fn bedrock_usage(value: Option<&Value>) -> Result<Usage, String> {
         )?,
         cache_creation_1h_input_tokens: bedrock_cache_hour_subset(usage, cache_write)?,
         reasoning_tokens: None,
+        image_output_tokens: None,
         billed_units: None,
         cache_writes_read_back: false,
     })

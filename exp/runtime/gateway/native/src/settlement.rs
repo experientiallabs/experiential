@@ -168,6 +168,11 @@ fn settle_argument(
     if let Some(billed) = usage.and_then(|usage| usage.billed_units.as_ref()) {
         argument["usage"]["billed_units"] = json!(billed);
     }
+    // The generated-image subset of output, priced at the image-output rate;
+    // likewise absent when unreported.
+    if let Some(image) = usage.and_then(|usage| usage.image_output_tokens) {
+        argument["usage"]["image_output_tokens"] = json!(image);
+    }
     compact_json(&argument)
 }
 

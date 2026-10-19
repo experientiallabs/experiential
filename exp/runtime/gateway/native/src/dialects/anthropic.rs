@@ -41,6 +41,7 @@ impl Normalizer {
                 .filter(|_| self.cache_write.is_some_and(|count| count > 0)),
             // Thinking is billed inside output with no reported subset.
             reasoning_tokens: None,
+            image_output_tokens: None,
             billed_units: None,
             cache_writes_read_back: false,
         })

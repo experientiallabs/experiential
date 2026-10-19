@@ -868,3 +868,86 @@ fn cache_subsets_cannot_exceed_openai_total_input() {
     assert_eq!(usage.cached_input_tokens, Some(6));
     assert_eq!(usage.cache_creation_input_tokens, Some(4));
 }
+
+#[test]
+fn gemini_image_modality_tokens_are_an_output_subset_beside_reasoning() {
+    let usage = gemini_usage(&json!({
+        "promptTokenCount": 9,
+        "candidatesTokenCount": 1174,
+        "thoughtsTokenCount": 32,
+        "candidatesTokensDetails": [
+            {"modality": "TEXT", "tokenCount": 54},
+            {"modality": "IMAGE", "tokenCount": 1120},
+        ],
+    }))
+    .unwrap();
+    assert_eq!(usage.output_tokens, Some(1206));
+    assert_eq!(usage.reasoning_tokens, Some(32));
+    assert_eq!(usage.image_output_tokens, Some(1120));
+    // A text-only breakdown or no breakdown reports no image count at all.
+    for details in [json!([{"modality": "TEXT", "tokenCount": 2}]), Value::Null] {
+        let text = gemini_usage(&json!({
+            "promptTokenCount": 1,
+            "candidatesTokenCount": 2,
+            "candidatesTokensDetails": details,
+        }))
+        .unwrap();
+        assert_eq!(text.image_output_tokens, None);
+    }
+    // Gemini 3 Pro Image's final meter with thoughts on (live, 2026-10-18)
+    // names more IMAGE tokens than candidates; the count is carried as reported.
+    let thinking = gemini_usage(&json!({
+        "promptTokenCount": 9,
+        "candidatesTokenCount": 55,
+        "thoughtsTokenCount": 100,
+        "candidatesTokensDetails": [{"modality": "IMAGE", "tokenCount": 1120}],
+    }))
+    .unwrap();
+    assert_eq!(thinking.output_tokens, Some(155));
+    assert_eq!(thinking.image_output_tokens, Some(1120));
+    for details in [
+        json!({"modality": "IMAGE"}),
+        json!(["IMAGE"]),
+        json!([{"modality": "IMAGE", "tokenCount": -1}]),
+    ] {
+        assert!(gemini_usage(&json!({
+            "candidatesTokenCount": 2,
+            "candidatesTokensDetails": details,
+        }))
+        .is_err());
+    }
+}
+
+#[test]
+fn openrouter_image_tokens_are_an_output_detail_beside_reasoning() {
+    let usage = openai_compatible_usage(&json!({
+        "prompt_tokens": 9,
+        "completion_tokens": 1300,
+        "total_tokens": 1309,
+        "completion_tokens_details": {"reasoning_tokens": 120, "image_tokens": 1120},
+    }))
+    .unwrap();
+    assert_eq!(usage.output_tokens, Some(1300));
+    assert_eq!(usage.reasoning_tokens, Some(120));
+    assert_eq!(usage.image_output_tokens, Some(1120));
+    let text = openai_compatible_usage(&json!({"prompt_tokens": 1, "completion_tokens": 2}));
+    assert_eq!(text.unwrap().image_output_tokens, None);
+    assert!(openai_compatible_usage(&json!({
+        "prompt_tokens": 1,
+        "completion_tokens": 2,
+        "completion_tokens_details": {"image_tokens": "3"},
+    }))
+    .is_err());
+    // A sparse image report survives a later report that omits it.
+    let mut accumulator = OpenAiUsageAccumulator::default();
+    let sparse = json!({"completion_tokens_details": {"image_tokens": 5}});
+    accumulator.update_chat(&sparse).unwrap();
+    let totals = json!({"prompt_tokens": 1, "completion_tokens": 6});
+    assert_eq!(
+        accumulator
+            .update_chat(&totals)
+            .unwrap()
+            .image_output_tokens,
+        Some(5)
+    );
+}

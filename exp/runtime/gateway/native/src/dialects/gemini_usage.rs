@@ -16,6 +16,7 @@ struct MeterFields {
     input: u64,
     candidates: u64,
     thoughts: Option<u64>,
+    image: Option<u64>,
 }
 
 #[derive(Default)]
@@ -71,6 +72,7 @@ impl Normalizer {
             input: previous.input.max(input.unwrap_or(0)),
             candidates: previous.candidates.max(candidates.unwrap_or(0)),
             thoughts: previous.thoughts.max(parsed.reasoning_tokens),
+            image: previous.image.max(parsed.image_output_tokens),
         };
         let output = bounded_ledger_sum(
             &[fields.candidates, fields.thoughts.unwrap_or(0)],
@@ -113,6 +115,7 @@ impl Normalizer {
             cache_creation_input_tokens: writes,
             cache_creation_1h_input_tokens: writes.map(|_| 0),
             reasoning_tokens: fields.thoughts,
+            image_output_tokens: fields.image,
             billed_units: None,
             cache_writes_read_back: writes.is_some(),
         });

@@ -993,6 +993,7 @@ fn a_first_dial_reserved_on_a_failover_only_rung_fails_closed() {
 }
 
 mod capture_logprobs_tests;
+mod gemini_image_tests;
 mod logprobs_tests;
 mod pre_first_byte_tests;
 mod responses_logprobs_tests;

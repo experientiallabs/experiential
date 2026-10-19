@@ -10,7 +10,8 @@ output items with a lifecycle ``status`` or ``phase`` but without the item
 Responses ``stream_options``, OpenCode sends Anthropic's ``output_config`` on
 Chat, WorkBuddy CLI tags Chat messages with ``agent``, and agents attach
 determinism and cache-retention hints (``seed``, ``prompt_cache_retention``) no
-route forwards. A
+route forwards, and image clients send OpenRouter's Chat ``modalities`` of text
+and image, which the route's own declared output modalities already decide. A
 named 400 for any of them fails every request the client makes, so each is
 removed here, before the compatibility manifest and the wire models read the
 body, and every removal that changes what the caller asked for is named in
@@ -359,6 +360,36 @@ def drop_unforwarded_hints(payload: JsonObject) -> tuple[JsonObject, tuple[str, 
     return {key: value for key, value in payload.items() if key not in removed}, disclosures
 
 
+_SERVED_CHAT_MODALITIES = frozenset({"text", "image"})
+
+
+def accept_chat_output_modalities(payload: JsonObject) -> JsonObject:
+    """Consume a Chat ``modalities`` list naming only text and image output.
+
+    Image clients send ``["image", "text"]`` because OpenRouter requires it for
+    image output. An image-emitting route already asks its provider for text
+    and images, and a text route's answer is text either way, so the list is
+    removed without disclosure. Audio output, unknown or repeated modalities,
+    and malformed lists stay in the payload and keep their named refusal.
+
+    Args:
+        payload: Parsed Chat Completions body.
+
+    Returns:
+        The payload without an accepted ``modalities`` list.
+    """
+    modalities = payload.get("modalities")
+    served = modalities is None or (
+        isinstance(modalities, list)
+        and bool(modalities)
+        and all(isinstance(value, str) and value in _SERVED_CHAT_MODALITIES for value in modalities)
+        and len(set(modalities)) == len(modalities)
+    )
+    if "modalities" not in payload or not served:
+        return payload
+    return {key: value for key, value in payload.items() if key != "modalities"}
+
+
 def translate_chat_output_config(payload: JsonObject) -> tuple[JsonObject, tuple[str, ...]]:
     """Consume Anthropic's ``output_config`` sent on a Chat request.
 
@@ -562,6 +593,7 @@ def repair_chat(
     payload, hints = drop_unforwarded_hints(payload)
     payload, stream = drop_chat_stream_options_without_stream(payload)
     payload, display = drop_chat_thinking_display(payload)
+    payload = accept_chat_output_modalities(payload)
     return payload, (
         *disclosures,
         *annotations,

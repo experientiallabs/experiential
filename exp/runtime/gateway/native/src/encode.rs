@@ -581,7 +581,7 @@ fn streaming_chat_usage(usage: &Usage) -> Value {
         "completion_tokens": output,
         "total_tokens": input + output,
         "prompt_tokens_details": chat_input_details(usage, true),
-        "completion_tokens_details": {"reasoning_tokens": usage.reasoning_tokens.unwrap_or(0)},
+        "completion_tokens_details": chat_output_details(usage, true),
     });
     let unreported = usage.unreported_token_details();
     if !unreported.is_empty() {
@@ -612,6 +612,23 @@ fn chat_input_details(usage: &Usage, streaming: bool) -> Value {
     }
 }
 
+/// Output subsets: streaming always reports reasoning (zero when unknown), and
+/// generated-image tokens appear under OpenRouter's `image_tokens` when known.
+fn chat_output_details(usage: &Usage, streaming: bool) -> Value {
+    let mut details = serde_json::Map::new();
+    if let Some(reasoning) = usage.reasoning_tokens.or(streaming.then_some(0)) {
+        details.insert("reasoning_tokens".into(), json!(reasoning));
+    }
+    if let Some(image) = usage.image_output_tokens {
+        details.insert("image_tokens".into(), json!(image));
+    }
+    if details.is_empty() {
+        Value::Null
+    } else {
+        Value::Object(details)
+    }
+}
+
 /// Non-streaming usage shape from `exp.runtime.openai_protocol.response.chat_usage`.
 fn completed_chat_usage(usage: Option<&Usage>) -> Value {
     let usage = match usage {
@@ -620,17 +637,12 @@ fn completed_chat_usage(usage: Option<&Usage>) -> Value {
     };
     let input = usage.input_tokens.unwrap_or(0);
     let output = usage.output_tokens.unwrap_or(0);
-    let details = chat_input_details(usage, false);
-    let output_details = match usage.reasoning_tokens {
-        Some(reasoning) => json!({"reasoning_tokens": reasoning}),
-        None => Value::Null,
-    };
     json!({
         "prompt_tokens": input,
         "completion_tokens": output,
         "total_tokens": input + output,
-        "prompt_tokens_details": details,
-        "completion_tokens_details": output_details,
+        "prompt_tokens_details": chat_input_details(usage, false),
+        "completion_tokens_details": chat_output_details(usage, false),
     })
 }
 

@@ -79,6 +79,20 @@ pub fn inline_image(media_type: &str, data: &str) -> Result<String, Failure> {
     Ok(format!("data:{media_type};base64,{data}"))
 }
 
+/// Validate one Gemini `inlineData` object into the delivered data URL.
+pub fn gemini_inline_image(image: &Value) -> Result<String, Failure> {
+    let field = |key: &str, message: &str| {
+        image.get(key).and_then(Value::as_str).ok_or_else(|| {
+            Failure::new(FailureClass::MalformedResponse, message).with_retry(false, false)
+        })
+    };
+    let media_type = field("mimeType", "Gemini image requires a media type")?;
+    inline_image(
+        media_type,
+        field("data", "Gemini image requires base64 data")?,
+    )
+}
+
 /// Decode the OpenRouter-style image URL envelope without fetching external URLs.
 pub fn chat_image(value: &Value) -> Result<String, Failure> {
     let url = value
@@ -199,5 +213,39 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, Event::TextDelta(value) if value == "A cat")));
         }
+    }
+
+    #[test]
+    fn signed_gemini_image_is_delivered_before_its_signature_and_metered_as_image_tokens() {
+        // Live shape: one non-thought image part whose signature runs near a
+        // MiB, then an empty text part with the finish and image-modality usage.
+        let signature = "s".repeat(200_000);
+        let url = inline_image("image/png", PNG).unwrap();
+        let mut normalizer = Normalizer::new(Dialect::GeminiGenerateContent);
+        let mut events = Vec::new();
+        for payload in [
+            json!({"candidates":[{"content":{"parts":[{"inlineData":{"mimeType":"image/png","data":PNG},"thoughtSignature":signature}]}}]}),
+            json!({"candidates":[{"content":{"parts":[{"text":""}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":9,"candidatesTokenCount":1174,"thoughtsTokenCount":32,"candidatesTokensDetails":[{"modality":"IMAGE","tokenCount":1120}]}}),
+        ] {
+            let data = payload.to_string();
+            events.extend(normalizer.feed(&SseEvent { event: None, data }).unwrap());
+        }
+        events.extend(normalizer.finish_metadata_drain());
+        assert!(matches!(&events[0], Event::Image(value) if value == &url));
+        let Event::GeminiThoughtPart(part) = &events[1] else {
+            panic!("the signature evidence follows the delivered image: {events:?}");
+        };
+        assert_eq!(part["thoughtSignature"], signature.as_str());
+        assert!(part["inlineData"].get("data").is_none());
+        let usage = events
+            .iter()
+            .find_map(|event| match event {
+                Event::Usage(usage) => Some(usage),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(usage.output_tokens, Some(1206));
+        assert_eq!(usage.reasoning_tokens, Some(32));
+        assert_eq!(usage.image_output_tokens, Some(1120));
     }
 }

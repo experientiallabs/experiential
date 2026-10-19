@@ -445,6 +445,7 @@ fn settle_argument_preserves_upstream_provider_and_cache_ttl_usage_together() {
         cache_creation_input_tokens: Some(600),
         cache_creation_1h_input_tokens: Some(200),
         reasoning_tokens: None,
+        image_output_tokens: None,
         billed_units: None,
         cache_writes_read_back: false,
     };
@@ -697,4 +698,37 @@ fn retry_after_fills_only_throttled_failures_and_never_overwrites() {
     let internal =
         crate::upstream::transport_failure(Some(500)).with_rate_limit_facts(None, Some(30));
     assert_eq!(internal.retry_after_seconds, None);
+}
+
+#[test]
+fn settle_argument_carries_image_output_tokens_only_when_reported() {
+    for image in [None, Some(1120)] {
+        let usage = Usage {
+            input_tokens: Some(9),
+            output_tokens: Some(1206),
+            reasoning_tokens: Some(32),
+            image_output_tokens: image,
+            ..Usage::default()
+        };
+        let argument = settle_argument(
+            "req",
+            "att",
+            "completed",
+            Some(&usage),
+            &[],
+            None,
+            true,
+            true,
+            None,
+            None,
+            None,
+            0,
+            0,
+        );
+        let parsed: Value = serde_json::from_str(&argument).expect("valid json");
+        assert_eq!(
+            parsed["usage"].get("image_output_tokens"),
+            image.map(|count| json!(count)).as_ref()
+        );
+    }
 }

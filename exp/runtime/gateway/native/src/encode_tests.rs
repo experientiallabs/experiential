@@ -43,6 +43,7 @@ fn chat_cache_ttl_survives_two_gateway_hops_without_inventing_zero() {
             cache_creation_input_tokens: Some(100),
             cache_creation_1h_input_tokens: hour,
             reasoning_tokens: Some(5),
+            image_output_tokens: None,
             billed_units: None,
             cache_writes_read_back: false,
         };
@@ -782,4 +783,34 @@ fn chat_reports_an_estimated_reasoning_count_when_the_provider_publishes_none() 
         completed.usage.expect("usage aggregates").reasoning_tokens,
         None
     );
+}
+
+#[test]
+fn chat_usage_reports_generated_image_tokens_under_openrouters_detail_key() {
+    let usage = Usage {
+        input_tokens: Some(9),
+        output_tokens: Some(1206),
+        reasoning_tokens: Some(32),
+        image_output_tokens: Some(1120),
+        ..Usage::default()
+    };
+    for wire in [
+        streaming_chat_usage(&usage),
+        completed_chat_usage(Some(&usage)),
+    ] {
+        assert_eq!(
+            wire["completion_tokens_details"],
+            json!({"reasoning_tokens": 32, "image_tokens": 1120})
+        );
+    }
+    let text = Usage {
+        image_output_tokens: None,
+        reasoning_tokens: None,
+        ..usage
+    };
+    assert_eq!(
+        streaming_chat_usage(&text)["completion_tokens_details"],
+        json!({"reasoning_tokens": 0})
+    );
+    assert!(completed_chat_usage(Some(&text))["completion_tokens_details"].is_null());
 }

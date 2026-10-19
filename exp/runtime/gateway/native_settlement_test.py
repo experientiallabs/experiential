@@ -299,6 +299,24 @@ def test_terminal_from_settlement_preserves_cache_write_usage_and_upstream_provi
     assert upstream_provider_from_settlement(payload) == "Azure"
 
 
+def test_terminal_from_settlement_preserves_image_output_tokens() -> None:
+    """The native image-output subset reaches the typed usage the control plane prices."""
+    payload: JsonObject = {
+        "outcome": "completed",
+        "usage": {"input_tokens": 9, "output_tokens": 1206, "image_output_tokens": 1120},
+        "tool_names": [],
+        "failure": None,
+    }
+    terminal, _failure = terminal_from_settlement(payload)
+    assert terminal.usage is not None
+    assert terminal.usage.image_output_tokens == 1120
+    text, _failure = terminal_from_settlement(
+        {**payload, "usage": {"input_tokens": 9, "output_tokens": 10}}
+    )
+    assert text.usage is not None
+    assert text.usage.image_output_tokens is None
+
+
 def test_terminal_from_settlement_normalizes_usage_and_tools() -> None:
     """Completed payloads retain token counts and ordered tool names."""
     terminal, failure = terminal_from_settlement(

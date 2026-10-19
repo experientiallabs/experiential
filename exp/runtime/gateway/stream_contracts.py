@@ -116,6 +116,11 @@ class GatewayUsage(ContractModel):
         cache_creation_input_tokens: Cache-write subset of the input.
         cache_creation_1h_input_tokens: One-hour subset of the cache writes.
         reasoning_tokens: Reasoning subset of the output.
+        image_output_tokens: Generated-image detail of the output, disjoint from
+            ``reasoning_tokens`` and priced at a separate image-output rate; None when
+            the provider reported no image modality count. Carried exactly as reported:
+            a Gemini 3 thinking image model's final meter can exceed its candidate
+            count, so pricing bounds it by ``output_tokens``.
         tool_names: Invoked tool names in first-use order.
         web_search_requests: Gateway-executed web searches billed to the attempt.
         tool_search_requests: Gateway-executed tool-search rounds billed to the attempt.
@@ -135,6 +140,7 @@ class GatewayUsage(ContractModel):
     """Observed 1-hour subset of cache writes; zero proves all writes use 5m.
     None means no complete TTL breakdown was reported, so write cost is unknown."""
     reasoning_tokens: int | None = Field(default=None, ge=0)
+    image_output_tokens: int | None = Field(default=None, ge=0)
     tool_names: tuple[str, ...] = ()
     """Invoked tool names in first-use order, names only and never arguments."""
     web_search_requests: int = Field(default=0, ge=0)
