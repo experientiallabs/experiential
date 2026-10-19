@@ -380,10 +380,14 @@ class GatewayMessage(ContractModel):
                 )
             if all(part.kind == "text" for part in self.content_parts):
                 raise ValueError("content parts are retained only for multimodal messages")
-            if self.role in ("tool", "assistant") and any(
+            if self.role == "tool" and any(
+                part.kind not in ("text", "image", "document") for part in self.content_parts
+            ):
+                raise ValueError("tool messages carry only text, image, and document parts")
+            if self.role == "assistant" and any(
                 part.kind not in ("text", "image") for part in self.content_parts
             ):
-                raise ValueError(f"{self.role} messages carry only text and image parts")
+                raise ValueError("assistant messages carry only text and image parts")
             texts = [part.text for part in self.content_parts if part.kind == "text"]
             if (self.content or "") != "".join(texts):
                 raise ValueError("content parts must flatten to the message content")

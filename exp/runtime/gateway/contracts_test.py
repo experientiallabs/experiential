@@ -1154,12 +1154,14 @@ def test_json_object_output_is_serialization_inert_but_binds_replay_identity() -
         )
 
 
-def test_tool_messages_carry_text_and_image_parts_only() -> None:
-    """A tool screenshot rides the tool message; other media kinds stay out."""
+def test_tool_messages_carry_text_image_and_document_parts() -> None:
+    """A tool screenshot or tool-returned PDF rides the tool message; other
+    media kinds stay out, and an assistant turn stays text and image only."""
     from exp.common.models.content import (
         DocumentContentPart,
         ImageContentPart,
         TextContentPart,
+        VideoContentPart,
     )
 
     message = GatewayMessage(
@@ -1169,15 +1171,23 @@ def test_tool_messages_carry_text_and_image_parts_only() -> None:
         content_parts=(
             TextContentPart(text="tool said:"),
             ImageContentPart(media_type="image/png", data="aGk="),
+            DocumentContentPart(media_type="application/pdf", data="aGk=", name="report.pdf"),
         ),
     )
-    assert [part.kind for part in message.content_parts] == ["text", "image"]
+    assert [part.kind for part in message.content_parts] == ["text", "image", "document"]
     assert message.images
+    assert message.documents[0].name == "report.pdf"
 
-    with pytest.raises(ValidationError, match="text and image parts"):
+    with pytest.raises(ValidationError, match="carry only text, image, and document parts"):
         GatewayMessage(
             role="tool",
             tool_call_id="call-1",
+            content="",
+            content_parts=(VideoContentPart(media_type="video/mp4", data="aGk="),),
+        )
+    with pytest.raises(ValidationError, match="assistant messages carry only text and image"):
+        GatewayMessage(
+            role="assistant",
             content="",
             content_parts=(DocumentContentPart(media_type="application/pdf", data="aGk="),),
         )

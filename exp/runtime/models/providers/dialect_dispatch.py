@@ -52,9 +52,19 @@ TOOL_RESULT_IMAGE_DROP_DISCLOSURE = "messages.content.tool_result.image->placeho
 TOOL_RESULT_IMAGE_FOLD_DISCLOSURE = "messages.content.tool_result.image->following_user_message"
 """Disclosed when a rung carries tool-result images in a user turn that follows
 the tool run (Chat Completions and Gemini define no image carrier inside a tool
-result; see ``wire_messages.fold_tool_result_images``)."""
+result; see ``wire_messages.fold_tool_result_attachments``)."""
 TOOL_RESULT_IMAGE_FOLD_DIALECTS = frozenset({"openai_compatible", "gemini_generate_content"})
 """Dialects whose payload builders fold tool-result images into a user turn."""
+TOOL_RESULT_DOCUMENT_FOLD_DISCLOSURE = (
+    "messages.content.tool_result.document->following_user_message"
+)
+"""Disclosed when a rung carries tool-result documents in a user turn that
+follows the tool run (only native Anthropic Messages serves a document inside a
+tool result; see ``wire_messages.fold_tool_result_attachments``)."""
+TOOL_RESULT_DOCUMENT_FOLD_DIALECTS = frozenset(
+    {"openai_compatible", "openai_responses", "gemini_generate_content", "bedrock_converse_stream"}
+)
+"""Dialects whose payload builders fold tool-result documents into a user turn."""
 THINKING_HISTORY_DROP_DISCLOSURE = "messages.thinking->dropped(unsupported_by_provider)"
 GEMINI_MISSING_TOOL_RESULT_DISCLOSURE = "messages.tool_results.missing->placeholder"
 """Disclosed when a Gemini rung answers an unanswered function call with a placeholder.
@@ -63,6 +73,41 @@ Gemini refuses a turn whose following content does not answer every function
 call of the model turn before it; a history whose call never got a result
 (an interrupted client) is served with ``GEMINI_MISSING_TOOL_RESULT`` in that
 call's slot instead (see ``gemini_requests._CallTurn``)."""
+
+
+def disclose_tool_result_attachment_folds(
+    profiles: Sequence[GatewayWireProfile],
+    messages: tuple[GatewayMessage, ...],
+    ignored: list[str],
+) -> None:
+    """Disclose, once per kind, the fold a rung applies to tool-result attachments.
+
+    An attachment a dialect cannot carry inside a tool result rides the user
+    turn after the tool run instead (see ``wire_messages.fold_tool_result_attachments``).
+
+    Args:
+        profiles: Ordered wire profiles of the route.
+        messages: The request's canonical messages.
+        ignored: The route's disclosure list, appended in place.
+    """
+    for dialects, disclosure, carries in (
+        (
+            TOOL_RESULT_IMAGE_FOLD_DIALECTS,
+            TOOL_RESULT_IMAGE_FOLD_DISCLOSURE,
+            lambda message: bool(message.images),
+        ),
+        (
+            TOOL_RESULT_DOCUMENT_FOLD_DIALECTS,
+            TOOL_RESULT_DOCUMENT_FOLD_DISCLOSURE,
+            lambda message: bool(message.documents),
+        ),
+    ):
+        if (
+            any(message.role == "tool" and carries(message) for message in messages)
+            and any(profile.dialect in dialects for profile in profiles)
+            and disclosure not in ignored
+        ):
+            ignored.append(disclosure)
 
 
 def disclose_gemini_missing_tool_results(

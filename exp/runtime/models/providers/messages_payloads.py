@@ -38,7 +38,7 @@ from exp.runtime.models.providers.reasoning_compat import (
 )
 from exp.runtime.models.providers.wire_messages import (
     anthropic_blocks,
-    fold_tool_result_images,
+    fold_tool_result_attachments,
     retained_cache_marked_blocks,
 )
 from exp.runtime.openai_protocol.model_adapter import model_request as gateway_model_request
@@ -528,11 +528,16 @@ def gemini_generate_content_stream_payload(
         ProviderResponseError: A message cannot preserve its tool linkage on
             Gemini's wire.
     """
-    # Gemini's functionResponse carries JSON text; a tool screenshot rides a
-    # following user content (one content per message, no role alternation
-    # rule on this wire). The native ``functionResponse.parts`` carrier is
-    # documented for the Gemini 3 series only and is not adopted unprobed.
-    folded = request.model_copy(update={"messages": fold_tool_result_images(request.messages)})
+    # Gemini's functionResponse carries JSON text; a tool screenshot or a
+    # tool-returned document rides a following user content (one content per
+    # message, no role alternation rule on this wire). The native
+    # ``functionResponse.parts`` carrier is documented for the Gemini 3
+    # series only and is not adopted unprobed.
+    folded = request.model_copy(
+        update={
+            "messages": fold_tool_result_attachments(request.messages, kinds=("image", "document"))
+        }
+    )
     try:
         return gemini_generate_request(
             model_id,
@@ -593,6 +598,13 @@ def bedrock_converse_stream_payload(
         ProviderResponseError: A message cannot be represented without
             dropping tool context.
     """
+    # A tool-returned document rides a following user turn: this wire's
+    # toolResult carries text, image, and JSON blocks, and a user turn carries
+    # the document natively (see the fold's docstring). A native toolResult
+    # document block is the unprobed follow-up this fold stands in for.
+    request = request.model_copy(
+        update={"messages": fold_tool_result_attachments(request.messages, kinds=("document",))}
+    )
     try:
         payload = converse_body(
             request,

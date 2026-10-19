@@ -3,8 +3,8 @@
 The strict wire models live beside the decoder in ``requests.py``; this module
 turns their Pydantic rejections into the stable, field-specific public errors
 the HTTP layer renders in the Anthropic envelope, and recognizes the
-known-but-unsupported content blocks (video, audio, documents inside a
-``tool_result``) whose union miss would otherwise misdirect the caller.
+known-but-unsupported content blocks (video and audio, at the top level or
+inside a ``tool_result``) whose union miss would otherwise misdirect the caller.
 """
 
 from __future__ import annotations
@@ -45,10 +45,6 @@ _MESSAGE_BLOCK_TYPES = frozenset(
 A block outside it misses every union arm at the same depth, and the deepest
 error would name the first arm (``Input should be 'text'``) instead of the
 block the caller actually sent."""
-_REJECTED_TOOL_RESULT_BLOCK_HINTS = {
-    "document": "document blocks are not supported inside tool_result content",
-    **_REJECTED_BLOCK_HINTS,
-}
 
 
 def validate_wire[WireModelT: BaseModel](payload: JsonObject, wire: type[WireModelT]) -> WireModelT:
@@ -158,12 +154,12 @@ def rejected_block_hint(payload: JsonObject) -> tuple[str, str] | None:
                         continue
                     inner_type = str(cast(JsonObject, inner).get("type"))
                     inner_param = f"{param}.content.{inner_index}"
-                    hint = _REJECTED_TOOL_RESULT_BLOCK_HINTS.get(inner_type)
+                    hint = _REJECTED_BLOCK_HINTS.get(inner_type)
                     if hint is not None:
                         return inner_param, hint
-                    if inner_type not in ("text", "image"):
+                    if inner_type not in ("text", "image", "document"):
                         return inner_param, (
                             f"unsupported block type '{inner_type}' inside tool_result "
-                            "content; only text and image sub-blocks are supported."
+                            "content; only text, image, and document sub-blocks are supported."
                         )
     return None

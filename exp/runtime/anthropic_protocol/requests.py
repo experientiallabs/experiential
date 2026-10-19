@@ -13,9 +13,8 @@ top-level automatic marker), and dropped on wires that do not cache a marked
 block because a cache hint changes cost, not semantics; ``image`` and PDF
 ``document`` blocks are retained as canonical content parts so a route that
 declares the matching input capability carries them — including ``image``
-sub-blocks inside ``tool_result`` content (tool screenshots), which ride the
-tool message's content parts; a document inside ``tool_result`` content is
-rejected loudly because the serving surface cannot preserve it there;
+and ``document`` sub-blocks inside ``tool_result`` content (tool screenshots
+and tool-returned files), which ride the tool message's content parts;
 ``video`` blocks are rejected because the wire defines none. Unknown or
 unsupported fields are rejected with a field-specific error, never silently
 dropped. Errors raise
@@ -51,9 +50,12 @@ from exp.runtime.anthropic_protocol.media_blocks import (
     CacheControl,
     DocumentBlock,
     ImageBlock,
+    cache_marker,
     document_part_from_block,
     image_part_from_block,
-    text_document_text,
+    plain_document_text,
+    tool_result_parts,
+    tool_result_text,
 )
 from exp.runtime.anthropic_protocol.reasoning_channels import (
     ReasoningConfig,
@@ -139,10 +141,11 @@ class _ToolResultBlock(AnthropicWireModel):
 
     type: Literal["tool_result"]
     tool_use_id: str = Field(min_length=1, max_length=256)
-    # Image sub-blocks are real Anthropic wire (tool screenshots: Claude Code's
-    # Read-on-image and computer-use tools emit them routinely); rejecting them
-    # wedges the caller's session because the block is baked into history.
-    content: str | tuple[_TextBlock | ImageBlock, ...] | None = None
+    # Image and PDF document sub-blocks are real Anthropic wire (tool
+    # screenshots and tool-returned files: Claude Code's Read tool emits both
+    # routinely); rejecting them wedges the caller's session because the block
+    # is baked into history.
+    content: str | tuple[_TextBlock | ImageBlock | DocumentBlock, ...] | None = None
     is_error: bool = False
     cache_control: CacheControl | None = None
 
@@ -863,28 +866,19 @@ def _gateway_messages(message: _Message, index: int) -> list[GatewayMessage]:
                     f"{param}.content.{block_index}",
                     "document blocks are only valid in user messages.",
                 )
-            text = text_document_text(block)
+            text = plain_document_text(block, f"{param}.content.{block_index}")
             if text is None:
                 content_parts.append(
                     document_part_from_block(block, f"{param}.content.{block_index}")
                 )
                 continue
-            if block.citations is not None and block.citations.enabled:
-                raise invalid_field(
-                    f"{param}.content.{block_index}.citations",
-                    "document citations are not supported over this gateway; "
-                    "send citations.enabled as false or omit the field.",
-                )
             # A plain-text document is the caller's text: it joins the turn as
             # a text block, so every wire serves it and a cache marker on the
             # block survives through the marked-run carrier.
-            marker = (
-                block.cache_control.model_dump(mode="json", exclude_none=True)
-                if block.cache_control is not None
-                else None
-            )
             text_parts.append(_TextBlock(type="text", text=text, cache_control=block.cache_control))
-            content_parts.append(TextContentPart(text=text, cache_control=marker))
+            content_parts.append(
+                TextContentPart(text=text, cache_control=cache_marker(block.cache_control))
+            )
         elif isinstance(block, (_ThinkingBlock, _RedactedThinkingBlock)):
             if message.role != "assistant":
                 raise invalid_field(
@@ -948,8 +942,10 @@ def _gateway_messages(message: _Message, index: int) -> list[GatewayMessage]:
             out.append(
                 GatewayMessage(
                     role="tool",
-                    content=_tool_result_text(block),
-                    content_parts=_tool_result_parts(block, f"{param}.content.{block_index}"),
+                    content=tool_result_text(block.content, f"{param}.content.{block_index}"),
+                    content_parts=tool_result_parts(
+                        block.content, f"{param}.content.{block_index}"
+                    ),
                     tool_call_id=block.tool_use_id,
                     tool_is_error=block.is_error,
                     # The marker Claude Code puts on its conversation
@@ -970,52 +966,3 @@ def _gateway_messages(message: _Message, index: int) -> list[GatewayMessage]:
             "or tool_result content.",
         )
     return out
-
-
-def _tool_result_text(block: _ToolResultBlock) -> str:
-    """Flatten one tool result into the canonical tool-message text."""
-    if block.content is None:
-        return ""
-    if isinstance(block.content, str):
-        return block.content
-    return "".join(part.text for part in block.content if isinstance(part, _TextBlock))
-
-
-def _tool_result_parts(block: _ToolResultBlock, param: str) -> tuple[MessageContentPart, ...]:
-    """Retain a tool result's ordered parts when it carries an image.
-
-    Text-only results keep the flattened ``content`` string and no parts, so
-    existing requests serialize and digest exactly as before. An image
-    sub-block (a tool screenshot) makes the result multimodal: every part is
-    retained in caller order so an image-capable Anthropic rung re-emits the
-    exact block run.
-
-    Args:
-        block: Validated tool_result wire block.
-        param: Public parameter path for reporting one invalid image.
-
-    Returns:
-        The ordered canonical parts, or ``()`` for a text-only result.
-    """
-    if isinstance(block.content, str) or block.content is None:
-        return ()
-    if not any(isinstance(part, ImageBlock) for part in block.content):
-        return ()
-    parts: list[MessageContentPart] = []
-    for index, part in enumerate(block.content):
-        if isinstance(part, ImageBlock):
-            parts.append(image_part_from_block(part, f"{param}.content.{index}"))
-        elif part.text:
-            # An empty text block adds no bytes to the flattened content and
-            # cannot ride a multimodal turn, mirroring the user-message path.
-            parts.append(
-                TextContentPart(
-                    text=part.text,
-                    cache_control=(
-                        part.cache_control.model_dump(mode="json", exclude_none=True)
-                        if part.cache_control is not None
-                        else None
-                    ),
-                )
-            )
-    return tuple(parts)

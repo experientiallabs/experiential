@@ -10,7 +10,7 @@ import pytest
 from pydantic import JsonValue
 
 from exp.common.core.artifacts import JsonObject
-from exp.common.models.content import MAXIMUM_DOCUMENTS_PER_REQUEST
+from exp.common.models.content import MAXIMUM_DOCUMENTS_PER_REQUEST, TextContentPart
 from exp.runtime.anthropic_protocol.requests import decode_messages, decode_messages_count_tokens
 from exp.runtime.gateway.contracts import (
     ExposedReasoningContentBlock,
@@ -610,8 +610,116 @@ def test_malformed_image_source_is_rejected() -> None:
     assert excinfo.value.detail.param == "messages.0.content.0.source"
 
 
-def test_document_block_inside_tool_result_is_rejected() -> None:
-    """Nested unsupported blocks inside tool results are rejected loudly."""
+def test_document_blocks_inside_tool_results_ride_the_tool_message_parts() -> None:
+    """A tool-returned PDF decodes losslessly instead of 400ing the session.
+
+    Anthropic's real API accepts document sub-blocks in tool_result content,
+    and Claude Code's Read tool on a PDF emits one routinely; the block is
+    baked into history, so rejecting it wedges every later turn.
+    """
+    decoded = decode_messages(
+        _body(
+            messages=[
+                {
+                    "role": "user",
+                    "content": "read the file",
+                },
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "tool_use", "id": "call-1", "name": "Read", "input": {}},
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "call-1",
+                            "content": [
+                                {"type": "text", "text": "the file:"},
+                                _pdf_block(title="report.pdf"),
+                            ],
+                        }
+                    ],
+                },
+            ]
+        )
+    )
+    tool_message = decoded.request.messages[-1]
+    assert tool_message.role == "tool"
+    assert tool_message.tool_call_id == "call-1"
+    assert tool_message.content == "the file:"
+    assert [part.kind for part in tool_message.content_parts] == ["text", "document"]
+    assert tool_message.documents[0].data == _PDF_BASE64
+    assert tool_message.documents[0].name == "report.pdf"
+
+
+def test_a_plain_text_document_inside_a_tool_result_stays_text() -> None:
+    """A text-source document in a tool result is the caller's text, exactly
+    as on a user turn: no parts when the result is text-only, a text part
+    beside a screenshot when it is not."""
+    text_document: JsonObject = {
+        "type": "document",
+        "title": "notes.txt",
+        "source": {"type": "text", "media_type": "text/plain", "data": "plain body"},
+    }
+    decoded = decode_messages(
+        _body(
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "call-1",
+                            "content": [text_document],
+                        }
+                    ],
+                }
+            ]
+        )
+    )
+    tool_message = decoded.request.messages[-1]
+    assert tool_message.role == "tool"
+    assert tool_message.content == "notes.txt\n\nplain body"
+    assert tool_message.content_parts == ()
+
+    multimodal = decode_messages(
+        _body(
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "call-1",
+                            "content": [
+                                text_document,
+                                {
+                                    "type": "image",
+                                    "source": {
+                                        "type": "base64",
+                                        "media_type": "image/png",
+                                        "data": _PNG_BASE64,
+                                    },
+                                },
+                            ],
+                        }
+                    ],
+                }
+            ]
+        )
+    )
+    tool_message = multimodal.request.messages[-1]
+    assert [part.kind for part in tool_message.content_parts] == ["text", "image"]
+    text_part = tool_message.content_parts[0]
+    assert isinstance(text_part, TextContentPart)
+    assert text_part.text == "notes.txt\n\nplain body"
+
+
+def test_document_citations_inside_a_tool_result_are_rejected_at_their_path() -> None:
+    """An enabled-citations document in a tool result names its inner path."""
     with pytest.raises(OpenAIProtocolError) as excinfo:
         decode_messages(
             _body(
@@ -622,14 +730,50 @@ def test_document_block_inside_tool_result_is_rejected() -> None:
                             {
                                 "type": "tool_result",
                                 "tool_use_id": "call-1",
-                                "content": [{"type": "document", "source": {}}],
+                                "content": [
+                                    _pdf_block(citations={"enabled": True}),
+                                ],
                             }
                         ],
                     }
                 ]
             )
         )
-    assert "document blocks are not supported" in excinfo.value.detail.message
+    assert excinfo.value.detail.param == "messages.0.content.0.content.0.citations"
+    assert "document citations are not supported" in excinfo.value.detail.message
+
+
+def test_citations_on_a_text_only_tool_result_document_are_refused_not_dropped() -> None:
+    """A text-source document is flattened to text, and its enabled citations
+    are refused exactly as on a user turn rather than silently dropped."""
+    with pytest.raises(OpenAIProtocolError) as excinfo:
+        decode_messages(
+            _body(
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": "call-1",
+                                "content": [
+                                    {
+                                        "type": "document",
+                                        "citations": {"enabled": True},
+                                        "source": {
+                                            "type": "text",
+                                            "media_type": "text/plain",
+                                            "data": "plain body",
+                                        },
+                                    }
+                                ],
+                            }
+                        ],
+                    }
+                ]
+            )
+        )
+    assert excinfo.value.detail.param == "messages.0.content.0.content.0.citations"
 
 
 def _tool_result_image_messages(*, leading_text: str | None = None) -> list[JsonObject]:
@@ -735,6 +879,30 @@ def test_an_unknown_tool_result_sub_block_names_its_index_and_type() -> None:
     assert excinfo.value.detail.param == "messages.0.content.0.content.0"
     assert "unsupported block type 'mystery'" in excinfo.value.detail.message
     assert ".str" not in (excinfo.value.detail.param or "")
+
+
+def test_a_valid_tool_result_document_never_takes_the_blame_for_a_bad_sibling() -> None:
+    """The error names the block that is actually wrong, never a valid PDF beside it."""
+    with pytest.raises(OpenAIProtocolError) as excinfo:
+        decode_messages(
+            _body(
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": "call-1",
+                                "content": [_pdf_block(), {"type": "mystery"}],
+                            }
+                        ],
+                    }
+                ]
+            )
+        )
+    assert excinfo.value.detail.param == "messages.0.content.0.content.1"
+    assert "unsupported block type 'mystery'" in excinfo.value.detail.message
+    assert "text, image, and document sub-blocks" in excinfo.value.detail.message
 
 
 def test_a_union_miss_never_reports_the_string_arm() -> None:
