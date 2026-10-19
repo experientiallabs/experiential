@@ -301,7 +301,10 @@ call, visible text or prefix; OpenCode echoes a schema-invalid call as its `inva
 unrevealed, disclosed as `messages.reasoning_content->dropped(assistant_turn_changed)`, as does one
 whose issuing rung left the route (a lane closed on exhausted credit): `issuing_route_unavailable`.
 A later carrier sealed over a dropped turn fails its prefix binding and drops too; an earlier intact
-one still pins. Authentication or authority failures (tamper, rotation) are still refused.
+one still pins. Authentication or authority failures (tamper, rotation) are still refused. A
+turn holding a custom (freeform) tool call, such as Codex's `apply_patch`, is never sealed: the call
+returns as an opaque `custom_tool_call` item that cannot bind a carrier, so the turn serves without
+preserved reasoning, as a failover would.
 
 First-party CLI compatibility is capture-driven: the fields real Claude Code and Codex send by
 default are accepted and preserved. On the Messages surface, `output_config` forwards verbatim on
@@ -819,7 +822,10 @@ is what keeps agent loops alive; stamped, the caller replays the real text and t
 covers turns minted elsewhere.
 
 Route admission preserves caller capabilities in three verbatim-preference layers before any
-coercion: operationally dead rungs are skipped (`dispatchable_route_profiles`), generation
+coercion: operationally dead rungs are skipped (`dispatchable_route_profiles`; when every rung is
+dead the route resolves once more against the catalogs as they stand now, since a refresh swaps
+them mid-admission, and a route still dead answers the retryable 503 `unavailable_route` with an
+`unavailable` ledger row and an `admission_dead_route` operator log naming each rung's cause), generation
 controls narrow the waterfall to the rungs that preserve every exact value
 (`compatible_generation_parameter_profile_indexes`), falling back to the rungs that can serve the
 request only through a disclosed drop when no rung preserves it, and each remaining deployment
