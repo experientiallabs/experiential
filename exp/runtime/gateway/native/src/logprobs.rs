@@ -96,19 +96,39 @@ fn malformed(message: &str) -> Failure {
     Failure::new(FailureClass::MalformedResponse, message).with_retry(false, true)
 }
 
+/// Read one token's UTF-8 `bytes` leniently: the field is optional metadata,
+/// so a provider that encodes it out of range never fails the whole answer.
+///
+/// Signed bytes (-128..-1, a Java/i8 tokenizer encoding) map onto their u8
+/// values; any other unrepresentable array (values past 255 such as code
+/// points, fractions, non-numbers) is dropped to `null` for that token, the
+/// token and its logprob kept, and named once on the operator log (a
+/// deepseek-v4.1-flash lane failed every logprob request this way, 2026-10-19).
 fn bytes(value: Option<&Value>) -> Result<Option<Vec<u8>>, Failure> {
     match value {
         None | Some(Value::Null) => Ok(None),
-        Some(Value::Array(values)) => values
-            .iter()
-            .map(|value| {
-                let number = value
-                    .as_u64()
-                    .ok_or_else(|| malformed("logprob bytes must be integers"))?;
-                u8::try_from(number).map_err(|_| malformed("logprob bytes must be in range 0..255"))
-            })
-            .collect::<Result<Vec<_>, _>>()
-            .map(Some),
+        Some(Value::Array(values)) => {
+            let parsed: Option<Vec<u8>> = values
+                .iter()
+                .map(|value| {
+                    let number = value.as_i64()?;
+                    match number {
+                        0..=255 => u8::try_from(number).ok(),
+                        -128..=-1 => u8::try_from(number + 256).ok(),
+                        _ => None,
+                    }
+                })
+                .collect();
+            if parsed.is_none() {
+                let line = serde_json::json!({
+                    "event": "logprob_bytes_dropped",
+                    "reason": "out_of_range",
+                    "length": values.len(),
+                });
+                eprintln!("exp-gateway-native: {line}");
+            }
+            Ok(parsed)
+        }
         Some(_) => Err(malformed("logprob bytes must be an array")),
     }
 }
@@ -252,6 +272,14 @@ pub fn is_refusal(event: &crate::events::Event) -> bool {
         if update.logprobs.as_ref().and_then(|v| v.refusal.as_ref()).is_some_and(|v| !v.is_empty()))
 }
 
+/// Whether a probability delta carries no token record in either channel.
+pub fn is_empty_delta(update: &ChoiceLogprobsDelta) -> bool {
+    update.logprobs.as_ref().is_none_or(|value| {
+        value.content.as_ref().is_none_or(Vec::is_empty)
+            && value.refusal.as_ref().is_none_or(Vec::is_empty)
+    })
+}
+
 /// Hold empty metadata without committing, and refusal-only output when retrying.
 pub fn withhold_before_commit(event: &crate::events::Event, refusal_failover: bool) -> bool {
     if let crate::events::Event::ProviderResponsesLogprobs { records, .. } = event {
@@ -274,6 +302,33 @@ pub fn withhold_before_commit(event: &crate::events::Event, refusal_failover: bo
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn signed_bytes_map_to_u8_and_out_of_range_bytes_drop_without_failing() {
+        let value = serde_json::json!({"content":[
+            {"token":"é","logprob":-0.5,"bytes":[-61,-87],"top_logprobs":[
+                {"token":"中","logprob":-1.0,"bytes":[20013]}
+            ]},
+            {"token":"x","logprob":-0.1,"bytes":[1.5],"top_logprobs":[]}
+        ]});
+        let parsed = parse(Some(&value), 0).unwrap().unwrap();
+        let content = parsed.logprobs.unwrap().content.unwrap();
+        assert_eq!(content[0].bytes, Some(vec![195, 169]));
+        assert_eq!(content[0].top_logprobs[0].bytes, None);
+        assert_eq!(content[0].top_logprobs[0].token, "中");
+        assert_eq!(content[1].bytes, None);
+        assert_eq!(content[1].logprob, -0.1);
+    }
+
+    #[test]
+    fn empty_delta_detects_records_in_either_channel() {
+        let empty = parse(Some(&serde_json::Value::Null), 0).unwrap().unwrap();
+        assert!(is_empty_delta(&empty));
+        let value = serde_json::json!({"content":[],"refusal":null});
+        assert!(is_empty_delta(&parse(Some(&value), 0).unwrap().unwrap()));
+        let value = serde_json::json!({"refusal":[{"token":"no","logprob":-1,"bytes":null,"top_logprobs":[]}]});
+        assert!(!is_empty_delta(&parse(Some(&value), 0).unwrap().unwrap()));
+    }
+
     #[test]
     fn preserves_zero_bytes_empty_arrays_and_partial_utf8() {
         let value = serde_json::json!({"content":[{"token":"é","logprob":-0.0,"bytes":[195,169,0],"top_logprobs":[]}]});

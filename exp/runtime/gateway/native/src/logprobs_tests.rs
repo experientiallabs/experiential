@@ -56,9 +56,13 @@ fn aggregate_appends_channels_and_preserves_empty_and_null() {
 }
 
 #[test]
-fn parser_rejects_bad_bytes_missing_alternatives_and_nonzero_choice() {
+fn parser_drops_bad_bytes_and_rejects_missing_alternatives_and_nonzero_choice() {
+    // Out-of-range bytes are optional metadata: dropped, never a failure.
     let bad_bytes = serde_json::json!({"content":[{"token":"x","logprob":0.0,"bytes":[256],"top_logprobs":[]}]});
-    assert!(crate::logprobs::parse(Some(&bad_bytes), 0).is_err());
+    let parsed = crate::logprobs::parse(Some(&bad_bytes), 0)
+        .unwrap()
+        .unwrap();
+    assert_eq!(parsed.logprobs.unwrap().content.unwrap()[0].bytes, None);
     let missing = serde_json::json!({"content":[{"token":"x","logprob":0.0}]});
     assert!(crate::logprobs::parse(Some(&missing), 0).is_err());
     let mut normalizer = Normalizer::new(Dialect::OpenAiCompatible);

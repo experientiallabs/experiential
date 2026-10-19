@@ -341,6 +341,20 @@ pub(super) async fn run_attempt(
                 // retained-output and worker budgets; an image model signs each
                 // image with 1 to 2 MB (live 2026-10-19), far past the
                 // refusal-delta byte bound. The event-count bound still applies.
+                // A reasoning model streams `"logprobs": null` beside every
+                // private reasoning chunk; one held empty delta stands for a
+                // run of identical ones (aggregation is unchanged), so a long
+                // think no longer overflows the withheld bound (deepseek-v4-flash
+                // on Azure, 25 logprob requests failed in a day, 2026-10-19).
+                if let (
+                    Event::ChoiceLogprobsDelta(update),
+                    Some(Event::ChoiceLogprobsDelta(held)),
+                ) = (&event, withheld.last())
+                {
+                    if crate::logprobs::is_empty_delta(update) && update == held {
+                        continue;
+                    }
+                }
                 let event_bytes = match event {
                     Event::GeminiThoughtPart(_) => 0,
                     _ => crate::relay::event_retained_bytes(&event),
