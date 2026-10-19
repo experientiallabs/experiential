@@ -197,7 +197,7 @@ pub(crate) async fn chat(
         return error_response(&error);
     }
 
-    let permit = match acquire_permit(&state, &mut guard, deadline).await {
+    let permit = match acquire_permit(&state, &mut guard, deadline, admission.class).await {
         Ok(permit) => permit,
         Err(response) => {
             if let Some(mut owner) = lease.take() {

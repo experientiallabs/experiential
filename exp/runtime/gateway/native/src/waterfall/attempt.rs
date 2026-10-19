@@ -380,6 +380,7 @@ pub(super) async fn run_attempt(
                         encrypted_reasoning_stripped,
                         tool_search_rounds: Vec::new(),
                         tool_search_dropped_after_output,
+                        pace: None,
                     }));
                 }
                 withheld_bytes += event_bytes;
@@ -409,6 +410,7 @@ pub(super) async fn run_attempt(
                     encrypted_reasoning_stripped,
                     tool_search_rounds: Vec::new(),
                     tool_search_dropped_after_output,
+                    pace: None,
                 }));
             }
             if !event.is_terminal() {

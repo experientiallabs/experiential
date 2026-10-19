@@ -86,6 +86,9 @@ pub struct CommittedAttempt {
     /// semantic output: the rung committed on that output and the call was
     /// dropped (disclosed as `tool_search->dropped(after_output)`).
     pub tool_search_dropped_after_output: bool,
+    /// The streamed-output pace the control plane set for this attempt
+    /// (`output_pacing`); `None` streams unpaced, as every attempt did before.
+    pub pace: Option<f64>,
 }
 
 /// One attempt whose terminal was reached and settled before commitment.
@@ -149,6 +152,10 @@ pub(crate) struct StartResponse {
     /// A durable zero-attempt certificate from the trusted accounting callback.
     #[serde(default)]
     pub(crate) known_unbilled: bool,
+    /// The reserved attempt's output pace; absent unless a self-hosted rung
+    /// is paced for this request's class (`output_pacing`).
+    #[serde(default)]
+    pub(crate) output_tokens_per_second: Option<f64>,
 }
 
 /// One pre-commit attempt outcome, private to the waterfall loop.
@@ -312,6 +319,7 @@ pub async fn acquire_attempt(ctx: &WaterfallContext<'_>, guard: &mut AttemptGuar
             error.known_unbilled = started.known_unbilled;
             return Won::Failed(error);
         }
+        let attempt_pace = started.output_tokens_per_second;
         let (Some(attempt_id), Some(depth)) = (started.attempt_id, started.route_depth) else {
             guard
                 .abandon(&Failure::new(
@@ -399,6 +407,7 @@ pub async fn acquire_attempt(ctx: &WaterfallContext<'_>, guard: &mut AttemptGuar
                 // is known here; settle it with whatever outcome follows.
                 guard.record_upstream_provider(committed.relay.upstream_provider());
                 committed.tool_search_rounds = std::mem::take(&mut tool_search_rounds);
+                committed.pace = attempt_pace;
                 return Won::Committed(committed);
             }
             AttemptEnd::Settled(mut settled) => {

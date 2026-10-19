@@ -7,6 +7,7 @@ from dataclasses import replace
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
 from exp.common.core.artifacts import JsonObject
 from exp.common.models import ModelCapabilities
@@ -751,6 +752,46 @@ def test_upstream_priority_maps_admission_level_on_opted_in_rung_only(
 
     assert payload(vllm)["priority"] == priority
     assert "priority" not in payload(third_party)
+
+
+@pytest.mark.parametrize(("level", "request_class", "priority"), [(2, 8, 0), (2, 2, 6), (0, 0, 8)])
+def test_upstream_priority_follows_request_class_when_host_sends_one(
+    level: int, request_class: int, priority: int
+) -> None:
+    """A request class replaces the admission-level map: vLLM priority is 8 minus the class."""
+    vllm = _priority_rung("vllm", upstream_priority=True)
+    authorization = _AUTHORIZATION.model_copy(
+        update={"priority_admission": level, "priority_class": request_class}
+    )
+    request = _request()
+    payload = build_rung_dispatch(
+        _route((vllm,)),
+        vllm,
+        _profile(),
+        _NoSigningClient(),
+        provider_request=request,
+        public_request=request,
+        authorization=authorization,
+    ).wire_entry["upstream_payload"]
+    assert isinstance(payload, dict)
+    assert payload["priority"] == priority
+
+
+def test_request_class_and_pace_default_to_none() -> None:
+    """An unset class and pace keep every existing snapshot and payload unchanged."""
+    assert _AUTHORIZATION.priority_class is None
+    assert _AUTHORIZATION.output_tokens_per_second is None
+    assert _AUTHORIZATION.output_pace_saturation is None
+    assert _AUTHORIZATION.self_hosted_class_concurrency is None
+    for invalid in (
+        {"priority_class": 9},
+        {"priority_class": -1},
+        {"output_tokens_per_second": 0},
+        {"output_pace_saturation": 0},
+        {"self_hosted_class_concurrency": 0},
+    ):
+        with pytest.raises(ValidationError):
+            AuthorizationSnapshot.model_validate(_AUTHORIZATION.model_dump() | invalid)
 
 
 @pytest.mark.parametrize("dispatch", [None, GatewayRungDispatchPolicy()])

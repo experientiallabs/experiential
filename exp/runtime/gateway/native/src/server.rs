@@ -88,6 +88,11 @@ pub struct ServeConfig {
     pub native_usage_enabled: bool,
     #[serde(default = "default_graceful_timeout_seconds")]
     pub graceful_timeout_seconds: f64,
+    /// Release waiting requests by class (`Admission::priority_class`) with
+    /// one class of aging per this many seconds (`permit_queue`). Absent
+    /// keeps the FIFO semaphore.
+    #[serde(default)]
+    pub permit_priority_aging_seconds: Option<f64>,
 }
 
 fn default_graceful_timeout_seconds() -> f64 {
@@ -152,6 +157,8 @@ pub(crate) struct AppState {
     pub(crate) bridge: Arc<Bridge>,
     pub(crate) http: crate::upstream::UpstreamClient,
     pub(crate) permits: Arc<Semaphore>,
+    /// The order waiting requests take `permits` in (FIFO unless configured).
+    pub(crate) permit_queue: Arc<crate::permit_queue::PermitQueue>,
     pub(crate) request_timeout: Duration,
     /// Fail-fast flat bound on the wait for the provider's response headers
     /// per attempt.
@@ -201,6 +208,9 @@ pub async fn run(
         bridge,
         http,
         permits: Arc::new(Semaphore::new(max_active_requests)),
+        permit_queue: Arc::new(crate::permit_queue::PermitQueue::new(
+            config.permit_priority_aging_seconds,
+        )),
         request_timeout: Duration::from_secs_f64(config.request_timeout_seconds),
         time_to_first_byte: Duration::from_secs_f64(config.time_to_first_byte_seconds.max(0.001)),
         time_to_first_byte_slope_seconds_per_million_input_tokens: config

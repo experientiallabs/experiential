@@ -203,7 +203,7 @@ pub(crate) async fn messages(
     let mut guard = new_guard(&state, admission.request_id.clone(), started);
     guard.record_web_search_requests(admission.web_search_requests());
 
-    let permit = match acquire_permit(&state, &mut guard, deadline).await {
+    let permit = match acquire_permit(&state, &mut guard, deadline, admission.class).await {
         Ok(permit) => permit,
         Err(response) => return *response,
     };
@@ -661,7 +661,7 @@ async fn stream_messages(
         let _permit = permit;
         let mut guard = guard;
         let mut committed = committed;
-        let mut delivery = Delivery::new(sender.clone(), false);
+        let mut delivery = Delivery::new(sender.clone(), false).paced(committed.pace);
         let mut encoder =
             MessagesSseEncoder::new_with_ignored(&request_id, &alias, ignored_parameters);
         configure_messages_encoder_for(&mut encoder, &admission);
@@ -831,7 +831,7 @@ async fn stream_messages(
                     return;
                 }
             }
-            for outward in outward_events {
+            for outward in delivery.pace(outward_events, deadline).await {
                 let encoded = match encoder.feed(&outward) {
                     Ok(encoded) => encoded,
                     Err(_) => {

@@ -199,7 +199,7 @@ pub(crate) async fn responses(
         return error_response(&error);
     }
 
-    let permit = match acquire_permit(&state, &mut guard, deadline).await {
+    let permit = match acquire_permit(&state, &mut guard, deadline, admission.class).await {
         Ok(permit) => permit,
         Err(response) => {
             if let Some(mut owner) = lease.take() {
@@ -746,7 +746,7 @@ async fn stream_responses(
         let mut guard = guard;
         let mut committed = committed;
         let mut lease = lease;
-        let mut delivery = Delivery::new(sender.clone(), lease.is_some());
+        let mut delivery = Delivery::new(sender.clone(), lease.is_some()).paced(committed.pace);
         // Keyed streams retain exact public frames through the publication tail.
         let mut capture: Vec<u8> = Vec::new();
         let mut replayable = lease.is_some();
@@ -904,7 +904,7 @@ async fn stream_responses(
                     }
                 }
             }
-            for outward in outward_events {
+            for outward in delivery.pace(outward_events, deadline).await {
                 let encoded = match encoder.feed(&outward) {
                     Ok(encoded) => encoded,
                     Err(_) => {

@@ -99,6 +99,36 @@ rung: that provider would receive an unknown field. Unset (the default) sends no
 no identity bytes. Like every new dispatch field, author it only after every serving worker
 runs a build that parses it.
 
+## Request-class throttles (inert by default)
+
+A host may vouch `AuthorizationSnapshot.priority_class`, a request class from `0` (free
+account) to `8` (the top plan's paid request), plus optional class throttles. Every throttle
+acts ONLY on a self-hosted rung: one whose dispatch policy authors `upstream_priority`
+(`class_throttles.is_self_hosted_rung`, the same predicate that gates vLLM's `priority` field).
+Third-party, BYOK and tenant rungs never author it, so on them every lever below is a no-op.
+
+- **vLLM priority by class** (frees capacity). With a class, an opted-in rung gets vLLM
+  priority `8 - priority_class` (`native_rungs.TOP_PRIORITY_CLASS`) instead of the
+  Pro/paying/free map, so the server schedules and preempts by class.
+- **Per-class in-flight cap** (frees capacity). `self_hosted_class_concurrency` caps how many
+  dispatches of the request's class one worker holds on a self-hosted rung; past it the rung
+  sheds as a hit overflow ceiling (never force-admitted), leaving GPU slots for other classes.
+- **Output pace** (delivery only; the GPU still generates at full speed).
+  `output_tokens_per_second` is evaluated at reservation (`class_throttles.output_pace`): with
+  `output_pace_saturation` set, only while the rung's in-flight count is at or above that
+  fraction of its bound (the authored `concurrency_bound`, else the worker's default lane
+  share; an unbounded rung has no signal and is never threshold-paced). A paced attempt's
+  `start_attempt` reply carries the rate and the data plane's Chat, Messages and Responses
+  stream loops hold released events in a one-second token bucket over estimated tokens
+  (`output_pacing.rs`), keeping heartbeats and never outliving the request deadline. An
+  unpaced reply is byte-identical to before.
+- **Class-ordered permits.** With `permit_priority_aging_seconds` in the serve config, requests
+  waiting for one of the worker's `max_active_requests` permits are released by
+  `priority_class` (carried on the admission), gaining one class per aging period so no class
+  starves (`permit_queue.rs`). Absent, the permits stay the FIFO semaphore.
+
+The class changes no admission bound, overflow factor or fair-share weight.
+
 The default bound is already half the worker's permits, so its Pro factor stays below
 `1 / DEFAULT_LANE_SHARE` and one lane's priority traffic never holds every permit. A rung whose
 forced admission hit its ceiling (`RungShed.overflow_ceiling`) is skipped, and the request is

@@ -130,7 +130,7 @@ pub(crate) async fn images(
         Err(_) => return wire_drift_response(&state, &admission_value, started).await,
     };
     let mut guard = new_guard(&state, admission.request_id.clone(), started);
-    let permit = match acquire_permit(&state, &mut guard, deadline).await {
+    let permit = match acquire_permit(&state, &mut guard, deadline, None).await {
         Ok(permit) => permit,
         Err(response) => return *response,
     };

@@ -14,6 +14,7 @@ from exp.common.models.gateway_catalog import ExactModelDeployment
 from exp.runtime.gateway.attempt_tokens import worst_case_input_tokens, worst_case_output_tokens
 from exp.runtime.gateway.budget_continuation import denied_destination_pool
 from exp.runtime.gateway.budgets import BudgetReservationRejected, BudgetScopeKind
+from exp.runtime.gateway.class_throttles import attempt_output_pace, started_attempt_payload
 from exp.runtime.gateway.contracts import (
     AuthorizationSnapshot,
     GatewayEvent,
@@ -629,9 +630,8 @@ class NativeAttemptAccounting:
                 entry.attempt_depths[attempt_id] = candidate
                 if tier is not None:
                     entry.attempt_service_tiers[attempt_id] = tier
-            return json.dumps(
-                {"attempt_id": attempt_id, "route_depth": candidate},
-                separators=(",", ":"),
+            return started_attempt_payload(
+                attempt_id, candidate, attempt_output_pace(entry, deployment, self._loads)
             )
         exhaustion = last_failure
         if exhaustion is None:

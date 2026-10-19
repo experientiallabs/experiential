@@ -71,6 +71,14 @@ Pro 0, paying 1, free 2: vLLM's priority scheduler runs the lowest value
 first and, when KV runs out, preempts the highest value first.
 """
 
+TOP_PRIORITY_CLASS = 8
+"""The highest ``AuthorizationSnapshot.priority_class``; vLLM gets ``8 - class``.
+
+A host that sends a request class (0 free account .. 8 top plan paid)
+replaces the three-level map, so the top class runs at vLLM priority 0 and a
+free account at 8. Without a class the admission-level map above applies.
+"""
+
 
 @dataclass(frozen=True, slots=True)
 class RungDispatch:
@@ -163,7 +171,9 @@ def build_rung_dispatch(
         # provider would receive an unknown field.
         upstream_payload = {
             **upstream_payload,
-            "priority": UPSTREAM_PRIORITY[authorization.priority_admission],
+            "priority": UPSTREAM_PRIORITY[authorization.priority_admission]
+            if authorization.priority_class is None
+            else TOP_PRIORITY_CLASS - authorization.priority_class,
         }
     request_headers = (
         anthropic_request_headers(dict(profile.headers), rung_request)

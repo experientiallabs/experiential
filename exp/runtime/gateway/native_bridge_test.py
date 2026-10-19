@@ -384,6 +384,44 @@ def _admit(
     return json.loads(control.admit(json.dumps(payload)))
 
 
+def test_request_class_reaches_the_admission_only_when_the_host_sets_one(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No class leaves the admission byte-identical; a set class orders the permit queue."""
+    control, raw_key = _control_plane(tmp_path)
+    unclassed = _admit(control, raw_key, _chat_body(stream=True))
+    assert "priority_class" not in unclassed
+    original = SQLiteGatewayStore.authorize_request
+
+    def authorize_classed(
+        self: SQLiteGatewayStore,
+        *,
+        raw_key: str,
+        alias: str,
+        request: ServingRequest,
+        deadline_monotonic: float,
+        app_referer: str | None = None,
+        app_title: str | None = None,
+        client_ip: str | None = None,
+    ) -> AuthorizationSnapshot:
+        """Ordinary authorization plus a host-vouched class 6."""
+        authority = original(
+            self,
+            raw_key=raw_key,
+            alias=alias,
+            request=request,
+            deadline_monotonic=deadline_monotonic,
+            app_referer=app_referer,
+            app_title=app_title,
+            client_ip=client_ip,
+        )
+        return authority.model_copy(update={"priority_class": 6})
+
+    monkeypatch.setattr(SQLiteGatewayStore, "authorize_request", authorize_classed)
+    classed = _admit(control, raw_key, _chat_body(stream=True))
+    assert classed["priority_class"] == 6
+
+
 @pytest.mark.parametrize("provider", ("anthropic", "openai-compatible"))
 @pytest.mark.parametrize("maximum", (2_048, 128_000))
 def test_omitted_cap_admission_freezes_provider_maximum_without_public_rewrite(

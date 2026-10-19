@@ -885,6 +885,10 @@ class AuthorizationSnapshot(ClientAttribution):
         model_chain_authority: Optional backend binding, revalidated at acceptance and reservation.
         fair_share_weight: Organization weight in [1, 1,000,000], default 1.
         priority_admission: Host-vouched 0 free, 1 paying, 2 Pro (lane_saturation caps).
+        priority_class: Host-vouched request class 0..8, higher first (class_throttles.py).
+        output_tokens_per_second: Class stream pace on self-hosted rungs; None never paces.
+        output_pace_saturation: Pace only at or above this rung load fraction; None = always.
+        self_hosted_class_concurrency: Per-worker in-flight cap for the class on a self-hosted rung.
         descendant_start_authorized: False unless the host proves root funding
             and policy gates before allowing a request to start at a child.
         zdr_requested: Caller demand for stricter ZDR filtering, default False.
@@ -922,6 +926,10 @@ class AuthorizationSnapshot(ClientAttribution):
     allowlist then fails closed, a denylist open). 45 chars fits any IPv6 form."""
     fair_share_weight: int = Field(default=1, ge=1, le=1_000_000)
     priority_admission: int = Field(default=0, ge=0, le=2)
+    priority_class: int | None = Field(default=None, ge=0, le=8)
+    output_tokens_per_second: float | None = Field(default=None, gt=0, allow_inf_nan=False)
+    output_pace_saturation: float | None = Field(default=None, gt=0, allow_inf_nan=False)
+    self_hosted_class_concurrency: int | None = Field(default=None, ge=1)
     descendant_start_authorized: bool = False
     zdr_requested: bool = False
     prompt_caching_disabled: bool = False

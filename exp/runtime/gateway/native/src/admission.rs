@@ -89,6 +89,11 @@ pub(crate) struct Admission {
     /// `length`), never a completed empty answer.
     #[serde(default)]
     pub maximum_output_tokens: Option<u64>,
+    /// The host-vouched request class (0..8, higher first) a configured
+    /// permit queue orders waiting requests by (`permit_queue`). Absent on
+    /// every request whose host sends no class.
+    #[serde(default, rename = "priority_class")]
+    pub class: Option<u8>,
     /// The caller's stable identity (organization and identity ids), the
     /// scope of the data plane's per-caller replay-repair memory. The
     /// request's own bearer cannot serve: in a hosted worker it is the
@@ -351,9 +356,11 @@ pub(crate) async fn acquire_permit(
     state: &AppState,
     guard: &mut AttemptGuard,
     deadline: Instant,
+    priority_class: Option<u8>,
 ) -> Result<tokio::sync::OwnedSemaphorePermit, Box<Response>> {
     let permit_wait_started = Instant::now();
-    match tokio::time::timeout_at(deadline.into(), state.permits.clone().acquire_owned()).await {
+    let acquire = state.permit_queue.acquire(&state.permits, priority_class);
+    match tokio::time::timeout_at(deadline.into(), acquire).await {
         Ok(Ok(permit)) => {
             METRICS.permit_wait_ms.record(permit_wait_started.elapsed());
             Ok(permit)

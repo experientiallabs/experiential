@@ -810,8 +810,7 @@ class NativeControlPlane(
             "caller_scope": f"{authorization.organization_id}:{authorization.identity_id}",
         }
         if route.snapshot.throttle_redial is not None:
-            # The pool's frozen backoff-and-redial schedule; absent (not null) on
-            # pools that keep throttles failover-only: their admission is byte-identical.
+            # Absent (not null) on failover-only pools: their admission is byte-identical.
             response["throttle_redial"] = route.snapshot.throttle_redial.model_dump(mode="json")
         if plan is not None:
             response["guardrail_output_plan"] = plan
@@ -820,13 +819,14 @@ class NativeControlPlane(
         if tool_search_admission is not None:
             response["tool_search"] = tool_search_admission
         if request.surface == GatewayApiSurface.MESSAGES:
-            # Display-only: what `message_start` shows as input when the
-            # upstream reports nothing before its final chunk. The ledger
-            # never reads it; settlement keeps the provider's meters.
+            # Display-only `message_start` input when the upstream reports
+            # nothing before its final chunk; the ledger never reads it.
             response["input_token_estimate"] = counted_input_tokens(public_request)
         if public_request.maximum_output_tokens is not None:
             # The caller's cap: classifies an output-less, usage-less `stop` (capped -> length).
             response["maximum_output_tokens"] = public_request.maximum_output_tokens
+        if authorization.priority_class is not None:
+            response["priority_class"] = authorization.priority_class  # the permit queue's order
         if request.surface == GatewayApiSurface.RESPONSES:
             response["surface"] = "responses"
             response["envelope"] = responses_envelope(public_request)
