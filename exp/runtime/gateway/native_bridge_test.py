@@ -8,6 +8,7 @@ import logging
 import sqlite3
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -72,6 +73,7 @@ from exp.runtime.gateway.native_bridge import (
 )
 from exp.runtime.gateway.native_bridge_errors import capability_param as _public_capability_param
 from exp.runtime.gateway.native_components import NativeGatewayComponents
+from exp.runtime.gateway.native_dead_rungs import UNAVAILABLE_AT_ADMISSION
 from exp.runtime.gateway.native_reasoning import (
     CHANGED_TURN_CARRIER_DROPPED,
     UNAVAILABLE_ISSUER_CARRIER_DROPPED,
@@ -3586,20 +3588,94 @@ def test_admit_recovers_a_dead_lead_when_its_credential_heals(tmp_path: Path) ->
     assert [item["model_id"] for item in recovered] == ["alpha-model-exact", "beta-model-exact"]
 
 
-def test_admit_escalates_when_every_rung_is_dead(tmp_path: Path) -> None:
-    """A route with no resolvable rung is finished closed, not served."""
+def test_admit_escalates_when_every_rung_is_dead(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A route with no resolvable rung is finished closed, not served.
+
+    The ledger row says ``unavailable`` (the caller gets the retryable 503), not
+    the internal servability fault it read as before (production 2026-10-19).
+    """
     environment = {"TEST_ALPHA_KEY": "alpha-secret", "TEST_PROVIDER_KEY": "beta-secret"}
     control, raw_key = _partial_pool_control_plane(tmp_path, environment)
+    recorded: list[GatewayFailure] = []
+    original_finish = control._accounting.finish_request_quietly  # noqa: SLF001
+
+    def _capture(
+        authorization: AuthorizationSnapshot,
+        failure: GatewayFailure,
+        *,
+        web_search_requests: int = 0,
+    ) -> bool:
+        """Record the verdict while preserving the complete current meter contract."""
+        recorded.append(failure)
+        return original_finish(authorization, failure, web_search_requests=web_search_requests)
+
+    monkeypatch.setattr(control._accounting, "finish_request_quietly", _capture)  # noqa: SLF001
 
     environment.clear()
     admission = _admit(control, raw_key, _chat_body())
 
-    assert "escalate" in admission
+    assert admission["escalate"] == UNAVAILABLE_AT_ADMISSION
+    assert [failure.failure_class for failure in recorded] == [GatewayFailureClass.UNAVAILABLE]
     control_plane = cast("JsonObject", control.metrics_snapshot()["control_plane"])
     assert control_plane["admission_dead_rungs_skipped"] == 2
     # A total outage escalates on its own path; the lead-skip counter means
     # "a fallback served while the lead was dead" and must stay silent here.
     assert control_plane["admission_lead_rungs_skipped"] == 0
+
+
+class _SwappingComponents:
+    """Delegate to real components; run ``on_swap`` at one chosen catalog read.
+
+    Stands in for a catalog refresh that swaps the runtime catalogs (and their
+    credential environment) while an admission is between two reads.
+    """
+
+    def __init__(self, components: object) -> None:
+        self._components = components
+        self.catalog_reads = 0
+        self.swap_at: int | None = None
+        self.on_swap: Callable[[], None] = lambda: None
+
+    def __getattr__(self, name: str) -> object:
+        if name == "runtime_catalogs":
+            self.catalog_reads += 1
+            if self.catalog_reads == self.swap_at:
+                self.on_swap()
+        return getattr(self._components, name)
+
+
+def test_admit_re_resolves_once_when_every_rung_is_dead(tmp_path: Path) -> None:
+    """A route dead only across a catalog swap serves on the re-read catalogs.
+
+    gemini-3.1-flash-lite's single Vertex rung answered 7 retryable 503s an hour
+    to one tenant, each landing on the worker's "gateway catalog refreshed"
+    line (production 2026-10-19); the generation that just swapped in serves it.
+    """
+    environment = {"TEST_ALPHA_KEY": "alpha-secret", "TEST_PROVIDER_KEY": "beta-secret"}
+    control, raw_key = _partial_pool_control_plane(tmp_path, environment)
+    swapping = _SwappingComponents(control._components)  # noqa: SLF001
+    control._components = swapping  # type: ignore[assignment]  # noqa: SLF001
+    _admit(control, raw_key, _chat_body())
+    reads_per_admission = swapping.catalog_reads
+
+    # The swap lands only after every read a healthy admission makes, so it
+    # is visible to the re-read alone.
+    saved = dict(environment)
+    environment.clear()
+    swapping.catalog_reads = 0
+    swapping.swap_at = reads_per_admission + 1
+    swapping.on_swap = lambda: environment.update(saved)
+    admission = _admit(control, raw_key, _chat_body())
+
+    assert "escalate" not in admission
+    route = cast("list[JsonObject]", admission["route"])
+    assert [item["model_id"] for item in route] == ["alpha-model-exact", "beta-model-exact"]
+    assert swapping.catalog_reads == reads_per_admission + 1
+    control_plane = cast("JsonObject", control.metrics_snapshot()["control_plane"])
+    # Nothing was dead once the swap landed, so no circuit opened.
+    assert control_plane["admission_dead_rungs_skipped"] == 0
 
 
 def test_admit_keeps_a_fully_resolvable_route_and_never_skips(tmp_path: Path) -> None:
@@ -7475,14 +7551,17 @@ def test_the_unavailable_at_admission_reason_matches_the_native_503_mapping() ->
     respond = (gateway / "native" / "src" / "respond.rs").read_text()
     reason = "every certified deployment was unavailable at admission"
     assert f'pub(crate) const UNAVAILABLE_AT_ADMISSION: &str =\n    "{reason}";' in respond
+    assert UNAVAILABLE_AT_ADMISSION == reason
     sites = [
         path.name
         for path in gateway.glob("native_*.py")
-        if not path.name.endswith("_test.py") and reason in path.read_text()
+        if not path.name.endswith("_test.py")
+        and (reason in path.read_text() or "UNAVAILABLE_AT_ADMISSION" in path.read_text())
     ]
     assert sorted(sites) == [
         "native_audio.py",
         "native_bridge.py",
+        "native_dead_rungs.py",
         "native_decisions.py",
         "native_embeddings.py",
         "native_images.py",

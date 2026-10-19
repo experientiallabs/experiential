@@ -80,6 +80,7 @@ from exp.runtime.gateway.native_continuation import (
     select_bound_continuation_route as _select_bound_continuation_route,
 )
 from exp.runtime.gateway.native_count_tokens import NativeCountTokensMixin
+from exp.runtime.gateway.native_dead_rungs import UNAVAILABLE_AT_ADMISSION, escalation_failure
 from exp.runtime.gateway.native_decode_boundary import NativeDecodeMixin
 from exp.runtime.gateway.native_dispatch_signing import NativeDispatchSigningMixin
 from exp.runtime.gateway.native_effects import admission_without_effects
@@ -467,7 +468,11 @@ class NativeControlPlane(
             )
             route, request = route_by_provider_preferences(route, request, self._components)
             # Skip unavailable deployments at admission so a live fallback can still serve.
-            dispatchable = dispatchable_route_profiles(self._components.runtime_catalogs, route)
+            dispatchable = dispatchable_route_profiles(
+                self._components.runtime_catalogs,
+                route,
+                reread=lambda: self._components.runtime_catalogs,
+            )
             record_dead_admission_rungs(
                 self._accounting,
                 authorization,
@@ -481,10 +486,7 @@ class NativeControlPlane(
                 ):
                     raise _continuation_binding_error()
                 # No dispatchable rung remains; finalize the accepted request closed.
-                return self._escalate_accepted(
-                    authorization,
-                    "every certified deployment was unavailable at admission",
-                )
+                return self._escalate_accepted(authorization, UNAVAILABLE_AT_ADMISSION)
             route = select_route_deployments(route, dispatchable.indexes)
             resolved_wires = dispatchable.resolved_wires
             route, resolved_wires, selected_placement = select_single_route_before_search(
@@ -978,10 +980,7 @@ class NativeControlPlane(
         """Close an accepted request with its prework meter and return its disposition."""
         self._accounting.finish_request_quietly(
             authorization,
-            GatewayFailure(
-                failure_class=GatewayFailureClass.INTERNAL,
-                safe_message="the native engine cannot serve the authorized route",
-            ),
+            escalation_failure(authorization, reason),
             web_search_requests=web_search_requests,
         )
         return _escalation(reason)

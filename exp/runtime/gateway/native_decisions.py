@@ -31,8 +31,11 @@ from exp.runtime.gateway.native_accounting import (
     NativeBridgeError,
     authority_error,
 )
-from exp.runtime.gateway.native_admission import record_dead_admission_rungs
+from exp.runtime.gateway.native_admission import (
+    record_dead_admission_rungs,
+)
 from exp.runtime.gateway.native_components import NativeGatewayComponents, SyncWriteLedger
+from exp.runtime.gateway.native_dead_rungs import UNAVAILABLE_AT_ADMISSION
 from exp.runtime.gateway.native_execution import (
     MAXIMUM_TOTAL_ATTEMPTS,
     InflightRequest,
@@ -182,6 +185,7 @@ def _admit_accepted(
         dispatchable = dispatchable_route_profiles(
             plane._components.runtime_catalogs,
             route,  # noqa: SLF001
+            reread=lambda: plane._components.runtime_catalogs,  # noqa: SLF001
         )
     except NativeDialectUnavailableError as exc:
         return plane._escalate_accepted(authorization, str(exc))  # noqa: SLF001
@@ -198,7 +202,7 @@ def _admit_accepted(
     )
     if not dispatchable.indexes:
         return plane._escalate_accepted(  # noqa: SLF001
-            authorization, "every certified deployment was unavailable at admission"
+            authorization, UNAVAILABLE_AT_ADMISSION
         )
     capable = tuple(
         index

@@ -28,8 +28,8 @@ from exp.runtime.gateway.class_throttles import fast_request, require_fast_path
 from exp.runtime.gateway.contracts import AuthorizationSnapshot, DirectTarget, GatewayRequest
 from exp.runtime.gateway.native_accounting import NativeAttemptAccounting
 from exp.runtime.gateway.native_components import NativeGatewayComponents
+from exp.runtime.gateway.native_dead_rungs import DeadRung, log_dead_rungs
 from exp.runtime.gateway.native_execution import (
-    DeadRung,
     deployment_health_key,
     reorder_route_deployments,
     request_carries_cache_markers,
@@ -960,17 +960,9 @@ def record_dead_admission_rungs(
             deployment_health_key(authorization, rung.deployment),
             rung.failure,
         )
-    lead = next((rung for rung in dead if rung.index == 0), None)
-    lead_masked = lead is not None and fallback_available
+    lead_masked = fallback_available and any(rung.index == 0 for rung in dead)
     accounting.record_admission_rung_skips(len(dead), lead_skipped=lead_masked)
-    if lead is not None and fallback_available:
-        _logger.warning(
-            "gateway admission skipped the lead rung for alias %r: served off a "
-            "fallback because deployment %r (provider %r) was dead at admission",
-            authorization.alias,
-            lead.deployment.deployment_id,
-            lead.deployment.provider,
-        )
+    log_dead_rungs(authorization, dead, fallback_available=fallback_available)
 
 
 def log_reasoning_continuation_rejection(
