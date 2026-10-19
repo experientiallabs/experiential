@@ -133,6 +133,16 @@ impl ReasoningCarrierState {
                 "Chat reasoning content requires complete unique tool calls.",
             ));
         }
+        // A custom (freeform) call returns to the gateway as an opaque
+        // `custom_tool_call` history item, never as a tool-call turn, so a
+        // carrier sealed over it could not be bound on the next request and its
+        // freeform input is no JSON object to digest. The turn serves without
+        // preserved reasoning, as a failover would (Codex `apply_patch` on
+        // Experiential Cloud failed every such completed turn at the terminal,
+        // production 2026-10-19).
+        if self.completed.values().any(|call| call.custom) {
+            return Ok(None);
+        }
         let route_sha256 = self.route_sha256.clone().ok_or_else(|| {
             invalid_provider_stream("Chat reasoning content omitted provider route identity.")
         })?;

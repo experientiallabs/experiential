@@ -839,7 +839,11 @@ impl ResponsesSseEncoder {
         status: &str,
         failure: Option<&Failure>,
     ) -> Result<Vec<String>, PublicError> {
-        if status == "completed" && !self.tools.is_empty() {
+        // A turn holding a custom (freeform) call is never sealed (see
+        // `ReasoningCarrierState::candidate`); its reasoning item serves without
+        // an encrypted carrier, exactly like a tool-free turn.
+        let sealable = !self.tools.values().any(|state| state.custom);
+        if status == "completed" && !self.tools.is_empty() && sealable {
             if let Some(reasoning) = self.fireworks_reasoning.as_mut() {
                 let carrier = self.reasoning_content_carrier.clone().ok_or_else(|| {
                     invalid_provider_stream(

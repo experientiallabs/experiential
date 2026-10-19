@@ -147,6 +147,76 @@ fn fireworks_responses_reasoning_fails_closed_without_a_sealed_carrier() {
     .is_err());
 }
 
+/// The provider events of a Codex `apply_patch` turn after the native-tool
+/// inverter restored the custom call: freeform input, no JSON object.
+fn fireworks_custom_tool_events() -> Vec<Event> {
+    let patch = "*** Begin Patch\n*** End Patch\n";
+    vec![
+        Event::ReasoningContentDelta {
+            route_sha256: "a".repeat(64),
+            delta: "hidden provider reasoning".to_string(),
+        },
+        Event::ToolCallStarted {
+            custom: true,
+            namespace: None,
+            caller: None,
+            index: 0,
+            call_id: "call-patch".to_string(),
+            name: "apply_patch".to_string(),
+            thought_signature: None,
+        },
+        Event::ToolArgumentsDelta {
+            index: 0,
+            delta: patch.to_string(),
+        },
+        Event::ToolCallCompleted {
+            index: 0,
+            call: CompletedToolCall {
+                namespace: None,
+                caller: None,
+                call_id: "call-patch".to_string(),
+                name: "apply_patch".to_string(),
+                raw_arguments: patch.to_string(),
+                provider_item_id: None,
+                provider_status: None,
+                custom: true,
+                thought_signature: None,
+            },
+        },
+        Event::Completed,
+    ]
+}
+
+#[test]
+fn fireworks_custom_tool_turn_serves_without_a_carrier() {
+    // Production 2026-10-19: every completed Codex apply_patch turn on an
+    // Experiential Cloud reasoning lane failed at the terminal because the
+    // carrier sealer tried to digest the freeform patch as JSON arguments.
+    let events = fireworks_custom_tool_events();
+    assert!(reasoning_carrier_candidate(&events)
+        .expect("provider events must validate")
+        .is_none());
+    let envelope = ResponsesEnvelope {
+        include_encrypted_reasoning: true,
+        ..ResponsesEnvelope::default()
+    };
+    let mut encoder =
+        ResponsesSseEncoder::new("request-1", "coding", 1_700_000_000, envelope.clone());
+    encoder.start().expect("stream start must encode");
+    let mut frames = Vec::new();
+    for event in &events {
+        frames.extend(encoder.feed(event).expect("Responses event must encode"));
+    }
+    let public = frames.join("");
+    assert!(public.contains("response.completed"));
+    assert!(public.contains("response.custom_tool_call_input.done"));
+    assert!(!public.contains("hidden provider reasoning"));
+    assert!(!public.contains("encrypted_content\":\""));
+    assert!(
+        completed_responses_body("request-1", "coding", 1_700_000_000, envelope, &events).is_ok()
+    );
+}
+
 #[test]
 fn fireworks_parallel_tools_share_public_and_carrier_order() {
     let events = vec![
