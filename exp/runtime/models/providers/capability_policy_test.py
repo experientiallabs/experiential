@@ -98,9 +98,10 @@ def test_efforts_order_by_nearness_and_prefer_the_lower_level_on_ties() -> None:
 def test_an_effort_below_every_tier_rises_to_the_nearest_one(effort: ReasoningEffort) -> None:
     """A high-only route serves an explicit lower effort at ``high``, disclosed.
 
-    gemini-3.8-flash serves only ``high``; ``medium`` was refused by name
-    (production 2026-10-17). Raising happens only when no tier at or below
-    the request serves, so it never replaces a lower tier that would.
+    A lane whose ladder is only ``high`` refused ``medium`` by name
+    (gemini-3.8-flash under a high-only ladder, production 2026-10-17).
+    Raising happens only when no tier at or below the request serves, so it
+    never replaces a lower tier that would.
     """
     coercion = coerce_generation_parameters(
         (_reasoning_profile("gpt-5-pro"),), _request(reasoning_effort=effort)

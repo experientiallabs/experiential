@@ -653,8 +653,9 @@ def _coerce_generation_semantics(
     # their own reason: the route cannot turn reasoning off or go that
     # shallow (pinned clients send "none" to every model; the gateway
     # refused 925 such requests a day). Any other effort between or below
-    # the ladder's tiers is ``nearest_supported`` (gemini-3.8-flash serves
-    # only "high"; "medium" was refused, production 2026-10-17).
+    # the ladder's tiers is ``nearest_supported`` (a lane whose ladder was
+    # only "high" refused "medium" by name, gemini-3.8-flash in production
+    # 2026-10-17, before its real low/medium/high ladder was recorded).
     above = tuple(
         effort
         for effort in REASONING_EFFORTS[REASONING_EFFORTS.index(request.reasoning_effort) + 1 :]

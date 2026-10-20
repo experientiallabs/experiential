@@ -478,6 +478,12 @@ def test_gemini_thinking_levels_follow_exact_model_tables() -> None:
     with pytest.raises(UnsupportedReasoningEffortError):
         gemini_thinking_level("gemini-3.1-flash-lite-image", "low")
     assert gemini_thinking_level("gemini-3.6-flash", "minimal") == "minimal"
+    # gemini-3.8-flash: low, medium and high only (live 2026-10-20).
+    assert gemini_thinking_level("gemini-3.8-flash", "low") == "low"
+    assert gemini_thinking_level("gemini-3.8-flash", "medium") == "medium"
+    for refused in ("none", "minimal", "xhigh"):
+        with pytest.raises(UnsupportedReasoningEffortError):
+            gemini_thinking_level("gemini-3.8-flash", refused)
     with pytest.raises(UnsupportedReasoningEffortError):
         gemini_thinking_level("gemini-2.5-pro", "minimal")
     with pytest.raises(UnsupportedReasoningEffortError):
@@ -634,6 +640,21 @@ def test_exact_effort_support_covers_each_reasoning_wire_family() -> None:
     )
     assert supported_reasoning_efforts("gemini-3-pro-preview", "gemini_thinking") == (
         "low",
+        "high",
+    )
+    for gemini_38_flash in (
+        "gemini-3.8-flash",
+        "models/gemini-3.8-flash",
+        "publishers/google/models/gemini-3.8-flash",
+    ):
+        assert supported_reasoning_efforts(gemini_38_flash, "gemini_thinking") == (
+            "low",
+            "medium",
+            "high",
+        )
+    assert supported_reasoning_efforts("google/gemini-3.8-flash", "reasoning") == (
+        "low",
+        "medium",
         "high",
     )
     assert supported_reasoning_efforts("gemini-4-argon", "gemini_thinking") == (

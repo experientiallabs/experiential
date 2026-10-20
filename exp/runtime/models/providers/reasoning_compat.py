@@ -400,6 +400,15 @@ def _gemini_supported_efforts(model_id: str) -> Collection[str]:
         # tokens on one prompt); MINIMAL and XHIGH answer 400. "none" rides
         # thinkingBudget 0, which this model accepts with zero thoughts.
         supported: Collection[str] = ("none", "low", "medium", "high")
+    elif "gemini-3-8-flash" in normalized:
+        # Probed live 2026-10-20 on Vertex (global generateContent) and AI
+        # Studio: LOW, MEDIUM and HIGH are accepted and think measurably more
+        # at each step (Vertex 573 / 777 / 811, AI Studio 400 / 916 / 1707
+        # thought tokens on one prompt). MINIMAL answers 400 on both ("not
+        # supported for this model") and XHIGH is not a field value. "none" is
+        # absent: thinkingBudget 0 is accepted but the model still thinks
+        # (290 and 604 thought tokens), so it would not be an off switch.
+        supported = ("low", "medium", "high")
     elif "gemini-3-7-flash" in normalized or "gemini-3-1-pro" in normalized:
         supported = ("low", "medium", "high")
     elif "gemini-3-pro" in normalized:
