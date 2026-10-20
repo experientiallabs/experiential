@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from typing import Literal
 
 from exp.runtime.gateway.contracts import GatewayFailure, GatewayFailureClass
+from exp.runtime.openai_protocol.errors import THROTTLED_RETRY_AFTER_SECONDS
 
 DeploymentHealthKey = tuple[str, str, str]
 
@@ -32,8 +33,10 @@ _OPERATIONAL_FAILURES = {
 # floor keeps a degenerate "0"/"1" from thrashing the rung; the ceiling keeps
 # one absurd header from suppressing a lane for days while still letting a
 # daily-quota reset (hours) mark the rung dead-for-hours so the waterfall
-# skips it for the whole window.
-RETRY_AFTER_WINDOW_MINIMUM_SECONDS = 5.0
+# skips it for the whole window. The floor equals the public throttled
+# Retry-After (`THROTTLED_RETRY_AFTER_SECONDS`): a short hint and a missing
+# hint must both suppress for exactly the wait the header tells the client.
+RETRY_AFTER_WINDOW_MINIMUM_SECONDS = float(THROTTLED_RETRY_AFTER_SECONDS)
 RETRY_AFTER_WINDOW_MAXIMUM_SECONDS = 6.0 * 3_600.0
 # A plan's usage window resets on the provider's own clock, and the longest one
 # (the weekly window) can be days away. Suppression follows the stated reset up
@@ -84,7 +87,7 @@ class DeploymentHealthRegistry:
         *,
         failure_threshold: int = 2,
         open_seconds: float = 30.0,
-        throttle_seconds: float = 30.0,
+        throttle_seconds: float = float(THROTTLED_RETRY_AFTER_SECONDS),
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         """Initialize finite in-process deployment health policy.
@@ -92,7 +95,10 @@ class DeploymentHealthRegistry:
         Args:
             failure_threshold: Consecutive operational failures that open one circuit.
             open_seconds: Circuit cooldown before one half-open probe.
-            throttle_seconds: Independent suppression window after provider throttling.
+            throttle_seconds: Suppression window after a provider throttle that
+                stated no ``Retry-After``. Capped at the public Retry-After
+                (``THROTTLED_RETRY_AFTER_SECONDS``); a longer value cannot
+                outlive the header a client is told to honor.
             clock: Injectable monotonic clock.
 
         Raises:
@@ -284,13 +290,20 @@ class DeploymentHealthRegistry:
             state.throttle_until = max(state.throttle_until, now + window)
 
     def _throttle_window_seconds(self, failure: GatewayFailure) -> float:
-        """Size one throttle window from the provider's own stated wait.
+        """Size one throttle window from the wait the client will be told.
 
         A throttled failure carrying a parsed ``Retry-After`` sizes the window
         from it, clamped to the bounded range, so a long provider backoff (an
         exhausted daily quota) actually suppresses the rung for the wait the
-        provider asked for instead of re-attempting every fixed default. An
-        absent or unparseable wait keeps the fixed default window.
+        provider asked for instead of re-attempting every fixed default. The
+        public mapper advertises that same clamped wait.
+
+        An absent wait used to fall back to a 30s ``throttle_seconds`` while
+        the public mapper advertised ``THROTTLED_RETRY_AFTER_SECONDS`` (5s).
+        A client that slept the header was then refused with no upstream
+        attempt for the rest of the longer window. The no-hint window is the
+        advertised header, and a configured ``throttle_seconds`` may only
+        shorten it.
 
         Args:
             failure: Sanitized throttled failure.
@@ -299,7 +312,7 @@ class DeploymentHealthRegistry:
             The window length in seconds.
         """
         if failure.retry_after_seconds is None:
-            return self._throttle_seconds
+            return min(self._throttle_seconds, float(THROTTLED_RETRY_AFTER_SECONDS))
         return min(
             max(float(failure.retry_after_seconds), RETRY_AFTER_WINDOW_MINIMUM_SECONDS),
             RETRY_AFTER_WINDOW_MAXIMUM_SECONDS,

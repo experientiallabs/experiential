@@ -7,9 +7,14 @@ import pytest
 from exp.runtime.gateway.contracts import GatewayFailure, GatewayFailureClass
 from exp.runtime.gateway.health import (
     PLAN_WINDOW_MAXIMUM_SECONDS,
+    RETRY_AFTER_WINDOW_MINIMUM_SECONDS,
     DeploymentHealthKey,
     DeploymentHealthRegistry,
     health_failure_cause,
+)
+from exp.runtime.openai_protocol.errors import (
+    THROTTLED_RETRY_AFTER_SECONDS,
+    public_failure_error,
 )
 
 _KEY: DeploymentHealthKey = ("catalog", "deployment", "connection")
@@ -207,8 +212,8 @@ def test_retry_after_sizes_the_throttle_window_clamped(
 
     A short or degenerate wait floors at five seconds, an in-range wait (an
     hourly quota reset) suppresses for exactly what the provider asked, and an
-    absurd wait ceilings at six hours; a throttle carrying no wait keeps the
-    fixed default window.
+    absurd wait ceilings at six hours. A throttle carrying no wait is covered
+    by ``test_throttle_without_retry_after_matches_the_advertised_header``.
     """
     now = [100.0]
     registry = DeploymentHealthRegistry(throttle_seconds=30.0, clock=lambda: now[0])
@@ -226,15 +231,48 @@ def test_retry_after_sizes_the_throttle_window_clamped(
     assert registry.claim(_KEY)
 
 
-def test_throttle_without_retry_after_keeps_the_default_window() -> None:
-    """An absent wait falls back to the registry's fixed throttle window."""
+def test_throttle_without_retry_after_matches_the_advertised_header() -> None:
+    """A 429 with no Retry-After must not suppress past the header it sends.
+
+    The public mapper answers ``THROTTLED_RETRY_AFTER_SECONDS`` (5). The
+    registry used to arm ``throttle_seconds`` (30) for that same failure, so
+    a client that slept the header was refused — ``claim``, the last-resort
+    probe, and the forced claim all false — with no upstream attempt until
+    the longer window elapsed. Configured ``throttle_seconds`` of 30, the
+    historical default, cannot recreate that gap. A provider-stated wait
+    still sizes both the header and the window.
+    """
+    assert float(THROTTLED_RETRY_AFTER_SECONDS) == RETRY_AFTER_WINDOW_MINIMUM_SECONDS
     now = [100.0]
     registry = DeploymentHealthRegistry(throttle_seconds=30.0, clock=lambda: now[0])
-    registry.failed(_KEY, _failure(GatewayFailureClass.THROTTLED))
-    now[0] = 129.0
+    failure = _failure(GatewayFailureClass.THROTTLED)
+    public = public_failure_error(failure)
+    assert public.headers() == {"Retry-After": str(THROTTLED_RETRY_AFTER_SECONDS)}
+
+    registry.failed(_KEY, failure)
+    advertised = float(THROTTLED_RETRY_AFTER_SECONDS)
+    now[0] = 100.0 + advertised - 0.1
     assert not registry.claim(_KEY)
-    now[0] = 131.0
+    assert not registry.claim_last_resort(_KEY)
+    assert not registry.claim_forced(_KEY)
+    # The old 30s window would still be closed here. The client that honors
+    # the header is admitted, so the next dial reaches the provider.
+    now[0] = 100.0 + advertised
     assert registry.claim(_KEY)
+
+    stated = GatewayFailure(
+        failure_class=GatewayFailureClass.THROTTLED,
+        safe_message="scripted throttle",
+        retry_after_seconds=20,
+    )
+    assert public_failure_error(stated).headers() == {"Retry-After": "20"}
+    stated_registry = DeploymentHealthRegistry(throttle_seconds=30.0, clock=lambda: now[0])
+    stated_at = now[0]
+    stated_registry.failed(_KEY, stated)
+    now[0] = stated_at + 19.0
+    assert not stated_registry.claim(_KEY)
+    now[0] = stated_at + 20.0
+    assert stated_registry.claim(_KEY)
 
 
 def test_suppressed_is_a_read_only_probe() -> None:
@@ -274,9 +312,14 @@ def test_throttled_remaining_seconds_names_a_fully_throttled_route() -> None:
     assert registry.throttled_remaining_seconds(()) is None
     assert registry.throttled_remaining_seconds((first,)) is None
 
-    registry.failed(first, _failure(GatewayFailureClass.THROTTLED))
+    hinted = GatewayFailure(
+        failure_class=GatewayFailureClass.THROTTLED,
+        safe_message="scripted throttle",
+        retry_after_seconds=30,
+    )
+    registry.failed(first, hinted)
     now[0] += 10.0
-    registry.failed(second, _failure(GatewayFailureClass.THROTTLED))
+    registry.failed(second, hinted)
     remaining = registry.throttled_remaining_seconds((first, second))
     assert remaining == 30.0
 
