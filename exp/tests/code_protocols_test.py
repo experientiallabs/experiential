@@ -51,6 +51,16 @@ PROTOCOLS = (
         "b01624522a004f1f4bdb72aefb4f91eb76902b5239fb6ef392a3bc90804853e4",
     ),
     Protocol(
+        "exp.optimize.evaluation.tasks.challenges:CHALLENGE_PROTOCOL",
+        "judge-challenge-v1",
+        (
+            "exp.optimize.evaluation.tasks.challenges",
+            "exp.simulation.evaluation.calibration:task_decision",
+            "exp.simulation.evaluation.calibration:blinded_case",
+        ),
+        "183baa5acc0f87a6a9ddc5d650e47712228e1d84479c0dcf0ccc151431f74a02",
+    ),
+    Protocol(
         "exp.optimize.evaluation.council.runner:COUNCIL_HARNESS_PROTOCOL",
         "council-harness-v3",
         (
