@@ -631,20 +631,11 @@ class _ChatRequest(_WireModel):
 
     @model_validator(mode="after")
     def _require_coherent_options(self) -> _ChatRequest:
-        """Reject conflicting token ceilings and orphaned logprob options.
+        """Reject orphaned logprob options.
 
-        ``stream_options`` on a non-streaming call is removed with disclosure
-        before validation (``client_field_repairs``)."""
-        if (
-            sum(
-                v is not None
-                for v in (self.max_tokens, self.max_completion_tokens, self.max_output_tokens)
-            )
-            > 1
-        ):
-            raise ValueError(
-                "max_tokens, max_completion_tokens and max_output_tokens are mutually exclusive"
-            )
+        Several output-limit spellings together are reconciled after validation
+        (``client_field_repairs.chat_output_cap``), and ``stream_options`` on a
+        non-streaming call is removed with disclosure before it."""
         if self.top_logprobs is not None and self.logprobs is not True:
             raise ValueError("top_logprobs requires logprobs=true")
         return self

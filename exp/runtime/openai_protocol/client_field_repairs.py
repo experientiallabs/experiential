@@ -21,6 +21,7 @@ body, and every removal that changes what the caller asked for is named in
 from __future__ import annotations
 
 import json
+from typing import Literal
 
 from exp.common.core.artifacts import JsonObject, JsonValue
 from exp.runtime.openai_protocol.errors import invalid_field
@@ -136,6 +137,54 @@ _UNFORWARDED_HINTS: tuple[tuple[str, str], ...] = (
     ("prompt_cache_retention", PROMPT_CACHE_RETENTION_IGNORED),
 )
 """Top-level hints both OpenAI surfaces accept and drop, in disclosure order."""
+
+
+ChatOutputCapField = Literal["max_completion_tokens", "max_tokens", "max_output_tokens"]
+"""Chat spellings of the caller's output cap, in tie-break preference order."""
+
+
+def chat_output_cap(
+    max_completion_tokens: int | None, max_tokens: int | None, max_output_tokens: int | None
+) -> tuple[int | None, ChatOutputCapField | None, tuple[str, ...]]:
+    """Choose the effective Chat output cap when a client sends several spellings.
+
+    Neither OpenAI's Chat API nor OpenRouter defines the fields as exclusive,
+    and UnityWebRequest, node, AsyncOpenAI, curl and opencode clients send
+    ``max_tokens`` beside ``max_completion_tokens`` (usually with the same
+    value). The smallest value is the cap, so no spelling can raise the bound
+    another one set; ties keep the first field in ``ChatOutputCapField``
+    order. Each other spelling is disclosed as
+    ``<field>->ignored(superseded_by_<winner>)``. Every value has already been
+    validated as a positive integer by the wire model.
+
+    Args:
+        max_completion_tokens: Validated ``max_completion_tokens`` or None.
+        max_tokens: Validated ``max_tokens`` or None.
+        max_output_tokens: Validated ``max_output_tokens`` or None.
+
+    Returns:
+        The cap, the field that set it, and one disclosure per superseded field.
+    """
+    present: list[tuple[ChatOutputCapField, int]] = [
+        (field, value)
+        for field, value in (
+            ("max_completion_tokens", max_completion_tokens),
+            ("max_tokens", max_tokens),
+            ("max_output_tokens", max_output_tokens),
+        )
+        if value is not None
+    ]
+    if not present:
+        return None, None, ()
+    # min() keeps the first of equal values, so ties follow the preference order.
+    winner, cap = min(present, key=lambda item: item[1])
+    return (
+        cap,
+        winner,
+        tuple(
+            f"{field}->ignored(superseded_by_{winner})" for field, _ in present if field != winner
+        ),
+    )
 
 
 def drop_chat_message_client_annotations(

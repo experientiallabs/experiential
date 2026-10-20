@@ -37,7 +37,11 @@ from exp.runtime.openai_protocol.cache_control import (
     drop_opencode_cache_control,
     restore_chat_cache_control,
 )
-from exp.runtime.openai_protocol.client_field_repairs import repair_chat, repair_responses
+from exp.runtime.openai_protocol.client_field_repairs import (
+    chat_output_cap,
+    repair_chat,
+    repair_responses,
+)
 from exp.runtime.openai_protocol.custom_tool_wire import (
     ChatCustomToolCall,
     CustomToolCallItem,
@@ -50,8 +54,15 @@ from exp.runtime.openai_protocol.custom_tools import (
     custom_turn_cache_disclosures,
     expand_chat_custom_calls,
 )
-from exp.runtime.openai_protocol.enable_thinking import translate_enable_thinking
-from exp.runtime.openai_protocol.errors import invalid_field, unsupported_field
+from exp.runtime.openai_protocol.enable_thinking import (
+    CHAT_TEMPLATE_PRESERVE_THINKING_IGNORED,
+    translate_enable_thinking,
+)
+from exp.runtime.openai_protocol.errors import (
+    invalid_field,
+    unsupported_field,
+    validated_operation_headers,
+)
 from exp.runtime.openai_protocol.manifest import (
     CHAT_MANIFEST,
     EMBEDDINGS_MANIFEST,
@@ -213,16 +224,6 @@ dropped-and-disclosed) forms.
 """
 
 
-CHAT_TEMPLATE_PRESERVE_THINKING_IGNORED = (
-    "chat_template_kwargs.preserve_thinking->ignored(not_forwarded)"
-)
-"""Disclosure recorded when Qwen's ``preserve_thinking`` template switch is accepted unused.
-
-No wire receives ``chat_template_kwargs`` verbatim (``enable_thinking`` is
-translated to the canonical reasoning control), so the switch cannot reach a
-chat template; it is named rather than refused."""
-
-
 def _without_chat_message_extensions(payload: JsonObject) -> JsonObject:
     """Hide the wire-model-owned message keys from official OpenAI validation."""
     raw_messages = payload.get("messages")
@@ -293,10 +294,12 @@ def decode_chat(
     )
     request = _validate_wire(_ChatRequest, payload)
     alias, online_suffix = split_online_suffix(request.model)
-    idempotency_key, client_request_id = _validated_operation_headers(
+    idempotency_key, client_request_id = validated_operation_headers(
         idempotency_key, client_request_id
     )
-    maximum = request.max_completion_tokens or request.max_tokens or request.max_output_tokens
+    maximum, maximum_parameter, cap_disclosures = chat_output_cap(
+        request.max_completion_tokens, request.max_tokens, request.max_output_tokens
+    )
     stop = (
         ()
         if request.stop is None
@@ -333,6 +336,7 @@ def decode_chat(
             json_object_output=chat_json_object_output(request.response_format),
             ignored_parameters=(
                 *alias_disclosures,
+                *cap_disclosures,
                 *cache_disclosures,
                 *custom_turn_cache_disclosures(cache_payload.get("messages")),
                 *thinking.disclosures,
@@ -353,15 +357,7 @@ def decode_chat(
                 online_suffix=online_suffix,
             ),
             maximum_output_tokens=maximum,
-            maximum_output_tokens_parameter=(
-                "max_completion_tokens"
-                if request.max_completion_tokens is not None
-                else "max_tokens"
-                if request.max_tokens is not None
-                else "max_output_tokens"
-                if request.max_output_tokens is not None
-                else None
-            ),
+            maximum_output_tokens_parameter=maximum_parameter,
             thinking_budget=request.thinking_budget,
             provider_thinking_config=thinking.thinking_config,
             stop=stop,
@@ -466,7 +462,7 @@ def decode_responses(
         include_output_text_logprobs,
         include_web_search_sources,
     ) = _responses_include_options(request.include)
-    idempotency_key, client_request_id = _validated_operation_headers(
+    idempotency_key, client_request_id = validated_operation_headers(
         idempotency_key, client_request_id
     )
     raw_input = payload.get("input")
@@ -636,31 +632,6 @@ def _validate_wire[ModelT: BaseModel](model: type[ModelT], payload: JsonObject) 
         return model.model_validate(payload)
     except ValidationError as exc:
         raise validation_protocol_error(exc) from exc
-
-
-def _validated_operation_headers(
-    idempotency_key: str | None, client_request_id: str | None
-) -> tuple[str | None, str | None]:
-    """Validate the two caller identity headers as independent concepts.
-
-    ``Idempotency-Key`` names one retriable operation and is the only header
-    that keys replay and duplicate detection. ``X-Client-Request-Id`` is a
-    caller correlation identity: Codex sends its session id there on every
-    request of a session (captured live 2026-08-29), and the provider serves
-    those requests without deduplication, so treating it as an operation key
-    would reject the second request of every real session as a conflict. It
-    is echoed on responses and scopes route affinity only, and the two
-    headers may therefore carry different values.
-    """
-    for name, value in (
-        ("Idempotency-Key", idempotency_key),
-        ("X-Client-Request-Id", client_request_id),
-    ):
-        if value is not None and (
-            not value or len(value) > 512 or any(ord(char) < 32 for char in value)
-        ):
-            raise invalid_field(name, f"{name} must be a non-empty display-safe value.")
-    return idempotency_key, client_request_id
 
 
 def _messages(messages: tuple[_Message, ...], prefix: str) -> tuple[GatewayMessage, ...]:

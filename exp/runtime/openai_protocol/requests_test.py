@@ -5346,18 +5346,74 @@ def test_chat_accepts_max_output_tokens_without_losing_the_ceiling(limit: int) -
     assert request.maximum_output_tokens_parameter == "max_output_tokens"
 
 
-@pytest.mark.parametrize("other", ("max_tokens", "max_completion_tokens"))
-def test_chat_output_limit_spellings_cannot_override_each_other(other: str) -> None:
-    """Reject ambiguous ceilings rather than increasing a caller's bound."""
-    with pytest.raises(OpenAIProtocolError):
-        decode_chat(
-            {
-                "model": "coding",
-                "messages": [{"role": "user", "content": "hi"}],
-                "max_output_tokens": 128,
-                other: 256,
-            }
-        )
+def _decode_chat_limits(**limits: JsonValue) -> GatewayRequest:
+    """Decode a minimal Chat request carrying the given output-limit fields."""
+    body: JsonObject = {"model": "coding", "messages": [{"role": "user", "content": "hi"}]}
+    return decode_chat({**body, **limits}).request
+
+
+def test_chat_equal_max_tokens_and_max_completion_tokens_serve_with_disclosure() -> None:
+    """UnityWebRequest, node, AsyncOpenAI and opencode send both spellings, usually equal.
+
+    A 400 failed ~110 such requests a day (2026-10); OpenAI and OpenRouter
+    define neither field as exclusive of the other.
+    """
+    request = _decode_chat_limits(max_tokens=4096, max_completion_tokens=4096)
+    assert request.maximum_output_tokens == 4096
+    assert request.maximum_output_tokens_parameter == "max_completion_tokens"
+    assert request.ignored_parameters == (
+        "max_tokens->ignored(superseded_by_max_completion_tokens)",
+    )
+
+
+@pytest.mark.parametrize(
+    ("limits", "cap", "winner"),
+    (
+        ({"max_tokens": 256, "max_completion_tokens": 1024}, 256, "max_tokens"),
+        ({"max_tokens": 1024, "max_completion_tokens": 256}, 256, "max_completion_tokens"),
+        ({"max_output_tokens": 128, "max_tokens": 256}, 128, "max_output_tokens"),
+        ({"max_output_tokens": 512, "max_completion_tokens": 64}, 64, "max_completion_tokens"),
+    ),
+)
+def test_chat_different_output_limits_serve_at_the_smallest(
+    limits: dict[str, int], cap: int, winner: str
+) -> None:
+    """No spelling can raise the bound another one set: the smallest value is the cap."""
+    request = _decode_chat_limits(**limits)
+    assert request.maximum_output_tokens == cap
+    assert request.maximum_output_tokens_parameter == winner
+    (loser,) = (field for field in limits if field != winner)
+    assert request.ignored_parameters == (f"{loser}->ignored(superseded_by_{winner})",)
+
+
+def test_chat_all_three_output_limits_serve_at_the_smallest() -> None:
+    """All three spellings together keep the smallest and disclose the other two."""
+    request = _decode_chat_limits(max_tokens=300, max_completion_tokens=200, max_output_tokens=200)
+    assert request.maximum_output_tokens == 200
+    assert request.maximum_output_tokens_parameter == "max_completion_tokens"
+    assert request.ignored_parameters == (
+        "max_tokens->ignored(superseded_by_max_completion_tokens)",
+        "max_output_tokens->ignored(superseded_by_max_completion_tokens)",
+    )
+
+
+@pytest.mark.parametrize(
+    ("limits", "param"),
+    (
+        ({"max_tokens": 0, "max_completion_tokens": 256}, "max_tokens"),
+        ({"max_tokens": 256, "max_completion_tokens": -1}, "max_completion_tokens"),
+        ({"max_tokens": 256, "max_output_tokens": "256"}, "max_output_tokens"),
+        ({"max_completion_tokens": 256, "max_output_tokens": 1.5}, "max_output_tokens"),
+    ),
+)
+def test_chat_invalid_output_limit_beside_another_is_still_refused(
+    limits: dict[str, JsonValue], param: str
+) -> None:
+    """Leniency covers only valid duplicates: a non-positive or mistyped value is named."""
+    with pytest.raises(OpenAIProtocolError) as error:
+        _decode_chat_limits(**limits)
+    assert error.value.detail.param == param
+    assert "mutually exclusive" not in error.value.detail.message
 
 
 def test_responses_web_search_sources_selector_is_honored() -> None:

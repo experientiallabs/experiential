@@ -5,8 +5,12 @@ not permission to select a smaller output budget or a more expensive reasoning m
 
 ## Output limits
 
-Chat Completions accepts `max_completion_tokens`, `max_tokens`, or `max_output_tokens`
-(one non-null spelling per request) through its protocol decoder. Messages requires `max_tokens`. An explicit limit remains a ceiling.
+Chat Completions accepts `max_completion_tokens`, `max_tokens`, or `max_output_tokens` through
+its protocol decoder. Neither OpenAI nor OpenRouter defines them as exclusive, and many clients
+send `max_tokens` beside `max_completion_tokens`, so when several arrive together the smallest
+value is the cap (ties keep `max_completion_tokens`, then `max_tokens`) and each other spelling is
+disclosed as `max_tokens->ignored(superseded_by_max_completion_tokens)`. Each value must still be
+a positive integer. Messages requires `max_tokens`. An explicit limit remains a ceiling.
 Admission prefers any rung that accepts the exact value. When no rung on the route does, the
 limit is clamped onto the leading rung's accepted range and the change is disclosed: a limit
 above the route maximum dispatches at that maximum (`max_tokens->32768(route_maximum)`; Claude
