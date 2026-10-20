@@ -29,6 +29,10 @@ from exp.runtime.gateway.contracts import (
 )
 from exp.runtime.gateway.tool_contracts import GatewayAllowedToolsChoice, GatewayCustomToolChoice
 from exp.runtime.models.providers.adaptive_thinking_budget import budgeted_enabled_config
+from exp.runtime.models.providers.dialect_dispatch import (
+    TOOL_RESULT_DOCUMENT_DROP_DISCLOSURE,
+    strip_tool_result_documents,
+)
 from exp.runtime.models.providers.errors import (
     ProviderCapabilityError,
     ProviderParameterError,
@@ -750,8 +754,10 @@ def coerce_capability(capability: str, request: GatewayRequest) -> RequestCoerci
     into the caller's history and a rejection wedges the whole session; a
     top-level user image keeps the fail-closed contract (the caller can
     re-send it), so ``image_input`` coerces only when every image in the
-    request lives in a tool message. Every other capability names a feature
-    with no approximation and stays fail-closed.
+    request lives in a tool message; ``pdf_input`` and ``pdf_url_input``
+    follow the same rule for documents a tool returned (Claude Code's Read on
+    a PDF). Every other capability names a feature with no approximation and
+    stays fail-closed.
 
     Args:
         capability: Stable capability literal from the preflight rejection.
@@ -770,6 +776,16 @@ def coerce_capability(capability: str, request: GatewayRequest) -> RequestCoerci
         return RequestCoercion(
             request=request.model_copy(update={"messages": stripped}),
             disclosures=(TOOL_RESULT_IMAGE_DROP_DISCLOSURE,),
+        )
+    if capability in ("pdf_input", "pdf_url_input"):
+        if any(message.role != "tool" and message.documents for message in request.messages):
+            return None
+        stripped = strip_tool_result_documents(request.messages)
+        if stripped is None:
+            return None
+        return RequestCoercion(
+            request=request.model_copy(update={"messages": stripped}),
+            disclosures=(TOOL_RESULT_DOCUMENT_DROP_DISCLOSURE,),
         )
     if capability == "service_tier":
         if request.service_tier is None:

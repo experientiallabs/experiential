@@ -835,6 +835,74 @@ def test_top_level_user_images_keep_the_fail_closed_contract() -> None:
     )
 
 
+def _tool_document_request(*, user_document: bool = False) -> GatewayRequest:
+    """Decode a Claude Code turn whose Read tool returned a PDF beside a screenshot."""
+    pdf: JsonObject = {
+        "type": "document",
+        "source": {"type": "base64", "media_type": "application/pdf", "data": "JVBERi0xLjQK"},
+        "title": "r.pdf",
+    }
+    user: list[JsonObject] = [{"type": "text", "text": "go"}]
+    if user_document:
+        user.append(pdf)
+    image: JsonObject = {
+        "type": "image",
+        "source": {"type": "base64", "media_type": "image/png", "data": "aGk="},
+    }
+    return decode_messages(
+        {
+            "model": "m",
+            "max_tokens": 64,
+            "messages": [
+                {"role": "user", "content": user},
+                {
+                    "role": "assistant",
+                    "content": [{"type": "tool_use", "id": "call-1", "name": "Read", "input": {}}],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "call-1",
+                            "content": [{"type": "text", "text": "read:"}, pdf, image],
+                        }
+                    ],
+                },
+            ],
+        }
+    ).request
+
+
+@pytest.mark.parametrize("capability", ["pdf_input", "pdf_url_input"])
+def test_tool_result_documents_degrade_with_placeholder_on_a_pdf_incapable_route(
+    capability: str,
+) -> None:
+    """A tool-returned PDF is baked into history like a screenshot: a route with
+    no PDF input serves it as a disclosed placeholder instead of refusing the
+    request (which would wedge the session), and the screenshot beside it stays."""
+    from exp.runtime.models.providers.dialect_dispatch import (
+        TOOL_RESULT_DOCUMENT_DROP_DISCLOSURE,
+    )
+
+    request = _tool_document_request()
+    assert request.documents
+    coercion = coerce_capability(capability, request)
+    assert coercion is not None
+    assert coercion.disclosures == (TOOL_RESULT_DOCUMENT_DROP_DISCLOSURE,)
+    assert coercion.request.documents == ()
+    tool_message = next(m for m in coercion.request.messages if m.role == "tool")
+    assert [part.kind for part in tool_message.content_parts] == ["text", "text", "image"]
+    assert tool_message.content == (
+        "read:[document 'r.pdf' omitted: this model route cannot carry documents]"
+    )
+
+
+def test_top_level_user_documents_keep_the_fail_closed_contract() -> None:
+    """A user document the caller can re-send never degrades silently."""
+    assert coerce_capability("pdf_input", _tool_document_request(user_document=True)) is None
+
+
 def _openai_reasoning_profile(
     efforts: tuple[ReasoningEffort, ...] = ("none", "low", "medium", "high"),
 ) -> GatewayWireProfile:

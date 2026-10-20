@@ -949,6 +949,73 @@ def test_tool_result_image_degrades_with_disclosure_on_a_non_vision_route(stream
 
 
 @pytest.mark.parametrize("stream", [True, False])
+def test_tool_result_pdf_degrades_with_disclosure_on_a_pdf_incapable_route(stream: bool) -> None:
+    """Claude Code's Read on a PDF serves on a route with no PDF input.
+
+    The document is baked into the caller's history like a screenshot, so a
+    ``pdf_input`` refusal would wedge every later turn; the route answers with a
+    placeholder naming the document and discloses the drop.
+    """
+    from exp.runtime.anthropic_protocol.requests import decode_messages
+    from exp.runtime.gateway.native_accounting import NativeAttemptAccounting
+    from exp.runtime.models.providers.dialect_dispatch import (
+        TOOL_RESULT_DOCUMENT_DROP_DISCLOSURE,
+    )
+
+    pdf: JsonObject = {
+        "type": "document",
+        "source": {"type": "base64", "media_type": "application/pdf", "data": "JVBERi0xLjQK"},
+        "title": "spec.pdf",
+    }
+    body: JsonObject = {
+        "model": "coding",
+        "max_tokens": 128,
+        "stream": stream,
+        "messages": [
+            {"role": "user", "content": "read the spec"},
+            {
+                "role": "assistant",
+                "content": [{"type": "tool_use", "id": "call-1", "name": "Read", "input": {}}],
+            },
+            {
+                "role": "user",
+                "content": [{"type": "tool_result", "tool_use_id": "call-1", "content": [pdf]}],
+            },
+        ],
+    }
+    request = decode_messages(body).request.model_copy(update={"include_usage": True})
+    text_only = GatewayDeploymentMetadata(
+        capabilities=GatewayDeploymentCapabilities(
+            supports_streaming=True,
+            supports_streaming_tool_arguments=True,
+        )
+    )
+    deployments = (_deployment("claude", provider="anthropic", gateway=text_only),)
+    route = _mixed_route("maximize_availability", deployments, GatewayApiSurface.MESSAGES)
+    client = cast(NativeWireClient, object())
+    wires = (
+        (GatewayWireProfile(dialect="anthropic_messages", url="https://anthropic.test"), client),
+    )
+    accounting = _AdmissionCoercionCounter()
+
+    _narrowed, _wires_out, public, provider, _placement = admitted_route_requests(
+        route,
+        wires,
+        request,
+        accounting=cast(NativeAttemptAccounting, accounting),
+        authorization=route.snapshot.authorization,
+    )
+
+    tool_message = provider.messages[-1]
+    assert tool_message.content_parts == ()
+    assert tool_message.content == (
+        "[document 'spec.pdf' omitted: this model route cannot carry documents]"
+    )
+    assert TOOL_RESULT_DOCUMENT_DROP_DISCLOSURE in public.ignored_parameters
+    assert accounting.recorded == 1
+
+
+@pytest.mark.parametrize("stream", [True, False])
 def test_a_chat_tool_screenshot_is_admitted_and_folded_on_a_vision_chat_route(stream: bool) -> None:
     """The Copilot/Codex repro (an ``image_url`` part inside a ``role: "tool"``
     message on /v1/chat/completions) decodes, admits on an image-capable Chat

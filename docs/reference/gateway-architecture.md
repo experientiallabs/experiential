@@ -526,10 +526,10 @@ breaks the tool-call linkage): the tool message keeps a numbered
 the user message introduces each attachment by number and `tool_call_id` under a fixed header,
 and the route discloses `messages.content.tool_result.image->following_user_message` or
 `messages.content.tool_result.document->following_user_message`; the attachment ceilings and
-size bounds apply as for top-level user attachments. A rung with no image input at all still
-degrades the image to placeholder text with the
-`messages.content.tool_result.image->placeholder` disclosure; a top-level user image keeps
-the fail-closed contract because the caller can re-send it.
+size bounds apply as for top-level user attachments. A route with no image (or PDF) input at
+all degrades the attachment to placeholder text, disclosed as
+`messages.content.tool_result.image->placeholder` (or `messages.content.tool_result.document->placeholder`);
+a top-level user attachment keeps the fail-closed contract because the caller can re-send it.
 Both OpenAI surfaces accept the Vercel AI SDK's camelCase `promptCacheKey` (sent verbatim by
 opencode and other `ai-sdk` coding clients) as an alias of `prompt_cache_key`: it is renamed
 before manifest validation and decodes exactly as the documented field. When both spellings

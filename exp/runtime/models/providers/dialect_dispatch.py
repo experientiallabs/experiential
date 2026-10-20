@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING
 from urllib.parse import urlsplit
 
 from exp.common.core.artifacts import JsonObject
+from exp.common.models.content import TextContentPart
 from exp.common.models.known_models import known_model_metadata
 from exp.runtime.gateway.contracts import (
     GatewayApiSurface,
@@ -65,6 +66,9 @@ TOOL_RESULT_DOCUMENT_FOLD_DIALECTS = frozenset(
     {"openai_compatible", "openai_responses", "gemini_generate_content", "bedrock_converse_stream"}
 )
 """Dialects whose payload builders fold tool-result documents into a user turn."""
+TOOL_RESULT_DOCUMENT_DROP_DISCLOSURE = "messages.content.tool_result.document->placeholder"
+"""Disclosed when a route with no PDF input serves a tool-result document as
+placeholder text (see ``capability_policy.coerce_capability``)."""
 THINKING_HISTORY_DROP_DISCLOSURE = "messages.thinking->dropped(unsupported_by_provider)"
 GEMINI_MISSING_TOOL_RESULT_DISCLOSURE = "messages.tool_results.missing->placeholder"
 """Disclosed when a Gemini rung answers an unanswered function call with a placeholder.
@@ -220,6 +224,47 @@ def strip_tool_result_images(
         )
         out.append(message.model_copy(update={"content": content, "content_parts": ()}))
     return tuple(out)
+
+
+def strip_tool_result_documents(
+    messages: tuple[GatewayMessage, ...],
+) -> tuple[GatewayMessage, ...] | None:
+    """Replace tool-message document parts with positional placeholder text.
+
+    Every other part (text, a screenshot beside the document) keeps its place;
+    a tool message left with only text collapses back to plain content.
+
+    Args:
+        messages: The request's canonical messages.
+
+    Returns:
+        The degraded messages, or ``None`` when no tool message carries a
+        document (nothing to strip).
+    """
+    if not any(message.role == "tool" and message.documents for message in messages):
+        return None
+    out: list[GatewayMessage] = []
+    for message in messages:
+        if message.role != "tool" or not message.documents:
+            out.append(message)
+            continue
+        parts = tuple(
+            TextContentPart(text=_tool_result_document_placeholder(part.name))
+            if part.kind == "document"
+            else part
+            for part in message.content_parts
+        )
+        content = "".join(part.text for part in parts if part.kind == "text")
+        if all(part.kind == "text" for part in parts):
+            parts = ()
+        out.append(message.model_copy(update={"content": content, "content_parts": parts}))
+    return tuple(out)
+
+
+def _tool_result_document_placeholder(name: str | None) -> str:
+    """Return the text left where a tool-result document cannot ride."""
+    label = f" {name!r}" if name else ""
+    return f"[document{label} omitted: this model route cannot carry documents]"
 
 
 def fireworks_continuation_required(profile: GatewayWireProfile, request: GatewayRequest) -> bool:
