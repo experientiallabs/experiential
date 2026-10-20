@@ -7,6 +7,7 @@ import pytest
 
 from exp.common.core.artifacts import JsonObject
 from exp.common.models.catalog import (
+    BillingSource,
     GatewayDeploymentCapabilities,
     GatewayDeploymentMetadata,
     GatewayRungDispatchPolicy,
@@ -23,6 +24,12 @@ from exp.common.models.content import (
 from exp.common.models.gateway_catalog import ExactModelDeployment, FailoverMode
 from exp.common.models.gateway_chains import ModelExecutionStage
 from exp.common.models.model import ModelCapabilities, ToolCall
+from exp.runtime.gateway.affinity import (
+    affinity_fingerprint,
+    affinity_seed_material,
+    affinity_weighted_rungs,
+    rendezvous_order,
+)
 from exp.runtime.gateway.contracts import (
     AuthorizationSnapshot,
     DirectTarget,
@@ -2692,3 +2699,111 @@ def test_prompt_caching_off_keeps_certified_order_and_adds_no_cache_state() -> N
         f"prompt_cache_key{PROMPT_CACHING_OFF_SUFFIX}",
         PROMPT_CACHING_BEST_EFFORT,
     )
+
+
+def _aggregator_fixture(
+    *,
+    billing_source: BillingSource,
+    provider: str = "openrouter",
+    url: str = "https://openrouter.ai/api/v1",
+    others: tuple[str, ...] = ("dep-a", "dep-b"),
+) -> tuple[GatewayRoute, tuple[tuple[GatewayWireProfile, NativeWireClient], ...]]:
+    """Build an affinity route whose FIRST rung is an OpenRouter rung of overwhelming weight.
+
+    The weight makes plain rendezvous rank the OpenRouter rung first for every
+    fingerprint, so a test can tell the demotion from the rendezvous draw.
+    """
+    aggregator = _deployment(
+        "dep-openrouter",
+        provider=provider,
+        gateway=GatewayDeploymentMetadata(dispatch=GatewayRungDispatchPolicy(affinity_weight=1e9)),
+    ).model_copy(update={"billing_source": billing_source})
+    deployments = (aggregator, *(_deployment(name) for name in others))
+    route = _mixed_route("maximize_cache_affinity", deployments, GatewayApiSurface.CHAT_COMPLETIONS)
+    client = cast(NativeWireClient, object())
+    wires = (
+        (GatewayWireProfile(dialect="openai_compatible", url=url), client),
+        *(
+            (GatewayWireProfile(dialect="openai_compatible", url=f"https://{name}.test"), client)
+            for name in others
+        ),
+    )
+    return route, wires
+
+
+def _rendezvous_names(route: GatewayRoute, request: GatewayRequest) -> tuple[str, ...]:
+    """The plain rendezvous order the route's rungs would take for ``request``."""
+    authorization = route.snapshot.authorization
+    fingerprint = affinity_fingerprint(
+        organization_id=authorization.organization_id,
+        identity_id=authorization.identity_id,
+        material=affinity_seed_material(
+            request, continuation_episode_key=None, request_id=authorization.request_id
+        ),
+    )
+    order = rendezvous_order(fingerprint, affinity_weighted_rungs(route.deployments))
+    return tuple(route.deployments[index].deployment_id for index in order)
+
+
+class TestHouseOpenRouterNeverLeadsAnAffinityPool:
+    """OpenRouter is never the first lane, whatever the rendezvous draw says."""
+
+    @pytest.mark.parametrize(
+        ("provider", "url"),
+        (
+            ("openrouter", "https://openrouter.ai/api/v1"),
+            # The Responses-wire rung: an ``openai`` connection on OpenRouter's origin.
+            ("openai", "https://openrouter.ai/api/v1"),
+        ),
+    )
+    def test_house_openrouter_moves_behind_the_rendezvous_order(
+        self, provider: str, url: str
+    ) -> None:
+        """[openrouter-house, a, b] with OpenRouter drawn first dispatches a/b first."""
+        for index in range(16):
+            route, wires = _aggregator_fixture(
+                billing_source=BillingSource.HOST_MANAGED, provider=provider, url=url
+            )
+            request = _session_request(f"session-{index}")
+            drawn = _rendezvous_names(route, request)
+            assert drawn[0] == "dep-openrouter"
+            ordered, ordered_wires, _placement = _affinity_ordered_rungs(
+                route,
+                wires,
+                request,
+                accounting=_affinity_accounting(),
+                authorization=route.snapshot.authorization,
+                continuation=None,
+            )
+            # The others keep their rendezvous order; OpenRouter goes last.
+            assert _order(ordered) == (*drawn[1:], "dep-openrouter")
+            assert ordered_wires[-1][0].url == url
+
+    def test_customer_managed_openrouter_keeps_its_rendezvous_place(self) -> None:
+        """A customer's own OpenRouter key may lead: their account, their choice."""
+        route, wires = _aggregator_fixture(billing_source=BillingSource.CUSTOMER_MANAGED)
+        request = _session_request("session-1")
+        ordered, _wires_out, _placement = _affinity_ordered_rungs(
+            route,
+            wires,
+            request,
+            accounting=_affinity_accounting(),
+            authorization=route.snapshot.authorization,
+            continuation=None,
+        )
+        assert _order(ordered) == _rendezvous_names(route, request)
+        assert _order(ordered)[0] == "dep-openrouter"
+
+    def test_a_single_openrouter_rung_still_serves(self) -> None:
+        """With nothing else on the pool the OpenRouter rung remains the route."""
+        route, wires = _aggregator_fixture(billing_source=BillingSource.HOST_MANAGED, others=())
+        ordered, ordered_wires, _placement = _affinity_ordered_rungs(
+            route,
+            wires,
+            _session_request("session-1"),
+            accounting=_affinity_accounting(),
+            authorization=route.snapshot.authorization,
+            continuation=None,
+        )
+        assert _order(ordered) == ("dep-openrouter",)
+        assert len(ordered_wires) == 1

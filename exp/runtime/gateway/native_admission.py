@@ -21,6 +21,8 @@ from exp.runtime.gateway import prompt_size
 from exp.runtime.gateway.affinity import (
     affinity_fingerprint,
     affinity_seed_material,
+    affinity_weighted_rungs,
+    house_aggregator_last,
     rendezvous_order,
 )
 from exp.runtime.gateway.capability_rungs import narrow_to_capable_rungs
@@ -603,19 +605,7 @@ def _affinity_ordered_rungs(
     )
     if len(resolved_wires) < 2 or _keeps_issuing_rung_first(route):
         return route, resolved_wires, AffinityPlacement(fingerprint=fingerprint)
-    weighted_rungs = tuple(
-        (
-            deployment.deployment_id,
-            (
-                1.0
-                if deployment.gateway.dispatch is None
-                or deployment.gateway.dispatch.affinity_weight is None
-                else deployment.gateway.dispatch.affinity_weight
-            ),
-        )
-        for deployment in route.deployments
-    )
-    order = rendezvous_order(fingerprint, weighted_rungs)
+    order = rendezvous_order(fingerprint, affinity_weighted_rungs(route.deployments))
     order, sticky_index, sticky_deployment_id = sticky_first_order(
         order,
         route,
@@ -635,6 +625,8 @@ def _affinity_ordered_rungs(
                 *(index for index in order if index in marker_capable),
                 *(index for index in order if index not in marker_capable),
             )
+    # Last, so neither a sticky binding nor the marker grouping can lead with it.
+    order = house_aggregator_last(order, route.deployments, [p for p, _ in resolved_wires])
     placement = AffinityPlacement(
         fingerprint=fingerprint,
         sticky_preferred=sticky_index is not None and order[0] == sticky_index,
