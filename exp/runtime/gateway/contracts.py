@@ -501,13 +501,10 @@ class GatewayRequest(ContractModel):
     diagnostics: JsonObject | None = Field(default=None, exclude=True)
     """Verbatim caller ``diagnostics`` from the Messages surface.
 
-    Anthropic's diagnostics-correlation object (Claude Code sends
-    ``{"previous_message_id": ...}`` conditionally). Validated only as an
-    object and forwarded byte-for-byte with the required beta header on
-    Anthropic rungs, dropped with disclosure elsewhere; the shape is an
-    evolving provider beta, so validation stays shallow. Excluded from
-    serialization; a present value joins replay identity through
-    :func:`canonical_request_sha256`.
+    Anthropic's diagnostics-correlation object (Claude Code sends ``{"previous_message_id":
+    ...}`` conditionally), validated only as an object (an evolving provider beta) and
+    forwarded byte-for-byte with its beta header on Anthropic rungs, dropped with disclosure
+    elsewhere. Excluded from serialization; a present value joins replay identity.
     """
     safeguards: tuple[JsonObject, ...] | None = Field(default=None, exclude=True)
     """Verbatim Claude Code auto-mode ``safeguards`` (Messages only): sent on
@@ -515,13 +512,10 @@ class GatewayRequest(ContractModel):
     speed: str | None = Field(default=None, max_length=64, exclude=True)
     """Verbatim caller ``speed`` selector from the Messages surface.
 
-    Anthropic's fast-mode selector (Claude Code sends ``"fast"``; accepted
-    live behind its beta header, 2026-08-30). Bounded but deliberately not
-    enumerated: the value set is an evolving provider surface. Forwarded
-    with the required beta header on Anthropic rungs and dropped with
-    disclosure elsewhere. Fast-mode output is provider-priced at a premium,
-    so a present value joins replay identity through
-    :func:`canonical_request_sha256`.
+    Anthropic's fast-mode selector (Claude Code sends ``"fast"``; accepted live behind its
+    beta header, 2026-08-30), bounded but not enumerated (an evolving provider surface).
+    Forwarded with its beta header on Anthropic rungs, dropped with disclosure elsewhere.
+    Fast-mode output is priced at a premium, so a present value joins replay identity.
     """
     provider_cache_control: JsonObject | None = Field(default=None, exclude=True)
     """Verbatim caller top-level ``cache_control`` from the Messages surface.
@@ -536,12 +530,10 @@ class GatewayRequest(ContractModel):
     inference_geo: str | None = Field(default=None, max_length=64, exclude=True)
     """Verbatim caller ``inference_geo`` selector from the Messages surface.
 
-    Anthropic's inference-region selector (accepted bare, verified live
-    2026-08-30). Bounded but deliberately not enumerated: the region set is
-    an evolving provider surface. Forwarded verbatim on Anthropic rungs and
-    dropped with disclosure elsewhere. Where inference runs is a
-    caller-visible processing commitment, so a present value joins replay
-    identity through :func:`canonical_request_sha256`.
+    Anthropic's inference-region selector (accepted bare, verified live 2026-08-30), bounded
+    but not enumerated (an evolving provider surface). Forwarded verbatim on Anthropic rungs,
+    dropped with disclosure elsewhere. Where inference runs is a caller-visible processing
+    commitment, so a present value joins replay identity (:func:`canonical_request_sha256`).
     """
     provider_beta_tokens: tuple[str, ...] = Field(default=(), exclude=True)
     """Allowlisted caller ``anthropic-beta`` tokens from the Messages surface.
@@ -649,6 +641,12 @@ class GatewayRequest(ContractModel):
     provider cache node that holds it while the caller's raw key never leaves
     the gateway. Excluded from serialization: it is routing state, never request identity.
     """
+    prompt_cache_ttl: Literal["12h"] | None = Field(default=None, exclude=True)
+    """OpenAI's 12-hour minimum prompt-cache lifetime (Responses ``prompt_cache_options.ttl``).
+
+    Routed only to rungs declaring ``supports_prompt_cache_ttl_12h`` and refused when none
+    does. Like ``provider_cache_control`` it changes cache-write cost, never semantics, so
+    it joins neither serialization nor replay identity."""
     service_tier: str | None = Field(default=None, max_length=64, exclude=True)
     """Caller provider processing tier, forwarded only on BYOK OpenAI-family
     rungs (routing and billing rules live at streaming_requests and

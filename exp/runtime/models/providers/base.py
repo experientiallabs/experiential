@@ -187,6 +187,14 @@ class GatewayWireProfile:
     strict OpenAI-compatible server, and the wire profile is the only place
     that knows.
     """
+    forwards_prompt_cache_ttl: bool = False
+    """Whether this rung's wire carries OpenAI's ``prompt_cache_options.ttl``.
+
+    True only on OpenAI's own Responses API. The catalog's
+    ``supports_prompt_cache_ttl_12h`` says the lane's model honours the 12-hour
+    lifetime; this says the wire can send it, so a ChatGPT plan rung or a relay
+    inheriting the lane's capabilities declines instead of guessing.
+    """
     """Whether this rung dispatches on tenant-owned (BYOK) credentials.
 
     Tier selectors (``service_tier``) forward only where the caller pays the

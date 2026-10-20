@@ -327,6 +327,8 @@ class TestClient:
         assert profile.signs_request_body
         assert profile.omits_output_token_limit
         assert profile.forwards_prompt_cache_key
+        # The plan backend is not OpenAI's API: no 12-hour cache lifetime.
+        assert not profile.forwards_prompt_cache_ttl
         assert profile.embeddings_url is None
         assert profile.images_url is None
 

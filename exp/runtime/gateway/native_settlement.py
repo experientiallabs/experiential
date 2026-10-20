@@ -677,6 +677,9 @@ def _usage_from_payload(
         cache_creation_1h_input_tokens=_optional_count(
             payload.get("cache_creation_1h_input_tokens")
         ),
+        cache_creation_12h_input_tokens=_optional_count(
+            payload.get("cache_creation_12h_input_tokens")
+        ),
         reasoning_tokens=_optional_count(payload.get("reasoning_tokens")),
         image_output_tokens=_optional_count(payload.get("image_output_tokens")),
         tool_names=names,

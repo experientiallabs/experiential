@@ -61,6 +61,11 @@ pub struct Usage {
     /// Observed one-hour subset; absent when no complete TTL breakdown exists.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_creation_1h_input_tokens: Option<u64>,
+    /// OpenAI's 12-hour subset of the writes (`ttl_12h_tokens`), disjoint from
+    /// the one-hour subset. Settlement prices it at the lane's 12-hour write
+    /// rate, 2.5 times input when the card authors none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_creation_12h_input_tokens: Option<u64>,
     pub reasoning_tokens: Option<u64>,
     /// Image-modality subset of `output_tokens` (generated images, never
     /// thinking), present only when the provider reported a nonzero count.
@@ -744,6 +749,9 @@ pub fn simplified_event(event: &Event) -> Value {
             }
             if let Some(hour) = usage.cache_creation_1h_input_tokens {
                 payload["cache_creation_1h_input_tokens"] = serde_json::json!(hour);
+            }
+            if let Some(half_day) = usage.cache_creation_12h_input_tokens {
+                payload["cache_creation_12h_input_tokens"] = serde_json::json!(half_day);
             }
             if let Some(image) = usage.image_output_tokens {
                 payload["image_output_tokens"] = serde_json::json!(image);

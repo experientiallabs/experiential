@@ -236,6 +236,7 @@ class CaptureUsage(ContractModel):
         reasoning_tokens: Observed reasoning subset, otherwise None.
         cache_creation_input_tokens: Cache-write subset, otherwise None.
         cache_creation_1h_input_tokens: One-hour cache-write subset, otherwise None.
+        cache_creation_12h_input_tokens: OpenAI 12-hour cache-write subset, otherwise None.
     """
 
     input_tokens: int | None = Field(ge=0)
@@ -244,6 +245,7 @@ class CaptureUsage(ContractModel):
     reasoning_tokens: int | None = Field(ge=0)
     cache_creation_input_tokens: int | None = Field(default=None, ge=0)
     cache_creation_1h_input_tokens: int | None = Field(default=None, ge=0)
+    cache_creation_12h_input_tokens: int | None = Field(default=None, ge=0)
 
 
 class CaptureMetrics(ContractModel):

@@ -269,6 +269,10 @@ def openai_responses_stream_payload(
         # changes cache-hit cost, never semantics, so rungs that do not route
         # by it omit it structurally with no decline and no disclosure.
         payload["prompt_cache_key"] = request.provider_prompt_cache_key
+    if request.prompt_cache_ttl is not None:
+        # Admission reaches this wire with a lifetime only on a rung declaring
+        # ``supports_prompt_cache_ttl_12h``; the default "30m" is never sent.
+        payload["prompt_cache_options"] = {"ttl": request.prompt_cache_ttl}
     # Native OpenAI Responses has no top-k request field. Never trust a
     # mistaken route declaration to send this extension to the API.
     del supports_top_k

@@ -37,6 +37,12 @@ The hard features handled here are all decided by the decoded request alone:
   rungs that honor it exactly (a rung that never reasons, one with a ``none``
   tier, or Anthropic's native wire), so a rung that cannot stop reasoning is
   only used when no rung can.
+- OpenAI's 12-hour prompt cache lifetime (``prompt_cache_options.ttl:
+  "12h"``): only rungs whose catalog declares ``supports_prompt_cache_ttl_12h``
+  and whose wire carries it (OpenAI's own Responses API) write at that
+  lifetime and price, so the route narrows to them first and a rung that would
+  write at the default lifetime (Azure, OpenRouter, a ChatGPT plan rung, a
+  pre-GPT-5.6 model) is never asked. With no such rung the request is refused.
 
 When no rung carries a feature the route is left whole and the existing
 checks and disclosed coercions decide. A reasoning-pinned continuation whose
@@ -70,6 +76,9 @@ REASONING_RUNG_SUFFIX = "->routed(reasoning_rung)"
 
 REASONING_OFF_RUNG_DISCLOSURE = "thinking->routed(reasoning_off_rung)"
 """Disclosure recorded when a thinking off switch moves the request off the lead rung."""
+
+PROMPT_CACHE_TTL_RUNG_DISCLOSURE = "prompt_cache_options.ttl->routed(prompt_cache_ttl_12h_rung)"
+"""Disclosure recorded when the 12-hour cache lifetime moves the request off the lead rung."""
 
 _ResolvedWires = tuple[tuple[GatewayWireProfile, NativeWireClient], ...]
 
@@ -220,6 +229,19 @@ def narrow_to_capable_rungs(
     ):
         return route, resolved_wires, ()
     disclosures: list[str] = []
+    if request.prompt_cache_ttl == "12h":
+        route, resolved_wires = _narrow(
+            route,
+            resolved_wires,
+            tuple(
+                index
+                for index, deployment in enumerate(route.deployments)
+                if deployment.gateway.capabilities.supports_prompt_cache_ttl_12h
+                and resolved_wires[index][0].forwards_prompt_cache_ttl
+            ),
+            PROMPT_CACHE_TTL_RUNG_DISCLOSURE,
+            disclosures,
+        )
     if request.tools or request.provider_native_tools:
         route, resolved_wires = _narrow(
             route,

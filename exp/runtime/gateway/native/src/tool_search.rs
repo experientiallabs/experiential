@@ -260,6 +260,9 @@ pub(crate) fn usage_json(usage: Option<&Usage>) -> Value {
     if let Some(image) = usage.image_output_tokens {
         wire["image_output_tokens"] = json!(image);
     }
+    if let Some(half_day) = usage.cache_creation_12h_input_tokens {
+        wire["cache_creation_12h_input_tokens"] = json!(half_day);
+    }
     wire
 }
 

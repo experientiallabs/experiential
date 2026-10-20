@@ -9,7 +9,10 @@ from exp.common.core.artifacts import JsonObject
 from exp.common.models.catalog import GatewayDeploymentCapabilities, GatewayDeploymentMetadata
 from exp.common.models.gateway_catalog import ExactModelDeployment
 from exp.common.models.model import ModelCapabilities
-from exp.runtime.gateway.capability_rungs import narrow_to_capable_rungs
+from exp.runtime.gateway.capability_rungs import (
+    PROMPT_CACHE_TTL_RUNG_DISCLOSURE,
+    narrow_to_capable_rungs,
+)
 from exp.runtime.gateway.contracts import (
     AuthorizationSnapshot,
     DirectTarget,
@@ -20,8 +23,10 @@ from exp.runtime.gateway.contracts import (
 )
 from exp.runtime.gateway.native_accounting import NativeAttemptAccounting
 from exp.runtime.gateway.native_admission import admitted_route_requests
+from exp.runtime.gateway.native_bridge_errors import public_capability_error
 from exp.runtime.gateway.routing import GatewayRoute
 from exp.runtime.models.providers.base import GatewayWireProfile
+from exp.runtime.models.providers.dialect_dispatch import dialect_stream_payload
 from exp.runtime.models.providers.errors import ProviderCapabilityError
 from exp.runtime.models.providers.protocol import NativeWireClient
 from exp.runtime.openai_protocol.requests import decode_chat, decode_responses
@@ -671,3 +676,127 @@ def test_images_route_past_the_sampling_exact_rung() -> None:
     assert _ids(narrowed) == ("openai",)
     assert provider.temperature is None
     assert "messages->routed(image_input_rung)" in public.ignored_parameters
+
+
+def _luna_rung(deployment_id: str, *, twelve_hour: bool) -> ExactModelDeployment:
+    """Build one gpt-5.6-luna rung that does or does not declare 12-hour caching."""
+    return _deployment(deployment_id, structured=True).model_copy(
+        update={
+            "gateway": GatewayDeploymentMetadata(
+                capabilities=GatewayDeploymentCapabilities(
+                    supports_streaming=True,
+                    supports_developer_messages=True,
+                    supports_prompt_cache_ttl_12h=twelve_hour,
+                )
+            ),
+        }
+    )
+
+
+def _luna_route(
+    order: tuple[str, ...],
+) -> tuple[GatewayRoute, tuple[tuple[GatewayWireProfile, NativeWireClient], ...]]:
+    """Mirror gpt-5.6-luna: only the house OpenAI Responses rung writes 12-hour caches.
+    Azure serves it over Chat, OpenRouter's relay takes no lifetime, and a ChatGPT
+    plan rung inherits the lane's capabilities but its wire cannot carry one."""
+    rungs = {
+        "openai": (True, "openai_responses", True),
+        "azure_openai": (False, "openai_compatible", False),
+        "openrouter": (False, "openai_responses", False),
+        "chatgpt_plan": (True, "openai_responses", False),
+    }
+    route = _route(
+        tuple(_luna_rung(name, twelve_hour=rungs[name][0]) for name in order),
+        GatewayApiSurface.RESPONSES,
+    )
+    wires = tuple(
+        (
+            GatewayWireProfile(
+                dialect=rungs[name][1],
+                url=f"https://{name}.test",
+                model_id="gpt-5.6-luna",
+                forwards_prompt_cache_ttl=rungs[name][2],
+            ),
+            _CLIENT,
+        )
+        for name in order
+    )
+    return route, wires
+
+
+def _twelve_hour_responses(ttl: str = "12h") -> GatewayRequest:
+    """Decode one Responses request asking for OpenAI's 12-hour cache lifetime."""
+    return decode_responses(
+        {
+            "model": "public-model",
+            "input": "answer",
+            "stream": True,
+            "prompt_cache_options": {"ttl": ttl},
+        }
+    ).request
+
+
+@pytest.mark.parametrize(
+    "order",
+    [
+        ("azure_openai", "openai", "openrouter"),
+        ("openai", "openrouter", "azure_openai"),
+        ("chatgpt_plan", "openai"),
+    ],
+)
+def test_twelve_hour_caching_routes_only_to_rungs_that_honour_it(order: tuple[str, ...]) -> None:
+    """A lane that would write at the default lifetime is never asked, so no 12-hour
+    write is ever billed at the 30-minute rate; a moved lead is disclosed."""
+    route, wires = _luna_route(order)
+    narrowed, public, provider, _recorded = _admit(route, wires, _twelve_hour_responses())
+    assert _ids(narrowed) == ("openai",)
+    assert provider.prompt_cache_ttl == "12h"
+    moved = PROMPT_CACHE_TTL_RUNG_DISCLOSURE in public.ignored_parameters
+    assert moved is (order[0] != "openai")
+    payload = dialect_stream_payload(wires[order.index("openai")][0], provider)
+    assert payload["prompt_cache_options"] == {"ttl": "12h"}
+
+
+def test_the_default_lifetime_keeps_every_rung_and_sends_no_option() -> None:
+    """``"30m"`` is OpenAI's default: nothing narrows and nothing extra is sent."""
+    route, wires = _luna_route(("azure_openai", "openai"))
+    narrowed, _public, provider, _recorded = _admit(route, wires, _twelve_hour_responses("30m"))
+    assert _ids(narrowed) == ("azure_openai", "openai")
+    assert provider.prompt_cache_ttl is None
+    assert "prompt_cache_options" not in dialect_stream_payload(wires[1][0], provider)
+
+
+@pytest.mark.parametrize("order", [("azure_openai", "openrouter"), ("chatgpt_plan",)])
+def test_no_twelve_hour_rung_refuses_with_a_named_400(order: tuple[str, ...]) -> None:
+    """No rung can carry the lifetime: the request is refused on the caller's field."""
+    route, wires = _luna_route(order)
+    with pytest.raises(ProviderCapabilityError) as caught:
+        _admit(route, wires, _twelve_hour_responses())
+    assert caught.value.capability == "prompt_cache_ttl_12h"
+    public = public_capability_error(
+        caught.value, GatewayApiSurface.RESPONSES, public_stream=True, public_tools=False
+    )
+    assert public.status_code == 400
+    assert public.detail.code == "unsupported_capability"
+    assert public.detail.param == "prompt_cache_options.ttl"
+    assert "12-hour" in public.detail.message
+
+
+@pytest.mark.parametrize(
+    "profile",
+    [
+        GatewayWireProfile(
+            dialect="openai_compatible", url="https://azure.test", model_id="gpt-5.6-luna"
+        ),
+        GatewayWireProfile(
+            dialect="openai_responses", url="https://chatgpt.test", model_id="gpt-5.6-luna"
+        ),
+    ],
+)
+def test_a_twelve_hour_request_rides_only_a_wire_that_carries_it(
+    profile: GatewayWireProfile,
+) -> None:
+    """A Chat wire or a plan wire declines instead of dropping the lifetime."""
+    with pytest.raises(ProviderCapabilityError) as caught:
+        dialect_stream_payload(profile, _twelve_hour_responses())
+    assert caught.value.capability == "prompt_cache_ttl_12h"

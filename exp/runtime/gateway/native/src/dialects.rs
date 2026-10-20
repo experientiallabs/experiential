@@ -217,6 +217,15 @@ impl Normalizer {
         );
     }
 
+    /// Record that this rung asked OpenAI for 12-hour cache writes, so writes
+    /// reported without their lifetime split bill at 12 hours. Only a
+    /// Responses normalizer honours it: no other wire carries the lifetime.
+    pub fn set_twelve_hour_cache_writes(&mut self, requested: bool) {
+        self.openai_usage.set_twelve_hour_writes_requested(
+            requested && self.dialect == Dialect::OpenAiResponses,
+        );
+    }
+
     /// Report reads of the cache this attempt just created as cache writes.
     /// Only the Gemini usage observer honours it.
     pub fn set_gemini_cache_writes(&mut self, written: Option<u64>) {

@@ -94,6 +94,8 @@ class Usage(ContractModel):
         cached_input_tokens: Observed read subset, or None when unreported.
         cache_write_input_tokens: Observed write subset, or None when unreported.
         cache_write_1h_input_tokens: Observed one-hour portion of writes; zero and None differ.
+        cache_write_12h_input_tokens: Observed OpenAI 12-hour portion of writes, disjoint
+            from the one-hour portion; None when the provider reported no lifetime split.
         reasoning_tokens: Observed reasoning portion of output, or None when unreported.
         service_tier: Explicitly returned processing tier; None uses the ordinary request basis.
     """
@@ -103,6 +105,9 @@ class Usage(ContractModel):
     cached_input_tokens: int | None = Field(default=None, ge=0)
     cache_write_input_tokens: int | None = Field(default=None, ge=0)
     cache_write_1h_input_tokens: int | None = Field(
+        default=None, ge=0, exclude_if=lambda value: value is None
+    )
+    cache_write_12h_input_tokens: int | None = Field(
         default=None, ge=0, exclude_if=lambda value: value is None
     )
     reasoning_tokens: int | None = Field(default=None, ge=0, exclude_if=lambda value: value is None)
@@ -209,6 +214,9 @@ def _sum_usage(values: Sequence[Usage]) -> Usage:
         cache_write_input_tokens=written_total,
         cache_write_1h_input_tokens=_sum_optional_counts(
             tuple(value.cache_write_1h_input_tokens for value in values)
+        ),
+        cache_write_12h_input_tokens=_sum_optional_counts(
+            tuple(value.cache_write_12h_input_tokens for value in values)
         ),
         reasoning_tokens=_sum_optional_counts(tuple(value.reasoning_tokens for value in values)),
         service_tier=(

@@ -394,6 +394,7 @@ def _estimated(
     cached_input_tokens = None if observed is None else observed.cached_input_tokens
     observed_writes = None if observed is None else observed.cache_creation_input_tokens
     observed_1h_writes = None if observed is None else observed.cache_creation_1h_input_tokens
+    observed_12h_writes = None if observed is None else observed.cache_creation_12h_input_tokens
     if observed is None or observed.input_tokens is None:
         input_tokens = max(input_tokens, (cached_input_tokens or 0) + (observed_writes or 0))
     room = input_tokens - (observed_writes or 0)
@@ -405,6 +406,7 @@ def _estimated(
         cached_input_tokens=cached_input_tokens,
         cache_creation_input_tokens=observed_writes,
         cache_creation_1h_input_tokens=observed_1h_writes,
+        cache_creation_12h_input_tokens=observed_12h_writes,
         reasoning_tokens=reasoning_tokens,
         tool_names=() if observed is None else observed.tool_names,
         web_search_requests=0 if observed is None else observed.web_search_requests,

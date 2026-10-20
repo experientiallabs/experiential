@@ -351,6 +351,23 @@ gateway hops and SDK provider adapters restore those details to unknown before v
 Every relay hop must preserve this evidence. A downstream parser cannot recover observability
 that an older relay already discarded.
 
+OpenAI's 12-hour prompt cache lifetime rides Responses `prompt_cache_options.ttl: "12h"`
+([OpenAI prompt caching](https://developers.openai.com/api/docs/guides/prompt-caching): "In the
+Responses API, set `prompt_cache_options.ttl` to choose the minimum cache lifetime"). `"30m"` is
+the provider default and is accepted as already satisfied; any other value, and any
+`prompt_cache_options` on Chat (OpenAI's Chat answers 400 for `"12h"`), is refused. Admission
+narrows the route to rungs declaring `supports_prompt_cache_ttl_12h` whose wire carries the field
+(OpenAI's own Responses API) and refuses the request with `unsupported_capability` on
+`prompt_cache_options.ttl` when none does, so no rung that would write at the default lifetime or
+refuse the field (Azure, OpenRouter, a ChatGPT plan rung, a pre-GPT-5.6 model) is ever asked. An organization
+with prompt caching off has the lifetime removed and disclosed. The provider's
+`input_tokens_details.cache_write_tokens_details.ttl_12h_tokens` becomes the 12-hour write
+subset, disjoint from any one-hour subset, and is relayed as `cache_write_tokens_details` with
+`ttl_30m_tokens` and `ttl_12h_tokens`. Those writes price at the card's
+`cache_creation_12h_input_nano_usd_per_million_tokens`, or at 2.5 times its input rate (OpenAI's
+published total write rate) when the card authors none, never at the 30-minute write rate. A
+12-hour request whose provider reports writes without the split bills every write at 12 hours.
+
 Anthropic Messages and Bedrock Converse bill thinking inside `output_tokens` and publish no
 separate count, so their reasoning meter stays unknown for settlement. Chat and Responses
 callers still receive an estimate, the way OpenRouter reports one: when the provider published

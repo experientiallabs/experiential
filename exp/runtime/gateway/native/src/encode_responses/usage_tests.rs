@@ -39,6 +39,7 @@ fn responses_cache_ttl_survives_two_gateway_hops_without_inventing_zero() {
             cached_input_tokens: Some(10),
             cache_creation_input_tokens: Some(100),
             cache_creation_1h_input_tokens: hour,
+            cache_creation_12h_input_tokens: None,
             reasoning_tokens: Some(5),
             billed_units: None,
             cache_writes_read_back: false,
@@ -113,4 +114,33 @@ fn responses_reports_an_estimated_reasoning_count_when_the_provider_publishes_no
         completed.usage.expect("usage aggregates").reasoning_tokens,
         None
     );
+}
+
+#[test]
+fn the_twelve_hour_write_split_survives_two_gateway_hops() {
+    let mut usage = Usage {
+        input_tokens: Some(3250),
+        output_tokens: Some(5),
+        cached_input_tokens: Some(0),
+        cache_creation_input_tokens: Some(3247),
+        cache_creation_12h_input_tokens: Some(2000),
+        reasoning_tokens: Some(0),
+        ..Usage::default()
+    };
+    for _ in 0..2 {
+        let wire = responses_usage(Some(&usage));
+        assert_eq!(
+            wire["input_tokens_details"]["cache_write_tokens_details"],
+            json!({"ttl_30m_tokens": 1247, "ttl_12h_tokens": 2000})
+        );
+        usage = crate::events::openai_usage(Some(&wire)).unwrap().unwrap();
+        assert_eq!(usage.cache_creation_input_tokens, Some(3247));
+        assert_eq!(usage.cache_creation_12h_input_tokens, Some(2000));
+    }
+    // A usage with no observed 12-hour count names no split.
+    usage.cache_creation_12h_input_tokens = None;
+    let wire = responses_usage(Some(&usage));
+    assert!(wire["input_tokens_details"]
+        .get("cache_write_tokens_details")
+        .is_none());
 }

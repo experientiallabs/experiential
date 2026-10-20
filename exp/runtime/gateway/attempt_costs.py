@@ -6,6 +6,7 @@ from typing import assert_never
 
 from exp.common.models.catalog_prices import BilledUnitKind
 from exp.common.models.gateway_catalog import ExactModelDeployment
+from exp.common.models.token_cost import twelve_hour_write_rate
 from exp.runtime.gateway.attempt_tokens import worst_case_input_tokens, worst_case_output_tokens
 from exp.runtime.gateway.audio_billing import audio_token_rates, flat_unit_rate
 from exp.runtime.gateway.audio_contracts import (
@@ -175,6 +176,13 @@ def _token_attempt_cost_nano_usd(
             else None,
             schedule.cache_creation_1h_input_nano_usd_per_million_tokens
             if capabilities.reports_cache_creation_input_tokens and requests_hour_cache(request)
+            else None,
+            # A 12-hour request may write its whole input at that lifetime.
+            twelve_hour_write_rate(
+                schedule.cache_creation_12h_input_nano_usd_per_million_tokens,
+                schedule.input_nano_usd_per_million_tokens,
+            )
+            if isinstance(request, GatewayRequest) and request.prompt_cache_ttl == "12h"
             else None,
         )
         if rate is not None

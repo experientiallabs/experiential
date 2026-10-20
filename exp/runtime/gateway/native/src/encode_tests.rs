@@ -42,6 +42,7 @@ fn chat_cache_ttl_survives_two_gateway_hops_without_inventing_zero() {
             cached_input_tokens: Some(10),
             cache_creation_input_tokens: Some(100),
             cache_creation_1h_input_tokens: hour,
+            cache_creation_12h_input_tokens: None,
             reasoning_tokens: Some(5),
             billed_units: None,
             cache_writes_read_back: false,

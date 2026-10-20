@@ -22,6 +22,9 @@ pub(super) fn responses_usage(usage: Option<&Usage>) -> Value {
     if let Some(hour) = usage.cache_creation_1h_input_tokens {
         input_details["cache_write_1h_tokens"] = json!(hour);
     }
+    if let Some(split) = crate::encode::cache_write_lifetimes(usage) {
+        input_details["cache_write_tokens_details"] = split;
+    }
     let mut wire = json!({
         "input_tokens": input,
         // `cache_write_tokens` joined the official shape (openai-python 3.x

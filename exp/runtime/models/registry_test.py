@@ -51,6 +51,7 @@ from exp.runtime.models.providers.async_transport import (
 from exp.runtime.models.providers.azure import AzureClient
 from exp.runtime.models.providers.base import ProviderHttpClient
 from exp.runtime.models.providers.chatgpt_subscription import ChatGptSubscriptionClient
+from exp.runtime.models.providers.openai import OpenAIClient
 from exp.runtime.models.providers.openai_compatible import OpenAICompatibleClient
 from exp.runtime.models.providers.tinker_sampling import (
     TinkerOptionalDependencyError,
@@ -877,6 +878,22 @@ def test_openrouter_resolution_forwards_the_prompt_cache_key_hint() -> None:
     resolved = catalog.resolve("fixture-model")
     assert isinstance(resolved.client, OpenAICompatibleClient)
     assert resolved.client.gateway_wire_profile().forwards_prompt_cache_key is True
+    # OpenRouter's relay is not proven to carry OpenAI's 12-hour cache lifetime.
+    assert resolved.client.gateway_wire_profile().forwards_prompt_cache_ttl is False
+
+
+def test_openai_resolution_carries_the_twelve_hour_cache_lifetime() -> None:
+    """OpenAI's own Responses rung is the one wire that sends ``prompt_cache_options``."""
+    catalog = RuntimeModelCatalog(
+        _catalog(provider="openai"),
+        environment={"FIXTURE_API_KEY": "fixture-key"},
+        transport_factory=ScriptedJsonTransport,
+    )
+    resolved = catalog.resolve("fixture-model")
+    assert isinstance(resolved.client, OpenAIClient)
+    profile = resolved.client.gateway_wire_profile()
+    assert profile.dialect == "openai_responses"
+    assert profile.forwards_prompt_cache_ttl is True
 
 
 def test_resolution_threads_system_messages_leading_only_to_compatible_rungs() -> None:

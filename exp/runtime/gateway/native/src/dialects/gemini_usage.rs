@@ -120,6 +120,7 @@ impl Normalizer {
             cached_input_tokens: Some(cache - writes.unwrap_or(0)),
             cache_creation_input_tokens: writes,
             cache_creation_1h_input_tokens: writes.map(|_| 0),
+            cache_creation_12h_input_tokens: None,
             reasoning_tokens: fields.thoughts,
             billed_units: None,
             cache_writes_read_back: writes.is_some(),

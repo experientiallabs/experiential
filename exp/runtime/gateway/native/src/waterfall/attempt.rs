@@ -246,6 +246,12 @@ pub(super) async fn run_attempt(
         }
         relay.set_serialize_tool_calls(wire.serialize_tool_calls);
         relay.set_cache_writes_within_reads(wire.cache_writes_within_reads);
+        relay.set_twelve_hour_cache_writes(
+            wire.upstream_payload
+                .pointer("/prompt_cache_options/ttl")
+                .and_then(Value::as_str)
+                == Some("12h"),
+        );
         relay.set_gemini_cache_writes(wire.automatic_cache_written_tokens);
         relay.set_native_tool_translation(wire.native_tool_translation.clone());
         relay.set_tool_search_tool_name(ctx.tool_search.map(|search| search.tool_name.clone()));

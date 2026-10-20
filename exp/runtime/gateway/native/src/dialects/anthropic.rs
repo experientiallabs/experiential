@@ -39,6 +39,7 @@ impl Normalizer {
             cache_creation_1h_input_tokens: self
                 .cache_write_1h
                 .filter(|_| self.cache_write.is_some_and(|count| count > 0)),
+            cache_creation_12h_input_tokens: None,
             // Thinking is billed inside output with no reported subset.
             reasoning_tokens: None,
             billed_units: None,

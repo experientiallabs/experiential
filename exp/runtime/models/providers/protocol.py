@@ -387,6 +387,11 @@ def preflight_gateway_request(
             capabilities.supports_streaming_tool_arguments,
             "streaming_tool_arguments",
         ),
+        (
+            request.prompt_cache_ttl == "12h",
+            capabilities.supports_prompt_cache_ttl_12h,
+            "prompt_cache_ttl_12h",
+        ),
     )
     if request.stream and not caller_stream:
         requirements += ((True, capabilities.supports_streaming, "streaming"),)

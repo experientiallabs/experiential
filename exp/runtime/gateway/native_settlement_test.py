@@ -299,6 +299,27 @@ def test_terminal_from_settlement_preserves_cache_write_usage_and_upstream_provi
     assert upstream_provider_from_settlement(payload) == "Azure"
 
 
+def test_terminal_from_settlement_preserves_the_twelve_hour_write_subset() -> None:
+    """The 12-hour subset reaches GatewayUsage; its absence stays unreported."""
+    payload: JsonObject = {
+        "outcome": "completed",
+        "usage": {
+            "input_tokens": 3_250,
+            "output_tokens": 5,
+            "cache_creation_input_tokens": 3_247,
+            "cache_creation_12h_input_tokens": 3_247,
+        },
+        "tool_names": [],
+        "failure": None,
+    }
+    terminal, _failure = terminal_from_settlement(payload)
+    assert terminal.usage is not None
+    assert terminal.usage.cache_creation_12h_input_tokens == 3_247
+    usage = _usage_from_payload({"input_tokens": 10, "output_tokens": 1}, [])
+    assert usage is not None
+    assert usage.cache_creation_12h_input_tokens is None
+
+
 def test_terminal_from_settlement_normalizes_usage_and_tools() -> None:
     """Completed payloads retain token counts and ordered tool names."""
     terminal, failure = terminal_from_settlement(

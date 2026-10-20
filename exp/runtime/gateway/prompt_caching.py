@@ -11,9 +11,10 @@ three promises on every route:
   so the route keeps its certified order.
 * Every caller cache marker is removed before any payload is built: Anthropic
   ``cache_control`` on the top level, content blocks, tool results, tool calls
-  and tool definitions (Bedrock would translate these to ``cachePoint``). The
-  caller's ``prompt_cache_key`` stays in request identity but reaches no
-  provider. Each removed path is disclosed in ``ignored_parameters``.
+  and tool definitions (Bedrock would translate these to ``cachePoint``), and
+  OpenAI's 12-hour ``prompt_cache_options.ttl``. The caller's
+  ``prompt_cache_key`` stays in request identity but reaches no provider.
+  Each removed path is disclosed in ``ignored_parameters``.
 * A provider that caches prompt prefixes on its own, with no request field
   that turns it off, may still do so. Such rungs stay routable and the
   response discloses ``prompt_caching`` as best effort instead.
@@ -98,6 +99,7 @@ def without_prompt_caching(
     return request.model_copy(
         update={
             "provider_cache_control": None,
+            "prompt_cache_ttl": None,
             "tools": tuple(
                 tool.model_copy(update={_MARKER: None}) if tool.cache_control else tool
                 for tool in request.tools
@@ -179,6 +181,8 @@ def _marker_paths(request: GatewayRequest) -> tuple[str, ...]:
         paths.append(f"messages.content.{_MARKER}")
     if request.prompt_cache_key is not None:
         paths.append("prompt_cache_key")
+    if request.prompt_cache_ttl is not None:
+        paths.append("prompt_cache_options.ttl")
     return tuple(paths)
 
 

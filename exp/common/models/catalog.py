@@ -489,6 +489,12 @@ class GatewayDeploymentCapabilities(ContractModel):
             This covers Chat ``prompt_cache_options`` and ``prompt_cache_retention``. False
             means those explicit boundaries are not declared as preserved; it does not mean
             implicit prefix caching is absent.
+        supports_prompt_cache_ttl_12h: Whether this route forwards OpenAI's 12-hour
+            minimum cache lifetime (Responses ``prompt_cache_options.ttl: "12h"``).
+
+            OpenAI serves it on the Responses API for GPT-5.6 and later; Chat
+            Completions answers 400 for it. Admission sends ``"12h"`` only to rungs
+            declaring this and refuses the request when none does.
         supports_media_handle_input: Whether this route forwards handles to media the caller
             uploaded to its provider.
 
@@ -601,6 +607,7 @@ class GatewayDeploymentCapabilities(ContractModel):
     supports_pdf_input: bool = False
     supports_pdf_url_input: bool = False
     supports_prompt_cache_boundaries: bool = False
+    supports_prompt_cache_ttl_12h: bool = False
     supports_media_handle_input: bool = False
     maximum_stop_sequences: int | None = Field(default=None, ge=1)
     minimum_output_tokens: int | None = Field(default=None, ge=1)

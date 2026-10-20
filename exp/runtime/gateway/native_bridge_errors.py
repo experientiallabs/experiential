@@ -60,6 +60,7 @@ _PUBLIC_REQUEST_CAPABILITY_PARAMS = {
         "media_handle_input": "input",
         "media_handle_provider": "input",
         "parallel_tool_calls": "parallel_tool_calls",
+        "prompt_cache_ttl_12h": "prompt_cache_options.ttl",
         "service_tier": "service_tier",
         "streaming": "stream",
         "streaming_tool_arguments": "stream",
@@ -90,6 +91,11 @@ _PUBLIC_REQUEST_CAPABILITY_PARAMS = {
 
 
 _ATTACHMENT_CAPABILITY_MESSAGES = {
+    "prompt_cache_ttl_12h": (
+        "This model route does not offer the 12-hour prompt cache lifetime (OpenAI "
+        "serves it on the Responses API for GPT-5.6 and later). Send "
+        'prompt_cache_options.ttl "30m" or omit it, or choose a model that supports it.'
+    ),
     "service_tier": (
         "This model does not offer a flex or priority processing tier. "
         "Remove service_tier, or choose a model with tiered pricing enabled."

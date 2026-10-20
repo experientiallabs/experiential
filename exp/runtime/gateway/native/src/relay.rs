@@ -439,14 +439,12 @@ impl UpstreamRelay {
         self.first_token_at
     }
 
-    /// The upstream an aggregator named as serving this stream (OpenRouter's
-    /// per-chunk `provider`), read at commit to settle with the attempt.
+    /// The upstream an aggregator named for this stream (OpenRouter's `provider`), settled at commit.
     pub fn upstream_provider(&self) -> Option<String> {
         self.normalizer.upstream_provider().map(str::to_string)
     }
 
-    /// Caller-known label words (the dispatched model id) exempt from the
-    /// provider-identifier screen on stream-error detail.
+    /// Caller-known words (the dispatched model id) exempt from the stream-error identifier screen.
     pub fn set_request_words<I, S>(&mut self, words: I)
     where
         I: IntoIterator<Item = S>,
@@ -464,6 +462,11 @@ impl UpstreamRelay {
     pub fn set_cache_writes_within_reads(&mut self, writes_within_reads: bool) {
         self.normalizer
             .set_cache_writes_within_reads(writes_within_reads);
+    }
+
+    /// Carry whether this rung asked for 12-hour cache writes into usage normalization.
+    pub fn set_twelve_hour_cache_writes(&mut self, requested: bool) {
+        self.normalizer.set_twelve_hour_cache_writes(requested);
     }
 
     /// Carry the tokens this attempt's own automatic cache create wrote.

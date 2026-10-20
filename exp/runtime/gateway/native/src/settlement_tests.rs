@@ -444,6 +444,7 @@ fn settle_argument_preserves_upstream_provider_and_cache_ttl_usage_together() {
         cached_input_tokens: Some(100),
         cache_creation_input_tokens: Some(600),
         cache_creation_1h_input_tokens: Some(200),
+        cache_creation_12h_input_tokens: None,
         reasoning_tokens: None,
         billed_units: None,
         cache_writes_read_back: false,
@@ -733,4 +734,39 @@ fn settle_argument_keeps_a_reported_zero_image_count_and_omits_an_unreported_one
         json!(1_120)
     );
     assert!(settle(None)["usage"].get("image_output_tokens").is_none());
+}
+
+#[test]
+fn settle_argument_carries_the_twelve_hour_write_subset_only_when_observed() {
+    let mut usage = Usage {
+        input_tokens: Some(3_250),
+        output_tokens: Some(5),
+        cached_input_tokens: Some(0),
+        cache_creation_input_tokens: Some(3_247),
+        cache_creation_12h_input_tokens: Some(3_247),
+        ..Usage::default()
+    };
+    let settle = |usage: &Usage| -> Value {
+        let argument = settle_argument(
+            "req",
+            "att",
+            "completed",
+            Some(usage),
+            &[],
+            None,
+            true,
+            true,
+            None,
+            None,
+            None,
+            0,
+            0,
+        );
+        serde_json::from_str::<Value>(&argument).expect("valid json")["usage"].clone()
+    };
+    assert_eq!(settle(&usage)["cache_creation_12h_input_tokens"], 3_247);
+    usage.cache_creation_12h_input_tokens = None;
+    assert!(settle(&usage)
+        .get("cache_creation_12h_input_tokens")
+        .is_none());
 }

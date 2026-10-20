@@ -115,6 +115,8 @@ class GatewayUsage(ContractModel):
         cached_input_tokens: Cache-read subset of the input.
         cache_creation_input_tokens: Cache-write subset of the input.
         cache_creation_1h_input_tokens: One-hour subset of the cache writes.
+        cache_creation_12h_input_tokens: OpenAI 12-hour subset of the cache writes,
+            disjoint from the one-hour subset, or None when no split was reported.
         reasoning_tokens: Reasoning subset of the output.
         image_output_tokens: Generated-image subset of the output (Gemini's IMAGE
             modality count, OpenRouter's ``image_tokens``), or None when unreported.
@@ -136,6 +138,7 @@ class GatewayUsage(ContractModel):
     cache_creation_1h_input_tokens: int | None = Field(default=None, ge=0)
     """Observed 1-hour subset of cache writes; zero proves all writes use 5m.
     None means no complete TTL breakdown was reported, so write cost is unknown."""
+    cache_creation_12h_input_tokens: int | None = Field(default=None, ge=0)
     reasoning_tokens: int | None = Field(default=None, ge=0)
     image_output_tokens: int | None = Field(default=None, ge=0)
     tool_names: tuple[str, ...] = ()
@@ -170,6 +173,12 @@ class GatewayUsage(ContractModel):
             or self.cache_creation_1h_input_tokens > self.cache_creation_input_tokens
         ):
             raise ValueError("1-hour cache writes require a covering cache-creation total")
+        if self.cache_creation_12h_input_tokens is not None and (
+            self.cache_creation_input_tokens is None
+            or self.cache_creation_12h_input_tokens + (self.cache_creation_1h_input_tokens or 0)
+            > self.cache_creation_input_tokens
+        ):
+            raise ValueError("12-hour cache writes require a covering cache-creation total")
         if self.image_output_tokens is not None and (
             self.output_tokens is None or self.image_output_tokens > self.output_tokens
         ):

@@ -24,6 +24,7 @@ from exp.runtime.gateway.native_capture import (
     CaptureConfiguration,
     CaptureController,
     CaptureDeliveryLimits,
+    CaptureMetrics,
     CaptureRecord,
     CaptureRequest,
     CaptureSpillConfiguration,
@@ -1272,3 +1273,26 @@ def test_spilling_collector_hands_an_oversized_request_over_whole_as_a_split_rec
     # The parts are removed once the destination acknowledged them.
     assert paths
     assert not any(Path(path).exists() for path in paths)
+
+
+def test_capture_metrics_admit_the_twelve_hour_write_subset() -> None:
+    """The native usage meter serializes OpenAI's 12-hour subset into capture metrics."""
+    metrics = CaptureMetrics.model_validate(
+        {
+            "started_at": 1.0,
+            "first_token_at": None,
+            "terminal_at": 2.0,
+            "duration_ms": 1000.0,
+            "usage_complete": True,
+            "usage": {
+                "input_tokens": 3250,
+                "output_tokens": 5,
+                "cached_input_tokens": 0,
+                "reasoning_tokens": 0,
+                "cache_creation_input_tokens": 3247,
+                "cache_creation_12h_input_tokens": 3247,
+            },
+        }
+    )
+    assert metrics.usage is not None
+    assert metrics.usage.cache_creation_12h_input_tokens == 3247

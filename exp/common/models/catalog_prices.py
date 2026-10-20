@@ -40,6 +40,7 @@ class GatewayLongContextTier(ContractModel):
     cached_input_nano_usd_per_million_tokens: NanoUsdRatePerMillionTokens = None
     cache_creation_input_nano_usd_per_million_tokens: NanoUsdRatePerMillionTokens = None
     cache_creation_1h_input_nano_usd_per_million_tokens: NanoUsdRatePerMillionTokens = None
+    cache_creation_12h_input_nano_usd_per_million_tokens: NanoUsdRatePerMillionTokens = None
     output_nano_usd_per_million_tokens: NanoUsdRatePerMillionTokens = None
     reasoning_nano_usd_per_million_tokens: NanoUsdRatePerMillionTokens = None
     image_output_nano_usd_per_million_tokens: NanoUsdRatePerMillionTokens = None
@@ -59,6 +60,7 @@ class GatewayServiceTierPrices(ContractModel):
     cached_input_nano_usd_per_million_tokens: NanoUsdRatePerMillionTokens = None
     cache_creation_input_nano_usd_per_million_tokens: NanoUsdRatePerMillionTokens = None
     cache_creation_1h_input_nano_usd_per_million_tokens: NanoUsdRatePerMillionTokens = None
+    cache_creation_12h_input_nano_usd_per_million_tokens: NanoUsdRatePerMillionTokens = None
     output_nano_usd_per_million_tokens: NanoUsdRatePerMillionTokens = None
     reasoning_nano_usd_per_million_tokens: NanoUsdRatePerMillionTokens = None
     image_output_nano_usd_per_million_tokens: NanoUsdRatePerMillionTokens = None
@@ -163,6 +165,7 @@ _TOKEN_RATE_FIELDS = (
     "cached_input_nano_usd_per_million_tokens",
     "cache_creation_input_nano_usd_per_million_tokens",
     "cache_creation_1h_input_nano_usd_per_million_tokens",
+    "cache_creation_12h_input_nano_usd_per_million_tokens",
     "output_nano_usd_per_million_tokens",
     "reasoning_nano_usd_per_million_tokens",
     "image_output_nano_usd_per_million_tokens",
@@ -299,6 +302,10 @@ class GatewayTokenPrices(ContractModel):
         cached_input_nano_usd_per_million_tokens: Cache-read tokens inside the input.
         cache_creation_input_nano_usd_per_million_tokens: Five-minute cache writes.
         cache_creation_1h_input_nano_usd_per_million_tokens: One-hour cache writes.
+        cache_creation_12h_input_nano_usd_per_million_tokens: OpenAI 12-hour cache writes.
+            None (the default, excluded from identity while None) prices them at 2.5
+            times the input rate, OpenAI's published total write rate
+            (``token_cost.twelve_hour_write_rate``), never at a shorter lifetime's rate.
         output_nano_usd_per_million_tokens: Output tokens.
         reasoning_nano_usd_per_million_tokens: Reasoning tokens inside the output.
         image_output_nano_usd_per_million_tokens: Generated-image tokens inside the
@@ -318,6 +325,7 @@ class GatewayTokenPrices(ContractModel):
     cached_input_nano_usd_per_million_tokens: NanoUsdRatePerMillionTokens = None
     cache_creation_input_nano_usd_per_million_tokens: NanoUsdRatePerMillionTokens = None
     cache_creation_1h_input_nano_usd_per_million_tokens: NanoUsdRatePerMillionTokens = None
+    cache_creation_12h_input_nano_usd_per_million_tokens: NanoUsdRatePerMillionTokens = None
     output_nano_usd_per_million_tokens: NanoUsdRatePerMillionTokens = None
     reasoning_nano_usd_per_million_tokens: NanoUsdRatePerMillionTokens = None
     image_output_nano_usd_per_million_tokens: NanoUsdRatePerMillionTokens = None
@@ -390,6 +398,7 @@ class GatewayTokenPrices(ContractModel):
             cached_input_nano_usd_per_million_tokens=card.cached_input_nano_usd_per_million_tokens,
             cache_creation_input_nano_usd_per_million_tokens=card.cache_creation_input_nano_usd_per_million_tokens,
             cache_creation_1h_input_nano_usd_per_million_tokens=card.cache_creation_1h_input_nano_usd_per_million_tokens,
+            cache_creation_12h_input_nano_usd_per_million_tokens=card.cache_creation_12h_input_nano_usd_per_million_tokens,
             output_nano_usd_per_million_tokens=card.output_nano_usd_per_million_tokens,
             reasoning_nano_usd_per_million_tokens=card.reasoning_nano_usd_per_million_tokens,
             image_output_nano_usd_per_million_tokens=card.image_output_nano_usd_per_million_tokens,
@@ -429,6 +438,7 @@ class GatewayTokenPrices(ContractModel):
             cached_input_nano_usd_per_million_tokens=card.cached_input_nano_usd_per_million_tokens,
             cache_creation_input_nano_usd_per_million_tokens=card.cache_creation_input_nano_usd_per_million_tokens,
             cache_creation_1h_input_nano_usd_per_million_tokens=card.cache_creation_1h_input_nano_usd_per_million_tokens,
+            cache_creation_12h_input_nano_usd_per_million_tokens=card.cache_creation_12h_input_nano_usd_per_million_tokens,
             output_nano_usd_per_million_tokens=card.output_nano_usd_per_million_tokens,
             reasoning_nano_usd_per_million_tokens=card.reasoning_nano_usd_per_million_tokens,
             image_output_nano_usd_per_million_tokens=card.image_output_nano_usd_per_million_tokens,

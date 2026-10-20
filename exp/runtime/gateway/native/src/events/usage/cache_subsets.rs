@@ -14,6 +14,15 @@ pub(super) fn validate_cache_subsets(usage: &Usage) -> Result<(), String> {
             return Err("one-hour cache writes exceed total cache writes".into());
         }
     }
+    if let Some(half_day) = usage.cache_creation_12h_input_tokens {
+        let timed = half_day.saturating_add(usage.cache_creation_1h_input_tokens.unwrap_or(0));
+        if usage
+            .cache_creation_input_tokens
+            .is_none_or(|written| timed > written)
+        {
+            return Err("12-hour cache writes exceed total cache writes".into());
+        }
+    }
     let subsets = bounded_ledger_sum(
         &[
             usage.cached_input_tokens.unwrap_or(0),

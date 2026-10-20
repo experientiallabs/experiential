@@ -3485,6 +3485,53 @@ def test_non_default_values_of_accepted_no_op_fields_stay_named_rejections(
     assert fragment in captured.value.detail.message
 
 
+def test_responses_prompt_cache_ttl_decodes_twelve_hours_and_accepts_the_default() -> None:
+    """``"12h"`` lands on the carrier; ``"30m"`` and an omitted mode are already satisfied.
+
+    OpenAI (https://developers.openai.com/api/docs/guides/prompt-caching): "In
+    the Responses API, set prompt_cache_options.ttl to choose the minimum cache
+    lifetime", "30m" (default) or "12h"; "Unsupported values return 400".
+    """
+    twelve = decode_responses(
+        {"model": "coding", "input": "x", "prompt_cache_options": {"ttl": "12h"}}
+    )
+    assert twelve.request.prompt_cache_ttl == "12h"
+    assert twelve.request.ignored_parameters == ()
+    # A cost hint, never identity or serialized request state.
+    assert "prompt_cache_ttl" not in twelve.request.model_dump(mode="json")
+    plain = decode_responses({"model": "coding", "input": "x"})
+    assert canonical_request_sha256(twelve.request) == canonical_request_sha256(plain.request)
+    for options in ({"ttl": "30m"}, {"mode": "implicit", "ttl": "30m"}, {}):
+        default = decode_responses(
+            {"model": "coding", "input": "x", "prompt_cache_options": options}
+        )
+        assert default.request.prompt_cache_ttl is None
+    both = decode_responses(
+        {
+            "model": "coding",
+            "input": "x",
+            "prompt_cache_options": {"mode": "implicit", "ttl": "12h"},
+        }
+    )
+    assert both.request.prompt_cache_ttl == "12h"
+    with pytest.raises(OpenAIProtocolError) as captured:
+        decode_responses({"model": "coding", "input": "x", "prompt_cache_options": {"ttl": "1h"}})
+    assert captured.value.detail.param == "prompt_cache_options.ttl"
+
+
+def test_chat_prompt_cache_options_stay_refused() -> None:
+    """OpenAI's Chat Completions answers 400 for ``ttl: "12h"`` (probed 2026-10-20)."""
+    with pytest.raises(OpenAIProtocolError) as captured:
+        decode_chat(
+            {
+                "model": "coding",
+                "messages": [{"role": "user", "content": "x"}],
+                "prompt_cache_options": {"ttl": "12h"},
+            }
+        )
+    assert captured.value.detail.param == "prompt_cache_options"
+
+
 def test_service_tier_decodes_on_both_openai_surfaces_and_rejects_unknown_values() -> None:
     """Valid tiers land on the carrier; Fast normalizes before provider forwarding."""
     chat = decode_chat(

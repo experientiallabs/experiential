@@ -563,6 +563,13 @@ def decode_responses(
             safety_identifier=request.safety_identifier,
             user=request.user,
             prompt_cache_key=request.prompt_cache_key,
+            # "30m" is OpenAI's default lifetime, already satisfied; only "12h" routes.
+            prompt_cache_ttl=(
+                "12h"
+                if request.prompt_cache_options is not None
+                and request.prompt_cache_options.ttl == "12h"
+                else None
+            ),
             service_tier=request.service_tier,
             idempotency_key=idempotency_key,
             client_request_id=client_request_id,

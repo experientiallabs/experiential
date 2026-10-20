@@ -479,6 +479,14 @@ def dialect_stream_payload(
         # field silently: admission then prefers a tier-preserving rung and
         # otherwise retries with the disclosed drop in capability_policy.
         raise ProviderCapabilityError(capability="service_tier")
+    if provider_request.prompt_cache_ttl is not None and not (
+        profile.dialect == "openai_responses" and profile.forwards_prompt_cache_ttl
+    ):
+        # Only OpenAI's own Responses wire carries a cache lifetime (its Chat
+        # answers 400 for "12h"). Any other rung declares it through inherited
+        # capabilities at most, so it declines here instead of silently writing
+        # at the default lifetime or sending a field its backend refuses.
+        raise ProviderCapabilityError(capability="prompt_cache_ttl_12h")
     required_reasoning_effort = (
         profile.reasoning_effort if profile.reasoning_effort_required and budget is None else None
     )

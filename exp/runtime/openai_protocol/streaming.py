@@ -15,6 +15,7 @@ from exp.runtime.gateway.contracts import (
     GatewayRequest,
     GatewayUsage,
 )
+from exp.runtime.openai_protocol.cache_write_lifetimes import cache_write_lifetimes
 from exp.runtime.openai_protocol.errors import OpenAIProtocolError, public_failure_error
 from exp.runtime.openai_protocol.reasoning_estimate import ReasoningEstimate
 from exp.runtime.openai_protocol.response_streaming_state import ResponseReasoningState
@@ -900,6 +901,7 @@ def _chat_usage(usage: GatewayUsage) -> JsonObject:
                 if usage.cache_creation_1h_input_tokens is not None
                 else {}
             ),
+            **_lifetime_split(usage),
         },
         "completion_tokens_details": {"reasoning_tokens": usage.reasoning_tokens or 0},
         **_unreported_usage_details(usage),
@@ -924,12 +926,19 @@ def _responses_usage(usage: GatewayUsage | None) -> JsonObject | None:
                 if usage.cache_creation_1h_input_tokens is not None
                 else {}
             ),
+            **_lifetime_split(usage),
         },
         "output_tokens": usage.output_tokens,
         "output_tokens_details": {"reasoning_tokens": usage.reasoning_tokens or 0},
         "total_tokens": usage.input_tokens + usage.output_tokens,
         **_unreported_usage_details(usage),
     }
+
+
+def _lifetime_split(usage: GatewayUsage) -> JsonObject:
+    """Return OpenAI's ``cache_write_tokens_details`` entry, or nothing without one."""
+    split = cache_write_lifetimes(usage)
+    return {} if split is None else {"cache_write_tokens_details": split}
 
 
 def _unreported_usage_details(usage: GatewayUsage) -> JsonObject:
