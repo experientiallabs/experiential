@@ -81,7 +81,7 @@ def upsert_provider_connection(
         ProviderAuthorityError: Identity, replacement, or revision invariants conflict.
     """
     config = config.canonicalized()
-    current = _active_row(
+    current = _current_row(
         connection,
         organization_id=organization_id,
         connection_id=connection_id,
@@ -90,12 +90,24 @@ def upsert_provider_connection(
     if current is not None:
         authority = _authority(current)
         if authority.config == config and authority.connection_sha256 == digest:
-            return False, authority
-        if not replace:
+            if authority.revision_id != revision_id:
+                raise ProviderAuthorityError(
+                    "provider connection replay names a different immutable revision"
+                )
+            if authority.active:
+                return False, authority
+            connection.execute(
+                """
+                UPDATE provider_connections SET active = 1, updated_at = ?
+                WHERE organization_id = ? AND connection_id = ?
+                """,
+                (now, organization_id, connection_id),
+            )
+            return True, authority.model_copy(update={"active": True})
+        if authority.active and not replace:
             raise ProviderAuthorityError(
                 "provider connection already exists with different metadata; pass --replace"
             )
-        revision_number = authority.revision_number + 1
     else:
         existing_id = connection.execute(
             """
@@ -114,16 +126,36 @@ def upsert_provider_connection(
             """,
             (connection_id, organization_id, now, now),
         )
-        revision_number = 1
-    revision_owner = connection.execute(
-        """
-        SELECT organization_id, connection_id
-        FROM provider_connection_revisions WHERE revision_id = ?
-        """,
-        (revision_id,),
-    ).fetchone()
-    if revision_owner is not None:
-        raise ProviderAuthorityError("provider connection revision ID is already in use")
+    existing_revision = _revision_row(connection, revision_id=revision_id)
+    if existing_revision is not None:
+        revision_organization_id = str(existing_revision["organization_id"])
+        revision_authority = _authority(existing_revision)
+        if (
+            revision_organization_id != organization_id
+            or revision_authority.connection_id != connection_id
+            or revision_authority.config != config
+            or revision_authority.connection_sha256 != digest
+        ):
+            raise ProviderAuthorityError("provider connection revision ID is already in use")
+        connection.execute(
+            """
+            UPDATE provider_connections
+            SET active_revision_id = ?, active = 1, updated_at = ?
+            WHERE organization_id = ? AND connection_id = ?
+            """,
+            (revision_id, now, organization_id, connection_id),
+        )
+        return True, revision_authority.model_copy(update={"active": True})
+    revision_number = int(
+        connection.execute(
+            """
+            SELECT COALESCE(MAX(revision_number), 0) + 1
+            FROM provider_connection_revisions
+            WHERE organization_id = ? AND connection_id = ?
+            """,
+            (organization_id, connection_id),
+        ).fetchone()[0]
+    )
     connection.execute(
         """
         INSERT INTO provider_connection_revisions (
@@ -308,7 +340,7 @@ def disable_provider_connection(
     return result.rowcount == 1
 
 
-def _active_row(
+def _current_row(
     connection: sqlite3.Connection,
     *,
     organization_id: str,
@@ -318,9 +350,24 @@ def _active_row(
     return connection.execute(
         f"""
         {_SELECT_AUTHORITY}
-        WHERE c.organization_id = ? AND c.connection_id = ? AND c.active = 1
+        WHERE c.organization_id = ? AND c.connection_id = ?
         """,
         (organization_id, connection_id),
+    ).fetchone()
+
+
+def _revision_row(
+    connection: sqlite3.Connection,
+    *,
+    revision_id: str,
+) -> sqlite3.Row | None:
+    """Read one exact provider revision and its connection state."""
+    return connection.execute(
+        f"""
+        {_SELECT_REVISION_AUTHORITY}
+        WHERE r.revision_id = ?
+        """,
+        (revision_id,),
     ).fetchone()
 
 
@@ -374,4 +421,16 @@ JOIN provider_connection_revisions AS r
   ON r.organization_id = c.organization_id
  AND r.connection_id = c.connection_id
  AND r.revision_id = c.active_revision_id
+"""
+
+_SELECT_REVISION_AUTHORITY = """
+SELECT c.organization_id, c.connection_id, r.revision_id, r.revision_number,
+       r.provider, r.base_url, r.api_key_env, r.api_version,
+       r.azure_api_surface, r.region,
+       r.aws_access_key_id_env, r.bedrock_auth_mode, r.trusted_custom_origin,
+       r.subscription, r.connection_sha256, c.active
+FROM provider_connections AS c
+JOIN provider_connection_revisions AS r
+  ON r.organization_id = c.organization_id
+ AND r.connection_id = c.connection_id
 """
