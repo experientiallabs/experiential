@@ -11,6 +11,7 @@ from typing import Literal
 from pydantic import Field, model_validator
 
 from exp.common.core.artifacts import ArtifactInput, ContractModel, JsonObject, Sha256, sha256_json
+from exp.common.evaluations.uncertainty import Z95_ONE_SIDED, wilson_interval
 from exp.common.project import ArtifactStore, artifact_input
 from exp.optimize.evaluation.analysis.memory_evidence import EvidenceLocator, located_value
 
@@ -279,11 +280,7 @@ def _measure(
     upper = None
     count = len(supported_units)
     if count:
-        z = 1.6448536269514722
-        p = len(error_units) / count
-        upper = (
-            p + z * z / (2 * count) + z * math.sqrt(p * (1 - p) / count + z * z / (4 * count**2))
-        ) / (1 + z * z / count)
+        upper = wilson_interval(len(error_units) / count, count, z=Z95_ONE_SIDED)[1]
     return PartitionMeasurement(
         partition=partition,
         planned=len(rows),

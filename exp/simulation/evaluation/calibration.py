@@ -13,7 +13,9 @@ from exp.common.core.artifacts import (
     stable_id,
 )
 from exp.common.evaluations.reconstruction import AxisOutcome, JudgeConfig, WorkflowEvidence
+from exp.common.evaluations.uncertainty import proportion_summary
 from exp.simulation.evaluation.admission import (
+    MINIMUM_ADMITTED_PER_VERDICT,
     AdmissionRefusal,
     EvidenceAdmission,
     adequacy_refusals,
@@ -39,6 +41,13 @@ class CalibrationCase(ContractModel):
         expected_unassessable: Criteria that the supplied task/evidence cannot support scoring.
         expected_task: Optional task-correctness label, distinct from component validity.
         task_label_scope: Whether the label establishes task correctness or only source reward.
+        category: Defect family this case represents or controls for, such as ``wrong_cell``
+            or ``unauthorized_write``; judge errors are reported per category. None reports
+            under ``uncategorized``.
+        sample: How the case entered the pack. ``representative`` cases estimate deployment
+            prevalence; ``failure_enriched`` cases are chosen to contain defects and only
+            estimate class-conditional rates. The two are never pooled; None reports under
+            ``unspecified``.
     """
 
     challenge: VerifierChallenge
@@ -52,6 +61,12 @@ class CalibrationCase(ContractModel):
     )
 
     expected_unassessable: tuple[str, ...] = ()
+    category: str | None = Field(
+        default=None, min_length=1, max_length=128, exclude_if=lambda value: value is None
+    )
+    sample: Literal["representative", "failure_enriched"] | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
 
     @model_validator(mode="after")
     def independent_scores(self) -> Self:
@@ -356,6 +371,7 @@ def calibrate(
         "task_withheld": sum(row["task_decision"] is None for row in task_cases),
         "task_false_acceptances": sum(bool(row["task_false_acceptance"]) for row in rows),
         "task_false_rejections": sum(bool(row["task_false_rejection"]) for row in rows),
+        "judge_validation": _judge_validation(pack, index, verified, confirmation_open),
         "development_status": "passed" if development_ready else "incomplete_or_incorrect",
         "selection_status": "not_run"
         if not has_selection
@@ -386,6 +402,193 @@ def calibrate(
         "actor_feedback": False,
         "physical_attempts": 0,
         "limitations": ["Finite cases do not establish universal fidelity or training effects."],
+    }
+
+
+def _judge_validation(
+    pack: CalibrationPack,
+    judgments: dict[str, CalibrationJudgment],
+    verified: frozenset[str],
+    confirmation_open: bool,
+) -> JsonObject:
+    """Report both error directions, abstention and threshold errors per sample and category.
+
+    Defect is the positive class: a ``fail`` label marks a defect and a ``pass`` label a valid
+    outcome. Representative and failure-enriched cases are reported separately and never
+    pooled; prevalence-dependent rates are reported only for representative cases.
+
+    Args:
+        pack: Frozen cases, predicates, judge and thresholds.
+        judgments: Saved judge results by case ID.
+        verified: Store-verified witnessed label IDs.
+        confirmation_open: Whether reserved confirmation cases may be read.
+
+    Returns:
+        The admission-floor interpretation and, per sample set and category, verifier and
+        task-decision confusion counts with Wilson intervals at the lineage count, plus
+        criterion-level abstention, unsupported-confidence and threshold-crossing counts.
+    """
+    grouped: dict[str, dict[str, list[tuple[CalibrationCase, CalibrationJudgment | None]]]] = {}
+    withheld = unadmitted = 0
+    for case in pack.cases:
+        if case.partition == "confirmation" and not confirmation_open:
+            withheld += 1
+            continue
+        if not label_admitted(case.challenge, verified):
+            unadmitted += 1
+            continue
+        sample = case.sample or "unspecified"
+        category = case.category or "uncategorized"
+        rows = grouped.setdefault(sample, {}).setdefault(category, [])
+        rows.append((case, judgments.get(case.challenge.id)))
+    samples: JsonObject = {}
+    for sample, categories in sorted(grouped.items()):
+        everything = [row for rows in categories.values() for row in rows]
+        samples[sample] = {
+            "overall": _category_validation(pack, everything, sample),
+            "categories": {
+                name: _category_validation(pack, rows, sample)
+                for name, rows in sorted(categories.items())
+            },
+        }
+    return {
+        "task": pack.task.artifact_id,
+        "convention": (
+            "defect is the positive class: a fail label is a defect, a pass label is valid; "
+            "a false acceptance passes a defect, a false rejection fails a valid outcome"
+        ),
+        "admission_floor": {
+            "minimum_admitted_per_verdict": MINIMUM_ADMITTED_PER_VERDICT,
+            "interpretation": (
+                "a structural repeated-contrast floor for admission; it is not a statistical "
+                "certification that the judge detects rare or consequential errors"
+            ),
+        },
+        "withheld_confirmation_cases": withheld,
+        "unadmitted_cases": unadmitted,
+        "samples": samples,
+    }
+
+
+def _category_validation(
+    pack: CalibrationPack,
+    rows: list[tuple[CalibrationCase, CalibrationJudgment | None]],
+    sample: str,
+) -> JsonObject:
+    """Measure one sample set and category for the verifier, task decision and criteria."""
+    verifier = [
+        (case.challenge.expected, grade(pack.candidate, case.challenge.outcome).status, case)
+        for case, _ in rows
+    ]
+    task: list[tuple[Verdict, Verdict, CalibrationCase]] = []
+    task_not_judged = 0
+    abstentions = operational = unsupported = assessed = expected_assessed = 0
+    correct_abstentions = optimistic = pessimistic = 0
+    for case, judgment in rows:
+        if case.expected_task is not None:
+            if judgment is None:
+                task_not_judged += 1
+            else:
+                mechanical = grade(pack.candidate, case.challenge.outcome).status
+                decision = task_decision(
+                    mechanical, _bound_axes(pack, case, judgment), pack.minimum_scores
+                )
+                task.append((case.expected_task, decision, case))
+        if judgment is None:
+            continue
+        axes = {axis.dimension_id: axis for axis in _bound_axes(pack, case, judgment)}
+        for key, expected in case.expert_scores.items():
+            expected_assessed += 1
+            axis = axes[key]
+            if axis.status == "unassessable":
+                abstentions += 1
+            elif axis.status != "assessed" or axis.score is None:
+                operational += 1
+            else:
+                assessed += 1
+                threshold = pack.minimum_scores.get(key)
+                if threshold is not None and (axis.score >= threshold) != (expected >= threshold):
+                    optimistic += axis.score >= threshold
+                    pessimistic += axis.score < threshold
+        for key in case.expected_unassessable:
+            status = axes[key].status
+            unsupported += status == "assessed"
+            correct_abstentions += status == "unassessable"
+            operational += status not in ("assessed", "unassessable")
+    return {
+        "cases": len(rows),
+        "verifier": _confusion(verifier, sample),
+        "task_decision": {**_confusion(task, sample), "not_judged": task_not_judged},
+        "criteria": {
+            "expected_assessable": expected_assessed,
+            "assessed": assessed,
+            "unnecessary_abstentions": abstentions,
+            "confident_without_evidence": unsupported,
+            "correct_abstentions": correct_abstentions,
+            "operationally_unavailable": operational,
+            "threshold_crossings": {
+                "optimistic": optimistic,
+                "pessimistic": pessimistic,
+                "scope": "assessed required criteria whose judge and expert scores fall on "
+                "opposite sides of the registered minimum",
+            },
+        },
+    }
+
+
+def _confusion(rows: list[tuple[Verdict, Verdict, CalibrationCase]], sample: str) -> JsonObject:
+    """Count both error directions and abstentions for ``(label, decision, case)`` rows."""
+
+    def count(label: Verdict, decision: Verdict) -> int:
+        """Rows with one label and one decision."""
+        return sum(row[0] == label and row[1] == decision for row in rows)
+
+    def units(*, label: Verdict | None = None, decision: Verdict | None = None) -> int | None:
+        """Distinct lineages among decided pass/fail rows matching a label or decision."""
+        found = {
+            row[2].lineage
+            for row in rows
+            if row[0] in ("pass", "fail")
+            and row[1] in ("pass", "fail")
+            and (label is None or row[0] == label)
+            and (decision is None or row[1] == decision)
+        }
+        return len(found) or None
+
+    flagged, accepted_defects = count("fail", "fail"), count("fail", "pass")
+    rejected_valid, accepted_valid = count("pass", "fail"), count("pass", "pass")
+    representative = sample == "representative"
+    prevalence_note = (
+        None
+        if representative
+        else "prevalence-dependent; not estimable from a failure-enriched or unspecified sample"
+    )
+    return {
+        "labeled": len(rows),
+        "flagged_defects": flagged,
+        "false_acceptances": accepted_defects,
+        "false_rejections": rejected_valid,
+        "correct_acceptances": accepted_valid,
+        "unnecessary_abstentions": count("fail", "unassessable") + count("pass", "unassessable"),
+        "confident_without_evidence": count("unassessable", "pass") + count("unassessable", "fail"),
+        "correct_abstentions": count("unassessable", "unassessable"),
+        "defect_sensitivity": proportion_summary(
+            flagged, flagged + accepted_defects, units=units(label="fail")
+        ),
+        "specificity": proportion_summary(
+            accepted_valid, accepted_valid + rejected_valid, units=units(label="pass")
+        ),
+        "defect_precision": proportion_summary(
+            flagged, flagged + rejected_valid, units=units(decision="fail")
+        )
+        if representative
+        else prevalence_note,
+        "accepted_defective_share": proportion_summary(
+            accepted_defects, accepted_defects + accepted_valid, units=units(decision="pass")
+        )
+        if representative
+        else prevalence_note,
+        "interval_unit": "lineage",
     }
 
 

@@ -40,7 +40,7 @@ class Protocol:
 PROTOCOLS = (
     Protocol(
         "exp.optimize.evaluation.tasks.calibration:CALIBRATION_PROTOCOL",
-        "task-calibration-v2",
+        "task-calibration-v3",
         (
             "exp.optimize.evaluation.tasks.calibration",
             "exp.optimize.evaluation.tasks.admission",
@@ -48,7 +48,7 @@ PROTOCOLS = (
             "exp.simulation.evaluation.tasks",
             "exp.simulation.evaluation.admission",
         ),
-        "74b3d8c27ddd77e817cc12cd555c16eaf584d67323dd223dc403d26a38e6b484",
+        "b01624522a004f1f4bdb72aefb4f91eb76902b5239fb6ef392a3bc90804853e4",
     ),
     Protocol(
         "exp.optimize.evaluation.council.runner:COUNCIL_HARNESS_PROTOCOL",

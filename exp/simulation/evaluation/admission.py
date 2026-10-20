@@ -80,7 +80,9 @@ AdmissionReason = Literal[
 WitnessKind = Literal["specification_check", "native_execution"]
 
 # Admitted labels required for each verdict in each partition (and each rubric axis): one
-# case per side can agree by coincidence, two per side is the smallest repeated contrast.
+# case per side can agree by coincidence, two per side is the smallest repeated contrast. This
+# is a structural admission floor, not a sample size that certifies judge reliability; error
+# rates and their uncertainty are reported separately by calibration.
 MINIMUM_ADMITTED_PER_VERDICT = 2
 
 # Generated proposal and construction types. Label evidence derived from any of them is a
@@ -609,7 +611,8 @@ def adequacy_refusals(
                             detail=(
                                 f"{count} admitted {verdict} labels; at least "
                                 f"{MINIMUM_ADMITTED_PER_VERDICT} witnessed or attested labels "
-                                "are required"
+                                "are required (a structural floor, not a statistical "
+                                "certification)"
                             ),
                         )
                     )

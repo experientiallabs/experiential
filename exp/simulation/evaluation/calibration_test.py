@@ -611,3 +611,140 @@ def test_a_witness_establishes_one_verdict() -> None:
     data["expected_task"] = "fail" if case.challenge.expected == "pass" else "pass"
     with pytest.raises(ValidationError, match="one verdict"):
         CalibrationCase.model_validate(data)
+
+
+def stratified_pack() -> CalibrationPack:
+    """Human-anchored task labels split into representative and failure-enriched samples."""
+    original = task_pack(variants=2)
+    return CalibrationPack.model_validate(
+        {
+            **original.model_dump(),
+            "cases": tuple(
+                {
+                    **case.model_dump(),
+                    "challenge": {**case.challenge.model_dump(), "authority": "human"},
+                    "expert_scores": {"outcome": 5 if case.expected_task == "pass" else 1},
+                    "category": "wrong_cell",
+                    "sample": "failure_enriched"
+                    if case.challenge.id.endswith("-1")
+                    else "representative",
+                }
+                for case in original.cases
+            ),
+        }
+    )
+
+
+def with_outcome(
+    judgment: CalibrationJudgment, status: str, score: int | None
+) -> CalibrationJudgment:
+    """Replace the judged outcome criterion while keeping the exact case binding."""
+    return judgment.model_copy(
+        update={
+            "axes": tuple(
+                axis.model_copy(update={"status": status, "score": score})
+                if axis.dimension_id == "outcome"
+                else axis
+                for axis in judgment.axes
+            )
+        }
+    )
+
+
+def validation(report: JsonObject) -> JsonObject:
+    """Return the per-category judge validation section of a calibration report."""
+    section = report["judge_validation"]
+    assert isinstance(section, dict)
+    return section
+
+
+def test_judge_errors_are_reported_per_sample_and_category_without_pooling() -> None:
+    """A failure-enriched false acceptance never dilutes into representative error rates."""
+    original = stratified_pack()
+    judgments = list(task_judgments(original))
+    ids = [case.challenge.id for case in original.cases]
+    # The enriched defective variant is passed; a representative valid case scores 3 against an
+    # expert 5 at threshold 4 (a one-point crossing), so it is falsely rejected.
+    judgments[ids.index("development-False-1")] = with_outcome(
+        judgments[ids.index("development-False-1")], "assessed", 5
+    )
+    judgments[ids.index("development-True")] = with_outcome(
+        judgments[ids.index("development-True")], "assessed", 3
+    )
+    report = calibrate(original, tuple(judgments))
+    section = validation(report)
+    assert section["task"] == "evaluation-task"
+    assert section["withheld_confirmation_cases"] == 4, "confirmation stays closed"
+    floor = section["admission_floor"]
+    assert isinstance(floor, dict) and floor["minimum_admitted_per_verdict"] == 2
+    assert "not a statistical certification" in str(floor["interpretation"])
+    samples = section["samples"]
+    assert isinstance(samples, dict) and set(samples) == {"failure_enriched", "representative"}
+    enriched = samples["failure_enriched"]["categories"]["wrong_cell"]
+    representative = samples["representative"]["categories"]["wrong_cell"]
+    assert enriched["task_decision"]["false_acceptances"] == 1
+    assert enriched["task_decision"]["false_rejections"] == 0
+    assert representative["task_decision"]["false_acceptances"] == 0
+    assert representative["task_decision"]["false_rejections"] == 1
+    assert enriched["task_decision"]["defect_sensitivity"]["estimate"] == 0.0
+    assert "prevalence-dependent" in enriched["task_decision"]["defect_precision"]
+    precision = representative["task_decision"]["defect_precision"]
+    assert precision["successes"] == 1 and precision["trials"] == 2
+    assert precision["independent_units"] == 1, "one development lineage, not two cases"
+    crossings = representative["criteria"]["threshold_crossings"]
+    assert crossings["pessimistic"] == 1 and crossings["optimistic"] == 0
+    assert enriched["criteria"]["threshold_crossings"]["optimistic"] == 1
+    assert samples["representative"]["overall"]["cases"] == 2
+
+
+def test_unnecessary_abstention_and_unsupported_confidence_are_counted_separately() -> None:
+    """Declining a judgeable case and judging an unjudgeable one are different errors."""
+    original = stratified_pack()
+    cases = list(original.cases)
+    ids = [case.challenge.id for case in cases]
+    index = ids.index("development-True-1")
+    unsupported = cases[index].model_dump()
+    unsupported.update(
+        {
+            "expected_task": "unassessable",
+            "expert_scores": {},
+            "expected_unassessable": ("quality",),
+        }
+    )
+    cases[index] = CalibrationCase.model_validate(unsupported)
+    labeled = CalibrationPack.model_validate({**original.model_dump(), "cases": tuple(cases)})
+    judgments = list(task_judgments(labeled))
+    judgments[index] = judgments[index].model_copy(
+        update={
+            "axes": tuple(
+                axis.model_copy(update={"status": "assessed", "score": 5})
+                if axis.dimension_id in ("outcome", "quality")
+                else axis
+                for axis in judgments[index].axes
+            )
+        }
+    )
+    declined = ids.index("development-False")
+    judgments[declined] = with_outcome(judgments[declined], "unassessable", None)
+    report = calibrate(labeled, tuple(judgments))
+    samples = validation(report)["samples"]
+    assert isinstance(samples, dict)
+    enriched = samples["failure_enriched"]["categories"]["wrong_cell"]
+    representative = samples["representative"]["categories"]["wrong_cell"]
+    assert enriched["task_decision"]["confident_without_evidence"] == 1
+    assert enriched["criteria"]["confident_without_evidence"] == 1
+    assert representative["task_decision"]["unnecessary_abstentions"] == 1
+    assert representative["criteria"]["unnecessary_abstentions"] == 1
+    assert representative["task_decision"]["false_acceptances"] == 0
+
+
+def test_uncategorized_cases_without_judgments_stay_visible() -> None:
+    """Legacy packs report under explicit defaults and unjudged task cases are not decisions."""
+    report = calibrate(task_pack())
+    samples = validation(report)["samples"]
+    assert isinstance(samples, dict) and set(samples) == {"unspecified"}
+    category = samples["unspecified"]["categories"]["uncategorized"]
+    assert category["task_decision"]["not_judged"] == 2
+    assert category["task_decision"]["labeled"] == 0
+    assert category["verifier"]["labeled"] == 2
+    assert "prevalence-dependent" in category["verifier"]["defect_precision"]
