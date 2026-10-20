@@ -216,13 +216,14 @@ def test_scores_keep_first_report_and_retests_require_learning(
         with pytest.raises(ValueError, match="nothing has been learned"):
             register_miss_retest(store, 99, code_revision=REVISION, clock=now)
         return
-    assert curve.incomplete == 0
-    case, first_attempt, _, _ = scored[0]
-    attempts = trace_learning._saved_attempts(store, plan, case)
-    assert len(attempts) > 1 and attempts[0][0].id == first_attempt.id, "first attempt stays scored"
+    assert curve.incomplete == 1
+    failed = [(case, prepared) for case, prepared, _, learned in scored if not learned]
+    assert len(failed) == 1
+    case, first_attempt = failed[0]
+    assert len(trace_learning._saved_attempts(store, plan, case)) == 1
     panel = register_miss_retest(store, 99, code_revision=REVISION, clock=now)
-    assert panel.learned == USERS
-    assert panel.before[0].run_id == first_attempt.spec.run_id
+    assert panel.learned == USERS - 1
+    assert first_attempt.spec.run_id not in {row.run_id for row in panel.before}
 
 
 class RedrawnPrediction(FlakyInvestigator):
@@ -261,17 +262,23 @@ def test_investigation_failure_cannot_select_a_better_prediction_score(
     outcome = learn_from_traces(
         store, recall_alias="jev", maximum_attempts=10_000, code_revision=REVISION, clock=now
     )
-    assert outcome.learned == 4 and outcome.incomplete == 0
+    assert outcome.learned == 4 - investigation_failures
+    assert outcome.incomplete == investigation_failures
+    assert provider.draws == 1
     curve = learning_curve(store)
     assert curve is not None
     assert sum(point.exact for point in curve.points) == 11
     assert sum(point.steps for point in curve.points) == 12
     case = trace_learning.learning_cases(store, "all")[0]
     attempts = trace_learning._saved_attempts(store, learning_plan(store), case)
-    assert len(attempts) == 1 + investigation_failures
+    assert len(attempts) == 1
     assert curve.points[0].run_id == attempts[0][0].spec.run_id
-    panel = register_miss_retest(store, 4, code_revision=REVISION, clock=now)
-    assert panel.before[0].run_id == attempts[0][0].spec.run_id
+    if investigation_failures:
+        with pytest.raises(ValueError, match="no miss to retest"):
+            register_miss_retest(store, 4, code_revision=REVISION, clock=now)
+    else:
+        panel = register_miss_retest(store, 4, code_revision=REVISION, clock=now)
+        assert panel.before[0].run_id == attempts[0][0].spec.run_id
 
 
 def test_a_world_model_without_tools_is_refused_before_any_call(
@@ -323,3 +330,29 @@ def test_both_profiles_derive_tool_schemas_from_the_same_fit_calls(
     assert {name for name, _ in fit_calls(store)} == {
         name for name, _ in observed_calls(fit.transitions)
     }
+
+
+def test_saved_predictions_are_not_redrawn_after_failed_investigation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failed learning stage must not purchase new draws of committed predictions."""
+    episodes = [episode(i) for i in range(4)]
+    provider = RedrawnPrediction(episodes)
+    provider.failures = 1
+    _, store, _ = build_project(tmp_path, monkeypatch, provider, episodes=episodes)
+    outcome = learn_from_traces(
+        store, recall_alias="jev", maximum_attempts=10_000, code_revision=REVISION, clock=now
+    )
+    assert provider.draws == 1, "saved prediction was purchased again after research failed"
+    assert outcome.incomplete == 1 and outcome.learned == 3
+    before = len(provider.requests)
+    replay = learn_from_traces(
+        store,
+        recall_alias="jev",
+        maximum_attempts=10_000,
+        code_revision=REVISION,
+        clock=now,
+        retry_incomplete=True,
+    )
+    assert replay.learned == outcome.learned and replay.incomplete == outcome.incomplete
+    assert len(provider.requests) == before

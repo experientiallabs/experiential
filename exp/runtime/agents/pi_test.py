@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import AbstractContextManager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -12,7 +14,7 @@ from types import TracebackType
 
 import pytest
 
-from exp.common.core.artifacts import FailureAttribution, FailureCode
+from exp.common.core.artifacts import FailureAttribution, FailureCode, JsonObject
 from exp.common.models import (
     AssistantAction,
     BillingSource,
@@ -31,6 +33,8 @@ from exp.runtime.agents.pi import (
     PiTranscriptError,
     _episode_from_pi_events,
     _normalize_pi_chat_payload,
+    _PiBridge,
+    _PiBridgeError,
 )
 from exp.runtime.environments import EnvironmentSession, Observation
 from exp.runtime.openai_protocol import decode_chat, model_request
@@ -70,6 +74,88 @@ def test_default_pi_runtime_binds_the_injected_model_and_environment(
         "event": "tool_execution_end",
         "is_error": False,
     }
+
+
+def test_pi_delivers_public_facts_and_instruction_roles_to_injected_model(tmp_path: Path) -> None:
+    """Switching adapters cannot remove the public evidence that makes the task answerable."""
+    model = _Model()
+    task = _task().model_copy(
+        update={
+            "initial_context": {
+                "headers": ["name", "amount"],
+                "instruction_messages": [
+                    {"role": "system", "content": "Keep the input unchanged."},
+                    {"role": "developer", "content": "Inspect before editing."},
+                ],
+            },
+            "reference_answer": "private-evaluator-answer",
+        }
+    )
+    runtime = PiAgentRuntime(executable=str(_write_pi_binding_fixture(tmp_path)))
+    execute_agent_episode(runtime, _EnvironmentRuntime(), task, model)
+    messages = model.requests[0].messages
+    assert [(row.role, row.content) for row in messages[:2]] == [
+        ("system", "Keep the input unchanged."),
+        ("developer", "Inspect before editing."),
+    ]
+    assert (
+        messages[-1].content
+        == task.instruction + '\n\nInitial context:\n{"headers":["name","amount"]}'
+    )
+    assert "private-evaluator-answer" not in model.requests[0].model_dump_json()
+
+
+def test_pi_model_ceiling_is_atomic_across_bridge_threads() -> None:
+    """Concurrent requests cannot spend more than the actor's own model-call allowance."""
+    model = _Model()
+    bridge = _PiBridge(_task(), model, _Environment(), maximum_model_calls=2)
+
+    def call(_: int) -> bool:
+        """Attempt one model dispatch through the same bridge lock used by HTTP handlers."""
+        try:
+            bridge.complete_model({"messages": [{"role": "user", "content": "task"}]})
+        except _PiBridgeError:
+            return False
+        return True
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        results = tuple(pool.map(call, range(8)))
+    assert sum(results) == len(model.requests) == 2
+    assert bridge.limit_reached
+
+
+def test_pi_output_allowance_cannot_exceed_the_injected_actor_budget() -> None:
+    """Pi's default model metadata cannot override the coordinator's smaller call ceiling."""
+    model = _Model()
+    bridge = _PiBridge(_task(), model, _Environment(), maximum_output_tokens=512)
+    bridge.complete_model(
+        {
+            "messages": [{"role": "user", "content": "task"}],
+            "max_tokens": 16384,
+        }
+    )
+    assert model.requests[0].maximum_output_tokens == 512
+
+
+def test_pi_failed_model_calls_still_consume_the_actor_allowance() -> None:
+    """An unknown completion cannot be used to purchase an unbounded series of redraws."""
+
+    class FailingModel(_Model):
+        """Record an attempt before simulating a lost provider response."""
+
+        def complete(self, request: ModelRequest) -> ModelResponse:
+            """Record the purchased attempt and lose its result."""
+            self.requests.append(request)
+            raise RuntimeError("lost response")
+
+    model = FailingModel()
+    bridge = _PiBridge(_task(), model, _Environment(), maximum_model_calls=1)
+    payload: JsonObject = {"messages": [{"role": "user", "content": "task"}]}
+    with pytest.raises(RuntimeError, match="lost response"):
+        bridge.complete_model(payload)
+    with pytest.raises(_PiBridgeError, match="allowance exhausted"):
+        bridge.complete_model(payload)
+    assert len(model.requests) == 1
 
 
 @pytest.mark.parametrize("instruction", ("@candidate", "--candidate"))
@@ -464,7 +550,8 @@ def post(path, payload):
     request = Request(
         bridge_url + path,
         data=json.dumps(payload).encode("utf-8"),
-        headers={{"content-type": "application/json"}},
+        headers={{"content-type": "application/json",
+                  "Authorization": "Bearer " + provider["apiKey"]}},
         method="POST",
     )
     with urlopen(request) as response:
@@ -608,3 +695,82 @@ def test_pi_bridge_messages_tolerate_openai_wire_variations() -> None:
     ]
     assert messages[2].assistant_action is not None
     assert messages[2].assistant_action.tool_calls[0].call_id == "call-1"
+
+
+def test_pi_child_has_no_ambient_credentials_or_runtime_injection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An actual child sees inert task settings, never parent credentials or loader overrides."""
+    canaries = {
+        "OPENAI_API_KEY": "inert-provider-canary",
+        "AWS_SESSION_TOKEN": "inert-cloud-canary",
+        "GOOGLE_APPLICATION_CREDENTIALS": "/inert/credential-path",
+        "NODE_OPTIONS": "--inert-loader-option",
+        "PYTHONPATH": "/inert/python-injection",
+        "HTTP_PROXY": "http://inert-proxy.invalid",
+        "EXP_UNRELATED_SECRET": "inert-extra-canary",
+    }
+    for key, value in canaries.items():
+        monkeypatch.setenv(key, value)
+    executable = tmp_path / "pi-environment-fixture"
+    executable.write_text(
+        f"#!{sys.executable}\n"
+        "import json, os\nfrom pathlib import Path\n"
+        f"for name in {list(canaries)!r}:\n"
+        "    assert name not in os.environ, name\n"
+        "root = Path.cwd()\n"
+        "for key in ('HOME', 'TMPDIR', 'XDG_CONFIG_HOME', 'XDG_CACHE_HOME'):\n"
+        "    path = Path(os.environ[key])\n"
+        "    assert path.is_dir() and path.is_relative_to(root), key\n"
+        "assert os.environ['PI_OFFLINE'] == '1'\n"
+        "print(json.dumps({'type':'agent_end'}))\n"
+    )
+    executable.chmod(executable.stat().st_mode | S_IXUSR)
+    result = PiAgentRuntime(executable=str(executable)).run(
+        _task(), model=_Model(), environment=_Environment()
+    )
+    assert result.stop_reason == StopReason.COMPLETED
+    for key, value in canaries.items():
+        assert os.environ[key] == value
+
+
+def test_pi_bridge_requires_its_own_episode_capability() -> None:
+    """Knowing a loopback port or another episode's capability cannot buy calls or run tools."""
+    import httpx
+
+    from exp.runtime.agents.pi import _PiBridge
+
+    model, environment = _Model(), _Environment()
+    with (
+        _PiBridge(_task(), model, environment) as first,
+        _PiBridge(_task(), _Model(), _Environment()) as second,
+    ):
+        first_env = first.invocation(sys.executable, "task").environment
+        second_env = second.invocation(sys.executable, "task").environment
+        url = first_env["EXP_PI_BRIDGE_URL"]
+        with httpx.Client(trust_env=False) as client:
+            for token in (None, "inert-wrong-capability", second_env["EXP_PI_BRIDGE_TOKEN"]):
+                headers = {} if token is None else {"Authorization": "Bearer " + token}
+                response = client.post(
+                    url + "/v1/chat/completions",
+                    json={"messages": [{"role": "user", "content": "test"}]},
+                    headers=headers,
+                )
+                assert response.status_code == 401
+                response = client.post(
+                    url + "/tools/lookup", json={"call_id": "x", "arguments": {}}, headers=headers
+                )
+                assert response.status_code == 401
+            assert not model.requests and not environment.actions
+            headers = {"Authorization": "Bearer " + first_env["EXP_PI_BRIDGE_TOKEN"]}
+            response = client.post(
+                url + "/v1/chat/completions",
+                json={"messages": [{"role": "user", "content": "test"}]},
+                headers=headers,
+            )
+            assert response.status_code == 200
+            response = client.post(
+                url + "/tools/lookup", json={"call_id": "x", "arguments": {}}, headers=headers
+            )
+            assert response.status_code == 200
+            assert len(model.requests) == len(environment.actions) == 1

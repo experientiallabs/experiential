@@ -321,6 +321,30 @@ def test_actor_evaluation_reads_learned_memory_without_its_own_lineage(
     assert report["memory"]["version"] == head.version
     assert report["simulator_memory"].startswith(f"Simulator memory: v{head.version}")
 
+    # Even a bounded selection with zero dispatches leaves durable coverage evidence.
+    pinned = learned_memory.learned_evaluation_memory(
+        store, load_model_catalog(root / "models.toml")
+    )
+    assert pinned is not None
+    bounded = pinned.model_copy(
+        update={"recall": pinned.recall.model_copy(update={"memory_input_bytes": 24000})}
+    )
+    record = learned_memory._selection_recorder(store, bounded, REVISION)
+    coverage: JsonObject = {
+        "packed_ids": [],
+        "omitted_ids": ["too-large"],
+        "stop_reason": "no-original-fits",
+    }
+    record(coverage)
+    record(coverage)
+    identities = store.artifacts.list_ids(artifact_type="evaluation-recall-selection")
+    recorded = [json.loads(store.artifacts.read_bytes(key, "selection.json")) for key in identities]
+    matches = [row for row in recorded if row["selection"] == coverage]
+    assert len(matches) == 1
+    saved_coverage = matches[0]
+    assert saved_coverage["selection"] == coverage
+    assert saved_coverage["memory"]["recall"]["memory_input_bytes"] == 24000
+
 
 def test_memory_version_is_part_of_the_plan_identity(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch

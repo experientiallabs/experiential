@@ -4,16 +4,18 @@ import functools
 import json
 import re
 from collections.abc import Mapping
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from threading import Barrier
 
 import pytest
 from typer.testing import CliRunner
 
 from exp.cli.app import app
-from exp.common.core.artifacts import JsonObject
-from exp.common.models import load_model_catalog, write_model_catalog
-from exp.common.project import ProjectStore
+from exp.common.core.artifacts import ArtifactEnvelope, JsonObject
+from exp.common.models import ModelSnapshot, load_model_catalog, write_model_catalog
+from exp.common.project import ProjectStore, artifact_input, write_project_config
 from exp.optimize.evaluation.audit import panel_test as held_out_fidelity_test
 from exp.optimize.evaluation.audit.panel_test import (
     PROJECT,
@@ -22,9 +24,11 @@ from exp.optimize.evaluation.audit.panel_test import (
     SimulatedProvider,
     _at,
     _obj,
+    _tool_reply,
     build_project,
     build_report,
     episode,
+    held_out_customers,
     held_out_lineages,
     package_rows,
     write_catalog,
@@ -32,12 +36,16 @@ from exp.optimize.evaluation.audit.panel_test import (
 from exp.optimize.evaluation.fidelity import replay
 from exp.optimize.evaluation.fidelity.runner import FidelityMemory, FidelitySpec
 from exp.optimize.evaluation.learning import traces
+from exp.optimize.evaluation.learning.profile import learned_evaluation_memory
 from exp.optimize.evaluation.learning.traces import (
+    LearningPlan,
     learn_from_traces,
     learning_cases,
     learning_curve,
     learning_plan,
     learning_spec,
+    recorded_plan,
+    reserve_held_out,
 )
 from exp.runtime.models import RuntimeModelCatalog
 from exp.runtime.models.providers.transport import (
@@ -45,12 +53,271 @@ from exp.runtime.models.providers.transport import (
     ProviderTransportError,
     RecordedRequest,
 )
+from exp.simulation.engines.text.knowledge import SimulationKnowledge
+from exp.simulation.world_model import dreaming
+from exp.simulation.world_model.artifact import persist_grounded_world_model
 from exp.simulation.world_model.experience_memory import (
     Eligibility,
     consumed_task_lineages,
     is_reserved,
     memory_head,
 )
+from exp.simulation.world_model.runtime import load_grounded_world_model_artifact
+
+
+def test_serving_change_reuses_bank_but_pins_new_execution(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A top-k edit retains learned knowledge and policy without replaying the old predictor."""
+    episodes = [episode(i) for i in range(2)]
+    provider = SimulatedProvider(episodes)
+    _, store, _ = build_project(tmp_path, monkeypatch, provider, episodes=episodes, learn=True)
+    original = learning_plan(store)
+    fit_original = learning_plan(store, "jev", "fit", record=True)
+    assert reserve_held_out(store, fit_original, code_revision=REVISION) > 0
+    held = held_out_lineages(store)
+    head = memory_head(store.artifacts, original.lineage)
+    assert head is not None
+    config = store.load_project()
+    assert config.build is not None
+    world = load_grounded_world_model_artifact(store.artifacts, original.world_model)
+    changed = persist_grounded_world_model(
+        store.artifacts,
+        serving_rag=world.serving_rag,
+        model_alias=world.model_alias,
+        model=world.model,
+        created_at=world.created_at,
+        code_revision=world.code_revision,
+        top_k=world.top_k + 1,
+        knowledge=world.knowledge,
+        selection_policy_sha256=world.selection_policy_sha256,
+    )
+    changed_ref = artifact_input(changed.manifest)
+    write_project_config(
+        store.paths,
+        config.model_copy(
+            update={
+                "build": config.build.model_copy(update={"world_model": changed_ref}),
+            }
+        ),
+    )
+    assert recorded_plan(store, "all"), "compatible memory must remain discoverable"
+    before = store.artifacts.list_ids()
+    updated = learning_plan(store, scope="all")
+    assert store.artifacts.list_ids() == before, "preflight must not publish a new plan"
+    assert updated.lineage == original.lineage
+    assert updated.world_model == changed_ref != original.world_model
+    assert updated.recall == original.recall
+    memory = learned_evaluation_memory(store, load_model_catalog(store.model_catalog_path))
+    assert memory is not None and memory.version == head.version
+    assert memory.lineage == original.lineage and memory.world_model == changed_ref
+    case = learning_cases(store, "all")[0]
+    deadline = datetime.now(UTC) + timedelta(hours=1)
+    old_run = learning_spec(store, original, case, deadline=deadline)
+    new_run = learning_spec(store, updated, case, deadline=deadline)
+    assert old_run.run_id != new_run.run_id and old_run.world_model != new_run.world_model
+    saved = learning_plan(store, scope="all", record=True)
+    assert saved == updated
+    assert len(set(store.artifacts.list_ids()) - set(before)) == 1
+    assert memory_head(store.artifacts, updated.lineage) == head
+    fit_updated = learning_plan(store, None, "fit")
+    assert fit_updated.lineage == fit_original.lineage != updated.lineage
+    assert fit_updated.world_model != fit_original.world_model
+    assert all(is_reserved(store.artifacts, fit_updated.lineage, lineage) for lineage in held)
+    with pytest.raises(ValueError, match="recall alias"):
+        learning_plan(store, "different", "all")
+    different = persist_grounded_world_model(
+        store.artifacts,
+        serving_rag=world.serving_rag,
+        model_alias=world.model_alias,
+        model=world.model,
+        created_at=world.created_at,
+        code_revision=world.code_revision,
+        top_k=world.top_k,
+        knowledge=SimulationKnowledge(rules="Refuse every cancellation.", authored=True),
+    )
+    write_project_config(
+        store.paths,
+        config.model_copy(
+            update={
+                "build": config.build.model_copy(
+                    update={"world_model": artifact_input(different.manifest)}
+                ),
+            }
+        ),
+    )
+    assert not recorded_plan(store, "all"), "different knowledge cannot inherit the bank"
+    with pytest.raises(ValueError, match="no learned memory"):
+        learning_plan(store, scope="all")
+    assert learning_plan(store, "jev", "all").lineage != original.lineage
+
+
+def test_obsolete_plan_refuses_silent_memory_reset(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A prior plan schema must request fresh setup, never appear to be empty memory."""
+    episodes = [episode(0), episode(1)]
+    provider = SimulatedProvider(episodes)
+    _, store, _ = build_project(tmp_path, monkeypatch, provider, episodes=episodes)
+    plan = learning_plan(store, "jev", "all")
+    store.artifacts.write_json(
+        artifact_id="trace-learning-plan-obsolete",
+        artifact_type="trace-learning-plan",
+        envelope=ArtifactEnvelope(
+            schema_version=1, created_at=datetime.now(UTC), code_revision="old-plan"
+        ),
+        files={"plan.json": plan.model_dump(mode="json", exclude={"bank_protocol"})},
+    )
+    before = len(provider.requests)
+    with pytest.raises(ValueError, match="incompatible bank contract.*fresh project"):
+        recorded_plan(store, "all")
+    with pytest.raises(ValueError, match="incompatible bank contract.*fresh project"):
+        learning_plan(store, "jev", "all", record=True)
+    assert len(provider.requests) == before
+
+
+def test_concurrent_bank_creation_has_one_recall_policy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two bank writers cannot publish conflicting recall policies under one lineage."""
+    episodes = [episode(0), episode(1)]
+    provider = SimulatedProvider(episodes)
+    _, store, _ = build_project(tmp_path, monkeypatch, provider, episodes=episodes)
+    gate = Barrier(2)
+
+    def start(alias: str) -> LearningPlan | str:
+        """Race registration only, without constructing or calling either provider."""
+        gate.wait(timeout=10)
+        try:
+            return learning_plan(store, alias, "all", record=True)
+        except ValueError as error:
+            return str(error)
+
+    before = len(provider.requests)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(start, ["jev", "other"]))
+    plans = [row for row in results if isinstance(row, LearningPlan)]
+    errors = [row for row in results if isinstance(row, str)]
+    assert len(plans) == len(errors) == 1 and "recall alias" in errors[0]
+    assert learning_plan(store, scope="all") == plans[0]
+    assert len(provider.requests) == before
+
+
+class ReadingProvider(SimulatedProvider):
+    """Exercise the real CLI and dispatch ledger with deterministic wire responses."""
+
+    def post(
+        self,
+        url: str,
+        *,
+        headers: Mapping[str, str],
+        payload: JsonObject,
+        timeout_seconds: float,
+    ) -> JsonHttpResponse:
+        questions = payload.get("questions")
+        if isinstance(questions, dict) and "support" in questions:
+            self.requests.append(RecordedRequest(url, dict(headers), payload))
+            return JsonHttpResponse(
+                status_code=200,
+                body={
+                    "answers": {
+                        "support": {"type": "choice", "choice": "whole"},
+                        "contradiction": {"type": "choice", "choice": "none"},
+                    }
+                },
+            )
+        if not url.endswith(("/embeddings", "/systemone")):
+            schema = _obj(_at(payload, "tools", 0, "function", "parameters", "properties"))
+            if "read_more" in schema:
+                self.requests.append(RecordedRequest(url, dict(headers), payload))
+                name = str(_at(payload, "tool_choice", "function", "name"))
+                return _tool_reply(
+                    "world-v1",
+                    name,
+                    {
+                        "question": "Which recorded fields establish the response format?",
+                        "read_more": True,
+                    },
+                )
+        return super().post(url, headers=headers, payload=payload, timeout_seconds=timeout_seconds)
+
+
+def test_cli_evidence_reading_is_pinned_metered_and_replayed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    episodes = [episode(i) for i in range(3)]
+    provider = ReadingProvider(episodes, wrong=frozenset({"get_user_details"}))
+    _, store, _ = build_project(
+        tmp_path, monkeypatch, provider, "--evidence-reading", learn=True, episodes=episodes
+    )
+    plan = learning_plan(store)
+    assert plan.reading is not None
+    assert plan.recall.memory_input_bytes == 24000
+    report = build_report(store)  # the build keeps its terminal short; the preflight is saved
+    assert "objective-driven investigations" in report
+    assert "canonical dataset order" in report
+    assert "in export order" not in report
+    assert any(
+        isinstance(questions := row.payload.get("questions"), dict) and "support" in questions
+        for row in provider.requests
+    )
+    case = learning_cases(store, "all")[0]
+    spec = learning_spec(store, plan, case, deadline=datetime.now(UTC) + timedelta(hours=1))
+    control = learning_spec(
+        store, plan.model_copy(update={"reading": None}), case, deadline=spec.deadline
+    )
+    assert spec.memory_selection_identity == plan.selector_identity
+    assert spec.retrieval is not None and spec.retrieval.memory_input_bytes == 24000
+    assert spec.maximum_physical_attempts > control.maximum_physical_attempts
+    assert spec.run_id != control.run_id
+    assert memory_head(store.artifacts, plan.lineage) is not None
+    before = len(provider.requests)
+    outcome = learn_from_traces(
+        store,
+        recall_alias="jev",
+        maximum_attempts=10_000,
+        code_revision=REVISION,
+        clock=lambda: datetime.now(UTC),
+    )
+    assert outcome.incomplete == 0
+    assert len(provider.requests) == before
+    with pytest.raises(ValueError, match="differs from saved memory"):
+        learning_plan(store, "jev", "all", evidence_reading=False)
+
+
+def test_fit_only_reader_never_receives_held_out_sources(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    episodes = [episode(i) for i in range(USERS)]
+    provider = ReadingProvider(episodes, wrong=frozenset({"get_user_details"}))
+    _, store, _ = build_project(tmp_path, monkeypatch, provider)
+    plan = learning_plan(store, "jev", "fit", evidence_reading=True)
+    cases = learning_cases(store, "fit")
+    ceiling = sum(
+        learning_spec(
+            store, plan, case, deadline=datetime.now(UTC) + timedelta(hours=1)
+        ).maximum_physical_attempts
+        for case in cases[:2]
+    )
+    outcome = learn_from_traces(
+        store,
+        recall_alias="jev",
+        scope="fit",
+        maximum_attempts=ceiling,
+        evidence_reading=True,
+        code_revision=REVISION,
+        clock=lambda: datetime.now(UTC),
+    )
+    assert outcome.learned >= 2 and outcome.incomplete == 0
+    forbidden = held_out_lineages(store) | held_out_customers(store)
+    reader_requests = [
+        row
+        for row in provider.requests
+        if isinstance(questions := row.payload.get("questions"), dict) and "support" in questions
+    ]
+    assert reader_requests
+    for row in reader_requests:
+        assert not any(lineage in json.dumps(row.payload) for lineage in forbidden)
 
 
 def test_budget_stops_between_traces_and_a_rerun_continues(
@@ -284,7 +551,7 @@ def test_a_protocol_change_learns_a_fresh_memory_trace_by_trace(
     provider = SimulatedProvider([episode(i) for i in range(USERS)], learnable=True)
     _, store, _ = build_project(tmp_path, monkeypatch, provider, learn=True)
     before = learning_plan(store, scope="all").lineage
-    changed = lambda **_: "changed-prompts"  # noqa: E731 - one stand-in for an edited prompt
+    changed = lambda *_, **__: "changed-prompts"  # noqa: E731 - one stand-in for an edited prompt
     monkeypatch.setattr(traces, "protocol_prompts_sha256", changed)
     monkeypatch.setattr(replay, "protocol_prompts_sha256", changed)
     _relearn(store)
@@ -432,3 +699,96 @@ def test_an_embedding_failure_in_a_configured_build_stops_readably(
     assert "a provider request failed" in output
     assert "Run the same exp build command again to resume" in output
     assert not isinstance(result.exception, ProviderTransportError | AssertionError)
+
+
+def test_saved_dream_plan_pins_protocol_and_refuses_changed_reader(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A resumed learning lineage cannot silently adopt changed consolidation semantics."""
+    provider = SimulatedProvider([episode(index) for index in range(USERS)])
+    _, store, _ = build_project(tmp_path, monkeypatch, provider, learn=False)
+    plan = learning_plan(store, "jev", "all", dream_every=1, record=True)
+    assert plan.dreaming is not None and plan.dream_protocol == plan.dreaming.identity
+    unpinned = plan.model_dump(mode="json")
+    del unpinned["dream_protocol"]
+    with pytest.raises(ValueError, match="dream protocol"):
+        LearningPlan.model_validate(unpinned)
+    requests = len(provider.requests)
+    monkeypatch.setattr(dreaming, "JOINT_CHECK_PROMPT", dreaming.JOINT_CHECK_PROMPT + " changed")
+    with pytest.raises(ValueError, match="dream protocol"):
+        learning_plan(store, "jev", "all")
+    assert len(provider.requests) == requests
+
+
+@pytest.mark.parametrize(
+    "change",
+    ["serving_model", "top_k", "selection_policy", "prediction_guidance", "knowledge"],
+)
+def test_lineage_keys_knowledge_not_serving_configuration(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, change: str
+) -> None:
+    """A serving or retrieval change keeps compatible memory; only a knowledge change re-keys it."""
+    episodes = [episode(i) for i in range(2)]
+    provider = SimulatedProvider(episodes)
+    _, store, _ = build_project(tmp_path, monkeypatch, provider, episodes=episodes, learn=True)
+    original = learning_plan(store, scope="all")
+    world = load_grounded_world_model_artifact(store.artifacts, original.world_model)
+    knowledge = SimulationKnowledge(rules="Answer from the records.", authored=True)
+
+    def lineage(
+        *,
+        alias: str = world.model_alias,
+        model: ModelSnapshot = world.model,
+        top_k: int = world.top_k,
+        served_knowledge: SimulationKnowledge = knowledge,
+        selection_policy: str | None = world.selection_policy_sha256,
+    ) -> str:
+        """Serve a simulator with these settings and return the lineage it learns into."""
+        served = persist_grounded_world_model(
+            store.artifacts,
+            serving_rag=world.serving_rag,
+            model_alias=alias,
+            model=model,
+            created_at=world.created_at,
+            code_revision=world.code_revision,
+            top_k=top_k,
+            knowledge=served_knowledge,
+            selection_policy_sha256=selection_policy,
+        )
+        config = store.load_project()
+        assert config.build is not None
+        reference = artifact_input(served.manifest)
+        write_project_config(
+            store.paths,
+            config.model_copy(
+                update={"build": config.build.model_copy(update={"world_model": reference})}
+            ),
+        )
+        plan = learning_plan(store, original.recall.jev_alias, "all")
+        assert plan.world_model == reference
+        return plan.lineage
+
+    baseline = lineage()
+    if change == "serving_model":
+        changed = lineage(
+            alias="another-simulator",
+            model=world.model.model_copy(update={"model_id": "another-model"}),
+        )
+    elif change == "top_k":
+        changed = lineage(top_k=world.top_k + 1)
+    elif change == "selection_policy":
+        changed = lineage(selection_policy="1" * 64)
+    elif change == "prediction_guidance":
+        changed = lineage(
+            served_knowledge=knowledge.model_copy(
+                update={"prediction_guidance": "Prefer the most recent record."}
+            )
+        )
+    else:
+        changed = lineage(
+            served_knowledge=SimulationKnowledge(rules="Refuse every request.", authored=True)
+        )
+    if change == "knowledge":
+        assert changed != baseline, "changed knowledge starts a fresh memory"
+    else:
+        assert changed == baseline, f"a {change} change keeps compatible memory"

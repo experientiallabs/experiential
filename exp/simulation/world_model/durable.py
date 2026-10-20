@@ -26,6 +26,7 @@ from exp.common.models.client import StructuredRequestPreflight
 from exp.common.models.unknown_outcome import resume_unknown
 from exp.common.project import ArtifactStore, artifact_input
 from exp.runtime.environments import Observation
+from exp.runtime.models.call_evidence import call_consumer
 from exp.runtime.sessions.store import (
     ProviderBudgetExhaustedError,
     SessionBinding,
@@ -36,6 +37,7 @@ from exp.runtime.sessions.store import (
     StepInFlightError,
     StepStatus,
 )
+from exp.simulation.engines.reasks import reask_proposal
 from exp.simulation.engines.reconstructed import InformationChannels, ReconstructedTextEngine
 from exp.simulation.engines.transition import Completion, PreparedPrediction, TransitionEngine
 from exp.simulation.reconstruction.models import (
@@ -319,7 +321,8 @@ class DurableWorldModelSession:
                     self._store.record_proposal(claim, raw)
                 else:
                     try:
-                        raw = resume_unknown(partial(self._complete, body), logical, retried)
+                        with call_consumer("simulator"):
+                            raw = resume_unknown(partial(self._complete, body), logical, retried)
                     except Exception as error:  # noqa: BLE001 - dispatched failures remain ambiguous.
                         self._store.mark_ambiguous(claim, type(error).__name__)
                         raise
@@ -360,7 +363,7 @@ class DurableWorldModelSession:
                     refusals.append(
                         {"proposal": proposal_input.model_dump(mode="json"), "reason": reason}
                     )
-                    body = _reask(body, raw, reason)
+                    body = reask_proposal(body, raw, reason)
                     logical = f"{scope}-reask-{len(refusals)}"
                     intent = self._save(
                         logical + "-input",
@@ -439,33 +442,6 @@ class DurableWorldModelSession:
             files={"record.json": payload},
         )
         return artifact_input(self._artifacts.read(identity).manifest)
-
-
-def _reask(body: JsonObject, raw: JsonObject, reason: str) -> JsonObject:
-    """The same request plus the refused output and why it was refused; nothing is repaired."""
-    messages = body.get("messages")
-    if not isinstance(messages, list):
-        raise ValueError("a re-ask needs the original request messages")
-    output = raw.get("output")
-    calls = output.get("tool_calls") if isinstance(output, dict) else None
-    text = output.get("text") if isinstance(output, dict) else None
-    refused = (
-        json.dumps(calls, ensure_ascii=False)
-        if calls
-        else str(text or json.dumps(raw, ensure_ascii=False))
-    )
-    return {
-        **body,
-        "messages": [
-            *messages,
-            {"role": "assistant", "content": refused[:8000]},
-            {
-                "role": "user",
-                "content": f"That proposal was refused: {reason} Return one complete, valid "
-                "proposal for the same actions, following the required format exactly.",
-            },
-        ],
-    }
 
 
 def _proposal(record: JsonObject) -> JsonObject:

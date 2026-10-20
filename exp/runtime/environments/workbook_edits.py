@@ -13,6 +13,7 @@ from xml.etree import ElementTree
 from zipfile import ZIP_DEFLATED, ZipFile, ZipInfo
 
 from openpyxl import load_workbook
+from openpyxl.cell.cell import Cell, MergedCell
 from openpyxl.workbook.workbook import Workbook
 from pydantic import Field, model_validator
 
@@ -20,6 +21,7 @@ from exp.common.core.artifacts import (
     ContractModel,
     JsonObject,
     JsonValue,
+    sha256_json,
     validate_artifact_file_path,
 )
 from exp.common.models import ToolCall
@@ -29,13 +31,19 @@ from exp.runtime.environments.worlds import WorldAccess
 # Identity of the code that decides this artifact's behavior, in place of its source text.
 # Bump it when behavior changes. exp/tests/code_protocols_test.py fails when the covered
 # source changes until it is bumped or, for a pure refactor, its digest is updated.
-XLSX_ROW_EDITS_PROTOCOL = "xlsx-row-edits-v2"
+XLSX_ROW_EDITS_PROTOCOL = "xlsx-row-edits-v3"
 
 _ALLOWED_PART = re.compile(
     r"(?:\[Content_Types\]\.xml|_rels/\.rels|docProps/(?:app|core)\.xml|"
     r"xl/(?:workbook\.xml|_rels/workbook\.xml\.rels|styles\.xml|sharedStrings\.xml|"
     r"theme/theme\d+\.xml|worksheets/sheet\d+\.xml))"
 )
+
+
+def _require_workbook_source(source: str) -> None:
+    """Require an explicit workbook path inside the detached artifact namespace."""
+    if validate_artifact_file_path(source).as_posix() != source or not source.endswith(".xlsx"):
+        raise ValueError("workbook source must be a canonical relative .xlsx path")
 
 
 class DeleteWorkbookRows(ContractModel):
@@ -74,6 +82,52 @@ class WorkbookEditArguments(ContractModel):
         return self
 
 
+class WorkbookReadArguments(ContractModel):
+    """A bounded rectangular observation of a current native workbook.
+
+    Attributes:
+        source: Registered workbook path, never a host path.
+        sheet: Exact worksheet name.
+        start_row: One-based first row.
+        row_count: Requested existing rows, bounded to 128.
+        start_column: One-based first column.
+        column_count: Requested existing columns, bounded to 64.
+    """
+
+    source: str
+    sheet: str = Field(min_length=1)
+    start_row: int = Field(default=1, ge=1, strict=True)
+    row_count: int = Field(default=1, ge=1, le=128, strict=True)
+    start_column: int = Field(default=1, ge=1, strict=True)
+    column_count: int = Field(default=1, ge=1, le=64, strict=True)
+
+    @model_validator(mode="after")
+    def safe_source(self) -> Self:
+        """Refuse paths outside the detached artifact namespace."""
+        _require_workbook_source(self.source)
+        return self
+
+
+class WorkbookDescriptionArguments(ContractModel):
+    """Paginated native worksheet names and dimensions, without reading cell contents.
+
+    Attributes:
+        source: Registered workbook path, never a host path.
+        offset: Zero-based first worksheet in workbook order.
+        limit: Maximum worksheet descriptions, bounded to 128.
+    """
+
+    source: str
+    offset: int = Field(default=0, ge=0, strict=True)
+    limit: int = Field(default=32, ge=1, le=128, strict=True)
+
+    @model_validator(mode="after")
+    def safe_source(self) -> Self:
+        """Use the same canonical file namespace as explicit cell reads."""
+        _require_workbook_source(self.source)
+        return self
+
+
 class WorkbookEditAdapter:
     """Pure native XLSX transformation; no shell, filesystem inputs or reference answers."""
 
@@ -87,6 +141,10 @@ class WorkbookEditAdapter:
             "dependencies": {name: version(name) for name in ("openpyxl", "et-xmlfile")},
             "tool": "edit_workbook",
             "arguments_schema": WorkbookEditArguments.model_json_schema(),
+            "read_tool": "inspect_workbook",
+            "read_arguments_schema": WorkbookReadArguments.model_json_schema(),
+            "describe_tool": "describe_workbook",
+            "describe_arguments_schema": WorkbookDescriptionArguments.model_json_schema(),
             "projection": "ordered sheets and rectangular cells: value, data_type, number_format",
             "normalization": "sorted ZIP members, fixed ZIP timestamps and core modified timestamp",
             "effects": "detached artifact bytes only",
@@ -94,8 +152,16 @@ class WorkbookEditAdapter:
 
     def access(self, action: ToolCall) -> WorldAccess:
         """Resolve the workbook one edit reads and the workbook it writes, without applying it."""
+        if action.name == "inspect_workbook":
+            read = WorkbookReadArguments.model_validate(action.arguments)
+            return WorldAccess(reads=frozenset({read.source}))
+        if action.name == "describe_workbook":
+            description = WorkbookDescriptionArguments.model_validate(action.arguments)
+            return WorldAccess(reads=frozenset({description.source}))
         if action.name != "edit_workbook":
-            raise ValueError("unsupported native tool; this adapter only accepts edit_workbook")
+            raise ValueError(
+                "unsupported tool; use edit_workbook, inspect_workbook or describe_workbook"
+            )
         arguments = WorkbookEditArguments.model_validate(action.arguments)
         return WorldAccess(
             reads=frozenset({arguments.source}), writes=frozenset({arguments.destination})
@@ -112,8 +178,60 @@ class WorkbookEditAdapter:
         produced: dict[str, bytes] = {}
         projection: JsonObject = {}
         for action in operations:
+            if action.name == "describe_workbook":
+                description = WorkbookDescriptionArguments.model_validate(action.arguments)
+                if description.source not in current:
+                    raise ValueError("workbook description source is absent")
+                workbook = read_supported_workbook(current[description.source])
+                total = len(workbook.worksheets)
+                end = min(total, description.offset + description.limit)
+                projection[description.source] = {
+                    "offset": description.offset,
+                    "total_sheets": total,
+                    "next_offset": end if end < total else None,
+                    "sheets": [
+                        {
+                            "name": sheet.title,
+                            "max_row": sheet.max_row,
+                            "max_column": sheet.max_column,
+                        }
+                        for sheet in workbook.worksheets[description.offset : end]
+                    ],
+                }
+                continue
+            if action.name == "inspect_workbook":
+                read = WorkbookReadArguments.model_validate(action.arguments)
+                if read.source not in current:
+                    raise ValueError("workbook probe source is absent")
+                workbook = read_supported_workbook(current[read.source])
+                if read.sheet not in workbook.sheetnames:
+                    raise ValueError("workbook probe names a missing sheet")
+                sheet = workbook[read.sheet]
+                row_end = read.start_row + read.row_count - 1
+                column_end = read.start_column + read.column_count - 1
+                if row_end > sheet.max_row or column_end > sheet.max_column:
+                    raise ValueError("workbook probe extends beyond existing cells")
+                projection[read.source] = {
+                    "sheet": read.sheet,
+                    "max_row": sheet.max_row,
+                    "max_column": sheet.max_column,
+                    "start_row": read.start_row,
+                    "start_column": read.start_column,
+                    "rows": [
+                        [_cell_projection(cell) for cell in row]
+                        for row in sheet.iter_rows(
+                            min_row=read.start_row,
+                            max_row=row_end,
+                            min_col=read.start_column,
+                            max_col=column_end,
+                        )
+                    ],
+                }
+                continue
             if action.name != "edit_workbook":
-                raise ValueError("unsupported native tool; this adapter only accepts edit_workbook")
+                raise ValueError(
+                    "unsupported tool; use edit_workbook, inspect_workbook or describe_workbook"
+                )
             arguments = WorkbookEditArguments.model_validate(action.arguments)
             if arguments.destination not in output_paths:
                 raise ValueError("workbook edit targets an undeclared output")
@@ -127,14 +245,19 @@ class WorkbookEditAdapter:
                 if deletion.start + deletion.count - 1 > sheet.max_row:
                     raise ValueError("workbook deletion extends beyond existing rows")
                 sheet.delete_rows(deletion.start, deletion.count)
+            intended = workbook_projection(workbook)
             buffer = io.BytesIO()
             workbook.save(buffer)
-            payload = _canonical_workbook(buffer.getvalue())
+            payload = canonical_workbook_bytes(buffer.getvalue())
+            actual = workbook_projection(read_supported_workbook(payload))
+            if sha256_json(actual) != sha256_json(intended):
+                raise ValueError(
+                    "workbook serialization changes retained cell values, types or formats; "
+                    "use an adapter that preserves the declared precision"
+                )
             current[arguments.destination] = payload
             produced[arguments.destination] = payload
-            projection[arguments.destination] = workbook_projection(
-                read_supported_workbook(payload)
-            )
+            projection[arguments.destination] = actual
         return NativeArtifactOutput(produced, projection)
 
 
@@ -197,26 +320,22 @@ def workbook_projection(workbook: Workbook) -> JsonObject:
     for sheet in workbook:
         rows: list[JsonValue] = []
         for row in sheet:
-            cells: list[JsonValue] = []
-            for cell in row:
-                value = cell.value
-                if isinstance(value, (datetime, date, time)):
-                    value = value.isoformat()
-                if not isinstance(value, (str, int, float, bool, type(None))):
-                    raise ValueError("unsupported native cell value")
-                cells.append(
-                    {
-                        "value": value,
-                        "data_type": cell.data_type,
-                        "number_format": cell.number_format,
-                    }
-                )
-            rows.append(cells)
+            rows.append([_cell_projection(cell) for cell in row])
         sheets.append({"name": sheet.title, "rows": rows})
     return {"sheets": sheets}
 
 
-def _canonical_workbook(payload: bytes) -> bytes:
+def _cell_projection(cell: Cell | MergedCell) -> JsonObject:
+    """Preserve the same typed value for full internal checks and bounded public reads."""
+    value = cell.value
+    if isinstance(value, (datetime, date, time)):
+        value = value.isoformat()
+    if not isinstance(value, (str, int, float, bool, type(None))):
+        raise ValueError("unsupported native cell value")
+    return {"value": value, "data_type": cell.data_type, "number_format": cell.number_format}
+
+
+def canonical_workbook_bytes(payload: bytes) -> bytes:
     """Remove writer-clock variance without changing worksheet values or types."""
     output = io.BytesIO()
     with (

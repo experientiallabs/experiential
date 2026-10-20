@@ -415,3 +415,25 @@ def test_closed_world_and_bad_events_are_refused() -> None:
         )
     with pytest.raises(ValidationError, match="outage"):
         WorldEvent(event_id="x", due=1, kind="outage", tools=())
+
+
+def test_invalid_reply_shape_rolls_back_native_state_clock_and_randomness() -> None:
+    """A backend can mutate state and RNG before returning the wrong successful reply shape."""
+    policy = ToolEffectPolicy(name="roll", writes=("a",)).model_copy(
+        update={
+            "reply_schema": {
+                "type": "object",
+                "required": ["first"],
+                "properties": {"first": {"type": "string"}},
+            }
+        }
+    )
+    manifest = WorldManifest(domains=(StateDomain(name="a", owner="native"),), tools=(policy,))
+    runtime = ExecutableWorldRuntime(manifest, DictFactory({"a": "original"}))
+    with runtime.open(
+        _task().model_copy(update={"tools": (_task().tools[TOOLS.index("roll")],)})
+    ) as world:
+        before = world.checkpoint()
+        with pytest.raises(ValueError, match="reply.*schema"):
+            world.execute(_call("roll"))
+        assert world.checkpoint() == before

@@ -16,13 +16,16 @@ from exp.common.core.artifacts import (
     JsonValue,
     sha256_json,
     stable_id,
+    strict_equal,
 )
 from exp.common.core.json_schema import expand_local_references
-from exp.common.evaluations.reconstruction import WorkflowEvidence, strict_equal
+from exp.common.evaluations.reconstruction import WorkflowEvidence
 from exp.common.project import ArtifactStore, artifact_input
 from exp.common.tasks import TaskCase
 from exp.simulation.actor_context import ActorContextFragment
+from exp.simulation.capability_briefs import load_capability_brief
 from exp.simulation.reconstruction.models import check_schema, path_parts, resolve
+from exp.simulation.table_relations import TableRelation, assess_table_relation
 
 Verdict = Literal["pass", "fail", "unassessable"]
 LabelAuthority = Literal[
@@ -101,11 +104,16 @@ class TaskVerifier(ContractModel):
     Attributes:
         description: What this predicate establishes and its scope.
         outcome_schema: Draft 2020-12 schema; remote and recursive refs are refused.
-        required_paths: JSON pointers whose unavailable observations prevent assessment.
+        required_paths: Workflow-rooted JSON pointers, such as /final_state/files/input.xlsx,
+            whose unavailable observations prevent assessment.
         rules: Constrained authored field predicates, all required alongside the schema.
         relations: Equality requirements over observed fields, omitted when unused.
+        table_relations: Bounded transformations over complete observed tables.
         allowed_tools: Optional explicit operation policy, independent of call count.
-        preserve_state: Require complete observed initial/final state equality when true.
+        preserve_state: Require every observed state to equal the initial state.
+        preserved_paths: State-relative pointers, such as /files/input.xlsx, that must stay
+            unchanged through the workflow. Do not prepend /initial_state or /final_state.
+        argument_rules: Per-tool predicates over every observed call's arguments.
     """
 
     description: str = Field(min_length=1)
@@ -113,8 +121,13 @@ class TaskVerifier(ContractModel):
     required_paths: tuple[str, ...] = ()
     rules: tuple[OutcomeRule, ...] = ()
     relations: tuple[FieldRelation, ...] = Field(default=(), exclude_if=not_)
+    table_relations: tuple[TableRelation, ...] = Field(default=(), max_length=32, exclude_if=not_)
     allowed_tools: tuple[str, ...] | None = Field(default=None, exclude_if=lambda v: v is None)
     preserve_state: bool = Field(default=False, strict=True, exclude_if=not_)
+    preserved_paths: tuple[str, ...] = Field(default=(), exclude_if=not_)
+    argument_rules: dict[str, tuple[OutcomeRule, ...]] = Field(
+        default_factory=dict, exclude_if=not_
+    )
 
     @model_validator(mode="after")
     def supported_schema(self) -> Self:
@@ -124,7 +137,7 @@ class TaskVerifier(ContractModel):
         except SchemaError as error:
             raise ValueError("invalid verifier JSON Schema") from error
         _bounded_predicate(expand_local_references(self.outcome_schema))
-        for pointer in self.required_paths:
+        for pointer in (*self.required_paths, *self.preserved_paths):
             path_parts(pointer)
         return self
 
@@ -137,16 +150,24 @@ class RuleVerifierDraft(ContractModel):
         rules: Nonempty conjunction of typed field predicates.
         required_paths: Observations whose absence prevents assessment.
         relations: Strict comparisons of observed fields.
+        table_relations: Bounded whole-row transformations without executable expressions.
         allowed_tools: Explicit operation policy independent of action count.
         preserve_state: Whether complete observed state must remain unchanged.
+        preserved_paths: State subtrees protected across observations.
+        argument_rules: Per-tool predicates over observed arguments.
     """
 
     description: str = Field(min_length=1)
     rules: tuple[OutcomeRule, ...] = Field(min_length=1)
     required_paths: tuple[str, ...] = ()
     relations: tuple[FieldRelation, ...] = Field(default=(), exclude_if=not_)
+    table_relations: tuple[TableRelation, ...] = Field(default=(), max_length=32, exclude_if=not_)
     allowed_tools: tuple[str, ...] | None = Field(default=None, exclude_if=lambda v: v is None)
     preserve_state: bool = Field(default=False, strict=True, exclude_if=not_)
+    preserved_paths: tuple[str, ...] = Field(default=(), exclude_if=not_)
+    argument_rules: dict[str, tuple[OutcomeRule, ...]] = Field(
+        default_factory=dict, exclude_if=not_
+    )
 
     def compile(self) -> TaskVerifier:
         """Construct a data verifier without model-authored JSON Schema syntax."""
@@ -156,8 +177,11 @@ class RuleVerifierDraft(ContractModel):
             rules=self.rules,
             required_paths=self.required_paths,
             relations=self.relations,
+            table_relations=self.table_relations,
             allowed_tools=self.allowed_tools,
             preserve_state=self.preserve_state,
+            preserved_paths=self.preserved_paths,
+            argument_rules=self.argument_rules,
         )
 
 
@@ -195,16 +219,30 @@ def _bounded_predicate(schema: JsonValue) -> None:
                 _bounded_predicate(child)
 
 
-class VerifierGrade(ContractModel):
-    """Mechanical verdict with the reason it can or cannot be assessed.
+class Assessment(ContractModel):
+    """One independent assessment of an observed workflow.
 
     Attributes:
-        status: Pass, fail, or unavailable evidence.
-        reason: Concrete validation result, never a model's self-assessment.
+        status: Pass, fail or unavailable evidence within this assessment's scope.
+        reason: Concrete mechanical evidence for the status.
     """
 
     status: Verdict
     reason: str = Field(min_length=1)
+
+
+class VerifierGrade(Assessment):
+    """Combined verdict retaining goal, policy and execution assessments independently.
+
+    Attributes:
+        goal: Declared outcome predicate, unassessable after incomplete execution.
+        policy: Observed prohibited behavior survives missing later observations.
+        complete: Whether the workflow completed with no unavailable steps.
+    """
+
+    goal: Assessment
+    policy: Assessment
+    complete: bool
 
 
 class VerifierChallenge(ContractModel):
@@ -323,6 +361,7 @@ class EvaluationTask(ContractModel):
         parent: Prior task artifact, retained even for a rejected child.
         context_fragments: Source-annotated actor instructions, fixed in this first slice.
         known_limits: Preserved qualifications about what the artifact establishes.
+        capability_brief: Optional private future-user intent and assumption provenance.
     """
 
     intent: str = Field(min_length=1)
@@ -334,6 +373,7 @@ class EvaluationTask(ContractModel):
     parent: ArtifactInput | None = None
     context_fragments: tuple[ActorContextFragment, ...] = ()
     known_limits: tuple[str, ...] = ()
+    capability_brief: ArtifactInput | None = Field(default=None, exclude_if=lambda v: v is None)
 
     @model_validator(mode="after")
     def public_inputs(self) -> Self:
@@ -399,73 +439,147 @@ def normalized_outcome(evidence: WorkflowEvidence) -> JsonObject:
 
 
 def grade(verifier: TaskVerifier, outcome: WorkflowEvidence | JsonObject) -> VerifierGrade:
-    """Evaluate a data predicate, preserving unavailable observations as unassessable.
+    """Assess goal and policy independently, retaining violations after an interruption.
 
     Args:
-        verifier: Validated finite local JSON Schema and required observations.
-        outcome: Candidate workflow or declared normalized observation.
+        verifier: Finite local predicates, argument constraints and preservation policy.
+        outcome: Observed workflow or declared normalized observation.
 
     Returns:
-        Mechanical verdict; no provider, native environment or generated code is invoked.
+        Combined verdict and its independent dimensions. A known violation is always a fail;
+        absent evidence cannot establish success or complete policy compliance.
     """
-    if isinstance(outcome, WorkflowEvidence):
-        if any(step.status != "valid" for step in outcome.steps):
-            return VerifierGrade(status="unassessable", reason="workflow has unavailable steps")
-        value = normalized_outcome(outcome)
-    else:
-        value = outcome
-    stop_reason = value.get("stop_reason")
-    if stop_reason is not None and stop_reason not in ("completed", "agent_stop"):
-        return VerifierGrade(status="unassessable", reason="workflow did not complete")
-    if not value or (value.get("steps") == [] and value.get("final_answer") is None):
-        return VerifierGrade(
-            status="unassessable", reason="workflow has no observed action or answer"
+    value = normalized_outcome(outcome) if isinstance(outcome, WorkflowEvidence) else outcome
+    steps = value.get("steps")
+    complete = value.get("stop_reason") in (None, "completed", "agent_stop") and not (
+        isinstance(steps, list)
+        and any(
+            isinstance(step, dict) and step.get("status") not in (None, "valid") for step in steps
         )
-    for pointer in verifier.required_paths:
+    )
+    goal = (
+        _grade_goal(verifier, value)
+        if complete
+        else Assessment(
+            status="unassessable", reason="workflow did not complete or has unavailable steps"
+        )
+    )
+    policy = _grade_policy(verifier, value, complete=complete)
+    if policy.status == "fail":
+        combined = policy
+    elif goal.status == "fail":
+        combined = goal
+    elif goal.status == "unassessable":
+        combined = goal
+    elif policy.status == "unassessable":
+        combined = policy
+    else:
+        combined = Assessment(
+            status="pass", reason="observed outcome satisfies the declared predicates"
+        )
+    return VerifierGrade(**combined.model_dump(), goal=goal, policy=policy, complete=complete)
+
+
+def _grade_goal(verifier: TaskVerifier, value: JsonObject) -> Assessment:
+    """Assess only the declared outcome, with no assumption about behavioral compliance."""
+    if not value or (value.get("steps") == [] and value.get("final_answer") is None):
+        return Assessment(status="unassessable", reason="workflow has no observed action or answer")
+    table_paths = tuple(
+        path for rule in verifier.table_relations for path in (rule.source, rule.target)
+    )
+    for pointer in (*verifier.required_paths, *table_paths):
         try:
             resolve(value, pointer)
         except ValueError:
-            return VerifierGrade(status="unassessable", reason=f"missing observation {pointer}")
+            return Assessment(status="unassessable", reason=f"missing observation {pointer}")
     schema = expand_local_references(verifier.outcome_schema)
     error = next(Draft202012Validator(schema).iter_errors(value), None)
     if error is not None:
-        return VerifierGrade(status="fail", reason=error.message)
+        return Assessment(status="fail", reason=error.message)
     for rule in verifier.rules:
         try:
             observed = resolve(value, rule.path)
         except ValueError:
-            return VerifierGrade(status="fail", reason=f"rule field missing at {rule.path}")
+            return Assessment(status="fail", reason=f"rule field missing at {rule.path}")
         if not _rule_matches(rule, observed):
-            return VerifierGrade(
-                status="fail", reason=f"{rule.operator} rule failed at {rule.path}"
-            )
+            return Assessment(status="fail", reason=f"{rule.operator} rule failed at {rule.path}")
     for relation in verifier.relations:
         try:
             left, right = resolve(value, relation.left), resolve(value, relation.right)
         except ValueError:
-            return VerifierGrade(
-                status="unassessable", reason="required relation field unavailable"
-            )
+            return Assessment(status="unassessable", reason="required relation field unavailable")
         if not strict_equal(left, right):
-            return VerifierGrade(
+            return Assessment(
                 status="fail", reason=f"observations differ at {relation.left} and {relation.right}"
             )
-    if verifier.allowed_tools is not None:
-        steps = value.get("steps")
+    table_results = [assess_table_relation(rule, value) for rule in verifier.table_relations]
+    for disposition in ("fail", "unassessable"):
+        for status, reason in table_results:
+            if status == disposition:
+                return Assessment(status=status, reason=reason)
+    return Assessment(status="pass", reason="observed outcome satisfies the declared predicates")
+
+
+def _grade_policy(verifier: TaskVerifier, value: JsonObject, *, complete: bool) -> Assessment:
+    """Collect policy evidence without letting one unknown hide a later known violation."""
+    missing: list[str] = []
+    violations: list[str] = []
+    steps = value.get("steps")
+    if verifier.allowed_tools is not None or verifier.argument_rules:
         if not isinstance(steps, list):
-            return VerifierGrade(status="unassessable", reason="action inventory unavailable")
-        for step in steps:
-            action = step.get("action") if isinstance(step, dict) else None
-            if not isinstance(action, dict) or not isinstance(action.get("name"), str):
-                return VerifierGrade(status="unassessable", reason="action identity unavailable")
-            if action["name"] not in verifier.allowed_tools:
-                return VerifierGrade(status="fail", reason="operation violates allowed tool policy")
-    if verifier.preserve_state:
-        if value.get("initial_state") is None or value.get("final_state") is None:
-            return VerifierGrade(status="unassessable", reason="state comparison unavailable")
-        if not strict_equal(value["initial_state"], value["final_state"]):
-            return VerifierGrade(status="fail", reason="read-only task changed observed state")
-    return VerifierGrade(status="pass", reason="observed outcome satisfies the declared predicates")
+            missing.append("action inventory unavailable")
+        else:
+            for step in steps:
+                action = step.get("action") if isinstance(step, dict) else None
+                if not isinstance(action, dict) or not isinstance(action.get("name"), str):
+                    missing.append("action identity unavailable")
+                    continue
+                name = action["name"]
+                if verifier.allowed_tools is not None and name not in verifier.allowed_tools:
+                    violations.append("operation violates allowed tool policy")
+                for rule in verifier.argument_rules.get(name, ()):
+                    try:
+                        argument = resolve(action.get("arguments"), rule.path)
+                    except ValueError:
+                        missing.append(f"argument observation unavailable: {name}{rule.path}")
+                        continue
+                    if not _rule_matches(rule, argument):
+                        violations.append(f"operation violates argument policy: {name}{rule.path}")
+        if not complete:
+            missing.append("incomplete workflow cannot establish complete action compliance")
+    paths = ("",) if verifier.preserve_state else verifier.preserved_paths
+    states = [value.get("final_state")]
+    if isinstance(steps, list):
+        states.extend(step.get("after") for step in steps if isinstance(step, dict))
+        if paths and any(not isinstance(step, dict) for step in steps):
+            missing.append("state transition observation unavailable")
+    elif paths:
+        missing.append("state transition inventory unavailable")
+    for pointer in paths:
+        try:
+            initial = resolve(value.get("initial_state"), pointer)
+            if value.get("initial_state") is None:
+                raise ValueError("missing initial state")
+        except ValueError:
+            missing.append(f"initial state comparison unavailable: {pointer}")
+            continue
+        for state in states:
+            try:
+                if state is None:
+                    raise ValueError("missing state observation")
+                observed = resolve(state, pointer)
+            except ValueError:
+                missing.append(f"state comparison unavailable: {pointer}")
+                continue
+            if not strict_equal(initial, observed):
+                violations.append(f"protected state changed: {pointer}")
+        if not complete:
+            missing.append("incomplete workflow cannot establish state preservation")
+    if violations:
+        return Assessment(status="fail", reason="; ".join(dict.fromkeys(violations)))
+    if missing:
+        return Assessment(status="unassessable", reason="; ".join(dict.fromkeys(missing)))
+    return Assessment(status="pass", reason="observed workflow satisfies the declared policy")
 
 
 def _rule_matches(rule: OutcomeRule, observed: JsonValue) -> bool:
@@ -591,6 +705,8 @@ def apply_task_revision(
 def _references(task: EvaluationTask) -> tuple[ArtifactInput, ...]:
     """Collect one canonical reference for every immutable task dependency."""
     refs = [task.world_model, task.checkpoint]
+    if task.capability_brief is not None:
+        refs.append(task.capability_brief)
     if task.parent is not None:
         refs.append(task.parent)
     refs.extend(reference for case in task.challenges for reference in case.source_refs)
@@ -627,6 +743,8 @@ def _protect_parent(parent: EvaluationTask, child: EvaluationTask) -> None:
     """Enforce task identity rather than allowing a revision to redefine its goal."""
     if parent.intent != child.intent:
         raise ValueError("task revision cannot change original intent")
+    if parent.capability_brief != child.capability_brief:
+        raise ValueError("task revision cannot change its capability brief")
     if parent.world_model != child.world_model or parent.checkpoint != child.checkpoint:
         raise ValueError("task revision cannot change the frozen world or checkpoint")
     if child.task.model_copy(update={"instruction": parent.task.instruction}) != parent.task:
@@ -652,6 +770,10 @@ def persist_evaluation_task(
         Manifest-bound artifact reference, reusable by project selection/export.
     """
     checked = EvaluationTask.model_validate(task.model_dump(mode="json"))
+    if checked.capability_brief is not None:
+        load_capability_brief(store, checked.capability_brief).require_task(
+            checked.task, checked.intent
+        )
     references = _references(checked)
     _verify_graph(store, references)
     if checked.parent is not None:
@@ -691,6 +813,8 @@ def load_evaluation_task(store: ArtifactStore, reference: ArtifactInput) -> Eval
     if manifest.artifact_type != "evaluation-task":
         raise ValueError("artifact is not an evaluation task")
     task = EvaluationTask.model_validate_json(store.read_bytes(reference.artifact_id, "task.json"))
+    if task.capability_brief is not None:
+        load_capability_brief(store, task.capability_brief).require_task(task.task, task.intent)
     if manifest.inputs != _references(task):
         raise ValueError("evaluation task manifest dependency inventory differs")
     if task.parent is not None:

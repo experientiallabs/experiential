@@ -26,8 +26,10 @@ from exp.common.project import (
     ArtifactCorruptionError,
     ProjectStore,
 )
+from exp.optimize.model.sft.continuation_source import resolve_continuation_source
 from exp.optimize.model.sft.contracts import (
     AssistantActionEvent,
+    ContinuationExampleSource,
     InfrastructureFailureEvent,
     PartitionedSFTExample,
     ProductionSFTSource,
@@ -83,6 +85,7 @@ def build_sft_dataset(
     production_sources: Sequence[ProductionSFTSource],
     teacher_sources: Sequence[TeacherSFTSource],
     runtime_sources: Sequence[RuntimeSFTSource] = (),
+    continuation_sources: Sequence[ArtifactInput] = (),
     spec: SFTBuildSpec,
     created_at: datetime,
     code_revision: str,
@@ -94,6 +97,7 @@ def build_sft_dataset(
         production_sources: Pointers to persisted production-acceptance artifacts.
         teacher_sources: Pointers to persisted teacher-acceptance artifacts.
         runtime_sources: Pointers to verified routed-interaction snapshots.
+        continuation_sources: Witnessed development continuation admission reports.
         spec: Frozen split and sampling controls for this build.
         created_at: Time recorded in the resulting immutable dataset envelope.
         code_revision: Exact revision that built the artifact.
@@ -151,6 +155,16 @@ def build_sft_dataset(
             source_references.append(reference)
         exclusions.extend(resolved.exclusions)
 
+    for reference in sorted(continuation_sources, key=lambda item: item.artifact_id):
+        resolved, omitted, references = resolve_continuation_source(store, reference)
+        for candidate in resolved:
+            _require_unique_source_key(seen_source_keys, (candidate.kind, candidate.source_id))
+            prepared.append(candidate)
+        for source_reference in references:
+            _require_unique_reference(source_references, source_reference)
+            source_references.append(source_reference)
+        exclusions.extend(omitted)
+
     scanned_actions: list[_ScannedAction] = []
     for source in prepared:
         scanned, source_exclusions = _scan_source_actions(source)
@@ -166,7 +180,10 @@ def build_sft_dataset(
     exclusions = sorted(exclusions, key=_exclusion_sort_key)
 
     all_inputs = _sorted_inputs(
-        input_item for source in prepared for input_item in source.direct_inputs
+        (
+            *(input_item for source in prepared for input_item in source.direct_inputs),
+            *continuation_sources,
+        )
     )
     source_references = sorted(source_references, key=lambda item: (item.kind, item.source_id))
     partitions = tuple(sorted(partitions, key=lambda item: item.component_id))
@@ -413,6 +430,16 @@ def load_verified_sft_dataset(
             production_sources=production_sources,
             teacher_sources=teacher_sources,
             runtime_sources=runtime_sources,
+            continuation_sources=tuple(
+                sorted(
+                    {
+                        source.acceptance_evidence
+                        for source in loaded.sources
+                        if source.kind == "continuation" and source.acceptance_evidence is not None
+                    },
+                    key=lambda ref: ref.artifact_id,
+                )
+            ),
             spec=build_spec,
             created_at=loaded.dataset.created_at,
             code_revision=loaded.dataset.code_revision,
@@ -513,6 +540,7 @@ def _scan_source_actions(
                     task=source.task,
                     history=history_snapshot,
                     target=event.action,
+                    tools=source.tools,
                 ),
                 target=event,
             )
@@ -625,6 +653,7 @@ def _expand_scanned_actions(
                     example_id=_example_id(action),
                     leakage_group_id=action.source.leakage_group_id,
                     task=action.source.task,
+                    tools=action.source.tools,
                     history=action.history,
                     target=action.target.action,
                     source=action.source.example_source,
@@ -839,6 +868,8 @@ def _source_id_from_example(example: SFTExample) -> str:
         return example.source.trace_id
     if isinstance(example.source, RuntimeInteractionExampleSource):
         return example.source.interaction_id
+    if isinstance(example.source, ContinuationExampleSource):
+        return f"{example.source.study.artifact_id}-branch-{example.source.branch}"
     return example.source.rollout_id
 
 

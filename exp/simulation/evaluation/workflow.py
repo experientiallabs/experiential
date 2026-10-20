@@ -5,7 +5,7 @@ from datetime import datetime
 
 from pydantic import Field
 
-from exp.common.core.artifacts import ArtifactId, ContractModel, JsonObject
+from exp.common.core.artifacts import ArtifactId, ContractModel, JsonObject, strict_equal
 from exp.common.evaluations.reconstruction import (
     DualReport,
     EvaluationReferences,
@@ -13,7 +13,6 @@ from exp.common.evaluations.reconstruction import (
     WorkflowEvidence,
     WorkflowStep,
     evaluate,
-    strict_equal,
 )
 from exp.common.models import ToolCall
 from exp.common.progress import ProgressHook, report
@@ -191,6 +190,23 @@ def evaluate_workflow(
         detail="stopped" if simulated < len(workload.actions) else None,
     )
     context = session.evaluation_context
+    deliveries = []
+    for index, transition in enumerate(session.transitions):
+        evidence = transition.get("evidence")
+        if isinstance(evidence, dict) and "memory_claims" in evidence:
+            deliveries.append(
+                {
+                    "step": index,
+                    "operation_id": transition.get("operation_id"),
+                    "request_sha256": evidence.get("request_sha256"),
+                    "claims": evidence["memory_claims"],
+                }
+            )
+    if deliveries:
+        metadata = context.get("audit_metadata", {})
+        if not isinstance(metadata, dict):
+            raise ValueError("evaluation audit metadata must be an object")
+        context["audit_metadata"] = {**metadata, "memory_claim_deliveries": deliveries}
     if reply_feedback_source is not None:
         sources = context.get("sources", {})
         if not isinstance(sources, dict):

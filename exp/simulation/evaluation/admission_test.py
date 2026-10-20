@@ -166,27 +166,124 @@ def test_the_predicate_under_test_cannot_witness_its_own_labels(tmp_path: Path) 
     label = witnessed(store, specification(store, predicate=candidate), "done")
     refusal = verify_label_witness(store.artifacts, label, label="pass", compared=(candidate,))
     assert refusal is not None and refusal.reason == "self_approval"
-    independent = witnessed(store, specification(store), "done")
-    assert (
-        verify_label_witness(store.artifacts, independent, label="pass", compared=(candidate,))
-        is None
+    renamed = witnessed(store, specification(store), "done")
+    refusal = verify_label_witness(store.artifacts, renamed, label="pass", compared=(candidate,))
+    assert refusal is not None and refusal.reason == "self_approval"
+
+
+@pytest.mark.parametrize(
+    "change", ["description", "annotations", "conjunction_order", "ignored_vocabulary"]
+)
+def test_cosmetic_predicate_changes_cannot_manufacture_independence(
+    tmp_path: Path, change: str
+) -> None:
+    """Titles, descriptions and conjunction ordering do not create a second source of truth."""
+    store = ProjectStore(tmp_path, "admission")
+    candidate = TaskVerifier(
+        description="Candidate requirement.",
+        outcome_schema={"type": "object", "properties": {"final_state": {"type": "object"}}},
+        required_paths=("/final_state", "/final_answer"),
+        rules=(
+            OutcomeRule(path="/final_state/status", operator="equals", value="done"),
+            OutcomeRule(path="/final_answer", operator="type", value="string"),
+        ),
     )
+    updates: JsonObject = {}
+    if change == "description":
+        updates["description"] = "Claims to be independent."
+    elif change == "annotations":
+        updates["outcome_schema"] = {
+            "title": "Independent oracle",
+            "type": "object",
+            "properties": {
+                "final_state": {"type": "object", "description": "Copied constraint"},
+            },
+        }
+    elif change == "ignored_vocabulary":
+        updates["outcome_schema"] = {
+            **candidate.outcome_schema,
+            "x-claim": "independent",
+            "format": "anything",
+        }
+    else:
+        updates["required_paths"] = list(reversed(candidate.required_paths))
+        updates["rules"] = [rule.model_dump(mode="json") for rule in reversed(candidate.rules)]
+    copied = TaskVerifier.model_validate({**candidate.model_dump(mode="json"), **updates})
+    label = witnessed(store, specification(store, predicate=copied), "done")
+    refusal = verify_label_witness(store.artifacts, label, label="pass", compared=(candidate,))
+    assert refusal is not None and refusal.reason == "self_approval"
+
+
+def test_schema_property_named_description_remains_an_assertion(tmp_path: Path) -> None:
+    """Removing schema annotations must not remove data properties with the same spelling."""
+    store = ProjectStore(tmp_path, "admission")
+    first = TaskVerifier(
+        description="Field requirement.",
+        outcome_schema={
+            "properties": {
+                "description": {"const": "first"},
+            }
+        },
+    )
+    different = first.model_copy(
+        update={"outcome_schema": {"properties": {"description": {"const": "second"}}}}
+    )
+    label = witnessed(store, specification(store, predicate=first), "done")
+    assert verify_label_witness(store.artifacts, label, label="pass", compared=(different,)) is None
+
+
+def test_prefix_item_order_remains_semantic_when_detecting_copies(tmp_path: Path) -> None:
+    """Ordered tuple constraints cannot be normalized like an unordered conjunction."""
+    store = ProjectStore(tmp_path, "admission")
+    first = TaskVerifier(
+        description="Ordered prefix",
+        outcome_schema={
+            "properties": {"steps": {"prefixItems": [{"const": 1}, {"const": 2}]}},
+        },
+    )
+    other = first.model_copy(
+        update={
+            "outcome_schema": {
+                "properties": {"steps": {"prefixItems": [{"const": 2}, {"const": 1}]}},
+            }
+        }
+    )
+    label = witnessed(store, specification(store, predicate=first), "done")
+    assert verify_label_witness(store.artifacts, label, label="pass", compared=(other,)) is None
 
 
 @pytest.mark.parametrize("depth", [1, 3])
+@pytest.mark.parametrize(
+    "source_type",
+    [
+        "task-refinement-proposal",
+        "continuation-study",
+        "continuation-checkpoint",
+        "executable-world-image",
+        "investigation-evidence",
+        "task-factory-registration",
+        "task-factory-cell",
+        "task-factory-result",
+        "author-intent",
+        "author-response",
+        "world-binding-intent",
+        "world-proposal-cell",
+        "world-proposals",
+    ],
+)
 def test_generated_provenance_anywhere_in_the_chain_is_self_approval(
-    tmp_path: Path, depth: int
+    tmp_path: Path, depth: int, source_type: str
 ) -> None:
     """A specification derived, at any depth, from model output cannot label anything."""
     store = ProjectStore(tmp_path, "admission")
-    source = saved(store, "proposal", "task-refinement-proposal")
+    source = saved(store, "proposal", source_type)
     for index in range(depth - 1):
         source = saved(store, f"derived-{index}", "curated-notes", (source,))
     label = witnessed(store, specification(store, sources=(source,)), "done")
     refusal = verify_label_witness(store.artifacts, label, label="pass", compared=())
     assert refusal is not None
     assert refusal.reason == "self_approval"
-    assert "task-refinement-proposal" in refusal.detail
+    assert source_type in refusal.detail
     recorded = saved(store, "recorded", "trace-dataset")
     clean = witnessed(store, specification(store, sources=(recorded,)), "done")
     assert verify_label_witness(store.artifacts, clean, label="pass", compared=()) is None
@@ -278,3 +375,46 @@ def test_a_hand_written_witness_verdict_is_regraded(tmp_path: Path) -> None:
     assert refusal is not None
     assert refusal.reason == "unverifiable_witness"
     assert "re-grades to another verdict" in refusal.detail
+
+
+def test_reordered_table_relations_cannot_certify_themselves(tmp_path: Path) -> None:
+    """Composite-key order, annotations and duplicate clauses do not create independent checks."""
+    from exp.simulation.table_relations import TableRelation
+
+    project = ProjectStore(tmp_path, "tables")
+    relation = TableRelation(
+        source="/initial_state/rows",
+        target="/final_state/rows",
+        operation="last_per_key",
+        key_columns=(0, 1),
+    )
+    candidate = TaskVerifier(description="Original", outcome_schema={}, table_relations=(relation,))
+    disguised = candidate.model_copy(
+        update={
+            "description": "Independent",
+            "required_paths": (relation.source, relation.target),
+            "table_relations": (relation.model_copy(update={"key_columns": (1, 0)}), relation),
+        }
+    )
+    ref = specification(project, predicate=disguised)
+    value: JsonObject = {
+        "initial_state": {"rows": [[1, 2]]},
+        "final_state": {"rows": [[1, 2]]},
+        "steps": [],
+        "final_answer": "done",
+    }
+    witness = record_label_witness(
+        project.artifacts, specification=ref, outcome=value, created_at=NOW, code_revision="test"
+    )
+    challenge = VerifierChallenge(
+        id="rows",
+        outcome=value,
+        expected="pass",
+        authority="synthetic_specification",
+        witness=witness,
+        rationale="Check table semantics.",
+    )
+    refusal = verify_label_witness(
+        project.artifacts, challenge, label="pass", compared=(candidate,)
+    )
+    assert refusal is not None and refusal.reason == "self_approval"

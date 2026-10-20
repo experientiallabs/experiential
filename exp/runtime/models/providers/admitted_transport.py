@@ -3,11 +3,13 @@
 import json
 import math
 from collections.abc import Callable, Mapping
+from copy import deepcopy
 from datetime import UTC, datetime
 
 from exp.common.core.artifacts import ArtifactEnvelope, ArtifactInput, JsonObject, sha256_json
 from exp.common.project import ArtifactStore, ArtifactStoreError, artifact_input
 from exp.common.project.request_budget import validate_provider_response
+from exp.runtime.models.call_evidence import current_call_intent, current_consumer
 from exp.runtime.models.providers.transport import JsonHttpResponse, JsonHttpTransport
 from exp.runtime.sessions.dispatch_ledger import DispatchLedger
 
@@ -66,6 +68,13 @@ class AdmittedJsonTransport(JsonHttpTransport):
         """Admit once, record intent, send once, then retain the returned body or failure."""
         if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
             raise ValueError("physical request timeout must be finite and positive")
+        try:
+            validate_provider_response(json.dumps(payload, ensure_ascii=False, allow_nan=False))
+        except ArtifactStoreError as error:
+            raise ArtifactStoreError(
+                "provider request cannot be retained at the credential boundary; "
+                "remove credential-bearing content before dispatch"
+            ) from error
         now = self._clock()
         remaining = (self._deadline - now).total_seconds()
         if remaining <= 0:
@@ -74,6 +83,7 @@ class AdmittedJsonTransport(JsonHttpTransport):
             self._before_claim()
         sequence, attempt = self._ledger.claim(now.isoformat())
         base = "provider-attempt-" + attempt
+        canonical = current_call_intent()
         intent = self._record(
             base + "-intent",
             {
@@ -81,8 +91,12 @@ class AdmittedJsonTransport(JsonHttpTransport):
                 "method": method,
                 "endpoint_sha256": sha256_json({"url": url}),
                 "request_sha256": sha256_json(payload),
+                "request_body": payload,
+                "consumer": current_consumer(),
                 "timeout_seconds": min(remaining, timeout_seconds),
+                **({"canonical_request": canonical.model_dump(mode="json")} if canonical else {}),
             },
+            () if canonical is None else (canonical,),
         )
         remaining = (self._deadline - self._clock()).total_seconds()
         if remaining <= 0:
@@ -137,6 +151,20 @@ class AdmittedJsonTransport(JsonHttpTransport):
             },
             (intent,),
         )
+        if self._clock() >= self._deadline:
+            self._record(
+                base + "-delivery-refused",
+                {
+                    "sequence": sequence,
+                    "outcome": "saved_response_after_deadline",
+                    "phase": "response_delivery",
+                    "dispatch": "completed",
+                },
+                (intent,),
+            )
+            raise TimeoutError(
+                "provider response retained after execution deadline; no action is authorized"
+            )
         return response
 
     def get(
@@ -160,6 +188,7 @@ class AdmittedJsonTransport(JsonHttpTransport):
         timeout_seconds: float,
     ) -> JsonHttpResponse:
         """Record each provider-owned retry separately before model-protocol parsing."""
+        payload = deepcopy(payload)
         return self._request(
             "POST",
             url,

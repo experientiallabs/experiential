@@ -25,6 +25,7 @@ from exp.optimize.evaluation.council.runner import (
     prepare_trace_council,
 )
 from exp.optimize.evaluation.tasks.admission import require_refinement_admission
+from exp.optimize.evaluation.tasks.proposals import AuthorProposal, HackerProposal, VerifierProposal
 from exp.runtime.models import RuntimeModelCatalog
 from exp.runtime.models.budget import RequestBudget
 from exp.runtime.models.providers.admitted_transport import AdmittedJsonTransport
@@ -32,10 +33,11 @@ from exp.runtime.models.providers.transport import HttpxJsonTransport
 from exp.runtime.models.structured_completion import CompletionPlan, StructuredCompletion
 from exp.runtime.sessions.dispatch_ledger import DispatchLedger
 from exp.runtime.sessions.store import SessionStore
+from exp.simulation.capability_briefs import load_capability_brief
+from exp.simulation.evaluation.admission import EvidenceAdmissionError
 from exp.simulation.evaluation.analysis import CouncilTrace, TraceAnalysis
 from exp.simulation.evaluation.tasks import (
     EvaluationTask,
-    RuleVerifierDraft,
     TaskRevisionProposal,
     TaskVerifier,
     VerifierChallenge,
@@ -73,6 +75,7 @@ class TaskRefinementSpec(ContractModel):
         run_id: Durable identity for this bounded revision cycle.
         source_council: Exact saved council plan, including frozen execution bindings.
         intent: Capability this task is intended to exercise.
+        capability_brief: Optional frozen future-user needs and world assumptions.
         prior_proposals: Explicit saved report supplying unchanged author/verifier proposals.
         verifier: Parent data-only outcome verifier.
         development_challenges: Admitted development labels and explicitly provisional cases.
@@ -90,6 +93,7 @@ class TaskRefinementSpec(ContractModel):
     run_id: str = Field(min_length=1)
     source_council: ArtifactInput
     intent: str = Field(min_length=1)
+    capability_brief: ArtifactInput | None = Field(default=None, exclude_if=lambda v: v is None)
     prior_proposals: ArtifactInput | None = Field(
         default=None, exclude_if=lambda value: value is None
     )
@@ -142,53 +146,12 @@ class PreparedTaskRefinement(ContractModel):
     code_revision: str
 
 
-class AuthorProposal(ContractModel):
-    """A public instruction suggestion, with a legitimate no-change outcome.
-
-    Attributes:
-        prompt: Proposed replacement, or null when no source-backed change is justified.
-        reason: Why this change preserves intent, or why the current prompt should remain.
-        evidence_refs: Supplied development locators supporting the decision.
-    """
-
-    prompt: str | None = Field(default=None, min_length=1)
-    reason: str = Field(min_length=1)
-    evidence_refs: tuple[str, ...] = Field(min_length=1)
-
-
-class VerifierProposal(ContractModel):
-    """A verifier-only edit that cannot smuggle in a public instruction change.
-
-    Attributes:
-        verifier: Replacement data predicate over the fixed normalized outcome fields.
-        reason: Source-backed explanation of its relationship to task intent.
-        evidence_refs: Actual supplied development evidence.
-    """
-
-    verifier: RuleVerifierDraft
-    reason: str = Field(min_length=1)
-    evidence_refs: tuple[str, ...] = Field(min_length=1)
-
-
-class HackerProposal(ContractModel):
-    """Untrusted possible reward-hacking outcome, without label approval authority.
-
-    Attributes:
-        outcome: Proposed actor outcome to check against the candidate verifier.
-        rationale: Why acceptance could contradict task intent.
-        evidence_refs: Actual supplied development evidence supporting the concern.
-    """
-
-    outcome: JsonObject | None = None
-    rationale: str = Field(min_length=1)
-    evidence_refs: tuple[str, ...] = Field(min_length=1)
-
-
 def _protocol() -> str:
     """Bind role guidance and exact output contracts, independently of run identity."""
     return sha256_json(
         {
             "guidance": _ROLE_GUIDANCE,
+            "witness_admission": "before roles and after generated proposals",
             "request_renderer": REFINEMENT_REQUEST_PROTOCOL,
             "verifier_contract": TaskVerifier.model_json_schema(),
             "author": AuthorProposal.model_json_schema(),
@@ -244,6 +207,7 @@ def _prior_proposals(
     fields = (
         "source_council",
         "intent",
+        "capability_brief",
         "verifier",
         "development_challenges",
         "confirmation_challenges",
@@ -347,6 +311,7 @@ def prepare_task_refinement(
         project.artifacts,
         EvaluationTask(
             intent=spec.intent,
+            capability_brief=spec.capability_brief,
             task=task,
             world_model=source.spec.world_model,
             checkpoint=checkpoint_ref,
@@ -411,6 +376,8 @@ def saved_task_refinement(
     project: ProjectStore, prepared: PreparedTaskRefinement
 ) -> JsonObject | None:
     """Return the immutable completed cycle without credentials or provider calls."""
+    if prepared.protocol_sha256 != _protocol():
+        raise ValueError("refinement protocol changed; qualify under a fresh run ID")
     if not project.artifacts.exists(prepared.id + "-report"):
         return None
     return json.loads(project.artifacts.read_bytes(prepared.id + "-report", "report.json"))
@@ -568,6 +535,8 @@ def execute_task_refinement(
             {"native_environment_accessed": False},
         )
         allowed = {"task", "verifier", "source_council"}
+        if spec.capability_brief is not None:
+            allowed.add("capability_brief")
         rows = baseline.get("traces", [])
         if not isinstance(rows, list):
             raise ValueError("source council trace inventory is invalid")
@@ -608,6 +577,15 @@ def execute_task_refinement(
             )
 
         payload: JsonObject = {
+            **(
+                {
+                    "capability_brief": load_capability_brief(
+                        project.artifacts, spec.capability_brief
+                    ).model_dump(mode="json")
+                }
+                if spec.capability_brief is not None
+                else {}
+            ),
             "intent": parent.intent,
             "task": parent.task.model_dump(mode="json"),
             "verifier": parent.verifier.model_dump(mode="json"),
@@ -791,6 +769,11 @@ def execute_task_refinement(
         adversarial_review_required = (
             isinstance(attack_grade, dict) and attack_grade.get("status") == "pass"
         )
+        try:
+            verified = _admit(project, spec, source)
+        except EvidenceAdmissionError as error:
+            verified = frozenset()
+            failures["witness_admission"] = [row.model_dump(mode="json") for row in error.refusals]
         qualification = qualify_verifier(
             parent.verifier, candidate.verifier, spec.development_challenges, verified=verified
         )

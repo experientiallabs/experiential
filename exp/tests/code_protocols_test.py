@@ -40,7 +40,7 @@ class Protocol:
 PROTOCOLS = (
     Protocol(
         "exp.optimize.evaluation.tasks.calibration:CALIBRATION_PROTOCOL",
-        "task-calibration-v1",
+        "task-calibration-v2",
         (
             "exp.optimize.evaluation.tasks.calibration",
             "exp.optimize.evaluation.tasks.admission",
@@ -48,17 +48,18 @@ PROTOCOLS = (
             "exp.simulation.evaluation.tasks",
             "exp.simulation.evaluation.admission",
         ),
-        "adf701e1607f84143bf50b733e17cb3ab8de97d37571fe97139166289c8db94d",
+        "26b88d421b98d26a780015f18d9aaac849a1f729e14e5e8c33a6ff7bd35ab632",
     ),
     Protocol(
         "exp.optimize.evaluation.council.runner:COUNCIL_HARNESS_PROTOCOL",
-        "council-harness-v1",
+        "council-harness-v2",
         (
             "exp.runtime.agents.chat:ChatAgentRuntime",
+            "exp.runtime.agents.pi:PiAgentRuntime",
             "exp.simulation.actor:run_actor_workflow",
             "exp.simulation.world_model.grounded_session:open_grounded_session",
         ),
-        "a5ab94f3d7d14a6bc243ee2448c4d7e037dcea0628916e87ce6298422604c63d",
+        "c719e578c8b2b0a446d38d478b65700fe3e640613f4a8890d91b3b6e6c6b0024",
     ),
     Protocol(
         "exp.optimize.evaluation.tasks.refinement:REFINEMENT_REQUEST_PROTOCOL",
@@ -68,21 +69,21 @@ PROTOCOLS = (
     ),
     Protocol(
         "exp.runtime.environments.workbook_edits:XLSX_ROW_EDITS_PROTOCOL",
-        "xlsx-row-edits-v2",
+        "xlsx-row-edits-v3",
         ("exp.runtime.environments.workbook_edits",),
-        "ebfe4bedc408b82d4cf1f25c8667ca94fd22d748462bfa9d511b0f2258813ec5",
+        "e98496c391918efdef29f6425793c7c8c41e10b3114ce167065fa0c475127abe",
     ),
     Protocol(
         "exp.runtime.environments.artifact_world:ARTIFACT_WORLD_PROTOCOL",
-        "artifact-world-v1",
+        "artifact-world-v2",
         ("exp.runtime.environments.artifact_world",),
-        "ec1677325a0579acefdf66a362434e9e62351c2bccaa19e5994e52d638104ccd",
+        "b57a74dbfb1482e69a5f11e2e70a60a0c24bbc2bcf8d1beac229fe0d754b0710",
     ),
     Protocol(
         "exp.runtime.environments.record_world:RECORD_WORLD_PROTOCOL",
         "sqlite-record-world-v1",
         ("exp.runtime.environments.record_world",),
-        "d61a58d64896122ed41fd41490c1cf30a48aaf8916d35d5895261c5f6e09f3a0",
+        "7a97535d9a1e939a0b9b1d812e1ff326b06cd89866618df8325e97f417add01f",
     ),
 )
 

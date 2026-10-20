@@ -18,6 +18,7 @@ from exp.common.core.artifacts import (
     JsonValue,
     Sha256,
     sha256_json,
+    strict_equal,
     validate_artifact_id,
 )
 from exp.common.judging.definition import JudgeDefinition
@@ -57,6 +58,7 @@ class WorkflowEvidence(ContractModel):
         initial_state: Candidate initializer state.
         steps: Every planned slot in order.
         sources: Admitted reference evidence available to the judge.
+        audit_metadata: Private execution receipts, retained for audits and excluded from judging.
         contract: Declared external tool/state interface.
         final_answer: Actor answer, if the workload includes one.
         stop_reason: Actual workflow termination reason."""
@@ -68,6 +70,7 @@ class WorkflowEvidence(ContractModel):
     initial_state: JsonObject
     steps: tuple[WorkflowStep, ...]
     sources: JsonObject = Field(default_factory=dict)
+    audit_metadata: JsonObject = Field(default_factory=dict, exclude_if=not_)
     contract: JsonObject = Field(default_factory=dict)
     final_answer: JsonValue = None
     stop_reason: str = "unknown"
@@ -981,18 +984,3 @@ def evaluate(
             code_revision=code_revision,
             resume=resume,
         )
-
-
-def strict_equal(actual: JsonValue, expected: JsonValue) -> bool:
-    """Compare exact JSON types, preserving booleans and numeric representations."""
-    if type(actual) is not type(expected):
-        return False
-    if isinstance(actual, dict) and isinstance(expected, dict):
-        return actual.keys() == expected.keys() and all(
-            strict_equal(actual[k], expected[k]) for k in actual
-        )
-    if isinstance(actual, list) and isinstance(expected, list):
-        return len(actual) == len(expected) and all(
-            strict_equal(a, b) for a, b in zip(actual, expected, strict=True)
-        )
-    return actual == expected

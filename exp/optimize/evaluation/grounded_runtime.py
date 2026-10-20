@@ -1,0 +1,329 @@
+"""Built-in executable factory for a frozen learned simulator with admitted provider calls.
+
+This factory supplies simulated state only. Native implementations can compose its world with
+MixedRealityEnvironmentRuntime; domain ownership forbids pretending simulated effects changed
+native files. Private probes here describe simulated state, never native truth.
+"""
+
+import json
+from datetime import UTC, datetime
+
+from pydantic import AwareDatetime, Field
+
+from exp.common.core.artifacts import (
+    ArtifactEnvelope,
+    ArtifactInput,
+    ContractModel,
+    JsonObject,
+    Sha256,
+    sha256_json,
+)
+from exp.common.models import ModelRequest, load_model_catalog
+from exp.common.project import ProjectStore
+from exp.common.release_revision import installed_execution_revision
+from exp.common.tasks import TaskCase
+from exp.optimize.evaluation.continuation_job import ContinuationRuntime
+from exp.optimize.evaluation.fidelity.decision_access import decision_caller, receipt_recorder
+from exp.optimize.evaluation.fidelity.retrieval_binding import index_embedder_alias
+from exp.optimize.evaluation.learning.profile import EvaluationMemory, bind_evaluation_memory
+from exp.optimize.evaluation.provider_grant import ProviderGrant
+from exp.runtime.environments.worlds import (
+    ExecutableCheckpoint,
+    ExecutableWorldRuntime,
+    WorldManifest,
+)
+from exp.runtime.models.budget import RequestBudget
+from exp.runtime.models.call_evidence import call_consumer
+from exp.runtime.models.providers.admitted_transport import AdmittedJsonTransport
+from exp.runtime.models.providers.transport import HttpxJsonTransport
+from exp.runtime.models.registry import RuntimeModelCatalog
+from exp.runtime.models.structured_completion import CompletionPlan, StructuredCompletion
+from exp.runtime.sessions.dispatch_ledger import DispatchLedger
+from exp.simulation.continuations import WorldCheckpoint
+from exp.simulation.development_scope import require_development_task
+from exp.simulation.reconstruction.models import resolve
+from exp.simulation.retrieval import RAGEmbedderBinding
+from exp.simulation.retrieval.evidence_reading import EvidenceReader
+from exp.simulation.world_model.executable import GroundedWorldFactory, PredictorEvent
+from exp.simulation.world_model.grounded_session import GroundedTransitionEngine
+from exp.simulation.world_model.prediction_reading import PredictionReading, PredictionResolver
+from exp.simulation.world_model.runtime import (
+    load_grounded_world_model,
+    load_grounded_world_model_artifact,
+)
+
+
+class GroundedRuntimeDefinition(ContractModel):
+    """Frozen simulator, owned domains, private projection and finite provider allowance.
+
+    Attributes:
+        task: Public development task, without evaluator answers.
+        world_model: Exact build-produced grounded artifact, including its retrieval index.
+        catalog_sha256: Frozen connection/model definitions, excluding credential values.
+        manifest: Domain ownership and per-tool effects; this factory owns simulated domains.
+        initial_state: Exact initial JSON value of each simulated domain.
+        research_history: False ablates current research delivery without mutating the bank.
+        prediction_reading: Optional bounded reading of eligible originals before prediction.
+        memory: Explicit version pinned before capture; None means no learned memory is used.
+        probe_paths: Evaluator field names mapped to JSON pointers into simulated domain state.
+        seed: World scheduler seed; does not make future model responses deterministic.
+        maximum_output_tokens: Per-prediction output ceiling.
+        maximum_reasks: Explicit extra proposals after known contract refusals, within the
+            same physical budget. Never retries unknown outcomes or a valid scored result.
+        maximum_physical_attempts: Cumulative durable ceiling, including query/recall retries.
+        deadline: Shared deadline for every provider call made by this definition.
+    """
+
+    task: TaskCase
+    world_model: ArtifactInput
+    catalog_sha256: Sha256
+    manifest: WorldManifest
+    initial_state: JsonObject
+    memory: EvaluationMemory | None = None
+    research_history: bool = Field(default=True, strict=True, exclude_if=lambda value: value)
+    prediction_reading: PredictionReading | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    probe_paths: dict[str, str] = Field(min_length=1, max_length=128)
+    seed: int = 0
+    maximum_output_tokens: int = Field(default=4096, ge=1, le=65536)
+    maximum_reasks: int = Field(default=0, ge=0, le=3, strict=True)
+    maximum_physical_attempts: int = Field(ge=1, le=100_000)
+    deadline: AwareDatetime
+
+    @property
+    def probe_sha256(self) -> Sha256:
+        """Bind a pure projection whose authority is explicitly simulated."""
+        return sha256_json({"kind": "simulated-domain-projection", "paths": self.probe_paths})
+
+
+def continuation_runtime(project: ProjectStore, configuration: JsonObject) -> ContinuationRuntime:
+    """Compose the built simulator for capture, continuation, or an executable Harbor trial.
+
+    The CLI obtains spend consent before executing this explicitly selected factory. SDKs that
+    bypass the shared HTTP transport are refused before credential resolution. Predictor, query
+    embedding and memory readers share one physical-attempt ledger across all restored forks.
+    """
+    return _runtime(project, GroundedRuntimeDefinition.model_validate(configuration))
+
+
+def trial_runtime(
+    project: ProjectStore, configuration: JsonObject, provider_grant: ProviderGrant
+) -> ContinuationRuntime:
+    """Use explicitly renewed trial authority while keeping the frozen world semantics exact."""
+    provider_grant.require_configuration(project, configuration)
+    spec = GroundedRuntimeDefinition.model_validate(configuration)
+    if provider_grant.limits.maximum_physical_attempts > spec.maximum_physical_attempts:
+        raise ValueError("trial provider allowance exceeds the frozen simulator ceiling")
+    return _runtime(project, spec, provider_grant)
+
+
+def _runtime(
+    project: ProjectStore,
+    spec: GroundedRuntimeDefinition,
+    provider_grant: ProviderGrant | None = None,
+) -> ContinuationRuntime:
+    """Compose identical state/predictor definitions under one explicitly selected call ledger."""
+    require_development_task(project.artifacts, spec.task)
+    if spec.task.reference_answer is not None:
+        raise ValueError("grounded executable tasks must not contain private expected answers")
+    if set(spec.initial_state) != {d.name for d in spec.manifest.domains if d.owner == "simulated"}:
+        raise ValueError("initial state must name exactly the simulated domains")
+    for pointer in spec.probe_paths.values():
+        resolve(spec.initial_state, pointer)
+    catalog = load_model_catalog(project.model_catalog_path)
+    if sha256_json(catalog.model_dump(mode="json")) != spec.catalog_sha256:
+        raise ValueError("executable simulator catalog differs from its frozen definition")
+    artifact = load_grounded_world_model_artifact(project.artifacts, spec.world_model)
+    embedder_alias = index_embedder_alias(project, catalog, artifact)
+    aliases = [artifact.model_alias]
+    if embedder_alias is not None:
+        aliases.append(embedder_alias)
+    for alias in aliases:
+        provider = catalog.connections[catalog.models[alias].connection].provider
+        if provider not in {
+            "openai",
+            "openai-compatible",
+            "openrouter",
+            "anthropic",
+            "gemini",
+            "azure",
+        }:
+            raise ValueError(
+                "executable simulator requires a provider using the admitted HTTP transport"
+            )
+    if spec.memory is not None:
+        recall = catalog.models[spec.memory.recall.jev_alias]
+        if catalog.connections[recall.connection].provider != "typesafe":
+            raise ValueError("executable memory recall requires the admitted native decision wire")
+        # bind_evaluation_memory dispatches this wire through decision_transport below;
+        # TypeSafeClient supplies endpoint/auth facts and never performs a completion.
+    if spec.prediction_reading is not None:
+        alias = catalog.models[spec.prediction_reading.reader_alias]
+        if catalog.connections[alias.connection].provider != "typesafe":
+            raise ValueError("prediction reader requires the admitted native decision wire")
+        if spec.prediction_reading.policy.rounds > 2:
+            raise ValueError("prediction reading permits at most two rounds")
+    revision = installed_execution_revision()
+    identity_fields: JsonObject = {"definition": spec.model_dump(mode="json"), "code": revision}
+    if provider_grant is not None:
+        identity_fields = {
+            "provider_grant": provider_grant.model_dump(mode="json"),
+            "code": revision,
+        }
+    identity = sha256_json(identity_fields)
+    transport = AdmittedJsonTransport(
+        HttpxJsonTransport(),
+        artifacts=project.artifacts,
+        code_revision=revision,
+        deadline=spec.deadline if provider_grant is None else provider_grant.limits.deadline,
+        ledger=DispatchLedger(
+            project.artifacts.project_directory / (identity + "-world.sqlite"),
+            spec.maximum_physical_attempts
+            if provider_grant is None
+            else provider_grant.limits.maximum_physical_attempts,
+            identity,
+        ),
+    )
+    registry = RuntimeModelCatalog(catalog, transport_factory=lambda: transport)
+    predictor = registry.resolve(artifact.model_alias)
+    if predictor.snapshot != artifact.model:
+        raise ValueError("executable predictor differs from the built simulator")
+    embedding = None
+    if embedder_alias is not None:
+        resolved = registry.resolve(embedder_alias)
+        if resolved.embedding_client is None:
+            raise ValueError("retrieval alias cannot embed queries")
+        embedding = RAGEmbedderBinding(
+            client=resolved.embedding_client,
+            snapshot=resolved.snapshot,
+            maximum_input_tokens=resolved.capabilities.context_window_tokens,
+        )
+    runtime = load_grounded_world_model(
+        project.artifacts,
+        spec.world_model.artifact_id,
+        client=predictor.client,
+        capabilities=predictor.capabilities,
+        embedder=embedding,
+    )
+    memory = (
+        None
+        if spec.memory is None
+        else bind_evaluation_memory(
+            project,
+            spec.memory,
+            catalog=registry,
+            artifact=artifact,
+            world_model=spec.world_model,
+            created_at=datetime.now(UTC),
+            code_revision=revision,
+            decision_transport=transport,
+            research_history=spec.research_history,
+        ).for_task(spec.task)
+    )
+
+    deadline = spec.deadline if provider_grant is None else provider_grant.limits.deadline
+    completion = StructuredCompletion(
+        client=predictor.client,
+        plan=CompletionPlan(
+            model=predictor.snapshot,
+            capabilities=predictor.capabilities,
+            deadline=deadline,
+            output_tokens=spec.maximum_output_tokens,
+            maximum_cost_per_call=1.0,
+            code_revision=revision,
+            output_protocol="tool",
+        ),
+        budget=RequestBudget(project, identity=identity),
+        artifacts=project.artifacts,
+    )
+
+    def complete(body: JsonObject, operation: str) -> JsonObject:
+        """Use the actual provider client through the shared admitted physical transport."""
+        with call_consumer("simulator"):
+            return completion.complete_request(
+                ModelRequest.model_validate(body), operation
+            ).model_dump(mode="json")
+
+    reader = None
+    if spec.prediction_reading is not None:
+        native_reader = registry.resolve(spec.prediction_reading.reader_alias)
+
+        def plan(body: JsonObject, operation: str) -> JsonObject:
+            """Meter and retain the planner independently from the simulator's final request."""
+            with call_consumer("selector"):
+                return completion(body, operation)
+
+        reader = PredictionResolver(
+            EvidenceReader(
+                spec.prediction_reading.policy,
+                decision_caller(native_reader, transport, deadline, lambda: datetime.now(UTC)),
+                receipt_recorder(project, identity, revision, lambda: datetime.now(UTC)),
+            ),
+            plan,
+            {}
+            if memory is None
+            else {
+                key: row
+                for key, row in memory.records.items()
+                if row.get("kind") == "original-observation"
+            },
+            sha256_json(
+                {
+                    "planner": completion.completion_profile_sha256,
+                    "reader": native_reader.snapshot.model_dump(mode="json"),
+                }
+            ),
+        )
+
+    def record(event: PredictorEvent) -> None:
+        """Retain original prediction requests and raw responses before parsing or committing."""
+        project.artifacts.write_json(
+            artifact_id=event.operation_id + "-" + event.stage,
+            artifact_type="grounded-world-prediction",
+            envelope=ArtifactEnvelope(
+                schema_version=1,
+                created_at=datetime.now(UTC),
+                code_revision=revision,
+                inputs=tuple(
+                    sorted(
+                        (spec.world_model,)
+                        + (() if provider_grant is None else (provider_grant.registration,)),
+                        key=lambda reference: reference.artifact_id,
+                    )
+                ),
+            ),
+            files={"event.json": event},
+        )
+
+    factory = GroundedWorldFactory(
+        GroundedTransitionEngine(
+            runtime,
+            spec.task,
+            maximum_output_tokens=spec.maximum_output_tokens,
+            output_protocol="json-tool",
+            research_history=spec.research_history,
+            prediction_reader=reader,
+        ),
+        spec.manifest,
+        spec.initial_state,
+        complete=complete,
+        record=record,
+        memory=memory,
+        maximum_reasks=spec.maximum_reasks,
+    )
+
+    def probe(checkpoint: WorldCheckpoint) -> JsonObject:
+        """Read only registered simulated state; unresolved fields refuse assessment."""
+        if not isinstance(checkpoint, ExecutableCheckpoint):
+            raise ValueError("simulated projection requires its executable checkpoint")
+        if checkpoint.backend_sha256 != sha256_json(factory.definition):
+            raise ValueError("probe checkpoint differs from the frozen simulator")
+        wire = json.loads(checkpoint.image.parts["predictor.json"])
+        return {name: resolve(wire["state"], path) for name, path in spec.probe_paths.items()}
+
+    return ContinuationRuntime(
+        ExecutableWorldRuntime(spec.manifest, factory, owner="simulated", seed=spec.seed),
+        probe,
+        spec.probe_sha256,
+    )

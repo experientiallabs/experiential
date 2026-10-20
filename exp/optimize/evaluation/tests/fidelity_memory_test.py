@@ -22,9 +22,7 @@ from exp.common.models import (
 )
 from exp.common.project import ArtifactStore, ProjectStore, artifact_input
 from exp.optimize.evaluation.fidelity import runner as fidelity
-from exp.optimize.evaluation.fidelity.memory import (
-    saved_memory_receipt,
-)
+from exp.optimize.evaluation.fidelity.memory import memory_lines, saved_memory_receipt
 from exp.optimize.evaluation.fidelity.runner import (
     FidelityRetrieval,
     FidelitySpec,
@@ -46,9 +44,39 @@ from exp.simulation.world_model.experience_memory import (
     memory_records,
     publish_trajectory,
 )
+from exp.simulation.world_model.memory_tree import LINE_BYTES
 from exp.simulation.world_model.runtime import load_grounded_world_model_artifact
 from exp.simulation.world_model.session_research import OnlineResearchPolicy
 from exp.simulation.world_model.session_research_test import payload, structured_reply
+
+
+def test_long_investigation_cue_keeps_claim_in_recall_preview(tmp_path: Path) -> None:
+    """A verbose condition must not turn a retrieval line into a condition with no lesson."""
+    _, spec = memory_project(tmp_path)
+    claim = "Delivered orders cannot be cancelled."
+    cue = "配送済みの注文 " * 100
+    receipts: list[JsonObject] = [
+        {
+            "id": "research-long-cue",
+            "investigation": {
+                "transferable": True,
+                "observable_cue": cue,
+                "hypothesis": claim,
+                "supersedes": ["earlier-rule"],
+            },
+        }
+    ]
+    kind, text, origin = memory_lines(spec, receipts)[1]
+    assert claim in text
+    assert "配送済み" in text and "preview" in text and "read record" in text
+    assert "[unresolved rule]" in text and len(text.encode()) <= LINE_BYTES
+    assert kind == "hypothesis" and origin == "research-long-cue"
+    assert receipts[0]["investigation"] == {
+        "transferable": True,
+        "observable_cue": cue,
+        "hypothesis": claim,
+        "supersedes": ["earlier-rule"],
+    }, "the complete condition and supersession stay in the source record"
 
 
 class RoutedTransport(ScriptedJsonTransport):

@@ -7,10 +7,34 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from threading import Thread
+from typing import Protocol
 
 from exp.common.core.artifacts import JsonObject
 from exp.common.models import ToolCall
-from exp.optimize.evaluation.harbor.trial import HarborTrial
+
+
+class HarborTrialOperations(Protocol):
+    """Execute-only actor and private grading operations shared by frozen runtime owners."""
+
+    def tools(self) -> JsonObject:
+        """Return the public tool catalog."""
+        ...
+
+    def call(self, action: ToolCall) -> JsonObject:
+        """Execute or replay one actor operation."""
+        ...
+
+    def submit(self, answer: JsonObject) -> JsonObject:
+        """Freeze the final actor submission."""
+        ...
+
+    def result(self) -> JsonObject:
+        """Return the privately evaluated outcome."""
+        ...
+
+    def output_files(self) -> JsonObject:
+        """Return only explicitly declared public output files."""
+        ...
 
 
 @dataclass(frozen=True)
@@ -30,7 +54,7 @@ class HarborEndpoint:
 
 @contextmanager
 def serve_harbor_trial(
-    trial: HarborTrial, *, host: str = "127.0.0.1", port: int = 0
+    trial: HarborTrialOperations, *, host: str = "127.0.0.1", port: int = 0
 ) -> Iterator[HarborEndpoint]:
     """Expose one existing session and close transport on exit.
 
@@ -46,6 +70,11 @@ def serve_harbor_trial(
 
     class Handler(BaseHTTPRequestHandler):
         """Transport boundary with no endpoint for arbitrary files or simulator internals."""
+
+        def setup(self) -> None:
+            """Bound incomplete HTTP bodies so closing a trial can drain request handlers."""
+            super().setup()
+            self.connection.settimeout(30)
 
         def log_message(self, format: str, *args: str) -> None:
             """Suppress request metadata that may contain runtime capabilities."""
@@ -106,7 +135,9 @@ def serve_harbor_trial(
             self.wfile.write(body)
 
     server = ThreadingHTTPServer((host, port), Handler)
-    server.daemon_threads = True
+    # Drain active handlers before the enclosing world owner releases its exclusive lease.
+    server.daemon_threads = False
+    server.block_on_close = True
     thread = Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:

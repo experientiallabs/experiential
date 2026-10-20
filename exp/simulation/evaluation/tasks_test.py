@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from exp.common.core.artifacts import ArtifactInput, JsonObject
+from exp.common.core.artifacts import ArtifactInput, JsonObject, JsonValue
 from exp.common.evaluations.reconstruction import WorkflowEvidence, WorkflowStep
 from exp.common.project import ProjectStore
 from exp.common.tasks import TaskCase
@@ -414,3 +414,155 @@ def test_rules_preserve_boolean_number_distinctions_and_unknown_observations() -
     ).compile()
     assert grade(missing, {"other": 1}).status == "unassessable"
     assert grade(missing, {"value": None}).status == "pass"
+
+
+def test_observed_policy_violation_survives_later_missing_evidence() -> None:
+    """An interrupted workflow cannot erase an earlier prohibited action."""
+    check = TaskVerifier(
+        description="Finish without sending mail.", outcome_schema={}, allowed_tools=("read",)
+    )
+    result = grade(
+        check,
+        {
+            "steps": [
+                {"action": {"name": "send_email", "arguments": {}}, "status": "valid"},
+                {"action": None, "status": "unavailable"},
+            ],
+            "stop_reason": "failure",
+        },
+    )
+    assert result.status == "fail"
+    assert result.policy.status == "fail"
+    assert result.goal.status == "unassessable"
+    assert not result.complete
+
+
+def test_argument_policy_and_protected_state_are_independent_of_goal() -> None:
+    """An otherwise correct result cannot hide a forbidden recipient or unrelated edit."""
+    check = TaskVerifier(
+        description="Send only to the declared recipient; preserve the ledger.",
+        outcome_schema={},
+        allowed_tools=("send_email",),
+        argument_rules={
+            "send_email": (
+                OutcomeRule(path="/to", operator="equals", value="permitted@example.invalid"),
+            )
+        },
+        preserved_paths=("/ledger",),
+    )
+    value: JsonObject = {
+        "initial_state": {"ledger": 1, "draft": "old"},
+        "final_state": {"ledger": 1, "draft": "sent"},
+        "steps": [
+            {
+                "action": {
+                    "name": "send_email",
+                    "arguments": {
+                        "to": "permitted@example.invalid",
+                    },
+                },
+                "status": "valid",
+                "after": {"ledger": 1, "draft": "sent"},
+            }
+        ],
+        "stop_reason": "completed",
+        "final_answer": "done",
+    }
+    assert grade(check, value).status == "pass"
+    wrong_recipient = {
+        **value,
+        "steps": [
+            {
+                "action": {
+                    "name": "send_email",
+                    "arguments": {"to": "forbidden@example.invalid"},
+                },
+                "status": "valid",
+            }
+        ],
+    }
+    assert grade(check, wrong_recipient).status == "fail"
+    changed_then_restored = {
+        **value,
+        "steps": [
+            {
+                "action": {
+                    "name": "send_email",
+                    "arguments": {"to": "permitted@example.invalid"},
+                },
+                "status": "valid",
+                "after": {"ledger": 2, "draft": "sent"},
+            }
+        ],
+    }
+    result = grade(check, changed_then_restored)
+    assert result.goal.status == "pass"
+    assert result.policy.status == "fail"
+
+
+def test_incomplete_action_inventory_cannot_prove_compliance() -> None:
+    """Known allowed actions are not proof that unobserved actions were allowed."""
+    check = TaskVerifier(description="Only read.", outcome_schema={}, allowed_tools=("read",))
+    result = grade(check, {"steps": [{"action": None}], "final_answer": "done"})
+    assert result.status == "unassessable"
+    assert result.policy.status == "unassessable"
+
+
+@pytest.mark.parametrize("steps", [None, "unavailable", [None]])
+def test_matching_endpoints_do_not_prove_preservation_without_transition_inventory(
+    steps: JsonValue,
+) -> None:
+    """Lost transitions could hide an edit then undo; equal endpoints cannot clear it."""
+    check = TaskVerifier(description="Preserve state.", outcome_schema={}, preserve_state=True)
+    result = grade(
+        check,
+        {
+            "initial_state": {"balance": 5},
+            "final_state": {"balance": 5},
+            "steps": steps,
+            "final_answer": "done",
+        },
+    )
+    assert result.goal.status == "pass"
+    assert result.policy.status == "unassessable"
+
+
+def test_table_relations_compose_with_policy_and_incomplete_execution() -> None:
+    """Correct rows cannot hide forbidden effects, and missing state cannot become a pass."""
+    from exp.simulation.evaluation.tasks import RuleVerifierDraft
+    from exp.simulation.table_relations import TableRelation
+
+    relation = TableRelation(
+        source="/initial_state/rows",
+        target="/final_state/rows",
+        operation="last_per_key",
+        key_columns=(0,),
+    )
+    draft = RuleVerifierDraft(
+        description="Keep last row and preserve the protected field.",
+        rules=(OutcomeRule(path="/final_state/output", operator="exists"),),
+        table_relations=(relation,),
+        preserved_paths=("/protected",),
+    )
+    predicate = draft.compile()
+    assert predicate.table_relations == (relation,)
+    initial: JsonObject = {"rows": [[1, "old"], [2, "keep"], [1, "new"]], "protected": 42}
+    final: JsonObject = {"rows": [[2, "keep"], [1, "new"]], "protected": 42, "output": True}
+    value: JsonObject = {
+        "initial_state": initial,
+        "final_state": final,
+        "steps": [{"after": final, "status": "valid"}],
+        "final_answer": "done",
+        "stop_reason": "completed",
+    }
+    assert grade(predicate, value).status == "pass"
+    changed = grade(predicate, {**value, "final_state": {**final, "protected": 0}})
+    assert changed.goal.status == "pass" and changed.policy.status == "fail"
+    assert (
+        grade(predicate, {**value, "final_state": {"protected": 42}}).goal.status == "unassessable"
+    )
+    assert grade(predicate, {**value, "stop_reason": "failure"}).goal.status == "unassessable"
+    assert (
+        grade(predicate, {**value, "final_state": {**final, "rows": initial["rows"]}}).goal.status
+        == "fail"
+    )

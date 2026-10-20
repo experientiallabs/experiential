@@ -38,7 +38,7 @@ from exp.optimize.evaluation.fidelity.retrieval_binding import (
     require_unindexed_held_out_task,
 )
 from exp.optimize.evaluation.fidelity.runner import FidelityRetrieval
-from exp.runtime.agents.chat import ChatAgentRuntime
+from exp.runtime.agents.factory import ActorHarness, create_actor_runtime
 from exp.runtime.models import RuntimeModelCatalog
 from exp.runtime.models.budget import RequestBudget
 from exp.runtime.models.providers.admitted_transport import AdmittedJsonTransport
@@ -82,7 +82,7 @@ from exp.simulation.world_model.runtime import (
 # Identity of the code that decides this artifact's behavior, in place of its source text.
 # Bump it when behavior changes. exp/tests/code_protocols_test.py fails when the covered
 # source changes until it is bumped or, for a pure refactor, its digest is updated.
-COUNCIL_HARNESS_PROTOCOL = "council-harness-v1"
+COUNCIL_HARNESS_PROTOCOL = "council-harness-v2"
 
 
 class CouncilActor(ContractModel):
@@ -118,7 +118,8 @@ class TraceCouncilSpec(ContractModel):
         deadline: Shared deadline for actors, simulation, judging and analysis.
         maximum_physical_attempts: Global finite cap, including transport retries.
         maximum_concurrency: Bounded independent actor/task workers; one preserves serial execution.
-        maximum_actor_turns: Maintained chat-agent turn limit for every cell.
+        maximum_actor_turns: Maintained adapter model-call limit for every cell.
+        actor_harness: Same adapter and pinned Pi installation, when selected, for every actor.
         maximum_tool_operations: Durable simulator operation cap for every cell.
         actor_output_tokens: Per-call actor allowance.
         simulator_output_tokens: Per-call simulator allowance.
@@ -150,6 +151,7 @@ class TraceCouncilSpec(ContractModel):
         default=1, ge=1, le=32, strict=True, exclude_if=lambda value: value == 1
     )
     maximum_actor_turns: int = Field(default=4, gt=0, strict=True)
+    actor_harness: ActorHarness = Field(default_factory=ActorHarness)
     maximum_tool_operations: int = Field(default=8, gt=0, strict=True)
     actor_output_tokens: int = Field(default=4096, gt=0, strict=True)
     simulator_output_tokens: int = Field(default=12288, gt=0, strict=True)
@@ -269,6 +271,7 @@ def prepare_trace_council(
             _reserve_actor_tasks(project, spec, code_revision)
         return saved
     artifact = load_grounded_world_model_artifact(project.artifacts, spec.world_model)
+    spec.actor_harness.preflight()
     task_definition = None
     if spec.task_bundle is not None:
         task_definition = load_evaluation_task(project.artifacts, spec.task_bundle)
@@ -325,8 +328,17 @@ def prepare_trace_council(
             ),
         },
         "harness": {
-            "agent": "exp.runtime.agents.chat.ChatAgentRuntime",
+            "agent": (
+                "exp.runtime.agents.chat.ChatAgentRuntime"
+                if spec.actor_harness.kind == "chat"
+                else "exp.runtime.agents.pi.PiAgentRuntime"
+            ),
             "protocol": COUNCIL_HARNESS_PROTOCOL,
+            "adapter": spec.actor_harness.model_dump(mode="json"),
+            "installation_scope": (
+                "declared entrypoint and dependency pins; no complete transitive dependency "
+                "or deployed filesystem/network containment claim"
+            ),
             "capture": "exp.simulation.actor.run_actor_workflow",
             "session": "exp.simulation.world_model.durable.DurableWorldModelSession",
             "maximum_actor_turns": spec.maximum_actor_turns,
@@ -451,6 +463,7 @@ def execute_trace_council(
                 "incomplete council; inspect saved attempts before authorizing another run"
             )
         spec = prepared.spec
+        spec.actor_harness.preflight()
         if prepared.definition.get("analysis_protocol_sha256") != sha256_json(
             {"prompt": ANALYSIS_PROMPT, "schema": TraceAnalysis.model_json_schema()}
         ):
@@ -653,7 +666,11 @@ def execute_trace_council(
                 workflow = run_actor_workflow(
                     session,
                     actor_task,
-                    agent=ChatAgentRuntime(maximum_model_calls=spec.maximum_actor_turns),
+                    agent=create_actor_runtime(
+                        spec.actor_harness,
+                        maximum_model_calls=spec.maximum_actor_turns,
+                        maximum_output_tokens=spec.actor_output_tokens,
+                    ),
                     model=context_client,
                     artifacts=project.artifacts,
                     clock=now,

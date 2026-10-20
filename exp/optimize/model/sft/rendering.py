@@ -15,6 +15,7 @@ from exp.common.core.artifacts import (
     sha256_json,
 )
 from exp.common.models import AssistantAction
+from exp.common.tasks import ToolSchema
 from exp.optimize.model.sft.contracts import (
     AssistantActionEvent,
     PartitionedSFTExample,
@@ -43,13 +44,18 @@ class CanonicalSFTTurn(ContractModel):
     task: str
     history: tuple[CanonicalSFTContextEvent, ...]
     target: AssistantAction
+    tools: tuple[ToolSchema, ...] = Field(default=(), exclude_if=lambda value: not value)
 
 
 def context_target_fingerprint(
-    *, task: str, history: tuple[SFTContextEvent, ...], target: AssistantAction
+    *,
+    task: str,
+    history: tuple[SFTContextEvent, ...],
+    target: AssistantAction,
+    tools: tuple[ToolSchema, ...] = (),
 ) -> Sha256:
     """Return the stable SHA-256 fingerprint used for lineage union and deduplication."""
-    return sha256_json(_canonical_turn(task=task, history=history, target=target))
+    return sha256_json(_canonical_turn(task=task, history=history, target=target, tools=tools))
 
 
 def canonical_partitioned_rows_jsonl(rows: Sequence[PartitionedSFTExample]) -> bytes:
@@ -70,13 +76,18 @@ def partitioned_rows_sha256(rows: Sequence[PartitionedSFTExample]) -> Sha256:
 
 
 def _canonical_turn(
-    *, task: str, history: tuple[SFTContextEvent, ...], target: AssistantAction
+    *,
+    task: str,
+    history: tuple[SFTContextEvent, ...],
+    target: AssistantAction,
+    tools: tuple[ToolSchema, ...] = (),
 ) -> CanonicalSFTTurn:
     """Build one typed canonical turn from source-visible context and its assistant target."""
     return CanonicalSFTTurn(
         task=task,
         history=tuple(_canonical_event(event) for event in history),
         target=target,
+        tools=tools,
     )
 
 

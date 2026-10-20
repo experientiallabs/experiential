@@ -3,7 +3,9 @@
 import json
 
 import pytest
+from jsonschema import Draft202012Validator
 
+from exp.common.core.artifacts import JsonObject
 from exp.simulation.evaluation.analysis import (
     CouncilTrace,
     aggregate_analyses,
@@ -46,6 +48,42 @@ def test_analysis_rejects_a_fabricated_native_locator() -> None:
         analyze_traces(
             {}, [], complete=lambda body, identity: output("native:answer"), logical_id="a"
         )
+
+
+def test_paired_analysis_requires_actual_pair_citations() -> None:
+    """Paired evidence changes authority explicitly, without granting fabricated references."""
+    definition: JsonObject = {
+        "paired_evidence": {"pair:0:candidate:0": {"material_agreement": "different"}}
+    }
+    body, refs = analysis_request(definition, (), evidence_scope="paired_execution")
+    assert "pair:0:candidate:0" in refs
+    assert "actual environment is unavailable" not in json.dumps(body).lower()
+    with pytest.raises(ValueError, match="paired execution citation"):
+        analyze_traces(
+            definition,
+            (),
+            logical_id="paired",
+            evidence_scope="paired_execution",
+            complete=lambda body, identity: output("harness"),
+        )
+    with pytest.raises(ValueError, match="unavailable evidence"):
+        analyze_traces(
+            definition,
+            (),
+            logical_id="paired",
+            evidence_scope="paired_execution",
+            complete=lambda body, identity: output("pair:invented"),
+        )
+    result = analyze_traces(
+        definition,
+        (),
+        logical_id="paired",
+        evidence_scope="paired_execution",
+        complete=lambda body, identity: output("pair:0:candidate:0"),
+    )
+    assert len(result.findings) == 1
+    _, ordinary_refs = analysis_request(definition, ())
+    assert "pair:0:candidate:0" not in ordinary_refs
 
 
 def test_aggregation_preserves_proposals_without_implying_native_validation() -> None:
@@ -117,3 +155,41 @@ def test_unavailable_counterfactual_record_can_explain_uncertainty() -> None:
         logical_id="unavailable",
     )
     assert result.findings[0].counterfactual_support == "unavailable"
+
+
+def test_request_schema_prevents_cross_category_and_invented_citations() -> None:
+    """The generation contract rejects the same invented references as admission."""
+    definition: JsonObject = {"paired_evidence": {"pair:0:candidate:0": {}}}
+    body, _ = analysis_request(definition, (), evidence_scope="paired_execution")
+    validator = Draft202012Validator(body["response_schema"])
+    valid = output("pair:0:candidate:0")
+    assert validator.is_valid(valid)
+    for field in ("evidence_refs", "fidelity_refs", "counterfactual_refs"):
+        invalid = output("pair:0:candidate:0")
+        invalid["findings"][0][field] = ["pair:0:candidate:0:invented"]
+        assert not validator.is_valid(invalid)
+    invalid = output("pair:0:candidate:0")
+    invalid["findings"][0]["fidelity_refs"] = ["pair:0:candidate:0"]
+    assert not validator.is_valid(invalid)
+    invalid = output("pair:0:candidate:0")
+    invalid["findings"][0]["counterfactual_support"] = "supports"
+    assert not validator.is_valid(invalid)
+
+
+def test_request_schema_allows_only_supplied_category_members() -> None:
+    """Measured tools and applicable counterfactuals retain separate citation inventories."""
+    definition: JsonObject = {
+        "tool_fidelity": {"profiles": [{"profile_id": "p", "tools": [{"tool": "read"}]}]},
+        "counterfactuals": [{"ref": "counterfactual:c:0", "applicable": True}],
+    }
+    body, _ = analysis_request(definition, ())
+    validator = Draft202012Validator(body["response_schema"])
+    valid = output("harness")
+    valid["findings"][0].update(
+        fidelity_refs=["fidelity:p:read"],
+        counterfactual_refs=["counterfactual:c:0"],
+        counterfactual_support="supports",
+    )
+    assert validator.is_valid(valid)
+    valid["findings"][0]["counterfactual_refs"] = ["fidelity:p:read"]
+    assert not validator.is_valid(valid)

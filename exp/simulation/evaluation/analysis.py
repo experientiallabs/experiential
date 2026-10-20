@@ -1,4 +1,4 @@
-"""Evidence-bound analysis of simulator-only actor councils, without native execution."""
+"""Evidence-bound analysis of simulator councils and saved paired executions."""
 
 import json
 from collections.abc import Callable, Sequence
@@ -19,6 +19,30 @@ Category = Literal[
     "missing_evidence",
     "context_conflict",
 ]
+
+EvidenceScope = Literal["simulator_only", "paired_execution"]
+PAIRED_ANALYSIS_GUIDANCE = """You analyze saved paired reference and candidate executions.
+The reference is the explicitly selected executable environment, not an assumed universal oracle.
+Use only supplied evidence; no outside environment access is available to you. Every planned
+cell, including failures, is retained. Paired differences alone do not prove causal blame: compare
+repeated-reference controls and explain unresolved actor variability and initialization limits.
+Independent task checks and material state comparisons take precedence over model ratings.
+Reference and candidate calls may follow different valid paths. Do not require sequence equality.
+Never call a simulator crash an actor mistake. Findings are proposals, not training labels.
+For each finding cite at least one supplied pair: evidence locator. Reference executions are not
+automatically action-matched counterfactuals. Do not infer unavailable effects or hidden state.
+"""
+
+MEMORY_ANALYSIS_GUIDANCE = """
+Additional diagnostic evidence describes exact canonical inputs and provider-exposed text.
+Consumers are separate: simulator memory is not actor memory. Canonical intent does not prove
+provider receipt, attention, task correctness or causal utility. Missing mention is not ignored
+memory; opaque reasoning and token counts are not readable thoughts. Never reconstruct hidden
+reasoning. Any memory-use interpretation remains a hypothesis with undetermined attribution and
+unresolved simulator causation. Cite supplied input and exposed-output locators from the SAME call;
+when evidence is insufficient, use missing_evidence and state what is unassessable. No training,
+memory publication or change to ordinary task scores is authorized by this diagnostic.
+"""
 
 ANALYSIS_PROMPT = """You analyze an evaluation conducted entirely inside a reconstructed simulator.
 The actual environment is unavailable. You may inspect only the supplied definition, verifier,
@@ -151,13 +175,17 @@ class CouncilTrace(ContractModel):
 
 
 def analysis_request(
-    definition: JsonObject, traces: Sequence[CouncilTrace]
+    definition: JsonObject,
+    traces: Sequence[CouncilTrace],
+    *,
+    evidence_scope: EvidenceScope = "simulator_only",
 ) -> tuple[JsonObject, frozenset[str]]:
     """Render complete read-only analysis inputs and their valid citation inventory.
 
     Args:
         definition: Frozen simulator, task, harness and verifier definitions.
         traces: Every planned actor cell, including unavailable outcomes.
+        evidence_scope: Whether the caller supplies paired executable reference evidence.
 
     Returns:
         Provider-neutral request and the only evidence locators a response may cite.
@@ -191,23 +219,69 @@ def analysis_request(
                     if isinstance(tool, dict):
                         refs.add("fidelity:" + str(profile["profile_id"]) + ":" + str(tool["tool"]))
     counterfactuals = definition.get("counterfactuals", [])
+    counterfactual_refs: set[str] = set()
+    applicable_refs: set[str] = set()
     if isinstance(counterfactuals, list):
-        refs.update(str(row["ref"]) for row in counterfactuals if isinstance(row, dict))
+        counterfactual_refs = {str(row["ref"]) for row in counterfactuals if isinstance(row, dict)}
+        applicable_refs = {
+            str(row["ref"])
+            for row in counterfactuals
+            if isinstance(row, dict) and row.get("applicable") is True
+        }
+        refs.update(counterfactual_refs)
+    diagnostics = definition.get("memory_diagnostics", {})
+    if isinstance(diagnostics, dict):
+        refs.update(diagnostics)
+    paired = definition.get("paired_evidence", {})
+    if evidence_scope == "paired_execution":
+        if (
+            not isinstance(paired, dict)
+            or not paired
+            or any(not key.startswith("pair:") for key in paired)
+        ):
+            raise ValueError("paired analysis requires an explicit paired evidence inventory")
+        refs.update(paired)
+    prompt = ANALYSIS_PROMPT
+    if evidence_scope == "paired_execution":
+        prompt = PAIRED_ANALYSIS_GUIDANCE + ANALYSIS_PROMPT[ANALYSIS_PROMPT.index("Treat ALL") :]
     payload: JsonObject = {
         "authority": (
-            "simulator_only; no live native execution; "
+            "paired saved executions; selected reference scope; proposals only"
+            if evidence_scope == "paired_execution"
+            else "simulator_only; no live native execution; "
             "only explicitly matched archived counterfactuals"
         ),
         "definition": definition,
         "traces": rows,
         "valid_evidence_refs": sorted(refs),
+        "valid_fidelity_refs": sorted(ref for ref in refs if ref.startswith("fidelity:")),
+        "valid_counterfactual_refs": sorted(counterfactual_refs),
+        "applicable_counterfactual_refs": sorted(applicable_refs),
     }
+    schema = TraceAnalysis.model_json_schema()
+    finding = schema["$defs"]["TraceFinding"]
+    properties = finding["properties"]
+    for field, allowed in (
+        ("evidence_refs", refs),
+        ("fidelity_refs", {ref for ref in refs if ref.startswith("fidelity:")}),
+        ("counterfactual_refs", counterfactual_refs),
+    ):
+        properties[field]["items"] = {"type": "string", "enum": sorted(allowed)} if allowed else {}
+        if not allowed:
+            properties[field]["maxItems"] = 0
+    if not counterfactual_refs:
+        properties["counterfactual_support"]["enum"] = ["unavailable"]
+    elif not applicable_refs:
+        properties["counterfactual_support"]["enum"] = ["unavailable", "inconclusive"]
     return {
         "messages": [
-            {"role": "system", "content": ANALYSIS_PROMPT},
+            {
+                "role": "system",
+                "content": prompt + (MEMORY_ANALYSIS_GUIDANCE if diagnostics else ""),
+            },
             {"role": "user", "content": json.dumps(payload, ensure_ascii=False, sort_keys=True)},
         ],
-        "response_schema": TraceAnalysis.model_json_schema(),
+        "response_schema": schema,
     }, frozenset(refs)
 
 
@@ -217,6 +291,7 @@ def analyze_traces(
     *,
     complete: Callable[[JsonObject, str], JsonObject],
     logical_id: str,
+    evidence_scope: EvidenceScope = "simulator_only",
 ) -> TraceAnalysis:
     """Analyze saved traces, rejecting invented locators without retrying the answer.
 
@@ -225,19 +300,50 @@ def analyze_traces(
         traces: Complete council inventory.
         complete: Existing metered structured-completion boundary.
         logical_id: Durable analysis attempt identity.
+        evidence_scope: Frozen evidence authority, independent of analyst assertions.
 
     Returns:
         Validated analysis containing only references supplied to the analyst.
     """
-    body, refs = analysis_request(definition, traces)
+    body, refs = analysis_request(definition, traces, evidence_scope=evidence_scope)
     result = TraceAnalysis.model_validate(complete(body, logical_id))
     for finding in result.findings:
+        if evidence_scope == "paired_execution" and not any(
+            ref.startswith("pair:") for ref in finding.evidence_refs
+        ):
+            raise ValueError("paired finding requires a supplied paired execution citation")
         unknown = (
             set((*finding.evidence_refs, *finding.fidelity_refs, *finding.counterfactual_refs))
             - refs
         )
         if unknown:
             raise ValueError(f"analysis cited unavailable evidence: {sorted(unknown)}")
+        memory_refs = [ref for ref in finding.evidence_refs if ref.startswith("memory:")]
+        if definition.get("memory_diagnostics") and not traces and not memory_refs:
+            raise ValueError("memory-only analysis requires supplied memory citations")
+        if memory_refs:
+            if (
+                finding.basis != "hypothesis"
+                or finding.attribution != "undetermined"
+                or finding.simulator_assessment != "unresolved"
+            ):
+                raise ValueError("memory diagnostics cannot establish causal attribution")
+            diagnostics = definition.get("memory_diagnostics", {})
+            assert isinstance(diagnostics, dict)
+            cited = [diagnostics[ref] for ref in memory_refs]
+            if finding.category != "missing_evidence":
+                calls = {str(row.get("call")) for row in cited if isinstance(row, dict)}
+                kinds = {str(row.get("kind")) for row in cited if isinstance(row, dict)}
+                consumers = {str(row.get("consumer")) for row in cited if isinstance(row, dict)}
+                if (
+                    len(calls) != 1
+                    or len(consumers) != 1
+                    or "unknown" in consumers
+                    or not {"input", "exposed_text"} <= kinds
+                ):
+                    raise ValueError(
+                        "memory interpretation requires input and exposed text from one call"
+                    )
         if any(not ref.startswith("fidelity:") for ref in finding.fidelity_refs):
             raise ValueError("fidelity assessment must cite measured-tool evidence")
         applicable = definition.get("counterfactuals", [])

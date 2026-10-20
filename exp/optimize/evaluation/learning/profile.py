@@ -29,7 +29,7 @@ from exp.common.core.artifacts import (
     stable_id,
 )
 from exp.common.models import ModelCatalog, ModelSnapshot
-from exp.common.project import ProjectStore, artifact_input
+from exp.common.project import ArtifactAlreadyExistsError, ProjectStore, artifact_input
 from exp.common.tasks import TaskCase
 from exp.optimize.evaluation.fidelity.runner import FidelityRetrieval
 from exp.optimize.evaluation.learning.traces import learning_plan, recorded_plan
@@ -38,6 +38,7 @@ from exp.runtime.gateway.decisions_contracts import DecisionRequest
 from exp.runtime.models import RuntimeModelCatalog
 from exp.runtime.models.providers.transport import (
     HttpxJsonTransport,
+    JsonHttpTransport,
     ProviderTransportError,
     RetryPolicy,
     run_with_retry,
@@ -134,6 +135,8 @@ def bind_evaluation_memory(
     world_model: ArtifactInput,
     created_at: datetime,
     code_revision: str,
+    decision_transport: JsonHttpTransport | None = None,
+    research_history: bool = True,
 ) -> FrozenMemory:
     """Bind the pinned version read-only, after checking it still matches the simulator.
 
@@ -158,8 +161,9 @@ def bind_evaluation_memory(
     selector = JEVCueSelector(
         policy=memory.recall.jev,
         top_k=memory.recall.memory_top_k,
-        decide=_recorded_decisions(project, memory, catalog, code_revision),
-        record=lambda receipt: None,
+        maximum_input_bytes=memory.recall.memory_input_bytes,
+        decide=_recorded_decisions(project, memory, catalog, code_revision, decision_transport),
+        record=_selection_recorder(project, memory, code_revision),
     )
     require_memory_scope(
         version,
@@ -192,6 +196,8 @@ def bind_evaluation_memory(
         pinned=pinned_summaries(
             project.artifacts, version, created_at=created_at, code_revision=code_revision
         ),
+        record=_selection_recorder(project, memory, code_revision),
+        research_history=research_history,
     )
 
 
@@ -200,6 +206,7 @@ def _recorded_decisions(
     memory: EvaluationMemory,
     catalog: RuntimeModelCatalog,
     code_revision: str,
+    transport: JsonHttpTransport | None = None,
 ) -> Callable[[DecisionRequest], JsonObject]:
     """Native recall decisions, each saved once and replayed for an identical request.
 
@@ -214,7 +221,7 @@ def _recorded_decisions(
     if profile is None or profile.dialect != "typesafe_systemone" or not profile.decisions_url:
         raise ValueError("the recall alias does not expose the native decision wire")
     url = profile.decisions_url
-    transport = HttpxJsonTransport()
+    transport = transport if transport is not None else HttpxJsonTransport()
     retry_policy = RetryPolicy()
     request_timeout = 120.0
     lock_timeout = retry_policy.maximum_attempts * (
@@ -293,3 +300,35 @@ def _recorded_decisions(
         return saved["response"]
 
     return decide
+
+
+def _selection_recorder(
+    project: ProjectStore, memory: EvaluationMemory, code_revision: str
+) -> Callable[[JsonObject], None]:
+    """Retain bounded recall coverage, including a selection that makes no provider call."""
+
+    def record(receipt: JsonObject) -> None:
+        """Save each complete selection receipt once under its frozen memory identity."""
+        contents: JsonObject = {
+            "memory": memory.model_dump(mode="json"),
+            "selection": receipt,
+        }
+        identity = stable_id("evaluation-recall-selection", contents)
+        if project.artifacts.exists(identity):
+            return
+        try:
+            project.artifacts.write_json(
+                artifact_id=identity,
+                artifact_type="evaluation-recall-selection",
+                envelope=ArtifactEnvelope(
+                    schema_version=1,
+                    created_at=datetime.now(UTC),
+                    code_revision=code_revision,
+                    inputs=(memory.world_model,),
+                ),
+                files={"selection.json": contents},
+            )
+        except ArtifactAlreadyExistsError:
+            pass  # Another evaluation saved this identical receipt first.
+
+    return record

@@ -72,7 +72,10 @@ def _add(name: str, *, reject: bool = False) -> ToolCall:
 
 def _context() -> WorldContext:
     """Return a context for direct backend calls whose tools never schedule or draw."""
-    return WorldContext.__new__(WorldContext)
+    from exp.runtime.environments.worlds_test import _runtime
+
+    with _runtime().open(_task()) as world:
+        return WorldContext(world)
 
 
 def test_image_is_a_loadable_sqlite_database_and_restores_isolated() -> None:
@@ -117,3 +120,38 @@ def test_equal_histories_give_identical_images_after_restore() -> None:
         world.execute(_add("second"), _context())
         world.execute(_add("third", reject=True), _context())
     assert original.capture() == restored.capture()
+
+
+def schedule_then_reject(
+    db: sqlite3.Connection, arguments: JsonObject, context: WorldContext
+) -> JsonValue:
+    """Stage state, a future action and randomness before rejecting the business operation."""
+    db.execute("INSERT INTO items (name) VALUES ('partial')")
+    context.random()
+    context.schedule(_add("future"), delay=3)
+    raise RecordToolError("rejected after staging")
+
+
+def test_business_rejection_discards_scheduled_events_and_random_draws() -> None:
+    """Rolling back a DB transaction must also discard that call's kernel-side effects."""
+    from exp.runtime.environments.worlds import (
+        ExecutableWorldRuntime,
+        StateDomain,
+        ToolEffectPolicy,
+        WorldManifest,
+    )
+
+    runtime = ExecutableWorldRuntime(
+        WorldManifest(
+            domains=(StateDomain(name="items", owner="native"),),
+            tools=(ToolEffectPolicy(name="add", writes=("items",)),),
+        ),
+        _factory(RecordTool(access=items, run=schedule_then_reject)),
+    )
+    with runtime.open(_task()) as world:
+        before = world.checkpoint()
+        assert world.execute(_add("bad")).is_error
+        after = world.checkpoint()
+        assert after.image == before.image
+        assert after.pending == before.pending
+        assert after.draws == before.draws and after.next_event == before.next_event

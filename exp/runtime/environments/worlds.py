@@ -19,6 +19,7 @@ state exactly cannot implement this contract.
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import threading
 from collections.abc import Iterator, Mapping
@@ -27,76 +28,36 @@ from typing import Literal, NoReturn, Protocol, Self, runtime_checkable
 
 from pydantic import ConfigDict, Field, model_validator
 
-from exp.common.core.artifacts import ContractModel, JsonObject, Sha256, sha256_json
+from exp.common.core.artifacts import (
+    ContractModel,
+    JsonObject,
+    Sha256,
+    redact_secret_text,
+    sha256_json,
+)
 from exp.common.models import ToolCall
 from exp.common.tasks import TaskCase
 from exp.runtime.environments.interface import EnvironmentSession, Observation
+from exp.runtime.environments.world_contracts import (
+    AuthorityError,
+    Owner,
+    RestoreError,
+    StateDomain,
+    ToolEffectPolicy,
+    UndeclaredEffectError,
+    WorldPolicyError,
+)
+from exp.runtime.environments.world_grounding import NativeReadBridge, NativeReadReceipt
+from exp.runtime.environments.world_outcomes import ExecutionProgress, WorldExecutionReceipt
+from exp.runtime.environments.world_responses import (
+    StateProjection,
+    validate_reply,
+    validate_reply_state,
+    validate_state_projection,
+)
+from exp.runtime.environments.world_state_paths import ArgumentKey
 
-Owner = Literal["native", "simulated"]
 _GENERATED_EVENT_PREFIX = "scheduled-"
-
-
-class WorldPolicyError(PermissionError):
-    """A call was refused by the world's declared policy; no state changed."""
-
-
-class UndeclaredEffectError(WorldPolicyError):
-    """A call reads or writes outside its tool's declared effect policy."""
-
-
-class AuthorityError(WorldPolicyError):
-    """A call touches a state domain that this world's backend does not own."""
-
-
-class RestoreError(ValueError):
-    """A checkpoint cannot be restored by this runtime, or restored state did not verify."""
-
-
-class StateDomain(ContractModel):
-    """One named partition of episode state with exactly one owner.
-
-    Attributes:
-        name: Exact domain name, such as a table or an artifact path.
-        owner: Backend authority for the episode: ``native`` or ``simulated``.
-        kind: ``state`` for business state; ``effect`` for an external effect sink.
-        sandboxed: Required for a native effect domain: the native sink records effects
-            instead of performing them. Unsandboxed external effects belong to the simulator.
-    """
-
-    name: str = Field(min_length=1, max_length=256)
-    owner: Owner
-    kind: Literal["state", "effect"] = "state"
-    sandboxed: bool = False
-
-    @model_validator(mode="after")
-    def sandboxed_native_effects(self) -> Self:
-        """Refuse a native external-effect domain without a sandboxed sink."""
-        if self.kind == "effect" and self.owner == "native" and not self.sandboxed:
-            raise ValueError(
-                f"effect domain {self.name!r} is native but not sandboxed; declare a sandboxed "
-                "native sink or make the simulator own it"
-            )
-        return self
-
-
-class ToolEffectPolicy(ContractModel):
-    """The declared effect policy of one tool.
-
-    Attributes:
-        name: Exact tool name.
-        reads: Domains the tool may read. Declared writes may also be read.
-        writes: Domains the tool may change, including effect sinks.
-        duration: Logical ticks the clock advances after one call of this tool.
-    """
-
-    name: str = Field(min_length=1, max_length=256)
-    reads: tuple[str, ...] = ()
-    writes: tuple[str, ...] = ()
-    duration: int = Field(default=1, ge=0, strict=True)
-
-    def domains(self) -> frozenset[str]:
-        """Return every domain this tool may read or write."""
-        return frozenset(self.reads) | frozenset(self.writes)
 
 
 class WorldManifest(ContractModel):
@@ -106,10 +67,12 @@ class WorldManifest(ContractModel):
         domains: Unique domains with their initial owners.
         tools: Unique tool policies. A tool may only declare domains of a single owner:
             cross-ownership writes need a branch or sync protocol this contract refuses.
+        native_reads: Explicit read-only observations permitted to condition simulated calls.
     """
 
     domains: tuple[StateDomain, ...] = Field(min_length=1)
     tools: tuple[ToolEffectPolicy, ...] = Field(min_length=1)
+    native_reads: tuple[NativeReadBridge, ...] = Field(default=(), exclude_if=lambda rows: not rows)
 
     @model_validator(mode="after")
     def closed_declarations(self) -> Self:
@@ -123,10 +86,39 @@ class WorldManifest(ContractModel):
             unknown = sorted(tool.domains() - owners.keys())
             if unknown:
                 raise ValueError(f"tool {tool.name!r} declares unknown domains {unknown!r}")
+            if any(
+                not binding.state_path
+                or (
+                    not isinstance(binding.state_path[0], ArgumentKey)
+                    and (
+                        not isinstance(binding.state_path[0], str)
+                        or binding.state_path[0] not in tool.domains()
+                    )
+                )
+                for binding in tool.reply_bindings
+            ):
+                raise ValueError(
+                    "reply state bindings must stay inside the tool's declared domains"
+                )
             if len({owners[name] for name in tool.domains()}) > 1:
                 raise ValueError(
                     f"tool {tool.name!r} spans native and simulated domains; split the tool or "
                     "give its domains one owner"
+                )
+        if len({bridge.name for bridge in self.native_reads}) != len(self.native_reads):
+            raise ValueError("native read bridge names must be unique")
+        for bridge in self.native_reads:
+            probe, target = self.tool(bridge.probe_tool), self.tool(bridge.target_tool)
+            if (
+                probe.writes
+                or probe.duration
+                or not probe.reads
+                or any(owners[name] != "native" for name in probe.domains())
+                or not target.domains()
+                or any(owners[name] != "simulated" for name in target.domains())
+            ):
+                raise ValueError(
+                    "native read bridges require zero-duration native reads and simulated targets"
                 )
         return self
 
@@ -265,14 +257,26 @@ class WorldContext:
     call is accepted, so a refused or rolled-back call leaves the episode untouched.
     """
 
-    def __init__(self, world: ExecutableWorld) -> None:
+    def __init__(
+        self, world: ExecutableWorld, native_reads: tuple[NativeReadReceipt, ...] = ()
+    ) -> None:
         """Stage episode changes against the world's current counters."""
         self.now = world.clock
+        self.native_reads = native_reads
         self._world = world
         self._next_event = world._next_event
         self._draws = world._draws
+        self._initial_next_event = self._next_event
+        self._initial_draws = self._draws
         self.scheduled: list[WorldEvent] = []
         self.cancelled: set[str] = set()
+
+    def discard(self) -> None:
+        """Discard staged kernel effects when a backend rolls back a business operation."""
+        self.scheduled.clear()
+        self.cancelled.clear()
+        self._next_event = self._initial_next_event
+        self._draws = self._initial_draws
 
     def schedule(self, action: ToolCall, *, delay: int) -> str:
         """Schedule one tool call ``delay`` ticks from now and return its event identity.
@@ -491,6 +495,7 @@ class ExecutableWorld:
         self._steps = 0
         self._closed = False
         self._lock = threading.RLock()
+        self.last_execution: WorldExecutionReceipt | None = None
 
     @property
     def pending(self) -> tuple[WorldEvent, ...]:
@@ -516,23 +521,119 @@ class ExecutableWorld:
     def execute(self, action: ToolCall) -> Observation:
         """Execute one call at the current time, then advance the clock by its duration.
 
-        Events due at or before the current time fire first. A call refused before execution
-        changes nothing, including the clock; a call whose actual changes exceed its resolved
-        writes, or whose backend raises, is rolled back to its pre-call image.
+        Initial capability admission precedes due events and changes nothing on refusal.
+        Admitted calls then fire due events before backend execution. A backend failure or
+        excess write rolls back the tool image, retaining events that already fired.
 
         Raises:
             UndeclaredEffectError: The tool has no policy or the call reaches beyond it.
             AuthorityError: The call touches a domain this backend does not own.
         """
+        return self.execute_grounded(action, ())
+
+    def execute_grounded(
+        self, action: ToolCall, native_reads: tuple[NativeReadReceipt, ...]
+    ) -> Observation:
+        """Execute with the exact current observations required by the frozen manifest.
+
+        Receipt construction belongs to the trusted mixed router, not actor input. A plain
+        call or scheduled action cannot bypass a required bridge with missing evidence.
+        """
+        with self._lock:
+            progress = ExecutionProgress()
+            before = self._checkpoint_digest()
+            error_type = None
+            diagnostic_reason = None
+            refusal = None
+            try:
+                self._require_open()
+                policy = self._runtime.manifest.tool(action.name)
+                self._authorize(policy, self._backend.access(action))
+                progress.phase = "scheduled_events_before"
+                self._advance_to(self.clock)
+                progress.phase = "tool_admission"
+                observation = self._apply(action, policy, native_reads, progress=progress)
+                self._steps += 1
+                progress.phase = "scheduled_events_after"
+                self._advance_to(self.clock + policy.duration)
+                progress.phase = "completed"
+                return observation
+            except BaseException as exc:
+                error_type = type(exc).__name__
+                diagnostic_reason = redact_secret_text(str(exc))[0][:2000]
+                if isinstance(exc, UndeclaredEffectError) and progress.phase == "admission":
+                    refusal = (
+                        "Call refused before execution: access exceeds declared capabilities. "
+                        "Choose a permitted tool and state domain."
+                    )
+                raise
+            finally:
+                after = self._checkpoint_digest()
+                self.last_execution = WorldExecutionReceipt(
+                    owner=self._runtime.owner,
+                    action_sha256=sha256_json(action),
+                    phase=progress.phase,
+                    dispatched=progress.dispatched,
+                    effects=progress.effects,
+                    before_sha256=before,
+                    after_sha256=after,
+                    public_refusal=refusal if before is not None and before == after else None,
+                    error_type=error_type,
+                    diagnostic_reason=diagnostic_reason,
+                )
+
+    def _checkpoint_digest(self) -> Sha256 | None:
+        """Capture effect evidence without masking an original execution or restore failure."""
+        try:
+            point = self.checkpoint()
+            return sha256_json(
+                {
+                    "kernel": point.model_dump(mode="json", exclude={"image"}),
+                    "domains": point.image.domains,
+                    "parts": {
+                        name: digest_bytes(payload) for name, payload in point.image.parts.items()
+                    },
+                }
+            )
+        except Exception:  # noqa: BLE001 - inability to capture remains explicit uncertainty.
+            return None
+
+    def observe_native(self, bridge: NativeReadBridge, target: ToolCall) -> NativeReadReceipt:
+        """Read an isolated native fork and refuse any state, scheduler or RNG mutation.
+
+        The router first fires current-time events in both owners. The read uses their
+        resulting current snapshot; it neither advances time nor enters the actor history.
+        Backend implementations remain trusted in-process code, not sandboxed plugins.
+        Negative observations are retained as receipts for a recoverable caller refusal;
+        they are never sufficient evidence to execute a simulated transition.
+        """
         with self._lock:
             self._require_open()
+            if self._runtime.owner != "native" or bridge not in self._runtime.manifest.native_reads:
+                raise AuthorityError("native read bridge is not registered on this native world")
+            if any(event.due <= self.clock for event in self._pending):
+                raise WorldPolicyError("fire current-time events before reading native facts")
+            action = bridge.action(target)
             policy = self._runtime.manifest.tool(action.name)
-            self._authorize(policy, self._backend.access(action))
-            self._advance_to(self.clock)
-            observation = self._apply(action, policy)
-            self._steps += 1
-            self._advance_to(self.clock + policy.duration)
-            return observation
+            access = self._backend.access(action)
+            self._authorize(policy, access)
+            before = self.checkpoint()
+            with self.fork() as child:
+                observation = child._apply(action, policy)
+                if child.checkpoint() != before:
+                    raise UndeclaredEffectError("native probe mutated world state or scheduler")
+            if len(observation.model_dump_json().encode()) > bridge.maximum_response_bytes:
+                raise WorldPolicyError("native probe exceeds its declared response allowance")
+            return NativeReadReceipt(
+                bridge_sha256=sha256_json(bridge),
+                target_sha256=sha256_json(target),
+                checkpoint_sha256=sha256_json(before),
+                backend_sha256=before.backend_sha256,
+                logical_time=before.clock,
+                domains={name: before.image.domains[name] for name in sorted(access.reads)},
+                action=action,
+                observation=observation,
+            )
 
     def advance(self, ticks: int) -> tuple[FiredEvent, ...]:
         """Advance the logical clock, firing due events in order, and return their outcomes."""
@@ -603,12 +704,26 @@ class ExecutableWorld:
                 f"backend holds domains {sorted(held)!r} but the manifest gives this world "
                 f"{sorted(owned)!r}; align the backend with the manifest"
             )
+        self._verify_state()
+
+    def _verify_state(self) -> None:
+        """Enforce declared state representations independently of a backend's replies."""
+        schemas = {
+            row.name: row.state_schema
+            for row in self._runtime.manifest.domains
+            if row.state_schema is not None and self._ownership[row.name] == self._runtime.owner
+        }
+        if schemas:
+            if not isinstance(self._backend, StateProjection):
+                raise WorldPolicyError("state schemas require a backend state projection")
+            validate_state_projection(self._backend.state_projection(), schemas)
 
     def _resume(self, checkpoint: ExecutableCheckpoint) -> None:
         """Adopt a checkpoint's episode state after verifying the restored native state."""
         if self._backend.domain_digests() != checkpoint.image.domains:
             raise RestoreError("restored native state does not match the checkpoint's digests")
         self._ownership = dict(checkpoint.ownership)
+        self._verify_state()
         self.clock = checkpoint.clock
         self._next_event = checkpoint.next_event
         self._pending = list(checkpoint.pending)
@@ -655,8 +770,27 @@ class ExecutableWorld:
             event_id=event.event_id, at=self.clock, status=status, detail=observation.content
         )
 
-    def _apply(self, action: ToolCall, policy: ToolEffectPolicy) -> Observation:
+    def _apply(
+        self,
+        action: ToolCall,
+        policy: ToolEffectPolicy,
+        native_reads: tuple[NativeReadReceipt, ...] = (),
+        *,
+        progress: ExecutionProgress | None = None,
+    ) -> Observation:
         """Authorize, execute and verify one call; roll back anything outside its access."""
+        bridges = tuple(
+            row for row in self._runtime.manifest.native_reads if row.target_tool == action.name
+        )
+        if len(native_reads) != len(bridges) or any(
+            receipt.observation.is_error
+            or receipt.bridge_sha256 != sha256_json(bridge)
+            or receipt.target_sha256 != sha256_json(action)
+            or receipt.logical_time != self.clock
+            or receipt.action != bridge.action(action)
+            for bridge, receipt in zip(bridges, native_reads, strict=True)
+        ):
+            raise AuthorityError("simulated call requires its exact current native read receipts")
         until = self._degraded.get(action.name)
         if until is not None and until > self.clock:
             return Observation(
@@ -666,10 +800,35 @@ class ExecutableWorld:
             )
         access = self._backend.access(action)
         self._authorize(policy, access)
+        if policy.reply_bindings and not isinstance(self._backend, StateProjection):
+            raise WorldPolicyError(
+                "tool reply bindings require a backend state projection; "
+                "implement it before execution"
+            )
+        before = (
+            copy.deepcopy(self._backend.state_projection())
+            if policy.reply_bindings and isinstance(self._backend, StateProjection)
+            else {}
+        )
         image = self._backend.capture()
-        context = WorldContext(self)
+        context = WorldContext(self, native_reads)
         try:
+            if progress is not None:
+                progress.phase = "backend_execution"
+                progress.dispatched = True
+                progress.effects = "unknown"
             observation = self._backend.execute(action, context)
+            self._verify_state()
+            validate_reply(observation, policy.reply_schema)
+            if policy.reply_bindings and isinstance(self._backend, StateProjection):
+                validate_reply_state(
+                    observation,
+                    policy.reply_bindings,
+                    before,
+                    self._backend.state_projection(),
+                    action=action,
+                    domains=policy.domains(),
+                )
             changed = _changed(image.domains, self._backend.domain_digests())
             if not changed <= access.writes:
                 raise UndeclaredEffectError(
@@ -678,8 +837,12 @@ class ExecutableWorld:
                 )
         except BaseException:
             self._rollback(image)
+            if progress is not None:
+                progress.effects = "rolled_back"
             raise
         self._commit(context)
+        if progress is not None:
+            progress.effects = "committed"
         return observation
 
     def _authorize(self, policy: ToolEffectPolicy, access: WorldAccess) -> None:

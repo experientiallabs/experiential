@@ -645,3 +645,39 @@ def test_evaluation_binds_actual_completion_profile_and_refuses_changed_replay(
         )
     assert complete.calls == 1
     assert not project.artifacts.exists("wrong-model-intent")
+
+
+def test_private_execution_receipts_are_bound_but_never_sent_to_the_judge(tmp_path: Path) -> None:
+    """Rule-use telemetry cannot bias the independent grade or consume its prompt allowance."""
+    import json
+
+    from exp.common.evaluations.reconstruction import JudgeNotRun
+
+    project = ProjectStore(tmp_path, "audit")
+    base = evidence()
+    value = base.model_copy(update={"audit_metadata": {"marker": "PRIVATE-CLAIM-RECEIPT"}})
+    calls = []
+
+    def judge(body: JsonObject, identity: str) -> JsonObject:
+        """Inspect the actual dispatched body while buying no provider inference."""
+        del identity
+        calls.append(body)
+        assert "PRIVATE-CLAIM-RECEIPT" not in json.dumps(body)
+        assert "audit_metadata" not in json.dumps(body)
+        raise JudgeNotRun("No inference needed for the information-boundary test")
+
+    report = evaluate(
+        value,
+        references(),
+        judge=default_judge("fixture"),
+        complete=judge,
+        artifacts=project.artifacts,
+        artifact_id="audit-report",
+        clock=lambda: NOW,
+        code_revision="test",
+    )
+    assert len(calls) == 1 and report.evidence_sha256 == sha256_json(value)
+    assert report.evidence_sha256 != sha256_json(base)
+    saved = project.artifacts.read_bytes("audit-report-intent", "evidence.json")
+    assert b"PRIVATE-CLAIM-RECEIPT" in saved
+    assert "audit_metadata" not in base.model_dump(mode="json")

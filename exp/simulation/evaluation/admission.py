@@ -7,7 +7,9 @@ never by a caller's approval. Two witness kinds exist:
 - ``native_execution``: the same kind of specification graded on the observation of a saved
   native materialization receipt whose input bytes, adapter digest, edit plan and output bytes
   are re-checked, whose output bytes and projection a maintained adapter re-derives from the
-  input bytes, and whose edit plan is exactly the one the labeled outcome proposed.
+  input bytes, and whose edit plan is exactly the one the labeled outcome proposed; or a
+  record receipt re-executed under an explicitly supplied native runtime, with exact actions,
+  observations and checkpoints and an explicit observed-goal predicate. Neither proves prose.
 
 Every refusal carries one named reason, so qualification and paid work stop with a cause
 the caller can act on:
@@ -28,6 +30,7 @@ from collections.abc import Iterable, Sequence
 from datetime import datetime
 from typing import Literal, Self
 
+from jsonschema import Draft202012Validator
 from pydantic import Field, ValidationError, model_validator
 
 from exp.common.core.artifacts import (
@@ -40,8 +43,10 @@ from exp.common.core.artifacts import (
     sha256_bytes,
     sha256_json,
     stable_id,
+    strict_equal,
 )
-from exp.common.evaluations.reconstruction import WorkflowEvidence, strict_equal
+from exp.common.core.json_schema import expand_local_references
+from exp.common.evaluations.reconstruction import WorkflowEvidence
 from exp.common.project import ArtifactStore, ArtifactStoreError, artifact_input
 from exp.runtime.environments.artifact_edits import (
     ArtifactEditAdapter,
@@ -51,12 +56,18 @@ from exp.runtime.environments.artifact_edits import (
 from exp.simulation.evaluation.tasks import (
     WITNESSED_AUTHORITIES,
     EvaluationTask,
+    OutcomeRule,
     TaskVerifier,
     Verdict,
     VerifierChallenge,
     grade,
     load_evaluation_task,
     normalized_outcome,
+)
+from exp.simulation.record_execution import (
+    RECORD_RECEIPT_TYPE,
+    RecordReplayRuntime,
+    verify_record_execution,
 )
 
 AdmissionReason = Literal[
@@ -72,17 +83,79 @@ WitnessKind = Literal["specification_check", "native_execution"]
 # case per side can agree by coincidence, two per side is the smallest repeated contrast.
 MINIMUM_ADMITTED_PER_VERDICT = 2
 
-# Artifact types whose content a model produced. Label evidence derived from any of them is a
-# generated label, whatever authority it later claims.
+# Generated proposal and construction types. Label evidence derived from any of them is a
+# generated label, whatever authority it later claims. Deterministic rendering adds no authority.
 GENERATED_ARTIFACT_TYPES = frozenset(
     {
         "actor-workflow",
+        "world-construction",
+        "author-intent",
+        "author-response",
+        "world-binding-intent",
+        "world-proposal-cell",
+        "world-proposals",
+        "task-variant",
+        "task-variant-proposal",
+        "memory-prediction-outcomes",
+        "failure-analysis",
+        "action-intervention",
+        "action-intervention-intent",
+        "action-contrast-registration",
+        "action-contrast-intent",
+        "action-contrast-cell",
+        "action-contrast",
+        "observation-contrast-registration",
+        "observation-contrast-intent",
+        "observation-contrast-cell",
+        "observation-contrast",
+        "task-proposal-intent",
+        "task-proposal-response",
+        "task-proposals",
+        "candidate-batch-registration",
+        "candidate-batch-intent",
+        "candidate-measurement",
+        "candidate-batch",
+        "task-factory-registration",
+        "task-factory-cell",
+        "task-factory-result",
+        "scenario-search-registration",
+        "scenario-search-intent",
+        "scenario-search-cell",
+        "scenario-search-result",
+        "mixed-executable-event",
+        "checkpoint-selection",
+        "checkpoint-experiment",
+        "checkpoint-experiment-registration",
+        "checkpoint-experiment-intent",
+        "checkpoint-experiment-cell",
+        "actor-critic-prediction",
+        "actor-critic-response",
+        "actor-critic-intent",
+        "actor-panel-registration",
+        "actor-panel-report",
+        "actor-panel-cell",
+        "grounded-world-prediction",
         "behavioral-library-edit",
+        "continuation-checkpoint",
+        "continuation-turn",
+        "continuation-study",
+        "executable-world-image",
+        "executable-task",
+        "executable-trial",
+        "executable-qualification",
+        "reachable-record-scenario",
+        "native-record-execution",
+        "framing-registration",
+        "framing-cell",
+        "framing-report",
+        "continuation-admission",
         "experience-library",
         "fidelity-report",
+        "investigation-evidence",
         "judgment",
         "library-edit-intent",
         "memory-compression",
+        "memory-dream",
         "memory-line",
         "memory-summary",
         "provider-response",
@@ -268,6 +341,7 @@ def record_label_witness(
     receipt: ArtifactInput | None = None,
     created_at: datetime,
     code_revision: str,
+    record_runtime: RecordReplayRuntime | None = None,
 ) -> ArtifactInput:
     """Grade one outcome, or its native receipt, against a specification and save the result.
 
@@ -278,6 +352,8 @@ def record_label_witness(
         receipt: Native materialization receipt for a native-execution witness.
         created_at: Publication time.
         code_revision: Producing source identity.
+        record_runtime: Explicit trusted native runtime for record receipts; never loaded
+            from receipt contents. Required to re-execute record-world evidence.
 
     Returns:
         Exact ``label-witness`` reference to place on the challenge as ``witness``.
@@ -294,7 +370,8 @@ def record_label_witness(
     else:
         if spec.subject != "native_observation":
             raise ValueError("a native witness needs a native-observation specification")
-        observation = _native_observation(store, receipt, outcome)
+        _require_record_goal(store, receipt, spec.predicate)
+        observation = _native_observation(store, receipt, outcome, record_runtime)
     result = grade(spec.predicate, observation)
     witness = LabelWitness(
         kind=kind,
@@ -326,6 +403,7 @@ def verify_label_witness(
     *,
     label: Verdict,
     compared: Sequence[TaskVerifier],
+    record_runtime: RecordReplayRuntime | None = None,
 ) -> AdmissionRefusal | None:
     """Re-derive one witnessed label from the store; refuse anything that does not reproduce.
 
@@ -335,6 +413,7 @@ def verify_label_witness(
         label: Verdict the witness must establish (the case's primary label).
         compared: Predicates under qualification and generated proposals; a witness whose
             specification is one of them would let a predicate approve itself.
+        record_runtime: Explicit native replay capability for record-execution receipts.
 
     Returns:
         None when the witness re-verifies, otherwise one named refusal.
@@ -358,8 +437,8 @@ def verify_label_witness(
             f"the witness specification derives from generated artifact {generated}; "
             "author the specification from recorded or native evidence",
         )
-    predicate = sha256_json(specification.predicate)
-    if any(sha256_json(row) == predicate for row in compared):
+    predicate = _predicate_fingerprint(specification.predicate)
+    if any(_predicate_fingerprint(row) == predicate for row in compared):
         return refuse(
             "self_approval",
             "the witness specification is a predicate under qualification or a generated "
@@ -370,10 +449,12 @@ def verify_label_witness(
     if witness.outcome_sha256 != sha256_json(challenge.outcome):
         return refuse("unverifiable_witness", "the witness is about a different outcome")
     try:
+        if witness.receipt is not None:
+            _require_record_goal(store, witness.receipt, specification.predicate)
         observation = (
             _outcome_value(challenge.outcome)
             if witness.receipt is None
-            else _native_observation(store, witness.receipt, challenge.outcome)
+            else _native_observation(store, witness.receipt, challenge.outcome, record_runtime)
         )
     except (ArtifactStoreError, OSError, ValueError, ValidationError) as error:
         return refuse("unverifiable_witness", f"native receipt does not re-verify: {error}")
@@ -390,6 +471,96 @@ def verify_label_witness(
             f"the witness establishes {verdict}, but the label declares {label}",
         )
     return None
+
+
+def _predicate_fingerprint(verifier: TaskVerifier) -> Sha256:
+    """Detect syntactic copies despite annotations or reordered conjunctions.
+
+    This is a conservative copy check, not a proof that differently expressed predicates were
+    authored independently. Provenance checks remain necessary; logically equivalent but
+    structurally different programs cannot establish independent truth merely by differing here.
+    """
+
+    def conjunction(rules: tuple[OutcomeRule, ...]) -> list[JsonObject]:
+        """Canonicalize conjunctions without reinterpreting their literal values."""
+        values = {sha256_json(rule): rule.model_dump(mode="json") for rule in rules}
+        return [values[key] for key in sorted(values)]
+
+    value: JsonObject = verifier.model_dump(mode="json", exclude={"description"})
+    value["outcome_schema"] = _schema_assertions(expand_local_references(verifier.outcome_schema))
+    value["rules"] = conjunction(verifier.rules)
+    value["required_paths"] = sorted(
+        {
+            *verifier.required_paths,
+            *(path for row in verifier.table_relations for path in (row.source, row.target)),
+        }
+    )
+    value["preserved_paths"] = (
+        [] if verifier.preserve_state else sorted(set(verifier.preserved_paths))
+    )
+    value["allowed_tools"] = (
+        None if verifier.allowed_tools is None else sorted(set(verifier.allowed_tools))
+    )
+    value["relations"] = [
+        list(pair)
+        for pair in sorted({tuple(sorted((row.left, row.right))) for row in verifier.relations})
+    ]
+    table_rules = {
+        sha256_json(
+            row.model_copy(update={"key_columns": tuple(sorted(row.key_columns))})
+        ): row.model_copy(update={"key_columns": tuple(sorted(row.key_columns))}).model_dump(
+            mode="json"
+        )
+        for row in verifier.table_relations
+    }
+    value["table_relations"] = [table_rules[key] for key in sorted(table_rules)]
+    value["argument_rules"] = {
+        name: conjunction(rules) for name, rules in verifier.argument_rules.items()
+    }
+    return sha256_json(value)
+
+
+def _schema_assertions(schema: JsonValue) -> JsonValue:
+    """Remove annotations only at schema positions, preserving identically named data fields."""
+    if not isinstance(schema, dict):
+        return schema
+    result: JsonObject = {}
+    for key, value in schema.items():
+        # grade() uses this validator without a FormatChecker. Unknown vocabulary and
+        # annotations do not constrain its verdict and cannot manufacture a second oracle.
+        if key not in Draft202012Validator.VALIDATORS or key == "format":
+            continue
+        if key in {
+            "additionalProperties",
+            "contains",
+            "contentSchema",
+            "else",
+            "if",
+            "items",
+            "not",
+            "propertyNames",
+            "then",
+            "unevaluatedItems",
+            "unevaluatedProperties",
+        }:
+            value = _schema_assertions(value)
+        elif key in {"properties", "patternProperties", "dependentSchemas"} and isinstance(
+            value, dict
+        ):
+            value = {name: _schema_assertions(child) for name, child in value.items()}
+        elif key in {"allOf", "anyOf", "oneOf", "prefixItems"} and isinstance(value, list):
+            value = [_schema_assertions(child) for child in value]
+            if key != "prefixItems":
+                value = sorted(value, key=sha256_json)
+        elif key in {"required", "enum"} and isinstance(value, list):
+            value = sorted(value, key=sha256_json)
+        elif key == "dependentRequired" and isinstance(value, dict):
+            value = {
+                name: sorted(required, key=sha256_json) if isinstance(required, list) else required
+                for name, required in value.items()
+            }
+        result[key] = value
+    return result
 
 
 def adequacy_refusals(
@@ -515,8 +686,44 @@ def _outcome_value(outcome: WorkflowEvidence | JsonObject) -> JsonObject:
     return normalized_outcome(outcome) if isinstance(outcome, WorkflowEvidence) else outcome
 
 
+def _require_record_goal(
+    store: ArtifactStore, receipt: ArtifactInput, predicate: TaskVerifier
+) -> None:
+    """Require an explicit native goal observation, not process completion or empty checks.
+
+    This is a minimum evidence condition, not a proof the authored goal matches user intent.
+    Refusal tasks may assert actual reply fields; state tasks assert actual resulting state.
+    Schema-only record witnesses must express their goal as a data-only outcome rule.
+    """
+    if store.read(receipt.artifact_id).manifest.artifact_type != RECORD_RECEIPT_TYPE:
+        return
+    paths = [rule.path for rule in predicate.rules]
+    paths.extend(
+        path for relation in predicate.relations for path in (relation.left, relation.right)
+    )
+    paths.extend(
+        path
+        for relation in predicate.table_relations
+        for path in (relation.source, relation.target)
+    )
+    if not any(
+        path == "/final_state"
+        or path.startswith("/final_state/")
+        or (path.startswith("/steps/") and "/reply/" in path)
+        for path in paths
+    ):
+        raise ValueError(
+            "record witness requires an explicit observable goal rule over native state "
+            "or replies; "
+            "no detected error or completed execution alone cannot establish task success"
+        )
+
+
 def _native_observation(
-    store: ArtifactStore, reference: ArtifactInput, outcome: WorkflowEvidence | JsonObject
+    store: ArtifactStore,
+    reference: ArtifactInput,
+    outcome: WorkflowEvidence | JsonObject,
+    record_runtime: RecordReplayRuntime | None = None,
 ) -> JsonObject:
     """Re-check a native receipt end to end and return its native observation.
 
@@ -525,6 +732,17 @@ def _native_observation(
     """
     stored = store.read(reference.artifact_id)
     manifest = stored.manifest
+    if manifest.artifact_type == RECORD_RECEIPT_TYPE:
+        if record_runtime is None:
+            raise ValueError(
+                "record witnesses require an explicitly supplied native replay runtime"
+            )
+        execution = verify_record_execution(store, reference, record_runtime)
+        value = _outcome_value(outcome)
+        for key in ("initial_state", "steps", "final_state", "stop_reason"):
+            if key not in value or not strict_equal(value[key], execution.outcome[key]):
+                raise ValueError(f"record receipt differs from the labeled outcome's {key}")
+        return execution.outcome
     if artifact_input(manifest) != reference or manifest.artifact_type != NATIVE_RECEIPT_TYPE:
         raise ValueError("native witness does not name an exact native materialization receipt")
     receipt = _object(store.read_bytes(reference.artifact_id, "receipt.json"))

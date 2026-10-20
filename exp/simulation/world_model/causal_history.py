@@ -3,8 +3,7 @@
 import json
 from collections.abc import Mapping, Sequence
 
-from exp.common.core.artifacts import JsonObject, JsonValue
-from exp.common.evaluations.reconstruction import strict_equal
+from exp.common.core.artifacts import JsonObject, JsonValue, strict_equal
 
 CAUSAL_HISTORY_BUDGET = 48_000
 """Characters of serialized steps; whole steps beyond it are dropped, oldest first."""

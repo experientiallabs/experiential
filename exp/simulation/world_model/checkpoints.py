@@ -14,8 +14,9 @@ from exp.common.core.artifacts import (
     JsonObject,
     sha256_json,
     stable_id,
+    strict_equal,
 )
-from exp.common.evaluations.reconstruction import WorkflowEvidence, strict_equal
+from exp.common.evaluations.reconstruction import WorkflowEvidence
 from exp.common.project import ArtifactStore, artifact_input
 from exp.runtime.sessions.store import SessionRecord, SessionStore
 from exp.simulation.world_model.durable import DurableWorldModelSession, SessionSnapshot

@@ -562,7 +562,7 @@ def test_rerunning_a_calibration_spec_refuses_a_stale_qualified_report(tmp_path:
         files={
             "proposal.json": {
                 "verifier": {
-                    "description": REFERENCE.description,
+                    "description": "A proposal that matches the reference specification.",
                     "rules": [{"path": "/final_answer", "operator": "equals", "value": "done"}],
                 }
             }

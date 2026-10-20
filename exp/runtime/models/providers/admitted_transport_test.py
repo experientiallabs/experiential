@@ -160,3 +160,103 @@ def test_a_refusing_guard_runs_before_every_claim_and_stops_the_send(tmp_path: P
     with pytest.raises(RuntimeError, match="reservation released"):
         transport.post("https://fixture.invalid", headers={}, payload={}, timeout_seconds=30)
     assert checks == [0, 1] and ledger.used() == 1 and len(inner.requests) == 1
+
+
+def test_final_transport_body_is_saved_without_headers_or_endpoint_secrets(tmp_path: Path) -> None:
+    """The receipt describes the actual provider-protocol input, not a reconstructed prompt."""
+    import json
+
+    from exp.common.core.artifacts import sha256_json
+    from exp.runtime.models.call_evidence import call_consumer
+
+    project = ProjectStore(tmp_path, "attempt")
+    inner = ScriptedJsonTransport([JsonHttpResponse(status_code=200, body={})])
+    transport = AdmittedJsonTransport(
+        inner,
+        ledger=DispatchLedger(tmp_path / "calls.sqlite", 1, "b" * 64),
+        artifacts=project.artifacts,
+        code_revision="test",
+        deadline=datetime.now(UTC) + timedelta(minutes=1),
+    )
+    payload: JsonObject = {
+        "messages": [{"role": "user", "content": "post-hook input"}],
+        "model": "x",
+    }
+    with call_consumer("actor"):
+        transport.post(
+            "https://fixture.invalid/?key=inert-url-secret",
+            headers={"Authorization": "inert-header-secret"},
+            payload=payload,
+            timeout_seconds=5,
+        )
+    identity = next(x for x in project.artifacts.list_ids() if x.endswith("-intent"))
+    encoded = project.artifacts.read_bytes(identity, "receipt.json")
+    saved = json.loads(encoded)
+    assert saved["request_body"] == inner.requests[0].payload == payload
+    assert saved["request_sha256"] == sha256_json(saved["request_body"])
+    assert saved["consumer"] == "actor"
+    assert b"inert-url-secret" not in encoded and b"inert-header-secret" not in encoded
+
+
+def test_credential_bearing_request_refuses_before_claim_and_io(tmp_path: Path) -> None:
+    """A body that cannot be safely retained cannot be silently dispatched with hash-only proof."""
+    project = ProjectStore(tmp_path, "attempt")
+    inner = ScriptedJsonTransport([JsonHttpResponse(status_code=200, body={})])
+    ledger = DispatchLedger(tmp_path / "calls.sqlite", 1, "b" * 64)
+    transport = AdmittedJsonTransport(
+        inner,
+        ledger=ledger,
+        artifacts=project.artifacts,
+        code_revision="test",
+        deadline=datetime.now(UTC) + timedelta(minutes=1),
+    )
+    with pytest.raises(ArtifactStoreError, match="request"):
+        transport.post(
+            "https://fixture.invalid",
+            headers={},
+            payload={"messages": [{"role": "user", "content": '{"api_key": "inert-body-secret"}'}]},
+            timeout_seconds=5,
+        )
+    assert not inner.requests and ledger.used() == 0
+    assert not project.artifacts.list_ids()
+
+
+def test_late_paid_response_is_retained_but_cannot_authorize_an_action(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A late response is evidence, not permission to continue mutating the world."""
+    import json
+    from collections.abc import Mapping
+
+    now = [datetime(2030, 1, 1, tzinfo=UTC)]
+    body: JsonObject = {"choices": [{"message": {"content": "perform the write"}}]}
+    inner = ScriptedJsonTransport([JsonHttpResponse(status_code=200, body=body)])
+    original = inner.post
+
+    def late(
+        url: str, *, headers: Mapping[str, str], payload: JsonObject, timeout_seconds: float
+    ) -> JsonHttpResponse:
+        """Return after the declared boundary despite the requested transport timeout."""
+        now[0] += timedelta(seconds=2)
+        return original(url, headers=headers, payload=payload, timeout_seconds=timeout_seconds)
+
+    monkeypatch.setattr(inner, "post", late)
+    project = ProjectStore(tmp_path, "attempt")
+    ledger = DispatchLedger(tmp_path / "calls.sqlite", 1, "c" * 64)
+    transport = AdmittedJsonTransport(
+        inner,
+        ledger=ledger,
+        artifacts=project.artifacts,
+        code_revision="test",
+        deadline=now[0] + timedelta(seconds=1),
+        clock=lambda: now[0],
+    )
+    with pytest.raises(TimeoutError, match="response.*deadline"):
+        transport.post("https://fixture.invalid", headers={}, payload={}, timeout_seconds=30)
+    assert len(inner.requests) == ledger.used() == 1
+    identity = next(x for x in project.artifacts.list_ids() if x.endswith("-response"))
+    saved = json.loads(project.artifacts.read_bytes(identity, "receipt.json"))
+    assert saved["response_body"] == body and saved["returned_after_deadline"] is True
+    with pytest.raises(TimeoutError, match="before physical dispatch"):
+        transport.post("https://fixture.invalid", headers={}, payload={}, timeout_seconds=30)
+    assert len(inner.requests) == ledger.used() == 1

@@ -15,6 +15,7 @@ from exp.common.project import ArtifactStore, ArtifactStoreError, ProjectStore
 from exp.common.tasks import TaskCase
 from exp.optimize.evaluation.audit.exposure import held_out_exposure
 from exp.optimize.evaluation.fidelity.knowledge_exposure import require_unexposed_task
+from exp.simulation.capability_briefs import load_capability_brief
 from exp.simulation.evaluation.admission import (
     AdmissionRefusal,
     EvidenceAdmission,
@@ -55,6 +56,14 @@ def admit_calibration_evidence(project: ProjectStore, pack: CalibrationPack) -> 
         (pack.parent, pack.candidate, *generated_predicates(project.artifacts)),
     )
     refusals += knowledge_refusals(project, task.world_model, task.task)
+    if task.capability_brief is not None:
+        brief = load_capability_brief(project.artifacts, task.capability_brief)
+        refusals += tuple(
+            AdmissionRefusal(
+                reason="inadequate_evidence", subject="capability brief", detail=detail
+            )
+            for detail in brief.blockers()
+        )
     refusals += _authoring_refusals(project.artifacts, task, pack.cases)
     ledger_refusals, ledger = _ledger_refusals(
         project,

@@ -5,12 +5,13 @@ import threading
 from collections.abc import Mapping
 from datetime import UTC, datetime
 from pathlib import Path
+from shutil import which
 
 import pytest
 from typer.testing import CliRunner
 
 from exp.cli.app import app
-from exp.common.core.artifacts import ArtifactEnvelope, JsonObject
+from exp.common.core.artifacts import ArtifactEnvelope, JsonObject, sha256_bytes
 from exp.common.models import load_model_catalog, write_model_catalog
 from exp.common.project import ProjectStore, artifact_input
 from exp.common.release_revision import installed_release_revision
@@ -30,6 +31,7 @@ from exp.optimize.evaluation.tests.fidelity_memory_test import (
     predicted,
     trajectory,
 )
+from exp.runtime.agents.factory import ActorHarness
 from exp.runtime.models.providers.transport import (
     JsonHttpResponse,
     RecordedRequest,
@@ -127,6 +129,74 @@ def sequence(fidelity: FidelitySpec) -> list[JsonHttpResponse]:
         )
     )
     return responses
+
+
+def test_installed_pi_runs_every_council_actor_with_isolated_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Installed Pi traverses the same five-model wire, durable worlds and retained judgments."""
+    installed = which("pi")
+    if installed is None:
+        pytest.skip("external Pi executable is not installed")
+    executable = Path(installed).absolute()
+    project, spec, fidelity = spec_project(tmp_path)
+    catalog = load_model_catalog(project.model_catalog_path)
+    models = dict(catalog.models)
+    actors, responses = [], []
+    for index in range(5):
+        alias, model = f"actor-{index}", f"fixture-actor-{index}"
+        models[alias] = models["model"].model_copy(update={"model": model})
+        actors.append(trace_council.CouncilActor(alias=alias, tier=f"declared-{index}"))
+        responses.extend(
+            (
+                actor_reply(final=False, model=model),
+                sequence(fidelity)[1],
+                actor_reply(final=True, model=model),
+                judged(fidelity),
+            )
+        )
+    responses.append(sequence(fidelity)[-1])
+    write_model_catalog(project.model_catalog_path, catalog.model_copy(update={"models": models}))
+    spec = spec.model_copy(
+        update={
+            "actors": tuple(actors),
+            "maximum_physical_attempts": 30,
+            "actor_harness": ActorHarness(
+                kind="pi",
+                executable=executable,
+                executable_sha256=sha256_bytes(executable.read_bytes()),
+                version="installed-conformance-probe",
+                timeout_seconds=20,
+            ),
+            "tasks": (
+                spec.tasks[0].model_copy(
+                    update={
+                        "initial_context": {"public_fact": "inspect current before answering"},
+                    }
+                ),
+            ),
+        }
+    )
+    wire = ScriptedJsonTransport(tuple(responses))
+    monkeypatch.setenv("FIDELITY_TEST_KEY", "inert-fixture-key")
+    monkeypatch.setattr(trace_council, "HttpxJsonTransport", lambda: wire)
+    prepared = trace_council.prepare_trace_council(project, spec, code_revision="test")
+    result = trace_council.execute_trace_council(project, prepared)
+    rows = result["traces"]
+    assert isinstance(rows, list) and len(rows) == 5
+    for row in rows:
+        trace = CouncilTrace.model_validate(row)
+        assert trace.error_type is None, trace.model_dump_json()
+        assert trace.workflow is not None and trace.evaluation is not None
+        assert len(trace.workflow.evidence.steps) == 1
+        assert trace.workflow.evidence.steps[0].before == {}
+    assert result["analysis_failures"] == {}
+    assert len(wire.requests) == result["physical_attempts"] == 21
+    for index in range(5):
+        assert "public_fact" in json.dumps(wire.requests[4 * index].payload)
+        assert "mechanical_check_source" not in json.dumps(wire.requests[4 * index].payload)
+    assert trace_council.execute_trace_council(project, prepared) == result
+    assert len(wire.requests) == 21
 
 
 @pytest.mark.parametrize("judge_output_protocol", ["tool", "json"])
@@ -255,7 +325,7 @@ def test_invented_analyst_evidence_is_recorded_as_failure(
     monkeypatch.setenv("FIDELITY_TEST_KEY", "fixture-only")
     prepared = trace_council.prepare_trace_council(project, spec, code_revision="fixture")
     result = trace_council.execute_trace_council(project, prepared)
-    assert result["analysis_failures"] == {"model": "ValueError"}
+    assert result["analysis_failures"] == {"model": "ReturnedOutputRejected"}
     assert result["planned_actor_cells"] == 2
     assert result["categories"] == {}
 

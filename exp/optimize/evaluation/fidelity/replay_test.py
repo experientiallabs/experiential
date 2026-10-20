@@ -10,12 +10,26 @@ from exp.common.traces import Trace, TraceSource, TraceSpan
 from exp.optimize.evaluation.fidelity import replay as trace_replay
 from exp.optimize.evaluation.fidelity.replay import (
     content_run_id,
+    protocol_prompts_sha256,
     recorded_exchanges,
     replay_boundary,
 )
 from exp.optimize.evaluation.fidelity.runner_test import source_project
+from exp.simulation.retrieval import evidence_reading
 
 NOW = datetime(2026, 10, 15, tzinfo=UTC)
+
+
+def test_unused_reader_changes_cannot_invalidate_baseline_replay(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    baseline = protocol_prompts_sha256()
+    reading = evidence_reading.ReadingPolicy()
+    enabled = protocol_prompts_sha256(reading)
+    assert enabled != baseline
+    monkeypatch.setattr(evidence_reading, "READER_PROMPT", "A different evidence question protocol")
+    assert protocol_prompts_sha256() == baseline
+    assert protocol_prompts_sha256(reading) != enabled
 
 
 def trace(context: JsonObject) -> Trace:

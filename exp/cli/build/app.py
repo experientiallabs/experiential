@@ -175,6 +175,21 @@ def build(
         help="Require complete model flags and never ask setup or cost questions.",
     ),
     provider: list[str] | None = _PROVIDER_OPTION,
+    evidence_reading: bool = typer.Option(
+        False,
+        "--evidence-reading",
+        help=(
+            "Use bounded objective-driven readers during learning investigations; "
+            "saved plans stay pinned."
+        ),
+    ),
+    dream_every: int | None = typer.Option(
+        None,
+        "--dream-every",
+        min=1,
+        max=1000,
+        help="Consolidate cited memory every N traces and at completion; policy stays pinned.",
+    ),
     retry_incomplete: bool = typer.Option(
         False,
         "--retry-incomplete",
@@ -209,6 +224,8 @@ def build(
         no_interactive: Disable inline setup and cost questions even at a terminal.
         provider: Repeatable provider names that skip the opening list during setup.
         retry_incomplete: Resume an interrupted learning trace in place.
+        evidence_reading: Optional investigation readers; omitted follows a saved learning plan.
+        dream_every: Optional consolidation interval; omitted follows the saved learning plan.
 
     Raises:
         typer.BadParameter: Input, setup, role, cost, project, or artifact validation fails.
@@ -228,6 +245,13 @@ def build(
     elif identity is not None:
         raise typer.BadParameter("--identity requires --source gateway")
     if trace_file is None and import_id is None:
+        if dream_every is not None:
+            raise typer.BadParameter("--dream-every requires --traces PATH or --import-id ID")
+        if evidence_reading:
+            raise typer.BadParameter(
+                "--evidence-reading requires --traces PATH or --import-id ID; "
+                "the interactive router wizard does not run this learning profile"
+            )
         if dry_run or no_interactive or not can_prompt(_console):
             raise typer.BadParameter(
                 "automation and dry runs require -t/--traces PATH or --import-id ID; bare "
@@ -437,6 +461,8 @@ def build(
                 retry_incomplete=retry_incomplete,
                 pipeline=pipeline,
                 command=rerun,
+                evidence_reading=True if evidence_reading else None,
+                dream_every=dream_every,
             )
     except BaseException:
         pipeline.abort()

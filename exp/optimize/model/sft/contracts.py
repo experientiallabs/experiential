@@ -17,13 +17,14 @@ from exp.common.core.artifacts import (
     validate_artifact_file_path,
 )
 from exp.common.models import AssistantAction
+from exp.common.tasks import ToolSchema
 
 
 class SFTMessage(ContractModel):
     """A non-assistant message retained verbatim in canonical SFT context."""
 
     kind: Literal["message"] = "message"
-    role: Literal["system", "user", "observation"]
+    role: Literal["system", "developer", "user", "observation"]
     content: str
 
 
@@ -292,8 +293,20 @@ class RuntimeInteractionExampleSource(ContractModel):
     completed_ordinal: int = Field(gt=0)
 
 
+class ContinuationExampleSource(ContractModel):
+    """One witnessed continuation, with every sibling attempt retained in its study."""
+
+    kind: Literal["continuation"] = "continuation"
+    study: ArtifactInput
+    branch: int = Field(ge=0)
+    acceptance_evidence: ArtifactInput
+
+
 SFTExampleSource = Annotated[
-    TraceExampleSource | RolloutExampleSource | RuntimeInteractionExampleSource,
+    TraceExampleSource
+    | RolloutExampleSource
+    | RuntimeInteractionExampleSource
+    | ContinuationExampleSource,
     Field(discriminator="kind"),
 ]
 
@@ -306,6 +319,7 @@ class SFTExample(ContractModel):
     task: str = Field(min_length=1)
     history: tuple[SFTContextEvent, ...]
     target: AssistantAction
+    tools: tuple[ToolSchema, ...] = Field(default=(), exclude_if=lambda value: not value)
     source: SFTExampleSource
     source_step_index: int = Field(ge=0)
     score: float | None = Field(default=None, ge=0, le=1)
@@ -357,7 +371,7 @@ class SFTBuildSpec(ContractModel):
 class SFTSourceReference(ContractModel):
     """Auditable immutable source provenance retained in a frozen dataset manifest."""
 
-    kind: Literal["production_trace", "teacher_rollout", "runtime_interaction"]
+    kind: Literal["production_trace", "teacher_rollout", "runtime_interaction", "continuation"]
     source_id: str = Field(min_length=1, max_length=512)
     source_artifact: ArtifactInput
     source_record_sha256: Sha256
@@ -391,7 +405,9 @@ class SFTSourceReference(ContractModel):
 class SFTExclusion(ContractModel):
     """One source-level or action-level reason data was withheld from an SFT dataset."""
 
-    source_kind: Literal["production_trace", "teacher_rollout", "runtime_interaction"]
+    source_kind: Literal[
+        "production_trace", "teacher_rollout", "runtime_interaction", "continuation"
+    ]
     source_id: str = Field(min_length=1, max_length=512)
     action_index: int | None = Field(default=None, ge=0)
     reason: Literal[

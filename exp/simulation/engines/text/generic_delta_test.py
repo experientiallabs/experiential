@@ -51,3 +51,28 @@ def test_remove_value_is_type_aware_and_removes_only_first_match() -> None:
         [{"op": "remove_value", "path": ["list"], "value": 1}],
     )
     assert post == {"list": [True, 1.0]}
+
+
+def test_copy_then_edit_preserves_typed_source_without_aliasing() -> None:
+    """A row deletion copies exact metadata, rather than regenerating unchanged cells."""
+    state: JsonObject = {
+        "input": [{"value": "key", "data_type": "s"}, {"value": 1}],
+        "output": None,
+    }
+    post = apply_delta(
+        state,
+        [
+            {"op": "copy", "from": ["input"], "path": ["output"]},
+            {"op": "delete", "path": ["output", 1]},
+        ],
+    )
+    assert post["output"] == [{"value": "key", "data_type": "s"}]
+    assert post["input"] == state["input"]
+    assert state["output"] is None
+
+
+@pytest.mark.parametrize("source", [[], ["missing"], ["input", True]])
+def test_copy_refuses_missing_or_ambiguous_sources(source: list[str | int]) -> None:
+    """Copy never turns absent evidence into null or treats booleans as indices."""
+    with pytest.raises(DeltaError):
+        apply_delta({"input": [1]}, [{"op": "copy", "from": source, "path": ["output"]}])

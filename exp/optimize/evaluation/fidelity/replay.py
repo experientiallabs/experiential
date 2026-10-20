@@ -57,7 +57,6 @@ from exp.common.tasks.facts import InstanceFacts, InstanceFactsProvider
 from exp.common.traces import Trace
 from exp.common.traces.facts import TracePackageFacts
 from exp.optimize.evaluation.fidelity.instance_facts import ReplayFacts
-from exp.optimize.evaluation.fidelity.memory import INCOMPLETE, saved_memory_receipt
 from exp.optimize.evaluation.fidelity.recovery import UnknownOutcome
 from exp.optimize.evaluation.fidelity.runner import (
     FidelityMemory,
@@ -82,6 +81,7 @@ from exp.simulation.engines.text.prompt import (
 )
 from exp.simulation.evaluation.workflow import FixedWorkflow
 from exp.simulation.retrieval import RAGLineageBinding
+from exp.simulation.retrieval.evidence_reading import ReadingPolicy
 from exp.simulation.retrieval.transitions import extract_real_transitions
 from exp.simulation.world_model.memory_tree import COMPRESSION_PROMPT
 from exp.simulation.world_model.observed_tools import public_task_tools
@@ -130,7 +130,6 @@ class ReplayCase(ContractModel):
     facts: InstanceFacts | None = Field(default=None, exclude_if=lambda value: value is None)
 
 
-MAX_LEARNING_ATTEMPTS = 3
 PROPOSAL_REASKS = 2
 
 
@@ -393,7 +392,11 @@ def replay_spec(
         + learning
         + PROPOSAL_REASKS
     )
+    if online_research is not None and online_research.reading is not None:
+        per_step += online_research.reading.additional_calls
     tail = judged + (memory.maximum_compressions if memory is not None and learning else 0)
+    if memory is not None and memory.dreaming is not None:
+        tail += memory.dreaming.calls
     prediction = _allowance(PREDICTION_TOKENS, predictor)
     spec = FidelitySpec(
         run_id="pending",
@@ -446,7 +449,9 @@ def replay_spec(
     return spec.model_copy(update={"run_id": content_run_id(spec, label, case.trace_id)})
 
 
-def protocol_prompts_sha256(*, native_artifacts: bool = False) -> str:
+def protocol_prompts_sha256(
+    reading: ReadingPolicy | None = None, *, native_artifacts: bool = False
+) -> str:
     """Identity of every system prompt a replay can send beyond its artifact's own prompt."""
     return sha256_json(
         {
@@ -455,6 +460,7 @@ def protocol_prompts_sha256(*, native_artifacts: bool = False) -> str:
             "text": RECONSTRUCTED_TEXT_SYSTEM_PROMPT,
             "memory": MEMORY_CONTEXT_GUIDANCE,
             "investigation": INVESTIGATION_PROMPT,
+            **({"reading": reading.identity} if reading is not None else {}),
             "compression": COMPRESSION_PROMPT,
         }
     )
@@ -488,8 +494,14 @@ def content_run_id(spec: FidelitySpec, label: str, trace: str, generation: int =
                 mode="json", exclude={"run_id": True, "deadline": True, **unjudged}
             ),
             "prompts": protocol_prompts_sha256(
+                None if spec.online_research is None else spec.online_research.reading,
                 native_artifacts=spec.task.initial_context.get("native_artifact_binding")
-                is not None
+                is not None,
+            ),
+            **(
+                {"dreaming": spec.memory.dreaming.identity}
+                if spec.memory is not None and spec.memory.dreaming is not None
+                else {}
             ),
             # Only runs that deliver facts send the facts guidance; fact-free IDs are unchanged.
             **({} if spec.facts is None else {"facts_prompt": INSTANCE_FACTS_GUIDANCE}),
@@ -542,7 +554,7 @@ def register_replay(
         if project.artifacts.exists(stable_id("fidelity", {"run_id": successor})):
             generation += 1  # replaced by an earlier registration; follow the chain
             continue
-        if not _retired(project, saved, now, generation):
+        if not _retired(project, saved, now):
             return saved, tuple(retired)
         retired.append(saved.spec.run_id)
         generation += 1
@@ -675,13 +687,12 @@ def _retired(
     project: ProjectStore,
     saved: PreparedFidelity,
     now: datetime,
-    generation: int,
 ) -> bool:
     """Whether an earlier attempt can never complete and may be replaced.
 
-    An attempt with a saved report replays, except a learning attempt whose trajectory
-    stopped early and was not consumed: it is retried, at most ``MAX_LEARNING_ATTEMPTS``
-    times, so one failed step never silently drops a trace from memory.
+    An attempt with a saved report always replays. Failed learning remains explicitly
+    incomplete; it cannot buy fresh prediction draws merely to repair an investigation.
+    Recovery of a finalized incomplete report requires a separate learning-only lifecycle.
 
     An attempt without a report is replaced when it never executed and the model catalog has
     since changed (the executor would refuse it), or when it can no longer finish (past its
@@ -690,13 +701,7 @@ def _retired(
     the executor stops visibly on it, or resumes it with ``--retry-incomplete``.
     """
     if saved_fidelity_report(project, saved) is not None:
-        receipt = saved_memory_receipt(project, saved)
-        return (
-            generation < MAX_LEARNING_ATTEMPTS
-            and receipt is not None
-            and receipt.get("published") is False
-            and receipt.get("reason") == INCOMPLETE
-        )
+        return False
     if not project.artifacts.exists(saved.id + "-execution"):
         if now >= saved.spec.deadline:
             return True

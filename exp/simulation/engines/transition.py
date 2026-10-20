@@ -28,7 +28,7 @@ class ApplyEdits(ContractModel):
 
     Attributes:
         kind: Explicit edit effect, distinct from replacement and RFC JSON Patch.
-        edits: Ordered set/delete/append/remove_value edits.
+        edits: Ordered set/delete/append/remove_value/copy edits.
     """
 
     kind: Literal["edits"] = "edits"

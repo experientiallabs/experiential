@@ -18,13 +18,9 @@ from exp.common.core.artifacts import (
     JsonObject,
     sha256_json,
     stable_id,
-)
-from exp.common.evaluations.reconstruction import (
-    DualReport,
-    WorkflowEvidence,
-    WorkflowStep,
     strict_equal,
 )
+from exp.common.evaluations.reconstruction import DualReport, WorkflowEvidence, WorkflowStep
 from exp.common.models import ToolCall
 from exp.common.project import ArtifactStore, artifact_input
 from exp.optimize.evaluation.native_artifacts import (

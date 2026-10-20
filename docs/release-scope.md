@@ -6,7 +6,7 @@ on the exact release checkout.
 
 ## Supported and verified
 
-- Root CLI commands are exactly `build`, `capture`, `config`, `login`, `optimize`, and `run`; an invocation with no subcommand
+- Root CLI commands are exactly `build`, `capture`, `config`, `eval`, `login`, `optimize`, and `run`; an invocation with no subcommand
   opens the default gateway home screen. Optimizer commands are exactly `router` and `model`.
 - `exp login` opens the Platform approval flow for Experiential Cloud, stores the returned
   organization key in the user-data credential file, and synchronizes the authenticated account's
@@ -141,3 +141,105 @@ reported usage, not account limits, price-invoice agreement, production availabi
 These exclusions are product boundaries, not evidence that the corresponding hosted services are
 unsafe or unsupported forever. Any future claim requires separately authorized, finite-budget,
 denominator-preserving evidence.
+
+## Development task factory
+
+`exp eval PROJECT --root ROOT --pipeline pipeline.json --dry-run` validates a
+`exp.optimize.evaluation.task_factory.TaskFactorySpec`. Repeat with `--yes --non-interactive`
+to authorize the displayed finite author/actor allowance when prices are unknown. The manifest
+binds seed tasks, capability briefs, independent control witnesses, the shared actor panel,
+coverage strata, deadline and export destination. Runtime inference keeps its separately declared
+allowance; this command does not claim an aggregate dollar ceiling.
+
+Each seed uses the existing two-to-four-candidate author, native feasibility, observable-contract
+qualification, actor panel and Harbor exporter. Related source lineages, traces or equal workflow
+signatures form one connected component. Variants and actor attempts do not increase family
+counts. Coverage targets remain fixed, and failed or rejected candidates stay in the inventory.
+Impossible planned coverage dispatches no measurements. Saved results verify exported bytes;
+publication recovery reuses saved child results without purchasing them again.
+
+This is development qualification over supplied seed worlds and witnessed controls. It does not
+discover arbitrary future capabilities, generate a complete application, provide protected release
+confirmation, prove native reconstruction accuracy, calibrate subjective judgments, demonstrate
+training benefit or certify container isolation. Those claims need their own evidence. No weights
+are trained. The factory does not promote its reports into independent label authority.
+
+`TraceCouncilSpec.actor_harness` selects `chat` or `pi` for every actor in a council. Pi requires an
+absolute executable path, its `executable_sha256`, a declared version and optional dependency-file
+digests. New execution checks those pins; completed reports replay without the installation.
+Both adapters receive public task context and instruction roles. Pi calls and output tokens are
+bounded by the council policy; tools still execute through its injected simulator. Declared file
+pins do not establish complete dependency closure or filesystem/network confinement.
+
+Executable predictors receive only the current tool's declared read/write domains. The manifest's
+write roots constrain both the advertised proposal schema and local edit admission; the kernel
+owns clock advancement. Forbidden edits are refused with the raw proposal retained, never silently
+removed. This contract requires the typed `json-tool` proposal protocol.
+
+Optional `ToolEffectPolicy.reply_bindings` compare decoded reply fields with a backend's private
+before/after state projection before commit. Missing fields refuse the transition. These bindings
+establish declared local relationships only: they do not establish native reconstruction fidelity,
+complete domain semantics or correctness of an independently authored goal. SQLite exposes table
+contents; artifact worlds expose file existence, hashes and sizes; simulated worlds expose their
+candidate domains. Unsupported projection requirements fail before backend dispatch.
+
+Execution receipts distinguish calls not started, rolled-back tool effects, committed effects and
+unknown effects. They bind checkpoint digests and retain scheduled-event changes separately from
+tool rollback. Record business errors discard staged events and random draws with their transaction.
+Continuation actors can recover from an unchanged, pre-dispatch access refusal while the attempted
+operation remains in the evidence. Unknown effects never authorize automatic retries. Mixed routers
+retain authoritative effect receipts; a stopped mixed session still requires explicit recovery.
+Known failed executions remain incomplete and ineligible for training; their proven rollbacks are
+reported separately from ambiguous outcomes. Harbor trials retain this distinction after restart.
+
+`ActorComparison` requires separate reference and candidate execution assessments. Task checks move
+with their trace during A/B counterbalancing. Incomplete or failed execution slots are unassessable
+without judge dispatch. Equivalent observed actor mistakes may support fidelity, but never establish
+actor competence. Rubric normalization remains distinct from mechanical accuracy.
+
+`exp eval PROJECT --root ROOT --continuations SPEC.json` accepts
+`{"action":"compare-environments","equivalence":...}`. Each `EquivalenceSpec` case binds a
+reference and candidate `ContinuationJob`, identical public actor checkpoints and policies,
+and explicit initial-state and material final-state probe paths. The candidate may use the
+frozen grounded simulator or mixed runtime. Separate reference, candidate and repeated-reference
+executions retain every planned branch, including unavailable ones. The reference repeat exposes
+actor variability; it does not establish a confidence interval or population equivalence.
+`--dry-run` checks the frozen contract without calls, and completed results replay without loading
+runtime code or credentials. New dispatch needs the normal spend consent.
+
+The report separates mechanical outcome/effect agreement, task competence, unavailable-pair
+bounds and semantic rubric ratings. Missing initial evidence, changed initial actor requests or
+incomplete execution make the comparison unassessable. Matching failures do not become successful
+training examples. No judge score overrides mechanical disagreement. Private evaluator probes
+and council findings never enter the actor requests.
+Blinded A/B judge packets exclude backend observation metadata and execution-owner receipts;
+the council retains that provenance separately for diagnosis. Task content may still reveal its
+environment, so this is removal of explicit backend tags, not proof of complete blinding.
+
+The paired trace council inspects actual actions, replies, state projections, delivered message
+fragments and failure receipts for each actor/task case. Findings require citations into that
+paired evidence and remain diagnostic proposals. Invalid reviews and unknown dispatch outcomes
+are retained without redrawing; saved reports must reproduce from original execution and review
+artifacts. This path resumes the built-in Chat actor only. The separate simulator-only council
+supports Pi, but paired Pi checkpoint execution is not implemented. Neither path establishes
+independent analyst calibration, protected held-out status or training admission.
+
+Continuation SFT export binds each complete response batch to its ordered saved tool results.
+Every call must have an explicitly successful observation; error-producing batches remain intact
+as context for later recovery and are excluded as targets. Tool observations in later model
+requests must match those saved results. Passing final-workflow checks does not approve earlier
+tool errors. These checks establish observed execution within the declared world, not each
+action's usefulness or native/simulator actor equivalence. Free-text explanations still require
+separate judgment authority and remain excluded from targets on this mechanical export path.
+
+`search-scenarios` under `exp eval --continuations` accepts `ScenarioSearchSpec`: two to sixteen
+prospective native setup definitions, independent acceptance references, and proposed solution,
+alternative, recovery, targeted-error and unwanted-effect scripts. It executes existing setup and
+witness owners, retains every candidate and checks discrimination before publishing a related
+`scenario_variation`. A recovery control requires an observed error before completion; a targeted
+error must fail the goal through permitted effects. Supplied scripts and labels cannot approve
+themselves. Construction definitions and controls must currently be supplied; this is not automatic
+discovery of useful capabilities or arbitrary executable applications. New variants retain their
+parent lineage and clear inherited critic, selection and training evidence. They still require fresh
+qualification before qualified Harbor delivery. No hosted-model accuracy or container-containment
+claim follows from provider-scripted conformance tests.

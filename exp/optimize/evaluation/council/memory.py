@@ -18,6 +18,7 @@ from exp.simulation.world_model.experience_memory import (
     summary_generations,
 )
 from exp.simulation.world_model.memory_tree import overview, overview_sources
+from exp.simulation.world_model.overview_pin import pinned_summaries
 from exp.simulation.world_model.runtime import load_grounded_world_model_artifact
 
 
@@ -99,6 +100,9 @@ def read_council_memory(
         admits=admits,
         admits_line=lambda line: line.origin not in view.retired,
         generations=summary_generations(version),
+        pinned=pinned_summaries(
+            store, version, created_at=version.created_at, code_revision=version.code_revision
+        ),
     )
     reference = artifact_input(
         store.read(memory_version_id(config.lineage, config.checkpoint)).manifest

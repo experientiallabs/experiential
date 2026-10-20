@@ -23,6 +23,7 @@ from exp.simulation.evaluation.admission import (
     record_label_witness,
 )
 from exp.simulation.evaluation.tasks import (
+    FieldRelation,
     OutcomeRule,
     RuleVerifierDraft,
     TaskVerifier,
@@ -31,8 +32,8 @@ from exp.simulation.evaluation.tasks import (
 )
 
 
-def specification(project: ProjectStore) -> ArtifactInput:
-    """Save the independent specification that labels every refinement challenge."""
+def specification(project: ProjectStore, *, copied: bool = False) -> ArtifactInput:
+    """Compare the observed current value with the result; optionally supply a deliberate copy."""
     return persist_specification(
         project.artifacts,
         EvaluationSpecification(
@@ -40,7 +41,12 @@ def specification(project: ProjectStore) -> ArtifactInput:
             predicate=TaskVerifier(
                 description="Reference specification for the current value.",
                 outcome_schema={"type": "object"},
-                rules=(OutcomeRule(path="/final_state/last", operator="equals", value="current"),),
+                rules=(OutcomeRule(path="/final_state/last", operator="equals", value="current"),)
+                if copied
+                else (),
+                relations=()
+                if copied
+                else (FieldRelation(left="/final_state/last", right="/initial_state/current"),),
             ),
             subject="outcome",
         ),
@@ -83,13 +89,14 @@ def fit_council_project(
 
 
 @pytest.mark.parametrize(
-    "change_prompt,failed_judge,bad_verifier,hacker_succeeds",
+    "change_prompt,failed_judge,bad_verifier,hacker_succeeds,copied_reference",
     [
-        (False, False, False, False),
-        (True, False, False, False),
-        (False, True, False, False),
-        (False, False, True, False),
-        (False, False, False, True),
+        (False, False, False, False, False),
+        (True, False, False, False, False),
+        (False, True, False, False, False),
+        (False, False, True, False, False),
+        (False, False, False, True, False),
+        (False, False, False, False, True),
     ],
 )
 def test_refinement_keeps_confirmation_private_and_replays_without_calls(
@@ -99,6 +106,7 @@ def test_refinement_keeps_confirmation_private_and_replays_without_calls(
     failed_judge: bool,
     bad_verifier: bool,
     hacker_succeeds: bool,
+    copied_reference: bool,
 ) -> None:
     """Exercise source capture, proposing roles, child actors, grading and zero-call replay."""
     project, council, fidelity = fit_council_project(tmp_path)
@@ -109,11 +117,15 @@ def test_refinement_keeps_confirmation_private_and_replays_without_calls(
         project, council, code_revision="fixture-revision"
     )
     trace_council.execute_trace_council(project, prepared_source)
-    reference = specification(project)
+    reference = specification(project, copied=copied_reference)
 
     def challenge(identity: str, value: str) -> VerifierChallenge:
         """Label with saved checks of an independent specification, not generated truth."""
-        outcome: JsonObject = {"final_state": {"last": value}, "partition_marker": identity}
+        outcome: JsonObject = {
+            "initial_state": {"current": "current"},
+            "final_state": {"last": value},
+            "partition_marker": identity,
+        }
         return VerifierChallenge(
             id=identity,
             outcome=outcome,
@@ -201,7 +213,13 @@ def test_refinement_keeps_confirmation_private_and_replays_without_calls(
     monkeypatch.setattr(task_refinement, "HttpxJsonTransport", lambda: role_wire)
     monkeypatch.setattr(trace_council, "HttpxJsonTransport", lambda: child_wire)
     select = project.select_evaluation_task
-    if not change_prompt and not failed_judge and not bad_verifier and not hacker_succeeds:
+    if (
+        not change_prompt
+        and not failed_judge
+        and not bad_verifier
+        and not hacker_succeeds
+        and not copied_reference
+    ):
 
         def interrupted(reference: ArtifactInput) -> None:
             """Interrupt final publication after the durable report, before its selection."""
@@ -236,6 +254,20 @@ def test_refinement_keeps_confirmation_private_and_replays_without_calls(
         assert "Saved task refinement. No provider calls." in replay.output
         assert project.load_project().evaluation_tasks
     result = task_refinement.execute_task_refinement(project, prepared)
+    if copied_reference:
+        assert result["development_status"] == "incomplete"
+        assert result["confirmation_status"] == "not_run"
+        assert result["child_execution_status"] == "not_dispatched"
+        assert result["child_physical_attempts"] == 0 and not child_wire.requests
+        assert "self_approval" in json.dumps(result["role_failures"])
+        calls = len(role_wire.requests)
+        monkeypatch.delenv("FIDELITY_TEST_KEY", raising=False)
+        assert task_refinement.execute_task_refinement(project, prepared) == result
+        assert len(role_wire.requests) == calls
+        monkeypatch.setattr(task_refinement, "_protocol", lambda: "0" * 64)
+        with pytest.raises(ValueError, match="protocol changed"):
+            task_refinement.prepare_task_refinement(project, spec, code_revision="fixture-revision")
+        return
     assert result["development_status"] == (
         "rejected"
         if bad_verifier
@@ -277,7 +309,13 @@ def test_refinement_keeps_confirmation_private_and_replays_without_calls(
     assert task_refinement.execute_task_refinement(project, prepared) == result
     assert len(role_wire.requests) == 3
     assert len(child_wire.requests) == (0 if bad_verifier else 9)
-    if not change_prompt and not failed_judge and not bad_verifier and not hacker_succeeds:
+    if (
+        not change_prompt
+        and not failed_judge
+        and not bad_verifier
+        and not hacker_succeeds
+        and not copied_reference
+    ):
         reused_spec = spec.model_copy(
             update={
                 "run_id": "reuse-qualified-proposals",
@@ -391,7 +429,11 @@ def test_refinement_refuses_unqualifiable_labels_before_any_paid_call(
 
     def challenge(identity: str, value: str) -> VerifierChallenge:
         """One specification-witnessed label."""
-        outcome: JsonObject = {"final_state": {"last": value}, "partition_marker": identity}
+        outcome: JsonObject = {
+            "initial_state": {"current": "current"},
+            "final_state": {"last": value},
+            "partition_marker": identity,
+        }
         return VerifierChallenge(
             id=identity,
             outcome=outcome,

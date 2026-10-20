@@ -20,8 +20,8 @@ from exp.common.core.artifacts import (
     Sha256,
     sha256_json,
     stable_id,
+    strict_equal,
 )
-from exp.common.evaluations.reconstruction import strict_equal
 from exp.common.models import ToolCall
 from exp.common.models.unknown_outcome import resume_unknown
 from exp.common.project import ArtifactStore
@@ -33,9 +33,11 @@ from exp.simulation.engines.transition import (
     ProposedTransition,
     TransitionEngine,
 )
+from exp.simulation.retrieval.evidence_reading import EvidenceReader, ReadingPolicy
 from exp.simulation.retrieval.selection import EvidencePolicy, SelectionQuery, selected_evidence
 from exp.simulation.world_model.causal_history import CAUSAL_HISTORY_BUDGET, causal_history
-from exp.simulation.world_model.resumption import Resumption
+from exp.simulation.world_model.research_reading import archive_reading
+from exp.simulation.world_model.resumption import Resumption, dispatch_reader
 
 _INVESTIGATE = """Investigate one completed simulator prediction using only this input.
 The disclosed observation is feedback about this past action, not a future answer or full
@@ -80,6 +82,7 @@ class OnlineResearchPolicy(ContractModel):
 
     Attributes:
         feedback_source: Declared origin of disclosed past native replies.
+        reading: Optional bounded evidence-reading policy for post-feedback investigations.
         maximum_updates: Maximum model-generated investigations, not prediction retries.
         retained_notes: Maximum active investigations supplied to the investigator.
         selection_policy_sha256: Exact query-dependent memory selection policy.
@@ -94,6 +97,7 @@ class OnlineResearchPolicy(ContractModel):
     feedback_source: str = Field(min_length=1)
     generate_hypotheses: bool = Field(default=True, strict=True, exclude_if=bool)
     notes_reach_predictions: bool = Field(default=True, strict=True, exclude_if=bool)
+    reading: ReadingPolicy | None = Field(default=None, exclude_if=lambda value: value is None)
     maximum_updates: int = Field(default=24, gt=0, strict=True)
     retained_notes: int = Field(default=24, gt=0, strict=True)
 
@@ -161,6 +165,7 @@ class SessionResearch:
         clock: Callable[[], datetime],
         code_revision: str,
         selection: EvidencePolicy,
+        reader: EvidenceReader | None = None,
         prior: Mapping[str, JsonObject] | None = None,
         prior_identity: JsonObject | None = None,
         overview: Sequence[JsonObject] = (),
@@ -184,6 +189,7 @@ class SessionResearch:
             clock: Aware clock.
             code_revision: Implementation identity.
             selection: Query-dependent selector over prior and session records.
+            reader: Metered evidence reader matching the optional online reading policy.
             prior: Active research from earlier trajectories, keyed by record identity.
             prior_identity: Memory version bound into this session's identity.
             overview: Budgeted memory overview at session start.
@@ -204,6 +210,12 @@ class SessionResearch:
             raise ValueError("memory selector differs from registered online policy")
         if policy is None and not prior_identity:
             raise ValueError("research delivery without feedback requires a frozen memory")
+        reading = None if policy is None else policy.reading
+        if (reader is None) != (reading is None) or (
+            reader is not None and reader.policy != reading
+        ):
+            raise ValueError("investigation reader must match the registered reading policy")
+        self._reader = reader
         self._selection = selection
         self.session_id, self.policy = session_id, policy
         self._prior = copy.deepcopy(dict(prior or {}))
@@ -233,6 +245,7 @@ class SessionResearch:
                 "causal_history_budget": CAUSAL_HISTORY_BUDGET,
                 "use": MEMORY_CONTEXT_GUIDANCE,
                 "schema": investigation_schema(),
+                **({"reading": self._reader.policy.identity} if self._reader is not None else {}),
             }
         )
 
@@ -390,7 +403,7 @@ class SessionResearch:
                     ],
                     "response_schema": investigation_schema(),
                 }
-                proposal = self._investigate(complete, identity, operation_id, body)
+                proposal = self._investigate(complete, identity, operation_id, body, record)
                 update = Investigation.model_validate(proposal)
                 available = {str(row["id"]) for row in (*active, *prior)}
                 if len(set(update.supersedes)) != len(update.supersedes) or not set(
@@ -400,6 +413,7 @@ class SessionResearch:
                 if self._clock() >= self._deadline(current):
                     raise TimeoutError("late investigation retained but not activated")
                 record["investigation"] = update.model_dump(mode="json")
+            supplied |= self._reading_sources(record)
             record["depends_on"] = self._dependencies(
                 supplied,
                 local,
@@ -579,7 +593,9 @@ class SessionResearch:
                     ],
                     "response_schema": investigation_schema(),
                 }
-                proposal = self._investigate(complete, identity, str(record["operation_id"]), body)
+                proposal = self._investigate(
+                    complete, identity, str(record["operation_id"]), body, record
+                )
                 update = Investigation.model_validate(proposal)
                 available = {str(row["id"]) for row in prior}
                 if len(set(update.supersedes)) != len(update.supersedes) or not set(
@@ -589,6 +605,11 @@ class SessionResearch:
                 if self._clock() >= self._deadline(current):
                     raise TimeoutError("late investigation retained but not activated")
                 record = {**record, "investigation": update.model_dump(mode="json")}
+                record["depends_on"] = self._dependencies(
+                    supplied | self._reading_sources(record),
+                    {},
+                    [ArtifactInput.model_validate(ref) for ref in depends_on],
+                )
             self._save(identity, record)
             return copy.deepcopy(record)
 
@@ -612,7 +633,12 @@ class SessionResearch:
         return self._resumption.deadline(current.binding.deadline)
 
     def _investigate(
-        self, complete: Completion, identity: str, operation_id: str, body: JsonObject
+        self,
+        complete: Completion,
+        identity: str,
+        operation_id: str,
+        body: JsonObject,
+        feedback: JsonObject,
     ) -> JsonObject:
         """Save the intent, then send, replay, or (resuming) re-dispatch one investigation.
 
@@ -626,10 +652,12 @@ class SessionResearch:
             if sha256_json(saved.get("request")) != sha256_json(body):
                 raise ValueError("an unfinished investigation's request differs on resumption")
             if self._artifacts.exists(identity + "-proposal"):
-                record = json.loads(
+                saved_proposal = json.loads(
                     self._artifacts.read_bytes(identity + "-proposal", "record.json")
                 )
-                proposal = record.get("proposal")
+                if "evidence_reading" in saved_proposal:
+                    feedback["evidence_reading"] = saved_proposal["evidence_reading"]
+                proposal = saved_proposal.get("proposal")
                 if not isinstance(proposal, dict):
                     raise ValueError("saved investigation proposal is not an object")
                 return proposal
@@ -640,11 +668,102 @@ class SessionResearch:
             if self._resumption is None
             else self._resumption.recorder("investigation", operation_id)
         )
-        proposal = resume_unknown(
-            lambda logical: complete(body, logical), identity + "-investigate", retried
+
+        def resumed_complete(request: JsonObject, logical_id: str) -> JsonObject:
+            """Resume each planner or synthesis request independently."""
+            return resume_unknown(lambda logical: complete(request, logical), logical_id, retried)
+
+        proposal = self._read_investigation(body, identity, feedback, resumed_complete)
+        self._save(
+            identity + "-proposal",
+            {
+                "proposal": proposal,
+                **(
+                    {"evidence_reading": feedback["evidence_reading"]}
+                    if "evidence_reading" in feedback
+                    else {}
+                ),
+            },
         )
-        self._save(identity + "-proposal", {"proposal": proposal})
         return proposal
+
+    def _read_investigation(
+        self, body: JsonObject, identity: str, record: JsonObject, complete: Completion
+    ) -> JsonObject:
+        """Read only admitted prior records, retaining all inspected source dependencies."""
+        if self._reader is None:
+            return complete(body, identity + "-investigate")
+        # Only the active prior notes offered by the caller can be re-read. Original
+        # observations remain available separately; retired hypotheses cannot re-enter.
+        messages = body.get("messages")
+        if not isinstance(messages, list) or len(messages) != 2:
+            raise ValueError("investigation reading requires the registered message pair")
+        message = messages[1]
+        if not isinstance(message, dict) or not isinstance(message.get("content"), str):
+            raise ValueError("investigation reading requires a JSON evidence payload")
+        payload = json.loads(message["content"])
+        active = {str(row["id"]) for row in payload["prior_trajectory_investigations"]}
+        sources = {
+            key: row
+            for key, row in self._prior.items()
+            if key in active or row.get("kind") == "original-observation"
+        }
+        # The slow planner gets original prior content only through selected passages.
+        payload["prior_trajectory_investigations"] = []
+        payload["available_prior_note_ids"] = sorted(active)
+        reading_body = {
+            **body,
+            "messages": [
+                messages[0],
+                {
+                    "role": "user",
+                    "content": json.dumps(payload, ensure_ascii=False, allow_nan=False),
+                },
+            ],
+        }
+        missing = [key for key in sources if not self._prior_sources.get(key)]
+        if missing:
+            raise ValueError("evidence reading requires provenance for every prior source")
+        result = self._reader.investigate(
+            reading_body,
+            identity + "-investigate",
+            sources,
+            complete,
+            dispatch_reader=lambda logical, call: dispatch_reader(
+                self._artifacts,
+                self._save,
+                identity,
+                str(record["operation_id"]),
+                logical,
+                call,
+                self._resumption,
+            ),
+        )
+        # Full originals belong to the audit archive, not recursively inside recalled notes.
+        refs = {ref for key in result.inspected_ids for ref in self._prior_sources[key]}
+        record["evidence_reading"] = archive_reading(
+            self._artifacts,
+            identity,
+            result,
+            tuple(refs),
+            created_at=self._clock(),
+            code_revision=self._code_revision,
+        )
+        visible = {row.source_id for row in result.passages} | {
+            str(row["id"]) for row in payload["previous_investigations"]
+        }
+        if not set(Investigation.model_validate(result.proposal).supersedes).issubset(visible):
+            raise ValueError(
+                "investigation cannot supersede a note whose original was not delivered"
+            )
+        return result.proposal
+
+    @staticmethod
+    def _reading_sources(record: JsonObject) -> set[str]:
+        """Include rejected reader inputs as well as passages selected for synthesis."""
+        reading = record.get("evidence_reading")
+        ids = reading.get("inspected_ids") if isinstance(reading, dict) else None
+        return {str(key) for key in ids} if isinstance(ids, list) else set()
 
     def _retrieved(self, transitions: list[JsonValue]) -> Sequence[ArtifactInput]:
         """Recorded traces behind every retrieved transition this session's predictions saw."""

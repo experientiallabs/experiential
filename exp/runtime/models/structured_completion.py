@@ -29,10 +29,11 @@ from exp.common.models import (
     ToolChoice,
 )
 from exp.common.models.client import RequestCapacityExceeded
-from exp.common.project import ArtifactStore
+from exp.common.project import ArtifactStore, artifact_input
 from exp.common.tasks import ToolSchema
 from exp.common.traces.ingest.json_strict import reject_duplicate_json_keys
 from exp.runtime.models.budget import RequestBudget
+from exp.runtime.models.call_evidence import call_consumer, canonical_call, current_consumer
 
 _JSON_OBJECT = TypeAdapter(JsonObject)
 
@@ -287,7 +288,7 @@ class StructuredCompletion:
             identity = stable_id(
                 "structured-intent", {"logical_id": logical_id, "fingerprint": fingerprint}
             )
-            self._artifacts.write_json(
+            manifest = self._artifacts.write_json(
                 artifact_id=identity,
                 artifact_type="structured-call-intent",
                 envelope=ArtifactEnvelope(
@@ -298,12 +299,15 @@ class StructuredCompletion:
                 ),
                 files={
                     "request.json": {
+                        "logical_id": logical_id,
+                        "consumer": current_consumer(),
                         "request": request.model_dump(mode="json"),
                         "plan": self.plan.model_dump(mode="json"),
                     }
                 },
             )
-            return self._client.complete(request)
+            with canonical_call(artifact_input(manifest)):
+                return self._client.complete(request)
 
         with self._budget.scope(logical_id):
             response = self._budget.call(
@@ -368,7 +372,8 @@ class _EpisodeClient:
         """Consume one exact turn coordinate before calling the existing budget owner."""
         turn = self._turn
         self._turn += 1
-        return self._owner.complete_request(request, f"{self._episode_id}/actor-{turn}")
+        with call_consumer("actor"):
+            return self._owner.complete_request(request, f"{self._episode_id}/actor-{turn}")
 
 
 def _utc_now() -> datetime:

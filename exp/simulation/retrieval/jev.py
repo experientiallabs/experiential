@@ -1,5 +1,6 @@
 """Query-dependent JEV evidence ranking through the maintained decision protocol."""
 
+import json
 from collections.abc import Callable, Mapping, Sequence
 from typing import Literal
 
@@ -227,73 +228,87 @@ class JEVCueSelector:
         top_k: int,
         decide: Callable[[DecisionRequest], JsonObject],
         record: Callable[[JsonObject], None],
+        maximum_input_bytes: int | None = None,
     ) -> None:
         """Bind the three-question rubric, a finite shortlist and an admitted caller."""
         if top_k < 1 or top_k > policy.candidate_limit:
             raise ValueError("cue top_k must fit the JEV candidate limit")
+        if maximum_input_bytes is not None and not 4096 <= maximum_input_bytes <= 24000:
+            raise ValueError("memory recall input budget must be between 4096 and 24000 bytes")
+        self._maximum_input_bytes = maximum_input_bytes
         self.policy, self._top_k = policy, top_k
         self._decide, self._record = decide, record
 
     @property
     def identity(self) -> Sha256:
         """Bind the shared rubric, normalized weights and deterministic shortlist."""
-        return sha256_json(
-            {
-                "version": "jev-memory-cues-v1",
-                "rubric": self.policy.identity,
-                "top_k": self._top_k,
-                "shortlist": "raw-originals-signed-token-hashing-v1",
+        definition: JsonObject = {
+            "version": "jev-memory-cues-v1",
+            "rubric": self.policy.identity,
+            "top_k": self._top_k,
+            "shortlist": "raw-originals-signed-token-hashing-v1",
+        }
+        if self._maximum_input_bytes is not None:
+            definition["packing"] = {
+                "version": "whole-records-ranked-first-fit-v1",
+                "maximum_input_bytes": self._maximum_input_bytes,
+                "framing_reserve_bytes": 1024,
             }
-        )
+        return sha256_json(definition)
 
     def select(self, query: SelectionQuery, catalog: Mapping[str, JsonValue]) -> tuple[str, ...]:
         """Select relevant active hypotheses without promoting their authority to truth."""
         if not catalog:
             return ()
         ids = HashingOriginals(top_k=self.policy.candidate_limit).select(query, catalog)
-        questions: dict[str, ScoreQuestion | ChoiceQuestion | NoulQuestion] = {
-            "dependency": ChoiceQuestion(
-                instructions="What does this action mainly depend on? " + self.policy.guidance,
-                criteria={
-                    "entity-state": "Current entity identity, status, fields or version",
-                    "semantic lookup": "Finding semantically related content",
-                    "tool behavior": "General operation semantics or interface",
-                    "unclear": "The permitted context does not establish a dependency",
-                },
-            )
-        }
-        for index in range(len(ids)):
-            questions[f"field_{index}"] = ScoreQuestion(
-                instructions=_FIELD + f"Score records[{index}]. " + self.policy.guidance,
-                criteria=("0=irrelevant/superseded", "1=indirect/uncertain", "2=direct evidence"),
-            )
-            questions[f"history_{index}"] = ScoreQuestion(
-                instructions=_HISTORY + f"Score records[{index}]. " + self.policy.guidance,
-                criteria=("0=unrelated", "1=weak connection", "2=linked update/read"),
-            )
-        request = DecisionRequest(
-            state={
-                "current_action": query.action.model_dump(mode="json"),
-                "known_current_state": query.state,
-                "current_episode_history": list(query.history),
-                "records": [{"id": key, "record": catalog[key]} for key in ids],
-                "authority": "Past disclosed replies plus provisional research hypotheses. "
-                "Hypotheses are not native truth. No future outcomes supplied.",
-            },
-            questions=questions,
-        )
+        shortlist = ids
+        omitted: list[str] = []
+        if self._maximum_input_bytes is not None:
+            empty = self._request(query, catalog, ())
+            base_bytes = len(empty.model_dump_json().encode()) + 1024
+            if base_bytes > self._maximum_input_bytes:
+                raise ValueError(
+                    "memory recall current context exceeds its frozen input budget; "
+                    "reduce the public context before preparing a new run"
+                )
+            packed: tuple[str, ...] = ()
+            for key in shortlist:
+                # Reject huge originals before DecisionRequest's own payload validator.
+                original_bytes = len(json.dumps(catalog[key], ensure_ascii=False).encode())
+                if base_bytes + original_bytes > self._maximum_input_bytes:
+                    omitted.append(key)
+                    continue
+                candidate = self._request(query, catalog, (*packed, key))
+                if len(candidate.model_dump_json().encode()) + 1024 > self._maximum_input_bytes:
+                    omitted.append(key)
+                    continue
+                packed = (*packed, key)
+            ids = packed
+        request = self._request(query, catalog, ids)
+        coverage: JsonObject = {}
+        if self._maximum_input_bytes is not None:
+            coverage = {
+                "packed_ids": list(ids),
+                "omitted_ids": omitted,
+                "maximum_input_bytes": self._maximum_input_bytes,
+                "request_bytes_with_reserve": len(request.model_dump_json().encode()) + 1024,
+                "stop_reason": "packed" if ids else "no-original-fits",
+            }
         self._record(
             {
                 "policy_sha256": self.identity,
                 "request": request.model_dump(mode="json"),
                 "eligible_ids": list(catalog),
-                "shortlist_ids": list(ids),
+                "shortlist_ids": list(shortlist),
+                **coverage,
             }
         )
+        if not ids:
+            return ()
         response = self._decide(request)
         self._record({"request_sha256": sha256_json(request), "response": response})
         answers = response.get("answers")
-        if not isinstance(answers, dict) or set(answers) != set(questions):
+        if not isinstance(answers, dict) or set(answers) != set(request.questions):
             raise ValueError("JEV memory answer inventory differs from the request")
         dependency = answers["dependency"]
         if (
@@ -327,3 +342,39 @@ class JEVCueSelector:
             }
         )
         return selected
+
+    def _request(
+        self, query: SelectionQuery, catalog: Mapping[str, JsonValue], ids: tuple[str, ...]
+    ) -> DecisionRequest:
+        """Frame complete originals with the same rubric used during packing and dispatch."""
+        questions: dict[str, ScoreQuestion | ChoiceQuestion | NoulQuestion] = {
+            "dependency": ChoiceQuestion(
+                instructions="What does this action mainly depend on? " + self.policy.guidance,
+                criteria={
+                    "entity-state": "Current entity identity, status, fields or version",
+                    "semantic lookup": "Finding semantically related content",
+                    "tool behavior": "General operation semantics or interface",
+                    "unclear": "The permitted context does not establish a dependency",
+                },
+            )
+        }
+        for index in range(len(ids)):
+            questions[f"field_{index}"] = ScoreQuestion(
+                instructions=_FIELD + f"Score records[{index}]. " + self.policy.guidance,
+                criteria=("0=irrelevant/superseded", "1=indirect/uncertain", "2=direct evidence"),
+            )
+            questions[f"history_{index}"] = ScoreQuestion(
+                instructions=_HISTORY + f"Score records[{index}]. " + self.policy.guidance,
+                criteria=("0=unrelated", "1=weak connection", "2=linked update/read"),
+            )
+        return DecisionRequest(
+            state={
+                "current_action": query.action.model_dump(mode="json"),
+                "known_current_state": query.state,
+                "current_episode_history": list(query.history),
+                "records": [{"id": key, "record": catalog[key]} for key in ids],
+                "authority": "Past disclosed replies plus provisional research hypotheses. "
+                "Hypotheses are not native truth. No future outcomes supplied.",
+            },
+            questions=questions,
+        )

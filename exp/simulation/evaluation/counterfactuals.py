@@ -4,8 +4,8 @@ from collections.abc import Sequence
 
 from pydantic import Field
 
-from exp.common.core.artifacts import ContractModel, JsonObject, JsonValue
-from exp.common.evaluations.reconstruction import WorkflowStep, strict_equal
+from exp.common.core.artifacts import ContractModel, JsonObject, JsonValue, strict_equal
+from exp.common.evaluations.reconstruction import WorkflowStep
 from exp.common.tasks import TaskCase
 
 

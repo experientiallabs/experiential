@@ -440,7 +440,9 @@ def test_run_acceptance_holds_journal_lock_through_w13_manifest_commit(
         code_revision="automatic-sft-test",
     )
 
-    assert writer_finished.wait(timeout=1.0)
+    # The assertion above proves lock ownership during commit. This wait checks eventual
+    # release, not subsecond disk latency while other tests compile and write artifacts.
+    assert writer_finished.wait(timeout=10.0)
     assert manifest_committed_before_writer == [True]
     assert accepted.dataset_id == prepared.dataset.dataset.dataset_id
     refreshed = prepare_runtime_sft_model_optimization(

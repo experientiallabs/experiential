@@ -10,6 +10,7 @@ from pathlib import Path
 from exp.common.core.artifacts import ArtifactInput, JsonObject
 from exp.common.project import ProjectStore, artifact_input
 from exp.runtime.environments.artifact_edits import NativeArtifactBinding
+from exp.simulation.capability_briefs import load_capability_brief
 from exp.simulation.evaluation.tasks import load_evaluation_task
 from exp.simulation.world_model.checkpoints import load_world_checkpoint
 
@@ -41,10 +42,7 @@ def export_harbor_task(
     Returns:
         Task directory. A trusted runner must separately launch its frozen backend.
     """
-    if not re.fullmatch(r"[a-z0-9][a-z0-9.-]*/[a-z0-9][a-z0-9.-]*", name):
-        raise ValueError("Harbor name must be a safe organization/name pair")
-    if destination.exists():
-        raise ValueError("Harbor destination exists; select a new immutable package directory")
+    preflight_harbor_destination(destination, name=name)
     task = load_evaluation_task(project.artifacts, task_ref)
     checkpoint = load_world_checkpoint(project.artifacts, task.checkpoint)
     declared_native = task.task.initial_context.get("native_artifact_binding")
@@ -64,8 +62,73 @@ def export_harbor_task(
         qualified = report.get("qualification") == "qualified_in_scope"
     if native_binding is not None:
         qualified = False
+    brief = (
+        None
+        if task.capability_brief is None
+        else load_capability_brief(project.artifacts, task.capability_brief)
+    )
+    if brief is not None and brief.blockers():
+        qualified = False
     if not qualified and not diagnostic:
         raise ValueError("task is not calibrated; only an explicit diagnostic export is permitted")
+    binding: JsonObject = {
+        "capability_category": None if brief is None else brief.category,
+        "capability_brief": None
+        if task.capability_brief is None
+        else task.capability_brief.model_dump(mode="json"),
+        "task": task_ref.model_dump(mode="json"),
+        "world_model": task.world_model.model_dump(mode="json"),
+        "checkpoint": task.checkpoint.model_dump(mode="json"),
+        "calibration": None if calibration is None else calibration.model_dump(mode="json"),
+        "prefix_position": checkpoint.prefix_position,
+        "qualification": "qualified_in_scope" if qualified else "diagnostic_only",
+        "backend": "existing_frozen_experiential_session",
+        "native_environment_accessed": False,
+    }
+    return write_harbor_package(
+        destination,
+        name=name,
+        instruction=task.task.instruction,
+        public_context={
+            "initial_context": task.task.initial_context,
+            "context_fragments": [
+                fragment.model_dump(mode="json") for fragment in task.context_fragments
+            ],
+        },
+        binding=binding,
+        qualified=qualified,
+        notice="All observations come from a reconstructed simulator.",
+        output_paths=() if native_binding is None else native_binding.output_paths,
+    )
+
+
+def write_harbor_package(
+    destination: Path,
+    *,
+    name: str,
+    instruction: str,
+    public_context: JsonObject,
+    binding: JsonObject,
+    qualified: bool,
+    notice: str,
+    output_paths: tuple[str, ...] = (),
+) -> Path:
+    """Write the shared Harbor client and isolated verifier package for one frozen backend.
+
+    Args:
+        destination: New immutable package directory.
+        name: Safe organization/name pair.
+        instruction: Public user task only.
+        public_context: Exact actor-visible context, excluding private evaluator state.
+        binding: Frozen private-owner references; no file bytes or runtime credentials.
+        qualified: Whether the specific runtime and grading profile has qualified evidence.
+        notice: Accurate execution-authority disclosure for the selected backend.
+        output_paths: Declared native output files, when supported by the backend.
+
+    Returns:
+        Published package with the complete digest-bound file inventory.
+    """
+    preflight_harbor_destination(destination, name=name)
     destination.parent.mkdir(parents=True, exist_ok=True)
     staging = Path(tempfile.mkdtemp(prefix=".harbor-export-", dir=destination.parent))
     try:
@@ -85,15 +148,9 @@ def export_harbor_task(
         )
         (tests / "test.sh").write_text("#!/bin/sh\nset -eu\npython /tests/tools.py verify\n")
         (tests / "test.sh").chmod(0o755)
-        public_context = {
-            "initial_context": task.task.initial_context,
-            "context_fragments": [
-                fragment.model_dump(mode="json") for fragment in task.context_fragments
-            ],
-        }
         (environment / "actor-context.json").write_text(json.dumps(public_context, indent=2) + "\n")
         instruction = (
-            task.task.instruction
+            instruction
             + "\n\n"
             + (
                 "Read the public task context and source-labeled instructions in "
@@ -104,12 +161,13 @@ def export_harbor_task(
                 "call_id, name and arguments. Keep call_id stable when retrying an operation. "
                 "Submit the task's declared final JSON answer with "
                 "python /app/tools.py submit --body 'JSON'. "
-                "All observations come from a reconstructed simulator. "
-                "If required information cannot be obtained, follow the task's declared "
+                + notice
+                + " "
+                + "If required information cannot be obtained, follow the task's declared "
                 "uncertainty or escalation instructions.\n"
             )
         )
-        if native_binding is not None:
+        if output_paths:
             instruction += (
                 "After submitting, retrieve the declared native files with "
                 "python /app/tools.py outputs --directory /app/outputs. "
@@ -135,14 +193,14 @@ def export_harbor_task(
             'EXP_HARBOR_VERIFIER_TOKEN = "${EXP_HARBOR_VERIFIER_TOKEN}"\n'
             "[verifier.environment]\ncpus = 1\nmemory_mb = 512\n"
         )
-        if native_binding is not None:
+        if output_paths:
             artifacts = ", ".join(
                 "{source = "
                 + json.dumps("/app/outputs/" + path)
                 + ", destination = "
                 + json.dumps(path)
                 + "}"
-                for path in native_binding.output_paths
+                for path in output_paths
             )
             configuration = configuration.replace(
                 'schema_version = "1.4"\n',
@@ -150,16 +208,6 @@ def export_harbor_task(
                 1,
             )
         (staging / "task.toml").write_text(configuration)
-        binding: JsonObject = {
-            "task": task_ref.model_dump(mode="json"),
-            "world_model": task.world_model.model_dump(mode="json"),
-            "checkpoint": task.checkpoint.model_dump(mode="json"),
-            "calibration": None if calibration is None else calibration.model_dump(mode="json"),
-            "prefix_position": checkpoint.prefix_position,
-            "qualification": "qualified_in_scope" if qualified else "diagnostic_only",
-            "backend": "existing_frozen_experiential_session",
-            "native_environment_accessed": False,
-        }
         binding["files"] = {
             str(path.relative_to(staging)): sha256(path.read_bytes()).hexdigest()
             for path in sorted(staging.rglob("*"))
@@ -171,6 +219,21 @@ def export_harbor_task(
         shutil.rmtree(staging, ignore_errors=True)
         raise
     return destination
+
+
+def preflight_harbor_destination(destination: Path, *, name: str) -> None:
+    """Check a publication target without creating files, including dangling symlinks."""
+    if not re.fullmatch(r"[a-z0-9][a-z0-9.-]*/[a-z0-9][a-z0-9.-]*", name):
+        raise ValueError("Harbor name must be a safe organization/name pair")
+    if destination.exists() or destination.is_symlink():
+        raise ValueError("Harbor destination exists; select a new immutable package directory")
+    parent = destination.parent
+    while not parent.exists():
+        if parent.is_symlink():
+            raise ValueError("Harbor parent is a dangling symlink; choose a directory")
+        parent = parent.parent
+    if not parent.is_dir():
+        raise ValueError("Harbor parent is not a directory; choose a directory")
 
 
 def verify_harbor_export(directory: Path) -> JsonObject:

@@ -266,3 +266,59 @@ def test_captured_system_and_developer_roles_precede_the_scenario() -> None:
     assert messages[1].content == "Cite every source."
     assert "instruction_messages" not in (messages[-1].content or "")
     assert "Acme" in (messages[-1].content or "")
+
+
+def test_chat_resume_reuses_prefix_without_reexecuting_tools() -> None:
+    """Restore a completed tool turn and buy only its previously unexecuted suffix."""
+    checkpoints = []
+    runtime = ChatAgentRuntime(maximum_model_calls=3)
+    model = _Model(
+        (
+            _response(
+                AssistantAction(
+                    tool_calls=(ToolCall(call_id="read-1", name="lookup", arguments={}),)
+                )
+            ),
+            _response(AssistantAction(content="original answer")),
+        )
+    )
+    environment = _Environment()
+    runtime.run(_task(), model=model, environment=environment, on_checkpoint=checkpoints.append)
+    assert len(checkpoints) == 2
+    assert checkpoints[1].calls == 1
+    restored = _Environment()
+    continuation = _Model((_response(AssistantAction(content="new answer")),))
+    result = runtime.resume(_task(), checkpoints[1], model=continuation, environment=restored)
+    assert restored.calls == []
+    assert continuation.requests[0].messages == model.requests[1].messages
+    assert result.final_action == AssistantAction(content="new answer")
+    assert len(continuation.requests) == 1
+
+
+def test_chat_resume_rejects_changed_task_and_exhausted_allowance() -> None:
+    """Permissions, instructions and remaining calls are part of the continuation boundary."""
+    checkpoints = []
+    runtime = ChatAgentRuntime(maximum_model_calls=1)
+    runtime.run(
+        _task(),
+        model=_Model(
+            (
+                _response(
+                    AssistantAction(
+                        tool_calls=(ToolCall(call_id="read-1", name="lookup", arguments={}),)
+                    )
+                ),
+            )
+        ),
+        environment=_Environment(),
+        on_checkpoint=checkpoints.append,
+    )
+    with pytest.raises(ValueError, match="no remaining"):
+        runtime.resume(_task(), checkpoints[-1], model=_Model(()), environment=_Environment())
+    with pytest.raises(ValueError, match="differs"):
+        runtime.resume(
+            _task().model_copy(update={"tools": ()}),
+            checkpoints[0],
+            model=_Model(()),
+            environment=_Environment(),
+        )

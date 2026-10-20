@@ -1,0 +1,608 @@
+"""The public continuation CLI executes and exports the same native workbook evidence."""
+
+from pathlib import Path
+
+import pytest
+from typer.testing import CliRunner
+
+from exp.cli.app import app
+from exp.cli.evaluation.continuations import ContinuationCommand, ContinuationExport
+from exp.common.project import artifact_input
+from exp.optimize.evaluation.continuation_job_test import job_fixture
+from exp.optimize.evaluation.observation_contrast_test import observation_fixture
+from exp.optimize.model.sft.builder import load_verified_sft_dataset
+from exp.optimize.model.sft.contracts import SFTBuildSpec
+
+
+def test_cli_compares_saved_observations_and_replays_without_runtime(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The public operation validates dry, executes both arms and retains failed draws on replay."""
+    project, spec, transport = observation_fixture(tmp_path, monkeypatch)
+    request = tmp_path / "observations.json"
+    request.write_text(
+        ContinuationCommand(action="compare-observations", observations=spec).model_dump_json()
+    )
+    command = [
+        "eval",
+        "case",
+        "--root",
+        str(tmp_path),
+        "--continuations",
+        str(request),
+        "--yes",
+        "--non-interactive",
+    ]
+    runner = CliRunner()
+    dry = runner.invoke(app, [*command, "--dry-run"])
+    assert dry.exit_code == 0, dry.output
+    assert not transport.requests and not project.artifacts.list_ids(
+        artifact_type="observation-contrast"
+    )
+    result = runner.invoke(app, command)
+    assert result.exit_code == 0, result.output
+    assert '"unknown": 1' in result.output and "authored alternative is unverified" in result.output
+    count = len(transport.requests)
+    (tmp_path / "selected_runtime.py").unlink()
+    project.model_catalog_path.unlink()
+    replay = runner.invoke(app, command)
+    assert replay.exit_code == 0, replay.output
+    assert replay.output[replay.output.index("{") :] == result.output[result.output.index("{") :]
+    assert len(transport.requests) == count
+
+
+def test_cli_captures_builtin_workbook_without_custom_factory_or_credentials(
+    tmp_path: Path,
+) -> None:
+    """A package-owned native adapter uses the same capture operation as other worlds."""
+    from exp.common.core.artifacts import sha256_bytes
+    from exp.optimize.evaluation import workbook_runtime
+    from exp.optimize.evaluation.continuation_capture import CaptureDefinition
+    from exp.optimize.evaluation.workbook_runtime_test import workbook_definition
+
+    project, spec, task = workbook_definition(tmp_path)
+    path = Path(workbook_runtime.__file__)
+    request = tmp_path / "capture-native.json"
+    request.write_text(
+        ContinuationCommand(
+            action="capture",
+            capture=CaptureDefinition(
+                task=task,
+                sources=(spec.input_artifact,),
+                runtime_file=path,
+                runtime_sha256=sha256_bytes(path.read_bytes()),
+                configuration=spec.model_dump(mode="json"),
+                probe_sha256=spec.probe_sha256,
+            ),
+        ).model_dump_json()
+    )
+    command = [
+        "eval",
+        "case",
+        "--root",
+        str(tmp_path),
+        "--continuations",
+        str(request),
+        "--yes",
+        "--non-interactive",
+    ]
+    result = CliRunner().invoke(app, command)
+    assert result.exit_code == 0, result.output
+    assert len(project.artifacts.list_ids(artifact_type="continuation-checkpoint")) == 1
+    assert not project.model_catalog_path.exists()
+
+
+def test_cli_localizes_saved_failures_without_runtime_or_provider(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Analysis retains both native outcomes and replays after the runtime and catalog disappear."""
+    from exp.optimize.evaluation.continuation_job import (
+        continuation_result_reference,
+        execute_continuation_job,
+    )
+
+    project, job, transport = job_fixture(tmp_path, monkeypatch)
+    execute_continuation_job(project, job, code_revision="test")
+    reference = continuation_result_reference(project, job, code_revision="test")
+    job.runtime_file.unlink()
+    project.model_catalog_path.unlink()
+    request = tmp_path / "analysis.json"
+    request.write_text(
+        ContinuationCommand(action="analyse-failures", analysis=reference).model_dump_json()
+    )
+    command = [
+        "eval",
+        "case",
+        "--root",
+        str(tmp_path),
+        "--continuations",
+        str(request),
+        "--non-interactive",
+    ]
+    runner = CliRunner()
+    dry = runner.invoke(app, [*command, "--dry-run"])
+    assert dry.exit_code == 0, dry.output
+    assert not project.artifacts.list_ids(artifact_type="failure-analysis")
+    result = runner.invoke(app, command)
+    assert result.exit_code == 0, result.output
+    assert '"goal_failed"' in result.output and '"training_admitted": false' in result.output
+    assert len(project.artifacts.list_ids(artifact_type="failure-analysis")) == 1
+    assert runner.invoke(app, command).exit_code == 0
+    assert len(transport.requests) == 3
+
+
+def test_cli_captures_configured_native_and_learned_world_without_model_calls(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One configuration reaches both runtime owners through the existing public capture action."""
+    from exp.common.core.artifacts import sha256_bytes
+    from exp.optimize.evaluation import mixed_runtime
+    from exp.optimize.evaluation.continuation_capture import CaptureDefinition
+    from exp.optimize.evaluation.mixed_runtime_test import mixed_fixture
+
+    project, spec, image, transport = mixed_fixture(tmp_path, monkeypatch)
+    factory = Path(mixed_runtime.__file__)
+    capture = CaptureDefinition(
+        task=spec.simulated.task,
+        sources=(spec.simulated.world_model, image),
+        runtime_file=factory,
+        runtime_sha256=sha256_bytes(factory.read_bytes()),
+        configuration=spec.model_dump(mode="json"),
+        probe_sha256=spec.probe_sha256,
+    )
+    request = tmp_path / "mixed-capture.json"
+    request.write_text(ContinuationCommand(action="capture", capture=capture).model_dump_json())
+    command = [
+        "eval",
+        project.paths.project_id,
+        "--root",
+        str(tmp_path),
+        "--continuations",
+        str(request),
+        "--yes",
+        "--non-interactive",
+    ]
+    runner = CliRunner()
+    assert runner.invoke(app, [*command, "--dry-run"]).exit_code == 0
+    result = runner.invoke(app, command)
+    assert result.exit_code == 0, result.output
+    assert not transport.requests
+    spec.native.runtime_file.unlink()
+    assert runner.invoke(app, command).exit_code == 0
+    assert not transport.requests
+
+
+def test_cli_registers_a_brief_without_hiding_unresolved_assumptions(tmp_path: Path) -> None:
+    """Registration is a source-linked research record, never approval of its assumptions."""
+    from exp.common.project import ProjectStore
+    from exp.simulation.capability_briefs_test import brief
+
+    project = ProjectStore(tmp_path, "case")
+    request = tmp_path / "brief.json"
+    request.write_text(
+        ContinuationCommand(action="register-brief", brief=brief()).model_dump_json()
+    )
+    command = [
+        "eval",
+        "case",
+        "--root",
+        str(tmp_path),
+        "--continuations",
+        str(request),
+        "--non-interactive",
+    ]
+    runner = CliRunner()
+    dry = runner.invoke(app, [*command, "--dry-run"])
+    assert dry.exit_code == 0, dry.output
+    assert not project.artifacts.list_ids(artifact_type="capability-brief")
+    result = runner.invoke(app, command)
+    assert result.exit_code == 0, result.output
+    assert "unresolved assumption" in result.output
+    assert len(project.artifacts.list_ids(artifact_type="capability-brief")) == 1
+    assert runner.invoke(app, command).exit_code == 0
+    assert len(project.artifacts.list_ids(artifact_type="capability-brief")) == 1
+
+
+def test_cli_evaluates_and_packages_every_saved_candidate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The public batch command links native feasibility, independent controls and actor panels."""
+    from exp.optimize.evaluation.candidate_batch_test import batch_fixture
+
+    project, spec, transport = batch_fixture(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        "exp.cli.evaluation.continuations.installed_execution_revision", lambda: "test"
+    )
+    request = tmp_path / "batch.json"
+    request.write_text(
+        ContinuationCommand(action="evaluate-candidates", batch=spec).model_dump_json()
+    )
+    command = [
+        "eval",
+        "case",
+        "--root",
+        str(tmp_path),
+        "--continuations",
+        str(request),
+        "--yes",
+        "--non-interactive",
+    ]
+    runner = CliRunner()
+    dry = runner.invoke(app, [*command, "--dry-run"])
+    assert dry.exit_code == 0, dry.output
+    assert not transport.requests and spec.destination is not None and not spec.destination.exists()
+    result = runner.invoke(app, command)
+    assert result.exit_code == 0, result.output
+    assert '"packaged": 2' in result.output and len(transport.requests) == 12
+    assert project.artifacts.list_ids(artifact_type="candidate-batch")
+    assert runner.invoke(app, command).exit_code == 0
+    assert len(transport.requests) == 12
+
+
+def test_cli_proposes_multiple_tasks_without_inheriting_qualification(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One paid logical proposal produces every candidate and can replay without the catalog."""
+    from exp.optimize.evaluation.task_proposals_test import proposal_fixture
+
+    project, spec, transport = proposal_fixture(tmp_path, monkeypatch)
+    request = tmp_path / "proposals.json"
+    request.write_text(
+        ContinuationCommand(action="propose-tasks", proposals=spec).model_dump_json()
+    )
+    command = [
+        "eval",
+        "case",
+        "--root",
+        str(tmp_path),
+        "--continuations",
+        str(request),
+        "--yes",
+        "--non-interactive",
+    ]
+    runner = CliRunner()
+    dry = runner.invoke(app, [*command, "--dry-run"])
+    assert dry.exit_code == 0, dry.output
+    assert not transport.requests
+    result = runner.invoke(app, command)
+    assert result.exit_code == 0, result.output
+    assert len(project.artifacts.list_ids(artifact_type="task-variant")) == 2
+    assert not project.artifacts.list_ids(artifact_type="executable-qualification")
+    project.model_catalog_path.unlink()
+    replay = runner.invoke(app, command)
+    assert replay.exit_code == 0, replay.output
+    assert len(transport.requests) == 1
+
+
+def test_cli_compares_actions_then_replays_without_runtime(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The public CLI preserves preregistration and all four native treatment measurements."""
+    from exp.optimize.evaluation.action_contrast_test import contrast_fixture
+
+    project, spec, transport = contrast_fixture(tmp_path, monkeypatch)
+    request = tmp_path / "contrast.json"
+    request.write_text(
+        ContinuationCommand(action="compare-actions", contrast=spec).model_dump_json()
+    )
+    command = [
+        "eval",
+        "case",
+        "--root",
+        str(tmp_path),
+        "--continuations",
+        str(request),
+        "--yes",
+        "--non-interactive",
+    ]
+    runner = CliRunner()
+    dry = runner.invoke(app, [*command, "--dry-run"])
+    assert dry.exit_code == 0, dry.output
+    assert not transport.requests
+    assert not project.artifacts.list_ids(artifact_type="action-contrast-registration")
+    result = runner.invoke(app, command)
+    assert result.exit_code == 0, result.output
+    assert '"alternative_minus_baseline_bounds"' in result.output
+    assert len(transport.requests) == 4
+    spec.base.runtime_file.unlink()
+    replay = runner.invoke(app, command)
+    assert replay.exit_code == 0, replay.output
+    assert len(transport.requests) == 4
+
+
+def test_cli_run_and_export_with_private_native_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """CLI run, saved replay and witnessed export retain the planned branch denominator."""
+    project, job, transport = job_fixture(tmp_path, monkeypatch)
+    monkeypatch.setenv("EXP_RELEASE_REVISION", "c" * 40)
+    request = tmp_path / "continuations.json"
+    request.write_text(ContinuationCommand(action="run", job=job).model_dump_json())
+    command = [
+        "eval",
+        "case",
+        "--root",
+        str(tmp_path),
+        "--continuations",
+        str(request),
+        "--yes",
+        "--non-interactive",
+    ]
+    runner = CliRunner()
+    dry = runner.invoke(app, [*command, "--dry-run"])
+    assert dry.exit_code == 0, dry.output
+    assert not transport.requests
+    run = runner.invoke(app, command)
+    assert run.exit_code == 0, run.output
+    assert '"successes": 1' in run.output
+    assert len(transport.requests) == 3
+    replay = runner.invoke(app, command)
+    assert replay.exit_code == 0 and len(transport.requests) == 3
+    results = [
+        key
+        for key in project.artifacts.list_ids(artifact_type="continuation-study")
+        if key.endswith("-result")
+    ]
+    study = next(
+        key for key in results if project.artifacts.read(key).manifest.code_revision != "test"
+    )
+    request.write_text(
+        ContinuationCommand(
+            action="export",
+            export=ContinuationExport(
+                studies=(artifact_input(project.artifacts.read(study).manifest),),
+                dataset=SFTBuildSpec(held_out_fraction=0),
+            ),
+        ).model_dump_json()
+    )
+    exported = runner.invoke(app, command)
+    assert exported.exit_code == 0, exported.output
+    assert "1/2 branches" in exported.output and "Assistant targets: 1" in exported.output
+    assert len(transport.requests) == 3
+    dataset = project.artifacts.list_ids(artifact_type="sft-dataset")[0]
+    assert len(load_verified_sft_dataset(project, dataset).rows) == 1
+
+
+def test_cli_captures_initial_world_without_actor_calls(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The public CLI creates the same native checkpoint consumed by subsequent run jobs."""
+    import json
+
+    from exp.common.core.artifacts import ArtifactInput
+    from exp.optimize.evaluation.continuation_capture_test import capture_fixture
+    from exp.simulation.continuations import load_continuation_checkpoint
+
+    project, definition, transport = capture_fixture(tmp_path, monkeypatch)
+    request = tmp_path / "capture.json"
+    request.write_text(ContinuationCommand(action="capture", capture=definition).model_dump_json())
+    command = [
+        "eval",
+        "case",
+        "--root",
+        str(tmp_path),
+        "--continuations",
+        str(request),
+        "--yes",
+        "--non-interactive",
+    ]
+    runner = CliRunner()
+    dry = runner.invoke(app, [*command, "--dry-run"])
+    assert dry.exit_code == 0, dry.output
+    assert not project.artifacts.list_ids(artifact_type="continuation-capture")
+    result = runner.invoke(app, command)
+    assert result.exit_code == 0, result.output
+    # Consent can print before the JSON object; parse the returned artifact reference only.
+    reference = ArtifactInput.model_validate(json.loads(result.output[result.output.index("{") :]))
+    saved = load_continuation_checkpoint(project.artifacts, reference)
+    assert saved.actor.calls == 0
+    assert saved.task == definition.task
+    assert not transport.requests
+
+
+def test_cli_compares_actor_snapshots_without_hiding_unavailable_outcomes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The actor-panel CLI uses the same frozen studies and refuses an assumed tier ranking."""
+    from exp.optimize.evaluation.actor_panel_test import panel_fixture
+
+    _, spec, transport = panel_fixture(tmp_path, monkeypatch)
+    request = tmp_path / "actors.json"
+    request.write_text(ContinuationCommand(action="compare-actors", actors=spec).model_dump_json())
+    command = [
+        "eval",
+        "case",
+        "--root",
+        str(tmp_path),
+        "--continuations",
+        str(request),
+        "--yes",
+        "--non-interactive",
+    ]
+    runner = CliRunner()
+    dry = runner.invoke(app, [*command, "--dry-run"])
+    assert dry.exit_code == 0, dry.output
+    assert not transport.requests
+    run = runner.invoke(app, command)
+    assert run.exit_code == 0, run.output
+    assert '"separates_on_fixed_panel": false' in run.output
+    assert '"unknown": 2' in run.output
+
+
+def test_cli_records_a_prospective_critic_without_exposing_private_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The CLI returns a durable estimate reference for a later continuation registration."""
+    from exp.optimize.evaluation.actor_critic_test import critic_fixture
+
+    _, _, spec, transport = critic_fixture(tmp_path, monkeypatch)
+    request = tmp_path / "critic.json"
+    request.write_text(ContinuationCommand(action="predict-success", critic=spec).model_dump_json())
+    command = [
+        "eval",
+        "case",
+        "--root",
+        str(tmp_path),
+        "--continuations",
+        str(request),
+        "--yes",
+        "--non-interactive",
+    ]
+    runner = CliRunner()
+    dry = runner.invoke(app, [*command, "--dry-run"])
+    assert dry.exit_code == 0, dry.output
+    assert not transport.requests
+    result = runner.invoke(app, command)
+    assert result.exit_code == 0, result.output
+    assert '"predicted_success": 0.75' in result.output
+    assert '"reference"' in result.output
+    replay = runner.invoke(app, command)
+    assert replay.exit_code == 0, replay.output
+    assert len(transport.requests) == 1
+
+
+def test_cli_matches_checkpoints_then_runs_and_replays_registered_experiment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The full control comparison is available through the CLI, with credential-free replay."""
+    import json
+
+    from exp.common.core.artifacts import ArtifactInput
+    from exp.optimize.evaluation.checkpoint_experiment import CheckpointExperimentSpec
+    from exp.optimize.evaluation.checkpoint_selection_test import selection_fixture
+
+    _, selection = selection_fixture(tmp_path, monkeypatch)
+    request = tmp_path / "selection.json"
+    request.write_text(
+        ContinuationCommand(action="match-checkpoints", selection=selection).model_dump_json()
+    )
+    command = [
+        "eval",
+        "case",
+        "--root",
+        str(tmp_path),
+        "--continuations",
+        str(request),
+        "--yes",
+        "--non-interactive",
+    ]
+    runner = CliRunner()
+    result = runner.invoke(app, command)
+    assert result.exit_code == 0, result.output
+    reference = ArtifactInput.model_validate(json.loads(result.output)["reference"])
+    request.write_text(
+        ContinuationCommand(
+            action="run-selection", experiment=CheckpointExperimentSpec(selection=reference)
+        ).model_dump_json()
+    )
+    dry = runner.invoke(app, [*command, "--dry-run"])
+    assert dry.exit_code == 0, dry.output
+    run = runner.invoke(app, command)
+    assert run.exit_code == 0, run.output
+    assert '"planned_branches": 2' in run.output and '"unknown": 2' in run.output
+    selection.base.runtime_file.unlink()
+    replay = runner.invoke(app, command)
+    assert replay.exit_code == 0, replay.output
+    request.write_text(
+        ContinuationCommand(action="match-checkpoints", selection=selection).model_dump_json()
+    )
+    assert runner.invoke(app, command).exit_code == 0
+    with pytest.raises(ValueError, match="requires only"):
+        ContinuationCommand(action="run", job=selection.base, selection=selection)
+
+
+def test_cli_action_intervention_changes_native_state_without_actor_inference(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The CLI publishes the imposed-effect capsule and replays it without runtime code."""
+    from exp.optimize.evaluation.action_intervention import ActionInterventionSpec
+    from exp.runtime.environments.tests.world_conformance_test import workbook_case
+
+    _, job, transport = job_fixture(tmp_path, monkeypatch)
+    spec = ActionInterventionSpec(
+        base=job, action=workbook_case().first, rationale="One-row contrast."
+    )
+    request = tmp_path / "intervention.json"
+    request.write_text(ContinuationCommand(action="intervene", intervention=spec).model_dump_json())
+    command = [
+        "eval",
+        "case",
+        "--root",
+        str(tmp_path),
+        "--continuations",
+        str(request),
+        "--yes",
+        "--non-interactive",
+    ]
+    runner = CliRunner()
+    dry = runner.invoke(app, [*command, "--dry-run"])
+    assert dry.exit_code == 0, dry.output
+    result = runner.invoke(app, command)
+    assert result.exit_code == 0, result.output
+    assert '"rows": 6' in result.output and "scripted action" in result.output
+    assert not transport.requests
+    job.runtime_file.unlink()
+    replay = runner.invoke(app, command)
+    assert replay.exit_code == 0, replay.output
+
+
+def test_cli_publishes_a_variant_without_promoting_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Task families flow into executable qualification through the same public CLI."""
+    import json
+
+    from exp.common.core.artifacts import ArtifactInput
+    from exp.optimize.evaluation.task_variants import load_task_variant
+    from exp.optimize.evaluation.task_variants_test import variant_fixture
+
+    project, spec = variant_fixture(tmp_path, monkeypatch)
+    request = tmp_path / "variant.json"
+    request.write_text(ContinuationCommand(action="make-variant", variant=spec).model_dump_json())
+    command = [
+        "eval",
+        "case",
+        "--root",
+        str(tmp_path),
+        "--continuations",
+        str(request),
+        "--non-interactive",
+    ]
+    runner = CliRunner()
+    dry = runner.invoke(app, [*command, "--dry-run"])
+    assert dry.exit_code == 0, dry.output
+    assert not project.artifacts.list_ids(artifact_type="task-variant")
+    result = runner.invoke(app, command)
+    assert result.exit_code == 0, result.output
+    ref = ArtifactInput.model_validate(json.loads(result.output)["reference"])
+    variant = load_task_variant(project, ref)
+    assert variant.spec == spec and "candidate" in variant.scope
+    replay = runner.invoke(app, command)
+    assert replay.exit_code == 0 and replay.output == result.output
+
+
+def test_cli_measures_saved_decisions_without_provider_setup(tmp_path: Path) -> None:
+    """The public CLI preserves failed slots and performs no credential or runtime setup."""
+    from exp.optimize.evaluation.decision_calibration_test import study
+
+    store, spec = study(tmp_path)
+    before = store.list_ids()
+    request = tmp_path / "decisions.json"
+    request.write_text(
+        ContinuationCommand(action="measure-decisions", decisions=spec).model_dump_json()
+    )
+    result = CliRunner().invoke(
+        app,
+        [
+            "eval",
+            "decisions",
+            "--root",
+            str(tmp_path),
+            "--continuations",
+            str(request),
+            "--non-interactive",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert '"confirmation_supported": false' in result.output and '"planned": 3' in result.output
+    assert store.list_ids() == before
