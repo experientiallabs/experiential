@@ -468,3 +468,206 @@ def test_deepseek_origin_relaxes_a_forced_tool_choice_while_thinking() -> None:
     )
     assert provider.tool_choice == "auto"
     assert "tool_choice->auto" in public.ignored_parameters
+
+
+def _astra_rung(deployment_id: str, *, tools: bool) -> ExactModelDeployment:
+    """Build one gpt-6-astra rung that does or does not declare function tools."""
+    return _deployment(deployment_id, structured=True).model_copy(
+        update={
+            "capabilities": ModelCapabilities(
+                maximum_output_tokens=128_000,
+                supports_structured_output=True,
+                supports_tools=tools,
+            ),
+            "gateway": GatewayDeploymentMetadata(
+                capabilities=GatewayDeploymentCapabilities(
+                    supports_streaming=True,
+                    supports_streaming_tool_arguments=True,
+                    supports_parallel_tool_calls=True,
+                    supports_structured_text=True,
+                    supports_developer_messages=True,
+                )
+            ),
+        }
+    )
+
+
+def _astra_profile(url: str, *, sampling: bool) -> tuple[GatewayWireProfile, NativeWireClient]:
+    """One reasoning rung; only ``sampling`` rungs take ``temperature``/``top_p``."""
+    profile = GatewayWireProfile(
+        dialect="openai_compatible",
+        url=url,
+        model_id="gpt-6-astra",
+        supports_temperature=sampling,
+        supports_top_p=sampling,
+        supports_reasoning=True,
+        reasoning_wire_format="reasoning_effort",
+        supported_reasoning_efforts=("none", "low", "medium", "high", "xhigh"),
+        reasoning_effort="medium",
+    )
+    return profile, _CLIENT
+
+
+def _astra_route(
+    order: tuple[str, ...],
+) -> tuple[GatewayRoute, tuple[tuple[GatewayWireProfile, NativeWireClient], ...]]:
+    """Mirror gpt-6-astra (2026-10-20): only the openai rung declares tools, and only
+    the novita rung takes the caller's sampling controls."""
+    rungs = {
+        "openai": (_astra_rung("openai", tools=True), False),
+        "azure_openai": (_astra_rung("azure_openai", tools=False), False),
+        "novita": (_astra_rung("novita", tools=False), True),
+    }
+    route = _route(tuple(rungs[name][0] for name in order))
+    wires = tuple(_astra_profile(f"https://{name}.test", sampling=rungs[name][1]) for name in order)
+    return route, wires
+
+
+def _copilot_chat(*, tools: bool = True) -> GatewayRequest:
+    """Decode the GitHub Copilot 0.69 Chat shape: tools plus temperature, top_p, empty stop."""
+    tool: JsonObject = {
+        "type": "function",
+        "function": {
+            "name": "read_file",
+            "description": "Read a file.",
+            "strict": False,
+            "parameters": {
+                "type": "object",
+                "properties": {"path": {"type": "string"}},
+                "required": ["path"],
+            },
+        },
+    }
+    payload: JsonObject = {
+        "model": "public-model",
+        "messages": [{"role": "user", "content": "read it"}],
+        "stream": True,
+        "stream_options": {"include_usage": True},
+        "temperature": 0.1,
+        "top_p": 1,
+        "stop": [],
+    }
+    if tools:
+        payload["tools"] = [tool]
+    return decode_chat(payload).request
+
+
+@pytest.mark.parametrize(
+    "order",
+    [("novita", "openai", "azure_openai"), ("openai", "azure_openai", "novita")],
+)
+def test_function_tools_route_past_the_sampling_exact_rung(order: tuple[str, ...]) -> None:
+    """Copilot 0.69 on gpt-6-astra sent tools with temperature and top_p. Only the
+    novita rung takes those sampling controls, so the exact-sampling ranking chose
+    it and the capability check then refused ``tools`` that the openai rung serves
+    (production 2026-10-20). Tools now narrow first; openai serves and drops the
+    sampling it does not take, disclosed."""
+    route, wires = _astra_route(order)
+    narrowed, public, provider, _recorded = _admit(route, wires, _copilot_chat())
+    assert _ids(narrowed) == ("openai",)
+    assert provider.tools
+    assert provider.temperature is None
+    assert provider.top_p is None
+    assert "temperature->dropped(unsupported_by_provider)" in public.ignored_parameters
+    moved = "tools->routed(tools_rung)" in public.ignored_parameters
+    assert moved is (order[0] != "openai")
+
+
+def test_tool_free_requests_keep_the_sampling_exact_rung() -> None:
+    """Without tools nothing narrows: the rung that keeps the sampling still wins."""
+    route, wires = _astra_route(("openai", "azure_openai", "novita"))
+    narrowed, public, provider, _recorded = _admit(route, wires, _copilot_chat(tools=False))
+    assert _ids(narrowed) == ("novita",)
+    assert provider.temperature == 0.1
+    assert not any(item.startswith("tools->") for item in public.ignored_parameters)
+
+
+def test_no_rung_with_tools_still_refuses_on_tools() -> None:
+    """When no rung declares tools the route stays whole and the refusal names tools."""
+    route, wires = _astra_route(("azure_openai", "novita"))
+    with pytest.raises(ProviderCapabilityError) as caught:
+        _admit(route, wires, _copilot_chat())
+    assert caught.value.capability == "function_tools"
+
+
+def test_tools_with_a_schema_no_tool_rung_enforces_refuses_on_the_schema() -> None:
+    """No rung carries both: the tool rung is kept and the refusal names the schema it
+    cannot enforce, the conflict the caller can act on, instead of ``tools``."""
+    route, wires = _astra_route(("novita", "openai"))
+    tool_rung = route.deployments[1]
+    assert tool_rung.capabilities is not None
+    no_schema = tool_rung.model_copy(
+        update={
+            "capabilities": tool_rung.capabilities.model_copy(
+                update={"supports_structured_output": False}
+            )
+        }
+    )
+    route = _route((route.deployments[0], no_schema))
+    request = _copilot_chat().model_copy(
+        update={"structured_text": _structured_chat().structured_text}
+    )
+    with pytest.raises(ProviderCapabilityError) as caught:
+        _admit(route, wires, request)
+    assert caught.value.capability == "structured_output"
+
+
+def test_responses_tools_route_past_the_sampling_exact_rung() -> None:
+    """The same narrowing on the Responses surface."""
+    route, wires = _astra_route(("novita", "openai"))
+    request = decode_responses(
+        {
+            "model": "public-model",
+            "input": "read it",
+            "stream": True,
+            "temperature": 0.1,
+            "top_p": 1,
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "read_file",
+                    "parameters": {"type": "object", "properties": {}},
+                }
+            ],
+        }
+    ).request
+    narrowed, public, _provider, _recorded = _admit(route, wires, request)
+    assert _ids(narrowed) == ("openai",)
+    assert "tools->routed(tools_rung)" in public.ignored_parameters
+
+
+def test_images_route_past_the_sampling_exact_rung() -> None:
+    """An image narrows to the rungs that take images before the sampling ranking."""
+    route, wires = _astra_route(("novita", "openai"))
+    sees = route.deployments[1].model_copy(
+        update={
+            "gateway": GatewayDeploymentMetadata(
+                capabilities=GatewayDeploymentCapabilities(
+                    supports_streaming=True,
+                    supports_image_input=True,
+                    supports_image_url_input=True,
+                )
+            )
+        }
+    )
+    route = _route((route.deployments[0], sees))
+    request = decode_chat(
+        {
+            "model": "public-model",
+            "stream": True,
+            "temperature": 0.1,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "what is this"},
+                        {"type": "image_url", "image_url": {"url": "https://example.test/a.png"}},
+                    ],
+                }
+            ],
+        }
+    ).request
+    narrowed, public, provider, _recorded = _admit(route, wires, request)
+    assert _ids(narrowed) == ("openai",)
+    assert provider.temperature is None
+    assert "messages->routed(image_input_rung)" in public.ignored_parameters

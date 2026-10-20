@@ -10,10 +10,20 @@ schema-enforcing rung does not take, 2026-10-17). A hard feature therefore
 narrows the route FIRST, to the rungs that declare it, in route order; the
 soft preferences are judged among those rungs only.
 
-Two hard features are handled here, both decided by the decoded request alone:
+The hard features handled here are all decided by the decoded request alone:
 
+- Function tools and media inputs (images, video, audio, PDFs): content the
+  caller sent that no shaping removes, and that the per-rung preflight
+  refuses on any rung declaring it unsupported. Narrowing to the rungs that
+  declare it therefore never drops a rung that could have served; it only
+  stops the sampling preference from picking one that cannot (gpt-6-astra:
+  GitHub Copilot's tools with ``temperature`` and ``top_p``, which only the
+  tool-less Novita rung takes, were refused as unsupported ``tools`` while
+  the OpenAI rung serves tools, 2026-10-20). They narrow first.
 - Structured output (``response_format`` / ``text.format`` json_schema): no
-  later shaping or coercion can remove it.
+  later shaping or coercion can remove it. It narrows among the rungs the
+  content features kept, so when no rung carries both the refusal names the
+  feature the kept rungs lack rather than the one they carry.
 - Explicit thinking (an active ``thinking`` config, an enable-thinking toggle,
   or an effort above ``none``): a rung that cannot reason would otherwise lead
   the per-rung ranking and the route-wide shaping would refuse a request the
@@ -35,6 +45,8 @@ issuing rung is still on the route, and a caller-pinned route, never move.
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 from exp.common.models.gateway_catalog import ExactModelDeployment
 from exp.runtime.gateway.contracts import GatewayApiSurface, GatewayRequest
 from exp.runtime.gateway.native_execution import select_route_deployments
@@ -49,6 +61,9 @@ from exp.runtime.models.providers.protocol import NativeWireClient
 
 STRUCTURED_OUTPUT_RUNG_SUFFIX = "->routed(structured_output_rung)"
 """Disclosure suffix recorded when structured output moves the request off the lead rung."""
+
+TOOLS_RUNG_DISCLOSURE = "tools->routed(tools_rung)"
+"""Disclosure recorded when function tools move the request off the lead rung."""
 
 REASONING_RUNG_SUFFIX = "->routed(reasoning_rung)"
 """Disclosure suffix recorded when explicit thinking moves the request off the lead rung."""
@@ -70,6 +85,46 @@ def serves_structured_output(deployment: ExactModelDeployment) -> bool:
     return deployment.gateway.capabilities.supports_structured_text and (
         model is None or model.supports_structured_output
     )
+
+
+def serves_function_tools(deployment: ExactModelDeployment) -> bool:
+    """Whether one rung's catalog declares function tools, as preflight judges it.
+
+    Mirrors ``preflight_gateway_request``: only an explicit
+    ``supports_tools=False`` refuses, and a rung whose catalog carries no model
+    capabilities is not judged on tools at all.
+    """
+    model = deployment.capabilities
+    return model is None or model.supports_tools is not False
+
+
+def _media_requirements(
+    request: GatewayRequest,
+) -> tuple[tuple[str, Callable[[ExactModelDeployment], bool]], ...]:
+    """Media inputs the request carries, each with the deployment flag preflight reads."""
+    media: tuple[tuple[bool, str, Callable[[ExactModelDeployment], bool]], ...] = (
+        (
+            bool(request.images),
+            "image_input",
+            lambda deployment: deployment.gateway.capabilities.supports_image_input,
+        ),
+        (
+            bool(request.videos),
+            "video_input",
+            lambda deployment: deployment.gateway.capabilities.supports_video_input,
+        ),
+        (
+            bool(request.audios),
+            "audio_input",
+            lambda deployment: deployment.gateway.capabilities.supports_audio_input,
+        ),
+        (
+            bool(request.documents),
+            "pdf_input",
+            lambda deployment: deployment.gateway.capabilities.supports_pdf_input,
+        ),
+    )
+    return tuple((label, serves) for present, label, serves in media if present)
 
 
 def requests_thinking(request: GatewayRequest) -> bool:
@@ -156,7 +211,7 @@ def narrow_to_capable_rungs(
     Returns:
         The narrowed route and wires plus the reorder disclosures, each
         recorded only when its feature passed over the lead rung. The inputs
-        come back unchanged when the request asks for neither feature, every
+        come back unchanged when the request asks for no hard feature, every
         rung or no rung carries it, or the route is pinned to a live rung.
     """
     pinned = route.reasoning_pinned_deployment_id
@@ -165,6 +220,29 @@ def narrow_to_capable_rungs(
     ):
         return route, resolved_wires, ()
     disclosures: list[str] = []
+    if request.tools or request.provider_native_tools:
+        route, resolved_wires = _narrow(
+            route,
+            resolved_wires,
+            tuple(
+                index
+                for index, deployment in enumerate(route.deployments)
+                if serves_function_tools(deployment)
+            ),
+            TOOLS_RUNG_DISCLOSURE,
+            disclosures,
+        )
+    content_field = "input" if request.surface == GatewayApiSurface.RESPONSES else "messages"
+    for label, serves in _media_requirements(request):
+        route, resolved_wires = _narrow(
+            route,
+            resolved_wires,
+            tuple(
+                index for index, deployment in enumerate(route.deployments) if serves(deployment)
+            ),
+            f"{content_field}->routed({label}_rung)",
+            disclosures,
+        )
     if request.structured_text is not None:
         route, resolved_wires = _narrow(
             route,

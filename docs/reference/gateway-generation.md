@@ -42,6 +42,22 @@ would win the ranking and be refused, although a later rung serves the schema (q
 with no structured-output rung keeps failing closed on the field. A continuation pinned to the
 rung that sealed its reasoning, and a caller-pinned `gateway.routing.route_id`, never move.
 
+## Tool and media routing
+
+Function `tools` and media inputs (images, video, audio, PDFs) are hard capabilities too, and they
+narrow before structured output: admission keeps only the rungs whose catalog declares them, then
+ranks those by sampling. A rung that does not declare the feature would be refused by the
+per-rung capability check anyway, so narrowing never drops a rung that could serve; it stops a
+tool-less rung that keeps `temperature` and `top_p` exactly from winning the ranking. GitHub
+Copilot sends tools with `temperature` 0.1 and `top_p` 1; on gpt-6-astra only the tool-less Novita
+rung takes those controls, so the request was refused as unsupported `tools` although the OpenAI
+rung serves tools (2026-10-20). That rung now serves and drops the sampling it does not take,
+disclosed. A passed-over lead is disclosed as `tools->routed(tools_rung)`, or
+`messages->routed(image_input_rung)` (`input->...` on Responses) for media. Because structured
+output narrows among the rungs tools kept, a request no rung can serve whole is refused on the
+feature the tool rungs lack (`response_format`), not on `tools`. A route with no rung for the
+feature keeps failing closed on it.
+
 ## Output limits and context windows
 
 A limit that no rung's declared context window can reserve beside the prompt (`max_tokens`
