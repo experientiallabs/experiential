@@ -78,6 +78,7 @@ from exp.optimize.evaluation.fidelity.runner import (
     saved_fidelity_report,
 )
 from exp.runtime.models.providers.transport import RetryPolicy
+from exp.simulation.engines.text.prompt import INSTANCE_FACTS_GUIDANCE
 from exp.simulation.retrieval.build_inputs import load_completed_build_rag_lineage_bindings
 from exp.simulation.retrieval.jev import JEVCueSelector, JEVPolicy
 from exp.simulation.world_model.experience_memory import (
@@ -352,9 +353,14 @@ def _lineage(world_model: ArtifactInput, scope: Scope) -> str:
 
 
 def _protocol() -> JsonObject:
-    """The learning run inputs shared by every trace of a lineage."""
+    """The learning run inputs shared by every trace of a lineage.
+
+    The prompts include the native-artifact and instance-facts guidance even though only some
+    traces send them: a lineage spans every trace, so editing either prompt starts a fresh memory.
+    """
     return {
-        "prompts": protocol_prompts_sha256(),
+        "prompts": protocol_prompts_sha256(native_artifacts=True),
+        "facts_prompt": INSTANCE_FACTS_GUIDANCE,
         "proposal_reasks": PROPOSAL_REASKS,
         "output_tokens": {"prediction": PREDICTION_TOKENS, "investigation": INVESTIGATION_TOKENS},
         "attempts_per_request": RetryPolicy().maximum_attempts,

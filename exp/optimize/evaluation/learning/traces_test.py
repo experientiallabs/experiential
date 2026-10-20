@@ -29,9 +29,9 @@ from exp.optimize.evaluation.audit.panel_test import (
     package_rows,
     write_catalog,
 )
-from exp.optimize.evaluation.fidelity import replay as trace_replay
+from exp.optimize.evaluation.fidelity import replay
 from exp.optimize.evaluation.fidelity.runner import FidelityMemory, FidelitySpec
-from exp.optimize.evaluation.learning import traces as trace_learning
+from exp.optimize.evaluation.learning import traces
 from exp.optimize.evaluation.learning.traces import (
     learn_from_traces,
     learning_cases,
@@ -284,13 +284,9 @@ def test_a_protocol_change_learns_a_fresh_memory_trace_by_trace(
     provider = SimulatedProvider([episode(i) for i in range(USERS)], learnable=True)
     _, store, _ = build_project(tmp_path, monkeypatch, provider, learn=True)
     before = learning_plan(store, scope="all").lineage
-
-    def changed(*, native_artifacts: bool = False) -> str:
-        """Stand in for a protocol edit, with or without the native-artifact guidance."""
-        return "changed-prompts"
-
-    monkeypatch.setattr(trace_learning, "protocol_prompts_sha256", changed)
-    monkeypatch.setattr(trace_replay, "protocol_prompts_sha256", changed)
+    changed = lambda **_: "changed-prompts"  # noqa: E731 - one stand-in for an edited prompt
+    monkeypatch.setattr(traces, "protocol_prompts_sha256", changed)
+    monkeypatch.setattr(replay, "protocol_prompts_sha256", changed)
     _relearn(store)
     plan = learning_plan(store, scope="all")
     assert plan.lineage != before, "the edited protocol learns into a new memory"
@@ -303,6 +299,21 @@ def test_a_protocol_change_learns_a_fresh_memory_trace_by_trace(
     assert curve.points[0].exact == 2
 
 
+def test_editing_the_workbook_or_facts_prompt_starts_a_fresh_memory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Prompts only some traces send are still part of the lineage that spans every trace."""
+    provider = SimulatedProvider([episode(i) for i in range(USERS)], learnable=True)
+    _, store, _ = build_project(tmp_path, monkeypatch, provider, learn=True)
+    learned = learning_plan(store, scope="all")
+    before, recall = learned.lineage, learned.recall.jev_alias
+    monkeypatch.setattr(traces, "INSTANCE_FACTS_GUIDANCE", "edited facts guidance")
+    facts_edited = learning_plan(store, recall, scope="all").lineage
+    monkeypatch.setattr(replay, "NATIVE_ARTIFACT_PLAN_GUIDANCE", "edited workbook guidance")
+    workbook_edited = learning_plan(store, recall, scope="all").lineage
+    assert len({before, facts_edited, workbook_edited}) == 3
+
+
 def test_learning_refuses_to_predict_a_learned_trace_on_later_memory(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -310,13 +321,13 @@ def test_learning_refuses_to_predict_a_learned_trace_on_later_memory(
     provider = SimulatedProvider([episode(i) for i in range(USERS)], learnable=True)
     _, store, _ = build_project(tmp_path, monkeypatch, provider, learn=True)
     purchased = len(provider.requests)
-    content_run_id = trace_replay.content_run_id
+    content_run_id = replay.content_run_id
 
     def drifted(spec: FidelitySpec, label: str, trace: str, generation: int = 1) -> str:
         """Every run ID changes while the lineage stays the same."""
         return content_run_id(spec, label, trace + "-drift", generation)
 
-    monkeypatch.setattr(trace_replay, "content_run_id", drifted)
+    monkeypatch.setattr(replay, "content_run_id", drifted)
     with pytest.raises(ValueError, match="already learned into memory"):
         _relearn(store)
     assert len(provider.requests) == purchased, "refused before any call"
