@@ -55,7 +55,11 @@ from exp.runtime.models.providers.openrouter_routing import (
     openrouter_chat_wire,
     openrouter_metadata_headers,
 )
-from exp.runtime.models.providers.protocol import GatewayDispatchSigner, NativeWireClient
+from exp.runtime.models.providers.protocol import (
+    GatewayDispatchSigner,
+    NativeWireClient,
+    developer_role_rewrite_disclosure,
+)
 from exp.runtime.models.providers.wire_messages import anthropic_request_headers
 
 ZDR_CONSTRAINT_CAPABILITY = "zero_data_retention_constraint"
@@ -90,7 +94,21 @@ class RungDispatch:
     carrier_authority: ReasoningCarrierAuthority | None
     parallel_disclosure: str | None
     output_disclosure: str | None
+    developer_disclosure: str | None
     reserved_output_tokens: int
+
+    @property
+    def disclosures(self) -> tuple[str, ...]:
+        """Every per-rung shaping disclosure this dispatch publishes."""
+        return tuple(
+            disclosure
+            for disclosure in (
+                self.parallel_disclosure,
+                self.output_disclosure,
+                self.developer_disclosure,
+            )
+            if disclosure is not None
+        )
 
 
 def build_rung_dispatch(
@@ -123,6 +141,9 @@ def build_rung_dispatch(
     )
     rung_request, parallel_disclosure = shape_parallel_tool_calls(
         provider_request, deployment.gateway.capabilities
+    )
+    developer_disclosure = developer_role_rewrite_disclosure(
+        profile.dialect, provider_request, deployment.gateway.capabilities
     )
     capabilities = deployment.capabilities
     rung_request, output_bound = bounded_output_request(
@@ -230,6 +251,7 @@ def build_rung_dispatch(
         carrier_authority=carrier_authority,
         parallel_disclosure=parallel_disclosure,
         output_disclosure=output_disclosure,
+        developer_disclosure=developer_disclosure,
         reserved_output_tokens=output_bound,
     )
 

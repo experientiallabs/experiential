@@ -257,8 +257,8 @@ def inject_results(request: GatewayRequest, text: str) -> GatewayRequest:
 
     Returns:
         The request with the injected ``system`` turn positioned so every wire
-        treats it as an instruction (``developer`` would demand the
-        ``supports_developer_messages`` capability a compatible rung may lack).
+        treats it as an instruction (``developer`` would need a Responses rung
+        that declares the role, or a disclosed rewrite on any other wire).
     """
     injected = GatewayMessage(role="system", content=text)
     messages = list(request.messages)

@@ -620,7 +620,11 @@ def openai_chat_message(
     Responses dialect) and the third-party OpenAI-compatible servers behind
     it (Azure AI Foundry, DeepSeek, vLLM, and the like) enumerate the classic
     roles only and 400 on ``developer`` by name. The Responses builder keeps
-    ``developer`` verbatim, since that wire defines the role.
+    ``developer`` verbatim, since that wire defines the role. A rung whose
+    catalog does not declare ``developer`` support is admitted because of
+    this fold and the caller reads it as
+    ``messages.developer->system(rewritten_by_gateway)``
+    (``developer_role_rewrite_disclosure``).
 
     ``reasoning_route_sha256`` is the active preserved-thinking route identity
     for this rung (Fireworks or Hunyuan); an unsealed ``reasoning_content``

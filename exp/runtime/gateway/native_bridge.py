@@ -613,10 +613,7 @@ class NativeControlPlane(
                     authorization=authorization,
                     throttle_redial_budget=budget,
                 )
-                if dispatch.parallel_disclosure is not None:
-                    parallel_disclosures.add(dispatch.parallel_disclosure)
-                if dispatch.output_disclosure is not None:
-                    parallel_disclosures.add(dispatch.output_disclosure)
+                parallel_disclosures.update(dispatch.disclosures)
                 output_bounds.append(dispatch.reserved_output_tokens)
                 wire_route.append(dispatch.wire_entry)
                 signers.append(dispatch.signer)

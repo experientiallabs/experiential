@@ -94,6 +94,7 @@ from exp.runtime.models.providers.instruction_turns import (
     SYSTEM_FOLD_DISCLOSURE,
 )
 from exp.runtime.models.providers.openai_compatible import OpenAICompatibleClient
+from exp.runtime.models.providers.protocol import DEVELOPER_ROLE_REWRITE_DISCLOSURE
 from exp.runtime.models.providers.streaming_requests import openai_compatible_stream_payload
 from exp.runtime.openai_protocol.errors import OpenAIProtocolError, public_failure_error
 from exp.runtime.openai_protocol.requests import decode_chat, decode_responses
@@ -5791,9 +5792,12 @@ def test_capability_rejection_names_the_public_request_field(
 
     Both the caller's 400 and the ledger row name it: an alert that only
     read "cannot preserve a requested capability" could not be triaged
-    without opening the request.
+    without opening the request. The lane is native Responses, the one wire
+    that defines ``developer`` and so still requires the declaration.
     """
-    control, raw_key = _control_plane(tmp_path)
+    control, raw_key = _openai_responses_pool_control_plane(
+        tmp_path, {"TEST_ALPHA_KEY": "alpha-secret", "TEST_BETA_KEY": "beta-secret"}
+    )
     recorded: list[GatewayFailure] = []
     original_finish = control._accounting.finish_request_quietly  # noqa: SLF001
 
@@ -7509,3 +7513,70 @@ def test_chat_client_hints_serve_disclosed_instead_of_refusing(tmp_path: Path) -
     assert "prompt_cache_retention" not in upstream
     messages = cast("list[JsonObject]", upstream["messages"])
     assert all("agent" not in message for message in messages)
+
+
+@pytest.mark.parametrize("declared", (False, True))
+def test_developer_messages_reach_a_chat_wire_lane_as_system(
+    tmp_path: Path, declared: bool
+) -> None:
+    """A Chat-wire lane serves ``developer`` as ``system`` instead of narrowing out.
+
+    The OpenAI-compatible wire enumerates system/user/assistant only, so the
+    payload always carries the instruction as ``system`` (in place, after any
+    existing system turn). A lane whose catalog does not declare the role
+    used to be removed from the route, handing the request to a fallback
+    provider; it is now admitted and the rewrite is disclosed. A lane that
+    declares the role keeps serving exactly as before, with no disclosure.
+    """
+    _manager, raw_key = _configured_gateway(
+        tmp_path,
+        gateway_capabilities=GatewayDeploymentCapabilities(
+            supports_streaming=True,
+            supports_streaming_tool_arguments=True,
+            supports_developer_messages=declared,
+        ),
+    )
+    control = NativeControlPlane(
+        load_gateway_components(tmp_path, environment={"TEST_PROVIDER_KEY": "local-test-key"})
+    )
+    body = json.dumps(
+        {
+            "model": "coding",
+            "messages": [
+                {"role": "system", "content": "You are terse."},
+                {"role": "developer", "content": "Answer in French."},
+                {"role": "user", "content": "hello"},
+            ],
+        }
+    )
+
+    admission = _admit(control, raw_key, body)
+
+    route = admission["route"]
+    assert isinstance(route, list) and isinstance(route[0], dict)
+    payload = route[0]["upstream_payload"]
+    assert isinstance(payload, dict)
+    assert payload["messages"] == [
+        {"role": "system", "content": "You are terse."},
+        {"role": "system", "content": "Answer in French."},
+        {"role": "user", "content": "hello"},
+    ]
+    expected = [] if declared else [DEVELOPER_ROLE_REWRITE_DISCLOSURE]
+    assert admission.get("ignored_parameters", []) == expected
+
+
+def test_responses_instructions_reach_a_chat_wire_lane_as_system(tmp_path: Path) -> None:
+    """Responses ``instructions`` (a developer turn) no longer narrow a Chat lane out."""
+    control, raw_key = _control_plane(tmp_path)
+    body = json.dumps({"model": "coding", "instructions": "Answer in French.", "input": "hello"})
+
+    admission = _admit_responses(control, raw_key, body)
+
+    route = admission["route"]
+    assert isinstance(route, list) and isinstance(route[0], dict)
+    payload = route[0]["upstream_payload"]
+    assert isinstance(payload, dict)
+    messages = payload["messages"]
+    assert isinstance(messages, list)
+    assert messages[0] == {"role": "system", "content": "Answer in French."}
+    assert admission["ignored_parameters"] == [DEVELOPER_ROLE_REWRITE_DISCLOSURE]
