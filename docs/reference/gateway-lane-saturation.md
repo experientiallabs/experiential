@@ -157,8 +157,9 @@ card with these levers, except the permit class, which reads the host's authoriz
 A fast request is placed by conversation like any other (`maximize_cache_affinity` keeps its
 replica's prefix cache warm). A dedicated low-batch replica can author
 `GatewayRungDispatchPolicy.max_prompt_tokens`: a prompt at least that long (lower-bound
-estimate, prompt only) skips the rung at admission and runs on the route's next rung, so long
-cold prefills never land on it.
+estimate, prompt only) skips the rung at admission, after every hard filter, when an uncapped
+rung of the same model stays on the route (`prompt_size.prompt_cap_indexes`), so long cold
+prefills stay off it. The cap never refuses a request and never moves it to another model.
 
 The default bound is already half the worker's permits, so its Pro factor stays below
 `1 / DEFAULT_LANE_SHARE` and one lane's priority traffic never holds every permit. A rung whose

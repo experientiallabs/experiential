@@ -301,6 +301,10 @@ def prepare_route_requests(
         ):
             route = select_route_deployments(route, tier_indexes)
             resolved_wires = tuple(resolved_wires[index] for index in tier_indexes)
+    # Rung prompt caps last, after every hard filter (prompt_size.prompt_cap_indexes).
+    if (uncapped := prompt_size.prompt_cap_indexes(route, request)) is not None:
+        route = select_route_deployments(route, uncapped)
+        resolved_wires = tuple(resolved_wires[index] for index in uncapped)
 
     admitted_request = request
     coercion_disclosures: tuple[str, ...] = admission_disclosures

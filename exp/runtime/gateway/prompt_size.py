@@ -176,9 +176,6 @@ def context_window_compatible_indexes(
 ) -> tuple[int, ...]:
     """Return the rungs whose declared context window can hold this request.
 
-    A rung whose authored prompt cap (``GatewayRungDispatchPolicy.max_prompt_tokens``)
-    the prompt reaches is skipped too, unless every rung that fits is capped.
-
     A rung is compatible when it declares no window (permissive: the provider's
     own count decides) or when its window holds the prompt's lower-bound token
     count PLUS the caller's requested ``max_tokens`` (any spelling). An
@@ -218,8 +215,6 @@ def context_window_compatible_indexes(
     minimum = text_bytes // MAXIMUM_BYTES_PER_TOKEN
     requested = request.maximum_output_tokens or 0
     compatible: list[int] = []
-    # Rungs whose authored prompt cap (``max_prompt_tokens``) is below the prompt.
-    capped: list[int] = []
     largest: int | None = None
     reserve = requested
     for index, deployment in enumerate(route.deployments):
@@ -228,17 +223,12 @@ def context_window_compatible_indexes(
             if deployment.capabilities is None
             else deployment.capabilities.context_window_tokens
         )
-        fits = window is None or minimum + requested <= window
-        dispatch = deployment.gateway.dispatch
-        cap = None if dispatch is None else dispatch.max_prompt_tokens
-        if fits and cap is not None and minimum >= cap:
-            capped.append(index)
-        elif fits:
+        if window is None or minimum + requested <= window:
             compatible.append(index)
         if window is not None and (largest is None or window > largest):
             largest = window
-    if compatible or capped or largest is None:
-        return tuple(compatible or capped)
+    if compatible or largest is None:
+        return tuple(compatible)
     if minimum > largest:
         param = "input" if request.surface == GatewayApiSurface.RESPONSES else "messages"
         message = (
@@ -256,3 +246,36 @@ def context_window_compatible_indexes(
             "larger context window."
         )
     raise ProviderParameterError(message=message, param=param, code=CONTEXT_LENGTH_EXCEEDED_CODE)
+
+
+def prompt_cap_indexes(route: GatewayRoute, request: GatewayRequest) -> tuple[int, ...] | None:
+    """The rungs to keep once ``max_prompt_tokens`` caps are applied, or ``None`` to keep all.
+
+    A rung whose authored prompt cap (``GatewayRungDispatchPolicy.max_prompt_tokens``)
+    the prompt's lower-bound estimate reaches is dropped, counting the prompt
+    only (a large ``max_tokens`` never drops it), but only when an uncapped
+    rung of the same exact model stays on the route: the cap is a preference
+    (a dedicated low-batch replica keeping long cold prefills off), never a
+    reason to refuse or to move the request to another model. Run it after
+    every hard filter, so a capped rung is never the reason nothing is left.
+    """
+    minimum = prompt_text_bytes(request) // MAXIMUM_BYTES_PER_TOKEN
+    capped: set[int] = set()
+    for index, deployment in enumerate(route.deployments):
+        dispatch = deployment.gateway.dispatch
+        cap = None if dispatch is None else dispatch.max_prompt_tokens
+        if cap is not None and minimum >= cap:
+            capped.add(index)
+    if not capped:
+        return None
+    served_models = {
+        deployment.exact_model_id
+        for index, deployment in enumerate(route.deployments)
+        if index not in capped
+    }
+    keep = tuple(
+        index
+        for index, deployment in enumerate(route.deployments)
+        if index not in capped or deployment.exact_model_id not in served_models
+    )
+    return None if len(keep) == len(route.deployments) else keep

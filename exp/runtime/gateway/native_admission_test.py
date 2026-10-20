@@ -2878,3 +2878,54 @@ class TestHouseOpenRouterNeverLeadsAnAffinityPool:
         )
         assert _order(ordered) == ("dep-openrouter",)
         assert len(ordered_wires) == 1
+
+
+def test_a_prompt_cap_moves_a_long_prompt_to_the_main_lane_but_never_refuses() -> None:
+    """Applied after the tier filter: with no uncapped carded rung left, the capped one serves."""
+    from exp.common.models.dispatch_policy import GatewayRungDispatchPolicy
+
+    capped = GatewayDeploymentMetadata(
+        capabilities=GatewayDeploymentCapabilities(supports_streaming=True),
+        dispatch=GatewayRungDispatchPolicy(max_prompt_tokens=100),
+    )
+    plain = GatewayDeploymentMetadata(
+        capabilities=GatewayDeploymentCapabilities(supports_streaming=True)
+    )
+    route = _mixed_route(
+        "maximize_availability",
+        (_deployment("fast", gateway=capped), _deployment("main", gateway=plain)),
+        GatewayApiSurface.CHAT_COMPLETIONS,
+    )
+    client = cast(NativeWireClient, object())
+    carded = GatewayWireProfile(
+        dialect="openai_compatible",
+        url="https://lane.test",
+        service_tier_pricing_enabled=True,
+        service_tier_cards=frozenset({"priority"}),
+    )
+    uncarded = GatewayWireProfile(dialect="openai_compatible", url="https://main.test")
+    long_prompt = GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=(GatewayMessage(role="user", content="x" * 8_000),),
+    )
+    fast = route.snapshot.authorization.model_copy(update={"fast": True})
+    # A carded main lane: the long :fast prompt leaves the capped replica.
+    narrowed, _, _, provider, _ = admitted_route_requests(
+        route,
+        ((carded, client), (carded, client)),
+        long_prompt,
+        accounting=cast(NativeAttemptAccounting, _CoercionCounter()),
+        authorization=fast,
+    )
+    assert tuple(d.deployment_id for d in narrowed.deployments) == ("main",)
+    assert provider.service_tier == "priority"
+    # An uncarded main lane: the tier filter leaves only the replica, which serves.
+    narrowed, _, _, provider, _ = admitted_route_requests(
+        route,
+        ((carded, client), (uncarded, client)),
+        long_prompt,
+        accounting=cast(NativeAttemptAccounting, _CoercionCounter()),
+        authorization=fast,
+    )
+    assert tuple(d.deployment_id for d in narrowed.deployments) == ("fast",)
+    assert provider.service_tier == "priority"

@@ -27,6 +27,7 @@ from exp.runtime.gateway.prompt_size import (
     clamp_output_to_context_window,
     context_window_compatible_indexes,
     minimum_prompt_tokens,
+    prompt_cap_indexes,
     prompt_text_bytes,
 )
 from exp.runtime.gateway.routing import GatewayRoute
@@ -298,13 +299,15 @@ def _capped(deployment: ExactModelDeployment, cap: int) -> ExactModelDeployment:
 def test_a_prompt_cap_skips_its_rung_by_prompt_only() -> None:
     """A long prompt leaves the capped replica for the main lane; a big max_tokens never does."""
     route = _route(_capped(_deployment("fast", 200_000), 1_000), _deployment("main", 200_000))
-    assert context_window_compatible_indexes(route, _request(_tokens(999))) == (0, 1)
-    assert context_window_compatible_indexes(route, _request(_tokens(1_000))) == (1,)
-    short_long_answer = _request(_tokens(10), max_tokens=100_000)
-    assert context_window_compatible_indexes(route, short_long_answer) == (0, 1)
+    assert prompt_cap_indexes(route, _request(_tokens(999))) is None
+    assert prompt_cap_indexes(route, _request(_tokens(1_000))) == (1,)
+    assert prompt_cap_indexes(route, _request(_tokens(10), max_tokens=100_000)) is None
 
 
-def test_capped_rungs_serve_when_nothing_else_fits() -> None:
-    """Every fitting rung capped below the prompt: they are kept, never a refusal."""
-    route = _route(_capped(_deployment("fast", 200_000), 1_000), _deployment("small", 500))
-    assert context_window_compatible_indexes(route, _request(_tokens(2_000))) == (0,)
+def test_capped_rungs_stay_when_no_uncapped_rung_of_their_model_is_left() -> None:
+    """Every rung capped: kept, never a refusal. A cap never moves a request to another model."""
+    alone = _route(_capped(_deployment("fast", 200_000), 1_000))
+    assert prompt_cap_indexes(alone, _request(_tokens(2_000))) is None
+    other_model = _deployment("other", 200_000).model_copy(update={"exact_model_id": "exact-two"})
+    mixed = _route(_capped(_deployment("fast", 200_000), 1_000), other_model)
+    assert prompt_cap_indexes(mixed, _request(_tokens(2_000))) is None
