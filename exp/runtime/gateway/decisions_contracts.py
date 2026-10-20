@@ -213,7 +213,8 @@ class ImageAsset(ContractModel):
                 "asset data_base64 must be standard base64 with = padding, no whitespace, "
                 "and no data: prefix",
             )
-        size = len(data) // 4 * 3 - (len(data) - len(data.rstrip("=")))
+        padding = 2 if data.endswith("==") else 1 if data.endswith("=") else 0
+        size = len(data) // 4 * 3 - padding
         if size > MAX_DECISION_ASSET_BYTES:
             raise DecisionRequestError(
                 "assets", "each image must be at most 16777216 bytes after base64 decoding"
