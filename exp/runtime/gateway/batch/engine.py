@@ -185,7 +185,14 @@ class BatchEngine:
             expires_at=created + timedelta(seconds=COMPLETION_WINDOW_SECONDS),
         )
         job = self._reserve(job)
-        self._store.create_job(job=job)
+        try:
+            self._store.create_job(job=job)
+        except Exception as exc:
+            self._release_reservations(job, job.lines)
+            raise BatchSubmitError(
+                "batch job could not be persisted after its reservations were created",
+                code="internal_error",
+            ) from exc
         return job
 
     def _validate_lines(
@@ -380,8 +387,7 @@ class BatchEngine:
             try:
                 amount = self._ledger.reserve_line(job=job, line=line)
             except Exception as exc:
-                for done in reserved:
-                    self._ledger.release_line(job=job, line=done, reason="submit_rejected")
+                self._release_reservations(job, reserved)
                 raise BatchSubmitError(
                     f"reservation rejected at line {line.custom_id!r}: {exc}",
                     code="insufficient_quota",
@@ -389,6 +395,19 @@ class BatchEngine:
             reserved.append(line.model_copy(update={"reserved_nano_usd": amount}))
             total += amount
         return job.model_copy(update={"lines": tuple(reserved), "reserved_nano_usd": total})
+
+    def _release_reservations(
+        self, job: BatchJob, lines: list[BatchLine] | tuple[BatchLine, ...]
+    ) -> None:
+        """Attempt every reservation release even when an earlier release fails."""
+        for line in lines:
+            try:
+                self._ledger.release_line(job=job, line=line, reason="submit_rejected")
+            except Exception:
+                _LOGGER.exception(
+                    "batch reservation release failed during rejected submit",
+                    extra={"batch_id": job.batch_id, "custom_id": line.custom_id},
+                )
 
     def retrieve(self, *, organization_id: str, batch_id: str) -> BatchJob | None:
         """Return one owned job, or None when absent."""

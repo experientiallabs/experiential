@@ -66,6 +66,15 @@ class MemoryStore:
         return True
 
 
+class FailingCreateStore(MemoryStore):
+    """Store that rejects the durable job insert after reservations succeed."""
+
+    def create_job(self, *, job: BatchJob) -> None:
+        """Simulate an unavailable durable store."""
+        del job
+        raise RuntimeError("database is locked")
+
+
 class MemoryFiles:
     """In-memory BatchFileStore."""
 
@@ -126,13 +135,19 @@ class MemoryCatalog:
 class MemoryLedger:
     """BatchLedger recording every verb; optionally rejecting reservations."""
 
-    def __init__(self, *, reject_after: int | None = None) -> None:
-        """Optionally reject the Nth reservation onward."""
+    def __init__(
+        self,
+        *,
+        reject_after: int | None = None,
+        fail_release_custom_id: str | None = None,
+    ) -> None:
+        """Optionally reject reservations or one scripted release."""
         self.reserved: list[str] = []
         self.settled: list[tuple[str, int]] = []
         self.settled_results: list[BatchLineResult] = []
         self.released: list[tuple[str, str]] = []
         self._reject_after = reject_after
+        self._fail_release_custom_id = fail_release_custom_id
 
     def reserve_line(self, *, job: BatchJob, line: BatchLine) -> int:
         """Reserve a deterministic estimate or reject when scripted to."""
@@ -148,6 +163,8 @@ class MemoryLedger:
 
     def release_line(self, *, job: BatchJob, line: BatchLine, reason: str) -> None:
         """Record one release."""
+        if line.custom_id == self._fail_release_custom_id:
+            raise RuntimeError("ledger release failed")
         self.released.append((line.custom_id, reason))
 
 
@@ -380,6 +397,52 @@ def test_submit_rolls_back_reservations_on_rejection() -> None:
             endpoint="/v1/chat/completions",
         )
     assert ledger.released == [("a", "submit_rejected")]
+
+
+def test_submit_attempts_every_rollback_when_one_release_fails() -> None:
+    """One failed cleanup cannot prevent later reservations from being released."""
+    ledger = MemoryLedger(reject_after=2, fail_release_custom_id="a")
+    engine, _, _, _, _ = _engine(ledger=ledger)
+    file_id = _upload(engine, [_chat_line("a"), _chat_line("b"), _chat_line("c")])
+
+    with pytest.raises(BatchSubmitError, match="reservation rejected"):
+        engine.submit(
+            organization_id="org_a",
+            identity_id="id_a",
+            input_file_id=file_id,
+            endpoint="/v1/chat/completions",
+        )
+
+    assert ledger.released == [("b", "submit_rejected")]
+
+
+def test_submit_releases_reservations_when_job_persistence_fails() -> None:
+    """A failed durable insert releases every hold because no job can own it."""
+    ledger = MemoryLedger()
+    client = ScriptedClient(
+        [ProviderBatchSnapshot(status=BatchStatus.COMPLETED, results_ready=True)], []
+    )
+    engine = BatchEngine(
+        store=FailingCreateStore(),
+        files=MemoryFiles(),
+        catalog=MemoryCatalog(),
+        ledger=ledger,
+        secrets_resolver=MemorySecrets(),
+        clients={"openrouter": client, "openai": client},
+    )
+    file_id = _upload(engine, [_chat_line("a"), _chat_line("b")])
+
+    with pytest.raises(BatchSubmitError, match="could not be persisted") as error:
+        engine.submit(
+            organization_id="org_a",
+            identity_id="id_a",
+            input_file_id=file_id,
+            endpoint="/v1/chat/completions",
+        )
+
+    assert error.value.code == "internal_error"
+    assert ledger.reserved == ["a", "b"]
+    assert ledger.released == [("a", "submit_rejected"), ("b", "submit_rejected")]
 
 
 def test_poller_submits_polls_and_settles_idempotently() -> None:
