@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
 from exp.common.core.artifacts import JsonObject
@@ -20,6 +22,7 @@ from exp.runtime.models.providers.anthropic import (
     anthropic_messages_request,
     anthropic_messages_response,
 )
+from exp.runtime.models.providers.async_transport import ScriptedAsyncJsonTransport
 from exp.runtime.models.providers.errors import (
     ProviderRefusalError,
     ProviderRefusalSignal,
@@ -612,6 +615,99 @@ def test_openai_reasoning_only_output_surfaces_a_retryable_error_after_exhaustio
     with pytest.raises(ProviderRetryableResponseError, match="no text or tool call"):
         client.complete(_request())
 
+    assert len(transport.requests) == 2
+
+
+def test_anthropic_reasoning_only_output_retries_then_completes() -> None:
+    """A thinking-only Messages response re-dispatches before returning an answer."""
+    transport = ScriptedAsyncJsonTransport(
+        [
+            JsonHttpResponse(
+                status_code=200,
+                body={
+                    "model": "claude-fixture",
+                    "content": [{"type": "thinking", "thinking": "private", "signature": "sig"}],
+                    "stop_reason": "max_tokens",
+                    "usage": {"input_tokens": 20, "output_tokens": 4096},
+                },
+            ),
+            JsonHttpResponse(
+                status_code=200,
+                body={
+                    "model": "claude-fixture",
+                    "content": [{"type": "text", "text": "done"}],
+                    "stop_reason": "end_turn",
+                    "usage": {"input_tokens": 20, "output_tokens": 2},
+                },
+            ),
+        ]
+    )
+    client = AnthropicClient(
+        model=_snapshot("anthropic", "claude-fixture"),
+        api_key="fixture",
+        base_url="https://anthropic.fixture/v1",
+        transport=transport,
+        retry_policy=RetryPolicy(maximum_attempts=2, initial_delay_seconds=0.0),
+    )
+
+    response = asyncio.run(client.complete_async(_request()))
+
+    assert response.output.content == "done"
+    assert len(transport.requests) == 2
+
+
+@pytest.mark.parametrize(
+    "empty_content",
+    [
+        {"role": "model"},
+        {
+            "role": "model",
+            "parts": [
+                {"thought": True, "text": "private summary"},
+                {"thoughtSignature": "opaque"},
+            ],
+        },
+    ],
+)
+def test_gemini_reasoning_only_output_retries_then_completes(
+    empty_content: JsonObject,
+) -> None:
+    """A thinking-exhausted Gemini candidate receives one bounded retry."""
+    transport = ScriptedAsyncJsonTransport(
+        [
+            JsonHttpResponse(
+                status_code=200,
+                body={
+                    "candidates": [
+                        {"content": empty_content, "finishReason": "MAX_TOKENS", "index": 0}
+                    ],
+                    "usageMetadata": {
+                        "promptTokenCount": 20,
+                        "thoughtsTokenCount": 4095,
+                        "totalTokenCount": 4115,
+                    },
+                },
+            ),
+            JsonHttpResponse(
+                status_code=200,
+                body={
+                    "candidates": [{"content": {"parts": [{"text": "done"}]}}],
+                    "usageMetadata": {"promptTokenCount": 20, "candidatesTokenCount": 2},
+                },
+            ),
+        ]
+    )
+    client = GeminiClient(
+        model=_snapshot("gemini", "gemini-fixture"),
+        api_key="fixture",
+        base_url="https://gemini.fixture/v1beta",
+        transport=transport,
+        retry_policy=RetryPolicy(maximum_attempts=2, initial_delay_seconds=0.0),
+    )
+
+    response = asyncio.run(client.complete_async(_request()))
+
+    assert response.output.content == "done"
     assert len(transport.requests) == 2
 
 

@@ -30,6 +30,7 @@ from exp.runtime.models.providers.errors import (
     ProviderRefusalError,
     ProviderRefusalSignal,
     ProviderResponseError,
+    ProviderRetryableResponseError,
     require_array,
     require_integer,
     require_object,
@@ -175,6 +176,7 @@ def anthropic_messages_response(
         The typed assistant action, served model identity, and observed economics.
 
     Raises:
+        ProviderRetryableResponseError: The completed response has no usable assistant action.
         ProviderResponseError: The completed response has malformed or unsupported content.
     """
     if payload.get("stop_reason") == "refusal":
@@ -214,7 +216,7 @@ def anthropic_messages_response(
     try:
         output = AssistantAction(content=content, tool_calls=tuple(tool_calls))
     except ValueError as exc:
-        raise ProviderResponseError("Anthropic response has no text or tool call") from exc
+        raise ProviderRetryableResponseError("Anthropic response has no text or tool call") from exc
     return ModelResponse.completed(
         output=output,
         configured_model=configured_model,

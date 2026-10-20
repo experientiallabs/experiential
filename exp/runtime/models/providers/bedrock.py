@@ -23,7 +23,11 @@ from exp.common.models import (
     ToolCall,
     Usage,
 )
-from exp.runtime.models.providers.base import DEFAULT_RETRY_POLICY, GatewayWireProfile
+from exp.runtime.models.providers.base import (
+    DEFAULT_RETRY_POLICY,
+    GatewayWireProfile,
+    classify_complete_retry,
+)
 from exp.runtime.models.providers.bedrock_endpoints import (
     bedrock_runtime_origin,
     bedrock_signing_region,
@@ -34,6 +38,7 @@ from exp.runtime.models.providers.errors import (
     ProviderRefusalError,
     ProviderRefusalSignal,
     ProviderResponseError,
+    ProviderRetryableResponseError,
     require_array,
     require_integer,
     require_object,
@@ -444,11 +449,12 @@ class BedrockClient:
             supports_top_k=self._supports_top_k,
             supports_logprobs=self._supports_logprobs,
         )
-        response = self._call_with_retry(lambda: self._runtime().converse(**payload))
-        return converse_response(
-            response,
-            configured_model=self._model,
-            latency_seconds=time.monotonic() - started_at,
+        return self._call_with_retry(
+            lambda: converse_response(
+                self._runtime().converse(**payload),
+                configured_model=self._model,
+                latency_seconds=time.monotonic() - started_at,
+            )
         )
 
     def embed(self, texts: Sequence[str]) -> tuple[Embedding, ...]:
@@ -655,15 +661,15 @@ class BedrockClient:
         auth_factory(frozen, "bedrock", bedrock_signing_region(region)).add_auth(request)
         return {str(name): str(value) for name, value in dict(request.headers).items()}
 
-    def _call_with_retry(
+    def _call_with_retry[ResultT](
         self,
-        operation: Callable[[], Mapping[str, object]],
+        operation: Callable[[], ResultT],
         *,
         retry_policy: RetryPolicy | None = None,
-    ) -> Mapping[str, object]:
+    ) -> ResultT:
         """Retry one Bedrock call on the same region and model without botocore multiplication."""
 
-        def send() -> Mapping[str, object]:
+        def send() -> ResultT:
             """Run one attempt and translate provider failures into transport errors."""
             try:
                 return operation()
@@ -676,7 +682,8 @@ class BedrockClient:
             except Exception as exc:
                 raise _as_transport_error(exc) from exc
 
-        return run_with_retry(send, policy=retry_policy or self._retry_policy)
+        policy = retry_policy or self._retry_policy
+        return run_with_retry(send, policy=policy, classify=classify_complete_retry)
 
 
 class BoundedBedrockClient(BoundedSyncModelClientAdapter):
@@ -887,8 +894,11 @@ def converse_response(
         Typed output, configured model identity, and observed usage and latency.
 
     Raises:
+        ProviderRefusalError: The stop reason reports a content filter or guardrail.
+        ProviderRetryableResponseError: The completed response has no usable assistant action.
         ProviderResponseError: The response is malformed or uses an unsupported block or stop.
     """
+    finish_reason = _finish_reason(payload.get("stopReason"))
     output = require_object(cast("JsonValue | None", payload.get("output")), "Bedrock output")
     message = require_object(output.get("message"), "Bedrock output.message")
     blocks = require_array(message.get("content"), "Bedrock output.message.content")
@@ -908,11 +918,6 @@ def converse_response(
             tool_calls.append(_tool_use(block["toolUse"], index))
             continue
         if "reasoningContent" in block:
-            # Converse leads a reasoning model's turn with its thinking blocks
-            # (captured live 2026-09-02 on us.anthropic.claude-opus-5). The
-            # non-streaming completion contract carries answer text and tool
-            # calls only, so the thinking is read and dropped rather than
-            # failing the response.
             require_object(
                 block["reasoningContent"],
                 f"Bedrock output.message.content[{index}].reasoningContent",
@@ -925,10 +930,9 @@ def converse_response(
     try:
         action = AssistantAction(content=content, tool_calls=tuple(tool_calls))
     except ValueError as exc:
-        raise ProviderResponseError(
+        raise ProviderRetryableResponseError(
             "Bedrock Converse response has neither text nor a complete tool call"
         ) from exc
-    finish_reason = _finish_reason(payload.get("stopReason"))
     return ModelResponse.completed(
         output=action,
         configured_model=configured_model,

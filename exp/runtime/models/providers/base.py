@@ -627,7 +627,7 @@ class ProviderHttpClient(abc.ABC):
             policy=self._retry_policy,
             deadline=request_deadline,
             attempt_timeout_seconds=completion_timeout,
-            classify=_classify_complete_retry,
+            classify=classify_complete_retry,
         )
         return result.model_copy(
             update={
@@ -719,7 +719,7 @@ class ProviderHttpClient(abc.ABC):
         """Convert one decoded provider payload into the shared response contract."""
 
 
-def _classify_complete_retry(exception: Exception) -> RetryClassification:
+def classify_complete_retry(exception: Exception) -> RetryClassification:
     """Classify transport and empty-output failures in one shared attempt loop.
 
     Args:

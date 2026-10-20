@@ -47,8 +47,13 @@ from exp.runtime.models.providers.errors import (
     ProviderRefusalError,
     ProviderRefusalSignal,
     ProviderResponseError,
+    ProviderRetryableResponseError,
 )
-from exp.runtime.models.providers.transport import ProviderTransportError, ScriptedJsonTransport
+from exp.runtime.models.providers.transport import (
+    ProviderTransportError,
+    RetryPolicy,
+    ScriptedJsonTransport,
+)
 from exp.runtime.models.registry import RuntimeModelCatalog
 
 
@@ -316,6 +321,71 @@ def test_retries_stay_on_the_same_region_and_model() -> None:
     assert response.output.content == "ok"
     assert runtime.attempts == 2
     assert runtime.converse_calls[0]["modelId"] == "exact-model"
+
+
+def test_reasoning_only_converse_response_retries_then_completes() -> None:
+    """A length-limited thinking-only Converse response receives one bounded retry."""
+
+    class _ReasoningThenAnswerRuntime(_FakeBedrockRuntime):
+        """Return one thinking-only response before a normal visible answer."""
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.responses: list[Mapping[str, object]] = [
+                {
+                    "output": {
+                        "message": {
+                            "content": [
+                                {"reasoningContent": {"reasoningText": {"text": "private"}}}
+                            ]
+                        }
+                    },
+                    "stopReason": "max_tokens",
+                    "usage": {"inputTokens": 20, "outputTokens": 4096},
+                },
+                {
+                    "output": {"message": {"content": [{"text": "done"}]}},
+                    "stopReason": "end_turn",
+                    "usage": {"inputTokens": 20, "outputTokens": 2},
+                },
+            ]
+
+        def converse(self, **request: object) -> Mapping[str, object]:
+            """Record each attempt and return the next response."""
+            self.converse_calls.append(request)
+            return self.responses.pop(0)
+
+    runtime = _ReasoningThenAnswerRuntime()
+    client = BedrockClient(
+        model=_snapshot(),
+        region="us-east-1",
+        environment={},
+        runtime_factory=lambda *, region_name: runtime,
+        retry_policy=RetryPolicy(maximum_attempts=2, initial_delay_seconds=0.0),
+    )
+
+    response = client.complete(_request())
+
+    assert response.output.content == "done"
+    assert len(runtime.converse_calls) == 2
+
+
+def test_reasoning_only_converse_response_is_retryable() -> None:
+    """A well-formed Converse response without a visible action keeps its typed cause."""
+    with pytest.raises(ProviderRetryableResponseError, match="neither text nor"):
+        converse_response(
+            {
+                "output": {
+                    "message": {
+                        "content": [{"reasoningContent": {"reasoningText": {"text": "private"}}}]
+                    }
+                },
+                "stopReason": "max_tokens",
+                "usage": {"inputTokens": 20, "outputTokens": 4096},
+            },
+            configured_model=_snapshot(),
+            latency_seconds=0.1,
+        )
 
 
 def test_catalog_requires_a_complete_bedrock_access_key_pair_and_resolves_ambient() -> None:
@@ -1019,14 +1089,13 @@ def test_converse_response_maps_length_and_rejects_unsupported_blocks() -> None:
     with pytest.raises(ProviderRefusalError) as refusal_error:
         converse_response(
             {
-                "output": {"message": {"content": [{"text": "blocked"}]}},
+                "output": {"message": {"content": []}},
                 "stopReason": "content_filtered",
             },
             configured_model=_snapshot(),
             latency_seconds=0.1,
         )
     assert refusal_error.value.signal is ProviderRefusalSignal.GUARDRAIL
-    assert "blocked" not in str(refusal_error.value)
 
 
 def _signing_client(monkeypatch: pytest.MonkeyPatch, *, token: str | None = None) -> BedrockClient:

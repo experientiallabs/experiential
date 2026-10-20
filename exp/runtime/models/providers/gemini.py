@@ -27,6 +27,7 @@ from exp.runtime.models.providers.errors import (
     ProviderRefusalError,
     ProviderRefusalSignal,
     ProviderResponseError,
+    ProviderRetryableResponseError,
     require_array,
     require_integer,
     require_object,
@@ -61,6 +62,7 @@ def gemini_generate_response(
     Raises:
         ProviderRefusalError: Google blocked the prompt itself (``promptFeedback.blockReason``)
             or stopped the candidate on a safety, copyright, or sensitive-information reason.
+        ProviderRetryableResponseError: The completed response has no usable assistant action.
         ProviderResponseError: The response omits a usable candidate or has malformed content.
     """
     prompt_block = _gemini_prompt_block_signal(payload)
@@ -76,22 +78,31 @@ def gemini_generate_response(
     content = require_object(candidate.get("content"), "Gemini candidates[0].content")
     text_parts: list[str] = []
     tool_calls: list[ToolCall] = []
-    parts = require_array(content.get("parts"), "Gemini candidates[0].content.parts")
+    raw_parts = content.get("parts")
+    parts = (
+        []
+        if raw_parts is None and candidate.get("finishReason") == "MAX_TOKENS"
+        else require_array(raw_parts, "Gemini candidates[0].content.parts")
+    )
     for index, part_value in enumerate(parts):
         part = require_object(part_value, f"Gemini candidates[0].content.parts[{index}]")
+        if part.get("thought") is True:
+            continue
         text = part.get("text")
         function_call = part.get("functionCall")
         if isinstance(text, str):
             text_parts.append(text)
         elif function_call is not None:
             tool_calls.append(_gemini_tool_call(function_call, index))
+        elif isinstance(part.get("thoughtSignature"), str):
+            continue
         else:
             raise ProviderResponseError(f"Gemini content part {index} is unsupported")
     output_text = "".join(text_parts) if text_parts else None
     try:
         output = AssistantAction(content=output_text, tool_calls=tuple(tool_calls))
     except ValueError as exc:
-        raise ProviderResponseError("Gemini response has no text or tool call") from exc
+        raise ProviderRetryableResponseError("Gemini response has no text or tool call") from exc
     return ModelResponse.completed(
         output=output,
         configured_model=configured_model,
