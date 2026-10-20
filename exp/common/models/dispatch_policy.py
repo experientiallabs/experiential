@@ -226,6 +226,17 @@ class GatewayRungDispatchPolicy(ContractModel):
     priority_overflow_paying: float | None = Field(default=None, ge=1, le=4, allow_inf_nan=False)
     priority_overflow_pro: float | None = Field(default=None, ge=1, le=4, allow_inf_nan=False)
     upstream_priority: bool = False
+    max_prompt_tokens: int | None = Field(default=None, ge=1)
+    """The longest prompt this rung takes, by the prompt's lower-bound estimate.
+
+    A request whose prompt is at least this long skips the rung at admission,
+    the same narrowing as an undersized context window but counting the prompt
+    only (``max_tokens`` never excludes a rung here). The choice for a
+    dedicated low-batch rung (a ``:fast`` replica) that long cold prefills
+    would slow for everyone on it. When every rung of the route is capped
+    below the prompt, the capped rungs are kept rather than refusing.
+    ``None`` caps nothing.
+    """
 
     @model_validator(mode="after")
     def _require_coherent_authoring(self) -> GatewayRungDispatchPolicy:

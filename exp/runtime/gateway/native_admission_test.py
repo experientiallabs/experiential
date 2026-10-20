@@ -2681,21 +2681,24 @@ def test_reasoning_summary_serves_without_summaries_on_chat_wire_lanes() -> None
     )
 
 
-def test_fast_keeps_the_host_order_on_an_affinity_pool() -> None:
-    """A :fast request dispatches in the host's (least-loaded first) order, never rendezvous."""
+def test_fast_is_placed_by_conversation_like_any_request() -> None:
+    """A :fast conversation keeps its affinity placement (its replica's prefix cache stays warm)."""
     route, wires = _affinity_fixture()
-    authorization = route.snapshot.authorization.model_copy(update={"fast": True})
+    fast = route.snapshot.authorization.model_copy(update={"fast": True})
     for session in ("session-1", "session-2", "session-3"):
-        ordered, _wires_out, placement = _affinity_ordered_rungs(
-            route,
-            wires,
-            _session_request(session),
-            accounting=_affinity_accounting(),
-            authorization=authorization,
-            continuation=None,
-        )
-        assert _order(ordered) == ("dep-house", "dep-fireworks", "dep-openrouter")
-        assert placement.fingerprint is None
+        placed = [
+            _affinity_ordered_rungs(
+                route,
+                wires,
+                _session_request(session),
+                accounting=_affinity_accounting(),
+                authorization=authorization,
+                continuation=None,
+            )
+            for authorization in (route.snapshot.authorization, fast)
+        ]
+        assert _order(placed[1][0]) == _order(placed[0][0])
+        assert placed[1][2].fingerprint is not None
 
 
 def test_prompt_caching_off_keeps_certified_order_and_adds_no_cache_state() -> None:

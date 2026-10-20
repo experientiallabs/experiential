@@ -8,6 +8,7 @@ import base64
 import pytest
 
 from exp.common.models.content import ImageContentPart, TextContentPart
+from exp.common.models.dispatch_policy import GatewayRungDispatchPolicy
 from exp.common.models.gateway_catalog import ExactModelDeployment
 from exp.common.models.model import ModelCapabilities, ToolCall
 from exp.runtime.gateway.contracts import (
@@ -281,3 +282,29 @@ def test_the_window_clamp_leaves_fitting_permissive_and_hopeless_requests_alone(
     permissive = _route(_deployment("open", None), _deployment("large", 2_000))
     request = _request("hi", max_tokens=10_000_000)
     assert clamp_output_to_context_window(permissive, request) == (request, ())
+
+
+def _capped(deployment: ExactModelDeployment, cap: int) -> ExactModelDeployment:
+    """``deployment`` with an authored prompt cap (a dedicated :fast replica)."""
+    return deployment.model_copy(
+        update={
+            "gateway": deployment.gateway.model_copy(
+                update={"dispatch": GatewayRungDispatchPolicy(max_prompt_tokens=cap)}
+            )
+        }
+    )
+
+
+def test_a_prompt_cap_skips_its_rung_by_prompt_only() -> None:
+    """A long prompt leaves the capped replica for the main lane; a big max_tokens never does."""
+    route = _route(_capped(_deployment("fast", 200_000), 1_000), _deployment("main", 200_000))
+    assert context_window_compatible_indexes(route, _request(_tokens(999))) == (0, 1)
+    assert context_window_compatible_indexes(route, _request(_tokens(1_000))) == (1,)
+    short_long_answer = _request(_tokens(10), max_tokens=100_000)
+    assert context_window_compatible_indexes(route, short_long_answer) == (0, 1)
+
+
+def test_capped_rungs_serve_when_nothing_else_fits() -> None:
+    """Every fitting rung capped below the prompt: they are kept, never a refusal."""
+    route = _route(_capped(_deployment("fast", 200_000), 1_000), _deployment("small", 500))
+    assert context_window_compatible_indexes(route, _request(_tokens(2_000))) == (0,)

@@ -144,14 +144,21 @@ the tier is ours, so the request gets more of the GPU:
 - no class cap and no pace;
 - a split bound: fast reservations may hold the upper half of the rung's bound (at least one),
   outside fair share; while any is held, every other reservation may hold only the lower half
-  (at least one), hard, even for a priority overflow. A fast request that finds the rung full
-  still admits, so the rung exceeds its bound by at most that one. Like every registry bound
-  this is per gateway worker, and rate windows still apply;
+  (at least one), hard, even for a priority overflow. Fast ignores the rung's total, so a full
+  rung can briefly hold its bound plus the upper half until earlier requests finish. Like
+  every registry bound this is per gateway worker, and rate windows still apply;
 - settlement confirmed at the requested card (`tier_settlement`): our server reports no tier.
 
 Every self-hosted lever needs the rung's priority card (`fast_on_rung`), so a fast request
-never gets more of the GPU at the standard price. A caller's plain `service_tier=priority` on a
-self-hosted rung (not `:fast`) keeps the evidence rule and gets none of these levers.
+never gets more of the GPU at the standard price. A caller's plain `service_tier=priority` that
+admission keeps is treated as fast on the rung (`tier_authorization`): held and settled at the
+card with these levers, except the permit class, which reads the host's authorization.
+
+A fast request is placed by conversation like any other (`maximize_cache_affinity` keeps its
+replica's prefix cache warm). A dedicated low-batch replica can author
+`GatewayRungDispatchPolicy.max_prompt_tokens`: a prompt at least that long (lower-bound
+estimate, prompt only) skips the rung at admission and runs on the route's next rung, so long
+cold prefills never land on it.
 
 The default bound is already half the worker's permits, so its Pro factor stays below
 `1 / DEFAULT_LANE_SHARE` and one lane's priority traffic never holds every permit. A rung whose
