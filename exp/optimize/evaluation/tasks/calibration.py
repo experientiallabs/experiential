@@ -18,8 +18,8 @@ from exp.common.evaluations.reconstruction import DualReport, WorkflowEvidence
 from exp.common.project import ProjectStore, artifact_input
 from exp.optimize.evaluation.harbor.export import export_harbor_task, verify_harbor_export
 from exp.optimize.evaluation.tasks.admission import admit_calibration_evidence
-from exp.simulation.evaluation_calibration import CalibrationJudgment, CalibrationPack, calibrate
-from exp.simulation.evaluation_tasks import load_evaluation_task, normalized_outcome
+from exp.simulation.evaluation.calibration import CalibrationJudgment, CalibrationPack, calibrate
+from exp.simulation.evaluation.tasks import load_evaluation_task, normalized_outcome
 
 # Identity of the code that decides this artifact's behavior, in place of its source text.
 # Bump it when behavior changes. exp/tests/code_protocols_test.py fails when the covered

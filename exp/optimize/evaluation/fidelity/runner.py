@@ -61,7 +61,7 @@ from exp.runtime.models.structured_completion import (
 )
 from exp.runtime.sessions.dispatch_ledger import DispatchLedger
 from exp.runtime.sessions.store import SessionStore
-from exp.simulation.evaluation import FixedWorkflow, evaluate_workflow
+from exp.simulation.evaluation.workflow import FixedWorkflow, evaluate_workflow
 from exp.simulation.retrieval.jev import JEVCueSelector, JEVPolicy, JEVSelector
 from exp.simulation.retrieval.selection import EvidencePolicy
 from exp.simulation.world_model.artifact import GroundedWorldModelArtifact

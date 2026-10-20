@@ -9,7 +9,13 @@ from exp.common.core.artifacts import ArtifactInput, JsonObject
 from exp.common.evaluations.reconstruction import WorkflowEvidence, WorkflowStep
 from exp.common.project import ProjectStore
 from exp.common.tasks import TaskCase
-from exp.simulation.evaluation_tasks import (
+from exp.simulation.evaluation.admission import (
+    EvaluationSpecification,
+    persist_specification,
+    record_label_witness,
+    verify_label_witness,
+)
+from exp.simulation.evaluation.tasks import (
     EvaluationTask,
     OutcomeRule,
     TaskRevisionProposal,
@@ -20,12 +26,6 @@ from exp.simulation.evaluation_tasks import (
     load_evaluation_task,
     persist_evaluation_task,
     qualify_verifier,
-)
-from exp.simulation.evidence_admission import (
-    EvaluationSpecification,
-    persist_specification,
-    record_label_witness,
-    verify_label_witness,
 )
 
 
@@ -352,7 +352,7 @@ def test_verifier_preserves_literal_pattern_keys() -> None:
 
 def test_rule_draft_grades_nested_arrays_and_numeric_object_keys() -> None:
     """A constrained authored predicate handles paths without inventing tool behavior."""
-    from exp.simulation.evaluation_tasks import OutcomeRule, RuleVerifierDraft
+    from exp.simulation.evaluation.tasks import OutcomeRule, RuleVerifierDraft
 
     draft = RuleVerifierDraft(
         description="Require an observed read with the declared structure.",
@@ -390,7 +390,7 @@ def test_rule_draft_grades_nested_arrays_and_numeric_object_keys() -> None:
 )
 def test_rules_refuse_wrong_operator_value_types(operator: str, value: object) -> None:
     """Operator arguments are validated rather than coerced or silently ignored."""
-    from exp.simulation.evaluation_tasks import OutcomeRule
+    from exp.simulation.evaluation.tasks import OutcomeRule
 
     with pytest.raises(ValueError):
         OutcomeRule.model_validate({"path": "/steps", "operator": operator, "value": value})
@@ -398,7 +398,7 @@ def test_rules_refuse_wrong_operator_value_types(operator: str, value: object) -
 
 def test_rules_preserve_boolean_number_distinctions_and_unknown_observations() -> None:
     """Strict equality and JSON types avoid bool-as-int accidental acceptance."""
-    from exp.simulation.evaluation_tasks import OutcomeRule, RuleVerifierDraft
+    from exp.simulation.evaluation.tasks import OutcomeRule, RuleVerifierDraft
 
     for operator, expected in (("equals", 1), ("type", "integer"), ("type", "number")):
         predicate = RuleVerifierDraft(

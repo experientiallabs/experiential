@@ -9,12 +9,12 @@ from exp.common.core.artifacts import ArtifactInput, JsonObject, sha256_json
 from exp.common.evaluations.actor_rubric import actor_judge
 from exp.common.evaluations.reconstruction import AxisOutcome, JudgeConfig
 from exp.optimize.evaluation.tasks.rubrics import RubricEdit, refine_rubric
-from exp.simulation.evaluation_calibration import (
+from exp.simulation.evaluation.calibration import (
     CalibrationCase,
     CalibrationJudgment,
     CalibrationPack,
 )
-from exp.simulation.evaluation_calibration_test import pack
+from exp.simulation.evaluation.calibration_test import pack
 
 
 @pytest.mark.parametrize("task_labels", [False, True])

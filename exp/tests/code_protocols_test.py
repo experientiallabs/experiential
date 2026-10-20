@@ -44,11 +44,11 @@ PROTOCOLS = (
         (
             "exp.optimize.evaluation.tasks.calibration",
             "exp.optimize.evaluation.tasks.admission",
-            "exp.simulation.evaluation_calibration",
-            "exp.simulation.evaluation_tasks",
-            "exp.simulation.evidence_admission",
+            "exp.simulation.evaluation.calibration",
+            "exp.simulation.evaluation.tasks",
+            "exp.simulation.evaluation.admission",
         ),
-        "f7c7cd04b73687d79e5e4ba283239e353a035e6169de353d5568001aaddaa945",
+        "adf701e1607f84143bf50b733e17cb3ab8de97d37571fe97139166289c8db94d",
     ),
     Protocol(
         "exp.optimize.evaluation.council.runner:COUNCIL_HARNESS_PROTOCOL",

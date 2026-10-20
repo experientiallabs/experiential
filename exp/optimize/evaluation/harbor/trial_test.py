@@ -29,7 +29,7 @@ from exp.optimize.evaluation.harbor.export import export_harbor_task, verify_har
 from exp.optimize.evaluation.harbor.trial import HarborTrial
 from exp.runtime.models import RuntimeModelCatalog
 from exp.runtime.sessions.store import SessionStore
-from exp.simulation.evaluation_tasks import (
+from exp.simulation.evaluation.tasks import (
     EvaluationTask,
     FieldRelation,
     TaskVerifier,

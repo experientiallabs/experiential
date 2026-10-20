@@ -48,7 +48,7 @@ from exp.runtime.environments.artifact_edits import (
     NativeArtifactBinding,
     NativeArtifactPlan,
 )
-from exp.simulation.evaluation_tasks import (
+from exp.simulation.evaluation.tasks import (
     WITNESSED_AUTHORITIES,
     EvaluationTask,
     TaskVerifier,

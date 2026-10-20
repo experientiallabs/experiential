@@ -32,8 +32,8 @@ from exp.optimize.evaluation.native_artifacts import (
     materialize_native_artifacts,
 )
 from exp.runtime.environments.artifact_edits import ArtifactEditAdapter, NativeArtifactBinding
-from exp.simulation.evaluation_calibration import task_decision
-from exp.simulation.evaluation_tasks import EvaluationTask, grade, load_evaluation_task
+from exp.simulation.evaluation.calibration import task_decision
+from exp.simulation.evaluation.tasks import EvaluationTask, grade, load_evaluation_task
 from exp.simulation.world_model.checkpoints import (
     capture_world_checkpoint,
     load_world_checkpoint,

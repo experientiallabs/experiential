@@ -34,7 +34,7 @@ from exp.optimize.evaluation.fidelity.runner import (
 from exp.optimize.evaluation.fidelity.runner_test import source_project, transition_reply
 from exp.runtime.models.providers.transport import JsonHttpResponse, ScriptedJsonTransport
 from exp.simulation.engines.text.knowledge import SimulationKnowledge
-from exp.simulation.evaluation import FixedWorkflow
+from exp.simulation.evaluation.workflow import FixedWorkflow
 from exp.simulation.retrieval.jev import JEVCueSelector, JEVPolicy
 from exp.simulation.world_model.artifact import (
     GroundedWorldModelArtifact,

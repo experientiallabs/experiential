@@ -4,7 +4,7 @@ import json
 
 import pytest
 
-from exp.simulation.trace_analysis import (
+from exp.simulation.evaluation.analysis import (
     CouncilTrace,
     aggregate_analyses,
     analysis_request,

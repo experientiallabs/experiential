@@ -14,7 +14,7 @@ from exp.common.models import ToolCall
 from exp.common.project import ArtifactStore, ProjectConfig, ProjectStore
 from exp.runtime.sessions.store import SessionStore, StepDeadlineExceededError, StepRejectedError
 from exp.simulation.engines.reconstructed import InformationChannels
-from exp.simulation.evaluation import FixedWorkflow, evaluate_workflow
+from exp.simulation.evaluation.workflow import FixedWorkflow, evaluate_workflow
 from exp.simulation.reconstruction import RawEpisode, RawInputs, initialize, reconstruct
 from exp.simulation.world_model.durable import (
     DurableWorldModelSession,

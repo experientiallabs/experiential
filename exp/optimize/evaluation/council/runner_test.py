@@ -36,7 +36,7 @@ from exp.runtime.models.providers.transport import (
     ScriptedJsonTransport,
 )
 from exp.simulation.actor_context import ActorContextFragment
-from exp.simulation.trace_analysis import CouncilTrace
+from exp.simulation.evaluation.analysis import CouncilTrace
 from exp.simulation.world_model.experience_memory import is_reserved, memory_head
 from exp.simulation.world_model.session_research_test import payload as prediction_context
 from exp.simulation.world_model.session_research_test import structured_reply

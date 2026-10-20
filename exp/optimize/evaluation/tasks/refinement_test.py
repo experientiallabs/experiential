@@ -16,18 +16,18 @@ from exp.optimize.evaluation.fidelity.runner import FidelitySpec
 from exp.optimize.evaluation.tasks import refinement as task_refinement
 from exp.optimize.evaluation.tests.fidelity_memory_test import structured_reply
 from exp.runtime.models.providers.transport import ScriptedJsonTransport
-from exp.simulation.evaluation_tasks import (
+from exp.simulation.evaluation.admission import (
+    EvaluationSpecification,
+    EvidenceAdmissionError,
+    persist_specification,
+    record_label_witness,
+)
+from exp.simulation.evaluation.tasks import (
     OutcomeRule,
     RuleVerifierDraft,
     TaskVerifier,
     VerifierChallenge,
     load_evaluation_task,
-)
-from exp.simulation.evidence_admission import (
-    EvaluationSpecification,
-    EvidenceAdmissionError,
-    persist_specification,
-    record_label_witness,
 )
 
 

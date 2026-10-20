@@ -7,15 +7,15 @@ from pydantic import Field
 from exp.common.core.artifacts import ContractModel, JsonObject, sha256_json
 from exp.common.evaluations.reconstruction import JudgeConfig
 from exp.common.judging.definition import JudgeDefinition
-from exp.simulation.evaluation_calibration import (
+from exp.simulation.evaluation.admission import EvidenceAdmission, require_admitted
+from exp.simulation.evaluation.calibration import (
     CalibrationCase,
     CalibrationJudgment,
     CalibrationPack,
     blinded_case,
     calibrate,
 )
-from exp.simulation.evaluation_tasks import label_admitted
-from exp.simulation.evidence_admission import EvidenceAdmission, require_admitted
+from exp.simulation.evaluation.tasks import label_admitted
 
 
 class RubricEdit(ContractModel):

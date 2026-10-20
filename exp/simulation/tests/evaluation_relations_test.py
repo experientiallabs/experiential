@@ -4,7 +4,7 @@ import pytest
 from pydantic import ValidationError
 
 from exp.common.core.artifacts import JsonObject
-from exp.simulation.evaluation_tasks import FieldRelation, TaskVerifier, grade
+from exp.simulation.evaluation.tasks import FieldRelation, TaskVerifier, grade
 
 
 def outcome() -> JsonObject:

@@ -80,7 +80,7 @@ from exp.simulation.engines.text.prompt import (
     RECONSTRUCTED_JSON_TOOL_SYSTEM_PROMPT,
     RECONSTRUCTED_TEXT_SYSTEM_PROMPT,
 )
-from exp.simulation.evaluation import FixedWorkflow
+from exp.simulation.evaluation.workflow import FixedWorkflow
 from exp.simulation.retrieval import RAGLineageBinding
 from exp.simulation.retrieval.transitions import extract_real_transitions
 from exp.simulation.world_model.memory_tree import COMPRESSION_PROMPT

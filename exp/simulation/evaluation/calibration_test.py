@@ -6,7 +6,8 @@ from pydantic import ValidationError
 from exp.common.core.artifacts import ArtifactInput, JsonObject, canonical_json_bytes, sha256_json
 from exp.common.evaluations.actor_rubric import actor_judge
 from exp.common.evaluations.reconstruction import AxisOutcome, WorkflowEvidence, WorkflowStep
-from exp.simulation.evaluation_calibration import (
+from exp.simulation.evaluation.admission import AdmissionRefusal, EvidenceAdmission
+from exp.simulation.evaluation.calibration import (
     CalibrationCase,
     CalibrationJudgment,
     CalibrationPack,
@@ -14,8 +15,7 @@ from exp.simulation.evaluation_calibration import (
     calibrate,
     task_decision,
 )
-from exp.simulation.evaluation_tasks import FieldRelation, TaskVerifier, VerifierChallenge
-from exp.simulation.evidence_admission import AdmissionRefusal, EvidenceAdmission
+from exp.simulation.evaluation.tasks import FieldRelation, TaskVerifier, VerifierChallenge
 
 
 def pack(*, variants: int = 1) -> CalibrationPack:

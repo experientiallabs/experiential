@@ -37,7 +37,7 @@ from exp.runtime.environments.artifact_edits import (
 )
 from exp.runtime.models import RuntimeModelCatalog
 from exp.runtime.sessions.store import SessionStore
-from exp.simulation.evaluation_tasks import EvaluationTask, TaskVerifier, persist_evaluation_task
+from exp.simulation.evaluation.tasks import EvaluationTask, TaskVerifier, persist_evaluation_task
 from exp.simulation.world_model.checkpoints import capture_world_checkpoint, load_world_checkpoint
 from exp.simulation.world_model.durable import DurableWorldModelSession, SessionPolicy
 from exp.simulation.world_model.grounded_session import open_grounded_session

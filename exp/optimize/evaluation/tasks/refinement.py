@@ -32,7 +32,8 @@ from exp.runtime.models.providers.transport import HttpxJsonTransport
 from exp.runtime.models.structured_completion import CompletionPlan, StructuredCompletion
 from exp.runtime.sessions.dispatch_ledger import DispatchLedger
 from exp.runtime.sessions.store import SessionStore
-from exp.simulation.evaluation_tasks import (
+from exp.simulation.evaluation.analysis import CouncilTrace, TraceAnalysis
+from exp.simulation.evaluation.tasks import (
     EvaluationTask,
     RuleVerifierDraft,
     TaskRevisionProposal,
@@ -45,7 +46,6 @@ from exp.simulation.evaluation_tasks import (
     persist_evaluation_task,
     qualify_verifier,
 )
-from exp.simulation.trace_analysis import CouncilTrace, TraceAnalysis
 from exp.simulation.world_model.checkpoints import capture_stored_world_checkpoint
 
 # Identity of the code that decides this artifact's behavior, in place of its source text.

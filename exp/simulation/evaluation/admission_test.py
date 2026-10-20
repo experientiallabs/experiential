@@ -8,14 +8,7 @@ from pydantic import ValidationError
 
 from exp.common.core.artifacts import ArtifactEnvelope, ArtifactInput, JsonObject, sha256_json
 from exp.common.project import ProjectStore, artifact_input
-from exp.simulation.evaluation_tasks import (
-    OutcomeRule,
-    TaskVerifier,
-    Verdict,
-    VerifierChallenge,
-    label_admitted,
-)
-from exp.simulation.evidence_admission import (
+from exp.simulation.evaluation.admission import (
     EvaluationSpecification,
     EvidenceAdmission,
     EvidenceAdmissionError,
@@ -25,6 +18,13 @@ from exp.simulation.evidence_admission import (
     record_label_witness,
     require_admitted,
     verify_label_witness,
+)
+from exp.simulation.evaluation.tasks import (
+    OutcomeRule,
+    TaskVerifier,
+    Verdict,
+    VerifierChallenge,
+    label_admitted,
 )
 
 NOW = datetime(2026, 10, 17, tzinfo=UTC)

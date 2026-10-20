@@ -32,7 +32,7 @@ from exp.optimize.evaluation.fidelity.runner import (
 )
 from exp.runtime.models import RuntimeModelCatalog
 from exp.runtime.models.providers.transport import JsonHttpResponse, ScriptedJsonTransport
-from exp.simulation.evaluation import FixedWorkflow
+from exp.simulation.evaluation.workflow import FixedWorkflow
 from exp.simulation.retrieval import RAGLineageBinding, persist_trace_rag
 from exp.simulation.world_model.construction import ground_world_model_from_traces
 

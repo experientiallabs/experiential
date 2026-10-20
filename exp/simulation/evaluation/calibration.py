@@ -13,17 +13,17 @@ from exp.common.core.artifacts import (
     stable_id,
 )
 from exp.common.evaluations.reconstruction import AxisOutcome, JudgeConfig, WorkflowEvidence
-from exp.simulation.evaluation_tasks import (
+from exp.simulation.evaluation.admission import (
+    AdmissionRefusal,
+    EvidenceAdmission,
+    adequacy_refusals,
+)
+from exp.simulation.evaluation.tasks import (
     TaskVerifier,
     Verdict,
     VerifierChallenge,
     grade,
     label_admitted,
-)
-from exp.simulation.evidence_admission import (
-    AdmissionRefusal,
-    EvidenceAdmission,
-    adequacy_refusals,
 )
 
 

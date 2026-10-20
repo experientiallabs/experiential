@@ -10,7 +10,7 @@ from pathlib import Path
 from exp.common.core.artifacts import ArtifactInput, JsonObject
 from exp.common.project import ProjectStore, artifact_input
 from exp.runtime.environments.artifact_edits import NativeArtifactBinding
-from exp.simulation.evaluation_tasks import load_evaluation_task
+from exp.simulation.evaluation.tasks import load_evaluation_task
 from exp.simulation.world_model.checkpoints import load_world_checkpoint
 
 HARBOR_VERSION = "0.24.0"

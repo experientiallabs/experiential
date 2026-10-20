@@ -2,7 +2,7 @@
 
 from exp.common.evaluations.reconstruction import WorkflowStep
 from exp.common.tasks import TaskCase
-from exp.simulation.trace_counterfactuals import RecordedEpisode, matched_native_replies
+from exp.simulation.evaluation.counterfactuals import RecordedEpisode, matched_native_replies
 
 
 def test_action_match_after_divergent_history_does_not_reveal_native_reply() -> None:

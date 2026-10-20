@@ -29,23 +29,23 @@ from exp.optimize.evaluation.tasks.admission import (
 )
 from exp.optimize.evaluation.tasks.calibration import CalibrationSpec, execute_calibration
 from exp.optimize.evaluation.tests.knowledge_exposure_test import OWN, bound
-from exp.simulation import evidence_admission as witness_admission
 from exp.simulation.engines.text.knowledge import SimulationKnowledge
-from exp.simulation.evaluation_calibration import CalibrationCase, CalibrationPack
-from exp.simulation.evaluation_tasks import (
-    EvaluationTask,
-    OutcomeRule,
-    TaskVerifier,
-    VerifierChallenge,
-    persist_evaluation_task,
-)
-from exp.simulation.evidence_admission import (
+from exp.simulation.evaluation import admission as witness_admission
+from exp.simulation.evaluation.admission import (
     NATIVE_RECEIPT_TYPE,
     EvaluationSpecification,
     EvidenceAdmissionError,
     persist_specification,
     record_label_witness,
     verify_label_witness,
+)
+from exp.simulation.evaluation.calibration import CalibrationCase, CalibrationPack
+from exp.simulation.evaluation.tasks import (
+    EvaluationTask,
+    OutcomeRule,
+    TaskVerifier,
+    VerifierChallenge,
+    persist_evaluation_task,
 )
 from exp.simulation.mining.exposure_ledger import ExposureLedger, LedgerExposure
 from exp.simulation.world_model.checkpoints import load_world_checkpoint

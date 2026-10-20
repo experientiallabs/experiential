@@ -56,16 +56,16 @@ from exp.simulation.actor_context import (
     ContextRecordingClient,
     with_actor_context,
 )
-from exp.simulation.evaluation_tasks import load_evaluation_task
-from exp.simulation.retrieval.jev import JEVCueSelector, JEVSelector
-from exp.simulation.trace_analysis import (
+from exp.simulation.evaluation.analysis import (
     ANALYSIS_PROMPT,
     CouncilTrace,
     TraceAnalysis,
     aggregate_analyses,
     analyze_traces,
 )
-from exp.simulation.trace_counterfactuals import RecordedEpisode, matched_native_replies
+from exp.simulation.evaluation.counterfactuals import RecordedEpisode, matched_native_replies
+from exp.simulation.evaluation.tasks import load_evaluation_task
+from exp.simulation.retrieval.jev import JEVCueSelector, JEVSelector
 from exp.simulation.world_model.checkpoints import load_world_checkpoint
 from exp.simulation.world_model.durable import SessionPolicy
 from exp.simulation.world_model.experience_memory import (

@@ -15,8 +15,16 @@ from exp.common.project import ArtifactStore, ArtifactStoreError, ProjectStore
 from exp.common.tasks import TaskCase
 from exp.optimize.evaluation.audit.exposure import held_out_exposure
 from exp.optimize.evaluation.fidelity.knowledge_exposure import require_unexposed_task
-from exp.simulation.evaluation_calibration import CalibrationCase, CalibrationPack
-from exp.simulation.evaluation_tasks import (
+from exp.simulation.evaluation.admission import (
+    AdmissionRefusal,
+    EvidenceAdmission,
+    adequacy_refusals,
+    require_admitted,
+    task_lineage_challenges,
+    verify_label_witness,
+)
+from exp.simulation.evaluation.calibration import CalibrationCase, CalibrationPack
+from exp.simulation.evaluation.tasks import (
     WITNESSED_AUTHORITIES,
     EvaluationTask,
     RuleVerifierDraft,
@@ -25,14 +33,6 @@ from exp.simulation.evaluation_tasks import (
     VerifierChallenge,
     label_admitted,
     load_evaluation_task,
-)
-from exp.simulation.evidence_admission import (
-    AdmissionRefusal,
-    EvidenceAdmission,
-    adequacy_refusals,
-    require_admitted,
-    task_lineage_challenges,
-    verify_label_witness,
 )
 from exp.simulation.mining.bindings import load_task_set_lineage_bindings
 from exp.simulation.world_model.runtime import load_grounded_world_model_artifact

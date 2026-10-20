@@ -32,8 +32,8 @@ from exp.optimize.evaluation.fidelity.runner import (
     prepare_fidelity_evaluation,
 )
 from exp.runtime.models.providers.transport import RetryPolicy
+from exp.simulation.evaluation.counterfactuals import RecordedEpisode, RecordedStep
 from exp.simulation.retrieval.jev import JEVPolicy
-from exp.simulation.trace_counterfactuals import RecordedEpisode, RecordedStep
 from exp.simulation.world_model.artifact import persist_grounded_world_model
 from exp.simulation.world_model.runtime import load_grounded_world_model_artifact
 
