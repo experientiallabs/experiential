@@ -592,6 +592,36 @@ def test_unreported_truncation_settles_its_budget_as_an_estimate_not_unknown(
     assert terminal.usage.output_tokens == (expected_output or streamed)
 
 
+@pytest.mark.parametrize(("cap", "expected_output"), [(16, 16), (None, 206)])
+def test_reported_output_past_the_callers_ceiling_settles_at_the_ceiling(
+    cap: int | None, expected_output: int
+) -> None:
+    """A lane that overshoots the caller's max_tokens bills the ceiling, the sweep included."""
+    registry, ledger, entry = _registry()
+    entry.request = entry.request.model_copy(update={"maximum_output_tokens": cap})
+    started = _start(registry, ordinal=0)
+    registry.settle(
+        json.dumps(
+            {
+                "request_id": entry.authorization.request_id,
+                "attempt_id": started["attempt_id"],
+                "outcome": "completed",
+                "usage": {"input_tokens": 12, "output_tokens": 206, "reasoning_tokens": 203},
+                "tool_names": [],
+                "failure": None,
+                "finalize": True,
+                "opened": True,
+                "dispatched": True,
+            }
+        )
+    )
+    terminal = ledger.terminal_events[-1]
+    assert terminal is not None and terminal.usage is not None
+    assert terminal.usage.output_tokens == expected_output
+    assert terminal.usage.reasoning_tokens == min(203, expected_output)
+    assert terminal.usage.input_tokens == 12
+
+
 def test_unreported_truncation_marker_rejects_inconsistent_evidence() -> None:
     """Failed, completed, or undispatched work cannot claim an unreported truncation."""
     base: JsonObject = {

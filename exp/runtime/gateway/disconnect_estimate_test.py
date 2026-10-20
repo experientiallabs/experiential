@@ -15,6 +15,7 @@ from exp.runtime.gateway.contracts import (
 )
 from exp.runtime.gateway.disconnect_estimate import (
     FALLBACK_CHARACTERS_PER_TOKEN,
+    bill_within_output_ceiling,
     estimate_disconnect_usage,
     estimate_unreported_truncation_usage,
 )
@@ -506,3 +507,49 @@ def test_unreported_truncation_marker_rides_only_incomplete_terminals() -> None:
         usage_estimated=True,
     )
     assert "usage_unreported_truncation" not in marked.model_dump()
+
+
+def _completed(usage: GatewayUsage) -> GatewayEvent:
+    """Build one completed terminal carrying a provider-reported meter."""
+    return GatewayEvent(kind=GatewayEventKind.COMPLETED, sequence_number=0, usage=usage)
+
+
+def test_output_past_the_callers_ceiling_bills_at_the_ceiling() -> None:
+    """Novita r1-turbo answered max_tokens=16 with 206 tokens (203 reasoning); 16 is billed."""
+    reported = GatewayUsage(
+        input_tokens=12, output_tokens=206, reasoning_tokens=203, cached_input_tokens=4
+    )
+    clamped = bill_within_output_ceiling(
+        _completed(reported), output_ceiling=16, deployment_id="deployment-a"
+    ).usage
+    assert clamped is not None
+    assert (clamped.output_tokens, clamped.reasoning_tokens) == (16, 16)
+    # Input legs are the caller's prompt, never the overshoot.
+    assert (clamped.input_tokens, clamped.cached_input_tokens) == (12, 4)
+    partial = bill_within_output_ceiling(
+        _completed(GatewayUsage(input_tokens=12, output_tokens=40, reasoning_tokens=10)),
+        output_ceiling=32,
+    ).usage
+    assert partial is not None
+    assert (partial.output_tokens, partial.reasoning_tokens) == (32, 10)
+
+
+@pytest.mark.parametrize(
+    ("usage", "ceiling"),
+    [
+        (GatewayUsage(input_tokens=12, output_tokens=16, reasoning_tokens=12), 16),
+        (GatewayUsage(input_tokens=12, output_tokens=206, reasoning_tokens=203), None),
+        (GatewayUsage(input_tokens=12), 16),
+        (None, 16),
+    ],
+)
+def test_meters_within_or_without_a_ceiling_are_billed_as_reported(
+    usage: GatewayUsage | None, ceiling: int | None
+) -> None:
+    """Only a known output total past an explicit ceiling is clamped."""
+    terminal = (
+        _completed(usage)
+        if usage is not None
+        else GatewayEvent(kind=GatewayEventKind.INCOMPLETE, sequence_number=0)
+    )
+    assert bill_within_output_ceiling(terminal, output_ceiling=ceiling) is terminal
