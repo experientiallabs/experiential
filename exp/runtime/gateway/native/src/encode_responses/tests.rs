@@ -897,3 +897,73 @@ mod probabilities_tests;
 
 #[path = "tool_attribution_tests.rs"]
 mod tool_attribution_tests;
+
+/// Azure Foundry's DeepSeek output filter streams text and then ends the
+/// turn with `finish_reason: "content_filter"`, which the compatible dialect
+/// reads as an empty refusal after the text (live 2026-10-20). The Responses
+/// surface serves it as chat does, the text part then a refusal part, never
+/// as a malformed-stream 502.
+#[test]
+fn refusal_after_text_opens_a_second_content_part() {
+    let mut events = vec![
+        Event::TextDelta("{\"page_type\": \"st".to_string()),
+        Event::RefusalDelta(String::new()),
+        Event::Failed(crate::errors::Failure::refusal(
+            crate::errors::RefusalReason::ContentPolicy,
+        )),
+    ];
+    let mut encoder = ResponsesSseEncoder::new(
+        "request-1",
+        "coding",
+        1_700_000_000,
+        ResponsesEnvelope::default(),
+    );
+    encoder.start().expect("stream start must encode");
+    encoder.feed(&events[0]).expect("text delta encodes");
+    let frames = encoder
+        .feed(&events[1])
+        .expect("a refusal after text is served, not refused");
+    assert!(frames
+        .iter()
+        .any(|frame| frame.contains("response.content_part.added")
+            && frame.contains("\"content_index\":1")
+            && frame.contains("\"type\":\"refusal\"")));
+    assert!(frames
+        .iter()
+        .any(|frame| frame.contains("response.refusal.delta")
+            && frame.contains("\"content_index\":1")));
+
+    let refusal = crate::respond::complete_visible_refusal(&mut events);
+    assert!(refusal.is_some(), "the ledger still records the refusal");
+    let completed = completed_responses_body(
+        "request-1",
+        "coding",
+        1_700_000_000,
+        ResponsesEnvelope::default(),
+        &events,
+    )
+    .expect("completed body must encode");
+    assert!(completed.failure.is_none());
+    assert_eq!(
+        completed.body["output"][0]["content"],
+        json!([
+            {"type": "output_text", "text": "{\"page_type\": \"st", "annotations": []},
+            {"type": "refusal", "refusal": ""},
+        ])
+    );
+}
+
+#[test]
+fn text_after_a_refusal_still_fails_closed() {
+    let mut encoder = ResponsesSseEncoder::new(
+        "request-1",
+        "coding",
+        1_700_000_000,
+        ResponsesEnvelope::default(),
+    );
+    encoder.start().expect("stream start must encode");
+    encoder
+        .feed(&Event::RefusalDelta("I can't help with that.".to_string()))
+        .expect("refusal delta encodes");
+    assert!(encoder.feed(&Event::TextDelta("Sure".to_string())).is_err());
+}
