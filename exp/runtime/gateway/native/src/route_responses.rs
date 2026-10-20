@@ -173,7 +173,7 @@ pub(crate) async fn responses(
         }
     };
     let mut guard = new_guard(&state, admission.request_id.clone(), started);
-    guard.record_web_search_requests(admission.web_search_requests());
+    guard.record_web_search(admission.web_search_meter());
     // The replay key was authorized independently of admission; a revision
     // swap between the two fails closed exactly like the chat surface.
     if lease

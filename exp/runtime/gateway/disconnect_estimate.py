@@ -43,7 +43,9 @@ from exp.runtime.gateway.native_settlement import (
     streamed_output_from_settlement,
     terminal_from_settlement,
     tool_search_requests_from_settlement,
+    web_search_cost_from_settlement,
     web_search_requests_from_settlement,
+    web_search_results_from_settlement,
 )
 from exp.runtime.gateway.reservation_tokenizer import reservation_encoder
 from exp.runtime.gateway.rung_admission import RungLoadRegistry
@@ -114,6 +116,8 @@ def settled_terminal(
                 "usage": terminal.usage.model_copy(
                     update={
                         "web_search_requests": web_search_requests_from_settlement(data),
+                        "web_search_results": web_search_results_from_settlement(data),
+                        "web_search_cost_nano_usd": web_search_cost_from_settlement(data),
                         "tool_search_requests": tool_search_requests_from_settlement(data),
                     }
                 )
@@ -408,6 +412,8 @@ def _estimated(
         reasoning_tokens=reasoning_tokens,
         tool_names=() if observed is None else observed.tool_names,
         web_search_requests=0 if observed is None else observed.web_search_requests,
+        web_search_results=None if observed is None else observed.web_search_results,
+        web_search_cost_nano_usd=None if observed is None else observed.web_search_cost_nano_usd,
         tool_search_requests=0 if observed is None else observed.tool_search_requests,
     )
     return terminal.model_copy(update={"usage": usage, "usage_estimated": True})

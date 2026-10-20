@@ -120,6 +120,10 @@ class GatewayUsage(ContractModel):
             modality count, OpenRouter's ``image_tokens``), or None when unreported.
         tool_names: Invoked tool names in first-use order.
         web_search_requests: Gateway-executed web searches billed to the attempt.
+        web_search_results: Results those searches returned (each billed by the
+            vendor as one contents page), or None when the settlement named none.
+        web_search_cost_nano_usd: The search vendor's own reported cost for those
+            searches in whole nano-USD, or None when it reported none.
         tool_search_requests: Gateway-executed tool-search rounds billed to the attempt.
         billed_units: Media units priced by the deployment's unit card (characters,
             audio or video seconds, images), beside or instead of tokens; None on
@@ -144,6 +148,14 @@ class GatewayUsage(ContractModel):
     """Gateway-executed web searches billed to this attempt; never a provider
     meter and not a subset of any token total. Zero on every attempt that ran
     no search, including every attempt settled by an engine predating it."""
+    web_search_results: int | None = Field(default=None, ge=0)
+    """Results the gateway's web searches returned (each one a vendor contents
+    page); None whenever ``web_search_requests`` is zero or the engine that
+    settled predates the field, so a host prices the search as before."""
+    web_search_cost_nano_usd: int | None = Field(default=None, ge=0)
+    """The search vendor's own reported cost for this attempt's web searches
+    (Exa ``costDollars.total``) in whole nano-USD; None when the vendor
+    reported none. A host billing the true pass-through prefers it."""
     tool_search_requests: int = Field(default=0, ge=0)
     """Gateway-executed tool-search rounds billed to this attempt; never a
     provider meter and not a subset of any token total. Zero on every attempt

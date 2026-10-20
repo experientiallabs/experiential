@@ -168,7 +168,7 @@ pub(crate) async fn chat(
             }
         };
     let mut guard = new_guard(&state, admission.request_id.clone(), started);
-    guard.record_web_search_requests(admission.web_search_requests());
+    guard.record_web_search(admission.web_search_meter());
     // The replay key was authorized independently of admission. If an alias
     // activation landed between the two, the admitted work belongs to a newer
     // revision than the claimed replay scope, so the request fails closed:

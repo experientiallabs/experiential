@@ -19,6 +19,7 @@ use crate::events::{Event, Usage};
 use crate::metrics::METRICS;
 use crate::replay::OwnerLease;
 use crate::waterfall::CommittedAttempt;
+use crate::web_search::WebSearchMeter;
 
 #[path = "settlement_observation.rs"]
 mod observation;
@@ -97,7 +98,7 @@ fn settle_argument(
     first_token_at: Option<SystemTime>,
     rate_limit_headers: Option<&serde_json::Map<String, Value>>,
     upstream_provider: Option<&str>,
-    web_search_requests: u32,
+    web_search: WebSearchMeter,
     tool_search_requests: u32,
 ) -> String {
     let mut argument = json!({
@@ -162,8 +163,15 @@ fn settle_argument(
     // carries the count, so a failed rung's non-finalizing settlement can
     // never bill it a second time. Absent at zero, so unsearched requests
     // settle with exactly the bytes they always did.
-    if finalize && web_search_requests > 0 {
-        argument["web_search_requests"] = json!(web_search_requests);
+    if finalize && web_search.requests > 0 {
+        argument["web_search_requests"] = json!(web_search.requests);
+        // What the searches returned and, when the vendor reported it, what
+        // they cost, so the host can bill the true pass-through instead of a
+        // flat per-search rate. Both ride only beside a positive count.
+        argument["web_search_results"] = json!(web_search.results);
+        if let Some(cost) = web_search.cost_nano_usd {
+            argument["web_search_cost_nano_usd"] = json!(cost);
+        }
     }
     // The gateway's own tool-search rounds bill the same way: once, on the
     // settlement that closes the request, absent at zero.
@@ -251,10 +259,11 @@ pub struct AttemptGuard {
     /// The upstream an aggregator named as serving the active attempt's
     /// committed stream, recorded at commit and settled alongside the outcome.
     upstream_provider: Option<String>,
-    /// How many web searches the control plane executed for this request
-    /// before dispatch (from the admission); a request-level fact that
-    /// survives `rebind` and rides only the finalizing settlement.
-    web_search_requests: u32,
+    /// The web searches the control plane executed for this request before
+    /// dispatch (count, results, vendor cost; from the admission); a
+    /// request-level fact that survives `rebind` and rides only the
+    /// finalizing settlement.
+    web_search: WebSearchMeter,
     /// How many gateway-run tool-search rounds this request completed so
     /// far (recorded by the waterfall as each round lands); request-level
     /// like the web-search count, so it survives `rebind` and rides only the
@@ -310,7 +319,7 @@ impl AttemptGuard {
             first_token_at: None,
             rate_limit_headers: None,
             upstream_provider: None,
-            web_search_requests: 0,
+            web_search: WebSearchMeter::default(),
             tool_search_requests: 0,
             observation: Observation::default(),
         }
@@ -344,10 +353,10 @@ impl AttemptGuard {
         eprintln!("exp-gateway-native: {line}");
     }
 
-    /// Record the admission's count of gateway-executed web searches, so the
-    /// finalizing settlement bills them.
-    pub fn record_web_search_requests(&mut self, requests: u32) {
-        self.web_search_requests = requests;
+    /// Record the admission's gateway-executed web-search meter, so the
+    /// finalizing settlement bills it.
+    pub fn record_web_search(&mut self, meter: WebSearchMeter) {
+        self.web_search = meter;
     }
 
     /// Record how many gateway-run tool-search rounds the request has
@@ -506,7 +515,7 @@ impl AttemptGuard {
             self.first_token_at,
             rate_limit_headers,
             self.upstream_provider.as_deref(),
-            self.web_search_requests,
+            self.web_search,
             self.tool_search_requests,
         );
         let argument = tier_provenance(argument, &observed.service_tier);
@@ -739,7 +748,7 @@ impl Drop for AttemptGuard {
                                     .and_then(|failure| failure.rate_limit_headers.as_deref())
                             }),
                             self.upstream_provider.as_deref(),
-                            self.web_search_requests,
+                            self.web_search,
                             self.tool_search_requests,
                         ),
                     )

@@ -36,7 +36,11 @@ from exp.common.core.artifacts import JsonObject
 from exp.runtime.gateway.contracts import GatewayMessage, GatewayNamedToolChoice, GatewayRequest
 from exp.runtime.gateway.guardrails.bounded import run_on_native_loop
 from exp.runtime.gateway.tool_contracts import GatewayAllowedToolsChoice
-from exp.runtime.gateway.web_search.backend import WebSearchBackend, WebSearchBackendError
+from exp.runtime.gateway.web_search.backend import (
+    WebSearchBackend,
+    WebSearchBackendError,
+    vendor_cost_nano_usd,
+)
 from exp.runtime.gateway.web_search.contracts import GatewayWebSearch, GatewayWebSearchResult
 
 _logger = logging.getLogger(__name__)
@@ -100,7 +104,10 @@ class WebSearchPlan:
 
     request: GatewayRequest
     admission: JsonObject | None
-    """``{"query", "requests", "results": [{"url", "title"}]}`` for the data plane."""
+    """``{"query", "requests", "results": [{"url", "title"}]}`` for the data plane.
+
+    Plus ``cost_nano_usd`` only when the backend reported the vendor's own
+    price for the search."""
 
 
 def natively_served(search: GatewayWebSearch, dialects: Sequence[str]) -> bool:
@@ -344,6 +351,7 @@ def plan_web_search(
     except Exception as exc:  # noqa: BLE001 - a vendor fault must never fail the request.
         _logger.warning("gateway web search raised (%s): %s", backend.name, type(exc).__name__)
         return _disclosed(request, DROPPED_FAILED)
+    cost_nano_usd = vendor_cost_nano_usd(results)
     results = tuple(results)[: search.max_results]
     injected = inject_results(
         strip_search_carriers(request), instruction_text(search, query, results)
@@ -356,4 +364,8 @@ def plan_web_search(
         # and lists its sources on the action when the caller asked for them.
         "include_sources": request.include_web_search_sources,
     }
+    if cost_nano_usd is not None:
+        # The vendor's own price for this search (Exa ``costDollars.total``),
+        # settled beside the count so the host can bill the true pass-through.
+        admission["cost_nano_usd"] = cost_nano_usd
     return WebSearchPlan(injected, admission)

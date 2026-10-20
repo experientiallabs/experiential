@@ -32,9 +32,11 @@ from exp.runtime.gateway.native_settlement import (
     tool_search_requests_kwarg,
     upstream_provider_from_settlement,
     upstream_provider_kwarg,
+    web_search_cost_from_settlement,
     web_search_requests_from_settlement,
     web_search_requests_from_terminal,
     web_search_requests_kwarg,
+    web_search_results_from_settlement,
 )
 
 
@@ -683,6 +685,48 @@ def test_web_search_requests_ride_on_the_settled_usage() -> None:
     assert absent.usage is not None and absent.usage.web_search_requests == 0
     assert _usage_from_payload(tokens, [], web_search_requests=4) == GatewayUsage(
         input_tokens=8, output_tokens=3, web_search_requests=4
+    )
+
+
+def test_web_search_results_and_vendor_cost_ride_beside_the_count() -> None:
+    """Results and vendor cost settle on the usage only beside a positive search count."""
+    tokens: JsonObject = {"input_tokens": 8, "output_tokens": 3}
+    terminal, _failure = terminal_from_settlement(
+        {
+            "outcome": "completed",
+            "usage": tokens,
+            "tool_names": [],
+            "web_search_requests": 1,
+            "web_search_results": 5,
+            "web_search_cost_nano_usd": 12_000_000,
+        }
+    )
+    assert terminal.usage is not None
+    assert terminal.usage.web_search_results == 5
+    assert terminal.usage.web_search_cost_nano_usd == 12_000_000
+
+    # An engine predating the fields (count only) leaves both unknown.
+    legacy, _failure = terminal_from_settlement(
+        {"outcome": "completed", "usage": tokens, "tool_names": [], "web_search_requests": 1}
+    )
+    assert legacy.usage is not None
+    assert legacy.usage.web_search_results is None
+    assert legacy.usage.web_search_cost_nano_usd is None
+
+    # Without a positive count, or with unusable values, both read as unknown.
+    assert web_search_results_from_settlement({"web_search_results": 5}) is None
+    assert web_search_cost_from_settlement({"web_search_cost_nano_usd": 7}) is None
+    assert web_search_results_from_settlement(None) is None
+    for bad in (-1, "5", True, None, 1.5):
+        payload: JsonObject = {
+            "web_search_requests": 1,
+            "web_search_results": bad,
+            "web_search_cost_nano_usd": bad,
+        }
+        assert web_search_results_from_settlement(payload) is None
+        assert web_search_cost_from_settlement(payload) is None
+    assert (
+        web_search_results_from_settlement({"web_search_requests": 1, "web_search_results": 0}) == 0
     )
 
 

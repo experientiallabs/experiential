@@ -16,6 +16,7 @@ from exp.runtime.gateway.tests.web_search_backend_fixture_test import (
     StaticWebSearchBackend,
 )
 from exp.runtime.gateway.tool_contracts import GatewayAllowedToolsChoice
+from exp.runtime.gateway.web_search.backend import WebSearchHits
 from exp.runtime.gateway.web_search.contracts import GatewayWebSearch, GatewayWebSearchResult
 from exp.runtime.gateway.web_search.plan import (
     DROPPED_FAILED,
@@ -298,3 +299,43 @@ def test_a_declared_search_outside_the_allowed_set_never_searches() -> None:
     )
     plan_web_search(allowed, ["openai_compatible"], backend, deadline_monotonic=_deadline())
     assert backend.queries == ["What is the latest Rust release?"]
+
+
+class _CostReportingBackend:
+    """A backend that attaches a vendor cost to its hits, like Exa's ``costDollars``."""
+
+    name = "costed"
+
+    def __init__(self, cost: int | None) -> None:
+        self._cost = cost
+
+    async def search(
+        self,
+        query: str,
+        *,
+        max_results: int,
+        allowed_domains: object,
+        blocked_domains: object,
+        timeout_seconds: float,
+    ) -> WebSearchHits:
+        del query, allowed_domains, blocked_domains, timeout_seconds
+        return WebSearchHits(_HITS[:max_results], vendor_cost_nano_usd=self._cost)
+
+
+def test_admission_carries_the_vendor_reported_cost_only_when_reported() -> None:
+    request = _request(search=GatewayWebSearch(declared_as="plugin", max_results=2))
+    costed = plan_web_search(
+        request,
+        ["openai_compatible"],
+        _CostReportingBackend(9_000_000),
+        deadline_monotonic=_deadline(),
+    )
+    assert costed.admission is not None
+    assert costed.admission["cost_nano_usd"] == 9_000_000
+    assert costed.admission["requests"] == 1
+    assert costed.admission["results"] == [{"url": hit.url, "title": hit.title} for hit in _HITS]
+    unreported = plan_web_search(
+        request, ["openai_compatible"], _CostReportingBackend(None), deadline_monotonic=_deadline()
+    )
+    assert unreported.admission is not None
+    assert "cost_nano_usd" not in unreported.admission
