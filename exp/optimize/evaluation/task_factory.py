@@ -8,7 +8,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal, Self
 
-from filelock import FileLock
+from filelock import FileLock, Timeout
 from pydantic import AwareDatetime, Field, model_validator
 
 from exp.common.core.artifacts import (
@@ -471,6 +471,8 @@ def run_task_factory(
                                 "phase": "complete",
                             }
                         )
+                    except Timeout:
+                        raise  # Busy work remains pending; the owning process may still finish it.
                     except (OSError, ValueError, RuntimeError) as error:
                         cell = cell.model_copy(
                             update={

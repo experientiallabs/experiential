@@ -34,7 +34,13 @@ from exp.optimize.evaluation.executable_qualification import (
     qualify_executable_task,
 )
 from exp.optimize.evaluation.executable_qualification_test import qualified_fixture
+from exp.optimize.model.sft.builder import (
+    build_sft_dataset,
+    load_verified_sft_dataset,
+    write_sft_dataset,
+)
 from exp.optimize.model.sft.continuation_source import resolve_continuation_source
+from exp.optimize.model.sft.contracts import SFTBuildSpec
 from exp.runtime.environments.tests.world_conformance_test import workbook_case
 from exp.runtime.models.providers.transport import ScriptedJsonTransport
 from exp.runtime.models.registry import RuntimeModelCatalog
@@ -130,6 +136,23 @@ def test_qualified_run_and_export_retain_evidence_without_fidelity_claim(
     job.runtime_file.unlink()
     prepared, _, _ = resolve_continuation_source(project, reference)
     assert len(prepared) == 1 and len(transport.requests) == 3
+    dataset = build_sft_dataset(
+        store=project,
+        production_sources=(),
+        teacher_sources=(),
+        continuation_sources=(reference,),
+        spec=SFTBuildSpec(held_out_fraction=0),
+        created_at=datetime.now(UTC),
+        code_revision="test",
+    )
+    assert dataset.dataset.status == "accepted"
+    assert all(
+        row.example.source.model_dump().get("qualification") == qualification.model_dump()
+        for row in dataset.rows
+    )
+    write_sft_dataset(project, dataset)
+    assert load_verified_sft_dataset(project, dataset.dataset.dataset_id) == dataset
+    assert len(transport.requests) == 3
     assert qualification in project.artifacts.read(reference.artifact_id).manifest.inputs
 
 

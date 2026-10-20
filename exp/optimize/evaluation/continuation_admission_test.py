@@ -5,8 +5,8 @@ from pathlib import Path
 
 import pytest
 
-from exp.common.core.artifacts import ArtifactInput, sha256_json
-from exp.common.models import AssistantAction, ModelMessage
+from exp.common.core.artifacts import ArtifactInput, JsonObject, sha256_json
+from exp.common.models import AssistantAction
 from exp.common.project import ProjectStore, artifact_input
 from exp.optimize.evaluation.continuation_admission import (
     ContinuationAdmission,
@@ -31,23 +31,11 @@ def admitted_workbook_study(
     narrated_action: bool = False,
     followup_action: bool = False,
     actor_actions: tuple[AssistantAction, ...] | None = None,
+    policy_only_schema: JsonObject | None = None,
 ) -> ArtifactInput:
     """Execute two native branches against independently specified workbook acceptance."""
     store = project.artifacts
     checkpoint, actor = capsule(store)
-    checkpoint = checkpoint.model_copy(
-        update={
-            "actor": checkpoint.actor.model_copy(
-                update={
-                    "messages": (
-                        *checkpoint.actor.messages,
-                        ModelMessage(role="assistant", content="Earlier mistaken hypothesis."),
-                        ModelMessage(role="user", content="Recheck before acting."),
-                    ),
-                }
-            )
-        }
-    )
     reference = persist_continuation_checkpoint(
         store, checkpoint, created_at=datetime.now(UTC), code_revision="test"
     )
@@ -77,6 +65,12 @@ def admitted_workbook_study(
             preserved_paths=("/input_digest",),
         )
     )
+    if policy_only_schema is not None:
+        independent = TaskVerifier(
+            description="Tool policy alone supplies no task success evidence.",
+            outcome_schema=policy_only_schema,
+            allowed_tools=("edit_workbook",),
+        )
     specification = persist_specification(
         store,
         EvaluationSpecification(
@@ -163,3 +157,17 @@ def test_only_independent_registered_acceptance_admits_branches(
     assert sum(row.admitted for row in report.branches) == accepted
     assert not report.branches[1].admitted
     assert "goal or policy" in report.branches[1].reason
+
+
+@pytest.mark.parametrize("schema", [{}, {"type": "object", "description": "success"}])
+def test_policy_only_specification_cannot_admit_a_passing_trajectory(
+    tmp_path: Path, schema: JsonObject
+) -> None:
+    """An independently saved allowlist does not independently check task accomplishment."""
+    project = ProjectStore(tmp_path, "case")
+    reference = admitted_workbook_study(project, policy_only_schema=schema)
+    report = ContinuationAdmission.model_validate_json(
+        project.artifacts.read_bytes(reference.artifact_id, "admission.json")
+    )
+    assert not any(branch.admitted for branch in report.branches)
+    assert "outcome predicate" in report.branches[0].reason

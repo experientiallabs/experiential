@@ -5,12 +5,15 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
+from filelock import Timeout
 
 from exp.common.core.artifacts import JsonObject
 from exp.common.models import load_model_catalog
 from exp.common.project import ProjectStore, artifact_input
 from exp.optimize.evaluation.actor_panel import PanelActor
 from exp.optimize.evaluation.candidate_batch import CandidateBatchSpec, run_candidate_batch
+from exp.optimize.evaluation.continuation_job import ContinuationJob
+from exp.optimize.evaluation.continuation_study import ContinuationStudy
 from exp.optimize.evaluation.executable_qualification_test import qualified_fixture
 from exp.optimize.evaluation.executable_task import (
     load_executable_task,
@@ -326,3 +329,25 @@ def test_failed_export_keeps_operator_phase_and_never_raw_exception(
     assert "inert-private-storage-canary" not in result.model_dump_json()
     assert run_candidate_batch(project, spec, code_revision="test") == result
     assert len(transport.requests) == 12
+
+
+def test_busy_feasibility_child_remains_retryable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A locked child cannot permanently exclude an otherwise measurable candidate."""
+    project, spec, _ = batch_fixture(tmp_path, monkeypatch)
+
+    def busy(
+        project: ProjectStore, job: ContinuationJob, *, code_revision: str
+    ) -> ContinuationStudy:
+        """Inject contention at the feasibility owner's lease boundary."""
+        raise Timeout("feasibility.lock")
+
+    with monkeypatch.context() as patch:
+        patch.setattr("exp.optimize.evaluation.candidate_batch.execute_continuation_job", busy)
+        with pytest.raises(Timeout):
+            run_candidate_batch(project, spec, code_revision="test")
+    assert not project.artifacts.exists(spec.identity("test") + "-candidate-0")
+    report = run_candidate_batch(project, spec, code_revision="test")
+    assert report.candidates[0].feasibility is not None
+    assert run_candidate_batch(project, spec, code_revision="test") == report

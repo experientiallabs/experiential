@@ -10,10 +10,12 @@ from typing import Literal
 from pydantic import Field, model_validator
 from rich.console import Console
 
+from exp.cli.evaluation.spend import review_components, review_cost
 from exp.cli.shared.consent import require_spend_consent
 from exp.common.core.artifacts import ArtifactInput, ContractModel
 from exp.common.project import ProjectStore
 from exp.optimize.evaluation.continuation_evidence import qualified_training_job
+from exp.optimize.evaluation.costs import runtime_costs
 from exp.optimize.evaluation.executable_qualification import (
     ExecutableQualificationSpec,
     load_executable_qualification,
@@ -194,7 +196,7 @@ def run_executable_command(
             console,
             root=project.paths.root,
             yes=yes,
-            estimated_cost_usd=None,
+            estimated_cost_usd=review_cost(console, project, spec),
             cost_is_upper_bound=False,
             non_interactive=non_interactive,
             command=f"exp eval {project.paths.project_id} --continuations propose-worlds.json",
@@ -367,7 +369,10 @@ def run_executable_command(
         console,
         root=project.paths.root,
         yes=yes,
-        estimated_cost_usd=None,
+        estimated_cost_usd=review_components(
+            console,
+            runtime_costs(project, definition.job.runtime_sha256, definition.job.configuration),
+        ),
         cost_is_upper_bound=False,
         non_interactive=non_interactive,
         command=f"exp eval {project.paths.project_id} --continuations executable-serve.json",

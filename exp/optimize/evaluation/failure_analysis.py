@@ -120,7 +120,7 @@ def _analyse_branch(
     store: ArtifactStore, study: ContinuationStudy, branch: ContinuationBranch
 ) -> BranchFailureAnalysis:
     """Keep final failure separate from observed per-step violations and operational symptoms."""
-    assessment = grade(study.spec.verifier, branch.outcome)
+    assessment = grade(study.spec.verifier, branch.grading_outcome())
     points = (study.spec.checkpoint, *branch.checkpoints)
     capsules = {ref: load_continuation_checkpoint(store, ref) for ref in points}
     root_calls = capsules[study.spec.checkpoint].actor.calls

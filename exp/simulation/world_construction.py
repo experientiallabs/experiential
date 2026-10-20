@@ -48,7 +48,7 @@ class ValuesColumn(ContractModel):
         values: One broadcast value or exactly as many values as the table has rows.
     """
 
-    kind: Literal["values"] = "values"
+    kind: Literal["values"]
     values: tuple[Cell, ...] = Field(min_length=1, max_length=10000)
 
 
@@ -61,7 +61,7 @@ class SequenceColumn(ContractModel):
         step: Increment per row, including zero or negative increments.
     """
 
-    kind: Literal["sequence"] = "sequence"
+    kind: Literal["sequence"]
     start: int = Field(default=1, strict=True, ge=-(2**53), le=2**53)
     step: int = Field(default=1, strict=True, ge=-(2**53), le=2**53)
 
@@ -77,7 +77,7 @@ class LookupColumn(ContractModel):
         key_from: Local column supplying the lookup keys.
     """
 
-    kind: Literal["lookup"] = "lookup"
+    kind: Literal["lookup"]
     table: Name
     key_column: Name
     value_column: Name

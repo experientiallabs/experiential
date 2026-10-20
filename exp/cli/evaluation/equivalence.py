@@ -4,6 +4,7 @@ from pathlib import Path
 
 from rich.console import Console
 
+from exp.cli.evaluation.spend import review_cost
 from exp.cli.shared.consent import require_spend_consent
 from exp.common.progress import ProgressEvent
 from exp.common.project import ProjectStore
@@ -46,7 +47,7 @@ def run_equivalence_command(
         console,
         root=root,
         yes=yes,
-        estimated_cost_usd=None,
+        estimated_cost_usd=review_cost(console, store, spec),
         cost_is_upper_bound=False,
         command=f"exp eval {project} --continuations {spec_path}",
         non_interactive=non_interactive,

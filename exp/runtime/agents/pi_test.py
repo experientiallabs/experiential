@@ -11,6 +11,8 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from stat import S_IXUSR
 from types import TracebackType
+from urllib.error import HTTPError
+from urllib.request import Request, urlopen
 
 import pytest
 
@@ -24,6 +26,7 @@ from exp.common.models import (
     OperationEconomics,
     ToolCall,
 )
+from exp.common.models.client import RequestAdmissionRefused
 from exp.common.rollouts import RolloutEventKind, StopReason
 from exp.common.tasks import TaskCase, ToolSchema
 from exp.runtime.agents import execute_agent_episode
@@ -35,6 +38,7 @@ from exp.runtime.agents.pi import (
     _normalize_pi_chat_payload,
     _PiBridge,
     _PiBridgeError,
+    _PiInvocation,
 )
 from exp.runtime.environments import EnvironmentSession, Observation
 from exp.runtime.openai_protocol import decode_chat, model_request
@@ -153,7 +157,7 @@ def test_pi_failed_model_calls_still_consume_the_actor_allowance() -> None:
     payload: JsonObject = {"messages": [{"role": "user", "content": "task"}]}
     with pytest.raises(RuntimeError, match="lost response"):
         bridge.complete_model(payload)
-    with pytest.raises(_PiBridgeError, match="allowance exhausted"):
+    with pytest.raises(RuntimeError, match="lost response"):
         bridge.complete_model(payload)
     assert len(model.requests) == 1
 
@@ -774,3 +778,53 @@ def test_pi_bridge_requires_its_own_episode_capability() -> None:
             )
             assert response.status_code == 200
             assert len(model.requests) == len(environment.actions) == 1
+
+
+@pytest.mark.parametrize("admission_stop", [False, True])
+def test_pi_cannot_hide_tool_outage_with_a_successful_transcript(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, admission_stop: bool
+) -> None:
+    """A subprocess catching HTTP 500 cannot turn a simulator timeout into actor success."""
+
+    class BrokenEnvironment(_Environment):
+        """Lose the tool response instead of returning a domain refusal."""
+
+        def execute(self, action: ToolCall) -> Observation:
+            """Raise the original timeout behind the lifecycle's execute-only proxy."""
+            if admission_stop:
+                raise RequestAdmissionRefused("private provider budget detail")
+            raise TimeoutError("private provider deadline detail")
+
+    class BrokenRuntime(_EnvironmentRuntime):
+        """Open the failing dependency with normal lifecycle cleanup."""
+
+        def __init__(self) -> None:
+            """Use the existing cleanup owner with a failing dependency."""
+            super().__init__()
+            self._session = BrokenEnvironment()
+
+    def swallowed(executable: str, invocation: _PiInvocation, timeout: float) -> str:
+        """Exercise the real HTTP bridge, then imitate Pi ignoring the failed request."""
+        request = Request(
+            invocation.environment["EXP_PI_BRIDGE_URL"] + "/tools/lookup",
+            data=json.dumps({"call_id": "lost", "arguments": {"id": "record-1"}}).encode(),
+            headers={"Authorization": "Bearer " + invocation.environment["EXP_PI_BRIDGE_TOKEN"]},
+        )
+        with pytest.raises(HTTPError) as caught:
+            urlopen(request)
+        assert caught.value.code == 500
+        assert b"private provider" not in caught.value.read()
+        return json.dumps({"type": "agent_end"})
+
+    monkeypatch.setattr("exp.runtime.agents.pi._invoke_installed_pi", swallowed)
+    runtime = PiAgentRuntime(executable=str(_write_pi_binding_fixture(tmp_path)))
+    if admission_stop:
+        with pytest.raises(RequestAdmissionRefused, match="private provider budget"):
+            execute_agent_episode(runtime, BrokenRuntime(), _task(), _Model())
+        return
+    episode = execute_agent_episode(runtime, BrokenRuntime(), _task(), _Model())
+    assert episode.stop_reason == StopReason.FAILURE
+    assert episode.failure is not None
+    assert episode.failure.attribution == FailureAttribution.TOOL
+    assert episode.failure.code == FailureCode.TIMEOUT
+    assert episode.failure.exception_type == "TimeoutError"

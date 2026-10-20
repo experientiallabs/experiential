@@ -21,6 +21,11 @@ def test_reserved_source_survives_task_relabeling(
     tasks = load_task_set(project.artifacts, build.task_set.artifact_id)
     held_out = next(task for task in tasks.tasks if task.partition == "held_out")
     fit = next(task for task in tasks.tasks if task.partition == "fit")
+    disguised_authored = held_out.model_copy(
+        update={"partition": "fit", "origin": "authored", "source_trace_ids": ()}
+    )
+    with pytest.raises(ValueError, match="lineage is reserved"):
+        require_development_task(project.artifacts, disguised_authored)
     require_development_task(project.artifacts, fit)
     disguised = held_out.model_copy(
         update={"partition": "fit", "task_id": "new-task", "lineage_group_id": "new-lineage"}

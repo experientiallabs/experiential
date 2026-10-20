@@ -294,12 +294,32 @@ class RuntimeInteractionExampleSource(ContractModel):
 
 
 class ContinuationExampleSource(ContractModel):
-    """One witnessed continuation, with every sibling attempt retained in its study."""
+    """One witnessed continuation with explicit task qualification, never implied fidelity.
+
+    Attributes:
+        kind: Source discriminator.
+        study: Complete execution, retaining every sibling attempt.
+        branch: Selected original branch index.
+        acceptance_evidence: Independently specified observed-outcome admission.
+        qualification: Challenged task receipt, absent for diagnostic-only examples.
+        qualification_scope: Exact limited claim from that receipt, not native fidelity.
+    """
 
     kind: Literal["continuation"] = "continuation"
     study: ArtifactInput
     branch: int = Field(ge=0)
     acceptance_evidence: ArtifactInput
+    qualification: ArtifactInput | None = None
+    qualification_scope: str | None = None
+
+    @model_validator(mode="after")
+    def qualification_is_explicit(self) -> ContinuationExampleSource:
+        """A limited qualification requires both its receipt and its declared scope."""
+        if (self.qualification is None) != (self.qualification_scope is None):
+            raise ValueError("continuation qualification requires a receipt and scope together")
+        if self.qualification_scope is not None and not self.qualification_scope.strip():
+            raise ValueError("continuation qualification scope must not be blank")
+        return self
 
 
 SFTExampleSource = Annotated[
@@ -428,7 +448,7 @@ class SFTDataset(ArtifactEnvelope):
 
     dataset_id: ArtifactId
     build_sha256: Sha256
-    status: Literal["accepted", "insufficient"]
+    status: Literal["accepted", "diagnostic", "insufficient"]
     acceptance_rule_ids: tuple[ArtifactId, ...]
     acceptance_evidence_ids: tuple[ArtifactId, ...]
     train_leakage_group_ids: tuple[ArtifactId, ...]

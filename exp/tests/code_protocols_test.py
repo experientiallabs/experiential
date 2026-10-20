@@ -48,18 +48,18 @@ PROTOCOLS = (
             "exp.simulation.evaluation.tasks",
             "exp.simulation.evaluation.admission",
         ),
-        "26b88d421b98d26a780015f18d9aaac849a1f729e14e5e8c33a6ff7bd35ab632",
+        "74b3d8c27ddd77e817cc12cd555c16eaf584d67323dd223dc403d26a38e6b484",
     ),
     Protocol(
         "exp.optimize.evaluation.council.runner:COUNCIL_HARNESS_PROTOCOL",
-        "council-harness-v2",
+        "council-harness-v3",
         (
             "exp.runtime.agents.chat:ChatAgentRuntime",
             "exp.runtime.agents.pi:PiAgentRuntime",
             "exp.simulation.actor:run_actor_workflow",
             "exp.simulation.world_model.grounded_session:open_grounded_session",
         ),
-        "c719e578c8b2b0a446d38d478b65700fe3e640613f4a8890d91b3b6e6c6b0024",
+        "b048a8d7ba2aaf0b5136c71684c53983a2d8cc532a9e17d504f8dccaaeb2da8e",
     ),
     Protocol(
         "exp.optimize.evaluation.tasks.refinement:REFINEMENT_REQUEST_PROTOCOL",

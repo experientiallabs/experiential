@@ -5,7 +5,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal
 
-from filelock import FileLock
+from filelock import FileLock, Timeout
 from pydantic import Field
 
 from exp.common.core.artifacts import (
@@ -42,6 +42,7 @@ from exp.optimize.evaluation.executable_task import (
     load_executable_task,
     verify_executable_package,
 )
+from exp.optimize.evaluation.execution_deferral import deferred_execution, record_execution_deferral
 from exp.optimize.evaluation.harbor.export import verify_harbor_export
 from exp.optimize.evaluation.task_proposals import load_task_proposals
 from exp.optimize.evaluation.task_variants import load_task_variant
@@ -263,6 +264,8 @@ def _measure(
                 update={"package": _package(project, spec, cell, index), "status": "packaged"}
             )
         return cell
+    except Timeout:
+        raise  # Busy work remains pending; the owning process may still finish it.
     except (ValueError, OSError, RuntimeError) as exc:
         return cell.model_copy(
             update={
@@ -283,12 +286,17 @@ def _measure(
         )
 
 
-def _inputs(registration: ArtifactInput, cell: CandidateMeasurement) -> tuple[ArtifactInput, ...]:
+def _inputs(
+    registration: ArtifactInput,
+    cell: CandidateMeasurement,
+    deferrals: tuple[ArtifactInput, ...] = (),
+) -> tuple[ArtifactInput, ...]:
     """Retain every completed stage's immutable evidence even if a later stage failed."""
     return tuple(
         sorted(
             {
                 registration,
+                *deferrals,
                 cell.variant,
                 cell.task,
                 *(
@@ -356,7 +364,8 @@ def saved_candidate_batch(
             cell.variant != variant
             or cell.task != reference
             or CandidateMeasurement.model_validate_json(store.read_bytes(key, "cell.json")) != cell
-            or store.read(key).manifest.inputs != _inputs(registration, cell)
+            or store.read(key).manifest.inputs
+            != _inputs(registration, cell, deferred_execution(store, key))
         ):
             raise ValueError("candidate batch changed its planned population or stage evidence")
         if cell.feasibility is not None:
@@ -468,8 +477,8 @@ def run_candidate_batch(
                 cell = CandidateMeasurement(
                     variant=variant, task=reference, status="unavailable", separation=None
                 )
-                execute = not store.exists(key + "-intent")
-                if execute:
+                execute = not store.exists(key + "-intent") or bool(deferred_execution(store, key))
+                if not store.exists(key + "-intent"):
                     store.write_json(
                         artifact_id=key + "-intent",
                         artifact_type="candidate-batch-intent",
@@ -485,13 +494,21 @@ def run_candidate_batch(
                         ),
                         files={"cell.json": cell},
                     )
-                cell = _measure(
-                    project, spec, cell, index, code_revision=code_revision, execute=execute
-                )
+                try:
+                    cell = _measure(
+                        project, spec, cell, index, code_revision=code_revision, execute=execute
+                    )
+                except Timeout:
+                    record_execution_deferral(store, key)
+                    raise
                 store.write_json(
                     artifact_id=key,
                     artifact_type="candidate-measurement",
-                    envelope=envelope.model_copy(update={"inputs": _inputs(registration, cell)}),
+                    envelope=envelope.model_copy(
+                        update={
+                            "inputs": _inputs(registration, cell, deferred_execution(store, key))
+                        }
+                    ),
                     files={"cell.json": cell},
                 )
             cells.append(cell)

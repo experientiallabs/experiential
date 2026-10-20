@@ -3,7 +3,7 @@
 from datetime import UTC, datetime
 from typing import Literal
 
-from filelock import FileLock
+from filelock import FileLock, Timeout
 from pydantic import Field
 
 from exp.common.core.artifacts import (
@@ -25,6 +25,7 @@ from exp.optimize.evaluation.continuation_job import (
     saved_continuation_job,
 )
 from exp.optimize.evaluation.continuation_records import load_study
+from exp.optimize.evaluation.execution_deferral import deferred_execution, record_execution_deferral
 from exp.simulation.continuations import (
     ContinuationCheckpoint,
     load_continuation_checkpoint,
@@ -236,7 +237,7 @@ def _assess(
     study = load_study(project.artifacts, cell.result)
     if study.spec != cell.job.study or len(study.branches) != 1:
         raise ValueError("observation comparison changed its continuation population")
-    return grade_intervention_outcome(effect, study.branches[0].outcome)
+    return grade_intervention_outcome(effect, study.branches[0].grading_outcome())
 
 
 def saved_observation_contrast(
@@ -278,7 +279,11 @@ def saved_observation_contrast(
             != _capsule(project, effect, spec, arm, registration)
         ):
             raise ValueError("observation cell changed more than its registered reply")
-        inputs = {registration, cell.job.study.checkpoint}
+        inputs = {
+            registration,
+            cell.job.study.checkpoint,
+            *deferred_execution(store, manifest.artifact_id),
+        }
         if cell.result is not None:
             if (
                 cell.failure is not None
@@ -347,10 +352,14 @@ def run_observation_contrast(
                 cell = ObservationCell.model_validate_json(store.read_bytes(key, "cell.json"))
             else:
                 complete = saved_continuation_job(project, cell.job, code_revision=code_revision)
-                if complete is None and store.exists(key + "-intent"):
+                if (
+                    complete is None
+                    and store.exists(key + "-intent")
+                    and not deferred_execution(store, key)
+                ):
                     cell = cell.model_copy(update={"failure": "UnfinishedDispatchIntent"})
                 else:
-                    if complete is None:
+                    if complete is None and not store.exists(key + "-intent"):
                         store.write_json(
                             artifact_id=key + "-intent",
                             artifact_type="observation-contrast-intent",
@@ -367,6 +376,9 @@ def run_observation_contrast(
                         cell = cell.model_copy(
                             update={"assessment": _assess(project, effect, cell)}
                         )
+                    except Timeout:
+                        record_execution_deferral(store, key)
+                        raise
                     except (OSError, ValueError, RuntimeError) as exc:
                         cell = cell.model_copy(
                             update={
@@ -375,6 +387,7 @@ def run_observation_contrast(
                                 "failure": type(exc).__name__,
                             }
                         )
+                inputs.update(deferred_execution(store, key))
                 if cell.result is not None:
                     inputs.add(cell.result)
                 store.write_json(

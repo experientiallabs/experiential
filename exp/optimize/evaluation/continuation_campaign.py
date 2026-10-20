@@ -3,7 +3,7 @@
 from datetime import UTC, datetime
 from typing import Self
 
-from filelock import FileLock
+from filelock import FileLock, Timeout
 from pydantic import Field, model_validator
 
 from exp.common.core.artifacts import (
@@ -467,6 +467,8 @@ def run_continuation_campaign(
                                 store.read(experiment.identity(code_revision) + "-result").manifest
                             )
                             failure = None
+                    except Timeout:
+                        raise  # Busy work remains pending; the owning process may still finish it.
                     except (ValueError, RuntimeError, OSError):
                         pass
                     cell = CampaignCell(

@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
+from jsonschema import Draft202012Validator, ValidationError
 from openpyxl import load_workbook
 from pydantic import JsonValue
 
@@ -36,16 +37,20 @@ def linked_spec() -> ConstructionSpec:
                 rows=2,
                 key="id",
                 columns={
-                    "id": SequenceColumn(),
-                    "name": ValuesColumn(values=("Ada", "Bo")),
+                    "id": SequenceColumn(kind="sequence"),
+                    "name": ValuesColumn(kind="values", values=("Ada", "Bo")),
                 },
             ),
             "Orders": TablePlan(
                 rows=3,
                 columns={
-                    "customer": ValuesColumn(values=(2, 1, 2)),
+                    "customer": ValuesColumn(kind="values", values=(2, 1, 2)),
                     "name": LookupColumn(
-                        table="Customers", key_column="id", value_column="name", key_from="customer"
+                        kind="lookup",
+                        table="Customers",
+                        key_column="id",
+                        value_column="name",
+                        key_from="customer",
                     ),
                 },
             ),
@@ -135,7 +140,9 @@ def test_xlsx_refuses_lossy_cells(value: str | int) -> None:
     spec = ConstructionSpec(
         name="lossy",
         assumptions=("test",),
-        tables={"Data": TablePlan(rows=1, columns={"x": ValuesColumn(values=(value,))})},
+        tables={
+            "Data": TablePlan(rows=1, columns={"x": ValuesColumn(kind="values", values=(value,))})
+        },
         workbooks={"input.xlsx": ("Data",)},
     )
     with pytest.raises(ValueError, match="XLSX"):
@@ -147,7 +154,9 @@ def test_formula_shaped_text_is_literal() -> None:
     spec = ConstructionSpec(
         name="literal",
         assumptions=("test",),
-        tables={"Data": TablePlan(rows=1, columns={"x": ValuesColumn(values=("=1+2",))})},
+        tables={
+            "Data": TablePlan(rows=1, columns={"x": ValuesColumn(kind="values", values=("=1+2",))})
+        },
         workbooks={"input.xlsx": ("Data",)},
     )
     book = load_workbook(io.BytesIO(compile_construction(spec)["assets/input.xlsx"]))
@@ -174,7 +183,9 @@ def test_budget_applies_to_broadcasts_and_repeated_rendering() -> None:
         name="big",
         assumptions=("test",),
         tables={
-            "Data": TablePlan(rows=10000, columns={"text": ValuesColumn(values=("x" * 32767,))})
+            "Data": TablePlan(
+                rows=10000, columns={"text": ValuesColumn(kind="values", values=("x" * 32767,))}
+            )
         },
     )
     with pytest.raises(ValueError, match="8 MiB"):
@@ -289,7 +300,9 @@ def test_xlsx_cannot_change_scalar_types_or_dimensions(value: float | None) -> N
     spec = ConstructionSpec(
         name="shape",
         assumptions=("test",),
-        tables={"Data": TablePlan(rows=2, columns={"x": ValuesColumn(values=(value,))})},
+        tables={
+            "Data": TablePlan(rows=2, columns={"x": ValuesColumn(kind="values", values=(value,))})
+        },
         workbooks={"input.xlsx": ("Data",)},
     )
     with pytest.raises(ValueError, match="XLSX loses"):
@@ -308,7 +321,11 @@ def test_native_deletion_distinguishes_interleaved_keys() -> None:
             assumptions=("authored",),
             tables={
                 "Data": TablePlan(
-                    rows=4, columns={"id": SequenceColumn(), "key": ValuesColumn(values=keys)}
+                    rows=4,
+                    columns={
+                        "id": SequenceColumn(kind="sequence"),
+                        "key": ValuesColumn(kind="values", values=keys),
+                    },
                 )
             },
             workbooks={"input.xlsx": ("Data",)},
@@ -344,3 +361,16 @@ def test_native_deletion_distinguishes_interleaved_keys() -> None:
         [[(3, 1), (4, 2)], [(3, 1), (4, 2)]],
         [[(2, 2), (4, 1)], [(1, 1), (2, 2), (4, 1)]],
     ]
+
+
+def test_schema_requires_every_column_discriminator() -> None:
+    """A schema-valid author response must not fail because the union needs an omitted kind."""
+    original = linked_spec().model_dump(mode="json")
+    validator = Draft202012Validator(ConstructionSpec.model_json_schema())
+    validator.validate(original)
+    for table in original["tables"].values():
+        for column in table["columns"].values():
+            kind = column.pop("kind")
+            with pytest.raises(ValidationError):
+                validator.validate(original)
+            column["kind"] = kind

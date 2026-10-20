@@ -9,11 +9,12 @@ from rich.console import Console
 
 from exp.cli.evaluation.equivalence import run_equivalence_command
 from exp.cli.evaluation.executable import ExecutableCommand, run_executable_command
+from exp.cli.evaluation.spend import review_cost
 from exp.cli.shared.consent import require_spend_consent
 from exp.cli.shared.options import usage_error
 from exp.cli.shared.theme import EXP_THEME
 from exp.common.core.artifacts import ArtifactInput, ContractModel
-from exp.common.project import ProjectStore
+from exp.common.project import ArtifactStoreError, ProjectStore
 from exp.common.release_revision import installed_execution_revision
 from exp.optimize.evaluation.action_contrast import (
     ActionContrastSpec,
@@ -324,7 +325,7 @@ def run_continuations(
 ) -> None:
     """Run one bounded study or export its independently verified development targets."""
     console = Console(theme=EXP_THEME)
-    with usage_error(OSError, ValueError):
+    with usage_error(OSError, ValueError, ArtifactStoreError):
         command = ContinuationCommand.model_validate_json(spec_path.read_bytes())
         store = ProjectStore(root, project)
         revision = installed_execution_revision()
@@ -370,7 +371,7 @@ def run_continuations(
                 console,
                 root=root,
                 yes=yes,
-                estimated_cost_usd=None,
+                estimated_cost_usd=review_cost(console, store, campaign),
                 cost_is_upper_bound=False,
                 command=f"exp eval {project} --continuations {spec_path}",
                 non_interactive=non_interactive,
@@ -391,7 +392,7 @@ def run_continuations(
                 console,
                 root=root,
                 yes=yes,
-                estimated_cost_usd=None,
+                estimated_cost_usd=review_cost(console, store, selector),
                 cost_is_upper_bound=False,
                 command=f"exp eval {project} --continuations {spec_path}",
                 non_interactive=non_interactive,
@@ -449,7 +450,7 @@ def run_continuations(
                 console,
                 root=root,
                 yes=yes,
-                estimated_cost_usd=None,
+                estimated_cost_usd=review_cost(console, store, decision_spec),
                 cost_is_upper_bound=False,
                 command=f"exp eval {project} --continuations {spec_path}",
                 non_interactive=non_interactive,
@@ -473,7 +474,7 @@ def run_continuations(
                 console,
                 root=root,
                 yes=yes,
-                estimated_cost_usd=None,
+                estimated_cost_usd=review_cost(console, store, analyst),
                 cost_is_upper_bound=False,
                 command=f"exp eval {project} --continuations {spec_path}",
                 non_interactive=non_interactive,
@@ -560,7 +561,7 @@ def run_continuations(
                 console,
                 root=root,
                 yes=yes,
-                estimated_cost_usd=None,
+                estimated_cost_usd=review_cost(console, store, spec),
                 cost_is_upper_bound=False,
                 command=f"exp eval {project} --continuations {spec_path}",
                 non_interactive=non_interactive,
@@ -620,7 +621,7 @@ def run_continuations(
                 console,
                 root=root,
                 yes=yes,
-                estimated_cost_usd=None,
+                estimated_cost_usd=review_cost(console, store, batch),
                 cost_is_upper_bound=False,
                 command=f"exp eval {project} --continuations {spec_path}",
                 non_interactive=non_interactive,
@@ -647,7 +648,7 @@ def run_continuations(
                     console,
                     root=root,
                     yes=yes,
-                    estimated_cost_usd=None,
+                    estimated_cost_usd=review_cost(console, store, proposals),
                     cost_is_upper_bound=False,
                     command=f"exp eval {project} --continuations {spec_path}",
                     non_interactive=non_interactive,
@@ -671,7 +672,7 @@ def run_continuations(
                 console,
                 root=root,
                 yes=yes,
-                estimated_cost_usd=None,
+                estimated_cost_usd=review_cost(console, store, contrast),
                 cost_is_upper_bound=False,
                 command=f"exp eval {project} --continuations {spec_path}",
                 non_interactive=non_interactive,
@@ -712,7 +713,7 @@ def run_continuations(
                 console,
                 root=root,
                 yes=yes,
-                estimated_cost_usd=None,
+                estimated_cost_usd=review_cost(console, store, intervention),
                 cost_is_upper_bound=False,
                 command=f"exp eval {project} --continuations {spec_path}",
                 non_interactive=non_interactive,
@@ -775,7 +776,7 @@ def run_continuations(
                 console,
                 root=root,
                 yes=yes,
-                estimated_cost_usd=None,
+                estimated_cost_usd=review_cost(console, store, experiment),
                 cost_is_upper_bound=False,
                 command=f"exp eval {project} --continuations {spec_path}",
                 non_interactive=non_interactive,
@@ -802,7 +803,7 @@ def run_continuations(
                 console,
                 root=root,
                 yes=yes,
-                estimated_cost_usd=None,
+                estimated_cost_usd=review_cost(console, store, command.critic),
                 cost_is_upper_bound=False,
                 command=f"exp eval {project} --continuations {spec_path}",
                 non_interactive=non_interactive,
@@ -836,7 +837,7 @@ def run_continuations(
                 console,
                 root=root,
                 yes=yes,
-                estimated_cost_usd=None,
+                estimated_cost_usd=review_cost(console, store, command.actors),
                 cost_is_upper_bound=False,
                 command=f"exp eval {project} --continuations {spec_path}",
                 non_interactive=non_interactive,
@@ -858,7 +859,7 @@ def run_continuations(
                 console,
                 root=root,
                 yes=yes,
-                estimated_cost_usd=None,
+                estimated_cost_usd=review_cost(console, store, command.capture),
                 cost_is_upper_bound=False,
                 non_interactive=non_interactive,
                 command=f"exp eval {project} --continuations {spec_path}",
@@ -896,7 +897,7 @@ def run_continuations(
                 console,
                 root=root,
                 yes=yes,
-                estimated_cost_usd=None,
+                estimated_cost_usd=review_cost(console, store, spec),
                 cost_is_upper_bound=False,
                 command=f"exp eval {project} --continuations {spec_path}",
                 non_interactive=non_interactive,
@@ -922,7 +923,7 @@ def run_continuations(
                 console,
                 root=root,
                 yes=yes,
-                estimated_cost_usd=None,
+                estimated_cost_usd=review_cost(console, store, job),
                 cost_is_upper_bound=False,
                 command=f"exp eval {project} --continuations {spec_path}",
                 non_interactive=non_interactive,

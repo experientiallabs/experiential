@@ -48,15 +48,20 @@ class VerifierProbeReport(ContractModel):
 def _replacements(value: JsonValue) -> tuple[JsonValue, ...]:
     """Use small, deterministic value and cardinality changes without hidden expected answers."""
     if isinstance(value, bool):
-        return (not value,)
+        return (not value, int(value), None)
     if isinstance(value, str):
-        return (value + "__probe__",)
-    if isinstance(value, (int, float)):
-        return (value + 1,)
+        return (value + "__probe__", None, 0)
+    if isinstance(value, int):
+        # Preserve numeric equality while changing type, without overflowing large integers.
+        typed = (float(value),) if abs(value) <= 2**53 else ()
+        return (value + 1, *typed, str(value), None, bool(value))
+    if isinstance(value, float):
+        typed = (int(value),) if value.is_integer() else ()
+        return (value + 1, *typed, str(value), None)
     if isinstance(value, list):
-        return ([], [*value, deepcopy(value[-1])]) if value else ([None],)
+        return ([], [*value, deepcopy(value[-1])], None, {}) if value else ([None], None, {})
     if isinstance(value, dict):
-        return ({**value, "__unexpected_effect__": True},)
+        return ({**value, "__unexpected_effect__": True}, None, [])
     return ("__unknown_changed__",)
 
 

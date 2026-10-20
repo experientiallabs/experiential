@@ -90,13 +90,13 @@ def workflow(
         steps=tuple(steps),
         audit_metadata={"steps": audit},
         final_answer=branch.outcome.get("final_answer"),
-        stop_reason=str(branch.outcome.get("stop_reason", "unknown")),
+        stop_reason=str(branch.grading_outcome().get("stop_reason", "unknown")),
     )
 
 
 def assessment(branch: ContinuationBranch, verifier: TaskVerifier) -> ActorExecutionAssessment:
     """Recompute goal and policy from evidence; never trust a stored success flag."""
-    checks = grade(verifier, branch.outcome)
+    checks = grade(verifier, branch.grading_outcome())
     return ActorExecutionAssessment(
         execution="completed"
         if branch.status == "completed" and checks.complete
@@ -183,6 +183,18 @@ def measure_pair(
 
 
 def equivalence_metrics(measurements: tuple[PairMeasurement, ...]) -> JsonObject:
+    """Retain per-case results so pooled agreement cannot conceal a failing environment."""
+    return {
+        **_pooled_metrics(measurements),
+        "aggregation": "pooled pairs; cases with more repeats contribute more weight",
+        "by_case": {
+            str(case): _pooled_metrics(tuple(row for row in measurements if row.case == case))
+            for case in sorted({row.case for row in measurements})
+        },
+    }
+
+
+def _pooled_metrics(measurements: tuple[PairMeasurement, ...]) -> JsonObject:
     """Keep every planned pair and distinguish matching failures from matching successes."""
     result: JsonObject = {}
     for condition in ("candidate", "reference_control"):

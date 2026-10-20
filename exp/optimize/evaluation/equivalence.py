@@ -4,7 +4,7 @@ from datetime import UTC, datetime
 from functools import partial
 from typing import Literal
 
-from filelock import FileLock
+from filelock import FileLock, Timeout
 from pydantic import AwareDatetime, Field, model_validator
 
 from exp.common.core.artifacts import (
@@ -39,6 +39,7 @@ from exp.optimize.evaluation.equivalence_review import (
     review_call,
     review_inputs,
 )
+from exp.optimize.evaluation.execution_deferral import deferred_execution, record_execution_deferral
 from exp.optimize.evaluation.failure_analysis import analyse_failures
 from exp.simulation.continuations import load_continuation_checkpoint
 from exp.simulation.evaluation.analysis import TraceAnalysis, analyze_traces
@@ -396,6 +397,8 @@ def _assemble(
                 measurements.append(measured)
                 prefix = f"pair:{index}:{condition}:{repeat}"
                 paired[prefix] = {
+                    "reference_execution": f"pair:{index}:execution:reference:{repeat}",
+                    "other_execution": f"pair:{index}:execution:{condition}:{repeat}",
                     "material_agreement": measured.material_agreement,
                     "differences": list(measured.differences),
                     "reference_checks": measured.comparison.reference_assessment.model_dump(
@@ -409,14 +412,29 @@ def _assemble(
                     else measured.judgment.model_dump(mode="json"),
                 }
                 for side, branch in (("reference", reference), ("candidate", other)):
+                    actual = "reference" if side == "reference" else condition
+                    execution = f"pair:{index}:execution:{actual}:{repeat}"
+                    if execution in paired:
+                        continue
+                    study_reference = selected[actual].result
+                    paired[execution] = {
+                        "kind": "execution",
+                        "condition": actual,
+                        "case": index,
+                        "repeat": repeat,
+                        "branch": branch.index,
+                        "study": None
+                        if study_reference is None
+                        else study_reference.model_dump(mode="json"),
+                    }
                     trace = getattr(measured.comparison, side)
-                    paired[f"{prefix}:{side}:execution_receipts"] = trace.audit_metadata
-                    paired[f"{prefix}:{side}:final"] = {
+                    paired[f"{execution}:execution_receipts"] = trace.audit_metadata
+                    paired[f"{execution}:final"] = {
                         "answer": trace.final_answer,
                         "stop_reason": trace.stop_reason,
                     }
                     for step in trace.steps:
-                        paired[f"{prefix}:{side}:step:{step.step}"] = step.model_dump(mode="json")
+                        paired[f"{execution}:step:{step.step}"] = step.model_dump(mode="json")
                     calls = branch.outcome.get("model_calls", [])
                     if isinstance(calls, list):
                         for turn, call in enumerate(calls):
@@ -428,13 +446,15 @@ def _assemble(
                             if isinstance(messages, list):
                                 for position, message in enumerate(messages):
                                     paired[
-                                        f"{prefix}:{side}:context:turn-{turn}:messages[{position}]"
+                                        f"{execution}:context:turn-{turn}:messages[{position}]"
                                     ] = message
     # Mechanical failure routing uses the existing owner; all findings remain diagnostic.
     failures = {
-        f"pair:{cell.case}:failure:{i}": analyse_failures(
-            project.artifacts, cell.result
-        ).model_dump(mode="json")
+        f"pair:{cell.case}:failure:{i}": {
+            "condition": cell.condition,
+            "study": cell.result.model_dump(mode="json"),
+            "analysis": analyse_failures(project.artifacts, cell.result).model_dump(mode="json"),
+        }
         for i, cell in enumerate(cells)
         if cell.result is not None
     }
@@ -466,6 +486,8 @@ def _assemble(
                     evidence_scope="paired_execution",
                     complete=partial(review, analyst, consumer="analyst"),
                 )
+            except Timeout:
+                raise
             except (ValueError, OSError, RuntimeError) as error:
                 errors[label] = (
                     type(error).__name__ + ": " + redact_secret_text(str(error))[0][:2000]
@@ -525,7 +547,11 @@ def saved_equivalence(
         )
         if cell.model_copy(update={"result": None, "failure": None}) != planned:
             raise ValueError("equivalence cell changed its frozen actor or environment")
-        inputs = {registration, cell.job.study.checkpoint}
+        inputs = {
+            registration,
+            cell.job.study.checkpoint,
+            *deferred_execution(store, manifest.artifact_id),
+        }
         if cell.result is not None:
             if (
                 continuation_result_reference(project, cell.job, code_revision=code_revision)
@@ -615,7 +641,7 @@ def run_equivalence(
                             )
                         }
                     )
-                elif store.exists(key + "-intent"):
+                elif store.exists(key + "-intent") and not deferred_execution(store, key):
                     intent = store.read(key + "-intent").manifest
                     if (
                         intent.artifact_type != "actor-equivalence-cell-intent"
@@ -629,15 +655,16 @@ def run_equivalence(
                         raise ValueError("unfinished equivalence intent differs from its plan")
                     cell = cell.model_copy(update={"failure": "UnfinishedDispatchIntent"})
                 else:
-                    _write(
-                        project,
-                        key + "-intent",
-                        "actor-equivalence-cell-intent",
-                        "cell.json",
-                        cell,
-                        inputs,
-                        code_revision,
-                    )
+                    if not store.exists(key + "-intent"):
+                        _write(
+                            project,
+                            key + "-intent",
+                            "actor-equivalence-cell-intent",
+                            "cell.json",
+                            cell,
+                            inputs,
+                            code_revision,
+                        )
                     try:
                         execute_continuation_job(project, cell.job, code_revision=code_revision)
                         cell = cell.model_copy(
@@ -647,6 +674,9 @@ def run_equivalence(
                                 )
                             }
                         )
+                    except Timeout:
+                        record_execution_deferral(store, key)
+                        raise
                     except (ValueError, OSError, RuntimeError) as error:
                         cell = cell.model_copy(
                             update={
@@ -657,6 +687,7 @@ def run_equivalence(
                         )
                 if cell.result is not None:
                     inputs.add(cell.result)
+                inputs.update(deferred_execution(store, key))
                 _write(
                     project, key, "actor-equivalence-cell", "cell.json", cell, inputs, code_revision
                 )
@@ -667,6 +698,7 @@ def run_equivalence(
                 ):
                     raise ValueError("saved equivalence cell has a different runtime result")
                 inputs.add(cell.result)
+            inputs.update(deferred_execution(store, key))
             manifest = store.read(key).manifest
             if (
                 manifest.artifact_type != "actor-equivalence-cell"

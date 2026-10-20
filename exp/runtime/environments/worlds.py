@@ -26,7 +26,7 @@ from collections.abc import Iterator, Mapping
 from contextlib import AbstractContextManager, contextmanager
 from typing import Literal, NoReturn, Protocol, Self, runtime_checkable
 
-from pydantic import ConfigDict, Field, model_validator
+from pydantic import ConfigDict, Field, ValidationError, model_validator
 
 from exp.common.core.artifacts import (
     ContractModel,
@@ -549,6 +549,7 @@ class ExecutableWorld:
                 self._require_open()
                 policy = self._runtime.manifest.tool(action.name)
                 self._authorize(policy, self._backend.access(action))
+                self._require_native_reads(action, native_reads)
                 progress.phase = "scheduled_events_before"
                 self._advance_to(self.clock)
                 progress.phase = "tool_admission"
@@ -565,6 +566,11 @@ class ExecutableWorld:
                     refusal = (
                         "Call refused before execution: access exceeds declared capabilities. "
                         "Choose a permitted tool and state domain."
+                    )
+                elif isinstance(exc, ValidationError) and progress.phase == "admission":
+                    refusal = (
+                        "Call refused before execution: arguments do not match the tool schema. "
+                        "Correct the arguments and try a new call."
                     )
                 raise
             finally:
@@ -770,15 +776,10 @@ class ExecutableWorld:
             event_id=event.event_id, at=self.clock, status=status, detail=observation.content
         )
 
-    def _apply(
-        self,
-        action: ToolCall,
-        policy: ToolEffectPolicy,
-        native_reads: tuple[NativeReadReceipt, ...] = (),
-        *,
-        progress: ExecutionProgress | None = None,
-    ) -> Observation:
-        """Authorize, execute and verify one call; roll back anything outside its access."""
+    def _require_native_reads(
+        self, action: ToolCall, native_reads: tuple[NativeReadReceipt, ...]
+    ) -> None:
+        """Reject missing or stale conditioning before any scheduled or tool effects."""
         bridges = tuple(
             row for row in self._runtime.manifest.native_reads if row.target_tool == action.name
         )
@@ -791,6 +792,17 @@ class ExecutableWorld:
             for bridge, receipt in zip(bridges, native_reads, strict=True)
         ):
             raise AuthorityError("simulated call requires its exact current native read receipts")
+
+    def _apply(
+        self,
+        action: ToolCall,
+        policy: ToolEffectPolicy,
+        native_reads: tuple[NativeReadReceipt, ...] = (),
+        *,
+        progress: ExecutionProgress | None = None,
+    ) -> Observation:
+        """Authorize, execute and verify one call; roll back anything outside its access."""
+        self._require_native_reads(action, native_reads)
         until = self._degraded.get(action.name)
         if until is not None and until > self.clock:
             return Observation(

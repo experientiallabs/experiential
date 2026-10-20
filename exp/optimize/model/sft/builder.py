@@ -217,7 +217,15 @@ def build_sft_dataset(
         code_revision=code_revision,
         dataset_id=dataset_id,
         build_sha256=build_sha256,
-        status="accepted" if train_rows else "insufficient",
+        status="insufficient"
+        if not train_rows
+        else "diagnostic"
+        if any(
+            isinstance(row.example.source, ContinuationExampleSource)
+            and row.example.source.qualification is None
+            for row in rows
+        )
+        else "accepted",
         acceptance_rule_ids=tuple(
             sorted(
                 {
@@ -380,7 +388,8 @@ def load_sft_dataset(
     _validate_artifact_rows(artifact)
     if require_accepted and artifact.dataset.status != "accepted":
         raise SFTBuildError(
-            f"SFT dataset {dataset_id} is insufficient and cannot be consumed for training"
+            f"SFT dataset {dataset_id} is {artifact.dataset.status} "
+            "and cannot be consumed for training"
         )
     return artifact
 
@@ -799,6 +808,15 @@ def _validate_artifact_rows(artifact: SFTDatasetArtifact) -> None:
         sorted(row.example.example_id for row in held_out_rows)
     ):
         raise SFTBuildError("SFT held-out example IDs do not match stored rows")
+    diagnostic = any(
+        isinstance(row.example.source, ContinuationExampleSource)
+        and row.example.source.qualification is None
+        for row in rows
+    )
+    if artifact.dataset.status == "accepted" and diagnostic:
+        raise SFTBuildError("unqualified continuation examples require diagnostic dataset status")
+    if artifact.dataset.status == "diagnostic" and (not diagnostic or not train_rows):
+        raise SFTBuildError("diagnostic dataset status requires unqualified continuation examples")
     if artifact.dataset.status == "accepted" and not train_rows:
         raise SFTBuildError("accepted SFT datasets require at least one train example")
     if artifact.dataset.status == "insufficient" and rows:

@@ -5,10 +5,12 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
+from filelock import Timeout
 
 from exp.common.core.artifacts import ArtifactInput, JsonObject, sha256_bytes, sha256_json
 from exp.common.models import load_model_catalog, write_model_catalog
 from exp.common.project import ProjectStore
+from exp.optimize.evaluation import equivalence as owner
 from exp.optimize.evaluation.continuation_job import ContinuationJob, ContinuationRuntime
 from exp.optimize.evaluation.continuation_job_test import job_fixture
 from exp.optimize.evaluation.continuation_study import ContinuationStudy
@@ -342,6 +344,25 @@ def test_paired_pipeline_and_trace_council_replay_without_runtime_or_credentials
     analyst = json.dumps(reviews.requests[-1].payload)
     assert "paired_evidence" in analyst and "reference_control" in analyst
     assert "actual environment is unavailable" not in analyst.lower()
+    messages = reviews.requests[-1].payload["messages"]
+    assert isinstance(messages, list) and isinstance(messages[1], dict)
+    packet = json.loads(str(messages[1]["content"]))["definition"]["paired_evidence"]
+    executions = [
+        value
+        for value in packet.values()
+        if isinstance(value, dict) and value.get("kind") == "execution"
+    ]
+    assert len(executions) == 3
+    assert {value["condition"] for value in executions} == {
+        "reference",
+        "reference_control",
+        "candidate",
+    }
+    assert (
+        packet["pair:0:candidate:0"]["reference_execution"]
+        == packet["pair:0:reference_control:0"]["reference_execution"]
+    )
+
     assert result.metrics["source_families"] == 1
     spec.cases[0].reference.runtime_file.unlink()
     project.model_catalog_path.unlink()
@@ -581,3 +602,29 @@ def test_five_actor_panel_preserves_one_source_family_and_scopes_each_analyst(
         packet = json.dumps(request.payload)
         assert f"pair:{case}:candidate:0" in packet
         assert f"pair:{(case + 1) % 5}:candidate:0" not in packet
+
+
+def test_deferred_child_resumes_the_same_registered_cell(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Known contention stays pending and retry reuses the child's original execution identity."""
+    project, spec, transport, _ = equivalence_fixture(tmp_path, monkeypatch)
+    original = owner.execute_continuation_job
+    blocked = []
+
+    def busy_once(
+        project: ProjectStore, job: ContinuationJob, *, code_revision: str
+    ) -> ContinuationStudy:
+        """Inject one child lease refusal before delegating to durable native execution."""
+        if not blocked:
+            blocked.append(job)
+            raise Timeout("child.lock")
+        return original(project, job, code_revision=code_revision)
+
+    monkeypatch.setattr(owner, "execute_continuation_job", busy_once)
+    with pytest.raises(Timeout):
+        run_equivalence(project, spec, code_revision="test")
+    assert not project.artifacts.exists(spec.identity("test") + "-cell-0")
+    report = run_equivalence(project, spec, code_revision="test")
+    assert report.cells[0].result is not None and report.cells[0].failure is None
+    assert run_equivalence(project, spec, code_revision="test") == report

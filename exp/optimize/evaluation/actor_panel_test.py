@@ -3,12 +3,15 @@
 from pathlib import Path
 
 import pytest
+from filelock import FileLock, Timeout
 
-from exp.common.models import load_model_catalog
+from exp.common.core.artifacts import sha256_json, stable_id
+from exp.common.models import load_model_catalog, write_model_catalog
 from exp.common.project import ProjectStore
 from exp.optimize.evaluation.actor_panel import (
     ActorPanelSpec,
     PanelActor,
+    panel_jobs,
     preflight_actor_panel,
     run_actor_panel,
 )
@@ -34,6 +37,27 @@ def panel_fixture(
         ),
     )
     return project, spec, transport
+
+
+def test_busy_child_can_resume_without_a_terminal_panel_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A real child lease conflict buys nothing and remains retryable after release."""
+    project, spec, transport = panel_fixture(tmp_path, monkeypatch)
+    identity = spec.identity("test")
+    cell = panel_jobs(spec, "test")[0]
+    child = stable_id(
+        "continuation-study",
+        {"spec": sha256_json(cell.job.study), "code": cell.job.implementation("test")},
+    )
+    with FileLock(project.artifacts.project_directory / (child + ".lock"), timeout=0):
+        with pytest.raises(Timeout):
+            run_actor_panel(project, spec, code_revision="test")
+        assert not transport.requests
+        assert not project.artifacts.exists(identity + "-cell-0")
+    report = run_actor_panel(project, spec, code_revision="test")
+    assert report.cells[0].result is not None and report.cells[0].failure is None
+    assert len(transport.requests) > 0
 
 
 def test_actor_panel_does_not_turn_missing_strong_outcomes_into_tier_separation(
@@ -132,3 +156,37 @@ def test_actor_panel_requires_observed_difference_not_declared_labels(
     assert comparison[0]["difference_bounds"] == [1.0, 1.0]
     assert comparison[0]["separates_on_fixed_panel"] is True
     assert len(transport.requests) == 4
+
+
+def test_every_actor_capacity_is_checked_before_any_panel_call(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An undersized second actor refuses the panel before the first actor spends."""
+    project, spec, transport = panel_fixture(tmp_path, monkeypatch)
+    catalog = load_model_catalog(project.model_catalog_path)
+    second = catalog.models["judge"]
+    assert second.capabilities is not None
+    models = dict(catalog.models)
+    models["judge"] = second.model_copy(
+        update={"capabilities": second.capabilities.model_copy(update={"maximum_output_tokens": 1})}
+    )
+    catalog = catalog.model_copy(update={"models": models})
+    write_model_catalog(project.model_catalog_path, catalog)
+    registry = RuntimeModelCatalog(catalog, environment={})
+    spec = spec.model_copy(
+        update={
+            "cases": tuple(
+                job.model_copy(
+                    update={"catalog_sha256": sha256_json(catalog.model_dump(mode="json"))}
+                )
+                for job in spec.cases
+            ),
+            "actors": tuple(
+                actor.model_copy(update={"model": registry.snapshot(actor.alias)[0]})
+                for actor in spec.actors
+            ),
+        }
+    )
+    with pytest.raises(ValueError, match="output allowance exceeds"):
+        run_actor_panel(project, spec, code_revision="test")
+    assert not transport.requests

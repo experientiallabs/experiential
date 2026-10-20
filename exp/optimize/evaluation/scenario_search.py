@@ -8,7 +8,7 @@ never release qualification, a new independent lineage or training admission.
 from datetime import UTC, datetime
 from typing import Literal, Self
 
-from filelock import FileLock
+from filelock import FileLock, Timeout
 from pydantic import Field, model_validator
 
 from exp.common.core.artifacts import (
@@ -24,6 +24,7 @@ from exp.common.project import ProjectStore, artifact_input
 from exp.optimize.evaluation.continuation_capture import preflight_capture
 from exp.optimize.evaluation.continuation_job import load_runtime_definition
 from exp.optimize.evaluation.executable_task import load_executable_task
+from exp.optimize.evaluation.execution_deferral import deferred_execution, record_execution_deferral
 from exp.optimize.evaluation.failure_research import ResearchFailure
 from exp.optimize.evaluation.record_scenarios import (
     RecordScenarioSpec,
@@ -364,6 +365,8 @@ def _cell(
                 created_at=datetime.now(UTC),
                 code_revision=revision,
             )
+    except Timeout:
+        raise  # Busy work remains pending; the owning process may still finish it.
     except (ValueError, OSError, RuntimeError) as error:
         refusals.append(
             phase + ": " + type(error).__name__ + ": " + redact_secret_text(str(error))[0][:2000]
@@ -416,7 +419,11 @@ def run_scenario_search(
                     *((cell.scenario,) if cell.scenario else ()),
                     *((cell.variant,) if cell.variant else ()),
                 }
-                if set(child.inputs) != {artifact_input(registration), *refs}:
+                if set(child.inputs) != {
+                    artifact_input(registration),
+                    *refs,
+                    *deferred_execution(store, child.artifact_id),
+                }:
                     raise ValueError("scenario cell lost its source inventory")
                 for ref in refs:
                     if artifact_input(store.read(ref.artifact_id).manifest) != ref:
@@ -460,7 +467,7 @@ def run_scenario_search(
             cell_id = identity + f"-cell-{index}"
             if store.exists(cell_id):
                 cell = ScenarioCell.model_validate_json(store.read_bytes(cell_id, "cell.json"))
-            elif store.exists(cell_id + "-intent"):
+            elif store.exists(cell_id + "-intent") and not deferred_execution(store, cell_id):
                 cell = ScenarioCell(
                     index=index,
                     refusals=(
@@ -469,15 +476,20 @@ def run_scenario_search(
                     ),
                 )
             else:
-                store.write_json(
-                    artifact_id=cell_id + "-intent",
-                    artifact_type="scenario-search-intent",
-                    envelope=envelope.model_copy(update={"inputs": (registration,)}),
-                    files={"candidate.json": spec.candidates[index]},
-                )
-                cell = _cell(project, spec, index, code_revision)
+                if not store.exists(cell_id + "-intent"):
+                    store.write_json(
+                        artifact_id=cell_id + "-intent",
+                        artifact_type="scenario-search-intent",
+                        envelope=envelope.model_copy(update={"inputs": (registration,)}),
+                        files={"candidate.json": spec.candidates[index]},
+                    )
+                try:
+                    cell = _cell(project, spec, index, code_revision)
+                except Timeout:
+                    record_execution_deferral(store, cell_id)
+                    raise
             if not store.exists(cell_id):
-                refs = {registration, *cell.witnesses}
+                refs = {registration, *cell.witnesses, *deferred_execution(store, cell_id)}
                 refs.update(ref for ref in (cell.scenario, cell.variant) if ref is not None)
                 store.write_json(
                     artifact_id=cell_id,

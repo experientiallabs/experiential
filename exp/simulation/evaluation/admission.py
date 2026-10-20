@@ -473,6 +473,18 @@ def verify_label_witness(
     return None
 
 
+def has_outcome_constraints(verifier: TaskVerifier) -> bool:
+    """Reject empty and root-object-only goals, irrespective of policy or annotations.
+
+    This is a minimum structural condition, not semantic qualification. Nonempty checks
+    can still be vacuous or wrong and require independent positive and negative controls.
+    """
+    if verifier.rules or verifier.relations or verifier.table_relations:
+        return True
+    schema = _schema_assertions(expand_local_references(verifier.outcome_schema))
+    return schema not in ({}, {"type": "object"}, {"type": ["object"]})
+
+
 def _predicate_fingerprint(verifier: TaskVerifier) -> Sha256:
     """Detect syntactic copies despite annotations or reordered conjunctions.
 

@@ -54,6 +54,7 @@ from exp.runtime.models.providers.transport import (
     RecordedRequest,
 )
 from exp.simulation.engines.text.knowledge import SimulationKnowledge
+from exp.simulation.retrieval.evidence_reading import ReadingPolicy
 from exp.simulation.world_model import dreaming
 from exp.simulation.world_model.artifact import persist_grounded_world_model
 from exp.simulation.world_model.experience_memory import (
@@ -551,7 +552,11 @@ def test_a_protocol_change_learns_a_fresh_memory_trace_by_trace(
     provider = SimulatedProvider([episode(i) for i in range(USERS)], learnable=True)
     _, store, _ = build_project(tmp_path, monkeypatch, provider, learn=True)
     before = learning_plan(store, scope="all").lineage
-    changed = lambda *_, **__: "changed-prompts"  # noqa: E731 - one stand-in for an edited prompt
+
+    def changed(reading: ReadingPolicy | None = None, *, native_artifacts: bool = False) -> str:
+        """Stand in for a protocol edit across both supported request projections."""
+        return "changed-prompts"
+
     monkeypatch.setattr(traces, "protocol_prompts_sha256", changed)
     monkeypatch.setattr(replay, "protocol_prompts_sha256", changed)
     _relearn(store)
@@ -792,3 +797,57 @@ def test_lineage_keys_knowledge_not_serving_configuration(
         assert changed != baseline, "changed knowledge starts a fresh memory"
     else:
         assert changed == baseline, f"a {change} change keeps compatible memory"
+
+
+class _InvestigationOutage(SimulatedProvider):
+    """Reject research while preserving successful prediction and embedding responses."""
+
+    fail = True
+
+    def post(
+        self,
+        url: str,
+        *,
+        headers: Mapping[str, str],
+        payload: JsonObject,
+        timeout_seconds: float,
+    ) -> JsonHttpResponse:
+        """Return an authentication failure only for discrepancy investigations."""
+        if self.fail and not url.endswith(("/embeddings", "/systemone")):
+            name = str(_at(payload, "tool_choice", "function", "name"))
+            schema = _obj(_at(payload, "tools", 0, "function", "parameters", "properties"))
+            if name != "submit_transition" and "axes" not in schema and "summary" not in schema:
+                self.requests.append(RecordedRequest(url, dict(headers), payload))
+                return JsonHttpResponse(status_code=401, body={"error": "bad key"})
+        return super().post(url, headers=headers, payload=payload, timeout_seconds=timeout_seconds)
+
+
+def test_investigation_outage_resumes_without_redrawing_predictions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A rejected investigation leaves a resumable run, not a terminal unlearned report."""
+    episodes = [episode(0)]
+    provider = _InvestigationOutage(episodes, learnable=True)
+    _, store, _ = build_project(tmp_path, monkeypatch, provider, episodes=episodes)
+    with pytest.raises(ProviderTransportError):
+        learn_from_traces(
+            store,
+            recall_alias="jev",
+            maximum_attempts=10**6,
+            code_revision=REVISION,
+            clock=lambda: datetime.now(UTC),
+        )
+    predictions = provider.predictions()
+    assert predictions
+    assert memory_head(store.artifacts, learning_plan(store).lineage) is None
+    provider.fail = False
+    result = learn_from_traces(
+        store,
+        recall_alias="jev",
+        maximum_attempts=10**6,
+        code_revision=REVISION,
+        clock=lambda: datetime.now(UTC),
+        retry_incomplete=True,
+    )
+    assert result.learned == 1 and result.incomplete == 0
+    assert provider.predictions() == predictions

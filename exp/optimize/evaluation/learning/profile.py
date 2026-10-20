@@ -18,7 +18,7 @@ from collections.abc import Callable
 from datetime import UTC, datetime
 
 from filelock import FileLock
-from pydantic import Field
+from pydantic import AwareDatetime, Field
 
 from exp.common.core.artifacts import (
     ArtifactEnvelope,
@@ -36,6 +36,8 @@ from exp.optimize.evaluation.learning.traces import learning_plan, recorded_plan
 from exp.optimize.router.evaluation.build import completed_project_build
 from exp.runtime.gateway.decisions_contracts import DecisionRequest
 from exp.runtime.models import RuntimeModelCatalog
+from exp.runtime.models.call_evidence import canonical_call
+from exp.runtime.models.providers.admitted_transport import AdmittedJsonTransport
 from exp.runtime.models.providers.transport import (
     HttpxJsonTransport,
     JsonHttpTransport,
@@ -43,6 +45,7 @@ from exp.runtime.models.providers.transport import (
     RetryPolicy,
     run_with_retry,
 )
+from exp.runtime.sessions.dispatch_ledger import DispatchLedger
 from exp.simulation.retrieval.build_inputs import load_completed_build_rag_lineage_bindings
 from exp.simulation.retrieval.jev import JEVCueSelector
 from exp.simulation.world_model.artifact import GroundedWorldModelArtifact
@@ -201,12 +204,48 @@ def bind_evaluation_memory(
     )
 
 
+class RecallRecovery(ContractModel):
+    """Explicit authority for one replacement of a lost read-only recall decision.
+
+    Attributes:
+        intent: Exact original request whose external outcome remains unknown.
+        deadline: Absolute cutoff for the single new physical attempt.
+        rationale: Operator acknowledgement of possible duplicate billing and selection bias.
+    """
+
+    intent: ArtifactInput
+    deadline: AwareDatetime
+    rationale: str = Field(min_length=1)
+
+
+def recover_recall_decision(
+    project: ProjectStore,
+    memory: EvaluationMemory,
+    request: DecisionRequest,
+    *,
+    recovery: RecallRecovery,
+    catalog: RuntimeModelCatalog,
+    code_revision: str,
+    transport: JsonHttpTransport | None = None,
+) -> JsonObject:
+    """Explicitly recover one lost recall, preserving its identity and ambiguity receipts.
+
+    A completed replacement replays. An interrupted replacement is never dispatched again
+    by this permit. This is a development re-attempt, not a new independent measurement.
+    """
+    return _recorded_decisions(
+        project, memory, catalog, code_revision, transport, recovery=recovery
+    )(request)
+
+
 def _recorded_decisions(
     project: ProjectStore,
     memory: EvaluationMemory,
     catalog: RuntimeModelCatalog,
     code_revision: str,
     transport: JsonHttpTransport | None = None,
+    *,
+    recovery: RecallRecovery | None = None,
 ) -> Callable[[DecisionRequest], JsonObject]:
     """Native recall decisions, each saved once and replayed for an identical request.
 
@@ -228,9 +267,9 @@ def _recorded_decisions(
         request_timeout + retry_policy.maximum_delay_seconds
     )
 
-    def post(request: DecisionRequest) -> JsonObject:
+    def post(request: DecisionRequest, active_transport: JsonHttpTransport) -> JsonObject:
         """One decision attempt; transport failures are retried, refusals are not."""
-        response = transport.post(
+        response = active_transport.post(
             url,
             headers=profile.headers,
             payload=request.provider_body(profile.model_id),
@@ -254,38 +293,91 @@ def _recorded_decisions(
         with FileLock(store.project_directory / (identity + ".lock"), timeout=lock_timeout):
             if not store.exists(identity):
                 intent = identity + "-intent"
-                if store.exists(intent):
+                recovering = store.exists(intent)
+                if recovering and recovery is None:
                     raise ValueError(
-                        "recall decision has an unknown outcome; "
-                        f"inspect retained intent {intent}; "
-                        "automatic replay cannot purchase it again"
+                        "recall decision has an unknown outcome; use recover_recall_decision "
+                        "with its exact intent and an explicit single-attempt permit"
                     )
+                if recovery is not None:
+                    if (
+                        not recovering
+                        or artifact_input(store.read(intent).manifest) != recovery.intent
+                    ):
+                        raise ValueError(
+                            "recall recovery requires the exact unknown original intent"
+                        )
+                    if datetime.now(UTC) >= recovery.deadline:
+                        raise ValueError("recall recovery deadline expired before dispatch")
+                    original = json.loads(store.read_bytes(intent, "request.json"))
+                    if original != {
+                        "memory": memory.model_dump(mode="json"),
+                        "request_sha256": request_sha256,
+                        "request": request.model_dump(mode="json"),
+                    }:
+                        raise ValueError("recall recovery request differs from its original intent")
+                    if store.exists(identity + "-recovery"):
+                        raise ValueError(
+                            "recall recovery outcome is unknown; no second replacement"
+                        )
                 envelope = ArtifactEnvelope(
                     schema_version=1,
                     created_at=datetime.now(UTC),
                     code_revision=code_revision,
                     inputs=(memory.world_model,),
                 )
-                store.write_json(
-                    artifact_id=intent,
-                    artifact_type="evaluation-recall-intent",
-                    envelope=envelope,
-                    files={
-                        "request.json": {
-                            "memory": memory.model_dump(mode="json"),
-                            "request_sha256": request_sha256,
-                            "request": request.model_dump(mode="json"),
-                        }
-                    },
-                )
+                if not recovering:
+                    store.write_json(
+                        artifact_id=intent,
+                        artifact_type="evaluation-recall-intent",
+                        envelope=envelope,
+                        files={
+                            "request.json": {
+                                "memory": memory.model_dump(mode="json"),
+                                "request_sha256": request_sha256,
+                                "request": request.model_dump(mode="json"),
+                            }
+                        },
+                    )
                 started = time.monotonic()
-                body = run_with_retry(lambda: post(request), policy=retry_policy)
+                dependencies = (artifact_input(store.read(intent).manifest),)
+                if recovery is None:
+                    body = run_with_retry(lambda: post(request, transport), policy=retry_policy)
+                else:
+                    recovery_manifest = store.write_json(
+                        artifact_id=identity + "-recovery",
+                        artifact_type="evaluation-recall-recovery",
+                        envelope=envelope.model_copy(update={"inputs": dependencies}),
+                        files={
+                            "recovery.json": {
+                                "permit": recovery.model_dump(mode="json"),
+                                "measurement": (
+                                    "development re-attempt; original outcome remains unknown"
+                                ),
+                                "maximum_new_physical_attempts": 1,
+                            }
+                        },
+                    )
+                    recovery_ref = artifact_input(recovery_manifest)
+                    admitted = AdmittedJsonTransport(
+                        transport,
+                        ledger=DispatchLedger(
+                            store.project_directory / (identity + "-recovery.sqlite"),
+                            1,
+                            sha256_json(recovery),
+                        ),
+                        artifacts=store,
+                        code_revision=code_revision,
+                        deadline=recovery.deadline,
+                    )
+                    with canonical_call(recovery_ref):
+                        body = post(request, admitted)
+                    dependencies += (recovery_ref,)
+
                 store.write_json(
                     artifact_id=identity,
                     artifact_type=_DECISION,
-                    envelope=envelope.model_copy(
-                        update={"inputs": (artifact_input(store.read(intent).manifest),)}
-                    ),
+                    envelope=envelope.model_copy(update={"inputs": dependencies}),
                     files={
                         "decision.json": {
                             "request_sha256": request_sha256,

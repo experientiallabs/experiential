@@ -16,7 +16,6 @@ from exp.optimize.evaluation.audit.panel_test import (
     _obj,
     _tool_reply,
     build_project,
-    build_report,
     episode,
 )
 from exp.optimize.evaluation.learning.traces import (
@@ -94,12 +93,14 @@ def test_build_consolidation_is_budgeted_pinned_hidden_and_replayed(
     provider = DreamProvider(episodes, learnable=True)
     if long_cue:
         provider.cue = "calling this tool with the recorded inputs " * 15
-    _, project, _ = build_project(
+    _, project, output = build_project(
         tmp_path, monkeypatch, provider, "--dream-every", "1", learn=True, episodes=episodes
     )
     plan = learning_plan(project)
     assert plan.dreaming is not None and plan.dreaming.interval == 1
-    assert "dreaming" in build_report(project)  # the preflight is saved, not printed
+    report_path = project.paths.runtime_directory / "learning" / plan.lineage / "report.txt"
+    assert "Report:" in output and report_path.is_file()
+    assert "dreaming" in report_path.read_text()
     assert len(plan.dream_trace_ids) == 2
     cases = learning_cases(project, "all")
     spec = learning_spec(project, plan, cases[0], deadline=datetime.now(UTC) + timedelta(hours=1))

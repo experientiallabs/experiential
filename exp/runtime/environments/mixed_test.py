@@ -20,6 +20,7 @@ from exp.runtime.environments.mixed import (
     ToolRoute,
 )
 from exp.runtime.environments.record_world import RecordTool, RecordWorldFactory
+from exp.runtime.environments.world_outcomes import execute_with_recovery
 from exp.runtime.environments.worlds import (
     ExecutableWorldRuntime,
     RestoreError,
@@ -573,7 +574,7 @@ def _world_policy(world: WorldManifest | None = WORLD, **modes: str) -> MixedRea
 
 
 def _world_runtime(
-    events: list[MixedEvent],
+    events: list[MixedEvent], *, shadow: bool = False
 ) -> MixedRealityEnvironmentRuntime:
     """Bind a native SQLite orders world and a simulated SQLite refunds world."""
     native = ExecutableWorldRuntime(
@@ -594,7 +595,10 @@ def _world_runtime(
         owner="simulated",
     )
     return MixedRealityEnvironmentRuntime(
-        policy=_world_policy(), native=native, candidate=candidate, record=events.append
+        policy=_world_policy(place_order="shadow") if shadow else _world_policy(),
+        native=native,
+        candidate=candidate,
+        record=events.append,
     )
 
 
@@ -709,3 +713,62 @@ def test_candidate_world_failure_stops_the_mixed_episode() -> None:
             session.execute(ToolCall(call_id="bad", name="refund", arguments={}))
         with pytest.raises(RuntimeError, match="cannot be checkpointed"):
             session.checkpoint()
+
+
+def test_owned_shadow_route_refuses_before_opening_an_unavailable_mirror() -> None:
+    """An owned simulator cannot shadow native domains without a separate mirror contract."""
+    events: list[MixedEvent] = []
+    with pytest.raises(ValueError, match="shadow.*mirror"):
+        _world_runtime(events, shadow=True)
+    assert not events
+
+
+def test_mixed_pre_dispatch_refusal_preserves_both_clocks_and_allows_correction() -> None:
+    """A proven rejected access is an actor observation, not an irrecoverable simulator outage."""
+    read_world = WORLD.model_copy(
+        update={
+            "tools": (
+                WORLD.tools[0].model_copy(update={"writes": ()}),
+                WORLD.tools[1],
+            )
+        }
+    )
+    policy = MixedRealityPolicy(
+        native_identity=sha256_json({"n": 1}),
+        candidate_identity=sha256_json({"c": 1}),
+        world=read_world,
+        routes=(
+            ToolRoute(name="place_order", mode="real", effect="read"),
+            ToolRoute(name="refund", mode="simulated", effect="write"),
+        ),
+    )
+    native = ExecutableWorldRuntime(
+        read_world,
+        RecordWorldFactory(
+            service={"name": "orders"},
+            schema=ORDERS_SCHEMA,
+            tools={"place_order": RecordTool(access=_orders, run=place_order)},
+        ),
+    )
+    candidate = ExecutableWorldRuntime(
+        read_world,
+        RecordWorldFactory(
+            service={"name": "refunds"},
+            schema=REFUNDS_SCHEMA,
+            tools={"refund": RecordTool(access=_refunds, run=refund)},
+        ),
+        owner="simulated",
+    )
+    runtime = MixedRealityEnvironmentRuntime(
+        policy=policy, native=native, candidate=candidate, record=lambda event: None
+    )
+    with runtime.open(_task("place_order", "refund")) as session:
+        before = session.checkpoint()
+        reply = execute_with_recovery(session, _order("refused"))
+        assert reply.is_error
+        after = session.checkpoint()
+        assert after.native == before.native and after.candidate == before.candidate
+        assert session.execute(_refund("allowed")).is_error is False
+        done = session.checkpoint()
+        assert done.native is not None and done.candidate is not None
+        assert done.native.clock == done.candidate.clock == 2

@@ -3,7 +3,7 @@
 from datetime import UTC, datetime
 from typing import Literal, Self
 
-from filelock import FileLock
+from filelock import FileLock, Timeout
 from pydantic import Field, model_validator
 
 from exp.common.core.artifacts import (
@@ -30,6 +30,7 @@ from exp.optimize.evaluation.continuation_job import (
     saved_continuation_job,
 )
 from exp.optimize.evaluation.continuation_records import load_study
+from exp.optimize.evaluation.execution_deferral import deferred_execution, record_execution_deferral
 from exp.simulation.evaluation.tasks import VerifierGrade, grade
 
 
@@ -172,7 +173,7 @@ def _assessment(
     study = load_study(project.artifacts, result)
     if study.spec != _job(intervention).study or len(study.branches) != 1:
         raise ValueError("action contrast suffix changed its frozen policy or population")
-    return grade_intervention_outcome(intervention, study.branches[0].outcome)
+    return grade_intervention_outcome(intervention, study.branches[0].grading_outcome())
 
 
 def grade_intervention_outcome(
@@ -316,7 +317,7 @@ def saved_action_contrast(
         intervention = _intervention(
             spec, pair, arm, code_revision=code_revision, registration=registration
         )
-        inputs = {registration}
+        inputs = {registration, *deferred_execution(store, key)}
         if cell.intervention is not None:
             effect = saved_intervention(project, intervention, code_revision=code_revision)
             if (
@@ -391,15 +392,16 @@ def run_action_contrast(
                 intervention = _intervention(
                     spec, pair, arm, code_revision=code_revision, registration=registration
                 )
-                if store.exists(key + "-intent"):
+                if store.exists(key + "-intent") and not deferred_execution(store, key):
                     cell = _recover(project, intervention, pair, arm, code_revision=code_revision)
                 else:
-                    store.write_json(
-                        artifact_id=key + "-intent",
-                        artifact_type="action-contrast-intent",
-                        envelope=envelope.model_copy(update={"inputs": (registration,)}),
-                        files={"spec.json": intervention},
-                    )
+                    if not store.exists(key + "-intent"):
+                        store.write_json(
+                            artifact_id=key + "-intent",
+                            artifact_type="action-contrast-intent",
+                            envelope=envelope.model_copy(update={"inputs": (registration,)}),
+                            files={"spec.json": intervention},
+                        )
                     cell = ContrastCell(pair=pair, arm=arm)
                     try:
                         effect = capture_action_intervention(
@@ -420,10 +422,14 @@ def run_action_contrast(
                                 "assessment": _assessment(project, effect, result),
                             }
                         )
+                    except Timeout:
+                        record_execution_deferral(store, key)
+                        raise
                     except (ValueError, OSError, RuntimeError) as exc:
                         cell = cell.model_copy(update={"failure": type(exc).__name__})
                 inputs = {
                     registration,
+                    *deferred_execution(store, key),
                     *(ref for ref in (cell.intervention, cell.study) if ref is not None),
                 }
                 store.write_json(

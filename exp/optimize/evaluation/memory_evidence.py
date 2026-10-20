@@ -151,6 +151,23 @@ class MemoryExposureReport(ContractModel):
         "proof of provider receipt, attention, correctness or causal utility; no memory mutation"
     )
 
+    def sources(self) -> tuple[ArtifactInput, ...]:
+        """Retain roots and all original input/output receipts used by this inspection."""
+        sources = {*self.inventory.roots, *self.inventory.intents}
+        for call in self.calls:
+            sources.add(call.intent)
+            sources.update(fragment.location.source for fragment in call.fragments)
+            for attempt in call.attempts:
+                sources.add(attempt.intent)
+                if attempt.result is not None:
+                    sources.add(attempt.result)
+                sources.update(
+                    location.source
+                    for reasoning in attempt.reasoning
+                    for location in reasoning.locations
+                )
+        return tuple(sorted(sources, key=lambda reference: reference.artifact_id))
+
 
 def located_value(store: ArtifactStore, location: EvidenceLocator) -> JsonValue:
     """Verify the artifact and exact value digest before returning diagnostic evidence."""

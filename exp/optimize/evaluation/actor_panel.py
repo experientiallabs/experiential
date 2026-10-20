@@ -6,7 +6,7 @@ Unknown outcomes produce explicit worst/best-case bounds, never disappear from d
 
 from datetime import UTC, datetime
 
-from filelock import FileLock
+from filelock import FileLock, Timeout
 from pydantic import Field, model_validator
 
 from exp.common.core.artifacts import (
@@ -27,6 +27,7 @@ from exp.optimize.evaluation.continuation_job import (
     saved_continuation_job,
 )
 from exp.optimize.evaluation.continuation_records import load_study
+from exp.optimize.evaluation.execution_deferral import deferred_execution, record_execution_deferral
 from exp.runtime.models.registry import RuntimeModelCatalog
 from exp.simulation.continuations import load_continuation_checkpoint
 
@@ -156,8 +157,9 @@ def preflight_actor_panel(project: ProjectStore, spec: ActorPanelSpec) -> None:
             raise ValueError("actor panel alias differs from its registered snapshot")
     groups: set[str] = set()
     traces: set[str] = set()
+    for cell in panel_jobs(spec, "preflight"):
+        preflight_continuation_job(project, cell.job)
     for job in spec.cases:
-        preflight_continuation_job(project, job)
         task = load_continuation_checkpoint(project.artifacts, job.study.checkpoint).task
         if task.lineage_group_id in groups or traces.intersection(task.source_trace_ids):
             raise ValueError("actor panel cases must have disjoint declared source lineages")
@@ -266,7 +268,11 @@ def saved_actor_panel(
             != cell
         ):
             raise ValueError("actor panel report differs from its saved cell")
-        inputs = {registration, cell.job.study.checkpoint}
+        inputs = {
+            registration,
+            cell.job.study.checkpoint,
+            *deferred_execution(store, manifest.artifact_id),
+        }
         if cell.result is not None:
             if (
                 continuation_result_reference(project, cell.job, code_revision=code_revision)
@@ -327,7 +333,7 @@ def run_actor_panel(
                     raise ValueError("saved panel cell differs from registration")
                 cell = recorded
             else:
-                inputs = {registration, cell.job.study.checkpoint}
+                inputs = {registration, cell.job.study.checkpoint, *deferred_execution(store, key)}
                 if (
                     saved_continuation_job(project, cell.job, code_revision=code_revision)
                     is not None
@@ -339,15 +345,16 @@ def run_actor_panel(
                             )
                         }
                     )
-                elif store.exists(key + "-intent"):
+                elif store.exists(key + "-intent") and not deferred_execution(store, key):
                     cell = cell.model_copy(update={"failure": "UnfinishedDispatchIntent"})
                 else:
-                    store.write_json(
-                        artifact_id=key + "-intent",
-                        artifact_type="actor-panel-intent",
-                        envelope=envelope,
-                        files={"job.json": cell.job},
-                    )
+                    if not store.exists(key + "-intent"):
+                        store.write_json(
+                            artifact_id=key + "-intent",
+                            artifact_type="actor-panel-intent",
+                            envelope=envelope,
+                            files={"job.json": cell.job},
+                        )
                     try:
                         execute_continuation_job(project, cell.job, code_revision=code_revision)
                         cell = cell.model_copy(
@@ -357,6 +364,9 @@ def run_actor_panel(
                                 )
                             }
                         )
+                    except Timeout:
+                        record_execution_deferral(store, key)
+                        raise
                     except (ValueError, OSError, RuntimeError) as exc:
                         cell = cell.model_copy(update={"failure": type(exc).__name__})
                 if cell.result is not None:

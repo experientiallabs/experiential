@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, tzinfo
 from pathlib import Path
 
 import pytest
+from filelock import Timeout
 from pydantic import BaseModel, JsonValue
 
 from exp.common.core.artifacts import ArtifactEnvelope, sha256_bytes
@@ -227,26 +228,33 @@ def test_publication_crash_reuses_completed_native_cells_after_deadline(
     assert len(transport.requests) == 1
 
 
+@pytest.mark.parametrize("busy", [False, True])
 def test_interrupted_binding_is_recorded_and_never_imported_again(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, busy: bool
 ) -> None:
     """A durable binding intent with unknown effects cannot silently rerun selected local code."""
     project, spec, transport = world_fixture(tmp_path, monkeypatch)
 
     def crash(*args: object) -> None:
         """Interrupt after the binding intent and asset publication."""
+        if busy:
+            raise Timeout("binding.lock")
         raise KeyboardInterrupt("binding interrupted")
 
     with monkeypatch.context() as patch:
         patch.setattr("exp.optimize.evaluation.world_proposals.bind_construction", crash)
-        with pytest.raises(KeyboardInterrupt):
+        with pytest.raises(Timeout if busy else KeyboardInterrupt):
             propose_worlds(project, spec, code_revision="test")
     report = propose_worlds(project, spec, code_revision="test")
-    assert (
-        report.cells[0].refusal is not None
-        and "unfinished binding intent" in report.cells[0].refusal
-    )
-    assert report.search is None and report.cells[1].candidate is not None
+    if busy:
+        assert report.cells[0].candidate is not None and report.cells[0].refusal is None
+        assert report.search is not None
+        assert propose_worlds(project, spec, code_revision="test") == report
+    else:
+        assert report.cells[0].refusal is not None
+        assert "unfinished binding intent" in report.cells[0].refusal
+        assert report.search is None
+    assert report.cells[1].candidate is not None
     assert len(transport.requests) == 1
 
 

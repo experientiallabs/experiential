@@ -2,7 +2,7 @@
 
 from datetime import UTC, datetime
 
-from filelock import FileLock
+from filelock import FileLock, Timeout
 
 from exp.common.core.artifacts import (
     ArtifactEnvelope,
@@ -28,6 +28,7 @@ from exp.optimize.evaluation.continuation_job import (
     saved_continuation_job,
 )
 from exp.optimize.evaluation.continuation_records import load_study
+from exp.optimize.evaluation.execution_deferral import deferred_execution, record_execution_deferral
 
 
 class CheckpointExperimentSpec(ContractModel):
@@ -211,7 +212,11 @@ def saved_checkpoint_experiment(
             != cell
         ):
             raise ValueError("checkpoint experiment report differs from a saved cell")
-        inputs = {registration, cell.job.study.checkpoint}
+        inputs = {
+            registration,
+            cell.job.study.checkpoint,
+            *deferred_execution(store, manifest.artifact_id),
+        }
         if cell.job.study.critic_prediction is not None:
             prediction = load_critic_prediction(store, cell.job.study.critic_prediction)
             if spec.critic is None or prediction.spec != _critic(spec.critic, base):
@@ -305,15 +310,16 @@ def run_checkpoint_experiment(
                 cell = ExperimentCell.model_validate_json(store.read_bytes(key, "cell.json"))
             else:
                 cell = ExperimentCell(arm=arm, job=job)
-                if store.exists(key + "-intent"):
+                if store.exists(key + "-intent") and not deferred_execution(store, key):
                     cell = _recover_cell(project, spec, arm, job, code_revision=code_revision)
                 else:
-                    store.write_json(
-                        artifact_id=key + "-intent",
-                        artifact_type="checkpoint-experiment-intent",
-                        envelope=envelope,
-                        files={"job.json": job},
-                    )
+                    if not store.exists(key + "-intent"):
+                        store.write_json(
+                            artifact_id=key + "-intent",
+                            artifact_type="checkpoint-experiment-intent",
+                            envelope=envelope,
+                            files={"job.json": job},
+                        )
                     try:
                         if spec.critic is not None:
                             reference = predict_success(
@@ -345,9 +351,12 @@ def run_checkpoint_experiment(
                                 )
                             }
                         )
+                    except Timeout:
+                        record_execution_deferral(store, key)
+                        raise
                     except (ValueError, OSError, RuntimeError) as exc:
                         cell = cell.model_copy(update={"failure": type(exc).__name__})
-                inputs = {registration, cell.job.study.checkpoint}
+                inputs = {registration, cell.job.study.checkpoint, *deferred_execution(store, key)}
                 if cell.result is not None:
                     inputs.add(cell.result)
                 if cell.job.study.critic_prediction is not None:

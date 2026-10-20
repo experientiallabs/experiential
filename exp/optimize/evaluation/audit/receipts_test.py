@@ -198,6 +198,7 @@ def test_held_out_command_reports_receipts_checkpoint_and_exposure(
     assert "Prepared without provider calls" in dry and receipt.receipt_id in dry
 
     output = held_out_command(root, 1, "--verbose")
+    assert "Report:" in output
     assert "Held-out fidelity 3/3" in output and "now development data" in output
     output = audit_report(store)  # the receipt, checkpoint and exposure detail
     assert (
@@ -221,12 +222,18 @@ def test_held_out_command_reports_receipts_checkpoint_and_exposure(
     assert (receipt.checkpoint.lineage, receipt.checkpoint.version) == (plan.lineage, head.version)
     assert held_out_exposure(store).lineages == set(receipt.lineages)
 
-    following = held_out_command(root, 1) + " " + audit_report(store)
+    following = held_out_command(root, 1)
+    assert "Report:" in following
+    following += " " + audit_report(store)
     assert "Skipped 1 held-out lineage exposed, reserved or unresolved" in following
     assert f"{receipt.lineages[0]} (exposed, skipped): component of" in following
     second = audit_receipts(store)[-1]
     assert second.sequence == 2 and second.lineages != receipt.lineages
-    replay = held_out_command(root, 1) + " " + audit_report(store)
+    purchased_before_replay = len(provider.requests)
+    replay = held_out_command(root, 1)
+    assert "Held-out fidelity 3/3" in replay and "Report:" in replay
+    assert len(provider.requests) == purchased_before_replay
+    replay += " " + audit_report(store)
     assert "Held-out fidelity 3/3" in replay and "this run: replay" in replay
     assert f"Audit receipt #2 {second.receipt_id}: replay (independent)" in replay
 
@@ -264,7 +271,9 @@ def test_a_trace_reattempt_qualifies_the_headline_and_reports_both_subsets(
     view = receipt_view(store, receipt)
     [child] = view.reattempts
     assert view.headline == QUALIFIED
-    assert f"Audit receipt #1 {receipt.receipt_id}: {QUALIFIED}" in output
+    assert "Report:" in output
+    details = audit_report(store)
+    assert f"Audit receipt #1 {receipt.receipt_id}: {QUALIFIED}" in details
     assert "Held-out fidelity (independent, qualified: trace re-attempts) 6/6 replies" in output
     assert "Unaffected traces only 3/3 replies exact (100%)" in output
     assert "Re-attempted traces only 3/3 replies exact (100%)" in output
@@ -272,8 +281,9 @@ def test_a_trace_reattempt_qualifies_the_headline_and_reports_both_subsets(
     assert (
         "re-dispatched after an unknown outcome prediction 1 · judge 0 · investigation 0 · "
         "1 of 2 traces affected"
-    ) in output
+    ) in details
     assert child.in_place and child.retired_run == child.replacement_run
+    held_out_command(root, 2)
     assert (
         f"re-attempt of {child.trace_id}: {child.retired_run} resumed in place "
         f"({child.claimed_slots} claimed slots); step 1 re-dispatched after an unknown outcome "

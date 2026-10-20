@@ -4,10 +4,12 @@ from collections.abc import Mapping
 from pathlib import Path
 
 import pytest
+from filelock import Timeout
 from pydantic import BaseModel
 
-from exp.common.core.artifacts import ArtifactEnvelope, JsonValue
-from exp.common.project import ArtifactManifest, ProjectStore
+from exp.common.core.artifacts import ArtifactEnvelope, ArtifactInput, JsonValue
+from exp.common.project import ArtifactManifest, ArtifactStore, ProjectStore
+from exp.optimize.evaluation import action_contrast
 from exp.optimize.evaluation.action_contrast import (
     ActionContrastSpec,
     ContrastCell,
@@ -187,3 +189,59 @@ def test_parent_interruption_adopts_saved_action_and_suffix_without_new_calls(
     report = run_action_contrast(project, spec, code_revision="test")
     assert report.cells[0].study == lost[0] and report.cells[0].failure is None
     assert len(transport.requests) == 4
+
+
+@pytest.mark.parametrize("status", ["failed", "outcome_unknown"])
+def test_interrupted_suffix_cannot_pass_from_partial_outcome(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, status: str
+) -> None:
+    """Partial goal-satisfying state stays unknown when its execution never completed."""
+    project, spec, _ = contrast_fixture(tmp_path, monkeypatch)
+    original = action_contrast.load_study
+
+    def interrupted_study(store: ArtifactStore, reference: ArtifactInput) -> ContinuationStudy:
+        """Retain observed state while simulating a later operational interruption."""
+        study = original(store, reference)
+        return study.model_copy(
+            update={
+                "branches": tuple(
+                    branch.model_copy(update={"status": status}) for branch in study.branches
+                )
+            }
+        )
+
+    monkeypatch.setattr(action_contrast, "load_study", interrupted_study)
+    report = run_action_contrast(project, spec, code_revision="test")
+    for cell in report.cells:
+        assert cell.assessment is not None
+        assert not cell.assessment.complete
+        assert cell.assessment.status == "unassessable"
+    metrics = report.metrics["baseline"]
+    assert isinstance(metrics, dict)
+    assert metrics["success_bounds"] == [0.0, 1.0]
+
+
+def test_deferred_child_resumes_the_same_registered_cell(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Known contention stays pending and retry reuses the child's original execution identity."""
+    project, spec, transport = contrast_fixture(tmp_path, monkeypatch)
+    original = action_contrast.execute_continuation_job
+    blocked = []
+
+    def busy_once(
+        project: ProjectStore, job: ContinuationJob, *, code_revision: str
+    ) -> ContinuationStudy:
+        """Inject one child lease refusal before delegating to durable native execution."""
+        if not blocked:
+            blocked.append(job)
+            raise Timeout("child.lock")
+        return original(project, job, code_revision=code_revision)
+
+    monkeypatch.setattr(action_contrast, "execute_continuation_job", busy_once)
+    with pytest.raises(Timeout):
+        run_action_contrast(project, spec, code_revision="test")
+    assert not project.artifacts.exists(spec.identity("test") + "-cell-0")
+    report = run_action_contrast(project, spec, code_revision="test")
+    assert report.cells[0].study is not None and report.cells[0].failure is None
+    assert run_action_contrast(project, spec, code_revision="test") == report

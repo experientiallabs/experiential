@@ -14,7 +14,8 @@ from exp.simulation.continuations import load_continuation_checkpoint
 
 
 @pytest.mark.parametrize(
-    "fault", ["missing_state", "changed_initial", "changed_request", "matching_failure"]
+    "fault",
+    ["missing_state", "changed_initial", "changed_request", "matching_failure", "interrupted"],
 )
 def test_material_evidence_cannot_be_inferred_from_matching_final_prose(
     tmp_path: Path, fault: str
@@ -35,10 +36,12 @@ def test_material_evidence_cannot_be_inferred_from_matching_final_prose(
         outcome["initial_state"]["input_digest"] = "different"
     elif fault == "changed_request":
         outcome["model_calls"][0]["request"]["messages"][0]["content"] = "different task"
-    else:
+    elif fault == "matching_failure":
         outcome["final_state"]["rows"] = 4
         reference = reference.model_copy(update={"outcome": outcome})
     candidate = reference.model_copy(update={"outcome": outcome})
+    if fault == "interrupted":
+        candidate = candidate.model_copy(update={"status": "outcome_unknown"})
     measured = measure_pair(
         reference,
         candidate,
@@ -57,6 +60,20 @@ def test_material_evidence_cannot_be_inferred_from_matching_final_prose(
         assert measured.comparison.reference_assessment.task_result == "fail"
         metrics = equivalence_metrics((measured,))["candidate"]
         assert isinstance(metrics, dict) and metrics["both_task_pass"] == 0
+        pooled = equivalence_metrics(
+            (
+                measured,
+                measured.model_copy(update={"repeat": 1}),
+                measured.model_copy(update={"case": 1, "material_agreement": "different"}),
+            )
+        )
+        cases = pooled["by_case"]
+        assert isinstance(cases, dict)
+        assert cases["0"]["candidate"]["agreement_bounds"] == [1, 1]
+        assert cases["1"]["candidate"]["agreement_bounds"] == [0, 0]
     else:
         assert measured.material_agreement == "unassessable"
         assert measured.differences
+    if fault == "interrupted":
+        assert measured.comparison.candidate_assessment.task_result == "unassessable"
+        assert measured.comparison.candidate.stop_reason == "outcome_unknown"

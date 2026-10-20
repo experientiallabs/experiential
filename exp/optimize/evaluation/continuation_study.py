@@ -142,6 +142,13 @@ class ContinuationBranch(ContractModel):
     checkpoints: tuple[ArtifactInput, ...] = ()
     actor_calls: tuple[ArtifactInput, ...] = ()
 
+    def grading_outcome(self) -> JsonObject:
+        """Keep saved execution status authoritative over a promising partial observation."""
+        outcome = dict(self.outcome)
+        if self.status != "completed":
+            outcome["stop_reason"] = self.status
+        return outcome
+
 
 class ContinuationStudy(ContractModel):
     """Development measurements, with unavailable outcomes retained explicitly.

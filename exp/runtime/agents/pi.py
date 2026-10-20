@@ -34,6 +34,7 @@ from exp.common.models import (
     ModelResponse,
     ToolCall,
 )
+from exp.common.models.client import RequestAdmissionRefused
 from exp.common.rollouts import RolloutEventKind, RolloutSpan, StopReason
 from exp.common.tasks import TaskCase, ToolSchema
 from exp.runtime.agents.chat import task_messages
@@ -163,13 +164,19 @@ class PiAgentRuntime:
         with _PiBridge(
             task, model, environment, self._maximum_model_calls, self._maximum_output_tokens
         ) as bridge:
-            output = _invoke_installed_pi(
-                executable,
-                bridge.invocation(executable, task_messages(task)[-1].content or ""),
-                self._timeout_seconds,
-            )
+            try:
+                output = _invoke_installed_pi(
+                    executable,
+                    bridge.invocation(executable, task_messages(task)[-1].content or ""),
+                    self._timeout_seconds,
+                )
+            finally:
+                # Pi can catch an HTTP tool failure and emit a successful transcript. The
+                # coordinator must retain the original dependency error, including when
+                # Pi instead exits unsuccessfully or exhausts its model allowance.
+                bridge.raise_if_failed()
         episode = _episode_from_pi_events(output)
-        if bridge.limit_reached:
+        if bridge.limit_reached and episode.failure is None:
             return episode.model_copy(
                 update={"stop_reason": StopReason.MAXIMUM_STEPS, "failure": None}
             )
@@ -204,6 +211,8 @@ class _PiBridge(AbstractContextManager["_PiBridge"]):
         self._maximum_output_tokens = maximum_output_tokens
         self._model_calls = 0
         self.limit_reached = False
+        self._failure: Exception | RequestAdmissionRefused | None = None
+        self._failure_lock = threading.Lock()
         self._environment = environment
         self._tools_by_name = {tool.name: tool for tool in task.tools}
         if len(self._tools_by_name) != len(task.tools):
@@ -348,11 +357,16 @@ class _PiBridge(AbstractContextManager["_PiBridge"]):
             }
         )
         with self._model_lock:
+            self.raise_if_failed()
             if self._model_calls >= self._maximum_model_calls:
                 self.limit_reached = True
                 raise _PiBridgeError("Pi actor model-call allowance exhausted; no call dispatched")
             self._model_calls += 1
-            response = self._model_context.run(self._model.complete, request)
+            try:
+                response = self._model_context.run(self._model.complete, request)
+            except (Exception, RequestAdmissionRefused) as error:
+                self._record_failure(error)
+                raise
         return serving_request, response
 
     def execute_tool(self, tool_name: str, payload: JsonObject) -> Observation:
@@ -369,10 +383,28 @@ class _PiBridge(AbstractContextManager["_PiBridge"]):
         except ValidationError as exc:
             raise _PiBridgeError("Pi tool bridge request has non-object arguments") from exc
         with self._tool_lock:
-            return self._environment_context.run(
-                self._environment.execute,
-                ToolCall(call_id=call_id, name=tool_name, arguments=arguments),
-            )
+            self.raise_if_failed()
+            try:
+                return self._environment_context.run(
+                    self._environment.execute,
+                    ToolCall(call_id=call_id, name=tool_name, arguments=arguments),
+                )
+            except (Exception, RequestAdmissionRefused) as error:
+                self._record_failure(error)
+                raise
+
+    def _record_failure(self, error: Exception | RequestAdmissionRefused) -> None:
+        """Retain the first dependency failure across HTTP worker threads."""
+        with self._failure_lock:
+            if self._failure is None:
+                self._failure = error
+
+    def raise_if_failed(self) -> None:
+        """Refuse further dispatch and propagate the original error to the episode owner."""
+        with self._failure_lock:
+            failure = self._failure
+        if failure is not None:
+            raise failure
 
 
 class _PiBridgeHttpServer(ThreadingHTTPServer):
@@ -409,7 +441,7 @@ class _PiBridgeRequestHandler(BaseHTTPRequestHandler):
             self._write_json(HTTPStatus.NOT_FOUND, {"error": "unknown Pi bridge endpoint"})
         except _PiBridgeError as exc:
             self._write_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
-        except Exception:  # noqa: BLE001 - bridge failures must not expose episode payloads
+        except (Exception, RequestAdmissionRefused):  # noqa: BLE001 - redact dependency details.
             self._write_json(
                 HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "Pi bridge execution failed"}
             )

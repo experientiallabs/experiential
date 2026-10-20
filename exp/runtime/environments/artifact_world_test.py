@@ -60,9 +60,13 @@ def _delete(start: int) -> ToolCall:
 
 def test_image_holds_exact_bytes_and_marks_unwritten_outputs() -> None:
     """Captured parts are the native files; an output exists only after it is written."""
-    world = _factory().create(_task())
+    source = _workbook()
+    factory = ArtifactWorldFactory(
+        WorkbookEditAdapter(), files={"in.xlsx": source}, outputs=("out.xlsx",)
+    )
+    world = factory.create(_task())
     image = world.capture()
-    assert image.parts == {"in.xlsx": _workbook()}
+    assert image.parts == {"in.xlsx": source}
     absent = image.domains["out.xlsx"]
     reply = world.execute(_delete(2), WorldContext.__new__(WorldContext))
     assert not reply.is_error

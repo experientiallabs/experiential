@@ -7,7 +7,7 @@ code, permissions, independent acceptance, lineage, or model budgets. Every prop
 import json
 from datetime import UTC, datetime
 
-from filelock import FileLock
+from filelock import FileLock, Timeout
 from pydantic import Field
 
 from exp.common.core.artifacts import (
@@ -26,6 +26,7 @@ from exp.optimize.evaluation.authoring import AuthorSettings, author_response, p
 from exp.optimize.evaluation.construction_binding import ConstructionBinding, bind_construction
 from exp.optimize.evaluation.continuation_capture import preflight_capture
 from exp.optimize.evaluation.executable_task import load_executable_task
+from exp.optimize.evaluation.execution_deferral import deferred_execution, record_execution_deferral
 from exp.optimize.evaluation.record_scenarios import RecordScenarioSpec
 from exp.optimize.evaluation.scenario_search import (
     ScenarioCandidate,
@@ -324,6 +325,8 @@ def _cell(
         binding = bind_construction(project, spec.template.capture, assets)
         candidate = _candidate(spec, row, assets, binding)
         return WorldProposalCell(index=index, assets=assets, binding=binding, candidate=candidate)
+    except Timeout:
+        raise  # Busy work remains pending; the owning process may still finish it.
     except (ValueError, OSError, RuntimeError) as error:
         return WorldProposalCell(
             index=index,
@@ -372,6 +375,7 @@ def propose_worlds(
                     != {
                         response_ref,
                         artifact_input(intent),
+                        *deferred_execution(store, cell_id),
                         *((cell.assets,) if cell.assets else ()),
                     }
                 ):
@@ -396,7 +400,7 @@ def propose_worlds(
                     if cell.candidate is not None:
                         raise
             else:
-                if store.exists(cell_id + "-intent"):
+                if store.exists(cell_id + "-intent") and not deferred_execution(store, cell_id):
                     cell = WorldProposalCell(
                         index=index,
                         refusal=(
@@ -405,20 +409,25 @@ def propose_worlds(
                         ),
                     )
                 else:
-                    store.write_json(
-                        artifact_id=cell_id + "-intent",
-                        artifact_type="world-binding-intent",
-                        envelope=ArtifactEnvelope(
-                            schema_version=1,
-                            created_at=datetime.now(UTC),
-                            code_revision=code_revision,
-                            inputs=(response_ref,),
-                        ),
-                        files={"proposal.json": row},
-                    )
-                    cell = _cell(
-                        project, spec, row, index, response_ref, code_revision, fingerprints
-                    )
+                    if not store.exists(cell_id + "-intent"):
+                        store.write_json(
+                            artifact_id=cell_id + "-intent",
+                            artifact_type="world-binding-intent",
+                            envelope=ArtifactEnvelope(
+                                schema_version=1,
+                                created_at=datetime.now(UTC),
+                                code_revision=code_revision,
+                                inputs=(response_ref,),
+                            ),
+                            files={"proposal.json": row},
+                        )
+                    try:
+                        cell = _cell(
+                            project, spec, row, index, response_ref, code_revision, fingerprints
+                        )
+                    except Timeout:
+                        record_execution_deferral(store, cell_id)
+                        raise
                 store.write_json(
                     artifact_id=cell_id,
                     artifact_type="world-proposal-cell",
@@ -431,6 +440,7 @@ def propose_worlds(
                                 {
                                     response_ref,
                                     artifact_input(store.read(cell_id + "-intent").manifest),
+                                    *deferred_execution(store, cell_id),
                                     *((cell.assets,) if cell.assets else ()),
                                 },
                                 key=lambda ref: ref.artifact_id,

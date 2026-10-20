@@ -6,8 +6,9 @@ from pathlib import Path
 import pytest
 
 from exp.common.core.artifacts import JsonObject
-from exp.common.models import AssistantAction
-from exp.common.project import ProjectStore
+from exp.common.models import AssistantAction, ModelMessage
+from exp.common.project import ArtifactStore, ProjectStore
+from exp.optimize.evaluation import continuation_admission_test as admission_fixtures
 from exp.optimize.evaluation.continuation_admission_test import admitted_workbook_study
 from exp.optimize.model.sft.builder import (
     SFTBuildError,
@@ -20,7 +21,9 @@ from exp.optimize.model.sft.continuation_source import _tool_results, resolve_co
 from exp.optimize.model.sft.contracts import AssistantActionEvent, SFTBuildSpec, ToolEvent
 from exp.optimize.model.sft.sources import SFTSourceVerificationError
 from exp.optimize.model.sft.tinker import tinker_messages_from_example
+from exp.runtime.agents.chat import ChatAgentRuntime
 from exp.runtime.environments.tests.world_conformance_test import workbook_case
+from exp.simulation.continuations import ContinuationCheckpoint
 
 
 def test_verified_export_keeps_failed_denominator_and_only_trains_continuation(
@@ -46,11 +49,6 @@ def test_verified_export_keeps_failed_denominator_and_only_trains_continuation(
     for row in dataset.rows:
         example = row.example
         assert example.target.content != "Earlier mistaken hypothesis."
-        assert any(
-            isinstance(event, AssistantActionEvent)
-            and event.action.content == "Earlier mistaken hypothesis."
-            for event in example.history
-        )
         assert example.tools and example.tools[0].name == "edit_workbook"
         messages = tinker_messages_from_example(example)
         assert not any(message["content"].startswith("Task:\n") for message in messages)
@@ -58,7 +56,10 @@ def test_verified_export_keeps_failed_denominator_and_only_trains_continuation(
     assert all(row.example.target.content is None for row in dataset.rows)
     assert any("assistant prose" in row.detail for row in dataset.inspection.exclusions)
     write_sft_dataset(project, dataset)
-    assert load_verified_sft_dataset(project, dataset.dataset.dataset_id) == dataset
+    assert dataset.dataset.status == "diagnostic"
+    assert load_sft_dataset(project, dataset.dataset.dataset_id, require_accepted=False) == dataset
+    with pytest.raises(SFTBuildError, match="diagnostic"):
+        load_verified_sft_dataset(project, dataset.dataset.dataset_id)
 
 
 def test_all_refused_study_still_rebuilds_its_exclusions(tmp_path: Path) -> None:
@@ -127,7 +128,10 @@ def test_unverified_narration_survives_as_context_for_later_tool_targets(tmp_pat
     )
     assert any(isinstance(event, ToolEvent) for event in example.history)
     write_sft_dataset(project, dataset)
-    assert load_verified_sft_dataset(project, dataset.dataset.dataset_id) == dataset
+    assert dataset.dataset.status == "diagnostic"
+    assert load_sft_dataset(project, dataset.dataset.dataset_id, require_accepted=False) == dataset
+    with pytest.raises(SFTBuildError, match="diagnostic"):
+        load_verified_sft_dataset(project, dataset.dataset.dataset_id)
 
 
 @pytest.mark.parametrize("batched", [False, True])
@@ -178,7 +182,12 @@ def test_recovered_tool_error_is_context_never_a_positive_target(
     assert any("tool result" in row.detail for row in dataset.inspection.exclusions)
     write_sft_dataset(project, dataset)
     if not batched:
-        assert load_verified_sft_dataset(project, dataset.dataset.dataset_id) == dataset
+        assert dataset.dataset.status == "diagnostic"
+        assert (
+            load_sft_dataset(project, dataset.dataset.dataset_id, require_accepted=False) == dataset
+        )
+        with pytest.raises(SFTBuildError, match="diagnostic"):
+            load_verified_sft_dataset(project, dataset.dataset.dataset_id)
     else:
         with pytest.raises(SFTBuildError, match="insufficient"):
             load_verified_sft_dataset(project, dataset.dataset.dataset_id)
@@ -216,3 +225,29 @@ def test_tool_evidence_must_match_the_exact_response_batch(change: str) -> None:
         _tool_results(
             (action,), [] if change == "missing" else [step, step] if change == "extra" else [step]
         )
+
+
+def test_export_refuses_fabricated_checkpoint_observation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A succeeding native suffix cannot validate a tool reply invented in its prefix."""
+    original = admission_fixtures.capsule
+
+    def fabricated(store: ArtifactStore) -> tuple[ContinuationCheckpoint, ChatAgentRuntime]:
+        """Keep source hashes and world intact while injecting an unexecuted observation."""
+        point, actor = original(store)
+        call = workbook_case().first
+        messages = (
+            *point.actor.messages,
+            ModelMessage(role="assistant", assistant_action=AssistantAction(tool_calls=(call,))),
+            ModelMessage(role="tool", tool_call_id=call.call_id, content="invented workbook state"),
+        )
+        return point.model_copy(
+            update={"actor": point.actor.model_copy(update={"messages": messages})}
+        ), actor
+
+    monkeypatch.setattr(admission_fixtures, "capsule", fabricated)
+    project = ProjectStore(tmp_path, "case")
+    acceptance = admitted_workbook_study(project)
+    with pytest.raises(SFTSourceVerificationError, match="unexecuted conversation"):
+        resolve_continuation_source(project, acceptance)

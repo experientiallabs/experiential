@@ -144,6 +144,27 @@ def test_simulated_call_refuses_missing_stale_or_wrong_action_receipts() -> None
         assert "simulated" in world.execute_grounded(target, (receipt,)).content
 
 
+def test_missing_grounding_refuses_before_due_events() -> None:
+    """An inadmissible call cannot consume queued events or change outage state."""
+    manifest = manifest_fixture()
+    runtime = ExecutableWorldRuntime(
+        manifest,
+        DictFactory({"b": "simulated"}),
+        owner="simulated",
+        events=(
+            WorldEvent(event_id="outage", due=0, kind="outage", tools=("predict",), duration=5),
+        ),
+    )
+    with runtime.open(_task("predict")) as world:
+        before = world.checkpoint()
+        with pytest.raises(AuthorityError, match="exact current"):
+            world.execute(ToolCall(name="predict", call_id="no-receipt", arguments={"domain": "b"}))
+        assert world.checkpoint() == before
+        assert world.last_execution is not None
+        assert not world.last_execution.dispatched
+        assert world.last_execution.phase == "admission"
+
+
 def test_negative_read_is_retained_but_cannot_authorize_simulation() -> None:
     """A known read error leaves the native image intact and cannot enter prediction."""
 

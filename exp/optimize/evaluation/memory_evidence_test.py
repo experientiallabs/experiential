@@ -117,6 +117,11 @@ def test_canonical_intent_joins_physical_attempt_and_replay_without_another_call
     assert call.consumer == "actor" and call.logical_id == "episode/actor-0"
     assert call.coverage == "linked_attempts" and len(call.attempts) == 1
     assert call.attempts[0].status == "response_saved"
+    assert set(report.sources()) == {
+        call.intent,
+        call.attempts[0].intent,
+        call.attempts[0].result,
+    }
     reason = call.attempts[0].reasoning[0]
     assert reason.availability == "exposed_text"
     assert located_value(project.artifacts, reason.locations[0]) == "I compared the saved rule."

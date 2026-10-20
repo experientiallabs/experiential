@@ -492,12 +492,14 @@ def _lineage(project: ProjectStore, world_model: ArtifactInput, scope: Scope) ->
 def _protocol() -> JsonObject:
     """The learning run inputs shared by every trace of a lineage.
 
-    The prompts include the native-artifact and instance-facts guidance even though only some
-    traces send them: a lineage spans every trace, so editing either prompt starts a fresh memory.
+    The prompts include the native-artifact, instance-facts and evidence-reading protocols even
+    though only some traces use them: a lineage spans every trace, so editing any of them starts
+    a fresh memory.
     """
     return {
         "prompts": protocol_prompts_sha256(native_artifacts=True),
         "facts_prompt": INSTANCE_FACTS_GUIDANCE,
+        "reading_protocol": ReadingPolicy().identity,
         "proposal_reasks": PROPOSAL_REASKS,
         "output_tokens": {"prediction": PREDICTION_TOKENS, "investigation": INVESTIGATION_TOKENS},
         "attempts_per_request": RetryPolicy().maximum_attempts,

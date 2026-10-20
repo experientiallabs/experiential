@@ -16,18 +16,20 @@ def require_development_task(store: ArtifactStore, task: TaskCase) -> None:
         raise ValueError(
             "development requires fit data; reserved evaluation tasks cannot be consumed"
         )
-    if task.origin == "authored" and not task.source_trace_ids:
-        return
     project = ProjectStore(store.paths.root, store.paths.project_id)
     build = project.load_project().build if project.exists() else None
+    bindings = (
+        load_task_set_lineage_bindings(store, build.task_set.artifact_id).bindings
+        if build is not None
+        else ()
+    )
+    if task.lineage_group_id in {row.lineage_id for row in bindings if row.partition == "held_out"}:
+        raise ValueError("development task lineage is reserved by the frozen build")
+    if task.origin == "authored" and not task.source_trace_ids:
+        return
     if build is None or not task.source_trace_ids:
         raise ValueError("trace-backed development needs a frozen build and explicit source traces")
-    bindings = load_task_set_lineage_bindings(store, build.task_set.artifact_id)
-    by_trace = {row.trace_id: row for row in bindings.bindings}
-    if task.lineage_group_id in {
-        row.lineage_id for row in bindings.bindings if row.partition == "held_out"
-    }:
-        raise ValueError("development task lineage is reserved by the frozen build")
+    by_trace = {row.trace_id: row for row in bindings}
     for trace in task.source_trace_ids:
         source = by_trace.get(trace)
         if source is None or source.partition != "fit":

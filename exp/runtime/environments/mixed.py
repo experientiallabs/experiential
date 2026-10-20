@@ -36,7 +36,11 @@ from exp.common.models import NumericMeasurement, OperationEconomics, ToolCall, 
 from exp.common.tasks import TaskCase
 from exp.runtime.environments.interface import EnvironmentRuntime, EnvironmentSession, Observation
 from exp.runtime.environments.world_grounding import NativeReadReceipt
-from exp.runtime.environments.world_outcomes import ExecutionEvidence, WorldExecutionReceipt
+from exp.runtime.environments.world_outcomes import (
+    ExecutionEvidence,
+    WorldExecutionReceipt,
+    execute_with_recovery,
+)
 from exp.runtime.environments.worlds import (
     CheckpointableSession,
     ExecutableCheckpoint,
@@ -276,6 +280,13 @@ class MixedRealityEnvironmentRuntime:
         if any(route.mode != "real" for route in policy.routes) and candidate is None:
             raise ValueError("candidate routes require an executable candidate runtime")
         if policy.world is not None:
+            if isinstance(candidate, ExecutableWorldRuntime) and any(
+                route.mode == "shadow" for route in policy.routes
+            ):
+                raise ValueError(
+                    "owned-world shadow routes require an independent mirror contract; "
+                    "the simulated owner cannot execute native-owned tools"
+                )
             if policy.world.native_reads and not (
                 isinstance(native, ExecutableWorldRuntime)
                 and isinstance(candidate, ExecutableWorldRuntime)
@@ -607,7 +618,16 @@ class _MixedSession:
             self._scope = "divergent_prefix"
         if intent.route.mode == "real" and intent.route.effect == "write":
             self._scope = "unpaired_prefix"
-        if failure is None and not grounding_refused:
+        receipt = self.last_execution
+        refused = (
+            receipt is not None
+            and receipt.error_type is not None
+            and receipt.effects == "not_started"
+            and not receipt.dispatched
+            and receipt.before_sha256 is not None
+            and receipt.before_sha256 == receipt.after_sha256
+        )
+        if failure is None and not grounding_refused and not refused:
             self._align_clocks(intent, authority)
         if failure is not None:
             _raise_backend_failure("execution", failure)
@@ -638,7 +658,7 @@ class _MixedSession:
         """Give a backend its own public action copy, without mutating the other's request."""
         if backend is None:
             raise RuntimeError("selected environment backend is not bound")
-        return backend.execute(action.model_copy(deep=True))
+        return execute_with_recovery(backend, action.model_copy(deep=True))
 
 
 def _open(

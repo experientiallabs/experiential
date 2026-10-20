@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
+from filelock import FileLock, Timeout
 from pydantic import BaseModel, JsonValue
 from typer.testing import CliRunner
 
@@ -509,3 +510,19 @@ def test_factory_qualifies_distinct_workbook_and_record_workflows(
     assert result.counts["selected_components"] == 2
     assert result.coverage.deficits == {"workbook": 0, "retail": 0}
     assert len(wire.requests) == 24
+
+
+def test_busy_child_remains_pending_and_completes_after_release(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Lease contention cannot freeze an otherwise valid family as a permanent failure."""
+    project, spec, transport = factory_fixture(tmp_path, monkeypatch)
+    proposal_id = spec.families[0].proposal.identity("test")
+    with FileLock(project.artifacts.project_directory / (proposal_id + ".lock")):
+        with pytest.raises(Timeout):
+            run_task_factory(project, spec, code_revision="test")
+    assert not transport.requests
+    assert not project.artifacts.exists(spec.identity("test") + "-result")
+    result = run_task_factory(project, spec, code_revision="test")
+    assert result.status == "development_qualified"
+    assert all(cell.error_type is None for cell in result.cells)

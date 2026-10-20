@@ -8,6 +8,7 @@ from pydantic import AwareDatetime, Field
 
 from exp.common.core.artifacts import (
     ArtifactEnvelope,
+    ArtifactInput,
     ContractModel,
     JsonObject,
     Sha256,
@@ -17,6 +18,7 @@ from exp.common.core.artifacts import (
 from exp.common.models import ModelSnapshot, load_model_catalog
 from exp.common.project import ProjectStore, artifact_input
 from exp.optimize.evaluation.memory_evidence import MemoryInspection, inspect_memory, located_value
+from exp.optimize.evaluation.source_access import require_development_sources
 from exp.runtime.models.budget import RequestBudget
 from exp.runtime.models.call_evidence import call_consumer
 from exp.runtime.models.providers.admitted_transport import AdmittedJsonTransport
@@ -65,6 +67,7 @@ class MemoryAnalystSpec(ContractModel):
             {
                 "spec": sha256_json(self),
                 "code": revision,
+                "source_protocol": "complete-input-and-output-receipts-v1",
                 "rubric": sha256_json(
                     {
                         "base": ANALYSIS_PROMPT,
@@ -81,6 +84,9 @@ def diagnostic_definition(project: ProjectStore, spec: MemoryAnalystSpec) -> Jso
     report = inspect_memory(project.artifacts, spec.inspection)
     if sha256_json(report) != spec.exposure_sha256:
         raise ValueError("memory exposure changed since analyst registration")
+    require_development_sources(
+        project.artifacts, report.sources(), maximum_artifacts=spec.inspection.maximum_artifacts
+    )
     inventory: JsonObject = {}
     for call in report.calls:
         root = "memory:" + call.intent.artifact_id
@@ -159,6 +165,29 @@ def preflight_memory_analyst(project: ProjectStore, spec: MemoryAnalystSpec) -> 
     return definition
 
 
+def _analysis_sources(
+    project: ProjectStore, spec: MemoryAnalystSpec, identity: str
+) -> tuple[ArtifactInput, ...]:
+    """Bind every inspected original and the exact analyst request into the saved graph."""
+    report = inspect_memory(project.artifacts, spec.inspection)
+    if sha256_json(report) != spec.exposure_sha256:
+        raise ValueError("memory exposure changed since analyst registration")
+    canonical = tuple(
+        artifact_input(project.artifacts.read(call).manifest)
+        for call in project.artifacts.list_ids(artifact_type="structured-call-intent")
+        if json.loads(project.artifacts.read_bytes(call, "request.json")).get("logical_id")
+        == identity
+    )
+    if len(canonical) != 1:
+        raise ValueError("memory analysis lacks its exact canonical analyst call")
+    declarations = require_development_sources(
+        project.artifacts, report.sources(), maximum_artifacts=spec.inspection.maximum_artifacts
+    )
+    return tuple(
+        sorted({*report.sources(), *canonical, *declarations}, key=lambda ref: ref.artifact_id)
+    )
+
+
 def saved_memory_analysis(
     project: ProjectStore, spec: MemoryAnalystSpec, *, code_revision: str
 ) -> TraceAnalysis | None:
@@ -178,7 +207,7 @@ def saved_memory_analysis(
         or manifest.code_revision != code_revision
     ):
         raise ValueError("saved memory analyst identity differs")
-    if not set(spec.inspection.intents) < set(manifest.inputs):
+    if set(manifest.inputs) != set(_analysis_sources(project, spec, identity)):
         raise ValueError("memory analysis lost its original call evidence")
     for reference in manifest.inputs:
         if artifact_input(project.artifacts.read(reference.artifact_id).manifest) != reference:
@@ -191,7 +220,19 @@ def saved_memory_analysis(
 def run_memory_analysis(
     project: ProjectStore, spec: MemoryAnalystSpec, *, code_revision: str
 ) -> TraceAnalysis:
-    """Execute one metered, durable analyst call; never replace judges or publish to memory."""
+    """Execute one metered diagnostic under the same lease as source classification.
+
+    Admission and dispatch linearize before any later protection declaration. The lease
+    prevents concurrent classification changes while approved content is being disclosed.
+    """
+    with FileLock(project.artifacts.project_directory / "source-access.lock", timeout=0):
+        return _run_admitted_memory_analysis(project, spec, code_revision=code_revision)
+
+
+def _run_admitted_memory_analysis(
+    project: ProjectStore, spec: MemoryAnalystSpec, *, code_revision: str
+) -> TraceAnalysis:
+    """Run or replay a diagnostic while its source classification lease is held."""
     saved = saved_memory_analysis(project, spec, code_revision=code_revision)
     if saved is not None:
         return saved
@@ -236,23 +277,13 @@ def run_memory_analysis(
         )
         with call_consumer("analyst"):
             result = analyze_traces(definition, (), complete=completion, logical_id=identity)
-        canonical = tuple(
-            artifact_input(project.artifacts.read(call).manifest)
-            for call in project.artifacts.list_ids(artifact_type="structured-call-intent")
-            if json.loads(project.artifacts.read_bytes(call, "request.json")).get("logical_id")
-            == identity
-        )
-        if len(canonical) != 1:
-            raise ValueError("memory analysis lacks its exact canonical analyst call")
         project.artifacts.write_json(
             artifact_id=identity,
             artifact_type="memory-diagnostic-analysis",
             envelope=ArtifactEnvelope(
                 schema_version=1,
                 created_at=datetime.now(UTC),
-                inputs=tuple(
-                    sorted((*spec.inspection.intents, *canonical), key=lambda ref: ref.artifact_id)
-                ),
+                inputs=_analysis_sources(project, spec, identity),
                 code_revision=code_revision,
             ),
             files={"analysis.json": result, "spec.json": spec},

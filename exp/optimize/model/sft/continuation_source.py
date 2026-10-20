@@ -7,6 +7,7 @@ from exp.optimize.evaluation.continuation_admission import (
     ContinuationAdmission,
     admit_continuations,
 )
+from exp.optimize.evaluation.continuation_prefix import verify_training_prefix
 from exp.optimize.evaluation.continuation_records import load_study
 from exp.optimize.model.sft.contracts import (
     AssistantActionEvent,
@@ -56,6 +57,10 @@ def resolve_continuation_source(
         raise SFTSourceVerificationError("continuation admission no longer re-derives")
     study = load_study(store, admission.study)
     checkpoint = load_continuation_checkpoint(store, study.spec.checkpoint)
+    try:
+        verify_training_prefix(store, study.spec.checkpoint)
+    except ValueError as error:
+        raise SFTSourceVerificationError(str(error)) from error
     prepared, exclusions, references = [], [], []
     for decision, branch in zip(admission.branches, study.branches, strict=True):
         identity = f"{admission.study.artifact_id}-branch-{branch.index}"
@@ -149,7 +154,13 @@ def resolve_continuation_source(
                 task=checkpoint.task.instruction,
                 transcript_events=transcript.events,
                 example_source=ContinuationExampleSource(
-                    study=admission.study, branch=branch.index, acceptance_evidence=reference
+                    study=admission.study,
+                    branch=branch.index,
+                    acceptance_evidence=reference,
+                    qualification=admission.evidence.qualification if admission.evidence else None,
+                    qualification_scope=admission.evidence.qualification_scope
+                    if admission.evidence
+                    else None,
                 ),
                 score=None,
                 direct_inputs=(admission.study, reference, study.spec.checkpoint),

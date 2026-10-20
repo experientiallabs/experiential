@@ -103,9 +103,15 @@ def test_constructed_assets_enter_existing_runtime_and_restore(tmp_path: Path) -
         assumptions=("Authored counterexample.",),
         tables={
             "Data": TablePlan(
-                rows=3, columns={"id": SequenceColumn(), "key": ValuesColumn(values=(1, 2, 1))}
+                rows=3,
+                columns={
+                    "id": SequenceColumn(kind="sequence"),
+                    "key": ValuesColumn(kind="values", values=(1, 2, 1)),
+                },
             ),
-            "Protected": TablePlan(rows=1, columns={"sentinel": ValuesColumn(values=(42,))}),
+            "Protected": TablePlan(
+                rows=1, columns={"sentinel": ValuesColumn(kind="values", values=(42,))}
+            ),
         },
         workbooks={"original.xlsx": ("Data", "Protected")},
     )

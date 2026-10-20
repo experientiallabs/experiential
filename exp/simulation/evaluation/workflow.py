@@ -164,6 +164,8 @@ def evaluate_workflow(
                             source=reply_feedback_source,
                         )
                     )
+                except (ProviderTransportError, CompletionNotDispatched, TimeoutError):
+                    raise
                 except Exception as error:  # noqa: BLE001 - failed adaptation blocks future slots.
                     feedback_error = type(error).__name__
                     stopped = True
@@ -180,6 +182,11 @@ def evaluate_workflow(
         )
         feedback_receipts = [row for row in settled if not isinstance(row, Exception)]
         failures = [row for row in settled if isinstance(row, Exception)]
+        for failure in failures:
+            if isinstance(failure, (ProviderTransportError, CompletionNotDispatched, TimeoutError)):
+                # Predictions and successful feedback are durable; no terminal report may
+                # hide an operational interruption from explicit in-place recovery.
+                raise failure
         feedback_error = type(failures[0]).__name__ if failures else None
     simulated = sum(step.status != "blocked" for step in steps)
     report(

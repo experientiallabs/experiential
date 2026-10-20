@@ -4,6 +4,7 @@ from pathlib import Path
 
 from rich.console import Console
 
+from exp.cli.evaluation.spend import review_cost
 from exp.cli.shared.consent import require_spend_consent
 from exp.cli.shared.options import usage_error
 from exp.cli.shared.progress import progress_display
@@ -61,7 +62,7 @@ def run_pipeline(
                 console,
                 root=root,
                 yes=yes,
-                estimated_cost_usd=None,
+                estimated_cost_usd=review_cost(console, store, spec),
                 cost_is_upper_bound=False,
                 command=f"exp eval {project} --pipeline {path}",
                 non_interactive=non_interactive,

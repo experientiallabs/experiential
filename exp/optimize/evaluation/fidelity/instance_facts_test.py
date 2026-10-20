@@ -75,6 +75,7 @@ def test_every_replay_conditions_on_its_own_facts_and_nothing_else(
         learn=True,
     )
     assert "learned" in output
+    assert "Report:" in output
     assert "Miss retest" in build_report(store)
     held_out_command(root, 3)
 

@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import Never
 
 import pytest
+from filelock import Timeout
 
 from exp.common.project import ProjectStore, artifact_input
 from exp.optimize.evaluation import observation_contrast as owner
@@ -209,3 +210,29 @@ def test_completed_child_recovers_without_redrawing_after_parent_crash(
     assert all(
         cell.assessment is not None and cell.assessment.status == "pass" for cell in report.cells
     )
+
+
+def test_deferred_child_resumes_the_same_registered_cell(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Known contention stays pending and retry reuses the child's original execution identity."""
+    project, spec, transport = observation_fixture(tmp_path, monkeypatch)
+    original = owner.execute_continuation_job
+    blocked = []
+
+    def busy_once(
+        project: ProjectStore, job: ContinuationJob, *, code_revision: str
+    ) -> ContinuationStudy:
+        """Inject one child lease refusal before delegating to durable native execution."""
+        if not blocked:
+            blocked.append(job)
+            raise Timeout("child.lock")
+        return original(project, job, code_revision=code_revision)
+
+    monkeypatch.setattr(owner, "execute_continuation_job", busy_once)
+    with pytest.raises(Timeout):
+        run_observation_contrast(project, spec, code_revision="test")
+    assert not project.artifacts.exists(spec.identity("test") + "-cell-0")
+    report = run_observation_contrast(project, spec, code_revision="test")
+    assert report.cells[0].result is not None and report.cells[0].failure is None
+    assert run_observation_contrast(project, spec, code_revision="test") == report

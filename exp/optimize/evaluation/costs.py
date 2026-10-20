@@ -1,0 +1,332 @@
+"""Credential-free planning costs for the complete declared evaluation schedule.
+
+These estimates price full context capacity and every physical allowance, including simulator
+calls. They are deliberately not dollar authorizations: unknown tariffs and arbitrary trusted
+runtime code require explicit consent, and existing dispatch ledgers enforce the attempt limits.
+"""
+
+import math
+from dataclasses import dataclass
+from pathlib import Path
+
+from exp.common.core.artifacts import ContractModel, JsonObject, Sha256, sha256_bytes
+from exp.common.models import load_model_catalog
+from exp.common.models.pricing import completion_cost_reservation
+from exp.common.models.token_cost import schedule_maximum_cost_nano_usd
+from exp.common.project import ProjectStore
+from exp.optimize.evaluation import grounded_runtime, mixed_runtime, workbook_runtime
+from exp.optimize.evaluation.action_contrast import ActionContrastSpec
+from exp.optimize.evaluation.action_intervention import ActionIntervention, ActionInterventionSpec
+from exp.optimize.evaluation.actor_critic import CriticSpec
+from exp.optimize.evaluation.actor_decisions import ActorDecisionSpec
+from exp.optimize.evaluation.actor_panel import ActorPanelSpec
+from exp.optimize.evaluation.authoring import AuthorSettings
+from exp.optimize.evaluation.candidate_batch import CandidateBatchSpec
+from exp.optimize.evaluation.checkpoint_experiment import CheckpointExperimentSpec
+from exp.optimize.evaluation.checkpoint_proposals import CheckpointProposalSpec
+from exp.optimize.evaluation.checkpoint_selection import load_selection_plan, selection_jobs
+from exp.optimize.evaluation.continuation_campaign import ContinuationCampaignSpec
+from exp.optimize.evaluation.continuation_capture import CaptureDefinition
+from exp.optimize.evaluation.continuation_job import ContinuationJob
+from exp.optimize.evaluation.equivalence import EquivalenceSpec
+from exp.optimize.evaluation.executable_task import load_executable_task
+from exp.optimize.evaluation.fidelity.retrieval_binding import index_embedder_alias
+from exp.optimize.evaluation.framing_study import FramingStudySpec
+from exp.optimize.evaluation.memory_analyst import MemoryAnalystSpec
+from exp.optimize.evaluation.observation_contrast import ObservationContrastSpec
+from exp.optimize.evaluation.task_factory import TaskFactorySpec
+from exp.optimize.evaluation.task_proposals import load_task_proposals
+from exp.optimize.evaluation.task_variants import load_task_variant
+from exp.runtime.gateway.decisions_contracts import (
+    MAX_DECISION_CRITERIA,
+    MAX_DECISION_INPUT_BYTES,
+    MAX_DECISION_QUESTIONS,
+)
+from exp.runtime.models.registry import RuntimeModelCatalog
+from exp.simulation.world_model.runtime import load_grounded_world_model_artifact
+
+
+@dataclass(frozen=True)
+class CostComponent:
+    """One finite schedule component, or an explicitly unpriced dependency.
+
+    Attributes:
+        name: Role or dependency displayed before consent.
+        attempts: Maximum physical requests included in this component.
+        usd: Known-rate planning estimate; None when necessary prices or bounds are unavailable.
+    """
+
+    name: str
+    attempts: int
+    usd: float | None
+
+    def scaled(self, count: int) -> "CostComponent":
+        """Repeat an unchanged bounded schedule without assuming saved work is free."""
+        return CostComponent(
+            self.name, self.attempts * count, None if self.usd is None else self.usd * count
+        )
+
+
+def model_cost(
+    project: ProjectStore,
+    alias: str,
+    attempts: int,
+    output: int,
+    *,
+    input_tokens: int | None = None,
+) -> CostComponent:
+    """Price known tariff dimensions at full input capacity without resolving credentials."""
+    catalog = load_model_catalog(project.model_catalog_path)
+    model, caps = RuntimeModelCatalog(catalog, environment={}).snapshot(alias)
+    context, input_rate, output_rate = (
+        caps.context_window_tokens if input_tokens is None else input_tokens,
+        caps.input_cost_per_million_tokens_usd,
+        caps.output_cost_per_million_tokens_usd,
+    )
+    if context is None or input_rate is None or (output and output_rate is None):
+        return CostComponent(alias, attempts, None)
+    if output == 0:
+        return CostComponent(alias, attempts, attempts * context * input_rate / 1_000_000)
+    tariff = catalog.models[alias].token_prices
+    if tariff is not None:
+        return CostComponent(
+            alias,
+            attempts,
+            attempts
+            * schedule_maximum_cost_nano_usd(tariff, input_tokens=context, output_tokens=output)
+            / 1_000_000_000,
+        )
+    reservation = completion_cost_reservation(
+        model=model,
+        input_usd_per_million_tokens=input_rate,
+        output_usd_per_million_tokens=output_rate or 0,
+        cached_input_usd_per_million_tokens=caps.cached_input_cost_per_million_tokens_usd
+        or input_rate,
+        cache_write_usd_per_million_tokens=caps.cache_write_cost_per_million_tokens_usd
+        or input_rate,
+        maximum_attempts=attempts,
+        maximum_input_tokens=context,
+        maximum_output_tokens=output,
+    )
+    return CostComponent(alias, attempts, reservation.estimated_maximum_call_cost_usd)
+
+
+def decision_cost(project: ProjectStore, alias: str, attempts: int) -> CostComponent:
+    """Price the decision wire's repeated context and answer allowance, not an embedding.
+
+    Every question can repeat the whole bounded input. These are accounting allowances;
+    the decision provider has no client-set output-token ceiling. Unknown output prices
+    remain unknown even when a deployment usually returns only a short answer.
+    """
+    return model_cost(
+        project,
+        alias,
+        attempts,
+        MAX_DECISION_QUESTIONS * (1024 + 512 * MAX_DECISION_CRITERIA),
+        input_tokens=MAX_DECISION_QUESTIONS * (MAX_DECISION_INPUT_BYTES + 1024),
+    )
+
+
+def runtime_costs(
+    project: ProjectStore, digest: Sha256, configuration: JsonObject
+) -> tuple[CostComponent, ...]:
+    """Recognize maintained factory bytes without executing a caller's runtime module."""
+    if digest == sha256_bytes(Path(workbook_runtime.__file__).read_bytes()):
+        workbook_runtime.WorkbookRuntimeDefinition.model_validate(configuration)
+        return ()
+    if digest == sha256_bytes(Path(mixed_runtime.__file__).read_bytes()):
+        mixed = mixed_runtime.MixedRuntimeDefinition.model_validate(configuration)
+        return (
+            *runtime_costs(project, mixed.native.runtime_sha256, mixed.native.configuration),
+            *_grounded_costs(project, mixed.simulated),
+        )
+    if digest == sha256_bytes(Path(grounded_runtime.__file__).read_bytes()):
+        return _grounded_costs(
+            project, grounded_runtime.GroundedRuntimeDefinition.model_validate(configuration)
+        )
+    return (CostComponent("trusted custom runtime: provider allowance undeclared", 0, None),)
+
+
+def _grounded_costs(
+    project: ProjectStore, spec: grounded_runtime.GroundedRuntimeDefinition
+) -> tuple[CostComponent, ...]:
+    """Include predictor, query embedding and every enabled recall/reader route."""
+    catalog = load_model_catalog(project.model_catalog_path)
+    world = load_grounded_world_model_artifact(project.artifacts, spec.world_model)
+    components = [
+        model_cost(
+            project, world.model_alias, spec.maximum_physical_attempts, spec.maximum_output_tokens
+        )
+    ]
+    embedder = index_embedder_alias(project, catalog, world)
+    if embedder is not None:
+        components.append(model_cost(project, embedder, spec.maximum_physical_attempts, 0))
+    if spec.memory is not None:
+        components.append(
+            decision_cost(project, spec.memory.recall.jev_alias, spec.maximum_physical_attempts)
+        )
+    if spec.prediction_reading is not None:
+        components.append(
+            decision_cost(
+                project, spec.prediction_reading.reader_alias, spec.maximum_physical_attempts
+            )
+        )
+    # All roles share one ledger. Summing each role at that ceiling overestimates the mixture,
+    # but cannot omit an expensive role or assume a favorable allocation of requests.
+    return tuple(components)
+
+
+def job_costs(project: ProjectStore, job: ContinuationJob) -> tuple[CostComponent, ...]:
+    """Include actor attempts and the runtime's independent lifetime allowance."""
+    return (
+        model_cost(
+            project, job.actor_alias, job.maximum_physical_attempts, job.study.maximum_output_tokens
+        ),
+        *runtime_costs(project, job.runtime_sha256, job.configuration),
+    )
+
+
+def evaluation_costs(project: ProjectStore, spec: ContractModel) -> tuple[CostComponent, ...]:
+    """Expand maintained command contracts into complete bounded role inventories."""
+    if isinstance(spec, ContinuationJob):
+        return job_costs(project, spec)
+    if isinstance(spec, AuthorSettings):
+        return (
+            model_cost(
+                project, spec.model_alias, spec.maximum_physical_attempts, spec.output_tokens
+            ),
+        )
+    if isinstance(spec, CriticSpec):
+        return (
+            model_cost(
+                project,
+                spec.critic_alias,
+                spec.maximum_physical_attempts,
+                spec.critic_output_tokens,
+            ),
+        )
+    if isinstance(spec, MemoryAnalystSpec):
+        return (
+            model_cost(
+                project, spec.analyst_alias, spec.maximum_physical_attempts, spec.output_tokens
+            ),
+        )
+    if isinstance(spec, CheckpointProposalSpec):
+        return (model_cost(project, spec.selector_alias, 1, spec.output_tokens),)
+    if isinstance(spec, ActorDecisionSpec):
+        return tuple(
+            model_cost(
+                project, spec.actor_alias, 3 * spec.repeats, case.request.maximum_output_tokens or 0
+            )
+            for case in spec.cases
+        )
+    if isinstance(spec, CaptureDefinition):
+        return runtime_costs(project, spec.runtime_sha256, spec.configuration)
+    if isinstance(spec, ActionInterventionSpec):
+        return runtime_costs(project, spec.base.runtime_sha256, spec.base.configuration)
+    if isinstance(spec, FramingStudySpec):
+        return tuple(row.scaled(2 * spec.pairs) for row in job_costs(project, spec.base))
+    if isinstance(spec, ActionContrastSpec):
+        # Imposed actions can themselves invoke the simulator, before the suffix job begins.
+        return tuple(
+            row.scaled(2 * spec.base.study.repeats)
+            for row in (
+                *job_costs(project, spec.base),
+                *runtime_costs(project, spec.base.runtime_sha256, spec.base.configuration),
+            )
+        )
+    if isinstance(spec, ObservationContrastSpec):
+        effect = ActionIntervention.model_validate_json(
+            project.artifacts.read_bytes(spec.intervention.artifact_id, "intervention.json")
+        )
+        return tuple(row.scaled(2 * spec.pairs) for row in job_costs(project, effect.spec.base))
+    if isinstance(spec, ActorPanelSpec):
+        return tuple(
+            row
+            for job in spec.cases
+            for actor in spec.actors
+            for row in job_costs(project, job.model_copy(update={"actor_alias": actor.alias}))
+        )
+    if isinstance(spec, CheckpointExperimentSpec):
+        plan = load_selection_plan(project, spec.selection)
+        revision = project.artifacts.read(spec.selection.artifact_id).manifest.code_revision
+        jobs = selection_jobs(plan, code_revision=revision, plan_reference=spec.selection)
+        return tuple(
+            row
+            for _, job in jobs
+            for row in (
+                *job_costs(project, job),
+                *(evaluation_costs(project, spec.critic) if spec.critic is not None else ()),
+            )
+        )
+    if isinstance(spec, ContinuationCampaignSpec):
+        count = 2 * spec.points * len(spec.selectors)
+        suffix = spec.initial.model_copy(
+            update={"maximum_physical_attempts": spec.continuation_physical_attempts}
+        )
+        return (
+            *job_costs(project, spec.initial),
+            *(model_cost(project, role.alias, 1, role.output_tokens) for role in spec.selectors),
+            *(
+                row.scaled(count)
+                for critic in spec.critics
+                for row in (*job_costs(project, suffix), *evaluation_costs(project, critic))
+            ),
+        )
+    if isinstance(spec, EquivalenceSpec):
+        return (
+            *(
+                row
+                for case in spec.cases
+                for job in (case.reference, case.reference, case.candidate)
+                for row in job_costs(project, job)
+            ),
+            *(
+                model_cost(
+                    project, reviewer.alias, spec.maximum_review_attempts, reviewer.output_tokens
+                )
+                for reviewer in (spec.judge, *spec.analysts)
+            ),
+        )
+    if isinstance(spec, CandidateBatchSpec):
+        proposals = load_task_proposals(project, spec.proposals)
+        jobs = tuple(
+            load_executable_task(project, load_task_variant(project, ref).task).job
+            for ref in proposals.variants
+        )
+        return (
+            *tuple(row for job in jobs for row in job_costs(project, job)),
+            *evaluation_costs(project, ActorPanelSpec(cases=jobs, actors=spec.actors)),
+        )
+    if isinstance(spec, TaskFactorySpec):
+        return tuple(
+            row
+            for family in spec.families
+            for row in (
+                *evaluation_costs(project, family.proposal),
+                *(
+                    line.scaled(4)
+                    for line in job_costs(
+                        project, load_executable_task(project, family.proposal.base).job
+                    )
+                ),
+                *(
+                    line.scaled(4)
+                    for line in evaluation_costs(
+                        project,
+                        ActorPanelSpec(
+                            cases=(load_executable_task(project, family.proposal.base).job,),
+                            actors=spec.actors,
+                        ),
+                    )
+                ),
+            )
+        )
+    raise ValueError(f"no cost inventory is defined for {type(spec).__name__}")
+
+
+def total_cost(components: tuple[CostComponent, ...]) -> float | None:
+    """Keep an incomplete inventory explicitly unknown instead of reporting a partial total."""
+    if any(row.usd is None for row in components):
+        return None
+    return math.fsum(row.usd for row in components if row.usd is not None)

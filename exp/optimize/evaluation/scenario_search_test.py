@@ -6,6 +6,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
+from filelock import Timeout
 from pydantic import BaseModel, JsonValue
 from typer.testing import CliRunner
 
@@ -26,6 +27,7 @@ from exp.optimize.evaluation.record_scenarios import prepare_record_scenario
 from exp.optimize.evaluation.record_scenarios_test import scenario_fixture
 from exp.optimize.evaluation.scenario_search import (
     ScenarioCandidate,
+    ScenarioCell,
     ScenarioControl,
     ScenarioSearchSpec,
     run_scenario_search,
@@ -417,12 +419,17 @@ def workbook_search_fixture(
                         "Data": TablePlan(
                             rows=5,
                             columns={
-                                "id": ValuesColumn(values=("id", 1, 2, 3, 4)),
-                                "key": ValuesColumn(values=("key", *keys)),
+                                "id": ValuesColumn(kind="values", values=("id", 1, 2, 3, 4)),
+                                "key": ValuesColumn(kind="values", values=("key", *keys)),
                             },
                         ),
                         "Protected": TablePlan(
-                            rows=2, columns={"sentinel": ValuesColumn(values=("do not change", 42))}
+                            rows=2,
+                            columns={
+                                "sentinel": ValuesColumn(
+                                    kind="values", values=("do not change", 42)
+                                )
+                            },
                         ),
                     },
                     workbooks={"original.xlsx": ("Data", "Protected")},
@@ -824,3 +831,25 @@ def test_research_citations_are_checked_before_any_native_execution(
     assert project.artifacts.list_ids() == before
     with pytest.raises(ValueError, match="uniquely named"):
         ScenarioResearchTarget(failure=target.failure, hypothesis="invented")
+
+
+def test_busy_scenario_child_resumes_without_consuming_a_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Known contention reuses the native construction's original registration."""
+    project, spec = search_fixture(tmp_path, monkeypatch)
+
+    def busy(
+        project: ProjectStore, spec: ScenarioSearchSpec, index: int, revision: str
+    ) -> ScenarioCell:
+        """Inject a known lease refusal before the native child can execute."""
+        raise Timeout("scenario.lock")
+
+    with monkeypatch.context() as patch:
+        patch.setattr("exp.optimize.evaluation.scenario_search._cell", busy)
+        with pytest.raises(Timeout):
+            run_scenario_search(project, spec, code_revision="test")
+    assert not project.artifacts.exists(spec.identity("test") + "-cell-0")
+    report = run_scenario_search(project, spec, code_revision="test")
+    assert report.cells[0].scenario is not None
+    assert run_scenario_search(project, spec, code_revision="test") == report

@@ -768,3 +768,40 @@ def test_transferability_is_an_explicit_boolean(invalid: object) -> None:
     value = {**draft().model_dump(mode="json"), "transferable": invalid}
     with pytest.raises(ValueError):
         ClaimDraft.model_validate(value)
+
+
+def test_large_episode_leaves_room_to_revise_an_eligible_wiki_claim(tmp_path: Path) -> None:
+    """New originals cannot indefinitely starve the old claims that consolidation revises."""
+    store = ArtifactStore(ProjectPaths(tmp_path, "crowding"))
+    originals = {
+        f"o{i}": DreamSource(
+            original={"kind": "original-observation", "reply": i},
+            sources=(source(store, f"original-{i}"),),
+        )
+        for i in range(12)
+    }
+    originals["old-rule"] = DreamSource(
+        original={"kind": "wiki-claim", "claim": draft().model_dump(mode="json")},
+        sources=(source(store, "old"),),
+    )
+    seen: list[JsonObject] = []
+
+    def complete(body: JsonObject, logical: str) -> JsonObject:
+        """Retain the actual complete proposer input and make no new claims."""
+        seen.append(body)
+        return {"claims": []}
+
+    result = consolidate_memory(
+        store,
+        "crowding",
+        originals,
+        policy=DreamPolicy(),
+        eligibility=Eligibility(),
+        complete=complete,
+        decide=lambda _: answer("support"),
+        clock=lambda: NOW,
+        code_revision="test",
+    )
+    assert "old-rule" not in result.omitted
+    assert "old-rule" in json.dumps(seen)
+    assert len(result.omitted) == 1

@@ -5,10 +5,12 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
+from filelock import Timeout
 from pydantic import BaseModel
 
 from exp.common.core.artifacts import ArtifactEnvelope, ArtifactInput, JsonValue
-from exp.common.project import ArtifactManifest
+from exp.common.project import ArtifactManifest, ProjectStore
+from exp.optimize.evaluation import checkpoint_experiment as owner
 from exp.optimize.evaluation.checkpoint_experiment import (
     CheckpointExperimentSpec,
     ExperimentCell,
@@ -16,7 +18,8 @@ from exp.optimize.evaluation.checkpoint_experiment import (
 )
 from exp.optimize.evaluation.checkpoint_selection import persist_selection_plan
 from exp.optimize.evaluation.checkpoint_selection_test import selection_fixture
-from exp.optimize.evaluation.continuation_job import continuation_result_reference
+from exp.optimize.evaluation.continuation_job import ContinuationJob, continuation_result_reference
+from exp.optimize.evaluation.continuation_study import ContinuationStudy
 from exp.simulation.continuations import load_continuation_checkpoint
 
 
@@ -160,3 +163,33 @@ def test_matched_experiment_records_critic_before_each_fresh_measurement(
     job.runtime_file.unlink()
     assert run_checkpoint_experiment(project, spec, code_revision="test") == report
     assert len(transport.requests) == 2
+
+
+def test_deferred_child_resumes_the_same_registered_cell(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Known contention stays pending and retry reuses the child's original execution identity."""
+    project, selection = selection_fixture(tmp_path, monkeypatch)
+    reference = persist_selection_plan(
+        project, selection, created_at=datetime.now(UTC), code_revision="test"
+    )
+    spec = CheckpointExperimentSpec(selection=reference)
+    original = owner.execute_continuation_job
+    blocked = []
+
+    def busy_once(
+        project: ProjectStore, job: ContinuationJob, *, code_revision: str
+    ) -> ContinuationStudy:
+        """Inject one child lease refusal before delegating to durable native execution."""
+        if not blocked:
+            blocked.append(job)
+            raise Timeout("child.lock")
+        return original(project, job, code_revision=code_revision)
+
+    monkeypatch.setattr(owner, "execute_continuation_job", busy_once)
+    with pytest.raises(Timeout):
+        run_checkpoint_experiment(project, spec, code_revision="test")
+    assert not project.artifacts.exists(spec.identity("test") + "-cell-0")
+    report = run_checkpoint_experiment(project, spec, code_revision="test")
+    assert report.cells[0].result is not None and report.cells[0].failure is None
+    assert run_checkpoint_experiment(project, spec, code_revision="test") == report

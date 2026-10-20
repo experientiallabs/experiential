@@ -486,8 +486,11 @@ history. When a long trace exceeds the history budget, the oldest whole steps ar
 request states how many were omitted; no step is cut partway.
 
 A memory version pins its overview on first read; later compression cannot change it. Long rules keep both cue and claim as labelled previews, linked to their full records.
-Memory banks bind knowledge and scope. Changing serving top-k reuses compatible memory but creates a distinct execution plan; fit-only banks remain separate.
-Earlier full-artifact learning banks require a fresh project; they are not automatically migrated to knowledge-based banks.
+Learning banks bind the simulator's knowledge, the learning protocol and the scope. Changing a
+serving setting (the simulator model, retrieval top-k) keeps compatible memory under a new
+execution plan; changing knowledge or the learning protocol starts a fresh bank. A learning pass
+never re-predicts a consumed trace on later memory. Fit-only banks remain separate. Earlier bank
+contracts require a fresh project; they are not automatically migrated.
 
 The build ends by retesting every learned trace that had at least one inexact reply, against
 the final memory checkpoint, and compares each turn before and after learning: fixed, still
@@ -867,9 +870,7 @@ rationale are registered before outcomes. The caller must provide bounded provid
 this Python API does not authorize spend itself. The CLI below owns admission.
 
 Every branch restores the same world and actor prefix without executing completed calls.
-Goal and policy grades stay separate. Saved results replay; interrupted outcomes stay unknown. Only unstarted
-branches execute on another invocation. Reports retain all planned branches and disclose the
-assessable denominator for success rates and Brier scores.
+Goal and policy grades stay separate. Saved results replay; interrupted outcomes stay unknown. Only unstarted branches execute on another invocation. Reports retain all planned branches and disclose the assessable denominator for success rates and Brier scores.
 
 Only fit tasks with checked trace provenance are accepted. Training needs independent, preregistered
 acceptance evidence. Pi/process continuation and trained selectors/critics are absent. Native edits
@@ -880,7 +881,7 @@ refuse unsupported features or changed retained cell types/formats. Write replie
 
 Add `--dream-every N` to a learning build for bounded consolidation after every N traces and the
 last trace. Prediction and feedback precede consolidation and one memory-version publication.
-Original observations take budget priority over research context. Citations name only originals; page labels are optional. Checks include uncited counterexamples; hypotheses cannot support or veto claims.
+Original observations get the first record slot; one prior wiki claim gets the next for revision, then remaining originals precede research context. Citations name only originals; page labels are optional. Checks include uncited counterexamples; hypotheses cannot support or veto claims.
 When individual citations are inconclusive, one bounded joint read may check a multi-record claim.
 Any local contradiction, malformed judgment or oversized reader request vetoes publication. Complete evidence is never truncated; support must cover every factual clause.
 Plans pin the dream protocol; missing pins or changed prompts/schema/limits require a new project.
@@ -897,7 +898,7 @@ Compose it with `MixedRealityEnvironmentRuntime` for native and simulated domain
 explicit: a simulated edit cannot update a native workbook. Manifest `native_reads` bridges
 map simulated arguments to private zero-duration native read tools. Reads run on isolated forks;
 state, scheduler or RNG changes refuse. Bounded checkpoint/time-bound receipts condition only the
-current prediction through `InstanceFacts`, never learned rules. Required probes cannot be skipped.
+current prediction through `InstanceFacts`, never learned rules. Required probes are checked before due events and again before tool execution. Schema-invalid arguments and proven pre-dispatch access refusals return recoverable errors without advancing the world.
 This grounds reads without synchronizing state. The predictor receives per-tool `reply_schema`;
 shape violations leave state/history unchanged. Explicit `maximum_reasks` (0 to 3, default 0) permits bounded corrections of known refused proposals within the same physical budget; every response and refusal is retained, and successful observations report the refusal count. Lost responses and valid-but-wrong results are never retried by this mechanism. Domain `state_schema` applies at initialization, restore and commit. `reply_bindings` select current state using exact arguments, unique-member matches, exact ranges or explicitly clamped pagination. `workbook_contracts.simulated_workbook_manifest` binds these to full typed workbook projections. These checks establish internal consistency, not native fidelity.
 The built-in `exp/optimize/evaluation/grounded_runtime.py` factory's `GroundedRuntimeDefinition` pins the world-model reference, catalog,
@@ -908,7 +909,7 @@ this factory have simulated authority; they do not establish native truth. Missi
 no learned memory is delivered. `workbook_runtime.py` binds immutable XLSX inputs and private worksheet
 digest views. `mixed_runtime.py` combines a native factory with this simulator and real/simulated routes under one
 manifest; private projections stay under separate `native` and `simulated` keys. Execution receipts
-bind release plus installed EXP source/resource digest; code changes require fresh qualification. Third-party dependencies remain host-owned; shadow fidelity and cross-owner writes are not implied.
+bind release plus installed EXP source/resource digest; code changes require fresh qualification. Third-party dependencies remain host-owned. Owned executable-world shadow routes refuse at setup until an independent mirror contract exists; cross-owner writes remain unsupported.
 
 ### Continuation, Harbor and training CLI
 
@@ -917,6 +918,8 @@ All continuation operations use the existing command:
 exp eval PROJECT --root ROOT --continuations operation.json --dry-run
 exp eval PROJECT --root ROOT --continuations operation.json --yes --non-interactive
 ```
+
+Paid operations display actor and maintained simulator dependency estimates before consent. Unknown prices or custom-runtime allowances remain explicit; known subtotals are not total budgets. Actor and simulator physical-attempt ceilings are separate durable limits, not a shared dollar cap.
 
 `operation.json` uses `ContinuationCommand`; `register-brief` saves a source-linked `CapabilityBrief`. `compare-environments` takes `equivalence: EquivalenceSpec`: native/reference, repeated-reference and candidate actors, material checks and council reviews. Review attempts are divided equally across planned judgments and analysts so early retries cannot spend later reviewers' allowance; the budget must cover at least one attempt each. For multi-family qualification and delivery, use `--pipeline pipeline.json` with `TaskFactorySpec`; see the [development factory scope](release-scope.md#development-task-factory).
 
@@ -965,6 +968,7 @@ exp eval PROJECT --root ROOT --continuations operation.json --yes --non-interact
 - `action: "export"`, `export: ContinuationExport`: independently re-grade complete studies
   against their preregistered acceptance evidence. Export only admitted post-checkpoint assistant
   tool-only targets; prose, earlier mistakes and replies stay context. Mechanical acceptance cannot approve prose. Source-bound lineages stay grouped; oversized training inputs refuse context truncation.
+  Prefix observations must reconstruct exactly from saved executed ancestors; authored conversation interventions cannot supply positive supervision. Targets retain their qualification reference and scope. Missing qualification produces a `diagnostic` dataset, which the training loader refuses; inspection remains available. Empty or root-shape-only acceptance predicates refuse; nonempty checks still require independent controls.
 - `action: "harbor"`, `harbor: ExecutableCommand`: `propose-worlds` accepts `world_proposals: WorldProposalSpec`: one bounded author draw from cited research produces 2–4 data plans, candidate predicates and control scripts. The pinned runtime supplies `bind_construction(project, configuration, assets)` returning `ConstructionBinding`; it may change initial assets only. Independent acceptance stays fixed and hidden. All proposals and failures are saved; at least two distinct materialized worlds are required for native challenges. Unknown author/binding outcomes never silently rerun. This supplies development candidates, not actor equivalence or training admission. `construct-assets` accepts a `construction` (explicit tables with values, sequences and keyed lookups) and publishes unqualified generated JSON/XLSX assets for the existing runtime; `register`, `qualify`, `export`, then `serve`. `prepare-training` takes a `qualification` reference and returns a runnable continuation operation (`operation_file` saves a new JSON file); optional `comparison` plus `comparison_case` retain paired measurements for that exact candidate. Admission rechecks the pinned evidence without provider calls; qualification does not imply simulator fidelity.
   Mechanical qualification requires feasible execution plus independent positive, goal-failure,
   prohibited-effect and unknown-evidence controls. Its scope is a development observable contract,
@@ -979,12 +983,7 @@ simulator ceiling. Resumes keep the same grant and counter for predictor, embedd
 Submission requires every declared output file; missing files leave the trial open for correction.
 Configure a reachable private endpoint for containers. Packages use Harbor 0.24.0 schema 1.4 with a separate verifier environment.
 Local HTTP and package schemas are tested; container launch needs Docker/Harbor. Runtime factories execute in the trusted operator environment. Pi uses a minimal child environment and private HOME/TMPDIR, with provider credentials kept by the coordinator; this does not establish filesystem or network confinement.
-`exp optimize model PROJECT --root ROOT --training-job training.json` accepts a `TrainingJob`
-from `exp.cli.optimize.training_job`. Use `action: "score-initial"` to save frozen-model losses
-on the accepted training partition, then `action: "train"` with `spec.tail_sft.reference` pointing
-to that artifact. TailSFT drops the configured fraction of the smallest current-minus-initial
-loss margins per batch, retaining context but weighting only target tokens. Initial/model/dataset
-and exact rendered target identities must match. Unknown scoring or update intents refuse implicit
+`exp optimize model PROJECT --root ROOT --training-job training.json` accepts a `TrainingJob` from `exp.cli.optimize.training_job`. Use `action: "score-initial"` to save frozen-model losses on the accepted training partition, then `action: "train"` with `spec.tail_sft.reference` pointing to that artifact. TailSFT drops the configured fraction of the smallest current-minus-initial loss margins per batch, retaining context but weighting only target tokens. Initial/model/dataset and exact rendered target identities must match. Unknown scoring or update intents refuse implicit
 repetition. The static fraction and single-batch implementation do not claim published distributed
 schedule results. Training produces a candidate checkpoint; this path does not promote a model
 or alter active routing. Dry-run and shared spend consent apply before client construction.

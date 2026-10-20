@@ -73,7 +73,8 @@ class DreamPolicy(ContractModel):
 
     Attributes:
         interval: Consolidate every this many learned traces and at the final trace.
-        maximum_records: Whole records per pass; originals precede contextual interpretations.
+        maximum_records: Whole records per pass; one original and one eligible prior wiki claim
+            precede remaining originals, then other contextual interpretations.
         maximum_claims: Maximum proposed revisions per pass.
         input_bytes: Maximum complete proposer or reader request bytes; records never truncate.
         workers: Independent source checks in flight.
@@ -100,7 +101,7 @@ class DreamPolicy(ContractModel):
                 "check": CHECK_PROMPT,
                 "joint_check": JOINT_CHECK_PROMPT,
                 "schema": DreamProposal.model_json_schema(),
-                "protocol": "originals-first-explicit-transfer-claims-v6",
+                "protocol": "originals-with-wiki-revision-slot-v7",
             }
         )
 
@@ -234,13 +235,27 @@ def consolidate_memory(
     rule = eligibility.model_copy(update={"strict": True})
     selected: dict[str, DreamSource] = {}
     omitted: dict[str, str] = {}
-    ordered = sorted(
-        catalog.items(), key=lambda item: item[1].original.get("kind") != "original-observation"
-    )
-    for key, source in ordered:
+    eligible = {}
+    for key, source in catalog.items():
         if not all(rule.admits(load_source(store, ref)) for ref in source.sources):
             omitted[key] = "unknown or excluded source provenance"
-        elif len(selected) >= policy.maximum_records:
+        else:
+            eligible[key] = source
+    originals, wiki, context = [], [], []
+    for item in eligible.items():
+        kind = item[1].original.get("kind")
+        (
+            originals
+            if kind == "original-observation"
+            else wiki
+            if kind == "wiki-claim"
+            else context
+        ).append(item)
+    # Preserve original evidence priority while admitting a prior claim for revision. With a
+    # one-record budget only an original fits; omitted claims remain explicit, never truncated.
+    ordered = [*originals[:1], *wiki[:1], *originals[1:], *wiki[1:], *context]
+    for key, source in ordered:
+        if len(selected) >= policy.maximum_records:
             omitted[key] = "record limit"
         elif (
             len(canonical_json_bytes(_request({**selected, key: source}, policy)))

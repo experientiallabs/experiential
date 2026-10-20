@@ -131,22 +131,28 @@ def test_submission_requires_declared_outputs_and_actor_can_correct_missing_file
         assert trial.output_files()["files"]
 
 
+@pytest.mark.parametrize("bad_arguments", [False, True])
 def test_harbor_access_refusal_replays_and_actor_can_correct_it(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, bad_arguments: bool
 ) -> None:
     """The exported execution path shares continuation recovery without repeating the refusal."""
     project, task, _ = qualified_fixture(tmp_path, monkeypatch)
     case = workbook_case()
+    rejected = (
+        case.first.model_copy(update={"call_id": "malformed", "arguments": {}})
+        if bad_arguments
+        else case.outside_policy
+    )
     with open_executable_harbor_trial(
         project, task, trial_id="refusal", code_revision="test"
     ) as trial:
-        refused = trial.call(case.outside_policy)
+        refused = trial.call(rejected)
         assert refused["is_error"] is True
-        assert trial.call(case.outside_policy) == refused
+        assert trial.call(rejected) == refused
     with open_executable_harbor_trial(
         project, task, trial_id="refusal", code_revision="test"
     ) as trial:
-        assert trial.call(case.outside_policy) == refused
+        assert trial.call(rejected) == refused
         assert trial.call(case.first)["is_error"] is False
         trial.submit({"answer": "done"})
         result = trial.result()

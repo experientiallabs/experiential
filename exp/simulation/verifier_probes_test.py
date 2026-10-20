@@ -31,3 +31,31 @@ def test_header_and_extra_effect_counterexamples_survive_as_synthetic_evidence()
     assert any(row.path == () for row in report.false_passes)
     assert not probe_verifier(strong, strong, observation).false_passes
     assert probe_verifier(weak, strong, observation, maximum=1).truncated
+
+
+def test_numeric_type_counterexample_falsifies_schema_only_verifier() -> None:
+    """JSON Schema numeric equality accepts 5.0 for 5; an exact typed goal must catch it."""
+    state: JsonObject = {"amount": 5}
+    observation: JsonObject = {
+        "steps": [],
+        "stop_reason": "completed",
+        "final_answer": "done",
+        "final_state": state,
+    }
+    candidate = TaskVerifier(
+        description="Numeric const",
+        outcome_schema={
+            "type": "object",
+            "required": ["final_state"],
+            "properties": {"final_state": {"const": state}},
+        },
+    )
+    independent = TaskVerifier(
+        description="Typed goal",
+        outcome_schema={},
+        rules=(OutcomeRule(path="/final_state", operator="equals", value=state),),
+    )
+    report = probe_verifier(candidate, independent, observation)
+    assert any(
+        row.path == ("amount",) and type(row.replacement) is float for row in report.false_passes
+    )

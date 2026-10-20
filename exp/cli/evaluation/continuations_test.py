@@ -10,7 +10,11 @@ from exp.cli.evaluation.continuations import ContinuationCommand, ContinuationEx
 from exp.common.project import artifact_input
 from exp.optimize.evaluation.continuation_job_test import job_fixture
 from exp.optimize.evaluation.observation_contrast_test import observation_fixture
-from exp.optimize.model.sft.builder import load_verified_sft_dataset
+from exp.optimize.model.sft.builder import (
+    SFTBuildError,
+    load_sft_dataset,
+    load_verified_sft_dataset,
+)
 from exp.optimize.model.sft.contracts import SFTBuildSpec
 
 
@@ -360,7 +364,11 @@ def test_cli_run_and_export_with_private_native_state(
     assert "1/2 branches" in exported.output and "Assistant targets: 1" in exported.output
     assert len(transport.requests) == 3
     dataset = project.artifacts.list_ids(artifact_type="sft-dataset")[0]
-    assert len(load_verified_sft_dataset(project, dataset).rows) == 1
+    assert "(diagnostic)" in exported.output
+    inspected = load_sft_dataset(project, dataset, require_accepted=False)
+    assert len(inspected.rows) == 1
+    with pytest.raises(SFTBuildError, match="diagnostic"):
+        load_verified_sft_dataset(project, dataset)
 
 
 def test_cli_captures_initial_world_without_actor_calls(
@@ -606,3 +614,32 @@ def test_cli_measures_saved_decisions_without_provider_setup(tmp_path: Path) -> 
     assert result.exit_code == 0, result.output
     assert '"confirmation_supported": false' in result.output and '"planned": 3' in result.output
     assert store.list_ids() == before
+
+
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_missing_continuation_artifact_is_a_readable_usage_error(
+    tmp_path: Path, dry_run: bool
+) -> None:
+    """An invalid input reference is refused before inference, with no internal traceback."""
+    request = tmp_path / "missing.json"
+    request.write_text(
+        '{"action":"analyse-failures","analysis":{"artifact_id":"missing-study","sha256":"'
+        + "a" * 64
+        + '"}}'
+    )
+    result = CliRunner().invoke(
+        app,
+        [
+            "eval",
+            "case",
+            "--root",
+            str(tmp_path),
+            "--continuations",
+            str(request),
+            "--non-interactive",
+            *(["--dry-run"] if dry_run else []),
+        ],
+    )
+    assert result.exit_code == 2
+    assert "missing-study" in result.output and "missing" in result.output
+    assert "Traceback" not in result.output

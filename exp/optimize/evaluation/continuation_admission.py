@@ -21,6 +21,7 @@ from exp.simulation.continuations import load_continuation_checkpoint
 from exp.simulation.development_scope import require_development_task
 from exp.simulation.evaluation.admission import (
     EvaluationSpecification,
+    has_outcome_constraints,
     record_label_witness,
     verify_label_witness,
 )
@@ -104,7 +105,7 @@ def admit_continuations(
     for branch in study.branches:
         reason = None
         witness = None
-        assessment = grade(study.spec.verifier, branch.outcome)
+        assessment = grade(study.spec.verifier, branch.grading_outcome())
         if branch.status != "completed" or not assessment.complete:
             reason = "execution incomplete or outcome unknown"
         elif assessment.status != "pass" or assessment.policy.status != "pass":
@@ -114,6 +115,10 @@ def admit_continuations(
         elif predicate.subject != "outcome" or predicate.predicate.allowed_tools is None:
             reason = (
                 "training specification must cover the observed outcome and explicit tool policy"
+            )
+        elif not has_outcome_constraints(predicate.predicate):
+            reason = (
+                "training specification needs an outcome predicate beyond shape and tool policy"
             )
         else:
             witness = record_label_witness(
