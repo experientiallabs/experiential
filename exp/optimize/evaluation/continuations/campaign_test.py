@@ -11,9 +11,11 @@ from exp.cli.evaluation.continuations import ContinuationCommand
 from exp.common.core.artifacts import sha256_json
 from exp.common.project import ProjectStore
 from exp.optimize.evaluation.continuations.campaign import (
+    CampaignCell,
     CampaignSelector,
     ContinuationCampaignSpec,
     run_continuation_campaign,
+    saved_continuation_campaign,
 )
 from exp.optimize.evaluation.continuations.critic import CriticSpec
 from exp.optimize.evaluation.continuations.proposals_test import selector_fixture
@@ -159,9 +161,62 @@ def test_campaign_retains_selector_failure_without_buying_critics(
     report = run_continuation_campaign(project, spec, code_revision="test")
     assert report.metrics["unavailable_or_abstained"] == 1
     assert report.cells[0].failure == "SelectorUnavailable"
+    assert report.cells[0].reason == (
+        "ValueError: selector must complete one typed output under its frozen model"
+    )
     assert not critic.requests and not actor.requests
     assert run_continuation_campaign(project, spec, code_revision="test") == report
     assert len(malformed.requests) == 1
+
+
+def test_campaign_report_keeps_the_selector_refusal_reason(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An oversized packet refusal is retained in its cell and the report, not only its code."""
+    project, spec, selector, critic, actor = campaign_fixture(tmp_path, monkeypatch)
+    spec = spec.model_copy(update={"selector_input_bytes": 512})
+    report = run_continuation_campaign(project, spec, code_revision="test")
+    reason = report.cells[0].reason
+    assert reason is not None and reason.startswith(
+        "ValueError: selector complete evidence exceeds byte allowance ("
+    )
+    assert "> 512 bytes); raise the allowance" in reason
+    failures = report.metrics["failures"]
+    assert isinstance(failures, list) and isinstance(failures[0], dict)
+    assert failures[0]["code"] == "SelectorUnavailable" and failures[0]["reason"] == reason
+    assert not selector.requests and not critic.requests and not actor.requests
+    project.model_catalog_path.unlink()
+    assert saved_continuation_campaign(project, spec, code_revision="test") == report
+
+
+def test_campaign_reason_is_bounded_and_secret_free(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A provider refusal message is redacted and capped before it enters the saved cell."""
+    project, spec, selector, critic, actor = campaign_fixture(tmp_path, monkeypatch)
+    secret = "sk-" + "a" * 40
+
+    def refused(*args: object, **kwargs: object) -> None:
+        """Fail the selector stage with a credential-shaped, oversized provider message."""
+        raise RuntimeError(f"provider rejected key {secret} " + "detail " * 1000)
+
+    monkeypatch.setattr(
+        "exp.optimize.evaluation.continuations.campaign.propose_checkpoints", refused
+    )
+    report = run_continuation_campaign(project, spec, code_revision="test")
+    reason = report.cells[0].reason
+    assert reason is not None and len(reason) == 2000
+    assert reason.startswith("RuntimeError: provider rejected key [REDACTED] detail")
+    assert secret not in report.model_dump_json()
+    assert not selector.requests and not critic.requests and not actor.requests
+
+
+def test_campaign_cell_reason_requires_a_failure() -> None:
+    """A successful or unplanned cell cannot carry a refusal reason."""
+    with pytest.raises(ValueError, match="reason needs a failure"):
+        CampaignCell(
+            selector=0, critic=0, proposals=None, experiment=None, failure=None, reason="x"
+        )
 
 
 def test_campaign_cli_dry_run_execution_and_replay(

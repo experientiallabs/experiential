@@ -4,11 +4,13 @@ import json
 from pathlib import Path
 
 import pytest
+from pydantic import JsonValue
 from typer.testing import CliRunner
 
 from exp.cli.app import app
 from exp.cli.evaluation.continuations import ContinuationCommand
-from exp.common.models import load_model_catalog
+from exp.common.core.artifacts import JsonObject
+from exp.common.models import ModelMessage, ModelRequest, load_model_catalog
 from exp.common.project import ProjectStore
 from exp.optimize.evaluation.continuations import proposals as owner
 from exp.optimize.evaluation.continuations.job import (
@@ -17,14 +19,17 @@ from exp.optimize.evaluation.continuations.job import (
 )
 from exp.optimize.evaluation.continuations.job_test import job_fixture
 from exp.optimize.evaluation.continuations.proposals import (
+    SELECTOR_REQUEST_PROTOCOL,
     CheckpointProposalSpec,
     propose_checkpoints,
 )
+from exp.optimize.evaluation.continuations.records import load_study
 from exp.optimize.evaluation.continuations.selection import load_selection_plan
 from exp.optimize.evaluation.factory.candidates_test import _reply
 from exp.runtime.environments.tests.world_conformance_test import workbook_case
 from exp.runtime.models.providers.transport import ScriptedJsonTransport
 from exp.runtime.models.registry import RuntimeModelCatalog
+from exp.simulation.continuations import load_continuation_checkpoint
 
 
 def selector_fixture(
@@ -121,6 +126,27 @@ def selector_fixture(
     return project, spec, selector
 
 
+def expanded(packet: JsonValue) -> JsonValue:
+    """Replace every shared-value reference in a selector packet by the value it stands for."""
+    assert isinstance(packet, dict)
+    table = packet["shared_values"]
+    assert isinstance(table, list)
+
+    def expand(value: JsonValue) -> JsonValue:
+        """Recursively restore one encoded value."""
+        if isinstance(value, dict):
+            if set(value) == {"$shared"}:
+                index = value["$shared"]
+                assert isinstance(index, int)
+                return expand(table[index])
+            return {key: expand(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [expand(item) for item in value]
+        return value
+
+    return expand({key: item for key, item in packet.items() if key != "shared_values"})
+
+
 def test_complete_source_inventory_and_saved_plan_replay_without_runtime(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -135,7 +161,8 @@ def test_complete_source_inventory_and_saved_plan_replay_without_runtime(
     request = json.loads(
         project.artifacts.read_bytes(spec.identity("test") + "-intent", "request.json")
     )
-    packet = json.loads(request["messages"][1]["content"])
+    packet = expanded(json.loads(request["messages"][1]["content"]))
+    assert isinstance(packet, dict)
     assert len(packet["source_studies"][0]["branches"]) == 3
     assert len(packet["checkpoints"]) == len(report.pool)
     project.model_catalog_path.unlink()
@@ -251,3 +278,116 @@ def test_truncated_selector_reply_never_publishes_even_when_json_is_complete(
     assert len(transport.requests) == 1
     assert project.artifacts.exists(spec.identity("test") + "-response")
     assert not project.artifacts.exists(spec.identity("test"))
+
+
+def test_shared_packet_restores_every_prefix_and_pool_index_within_a_smaller_allowance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Repeated messages are written once, yet each candidate keeps its complete public prefix."""
+    project, spec, transport = selector_fixture(tmp_path, monkeypatch)
+    pool, _, request = owner._packet(project, spec)
+    content = request.messages[1].content
+    assert content is not None
+    encoded = json.loads(content)
+    assert encoded["shared_values"], "repeated prefix messages should be shared"
+    packet = expanded(encoded)
+    assert isinstance(packet, dict) and packet["protocol"] == SELECTOR_REQUEST_PROTOCOL
+    rows = packet["checkpoints"]
+    assert isinstance(rows, list) and [row["index"] for row in rows] == list(range(len(pool)))
+    store = project.artifacts
+    for row, reference in zip(rows, pool, strict=True):
+        assert row["reference"] == reference.model_dump(mode="json")
+        assert row["public_prefix"] == [
+            message.model_dump(mode="json")
+            for message in load_continuation_checkpoint(store, reference).actor.messages
+        ]
+    study = load_study(store, spec.studies[0])
+    assert packet["source_studies"] == [
+        {
+            "source": spec.studies[0].model_dump(mode="json"),
+            "branches": [branch.model_dump(mode="json") for branch in study.branches],
+        }
+    ]
+    shared = len(request.model_dump_json().encode())
+    plain = len(
+        request.model_copy(
+            update={
+                "messages": (
+                    request.messages[0],
+                    ModelMessage(role="user", content=json.dumps(packet, sort_keys=True)),
+                )
+            }
+        )
+        .model_dump_json()
+        .encode()
+    )
+    assert shared < plain
+    fitted = spec.model_copy(update={"maximum_input_bytes": shared})
+    assert owner._packet(project, fitted)[2] == request
+    with pytest.raises(ValueError, match=rf"complete evidence exceeds .*{shared} > {shared - 1}"):
+        owner._packet(project, spec.model_copy(update={"maximum_input_bytes": shared - 1}))
+    assert not transport.requests
+
+
+def test_request_protocol_keys_the_saved_selector_draw(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A new request rendering cannot replay a draw saved under another protocol."""
+    _, spec, _ = selector_fixture(tmp_path, monkeypatch)
+    current = spec.identity("test")
+    monkeypatch.setattr(owner, "SELECTOR_REQUEST_PROTOCOL", "checkpoint-selector-request-other")
+    assert spec.identity("test") != current
+
+
+def _real_sized_payload() -> JsonObject:
+    """Mirror SpreadsheetBench 414-20: 16 attempts, 75 checkpoints and saved actor requests."""
+    tools = [
+        {"name": name, "description": "Workbook tool " * 8, "input_schema": {"x": "y" * 900}}
+        for name in ("edit_workbook", "inspect_workbook", "describe_workbook")
+    ]
+    instruction = {"role": "user", "content": "Delete all rows above Invoice No. " * 12}
+    rows = "".join(f'{{"value":"cell {n}","data_type":"s"}},' for n in range(40))
+    state = {"files": {"input.xlsx": "d" * 64}, "views": {"rows": rows}}
+    checkpoints, branches = [], []
+    for attempt in range(16):
+        messages: list[JsonValue] = [instruction]
+        calls: list[JsonValue] = []
+        steps: list[JsonValue] = []
+        for turn in range(6 if attempt == 0 else 5 if attempt < 10 else 4):
+            checkpoints.append({"reference": f"{attempt}-{turn}", "public_prefix": list(messages)})
+            action = {"call_id": f"call-{attempt}-{turn}", "name": "inspect_workbook"}
+            reply = {"role": "tool", "tool_call_id": action["call_id"], "content": rows}
+            calls.append(
+                {
+                    "request": {"messages": list(messages), "tools": tools},
+                    "response": {"assistant_action": action, "usage": attempt + turn},
+                }
+            )
+            steps.append({"action": action, "after": state, "reply": reply})
+            messages.extend(({"role": "assistant", "assistant_action": action}, reply))
+        branches.append({"outcome": {"initial_state": state, "model_calls": calls, "steps": steps}})
+    return {
+        "checkpoints": [{"index": i, **row} for i, row in enumerate(checkpoints)],
+        "source_studies": [{"branches": branches}],
+    }
+
+
+def test_real_sized_study_fits_the_selector_allowance_losslessly() -> None:
+    """A 16-attempt study whose plain packet exceeds 1 MB fits the 512000 byte maximum."""
+    payload = _real_sized_payload()
+    assert isinstance(payload["checkpoints"], list) and len(payload["checkpoints"]) == 75
+
+    def size(body: JsonObject) -> int:
+        """Bytes of the complete selector request carrying one rendered packet."""
+        message = ModelMessage(role="user", content=json.dumps(body, sort_keys=True))
+        return len(ModelRequest(messages=(message,)).model_dump_json().encode())
+
+    shared = owner._shared_values(payload)
+    assert size(payload) > 1_000_000 and size(shared) < 512000
+    assert expanded(shared) == payload
+
+
+def test_reserved_reference_shape_in_source_evidence_refuses() -> None:
+    """Evidence that already looks like a reference is refused instead of being misread."""
+    with pytest.raises(ValueError, match="reserved \\$shared"):
+        owner._shared_values({"checkpoints": [{"$shared": 0}]})

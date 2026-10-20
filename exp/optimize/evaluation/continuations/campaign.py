@@ -12,6 +12,7 @@ from exp.common.core.artifacts import (
     ContractModel,
     JsonObject,
     Sha256,
+    redact_secret_text,
     sha256_json,
     stable_id,
 )
@@ -133,6 +134,8 @@ class CampaignCell(ContractModel):
         proposals: Saved automatic point proposals, absent if selector failed.
         experiment: Saved matched execution, absent for abstention or unresolved execution.
         failure: Safe stage code, retaining unsuccessful cells in the original inventory.
+        reason: Exception type and secret-redacted message of the refusal behind ``failure``,
+            at most 2000 characters; absent for success and explicit selector abstention.
     """
 
     selector: int
@@ -140,6 +143,14 @@ class CampaignCell(ContractModel):
     proposals: ArtifactInput | None
     experiment: ArtifactInput | None
     failure: str | None
+    reason: str | None = Field(min_length=1, max_length=2000)
+
+    @model_validator(mode="after")
+    def explained(self) -> Self:
+        """Attach a refusal reason only to an unsuccessful cell."""
+        if self.reason is not None and self.failure is None:
+            raise ValueError("campaign cell reason needs a failure code")
+        return self
 
 
 class ContinuationCampaign(ContractModel):
@@ -311,6 +322,7 @@ def _metrics(
                 "selector": cell.selector,
                 "critic": cell.critic,
                 "code": cell.failure,
+                "reason": cell.reason,
                 "selector_artifact_prefix": _selector(spec, cell.selector, source).identity(
                     revision
                 ),
@@ -442,7 +454,7 @@ def run_continuation_campaign(
                     ).manifest.inputs != _cell_inputs(registration, source, cell):
                         raise ValueError("campaign saved cell has changed roles or dependencies")
                 else:
-                    proposals_ref = experiment_ref = None
+                    proposals_ref = experiment_ref = reason = None
                     failure = "SelectorUnavailable"
                     try:
                         selector_spec = _selector(spec, i, source)
@@ -469,14 +481,17 @@ def run_continuation_campaign(
                             failure = None
                     except Timeout:
                         raise  # Busy work remains pending; the owning process may still finish it.
-                    except (ValueError, RuntimeError, OSError):
-                        pass
+                    except (ValueError, RuntimeError, OSError) as error:
+                        reason = (type(error).__name__ + ": " + redact_secret_text(str(error))[0])[
+                            :2000
+                        ]
                     cell = CampaignCell(
                         selector=i,
                         critic=j,
                         proposals=proposals_ref,
                         experiment=experiment_ref,
                         failure=failure,
+                        reason=reason,
                     )
                     store.write_json(
                         artifact_id=key,

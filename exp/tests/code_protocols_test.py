@@ -68,6 +68,16 @@ PROTOCOLS = (
         "7d532742e7fcd847233cf7af439fbb476d9dc5fde965ebee1ebf407fa4c70fa8",
     ),
     Protocol(
+        "exp.optimize.evaluation.continuations.proposals:SELECTOR_REQUEST_PROTOCOL",
+        "checkpoint-selector-request-v1",
+        (
+            "exp.optimize.evaluation.continuations.proposals:_canonical",
+            "exp.optimize.evaluation.continuations.proposals:_shared_values",
+            "exp.optimize.evaluation.continuations.proposals:_packet",
+        ),
+        "6e5bfdaded2ff273dd3f46d2d89d7eff984b8ac987332807dcea25052f3e7ac9",
+    ),
+    Protocol(
         "exp.runtime.environments.workbook_edits:XLSX_ROW_EDITS_PROTOCOL",
         "xlsx-row-edits-v3",
         ("exp.runtime.environments.workbook_edits",),
