@@ -187,6 +187,15 @@ def test_responses_twelve_hour_write_subset_survives_sdk_conversion(
     response = openai_responses_response(payload, configured_model=_snapshot(), latency_seconds=1)
     assert response.economics.usage is not None
     assert response.economics.usage.cache_write_12h_input_tokens == (None if split is None else 20)
+    # A 12-hour request bills split-less writes at 12 hours, as the native parser does.
+    requested = openai_responses_response(
+        payload,
+        configured_model=_snapshot(),
+        latency_seconds=1,
+        twelve_hour_writes_requested=True,
+    )
+    assert requested.economics.usage is not None
+    assert requested.economics.usage.cache_write_12h_input_tokens == (30 if split is None else 20)
 
 
 @pytest.mark.parametrize(

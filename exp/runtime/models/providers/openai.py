@@ -157,6 +157,7 @@ def openai_responses_response(
     *,
     configured_model: ModelSnapshot,
     latency_seconds: float,
+    twelve_hour_writes_requested: bool = False,
 ) -> ModelResponse:
     """Convert one completed native Responses response into a shared EXP response.
 
@@ -164,6 +165,9 @@ def openai_responses_response(
         payload: Decoded completed OpenAI Responses payload.
         configured_model: Resolved catalog identity used for the request.
         latency_seconds: Observed duration of the successful request sequence.
+        twelve_hour_writes_requested: Whether the request carried
+            ``prompt_cache_options.ttl: "12h"``. Writes reported without their
+            lifetime split then meter as 12-hour writes, as the native parser does.
 
     Returns:
         The typed assistant action, served model identity, and observed economics.
@@ -221,7 +225,12 @@ def openai_responses_response(
         output=action,
         configured_model=configured_model,
         served_model_id=parsed.model,
-        usage=_usage(parsed.usage, raw=payload.get("usage"), service_tier=parsed.service_tier),
+        usage=_usage(
+            parsed.usage,
+            raw=payload.get("usage"),
+            service_tier=parsed.service_tier,
+            twelve_hour_writes_requested=twelve_hour_writes_requested,
+        ),
         latency_seconds=latency_seconds,
         hit_length_limit=status == "incomplete",
     )
@@ -404,6 +413,7 @@ def _usage(
     *,
     raw: JsonValue,
     service_tier: str | None = None,
+    twelve_hour_writes_requested: bool = False,
 ) -> Usage | None:
     """Map optional typed Responses usage without accepting negative token counts."""
     if usage is None:
@@ -416,6 +426,11 @@ def _usage(
             None if raw_hour is None else require_integer(raw_hour, "OpenAI cache_write_1h_tokens")
         )
         half_day = _twelve_hour_writes(input_extra.get("cache_write_tokens_details"))
+        if half_day is None and twelve_hour_writes_requested:
+            # A 12-hour request whose writes arrive without the split bills every
+            # write at 12 hours, never the cheaper default lifetime (the native
+            # parser's resolve_twelve_hour_writes).
+            half_day = usage.input_tokens_details.cache_write_tokens
         reasoning = (
             None if "reasoning_tokens" in unknown else usage.output_tokens_details.reasoning_tokens
         )
