@@ -943,7 +943,7 @@ Paid operations display actor and maintained simulator dependency estimates befo
   from public context and a capability brief. Fixed intent/world/verifier; fresh qualification required.
 - `action: "evaluate-candidates"`, `batch: CandidateBatchSpec`: measure every saved prototype, check independent controls, then compare actors. Harbor export requires observable qualification; tier separation is a selection signal, not a correctness gate. Rejected/unknown candidates remain counted.
 - `action: "propose-checkpoints"`, `checkpoint_proposals: CheckpointProposalSpec`: select up to four informative checkpoints from complete saved development attempts, retaining the response and matched-random controls. Selection sees outcomes; prospective critics do not. Unknown draws never silently retry.
-- `action: "run-continuation-campaign"`, `campaign: ContinuationCampaignSpec`: register source attempts (for example 16), selectors, critics and equal-budget continuations in one command. Retain failed cells, unknown bounds and per-arm results; saved work replays without calls. Publication-only recovery needs no runtime or credentials. No training or independent correctness claim.
+- `action: "run-continuation-campaign"`, `campaign: ContinuationCampaignSpec`: register source attempts (for example 16), selectors, critics and equal-budget continuations in one command. Retain failed cells, unknown bounds and per-arm results; saved work replays without calls. The printed `inference` separates each checkpoint's repeated-attempt Wilson interval from the interval across independent task lineages (repeats averaged first), and compares critic Brier scores with the source attempts' base rate on the same outcomes. Publication-only recovery needs no runtime or credentials. No training or independent correctness claim.
 - `action: "make-variant"`, `variant: TaskVariantSpec`: publish a drill, rephrasing or executed
   state variation. Keep source lineage and the original environment restore binding. Actor
   wording may change; prior approvals do not carry over. Fresh qualification precedes rewards.
@@ -960,7 +960,8 @@ Paid operations display actor and maintained simulator dependency estimates befo
   explanations and a candidate pool; draw unused random controls at the nearest allowed horizon. Unmatched proposals remain explicit; content aliases cannot inflate the control pool.
 - `action: "run-selection"`, `experiment: CheckpointExperimentSpec`: execute both matched arms,
   optionally recording a public-context critic first. Retain unknowns and report success bounds
-  and Brier coverage separately. Recoverability does not establish action-level blame.
+  and Brier coverage separately; `inference` adds per-checkpoint and per-lineage Wilson intervals
+  and proposed-minus-random effects per lineage. Recoverability does not establish action-level blame.
 - `action: "compare-actors"`, `actors: ActorPanelSpec`: compare two to ten frozen model
   snapshots on the same case checkpoints, rotating dispatch order across cases. Unknown branches
   contribute explicit failure/success bounds. Reported separation applies only to the fixed

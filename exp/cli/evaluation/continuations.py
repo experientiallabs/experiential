@@ -87,6 +87,7 @@ from exp.optimize.evaluation.continuations.framing import (
     run_framing_study,
     saved_framing_study,
 )
+from exp.optimize.evaluation.continuations.inference import campaign_summary, experiment_summary
 from exp.optimize.evaluation.continuations.intervention import (
     ActionInterventionSpec,
     capture_action_intervention,
@@ -378,7 +379,7 @@ def run_continuations(
             ):
                 return
             result = completed or run_continuation_campaign(store, campaign, code_revision=revision)
-            console.print_json(data={"scope": result.scope, **result.metrics})
+            console.print_json(data=campaign_summary(store, result))
             return
         if command.checkpoint_proposals is not None:
             selector = command.checkpoint_proposals
@@ -785,9 +786,7 @@ def run_continuations(
             report = saved_experiment or run_checkpoint_experiment(
                 store, experiment, code_revision=revision
             )
-            console.print_json(
-                data={"scope": report.scope, "unmatched": report.unmatched, **report.metrics}
-            )
+            console.print_json(data=experiment_summary(store, report))
             return
         if command.critic is not None:
             exists = store.artifacts.exists(command.critic.identity(revision))
