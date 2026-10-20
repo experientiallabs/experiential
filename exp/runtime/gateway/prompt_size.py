@@ -256,8 +256,10 @@ def prompt_cap_indexes(route: GatewayRoute, request: GatewayRequest) -> tuple[in
     only (a large ``max_tokens`` never drops it), but only when an uncapped
     rung of the same exact model stays on the route: the cap is a preference
     (a dedicated low-batch replica keeping long cold prefills off), never a
-    reason to refuse or to move the request to another model. Run it after
-    every hard filter, so a capped rung is never the reason nothing is left.
+    reason to refuse or to move the request to another model. It runs after
+    the window, capability and tier narrowing; the generation-profile and
+    protocol narrowing follow it, which a dedicated replica of the same model
+    on the same wire passes exactly as its main lane does.
     """
     minimum = prompt_text_bytes(request) // MAXIMUM_BYTES_PER_TOKEN
     capped: set[int] = set()

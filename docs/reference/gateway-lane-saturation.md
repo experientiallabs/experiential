@@ -157,7 +157,8 @@ card with these levers, except the permit class, which reads the host's authoriz
 A fast request is placed by conversation like any other (`maximize_cache_affinity` keeps its
 replica's prefix cache warm). A dedicated low-batch replica can author
 `GatewayRungDispatchPolicy.max_prompt_tokens`: a prompt at least that long (lower-bound
-estimate, prompt only) skips the rung at admission, after every hard filter, when an uncapped
+estimate, prompt only) skips the rung at admission, after the window, capability and tier
+narrowing, when an uncapped
 rung of the same model stays on the route (`prompt_size.prompt_cap_indexes`), so long cold
 prefills stay off it. The cap never refuses a request and never moves it to another model.
 

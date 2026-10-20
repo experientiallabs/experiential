@@ -393,8 +393,8 @@ dispatch's conservative worst-case reserved input plus output tokens at reservat
 burst allowance admitting a single over-cap reservation into an EMPTY window (a prompt whose
 worst case exceeds the whole per-worker cap must stay admissible, then blocks the window until
 it slides out). `max_prompt_tokens` keeps a prompt at least that long (lower-bound estimate,
-prompt only) off the rung when an uncapped rung of the same model remains after every other
-admission filter (`prompt_size.prompt_cap_indexes`), for a dedicated low-batch replica. The working
+prompt only) off the rung when an uncapped rung of the same model remains after the window,
+capability and tier narrowing (`prompt_size.prompt_cap_indexes`), for a dedicated low-batch replica. The working
 request ceiling is additionally calibrated passively per worker: a provider throttle settlement
 clamps a learned ceiling to ninety percent of the rate observed in the window at that moment,
 every unthrottled recovery minute creeps it back up by five percent (at least one request, capped
