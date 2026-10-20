@@ -436,6 +436,12 @@ class BatchEngine:
             job = job.model_copy(update={"status": BatchStatus.CANCELLING})
             self._store.save_job(job=job)
             await client.cancel(job=job, api_key=self._api_key(job))
+            current = self._store.load_job(
+                batch_id=job.batch_id, organization_id=job.organization_id
+            )
+            if current is None:
+                raise BatchSubmitError(f"batch {batch_id!r} does not exist", code="not_found")
+            return current
         elif self._store.begin_dispatch(batch_id=job.batch_id):
             # Winning the one-time dispatch claim proves no submission ever
             # ran or will run, so the lines release safely right now.

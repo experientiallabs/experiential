@@ -758,6 +758,49 @@ def test_cancel_during_inflight_dispatch_keeps_reservations() -> None:
     assert client.cancelled == 0
 
 
+def test_provider_cancel_does_not_restore_a_snapshot_settled_by_the_poller() -> None:
+    """A poller that settles during provider cancellation remains authoritative."""
+
+    class RacingCancelClient(ScriptedClient):
+        """Settle the batch from a nested poll while direct cancellation waits."""
+
+        provider = "openai"
+        supports_cancel = True
+        requires_uniform_model = False
+
+        def __init__(self) -> None:
+            """Prepare one cancelled provider snapshot."""
+            super().__init__([ProviderBatchSnapshot(status=BatchStatus.CANCELLED)], [])
+            self.engine: BatchEngine | None = None
+
+        async def cancel(self, *, job: BatchJob, api_key: str) -> None:
+            """Let the poller observe cancellation during the first provider call."""
+            self.cancelled += 1
+            if self.cancelled == 1:
+                assert self.engine is not None
+                await self.engine.poll_once()
+
+    client = RacingCancelClient()
+    engine, store, files, ledger, _ = _engine(client=client)
+    client.engine = engine
+    file_id = _upload(engine, [_chat_line("a", model="kimi-k3-batch")])
+    job = engine.submit(
+        organization_id="org_a",
+        identity_id="id_a",
+        input_file_id=file_id,
+        endpoint="/v1/chat/completions",
+    )
+    asyncio.run(engine.poll_once())
+
+    cancelled = asyncio.run(engine.cancel(organization_id="org_a", batch_id=job.batch_id))
+    asyncio.run(engine.poll_once())
+
+    assert cancelled.status is BatchStatus.CANCELLED and cancelled.settled
+    assert store.jobs[job.batch_id] == cancelled
+    assert ledger.released == [("a", "cancelled")]
+    assert len(files.records) == 2
+
+
 def test_terminal_jobs_settle_partial_provider_results() -> None:
     """A cancelled provider batch still settles the lines that ran."""
     partial = [
