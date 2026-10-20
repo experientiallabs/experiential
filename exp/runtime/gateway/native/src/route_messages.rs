@@ -201,7 +201,7 @@ pub(crate) async fn messages(
         }
     };
     let mut guard = new_guard(&state, admission.request_id.clone(), started);
-    guard.record_web_search_requests(admission.web_search_requests());
+    guard.record_web_search(admission.web_search_meter());
 
     let permit = match acquire_permit(&state, &mut guard, deadline, admission.class).await {
         Ok(permit) => permit,

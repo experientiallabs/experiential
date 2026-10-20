@@ -90,6 +90,7 @@ fn web_search() -> WebSearchAdmission {
             title: "Python".to_string(),
         }],
         include_sources: false,
+        cost_nano_usd: None,
     }
 }
 

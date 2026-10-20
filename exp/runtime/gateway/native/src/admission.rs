@@ -25,7 +25,7 @@ use crate::settlement::AttemptGuard;
 use crate::throttle_backoff::ThrottleRedial;
 use crate::tool_search::{ToolSearchAdmission, ToolSearchRound};
 use crate::waterfall::{DeploymentWire, RoutePolicy, Served};
-use crate::web_search::WebSearchAdmission;
+use crate::web_search::{WebSearchAdmission, WebSearchMeter};
 
 /// The wire configuration returned by one successful admission: the full
 /// ordered certified route (one wire configuration per deployment, each with
@@ -167,12 +167,16 @@ impl Admission {
         }
     }
 
-    /// How many gateway-executed web searches this request bills; `0` when
-    /// the control plane ran none.
-    pub(crate) fn web_search_requests(&self) -> u32 {
+    /// The full web-search meter (count, results returned, vendor cost) the
+    /// finalizing settlement bills; all zero when the control plane ran none.
+    pub(crate) fn web_search_meter(&self) -> WebSearchMeter {
         self.web_search
             .as_ref()
-            .map_or(0, |web_search| web_search.requests)
+            .map_or_else(WebSearchMeter::default, |web_search| WebSearchMeter {
+                requests: web_search.requests,
+                results: u32::try_from(web_search.results.len()).unwrap_or(u32::MAX),
+                cost_nano_usd: web_search.cost_nano_usd,
+            })
     }
 
     /// Whether the winning completion must be buffered for an output chain,
