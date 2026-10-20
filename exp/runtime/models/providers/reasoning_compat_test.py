@@ -22,6 +22,7 @@ from exp.runtime.models.providers.reasoning_compat import (
     anthropic_adaptive_only_thinking,
     anthropic_reasoning_effort,
     default_reasoning_effort,
+    gemini_none_rides_minimal,
     gemini_thinking_level,
     openai_reasoning_effort,
     require_sampling_reasoning_compatibility,
@@ -748,3 +749,28 @@ def test_all_always_thinking_route_keeps_every_rung_for_thinking_off() -> None:
     public, provider = route_generation_parameter_requests(profiles, request)
     assert provider.provider_thinking_config == {"type": "adaptive", "display": "omitted"}
     assert "thinking.type->adaptive" in public.ignored_parameters
+
+
+def test_only_gemini_3_flash_families_with_minimal_ride_it_for_none() -> None:
+    """``none`` rides MINIMAL only where the exact ladder has minimal and no off level."""
+    for model_id in (
+        "gemini-3.1-flash-lite",
+        "gemini-3.6-flash",
+        "gemini-3-flash-preview",
+        "models/gemini-3.5-flash",
+        "publishers/google/models/gemini-3.5-flash-lite",
+        "google/gemini-3.1-flash-lite",
+    ):
+        assert gemini_none_rides_minimal(model_id), model_id
+    for model_id in (
+        # Flash generations that refuse MINIMAL by name.
+        "gemini-3.7-flash",
+        "gemini-3.8-flash",
+        # Not flash, or a real off level of their own.
+        "gemini-3-pro-preview",
+        "gemini-3.1-pro-preview",
+        "gemini-2.5-flash",
+        "gemini-4-argon",
+        "gemini-3.99-flash-unknown",
+    ):
+        assert not gemini_none_rides_minimal(model_id), model_id

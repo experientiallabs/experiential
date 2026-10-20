@@ -6074,3 +6074,139 @@ def test_web_search_sources_selector_stays_off_non_native_provider_payloads() ->
     assert not any("web_search_call" in path for path in public.ignored_parameters)
     payload = openai_responses_stream_payload("exact-model", provider, supports_temperature=True)
     assert "web_search_call.action.sources" not in cast("list[str]", payload.get("include", []))
+
+
+def _gemini_profile(model_id: str) -> GatewayWireProfile:
+    """Build one native Gemini reasoning rung for ``model_id``."""
+    return GatewayWireProfile(
+        dialect="gemini_generate_content",
+        url="https://gemini.test",
+        model_id=model_id,
+        supports_reasoning=True,
+        reasoning_wire_format="gemini_thinking",
+    )
+
+
+@pytest.mark.parametrize(
+    "model_id",
+    (
+        "gemini-3.1-flash-lite",
+        "gemini-3.6-flash",
+        "gemini-3-flash-preview",
+        "publishers/google/models/gemini-3.5-flash-lite",
+    ),
+)
+def test_gemini_3_flash_dispatches_none_as_disclosed_minimal(model_id: str) -> None:
+    """Gemini 3 Flash has no off level: ``none`` rides MINIMAL, disclosed.
+
+    The public request keeps the caller's ``none``; only the provider copy
+    carries ``minimal``, and the payload asks for MINIMAL thinking with no
+    zero budget (minimal still thinks, so the rewrite is disclosed).
+    """
+    profile = _gemini_profile(model_id)
+    request = _chat_request().model_copy(update={"reasoning_effort": "none"})
+
+    public, provider = route_generation_parameter_requests((profile,), request)
+
+    assert public.reasoning_effort == "none"
+    assert provider.reasoning_effort == "minimal"
+    assert "reasoning_effort->minimal" in public.ignored_parameters
+    generation = cast(
+        "dict[str, object]", dialect_stream_payload(profile, provider)["generationConfig"]
+    )
+    assert generation["thinkingConfig"] == {"thinkingLevel": "MINIMAL", "includeThoughts": True}
+
+
+def test_responses_none_on_gemini_3_flash_names_the_responses_field() -> None:
+    """The disclosure names the effort field the caller actually sent."""
+    request = GatewayRequest(
+        surface=GatewayApiSurface.RESPONSES,
+        messages=(GatewayMessage(role="user", content="hello"),),
+        reasoning_effort="none",
+        stream=True,
+    )
+
+    public, provider = route_generation_parameter_requests(
+        (_gemini_profile("gemini-3.1-flash-lite"),), request
+    )
+
+    assert provider.reasoning_effort == "minimal"
+    assert f"{request.caller_effort_parameter}->minimal" in public.ignored_parameters
+
+
+@pytest.mark.parametrize(
+    ("model_id", "effort"),
+    (
+        # No minimal level: the off switch keeps its typed refusal.
+        ("gemini-3.7-flash", "none"),
+        ("gemini-3.8-flash", "none"),
+        ("gemini-3-pro-preview", "none"),
+    ),
+)
+def test_gemini_without_minimal_keeps_the_none_refusal(
+    model_id: str, effort: ReasoningEffort
+) -> None:
+    """Only flash families that serve MINIMAL substitute it for ``none``."""
+    request = _chat_request().model_copy(update={"reasoning_effort": effort})
+
+    with pytest.raises(UnsupportedReasoningEffortError):
+        route_generation_parameter_requests((_gemini_profile(model_id),), request)
+
+
+def test_gemini_rung_that_honors_none_and_other_efforts_are_untouched() -> None:
+    """Argon's real off switch and every other effort pass through unchanged."""
+    argon = _gemini_profile("gemini-4-argon")
+    none_request = _chat_request().model_copy(update={"reasoning_effort": "none"})
+    public, provider = route_generation_parameter_requests((argon,), none_request)
+    assert provider.reasoning_effort == "none"
+    assert not any("->minimal" in path for path in public.ignored_parameters)
+
+    flash = _gemini_profile("gemini-3.1-flash-lite")
+    low_request = _chat_request().model_copy(update={"reasoning_effort": "low"})
+    public, provider = route_generation_parameter_requests((flash,), low_request)
+    assert provider.reasoning_effort == "low"
+    assert not any("->minimal" in path for path in public.ignored_parameters)
+
+
+def test_none_keeps_a_gemini_flash_house_rung_ahead_of_an_openrouter_rung() -> None:
+    """A house Gemini rung is no longer narrowed out by an OpenRouter ``none``.
+
+    OpenRouter publishes ``none`` for these models (it serves it as minimal);
+    before the substitution only that rung admitted the request, so every
+    pinned-``none`` caller left the house lanes.
+    """
+    house = _gemini_profile("gemini-3.1-flash-lite")
+    openrouter = GatewayWireProfile(
+        dialect="openai_compatible",
+        url="https://openrouter.test",
+        model_id="google/gemini-3.1-flash-lite",
+        supports_reasoning=True,
+        reasoning_wire_format="reasoning",
+        supported_reasoning_efforts=("none", "minimal", "low", "medium", "high"),
+    )
+    request = _chat_request().model_copy(update={"reasoning_effort": "none"})
+
+    assert compatible_generation_parameter_profile_indexes((house, openrouter), request) == (
+        0,
+        1,
+    )
+    public, provider = route_generation_parameter_requests((house, openrouter), request)
+    assert provider.reasoning_effort == "minimal"
+    assert "reasoning_effort->minimal" in public.ignored_parameters
+
+
+def test_none_on_a_mixed_route_with_a_non_gemini_rung_keeps_the_refusal() -> None:
+    """A rung of another family that cannot honor ``none`` is never rewritten."""
+    flash = _gemini_profile("gemini-3.1-flash-lite")
+    other = GatewayWireProfile(
+        dialect="openai_compatible",
+        url="https://other.test",
+        model_id="vendor/reasoner",
+        supports_reasoning=True,
+        reasoning_wire_format="reasoning_effort",
+        supported_reasoning_efforts=("minimal", "low"),
+    )
+    request = _chat_request().model_copy(update={"reasoning_effort": "none"})
+
+    with pytest.raises(UnsupportedReasoningEffortError):
+        route_generation_parameter_requests((flash, other), request)

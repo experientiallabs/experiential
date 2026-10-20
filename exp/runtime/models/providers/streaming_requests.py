@@ -61,6 +61,7 @@ from exp.runtime.models.providers.generation_parameter_validation import (
     anthropic_reasoning_disengaged,
     disclose_anthropic_tool_schemas,
     require_assistant_prefill_supported,
+    require_route_reasoning_effort,
     require_tool_names_supported,
     resolve_level_less_enable,
     serves_reasoning_summary,
@@ -93,7 +94,6 @@ from exp.runtime.models.providers.openai_payloads import (
     openai_responses_stream_payload as openai_responses_stream_payload,
 )
 from exp.runtime.models.providers.reasoning_compat import (
-    REASONING_EFFORTS,
     require_between_tools_support,
     shape_anthropic_thinking_config,
 )
@@ -383,17 +383,7 @@ def route_generation_parameter_requests(
         else:
             provider_updates["reasoning_effort"] = resolved_default
     if request.reasoning_effort is not None:
-        portable_efforts = set(REASONING_EFFORTS)
-        for profile in profiles:
-            portable_efforts.intersection_update(_profile_reasoning_efforts(profile))
-        if request.reasoning_effort not in portable_efforts:
-            raise UnsupportedReasoningEffortError(
-                effort=request.reasoning_effort,
-                supported_efforts=tuple(
-                    effort for effort in REASONING_EFFORTS if effort in portable_efforts
-                ),
-                param=effort_path,
-            )
+        require_route_reasoning_effort(profiles, request, provider_updates, ignored)
     elif budget is None:
         # An omitted caller value remains omitted on the shared request. Each
         # dialect payload injects only its own provider-required default, so a

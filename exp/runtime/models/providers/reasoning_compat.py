@@ -382,6 +382,39 @@ def gemini_thinks_by_default(model_id: str) -> bool:
     return not _gemini_family(model_id).startswith("gemini-2-5-flash-lite")
 
 
+GEMINI_NONE_SUBSTITUTE_EFFORT: Final = "minimal"
+"""The level a Gemini 3 Flash rung dispatches for a caller's ``none``."""
+
+
+def gemini_none_rides_minimal(model_id: str) -> bool:
+    """Whether a caller's ``none`` dispatches as ``minimal`` on this Gemini model.
+
+    The Gemini 3 Flash families have no thinking-off level: ``thinkingLevel``
+    stops at MINIMAL, the provider's own "closest to off" (it may still think a
+    little). OpenRouter serves ``none`` to these models as minimal, and
+    pinned clients send ``none`` to every model, so a house Gemini rung that
+    refused it handed every such request to OpenRouter. The substitute is a
+    disclosed rewrite (``reasoning_effort->minimal``), never a ``none`` tier on
+    the ladder: the rung still does not honor a real off switch, and every
+    consumer that asks "can this rung stop reasoning" keeps the true answer.
+    Only flash families whose exact ladder carries ``minimal`` and lacks
+    ``none`` qualify (gemini-3.7-flash and 3.8-flash refuse MINIMAL by name).
+
+    Args:
+        model_id: Exact provider model id, bare (``gemini-3.1-flash-lite``) or
+            prefixed (``models/``, ``publishers/google/models/``, ``google/``).
+
+    Returns:
+        ``True`` when ``none`` should dispatch as ``minimal`` with disclosure.
+    """
+    bare = model_id.rsplit("/", 1)[-1]
+    family = _gemini_family(bare)
+    if not family.startswith("gemini-3") or "flash" not in family:
+        return False
+    supported = _gemini_supported_efforts(bare)
+    return GEMINI_NONE_SUBSTITUTE_EFFORT in supported and "none" not in supported
+
+
 def _gemini_family(model_id: str) -> str:
     """Normalize a Gemini model id to the bare family form the tables match."""
     return (
