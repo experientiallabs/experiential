@@ -8,8 +8,8 @@ import pytest
 from exp.common.core.artifacts import JsonObject
 from exp.common.models import AssistantAction, ModelMessage
 from exp.common.project import ArtifactStore, ProjectStore
-from exp.optimize.evaluation import continuation_admission_test as admission_fixtures
-from exp.optimize.evaluation.continuation_admission_test import admitted_workbook_study
+from exp.optimize.evaluation.continuations import admission_test as admission_fixtures
+from exp.optimize.evaluation.continuations.admission_test import admitted_workbook_study
 from exp.optimize.model.sft.builder import (
     SFTBuildError,
     build_sft_dataset,

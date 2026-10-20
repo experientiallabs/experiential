@@ -7,7 +7,7 @@ from typer.testing import CliRunner
 
 from exp.cli.app import app
 from exp.cli.evaluation.continuations import ContinuationCommand
-from exp.optimize.evaluation.equivalence_test import equivalence_fixture
+from exp.optimize.evaluation.equivalence.runner_test import equivalence_fixture
 
 
 def test_public_cli_compares_environments_and_runs_its_council(

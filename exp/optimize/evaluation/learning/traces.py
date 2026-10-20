@@ -46,6 +46,7 @@ from exp.common.progress import ProgressHook, report
 from exp.common.project import ProjectBuildArtifacts, ProjectStore, artifact_input
 from exp.common.tasks import TaskCase
 from exp.common.traces.store import load_trace_dataset
+from exp.optimize.evaluation.fidelity.dreaming import dream_pending
 from exp.optimize.evaluation.fidelity.memory import (
     DUPLICATE,
     INCOMPLETE,
@@ -78,7 +79,6 @@ from exp.optimize.evaluation.fidelity.runner import (
     execute_fidelity_evaluation,
     saved_fidelity_report,
 )
-from exp.optimize.evaluation.fidelity_dreaming import dream_pending
 from exp.runtime.models.providers.transport import RetryPolicy
 from exp.simulation.engines.text.prompt import INSTANCE_FACTS_GUIDANCE
 from exp.simulation.retrieval.build_inputs import load_completed_build_rag_lineage_bindings

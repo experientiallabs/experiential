@@ -28,6 +28,7 @@ from exp.common.progress import ProgressHook, report
 from exp.common.project import ProjectStore, artifact_input
 from exp.common.tasks import TaskCase
 from exp.optimize.evaluation.fidelity.decision_access import decision_caller, receipt_recorder
+from exp.optimize.evaluation.fidelity.dreaming import dream_pending, run_dream
 from exp.optimize.evaluation.fidelity.instance_facts import ReplayFacts, require_fact_scope
 from exp.optimize.evaluation.fidelity.knowledge_exposure import require_unexposed_task
 from exp.optimize.evaluation.fidelity.memory import (
@@ -36,6 +37,8 @@ from exp.optimize.evaluation.fidelity.memory import (
     maintain_memory,
     trajectory_record,
 )
+from exp.optimize.evaluation.fidelity.memory_outcomes import record_memory_outcomes
+from exp.optimize.evaluation.fidelity.memory_policy import FidelityMemory
 from exp.optimize.evaluation.fidelity.recovery import (
     JUDGE_OPERATION,
     RecoveryLog,
@@ -48,9 +51,6 @@ from exp.optimize.evaluation.fidelity.retrieval_binding import (
     index_embedder_alias,
     require_unindexed_held_out_task,
 )
-from exp.optimize.evaluation.fidelity_dreaming import dream_pending, run_dream
-from exp.optimize.evaluation.memory_outcomes import record_memory_outcomes
-from exp.optimize.evaluation.memory_policy import FidelityMemory
 from exp.runtime.gateway.decisions_contracts import DecisionRequest
 from exp.runtime.models import RuntimeModelCatalog
 from exp.runtime.models.budget import RequestBudget

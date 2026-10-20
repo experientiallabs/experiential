@@ -863,7 +863,7 @@ Pair chat context and remaining calls with a native/mixed checkpoint using
 `ChatAgentRuntime.run(..., on_checkpoint=...)`, `ContinuationCheckpoint` and
 `persist_continuation_checkpoint`. Capsules bind immutable sources, public tasks and binary files.
 
-`exp.optimize.evaluation.continuation_study.run_continuation_study` consumes that capsule
+`exp.optimize.evaluation.continuations.study.run_continuation_study` consumes that capsule
 through a `ContinuationStudySpec`, an exact matching actor/world runtime, a caller-admitted
 model client, and a private state probe. The spec pins actor model, sampling, repeats, verifier and probe identity. Optional predicted success and selection
 rationale are registered before outcomes. The caller must provide bounded provider admission;
@@ -901,7 +901,7 @@ state, scheduler or RNG changes refuse. Bounded checkpoint/time-bound receipts c
 current prediction through `InstanceFacts`, never learned rules. Required probes are checked before due events and again before tool execution. Schema-invalid arguments and proven pre-dispatch access refusals return recoverable errors without advancing the world.
 This grounds reads without synchronizing state. The predictor receives per-tool `reply_schema`;
 shape violations leave state/history unchanged. Explicit `maximum_reasks` (0 to 3, default 0) permits bounded corrections of known refused proposals within the same physical budget; every response and refusal is retained, and successful observations report the refusal count. Lost responses and valid-but-wrong results are never retried by this mechanism. Domain `state_schema` applies at initialization, restore and commit. `reply_bindings` select current state using exact arguments, unique-member matches, exact ranges or explicitly clamped pagination. `workbook_contracts.simulated_workbook_manifest` binds these to full typed workbook projections. These checks establish internal consistency, not native fidelity.
-The built-in `exp/optimize/evaluation/grounded_runtime.py` factory's `GroundedRuntimeDefinition` pins the world-model reference, catalog,
+The built-in `exp/optimize/evaluation/executable/grounded.py` factory's `GroundedRuntimeDefinition` pins the world-model reference, catalog,
 optional exact `EvaluationMemory`, task, manifest, initial domain state, private projection,
 deadline and cumulative physical-attempt ceiling. Its predictor, query embeddings and memory
 readers share admission. Provider SDKs bypassing that transport are refused. Projections from

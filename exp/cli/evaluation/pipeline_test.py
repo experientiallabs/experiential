@@ -6,8 +6,8 @@ import pytest
 from typer.testing import CliRunner
 
 from exp.cli.app import app
-from exp.optimize.evaluation.executable_task import load_executable_task
-from exp.optimize.evaluation.task_factory_test import factory_fixture
+from exp.optimize.evaluation.executable.task import load_executable_task
+from exp.optimize.evaluation.factory.runner_test import factory_fixture
 
 
 def test_pipeline_dry_run_execution_and_saved_replay(

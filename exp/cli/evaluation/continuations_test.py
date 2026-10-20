@@ -8,8 +8,8 @@ from typer.testing import CliRunner
 from exp.cli.app import app
 from exp.cli.evaluation.continuations import ContinuationCommand, ContinuationExport
 from exp.common.project import artifact_input
-from exp.optimize.evaluation.continuation_job_test import job_fixture
-from exp.optimize.evaluation.observation_contrast_test import observation_fixture
+from exp.optimize.evaluation.continuations.job_test import job_fixture
+from exp.optimize.evaluation.continuations.observation_contrast_test import observation_fixture
 from exp.optimize.model.sft.builder import (
     SFTBuildError,
     load_sft_dataset,
@@ -60,9 +60,9 @@ def test_cli_captures_builtin_workbook_without_custom_factory_or_credentials(
 ) -> None:
     """A package-owned native adapter uses the same capture operation as other worlds."""
     from exp.common.core.artifacts import sha256_bytes
-    from exp.optimize.evaluation import workbook_runtime
-    from exp.optimize.evaluation.continuation_capture import CaptureDefinition
-    from exp.optimize.evaluation.workbook_runtime_test import workbook_definition
+    from exp.optimize.evaluation.continuations.capture import CaptureDefinition
+    from exp.optimize.evaluation.executable import workbook as workbook_runtime
+    from exp.optimize.evaluation.executable.workbook_test import workbook_definition
 
     project, spec, task = workbook_definition(tmp_path)
     path = Path(workbook_runtime.__file__)
@@ -100,7 +100,7 @@ def test_cli_localizes_saved_failures_without_runtime_or_provider(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Analysis retains both native outcomes and replays after the runtime and catalog disappear."""
-    from exp.optimize.evaluation.continuation_job import (
+    from exp.optimize.evaluation.continuations.job import (
         continuation_result_reference,
         execute_continuation_job,
     )
@@ -140,9 +140,9 @@ def test_cli_captures_configured_native_and_learned_world_without_model_calls(
 ) -> None:
     """One configuration reaches both runtime owners through the existing public capture action."""
     from exp.common.core.artifacts import sha256_bytes
-    from exp.optimize.evaluation import mixed_runtime
-    from exp.optimize.evaluation.continuation_capture import CaptureDefinition
-    from exp.optimize.evaluation.mixed_runtime_test import mixed_fixture
+    from exp.optimize.evaluation.continuations.capture import CaptureDefinition
+    from exp.optimize.evaluation.executable import mixed as mixed_runtime
+    from exp.optimize.evaluation.executable.mixed_test import mixed_fixture
 
     project, spec, image, transport = mixed_fixture(tmp_path, monkeypatch)
     factory = Path(mixed_runtime.__file__)
@@ -211,7 +211,7 @@ def test_cli_evaluates_and_packages_every_saved_candidate(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The public batch command links native feasibility, independent controls and actor panels."""
-    from exp.optimize.evaluation.candidate_batch_test import batch_fixture
+    from exp.optimize.evaluation.factory.candidates_test import batch_fixture
 
     project, spec, transport = batch_fixture(tmp_path, monkeypatch)
     monkeypatch.setattr(
@@ -247,7 +247,7 @@ def test_cli_proposes_multiple_tasks_without_inheriting_qualification(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """One paid logical proposal produces every candidate and can replay without the catalog."""
-    from exp.optimize.evaluation.task_proposals_test import proposal_fixture
+    from exp.optimize.evaluation.factory.proposals_test import proposal_fixture
 
     project, spec, transport = proposal_fixture(tmp_path, monkeypatch)
     request = tmp_path / "proposals.json"
@@ -282,7 +282,7 @@ def test_cli_compares_actions_then_replays_without_runtime(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The public CLI preserves preregistration and all four native treatment measurements."""
-    from exp.optimize.evaluation.action_contrast_test import contrast_fixture
+    from exp.optimize.evaluation.continuations.action_contrast_test import contrast_fixture
 
     project, spec, transport = contrast_fixture(tmp_path, monkeypatch)
     request = tmp_path / "contrast.json"
@@ -378,7 +378,7 @@ def test_cli_captures_initial_world_without_actor_calls(
     import json
 
     from exp.common.core.artifacts import ArtifactInput
-    from exp.optimize.evaluation.continuation_capture_test import capture_fixture
+    from exp.optimize.evaluation.continuations.capture_test import capture_fixture
     from exp.simulation.continuations import load_continuation_checkpoint
 
     project, definition, transport = capture_fixture(tmp_path, monkeypatch)
@@ -412,7 +412,7 @@ def test_cli_compares_actor_snapshots_without_hiding_unavailable_outcomes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The actor-panel CLI uses the same frozen studies and refuses an assumed tier ranking."""
-    from exp.optimize.evaluation.actor_panel_test import panel_fixture
+    from exp.optimize.evaluation.continuations.actors_test import panel_fixture
 
     _, spec, transport = panel_fixture(tmp_path, monkeypatch)
     request = tmp_path / "actors.json"
@@ -441,7 +441,7 @@ def test_cli_records_a_prospective_critic_without_exposing_private_state(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The CLI returns a durable estimate reference for a later continuation registration."""
-    from exp.optimize.evaluation.actor_critic_test import critic_fixture
+    from exp.optimize.evaluation.continuations.critic_test import critic_fixture
 
     _, _, spec, transport = critic_fixture(tmp_path, monkeypatch)
     request = tmp_path / "critic.json"
@@ -476,8 +476,8 @@ def test_cli_matches_checkpoints_then_runs_and_replays_registered_experiment(
     import json
 
     from exp.common.core.artifacts import ArtifactInput
-    from exp.optimize.evaluation.checkpoint_experiment import CheckpointExperimentSpec
-    from exp.optimize.evaluation.checkpoint_selection_test import selection_fixture
+    from exp.optimize.evaluation.continuations.experiment import CheckpointExperimentSpec
+    from exp.optimize.evaluation.continuations.selection_test import selection_fixture
 
     _, selection = selection_fixture(tmp_path, monkeypatch)
     request = tmp_path / "selection.json"
@@ -523,7 +523,7 @@ def test_cli_action_intervention_changes_native_state_without_actor_inference(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The CLI publishes the imposed-effect capsule and replays it without runtime code."""
-    from exp.optimize.evaluation.action_intervention import ActionInterventionSpec
+    from exp.optimize.evaluation.continuations.intervention import ActionInterventionSpec
     from exp.runtime.environments.tests.world_conformance_test import workbook_case
 
     _, job, transport = job_fixture(tmp_path, monkeypatch)
@@ -561,8 +561,8 @@ def test_cli_publishes_a_variant_without_promoting_it(
     import json
 
     from exp.common.core.artifacts import ArtifactInput
-    from exp.optimize.evaluation.task_variants import load_task_variant
-    from exp.optimize.evaluation.task_variants_test import variant_fixture
+    from exp.optimize.evaluation.factory.variants import load_task_variant
+    from exp.optimize.evaluation.factory.variants_test import variant_fixture
 
     project, spec = variant_fixture(tmp_path, monkeypatch)
     request = tmp_path / "variant.json"
@@ -591,7 +591,7 @@ def test_cli_publishes_a_variant_without_promoting_it(
 
 def test_cli_measures_saved_decisions_without_provider_setup(tmp_path: Path) -> None:
     """The public CLI preserves failed slots and performs no credential or runtime setup."""
-    from exp.optimize.evaluation.decision_calibration_test import study
+    from exp.optimize.evaluation.analysis.decision_calibration_test import study
 
     store, spec = study(tmp_path)
     before = store.list_ids()

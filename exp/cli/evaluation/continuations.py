@@ -16,25 +16,7 @@ from exp.cli.shared.theme import EXP_THEME
 from exp.common.core.artifacts import ArtifactInput, ContractModel
 from exp.common.project import ArtifactStoreError, ProjectStore
 from exp.common.release_revision import installed_execution_revision
-from exp.optimize.evaluation.action_contrast import (
-    ActionContrastSpec,
-    preflight_action_contrast,
-    run_action_contrast,
-    saved_action_contrast,
-)
-from exp.optimize.evaluation.action_intervention import (
-    ActionInterventionSpec,
-    capture_action_intervention,
-    preflight_intervention,
-    saved_intervention,
-)
-from exp.optimize.evaluation.actor_critic import (
-    CriticSpec,
-    load_critic_prediction,
-    predict_success,
-    preflight_critic,
-)
-from exp.optimize.evaluation.actor_decisions import (
+from exp.optimize.evaluation.analysis.actor_decisions import (
     ActorDecisionSpec,
     actor_decision_interfaces,
     actor_decisions_need_dispatch,
@@ -42,120 +24,138 @@ from exp.optimize.evaluation.actor_decisions import (
     run_actor_decisions,
     saved_actor_decisions,
 )
-from exp.optimize.evaluation.actor_panel import (
+from exp.optimize.evaluation.analysis.decision_calibration import (
+    DecisionCalibration,
+    calibrate_decisions,
+)
+from exp.optimize.evaluation.analysis.failures import analyse_failures, persist_failure_analysis
+from exp.optimize.evaluation.analysis.memory_analyst import (
+    MemoryAnalystSpec,
+    preflight_memory_analyst,
+    run_memory_analysis,
+    saved_memory_analysis,
+)
+from exp.optimize.evaluation.analysis.memory_evidence import MemoryInspection, inspect_memory
+from exp.optimize.evaluation.analysis.research import (
+    FailureResearchSpec,
+    check_failure_research,
+    persist_failure_research,
+)
+from exp.optimize.evaluation.continuations.action_contrast import (
+    ActionContrastSpec,
+    preflight_action_contrast,
+    run_action_contrast,
+    saved_action_contrast,
+)
+from exp.optimize.evaluation.continuations.actors import (
     ActorPanelSpec,
     preflight_actor_panel,
     run_actor_panel,
     saved_actor_panel,
 )
-from exp.optimize.evaluation.actor_prefixes import (
-    ActorPrefixSpec,
-    admit_actor_prefix,
-    persist_actor_prefix,
-)
-from exp.optimize.evaluation.candidate_batch import (
-    CandidateBatchSpec,
-    preflight_candidate_batch,
-    run_candidate_batch,
-    saved_candidate_batch,
-)
-from exp.optimize.evaluation.checkpoint_experiment import (
-    CheckpointExperimentSpec,
-    preflight_checkpoint_experiment,
-    run_checkpoint_experiment,
-    saved_checkpoint_experiment,
-)
-from exp.optimize.evaluation.checkpoint_proposals import (
-    CheckpointProposalSpec,
-    propose_checkpoints,
-)
-from exp.optimize.evaluation.checkpoint_selection import (
-    CheckpointSelectionSpec,
-    load_selection_plan,
-    match_checkpoints,
-    persist_selection_plan,
-    selection_jobs,
-)
-from exp.optimize.evaluation.continuation_admission import (
+from exp.optimize.evaluation.continuations.admission import (
     ContinuationAdmission,
     admit_continuations,
 )
-from exp.optimize.evaluation.continuation_campaign import (
+from exp.optimize.evaluation.continuations.campaign import (
     ContinuationCampaignSpec,
     campaign_requires_execution,
     preflight_continuation_campaign,
     run_continuation_campaign,
     saved_continuation_campaign,
 )
-from exp.optimize.evaluation.continuation_capture import (
+from exp.optimize.evaluation.continuations.capture import (
     CaptureDefinition,
     capture_initial_world,
     preflight_capture,
     saved_capture,
 )
-from exp.optimize.evaluation.continuation_job import (
+from exp.optimize.evaluation.continuations.critic import (
+    CriticSpec,
+    load_critic_prediction,
+    predict_success,
+    preflight_critic,
+)
+from exp.optimize.evaluation.continuations.experiment import (
+    CheckpointExperimentSpec,
+    preflight_checkpoint_experiment,
+    run_checkpoint_experiment,
+    saved_checkpoint_experiment,
+)
+from exp.optimize.evaluation.continuations.framing import (
+    FramingStudySpec,
+    run_framing_study,
+    saved_framing_study,
+)
+from exp.optimize.evaluation.continuations.intervention import (
+    ActionInterventionSpec,
+    capture_action_intervention,
+    preflight_intervention,
+    saved_intervention,
+)
+from exp.optimize.evaluation.continuations.job import (
     ContinuationJob,
     continuation_result_reference,
     execute_continuation_job,
     preflight_continuation_job,
     saved_continuation_job,
 )
-from exp.optimize.evaluation.continuation_records import load_study
-from exp.optimize.evaluation.decision_calibration import DecisionCalibration, calibrate_decisions
-from exp.optimize.evaluation.equivalence import EquivalenceSpec
-from exp.optimize.evaluation.failure_analysis import (
-    analyse_failures,
-    persist_failure_analysis,
-)
-from exp.optimize.evaluation.failure_research import (
-    FailureResearchSpec,
-    check_failure_research,
-    persist_failure_research,
-)
-from exp.optimize.evaluation.framing_study import (
-    FramingStudySpec,
-    run_framing_study,
-    saved_framing_study,
-)
-from exp.optimize.evaluation.learning_repair import LearningRepairSpec, repair_learning
-from exp.optimize.evaluation.memory_analyst import (
-    MemoryAnalystSpec,
-    preflight_memory_analyst,
-    run_memory_analysis,
-    saved_memory_analysis,
-)
-from exp.optimize.evaluation.memory_evidence import MemoryInspection, inspect_memory
-from exp.optimize.evaluation.observation_contrast import (
+from exp.optimize.evaluation.continuations.observation_contrast import (
     ObservationContrastSpec,
     preflight_observation_contrast,
     run_observation_contrast,
     saved_observation_contrast,
 )
-from exp.optimize.evaluation.record_scenarios import (
+from exp.optimize.evaluation.continuations.proposals import (
+    CheckpointProposalSpec,
+    propose_checkpoints,
+)
+from exp.optimize.evaluation.continuations.records import load_study
+from exp.optimize.evaluation.continuations.selection import (
+    CheckpointSelectionSpec,
+    load_selection_plan,
+    match_checkpoints,
+    persist_selection_plan,
+    selection_jobs,
+)
+from exp.optimize.evaluation.equivalence.prefixes import (
+    ActorPrefixSpec,
+    admit_actor_prefix,
+    persist_actor_prefix,
+)
+from exp.optimize.evaluation.equivalence.runner import EquivalenceSpec
+from exp.optimize.evaluation.executable.scenarios import (
     RecordScenarioSpec,
     RecordWitnessSpec,
     prepare_record_scenario,
     prepare_record_witness,
     saved_record_scenario,
 )
-from exp.optimize.evaluation.scenario_search import (
-    ScenarioSearchSpec,
-    preflight_scenario_search,
-    run_scenario_search,
+from exp.optimize.evaluation.factory.candidates import (
+    CandidateBatchSpec,
+    preflight_candidate_batch,
+    run_candidate_batch,
+    saved_candidate_batch,
 )
-from exp.optimize.evaluation.task_proposals import (
+from exp.optimize.evaluation.factory.proposals import (
     TaskProposalSpec,
     preflight_task_proposals,
     proposal_request,
     propose_tasks,
     saved_task_proposals,
 )
-from exp.optimize.evaluation.task_variants import (
+from exp.optimize.evaluation.factory.scenario_search import (
+    ScenarioSearchSpec,
+    preflight_scenario_search,
+    run_scenario_search,
+)
+from exp.optimize.evaluation.factory.variants import (
     TaskVariantSpec,
     load_task_variant,
     preflight_task_variant,
     publish_task_variant,
 )
+from exp.optimize.evaluation.learning.repair import LearningRepairSpec, repair_learning
 from exp.optimize.model.sft.builder import build_sft_dataset, write_sft_dataset
 from exp.optimize.model.sft.contracts import SFTBuildSpec
 from exp.simulation.capability_briefs import (

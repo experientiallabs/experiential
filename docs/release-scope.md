@@ -145,7 +145,7 @@ denominator-preserving evidence.
 ## Development task factory
 
 `exp eval PROJECT --root ROOT --pipeline pipeline.json --dry-run` validates a
-`exp.optimize.evaluation.task_factory.TaskFactorySpec`. Repeat with `--yes --non-interactive`
+`exp.optimize.evaluation.factory.runner.TaskFactorySpec`. Repeat with `--yes --non-interactive`
 to authorize the displayed finite author/actor allowance when prices are unknown. The manifest
 binds seed tasks, capability briefs, independent control witnesses, the shared actor panel,
 coverage strata, deadline and export destination. Runtime inference keeps its separately declared

@@ -14,16 +14,17 @@ from exp.cli.evaluation.spend import review_components, review_cost
 from exp.cli.shared.consent import require_spend_consent
 from exp.common.core.artifacts import ArtifactInput, ContractModel
 from exp.common.project import ProjectStore
-from exp.optimize.evaluation.continuation_evidence import qualified_training_job
-from exp.optimize.evaluation.costs import runtime_costs
-from exp.optimize.evaluation.executable_qualification import (
+from exp.optimize.evaluation.continuations.evidence import qualified_training_job
+from exp.optimize.evaluation.executable.costs import runtime_costs
+from exp.optimize.evaluation.executable.provider_grant import ProviderLimits
+from exp.optimize.evaluation.executable.qualification import (
     ExecutableQualificationSpec,
     load_executable_qualification,
     preflight_executable_qualification,
     preflight_qualification_reference,
     qualify_executable_task,
 )
-from exp.optimize.evaluation.executable_task import (
+from exp.optimize.evaluation.executable.task import (
     ExecutableTask,
     export_executable_harbor,
     load_executable_task,
@@ -31,16 +32,15 @@ from exp.optimize.evaluation.executable_task import (
     preflight_executable_task,
     verify_executable_package,
 )
-from exp.optimize.evaluation.executable_trial import open_executable_harbor_trial
-from exp.optimize.evaluation.harbor.bridge import serve_harbor_trial
-from exp.optimize.evaluation.harbor.export import preflight_harbor_destination, verify_harbor_export
-from exp.optimize.evaluation.provider_grant import ProviderLimits
-from exp.optimize.evaluation.world_proposals import (
+from exp.optimize.evaluation.executable.trial import open_executable_harbor_trial
+from exp.optimize.evaluation.factory.worlds import (
     WorldProposalSpec,
     preflight_world_proposals,
     propose_worlds,
     world_proposal_request,
 )
+from exp.optimize.evaluation.harbor.bridge import serve_harbor_trial
+from exp.optimize.evaluation.harbor.export import preflight_harbor_destination, verify_harbor_export
 from exp.simulation.world_construction import (
     ConstructionSpec,
     persist_construction,

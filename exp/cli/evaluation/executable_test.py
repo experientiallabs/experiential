@@ -11,15 +11,15 @@ from typer.testing import CliRunner
 from exp.cli.app import app
 from exp.cli.evaluation.continuations import ContinuationCommand, ContinuationExport
 from exp.cli.evaluation.executable import ExecutableCommand
-from exp.optimize.evaluation.continuation_admission import (
+from exp.optimize.evaluation.continuations.admission import (
     ContinuationAdmission,
     admit_continuations,
 )
-from exp.optimize.evaluation.continuation_job import continuation_result_reference
-from exp.optimize.evaluation.continuation_job_test import job_fixture
-from exp.optimize.evaluation.executable_qualification import qualify_executable_task
-from exp.optimize.evaluation.executable_qualification_test import qualified_fixture
-from exp.optimize.evaluation.executable_trial_test import _post
+from exp.optimize.evaluation.continuations.job import continuation_result_reference
+from exp.optimize.evaluation.continuations.job_test import job_fixture
+from exp.optimize.evaluation.executable.qualification import qualify_executable_task
+from exp.optimize.evaluation.executable.qualification_test import qualified_fixture
+from exp.optimize.evaluation.executable.trial_test import _post
 from exp.optimize.model.sft.builder import load_verified_sft_dataset
 from exp.optimize.model.sft.contracts import SFTBuildSpec
 from exp.runtime.environments.tests.world_conformance_test import workbook_case
@@ -81,9 +81,9 @@ def test_cli_serves_expired_frozen_simulator_under_one_explicit_trial_allowance(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The public CLI can reuse an old world without rebuying calls when a trial is resumed."""
-    from exp.optimize.evaluation.executable_task import export_executable_harbor
-    from exp.optimize.evaluation.provider_grant import ProviderLimits
-    from exp.optimize.evaluation.provider_grant_test import expired_task
+    from exp.optimize.evaluation.executable.provider_grant import ProviderLimits
+    from exp.optimize.evaluation.executable.provider_grant_test import expired_task
+    from exp.optimize.evaluation.executable.task import export_executable_harbor
 
     project, task, _, transport = expired_task(tmp_path, monkeypatch)
     monkeypatch.setattr(
@@ -262,7 +262,7 @@ def test_serve_preflight_does_not_execute_witnesses_without_consent(
     from rich.console import Console
 
     from exp.cli.evaluation.executable import run_executable_command
-    from exp.optimize.evaluation.executable_task import export_executable_harbor
+    from exp.optimize.evaluation.executable.task import export_executable_harbor
 
     project, task, spec = qualified_fixture(tmp_path, monkeypatch)
     qualification = qualify_executable_task(
@@ -306,7 +306,7 @@ def test_dry_run_checks_references_and_runtime_without_publishing(
 ) -> None:
     """Invalid handoffs fail during readiness checks, not after a misleading dry-run success."""
     from exp.common.core.artifacts import ArtifactInput
-    from exp.optimize.evaluation.executable_task import load_executable_task
+    from exp.optimize.evaluation.executable.task import load_executable_task
 
     project, reference, spec = qualified_fixture(tmp_path, monkeypatch)
     bad = ArtifactInput(artifact_id=reference.artifact_id, sha256="f" * 64)
@@ -426,8 +426,8 @@ def test_cli_authors_worlds_with_consent_then_replays_without_provider_or_runtim
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The public command buys one typed draw and exercises actual native world challenges."""
-    from exp.optimize.evaluation.world_proposals import WorldProposals
-    from exp.optimize.evaluation.world_proposals_test import world_fixture
+    from exp.optimize.evaluation.factory.worlds import WorldProposals
+    from exp.optimize.evaluation.factory.worlds_test import world_fixture
 
     project, spec, transport = world_fixture(tmp_path, monkeypatch)
     monkeypatch.setattr(

@@ -8,7 +8,7 @@ from exp.cli.evaluation.spend import review_cost
 from exp.cli.shared.consent import require_spend_consent
 from exp.common.progress import ProgressEvent
 from exp.common.project import ProjectStore
-from exp.optimize.evaluation.equivalence import (
+from exp.optimize.evaluation.equivalence.runner import (
     EquivalenceSpec,
     preflight_equivalence,
     run_equivalence,

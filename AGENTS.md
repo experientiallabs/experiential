@@ -366,8 +366,8 @@ uv run pytest -q
     | Concern | Owner | Use |
     | --- | --- | --- |
     | Progress of a long-running command | `exp/cli/shared/progress.py` | `progress_display` for one phase, `progress_phases` for several; services report through `exp/common/progress.py` `report` |
-    | Executable evaluation cost inventory | `exp/optimize/evaluation/costs.py` | Credential-free estimates for actors, simulator dependencies and review stages; unknown components remain explicit |
-    | Deferred evaluation child execution | `exp/optimize/evaluation/execution_deferral.py` | Retain known lease contention separately from unknown dispatch; retry the same durable child only |
+    | Executable evaluation cost inventory | `exp/optimize/evaluation/executable/costs.py` | Credential-free estimates for actors, simulator dependencies and review stages; unknown components remain explicit |
+    | Deferred evaluation child execution | `exp/optimize/evaluation/executable/deferral.py` | Retain known lease contention separately from unknown dispatch; retry the same durable child only |
     | Native gateway composition lifetime | `exp/runtime/gateway/native_lifecycle.py`, `exp/runtime/gateway/lifecycle.py`, `exp/runtime/gateway/instance_lock.py` | Close control-plane pollers before caller-owned local components; bounded worker drain and startup rollback release thread-owned SQLite caches; no daemon thread substitutes for explicit ownership; the root's owner lock is released only after a recorded finished teardown and is otherwise kept until exit |
     | Latency subprocess output lifetime | `exp/runtime/gateway/latency_measure.py` | `GatewayProcess`: keep one stdout reader; stop and wait for the process, join its reader, then close the pipe; startup failures use the same bounded owner |
     | Spend consent and cost warnings | `exp/cli/shared/consent.py` | `require_spend_consent` |
@@ -376,7 +376,7 @@ uv run pytest -q
     | Interactive choices | `exp/cli/shared/picker.py` | `choose_one` |
     | Terminal styling | `exp/cli/shared/theme.py` | `EXP_THEME` |
     | Unknown recall recovery | `exp/optimize/evaluation/learning/profile.py` | Exact original intent plus an explicit single-attempt permit; preserve ambiguity and refuse a second unknown replacement |
-    | Diagnostic source admission | `exp/optimize/evaluation/source_access.py` | Exact operator classifications over the complete dependency graph; unknown and protected sources refuse |
+    | Diagnostic source admission | `exp/optimize/evaluation/analysis/source_access.py` | Exact operator classifications over the complete dependency graph; unknown and protected sources refuse |
     | Saved-result identity | `exp/common/core/artifacts.py` | `stable_id` over content; never over paths or source files |
     | Local identifiers in paths | `exp/common/project/paths.py` | `validate_local_id` |
     | Atomic file writes | `exp/common/core/files.py` | `write_text_atomic` |

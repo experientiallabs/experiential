@@ -7,7 +7,7 @@ from rich.text import Text
 
 from exp.common.core.artifacts import ContractModel
 from exp.common.project import ProjectStore
-from exp.optimize.evaluation.costs import CostComponent, evaluation_costs, total_cost
+from exp.optimize.evaluation.executable.costs import CostComponent, evaluation_costs, total_cost
 
 
 def review_cost(console: Console, project: ProjectStore, spec: ContractModel) -> float | None:

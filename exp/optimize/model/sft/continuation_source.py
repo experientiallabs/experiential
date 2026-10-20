@@ -3,12 +3,12 @@
 from exp.common.core.artifacts import ArtifactInput, JsonValue, sha256_json
 from exp.common.models import AssistantAction, ModelMessage, ModelRequest, ModelResponse, ToolCall
 from exp.common.project import ProjectStore, artifact_input
-from exp.optimize.evaluation.continuation_admission import (
+from exp.optimize.evaluation.continuations.admission import (
     ContinuationAdmission,
     admit_continuations,
 )
-from exp.optimize.evaluation.continuation_prefix import verify_training_prefix
-from exp.optimize.evaluation.continuation_records import load_study
+from exp.optimize.evaluation.continuations.prefix import verify_training_prefix
+from exp.optimize.evaluation.continuations.records import load_study
 from exp.optimize.model.sft.contracts import (
     AssistantActionEvent,
     ContinuationExampleSource,

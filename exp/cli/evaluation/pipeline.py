@@ -11,7 +11,7 @@ from exp.cli.shared.progress import progress_display
 from exp.cli.shared.theme import EXP_THEME
 from exp.common.project import ProjectStore
 from exp.common.release_revision import installed_execution_revision
-from exp.optimize.evaluation.task_factory import (
+from exp.optimize.evaluation.factory.runner import (
     TaskFactorySpec,
     factory_attempt_bound,
     factory_population,
