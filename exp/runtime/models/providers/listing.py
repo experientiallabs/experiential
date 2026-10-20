@@ -41,6 +41,7 @@ _MAXIMUM_ANTHROPIC_PAGES = 10
 _MAXIMUM_GEMINI_PAGES = 10
 _CATALOG_PAGE_SIZE = 1_000
 _MAXIMUM_CATALOG_PAGES = 10
+_MAXIMUM_MODEL_ID_LENGTH = 512
 _CREDENTIAL_STATUS_CODES = frozenset({401, 403})
 
 
@@ -166,7 +167,7 @@ class HttpProviderModelLister:
         )
         models = []
         for entry in entries:
-            identity = _text(entry.get("id"))
+            identity = _model_identity(entry.get("id"))
             if identity is None:
                 continue
             models.append(
@@ -277,7 +278,7 @@ class HttpProviderModelLister:
         )
         models = []
         for entry in _entries(endpoint.provider, body.get("models") or body.get("data")):
-            identity = _text(entry.get("id"))
+            identity = _model_identity(entry.get("id"))
             if identity is None:
                 continue
             models.append(_openrouter_model(endpoint.provider, identity, entry))
@@ -296,12 +297,15 @@ class HttpProviderModelLister:
             url = f"{base_url}/models?{urlencode(query_parameters)}"
             body = self._read(endpoint, url, headers)
             for entry in _entries(endpoint.provider, body.get("models")):
-                identity = _text(entry.get("name"))
+                resource_name = _text(entry.get("name"))
+                identity = (
+                    _model_identity(resource_name.removeprefix("models/"))
+                    if resource_name is not None
+                    else None
+                )
                 if identity is None:
                     continue
-                models.append(
-                    _gemini_model(endpoint.provider, identity.removeprefix("models/"), entry)
-                )
+                models.append(_gemini_model(endpoint.provider, identity, entry))
             page_token = _text(body.get("nextPageToken"))
             if page_token is None:
                 break
@@ -492,7 +496,7 @@ def _identities(provider: str, value: object, key: str) -> tuple[str, ...]:
     """Read every non-empty string identity from one provider listing array."""
     identities = []
     for entry in _entries(provider, value):
-        identity = _text(entry.get(key))
+        identity = _model_identity(entry.get(key))
         if identity is not None:
             identities.append(identity)
     return tuple(identities)
@@ -506,11 +510,24 @@ def _text(value: object) -> str | None:
     return trimmed or None
 
 
+def _model_identity(value: object) -> str | None:
+    """Read one model ID that fits the public discovery contract."""
+    identity = _text(value)
+    if identity is None or len(identity) > _MAXIMUM_MODEL_ID_LENGTH:
+        return None
+    return identity
+
+
 def _positive_int(value: object) -> int | None:
     """Read one positive integer limit, or ``None`` when it is absent or unusable."""
     if isinstance(value, bool) or not isinstance(value, int | float):
         return None
-    limit = int(value)
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            return None
+        limit = int(value)
+    else:
+        limit = value
     return limit if limit > 0 else None
 
 
@@ -599,7 +616,7 @@ def _million_token_price(value: object) -> float | None:
         per_token = float(value)
     else:
         return None
-    if per_token < 0:
+    if not math.isfinite(per_token) or per_token < 0:
         return None
     return per_token * 1_000_000
 
