@@ -88,6 +88,12 @@ PROTOCOLS = (
         "6e5bfdaded2ff273dd3f46d2d89d7eff984b8ac987332807dcea25052f3e7ac9",
     ),
     Protocol(
+        "exp.optimize.evaluation.learning.sample_count:SAMPLE_COUNT_PROTOCOL",
+        "sample-count-v1",
+        ("exp.optimize.evaluation.learning.sample_count",),
+        "0d6a436e42eb2fafe530930865ad937351745c78d81aa83495007a1c753daef8",
+    ),
+    Protocol(
         "exp.runtime.environments.workbook_edits:XLSX_ROW_EDITS_PROTOCOL",
         "xlsx-row-edits-v3",
         ("exp.runtime.environments.workbook_edits",),
