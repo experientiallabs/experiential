@@ -83,8 +83,8 @@ def mixed_fixture(
     probe_sha = sha256_json({"native": "row-count-from-real-workbook"})
     native_file = tmp_path / "reviewed_native.py"
     native_file.write_text("""from exp.common.core.artifacts import ArtifactInput
-from exp.optimize.evaluation.continuation_job import ContinuationRuntime
-from exp.optimize.evaluation.continuation_study_test import probe
+from exp.optimize.evaluation.continuations.job import ContinuationRuntime
+from exp.optimize.evaluation.continuations.study_test import probe
 from exp.runtime.environments.artifact_world import ArtifactWorldFactory
 from exp.runtime.environments.workbook_edits import WorkbookEditAdapter
 from exp.runtime.environments.world_artifacts import load_world_image

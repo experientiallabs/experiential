@@ -31,7 +31,7 @@ from exp.simulation.record_execution_test import NOW, acceptance, fixture, sourc
 
 RUNTIME = '''"""Explicit test-only native factory; no credentials or model clients."""
 from functools import partial
-from exp.optimize.evaluation.continuation_job import ContinuationRuntime
+from exp.optimize.evaluation.continuations.job import ContinuationRuntime
 from exp.runtime.environments.record_world import RecordWorldFactory, RecordTool
 from exp.runtime.environments.worlds import ExecutableWorldRuntime, ToolEffectPolicy
 from exp.simulation.record_execution import record_state

@@ -33,7 +33,7 @@ def test_runtime_binding_is_not_workbook_specific_and_checks_source_before_execu
     project, search, _ = workbook_search_fixture(tmp_path, monkeypatch)
     source = tmp_path / "json_runtime.py"
     source.write_text("""
-from exp.optimize.evaluation.construction_binding import ConstructionBinding
+from exp.optimize.evaluation.executable.construction import ConstructionBinding
 from exp.common.core.artifacts import sha256_json
 def bind_construction(project, configuration, assets):
     data = project.artifacts.read_bytes(assets.artifact_id, "assets/tables.json")
