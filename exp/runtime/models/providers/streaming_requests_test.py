@@ -53,6 +53,7 @@ from exp.runtime.models.providers.errors import (
 from exp.runtime.models.providers.gemini_requests import gemini_generate_request
 from exp.runtime.models.providers.generation_route_compat import (
     compatible_generation_parameter_profile_indexes,
+    plaintext_reasoning_lead_order,
 )
 from exp.runtime.models.providers.instruction_turns import (
     HOISTING_WIRE_SYSTEM_FOLD_DISCLOSURE,
@@ -5523,6 +5524,17 @@ def test_plaintext_reasoning_route_gate_discloses_or_forwards() -> None:
         ),
         request,
     )
+    # The exposing lead forwards it; only a failover to the fallback drops it.
+    assert public.ignored_parameters == (
+        "messages.reasoning_content->dropped(unsupported_by_fallback_provider)",
+    )
+    public, _provider = route_generation_parameter_requests(
+        (
+            _exposed_profile(exposed=False, url="https://openrouter.test/v1"),
+            _exposed_profile(exposed=True),
+        ),
+        request,
+    )
     assert (
         "messages.reasoning_content->dropped(unsupported_by_provider)" in public.ignored_parameters
     )
@@ -5558,11 +5570,10 @@ def test_deepseek_rung_carries_plaintext_reasoning_without_disclosure_or_stamp()
     payload = dialect_stream_payload(_deepseek_profile(), provider)
     payload_messages = cast("list[JsonObject]", payload["messages"])
     assert payload_messages[1]["reasoning_content"] == "The user wants a directory listing."
-    # On a mixed waterfall the DeepSeek rung is exact and a stripping rung is a fallback.
-    assert compatible_generation_parameter_profile_indexes(
-        (_exposed_profile(exposed=False, url="https://openrouter.test/v1"), _deepseek_profile()),
-        request,
-    ) == (1,)
+    # On a mixed waterfall the DeepSeek rung leads and a stripping rung is a fallback.
+    mixed = (_exposed_profile(exposed=False, url="https://openrouter.test/v1"), _deepseek_profile())
+    assert compatible_generation_parameter_profile_indexes(mixed, request) == (0, 1)
+    assert plaintext_reasoning_lead_order(mixed, request, (0, 0)) == (1, 0)
 
 
 def test_deepseek_rung_backfills_tool_call_history_through_dialect_dispatch() -> None:
@@ -5606,16 +5617,47 @@ def test_deepseek_rung_backfills_tool_call_history_through_dialect_dispatch() ->
 
 
 def test_plaintext_reasoning_prefers_the_exposing_rung_on_a_mixed_waterfall() -> None:
-    """A rung that carries the reasoning is exact; a rung that would drop it is a fallback."""
+    """A rung that carries the reasoning leads; a rung that would drop it stays a fallback.
+
+    Narrowing to the carrier alone left a one-rung route: when that rung
+    timed out there was nothing to fail over to (glm-5.3-flash, 2026-10-20,
+    a Novita header timeout on every coding-agent turn replaying reasoning
+    while the Fireworks rung of the same chain was healthy).
+    """
     request = _exposed_reasoning_request()
     profiles = (
         _exposed_profile(exposed=False, url="https://openrouter.test/v1"),
         _exposed_profile(exposed=True),
     )
-    assert compatible_generation_parameter_profile_indexes(profiles, request) == (1,)
+    assert compatible_generation_parameter_profile_indexes(profiles, request) == (0, 1)
+    assert plaintext_reasoning_lead_order(profiles, request, (0, 0)) == (1, 0)
+    assert plaintext_reasoning_lead_order(tuple(reversed(profiles)), request, (0, 0)) == (0, 1)
     # Without plaintext history both rungs are exact and the order is preserved.
     plain = request.model_copy(update={"messages": (GatewayMessage(role="user", content="hi"),)})
     assert compatible_generation_parameter_profile_indexes(profiles, plain) == (0, 1)
+    assert plaintext_reasoning_lead_order(profiles, plain, (0, 0)) == (0, 1)
+
+
+def test_plaintext_reasoning_lead_order_never_crosses_a_model_stage() -> None:
+    """Carriers lead within their own stage; a chained model's rungs stay behind the root's."""
+    request = _exposed_reasoning_request()
+    plain = _exposed_profile(exposed=False, url="https://openrouter.test/v1")
+    carrier = _exposed_profile(exposed=True)
+    profiles = (plain, carrier, plain, carrier)
+    assert plaintext_reasoning_lead_order(profiles, request, (0, 0, 1, 1)) == (1, 0, 3, 2)
+    assert plaintext_reasoning_lead_order((plain, plain), request, (0, 0)) == (0, 1)
+
+
+def test_plaintext_reasoning_keeps_the_sampling_rule_hard() -> None:
+    """Only the reasoning preference relaxed: a rung dropping caller sampling stays out."""
+    request = _exposed_reasoning_request().model_copy(update={"temperature": 0.3})
+    carrier = _exposed_profile(exposed=True)
+    sampling_less = replace(
+        _exposed_profile(exposed=False, url="https://openrouter.test/v1"),
+        supports_temperature=False,
+    )
+    profiles = (carrier, sampling_less)
+    assert compatible_generation_parameter_profile_indexes(profiles, request) == (0,)
 
 
 def test_hosted_tool_echoes_reemit_natively_and_drop_with_disclosure_on_a_foreign_route() -> None:

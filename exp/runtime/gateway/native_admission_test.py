@@ -59,6 +59,7 @@ from exp.runtime.gateway.prompt_caching import (
     PROMPT_CACHING_OFF_SUFFIX,
 )
 from exp.runtime.gateway.prompt_size import MAXIMUM_BYTES_PER_TOKEN, TEMPLATE_RESERVE_TOKENS
+from exp.runtime.gateway.reasoning_blocks import ExposedReasoningContentBlock
 from exp.runtime.gateway.recovery import SessionRecoveryRegistry
 from exp.runtime.gateway.routing import GatewayRoute
 from exp.runtime.gateway.sticky_affinity import StickySpillRegistry
@@ -2875,3 +2876,62 @@ class TestHouseOpenRouterNeverLeadsAnAffinityPool:
         )
         assert _order(ordered) == ("dep-openrouter",)
         assert len(ordered_wires) == 1
+
+
+def test_plaintext_reasoning_history_leads_on_its_carrier_and_keeps_every_fallback() -> None:
+    """A replayed-reasoning turn dispatches the carrying rung first, the others behind it.
+
+    Admission used to narrow such a turn to the carrying rung ALONE, so a
+    header timeout there had no successor: on 2026-10-20 coding-agent turns
+    replaying reasoning on glm-5.3-flash died on Novita timeouts while the
+    route's Fireworks rung served every turn without that history.
+    """
+    route = _mixed_route(
+        "maximize_availability",
+        tuple(_deployment(name, gateway=_TOOL_CAPABLE) for name in ("plain", "carrier", "later")),
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+    )
+    client = cast(NativeWireClient, object())
+    plain = GatewayWireProfile(dialect="openai_compatible", url="https://plain.test")
+    carrier = GatewayWireProfile(
+        dialect="openai_compatible", url="https://carrier.test", reasoning_output_exposed=True
+    )
+    wires = ((plain, client), (carrier, client), (plain, client))
+    request = GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=(
+            GatewayMessage(role="user", content="run ls"),
+            GatewayMessage(
+                role="assistant",
+                content="done",
+                provider_reasoning=(ExposedReasoningContentBlock(content="list the files"),),
+            ),
+            GatewayMessage(role="user", content="again"),
+        ),
+        stream=True,
+    )
+    narrowed, wires_out, public, _provider, _placement = admitted_route_requests(
+        route,
+        wires,
+        request,
+        accounting=cast(NativeAttemptAccounting, _CoercionCounter()),
+        authorization=route.snapshot.authorization,
+    )
+    assert narrowed.snapshot.deployment_ids == ("carrier", "plain", "later")
+    assert wires_out == (wires[1], wires[0], wires[2])
+    assert (
+        "messages.reasoning_content->dropped(unsupported_by_fallback_provider)"
+        in public.ignored_parameters
+    )
+    # Without replayed reasoning the authored order stands.
+    plain_request = request.model_copy(
+        update={"messages": (GatewayMessage(role="user", content="hi"),)}
+    )
+    narrowed, _wires, _public, _provider, _placement = admitted_route_requests(
+        route,
+        wires,
+        plain_request,
+        accounting=cast(NativeAttemptAccounting, _CoercionCounter()),
+        authorization=route.snapshot.authorization,
+    )
+    assert narrowed.snapshot.deployment_ids == ("plain", "carrier", "later")

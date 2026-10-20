@@ -702,10 +702,13 @@ def route_generation_parameter_requests(
         # actionable for a framework-managed history, and a session that ever
         # touched an exposed model would otherwise die the moment it switches
         # models. Exposing rungs — when the route has any — still forward the
-        # plaintext verbatim; the others omit it at encoding.
+        # plaintext verbatim; the others omit it at encoding. A carrying lead
+        # drops it only if a failover reaches a fallback (the sources rule).
         ignore(
             "messages.reasoning_content",
-            "messages.reasoning_content->dropped(unsupported_by_provider)",
+            "messages.reasoning_content->dropped(unsupported_by_fallback_provider)"
+            if profiles[0].replays_plaintext_reasoning
+            else "messages.reasoning_content->dropped(unsupported_by_provider)",
         )
     history_thinking_present = any(
         block.kind in {"thinking", "redacted_thinking"}

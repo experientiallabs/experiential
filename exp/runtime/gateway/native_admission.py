@@ -77,6 +77,7 @@ from exp.runtime.models.providers.errors import (
 from exp.runtime.models.providers.generation_parameter_validation import bounded_output_request
 from exp.runtime.models.providers.generation_route_compat import (
     compatible_generation_parameter_profile_indexes,
+    plaintext_reasoning_lead_order,
 )
 from exp.runtime.models.providers.protocol import NativeWireClient
 from exp.runtime.models.providers.streaming_requests import route_generation_parameter_requests
@@ -350,6 +351,15 @@ def prepare_route_requests(
         coercion_disclosures = (*coercion_disclosures, *coercion.disclosures)
     route = select_route_deployments(route, compatible_indexes)
     resolved_wires = tuple(resolved_wires[index] for index in compatible_indexes)
+    if route.resolved_route_id is None and route.reasoning_pinned_deployment_id is None:
+        # Plaintext-reasoning carriers lead; the rungs that drop it stay as fallbacks.
+        order = plaintext_reasoning_lead_order(
+            tuple(profile for profile, _client in resolved_wires),
+            admitted_request,
+            [route.snapshot.stage_for_depth(i).stage_index for i in range(len(resolved_wires))],
+        )
+        route = reorder_route_deployments(route, order)
+        resolved_wires = tuple(resolved_wires[index] for index in order)
     # The headroom rule reads the rungs that SURVIVED narrowing: a rung with
     # no reasoning default (or no ``none`` tier) that narrowing has already
     # removed must not veto the coercion for the default-on rung that will
