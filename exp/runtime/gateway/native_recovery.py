@@ -53,6 +53,7 @@ def recovery_prefix_digest(request: GatewayRequest) -> str | None:
             "messages": request.messages[:count],
             "prompt_cache_key": None,
             "provider_prompt_cache_key": None,
+            "provider_session_id": None,
             "client_request_id": None,
             "idempotency_key": None,
             "previous_response_id": None,

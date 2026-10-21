@@ -37,9 +37,11 @@ from exp.runtime.gateway.model_plan import model_execution_snapshot, project_sta
 from exp.runtime.gateway.model_plan_test import catalog as staged_catalog
 from exp.runtime.gateway.native_execution import select_route_deployments
 from exp.runtime.gateway.native_rungs import (
+    NOVITA_SESSION_HEADER,
     ZDR_CONSTRAINT_CAPABILITY,
     RungDispatch,
     build_rung_dispatch,
+    with_session_affinity,
 )
 from exp.runtime.gateway.routing import GatewayRoute
 from exp.runtime.models.providers.base import GatewayWireProfile
@@ -925,3 +927,50 @@ def test_reasoning_off_on_an_openrouter_rung_ignores_upstreams_that_think_anyway
     on = payload_for("high")
     assert on["reasoning"] == {"effort": "high"}
     assert "provider" not in on
+
+
+_NOVITA_PROFILE = GatewayWireProfile(
+    dialect="openai_compatible",
+    url="https://api.novita.ai/v3/openai/chat/completions",
+    headers={"Authorization": "Bearer k"},
+    model_id="deepseek/deepseek-v4.1-flash",
+)
+
+
+def test_a_novita_rung_names_the_conversation_in_x_session_id() -> None:
+    """Novita pins by session: the derived id rides beside the static headers."""
+    request = _request().model_copy(update={"provider_session_id": "xpls-abc"})
+
+    assert with_session_affinity(_NOVITA_PROFILE, request, None) == {
+        "Authorization": "Bearer k",
+        NOVITA_SESSION_HEADER: "xpls-abc",
+    }
+    composed = {"Authorization": "Bearer k", "anthropic-beta": "x"}
+    assert with_session_affinity(_NOVITA_PROFILE, request, composed) == {
+        **composed,
+        NOVITA_SESSION_HEADER: "xpls-abc",
+    }
+
+
+def test_other_origins_and_sessionless_requests_keep_their_headers() -> None:
+    """Only Novita's host gets the header, and only when a session id was derived."""
+    request = _request().model_copy(update={"provider_session_id": "xpls-abc"})
+    assert with_session_affinity(_profile(), request, None) is None
+    assert with_session_affinity(_NOVITA_PROFILE, _request(), None) is None
+
+
+def test_the_session_header_reaches_the_frozen_wire_entry() -> None:
+    """build_rung_dispatch carries the header into what the data plane sends."""
+    rung = _deployment("novita-rung", "novita")
+    route = _route((rung,))
+    request = _request().model_copy(update={"provider_session_id": "xpls-abc"})
+    entry = build_rung_dispatch(
+        route,
+        rung,
+        _NOVITA_PROFILE,
+        _NoSigningClient(),
+        provider_request=request,
+        public_request=request,
+        authorization=route.snapshot.authorization,
+    ).wire_entry
+    assert entry["headers"] == {"Authorization": "Bearer k", NOVITA_SESSION_HEADER: "xpls-abc"}

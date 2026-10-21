@@ -641,6 +641,13 @@ class GatewayRequest(ContractModel):
     provider cache node that holds it while the caller's raw key never leaves
     the gateway. Excluded from serialization: it is routing state, never request identity.
     """
+    provider_session_id: str | None = Field(default=None, max_length=128, exclude=True)
+    """Tenant-namespaced per-conversation id for providers that pin by session.
+
+    Derived at admission (``prompt_cache_affinity.provider_session_id``) from
+    the caller's ``prompt_cache_key`` or the conversation's opening, and sent
+    only as Novita's ``x-session-id``. Routing state, never request identity.
+    """
     prompt_cache_ttl: Literal["12h"] | None = Field(default=None, exclude=True)
     """OpenAI's 12-hour minimum prompt-cache lifetime (Responses ``prompt_cache_options.ttl``).
 

@@ -28,7 +28,10 @@ from exp.common.core.artifacts import JsonObject
 from exp.common.models.content import MessageContentPart
 from exp.common.models.gateway_catalog import ExactModelDeployment
 from exp.runtime.gateway.contracts import AuthorizationSnapshot, GatewayMessage, GatewayRequest
-from exp.runtime.gateway.prompt_cache_affinity import provider_prompt_cache_key
+from exp.runtime.gateway.prompt_cache_affinity import (
+    provider_prompt_cache_key,
+    provider_session_id,
+)
 from exp.runtime.models.providers.base import GatewayWireProfile
 
 PROMPT_CACHING_OFF_SUFFIX = "->not_forwarded(organization_prompt_caching_off)"
@@ -43,14 +46,14 @@ _MARKER = "cache_control"
 def with_cache_affinity(
     provider_request: GatewayRequest, authorization: AuthorizationSnapshot
 ) -> GatewayRequest:
-    """Attach the tenant's cache-affinity key to the final dispatch request.
+    """Attach the tenant's cache-affinity key and session id to the final dispatch request.
 
     Cache affinity is per tenant and per session, so it is derived once, from
     the request admission settled on and the frozen authority, and read by
     every rung's payload builder that forwards it. It is applied last so no
     admission-time rebuild (route narrowing, capability or schema coercion)
     can drop it; the public request keeps the caller's own ``prompt_cache_key``
-    untouched. An organization with prompt caching off gets no key at all.
+    untouched. An organization with prompt caching off gets neither.
 
     Args:
         provider_request: The request admission settled on.
@@ -61,12 +64,15 @@ def with_cache_affinity(
     """
     if authorization.prompt_caching_disabled:
         return provider_request
+    organization_id = str(authorization.organization_id)
+    identity_id = str(authorization.identity_id)
     return provider_request.model_copy(
         update={
             "provider_prompt_cache_key": provider_prompt_cache_key(
-                provider_request,
-                organization_id=str(authorization.organization_id),
-                identity_id=str(authorization.identity_id),
+                provider_request, organization_id=organization_id, identity_id=identity_id
+            ),
+            "provider_session_id": provider_session_id(
+                provider_request, organization_id=organization_id, identity_id=identity_id
             ),
         }
     )

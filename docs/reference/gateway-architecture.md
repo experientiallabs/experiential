@@ -623,7 +623,15 @@ leading system/developer messages, which every turn of a session and every reque
 system prompt repeat verbatim; the first user turn when there is no system prompt) stands in, so
 a Terminus-style loop is pinned to the node holding its cached stem for its whole session with
 no client change (measured through the gateway on a hot stem: 9/10 hits keyed vs 4/10 unkeyed). The derived key is dispatch state on the provider request only;
-the public request, its digests, and replay identity never carry it. A host that sets `AuthorizationSnapshot.prompt_caching_disabled` (an organization that turned prompt caching off) gets none of this: admission (`exp/runtime/gateway/prompt_caching.py`) derives no key, skips rendezvous and sticky placement so every pool keeps its certified order, binds no Google cache resource, removes every caller `cache_control` marker before payloads are built (each path disclosed with `->not_forwarded(organization_prompt_caching_off)`, the caller's `prompt_cache_key` included), classes the request as a fresh session for lane spill, and discloses `prompt_caching->best_effort(provider_caches_implicitly)` unless every admitted rung is Anthropic's API or Claude on Vertex AI, which cache only at markers. LiteLLM message dumps
+the public request, its digests, and replay identity never carry it. Novita pins a session to the
+server holding its prefix cache by an `x-session-id` header instead (enabled on the house account
+2026-10-21; before it, a long DeepSeek conversation crossing Novita's context-length pools or a
+failover reprocessed up to 520,000 prompt tokens cold), so rungs on `api.novita.ai` also carry a
+`provider_session_id` there (`exp/runtime/gateway/native_rungs.py::with_session_affinity`). Its
+material separates conversations, unlike the stem key, which every session of one agent shares
+and which would pin them all to one server: the caller's `prompt_cache_key` when present,
+otherwise the conversation's opening (every message through the first user turn), namespaced
+the same way. A host that sets `AuthorizationSnapshot.prompt_caching_disabled` (an organization that turned prompt caching off) gets none of this: admission (`exp/runtime/gateway/prompt_caching.py`) derives no key or session id, skips rendezvous and sticky placement so every pool keeps its certified order, binds no Google cache resource, removes every caller `cache_control` marker before payloads are built (each path disclosed with `->not_forwarded(organization_prompt_caching_off)`, the caller's `prompt_cache_key` included), classes the request as a fresh session for lane spill, and discloses `prompt_caching->best_effort(provider_caches_implicitly)` unless every admitted rung is Anthropic's API or Claude on Vertex AI, which cache only at markers. LiteLLM message dumps
 (`provider_specific_fields`, null `thinking_blocks` / `reasoning_items` / `images`) decode when
 echoed back verbatim: the object is dropped with a `messages.provider_specific_fields`
 disclosure and the empty forms are accepted like the SDK's own empty keys, while populated

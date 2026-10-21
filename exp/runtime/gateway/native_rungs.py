@@ -19,6 +19,7 @@ vLLM lane) carries the caller's admission level as vLLM's ``priority`` field.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from urllib.parse import urlsplit
 
 from exp.common.core.artifacts import JsonObject, sha256_bytes
 from exp.common.models.gateway_catalog import ExactModelDeployment
@@ -62,6 +63,12 @@ from exp.runtime.models.providers.protocol import (
     developer_role_rewrite_disclosure,
 )
 from exp.runtime.models.providers.wire_messages import anthropic_request_headers
+
+NOVITA_HOST = "api.novita.ai"
+"""Novita's origin host: its rungs pin a conversation by ``x-session-id``."""
+
+NOVITA_SESSION_HEADER = "x-session-id"
+"""The header Novita routes cache affinity by (configured on the house account)."""
 
 ZDR_CONSTRAINT_CAPABILITY = "zero_data_retention_constraint"
 """The capability a flagged rung's wire must express, named on the refusal."""
@@ -201,6 +208,7 @@ def build_rung_dispatch(
         upstream_payload, request_headers = zdr_constrained_dispatch(
             deployment, profile, upstream_payload
         )
+    request_headers = with_session_affinity(profile, rung_request, request_headers)
     upstream_body, signer = frozen_dispatch(profile, client, upstream_payload)
     wire_entry = deployment_wire_entry(
         route,
@@ -278,3 +286,33 @@ def zdr_constrained_dispatch(
         constrain_openrouter_zero_data_retention(upstream_payload),
         openrouter_metadata_headers(dict(profile.headers)),
     )
+
+
+def with_session_affinity(
+    profile: GatewayWireProfile,
+    rung_request: GatewayRequest,
+    request_headers: dict[str, str] | None,
+) -> dict[str, str] | None:
+    """Name the conversation in ``x-session-id`` on a rung served from Novita's origin.
+
+    Novita pins a session to the server holding its prefix cache when the
+    request carries this header; its value is the tenant-namespaced
+    ``provider_session_id`` admission derived, never the caller's raw key. A
+    request with no session id (prompt caching off, or no user turn) and every
+    other origin keep their headers unchanged.
+
+    Args:
+        profile: The rung's resolved wire profile.
+        rung_request: The request this rung dispatches.
+        request_headers: Per-request headers already composed, or ``None`` for
+            the profile's static headers.
+
+    Returns:
+        The headers to dispatch with, the profile's static ones merged in when
+        the session header is added.
+    """
+    session_id = rung_request.provider_session_id
+    if session_id is None or (urlsplit(profile.url).hostname or "").lower() != NOVITA_HOST:
+        return request_headers
+    base = dict(profile.headers) if request_headers is None else request_headers
+    return {**base, NOVITA_SESSION_HEADER: session_id}
