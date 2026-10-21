@@ -157,6 +157,12 @@ def evaluate(
         materialize: Frozen native artifact handoff, without provider calls.
         continuations: Explicit runtime study or saved-evidence training export specification.
         pipeline: Bounded multi-family development qualification and verified package delivery.
+
+    Returns:
+        None. The selected mode prints its own result.
+
+    Raises:
+        typer.BadParameter: PROJECT is missing or options conflict with the selected mode.
     """
     rollout = (models, repeats, concurrency, maximum_steps, maximum_output_tokens)
     audit_flags = (verbose, retry_incomplete, include_inspected)
