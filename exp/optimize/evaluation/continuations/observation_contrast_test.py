@@ -14,7 +14,7 @@ from exp.optimize.evaluation.continuations.intervention import (
     capture_action_intervention,
 )
 from exp.optimize.evaluation.continuations.job import ContinuationJob
-from exp.optimize.evaluation.continuations.job_test import job_fixture
+from exp.optimize.evaluation.continuations.job_test import OutageTransport, job_fixture
 from exp.optimize.evaluation.continuations.observation_contrast import (
     ObservationContrastSpec,
     preflight_observation_contrast,
@@ -22,7 +22,7 @@ from exp.optimize.evaluation.continuations.observation_contrast import (
 )
 from exp.optimize.evaluation.continuations.study import ContinuationStudy
 from exp.runtime.environments.tests.world_conformance_test import workbook_case
-from exp.runtime.models.providers.transport import JsonHttpResponse, ScriptedJsonTransport
+from exp.runtime.models.providers.transport import JsonHttpResponse
 from exp.simulation.continuations import load_continuation_checkpoint
 
 
@@ -31,7 +31,7 @@ def observation_fixture(
     monkeypatch: pytest.MonkeyPatch,
     *,
     forbidden: bool = False,
-) -> tuple[ProjectStore, ObservationContrastSpec, ScriptedJsonTransport]:
+) -> tuple[ProjectStore, ObservationContrastSpec, OutageTransport]:
     """Execute a real workbook edit once and compare its acknowledgement with an authored error."""
     project, job, _ = job_fixture(tmp_path, monkeypatch)
     if forbidden:
@@ -40,7 +40,7 @@ def observation_fixture(
     spec = ActionInterventionSpec(base=job, action=workbook_case().first, rationale="Native edit.")
     capture_action_intervention(project, spec, code_revision="test")
     effect = artifact_input(project.artifacts.read(spec.identity("test") + "-result").manifest)
-    transport = ScriptedJsonTransport(
+    transport = OutageTransport(
         tuple(
             JsonHttpResponse(
                 status_code=200,

@@ -585,11 +585,15 @@ def _run_branch(
             checkpoints=tuple(points),
             actor_calls=saved_actor_call_evidence(store, branch_id),
         )
-    except Exception as error:  # noqa: BLE001 - retain every planned branch without private errors.
+    except (ValueError, OSError, RuntimeError) as error:
+        # Runtime, environment and provider failures become retained branch outcomes. Any other
+        # exception is a programming error: it propagates, and the saved intent keeps the branch
+        # outcome-unknown on the next run instead of hiding the defect as a measurement.
         outcome["stop_reason"] = "failure"
         if isinstance(error, InvisibleToolCallError):
             steps = outcome.get("steps")
-            assert isinstance(steps, list)
+            if not isinstance(steps, list):
+                raise TypeError("continuation outcome lost its step inventory") from error
             steps.append(
                 {
                     "action": error.action.model_dump(mode="json"),

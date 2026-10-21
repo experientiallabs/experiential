@@ -240,7 +240,8 @@ def _assess(
     project: ProjectStore, effect: ActionIntervention, cell: ObservationCell
 ) -> VerifierGrade:
     """Recompute the complete grade from original effects and saved suffix observations."""
-    assert cell.result is not None
+    if cell.result is None:
+        raise ValueError("observation cell has no saved continuation to assess")
     study = load_study(project.artifacts, cell.result)
     if study.spec != cell.job.study or len(study.branches) != 1:
         raise ValueError("observation comparison changed its continuation population")
@@ -417,5 +418,6 @@ def run_observation_contrast(
             files={"report.json": report},
         )
         verified = saved_observation_contrast(project, spec, code_revision=code_revision)
-        assert verified is not None
+        if verified is None:
+            raise RuntimeError("observation contrast report was not saved")
         return verified

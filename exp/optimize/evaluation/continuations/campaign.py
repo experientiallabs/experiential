@@ -296,7 +296,8 @@ def _metrics(
         ):
             raise ValueError("campaign selector differs from its frozen draw")
         proposals = propose_checkpoints(project, selector_spec, code_revision=revision)
-        assert proposals is not None
+        if proposals is None:
+            raise RuntimeError("checkpoint proposals returned no report outside a dry run")
         if cell.experiment is None:
             if cell.failure is None:
                 raise ValueError("campaign cell lost its unfinished or abstained experiment")
@@ -470,7 +471,10 @@ def run_continuation_campaign(
                         proposals = propose_checkpoints(
                             project, selector_spec, code_revision=code_revision
                         )
-                        assert proposals is not None
+                        if proposals is None:
+                            raise RuntimeError(
+                                "checkpoint proposals returned no report outside a dry run"
+                            )
                         proposals_ref = artifact_input(
                             store.read(selector_spec.identity(code_revision)).manifest
                         )

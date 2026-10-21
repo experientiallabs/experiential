@@ -21,8 +21,27 @@ from exp.optimize.evaluation.continuations.job import (
 )
 from exp.optimize.evaluation.continuations.records import load_study
 from exp.runtime.environments.tests.world_conformance_test import workbook_case
-from exp.runtime.models.providers.transport import JsonHttpResponse, ScriptedJsonTransport
+from exp.runtime.models.providers.transport import (
+    JsonHttpResponse,
+    ProviderTransportError,
+    ScriptedJsonTransport,
+)
 from exp.runtime.models.registry import RuntimeModelCatalog
+
+
+class OutageTransport(ScriptedJsonTransport):
+    """Scripted provider that is unreachable once its replies run out.
+
+    Continuation runners retain provider failures as outcome-unknown measurements, while a
+    programming error (such as the base double's unexpected-request assertion) propagates. Fixtures
+    that model an unavailable provider therefore end in a transport failure, not an assertion.
+    """
+
+    def _answer(self) -> JsonHttpResponse:
+        """Serve the next scripted reply, or fail like an unreachable provider."""
+        if not self._responses:
+            raise ProviderTransportError("scripted provider has no further replies")
+        return super()._answer()
 
 
 def job_fixture(
@@ -80,7 +99,7 @@ def continuation_runtime(project, configuration):
         {"role": "assistant", "content": "done"},
         {"role": "assistant", "content": "unsupported completion"},
     ]
-    transport = ScriptedJsonTransport(
+    transport = OutageTransport(
         tuple(
             JsonHttpResponse(
                 status_code=200,
