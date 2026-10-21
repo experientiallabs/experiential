@@ -31,7 +31,7 @@ from pydantic import Field, field_validator, model_validator
 
 from exp.common.auth import StoredOAuthTokens
 from exp.common.core.artifacts import ContractModel, JsonObject
-from exp.common.models import ModelSnapshot
+from exp.common.models import ModelSnapshot, ReasoningEffort
 from exp.runtime.models.providers.anthropic import ANTHROPIC_BASE_URL, AnthropicClient
 from exp.runtime.models.providers.async_transport import AsyncJsonHttpTransport
 from exp.runtime.models.providers.base import DEFAULT_TIMEOUT_SECONDS, GatewayWireProfile
@@ -338,7 +338,7 @@ class AnthropicSubscriptionClient(AnthropicClient):
         supports_top_p: bool = True,
         supports_top_k: bool = False,
         supports_reasoning: bool = False,
-        reasoning_effort: str | None = None,
+        reasoning_effort: ReasoningEffort | None = None,
     ) -> None:
         """Create a client whose credential is minted per request from the token source.
 

@@ -22,6 +22,7 @@ from exp.common.models import (
     ModelRequest,
     ModelResponse,
     ModelSnapshot,
+    ReasoningEffort,
     ToolCall,
     Usage,
 )
@@ -256,7 +257,7 @@ class OpenAIClient(OpenAIEmbeddingMixin):
         supports_frequency_penalty: bool = False,
         supports_presence_penalty: bool = False,
         supports_reasoning: bool = False,
-        reasoning_effort: str | None = None,
+        reasoning_effort: ReasoningEffort | None = None,
         sampling_requires_reasoning_none: bool = False,
     ) -> None:
         """Create a direct OpenAI client with one explicitly resolved credential.
@@ -282,6 +283,7 @@ class OpenAIClient(OpenAIEmbeddingMixin):
             transport=transport,
             retry_policy=retry_policy,
             timeout_seconds=timeout_seconds,
+            reasoning_effort=reasoning_effort,
         )
         self._supports_temperature = supports_temperature
         self._supports_top_p = supports_temperature if supports_top_p is None else supports_top_p
@@ -290,7 +292,6 @@ class OpenAIClient(OpenAIEmbeddingMixin):
         self._supports_frequency_penalty = supports_frequency_penalty
         self._supports_presence_penalty = supports_presence_penalty
         self._supports_reasoning = supports_reasoning
-        self._reasoning_effort = reasoning_effort
         self._sampling_requires_reasoning_none = sampling_requires_reasoning_none
 
     def gateway_wire_profile(self) -> GatewayWireProfile:
