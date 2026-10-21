@@ -515,6 +515,48 @@ def test_an_unauthorized_effect_can_be_added_to_an_existing_object() -> None:
         )
 
 
+@pytest.mark.parametrize(
+    ("pointer", "operation", "accepted"),
+    [
+        ("/actions/1/value", "replace", True),
+        ("/actions/01/value", "replace", False),
+        ("/actions/+1/value", "replace", False),
+        ("/observed/a~1b", "add", True),
+        ("/observed/a~2b", "add", False),
+    ],
+)
+def test_perturbation_pointers_follow_the_shared_json_pointer_owner(
+    pointer: str, operation: Literal["replace", "add"], accepted: bool
+) -> None:
+    """Noncanonical indexes and invalid escapes cannot name a saved value."""
+    base = study()
+    edit = Perturbation(
+        perturbation_id="case-a-pointer",
+        base_case_id="case-a",
+        factor="unauthorized_write" if operation == "add" else "wrong_cell",
+        edits=(OutputEdit(pointer=pointer, value=41, operation=operation),),
+        description="One exact edit.",
+    )
+
+    def registered() -> JudgeChallengeStudy:
+        """Register the base study with the one extra perturbation."""
+        return JudgeChallengeStudy.model_validate(
+            {**base.model_dump(), "perturbations": (*base.perturbations, edit)}
+        )
+
+    if not accepted:
+        with pytest.raises(ValueError, match="pointer"):
+            study_items(registered())
+        return
+    item = next(row for row in study_items(registered()) if row.item_id == "case-a-pointer")
+    assert isinstance(item.outcome, dict)
+    if operation == "add":
+        assert item.outcome["observed"] == {"value": 42, "a/b": 41}
+    else:
+        actions = item.outcome["actions"]
+        assert isinstance(actions, list) and actions[1] == {"cell": "B2", "value": 41}
+
+
 def test_agreeing_judged_repeats_with_an_unavailable_one_leave_consistency_unknown() -> None:
     """Two agreeing judgments of three planned repeats do not establish consistency."""
     registered = study(repeats=3)

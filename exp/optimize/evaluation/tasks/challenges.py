@@ -42,11 +42,12 @@ from exp.simulation.evaluation.calibration import (
     task_decision,
 )
 from exp.simulation.evaluation.tasks import Verdict, grade
+from exp.simulation.reconstruction.models import path_parts, resolve
 
 # Identity of the code that decides this artifact's behavior, in place of its source text.
 # Bump it when behavior changes. exp/tests/code_protocols_test.py fails when the covered
 # source changes until it is bumped or, for a pure refactor, its digest is updated.
-CHALLENGE_PROTOCOL = "judge-challenge-v5"
+CHALLENGE_PROTOCOL = "judge-challenge-v6"
 
 IrrelevantFactor = Literal[
     "actor_identity", "candidate_order", "explanation_length", "action_order"
@@ -837,26 +838,16 @@ def _json_type(value: JsonValue) -> str:
     return "array" if isinstance(value, list) else "object"
 
 
-def _tokens(pointer: str) -> list[str]:
-    """Unescaped RFC 6901 reference tokens of a nonroot pointer."""
-    return [token.replace("~1", "/").replace("~0", "~") for token in pointer.split("/")[1:]]
-
-
-def _resolve(document: JsonValue, pointer: str) -> JsonValue:
-    """Return the value at an existing pointer.
+def _saved(document: JsonValue, pointer: str) -> JsonValue:
+    """Return the value at an existing pointer through the shared JSON pointer owner.
 
     Raises:
         ValueError: The pointer does not name an existing value.
     """
-    current = document
-    for token in _tokens(pointer):
-        if isinstance(current, dict) and token in current:
-            current = current[token]
-        elif isinstance(current, list) and token.isdigit() and int(token) < len(current):
-            current = current[int(token)]
-        else:
-            raise ValueError(f"perturbation pointer {pointer} does not name a saved value")
-    return current
+    try:
+        return resolve(document, pointer)
+    except ValueError as error:
+        raise ValueError(f"perturbation pointer {pointer} does not name a saved value") from error
 
 
 def _before(document: JsonValue, edit: OutputEdit) -> JsonValue:
@@ -866,26 +857,17 @@ def _before(document: JsonValue, edit: OutputEdit) -> JsonValue:
         ValueError: The pointer names no saved value, or an added member already exists.
     """
     if edit.operation != "add":
-        return _resolve(document, edit.pointer)
-    tokens = _tokens(edit.pointer)
-    parent = (
-        _resolve(document, "".join("/" + _escape(token) for token in tokens[:-1]))
-        if (len(tokens) > 1)
-        else document
-    )
-    if not isinstance(parent, dict) or tokens[-1] in parent:
+        return _saved(document, edit.pointer)
+    # Escaped tokens contain no "/", so the parent pointer is everything before the last one.
+    parent = _saved(document, edit.pointer.rpartition("/")[0])
+    if not isinstance(parent, dict) or path_parts(edit.pointer)[-1] in parent:
         raise ValueError(f"add target {edit.pointer} must be a new member of an existing object")
     return None
 
 
-def _escape(token: str) -> str:
-    """RFC 6901 escaping of one reference token."""
-    return token.replace("~", "~0").replace("/", "~1")
-
-
 def _apply(document: JsonValue, edit: OutputEdit) -> JsonValue:
     """Return a copy of ``document`` with one edit applied."""
-    tokens = _tokens(edit.pointer)
+    tokens = path_parts(edit.pointer)
 
     def rebuild(node: JsonValue, depth: int) -> JsonValue:
         """Copy the path to the edited value."""

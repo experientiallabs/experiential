@@ -408,6 +408,19 @@ def test_changed_actor_policy_refuses_before_calls(
     assert not actors.requests and not reviews.requests
 
 
+@pytest.mark.parametrize("path", ["rows", "/rows~2", "/rows/~"])
+def test_state_paths_use_the_shared_pointer_rules(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, path: str
+) -> None:
+    """Relative pointers and invalid escapes refuse before any execution is registered."""
+    _, spec, actors, _ = equivalence_fixture(tmp_path, monkeypatch)
+    with pytest.raises(ValueError, match="pointer"):
+        EquivalenceCase.model_validate(
+            {**spec.cases[0].model_dump(mode="json"), "final_state_paths": [path]}
+        )
+    assert not actors.requests
+
+
 def test_failed_candidate_stays_in_denominator_and_is_not_judged(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
