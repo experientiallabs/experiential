@@ -3,12 +3,17 @@
 This factory supplies simulated state only. Native implementations can compose its world with
 MixedRealityEnvironmentRuntime; domain ownership forbids pretending simulated effects changed
 native files. Private probes here describe simulated state, never native truth.
+
+Instance facts are declared explicitly in the definition, with the fidelity-owned
+``ReplayFacts`` model and its validation and reservation rules. They condition every
+prediction exactly as in fidelity replay and are never derived from native state.
 """
 
 import json
 from datetime import UTC, datetime
+from typing import Self
 
-from pydantic import AwareDatetime, Field
+from pydantic import AwareDatetime, Field, model_validator
 
 from exp.common.core.artifacts import (
     ArtifactEnvelope,
@@ -25,6 +30,7 @@ from exp.common.tasks import TaskCase
 from exp.optimize.evaluation.executable.loader import ContinuationRuntime
 from exp.optimize.evaluation.executable.provider_grant import ProviderGrant
 from exp.optimize.evaluation.fidelity.decision_access import decision_caller, receipt_recorder
+from exp.optimize.evaluation.fidelity.instance_facts import ReplayFacts, require_fact_scope
 from exp.optimize.evaluation.fidelity.retrieval_binding import index_embedder_alias
 from exp.optimize.evaluation.learning.profile import EvaluationMemory, bind_evaluation_memory
 from exp.runtime.environments.world_contracts import ExecutableCheckpoint, WorldManifest
@@ -62,6 +68,10 @@ class GroundedRuntimeDefinition(ContractModel):
         catalog_sha256: Frozen connection/model definitions, excluding credential values.
         manifest: Domain ownership and per-tool effects; this factory owns simulated domains.
         initial_state: Exact initial JSON value of each simulated domain.
+        facts: Optional validated instance facts describing the episode's starting world, with
+            ``first_version`` the state version of that start. Every prediction receives the
+            conditioning facts in their own channel; they are not state and cannot be edited.
+            Absent facts leave the definition, and so every derived identity, unchanged.
         research_history: False ablates current research delivery without mutating the bank.
         prediction_reading: Optional bounded reading of eligible originals before prediction.
         memory: Explicit version pinned before capture; None means no learned memory is used.
@@ -79,6 +89,7 @@ class GroundedRuntimeDefinition(ContractModel):
     catalog_sha256: Sha256
     manifest: WorldManifest
     initial_state: JsonObject
+    facts: ReplayFacts | None = Field(default=None, exclude_if=lambda value: value is None)
     memory: EvaluationMemory | None = None
     research_history: bool = Field(default=True, strict=True, exclude_if=lambda value: value)
     prediction_reading: PredictionReading | None = Field(
@@ -90,6 +101,26 @@ class GroundedRuntimeDefinition(ContractModel):
     maximum_reasks: int = Field(default=0, ge=0, le=3, strict=True)
     maximum_physical_attempts: int = Field(ge=1, le=100_000)
     deadline: AwareDatetime
+
+    @model_validator(mode="after")
+    def _starting_facts_only(self) -> Self:
+        """Refuse facts an executable episode cannot honor or that shadow native receipts."""
+        if self.facts is None:
+            return self
+        for fact in self.facts.facts.facts:
+            if fact.provenance.state_version > self.facts.first_version:
+                raise ValueError(
+                    f"instance fact {fact.key!r} describes state version "
+                    f"{fact.provenance.state_version}, after the episode's starting version "
+                    f"{self.facts.first_version}; an executable actor chooses its own actions, "
+                    "so declare only facts about the starting world"
+                )
+            if fact.key.startswith("native-read/"):
+                raise ValueError(
+                    f"instance fact {fact.key!r} uses the reserved native-read/ namespace of "
+                    "native read receipts; rename the fact key"
+                )
+        return self
 
     @property
     def probe_sha256(self) -> Sha256:
@@ -131,6 +162,9 @@ def _runtime(
         raise ValueError("initial state must name exactly the simulated domains")
     for pointer in spec.probe_paths.values():
         resolve(spec.initial_state, pointer)
+    require_fact_scope(
+        project, spec.task, spec.facts, None if spec.memory is None else spec.memory.lineage
+    )
     catalog = load_model_catalog(project.model_catalog_path)
     if sha256_json(catalog.model_dump(mode="json")) != spec.catalog_sha256:
         raise ValueError("executable simulator catalog differs from its frozen definition")
@@ -291,6 +325,8 @@ def _runtime(
             spec.task,
             maximum_output_tokens=spec.maximum_output_tokens,
             output_protocol="json-tool",
+            facts=None if spec.facts is None else spec.facts.facts,
+            facts_version=0 if spec.facts is None else spec.facts.first_version,
             research_history=spec.research_history,
             prediction_reader=reader,
         ),
