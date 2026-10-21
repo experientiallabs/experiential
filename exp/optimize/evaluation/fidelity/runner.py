@@ -38,7 +38,11 @@ from exp.optimize.evaluation.fidelity.memory import (
     trajectory_record,
 )
 from exp.optimize.evaluation.fidelity.memory_outcomes import record_memory_outcomes
-from exp.optimize.evaluation.fidelity.memory_policy import FidelityMemory
+from exp.optimize.evaluation.fidelity.memory_policy import (
+    FidelityMemory,
+    lesson_view,
+    screened_lessons,
+)
 from exp.optimize.evaluation.fidelity.recovery import (
     JUDGE_OPERATION,
     RecoveryLog,
@@ -625,6 +629,8 @@ def execute_fidelity_evaluation(
                 strict=spec.memory.reserved,
             )
             view = memory_view(project.artifacts, prior, rule)
+            lessons = screened_lessons(project.artifacts, spec.memory, prior)
+            view = view if lessons is None else lesson_view(view, lessons)
             prior_records, withheld = view.records, view.withheld
             total = 0 if prior is None else prior.log_length or 0
             sources: dict[ArtifactInput, bool] = {}
@@ -653,7 +659,9 @@ def execute_fidelity_evaluation(
                     total,
                     rows,
                     admits=admits,
-                    admits_line=lambda line: line.origin not in retired,
+                    admits_line=lambda line: (
+                        line.origin not in retired and (lessons is None or line.origin in lessons)
+                    ),
                     generations=generations,
                     pinned=pinned,
                 )
@@ -680,6 +688,11 @@ def execute_fidelity_evaluation(
                     else {}
                 ),
                 **({} if spec.memory.withhold_own else {"withhold_own": False}),
+                **(
+                    {}
+                    if spec.memory.lessons is None
+                    else {"lessons": spec.memory.lessons.model_dump(mode="json")}
+                ),
                 "version": 0 if prior is None else prior.version,
                 "consumed_trajectories": 0 if prior is None else len(prior.consumed),
                 "library": None if prior is None else prior.library.model_dump(mode="json"),
