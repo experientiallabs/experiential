@@ -33,6 +33,7 @@ from exp.common.models import (
 from exp.common.models.catalog_roles import ModelRoles
 from exp.common.project import ProjectStore
 from exp.common.tasks.store import load_task_set
+from exp.optimize.evaluation.audit import panel as held_out_panel
 from exp.optimize.evaluation.audit.panel import (
     held_out_council_inputs,
     register_held_out_fidelity,
@@ -787,6 +788,24 @@ def test_run_ids_follow_content_and_retire_attempts_that_cannot_finish(
     changed = register(later)
     assert not changed.retired
     assert changed.prepared[0].spec.run_id.split("-")[-1] != run_id.split("-")[-1]
+
+
+def test_tasks_sharing_a_lineage_are_one_panel_unit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Selection takes one case per task lineage, so related tasks never count twice."""
+    provider = SimulatedProvider([episode(i) for i in range(USERS)])
+    _, store, _ = build_project(tmp_path, monkeypatch, provider)
+    tasks = held_out_panel._held_out_tasks(store)
+    assert len(tasks) >= 3
+    related = tasks[1].model_copy(update={"lineage_group_id": tasks[0].lineage_group_id})
+    shared = (tasks[0], related, *tasks[2:])
+    monkeypatch.setattr(held_out_panel, "_held_out_tasks", lambda project: shared)
+    _, cases = source_rag_inputs(store, len(shared))
+    assert [case.task.task_id for case in cases] == [
+        task.task_id for task in shared if task is not related
+    ]
+    assert len({case.task.lineage_group_id for case in cases}) == len(cases)
 
 
 def test_a_saved_result_never_replays_under_other_code(

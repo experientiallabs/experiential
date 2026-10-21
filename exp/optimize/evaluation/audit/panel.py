@@ -23,9 +23,9 @@ status live in :mod:`exp.optimize.evaluation.audit.receipts`.
 
 from collections.abc import Callable, Collection, Sequence
 from datetime import datetime
-from typing import Literal
+from typing import Literal, Self
 
-from pydantic import Field, JsonValue
+from pydantic import Field, JsonValue, model_validator
 
 from exp.common.core.artifacts import ArtifactInput, ContractModel, stable_id
 from exp.common.project import ProjectBuildArtifacts, ProjectStore
@@ -121,8 +121,15 @@ class PlannedPanel(ContractModel):
 
     @property
     def lineages(self) -> tuple[str, ...]:
-        """Audited task lineages, in panel order."""
+        """Audited task lineages, in panel order; one case per lineage."""
         return tuple(case.task.lineage_group_id for case in self.cases)
+
+    @model_validator(mode="after")
+    def one_case_per_lineage(self) -> Self:
+        """Refuse two cases of one lineage: they would count as two independent units."""
+        if len(set(self.lineages)) != len(self.cases):
+            raise ValueError("a held-out panel measures one case per task lineage")
+        return self
 
 
 class Retirement(ContractModel):
@@ -166,10 +173,12 @@ def held_out_cases(
     *,
     excluded: Collection[str] = frozenset(),
 ) -> tuple[ReplayCase, ...]:
-    """Select held-out traces deterministically, skipping excluded lineages.
+    """Select held-out traces deterministically, one per lineage, skipping excluded lineages.
 
     Held-out tasks are taken in task-ID order; each replays its first source trace. Traces with
-    nothing to measure after their public prefix are skipped.
+    nothing to measure after their public prefix are skipped. A lineage is the independent unit,
+    so only its first measurable task is selected: tasks sharing a lineage are related variants,
+    not separate evidence, and the whole lineage is reserved with that one case.
 
     Args:
         project: Project with a completed build.
@@ -178,7 +187,7 @@ def held_out_cases(
         excluded: Lineages never selected (the exposed ones, by default).
 
     Returns:
-        Up to ``count`` cases.
+        Up to ``count`` cases, each from a distinct lineage.
 
     Raises:
         ValueError: No held-out trace has recorded tool calls to replay, or every one that
@@ -190,10 +199,13 @@ def held_out_cases(
         for trace in load_trace_dataset(project.artifacts, build.trace_dataset.artifact_id).traces
     }
     cases: list[ReplayCase] = []
+    selected: set[str] = set()
     exhausted = False
     for task in _held_out_tasks(project):
         if len(cases) == count:
             break
+        if task.lineage_group_id in selected:
+            continue
         case = replay_case(task, traces[min(task.source_trace_ids)], visible_calls)
         if case is None:
             continue
@@ -201,6 +213,7 @@ def held_out_cases(
             exhausted = True
         else:
             cases.append(case)
+            selected.add(task.lineage_group_id)
     if not cases and exhausted:
         raise ValueError(
             "every held-out lineage of this build is exposed or reserved in the exposure ledger "
