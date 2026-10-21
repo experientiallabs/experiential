@@ -1,180 +1,146 @@
-"""Bounded continuation execution and credential-free witnessed SFT export."""
+"""The ``exp eval --continuations`` contract, its action registry and dispatch.
 
-from datetime import UTC, datetime
+Each action is implemented by the handler module of the workflow that owns it. This module only
+validates the spec, resolves the shared invocation context once and dispatches to that handler.
+"""
+
+from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
-from pydantic import Field, model_validator
+from pydantic import model_validator
 from rich.console import Console
 
+from exp.cli.evaluation.analysis import (
+    handle_analyse_failures,
+    handle_analyse_memory,
+    handle_check_failure_research,
+    handle_inspect_memory,
+    handle_measure_decisions,
+    handle_probe_actor_decisions,
+)
 from exp.cli.evaluation.continuation_context import ContinuationContext
-from exp.cli.evaluation.equivalence import handle_compare_environments
-from exp.cli.evaluation.executable import ExecutableCommand, run_executable_command
+from exp.cli.evaluation.continuation_studies import (
+    ContinuationExport,
+    handle_capture,
+    handle_compare_actions,
+    handle_compare_actors,
+    handle_compare_framing,
+    handle_compare_observations,
+    handle_export,
+    handle_intervene,
+    handle_match_checkpoints,
+    handle_predict_success,
+    handle_propose_checkpoints,
+    handle_run,
+    handle_run_continuation_campaign,
+    handle_run_selection,
+)
+from exp.cli.evaluation.equivalence import handle_admit_actor_prefix, handle_compare_environments
+from exp.cli.evaluation.executable import (
+    ExecutableCommand,
+    handle_harbor,
+    handle_prepare_scenario,
+    handle_witness_record,
+)
+from exp.cli.evaluation.factory import (
+    handle_evaluate_candidates,
+    handle_make_variant,
+    handle_propose_tasks,
+    handle_register_brief,
+    handle_search_scenarios,
+)
+from exp.cli.evaluation.learning_repair import handle_repair_learning
 from exp.cli.shared.options import usage_error
 from exp.cli.shared.theme import EXP_THEME
 from exp.common.core.artifacts import ArtifactInput, ContractModel
-from exp.common.project import ArtifactStoreError, ProjectStore, artifact_input
+from exp.common.project import ArtifactStoreError, ProjectStore
 from exp.common.release_revision import installed_execution_revision
-from exp.optimize.evaluation.analysis.actor_decisions import (
-    ActorDecisionSpec,
-    actor_decision_interfaces,
-    actor_decisions_need_dispatch,
-    preflight_actor_decisions,
-    run_actor_decisions,
-    saved_actor_decisions,
-)
-from exp.optimize.evaluation.analysis.decision_calibration import (
-    DecisionCalibration,
-    calibrate_decisions,
-)
-from exp.optimize.evaluation.analysis.failures import analyse_failures, persist_failure_analysis
-from exp.optimize.evaluation.analysis.memory_analyst import (
-    MemoryAnalystSpec,
-    preflight_memory_analyst,
-    run_memory_analysis,
-    saved_memory_analysis,
-)
-from exp.optimize.evaluation.analysis.memory_evidence import MemoryInspection, inspect_memory
-from exp.optimize.evaluation.analysis.research import (
-    FailureResearchSpec,
-    check_failure_research,
-    persist_failure_research,
-)
-from exp.optimize.evaluation.continuations.action_contrast import (
-    ActionContrastSpec,
-    preflight_action_contrast,
-    run_action_contrast,
-    saved_action_contrast,
-)
-from exp.optimize.evaluation.continuations.actors import (
-    ActorPanelSpec,
-    preflight_actor_panel,
-    run_actor_panel,
-    saved_actor_panel,
-)
-from exp.optimize.evaluation.continuations.admission import (
-    ContinuationAdmission,
-    admit_continuations,
-)
-from exp.optimize.evaluation.continuations.campaign import (
-    ContinuationCampaignSpec,
-    campaign_requires_execution,
-    preflight_continuation_campaign,
-    run_continuation_campaign,
-    saved_continuation_campaign,
-)
-from exp.optimize.evaluation.continuations.capture import (
-    CaptureDefinition,
-    capture_initial_world,
-    preflight_capture,
-    saved_capture,
-)
-from exp.optimize.evaluation.continuations.critic import (
-    CriticSpec,
-    load_critic_prediction,
-    predict_success,
-    preflight_critic,
-)
-from exp.optimize.evaluation.continuations.experiment import (
-    CheckpointExperimentSpec,
-    preflight_checkpoint_experiment,
-    run_checkpoint_experiment,
-    saved_checkpoint_experiment,
-)
-from exp.optimize.evaluation.continuations.framing import (
-    FramingStudySpec,
-    run_framing_study,
-    saved_framing_study,
-)
-from exp.optimize.evaluation.continuations.inference import campaign_summary, experiment_summary
-from exp.optimize.evaluation.continuations.intervention import (
-    ActionInterventionSpec,
-    capture_action_intervention,
-    preflight_intervention,
-    saved_intervention,
-)
-from exp.optimize.evaluation.continuations.job import (
-    ContinuationJob,
-    continuation_result_reference,
-    execute_continuation_job,
-    preflight_continuation_job,
-    saved_continuation_job,
-)
-from exp.optimize.evaluation.continuations.observation_contrast import (
-    ObservationContrastSpec,
-    preflight_observation_contrast,
-    run_observation_contrast,
-    saved_observation_contrast,
-)
-from exp.optimize.evaluation.continuations.proposals import (
-    CheckpointProposalSpec,
-    propose_checkpoints,
-)
-from exp.optimize.evaluation.continuations.records import load_study
-from exp.optimize.evaluation.continuations.selection import (
-    CheckpointSelectionSpec,
-    load_selection_plan,
-    match_checkpoints,
-    persist_selection_plan,
-    selection_jobs,
-)
-from exp.optimize.evaluation.equivalence.prefixes import (
-    ActorPrefixSpec,
-    admit_actor_prefix,
-    persist_actor_prefix,
-)
+from exp.optimize.evaluation.analysis.actor_decisions import ActorDecisionSpec
+from exp.optimize.evaluation.analysis.decision_calibration import DecisionCalibration
+from exp.optimize.evaluation.analysis.memory_analyst import MemoryAnalystSpec
+from exp.optimize.evaluation.analysis.memory_evidence import MemoryInspection
+from exp.optimize.evaluation.analysis.research import FailureResearchSpec
+from exp.optimize.evaluation.continuations.action_contrast import ActionContrastSpec
+from exp.optimize.evaluation.continuations.actors import ActorPanelSpec
+from exp.optimize.evaluation.continuations.campaign import ContinuationCampaignSpec
+from exp.optimize.evaluation.continuations.capture import CaptureDefinition
+from exp.optimize.evaluation.continuations.critic import CriticSpec
+from exp.optimize.evaluation.continuations.experiment import CheckpointExperimentSpec
+from exp.optimize.evaluation.continuations.framing import FramingStudySpec
+from exp.optimize.evaluation.continuations.intervention import ActionInterventionSpec
+from exp.optimize.evaluation.continuations.job import ContinuationJob
+from exp.optimize.evaluation.continuations.observation_contrast import ObservationContrastSpec
+from exp.optimize.evaluation.continuations.proposals import CheckpointProposalSpec
+from exp.optimize.evaluation.continuations.selection import CheckpointSelectionSpec
+from exp.optimize.evaluation.equivalence.prefixes import ActorPrefixSpec
 from exp.optimize.evaluation.equivalence.runner import EquivalenceSpec
-from exp.optimize.evaluation.executable.scenarios import (
-    RecordScenarioSpec,
-    RecordWitnessSpec,
-    prepare_record_scenario,
-    prepare_record_witness,
-    saved_record_scenario,
-)
-from exp.optimize.evaluation.factory.candidates import (
-    CandidateBatchSpec,
-    preflight_candidate_batch,
-    run_candidate_batch,
-    saved_candidate_batch,
-)
-from exp.optimize.evaluation.factory.proposals import (
-    TaskProposalSpec,
-    preflight_task_proposals,
-    proposal_request,
-    propose_tasks,
-    saved_task_proposals,
-)
-from exp.optimize.evaluation.factory.scenario_search import (
-    ScenarioSearchSpec,
-    preflight_scenario_search,
-    run_scenario_search,
-)
-from exp.optimize.evaluation.factory.variants import (
-    TaskVariantSpec,
-    load_task_variant,
-    preflight_task_variant,
-    publish_task_variant,
-)
-from exp.optimize.evaluation.learning.repair import LearningRepairSpec, repair_learning
-from exp.optimize.model.sft.builder import build_sft_dataset, write_sft_dataset
-from exp.optimize.model.sft.contracts import SFTBuildSpec
-from exp.simulation.capability_briefs import (
-    CapabilityBrief,
-    persist_capability_brief,
-    validate_brief_sources,
-)
+from exp.optimize.evaluation.executable.scenarios import RecordScenarioSpec, RecordWitnessSpec
+from exp.optimize.evaluation.factory.candidates import CandidateBatchSpec
+from exp.optimize.evaluation.factory.proposals import TaskProposalSpec
+from exp.optimize.evaluation.factory.scenario_search import ScenarioSearchSpec
+from exp.optimize.evaluation.factory.variants import TaskVariantSpec
+from exp.optimize.evaluation.learning.repair import LearningRepairSpec
+from exp.simulation.capability_briefs import CapabilityBrief
 
 
-class ContinuationExport(ContractModel):
-    """Saved development studies to independently re-grade and export without model calls.
+@dataclass(frozen=True)
+class ContinuationAction[Payload]:
+    """One ``--continuations`` action, its only payload field and its owning handler.
 
     Attributes:
-        studies: Exact complete results; every branch remains in their admission reports.
-        dataset: Existing SFT split controls. Related continuations share one leakage group.
+        name: Action name accepted in the spec's ``action`` field.
+        payload: ``ContinuationCommand`` field that carries this action's payload.
+        handler: Owner-module handler that runs the action with the validated payload.
     """
 
-    studies: tuple[ArtifactInput, ...] = Field(min_length=1)
-    dataset: SFTBuildSpec = Field(default_factory=SFTBuildSpec)
+    name: str
+    payload: str
+    handler: Callable[[ContinuationContext, Payload], None]
+
+
+CONTINUATION_ACTIONS = (
+    ContinuationAction("compare-environments", "equivalence", handle_compare_environments),
+    ContinuationAction("repair-learning", "learning_repair", handle_repair_learning),
+    ContinuationAction("admit-actor-prefix", "prefix", handle_admit_actor_prefix),
+    ContinuationAction("check-failure-research", "research", handle_check_failure_research),
+    ContinuationAction("propose-checkpoints", "checkpoint_proposals", handle_propose_checkpoints),
+    ContinuationAction("run-continuation-campaign", "campaign", handle_run_continuation_campaign),
+    ContinuationAction("probe-actor-decisions", "actor_decisions", handle_probe_actor_decisions),
+    ContinuationAction("inspect-memory", "memory", handle_inspect_memory),
+    ContinuationAction("measure-decisions", "decisions", handle_measure_decisions),
+    ContinuationAction("analyse-memory", "memory_analyst", handle_analyse_memory),
+    ContinuationAction("analyse-failures", "analysis", handle_analyse_failures),
+    ContinuationAction("compare-observations", "observations", handle_compare_observations),
+    ContinuationAction("capture", "capture", handle_capture),
+    ContinuationAction("run", "job", handle_run),
+    ContinuationAction("export", "export", handle_export),
+    ContinuationAction("compare-framing", "framing", handle_compare_framing),
+    ContinuationAction("compare-actors", "actors", handle_compare_actors),
+    ContinuationAction("predict-success", "critic", handle_predict_success),
+    ContinuationAction("harbor", "harbor", handle_harbor),
+    ContinuationAction("make-variant", "variant", handle_make_variant),
+    ContinuationAction("intervene", "intervention", handle_intervene),
+    ContinuationAction("match-checkpoints", "selection", handle_match_checkpoints),
+    ContinuationAction("run-selection", "experiment", handle_run_selection),
+    ContinuationAction("compare-actions", "contrast", handle_compare_actions),
+    ContinuationAction("propose-tasks", "proposals", handle_propose_tasks),
+    ContinuationAction("evaluate-candidates", "batch", handle_evaluate_candidates),
+    ContinuationAction("register-brief", "brief", handle_register_brief),
+    ContinuationAction("prepare-scenario", "scenario", handle_prepare_scenario),
+    ContinuationAction("search-scenarios", "scenario_search", handle_search_scenarios),
+    ContinuationAction("witness-record", "record_witness", handle_witness_record),
+)
+_ACTIONS_BY_NAME = {action.name: action for action in CONTINUATION_ACTIONS}
+
+# The registry is the one list of action names. Pydantic validates ``action`` against exactly
+# that list as a literal, keeping the literal's schema and error message; static checkers see
+# the names as data and type the field as ``str``.
+if TYPE_CHECKING:
+    ContinuationActionName = str
+else:
+    ContinuationActionName = Literal[tuple(action.name for action in CONTINUATION_ACTIONS)]
 
 
 class ContinuationCommand(ContractModel):
@@ -214,38 +180,7 @@ class ContinuationCommand(ContractModel):
         equivalence: Paired executable reference/candidate studies and diagnostic trace council.
     """
 
-    action: Literal[
-        "compare-environments",
-        "repair-learning",
-        "admit-actor-prefix",
-        "check-failure-research",
-        "propose-checkpoints",
-        "run-continuation-campaign",
-        "probe-actor-decisions",
-        "inspect-memory",
-        "measure-decisions",
-        "analyse-memory",
-        "analyse-failures",
-        "compare-observations",
-        "capture",
-        "run",
-        "export",
-        "compare-framing",
-        "compare-actors",
-        "predict-success",
-        "harbor",
-        "make-variant",
-        "intervene",
-        "match-checkpoints",
-        "run-selection",
-        "compare-actions",
-        "propose-tasks",
-        "evaluate-candidates",
-        "register-brief",
-        "prepare-scenario",
-        "search-scenarios",
-        "witness-record",
-    ]
+    action: ContinuationActionName
     analysis: ArtifactInput | None = None
     observations: ObservationContrastSpec | None = None
     variant: TaskVariantSpec | None = None
@@ -279,42 +214,18 @@ class ContinuationCommand(ContractModel):
 
     @model_validator(mode="after")
     def exact_payload(self) -> "ContinuationCommand":
-        """Reject unrelated payloads before any operation, including dry runs and replay."""
-        fields = {
-            "compare-environments": "equivalence",
-            "repair-learning": "learning_repair",
-            "admit-actor-prefix": "prefix",
-            "check-failure-research": "research",
-            "propose-checkpoints": "checkpoint_proposals",
-            "run-continuation-campaign": "campaign",
-            "probe-actor-decisions": "actor_decisions",
-            "inspect-memory": "memory",
-            "measure-decisions": "decisions",
-            "analyse-memory": "memory_analyst",
-            "prepare-scenario": "scenario",
-            "search-scenarios": "scenario_search",
-            "witness-record": "record_witness",
-            "analyse-failures": "analysis",
-            "compare-observations": "observations",
-            "register-brief": "brief",
-            "evaluate-candidates": "batch",
-            "propose-tasks": "proposals",
-            "compare-actions": "contrast",
-            "make-variant": "variant",
-            "intervene": "intervention",
-            "capture": "capture",
-            "run": "job",
-            "export": "export",
-            "compare-framing": "framing",
-            "compare-actors": "actors",
-            "predict-success": "critic",
-            "harbor": "harbor",
-            "match-checkpoints": "selection",
-            "run-selection": "experiment",
-        }
-        selected = fields[self.action]
+        """Reject unrelated payloads before any operation, including dry runs and replay.
+
+        Returns:
+            This command, unchanged, once only the selected action's payload is set.
+
+        Raises:
+            ValueError: The selected payload is missing or another action's payload is set.
+        """
+        selected = _ACTIONS_BY_NAME[self.action].payload
         if any(
-            (getattr(self, field) is not None) != (field == selected) for field in fields.values()
+            (getattr(self, action.payload) is not None) != (action.payload == selected)
+            for action in CONTINUATION_ACTIONS
         ):
             raise ValueError(f"{self.action} requires only its {selected} payload")
         return self
@@ -323,16 +234,26 @@ class ContinuationCommand(ContractModel):
 def run_continuations(
     project: str, spec_path: Path, *, root: Path, yes: bool, non_interactive: bool, dry_run: bool
 ) -> None:
-    """Run one bounded study or export its independently verified development targets."""
+    """Validate one ``--continuations`` spec and run its action through the owning handler.
+
+    Args:
+        project: Existing project named on the command line.
+        spec_path: JSON ``ContinuationCommand`` file; also named in spend prompts.
+        root: EXP root that owns the project store and spend settings.
+        yes: Explicit authorization of the displayed estimate, including budget overruns.
+        non_interactive: Fail rather than prompt when paid work lacks authorization.
+        dry_run: Validate inputs without provider calls, runtime execution or publication.
+
+    Returns:
+        None. The handler prints its result; readable failures become usage errors.
+    """
     console = Console(theme=EXP_THEME)
     with usage_error(OSError, ValueError, ArtifactStoreError):
         command = ContinuationCommand.model_validate_json(spec_path.read_bytes())
-        store = ProjectStore(root, project)
-        revision = installed_execution_revision()
         context = ContinuationContext(
-            store=store,
+            store=ProjectStore(root, project),
             console=console,
-            revision=revision,
+            revision=installed_execution_revision(),
             root=root,
             project=project,
             spec_path=spec_path,
@@ -340,525 +261,5 @@ def run_continuations(
             non_interactive=non_interactive,
             dry_run=dry_run,
         )
-        if command.equivalence is not None:
-            handle_compare_environments(context, command.equivalence)
-            return
-        if command.learning_repair is not None:
-            result = repair_learning(
-                store, command.learning_repair, code_revision=revision, dry_run=dry_run
-            )
-            console.print_json(data=result)
-            return
-        if command.campaign is not None:
-            campaign = command.campaign
-            completed = saved_continuation_campaign(store, campaign, code_revision=revision)
-            needs_execution = campaign_requires_execution(store, campaign, code_revision=revision)
-            if needs_execution:
-                preflight_continuation_campaign(store, campaign)
-            console.print(
-                f"Continuation campaign: {campaign.initial.study.repeats} initial attempts; "
-                f"{len(campaign.selectors)} selectors, {len(campaign.critics)} critics; "
-                f"up to {campaign.points} points each, {campaign.continuations} continuations "
-                f"per arm. Actor/selector/critic HTTP ceiling: {campaign.attempt_bound()}. "
-                "Simulator calls retain their separate pinned ceiling. No training."
-            )
-            if dry_run:
-                console.print(
-                    "Known profiles validated; future evidence packets are checked whole."
-                )
-                return
-            if needs_execution and not context.consent(campaign):
-                return
-            result = completed or run_continuation_campaign(store, campaign, code_revision=revision)
-            console.print_json(data=campaign_summary(store, result))
-            return
-        if command.checkpoint_proposals is not None:
-            selector = command.checkpoint_proposals
-            propose_checkpoints(store, selector, code_revision=revision, dry_run=True)
-            console.print("Retrospective checkpoint selector: at most one new provider attempt.")
-            if dry_run:
-                console.print("Complete source inventory validated; no model calls or publication.")
-                return
-            has_response = store.artifacts.exists(selector.identity(revision) + "-response")
-            if not has_response and not context.consent(selector):
-                return
-            selected = propose_checkpoints(store, selector, code_revision=revision)
-            assert selected is not None
-            console.print_json(data=selected.model_dump(mode="json"))
-            return
-        if command.prefix is not None:
-            case = admit_actor_prefix(store.artifacts, command.prefix)
-            console.print_json(data=case.model_dump(mode="json"))
-            if not dry_run:
-                reference = persist_actor_prefix(
-                    store.artifacts,
-                    command.prefix,
-                    created_at=datetime.now(UTC),
-                    code_revision=revision,
-                )
-                console.print_json(data={"saved_prefix": reference.model_dump(mode="json")})
-            return
-        if command.research is not None:
-            research_report = check_failure_research(store.artifacts, command.research)
-            console.print_json(data=research_report.model_dump(mode="json"))
-            if not dry_run:
-                reference = persist_failure_research(
-                    store.artifacts,
-                    command.research,
-                    created_at=datetime.now(UTC),
-                    code_revision=revision,
-                )
-                console.print_json(data={"saved_research": reference.model_dump(mode="json")})
-            return
-        if command.actor_decisions is not None:
-            decision_spec = command.actor_decisions
-            saved_decisions = saved_actor_decisions(store, decision_spec, code_revision=revision)
-            needs_dispatch = saved_decisions is None and actor_decisions_need_dispatch(
-                store, decision_spec, code_revision=revision
-            )
-            if needs_dispatch:
-                preflight_actor_decisions(store, decision_spec)
-            console.print(
-                f"Actor next-decision probes: {len(decision_spec.cases)} cases, "
-                f"{decision_spec.repeats} triples each; maximum physical attempts: "
-                f"{len(decision_spec.cases) * decision_spec.repeats * 3}. "
-                "No tools executed; development sensitivity, not full-episode equivalence."
-            )
-            console.print_json(
-                data={"interface_diagnostics": actor_decision_interfaces(decision_spec)}
-            )
-            if dry_run:
-                console.print("Complete requests and sources validated; no provider calls.")
-                return
-            if needs_dispatch and not context.consent(decision_spec):
-                return
-            decisions_report = saved_decisions or run_actor_decisions(
-                store, decision_spec, code_revision=revision
-            )
-            console.print_json(data=decisions_report.metrics())
-            console.print(f"Saved decisions: {decision_spec.identity(revision)}-result")
-            return
-        if command.memory_analyst is not None:
-            analyst = command.memory_analyst
-            saved_analysis = saved_memory_analysis(store, analyst, code_revision=revision)
-            if saved_analysis is None:
-                preflight_memory_analyst(store, analyst)
-            if dry_run:
-                console.print("Memory diagnostic sources and profile verified; no model call.")
-                return
-            if saved_analysis is None and not context.consent(analyst):
-                return
-            diagnostic = saved_analysis or run_memory_analysis(
-                store, analyst, code_revision=revision
-            )
-            console.print_json(
-                data={
-                    "calibration": "unqualified diagnostic",
-                    "analysis": diagnostic.model_dump(mode="json"),
-                }
-            )
-            return
-        if command.memory is not None:
-            report = inspect_memory(store.artifacts, command.memory)
-            console.print_json(data=report.model_dump(mode="json"))
-            return
-        if command.decisions is not None:
-            measurement = calibrate_decisions(store.artifacts, command.decisions)
-            console.print_json(data=measurement.model_dump(mode="json"))
-            return
-        if command.record_witness is not None:
-            preflight_capture(store, command.record_witness.capture)
-            if dry_run:
-                console.print(
-                    "Record witness inputs parsed; no runtime imported or script executed."
-                )
-                return
-            console.print_json(
-                data=prepare_record_witness(store, command.record_witness, code_revision=revision)
-            )
-            return
-        if command.scenario_search is not None:
-            search = command.scenario_search
-            if dry_run:
-                preflight_scenario_search(store, search)
-                console.print("Native scenario search pins checked; no runtime executed.")
-            else:
-                console.print_json(
-                    data=run_scenario_search(store, search, code_revision=revision).model_dump(
-                        mode="json"
-                    )
-                )
-            return
-        if command.scenario is not None:
-            scenario = command.scenario
-            saved_scenario = saved_record_scenario(store, scenario, code_revision=revision)
-            if saved_scenario is None:
-                preflight_capture(store, scenario.capture)
-            if dry_run:
-                console.print(
-                    "Native scenario parsed and source pins checked; no runtime imported."
-                )
-                return
-            result = saved_scenario or prepare_record_scenario(
-                store, scenario, code_revision=revision
-            )
-            console.print_json(data=result.model_dump(mode="json"))
-            return
-        if command.observations is not None:
-            spec = command.observations
-            saved_observations = saved_observation_contrast(store, spec, code_revision=revision)
-            if saved_observations is None:
-                attempts = preflight_observation_contrast(store, spec)
-            else:
-                attempts = sum(
-                    cell.job.maximum_physical_attempts for cell in saved_observations.cells
-                )
-            console.print(
-                f"Observation comparison: {spec.pairs * 2} draws; "
-                f"maximum actor HTTP attempts: {attempts}; original world retained."
-            )
-            console.print(
-                "Recorded reply retains source authority; authored alternative is unverified."
-            )
-            if dry_run:
-                console.print(
-                    "Sources and suffix policy validated without runtime imports or calls."
-                )
-                return
-            if saved_observations is None and not context.consent(spec):
-                return
-            report = saved_observations or run_observation_contrast(
-                store, spec, code_revision=revision
-            )
-            console.print_json(data={"scope": report.scope, **report.metrics()})
-            return
-        if command.analysis is not None:
-            report = analyse_failures(store.artifacts, command.analysis)
-            if dry_run:
-                console.print(
-                    "Source inventory and rewind boundaries verified; no report published."
-                )
-                return
-            reference = persist_failure_analysis(
-                store.artifacts,
-                command.analysis,
-                created_at=datetime.now(UTC),
-                code_revision=revision,
-            )
-            console.print_json(
-                data={
-                    "reference": reference.model_dump(mode="json"),
-                    **report.model_dump(mode="json"),
-                }
-            )
-            return
-        if command.brief is not None:
-            validate_brief_sources(store.artifacts, command.brief)
-            if dry_run:
-                console.print(
-                    "Brief sources validated; assumptions retain their declared authority."
-                )
-                return
-            reference = persist_capability_brief(
-                store.artifacts, command.brief, created_at=datetime.now(UTC), code_revision=revision
-            )
-            console.print_json(
-                data={
-                    "reference": reference.model_dump(mode="json"),
-                    "qualification_blockers": command.brief.blockers(),
-                }
-            )
-            return
-        if command.batch is not None:
-            batch = command.batch
-            saved_batch = saved_candidate_batch(store, batch, code_revision=revision)
-            if saved_batch is None:
-                preflight_candidate_batch(store, batch, code_revision=revision)
-            if dry_run:
-                console.print("Every candidate and model validated; no calls or packages created.")
-                return
-            if saved_batch is None and not context.consent(batch):
-                return
-            batch_result = saved_batch or run_candidate_batch(store, batch, code_revision=revision)
-            console.print_json(data=batch_result.model_dump(mode="json"))
-            return
-        if command.proposals is not None:
-            proposals = command.proposals
-            saved_proposals = saved_task_proposals(store, proposals, code_revision=revision)
-            response_saved = store.artifacts.exists(proposals.identity(revision) + "-response")
-            if saved_proposals is None and not response_saved:
-                preflight_task_proposals(store, proposals)
-            elif saved_proposals is None:
-                proposal_request(store, proposals)
-            if dry_run:
-                console.print("Public authoring context validated; no proposals purchased.")
-                return
-            if saved_proposals is None and not response_saved and not context.consent(proposals):
-                return
-            proposal_result = saved_proposals or propose_tasks(
-                store, proposals, code_revision=revision
-            )
-            console.print_json(data=proposal_result.model_dump(mode="json"))
-            return
-        if command.contrast is not None:
-            contrast = command.contrast
-            saved_contrast = saved_action_contrast(store, contrast, code_revision=revision)
-            if saved_contrast is None:
-                preflight_action_contrast(store, contrast, code_revision=revision)
-            if dry_run:
-                console.print("Paired decisions validated; no tools or actor calls executed.")
-                return
-            if saved_contrast is None and not context.consent(contrast):
-                return
-            contrast_result = saved_contrast or run_action_contrast(
-                store, contrast, code_revision=revision
-            )
-            console.print_json(data=contrast_result.model_dump(mode="json"))
-            return
-        if command.variant is not None:
-            preflight_task_variant(store, command.variant)
-            if dry_run:
-                console.print(
-                    "Variant sources and context validated; no artifact or world created."
-                )
-                return
-            reference = publish_task_variant(
-                store, command.variant, created_at=datetime.now(UTC), code_revision=revision
-            )
-            variant = load_task_variant(store, reference)
-            console.print_json(
-                data={
-                    "reference": reference.model_dump(mode="json"),
-                    **variant.model_dump(mode="json"),
-                }
-            )
-            return
-        if command.intervention is not None:
-            intervention = command.intervention
-            saved_action = saved_intervention(store, intervention, code_revision=revision)
-            if saved_action is None:
-                preflight_intervention(store, intervention)
-            if dry_run:
-                console.print("Intervention validated; no runtime imported or tool executed.")
-                return
-            if saved_action is None and not context.consent(intervention):
-                return
-            action_result = saved_action or capture_action_intervention(
-                store, intervention, code_revision=revision
-            )
-            console.print_json(data=action_result.model_dump(mode="json"))
-            return
-        if command.selection is not None:
-            selection = command.selection
-            identity = selection.identity(revision)
-            if store.artifacts.exists(identity):
-                plan = load_selection_plan(
-                    store, artifact_input(store.artifacts.read(identity).manifest)
-                )
-            else:
-                plan = match_checkpoints(store, selection)
-            if dry_run:
-                console.print_json(data=plan.model_dump(mode="json"))
-                return
-            reference = persist_selection_plan(
-                store, selection, created_at=datetime.now(UTC), code_revision=revision
-            )
-            console.print_json(
-                data={
-                    "reference": reference.model_dump(mode="json"),
-                    "matches": len(plan.matches),
-                    "unmatched": sum(pair.control is None for pair in plan.matches),
-                }
-            )
-            return
-        if command.experiment is not None:
-            experiment = command.experiment
-            saved_experiment = saved_checkpoint_experiment(
-                store, experiment, code_revision=revision
-            )
-            if saved_experiment is None:
-                preflight_checkpoint_experiment(store, experiment)
-            plan = load_selection_plan(store, experiment.selection)
-            plan_revision = store.artifacts.read(
-                experiment.selection.artifact_id
-            ).manifest.code_revision
-            jobs = selection_jobs(
-                plan, code_revision=plan_revision, plan_reference=experiment.selection
-            )
-            attempts = sum(job.maximum_physical_attempts for _, job in jobs)
-            if experiment.critic is not None:
-                attempts += len(jobs) * experiment.critic.maximum_physical_attempts
-            console.print(
-                f"Matched cells: {len(jobs)}; maximum actor/critic HTTP attempts: {attempts}"
-            )
-            if dry_run:
-                console.print("Validated without runtime imports or provider calls.")
-                return
-            if saved_experiment is None and not context.consent(experiment):
-                return
-            report = saved_experiment or run_checkpoint_experiment(
-                store, experiment, code_revision=revision
-            )
-            console.print_json(data=experiment_summary(store, report))
-            return
-        if command.critic is not None:
-            exists = store.artifacts.exists(command.critic.identity(revision))
-            if not exists:
-                preflight_critic(store, command.critic)
-            console.print(
-                f"Critic maximum HTTP attempts: {command.critic.maximum_physical_attempts}"
-            )
-            if dry_run:
-                console.print("Public critic context validated; no provider call.")
-                return
-            if not exists and not context.consent(command.critic):
-                return
-            reference = predict_success(store, command.critic, code_revision=revision)
-            prediction = load_critic_prediction(store.artifacts, reference)
-            console.print_json(
-                data={
-                    "reference": reference.model_dump(mode="json"),
-                    "predicted_success": prediction.estimate.probability,
-                    "rationale": prediction.estimate.rationale,
-                }
-            )
-            return
-        if command.actors is not None:
-            saved_panel = saved_actor_panel(store, command.actors, code_revision=revision)
-            if saved_panel is None:
-                preflight_actor_panel(store, command.actors)
-            attempts = sum(job.maximum_physical_attempts for job in command.actors.cases)
-            attempts *= len(command.actors.actors)
-            console.print(
-                f"Actor panel: {len(command.actors.cases)} cases, "
-                f"{len(command.actors.actors)} models; "
-                f"maximum actor HTTP attempts: {attempts}"
-            )
-            if dry_run:
-                console.print("Validated without runtime imports or provider calls.")
-                return
-            if saved_panel is None and not context.consent(command.actors):
-                return
-            panel = saved_panel or run_actor_panel(store, command.actors, code_revision=revision)
-            console.print_json(data={"scope": panel.scope, **panel.metrics})
-            return
-        if command.capture is not None:
-            saved = saved_capture(store, command.capture, code_revision=revision)
-            if saved is None:
-                preflight_capture(store, command.capture)
-            if dry_run:
-                console.print(
-                    "Capture validated without importing runtime code or opening a world."
-                )
-                return
-            if saved is None and not context.consent(command.capture):
-                return
-            reference = saved or capture_initial_world(
-                store, command.capture, code_revision=revision
-            )
-            console.print_json(data=reference.model_dump(mode="json"))
-            return
-        if command.harbor is not None:
-            run_executable_command(
-                store,
-                command.harbor,
-                console=console,
-                dry_run=dry_run,
-                yes=yes,
-                non_interactive=non_interactive,
-                code_revision=revision,
-                spec_path=spec_path,
-            )
-            return
-        if command.framing is not None:
-            spec = command.framing
-            saved_framing = saved_framing_study(store, spec, code_revision=revision)
-            if saved_framing is None:
-                preflight_continuation_job(store, spec.base)
-            console.print(
-                f"Framing cells: {spec.pairs * 2}; maximum HTTP attempts: "
-                f"{spec.base.maximum_physical_attempts * spec.pairs * 2}"
-            )
-            if dry_run:
-                console.print("Validated without runtime imports or provider calls.")
-                return
-            if saved_framing is None and not context.consent(spec):
-                return
-            report = saved_framing or run_framing_study(store, spec, code_revision=revision)
-            console.print_json(data=report.metrics())
-            return
-        if command.job is not None:
-            job = command.job
-            saved = saved_continuation_job(store, job, code_revision=revision)
-            if saved is None:
-                preflight_continuation_job(store, job)
-            console.print(
-                f"Planned branches: {job.study.repeats}; "
-                f"maximum HTTP attempts: {job.maximum_physical_attempts}"
-            )
-            console.print(f"Trusted local runtime: {job.runtime_file}", markup=False)
-            if dry_run:
-                console.print("Validated without importing runtime code or calling providers.")
-                return
-            if saved is None and not context.consent(job):
-                return
-            result = saved or execute_continuation_job(store, job, code_revision=revision)
-            console.print_json(
-                data={
-                    **result.metrics(),
-                    "checkpoints": [
-                        {"branch": branch.index, "reference": ref.model_dump(mode="json")}
-                        for branch in result.branches
-                        for ref in branch.checkpoints
-                    ],
-                    "reference": continuation_result_reference(
-                        store, job, code_revision=revision
-                    ).model_dump(mode="json"),
-                }
-            )
-            return
-        assert command.export is not None
-        for reference in command.export.studies:
-            load_study(store.artifacts, reference)
-        if dry_run:
-            console.print("Study inventories validated. Admission and dataset publication not run.")
-            return
-        accepted = tuple(
-            admit_continuations(
-                store.artifacts, reference, created_at=datetime.now(UTC), code_revision=revision
-            )
-            for reference in command.export.studies
-        )
-        for reference in accepted:
-            report = ContinuationAdmission.model_validate_json(
-                store.artifacts.read_bytes(reference.artifact_id, "admission.json")
-            )
-            console.print(
-                f"Admission {reference.artifact_id}: "
-                f"{sum(row.admitted for row in report.branches)}/{len(report.branches)} branches"
-            )
-            console.print(report.scope)
-            if report.evidence is None:
-                console.print("No task qualification attached; observed-outcome checks only.")
-            else:
-                console.print(report.evidence.qualification_scope)
-                if report.evidence.comparison_scope is not None:
-                    console.print(report.evidence.comparison_scope)
-        dataset = build_sft_dataset(
-            store=store,
-            production_sources=(),
-            teacher_sources=(),
-            continuation_sources=accepted,
-            spec=command.export.dataset,
-            created_at=datetime.now(UTC),
-            code_revision=revision,
-        )
-        write_sft_dataset(store, dataset)
-        console.print(f"Dataset: {dataset.dataset.dataset_id} ({dataset.dataset.status})")
-        console.print(
-            f"Assistant targets: {len(dataset.rows)}; "
-            f"exclusions: {len(dataset.inspection.exclusions)}"
-        )
-        console.print(
-            "Prefix and tool observations are context only. No training or promotion run."
-        )
+        action = _ACTIONS_BY_NAME[command.action]
+        action.handler(context, getattr(command, action.payload))

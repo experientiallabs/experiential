@@ -9,7 +9,8 @@ import pytest
 from typer.testing import CliRunner
 
 from exp.cli.app import app
-from exp.cli.evaluation.continuations import ContinuationCommand, ContinuationExport
+from exp.cli.evaluation.continuation_studies import ContinuationExport
+from exp.cli.evaluation.continuations import ContinuationCommand
 from exp.cli.evaluation.executable import ExecutableCommand
 from exp.optimize.evaluation.continuations.admission import (
     ContinuationAdmission,

@@ -1,7 +1,14 @@
-"""Continuation action owned by actor equivalence: paired comparison and its trace council."""
+"""Continuation actions owned by actor equivalence: paired comparison and retained prefixes."""
+
+from datetime import UTC, datetime
 
 from exp.cli.evaluation.continuation_context import ContinuationContext
 from exp.common.progress import ProgressEvent
+from exp.optimize.evaluation.equivalence.prefixes import (
+    ActorPrefixSpec,
+    admit_actor_prefix,
+    persist_actor_prefix,
+)
 from exp.optimize.evaluation.equivalence.runner import (
     EquivalenceSpec,
     preflight_equivalence,
@@ -74,3 +81,25 @@ def handle_compare_environments(context: ContinuationContext, spec: EquivalenceS
     console.print(
         f"Saved paired evidence: {spec.identity(revision)}-result. No training or promotion."
     )
+
+
+def handle_admit_actor_prefix(context: ContinuationContext, spec: ActorPrefixSpec) -> None:
+    """Extract a complete retained actor input and, unless dry-run, save the bound prefix.
+
+    Args:
+        context: Validated ``--continuations`` invocation.
+        spec: Retained actor input and the saved simulator observation it binds.
+
+    Returns:
+        None. The admitted case and any saved reference are printed to the console.
+    """
+    case = admit_actor_prefix(context.store.artifacts, spec)
+    context.console.print_json(data=case.model_dump(mode="json"))
+    if not context.dry_run:
+        reference = persist_actor_prefix(
+            context.store.artifacts,
+            spec,
+            created_at=datetime.now(UTC),
+            code_revision=context.revision,
+        )
+        context.console.print_json(data={"saved_prefix": reference.model_dump(mode="json")})
