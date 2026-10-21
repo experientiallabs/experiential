@@ -905,7 +905,8 @@ def learning_progress(
 def _registered(project: ProjectStore, plan: LearningPlan, case: ReplayCase) -> bool:
     """Whether any attempt of one case was registered and stopped without a saved report."""
     spec = learning_spec(project, plan, case, deadline=datetime.now().astimezone())
-    plan_id = stable_id("fidelity", {"run_id": content_run_id(spec, LABEL, case.trace_id, 1)})
+    run_id = content_run_id(spec, LABEL, case.trace_id, code_revision=None)  # learn: unkeyed
+    plan_id = stable_id("fidelity", {"run_id": run_id})
     return project.artifacts.exists(plan_id) and project.artifacts.exists(
         _intent_of(project, plan_id)
     )
@@ -927,7 +928,7 @@ def _saved_attempts(
     attempts: list[tuple[PreparedFidelity, DualReport]] = []
     generation = 1
     while True:
-        run_id = content_run_id(spec, LABEL, case.trace_id, generation)
+        run_id = content_run_id(spec, LABEL, case.trace_id, generation, code_revision=None)
         plan_id = stable_id("fidelity", {"run_id": run_id})
         if not project.artifacts.exists(plan_id):
             return attempts

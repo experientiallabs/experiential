@@ -151,11 +151,11 @@ def test_changing_a_fact_changes_the_run_id(tmp_path: Path) -> None:
             }
         )
 
-    plain = content_run_id(spec, "learn", "t")
-    first = content_run_id(facts("a"), "learn", "t")
-    second = content_run_id(facts("b"), "learn", "t")
+    plain = content_run_id(spec, "learn", "t", code_revision=REVISION)
+    first = content_run_id(facts("a"), "learn", "t", code_revision=REVISION)
+    second = content_run_id(facts("b"), "learn", "t", code_revision=REVISION)
     assert len({plain, first, second}) == 3
-    assert content_run_id(facts("a"), "learn", "t") == first
+    assert content_run_id(facts("a"), "learn", "t", code_revision=REVISION) == first
     assert "entry/current" not in json.dumps(trajectory_record(facts("a")))
     with pytest.raises(ValueError, match="not validated"):
         ReplayFacts(

@@ -789,6 +789,30 @@ def test_run_ids_follow_content_and_retire_attempts_that_cannot_finish(
     assert changed.prepared[0].spec.run_id.split("-")[-1] != run_id.split("-")[-1]
 
 
+def test_a_saved_result_never_replays_under_other_code(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A run measured by one code revision is registered and measured again by another."""
+    provider = SimulatedProvider([episode(i) for i in range(USERS)])
+    _, store, _ = build_project(tmp_path, monkeypatch, provider)
+
+    def register(revision: str):  # noqa: ANN202 - local shorthand
+        """Register one source-RAG held-out run at a code revision."""
+        return register_held_out_fidelity(
+            store, 1, profile="source-rag", code_revision=revision, clock=lambda: datetime.now(UTC)
+        )
+
+    measured = register(REVISION)
+    execute_fidelity_evaluation(store, measured.prepared[0])
+    assert register(REVISION).prepared == measured.prepared
+    other = register("d" * 40)
+    assert not other.retired
+    assert other.identity != measured.identity
+    assert other.prepared[0].spec.run_id != measured.prepared[0].spec.run_id
+    assert other.prepared[0].code_revision == "d" * 40
+    assert fidelity.saved_fidelity_report(store, other.prepared[0]) is None
+
+
 class Outage(SimulatedProvider):
     """The routed fake, with simulator predictions rejected while ``down`` (a revoked key)."""
 

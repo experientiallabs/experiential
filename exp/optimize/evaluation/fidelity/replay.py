@@ -18,13 +18,15 @@ their own request channel, and they are part of the spec and therefore of the ru
 environment adapter can supply them instead through ``replay_case(..., facts=provider)``.
 
 Run identities are content-addressed: the run ID is derived from the complete spec except its
-deadline, so changed inputs (a rebuilt simulator, another judge, a new tool inventory, a new
-memory checkpoint) register a new run automatically, and an unchanged run replays its saved
-result without provider calls. An earlier attempt that never bought a call and can never
-complete (its deadline passed, or its execution stopped with no process holding it) is retired
-and the next attempt gets a fresh generation suffix. An interrupted attempt that bought calls
-is never replaced: it stops visibly, and ``--retry-incomplete`` resumes it in place (see
-:mod:`exp.optimize.evaluation.fidelity.recovery`).
+deadline, plus the producing code revision of every measured run, so changed inputs (a rebuilt
+simulator, another judge, a new tool inventory, a new memory checkpoint, changed code) register a
+new run automatically, and an unchanged run replays its saved result without provider calls. A
+learn-mode run is not keyed on the code revision: it produces memory, and its reuse is governed
+by the memory lineage (see :func:`content_run_id`). An earlier attempt that never bought a call
+and can never complete (its deadline passed, or its execution stopped with no process holding
+it) is retired and the next attempt gets a fresh generation suffix. An interrupted attempt
+that bought calls is never replaced: it stops visibly, and ``--retry-incomplete`` resumes it in
+place (see :mod:`exp.optimize.evaluation.fidelity.recovery`).
 """
 
 import json
@@ -356,7 +358,8 @@ def replay_spec(
         judge_effort: Judge reasoning effort, applied when the judge model pins one.
 
     Returns:
-        Complete spec; its run ID is a generation-one content address.
+        Complete spec. Its run ID is the placeholder ``pending``: :func:`register_replay`
+        addresses the registered run by content, producer revision and generation.
 
     Raises:
         ValueError: The project configures no judge, or the world model lacks tool support.
@@ -398,7 +401,7 @@ def replay_spec(
     if memory is not None and memory.dreaming is not None:
         tail += memory.dreaming.calls
     prediction = _allowance(PREDICTION_TOKENS, predictor)
-    spec = FidelitySpec(
+    return FidelitySpec(
         run_id="pending",
         world_model=world_model,
         task=task,
@@ -446,7 +449,6 @@ def replay_spec(
             ),
         ),
     )
-    return spec.model_copy(update={"run_id": content_run_id(spec, label, case.trace_id)})
 
 
 def protocol_prompts_sha256(
@@ -466,7 +468,14 @@ def protocol_prompts_sha256(
     )
 
 
-def content_run_id(spec: FidelitySpec, label: str, trace: str, generation: int = 1) -> str:
+def content_run_id(
+    spec: FidelitySpec,
+    label: str,
+    trace: str,
+    generation: int = 1,
+    *,
+    code_revision: str | None,
+) -> str:
     """Address a fidelity run by its complete inputs except the run ID and deadline.
 
     The inputs include every system prompt the run can send (``protocol_prompts_sha256``, plus
@@ -474,15 +483,29 @@ def content_run_id(spec: FidelitySpec, label: str, trace: str, generation: int =
     new run instead of replaying a result it never produced. Facts are part of the spec, so
     changing any fact addresses a new run.
 
+    A measured run (held-out, retest, frozen memory or none) is also keyed on the code revision
+    that produces it, as continuation studies are, so changed code never replays a measurement
+    it did not make. A learn-mode run is not: it produces memory, each trace is learned into a
+    lineage once, and the lineage already keys every learning input, so re-keying it by code
+    would refuse every already-learned trace instead of measuring it again.
+
     Args:
         spec: Complete spec; its current run ID and deadline are ignored.
         label: Purpose prefix, such as ``held-out`` or ``learn``.
         trace: Replayed trace ID, kept readable in the run ID.
         generation: Attempt number for unchanged inputs; 1 has no suffix.
+        code_revision: Producing implementation identity; required for a measured run and
+            ignored for a learn-mode run, which may pass None.
 
     Returns:
         A valid run ID: ``<label>-<trace>-<digest>[-r<generation>]``.
+
+    Raises:
+        ValueError: A measured run was addressed without its code revision.
     """
+    learning = spec.memory is not None and spec.memory.mode == "learn"
+    if not learning and code_revision is None:
+        raise ValueError("a measured replay run is addressed by its producing code revision")
     # An unjudged run (learning) never calls the judge, so the judge is not one of its inputs:
     # configuring another judge must not re-address it.
     unjudged: dict[str, object] = (
@@ -505,6 +528,7 @@ def content_run_id(spec: FidelitySpec, label: str, trace: str, generation: int =
             ),
             # Only runs that deliver facts send the facts guidance; fact-free IDs are unchanged.
             **({} if spec.facts is None else {"facts_prompt": INSTANCE_FACTS_GUIDANCE}),
+            **({} if learning else {"code": code_revision}),
         }
     )[:12]
     slug = re.sub(r"[^a-z0-9]+", "-", trace.casefold()).strip("-")[:40] or "trace"
@@ -537,11 +561,12 @@ def register_replay(
 
     Returns:
         The registration (an existing one when unchanged and usable) and retired run IDs.
+        A measured run registered by other code is never returned: the revision addresses it.
     """
     retired: list[str] = []
     generation = 1
     while True:
-        run_id = content_run_id(spec, label, trace, generation)
+        run_id = content_run_id(spec, label, trace, generation, code_revision=code_revision)
         plan_id = stable_id("fidelity", {"run_id": run_id})
         if not project.artifacts.exists(plan_id):
             attempt = spec.model_copy(update={"run_id": run_id})
@@ -550,7 +575,7 @@ def register_replay(
         saved = PreparedFidelity.model_validate_json(
             project.artifacts.read_bytes(plan_id, "plan.json")
         )
-        successor = content_run_id(spec, label, trace, generation + 1)
+        successor = content_run_id(spec, label, trace, generation + 1, code_revision=code_revision)
         if project.artifacts.exists(stable_id("fidelity", {"run_id": successor})):
             generation += 1  # replaced by an earlier registration; follow the chain
             continue

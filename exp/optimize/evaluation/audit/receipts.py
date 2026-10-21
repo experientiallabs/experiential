@@ -101,7 +101,7 @@ class AuditReceipt(ContractModel):
         request: What the minting invocation asked for.
         basis: ``independent`` or ``development-re-audit``, fixed at minting.
         panel: Panel identity over the cases and their first-generation runs.
-        code_revision: Implementation of the frozen configuration; not part of run IDs.
+        code_revision: Implementation of the frozen configuration; part of every run ID.
         world_model: Simulator every run is bound to.
         checkpoint: Frozen memory checkpoint read, for the memory profile.
         cases: Audited cases, in panel order.

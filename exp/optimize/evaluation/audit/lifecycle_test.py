@@ -145,13 +145,12 @@ def test_content_is_reserved_before_any_run_is_registered(
         project: ProjectStore,
         planned: PlannedPanel,
         *,
-        code_revision: str,
         clock: Callable[[], datetime],
     ) -> HeldOutPanel:
         """Record whether the newest receipt's reservation was committed before registering."""
         receipts = audit_receipts(store)
         seen.append(bool(receipts) and ledger.snapshot().active(receipts[-1].receipt_id))
-        return register(project, planned, code_revision=code_revision, clock=clock)
+        return register(project, planned, clock=clock)
 
     monkeypatch.setattr(held_out_audit, "register_planned_panel", checked)
     with audit(store) as opened:
@@ -207,11 +206,19 @@ def test_a_reservation_committed_between_selection_and_commit_is_respected(
         count: int,
         *,
         profile: Profile,
+        code_revision: str,
         clock: Callable[[], datetime],
         excluded: Collection[str] = frozenset(),
     ) -> PlannedPanel:
         """Plan, then let another receipt reserve the planned lineage before the commit."""
-        planned = plan(project, count, profile=profile, clock=clock, excluded=excluded)
+        planned = plan(
+            project,
+            count,
+            profile=profile,
+            code_revision=code_revision,
+            clock=clock,
+            excluded=excluded,
+        )
         if not stolen:
             lineage = planned.lineages[0]
             stolen.append(lineage)
@@ -429,15 +436,23 @@ def test_a_configuration_change_with_zero_slots_releases_and_mints_a_new_receipt
 def test_a_configuration_change_after_dispatch_is_a_development_reaudit(
     built: tuple[ProjectStore, FailingOnce],
 ) -> None:
-    """A code-revision mismatch is detected; the dispatched reservation stays permanent."""
+    """A code-revision mismatch is detected; the dispatched reservation stays permanent.
+
+    The new receipt measures again: saved results of other code never stand in for its runs.
+    """
     store, _ = built
     with audit(store) as opened:
         original = opened.receipt
         run(store, opened)
+        measured = {prepared.spec.run_id for prepared in opened.panel.prepared}
     with audit(store, revision="d" * 40) as changed:
         assert changed.receipt.follow_reason == "dispatched"
         assert changed.receipt.basis == "development-re-audit"
         assert changed.receipt.reaudited == original.lineages
+        assert changed.receipt.panel != original.panel
+        assert measured.isdisjoint(prepared.spec.run_id for prepared in changed.panel.prepared)
+        assert all(prepared.code_revision == "d" * 40 for prepared in changed.panel.prepared)
+        assert all(saved_fidelity_report(store, p) is None for p in changed.panel.prepared)
     assert reservation_state(store, original) == "dispatched"
     assert receipt_view(store, original).headline == "independent"
 

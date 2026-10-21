@@ -87,6 +87,7 @@ class PlannedPanel(ContractModel):
         checkpoint: Frozen memory checkpoint read, for the memory profile.
         cases: Selected held-out traces in selection order.
         specs: One derived fidelity spec per case, in the same order.
+        code_revision: Implementation that produces every run; part of each run ID.
     """
 
     profile: Profile
@@ -94,12 +95,13 @@ class PlannedPanel(ContractModel):
     checkpoint: AuditCheckpoint | None = None
     cases: tuple[ReplayCase, ...] = Field(min_length=1)
     specs: tuple[FidelitySpec, ...] = Field(min_length=1)
+    code_revision: str = Field(min_length=1)
 
     @property
     def base_runs(self) -> tuple[str, ...]:
         """First-generation content-addressed run ID of every case, in panel order."""
         return tuple(
-            content_run_id(spec, LABEL, case.trace_id)
+            content_run_id(spec, LABEL, case.trace_id, code_revision=self.code_revision)
             for case, spec in zip(self.cases, self.specs, strict=True)
         )
 
@@ -108,9 +110,9 @@ class PlannedPanel(ContractModel):
         """Panel identity: the sorted selected case IDs with each one's content-addressed run.
 
         Run IDs already cover the simulator, memory checkpoint and recall policy, every prompt
-        sent, and the judge configuration. Replacement attempts share their first-generation
-        run ID, so they keep the panel identity. The code revision is deliberately not part of
-        run IDs and is compared beside this identity.
+        sent, the judge configuration and the producing code revision, so a panel run by other
+        code is another panel. Replacement attempts share their first-generation run ID, so they
+        keep the panel identity.
         """
         pairs = sorted(
             [case.task.task_id, run] for case, run in zip(self.cases, self.base_runs, strict=True)
@@ -258,6 +260,7 @@ def plan_held_out_panel(
     count: int,
     *,
     profile: Profile,
+    code_revision: str,
     clock: Callable[[], datetime],
     excluded: Collection[str] = frozenset(),
 ) -> PlannedPanel:
@@ -268,6 +271,7 @@ def plan_held_out_panel(
         count: Maximum number of held-out traces.
         profile: ``memory`` reads the final learned checkpoint with held-out lineages
             reserved; ``source-rag`` retrieves from the fit-only index.
+        code_revision: Implementation that will produce every run.
         clock: Aware clock for deadlines.
         excluded: Lineages never selected.
 
@@ -324,7 +328,12 @@ def plan_held_out_panel(
         for case in cases
     )
     return PlannedPanel(
-        profile=profile, world_model=world_model, checkpoint=checkpoint, cases=cases, specs=specs
+        profile=profile,
+        world_model=world_model,
+        checkpoint=checkpoint,
+        cases=cases,
+        specs=specs,
+        code_revision=code_revision,
     )
 
 
@@ -332,10 +341,9 @@ def register_planned_panel(
     project: ProjectStore,
     planned: PlannedPanel,
     *,
-    code_revision: str,
     clock: Callable[[], datetime],
 ) -> HeldOutPanel:
-    """Register a planned panel's runs without provider calls or credentials.
+    """Register a planned panel's runs at its code revision, without provider calls.
 
     A run interrupted after it claimed slots is never replaced here; execution resumes it in
     place with ``--retry-incomplete``. Only attempts that claimed no slot are re-registered.
@@ -343,7 +351,6 @@ def register_planned_panel(
     Args:
         project: Project owning the registrations.
         planned: Planned panel.
-        code_revision: Exact producing implementation identity.
         clock: Aware clock for attempt retirement.
 
     Returns:
@@ -358,7 +365,7 @@ def register_planned_panel(
             spec,
             label=LABEL,
             trace=case.trace_id,
-            code_revision=code_revision,
+            code_revision=planned.code_revision,
             now=now,
         )
         prepared.append(registration)
@@ -402,8 +409,15 @@ def register_held_out_fidelity(
     Returns:
         The registered panel.
     """
-    planned = plan_held_out_panel(project, count, profile=profile, clock=clock, excluded=excluded)
-    return register_planned_panel(project, planned, code_revision=code_revision, clock=clock)
+    planned = plan_held_out_panel(
+        project,
+        count,
+        profile=profile,
+        code_revision=code_revision,
+        clock=clock,
+        excluded=excluded,
+    )
+    return register_planned_panel(project, planned, clock=clock)
 
 
 def run_slots(project: ProjectStore, run_id: str) -> int:

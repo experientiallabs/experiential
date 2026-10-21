@@ -234,7 +234,9 @@ def test_the_procedure_runs_on_held_out_audits_of_the_learned_memory(
     root, store, _ = build_project(tmp_path, monkeypatch, provider)
     learn_fit(root, store)
     fit = len(fit_cases(store))
-    development = plan_held_out_panel(store, 1, profile="memory", clock=clock).lineages
+    development = plan_held_out_panel(
+        store, 1, profile="memory", code_revision="fixture", clock=clock
+    ).lineages
     with pytest.raises(ValueError, match="fit traces"):
         register_sample_count_study(
             store,
