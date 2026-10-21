@@ -520,6 +520,24 @@ judge, not a score), and the learning curve. The report
 names the audited checkpoint (memory lineage, version and `fit` scope). The build's all-traces
 memory is a different checkpoint, which this audit does not evaluate independently.
 
+Screened lessons. Learning records a miss on every inexact step; most describe one instance's
+data, not how the environment behaves. To compare memory profiles on any project:
+
+1. `exp eval PROJECT --audit N --audit-memory learned` learns the fit-only memory and audits it.
+2. Screen its misses with `--continuations` and `{"action": "repair-learning", "learning_repair":
+   {"resolution": "screen-lessons"}}` (`--dry-run` first: misses, new decisions, estimate). One
+   native decision per miss (recall alias) gives three probabilities: reusable behaviour, already
+   covered, supported by the recorded reply. The threshold is fitted on the fit split from saved
+   same-tool deliveries and saved; unknown decisions are never redrawn. Screened-in misses become
+   `unresolved` rule entries `derived_from` their trajectory; the rest stay source evidence.
+3. `--audit N --include-inspected --audit-memory none`, then the same with `lessons` (only
+   screened-in records and their overview lines, no raw observations): the same cases and specs
+   except memory, reported as development re-audits of step 1's lineages.
+4. Optionally `"resolution": "evolve-lessons"`, `lessons` set to the printed `lesson_set` and a
+   fresh `run_id`: one proposed rule edit, replayed on held-out and protected fit lineages without
+   memory, `accepted` only on a strict exact-reply gain without regressions; every attempt stays
+   `research`. Pass the returned `library` to build on an accepted edit.
+
 A held-out lineage stays independent only while nobody has read its per-trace results, or the
 results of anything grouped with it. That fact is kept in one exposure ledger at the `.exp` root
 (`<root>/exposure-ledger/ledger.sqlite`), shared by every project on the machine, so it survives

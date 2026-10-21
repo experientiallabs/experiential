@@ -30,7 +30,7 @@ from exp.optimize.evaluation.audit.lifecycle import (
     release_held_out_audit,
     reservation_state,
 )
-from exp.optimize.evaluation.audit.panel import HeldOutPanel, PlannedPanel, Profile
+from exp.optimize.evaluation.audit.panel import HeldOutPanel, MemoryProfile, PlannedPanel, Profile
 from exp.optimize.evaluation.audit.panel_test import (
     PROJECT,
     REVISION,
@@ -209,6 +209,7 @@ def test_a_reservation_committed_between_selection_and_commit_is_respected(
         code_revision: str,
         clock: Callable[[], datetime],
         excluded: Collection[str] = frozenset(),
+        memory_profile: MemoryProfile = "learned",
     ) -> PlannedPanel:
         """Plan, then let another receipt reserve the planned lineage before the commit."""
         planned = plan(
@@ -218,6 +219,7 @@ def test_a_reservation_committed_between_selection_and_commit_is_respected(
             code_revision=code_revision,
             clock=clock,
             excluded=excluded,
+            memory_profile=memory_profile,
         )
         if not stolen:
             lineage = planned.lineages[0]

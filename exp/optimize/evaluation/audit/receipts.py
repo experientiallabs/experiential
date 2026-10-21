@@ -36,6 +36,7 @@ from exp.optimize.evaluation.audit.exposure import LineageExposure, held_out_mem
 from exp.optimize.evaluation.audit.panel import (
     AuditCheckpoint,
     HeldOutPanel,
+    MemoryProfile,
     Profile,
     run_slots,
 )
@@ -68,11 +69,13 @@ class AuditRequest(ContractModel):
         profile: Simulator profile.
         count: Maximum held-out traces.
         include_inspected: Whether exposed or reserved lineages may be selected.
+        memory: Memory profile of a ``memory`` audit; ``learned`` reads all learned memory.
     """
 
     profile: Profile
     count: int = Field(ge=1)
     include_inspected: bool = False
+    memory: MemoryProfile = Field(default="learned", exclude_if=lambda value: value == "learned")
 
 
 class AuditCase(ContractModel):

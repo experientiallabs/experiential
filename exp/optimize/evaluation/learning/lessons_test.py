@@ -1,4 +1,4 @@
-"""Screened lessons end to end: learn fit traces, screen misses, publish.
+"""Screened lessons end to end: learn fit traces, screen misses, publish, audit three ways.
 
 Everything runs offline through the routed fake of :mod:`exp.optimize.evaluation.audit.panel_test`.
 One tool (``get_order_details``) is always mispredicted, like a read of unseen instance data;
@@ -16,6 +16,7 @@ from typer.testing import CliRunner
 from exp.cli.app import app
 from exp.common.core.artifacts import ArtifactEnvelope, ArtifactInput, JsonObject, JsonValue
 from exp.common.project import ProjectStore
+from exp.optimize.evaluation.audit.panel import MemoryProfile, plan_held_out_panel
 from exp.optimize.evaluation.audit.panel_test import (
     LEARNABLE,
     PROJECT,
@@ -26,6 +27,7 @@ from exp.optimize.evaluation.audit.panel_test import (
     _user_content,
     build_project,
     episode,
+    held_out_command,
     learn_fit,
 )
 from exp.optimize.evaluation.fidelity.memory_policy import LESSON_SET_TYPE
@@ -222,3 +224,86 @@ def test_screening_keeps_behavioural_misses_and_replays_without_calls(
     assert len(provider.requests) == purchased, "saved decisions and the lesson set replay"
     assert '"screened_in": 1' in again
     assert len(store.artifacts.list_ids(artifact_type=LESSON_SET_TYPE)) == 1
+
+
+def test_audit_compares_memory_profiles_on_identical_specs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No memory, all learned memory and screened lessons differ only in what memory is read."""
+    root, store, provider, reference = screened_project(tmp_path, monkeypatch)
+    lessons = load_lesson_set(store, reference)
+
+    def plan(profile: MemoryProfile) -> list[JsonObject]:
+        """Planned specs of one memory profile, without their memory and run identity."""
+        planned = plan_held_out_panel(
+            store,
+            2,
+            profile="memory",
+            code_revision="test",
+            clock=lambda: store.artifacts.read(reference.artifact_id).manifest.created_at,
+            memory_profile=profile,
+        )
+        return [
+            spec.model_dump(mode="json", exclude={"run_id", "deadline", "memory"})
+            for spec in planned.specs
+        ]
+
+    learned, none, screened = plan("learned"), plan("none"), plan("lessons")
+    # Without memory there is no recall call per turn, so only the attempt ceiling is lower.
+    assert all(
+        int(str(a.pop("maximum_physical_attempts"))) >= int(str(b.pop("maximum_physical_attempts")))
+        for a, b in zip(learned, none, strict=True)
+    )
+    assert all(row.pop("maximum_physical_attempts") for row in screened)
+    assert learned == none == screened
+
+    before = len(provider.requests)
+    output = held_out_command(root, 2, "--audit-memory", "lessons")
+    assert f"replays read only lesson set {reference.artifact_id}" in output
+    served = [
+        _user_content(request.payload)
+        for request in provider.requests[before:]
+        if request.url.endswith("/chat/completions")
+        and '"submit_transition"' in json.dumps(request.payload.get("tool_choice"))
+    ]
+    assert served, "the lesson audit replayed held-out traces"
+    allowed = set(lessons.selection.lessons)
+    for prediction in served:
+        assert not prediction.get("memory_observations"), "raw observations are not lessons"
+        history = json.dumps(prediction.get("research_history") or {})
+        for row in lessons.screened_out:
+            assert row.miss.record.artifact_id not in history
+        assert all(
+            identity in allowed
+            for identity in _record_ids(prediction.get("research_history") or {})
+        )
+    none = held_out_command(root, 2, "--audit-memory", "none", "--include-inspected")
+    assert "replays read no memory" in none
+    learned = held_out_command(root, 2, "--include-inspected")
+    assert "replays read" not in learned.split("Audited checkpoint")[-1].split("Complete")[0]
+
+
+def _record_ids(history: JsonValue) -> list[str]:
+    """Record identities delivered in a prediction's research history."""
+    found: list[str] = []
+    pending = [history]
+    while pending:
+        item = pending.pop()
+        if isinstance(item, dict):
+            identity = item.get("id")
+            if isinstance(identity, str) and item.get("kind") != "original-observation":
+                if "session_id" in item:
+                    found.append(identity)
+            pending.extend(item.values())
+        elif isinstance(item, list):
+            pending.extend(item)
+    return found
+
+
+def test_audit_memory_needs_the_audit_and_a_known_profile(tmp_path: Path) -> None:
+    """The option is refused outside an audit, and for an unknown profile."""
+    result = CliRunner().invoke(app, ["eval", PROJECT, "--audit-memory", "lessons"])
+    assert result.exit_code != 0
+    assert "--audit-memory applies only with --audit" in " ".join(result.output.split())
+    result = CliRunner().invoke(app, ["eval", PROJECT, "--audit", "2", "--audit-memory", "x"])
+    assert result.exit_code != 0

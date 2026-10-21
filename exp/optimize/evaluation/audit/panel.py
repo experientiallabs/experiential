@@ -11,6 +11,11 @@ reproduces held-out traces, in one of two explicit profiles:
 - ``source-rag``: the same world model retrieving from the build's fit-only index; the serving
   index also holds held-out traces and is never used here.
 
+The memory profile reads its checkpoint in one of three memory settings, every other spec field
+identical, so one panel's cases compare them: ``learned`` (all learned memory, the default),
+``none`` (no experience memory), and ``lessons`` (only the checkpoint's screened lessons, see
+:mod:`exp.optimize.evaluation.learning.lessons`).
+
 Held-out traces are selected deterministically and replayed through the shared trace-replay
 path and the existing fidelity owner; see :mod:`exp.optimize.evaluation.fidelity.replay` for the
 trace-context convention and content-addressed run identities.
@@ -44,6 +49,7 @@ from exp.optimize.evaluation.fidelity.replay import (
     saved_results,
 )
 from exp.optimize.evaluation.fidelity.runner import FidelityMemory, FidelitySpec, PreparedFidelity
+from exp.optimize.evaluation.learning.lessons import latest_lesson_set
 from exp.optimize.evaluation.learning.traces import (
     Scope,
     fit_calls,
@@ -59,6 +65,7 @@ from exp.simulation.world_model.runtime import persist_fit_only_world_model
 LABEL = "held-out"
 PANEL_JUDGE_EFFORT = "low"  # panels report the judge alongside exact replies; low suffices
 Profile = Literal["memory", "source-rag"]
+MemoryProfile = Literal["learned", "none", "lessons"]
 
 
 class AuditCheckpoint(ContractModel):
@@ -70,12 +77,16 @@ class AuditCheckpoint(ContractModel):
         scope: Traces that memory learned; ``fit`` reserves every held-out lineage. An
             all-traces build learns into a different lineage, which this checkpoint is not.
         fit_traces_learned: Fit traces consumed into memory when the audit was planned.
+        memory: What the replays read of the checkpoint: all of it, nothing, or its lessons.
+        lessons: Lesson set read under the ``lessons`` memory profile.
     """
 
     lineage: str
     version: int = Field(ge=1)
     scope: Scope
     fit_traces_learned: int = Field(ge=0)
+    memory: MemoryProfile = Field(default="learned", exclude_if=lambda value: value == "learned")
+    lessons: ArtifactInput | None = Field(default=None, exclude_if=lambda value: value is None)
 
 
 class PlannedPanel(ContractModel):
@@ -276,6 +287,7 @@ def plan_held_out_panel(
     code_revision: str,
     clock: Callable[[], datetime],
     excluded: Collection[str] = frozenset(),
+    memory_profile: MemoryProfile = "learned",
 ) -> PlannedPanel:
     """Select up to ``count`` held-out cases and derive their specs, registering nothing.
 
@@ -287,6 +299,8 @@ def plan_held_out_panel(
         code_revision: Implementation that will produce every run.
         clock: Aware clock for deadlines.
         excluded: Lineages never selected.
+        memory_profile: Memory profile only: read all learned memory, none, or only the
+            checkpoint's latest screened lesson set.
 
     Returns:
         The planned panel.
@@ -312,18 +326,35 @@ def plan_held_out_panel(
                 "PROJECT --audit N to learn it"
             )
         world_model = plan.world_model
+        lessons = (
+            latest_lesson_set(project, plan.lineage, head.version)
+            if memory_profile == "lessons"
+            else None
+        )
         checkpoint = AuditCheckpoint(
             lineage=plan.lineage,
             version=head.version,
             scope=plan.scope,
             fit_traces_learned=len(learned_runs(project, plan)),
+            memory=memory_profile,
+            lessons=lessons,
         )
         cases = held_out_cases(project, count, fit_calls(project), excluded=excluded)
-        memory = FidelityMemory(
-            lineage=plan.lineage, mode="frozen", checkpoint=head.version, reserved=True
+        memory = (
+            None
+            if memory_profile == "none"
+            else FidelityMemory(
+                lineage=plan.lineage,
+                mode="frozen",
+                checkpoint=head.version,
+                reserved=True,
+                lessons=lessons,
+            )
         )
         retrieval = plan.recall
     else:
+        if memory_profile != "learned":
+            raise ValueError("a memory profile applies only to the memory audit profile")
         world_model, cases = source_rag_inputs(project, count, excluded=excluded)
         retrieval = None
     deadline = clock() + DEADLINE
@@ -405,6 +436,7 @@ def register_held_out_fidelity(
     code_revision: str,
     clock: Callable[[], datetime],
     excluded: Collection[str] = frozenset(),
+    memory_profile: MemoryProfile = "learned",
 ) -> HeldOutPanel:
     """Plan and register a panel directly, outside any audit receipt or reservation.
 
@@ -418,6 +450,7 @@ def register_held_out_fidelity(
         code_revision: Exact producing implementation identity.
         clock: Aware clock for deadlines and attempt retirement.
         excluded: Lineages never selected.
+        memory_profile: Memory profile only: all learned memory, none, or screened lessons.
 
     Returns:
         The registered panel.
@@ -429,6 +462,7 @@ def register_held_out_fidelity(
         code_revision=code_revision,
         clock=clock,
         excluded=excluded,
+        memory_profile=memory_profile,
     )
     return register_planned_panel(project, planned, clock=clock)
 

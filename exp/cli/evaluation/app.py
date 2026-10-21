@@ -1,6 +1,7 @@
 """Light CLI command declaration for the evaluation application boundary."""
 
 from pathlib import Path
+from typing import Literal
 
 import typer
 
@@ -48,6 +49,16 @@ INCLUDE_INSPECTED_OPTION = typer.Option(
     "--include-inspected",
     help="With --audit, also re-run held-out lineages an earlier --verbose audit showed; "
     "reported as a development re-audit, never independent.",
+)
+
+AuditMemory = Literal["learned", "none", "lessons"]
+AUDIT_MEMORIES: tuple[AuditMemory, ...] = ("learned", "none", "lessons")
+AUDIT_MEMORY_OPTION = typer.Option(
+    None,
+    "--audit-memory",
+    metavar="learned|none|lessons",
+    help="With --audit, the memory the held-out replays read: all learned memory (default), "
+    "none, or only the checkpoint's screened lessons. Every other spec field is identical.",
 )
 
 VERBOSE_OPTION = typer.Option(
@@ -124,6 +135,7 @@ def evaluate(
     audit: int | None = AUDIT_OPTION,
     retry_incomplete: bool = RETRY_INCOMPLETE_OPTION,
     include_inspected: bool = INCLUDE_INSPECTED_OPTION,
+    audit_memory: str | None = AUDIT_MEMORY_OPTION,
     verbose: bool = VERBOSE_OPTION,
     trace_analysis: Path | None = TRACE_ANALYSIS_OPTION,
     refine_task: Path | None = REFINE_TASK_OPTION,
@@ -151,6 +163,7 @@ def evaluate(
         audit: Number of held-out traces replayed on a separately learned fit-only memory.
         retry_incomplete: Resume interrupted audit runs in place.
         include_inspected: Re-run held-out lineages an earlier audit showed in detail.
+        audit_memory: Memory profile the audit's held-out replays read.
         verbose: Plain per-turn fidelity detail, for agents and logs.
         trace_analysis: Simulator-only actor council and read-only evaluation refinement.
         refine_task: Bounded task refinement with independent qualification checks.
@@ -165,6 +178,10 @@ def evaluate(
     Raises:
         typer.BadParameter: PROJECT is missing or options conflict with the selected mode.
     """
+    if audit_memory is not None and (audit is None or audit_memory not in AUDIT_MEMORIES):
+        raise typer.BadParameter(
+            "--audit-memory applies only with --audit and is one of learned, none or lessons"
+        )
     rollout = (models, repeats, concurrency, maximum_steps, maximum_output_tokens)
     audit_flags = (verbose, retry_incomplete, include_inspected)
     if pipeline is not None:
@@ -350,6 +367,7 @@ def evaluate(
             verbose=verbose,
             retry_incomplete=retry_incomplete,
             include_inspected=include_inspected,
+            memory_profile=next(m for m in AUDIT_MEMORIES if m == (audit_memory or "learned")),
         )
         return
     if fidelity is not None:
