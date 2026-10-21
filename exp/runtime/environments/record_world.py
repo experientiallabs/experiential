@@ -15,11 +15,11 @@ import sqlite3
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 
-from exp.common.core.artifacts import JsonObject, JsonValue, Sha256, sha256_json
+from exp.common.core.artifacts import JsonObject, JsonValue, Sha256, sha256_bytes, sha256_json
 from exp.common.models import ToolCall
 from exp.common.tasks import TaskCase
 from exp.runtime.environments.interface import Observation
-from exp.runtime.environments.worlds import NativeImage, WorldAccess, WorldContext, digest_bytes
+from exp.runtime.environments.worlds import NativeImage, WorldAccess, WorldContext
 
 # Identity of the code that decides this artifact's behavior, in place of its source text.
 # Bump it when behavior changes. exp/tests/code_protocols_test.py fails when the covered
@@ -70,7 +70,7 @@ class RecordWorldFactory:
             "name": RECORD_WORLD_PROTOCOL,
             "sqlite": sqlite3.sqlite_version,
             "service": service,
-            "schema_sha256": digest_bytes(schema.encode()),
+            "schema_sha256": sha256_bytes(schema.encode()),
             "tools": {
                 name: {"access": _source_digest(tool.access), "run": _source_digest(tool.run)}
                 for name, tool in sorted(self._tools.items())
@@ -233,4 +233,4 @@ def _source_digest(function: Callable[..., object]) -> Sha256:
         raise ValueError(
             "record tools must be source-defined Python functions so checkpoints can bind them"
         ) from exc
-    return digest_bytes(source.encode())
+    return sha256_bytes(source.encode())

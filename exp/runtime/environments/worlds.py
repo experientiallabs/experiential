@@ -33,6 +33,7 @@ from exp.common.core.artifacts import (
     JsonObject,
     Sha256,
     redact_secret_text,
+    sha256_bytes,
     sha256_json,
 )
 from exp.common.models import ToolCall
@@ -597,7 +598,7 @@ class ExecutableWorld:
                     "kernel": point.model_dump(mode="json", exclude={"image"}),
                     "domains": point.image.domains,
                     "parts": {
-                        name: digest_bytes(payload) for name, payload in point.image.parts.items()
+                        name: sha256_bytes(payload) for name, payload in point.image.parts.items()
                     },
                 }
             )
@@ -928,11 +929,6 @@ class ExecutableWorld:
         ]
         self._next_event = context._next_event
         self._draws = context._draws
-
-
-def digest_bytes(payload: bytes) -> Sha256:
-    """Return the SHA-256 hex digest of one byte payload."""
-    return hashlib.sha256(payload).hexdigest()
 
 
 def _event_key(event: WorldEvent) -> tuple[int, int, str]:

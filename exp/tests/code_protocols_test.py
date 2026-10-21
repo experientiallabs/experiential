@@ -113,7 +113,7 @@ PROTOCOLS = (
         "exp.runtime.environments.artifact_world:ARTIFACT_WORLD_PROTOCOL",
         "artifact-world-v2",
         ("exp.runtime.environments.artifact_world",),
-        "b57a74dbfb1482e69a5f11e2e70a60a0c24bbc2bcf8d1beac229fe0d754b0710",
+        "fe8ea0954048b7cc657f5bc80d6b906a24bf7497d71410592383e678cf523502",
     ),
     Protocol(
         "exp.optimize.evaluation.executable.workbook:PRIVATE_VIEWS_PROTOCOL",
@@ -125,7 +125,7 @@ PROTOCOLS = (
         "exp.runtime.environments.record_world:RECORD_WORLD_PROTOCOL",
         "sqlite-record-world-v1",
         ("exp.runtime.environments.record_world",),
-        "7a97535d9a1e939a0b9b1d812e1ff326b06cd89866618df8325e97f417add01f",
+        "8b1af5a5147eec4c9aff9e9ba9efb2e9ecfb10e1f9ab55af6965c79b4270fec2",
     ),
 )
 
