@@ -61,7 +61,8 @@ CONTINUATIONS_OPTION = typer.Option(
     None,
     "--continuations",
     help="Run one ContinuationCommand JSON spec: continuation studies, witnessed SFT export, "
-    "saved-evidence analysis, environment comparison, task-factory authoring, or executable "
+    "trajectory trace export, saved-evidence analysis, environment comparison, task-factory "
+    "authoring, or executable "
     "tasks (action harbor: propose-worlds, construct-assets, register, qualify, "
     "prepare-training, export or serve).",
 )

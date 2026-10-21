@@ -54,13 +54,13 @@ from exp.runtime.environments.tests.world_conformance_test import (
     workbook_case,
 )
 from exp.runtime.environments.world_artifacts import WorldCheckpoint
-from exp.runtime.environments.worlds import (
+from exp.runtime.environments.world_contracts import (
     ExecutableCheckpoint,
-    ExecutableWorldRuntime,
     StateDomain,
     ToolEffectPolicy,
     WorldManifest,
 )
+from exp.runtime.environments.worlds import ExecutableWorldRuntime
 from exp.simulation.build import build_task_set
 from exp.simulation.continuations import ContinuationCheckpoint, persist_continuation_checkpoint
 from exp.simulation.continuations_test import capsule
