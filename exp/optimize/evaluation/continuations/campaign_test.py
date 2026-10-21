@@ -141,7 +141,7 @@ def test_campaign_connects_source_selector_critic_and_equal_budget_arms(
     assert isinstance(proposed, dict) and isinstance(random, dict)
     assert proposed["planned_branches"] == random["planned_branches"] == 2
     assert report.spec.initial.study.repeats == 3 and spec.continuations == 2
-    assert "no GRPO" in report.scope
+    assert "no weight updates" in report.scope
     project.model_catalog_path.unlink()
     spec.initial.runtime_file.unlink()
     assert run_continuation_campaign(project, spec, code_revision="test") == report

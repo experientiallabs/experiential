@@ -67,7 +67,8 @@ class ContinuationCampaignSpec(ContractModel):
     """An evaluation schedule, with no weight update, promotion or protected-audit authority.
 
     Attributes:
-        initial: Complete source attempt job; set study.repeats=16 for the proposed schedule.
+        initial: Complete source attempt job; its study repeats are the source attempts
+            every selector inspects and the critics' base rate is measured on.
         selectors: Registered retrospective selector models, all retained without winner picking.
         critics: Prospective critic templates; every selector is evaluated with each critic.
         points: Maximum selected points per selector, default four.
@@ -186,8 +187,8 @@ class ContinuationCampaign(ContractModel):
     metrics: JsonObject
     scope: str = (
         "development evaluation schedule; retrospective selectors, prospective critics; "
-        "correlated source attempts and model errors; no GRPO, training warm-up, "
-        "weight updates, independent task correctness or promotion"
+        "correlated source attempts and model errors; no weight updates, "
+        "independent task correctness or promotion"
     )
 
 
