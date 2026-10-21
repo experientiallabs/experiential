@@ -64,7 +64,10 @@ def workbook_definition(tmp_path: Path) -> tuple[ProjectStore, WorkbookRuntimeDe
         ),
         views={
             "protected": WorkbookStateView(
-                input_file="input.xlsx", output_file="output.xlsx", sheets=("Protected",)
+                input_file="input.xlsx",
+                output_file="output.xlsx",
+                sheets=("Protected",),
+                baseline_until_written=True,
             )
         },
     )
@@ -293,11 +296,9 @@ def test_private_row_projection_is_opt_in_and_does_not_change_actor_observations
         runtime = continuation_runtime(project, spec.model_dump(mode="json"))
         with runtime.world.open(task) as world:
             before = runtime.probe(world.checkpoint())
-            if spec == rich:
-                assert resolve(before, "/views/main/sheets/0/rows/1/0/value") == 1
-            else:
-                with pytest.raises(ValueError):
-                    resolve(before, "/views/main/sheets")
+            assert resolve(before, "/views/main/source") is None
+            with pytest.raises(ValueError):
+                resolve(before, "/views/main/sheets")
             reply = world.execute(
                 ToolCall(
                     name="edit_workbook",
@@ -315,3 +316,49 @@ def test_private_row_projection_is_opt_in_and_does_not_change_actor_observations
                 assert resolve(after, "/views/main/source") == "output.xlsx"
                 assert resolve(after, "/views/main/sheets/0/rows/0/0/value") == 1
     assert replies[0] == replies[1]
+
+
+def test_an_unwritten_output_is_unavailable_rather_than_the_unchanged_input(
+    tmp_path: Path,
+) -> None:
+    """A goal over the output cannot pass on input content the actor never transformed."""
+    project, definition, task = workbook_definition(tmp_path)
+    spec = definition.model_copy(
+        update={
+            "views": {
+                **definition.views,
+                "main": WorkbookStateView(
+                    input_file="input.xlsx", output_file="output.xlsx", sheets=("Protected",)
+                ),
+            }
+        }
+    )
+    runtime = continuation_runtime(project, spec.model_dump(mode="json"))
+    with runtime.world.open(task) as world:
+        state = runtime.probe(world.checkpoint())
+    views = state["views"]
+    assert isinstance(views, dict)
+    assert views["main"] == {"source": None, "unavailable": "registered file is absent"}
+    baseline = views["protected"]
+    assert isinstance(baseline, dict) and baseline["source"] == "input.xlsx"
+    # The unchanged input would satisfy this rule; the absent output must not.
+    predicate = TaskVerifier(
+        description="Protected content is carried into the output.",
+        outcome_schema={},
+        required_paths=("/final_state/views/main/sha256",),
+        rules=(
+            OutcomeRule(
+                path="/final_state/views/main/sha256", operator="equals", value=baseline["sha256"]
+            ),
+        ),
+    )
+    outcome: JsonObject = {
+        "initial_state": state,
+        "final_state": state,
+        "final_answer": "done",
+        "stop_reason": "completed",
+        "steps": [],
+    }
+    assert grade(predicate, outcome).goal.status == "unassessable"
+    with pytest.raises(ValueError, match="output_file"):
+        WorkbookStateView(input_file="input.xlsx", baseline_until_written=True)

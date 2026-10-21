@@ -361,7 +361,7 @@ def workbook_search_fixture(
                 outcome_schema={},
                 table_relations=(
                     TableRelation(
-                        source="/initial_state/views/main/sheets/0/rows",
+                        source="/initial_state/views/source/sheets/0/rows",
                         target="/final_state/views/main/sheets/0/rows",
                         operation="last_per_key",
                         key_columns=(1,),
@@ -447,6 +447,9 @@ def workbook_search_fixture(
                         output_file="output.xlsx",
                         sheets=("Data",),
                         include_rows=generated,
+                    ),
+                    "source": WorkbookStateView(
+                        input_file="input.xlsx", sheets=("Data",), include_rows=generated
                     ),
                     "protected": definition.views["protected"],
                 },
