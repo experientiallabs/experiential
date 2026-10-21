@@ -264,25 +264,18 @@ def persist_selection_plan(
         spec.base.study.checkpoint,
         *(reference for proposal in spec.proposed for reference in proposal.evidence),
     }
-    if project.artifacts.exists(identity):
-        saved = CheckpointSelectionPlan.model_validate_json(
-            project.artifacts.read_bytes(identity, "plan.json")
-        )
-        if saved != plan:
-            raise ValueError("saved checkpoint selection does not reproduce")
-    else:
-        project.artifacts.write_json(
-            artifact_id=identity,
-            artifact_type="checkpoint-selection",
-            envelope=ArtifactEnvelope(
-                schema_version=1,
-                created_at=created_at,
-                code_revision=code_revision,
-                inputs=tuple(sorted(inputs, key=lambda row: row.artifact_id)),
-            ),
-            files={"plan.json": plan},
-        )
-    return artifact_input(project.artifacts.read(identity).manifest)
+    manifest = project.artifacts.write_json(
+        artifact_id=identity,
+        artifact_type="checkpoint-selection",
+        envelope=ArtifactEnvelope(
+            schema_version=1,
+            created_at=created_at,
+            code_revision=code_revision,
+            inputs=tuple(sorted(inputs, key=lambda row: row.artifact_id)),
+        ),
+        files={"plan.json": plan},
+    )
+    return artifact_input(manifest)
 
 
 def selection_jobs(
