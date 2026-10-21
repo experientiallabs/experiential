@@ -37,6 +37,7 @@ from exp.optimize.evaluation.audit.panel_test import (
 )
 from exp.optimize.evaluation.fidelity import replay
 from exp.optimize.evaluation.fidelity.runner import FidelityMemory, FidelitySpec
+from exp.optimize.evaluation.learning import lineage as plan_lineage
 from exp.optimize.evaluation.learning import traces
 from exp.optimize.evaluation.learning.profile import learned_evaluation_memory
 from exp.optimize.evaluation.learning.traces import (
@@ -568,7 +569,7 @@ def test_a_protocol_change_learns_a_fresh_memory_trace_by_trace(
         """Stand in for a protocol edit across both supported request projections."""
         return "changed-prompts"
 
-    monkeypatch.setattr(traces, "protocol_prompts_sha256", changed)
+    monkeypatch.setattr(plan_lineage, "protocol_prompts_sha256", changed)
     monkeypatch.setattr(replay, "protocol_prompts_sha256", changed)
     _relearn(store)
     plan = learning_plan(store, scope="all")
@@ -611,7 +612,7 @@ def test_facts_delivery_keys_the_learning_lineage(
             return learning_plan(store, "jev", scope).lineage
 
     artifact = load_grounded_world_model_artifact(store.artifacts, delivered.world_model)
-    protocol = {"protocol": "test-then-train", **traces._protocol()}  # noqa: SLF001
+    protocol = {"protocol": "test-then-train", **plan_lineage.learning_protocol()}
     key = {"knowledge": knowledge_identity(artifact), "scope": scope, **protocol}
     fact_free = "learn-" + sha256_json(key)[:16]
     assert lineage() == fact_free, "a fact-free pass keeps the identity of earlier memories"
@@ -653,7 +654,7 @@ def test_editing_the_workbook_or_facts_prompt_starts_a_fresh_memory(
     _, store, _ = build_project(tmp_path, monkeypatch, provider, learn=True)
     learned = learning_plan(store, scope="all")
     before, recall = learned.lineage, learned.recall.jev_alias
-    monkeypatch.setattr(traces, "INSTANCE_FACTS_GUIDANCE", "edited facts guidance")
+    monkeypatch.setattr(plan_lineage, "INSTANCE_FACTS_GUIDANCE", "edited facts guidance")
     facts_edited = learning_plan(store, recall, scope="all").lineage
     monkeypatch.setattr(replay, "NATIVE_ARTIFACT_PLAN_GUIDANCE", "edited workbook guidance")
     workbook_edited = learning_plan(store, recall, scope="all").lineage
