@@ -1,68 +1,119 @@
-"""Verifier reruns cannot publish rewards inherited from earlier attempts."""
+"""Verifier reruns publish only current verdicts and never rewards from earlier attempts."""
 
 import base64
 import hashlib
 import io
 import json
 import sys
+from collections.abc import Callable
+from email.message import Message
 from pathlib import Path
-from urllib.error import URLError
+from urllib.error import HTTPError, URLError
 from urllib.request import Request
 
 import pytest
 
+from exp.common.core.artifacts import JsonObject
 from exp.optimize.evaluation.harbor import client as harbor_client
 
 
-@pytest.mark.parametrize("failure", ["incomplete", "malformed", "transport", "credential"])
-def test_failed_verification_removes_prior_reward(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
-) -> None:
-    """Every failed verifier attempt must erase a previous successful reward first."""
-    reward = tmp_path / "reward.txt"
-    reward.write_text("1\n")
-    monkeypatch.setattr(sys, "argv", ["tools.py", "verify"])
+def _verify(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, response: Callable[..., io.BytesIO]
+) -> int:
+    """Run the packaged verifier against a scripted grading response, without a network."""
+    monkeypatch.setattr(sys, "argv", ["tools.py", "verify", "--directory", str(tmp_path)])
     monkeypatch.setenv("EXP_HARBOR_ENDPOINT", "http://localhost:1234")
     monkeypatch.setenv("EXP_HARBOR_VERIFIER_TOKEN", "test-token")
-    monkeypatch.setattr(harbor_client, "Path", lambda path: tmp_path)
+    monkeypatch.setattr(harbor_client, "urlopen", response)
+    return harbor_client.main()
+
+
+def _prior_pass(directory: Path) -> None:
+    """Leave both Harbor reward forms from an earlier successful attempt."""
+    (directory / "reward.txt").write_text("1\n")
+    (directory / "reward.json").write_text('{"reward": 1, "scored": 1}\n')
+
+
+@pytest.mark.parametrize("failure", ["malformed", "transport", "http"])
+def test_grading_failure_retains_detail_and_removes_prior_reward(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    """No verdict means no reward file, so Harbor reports an exception rather than a score."""
+    _prior_pass(tmp_path)
 
     def response(request: Request, *, timeout: int) -> io.BytesIO:
         """Fail after a prior reward already exists, without using the network."""
         if failure == "transport":
             raise URLError("connection lost")
-        return io.BytesIO(
-            b"not JSON" if failure == "malformed" else b'{"status":"incomplete","reward":null}'
-        )
+        if failure == "http":
+            raise HTTPError(
+                request.full_url, 503, "unavailable", Message(), io.BytesIO(b'{"error":"X"}')
+            )
+        return io.BytesIO(b"not JSON")
 
-    monkeypatch.setattr(harbor_client, "urlopen", response)
-    if failure == "credential":
-        monkeypatch.delenv("EXP_HARBOR_VERIFIER_TOKEN")
-    if failure == "incomplete":
-        assert harbor_client.main() == 2
+    assert _verify(tmp_path, monkeypatch, response) == 2
+    assert not (tmp_path / "reward.txt").exists() and not (tmp_path / "reward.json").exists()
+    retained = (tmp_path / "experiential.json").read_bytes()
+    if failure == "malformed":
+        assert retained == b"not JSON"
     else:
-        with pytest.raises((ValueError, URLError, KeyError)):
-            harbor_client.main()
-    assert not reward.exists(), "A failed attempt left a stale passing reward"
+        assert json.loads(retained)["status"] == "grading_failed"
 
 
-def test_completed_verification_writes_current_reward(
+def test_missing_verifier_credential_fails_before_any_reward(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A completed failing grade replaces a prior successful grade."""
-    (tmp_path / "reward.txt").write_text("1\n")
-    monkeypatch.setattr(sys, "argv", ["tools.py", "verify"])
+    """A misconfigured verifier environment cannot leave an inherited passing reward."""
+    _prior_pass(tmp_path)
+    monkeypatch.delenv("EXP_HARBOR_VERIFIER_TOKEN", raising=False)
+    monkeypatch.setattr(sys, "argv", ["tools.py", "verify", "--directory", str(tmp_path)])
     monkeypatch.setenv("EXP_HARBOR_ENDPOINT", "http://localhost:1234")
-    monkeypatch.setenv("EXP_HARBOR_VERIFIER_TOKEN", "test-token")
-    monkeypatch.setattr(harbor_client, "Path", lambda path: tmp_path)
+    with pytest.raises(KeyError):
+        harbor_client.main()
+    assert not (tmp_path / "reward.txt").exists() and not (tmp_path / "reward.json").exists()
+
+
+@pytest.mark.parametrize(
+    "verdict",
+    [
+        {"status": "incomplete", "reward": None, "qualification": "diagnostic_only"},
+        {"status": "incomplete", "reward": None, "qualification": "qualified_observable_contract"},
+        {"status": "completed", "reward": None},
+        {"status": "completed", "reward": True},
+        {"status": "completed", "reward": 2},
+    ],
+)
+def test_unscored_verdict_writes_harbor_reward_file_without_a_reward(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, verdict: JsonObject
+) -> None:
+    """Harbor always finds a reward file; an unscored verdict never claims a reward value."""
+    _prior_pass(tmp_path)
+
+    def response(request: Request, *, timeout: int) -> io.BytesIO:
+        """Return an unscored but valid backend verdict."""
+        return io.BytesIO(json.dumps(verdict).encode())
+
+    assert _verify(tmp_path, monkeypatch, response) == 0
+    assert not (tmp_path / "reward.txt").exists()
+    assert json.loads((tmp_path / "reward.json").read_text()) == {"scored": 0}
+    assert json.loads((tmp_path / "experiential.json").read_bytes()) == verdict
+
+
+@pytest.mark.parametrize("reward", [0, 1])
+def test_completed_verification_writes_current_reward(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, reward: int
+) -> None:
+    """A completed grade replaces a prior successful grade with the current scored reward."""
+    _prior_pass(tmp_path)
 
     def response(request: Request, *, timeout: int) -> io.BytesIO:
         """Return a completed current grade through the actual client parser."""
-        return io.BytesIO(b'{"status":"completed","reward":0}')
+        return io.BytesIO(json.dumps({"status": "completed", "reward": reward}).encode())
 
-    monkeypatch.setattr(harbor_client, "urlopen", response)
-    assert harbor_client.main() == 0
-    assert (tmp_path / "reward.txt").read_text() == "0\n"
-    assert json.loads((tmp_path / "experiential.json").read_bytes())["reward"] == 0
+    assert _verify(tmp_path, monkeypatch, response) == 0
+    assert not (tmp_path / "reward.txt").exists()
+    assert json.loads((tmp_path / "reward.json").read_text()) == {"reward": reward, "scored": 1}
+    assert json.loads((tmp_path / "experiential.json").read_bytes())["reward"] == reward
 
 
 @pytest.mark.parametrize(
