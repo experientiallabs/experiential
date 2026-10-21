@@ -300,8 +300,7 @@ def learning_plan(
             evidence_reading=evidence_reading,
             dream_every=dream_every,
         )
-    world_model, identity = _plan_identity(project, scope)
-    lineage = _lineage(project, world_model, scope)
+    world_model, identity, lineage = _plan_identity(project, scope)
     with memory_lock(project.artifacts, lineage) if record else nullcontext():
         return _bind_learning_plan(
             project,
@@ -420,23 +419,27 @@ def _bind_learning_plan(
 def _active_scope(project: ProjectStore) -> Scope:
     """The scope whose memory published most recently; ``all`` before anything is learned."""
     published: list[tuple[datetime, int, Scope]] = []
+    recorded: list[Scope] = []
     for rank, scope in enumerate(SCOPES):
-        if not recorded_plan(project, scope):
+        lineage = _plan_identity(project, scope)[2]
+        if not _recorded(project, lineage):
             continue
-        world_model = _plan_identity(project, scope)[0]
-        head = memory_head(project.artifacts, _lineage(project, world_model, scope))
+        recorded.append(scope)
+        head = memory_head(project.artifacts, lineage)
         if head is not None:
             published.append((head.created_at, -rank, scope))
     if published:
         return max(published)[2]
-    recorded = [scope for scope in SCOPES if recorded_plan(project, scope)]
     return recorded[0] if recorded else "all"
 
 
 def recorded_plan(project: ProjectStore, scope: Scope) -> bool:
     """Whether this build's knowledge has a recorded learning policy in ``scope``."""
-    world_model = _plan_identity(project, scope)[0]
-    lineage = _lineage(project, world_model, scope)
+    return _recorded(project, _plan_identity(project, scope)[2])
+
+
+def _recorded(project: ProjectStore, lineage: str) -> bool:
+    """Whether a learning policy is recorded for ``lineage``."""
     exists = project.artifacts.exists(stable_id("trace-learning-bank", {"lineage": lineage}))
     if not exists:
         _require_plan_contract(project)
@@ -458,8 +461,8 @@ def _require_plan_contract(project: ProjectStore) -> None:
                 ) from error
 
 
-def _plan_identity(project: ProjectStore, scope: Scope) -> tuple[ArtifactInput, str]:
-    """The scope's hybrid simulator and the identity its recorded plan occupies."""
+def _plan_identity(project: ProjectStore, scope: Scope) -> tuple[ArtifactInput, str, str]:
+    """The scope's hybrid simulator, its recorded plan's identity, and its (costly) lineage."""
     build = _build(project)
     # Hybrid: learned memory supplies behavioral rules; the build's index supplies recorded
     # facts. Each task's own lineage is excluded from retrieval, so a trace never retrieves its
@@ -471,9 +474,8 @@ def _plan_identity(project: ProjectStore, scope: Scope) -> tuple[ArtifactInput, 
         else persist_fit_only_world_model(project.artifacts, build.world_model, build.fit_rag)
     )
     lineage = _lineage(project, world_model, scope)
-    return world_model, stable_id(
-        _PLAN_TYPE, {"lineage": lineage, "world_model": world_model.model_dump(mode="json")}
-    )
+    plan = {"lineage": lineage, "world_model": world_model.model_dump(mode="json")}
+    return world_model, stable_id(_PLAN_TYPE, plan), lineage
 
 
 def _lineage(project: ProjectStore, world_model: ArtifactInput, scope: Scope) -> str:

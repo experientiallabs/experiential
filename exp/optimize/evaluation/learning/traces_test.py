@@ -13,7 +13,7 @@ import pytest
 from typer.testing import CliRunner
 
 from exp.cli.app import app
-from exp.common.core.artifacts import ArtifactEnvelope, JsonObject, sha256_json
+from exp.common.core.artifacts import ArtifactEnvelope, ArtifactInput, JsonObject, sha256_json
 from exp.common.models import ModelSnapshot, load_model_catalog, write_model_catalog
 from exp.common.project import ProjectStore, artifact_input, write_project_config
 from exp.common.tasks.facts import InstanceFacts
@@ -40,6 +40,7 @@ from exp.optimize.evaluation.fidelity.runner import FidelityMemory, FidelitySpec
 from exp.optimize.evaluation.learning import traces
 from exp.optimize.evaluation.learning.profile import learned_evaluation_memory
 from exp.optimize.evaluation.learning.traces import (
+    SCOPES,
     LearningPlan,
     Scope,
     learn_from_traces,
@@ -614,6 +615,29 @@ def test_facts_delivery_keys_the_learning_lineage(
     private = fact("input.xlsx/expected", "x", visibility="verifier_private")
     assert lineage(private) == fact_free, "verifier-private facts are never delivered"
     assert lineage(fact("input.xlsx/workbook", {"A1": 1}), private) == delivered.lineage
+
+
+def test_reading_the_recorded_plan_derives_each_lineage_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A lineage reads every trace's facts, so one plan lookup derives it once per scope."""
+    episodes = [episode(i) for i in range(USERS)]
+    _, store, _ = build_project(tmp_path, monkeypatch, SimulatedProvider(episodes))
+    for scope in SCOPES:
+        learning_plan(store, "jev", scope, record=True)
+    derived: list[Scope] = []
+    lineage = traces._lineage  # noqa: SLF001
+
+    def counted(project: ProjectStore, world_model: ArtifactInput, scope: Scope) -> str:
+        """Count each lineage derivation."""
+        derived.append(scope)
+        return lineage(project, world_model, scope)
+
+    monkeypatch.setattr(traces, "_lineage", counted)
+    plan = learning_plan(store)
+    assert sorted(derived) == sorted([*SCOPES, plan.scope]), derived
+    derived.clear()
+    assert recorded_plan(store, "fit") and derived == ["fit"]
 
 
 def test_editing_the_workbook_or_facts_prompt_starts_a_fresh_memory(
