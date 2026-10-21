@@ -42,6 +42,10 @@ from exp.runtime.sessions.dispatch_ledger import DispatchLedger
 from exp.simulation.continuations import load_continuation_checkpoint
 from exp.simulation.development_scope import require_development_task
 
+# Shared ceiling on durable provider attempts registered by one continuation job and by every
+# panel, experiment, contrast or campaign composed from jobs, counted before any dispatch.
+MAXIMUM_PHYSICAL_ATTEMPTS = 100_000
+
 
 class ContinuationJob(ContractModel):
     """One explicit local runtime implementation and its frozen actor study.
@@ -68,7 +72,7 @@ class ContinuationJob(ContractModel):
     catalog_sha256: Sha256
     maximum_model_calls: int = Field(gt=0, le=1000)
     system_prompt: str | None = None
-    maximum_physical_attempts: int = Field(gt=0, le=100_000)
+    maximum_physical_attempts: int = Field(gt=0, le=MAXIMUM_PHYSICAL_ATTEMPTS)
     deadline: AwareDatetime
 
     def implementation(self, code_revision: str) -> Sha256:

@@ -20,7 +20,11 @@ from exp.common.core.artifacts import (
     stable_id,
 )
 from exp.common.project import ArtifactStore, ProjectStore, artifact_input
-from exp.optimize.evaluation.continuations.job import ContinuationJob, preflight_continuation_job
+from exp.optimize.evaluation.continuations.job import (
+    MAXIMUM_PHYSICAL_ATTEMPTS,
+    ContinuationJob,
+    preflight_continuation_job,
+)
 from exp.runtime.agents.chat import ChatAgentRuntime
 from exp.runtime.environments.mixed import MixedCheckpoint
 from exp.runtime.environments.world_contracts import ExecutableCheckpoint
@@ -76,8 +80,13 @@ class CheckpointSelectionSpec(ContractModel):
             raise ValueError("checkpoint pool and proposed identities must be unique")
         if not set(refs) <= set(self.pool):
             raise ValueError("every proposed checkpoint must belong to the registered pool")
-        if len(self.proposed) * 2 * self.base.maximum_physical_attempts > 100_000:
-            raise ValueError("checkpoint comparison exceeds the 100000 actor-attempt ceiling")
+        if len(self.proposed) * 2 * self.base.maximum_physical_attempts > (
+            MAXIMUM_PHYSICAL_ATTEMPTS
+        ):
+            raise ValueError(
+                f"checkpoint comparison exceeds the {MAXIMUM_PHYSICAL_ATTEMPTS} "
+                "actor-attempt ceiling"
+            )
         return self
 
     def identity(self, code_revision: str) -> str:

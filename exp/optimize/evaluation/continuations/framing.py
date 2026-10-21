@@ -20,6 +20,7 @@ from exp.common.core.artifacts import (
 from exp.common.models import ModelMessage
 from exp.common.project import ProjectStore, artifact_input
 from exp.optimize.evaluation.continuations.job import (
+    MAXIMUM_PHYSICAL_ATTEMPTS,
     ContinuationJob,
     continuation_result_reference,
     execute_continuation_job,
@@ -60,7 +61,7 @@ class FramingStudySpec(ContractModel):
         """Reject identical controls and unbounded cumulative provider allowances."""
         if self.control == self.intervention:
             raise ValueError("framing conditions must differ")
-        if self.base.maximum_physical_attempts * self.pairs * 2 > 100_000:
+        if self.base.maximum_physical_attempts * self.pairs * 2 > MAXIMUM_PHYSICAL_ATTEMPTS:
             raise ValueError("framing panel exceeds its total physical-attempt ceiling")
         if self.base.study.training_specification is not None:
             raise ValueError(

@@ -12,7 +12,9 @@ from exp.common.project import ProjectStore
 from exp.optimize.evaluation.audit.panel_test import write_catalog
 from exp.optimize.evaluation.continuations.admission import ContinuationAdmission
 from exp.optimize.evaluation.continuations.admission_test import admitted_workbook_study
+from exp.optimize.evaluation.continuations.framing import FramingStudySpec
 from exp.optimize.evaluation.continuations.job import (
+    MAXIMUM_PHYSICAL_ATTEMPTS,
     ContinuationJob,
     execute_continuation_job,
     preflight_continuation_job,
@@ -141,3 +143,22 @@ def test_runtime_drift_refuses_before_code_or_provider_calls(
     with pytest.raises(ValueError, match="runtime source changed"):
         execute_continuation_job(project, job, code_revision="test")
     assert not transport.requests
+
+
+def test_one_physical_attempt_ceiling_bounds_jobs_and_composed_panels(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A job and a panel composed from jobs share the same named attempt ceiling."""
+    _, job, _ = job_fixture(tmp_path, monkeypatch)
+    with pytest.raises(ValueError, match="less than or equal"):
+        job.model_validate(
+            {**job.model_dump(), "maximum_physical_attempts": MAXIMUM_PHYSICAL_ATTEMPTS + 1}
+        )
+    largest = job.model_copy(
+        update={
+            "maximum_physical_attempts": MAXIMUM_PHYSICAL_ATTEMPTS,
+            "study": job.study.model_copy(update={"training_specification": None}),
+        }
+    )
+    with pytest.raises(ValueError, match="physical-attempt ceiling"):
+        FramingStudySpec(base=largest, intervention="Evaluation", equivalence_rationale="cue")

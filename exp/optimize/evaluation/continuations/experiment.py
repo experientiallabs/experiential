@@ -24,6 +24,7 @@ from exp.optimize.evaluation.continuations.critic import (
     preflight_critic,
 )
 from exp.optimize.evaluation.continuations.job import (
+    MAXIMUM_PHYSICAL_ATTEMPTS,
     ContinuationJob,
     continuation_result_reference,
     execute_continuation_job,
@@ -132,7 +133,7 @@ def preflight_checkpoint_experiment(project: ProjectStore, spec: CheckpointExper
         if spec.critic is not None:
             preflight_critic(project, _critic(spec.critic, job))
             attempts += spec.critic.maximum_physical_attempts
-    if attempts > 100_000:
+    if attempts > MAXIMUM_PHYSICAL_ATTEMPTS:
         raise ValueError("checkpoint experiment exceeds its combined actor/critic attempt ceiling")
 
 

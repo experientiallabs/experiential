@@ -25,6 +25,7 @@ from exp.optimize.evaluation.continuations.intervention import (
     saved_intervention,
 )
 from exp.optimize.evaluation.continuations.job import (
+    MAXIMUM_PHYSICAL_ATTEMPTS,
     ContinuationJob,
     continuation_result_reference,
     execute_continuation_job,
@@ -63,7 +64,8 @@ class ActionContrastSpec(ContractModel):
             self.alternative.arguments,
         ):
             raise ValueError("action contrast requires two different decisions")
-        if self.base.maximum_physical_attempts * self.base.study.repeats * 2 > 100_000:
+        attempts = self.base.maximum_physical_attempts * self.base.study.repeats * 2
+        if attempts > MAXIMUM_PHYSICAL_ATTEMPTS:
             raise ValueError("action contrast exceeds its combined actor attempt ceiling")
         return self
 

@@ -25,6 +25,7 @@ from exp.optimize.evaluation.continuations.experiment import (
     saved_checkpoint_experiment,
 )
 from exp.optimize.evaluation.continuations.job import (
+    MAXIMUM_PHYSICAL_ATTEMPTS,
     ContinuationJob,
     continuation_result_reference,
     execute_continuation_job,
@@ -116,8 +117,11 @@ class ContinuationCampaignSpec(ContractModel):
                 or critic.deadline != job.deadline
             ):
                 raise ValueError("campaign critic must match the frozen actor/verifier/deadline")
-        if self.attempt_bound() > 100000:
-            raise ValueError("campaign exceeds the 100000 actor/selector/critic attempt ceiling")
+        if self.attempt_bound() > MAXIMUM_PHYSICAL_ATTEMPTS:
+            raise ValueError(
+                f"campaign exceeds the {MAXIMUM_PHYSICAL_ATTEMPTS} actor/selector/critic "
+                "attempt ceiling"
+            )
         return self
 
     def attempt_bound(self) -> int:

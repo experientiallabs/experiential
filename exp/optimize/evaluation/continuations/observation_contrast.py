@@ -22,6 +22,7 @@ from exp.optimize.evaluation.continuations.intervention import (
     saved_intervention,
 )
 from exp.optimize.evaluation.continuations.job import (
+    MAXIMUM_PHYSICAL_ATTEMPTS,
     ContinuationJob,
     continuation_result_reference,
     execute_continuation_job,
@@ -163,7 +164,7 @@ def _source(project: ProjectStore, spec: ObservationContrastSpec) -> ActionInter
         raise ValueError("observation source differs from its executed action")
     if spec.alternative == effect.observation.content:
         raise ValueError("observation arms must contain different replies")
-    if effect.spec.base.maximum_physical_attempts * spec.pairs * 2 > 100_000:
+    if effect.spec.base.maximum_physical_attempts * spec.pairs * 2 > MAXIMUM_PHYSICAL_ATTEMPTS:
         raise ValueError("observation comparison exceeds its combined actor attempt ceiling")
     for ref in spec.evidence:
         if artifact_input(store.read(ref.artifact_id).manifest) != ref:
