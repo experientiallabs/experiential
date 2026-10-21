@@ -98,6 +98,25 @@ PROTOCOLS = (
         "0d6a436e42eb2fafe530930865ad937351745c78d81aa83495007a1c753daef8",
     ),
     Protocol(
+        "exp.optimize.evaluation.learning.screening:SCREENING_PROTOCOL",
+        "learning-miss-screening-v1",
+        (
+            "exp.optimize.evaluation.learning.screening:screening_request",
+            "exp.optimize.evaluation.learning.screening:_bounded",
+            "exp.optimize.evaluation.learning.screening:_probabilities",
+        ),
+        "de36bab2fa626f87e9673bb8bfd220fa6e2051631cb443c15eb519016a353485",
+    ),
+    Protocol(
+        "exp.optimize.evaluation.learning.lesson_evolution:EVOLUTION_PROTOCOL",
+        "lesson-evolution-v1",
+        (
+            "exp.optimize.evaluation.learning.lesson_evolution:_attempt",
+            "exp.optimize.evaluation.learning.lesson_evolution:evolve_lessons",
+        ),
+        "8f2de3e4976b42c0657a24135edff38202c55f7a34ef70955ab67e47488a08d4",
+    ),
+    Protocol(
         "exp.runtime.models.providers.attempt_timeouts:ATTEMPT_TIMEOUT_PROTOCOL",
         "provider-attempt-timeout-v2",
         ("exp.runtime.models.providers.attempt_timeouts",),
