@@ -354,8 +354,6 @@ def _execute_and_record(
     Raises:
         TypeError: The supplied action is not a canonical tool call.
     """
-    from exp.common.models import ToolCall
-
     if not isinstance(call, ToolCall):
         raise TypeError("chat agent tool actions must use ToolCall")
     call_started_at = datetime.now(UTC)
