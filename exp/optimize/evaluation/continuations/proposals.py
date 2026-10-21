@@ -39,6 +39,7 @@ from exp.optimize.evaluation.continuations.records import load_study
 from exp.optimize.evaluation.continuations.selection import (
     CheckpointProposal,
     CheckpointSelectionSpec,
+    checkpoint_content_digest,
     load_selection_plan,
     match_checkpoints,
     persist_selection_plan,
@@ -350,15 +351,7 @@ def _render(
         if point.task != base.task or point.world_task != base.world_task:
             raise ValueError("selector studies must share the exact task and world task")
         remaining = actor.remaining_calls(point.actor)
-        world = point.world.model_dump(mode="json")
-        world.pop("episode_id", None)
-        digest = sha256_json(
-            {
-                "task": point.task.model_dump(mode="json"),
-                "actor": point.actor.model_dump(mode="json"),
-                "world": world,
-            }
-        )
+        digest = checkpoint_content_digest(point)
         reason = "terminal" if remaining <= 0 else "duplicate_content" if digest in seen else None
         if reason is not None:
             excluded.append({"checkpoint": point_ref.model_dump(mode="json"), "reason": reason})

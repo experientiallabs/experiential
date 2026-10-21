@@ -28,7 +28,7 @@ from exp.optimize.evaluation.continuations.job import (
 from exp.runtime.agents.chat import ChatAgentRuntime
 from exp.runtime.environments.mixed import MixedCheckpoint
 from exp.runtime.environments.world_contracts import ExecutableCheckpoint
-from exp.simulation.continuations import load_continuation_checkpoint
+from exp.simulation.continuations import ContinuationCheckpoint, load_continuation_checkpoint
 from exp.simulation.development_scope import require_development_task
 
 if TYPE_CHECKING:
@@ -132,6 +132,23 @@ class CheckpointSelectionPlan(ContractModel):
     )
 
 
+def checkpoint_content_digest(point: ContinuationCheckpoint) -> Sha256:
+    """Identify a checkpoint's task, actor context and world state, ignoring its episode label.
+
+    Two checkpoints with the same digest are the same starting point, so neither adds a distinct
+    control or pool entry.
+    """
+    world = point.world.model_dump(mode="json")
+    world.pop("episode_id", None)
+    return sha256_json(
+        {
+            "task": point.task.model_dump(mode="json"),
+            "actor": point.actor.model_dump(mode="json"),
+            "world": world,
+        }
+    )
+
+
 def _world_policy(checkpoint: ExecutableCheckpoint | MixedCheckpoint) -> Sha256:
     """Compare frozen backend/ownership policies without equating different checkpoint states."""
     if isinstance(checkpoint, MixedCheckpoint):
@@ -186,15 +203,7 @@ def _match(project: ProjectStore, spec: CheckpointSelectionSpec) -> CheckpointSe
                 "checkpoint controls must share the exact source task and world policy"
             )
         remaining = actor.remaining_calls(point.actor)
-        world = point.world.model_dump(mode="json")
-        world.pop("episode_id", None)
-        digest = sha256_json(
-            {
-                "task": point.task.model_dump(mode="json"),
-                "actor": point.actor.model_dump(mode="json"),
-                "world": world,
-            }
-        )
+        digest = checkpoint_content_digest(point)
         if digest in seen_points:
             raise ValueError("duplicate checkpoint content does not add a random control")
         seen_points.add(digest)
