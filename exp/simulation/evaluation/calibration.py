@@ -425,8 +425,9 @@ def _judge_validation(
 
     Returns:
         The admission-floor interpretation and, per sample set and category, verifier and
-        task-decision confusion counts with Wilson intervals at the lineage count, plus
-        criterion-level abstention, unsupported-confidence and threshold-crossing counts.
+        task-decision confusion counts with Wilson intervals at the lineage count, judge
+        failures kept apart from abstentions, plus criterion-level abstention,
+        unsupported-confidence and threshold-crossing counts.
     """
     grouped: dict[str, dict[str, list[tuple[CalibrationCase, CalibrationJudgment | None]]]] = {}
     withheld = unadmitted = 0
@@ -481,13 +482,17 @@ def _category_validation(
         for case, _ in rows
     ]
     task: list[tuple[Verdict, Verdict, CalibrationCase]] = []
-    task_not_judged = 0
+    task_not_judged = task_judge_failures = 0
     abstentions = operational = unsupported = assessed = expected_assessed = 0
     correct_abstentions = optimistic = pessimistic = 0
     for case, judgment in rows:
         if case.expected_task is not None:
             if judgment is None:
                 task_not_judged += 1
+            elif _judge_failed(judgment, pack.minimum_scores):
+                # A rejected or undispatched judge output is an operational failure, not a
+                # judge abstention; it stays out of both error directions.
+                task_judge_failures += 1
             else:
                 mechanical = grade(pack.candidate, case.challenge.outcome).status
                 decision = task_decision(
@@ -518,7 +523,11 @@ def _category_validation(
     return {
         "cases": len(rows),
         "verifier": _confusion(verifier, sample),
-        "task_decision": {**_confusion(task, sample), "not_judged": task_not_judged},
+        "task_decision": {
+            **_confusion(task, sample),
+            "not_judged": task_not_judged,
+            "judge_failures": task_judge_failures,
+        },
         "criteria": {
             "expected_assessable": expected_assessed,
             "assessed": assessed,
@@ -723,6 +732,15 @@ def _bound_axes(
     if len(axes) != len(judgment.axes) or set(axes) != expected_axes:
         raise ValueError("judge criteria differ from the independently labeled inventory")
     return judgment.axes
+
+
+def _judge_failed(judgment: CalibrationJudgment, minimum_scores: dict[str, int]) -> bool:
+    """Whether the evaluator obtained no judgment of a required criterion."""
+    return any(
+        axis.status in ("judge_failure", "judge_unknown", "not_run")
+        for axis in judgment.axes
+        if axis.dimension_id in minimum_scores
+    )
 
 
 def _required_assessed(axes: tuple[AxisOutcome, ...], minimum_scores: dict[str, int]) -> bool:

@@ -123,6 +123,13 @@ def perturbations(case: str) -> tuple[Perturbation, ...]:
             description="The two independent writes in the other valid order.",
         ),
         Perturbation(
+            perturbation_id=f"{case}-plain-wrong-cell",
+            base_case_id=case,
+            factor="wrong_cell",
+            edits=(OutputEdit(pointer="/actions/1/value", value=41),),
+            description="Wrong total with the original explanation.",
+        ),
+        Perturbation(
             perturbation_id=f"{case}-wrong-cell",
             base_case_id=case,
             factor="wrong_cell_persuasive",
@@ -268,11 +275,11 @@ def test_single_judges_and_panels_are_compared_on_the_same_outputs() -> None:
     judgments = run_challenge_study(registered, scripted_judge)
     report = assess_challenge_study(registered, judgments)
     assert report["protocol"] == CHALLENGE_PROTOCOL and report["not_run"] == 0
-    assert report["outputs"] == {"bases": 2, "invariance": 8, "defects": 6}
+    assert report["outputs"] == {"bases": 2, "invariance": 8, "defects": 8}
     careful = section(report, "arms", "careful")
     for factor in ("actor_identity", "candidate_order", "explanation_length", "action_order"):
         assert rate(careful, "invariance", factor, "stability") == 1.0
-    for kind in ("wrong_cell_persuasive", "unauthorized_write", "wrong_json_type"):
+    for kind in ("wrong_cell", "wrong_cell_persuasive", "unauthorized_write", "wrong_json_type"):
         assert rate(careful, "sensitivity", kind, "judge_sensitivity") == 1.0
     credulous = section(report, "arms", "credulous")
     assert rate(credulous, "invariance", "actor_identity", "stability") == 0.0
@@ -308,7 +315,7 @@ def test_repeated_same_model_judgments_report_consistency() -> None:
     report = assess_challenge_study(registered, run_challenge_study(registered, scripted_judge))
     consistency = section(report, "arms", "credulous")["repeat_consistency"]
     assert isinstance(consistency, dict)
-    assert consistency["trials"] == 16 and consistency["successes"] == 15
+    assert consistency["trials"] == 18 and consistency["successes"] == 17
     assert section(report, "arms", "careful")["repeat_consistency"] is None
 
 
@@ -317,12 +324,48 @@ def test_missing_judgments_stay_in_the_denominator() -> None:
     registered = study()
     judgments = run_challenge_study(registered, scripted_judge)
     report = assess_challenge_study(registered, judgments[1:])
-    assert report["planned_judgments"] == 48 and report["not_run"] == 1
+    assert report["planned_judgments"] == 54 and report["not_run"] == 1
     with pytest.raises(ValueError, match="must not repeat"):
         assess_challenge_study(registered, judgments + judgments[:1])
     rebound = judgments[0].model_copy(update={"item_id": "case-a-identity"})
     with pytest.raises(ValueError, match="another output"):
         assess_challenge_study(registered, (rebound,))
+
+
+def test_judge_failures_are_not_abstentions_flips_or_detections() -> None:
+    """A rejected judge output is reported as a failure, apart from every judge error."""
+    registered = study()
+    failing = {"case-a", "case-a-identity", "case-b-extra-write"}
+
+    def rejecting(judge: JudgeConfig, blinded: JsonObject, key: str) -> CalibrationJudgment:
+        """Fail the careful judge on three outputs, as a rejected structured output would."""
+        saved = scripted_judge(judge, blinded, key)
+        if judge.model_identity != "careful" or key.rsplit(":", 1)[1] not in failing:
+            return saved
+        axes = tuple(
+            AxisOutcome(dimension_id=axis.dimension_id, status="judge_failure", rationale="Rej")
+            for axis in saved.axes
+        )
+        return saved.model_copy(update={"axes": axes})
+
+    report = assess_challenge_study(registered, run_challenge_study(registered, rejecting))
+    careful = section(report, "arms", "careful")
+    assert careful["base_judge_failures"] == 1
+    assert careful["base_false_rejections"] == 0 and careful["base_false_acceptances"] == 0
+    invariance = careful["invariance"]
+    assert isinstance(invariance, dict)
+    identity = invariance["actor_identity"]
+    assert isinstance(identity, dict)
+    assert identity["judge_failures"] == 1 and identity["compared"] == 1
+    assert identity["decision_flips"] == 0
+    sensitivity = careful["sensitivity"]
+    assert isinstance(sensitivity, dict)
+    extra = sensitivity["unauthorized_write"]
+    assert isinstance(extra, dict)
+    assert extra["judge_failed"] == 1 and extra["judge_abstained"] == 0
+    assert extra["detected_by_judge"] == 1 and extra["accepted_by_judge"] == 0
+    majority = section(report, "panels", "majority")
+    assert majority["base_judge_failures"] == 0, "the other members still decide the panel"
 
 
 def test_saved_studies_replay_their_report_without_judge_calls(tmp_path: Path) -> None:
@@ -381,6 +424,16 @@ def test_invariance_edits_must_stay_inside_declared_irrelevant_locations() -> No
             "appends",
         ),
         (
+            "wrong_cell",
+            (OutputEdit(pointer="/actions/1/value", value=42),),
+            "replaces values with different ones",
+        ),
+        (
+            "unauthorized_write",
+            (OutputEdit(pointer="/observed/value", value=0, operation="add"),),
+            "new member of an existing object",
+        ),
+        (
             "wrong_cell_persuasive",
             (OutputEdit(pointer="/actions/1/value", value=41),),
             "prose defending it",
@@ -432,4 +485,28 @@ def test_registration_refuses_unknown_bases_panels_and_missing_thresholds() -> N
     )
     with pytest.raises(ValidationError, match="criterion thresholds"):
         JudgeChallengeStudy.model_validate({**base.model_dump(), "pack": unthresholded})
-    assert len(study_items(base)) == 16
+    assert len(study_items(base)) == 18
+
+
+def test_an_unauthorized_effect_can_be_added_to_an_existing_object() -> None:
+    """An unrequested state effect is a new member, injected without touching other values."""
+    base = study()
+    added = Perturbation(
+        perturbation_id="case-a-extra-effect",
+        base_case_id="case-a",
+        factor="unauthorized_write",
+        edits=(OutputEdit(pointer="/observed/Z9", value=0, operation="add"),),
+        description="The observed state gains an unrequested cell.",
+    )
+    registered = JudgeChallengeStudy.model_validate(
+        {**base.model_dump(), "perturbations": (*base.perturbations, added)}
+    )
+    items = study_items(registered)
+    variant = next(item for item in items if item.item_id == "case-a-extra-effect")
+    assert isinstance(variant.outcome, dict)
+    assert variant.outcome["observed"] == {"value": 42, "Z9": 0}
+    hidden = added.model_copy(update={"factor": "explanation_length", "perturbation_id": "hidden"})
+    with pytest.raises(ValidationError, match="does not declare irrelevant"):
+        JudgeChallengeStudy.model_validate(
+            {**base.model_dump(), "perturbations": (*base.perturbations, hidden)}
+        )

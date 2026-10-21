@@ -3,11 +3,14 @@
 A challenge study registers saved, independently labeled outputs from a calibration pack, the
 presentation factors its task declares irrelevant, and exact JSON edits of those outputs. Each
 edit either varies one declared-irrelevant factor (actor identity, candidate order, explanation
-length, a valid alternative action order) or injects one real defect (a wrong cell defended by
-persuasive prose, an unauthorized extra write, a value of the wrong JSON type). Every judge arm
+length, a valid alternative action order) or injects one real defect (a wrong cell, the same
+wrong cell defended by persuasive prose, an unauthorized extra write, a value of the wrong JSON
+type). Every judge arm
 then assesses the same blinded outputs through the existing evaluator callback, and the study
 reports how often a judgment stays stable where nothing relevant changed and how often it
-detects the injected defect, for single judges, repeated same-model judges and panels.
+detects the injected defect, for single judges, repeated same-model judges and panels. A
+judgment the evaluator could not obtain (a rejected or undispatched judge output) is counted as
+a judge failure, never as an abstention, a flip or a detection.
 
 The study performs no inference itself and never rewrites a label. Saved judgments replay the
 report exactly, so judge configurations can be compared on identical outputs without new calls.
@@ -43,12 +46,12 @@ from exp.simulation.evaluation.tasks import Verdict, grade
 # Identity of the code that decides this artifact's behavior, in place of its source text.
 # Bump it when behavior changes. exp/tests/code_protocols_test.py fails when the covered
 # source changes until it is bumped or, for a pure refactor, its digest is updated.
-CHALLENGE_PROTOCOL = "judge-challenge-v1"
+CHALLENGE_PROTOCOL = "judge-challenge-v3"
 
 IrrelevantFactor = Literal[
     "actor_identity", "candidate_order", "explanation_length", "action_order"
 ]
-DefectKind = Literal["wrong_cell_persuasive", "unauthorized_write", "wrong_json_type"]
+DefectKind = Literal["wrong_cell", "wrong_cell_persuasive", "unauthorized_write", "wrong_json_type"]
 INVARIANCE_FACTORS: tuple[IrrelevantFactor, ...] = (
     "actor_identity",
     "candidate_order",
@@ -56,6 +59,7 @@ INVARIANCE_FACTORS: tuple[IrrelevantFactor, ...] = (
     "action_order",
 )
 DEFECT_KINDS: tuple[DefectKind, ...] = (
+    "wrong_cell",
     "wrong_cell_persuasive",
     "unauthorized_write",
     "wrong_json_type",
@@ -88,15 +92,16 @@ class OutputEdit(ContractModel):
     """One exact edit of a saved outcome.
 
     Attributes:
-        pointer: JSON pointer to an existing value (``replace``) or an existing array
-            (``append``).
-        value: Replacement value, or the element appended.
-        operation: ``replace`` swaps the value; ``append`` adds an element to an array.
+        pointer: JSON pointer to an existing value (``replace``), an existing array
+            (``append``), or an absent member of an existing object (``add``).
+        value: Replacement value, the element appended, or the member added.
+        operation: ``replace`` swaps the value; ``append`` adds an element to an array;
+            ``add`` adds a member to an object, such as an unrequested effect in a state.
     """
 
     pointer: str = Field(pattern=r"^/.+")
     value: JsonValue
-    operation: Literal["replace", "append"] = "replace"
+    operation: Literal["replace", "append", "add"] = "replace"
 
 
 class Perturbation(ContractModel):
@@ -328,9 +333,10 @@ def assess_challenge_study(
         judgments: Saved judgments; missing ones stay in every denominator as not run.
 
     Returns:
-        Per-arm and per-panel invariance stability and defect sensitivity by factor, with
-        Wilson intervals at the count of independent base lineages, repeat consistency and
-        defects every panel member missed.
+        Per-arm and per-panel base-label errors, invariance stability and defect sensitivity
+        by factor, with Wilson intervals at the count of independent base lineages, judge
+        failures kept apart from abstentions, repeat consistency and defects every panel
+        member missed.
 
     Raises:
         ValueError: A judgment repeats, names an unknown arm or output, or is bound to
@@ -514,12 +520,15 @@ class _Decision(ContractModel):
         task: Mechanically gated task decision, as calibration grades it.
         verifier: Mechanical verifier verdict on the same output.
         scores: Assessed criterion scores by criterion.
+        failed: The evaluator obtained no judgment (rejected, unknown or undispatched output),
+            as distinct from a judge that abstained on purpose.
     """
 
     judge: Verdict
     task: Verdict
     verifier: Verdict
     scores: dict[str, int]
+    failed: bool = False
 
 
 def _decide(
@@ -542,11 +551,18 @@ def _decide(
             for axis in axes
             if axis.status == "assessed" and axis.score is not None
         },
+        failed=any(axis.status in _FAILED for axis in axes),
     )
 
 
+_FAILED = frozenset({"judge_failure", "judge_unknown", "not_run"})
+
+
 def _panel_decision(panel: ChallengePanel, members: list[_Decision | None]) -> _Decision | None:
-    """Aggregate member decisions; any missing member leaves the panel decision missing."""
+    """Aggregate member decisions; any missing member leaves the panel decision missing.
+
+    A panel fails operationally only when its rule cannot decide and a member failed.
+    """
     if any(member is None for member in members):
         return None
     known = [member for member in members if member is not None]
@@ -560,11 +576,13 @@ def _panel_decision(panel: ChallengePanel, members: list[_Decision | None]) -> _
             return "fail"
         return "pass" if passed * 2 > len(values) else "unassessable"
 
+    judge = combine([member.judge for member in known])
     return _Decision(
-        judge=combine([member.judge for member in known]),
+        judge=judge,
         task=combine([member.task for member in known]),
         verifier=known[0].verifier,
         scores={},
+        failed=judge == "unassessable" and any(member.failed for member in known),
     )
 
 
@@ -573,8 +591,9 @@ def _measure(
     items: tuple[ChallengeOutput, ...],
     decisions: dict[str, _Decision | None],
 ) -> JsonObject:
-    """Compute base agreement, stability per factor and sensitivity per defect kind."""
+    """Compute base agreement and errors, stability per factor and sensitivity per kind."""
     bases = [item for item in items if item.perturbation is None]
+    judged = [(item, decisions[item.item_id]) for item in bases]
     base_known = [
         (item, decision)
         for item in bases
@@ -596,6 +615,15 @@ def _measure(
             len(base_known),
             units=len({item.case.lineage for item, _ in base_known}) or None,
         ),
+        "base_false_acceptances": sum(
+            decision.judge == "pass" and item.case.label == "fail" for item, decision in base_known
+        ),
+        "base_false_rejections": sum(
+            decision.judge == "fail" and item.case.label == "pass" for item, decision in base_known
+        ),
+        "base_judge_failures": sum(
+            decision is not None and decision.failed for _, decision in judged
+        ),
         "invariance": invariance,
         "sensitivity": sensitivity,
     }
@@ -615,14 +643,20 @@ def _stability(
     rows: list[ChallengeOutput],
     decisions: dict[str, _Decision | None],
 ) -> JsonObject:
-    """Count unchanged decisions and bounded score shifts against each variant's base."""
-    stable = flips = compared = 0
+    """Count unchanged decisions and bounded score shifts against each variant's base.
+
+    A pair where either judgment failed is not compared: a lost judgment is not a flip.
+    """
+    stable = flips = compared = failures = 0
     shifts: list[int] = []
     lineages: set[str] = set()
     for item in rows:
         variant = decisions[item.item_id]
         base = decisions["base:" + item.case.challenge.id]
         if variant is None or base is None:
+            continue
+        if variant.failed or base.failed:
+            failures += 1
             continue
         compared += 1
         lineages.add(item.case.lineage)
@@ -640,6 +674,7 @@ def _stability(
     return {
         "variants": len(rows),
         "compared": compared,
+        "judge_failures": failures,
         "decision_flips": flips,
         "largest_score_shift": max(shifts, default=None),
         "stability": proportion_summary(stable, compared, units=len(lineages) or None),
@@ -650,12 +685,14 @@ def _sensitivity(rows: list[ChallengeOutput], decisions: dict[str, _Decision | N
     """Count injected defects the judge, the task decision and the verifier each detect."""
     known = [(item, decision) for item in rows if (decision := decisions[item.item_id]) is not None]
     decided = [(item, decision) for item, decision in known if decision.judge != "unassessable"]
+    failed = sum(decision.failed for _, decision in known)
     return {
         "variants": len(rows),
         "judged": len(known),
         "detected_by_judge": sum(decision.judge == "fail" for _, decision in decided),
         "accepted_by_judge": sum(decision.judge == "pass" for _, decision in decided),
-        "judge_abstained": len(known) - len(decided),
+        "judge_abstained": len(known) - len(decided) - failed,
+        "judge_failed": failed,
         "detected_by_task_decision": sum(decision.task == "fail" for _, decision in known),
         "detected_by_verifier": sum(decision.verifier == "fail" for _, decision in known),
         "judge_sensitivity": proportion_summary(
@@ -686,7 +723,7 @@ def _variant(
     )
     factor = perturbation.factor
     for edit in perturbation.edits:
-        before = _resolve(document, edit.pointer)
+        before = _before(document, edit)
         if perturbation.kind == "invariance":
             if not any(
                 edit.pointer == root or edit.pointer.startswith(root + "/")
@@ -738,7 +775,7 @@ def _require_defect(perturbation: Perturbation, case: CalibrationCase) -> None:
         if isinstance(original, WorkflowEvidence)
         else dict(original)
     )
-    befores = [_resolve(document, edit.pointer) for edit in perturbation.edits]
+    befores = [_before(document, edit) for edit in perturbation.edits]
     edits = perturbation.edits
     name = perturbation.perturbation_id
     if perturbation.factor == "wrong_json_type" and not any(
@@ -747,9 +784,14 @@ def _require_defect(perturbation: Perturbation, case: CalibrationCase) -> None:
     ):
         raise ValueError(f"{name}: a wrong-type defect must change a value's JSON type")
     if perturbation.factor == "unauthorized_write" and not any(
-        edit.operation == "append" for edit in edits
+        edit.operation in ("append", "add") for edit in edits
     ):
-        raise ValueError(f"{name}: an unauthorized write appends an extra action or effect")
+        raise ValueError(f"{name}: an unauthorized write appends or adds an extra action or effect")
+    if perturbation.factor == "wrong_cell" and any(
+        edit.operation != "replace" or edit.value == before
+        for edit, before in zip(edits, befores, strict=True)
+    ):
+        raise ValueError(f"{name}: a wrong-cell defect replaces values with different ones")
     if perturbation.factor == "wrong_cell_persuasive" and (
         len(edits) < 2
         or not any(isinstance(edit.value, str) and edit.operation == "replace" for edit in edits)
@@ -798,12 +840,38 @@ def _resolve(document: JsonValue, pointer: str) -> JsonValue:
     return current
 
 
+def _before(document: JsonValue, edit: OutputEdit) -> JsonValue:
+    """The value an edit changes; an added member has none and its object must exist.
+
+    Raises:
+        ValueError: The pointer names no saved value, or an added member already exists.
+    """
+    if edit.operation != "add":
+        return _resolve(document, edit.pointer)
+    tokens = _tokens(edit.pointer)
+    parent = (
+        _resolve(document, "".join("/" + _escape(token) for token in tokens[:-1]))
+        if (len(tokens) > 1)
+        else document
+    )
+    if not isinstance(parent, dict) or tokens[-1] in parent:
+        raise ValueError(f"add target {edit.pointer} must be a new member of an existing object")
+    return None
+
+
+def _escape(token: str) -> str:
+    """RFC 6901 escaping of one reference token."""
+    return token.replace("~", "~0").replace("/", "~1")
+
+
 def _apply(document: JsonValue, edit: OutputEdit) -> JsonValue:
     """Return a copy of ``document`` with one edit applied."""
     tokens = _tokens(edit.pointer)
 
     def rebuild(node: JsonValue, depth: int) -> JsonValue:
         """Copy the path to the edited value."""
+        if edit.operation == "add" and depth == len(tokens) - 1 and isinstance(node, dict):
+            return {**node, tokens[-1]: edit.value}
         if depth == len(tokens):
             if edit.operation == "replace":
                 return edit.value
@@ -818,7 +886,7 @@ def _apply(document: JsonValue, edit: OutputEdit) -> JsonValue:
             return [*node[:index], rebuild(node[index], depth + 1), *node[index + 1 :]]
         raise ValueError(f"perturbation pointer {edit.pointer} does not name a saved value")
 
-    _resolve(document, edit.pointer)
+    _before(document, edit)
     return rebuild(document, 0)
 
 

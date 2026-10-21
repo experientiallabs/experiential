@@ -42,7 +42,7 @@ class Protocol:
 PROTOCOLS = (
     Protocol(
         "exp.optimize.evaluation.tasks.calibration:CALIBRATION_PROTOCOL",
-        "task-calibration-v3",
+        "task-calibration-v4",
         (
             "exp.optimize.evaluation.tasks.calibration",
             "exp.optimize.evaluation.tasks.admission",
@@ -50,17 +50,17 @@ PROTOCOLS = (
             "exp.simulation.evaluation.tasks",
             "exp.simulation.evaluation.admission",
         ),
-        "b01624522a004f1f4bdb72aefb4f91eb76902b5239fb6ef392a3bc90804853e4",
+        "848411f148528e9ecdc1f929417a98f5e9fcd604f40e22e3eeb5c8fa3d659665",
     ),
     Protocol(
         "exp.optimize.evaluation.tasks.challenges:CHALLENGE_PROTOCOL",
-        "judge-challenge-v1",
+        "judge-challenge-v3",
         (
             "exp.optimize.evaluation.tasks.challenges",
             "exp.simulation.evaluation.calibration:task_decision",
             "exp.simulation.evaluation.calibration:blinded_case",
         ),
-        "183baa5acc0f87a6a9ddc5d650e47712228e1d84479c0dcf0ccc151431f74a02",
+        "8f2743cfa26bf79dfa2332995b93b1d45b02d313bfdc2bc89733028578017fab",
     ),
     Protocol(
         "exp.optimize.evaluation.council.runner:COUNCIL_HARNESS_PROTOCOL",

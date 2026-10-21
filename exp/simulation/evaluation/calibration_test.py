@@ -748,3 +748,33 @@ def test_uncategorized_cases_without_judgments_stay_visible() -> None:
     assert category["task_decision"]["labeled"] == 0
     assert category["verifier"]["labeled"] == 2
     assert "prevalence-dependent" in category["verifier"]["defect_precision"]
+
+
+def test_rejected_judge_outputs_are_failures_not_abstentions() -> None:
+    """A judge output the evaluator rejected is an operational failure, not a judge decision."""
+    original = stratified_pack()
+    judgments = list(task_judgments(original))
+    ids = [case.challenge.id for case in original.cases]
+    rejected = ids.index("development-False")
+    judgments[rejected] = judgments[rejected].model_copy(
+        update={
+            "axes": tuple(
+                axis.model_copy(
+                    update={
+                        "status": "judge_failure",
+                        "score": None,
+                        "rationale": "ReturnedOutputRejected",
+                        "evidence_refs": (),
+                    }
+                )
+                for axis in judgments[rejected].axes
+            )
+        }
+    )
+    report = calibrate(original, tuple(judgments))
+    samples = validation(report)["samples"]
+    assert isinstance(samples, dict)
+    representative = samples["representative"]["categories"]["wrong_cell"]["task_decision"]
+    assert representative["judge_failures"] == 1
+    assert representative["unnecessary_abstentions"] == 0
+    assert representative["false_acceptances"] == 0 and representative["false_rejections"] == 0
