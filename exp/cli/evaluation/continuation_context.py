@@ -7,8 +7,8 @@ from rich.console import Console
 
 from exp.cli.evaluation.spend import review_cost
 from exp.cli.shared.consent import require_spend_consent
-from exp.common.core.artifacts import ContractModel
 from exp.common.project import ProjectStore
+from exp.optimize.evaluation.executable.costs import CostedSpec
 
 
 @dataclass(frozen=True)
@@ -49,7 +49,7 @@ class ContinuationContext:
         """
         return f"exp eval {self.project} --continuations {self.spec_path}"
 
-    def consent(self, spec: ContractModel) -> bool:
+    def consent(self, spec: CostedSpec) -> bool:
         """Show the spec's credential-free cost inventory and request spend consent once.
 
         The estimate covers known components only; unpriced dependencies stay visible and the

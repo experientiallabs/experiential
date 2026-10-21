@@ -35,17 +35,16 @@ from exp.optimize.evaluation.executable.deferral import (
     deferred_execution,
     record_execution_deferral,
 )
+from exp.optimize.evaluation.executable.package import (
+    export_executable_harbor,
+    verify_executable_package,
+)
 from exp.optimize.evaluation.executable.qualification import (
     ExecutableQualificationSpec,
     load_executable_qualification,
     qualify_executable_task,
 )
-from exp.optimize.evaluation.executable.task import (
-    ExecutableTask,
-    export_executable_harbor,
-    load_executable_task,
-    verify_executable_package,
-)
+from exp.optimize.evaluation.executable.task import ExecutableTask, load_executable_task
 from exp.optimize.evaluation.factory.proposals import load_task_proposals
 from exp.optimize.evaluation.factory.variants import load_task_variant
 from exp.optimize.evaluation.harbor.export import verify_harbor_export

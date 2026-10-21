@@ -17,13 +17,13 @@ from exp.common.models import ToolCall
 from exp.common.project import ProjectStore
 from exp.common.project.manifests import ArtifactManifest
 from exp.optimize.evaluation.continuations.study import ContinuationStudySpec
+from exp.optimize.evaluation.executable.package import verify_executable_package
 from exp.optimize.evaluation.executable.scenarios import prepare_record_scenario
 from exp.optimize.evaluation.executable.scenarios_test import scenario_fixture
 from exp.optimize.evaluation.executable.task import (
     ExecutableTask,
     load_executable_task,
     persist_executable_task,
-    verify_executable_package,
 )
 from exp.optimize.evaluation.factory.candidates_test import _reply, batch_fixture
 from exp.optimize.evaluation.factory.proposals import (

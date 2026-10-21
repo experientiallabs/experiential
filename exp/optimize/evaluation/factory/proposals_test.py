@@ -6,7 +6,8 @@ from pathlib import Path
 import pytest
 
 from exp.common.project import ProjectStore
-from exp.optimize.evaluation.executable.task import export_executable_harbor, load_executable_task
+from exp.optimize.evaluation.executable.package import export_executable_harbor
+from exp.optimize.evaluation.executable.task import load_executable_task
 from exp.optimize.evaluation.factory.proposals import (
     TaskProposalSpec,
     preflight_task_proposals,

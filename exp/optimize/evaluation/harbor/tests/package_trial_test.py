@@ -34,13 +34,13 @@ from exp.common.project import ProjectStore, artifact_input
 from exp.optimize.evaluation.audit.panel_test import write_catalog
 from exp.optimize.evaluation.continuations.job import ContinuationJob, execute_continuation_job
 from exp.optimize.evaluation.continuations.study import ContinuationStudySpec
+from exp.optimize.evaluation.executable.package import verify_executable_package
 from exp.optimize.evaluation.executable.qualification import ExecutableQualificationSpec
 from exp.optimize.evaluation.executable.qualification_test import qualified_fixture
 from exp.optimize.evaluation.executable.task import (
     ExecutableTask,
     load_executable_task,
     persist_executable_task,
-    verify_executable_package,
 )
 from exp.optimize.evaluation.harbor.export import verify_harbor_export
 from exp.runtime.agents.chat import ChatAgentRuntime, ChatCheckpoint
@@ -55,12 +55,12 @@ from exp.simulation.evaluation.admission import (
     record_label_witness,
 )
 from exp.simulation.evaluation.calibration import CalibrationCase
+from exp.simulation.evaluation.record_execution_test import acceptance, fixture, source
 from exp.simulation.evaluation.tasks import OutcomeRule, TaskVerifier, VerifierChallenge
-from exp.simulation.record_execution_test import acceptance, fixture, source
 
 RECORD_RUNTIME = '''"""Explicitly selected test-only record runtime with no credentials."""
 from exp.optimize.evaluation.continuations.job import ContinuationRuntime
-from exp.simulation.record_execution_test import fixture
+from exp.simulation.evaluation.record_execution_test import fixture
 
 
 def continuation_runtime(project, configuration):

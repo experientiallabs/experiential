@@ -5,9 +5,9 @@ from pathlib import Path
 
 import pytest
 
+from exp.optimize.evaluation.executable.package import export_executable_harbor
 from exp.optimize.evaluation.executable.qualification import qualify_executable_task
 from exp.optimize.evaluation.executable.qualification_test import qualified_fixture
-from exp.optimize.evaluation.executable.task import export_executable_harbor
 from exp.optimize.evaluation.harbor.export import verify_harbor_export
 from exp.optimize.model.sft.training_test import _TIME
 

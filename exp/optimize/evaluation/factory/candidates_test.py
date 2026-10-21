@@ -13,12 +13,9 @@ from exp.common.project import ProjectStore, artifact_input
 from exp.optimize.evaluation.continuations.actors import PanelActor
 from exp.optimize.evaluation.continuations.job import ContinuationJob
 from exp.optimize.evaluation.continuations.study import ContinuationStudy
+from exp.optimize.evaluation.executable.package import verify_executable_package
 from exp.optimize.evaluation.executable.qualification_test import qualified_fixture
-from exp.optimize.evaluation.executable.task import (
-    load_executable_task,
-    persist_executable_task,
-    verify_executable_package,
-)
+from exp.optimize.evaluation.executable.task import load_executable_task, persist_executable_task
 from exp.optimize.evaluation.factory.candidates import CandidateBatchSpec, run_candidate_batch
 from exp.optimize.evaluation.factory.proposals import TaskProposalSpec, propose_tasks
 from exp.runtime.environments.tests.world_conformance_test import workbook_case

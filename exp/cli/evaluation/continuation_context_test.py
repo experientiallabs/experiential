@@ -2,6 +2,7 @@
 
 from io import StringIO
 from pathlib import Path
+from typing import cast
 
 import pytest
 from rich.console import Console
@@ -10,13 +11,15 @@ from exp.cli.evaluation import continuation_context
 from exp.cli.evaluation.continuation_context import ContinuationContext
 from exp.common.core.artifacts import ArtifactInput
 from exp.common.project import ProjectStore
+from exp.optimize.evaluation.executable.costs import CostedSpec
 
 
 def test_consent_reviews_the_spec_and_names_the_real_spec_path(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The one consent step reviews the payload's cost and shows the exact command."""
-    spec = ArtifactInput(artifact_id="study", sha256="a" * 64)
+    # review_cost is replaced below, so any payload object can stand in for a costed spec.
+    spec = cast("CostedSpec", ArtifactInput(artifact_id="study", sha256="a" * 64))
     reviewed: list[ArtifactInput] = []
     requests: list[dict[str, str | bool | float | None]] = []
 
