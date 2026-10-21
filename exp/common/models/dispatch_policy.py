@@ -241,18 +241,19 @@ class GatewayRungDispatchPolicy(ContractModel):
     """Share of ``concurrency_bound`` kept for ``:fast`` requests, always on.
 
     On a self-hosted rung that carries a priority card, every other request is
-    held to ``bound - max(1, ceil(fraction * bound))`` in flight whether or not
-    a ``:fast`` request is on the rung, and a ``:fast`` request admits while
-    the rung holds fewer than ``bound``, so ``:fast`` always finds room and
-    runs in a smaller batch. ``0.25`` on a bound of 48 holds others to 36. A
-    bound below 2 keeps no reserve. ``None`` keeps the in-flight split (fast
-    holds the upper half, others the lower half while one is held). Requires
-    ``concurrency_bound``; per worker, like the bound. Fair share, the
-    fresh-session threshold and pacing saturation of other traffic read the
-    regular share (``bound`` minus the reserve). The reserve is hard, so a
-    priority overflow never reaches it (``priority_overflow_*`` cannot lift
-    other traffic past the regular share), and under heavy regular load
-    ``:fast`` has the reserve alone.
+    held to the regular share, ``(1 - fraction) * bound`` rounded half up (at
+    least one), whether or not a ``:fast`` request is on the rung, and never to
+    the full bound; a ``:fast`` request admits below the bound. ``0.25`` on a
+    bound of 48 holds others to 36, on a bound of 4 to 3; a bound too small to
+    split (1, or 2 at 0.25) keeps no reserve. Under ``saturation="refuse"``
+    both limits are hard, even for a priority overflow. Under ``"overflow"``
+    they stay soft: a request past them spills to the next rung first (so
+    ``:fast`` has first claim on the kept slots) and admits on the forced pass
+    exactly as an overflow bound does today, never a refusal. ``None`` keeps
+    the in-flight split. Requires ``concurrency_bound``; per worker, like the
+    bound. Fair share, the fresh-session threshold and pacing saturation of
+    other traffic read the regular share, and fair share counts each
+    organization's regular reservations only.
     """
 
     @model_validator(mode="after")

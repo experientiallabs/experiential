@@ -162,6 +162,9 @@ class _OrganizationLoad:
     inflight: int = 0
     last_seen: float = 0.0
     weight: int = 1
+    # Of ``inflight``, the organization's :fast reservations (a reserve's
+    # fair share counts only the regular ones).
+    fast: int = 0
 
 
 @dataclass
@@ -265,6 +268,7 @@ class RungLoadRegistry:
         class_cap: tuple[int, int] | None = None,
         fast: bool = False,
         fast_reserve: int | None = None,
+        fast_reserve_hard: bool = True,
     ) -> str | RungShed:
         """Reserve one slot on a policy-bounded rung, or shed with a reason.
 
@@ -305,6 +309,11 @@ class RungLoadRegistry:
                 in-flight split: every other reservation holds at most
                 ``bound - fast_reserve`` and a ``:fast`` one admits while the
                 rung holds fewer than ``bound``; ``None`` keeps the split.
+            fast_reserve_hard: Whether the reserve refuses (a ``refuse``
+                lane): the regular share and the bound are hard for everyone.
+                ``False`` (an ``overflow`` lane) keeps them soft: a regular
+                request past its share spills first, so :fast has first claim
+                on the reserved slots, and its forced pass admits as today.
 
         Returns:
             An opaque ticket on admission, else the shed disclosure.
@@ -326,17 +335,19 @@ class RungLoadRegistry:
             # ignores the total, so a full rung can hold bound + ceil(bound/2)
             # until the requests already on it finish.
             # The always-on reserve (dispatch_policy.fast_reserve_fraction):
-            # others never hold the reserved slots, fast never passes the
-            # bound. Both are hard, like the split.
+            # others hold at most the regular share and never the full bound
+            # (:fast may hold the share's free slots too); fast admits below
+            # the bound. On a refuse lane both are hard, like the split; on an
+            # overflow lane both are soft, so a shed spills to the next rung
+            # and only a forced pass (every rung refused) goes past, as today.
             if bound is not None and fast_reserve is not None:
-                if fast and rung.total >= bound:
-                    return RungShed("queue_bound", overflow_ceiling=True)
-                # Others also stop at the full bound: :fast may be holding the
-                # regular share's free slots too.
-                if not fast and (
-                    rung.total - rung.fast >= bound - fast_reserve or rung.total >= bound
-                ):
-                    return RungShed("queue_bound", overflow_ceiling=True)
+                full = rung.total >= bound
+                regular_full = rung.total - rung.fast >= bound - fast_reserve
+                if fast_reserve_hard:
+                    if full or (not fast and regular_full):
+                        return RungShed("queue_bound", overflow_ceiling=True)
+                elif not force and full:
+                    return RungShed("queue_bound")
             elif bound is not None and (fast or rung.fast):
                 if fast and rung.fast >= max(1, bound - bound // 2):
                     return RungShed("queue_bound", overflow_ceiling=True)
@@ -381,6 +392,7 @@ class RungLoadRegistry:
                     fresh_spill_fraction=fresh_spill_fraction,
                     skip_rate=rate_retry,
                     occupied=occupied,
+                    regular_only=fast_reserve is not None,
                 )
                 if shed is not None:
                     return shed
@@ -400,6 +412,7 @@ class RungLoadRegistry:
                 self._ticket_classes[ticket] = class_cap[0]
             if fast:
                 rung.fast += 1
+                organization.fast += 1
                 self._fast_tickets.add(ticket)
             return ticket
 
@@ -446,6 +459,7 @@ class RungLoadRegistry:
                     now=now,
                     bound=bound,
                     occupied=occupied,
+                    regular_only=fast_reserve is not None,
                     fair_share=fair_share,
                     requests_per_minute=requests_per_minute,
                     tokens_per_minute=tokens_per_minute,
@@ -473,11 +487,14 @@ class RungLoadRegistry:
         fresh_spill_fraction: float | None,
         skip_rate: bool = False,
         occupied: int | None = None,
+        regular_only: bool = False,
     ) -> RungShed | None:
         """Decide one reservation under the registry lock; ``None`` admits.
 
         ``occupied`` is the in-flight count ``bound`` is judged against
         (default the rung's total; the regular count under a ``:fast`` reserve).
+        ``regular_only`` counts each organization's regular reservations only
+        in fair share, so holding :fast never costs an organization its share.
 
         The bound is hard: at or beyond it every arrival spills, which is the
         queue-death fix. Fresh sessions (no warm sticky standing on this rung)
@@ -548,10 +565,14 @@ class RungLoadRegistry:
         total_weight = sum(weight for _candidate, weight in weighted)
         own_weight = next(weight for candidate, weight in weighted if candidate is organization)
         share = bound * own_weight / total_weight
-        if organization.inflight + 1 <= share:
+
+        def holding(candidate: _OrganizationLoad) -> int:
+            return candidate.inflight - candidate.fast if regular_only else candidate.inflight
+
+        if holding(organization) + 1 <= share:
             return None
         reserved_deficit = sum(
-            max(0.0, bound * weight / total_weight - candidate.inflight)
+            max(0.0, bound * weight / total_weight - holding(candidate))
             for candidate, weight in weighted
             if candidate is not organization
         )
@@ -780,6 +801,8 @@ class RungLoadRegistry:
         organization = rung.organizations.get(organization_id)
         if organization is not None and organization.inflight > 0:
             organization.inflight -= 1
+            if was_fast and organization.fast > 0:
+                organization.fast -= 1
         if rung.total > 0:
             rung.total -= 1
 

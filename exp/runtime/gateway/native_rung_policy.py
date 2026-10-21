@@ -178,6 +178,9 @@ def reserve_rung_slot(
         class_cap=class_cap,
         fast=fast,
         fast_reserve=fast_reserve,
+        # A refusing lane's reserve is hard; an overflow lane's stays soft, so
+        # regular traffic past its share overflows as today (fast first claim).
+        fast_reserve_hard=refusing,
     )
     if isinstance(result, RungShed) and applies_default and result.reason == "queue_bound":
         result = dataclasses.replace(result, default_bound=True)

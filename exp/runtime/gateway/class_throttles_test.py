@@ -335,13 +335,17 @@ def _reserved(rung: ExactModelDeployment, fraction: float | None = 0.25) -> Exac
     )
 
 
-def test_fast_reserve_slots_need_our_carded_gpu_and_a_bound_of_two() -> None:
-    """ceil(fraction * bound), at least one, never the whole bound; else no reserve."""
+def test_fast_reserve_slots_need_our_carded_gpu_and_a_bound_that_splits() -> None:
+    """Regular share = (1 - fraction) * bound rounded half up (at least 1); the rest is kept."""
     assert fast_reserve_slots(_reserved(_rung(bound=48))) == 12
     assert fast_reserve_slots(_reserved(_rung(bound=4))) == 1
+    assert fast_reserve_slots(_reserved(_rung(bound=3))) == 1
     assert fast_reserve_slots(_reserved(_rung(bound=4), 0.9)) == 3
     assert fast_reserve_slots(_reserved(_rung(bound=2), 0.75)) == 1
+    # Too small to split at 0.25: no reserve, never the whole bound.
+    assert fast_reserve_slots(_reserved(_rung(bound=2))) is None
     assert fast_reserve_slots(_reserved(_rung(bound=1))) is None
+    assert fast_reserve_slots(_reserved(_rung(bound=1), 0.9)) is None
     assert fast_reserve_slots(_reserved(_rung(bound=48), None)) is None
     assert fast_reserve_slots(_reserved(_rung(bound=48, self_hosted=False))) is None
     uncarded = _reserved(_rung(bound=48))
@@ -503,6 +507,63 @@ def test_pacing_saturation_is_the_regular_share_under_a_reserve() -> None:
         )
         assert isinstance(ticket, str)
     assert rung_saturation(loads, rung) == 1.0
+
+
+def test_on_an_overflow_lane_the_reserve_is_soft_and_fast_has_first_claim() -> None:
+    """Past its share a regular request sheds softly (it spills first) and a forced pass admits.
+
+    A :fast request takes the reserved slot without spilling; at the full
+    bound it too sheds softly, and its forced pass admits as today. Nothing
+    on an overflow lane is a hard refusal.
+    """
+    loads = RungLoadRegistry()
+
+    def take(*, fast: bool = False, force: bool = False) -> str | RungShed:
+        return loads.reserve(
+            rung_load_key(_rung()),
+            organization_id="org",
+            weight=1,
+            bound=4,
+            fair_share=True,
+            fast=fast,
+            force=force,
+            fast_reserve=1,
+            fast_reserve_hard=False,
+        )
+
+    for _ in range(3):
+        assert isinstance(take(), str)
+    assert take() == RungShed("queue_bound")  # soft: no overflow ceiling
+    assert isinstance(take(fast=True), str)  # first claim on the reserved slot
+    assert take(fast=True) == RungShed("queue_bound")
+    assert isinstance(take(force=True), str)  # every rung refused: overflows as today
+    assert isinstance(take(fast=True, force=True), str)
+
+
+def test_holding_fast_never_costs_an_organization_its_regular_share() -> None:
+    """Fair share under a reserve counts each organization's regular reservations only."""
+    loads = RungLoadRegistry()
+
+    def take(organization: str, *, fast: bool = False) -> str | RungShed:
+        return loads.reserve(
+            rung_load_key(_rung()),
+            organization_id=organization,
+            weight=1,
+            bound=8,
+            fair_share=True,
+            fast=fast,
+            fast_reserve=2,
+        )
+
+    for _ in range(2):
+        assert isinstance(take("org-b", fast=True), str)
+    assert isinstance(take("org-b"), str)  # org-b active on the regular share
+    admitted_a = 0
+    while isinstance(take("org-a"), str):
+        admitted_a += 1
+    assert admitted_a == 3  # half of the regular six; org-b's :fast is not regular share
+    assert isinstance(take("org-b"), str)
+    assert isinstance(take("org-b"), str)
 
 
 def test_self_served_tier_settles_confirmed_only_on_our_gpu() -> None:

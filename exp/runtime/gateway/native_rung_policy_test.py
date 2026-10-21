@@ -16,7 +16,7 @@ from exp.common.models.catalog import (
     ModelCatalog,
     ModelRecord,
 )
-from exp.common.models.dispatch_policy import GatewayThrottleRedialPolicy
+from exp.common.models.dispatch_policy import GatewayThrottleRedialPolicy, SaturationPolicy
 from exp.common.models.failover_tokens import FailoverToken
 from exp.common.models.gateway_catalog import (
     ExactModelDeployment,
@@ -756,16 +756,18 @@ def test_shed_keeps_the_cache_placed_rung_on_the_first_dispatch_only() -> None:
         assert shed_keeps_pin(soft, 0) is False
 
 
-def test_reserve_rung_slot_keeps_the_fast_reserve_on_a_carded_gpu_rung() -> None:
-    """Ordinary traffic stops at bound minus the reserve; a :fast request takes the rest."""
+def _carded_reserve_rung(*, saturation: SaturationPolicy) -> ExactModelDeployment:
+    """A carded self-hosted rung, bound 4 per worker, reserving 25% for :fast."""
     from exp.common.models.catalog_prices import GatewayServiceTierPrices, GatewayTokenPrices
 
-    loads = RungLoadRegistry()
     base = _deployment(
         "deployment-a",
         connection_sha256="b" * 64,
         dispatch=GatewayRungDispatchPolicy(
-            concurrency_bound=4, upstream_priority=True, fast_reserve_fraction=0.25
+            concurrency_bound=4,
+            upstream_priority=True,
+            fast_reserve_fraction=0.25,
+            saturation=saturation,
         ),
     )
     carded = GatewayTokenPrices(
@@ -775,23 +777,53 @@ def test_reserve_rung_slot_keeps_the_fast_reserve_on_a_carded_gpu_rung() -> None
             input_nano_usd_per_million_tokens=2_000, output_nano_usd_per_million_tokens=4_000
         ),
     )
-    deployment = base.model_copy(
+    return base.model_copy(
         update={
             "billing_source": BillingSource.HOST_MANAGED,
             "gateway": base.gateway.model_copy(update={"prices": carded}),
         }
     )
+
+
+def test_a_refuse_lane_holds_regular_to_three_of_four_and_keeps_one_for_fast() -> None:
+    """GLM /glm3 shape: regular sheds hard at 3, even forced; :fast takes the fourth slot."""
+    loads = RungLoadRegistry()
+    deployment = _carded_reserve_rung(saturation="refuse")
     entry = _entry((deployment,))
     fast_entry = dataclasses.replace(
         entry, authorization=entry.authorization.model_copy(update={"fast": True})
     )
     sticky = StickySpillRegistry()
 
-    def reserve(item: InflightRequest) -> str | RungShed | None:
-        return reserve_rung_slot(loads, sticky, item, deployment, reserved_tokens=10, force=False)
+    def reserve(item: InflightRequest, *, force: bool = False) -> str | RungShed | None:
+        return reserve_rung_slot(loads, sticky, item, deployment, reserved_tokens=10, force=force)
 
     for _ in range(3):
         assert isinstance(reserve(entry), str)
     assert reserve(entry) == RungShed("queue_bound", overflow_ceiling=True)
+    assert reserve(entry, force=True) == RungShed("queue_bound", overflow_ceiling=True)
     assert isinstance(reserve(fast_entry), str)
     assert reserve(fast_entry) == RungShed("queue_bound", overflow_ceiling=True)
+
+
+def test_an_overflow_lane_never_turns_the_reserve_into_a_refusal() -> None:
+    """DeepSeek shape: regular past its share sheds softly and overflows on the forced pass."""
+    loads = RungLoadRegistry()
+    deployment = _carded_reserve_rung(saturation="overflow")
+    entry = _entry((deployment,))
+    fast_entry = dataclasses.replace(
+        entry, authorization=entry.authorization.model_copy(update={"fast": True})
+    )
+    sticky = StickySpillRegistry()
+
+    def reserve(item: InflightRequest, *, force: bool = False) -> str | RungShed | None:
+        return reserve_rung_slot(loads, sticky, item, deployment, reserved_tokens=10, force=force)
+
+    for _ in range(3):
+        assert isinstance(reserve(entry), str)
+    shed = reserve(entry)
+    assert isinstance(shed, RungShed)
+    assert shed.reason == "queue_bound"
+    assert not shed.overflow_ceiling
+    assert isinstance(reserve(fast_entry), str)  # first claim on the kept slot
+    assert isinstance(reserve(entry, force=True), str)  # overflow as today

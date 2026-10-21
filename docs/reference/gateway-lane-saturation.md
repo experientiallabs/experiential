@@ -148,16 +148,17 @@ the tier is ours, so the request gets more of the GPU:
   rung can briefly hold its bound plus the upper half until earlier requests finish. Like
   every registry bound this is per gateway worker, and rate windows still apply;
 - or, on a rung that authors `fast_reserve_fraction` (0 < f < 1, needs `concurrency_bound`), an
-  always-on reserve in place of the split: every other reservation holds at most
-  `bound - max(1, ceil(f * bound))` whether or not a fast request is in flight (hard, even for a
-  priority overflow, and an ordinary elective trial does not count the reserve as headroom),
-  and a fast reservation admits while the rung holds fewer than `bound`. `0.25` on a bound of 48
-  holds others to 36 and lets fast fill to 48; a bound below 2 keeps no reserve. Others also stop
-  at the full bound. Fair share, the fresh-session threshold and pacing saturation of other
-  traffic read the regular share, never the slots fast holds. The reserve is hard, so the
-  `priority_overflow_*` multiples cannot lift other traffic into it (a single-rung lane refuses
-  Pro past the regular share), and under heavy regular load fast has the reserve alone. Per
-  worker, like the bound;
+  always-on reserve in place of the split: every other reservation holds at most the regular
+  share, `(1 - f) * bound` rounded half up (at least one), whether or not a fast request is in
+  flight, and never the full bound; a fast reservation admits below the bound. `0.25` holds others
+  to 36 of 48 and 3 of 4; a bound too small to split (1, or 2 at 0.25) keeps no reserve. On a
+  `refuse` lane both limits are hard, even for a priority overflow (a single-rung lane refuses Pro
+  past the regular share). On an `overflow` lane they stay soft: a request past them spills to the
+  next rung first, so fast has first claim on the kept slots, and admits on the forced pass exactly
+  as an overflow bound does today, never a refusal. Fair share (each organization's regular
+  reservations only), the fresh-session threshold, trial headroom and pacing saturation of other
+  traffic read the regular share. Under heavy regular load on a refuse lane fast has the reserve
+  alone. Per worker, like the bound;
 - settlement confirmed at the requested card (`tier_settlement`): our server reports no tier.
 
 Every self-hosted lever needs the rung's priority card (`fast_on_rung`), so a fast request

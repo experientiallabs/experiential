@@ -199,23 +199,24 @@ def fast_on_rung(authorization: AuthorizationSnapshot, deployment: ExactModelDep
 def fast_reserve_slots(deployment: ExactModelDeployment) -> int | None:
     """In-flight slots per worker kept for ``:fast`` on this rung, or ``None``.
 
-    Only a self-hosted rung with a priority card and an authored bound of at
-    least 2 keeps a reserve (``GatewayRungDispatchPolicy.fast_reserve_fraction``):
-    ``max(1, ceil(fraction * bound))``, never the whole bound, so ordinary
-    traffic always keeps at least one slot.
+    Only a self-hosted rung with a priority card and an authored bound keeps a
+    reserve (``GatewayRungDispatchPolicy.fast_reserve_fraction``): the regular
+    share is ``(1 - fraction) * bound`` rounded half up, at least one, and the
+    reserve is the rest. A bound too small to split (1, or 2 at 0.25) keeps no
+    reserve rather than reserving everything.
     """
     policy = deployment.gateway.dispatch
     if (
         policy is None
         or policy.fast_reserve_fraction is None
         or policy.concurrency_bound is None
-        or policy.concurrency_bound < 2
         or not is_self_hosted_rung(deployment)
         or deployment.gateway.prices.priority is None
     ):
         return None
     bound = policy.concurrency_bound
-    return min(bound - 1, max(1, math.ceil(policy.fast_reserve_fraction * bound)))
+    regular = max(1, math.floor((1 - policy.fast_reserve_fraction) * bound + 0.5))
+    return bound - regular if regular < bound else None
 
 
 def fast_request(request: GatewayRequest, authorization: AuthorizationSnapshot) -> GatewayRequest:
