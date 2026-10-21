@@ -38,7 +38,7 @@ def job_fixture(
     catalog = load_model_catalog(project.model_catalog_path)
     model = RuntimeModelCatalog(catalog).resolve("world")
     runtime = tmp_path / "selected_runtime.py"
-    runtime.write_text("""from exp.optimize.evaluation.continuations.job import ContinuationRuntime
+    runtime.write_text("""from exp.optimize.evaluation.executable.loader import ContinuationRuntime
 from exp.optimize.evaluation.continuations.study_test import probe, workbook_runtime
 from exp.simulation.continuations import load_continuation_checkpoint
 from exp.common.core.artifacts import ArtifactInput

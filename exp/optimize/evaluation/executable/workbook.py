@@ -21,8 +21,8 @@ from exp.common.core.artifacts import (
     validate_artifact_file_path,
 )
 from exp.common.project import ProjectStore, artifact_input
-from exp.optimize.evaluation.continuations.job import ContinuationRuntime
 from exp.optimize.evaluation.executable.construction import ConstructionBinding
+from exp.optimize.evaluation.executable.loader import ContinuationRuntime
 from exp.runtime.environments.artifact_world import ArtifactWorldFactory
 from exp.runtime.environments.workbook_edits import (
     WorkbookEditAdapter,

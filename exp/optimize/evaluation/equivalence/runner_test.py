@@ -10,7 +10,7 @@ from filelock import Timeout
 from exp.common.core.artifacts import ArtifactInput, JsonObject, sha256_bytes, sha256_json
 from exp.common.models import load_model_catalog, write_model_catalog
 from exp.common.project import ProjectStore
-from exp.optimize.evaluation.continuations.job import ContinuationJob, ContinuationRuntime
+from exp.optimize.evaluation.continuations.job import ContinuationJob
 from exp.optimize.evaluation.continuations.job_test import job_fixture
 from exp.optimize.evaluation.continuations.study import ContinuationStudy
 from exp.optimize.evaluation.equivalence import runner as owner
@@ -23,6 +23,7 @@ from exp.optimize.evaluation.equivalence.runner import (
     run_equivalence,
     saved_equivalence,
 )
+from exp.optimize.evaluation.executable.loader import ContinuationRuntime
 from exp.runtime.environments.tests.world_conformance_test import workbook_case
 from exp.runtime.models.providers.transport import JsonHttpResponse, ScriptedJsonTransport
 from exp.runtime.models.registry import RuntimeModelCatalog

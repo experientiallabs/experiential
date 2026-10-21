@@ -22,7 +22,7 @@ from exp.common.models import ModelRequest, load_model_catalog
 from exp.common.project import ProjectStore
 from exp.common.release_revision import installed_execution_revision
 from exp.common.tasks import TaskCase
-from exp.optimize.evaluation.continuations.job import ContinuationRuntime
+from exp.optimize.evaluation.executable.loader import ContinuationRuntime
 from exp.optimize.evaluation.executable.provider_grant import ProviderGrant
 from exp.optimize.evaluation.fidelity.decision_access import decision_caller, receipt_recorder
 from exp.optimize.evaluation.fidelity.retrieval_binding import index_embedder_alias

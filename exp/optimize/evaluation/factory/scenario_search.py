@@ -23,11 +23,11 @@ from exp.common.models import ToolCall
 from exp.common.project import ProjectStore, artifact_input
 from exp.optimize.evaluation.analysis.research import ResearchFailure
 from exp.optimize.evaluation.continuations.capture import preflight_capture
-from exp.optimize.evaluation.continuations.job import load_runtime_definition
 from exp.optimize.evaluation.executable.deferral import (
     deferred_execution,
     record_execution_deferral,
 )
+from exp.optimize.evaluation.executable.loader import load_runtime_definition
 from exp.optimize.evaluation.executable.scenarios import (
     RecordScenarioSpec,
     RecordWitnessSpec,
