@@ -13,9 +13,11 @@ import pytest
 from typer.testing import CliRunner
 
 from exp.cli.app import app
-from exp.common.core.artifacts import ArtifactEnvelope, JsonObject
+from exp.common.core.artifacts import ArtifactEnvelope, JsonObject, sha256_json
 from exp.common.models import ModelSnapshot, load_model_catalog, write_model_catalog
 from exp.common.project import ProjectStore, artifact_input, write_project_config
+from exp.common.tasks.facts import InstanceFacts
+from exp.common.tasks.facts_test import fact
 from exp.optimize.evaluation.audit import panel_test as held_out_fidelity_test
 from exp.optimize.evaluation.audit.panel_test import (
     PROJECT,
@@ -39,6 +41,7 @@ from exp.optimize.evaluation.learning import traces
 from exp.optimize.evaluation.learning.profile import learned_evaluation_memory
 from exp.optimize.evaluation.learning.traces import (
     LearningPlan,
+    Scope,
     learn_from_traces,
     learning_cases,
     learning_curve,
@@ -62,6 +65,7 @@ from exp.simulation.world_model.experience_memory import (
     Eligibility,
     consumed_task_lineages,
     is_reserved,
+    knowledge_identity,
     memory_head,
 )
 from exp.simulation.world_model.runtime import load_grounded_world_model_artifact
@@ -570,6 +574,46 @@ def test_a_protocol_change_learns_a_fresh_memory_trace_by_trace(
     # The first trace is predicted on empty memory again, so it misses the learnable reply,
     # exactly as in the first pass; on the final memory it would have been exact.
     assert curve.points[0].exact == 2
+
+
+@pytest.mark.parametrize("scope", ["all", "fit"])
+def test_facts_delivery_keys_the_learning_lineage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, scope: Scope
+) -> None:
+    """Delivered facts are learning inputs: adding, changing or removing them re-keys memory.
+
+    Verifier-private facts never reach a simulator request, so they do not key the lineage,
+    and a pass that delivers no facts keeps the identity earlier memories were learned under.
+    """
+    supplied = [episode(i) for i in range(USERS)]
+    for item in supplied:
+        item["facts"] = {"facts": [fact("input.xlsx/workbook", {"A1": 1})]}
+    _, store, _ = build_project(
+        tmp_path, monkeypatch, SimulatedProvider(supplied), episodes=supplied
+    )
+    delivered = learning_plan(store, "jev", scope)
+    cases = learning_cases(store, scope)
+    assert cases and all(case.facts is not None for case in cases)
+    assert learning_plan(store, "jev", scope).lineage == delivered.lineage
+
+    def lineage(*rows: JsonObject) -> str:
+        """The lineage when every learned trace delivers ``rows`` instead (none: no facts)."""
+        facts = InstanceFacts.model_validate({"facts": rows}) if rows else None
+        replaced = tuple(case.model_copy(update={"facts": facts}) for case in cases)
+        with monkeypatch.context() as patch:
+            patch.setattr(traces, "learning_cases", lambda _project, _scope: replaced)
+            return learning_plan(store, "jev", scope).lineage
+
+    artifact = load_grounded_world_model_artifact(store.artifacts, delivered.world_model)
+    protocol = {"protocol": "test-then-train", **traces._protocol()}  # noqa: SLF001
+    key = {"knowledge": knowledge_identity(artifact), "scope": scope, **protocol}
+    fact_free = "learn-" + sha256_json(key)[:16]
+    assert lineage() == fact_free, "a fact-free pass keeps the identity of earlier memories"
+    changed = lineage(fact("input.xlsx/workbook", {"A1": 2}))
+    assert len({fact_free, delivered.lineage, changed}) == 3
+    private = fact("input.xlsx/expected", "x", visibility="verifier_private")
+    assert lineage(private) == fact_free, "verifier-private facts are never delivered"
+    assert lineage(fact("input.xlsx/workbook", {"A1": 1}), private) == delivered.lineage
 
 
 def test_editing_the_workbook_or_facts_prompt_starts_a_fresh_memory(

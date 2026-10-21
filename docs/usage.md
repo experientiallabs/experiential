@@ -676,7 +676,8 @@ cells, orders, tickets), under `instance_facts` in the same request context:
 "method": "..."}, "state_version": 0}}]}`. `exp build` (learning and its retest) and
 `exp eval --audit` then deliver that trace's facts to its own predictions in a
 separate `instance_facts` request channel, apart from memory and research history, and the
-facts are part of the content-addressed run ID. Facts are moved out of the request context on
+facts are part of the content-addressed run ID. The conditioning facts a learning pass delivers
+also key its memory lineage, so adding, changing or removing them learns a fresh memory. Facts are moved out of the request context on
 import, so they never reach retrieval grounding, mined tasks, recorded fingerprints or the
 memory other traces read. `state_version` counts applied actions (0 is the starting state): a
 prediction for the action at index i receives only facts of version i or earlier, so a fact read

@@ -8,8 +8,10 @@ existing learn-mode lifecycle of :func:`execute_fidelity_evaluation`: every step
 from the task, the visible history and the current memory, the recorded reply is disclosed only
 after the prediction commits, mismatches are investigated, the completed trajectory is
 published as one memory version, and maintenance compresses the memory log. No second runner
-exists. A rerun replays completed traces without provider calls and continues where it stopped;
-a trace interrupted mid-run resumes in place with ``retry_incomplete``, so its first saved
+exists. A trace whose package supplies instance facts (its starting world) delivers them to
+each of its predictions, as a held-out replay does; they key each run and the memory lineage.
+A rerun replays completed traces without provider calls and continues where it stopped; a
+trace interrupted mid-run resumes in place with ``retry_incomplete``, so its first saved
 measurement is still the one scored.
 
 Measurement is test-then-train: each trace is predicted whole on the memory pinned before it,
@@ -480,13 +482,44 @@ def _lineage(project: ProjectStore, world_model: ArtifactInput, scope: Scope) ->
     The lineage is a knowledge-compatible bank, separate from exact serving and execution
     identity: a serving change (such as retrieval top-k) keeps the learned memory. It also
     covers every learning run input besides the trace, simulator and memory, so changing any
-    of them (a prompt, an allowance) starts a fresh memory that is learned trace by trace
-    again, instead of predicting already-learned traces on a memory that has seen every later
-    trace.
+    of them (a prompt, an allowance, the instance facts delivered to predictions) starts a
+    fresh memory that is learned trace by trace again, instead of predicting already-learned
+    traces on a memory that has seen every later trace.
     """
     artifact = load_grounded_world_model_artifact(project.artifacts, world_model)
     key = {"knowledge": knowledge_identity(artifact), "scope": scope}
-    return "learn-" + sha256_json({**key, "protocol": "test-then-train", **_protocol()})[:16]
+    delivered = _delivered_facts(learning_cases(project, scope))
+    # Only a pass that delivers facts keys on them; fact-free lineages keep their identity.
+    facts: JsonObject = {} if delivered is None else {"instance_facts": delivered}
+    return (
+        "learn-" + sha256_json({**key, "protocol": "test-then-train", **_protocol(), **facts})[:16]
+    )
+
+
+def _delivered_facts(cases: Sequence[ReplayCase]) -> Sha256 | None:
+    """Identity of the instance facts a learning pass delivers to its predictions.
+
+    Facts condition every prediction of their trace, so they shape what each trace teaches:
+    adding, changing or removing any trace's conditioning facts starts a fresh memory, as a
+    prompt edit does. Verifier-private facts never reach a simulator request and are left out.
+
+    Args:
+        cases: The pass's replay cases in learning order.
+
+    Returns:
+        A digest over each trace's conditioning facts, or None when no trace delivers any.
+    """
+    delivered = {
+        case.trace_id: [
+            fact.model_dump(mode="json")
+            for fact in case.facts.facts
+            if fact.visibility == "conditioning"
+        ]
+        for case in cases
+        if case.facts is not None
+    }
+    delivered = {trace: facts for trace, facts in delivered.items() if facts}
+    return sha256_json(delivered) if delivered else None
 
 
 def _protocol() -> JsonObject:
