@@ -26,16 +26,16 @@ from exp.simulation.evaluation.admission import (
     LabelWitness,
     persist_specification,
 )
-from exp.simulation.record_execution import load_record_execution
-from exp.simulation.record_execution_test import NOW, acceptance, fixture, source
+from exp.simulation.evaluation.record_execution import load_record_execution
+from exp.simulation.evaluation.record_execution_test import NOW, acceptance, fixture, source
 
 RUNTIME = '''"""Explicit test-only native factory; no credentials or model clients."""
 from functools import partial
 from exp.optimize.evaluation.continuations.job import ContinuationRuntime
 from exp.runtime.environments.record_world import RecordWorldFactory, RecordTool
 from exp.runtime.environments.worlds import ExecutableWorldRuntime, ToolEffectPolicy
-from exp.simulation.record_execution import record_state
-from exp.simulation.record_execution_test import fixture, SCHEMA, access, change
+from exp.simulation.evaluation.record_execution import record_state
+from exp.simulation.evaluation.record_execution_test import fixture, SCHEMA, access, change
 
 def continuation_runtime(project, configuration):
     """Bind setup and actor tools to the same isolated native state owner."""

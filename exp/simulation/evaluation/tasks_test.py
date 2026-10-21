@@ -4,6 +4,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
 from exp.common.core.artifacts import ArtifactInput, JsonObject, JsonValue
 from exp.common.evaluations.reconstruction import WorkflowEvidence, WorkflowStep
@@ -17,6 +18,7 @@ from exp.simulation.evaluation.admission import (
 )
 from exp.simulation.evaluation.tasks import (
     EvaluationTask,
+    FieldRelation,
     OutcomeRule,
     TaskRevisionProposal,
     TaskVerifier,
@@ -566,8 +568,8 @@ def test_matching_endpoints_do_not_prove_preservation_without_transition_invento
 
 def test_table_relations_compose_with_policy_and_incomplete_execution() -> None:
     """Correct rows cannot hide forbidden effects, and missing state cannot become a pass."""
+    from exp.simulation.evaluation.table_relations import TableRelation
     from exp.simulation.evaluation.tasks import RuleVerifierDraft
-    from exp.simulation.table_relations import TableRelation
 
     relation = TableRelation(
         source="/initial_state/rows",
@@ -603,3 +605,94 @@ def test_table_relations_compose_with_policy_and_incomplete_execution() -> None:
         grade(predicate, {**value, "final_state": {**final, "rows": initial["rows"]}}).goal.status
         == "fail"
     )
+
+
+def relation_outcome() -> JsonObject:
+    """Return a declared structured reporting outcome for relation cases, not native evidence."""
+    return {
+        "initial_state": {"order": {"status": "pending"}},
+        "final_state": {"order": {"status": "pending"}},
+        "final_answer": {"status": "pending"},
+        "stop_reason": "completed",
+        "steps": [
+            {
+                "action": {"name": "inspect"},
+                "reply": {"status": "pending"},
+                "status": "valid",
+                "after": {"order": {"status": "pending"}},
+            }
+        ],
+    }
+
+
+def relation_verifier() -> TaskVerifier:
+    """Require observed status agreement and a genuinely read-only task."""
+    return TaskVerifier(
+        description="Report the observed status without mutation",
+        outcome_schema={"type": "object"},
+        relations=(FieldRelation(left="/final_answer/status", right="/steps/0/reply/status"),),
+        allowed_tools=("inspect",),
+        preserve_state=True,
+    )
+
+
+def test_status_contradiction_and_unrelated_state_are_not_rewarded() -> None:
+    """A valid envelope must not conceal a wrong report or an unauthorized mutation."""
+    value = relation_outcome()
+    assert grade(relation_verifier(), value).status == "pass"
+    value["final_answer"] = {"status": "delivered"}
+    assert grade(relation_verifier(), value).status == "fail"
+    value = relation_outcome()
+    value["final_state"] = {"order": {"status": "cancelled"}}
+    assert grade(relation_verifier(), value).status == "fail"
+
+
+def test_additional_valid_reads_pass_but_prohibited_action_fails() -> None:
+    """Call count is not a proxy for the declared read-only requirement."""
+    value = relation_outcome()
+    steps = value["steps"]
+    assert isinstance(steps, list)
+    steps *= 2
+    assert grade(relation_verifier(), value).status == "pass"
+    steps.append({"action": {"name": "mutate"}})
+    assert grade(relation_verifier(), value).status == "fail"
+
+
+def test_relation_requires_both_observations_and_strict_json_equality() -> None:
+    """Missing inputs are unavailable, and booleans are not numeric evidence."""
+    value = relation_outcome()
+    value["final_answer"] = {}
+    assert grade(relation_verifier(), value).status == "unassessable"
+    value = relation_outcome()
+    value["final_answer"] = {"status": True}
+    steps = value["steps"]
+    assert isinstance(steps, list)
+    first = steps[0]
+    assert isinstance(first, dict)
+    first["reply"] = {"status": 1}
+    assert grade(relation_verifier(), value).status == "fail"
+
+
+def test_new_constraints_are_omitted_when_unused() -> None:
+    """Unchanged task content retains the same serialized contract."""
+    value = TaskVerifier(description="Existing", outcome_schema={}).model_dump(mode="json")
+    assert "relations" not in value
+    assert "allowed_tools" not in value
+    assert "preserve_state" not in value
+
+
+def test_relations_reject_non_pointer_paths() -> None:
+    """A comparison cannot execute a generated expression."""
+    with pytest.raises(ValidationError):
+        FieldRelation(left="eval(answer)", right="/reply")
+
+
+def test_matching_endpoints_do_not_prove_unobserved_intermediate_preservation() -> None:
+    """A reverted side effect could hide between equal endpoints when step state is missing."""
+    value = relation_outcome()
+    steps = value["steps"]
+    assert isinstance(steps, list) and isinstance(steps[0], dict)
+    del steps[0]["after"]
+    result = grade(relation_verifier(), value)
+    assert result.goal.status == "pass" and result.policy.status == "unassessable"
+    assert result.status == "unassessable"

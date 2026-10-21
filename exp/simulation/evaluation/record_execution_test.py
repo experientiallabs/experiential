@@ -34,14 +34,14 @@ from exp.simulation.evaluation.admission import (
     record_label_witness,
     verify_label_witness,
 )
-from exp.simulation.evaluation.tasks import OutcomeRule, TaskVerifier, VerifierChallenge, grade
-from exp.simulation.record_execution import (
+from exp.simulation.evaluation.record_execution import (
     RecordReplayRuntime,
     execute_record_script,
     load_record_execution,
     record_state,
     verify_record_execution,
 )
+from exp.simulation.evaluation.tasks import OutcomeRule, TaskVerifier, VerifierChallenge, grade
 
 NOW = datetime(2026, 10, 18, tzinfo=UTC)
 SCHEMA = """

@@ -37,8 +37,8 @@ from exp.simulation.capability_briefs import persist_capability_brief
 from exp.simulation.capability_briefs_test import brief
 from exp.simulation.continuations import load_continuation_checkpoint
 from exp.simulation.evaluation.admission import EvaluationSpecification, persist_specification
+from exp.simulation.evaluation.record_execution_test import acceptance, source
 from exp.simulation.evaluation.tasks import OutcomeRule
-from exp.simulation.record_execution_test import acceptance, source
 
 
 def search_fixture(
@@ -281,8 +281,8 @@ def workbook_search_fixture(
         workbook_projection,
     )
     from exp.runtime.environments.worlds import ToolEffectPolicy
+    from exp.simulation.evaluation.table_relations import TableRelation
     from exp.simulation.evaluation.tasks import TaskVerifier
-    from exp.simulation.table_relations import TableRelation
     from exp.simulation.world_construction import (
         ConstructionSpec,
         TablePlan,

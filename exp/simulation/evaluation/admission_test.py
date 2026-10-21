@@ -393,7 +393,7 @@ def test_a_hand_written_witness_verdict_is_regraded(tmp_path: Path) -> None:
 
 def test_reordered_table_relations_cannot_certify_themselves(tmp_path: Path) -> None:
     """Composite-key order, annotations and duplicate clauses do not create independent checks."""
-    from exp.simulation.table_relations import TableRelation
+    from exp.simulation.evaluation.table_relations import TableRelation
 
     project = ProjectStore(tmp_path, "tables")
     relation = TableRelation(

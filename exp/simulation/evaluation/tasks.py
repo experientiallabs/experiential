@@ -25,8 +25,8 @@ from exp.common.project import ArtifactStore, artifact_input
 from exp.common.tasks import TaskCase
 from exp.simulation.actor_context import ActorContextFragment
 from exp.simulation.capability_briefs import load_capability_brief
+from exp.simulation.evaluation.table_relations import TableRelation, assess_table_relation
 from exp.simulation.reconstruction.models import check_schema, path_parts, resolve
-from exp.simulation.table_relations import TableRelation, assess_table_relation
 
 
 def _strict_const(

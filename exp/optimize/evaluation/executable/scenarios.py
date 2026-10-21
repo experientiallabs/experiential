@@ -34,13 +34,13 @@ from exp.simulation.continuations import (
 )
 from exp.simulation.development_scope import require_development_task
 from exp.simulation.evaluation.admission import record_label_witness
-from exp.simulation.reconstruction.models import path_parts, resolve
-from exp.simulation.record_execution import (
+from exp.simulation.evaluation.record_execution import (
     RecordReplayRuntime,
     execute_record_script,
     load_record_execution,
     require_record_runtime,
 )
+from exp.simulation.reconstruction.models import path_parts, resolve
 
 
 class RecordScenarioSpec(ContractModel):

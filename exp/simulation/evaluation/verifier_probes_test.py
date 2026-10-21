@@ -2,7 +2,7 @@
 
 from exp.common.core.artifacts import JsonObject
 from exp.simulation.evaluation.tasks import OutcomeRule, TaskVerifier
-from exp.simulation.verifier_probes import probe_verifier
+from exp.simulation.evaluation.verifier_probes import probe_verifier
 
 
 def test_header_and_extra_effect_counterexamples_survive_as_synthetic_evidence() -> None:

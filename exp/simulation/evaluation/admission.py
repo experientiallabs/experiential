@@ -53,6 +53,11 @@ from exp.runtime.environments.artifact_edits import (
     NativeArtifactBinding,
     NativeArtifactPlan,
 )
+from exp.simulation.evaluation.record_execution import (
+    RECORD_RECEIPT_TYPE,
+    RecordReplayRuntime,
+    verify_record_execution,
+)
 from exp.simulation.evaluation.tasks import (
     WITNESSED_AUTHORITIES,
     EvaluationTask,
@@ -63,11 +68,6 @@ from exp.simulation.evaluation.tasks import (
     grade,
     load_evaluation_task,
     normalized_outcome,
-)
-from exp.simulation.record_execution import (
-    RECORD_RECEIPT_TYPE,
-    RecordReplayRuntime,
-    verify_record_execution,
 )
 
 AdmissionReason = Literal[

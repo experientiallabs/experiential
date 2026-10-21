@@ -47,9 +47,9 @@ from exp.simulation.evaluation.admission import (
     LabelWitness,
     verify_label_witness,
 )
+from exp.simulation.evaluation.record_execution import RecordReplayRuntime
 from exp.simulation.evaluation.tasks import TaskVerifier, VerifierChallenge, grade
-from exp.simulation.record_execution import RecordReplayRuntime
-from exp.simulation.verifier_probes import VerifierProbeReport, probe_verifier
+from exp.simulation.evaluation.verifier_probes import VerifierProbeReport, probe_verifier
 
 
 class ScenarioControl(ContractModel):
