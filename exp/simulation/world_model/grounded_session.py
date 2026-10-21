@@ -47,7 +47,11 @@ from exp.simulation.retrieval.selection import EvidencePolicy
 from exp.simulation.world_model.checkpoints import WorldCheckpoint, load_world_checkpoint
 from exp.simulation.world_model.durable import DurableWorldModelSession, SessionPolicy
 from exp.simulation.world_model.experience_memory import retrieved_source
-from exp.simulation.world_model.memory_projection import project_research_request, without_research
+from exp.simulation.world_model.memory_projection import (
+    RESEARCH_HISTORY_ABLATION,
+    project_research_request,
+    without_research,
+)
 from exp.simulation.world_model.prediction_reading import PredictionResolver
 from exp.simulation.world_model.resumption import Resumption
 from exp.simulation.world_model.runtime import GroundedWorldModel
@@ -183,7 +187,7 @@ class GroundedTransitionEngine:
                     }
                 ),
                 **(
-                    {} if self.research_history else {"research_history": "off-current-delivery-v1"}
+                    {} if self.research_history else {"research_history": RESEARCH_HISTORY_ABLATION}
                 ),
                 # Recorded only when present, so fact-free identities stay unchanged.
                 **(

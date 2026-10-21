@@ -24,7 +24,11 @@ from exp.simulation.world_model.experience_memory import (
     memory_view,
     summary_generations,
 )
-from exp.simulation.world_model.memory_projection import observation_overview, without_research
+from exp.simulation.world_model.memory_projection import (
+    RESEARCH_HISTORY_ABLATION,
+    observation_overview,
+    without_research,
+)
 from exp.simulation.world_model.memory_tree import overview
 
 
@@ -148,7 +152,7 @@ class TaskView:
                 **(
                     {}
                     if self._research_history
-                    else {"research_history": "off-current-delivery-v1"}
+                    else {"research_history": RESEARCH_HISTORY_ABLATION}
                 ),
             }
         )
