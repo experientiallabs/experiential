@@ -1,27 +1,22 @@
 """Bounded provider-attempt timeouts derived from the whole request, not only its output budget.
 
-A completion attempt needs time to queue, read its input, reason and write its output. The 2026-10
-SpreadSheetBench wide pilot measured p99 output pacing of 0.04 to 0.066 seconds per token across
-six hosted models, and saw 100k-token prompts take 45 seconds at only 2,048 output tokens. An
-output-only allowance of 0.03 seconds per token turned slow or large requests into unknown
-outcomes, so the allowance here also scales with the request's size and declared reasoning effort.
+A completion attempt needs time to queue, read its input, reason and write its output. Slow
+output pacing and large prompts each stretch an attempt well past what its output budget alone
+predicts, so the per-attempt allowance scales with the requested output, the serialized request
+size and the declared reasoning effort, between the client's configured floor and a hard ceiling.
 
-The request-wide deadline gives every attempt the retry policy allows its whole allowance. In the
-pilot, a shared deadline equal to one attempt left most retries after an empty or throttled first
-attempt with 15 to 27 seconds, and almost all of those retries ended as unknown outcomes. The
-physical-attempt count is unchanged: the retry policy still decides how many attempts may run.
+The request-wide deadline gives every attempt the retry policy allows its whole allowance, plus a
+wait before each retry. A deadline of one attempt would leave a retry after an empty or throttled
+first attempt too little time to finish, turning it into an unknown outcome. The retry policy
+alone decides how many physical attempts may run.
 """
 
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import TYPE_CHECKING
 
-from exp.common.models import ReasoningEffort
-
-if TYPE_CHECKING:
-    from exp.common.models import ModelRequest
-    from exp.runtime.models.providers.transport import RetryPolicy
+from exp.common.models import ModelRequest, ReasoningEffort
+from exp.runtime.models.providers.transport import RetryPolicy
 
 # Identity of the timeout derivation below, recorded on each admitted physical attempt. Bump it
 # when the derivation changes. exp/tests/code_protocols_test.py fails when this module changes
@@ -29,13 +24,13 @@ if TYPE_CHECKING:
 ATTEMPT_TIMEOUT_PROTOCOL = "provider-attempt-timeout-v2"
 
 COMPLETION_SECONDS_PER_OUTPUT_TOKEN = 0.05
-"""Per-output-token allowance: 20 tokens per second, above the pilot's measured p99 pacing."""
+"""Per-output-token allowance: 20 tokens per second, a conservative bound on output pacing."""
 
 COMPLETION_SECONDS_PER_INPUT_TOKEN = 0.001
 """Per-input-token allowance for queueing and prompt processing: 1,000 tokens per second."""
 
 REQUEST_BYTES_PER_INPUT_TOKEN = 3.0
-"""Conservative serialized bytes per prompt token; the pilot measured 3.2 to 4.3."""
+"""Serialized bytes per prompt token, set low so the input allowance overestimates tokens."""
 
 REASONING_ALLOWANCE_SECONDS: Mapping[ReasoningEffort, float] = {
     "none": 0.0,

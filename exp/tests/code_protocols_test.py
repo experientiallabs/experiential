@@ -101,7 +101,7 @@ PROTOCOLS = (
         "exp.runtime.models.providers.attempt_timeouts:ATTEMPT_TIMEOUT_PROTOCOL",
         "provider-attempt-timeout-v2",
         ("exp.runtime.models.providers.attempt_timeouts",),
-        "792a67af91f4a19d1935306f560b12af0c3785395709032940de85322e7c68a3",
+        "ce424e2025444d35f339df9c23da581a49102d27efd35a0a58ec6fccfa841fe2",
     ),
     Protocol(
         "exp.runtime.environments.workbook_edits:XLSX_ROW_EDITS_PROTOCOL",
