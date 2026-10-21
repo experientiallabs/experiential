@@ -143,7 +143,7 @@ def reserve_rung_slot(
     # upper half of the bound and leaves everyone else the lower half, or, on
     # a rung with an always-on reserve, the reserved slots stay its own.
     fast = fast_on_rung(entry.authorization, deployment)
-    fast_reserve = None if applies_default else fast_reserve_slots(deployment)
+    fast_reserve = fast_reserve_slots(deployment)
     priority = entry.authorization.priority_admission
     result = loads.reserve(
         rung_load_key(deployment),

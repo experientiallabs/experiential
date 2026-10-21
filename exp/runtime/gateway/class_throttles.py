@@ -89,6 +89,9 @@ def is_self_hosted_rung(deployment: ExactModelDeployment) -> bool:
 def rung_saturation(loads: RungLoadRegistry, deployment: ExactModelDeployment) -> float | None:
     """The rung's in-flight load as a fraction of its bound on this worker.
 
+    On a rung with a ``:fast`` reserve it is the regular count over the
+    regular share (``bound`` minus the reserve).
+
     The bound is the rung's authored ``concurrency_bound``, else the worker's
     default lane share; ``None`` when the rung is unbounded (no saturation
     signal exists, so a threshold-gated pace never applies there).
@@ -101,7 +104,13 @@ def rung_saturation(loads: RungLoadRegistry, deployment: ExactModelDeployment) -
     )
     if bound is None:
         return None
-    return loads.inflight(rung_load_key(deployment)) / bound
+    key = rung_load_key(deployment)
+    # Under a :fast reserve the paced traffic lives in the regular share, so
+    # saturation is the regular count over that share and still reaches 1.0.
+    reserve = fast_reserve_slots(deployment)
+    if reserve is not None:
+        return (loads.inflight(key) - loads.fast_inflight(key)) / (bound - reserve)
+    return loads.inflight(key) / bound
 
 
 def attempt_output_pace(

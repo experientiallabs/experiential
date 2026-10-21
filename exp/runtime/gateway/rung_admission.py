@@ -331,7 +331,11 @@ class RungLoadRegistry:
             if bound is not None and fast_reserve is not None:
                 if fast and rung.total >= bound:
                     return RungShed("queue_bound", overflow_ceiling=True)
-                if not fast and rung.total - rung.fast >= bound - fast_reserve:
+                # Others also stop at the full bound: :fast may be holding the
+                # regular share's free slots too.
+                if not fast and (
+                    rung.total - rung.fast >= bound - fast_reserve or rung.total >= bound
+                ):
                     return RungShed("queue_bound", overflow_ceiling=True)
             elif bound is not None and (fast or rung.fast):
                 if fast and rung.fast >= max(1, bound - bound // 2):
@@ -341,7 +345,13 @@ class RungLoadRegistry:
             # ``force`` stays: a forced retry must skip the window it shed on.
             if fast:
                 bound, fair_share, overflow_ceiling = None, False, None
-            if hard_bound and bound is not None and rung.total >= bound:
+            # Under a reserve every other reservation lives in the regular
+            # share: its bound, fresh spill and fair share read the regular
+            # count against ``bound - fast_reserve``, never the slots :fast holds.
+            occupied = rung.total
+            if bound is not None and fast_reserve is not None:
+                bound, occupied = bound - fast_reserve, rung.total - rung.fast
+            if hard_bound and bound is not None and occupied >= bound:
                 return RungShed("queue_bound")
             # A class cap is hard: marked as a hit overflow ceiling so no
             # priority overflow retries the rung (lane_saturation.overflow_target).
@@ -370,6 +380,7 @@ class RungLoadRegistry:
                     warm_session=warm_session,
                     fresh_spill_fraction=fresh_spill_fraction,
                     skip_rate=rate_retry,
+                    occupied=occupied,
                 )
                 if shed is not None:
                     return shed
@@ -404,11 +415,14 @@ class RungLoadRegistry:
         tokens_per_minute: int | None,
         cache_priority_alpha: float | None,
         reserved_tokens: int,
+        fast_reserve: int | None = None,
     ) -> bool:
         """Check current local headroom without reserving or consuming a rate-window slot.
 
         This is an elective recovery hint only. Dispatch still performs the atomic
         reservation and may shed if competing traffic consumed the headroom meanwhile.
+        ``fast_reserve`` judges an ordinary trial against the regular share
+        exactly as ``reserve`` does (pass ``None`` for a ``:fast`` trial).
         """
         now = self._clock()
         with self._lock:
@@ -420,12 +434,18 @@ class RungLoadRegistry:
             organization.weight = weight
             self._prune(key, rung, now)
             self._prune_window(rung, now)
+            occupied = rung.total
+            if bound is not None and fast_reserve is not None:
+                if rung.total >= bound:
+                    return False
+                bound, occupied = bound - fast_reserve, rung.total - rung.fast
             return (
                 self._shed_reason(
                     rung,
                     organization,
                     now=now,
                     bound=bound,
+                    occupied=occupied,
                     fair_share=fair_share,
                     requests_per_minute=requests_per_minute,
                     tokens_per_minute=tokens_per_minute,
@@ -452,8 +472,12 @@ class RungLoadRegistry:
         warm_session: bool,
         fresh_spill_fraction: float | None,
         skip_rate: bool = False,
+        occupied: int | None = None,
     ) -> RungShed | None:
         """Decide one reservation under the registry lock; ``None`` admits.
+
+        ``occupied`` is the in-flight count ``bound`` is judged against
+        (default the rung's total; the regular count under a ``:fast`` reserve).
 
         The bound is hard: at or beyond it every arrival spills, which is the
         queue-death fix. Fresh sessions (no warm sticky standing on this rung)
@@ -475,13 +499,14 @@ class RungLoadRegistry:
         weights ``weight * (1 + alpha * congestion * cached_fraction)``, so the
         boost is zero on an idle rung and strongest exactly at saturation.
         """
+        held = rung.total if occupied is None else occupied
         if bound is not None:
-            if rung.total >= bound:
+            if held >= bound:
                 return RungShed("queue_bound")
             if (
                 fresh_spill_fraction is not None
                 and not warm_session
-                and rung.total >= bound * fresh_spill_fraction
+                and held >= bound * fresh_spill_fraction
             ):
                 return RungShed("fresh_session_spill")
         working_rpm = self._working_rpm(rung, requests_per_minute, now)
@@ -502,7 +527,7 @@ class RungLoadRegistry:
             return RungShed("rate_limit", learned_requests_per_minute=rung.learned_rpm)
         if not fair_share or bound is None:
             return None
-        congestion = rung.total / bound
+        congestion = held / bound
         recency_floor = organization.last_seen - self._window
         # Each ACTIVE organization's effective weight is resolved once; the
         # requesting organization is always active (its last_seen was just
@@ -530,7 +555,7 @@ class RungLoadRegistry:
             for candidate, weight in weighted
             if candidate is not organization
         )
-        if rung.total + 1 + int(reserved_deficit) > bound:
+        if held + 1 + int(reserved_deficit) > bound:
             return RungShed("fair_share_shed")
         return None
 
@@ -729,6 +754,12 @@ class RungLoadRegistry:
                 return rung.total
             organization = rung.organizations.get(organization_id)
             return 0 if organization is None else organization.inflight
+
+    def fast_inflight(self, key: RungLoadKey) -> int:
+        """Return one rung's in-flight ``:fast`` reservation count."""
+        with self._lock:
+            rung = self._rungs.get(key)
+            return 0 if rung is None else rung.fast
 
     def _release_locked(self, ticket: str) -> None:
         """Return one reserved slot to its rung under the registry lock."""

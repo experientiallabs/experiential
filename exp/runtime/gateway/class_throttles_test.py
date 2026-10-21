@@ -396,6 +396,115 @@ def test_fast_may_use_the_whole_bound_and_others_return_as_it_drains() -> None:
     assert isinstance(_reserve_kept(loads), str)
 
 
+def test_fair_share_and_fresh_spill_read_the_regular_share_under_a_reserve() -> None:
+    """Two equal organizations split the regular 6 of 8 evenly; fresh sessions spill at half of 6.
+
+    Judged against the full bound the first would take 4 of the 6, and a fresh-session
+    threshold of 0.75 would never fire before the reserve's hard stop.
+    """
+    loads = RungLoadRegistry()
+
+    def ordinary(
+        organization: str, *, warm: bool = True, spill: float | None = None
+    ) -> str | RungShed:
+        return loads.reserve(
+            rung_load_key(_rung()),
+            organization_id=organization,
+            weight=1,
+            bound=8,
+            fair_share=True,
+            warm_session=warm,
+            fresh_spill_fraction=spill,
+            fast_reserve=2,
+        )
+
+    # Both organizations are active, so each is owed half of the regular six.
+    assert isinstance(ordinary("org-b"), str)
+    admitted_a = 0
+    while isinstance(ordinary("org-a"), str):
+        admitted_a += 1
+    assert admitted_a == 3  # half of the regular six, not half of the bound
+    assert isinstance(ordinary("org-b"), str)
+    assert isinstance(ordinary("org-b"), str)
+    assert ordinary("org-b") == RungShed("queue_bound", overflow_ceiling=True)
+
+    fresh = RungLoadRegistry()
+    tickets = [
+        fresh.reserve(
+            rung_load_key(_rung()),
+            organization_id="org",
+            weight=1,
+            bound=8,
+            fair_share=False,
+            fast=True,
+            fast_reserve=2,
+        )
+        for _ in range(2)
+    ]
+    assert all(isinstance(ticket, str) for ticket in tickets)
+
+    def fresh_session() -> str | RungShed:
+        return fresh.reserve(
+            rung_load_key(_rung()),
+            organization_id="org",
+            weight=1,
+            bound=8,
+            fair_share=False,
+            warm_session=False,
+            fresh_spill_fraction=0.5,
+            fast_reserve=2,
+        )
+
+    # :fast in flight does not count toward the regular threshold (3 of 6).
+    for _ in range(3):
+        assert isinstance(fresh_session(), str)
+    assert fresh_session() == RungShed("fresh_session_spill")
+
+
+def test_an_ordinary_trial_sees_the_regular_headroom_with_fast_in_flight() -> None:
+    """can_admit agrees with reserve: :fast load never reads as regular saturation."""
+    loads = RungLoadRegistry()
+    fast_tickets = [_reserve_kept(loads, fast=True) for _ in range(4)]
+    assert all(isinstance(ticket, str) for ticket in fast_tickets)
+
+    def trial(reserve: int | None) -> bool:
+        return loads.can_admit(
+            rung_load_key(_rung()),
+            organization_id="org",
+            weight=1,
+            bound=4,
+            fair_share=False,
+            requests_per_minute=None,
+            tokens_per_minute=None,
+            cache_priority_alpha=None,
+            reserved_tokens=0,
+            fast_reserve=reserve,
+        )
+
+    assert not trial(None)
+    assert not trial(1)  # the bound is full even though the regular share is empty
+    loads.release_ticket(str(fast_tickets[0]))
+    assert trial(1)  # room below the bound, and the regular share (3) is empty
+
+
+def test_pacing_saturation_is_the_regular_share_under_a_reserve() -> None:
+    """Regular load over bound minus the reserve; :fast in flight adds nothing."""
+    rung = _reserved(_rung(bound=4))
+    loads = RungLoadRegistry()
+    for fast in (True, False, False, False):
+        ticket = loads.reserve(
+            rung_load_key(rung),
+            organization_id="org",
+            weight=1,
+            bound=4,
+            fair_share=False,
+            fast=fast,
+            fast_reserve=1,
+        )
+        assert isinstance(ticket, str)
+    assert rung_saturation(loads, rung) == 1.0
+
+
 def test_self_served_tier_settles_confirmed_only_on_our_gpu() -> None:
     """Our server reports no tier: missing evidence confirms the admitted card there only."""
     admission = GatewayServiceTierAdmission(

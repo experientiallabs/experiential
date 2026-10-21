@@ -152,8 +152,12 @@ the tier is ours, so the request gets more of the GPU:
   `bound - max(1, ceil(f * bound))` whether or not a fast request is in flight (hard, even for a
   priority overflow, and an ordinary elective trial does not count the reserve as headroom),
   and a fast reservation admits while the rung holds fewer than `bound`. `0.25` on a bound of 48
-  holds others to 36 and lets fast fill to 48; a bound below 2 keeps no reserve. Per worker, like
-  the bound;
+  holds others to 36 and lets fast fill to 48; a bound below 2 keeps no reserve. Others also stop
+  at the full bound. Fair share, the fresh-session threshold and pacing saturation of other
+  traffic read the regular share, never the slots fast holds. The reserve is hard, so the
+  `priority_overflow_*` multiples cannot lift other traffic into it (a single-rung lane refuses
+  Pro past the regular share), and under heavy regular load fast has the reserve alone. Per
+  worker, like the bound;
 - settlement confirmed at the requested card (`tier_settlement`): our server reports no tier.
 
 Every self-hosted lever needs the rung's priority card (`fast_on_rung`), so a fast request

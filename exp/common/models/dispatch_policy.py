@@ -247,7 +247,12 @@ class GatewayRungDispatchPolicy(ContractModel):
     runs in a smaller batch. ``0.25`` on a bound of 48 holds others to 36. A
     bound below 2 keeps no reserve. ``None`` keeps the in-flight split (fast
     holds the upper half, others the lower half while one is held). Requires
-    ``concurrency_bound``; per worker, like the bound.
+    ``concurrency_bound``; per worker, like the bound. Fair share, the
+    fresh-session threshold and pacing saturation of other traffic read the
+    regular share (``bound`` minus the reserve). The reserve is hard, so a
+    priority overflow never reaches it (``priority_overflow_*`` cannot lift
+    other traffic past the regular share), and under heavy regular load
+    ``:fast`` has the reserve alone.
     """
 
     @model_validator(mode="after")

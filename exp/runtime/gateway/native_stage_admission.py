@@ -193,24 +193,17 @@ def stage_affinity_ordered_rungs(
             if input_tokens is None:
                 return False
             reserved_tokens = input_tokens + worst_case_output_tokens(request, deployment)
-        bound = (
-            accounting.loads.default_bound
-            if policy is None or policy.concurrency_bound is None
-            else policy.concurrency_bound
-        )
-        # An ordinary trial never counts the slots kept for :fast as headroom.
-        reserve = fast_reserve_slots(deployment)
-        if (
-            bound is not None
-            and reserve is not None
-            and not fast_on_rung(authorization, deployment)
-        ):
-            bound -= reserve
         return accounting.loads.can_admit(
             rung_load_key(deployment),
             organization_id=authorization.organization_id,
             weight=authorization.fair_share_weight,
-            bound=bound,
+            bound=accounting.loads.default_bound
+            if policy is None or policy.concurrency_bound is None
+            else policy.concurrency_bound,
+            # An ordinary trial never counts the slots kept for :fast as headroom.
+            fast_reserve=None
+            if fast_on_rung(authorization, deployment)
+            else fast_reserve_slots(deployment),
             fair_share=True,
             requests_per_minute=None if policy is None else policy.requests_per_minute,
             tokens_per_minute=None if policy is None else policy.tokens_per_minute,
