@@ -173,6 +173,9 @@ class ReplayResult(ContractModel):
         report: The saved dual report.
         unknown_outcomes: Steps re-dispatched after an unknown outcome when the run resumed;
             empty for a run that never resent a lost request.
+        replay_seconds: Wall time from execution start to the saved report, from the two
+            artifacts' creation times; a resumed run includes its interruption. None when the
+            run has no execution record.
     """
 
     trace_id: str
@@ -188,6 +191,7 @@ class ReplayResult(ContractModel):
     turns: tuple[TurnOutcome, ...]
     report: DualReport
     unknown_outcomes: tuple[UnknownOutcome, ...] = ()
+    replay_seconds: float | None = None
 
     def recovery_lines(self) -> tuple[str, ...]:
         """Per-step disclosure of every unknown-outcome retry, for trace detail views."""
@@ -215,6 +219,7 @@ class ReplayAggregate(ContractModel):
             exact rate, or None without a completed trace.
         lineage_interval: Two-sided 95 percent Wilson interval of ``lineage_exact`` at the
             lineage count, from the uncertainty owner.
+        replay_seconds: Per-trace replay wall time of every completed trace that has one.
     """
 
     traces: int
@@ -231,6 +236,7 @@ class ReplayAggregate(ContractModel):
     lineages: int = 0
     lineage_exact: float | None = None
     lineage_interval: tuple[float, float] | None = None
+    replay_seconds: tuple[float, ...] = ()
 
 
 def reply_kind(reply: JsonValue) -> ReplyKind:
@@ -660,8 +666,8 @@ def replay_result(
         report: Its saved dual report.
 
     Returns:
-        Exact replies, overall and by recorded-reply kind, reply-field agreement, and assessed
-        judge scores.
+        Exact replies, overall and by recorded-reply kind, reply-field agreement, assessed
+        judge scores and the replay's wall time.
     """
     rows = report.mechanical.get("steps")
     reproduced = {
@@ -692,7 +698,28 @@ def replay_result(
         judge_status=report.judge_status,
         report=report,
         unknown_outcomes=unknown_outcomes(project, prepared),
+        replay_seconds=replay_seconds(project, prepared),
     )
+
+
+def replay_seconds(project: ProjectStore, prepared: PreparedFidelity) -> float | None:
+    """Wall time of one run from execution start to its saved report, without provider calls.
+
+    Measured from the creation times of the run's execution record and its report, so neither
+    registration nor any wait before execution counts; a resumed run includes its interruption.
+
+    Args:
+        project: Project holding the run.
+        prepared: Exact registration.
+
+    Returns:
+        Seconds, or None unless both the execution record and the report are saved.
+    """
+    started, finished = prepared.id + "-execution", prepared.id + "-report"
+    if not (project.artifacts.exists(started) and project.artifacts.exists(finished)):
+        return None
+    begun = project.artifacts.read(started).manifest.created_at
+    return (project.artifacts.read(finished).manifest.created_at - begun).total_seconds()
 
 
 def saved_results(
@@ -766,6 +793,9 @@ def aggregate(results: Sequence[ReplayResult]) -> ReplayAggregate:
         lineages=len(by_lineage),
         lineage_exact=float(estimate) if isinstance(estimate, (int, float)) else None,
         lineage_interval=_interval(interval),
+        replay_seconds=tuple(
+            result.replay_seconds for result in results if result.replay_seconds is not None
+        ),
     )
 
 

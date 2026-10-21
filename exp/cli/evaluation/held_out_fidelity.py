@@ -545,4 +545,8 @@ def run_audit(
     console.print(
         Text(f"Report: {save_details(store, 'audits', outcome.plan.lineage, buffer.getvalue())}")
     )
-    console.print(f"[green]Complete[/green] [dim]in {duration_text(monotonic() - started)}[/dim]")
+    console.print(
+        f"[green]Complete[/green] [dim]in {duration_text(monotonic() - started)} total wall time "
+        "(fit learning, the spend question and the held-out replay; per-trace replay time is "
+        "in the report)[/dim]"
+    )

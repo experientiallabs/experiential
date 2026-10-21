@@ -71,7 +71,7 @@ def test_every_infrastructure_stop_is_explained_and_never_scored(
     assert reason in output and "--retry-incomplete" in output
 
 
-def test_the_headline_states_lineage_uncertainty_reply_kinds_and_judge_coverage() -> None:
+def test_the_headline_states_lineage_uncertainty_reply_kinds_judge_coverage_and_time() -> None:
     """Pooled turns come with the per-lineage rate, its interval, and every denominator."""
     total = ReplayAggregate(
         traces=3,
@@ -90,6 +90,7 @@ def test_the_headline_states_lineage_uncertainty_reply_kinds_and_judge_coverage(
         lineages=3,
         lineage_exact=0.5,
         lineage_interval=(0.1, 0.9),
+        replay_seconds=(30.0, 90.0, 60.0),
     )
     line = " ".join(replay_view.aggregate_line(total, 4).split())
     assert "5/9 replies exact (56%)" in line
@@ -99,6 +100,7 @@ def test_the_headline_states_lineage_uncertainty_reply_kinds_and_judge_coverage(
     assert "exact by recorded reply: trivial 4/4 (100%) · structured 1/5 (20%)" in line
     assert "text 0/0" not in line, "a kind with no turns is left out"
     assert "under 60 characters" in line
+    assert "replay time per trace 1m00s median, 1m30s longest" in line
 
 
 def test_an_unjudged_panel_says_how_many_traces_the_judge_covered() -> None:

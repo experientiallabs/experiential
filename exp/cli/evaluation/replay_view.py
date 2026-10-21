@@ -2,6 +2,7 @@
 
 from collections.abc import Callable
 from contextlib import nullcontext
+from statistics import median
 
 import typer
 from rich.console import Console
@@ -10,7 +11,7 @@ from rich.text import Text
 
 from exp.cli.evaluation.fidelity import render_fidelity
 from exp.cli.evaluation.fidelity_turns import render_turns, turn_marks
-from exp.cli.shared.progress import progress_display
+from exp.cli.shared.progress import duration_text, progress_display
 from exp.common.models.client import RequestAdmissionRefused
 from exp.common.models.unknown_outcome import DispatchOutcomeUnknown
 from exp.common.progress import ProgressHook
@@ -86,7 +87,7 @@ def stop_reason(error: BaseException) -> str:
 
 
 def aggregate_line(total: ReplayAggregate, planned: int, title: str = "Held-out fidelity") -> str:
-    """The pooled headline, then the per-lineage rate and the recorded-reply-kind split.
+    """The pooled headline, then the per-lineage rate, the reply-kind split, and replay time.
 
     The headline pools every turn of every trace; the per-lineage mean weighs each independent
     lineage equally and carries its 95 percent interval at the lineage count. The judge mean
@@ -122,6 +123,11 @@ def aggregate_line(total: ReplayAggregate, planned: int, title: str = "Held-out 
             )
             + f" (trivial: empty or under {TRIVIAL_REPLY_CHARACTERS} characters)"
         )
+    if total.replay_seconds:
+        line += (
+            f"\n  replay time per trace {duration_text(median(total.replay_seconds))} median, "
+            f"{duration_text(max(total.replay_seconds))} longest (execution start to saved report)"
+        )
     if total.judge_turns:
         line += (
             f"\n  judge agrees with exact replies on {total.judge_agreements}/{total.judge_turns} "
@@ -155,7 +161,7 @@ def render_traces(
 ) -> None:
     """Per-trace rows, then every turn and criterion of each trace."""
     table = Table(box=None, padding=(0, 2))
-    for column in (label, "Replies exact", "Field match", "Judge", "Turns"):
+    for column in (label, "Replies exact", "Field match", "Judge", "Replay time", "Turns"):
         table.add_column(column)
     for result in results:
         table.add_row(
@@ -163,6 +169,7 @@ def render_traces(
             f"{result.exact}/{result.steps}",
             share(result.fields_matched, result.fields_total),
             _judge(result),
+            "-" if result.replay_seconds is None else duration_text(result.replay_seconds),
             turn_marks(result.turns),
         )
     console.print()

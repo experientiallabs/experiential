@@ -597,7 +597,10 @@ def test_audit_learns_fit_traces_then_measures_held_out_on_final_memory(
     report = audit_report(store)
     assert "Learning curve exact replies by trace order:" in report
     assert "Report:" in output and "report.txt" in output
-    assert re.search(r"Complete in (under 1s|\d+(s|m\d\ds|h\d\dm))", output), "time taken"
+    assert re.search(r"Complete in (under 1s|\d+(s|m\d\ds|h\d\dm)) total wall time", output), (
+        "the command's time is labelled as wall time spanning learning and the spend question"
+    )
+    assert "replay time per trace" in audit_report(store), "per-trace time from execution start"
     # Held-out lineages were reserved before learning and never consumed.
     held = held_out_lineages(store)
     assert all(is_reserved(store.artifacts, plan.lineage, lineage) for lineage in held)
@@ -675,6 +678,7 @@ def test_source_rag_profile_measures_held_out_and_feeds_the_council_offline(
     assert total.lineage_interval[0] < 2 / 3 < total.lineage_interval[1]
     assert sum(row.steps for row in total.kinds) == 9
     assert sum(row.exact for row in total.kinds) == 6
+    assert len(total.replay_seconds) == 3 and min(total.replay_seconds) >= 0
     # The fixture judge scores every turn 4, so it disagrees on the three wrong turns.
     assert (total.judge_agreements, total.judge_turns) == (6, 9)
     fidelity_requests = provider.requests[built:]
@@ -836,6 +840,21 @@ def test_a_saved_result_never_replays_under_other_code(
     assert other.prepared[0].spec.run_id != measured.prepared[0].spec.run_id
     assert other.prepared[0].code_revision == "d" * 40
     assert fidelity.saved_fidelity_report(store, other.prepared[0]) is None
+
+
+def test_replay_time_runs_from_execution_start_to_the_saved_report(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Waiting between registration and execution never counts as replay time."""
+    provider = SimulatedProvider([episode(i) for i in range(USERS)])
+    _, store, _ = build_project(tmp_path, monkeypatch, provider)
+    panel = register_held_out_fidelity(
+        store, 1, profile="source-rag", code_revision=REVISION, clock=lambda: datetime.now(UTC)
+    )
+    later = datetime.now(UTC) + timedelta(hours=1)
+    execute_fidelity_evaluation(store, panel.prepared[0], clock=lambda: later)
+    (result,) = saved_held_out_results(store, panel)
+    assert result.replay_seconds == 0, "the frozen execution clock never advanced"
 
 
 class Outage(SimulatedProvider):
