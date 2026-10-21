@@ -5,10 +5,12 @@ from pathlib import Path
 
 import pytest
 
-from exp.common.core.artifacts import JsonObject, sha256_json
+from exp.common.core.artifacts import ArtifactInput, JsonObject, sha256_json
 from exp.common.models import AssistantAction, ModelRequest, ModelResponse, ToolCall
 from exp.common.project import ArtifactStore, ProjectPaths
 from exp.optimize.evaluation.continuations.study import (
+    ContinuationBranch,
+    ContinuationStudy,
     ContinuationStudySpec,
     run_continuation_study,
 )
@@ -26,7 +28,7 @@ from exp.simulation.continuations import (
     persist_continuation_checkpoint,
 )
 from exp.simulation.continuations_test import capsule
-from exp.simulation.evaluation.tasks import OutcomeRule, TaskVerifier
+from exp.simulation.evaluation.tasks import OutcomeRule, TaskVerifier, grade
 from exp.simulation.reconstruction.models import resolve
 
 
@@ -594,3 +596,51 @@ def test_actor_request_is_durable_before_interruption_and_unknown_is_not_redrawn
     assert result.branches[0].status == "outcome_unknown"
     assert result.branches[0].failure_detail is not None
     assert result.branches[0].failure_detail.details["phase"] == "interrupted_branch"
+
+
+def test_step_limit_stops_stay_in_the_resumed_success_denominator() -> None:
+    """An arm that runs out of steps more often cannot report a higher success rate."""
+    verifier = TaskVerifier(
+        description="Answer done.",
+        outcome_schema={"properties": {"final_answer": {"const": "done"}}},
+        required_paths=("/final_answer",),
+    )
+    spec = ContinuationStudySpec(
+        checkpoint=ArtifactInput(artifact_id="checkpoint", sha256="0" * 64),
+        actor_model=_response(AssistantAction(content="done")).model,
+        verifier=verifier,
+        probe_sha256=sha256_json({"probe": "none"}),
+        repeats=4,
+        selector="denominator scenario",
+    )
+
+    def study(*stops: tuple[str, str | None]) -> ContinuationStudy:
+        """Grade completed branches with the given actor stop reason and final answer."""
+        branches = []
+        for index, (stop_reason, answer) in enumerate(stops):
+            outcome: JsonObject = {"steps": [], "final_answer": answer, "stop_reason": stop_reason}
+            branches.append(
+                ContinuationBranch(
+                    index=index,
+                    status="completed",
+                    outcome=outcome,
+                    assessment=grade(verifier, outcome),
+                )
+            )
+        return ContinuationStudy(spec=spec, branches=tuple(branches))
+
+    exhausted = study(
+        ("completed", "done"),
+        ("maximum_steps", None),
+        ("maximum_steps", None),
+        ("length", "do"),
+    ).metrics()
+    finishing = study(
+        ("completed", "done"),
+        ("completed", "done"),
+        ("completed", "wrong"),
+        ("completed", "wrong"),
+    ).metrics()
+    assert (exhausted["assessable"], exhausted["unassessable"]) == (4, 0)
+    assert exhausted["resumed_success_rate"] == 0.25
+    assert finishing["resumed_success_rate"] == 0.5
