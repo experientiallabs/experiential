@@ -39,6 +39,7 @@ from exp.simulation.evaluation.calibration import (
     CalibrationJudgment,
     CalibrationPack,
     blinded_case,
+    required_judge_failed,
     task_decision,
 )
 from exp.simulation.evaluation.tasks import Verdict, grade
@@ -368,14 +369,12 @@ def assess_challenge_study(
             [decisions.get((arm.arm_id, repeat, item.item_id)) for repeat in range(arm.repeats)]
             for item in items
         ]
-        consistent = [
-            len({row.judge for row in rows if row is not None}) == 1
-            for rows in repeated
-            if all(row is not None for row in rows)
-        ]
+        # A failed repeat obtained no judgment, so it is neither agreement nor disagreement:
+        # it is counted apart, and an item enters with at least two judged repeats.
+        judged = [[row for row in rows if row is not None and not row.failed] for rows in repeated]
+        consistent = [len({row.judge for row in rows}) == 1 for rows in judged if len(rows) >= 2]
         # Over planned repeats, observed disagreement is a known inconsistency and agreement
         # is known only when every repeat was judged; anything else stays unknown.
-        judged = [[row for row in rows if row is not None and not row.failed] for rows in repeated]
         agreeing = [rows for rows in judged if len({row.judge for row in rows}) <= 1]
         known_consistent = sum(len(rows) == arm.repeats for rows in agreeing)
         report_arms[arm.arm_id] = {
@@ -389,6 +388,11 @@ def assess_challenge_study(
                 "planned_bounds": missing_outcome_bounds(
                     known_consistent, len(agreeing) - known_consistent, len(items)
                 ),
+                "failed_repeats": sum(
+                    row is not None and row.failed for rows in repeated for row in rows
+                ),
+                "missing_repeats": sum(row is None for rows in repeated for row in rows),
+                "items_without_two_judged_repeats": len(items) - len(consistent),
             },
         }
     report_panels: JsonObject = {}
@@ -533,8 +537,9 @@ class _Decision(ContractModel):
         task: Mechanically gated task decision, as calibration grades it.
         verifier: Mechanical verifier verdict on the same output.
         scores: Assessed criterion scores by criterion.
-        failed: The evaluator obtained no judgment (rejected, unknown or undispatched output),
-            as distinct from a judge that abstained on purpose.
+        failed: The evaluator obtained no judgment of a required criterion (rejected, unknown
+            or undispatched output), as distinct from a judge that abstained on purpose. An
+            optional criterion's failure cannot block the decision and is not counted.
     """
 
     judge: Verdict
@@ -564,11 +569,8 @@ def _decide(
             for axis in axes
             if axis.status == "assessed" and axis.score is not None
         },
-        failed=any(axis.status in _FAILED for axis in axes),
+        failed=required_judge_failed(axes, study.pack.minimum_scores),
     )
-
-
-_FAILED = frozenset({"judge_failure", "judge_unknown", "not_run"})
 
 
 def _panel_decision(panel: ChallengePanel, members: list[_Decision | None]) -> _Decision | None:
