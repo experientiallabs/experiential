@@ -171,7 +171,7 @@ def simulated_workbook(project: ProjectStore, configuration: JsonObject) -> Cont
 def test_native_reference_and_grounded_candidate_use_actual_world_owners(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, illegal_clock: bool
 ) -> None:
-    """Compare real XLSX effects to simulated commits, keeping simulator failures unavailable."""
+    """Compare real XLSX effects to simulated commits; a simulator failure is a difference."""
     project, spec, _, reviews = equivalence_fixture(tmp_path, monkeypatch)
     reference = spec.cases[0].reference
     configuration: JsonObject = {
@@ -206,7 +206,8 @@ def test_native_reference_and_grounded_candidate_use_actual_world_owners(
     result = run_equivalence(project, spec, code_revision="test")
     measured = result.measurements[0]
     if illegal_clock:
-        assert measured.material_agreement == "unassessable"
+        assert measured.material_agreement == "different"
+        assert "different:completed_execution" in measured.differences
         assert measured.judgment is None
         assert measured.comparison.candidate_assessment.execution != "completed"
     else:

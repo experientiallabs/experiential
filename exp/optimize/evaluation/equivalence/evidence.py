@@ -2,13 +2,18 @@
 
 from typing import Literal
 
-from exp.common.core.artifacts import ContractModel, JsonObject, Sha256, sha256_json
+from exp.common.core.artifacts import ContractModel, JsonObject, JsonValue, Sha256, sha256_json
 from exp.common.evaluations.actor_equivalence import (
     ActorComparison,
     ActorEquivalenceReport,
     ActorExecutionAssessment,
 )
 from exp.common.evaluations.reconstruction import WorkflowEvidence, WorkflowStep
+from exp.common.evaluations.uncertainty import (
+    missing_outcome_bounds,
+    unit_difference_summary,
+    unit_mean_summary,
+)
 from exp.common.models import ModelRequest
 from exp.optimize.evaluation.continuations.study import ContinuationBranch
 from exp.runtime.environments.interface import Observation
@@ -108,6 +113,24 @@ def assessment(branch: ContinuationBranch, verifier: TaskVerifier) -> ActorExecu
     )
 
 
+def _probe(state: JsonObject | None, path: str) -> tuple[JsonValue] | None:
+    """Resolve one declared probe, keeping an unavailable value distinct from JSON null."""
+    if state is None:
+        return None
+    try:
+        return (resolve(state, path),)
+    except ValueError:
+        return None
+
+
+def _initial_request(branch: ContinuationBranch) -> ModelRequest | None:
+    """Return the first saved actor request, or None when the execution never made one."""
+    calls = branch.outcome.get("model_calls")
+    if not isinstance(calls, list) or not calls or not isinstance(calls[0], dict):
+        return None
+    return ModelRequest.model_validate(calls[0].get("request"))
+
+
 def measure_pair(
     reference: ContinuationBranch,
     candidate: ContinuationBranch,
@@ -122,46 +145,46 @@ def measure_pair(
     condition: Literal["candidate", "reference_control"],
     identity: str,
 ) -> PairMeasurement:
-    """Require matching initial evidence and compare declared consequences without a judge."""
+    """Require matching initial evidence and compare declared consequences without a judge.
+
+    Missing reference evidence, mismatched initial evidence or an outcome-unknown candidate
+    leaves the pair unassessable. A known candidate execution failure against a completed
+    reference is a material difference: the candidate evidence it could not produce is
+    explained by that failure, so it cannot hide the pair among unknowns.
+    """
     left, right = assessment(reference, verifier), assessment(candidate, verifier)
-    differences, missing = [], False
+    differences: list[str] = []
+    incomparable = candidate_missing = False
     for field, paths in (("initial_state", initial_paths), ("final_state", final_paths)):
+        a, b = _object(reference.outcome, field), _object(candidate.outcome, field)
         for path in paths:
-            a, b = _object(reference.outcome, field), _object(candidate.outcome, field)
-            try:
-                if a is None or b is None:
-                    raise ValueError("state unavailable")
-                x, y = resolve(a, path), resolve(b, path)
-            except ValueError:
+            x, y = _probe(a, path), _probe(b, path)
+            if x is None or y is None:
                 differences.append(f"unavailable:{field}{path}")
-                missing = True
-            else:
-                if sha256_json(x) != sha256_json(y):
-                    differences.append(f"different:{field}{path}")
-                    if field == "initial_state":
-                        missing = True
-    requests = []
-    for branch in (reference, candidate):
-        calls = branch.outcome.get("model_calls")
-        if not isinstance(calls, list) or not calls or not isinstance(calls[0], dict):
-            requests.append(None)
-        else:
-            requests.append(ModelRequest.model_validate(calls[0].get("request")))
+                incomparable = incomparable or x is None
+                candidate_missing = candidate_missing or y is None
+            elif sha256_json(x[0]) != sha256_json(y[0]):
+                differences.append(f"different:{field}{path}")
+                incomparable = incomparable or field == "initial_state"
+    requests = [_initial_request(branch) for branch in (reference, candidate)]
     if requests[0] is None or requests[0] != requests[1]:
         differences.append("unavailable:matching_initial_actor_requests")
-        missing = True
-    if left.execution != "completed" or right.execution != "completed":
+        incomparable = incomparable or requests[0] is None or requests[1] is not None
+        candidate_missing = candidate_missing or requests[1] is None
+    failed = left.execution == "completed" and candidate.status == "failed"
+    if failed:
+        differences.append("different:completed_execution")
+    elif left.execution != "completed" or right.execution != "completed":
         differences.append("unavailable:completed_execution")
-        missing = True
+        incomparable = True
     for key in ("goal", "policy"):
         a, b = left.checks.get(key), right.checks.get(key)
-        if (
-            not isinstance(a, dict)
-            or not isinstance(b, dict)
-            or "unassessable" in (a.get("status"), b.get("status"))
-        ):
+        if not isinstance(a, dict) or a.get("status") == "unassessable":
             differences.append("unavailable:" + key)
-            missing = True
+            incomparable = True
+        elif not isinstance(b, dict) or b.get("status") == "unassessable":
+            differences.append("unavailable:" + key)
+            candidate_missing = True
         elif a.get("status") != b.get("status"):
             differences.append("different:" + key)
     comparison = ActorComparison(
@@ -177,55 +200,124 @@ def measure_pair(
         repeat=repeat,
         condition=condition,
         comparison=comparison,
-        material_agreement="unassessable" if missing else "different" if differences else "match",
+        material_agreement="unassessable"
+        if incomparable or (candidate_missing and not failed)
+        else "different"
+        if failed or differences
+        else "match",
         differences=tuple(differences),
     )
 
 
 def equivalence_metrics(measurements: tuple[PairMeasurement, ...]) -> JsonObject:
-    """Retain per-case results so pooled agreement cannot conceal a failing environment."""
-    return {
-        **_pooled_metrics(measurements),
-        "aggregation": "pooled pairs; cases with more repeats contribute more weight",
-        "by_case": {
-            str(case): _pooled_metrics(tuple(row for row in measurements if row.case == case))
-            for case in sorted({row.case for row in measurements})
-        },
+    """Average repeats within each case first, then weigh every case equally.
+
+    The headline per condition is the equal-weight case mean of known material agreement with a
+    Wilson interval at the case count, beside case-averaged missing-outcome bounds. The candidate
+    is read against the repeated-reference control: their per-case difference measures how far
+    the candidate falls short of the reference's own repeat agreement. Pair counts are retained
+    as an inventory, never as the estimate.
+    """
+    cases = sorted({row.case for row in measurements})
+    known: dict[str, dict[str, list[float]]] = {}
+    result: JsonObject = {
+        "unit": "case",
+        "aggregation": "repeats averaged within each case first; every case weighs equally",
     }
-
-
-def _pooled_metrics(measurements: tuple[PairMeasurement, ...]) -> JsonObject:
-    """Keep every planned pair and distinguish matching failures from matching successes."""
-    result: JsonObject = {}
     for condition in ("candidate", "reference_control"):
         rows = tuple(row for row in measurements if row.condition == condition)
-        total = len(rows)
-        unknown = sum(row.material_agreement == "unassessable" for row in rows)
-        matches = sum(row.material_agreement == "match" for row in rows)
-        matrix: dict[str, int] = {}
-        for row in rows:
-            pair = row.comparison
-            key = (
-                pair.reference_assessment.task_result + "/" + pair.candidate_assessment.task_result
-            )
-            matrix[key] = matrix.get(key, 0) + 1
-        result[condition] = {
-            "planned_pairs": total,
-            "material_matches": matches,
-            "material_differences": total - matches - unknown,
-            "unassessable": unknown,
-            "agreement_bounds": [matches / total, (matches + unknown) / total] if total else None,
-            "task_result_matrix_reference_then_other": matrix,
-            "both_task_pass": sum(
-                row.material_agreement != "unassessable"
-                and row.comparison.reference_assessment.task_result == "pass"
-                and row.comparison.candidate_assessment.task_result == "pass"
+        known[condition] = {
+            str(case): [
+                float(row.material_agreement == "match")
                 for row in rows
-            ),
+                if row.case == case and row.material_agreement != "unassessable"
+            ]
+            for case in cases
         }
+        bounds = [
+            _bounds(tuple(row for row in rows if row.case == case))
+            for case in cases
+            if any(row.case == case for row in rows)
+        ]
+        result[condition] = {
+            **_counts(rows),
+            "agreement": unit_mean_summary(known[condition]),
+            "agreement_bounds": [
+                sum(low for low, _ in bounds) / len(bounds),
+                sum(high for _, high in bounds) / len(bounds),
+            ]
+            if bounds
+            else None,
+        }
+    result["candidate_minus_control"] = unit_difference_summary(
+        known["candidate"], known["reference_control"]
+    )
+    result["by_case"] = {
+        str(case): _case_metrics(tuple(row for row in measurements if row.case == case))
+        for case in cases
+    }
     result["interpretation"] = (
-        "declared material outcomes only; bounds assign unavailable pairs both mismatch and match; "
-        "not confidence intervals, population equivalence or training admission; "
-        "judge ratings separate"
+        "declared material outcomes only; agreement intervals use known pairs at the case count; "
+        "bounds assign unavailable pairs both mismatch and match; candidate_minus_control "
+        "subtracts repeated-reference agreement within each case; not population equivalence "
+        "or training admission; judge ratings separate"
     )
     return result
+
+
+def _bounds(rows: tuple[PairMeasurement, ...]) -> tuple[float, float]:
+    """Bound one case's agreement under each possible outcome of its unavailable pairs."""
+    matches = sum(row.material_agreement == "match" for row in rows)
+    unknown = sum(row.material_agreement == "unassessable" for row in rows)
+    bounds = missing_outcome_bounds(matches, unknown, len(rows))
+    if bounds is None:
+        raise ValueError("a measured case has at least one planned pair")
+    return bounds[0], bounds[1]
+
+
+def _case_metrics(rows: tuple[PairMeasurement, ...]) -> JsonObject:
+    """Keep one case's pair inventory, bounds and candidate-minus-control agreement."""
+    result: JsonObject = {}
+    means: dict[str, float | None] = {}
+    for condition in ("candidate", "reference_control"):
+        group = tuple(row for row in rows if row.condition == condition)
+        known = [
+            row.material_agreement == "match"
+            for row in group
+            if row.material_agreement != "unassessable"
+        ]
+        means[condition] = sum(known) / len(known) if known else None
+        result[condition] = {
+            **_counts(group),
+            "agreement": means[condition],
+            "agreement_bounds": list(_bounds(group)) if group else None,
+        }
+    candidate, control = means["candidate"], means["reference_control"]
+    result["candidate_minus_control"] = (
+        None if candidate is None or control is None else candidate - control
+    )
+    return result
+
+
+def _counts(rows: tuple[PairMeasurement, ...]) -> JsonObject:
+    """Count every planned pair and distinguish matching failures from matching successes."""
+    unknown = sum(row.material_agreement == "unassessable" for row in rows)
+    matches = sum(row.material_agreement == "match" for row in rows)
+    matrix: dict[str, int] = {}
+    for row in rows:
+        pair = row.comparison
+        key = pair.reference_assessment.task_result + "/" + pair.candidate_assessment.task_result
+        matrix[key] = matrix.get(key, 0) + 1
+    return {
+        "planned_pairs": len(rows),
+        "material_matches": matches,
+        "material_differences": len(rows) - matches - unknown,
+        "unassessable": unknown,
+        "task_result_matrix_reference_then_other": matrix,
+        "both_task_pass": sum(
+            row.material_agreement != "unassessable"
+            and row.comparison.reference_assessment.task_result == "pass"
+            and row.comparison.candidate_assessment.task_result == "pass"
+            for row in rows
+        ),
+    }

@@ -383,7 +383,15 @@ def _assemble(
                     condition=condition,
                     identity=key,
                 )
-                if measured.material_agreement != "unassessable":
+                # A known candidate failure is already a material difference with no trace
+                # for a semantic judge to rate, so only two completed executions are judged.
+                if measured.material_agreement != "unassessable" and all(
+                    side.execution == "completed"
+                    for side in (
+                        measured.comparison.reference_assessment,
+                        measured.comparison.candidate_assessment,
+                    )
+                ):
                     if not allow_dispatch and not project.artifacts.exists(key + "-intent"):
                         raise ValueError("equivalence report lost a planned judge request")
                     report(
