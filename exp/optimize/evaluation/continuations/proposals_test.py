@@ -472,3 +472,27 @@ def test_a_registered_prefix_draw_matches_controls_only_inside_its_pool(
     assert any(row["reason"] == "source_branch_omitted" for row in report.excluded)
     assert propose_checkpoints(project, spec, code_revision="test") == report
     assert len(transport.requests) == 1
+
+
+def test_selector_reasoning_effort_reaches_the_request_and_keys_the_draw(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A registered effort is sent with the draw; leaving it unset keeps the earlier identity."""
+    project, spec, _ = selector_fixture(tmp_path, monkeypatch)
+    assert "reasoning_effort" not in spec.model_dump(mode="json")
+    assert owner._packet(project, spec)[2].reasoning_effort is None
+    low = spec.model_copy(update={"reasoning_effort": "low"})
+    assert owner._packet(project, low)[2].reasoning_effort == "low"
+    assert low.identity("test") != spec.identity("test")
+
+
+def test_selector_reasoning_effort_must_be_declared_by_its_deployment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An effort the selector deployment cannot preserve refuses before any selector intent."""
+    project, spec, transport = selector_fixture(tmp_path, monkeypatch)
+    with pytest.raises(ValueError, match="reasoning effort 'low' is not supported"):
+        owner.preflight_checkpoint_proposals(
+            project, spec.model_copy(update={"reasoning_effort": "low"})
+        )
+    assert not transport.requests

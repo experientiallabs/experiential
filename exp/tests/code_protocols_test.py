@@ -88,7 +88,7 @@ PROTOCOLS = (
             "exp.optimize.evaluation.continuations.proposals:_packet",
             "exp.optimize.evaluation.continuations.proposals:_render",
         ),
-        "10ab5739a9497bd76ef9bb5be6d0dc5d54d2554d020616337e0223619c952f40",
+        "cb2ad6e8c7435817a17943b6a440dc68ee15aa83cf73b02513c1707c296c43e9",
     ),
     Protocol(
         "exp.optimize.evaluation.learning.sample_count:SAMPLE_COUNT_PROTOCOL",

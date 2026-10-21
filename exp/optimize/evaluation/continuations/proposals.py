@@ -28,6 +28,7 @@ from exp.common.models import (
     ModelRequest,
     ModelResponse,
     ModelSnapshot,
+    ReasoningEffort,
     ToolChoice,
     load_model_catalog,
 )
@@ -77,6 +78,8 @@ class CheckpointProposalSpec(ContractModel):
         catalog_sha256: Frozen credential-free catalog definition.
         points: Maximum proposals; the selector may explicitly abstain from some points.
         output_tokens: Maximum output allowance for the one logical selector draw.
+        reasoning_effort: Requested reasoning effort for the draw, or None for the catalog
+            default; it must be one the selector deployment declares it can preserve.
         maximum_input_bytes: Whole evidence packet ceiling; no history truncation.
         deadline: Last permitted new inference, not a deadline for saved publication.
         seed: Fixed random-control draw, set before selector or continuation outcomes.
@@ -94,6 +97,9 @@ class CheckpointProposalSpec(ContractModel):
     catalog_sha256: Sha256
     points: int = Field(default=4, ge=1, le=32, strict=True)
     output_tokens: int = Field(default=4096, ge=1, le=8192, strict=True)
+    reasoning_effort: ReasoningEffort | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
     maximum_input_bytes: int = Field(default=128000, ge=512, le=512000, strict=True)
     deadline: AwareDatetime
     seed: int = Field(default=0, ge=0, le=2**32 - 1, strict=True)
@@ -416,6 +422,7 @@ def _render(
         ),
         tool_choice=ToolChoice(name="select_points"),
         maximum_output_tokens=spec.output_tokens,
+        reasoning_effort=spec.reasoning_effort,
     )
     return tuple(pool), tuple(excluded), request
 
@@ -456,6 +463,12 @@ def preflight_checkpoint_proposals(project: ProjectStore, spec: CheckpointPropos
     model, capability = RuntimeModelCatalog(catalog, environment={}).snapshot(spec.selector_alias)
     if model != spec.selector_model or capability.supports_tools is not True:
         raise ValueError("selector needs its frozen model with typed tool output")
+    efforts = tuple(catalog.models[spec.selector_alias].supported_reasoning_efforts or ())
+    if spec.reasoning_effort is not None and spec.reasoning_effort not in efforts:
+        raise ValueError(
+            f"selector reasoning effort {spec.reasoning_effort!r} is not supported by "
+            f"{spec.selector_alias}; choose one of {', '.join(efforts) or 'none declared'}"
+        )
     size = len(request.model_dump_json().encode()) + 4 * len(request.messages)
     if (
         capability.maximum_output_tokens is not None
