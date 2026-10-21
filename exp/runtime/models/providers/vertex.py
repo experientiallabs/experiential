@@ -32,12 +32,15 @@ from exp.runtime.models.providers.async_transport import (
     ProviderDeadlineExceeded,
     RequestDeadline,
 )
+from exp.runtime.models.providers.attempt_timeouts import (
+    completion_deadline_seconds,
+    request_timeout_seconds,
+)
 from exp.runtime.models.providers.base import (
     DEFAULT_RETRY_POLICY,
     DEFAULT_TIMEOUT_SECONDS,
     GatewayWireProfile,
     ProviderHttpClient,
-    completion_timeout_seconds,
 )
 from exp.runtime.models.providers.gemini import (
     gemini_generate_request,
@@ -323,7 +326,12 @@ class VertexClient(ProviderHttpClient):
             The typed completed response with observed request economics.
         """
         request_deadline = deadline or RequestDeadline.after(
-            completion_timeout_seconds(self._timeout_seconds, request.maximum_output_tokens)
+            completion_deadline_seconds(
+                request_timeout_seconds(
+                    self._timeout_seconds, request, default_reasoning_effort=self._reasoning_effort
+                ),
+                self._retry_policy,
+            )
         )
         await _warm_vertex_bearer_token(
             self._token_provider, request_deadline, self._timeout_seconds
@@ -492,7 +500,12 @@ class VertexOpenAIClient(OpenAICompatibleClient):
             The typed completed response with observed request economics.
         """
         request_deadline = deadline or RequestDeadline.after(
-            completion_timeout_seconds(self._timeout_seconds, request.maximum_output_tokens)
+            completion_deadline_seconds(
+                request_timeout_seconds(
+                    self._timeout_seconds, request, default_reasoning_effort=self._reasoning_effort
+                ),
+                self._retry_policy,
+            )
         )
         await _warm_vertex_bearer_token(
             self._token_provider, request_deadline, self._timeout_seconds
@@ -662,7 +675,12 @@ class VertexAnthropicClient(ProviderHttpClient):
     ) -> ModelResponse:
         """Warm the bearer token off the event loop, then run the shared completion flow."""
         request_deadline = deadline or RequestDeadline.after(
-            completion_timeout_seconds(self._timeout_seconds, request.maximum_output_tokens)
+            completion_deadline_seconds(
+                request_timeout_seconds(
+                    self._timeout_seconds, request, default_reasoning_effort=self._reasoning_effort
+                ),
+                self._retry_policy,
+            )
         )
         await _warm_vertex_bearer_token(
             self._token_provider, request_deadline, self._timeout_seconds

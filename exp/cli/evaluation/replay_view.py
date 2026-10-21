@@ -16,6 +16,7 @@ from exp.common.project import ProjectStore
 from exp.optimize.evaluation.fidelity.panel import execute_panel, require_resumable
 from exp.optimize.evaluation.fidelity.replay import ReplayAggregate, ReplayResult
 from exp.optimize.evaluation.fidelity.runner import PreparedFidelity
+from exp.runtime.models.providers.async_transport import ProviderDeadlineExceeded
 from exp.runtime.models.providers.transport import ProviderTransportError
 from exp.runtime.models.structured_completion import CompletionNotDispatched
 
@@ -50,7 +51,7 @@ def run_panel(
     try:
         with nullcontext(progress) if progress is not None else progress_display(console) as hook:
             execute_panel(store, registrations, progress=hook, guard=guard, resume=resume)
-    except (ProviderTransportError, CompletionNotDispatched) as exc:
+    except (ProviderTransportError, ProviderDeadlineExceeded, CompletionNotDispatched) as exc:
         console.print(f"[red]error[/red] a provider request failed: {exc}")
         console.print(
             "Completed traces are saved. The stopped trace is never bought again silently: "

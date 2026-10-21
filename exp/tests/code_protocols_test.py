@@ -3,6 +3,8 @@
 Calibration, the actor council, task refinement and the restorable environment backends bind
 their saved results to a protocol constant instead of hashing their own source. Saved results then
 survive moves, formatting and unrelated edits, and re-key only when the protocol is bumped.
+Provider attempt timeouts follow the same rule: each admitted physical attempt records the
+protocol of the derivation that bounded it.
 
 This test keeps that honest. Each protocol lists the source that decides its behavior, with that
 source's digest at the protocol's current value. When the covered source changes, the test fails
@@ -92,6 +94,12 @@ PROTOCOLS = (
         "sample-count-v1",
         ("exp.optimize.evaluation.learning.sample_count",),
         "0d6a436e42eb2fafe530930865ad937351745c78d81aa83495007a1c753daef8",
+    ),
+    Protocol(
+        "exp.runtime.models.providers.attempt_timeouts:ATTEMPT_TIMEOUT_PROTOCOL",
+        "provider-attempt-timeout-v2",
+        ("exp.runtime.models.providers.attempt_timeouts",),
+        "792a67af91f4a19d1935306f560b12af0c3785395709032940de85322e7c68a3",
     ),
     Protocol(
         "exp.runtime.environments.workbook_edits:XLSX_ROW_EDITS_PROTOCOL",

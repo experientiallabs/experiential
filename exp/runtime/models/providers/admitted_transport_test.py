@@ -1,5 +1,6 @@
 """Physical receipts survive unusable output while credentials stay outside artifacts."""
 
+import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -8,6 +9,7 @@ import pytest
 from exp.common.core.artifacts import JsonObject
 from exp.common.project import ArtifactStoreError, ProjectConfig, ProjectStore
 from exp.runtime.models.providers.admitted_transport import AdmittedJsonTransport
+from exp.runtime.models.providers.attempt_timeouts import ATTEMPT_TIMEOUT_PROTOCOL
 from exp.runtime.models.providers.transport import JsonHttpResponse, ScriptedJsonTransport
 from exp.runtime.sessions.dispatch_ledger import DispatchCapExhaustedError, DispatchLedger
 
@@ -260,3 +262,24 @@ def test_late_paid_response_is_retained_but_cannot_authorize_an_action(
     with pytest.raises(TimeoutError, match="before physical dispatch"):
         transport.post("https://fixture.invalid", headers={}, payload={}, timeout_seconds=30)
     assert len(inner.requests) == ledger.used() == 1
+
+
+def test_each_attempt_intent_records_its_timeout_and_the_derivation_protocol(
+    tmp_path: Path,
+) -> None:
+    """A saved attempt names the bound it ran under and which registered derivation produced it."""
+    project = ProjectStore(tmp_path, "attempt")
+    project.initialize(ProjectConfig(project_id="attempt"))
+    inner = ScriptedJsonTransport([JsonHttpResponse(status_code=200, body={"ok": True})])
+    transport = AdmittedJsonTransport(
+        inner,
+        ledger=DispatchLedger(tmp_path / "physical.sqlite", 1, "a" * 64),
+        artifacts=project.artifacts,
+        code_revision="fixture",
+        deadline=datetime.now(UTC) + timedelta(minutes=10),
+    )
+    transport.post("https://fixture.invalid", headers={}, payload={"m": 1}, timeout_seconds=202.4)
+    intent = next(i for i in project.artifacts.list_ids() if i.endswith("-intent"))
+    receipt = json.loads(project.artifacts.read_bytes(intent, "receipt.json"))
+    assert receipt["timeout_seconds"] == pytest.approx(202.4)
+    assert receipt["timeout_protocol"] == ATTEMPT_TIMEOUT_PROTOCOL

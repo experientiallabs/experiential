@@ -29,6 +29,7 @@ from exp.optimize.evaluation.learning.traces import (
     learning_progress,
     learning_spec,
 )
+from exp.runtime.models.providers.async_transport import ProviderDeadlineExceeded
 from exp.runtime.models.providers.transport import ProviderTransportError
 from exp.runtime.models.structured_completion import CompletionNotDispatched
 
@@ -155,7 +156,7 @@ def run_learning(
                 evidence_reading=evidence_reading,
                 dream_every=dream_every,
             )
-    except (ProviderTransportError, CompletionNotDispatched) as exc:
+    except (ProviderTransportError, ProviderDeadlineExceeded, CompletionNotDispatched) as exc:
         screen.print(f"[red]error[/red] a provider request failed: {exc}")
         screen.print(
             "Learned traces are saved. The stopped trace is never bought again silently: "

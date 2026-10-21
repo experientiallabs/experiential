@@ -10,6 +10,7 @@ from exp.common.core.artifacts import ArtifactEnvelope, ArtifactInput, JsonObjec
 from exp.common.project import ArtifactStore, ArtifactStoreError, artifact_input
 from exp.common.project.request_budget import validate_provider_response
 from exp.runtime.models.call_evidence import current_call_intent, current_consumer
+from exp.runtime.models.providers.attempt_timeouts import ATTEMPT_TIMEOUT_PROTOCOL
 from exp.runtime.models.providers.transport import JsonHttpResponse, JsonHttpTransport
 from exp.runtime.sessions.dispatch_ledger import DispatchLedger
 
@@ -94,6 +95,7 @@ class AdmittedJsonTransport(JsonHttpTransport):
                 "request_body": payload,
                 "consumer": current_consumer(),
                 "timeout_seconds": min(remaining, timeout_seconds),
+                "timeout_protocol": ATTEMPT_TIMEOUT_PROTOCOL,
                 **({"canonical_request": canonical.model_dump(mode="json")} if canonical else {}),
             },
             () if canonical is None else (canonical,),
