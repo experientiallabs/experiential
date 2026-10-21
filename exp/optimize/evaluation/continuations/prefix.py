@@ -1,12 +1,13 @@
 """Reconstruct checkpoint conversations from executed ancestors before positive supervision."""
 
-from exp.common.core.artifacts import ArtifactInput, sha256_json, stable_id
+from exp.common.core.artifacts import ArtifactInput
 from exp.common.models import ModelMessage, ModelRequest, ModelResponse, ToolCall
 from exp.common.project import ArtifactStore, artifact_input
 from exp.optimize.evaluation.continuations.study import (
     ContinuationBranch,
     ContinuationStudySpec,
     saved_actor_call_evidence,
+    study_identity,
 )
 from exp.runtime.agents.chat import task_messages
 from exp.runtime.environments import Observation
@@ -60,7 +61,7 @@ def _executed_parent(
         store.read_bytes(intent.artifact_id, "record.json")
     )
     revision = store.read(intent.artifact_id).manifest.code_revision
-    registration_id = stable_id("continuation-study", {"spec": sha256_json(spec), "code": revision})
+    registration_id = study_identity(spec, revision)
     registration = artifact_input(store.read(registration_id).manifest)
     branch_id = intent.artifact_id.removesuffix("-intent")
     branch = ContinuationBranch.model_validate_json(store.read_bytes(branch_id, "record.json"))

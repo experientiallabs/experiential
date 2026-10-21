@@ -12,6 +12,7 @@ from exp.optimize.evaluation.continuations.study import (
     ContinuationBranch,
     ContinuationStudy,
     ContinuationStudySpec,
+    known_outcomes,
     run_continuation_study,
 )
 from exp.runtime.agents.chat import ChatAgentRuntime
@@ -644,3 +645,16 @@ def test_step_limit_stops_stay_in_the_resumed_success_denominator() -> None:
     assert (exhausted["assessable"], exhausted["unassessable"]) == (4, 0)
     assert exhausted["resumed_success_rate"] == 0.25
     assert finishing["resumed_success_rate"] == 0.5
+
+
+def test_known_outcomes_label_passes_and_failures_and_skip_unknowns() -> None:
+    """Only assessed grades become labels; missing and unassessable grades stay unknown."""
+    verifier = TaskVerifier(
+        description="Answer done.",
+        outcome_schema={"properties": {"final_answer": {"const": "done"}}},
+        required_paths=("/final_answer",),
+    )
+    passed = grade(verifier, {"steps": [], "final_answer": "done", "stop_reason": "completed"})
+    failed = grade(verifier, {"steps": [], "final_answer": "no", "stop_reason": "completed"})
+    unknown = grade(verifier, {"steps": [], "final_answer": "done", "stop_reason": "failure"})
+    assert known_outcomes((passed, None, failed, unknown, passed)) == (1, 0, 1)

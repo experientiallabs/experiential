@@ -17,7 +17,6 @@ from exp.common.core.artifacts import (
     Sha256,
     sha256_bytes,
     sha256_json,
-    stable_id,
 )
 from exp.common.models import load_model_catalog
 from exp.common.project import ProjectStore, artifact_input
@@ -26,6 +25,7 @@ from exp.optimize.evaluation.continuations.study import (
     ContinuationStudy,
     ContinuationStudySpec,
     run_continuation_study,
+    study_identity,
 )
 from exp.optimize.evaluation.executable.loader import (
     ContinuationRuntime,
@@ -123,13 +123,7 @@ def saved_continuation_job(
     project: ProjectStore, job: ContinuationJob, *, code_revision: str
 ) -> ContinuationStudy | None:
     """Read the complete saved study without loading environment code or provider credentials."""
-    identity = (
-        stable_id(
-            "continuation-study",
-            {"spec": sha256_json(job.study), "code": job.implementation(code_revision)},
-        )
-        + "-result"
-    )
+    identity = study_identity(job.study, job.implementation(code_revision)) + "-result"
     if not project.artifacts.exists(identity):
         return None
     return load_study(project.artifacts, artifact_input(project.artifacts.read(identity).manifest))
@@ -216,14 +210,5 @@ def continuation_result_reference(
     """Return the verified immutable result reference for CLI handoffs and downstream evidence."""
     if saved_continuation_job(project, job, code_revision=code_revision) is None:
         raise ValueError("continuation job has no complete saved result")
-    identity = (
-        stable_id(
-            "continuation-study",
-            {
-                "spec": sha256_json(job.study),
-                "code": job.implementation(code_revision),
-            },
-        )
-        + "-result"
-    )
+    identity = study_identity(job.study, job.implementation(code_revision)) + "-result"
     return artifact_input(project.artifacts.read(identity).manifest)

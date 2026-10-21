@@ -7,7 +7,7 @@ injected model client. A saved branch replays without opening an environment or 
 an interrupted branch is retained as outcome-unknown and is never silently rerolled.
 """
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from contextlib import AbstractContextManager
 from datetime import UTC, datetime
 from typing import Literal, Protocol
@@ -115,6 +115,32 @@ class ContinuationStudySpec(ContractModel):
     training_evidence: TrainingEvidence | None = None
 
 
+def study_identity(spec: ContinuationStudySpec, code_revision: str) -> str:
+    """Name a study registration by its frozen spec and producing implementation.
+
+    Args:
+        spec: Pre-outcome registration.
+        code_revision: Exact producing implementation; a job passes its ``implementation``.
+
+    Returns:
+        The registration identity; branches and the result extend it with suffixes.
+    """
+    return stable_id("continuation-study", {"spec": sha256_json(spec), "code": code_revision})
+
+
+def known_outcomes(grades: Iterable[VerifierGrade | None]) -> tuple[int, ...]:
+    """Binary labels of assessed outcomes: 1 for a pass, 0 for a known failure.
+
+    Missing and unassessable grades have unknown outcomes and are left out; callers keep them in
+    the planned denominator as missing-outcome bounds.
+    """
+    return tuple(
+        int(grade.status == "pass")
+        for grade in grades
+        if grade is not None and grade.status != "unassessable"
+    )
+
+
 class ContinuationBranch(ContractModel):
     """One planned branch, including operationally incomplete measurements.
 
@@ -163,11 +189,7 @@ class ContinuationStudy(ContractModel):
 
     def metrics(self) -> JsonObject:
         """Report known outcomes separately from all planned branches and critic coverage."""
-        labels = [
-            int(row.assessment.status == "pass")
-            for row in self.branches
-            if row.assessment is not None and row.assessment.status != "unassessable"
-        ]
+        labels = known_outcomes(row.assessment for row in self.branches)
         probability = self.spec.predicted_success
         return {
             "planned": len(self.branches),
@@ -387,7 +409,7 @@ def run_continuation_study(
         raise ValueError("continuation runtime or probe changed; use its frozen registration")
     if not actor.remaining_calls(checkpoint.actor):
         raise ValueError("continuation has no remaining actor calls; select an earlier turn")
-    identity = stable_id("continuation-study", {"spec": sha256_json(spec), "code": code_revision})
+    identity = study_identity(spec, code_revision)
     with FileLock(store.project_directory / (identity + ".lock"), timeout=0):
         result_id = identity + "-result"
         if store.exists(result_id):

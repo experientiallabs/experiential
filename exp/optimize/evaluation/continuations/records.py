@@ -2,13 +2,14 @@
 
 import json
 
-from exp.common.core.artifacts import ArtifactInput, sha256_json, stable_id
+from exp.common.core.artifacts import ArtifactInput, sha256_json
 from exp.common.project import ArtifactStore, artifact_input
 from exp.optimize.evaluation.continuations.critic import require_prediction_binding
 from exp.optimize.evaluation.continuations.study import (
     ContinuationBranch,
     ContinuationStudy,
     saved_actor_call_evidence,
+    study_identity,
 )
 from exp.simulation.continuations import load_continuation_checkpoint
 
@@ -21,9 +22,7 @@ def load_study(store: ArtifactStore, reference: ArtifactInput) -> ContinuationSt
     study = ContinuationStudy.model_validate_json(
         store.read_bytes(reference.artifact_id, "record.json")
     )
-    identity = stable_id(
-        "continuation-study", {"spec": sha256_json(study.spec), "code": manifest.code_revision}
-    )
+    identity = study_identity(study.spec, manifest.code_revision)
     if reference.artifact_id != identity + "-result":
         raise ValueError("study result is not bound to its registered configuration")
     if tuple(row.index for row in study.branches) != tuple(range(study.spec.repeats)):

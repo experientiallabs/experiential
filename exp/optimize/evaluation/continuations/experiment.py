@@ -33,6 +33,7 @@ from exp.optimize.evaluation.continuations.job import (
 )
 from exp.optimize.evaluation.continuations.records import load_study
 from exp.optimize.evaluation.continuations.selection import load_selection_plan, selection_jobs
+from exp.optimize.evaluation.continuations.study import known_outcomes
 from exp.optimize.evaluation.executable.deferral import (
     deferred_execution,
     record_execution_deferral,
@@ -149,11 +150,7 @@ def _metrics(project: ProjectStore, cells: tuple[ExperimentCell, ...]) -> JsonOb
             if cell.result is None:
                 continue
             result = load_study(project.artifacts, cell.result)
-            labels = [
-                int(row.assessment.status == "pass")
-                for row in result.branches
-                if row.assessment is not None and row.assessment.status != "unassessable"
-            ]
+            labels = known_outcomes(row.assessment for row in result.branches)
             passed += sum(labels)
             known += len(labels)
             mixed += bool(labels and 0 < sum(labels) < len(labels))

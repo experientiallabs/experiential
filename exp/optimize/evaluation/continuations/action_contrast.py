@@ -32,6 +32,7 @@ from exp.optimize.evaluation.continuations.job import (
     saved_continuation_job,
 )
 from exp.optimize.evaluation.continuations.records import load_study
+from exp.optimize.evaluation.continuations.study import known_outcomes
 from exp.optimize.evaluation.executable.deferral import (
     deferred_execution,
     record_execution_deferral,
@@ -211,11 +212,7 @@ def _metrics(cells: tuple[ContrastCell, ...]) -> JsonObject:
     bounds: dict[str, tuple[float, float]] = {}
     for arm in ("baseline", "alternative"):
         group = [cell for cell in cells if cell.arm == arm]
-        labels = [
-            int(cell.assessment.status == "pass")
-            for cell in group
-            if cell.assessment is not None and cell.assessment.status != "unassessable"
-        ]
+        labels = known_outcomes(cell.assessment for cell in group)
         total, known, passed = len(group), len(labels), sum(labels)
         arm_bounds = missing_outcome_bounds(passed, total - known, total)
         if arm_bounds is None:
@@ -248,17 +245,15 @@ def _metrics(cells: tuple[ContrastCell, ...]) -> JsonObject:
     pairs = []
     for pair in sorted({cell.pair for cell in cells}):
         matched = {cell.arm: cell for cell in cells if cell.pair == pair}
-        labels = {
-            arm: int(cell.assessment.status == "pass")
+        known = {
+            arm: label
             for arm, cell in matched.items()
-            if cell.assessment is not None and cell.assessment.status != "unassessable"
+            for label in known_outcomes((cell.assessment,))
         }
         pairs.append(
             {
                 "pair": pair,
-                "difference": labels["alternative"] - labels["baseline"]
-                if len(labels) == 2
-                else None,
+                "difference": known["alternative"] - known["baseline"] if len(known) == 2 else None,
             }
         )
     result["pairs"] = pairs

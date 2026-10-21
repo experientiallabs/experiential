@@ -30,6 +30,7 @@ from exp.optimize.evaluation.continuations.job import (
     saved_continuation_job,
 )
 from exp.optimize.evaluation.continuations.records import load_study
+from exp.optimize.evaluation.continuations.study import known_outcomes
 from exp.optimize.evaluation.executable.deferral import (
     deferred_execution,
     record_execution_deferral,
@@ -107,11 +108,7 @@ class ObservationContrast(ContractModel):
         result: JsonObject = {}
         for arm in ("recorded", "alternative"):
             rows = [cell for cell in self.cells if cell.arm == arm]
-            known = [
-                row.assessment.status == "pass"
-                for row in rows
-                if row.assessment is not None and row.assessment.status != "unassessable"
-            ]
+            known = known_outcomes(row.assessment for row in rows)
             unknown = len(rows) - len(known)
             bounds = missing_outcome_bounds(sum(known), unknown, len(rows))
             if bounds is None:
@@ -126,11 +123,10 @@ class ObservationContrast(ContractModel):
         pairs = []
         for pair in range(self.spec.pairs):
             values = {
-                cell.arm: int(cell.assessment.status == "pass")
+                cell.arm: label
                 for cell in self.cells
                 if cell.pair == pair
-                and cell.assessment is not None
-                and cell.assessment.status != "unassessable"
+                for label in known_outcomes((cell.assessment,))
             }
             pairs.append(
                 {
