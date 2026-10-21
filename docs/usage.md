@@ -978,6 +978,23 @@ Paid operations display actor and maintained simulator dependency estimates befo
   against their preregistered acceptance evidence. Export only admitted post-checkpoint assistant
   tool-only targets; prose, earlier mistakes and replies stay context. Mechanical acceptance cannot approve prose. Source-bound lineages stay grouped; oversized training inputs refuse context truncation.
   Prefix observations must reconstruct exactly from saved executed ancestors; authored conversation interventions cannot supply positive supervision. Targets retain their qualification reference and scope. Missing qualification produces a `diagnostic` dataset, which the training loader refuses; inspection remains available. Empty or root-shape-only acceptance predicates refuse; nonempty checks still require independent controls.
+- `action: "export-traces"`, `traces: TrajectoryTraceExport`: turn saved trajectories into
+  trace imports that `exp build PROJECT --import-id ID` learns from, with no runtime, world or
+  provider call. `generators` names saved results (a study, campaign, checkpoint experiment, actor
+  panel or environment comparison); every continuation-study branch they reach is converted, and
+  `project` picks the receiving project (default: this one). Only a reply whose world receipt names
+  a native owner is learning evidence. A branch with any native reply is imported as
+  `generated-native`; its simulated or unproven replies (including inherited prefix replies no
+  executed ancestor proves native) are removed and marked `excluded` in the trace's step ledger.
+  A branch with only simulated replies is imported as `generated-simulated` with `simulation`
+  provenance, and `exp build` refuses it, so the simulator never learns from its own output.
+  Branches without an executed step are listed as skipped. Every fork of one captured task keeps
+  the source task's lineage as its conversation and declared `task_lineage`, so a build keeps the
+  forks in one fit or held-out group and the exposure ledger joins them. Each trace's
+  `exp.trace.metadata` records its generators, study, branch, source checkpoint, fork lineage,
+  world manifest and backend digests, per-step owner, actor model, verifier grade and producing
+  code revision. Identical trajectories collapse into one trace, and an unchanged export replays
+  the same content-addressed import. `--dry-run` prints counts by authority without importing.
 - `action: "harbor"`, `harbor: ExecutableCommand`: `propose-worlds` accepts `world_proposals: WorldProposalSpec`: one bounded author draw from cited research produces 2–4 data plans, candidate predicates and control scripts. The pinned runtime supplies `bind_construction(project, configuration, assets)` returning `ConstructionBinding`; it may change initial assets only. Independent acceptance stays fixed and hidden. All proposals and failures are saved; at least two distinct materialized worlds are required for native challenges. Unknown author/binding outcomes never silently rerun. This supplies development candidates, not actor equivalence or training admission. `construct-assets` accepts a `construction` (explicit tables with values, sequences and keyed lookups) and publishes unqualified generated JSON/XLSX assets for the existing runtime; `register`, `qualify`, `export`, then `serve`. `prepare-training` takes a `qualification` reference and returns a runnable continuation operation (`operation_file` saves a new JSON file); optional `comparison` plus `comparison_case` retain paired measurements for that exact candidate. Admission rechecks the pinned evidence without provider calls; qualification does not imply simulator fidelity.
   Mechanical qualification requires feasible execution plus independent positive, goal-failure,
   prohibited-effect and unknown-evidence controls. Its scope is a development observable contract,

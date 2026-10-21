@@ -52,6 +52,7 @@ from exp.cli.evaluation.factory import (
     handle_search_scenarios,
 )
 from exp.cli.evaluation.learning_repair import handle_repair_learning
+from exp.cli.evaluation.trajectory_traces import handle_export_traces
 from exp.cli.shared.options import usage_error
 from exp.cli.shared.theme import EXP_THEME
 from exp.common.core.artifacts import ArtifactInput, ContractModel
@@ -74,6 +75,7 @@ from exp.optimize.evaluation.continuations.job import ContinuationJob
 from exp.optimize.evaluation.continuations.observation_contrast import ObservationContrastSpec
 from exp.optimize.evaluation.continuations.proposals import CheckpointProposalSpec
 from exp.optimize.evaluation.continuations.selection import CheckpointSelectionSpec
+from exp.optimize.evaluation.continuations.traces import TrajectoryTraceExport
 from exp.optimize.evaluation.equivalence.prefixes import ActorPrefixSpec
 from exp.optimize.evaluation.equivalence.runner import EquivalenceSpec
 from exp.optimize.evaluation.executable.scenarios import RecordScenarioSpec, RecordWitnessSpec
@@ -116,6 +118,7 @@ CONTINUATION_ACTIONS = (
     ContinuationAction("capture", "capture", handle_capture),
     ContinuationAction("run", "job", handle_run),
     ContinuationAction("export", "export", handle_export),
+    ContinuationAction("export-traces", "traces", handle_export_traces),
     ContinuationAction("compare-framing", "framing", handle_compare_framing),
     ContinuationAction("compare-actors", "actors", handle_compare_actors),
     ContinuationAction("predict-success", "critic", handle_predict_success),
@@ -163,6 +166,7 @@ class ContinuationCommand(ContractModel):
         capture: Initial actor/world capture definition.
         job: One resumed continuation study.
         export: Independently admitted studies and dataset split settings.
+        traces: Saved trajectory generators to convert into trace imports for export-traces.
         framing: Two authored incidental cues and their shared base job.
         harbor: Executable task registration, qualification, export or serving.
         scenario: Native setup and public initialization for prepare-scenario.
@@ -196,6 +200,7 @@ class ContinuationCommand(ContractModel):
     capture: CaptureDefinition | None = None
     job: ContinuationJob | None = None
     export: ContinuationExport | None = None
+    traces: TrajectoryTraceExport | None = None
     framing: FramingStudySpec | None = None
     harbor: ExecutableCommand | None = None
     scenario: RecordScenarioSpec | None = None
