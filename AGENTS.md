@@ -389,6 +389,7 @@ uv run pytest -q
     | Provider calls and retries | `exp/runtime/models/registry.py`, `exp/runtime/models/providers/transport.py` | `RuntimeModelCatalog`, `RetryPolicy` |
     | Infrastructure failures in scored workflows | `exp/simulation/evaluation/workflow.py` | `INFRASTRUCTURE_STOPS` are raised, never scored; the run stays incomplete and resumes in place |
     | Producer revision | `exp/common/release_revision.py` | `installed_release_revision` |
+| Generated trajectories as trace evidence | `exp/optimize/evaluation/continuations/traces.py` | `export_trajectory_traces` over saved continuation studies; only native-owned replies become learning evidence, and the build refuses `simulation` provenance |
 
     Keep this table current. A change that introduces an owner for a new concern adds its row in
     the same commit.
