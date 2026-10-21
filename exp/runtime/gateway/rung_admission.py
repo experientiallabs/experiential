@@ -197,7 +197,8 @@ class _RungLoad:
     # that named one (a host class cap on a self-hosted rung, class_throttles).
     classes: dict[int, int] = field(default_factory=dict)
     # In-flight :fast reservations (class_throttles.fast_on_rung); while any
-    # is held, every other reservation sees half the rung's bound.
+    # is held, every other reservation sees half the rung's bound, unless the
+    # rung keeps an always-on reserve (``reserve(fast_reserve=)``).
     fast: int = 0
 
 
@@ -263,6 +264,7 @@ class RungLoadRegistry:
         rate_retry: bool = False,
         class_cap: tuple[int, int] | None = None,
         fast: bool = False,
+        fast_reserve: int | None = None,
     ) -> str | RungShed:
         """Reserve one slot on a policy-bounded rung, or shed with a reason.
 
@@ -298,6 +300,11 @@ class RungLoadRegistry:
                 least one), so the shared decode batch stays small. Rate
                 windows apply to both, except on a forced retry (which skips
                 the window it shed on).
+            fast_reserve: Slots of ``bound`` kept for ``:fast`` at all times
+                (``class_throttles.fast_reserve_slots``), replacing the
+                in-flight split: every other reservation holds at most
+                ``bound - fast_reserve`` and a ``:fast`` one admits while the
+                rung holds fewer than ``bound``; ``None`` keeps the split.
 
         Returns:
             An opaque ticket on admission, else the shed disclosure.
@@ -318,7 +325,15 @@ class RungLoadRegistry:
             # (a hit overflow ceiling: no overflow retries the rung). Fast
             # ignores the total, so a full rung can hold bound + ceil(bound/2)
             # until the requests already on it finish.
-            if bound is not None and (fast or rung.fast):
+            # The always-on reserve (dispatch_policy.fast_reserve_fraction):
+            # others never hold the reserved slots, fast never passes the
+            # bound. Both are hard, like the split.
+            if bound is not None and fast_reserve is not None:
+                if fast and rung.total >= bound:
+                    return RungShed("queue_bound", overflow_ceiling=True)
+                if not fast and rung.total - rung.fast >= bound - fast_reserve:
+                    return RungShed("queue_bound", overflow_ceiling=True)
+            elif bound is not None and (fast or rung.fast):
                 if fast and rung.fast >= max(1, bound - bound // 2):
                     return RungShed("queue_bound", overflow_ceiling=True)
                 if not fast and rung.total - rung.fast >= max(1, bound // 2):

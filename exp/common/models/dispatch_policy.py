@@ -237,6 +237,18 @@ class GatewayRungDispatchPolicy(ContractModel):
     below the prompt, the capped rungs are kept rather than refusing.
     ``None`` caps nothing.
     """
+    fast_reserve_fraction: float | None = Field(default=None, gt=0, lt=1, allow_inf_nan=False)
+    """Share of ``concurrency_bound`` kept for ``:fast`` requests, always on.
+
+    On a self-hosted rung that carries a priority card, every other request is
+    held to ``bound - max(1, ceil(fraction * bound))`` in flight whether or not
+    a ``:fast`` request is on the rung, and a ``:fast`` request admits while
+    the rung holds fewer than ``bound``, so ``:fast`` always finds room and
+    runs in a smaller batch. ``0.25`` on a bound of 48 holds others to 36. A
+    bound below 2 keeps no reserve. ``None`` keeps the in-flight split (fast
+    holds the upper half, others the lower half while one is held). Requires
+    ``concurrency_bound``; per worker, like the bound.
+    """
 
     @model_validator(mode="after")
     def _require_coherent_authoring(self) -> GatewayRungDispatchPolicy:
@@ -255,6 +267,8 @@ class GatewayRungDispatchPolicy(ContractModel):
             and self.priority_overflow_paying > self.priority_overflow_pro
         ):
             raise ValueError("priority_overflow_paying may not exceed priority_overflow_pro")
+        if self.fast_reserve_fraction is not None and self.concurrency_bound is None:
+            raise ValueError("fast_reserve_fraction requires a concurrency_bound to reserve from")
         if self.cache_priority_alpha is not None and not self.fair_share:
             raise ValueError("cache_priority_alpha requires fair_share to weight")
         if self.fresh_session_spill_fraction is not None:

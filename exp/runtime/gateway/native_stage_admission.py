@@ -12,6 +12,7 @@ from exp.runtime.gateway.affinity import (
     rendezvous_order,
 )
 from exp.runtime.gateway.attempt_tokens import worst_case_input_tokens, worst_case_output_tokens
+from exp.runtime.gateway.class_throttles import fast_on_rung, fast_reserve_slots
 from exp.runtime.gateway.contracts import AuthorizationSnapshot, GatewayRequest
 from exp.runtime.gateway.native_accounting import NativeAttemptAccounting
 from exp.runtime.gateway.native_execution import (
@@ -192,13 +193,24 @@ def stage_affinity_ordered_rungs(
             if input_tokens is None:
                 return False
             reserved_tokens = input_tokens + worst_case_output_tokens(request, deployment)
+        bound = (
+            accounting.loads.default_bound
+            if policy is None or policy.concurrency_bound is None
+            else policy.concurrency_bound
+        )
+        # An ordinary trial never counts the slots kept for :fast as headroom.
+        reserve = fast_reserve_slots(deployment)
+        if (
+            bound is not None
+            and reserve is not None
+            and not fast_on_rung(authorization, deployment)
+        ):
+            bound -= reserve
         return accounting.loads.can_admit(
             rung_load_key(deployment),
             organization_id=authorization.organization_id,
             weight=authorization.fair_share_weight,
-            bound=accounting.loads.default_bound
-            if policy is None or policy.concurrency_bound is None
-            else policy.concurrency_bound,
+            bound=bound,
             fair_share=True,
             requests_per_minute=None if policy is None else policy.requests_per_minute,
             tokens_per_minute=None if policy is None else policy.tokens_per_minute,

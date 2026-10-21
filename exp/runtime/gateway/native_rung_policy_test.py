@@ -754,3 +754,44 @@ def test_shed_keeps_the_cache_placed_rung_on_the_first_dispatch_only() -> None:
             )
         ).route.model_copy(update={"cache_placed_deployment_id": "deployment-a"})
         assert shed_keeps_pin(soft, 0) is False
+
+
+def test_reserve_rung_slot_keeps_the_fast_reserve_on_a_carded_gpu_rung() -> None:
+    """Ordinary traffic stops at bound minus the reserve; a :fast request takes the rest."""
+    from exp.common.models.catalog_prices import GatewayServiceTierPrices, GatewayTokenPrices
+
+    loads = RungLoadRegistry()
+    base = _deployment(
+        "deployment-a",
+        connection_sha256="b" * 64,
+        dispatch=GatewayRungDispatchPolicy(
+            concurrency_bound=4, upstream_priority=True, fast_reserve_fraction=0.25
+        ),
+    )
+    carded = GatewayTokenPrices(
+        input_nano_usd_per_million_tokens=1_000,
+        output_nano_usd_per_million_tokens=2_000,
+        priority=GatewayServiceTierPrices(
+            input_nano_usd_per_million_tokens=2_000, output_nano_usd_per_million_tokens=4_000
+        ),
+    )
+    deployment = base.model_copy(
+        update={
+            "billing_source": BillingSource.HOST_MANAGED,
+            "gateway": base.gateway.model_copy(update={"prices": carded}),
+        }
+    )
+    entry = _entry((deployment,))
+    fast_entry = dataclasses.replace(
+        entry, authorization=entry.authorization.model_copy(update={"fast": True})
+    )
+    sticky = StickySpillRegistry()
+
+    def reserve(item: InflightRequest) -> str | RungShed | None:
+        return reserve_rung_slot(loads, sticky, item, deployment, reserved_tokens=10, force=False)
+
+    for _ in range(3):
+        assert isinstance(reserve(entry), str)
+    assert reserve(entry) == RungShed("queue_bound", overflow_ceiling=True)
+    assert isinstance(reserve(fast_entry), str)
+    assert reserve(fast_entry) == RungShed("queue_bound", overflow_ceiling=True)

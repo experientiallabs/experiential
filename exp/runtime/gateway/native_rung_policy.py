@@ -24,7 +24,11 @@ import time
 from collections.abc import Callable
 
 from exp.common.models.gateway_catalog import ExactModelDeployment
-from exp.runtime.gateway.class_throttles import class_concurrency_cap, fast_on_rung
+from exp.runtime.gateway.class_throttles import (
+    class_concurrency_cap,
+    fast_on_rung,
+    fast_reserve_slots,
+)
 from exp.runtime.gateway.contracts import (
     GatewayEvent,
     GatewayFailure,
@@ -136,8 +140,10 @@ def reserve_rung_slot(
     refusing = applies_default or (policy is not None and policy.saturation == "refuse")
     selected_first = entry.route.resolved_route_id is not None and entry.total_attempts == 0
     # A :fast request on our GPU (class_throttles.fast_on_rung) takes the
-    # upper half of the bound and leaves everyone else the lower half.
+    # upper half of the bound and leaves everyone else the lower half, or, on
+    # a rung with an always-on reserve, the reserved slots stay its own.
     fast = fast_on_rung(entry.authorization, deployment)
+    fast_reserve = None if applies_default else fast_reserve_slots(deployment)
     priority = entry.authorization.priority_admission
     result = loads.reserve(
         rung_load_key(deployment),
@@ -171,6 +177,7 @@ def reserve_rung_slot(
         rate_retry=rate_retry,
         class_cap=class_cap,
         fast=fast,
+        fast_reserve=fast_reserve,
     )
     if isinstance(result, RungShed) and applies_default and result.reason == "queue_bound":
         result = dataclasses.replace(result, default_bound=True)

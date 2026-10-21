@@ -40,6 +40,7 @@ before (``started_attempt_payload``).
 from __future__ import annotations
 
 import json
+import math
 
 from exp.common.models.catalog import BillingSource
 from exp.common.models.gateway_catalog import ExactModelDeployment
@@ -184,6 +185,28 @@ def fast_on_rung(authorization: AuthorizationSnapshot, deployment: ExactModelDep
         and is_self_hosted_rung(deployment)
         and deployment.gateway.prices.priority is not None
     )
+
+
+def fast_reserve_slots(deployment: ExactModelDeployment) -> int | None:
+    """In-flight slots per worker kept for ``:fast`` on this rung, or ``None``.
+
+    Only a self-hosted rung with a priority card and an authored bound of at
+    least 2 keeps a reserve (``GatewayRungDispatchPolicy.fast_reserve_fraction``):
+    ``max(1, ceil(fraction * bound))``, never the whole bound, so ordinary
+    traffic always keeps at least one slot.
+    """
+    policy = deployment.gateway.dispatch
+    if (
+        policy is None
+        or policy.fast_reserve_fraction is None
+        or policy.concurrency_bound is None
+        or policy.concurrency_bound < 2
+        or not is_self_hosted_rung(deployment)
+        or deployment.gateway.prices.priority is None
+    ):
+        return None
+    bound = policy.concurrency_bound
+    return min(bound - 1, max(1, math.ceil(policy.fast_reserve_fraction * bound)))
 
 
 def fast_request(request: GatewayRequest, authorization: AuthorizationSnapshot) -> GatewayRequest:
