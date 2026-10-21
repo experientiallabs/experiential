@@ -416,6 +416,36 @@ def test_rules_preserve_boolean_number_distinctions_and_unknown_observations() -
     assert grade(missing, {"value": None}).status == "pass"
 
 
+@pytest.mark.parametrize(
+    ("schema", "accepted", "refused"),
+    [
+        ({"type": "integer"}, (1, 0), (1.0, True)),
+        ({"type": "number"}, (1, 1.5), (True,)),
+        ({"const": 1}, (1,), (1.0, True)),
+        ({"const": 1.0}, (1.0,), (1, True)),
+        ({"enum": [0, "x"]}, (0, "x"), (0.0, False)),
+        ({"properties": {"rows": {"anyOf": [{"type": "integer"}, {"type": "null"}]}}}, (), ()),
+    ],
+)
+def test_schema_checks_keep_booleans_integers_and_floats_distinct(
+    schema: JsonObject, accepted: tuple[JsonValue, ...], refused: tuple[JsonValue, ...]
+) -> None:
+    """A schema-valid 1.0 or true cannot satisfy an integer the verifier requires."""
+    predicate = TaskVerifier(
+        description="Typed field",
+        outcome_schema={"properties": {"value": schema}, "required": ["value"]},
+    )
+    for value in accepted:
+        assert grade(predicate, {"value": value, "final_answer": "done"}).status == "pass"
+    for value in refused:
+        assert grade(predicate, {"value": value, "final_answer": "done"}).status == "fail"
+    nested = TaskVerifier(description="Nested", outcome_schema=schema)
+    if "properties" in schema:
+        assert grade(nested, {"rows": 6, "final_answer": "done"}).status == "pass"
+        assert grade(nested, {"rows": None, "final_answer": "done"}).status == "pass"
+        assert grade(nested, {"rows": 6.0, "final_answer": "done"}).status == "fail"
+
+
 def test_observed_policy_violation_survives_later_missing_evidence() -> None:
     """An interrupted workflow cannot erase an earlier prohibited action."""
     check = TaskVerifier(

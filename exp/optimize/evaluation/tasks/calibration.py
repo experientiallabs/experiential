@@ -24,7 +24,7 @@ from exp.simulation.evaluation.tasks import load_evaluation_task, normalized_out
 # Identity of the code that decides this artifact's behavior, in place of its source text.
 # Bump it when behavior changes. exp/tests/code_protocols_test.py fails when the covered
 # source changes until it is bumped or, for a pure refactor, its digest is updated.
-CALIBRATION_PROTOCOL = "task-calibration-v6"
+CALIBRATION_PROTOCOL = "task-calibration-v7"
 
 
 class SavedCalibrationJudge(ContractModel):
