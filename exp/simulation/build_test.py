@@ -426,6 +426,27 @@ def test_build_task_set_uses_only_the_persisted_trace_dataset_as_task_set_input(
     assert store.read(built.task_set.task_set_id).manifest.inputs == (dataset_input,)
 
 
+def test_build_task_set_refuses_simulation_provenance_before_writing(tmp_path: Path) -> None:
+    """Replies a simulated owner produced never become simulator learning evidence."""
+    store = ArtifactStore(ProjectPaths(root=tmp_path, project_id="project-a"))
+    simulated = _trace(1).model_copy(
+        update={
+            "source": TraceSource(
+                identity=SourceIdentity(kind="simulation", source_id="generated-simulated:x"),
+                semantic_convention_version="1.37.0",
+            )
+        }
+    )
+    with pytest.raises(ValueError, match="generated-simulated:x carry simulation provenance"):
+        build_task_set(
+            TraceNormalizationResult(traces=(simulated, _trace(2)), issues=()),
+            store,
+            created_at=datetime(2026, 8, 11, tzinfo=UTC),
+            code_revision="test-revision",
+        )
+    assert not store.list_ids()
+
+
 def test_build_project_resumes_without_publishing_unselected_review_readiness(
     tmp_path: Path,
 ) -> None:

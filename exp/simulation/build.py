@@ -331,7 +331,24 @@ def build_task_set(
 
     Returns:
         Immutable trace-dataset and task-set artifacts plus the mining evidence between them.
+
+    Raises:
+        ValueError: A trace carries simulation provenance. The simulator never learns from
+            replies a simulated owner produced.
     """
+    simulated = sorted(
+        {
+            trace.source.identity.source_id
+            for trace in normalized.traces
+            if trace.source.identity.kind == "simulation"
+        }
+    )
+    if simulated:
+        raise ValueError(
+            f"traces from {', '.join(simulated)} carry simulation provenance: a simulated world "
+            "owner produced their replies, and the simulator never learns from its own output. "
+            "Build from a generated-native trajectory import or recorded traces instead."
+        )
     trace_dataset = persist_trace_dataset(
         normalized,
         store,
