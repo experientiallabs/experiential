@@ -71,7 +71,7 @@ def test_every_infrastructure_stop_is_explained_and_never_scored(
     assert reason in output and "--retry-incomplete" in output
 
 
-def test_the_headline_states_lineage_uncertainty_and_reply_kinds() -> None:
+def test_the_headline_states_lineage_uncertainty_reply_kinds_and_judge_coverage() -> None:
     """Pooled turns come with the per-lineage rate, its interval, and every denominator."""
     total = ReplayAggregate(
         traces=3,
@@ -80,6 +80,8 @@ def test_the_headline_states_lineage_uncertainty_and_reply_kinds() -> None:
         fields_matched=20,
         fields_total=30,
         judge_mean=3.5,
+        judged_traces=2,
+        judge_failures=1,
         kinds=(
             ReplyKindCount(kind="trivial", exact=4, steps=4),
             ReplyKindCount(kind="text", exact=0, steps=0),
@@ -91,9 +93,17 @@ def test_the_headline_states_lineage_uncertainty_and_reply_kinds() -> None:
     )
     line = " ".join(replay_view.aggregate_line(total, 4).split())
     assert "5/9 replies exact (56%)" in line
-    assert "judge 3.5/5" in line
+    assert "judge 3.5/5 (2/3 traces judged, 1 judge failure)" in line
     assert "3/4 traces" in line
     assert "per-lineage mean exact 50% (95% interval 10% to 90%, 3 lineages)" in line
     assert "exact by recorded reply: trivial 4/4 (100%) · structured 1/5 (20%)" in line
     assert "text 0/0" not in line, "a kind with no turns is left out"
     assert "under 60 characters" in line
+
+
+def test_an_unjudged_panel_says_how_many_traces_the_judge_covered() -> None:
+    """Without an assessed score the judge reads as a dash, still with its coverage."""
+    total = ReplayAggregate(
+        traces=2, exact=0, steps=2, fields_matched=0, fields_total=0, judge_mean=None
+    )
+    assert "judge - (0/2 traces judged, 0 judge failures)" in replay_view.aggregate_line(total, 2)

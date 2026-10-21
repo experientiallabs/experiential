@@ -89,7 +89,8 @@ def aggregate_line(total: ReplayAggregate, planned: int, title: str = "Held-out 
     """The pooled headline, then the per-lineage rate and the recorded-reply-kind split.
 
     The headline pools every turn of every trace; the per-lineage mean weighs each independent
-    lineage equally and carries its 95 percent interval at the lineage count.
+    lineage equally and carries its 95 percent interval at the lineage count. The judge mean
+    states how many traces it covers and how many judge calls failed.
 
     Args:
         total: Sums over completed traces.
@@ -104,8 +105,7 @@ def aggregate_line(total: ReplayAggregate, planned: int, title: str = "Held-out 
         f"{share(total.fields_matched, total.fields_total)} reply fields match "
         f"({total.fields_matched}/{total.fields_total})"
     )
-    judge = "judge -" if total.judge_mean is None else f"judge {total.judge_mean:.1f}/5"
-    line = f"{title}  {exact} · {fields} · {judge} · {total.traces}/{planned} traces"
+    line = f"{title}  {exact} · {fields} · {judge_summary(total)} · {total.traces}/{planned} traces"
     if total.lineage_exact is not None and total.lineage_interval is not None:
         low, high = total.lineage_interval
         line += (
@@ -128,6 +128,22 @@ def aggregate_line(total: ReplayAggregate, planned: int, title: str = "Held-out 
             f"turns ({share(total.judge_agreements, total.judge_turns)})"
         )
     return line
+
+
+def judge_summary(total: ReplayAggregate) -> str:
+    """The judge mean with the traces it covers and the judge failures, for the headline.
+
+    Args:
+        total: Sums over completed traces.
+
+    Returns:
+        ``judge M/5 (J/T traces judged, F judge failures)``, with ``-`` for no assessed score.
+    """
+    mean = "-" if total.judge_mean is None else f"{total.judge_mean:.1f}/5"
+    failures = (
+        f"{total.judge_failures} judge {'failure' if total.judge_failures == 1 else 'failures'}"
+    )
+    return f"judge {mean} ({total.judged_traces}/{total.traces} traces judged, {failures})"
 
 
 def render_traces(

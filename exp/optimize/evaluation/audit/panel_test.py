@@ -669,7 +669,7 @@ def test_source_rag_profile_measures_held_out_and_feeds_the_council_offline(
     total = aggregate(saved_held_out_results(store, panel))
     # Three traces, each replaying 3 calls after a 1-call public prefix; one tool is wrong.
     assert (total.exact, total.steps, total.judge_mean) == (6, 9, 4.0)
-    assert total.lineages == 3
+    assert (total.judged_traces, total.judge_failures, total.lineages) == (3, 0, 3)
     assert total.lineage_exact == pytest.approx(2 / 3)
     assert total.lineage_interval is not None
     assert total.lineage_interval[0] < 2 / 3 < total.lineage_interval[1]

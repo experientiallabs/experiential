@@ -204,6 +204,8 @@ class ReplayAggregate(ContractModel):
         fields_matched: Matching reply leaf fields.
         fields_total: Compared reply leaf fields.
         judge_mean: Mean assessed criterion score, or None when nothing was assessed.
+        judged_traces: Completed traces with at least one assessed criterion score.
+        judge_failures: Completed traces whose judge failed or has an unknown outcome.
         judge_turns: Turns with a per-turn response score and a recorded reply.
         judge_agreements: Of those, turns where the judge's verdict (response score 4 or 5)
             agrees with exact reproduction; a calibration check on the judge, not a score.
@@ -221,6 +223,8 @@ class ReplayAggregate(ContractModel):
     fields_matched: int
     fields_total: int
     judge_mean: float | None
+    judged_traces: int = 0
+    judge_failures: int = 0
     judge_turns: int = 0
     judge_agreements: int = 0
     kinds: tuple[ReplyKindCount, ...] = ()
@@ -723,7 +727,7 @@ def aggregate(results: Sequence[ReplayResult]) -> ReplayAggregate:
     Returns:
         Pooled totals with their recorded-reply-kind split, and the per-lineage mean exact rate
         with its interval at the lineage count; the judge mean pools every assessed criterion
-        score.
+        score of the judged traces.
     """
     scores = [score for result in results for score in result.judge_scores]
     by_lineage: dict[str, list[float]] = {}
@@ -747,6 +751,8 @@ def aggregate(results: Sequence[ReplayResult]) -> ReplayAggregate:
         fields_matched=sum(result.fields_matched for result in results),
         fields_total=sum(result.fields_total for result in results),
         judge_mean=sum(scores) / len(scores) if scores else None,
+        judged_traces=sum(bool(result.judge_scores) for result in results),
+        judge_failures=sum(result.judge_status in ("failed", "unknown") for result in results),
         judge_turns=len(judged),
         judge_agreements=sum(verdict == exact for verdict, exact in judged),
         kinds=tuple(
