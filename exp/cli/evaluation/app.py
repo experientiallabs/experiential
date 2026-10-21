@@ -65,6 +65,32 @@ PIPELINE_OPTION = typer.Option(
 )
 
 
+def _exclusive_mode(
+    project: str | None,
+    *,
+    conflicts: tuple[str | int | Path | None, ...],
+    flags: tuple[bool, ...] = (),
+    message: str,
+) -> str:
+    """Require a project and refuse every option the selected evaluation mode cannot combine with.
+
+    Args:
+        project: Named project from the command line, which every exclusive mode requires.
+        conflicts: Option values that must stay unset for this mode.
+        flags: Boolean options that must stay off for this mode.
+        message: Usage error naming the mode and what it cannot combine with.
+
+    Returns:
+        The required project name.
+
+    Raises:
+        typer.BadParameter: The project is missing or a conflicting option was supplied.
+    """
+    if project is None or any(value is not None for value in conflicts) or any(flags):
+        raise typer.BadParameter(message)
+    return project
+
+
 def evaluate(
     project: str | None = typer.Argument(None, metavar="PROJECT"),
     models: str | None = typer.Option(
@@ -127,40 +153,31 @@ def evaluate(
         continuations: Explicit runtime study or saved-evidence training export specification.
         pipeline: Bounded multi-family development qualification and verified package delivery.
     """
+    rollout = (models, repeats, concurrency, maximum_steps, maximum_output_tokens)
+    audit_flags = (verbose, retry_incomplete, include_inspected)
     if pipeline is not None:
-        if (
-            project is None
-            or any(
-                value is not None
-                for value in (
-                    continuations,
-                    materialize,
-                    calibration,
-                    fidelity,
-                    audit,
-                    trace_analysis,
-                    refine_task,
-                    resume,
-                    report,
-                    models,
-                    repeats,
-                    concurrency,
-                    maximum_steps,
-                    maximum_output_tokens,
-                )
-            )
-            or verbose
-            or retry_incomplete
-            or include_inspected
-        ):
-            raise typer.BadParameter(
-                "--pipeline requires PROJECT and cannot combine with other evaluation modes "
-                "or rollout overrides"
-            )
+        selected = _exclusive_mode(
+            project,
+            conflicts=(
+                continuations,
+                materialize,
+                calibration,
+                fidelity,
+                audit,
+                trace_analysis,
+                refine_task,
+                resume,
+                report,
+                *rollout,
+            ),
+            flags=audit_flags,
+            message="--pipeline requires PROJECT and cannot combine with other evaluation modes "
+            "or rollout overrides",
+        )
         from exp.cli.evaluation.pipeline import run_pipeline
 
         run_pipeline(
-            project,
+            selected,
             pipeline,
             root=root,
             yes=yes,
@@ -169,37 +186,27 @@ def evaluate(
         )
         return
     if continuations is not None:
-        if (
-            project is None
-            or any(
-                value is not None
-                for value in (
-                    materialize,
-                    calibration,
-                    fidelity,
-                    audit,
-                    trace_analysis,
-                    refine_task,
-                    resume,
-                    report,
-                    models,
-                    repeats,
-                    concurrency,
-                    maximum_steps,
-                    maximum_output_tokens,
-                )
-            )
-            or verbose
-            or retry_incomplete
-            or include_inspected
-        ):
-            raise typer.BadParameter(
-                "--continuations requires PROJECT and cannot combine with other evaluation modes"
-            )
+        selected = _exclusive_mode(
+            project,
+            conflicts=(
+                materialize,
+                calibration,
+                fidelity,
+                audit,
+                trace_analysis,
+                refine_task,
+                resume,
+                report,
+                *rollout,
+            ),
+            flags=audit_flags,
+            message="--continuations requires PROJECT and cannot combine with other evaluation "
+            "modes",
+        )
         from exp.cli.evaluation.continuations import run_continuations
 
         run_continuations(
-            project,
+            selected,
             continuations,
             root=root,
             yes=yes,
@@ -208,90 +215,50 @@ def evaluate(
         )
         return
     if materialize is not None:
-        if (
-            project is None
-            or any(
-                value is not None
-                for value in (
-                    calibration,
-                    fidelity,
-                    audit,
-                    trace_analysis,
-                    refine_task,
-                    resume,
-                    report,
-                    models,
-                    repeats,
-                    concurrency,
-                    maximum_steps,
-                    maximum_output_tokens,
-                )
-            )
-            or verbose
-            or retry_incomplete
-            or include_inspected
-        ):
-            raise typer.BadParameter(
-                "--materialize requires PROJECT and cannot combine with other modes "
-                "or rollout overrides"
-            )
+        selected = _exclusive_mode(
+            project,
+            conflicts=(
+                calibration,
+                fidelity,
+                audit,
+                trace_analysis,
+                refine_task,
+                resume,
+                report,
+                *rollout,
+            ),
+            flags=audit_flags,
+            message="--materialize requires PROJECT and cannot combine with other modes "
+            "or rollout overrides",
+        )
         from exp.cli.evaluation.native_artifacts import run_materialization
 
-        run_materialization(project, materialize, root=root, dry_run=dry_run)
+        run_materialization(selected, materialize, root=root, dry_run=dry_run)
         return
     if calibration is not None:
-        if (
-            project is None
-            or any(
-                value is not None
-                for value in (
-                    fidelity,
-                    audit,
-                    trace_analysis,
-                    refine_task,
-                    resume,
-                    report,
-                    models,
-                    repeats,
-                    concurrency,
-                    maximum_steps,
-                    maximum_output_tokens,
-                )
-            )
-            or verbose
-            or retry_incomplete
-            or include_inspected
-        ):
-            raise typer.BadParameter(
-                "--calibrate requires PROJECT and cannot combine with other modes "
-                "or rollout overrides"
-            )
+        selected = _exclusive_mode(
+            project,
+            conflicts=(fidelity, audit, trace_analysis, refine_task, resume, report, *rollout),
+            flags=audit_flags,
+            message="--calibrate requires PROJECT and cannot combine with other modes "
+            "or rollout overrides",
+        )
         from exp.cli.evaluation.calibration import run_calibration
 
-        run_calibration(project, calibration, root=root, dry_run=dry_run)
+        run_calibration(selected, calibration, root=root, dry_run=dry_run)
         return
     if refine_task is not None:
-        if (
-            project is None
-            or fidelity is not None
-            or audit is not None
-            or trace_analysis is not None
-            or resume is not None
-            or report is not None
-            or verbose
-            or any(
-                value is not None
-                for value in (models, repeats, concurrency, maximum_steps, maximum_output_tokens)
-            )
-        ):
-            raise typer.BadParameter(
-                "--refine-task requires PROJECT and cannot combine with other evaluation modes "
-                "or model and rollout overrides"
-            )
+        selected = _exclusive_mode(
+            project,
+            conflicts=(fidelity, audit, trace_analysis, resume, report, *rollout),
+            flags=(verbose,),
+            message="--refine-task requires PROJECT and cannot combine with other evaluation "
+            "modes or model and rollout overrides",
+        )
         from exp.cli.evaluation.task_refinement import run_task_refinement
 
         run_task_refinement(
-            project,
+            selected,
             refine_task,
             root=root,
             yes=yes,
@@ -300,23 +267,25 @@ def evaluate(
         )
         return
     if trace_analysis == Path("auto"):
-        if (
-            project is None
-            or fidelity is not None
-            or audit is not None
-            or resume is not None
-            or report is not None
-            or verbose
-            or any(value is not None for value in (repeats, maximum_steps, maximum_output_tokens))
-        ):
-            raise typer.BadParameter(
-                "--trace-analysis auto requires PROJECT; "
-                "other evaluation overrides are not supported"
-            )
+        selected = _exclusive_mode(
+            project,
+            conflicts=(
+                fidelity,
+                audit,
+                resume,
+                report,
+                repeats,
+                maximum_steps,
+                maximum_output_tokens,
+            ),
+            flags=(verbose,),
+            message="--trace-analysis auto requires PROJECT; "
+            "other evaluation overrides are not supported",
+        )
         from exp.cli.evaluation.built_council import run_built_council
 
         run_built_council(
-            project,
+            selected,
             tuple(alias.strip() for alias in models.split(",") if alias.strip())
             if models is not None
             else None,
@@ -328,24 +297,16 @@ def evaluate(
         )
         return
     if trace_analysis is not None:
-        if (
-            project is None
-            or fidelity is not None
-            or audit is not None
-            or resume is not None
-            or report is not None
-            or any(
-                value is not None
-                for value in (models, repeats, concurrency, maximum_steps, maximum_output_tokens)
-            )
-        ):
-            raise typer.BadParameter(
-                "--trace-analysis requires PROJECT and cannot combine with other evaluation modes"
-            )
+        selected = _exclusive_mode(
+            project,
+            conflicts=(fidelity, audit, resume, report, *rollout),
+            message="--trace-analysis requires PROJECT and cannot combine with other "
+            "evaluation modes",
+        )
         from exp.cli.evaluation.trace_analysis import run_trace_analysis
 
         run_trace_analysis(
-            project,
+            selected,
             trace_analysis,
             root=root,
             yes=yes,
@@ -360,23 +321,15 @@ def evaluate(
     if verbose and fidelity is None and audit is None:
         raise typer.BadParameter("--verbose applies only with --fidelity or --audit")
     if audit is not None:
-        if (
-            project is None
-            or fidelity is not None
-            or resume is not None
-            or report is not None
-            or any(
-                value is not None
-                for value in (models, repeats, concurrency, maximum_steps, maximum_output_tokens)
-            )
-        ):
-            raise typer.BadParameter(
-                "--audit requires PROJECT and cannot combine with other evaluation modes"
-            )
+        selected = _exclusive_mode(
+            project,
+            conflicts=(fidelity, resume, report, *rollout),
+            message="--audit requires PROJECT and cannot combine with other evaluation modes",
+        )
         from exp.cli.evaluation.held_out_fidelity import run_audit
 
         run_audit(
-            project,
+            selected,
             audit,
             root=root,
             yes=yes,
@@ -388,22 +341,15 @@ def evaluate(
         )
         return
     if fidelity is not None:
-        if (
-            project is None
-            or resume is not None
-            or report is not None
-            or any(
-                value is not None
-                for value in (models, repeats, concurrency, maximum_steps, maximum_output_tokens)
-            )
-        ):
-            raise typer.BadParameter(
-                "--fidelity requires PROJECT and cannot combine with worker-evaluation options"
-            )
+        selected = _exclusive_mode(
+            project,
+            conflicts=(resume, report, *rollout),
+            message="--fidelity requires PROJECT and cannot combine with worker-evaluation options",
+        )
         from exp.cli.evaluation.fidelity import run_fidelity
 
         run_fidelity(
-            project,
+            selected,
             fidelity,
             root=root,
             yes=yes,
