@@ -7,14 +7,13 @@ from typing import Literal
 from pydantic import Field, model_validator
 from rich.console import Console
 
-from exp.cli.evaluation.equivalence import run_equivalence_command
+from exp.cli.evaluation.continuation_context import ContinuationContext
+from exp.cli.evaluation.equivalence import handle_compare_environments
 from exp.cli.evaluation.executable import ExecutableCommand, run_executable_command
-from exp.cli.evaluation.spend import review_cost
-from exp.cli.shared.consent import require_spend_consent
 from exp.cli.shared.options import usage_error
 from exp.cli.shared.theme import EXP_THEME
 from exp.common.core.artifacts import ArtifactInput, ContractModel
-from exp.common.project import ArtifactStoreError, ProjectStore
+from exp.common.project import ArtifactStoreError, ProjectStore, artifact_input
 from exp.common.release_revision import installed_execution_revision
 from exp.optimize.evaluation.analysis.actor_decisions import (
     ActorDecisionSpec,
@@ -330,19 +329,19 @@ def run_continuations(
         command = ContinuationCommand.model_validate_json(spec_path.read_bytes())
         store = ProjectStore(root, project)
         revision = installed_execution_revision()
+        context = ContinuationContext(
+            store=store,
+            console=console,
+            revision=revision,
+            root=root,
+            project=project,
+            spec_path=spec_path,
+            yes=yes,
+            non_interactive=non_interactive,
+            dry_run=dry_run,
+        )
         if command.equivalence is not None:
-            run_equivalence_command(
-                store,
-                command.equivalence,
-                console=console,
-                revision=revision,
-                root=root,
-                project=project,
-                spec_path=spec_path,
-                yes=yes,
-                non_interactive=non_interactive,
-                dry_run=dry_run,
-            )
+            handle_compare_environments(context, command.equivalence)
             return
         if command.learning_repair is not None:
             result = repair_learning(
@@ -368,15 +367,7 @@ def run_continuations(
                     "Known profiles validated; future evidence packets are checked whole."
                 )
                 return
-            if needs_execution and not require_spend_consent(
-                console,
-                root=root,
-                yes=yes,
-                estimated_cost_usd=review_cost(console, store, campaign),
-                cost_is_upper_bound=False,
-                command=f"exp eval {project} --continuations {spec_path}",
-                non_interactive=non_interactive,
-            ):
+            if needs_execution and not context.consent(campaign):
                 return
             result = completed or run_continuation_campaign(store, campaign, code_revision=revision)
             console.print_json(data=campaign_summary(store, result))
@@ -389,15 +380,7 @@ def run_continuations(
                 console.print("Complete source inventory validated; no model calls or publication.")
                 return
             has_response = store.artifacts.exists(selector.identity(revision) + "-response")
-            if not has_response and not require_spend_consent(
-                console,
-                root=root,
-                yes=yes,
-                estimated_cost_usd=review_cost(console, store, selector),
-                cost_is_upper_bound=False,
-                command=f"exp eval {project} --continuations {spec_path}",
-                non_interactive=non_interactive,
-            ):
+            if not has_response and not context.consent(selector):
                 return
             selected = propose_checkpoints(store, selector, code_revision=revision)
             assert selected is not None
@@ -447,15 +430,7 @@ def run_continuations(
             if dry_run:
                 console.print("Complete requests and sources validated; no provider calls.")
                 return
-            if needs_dispatch and not require_spend_consent(
-                console,
-                root=root,
-                yes=yes,
-                estimated_cost_usd=review_cost(console, store, decision_spec),
-                cost_is_upper_bound=False,
-                command=f"exp eval {project} --continuations {spec_path}",
-                non_interactive=non_interactive,
-            ):
+            if needs_dispatch and not context.consent(decision_spec):
                 return
             decisions_report = saved_decisions or run_actor_decisions(
                 store, decision_spec, code_revision=revision
@@ -471,15 +446,7 @@ def run_continuations(
             if dry_run:
                 console.print("Memory diagnostic sources and profile verified; no model call.")
                 return
-            if saved_analysis is None and not require_spend_consent(
-                console,
-                root=root,
-                yes=yes,
-                estimated_cost_usd=review_cost(console, store, analyst),
-                cost_is_upper_bound=False,
-                command=f"exp eval {project} --continuations {spec_path}",
-                non_interactive=non_interactive,
-            ):
+            if saved_analysis is None and not context.consent(analyst):
                 return
             diagnostic = saved_analysis or run_memory_analysis(
                 store, analyst, code_revision=revision
@@ -558,15 +525,7 @@ def run_continuations(
                     "Sources and suffix policy validated without runtime imports or calls."
                 )
                 return
-            if saved_observations is None and not require_spend_consent(
-                console,
-                root=root,
-                yes=yes,
-                estimated_cost_usd=review_cost(console, store, spec),
-                cost_is_upper_bound=False,
-                command=f"exp eval {project} --continuations {spec_path}",
-                non_interactive=non_interactive,
-            ):
+            if saved_observations is None and not context.consent(spec):
                 return
             report = saved_observations or run_observation_contrast(
                 store, spec, code_revision=revision
@@ -618,15 +577,7 @@ def run_continuations(
             if dry_run:
                 console.print("Every candidate and model validated; no calls or packages created.")
                 return
-            if saved_batch is None and not require_spend_consent(
-                console,
-                root=root,
-                yes=yes,
-                estimated_cost_usd=review_cost(console, store, batch),
-                cost_is_upper_bound=False,
-                command=f"exp eval {project} --continuations {spec_path}",
-                non_interactive=non_interactive,
-            ):
+            if saved_batch is None and not context.consent(batch):
                 return
             batch_result = saved_batch or run_candidate_batch(store, batch, code_revision=revision)
             console.print_json(data=batch_result.model_dump(mode="json"))
@@ -642,19 +593,7 @@ def run_continuations(
             if dry_run:
                 console.print("Public authoring context validated; no proposals purchased.")
                 return
-            if (
-                saved_proposals is None
-                and not response_saved
-                and not require_spend_consent(
-                    console,
-                    root=root,
-                    yes=yes,
-                    estimated_cost_usd=review_cost(console, store, proposals),
-                    cost_is_upper_bound=False,
-                    command=f"exp eval {project} --continuations {spec_path}",
-                    non_interactive=non_interactive,
-                )
-            ):
+            if saved_proposals is None and not response_saved and not context.consent(proposals):
                 return
             proposal_result = saved_proposals or propose_tasks(
                 store, proposals, code_revision=revision
@@ -669,15 +608,7 @@ def run_continuations(
             if dry_run:
                 console.print("Paired decisions validated; no tools or actor calls executed.")
                 return
-            if saved_contrast is None and not require_spend_consent(
-                console,
-                root=root,
-                yes=yes,
-                estimated_cost_usd=review_cost(console, store, contrast),
-                cost_is_upper_bound=False,
-                command=f"exp eval {project} --continuations {spec_path}",
-                non_interactive=non_interactive,
-            ):
+            if saved_contrast is None and not context.consent(contrast):
                 return
             contrast_result = saved_contrast or run_action_contrast(
                 store, contrast, code_revision=revision
@@ -710,15 +641,7 @@ def run_continuations(
             if dry_run:
                 console.print("Intervention validated; no runtime imported or tool executed.")
                 return
-            if saved_action is None and not require_spend_consent(
-                console,
-                root=root,
-                yes=yes,
-                estimated_cost_usd=review_cost(console, store, intervention),
-                cost_is_upper_bound=False,
-                command=f"exp eval {project} --continuations {spec_path}",
-                non_interactive=non_interactive,
-            ):
+            if saved_action is None and not context.consent(intervention):
                 return
             action_result = saved_action or capture_action_intervention(
                 store, intervention, code_revision=revision
@@ -729,8 +652,6 @@ def run_continuations(
             selection = command.selection
             identity = selection.identity(revision)
             if store.artifacts.exists(identity):
-                from exp.common.project import artifact_input
-
                 plan = load_selection_plan(
                     store, artifact_input(store.artifacts.read(identity).manifest)
                 )
@@ -773,15 +694,7 @@ def run_continuations(
             if dry_run:
                 console.print("Validated without runtime imports or provider calls.")
                 return
-            if saved_experiment is None and not require_spend_consent(
-                console,
-                root=root,
-                yes=yes,
-                estimated_cost_usd=review_cost(console, store, experiment),
-                cost_is_upper_bound=False,
-                command=f"exp eval {project} --continuations {spec_path}",
-                non_interactive=non_interactive,
-            ):
+            if saved_experiment is None and not context.consent(experiment):
                 return
             report = saved_experiment or run_checkpoint_experiment(
                 store, experiment, code_revision=revision
@@ -798,15 +711,7 @@ def run_continuations(
             if dry_run:
                 console.print("Public critic context validated; no provider call.")
                 return
-            if not exists and not require_spend_consent(
-                console,
-                root=root,
-                yes=yes,
-                estimated_cost_usd=review_cost(console, store, command.critic),
-                cost_is_upper_bound=False,
-                command=f"exp eval {project} --continuations {spec_path}",
-                non_interactive=non_interactive,
-            ):
+            if not exists and not context.consent(command.critic):
                 return
             reference = predict_success(store, command.critic, code_revision=revision)
             prediction = load_critic_prediction(store.artifacts, reference)
@@ -832,15 +737,7 @@ def run_continuations(
             if dry_run:
                 console.print("Validated without runtime imports or provider calls.")
                 return
-            if saved_panel is None and not require_spend_consent(
-                console,
-                root=root,
-                yes=yes,
-                estimated_cost_usd=review_cost(console, store, command.actors),
-                cost_is_upper_bound=False,
-                command=f"exp eval {project} --continuations {spec_path}",
-                non_interactive=non_interactive,
-            ):
+            if saved_panel is None and not context.consent(command.actors):
                 return
             panel = saved_panel or run_actor_panel(store, command.actors, code_revision=revision)
             console.print_json(data={"scope": panel.scope, **panel.metrics})
@@ -854,15 +751,7 @@ def run_continuations(
                     "Capture validated without importing runtime code or opening a world."
                 )
                 return
-            if saved is None and not require_spend_consent(
-                console,
-                root=root,
-                yes=yes,
-                estimated_cost_usd=review_cost(console, store, command.capture),
-                cost_is_upper_bound=False,
-                non_interactive=non_interactive,
-                command=f"exp eval {project} --continuations {spec_path}",
-            ):
+            if saved is None and not context.consent(command.capture):
                 return
             reference = saved or capture_initial_world(
                 store, command.capture, code_revision=revision
@@ -893,15 +782,7 @@ def run_continuations(
             if dry_run:
                 console.print("Validated without runtime imports or provider calls.")
                 return
-            if saved_framing is None and not require_spend_consent(
-                console,
-                root=root,
-                yes=yes,
-                estimated_cost_usd=review_cost(console, store, spec),
-                cost_is_upper_bound=False,
-                command=f"exp eval {project} --continuations {spec_path}",
-                non_interactive=non_interactive,
-            ):
+            if saved_framing is None and not context.consent(spec):
                 return
             report = saved_framing or run_framing_study(store, spec, code_revision=revision)
             console.print_json(data=report.metrics())
@@ -919,15 +800,7 @@ def run_continuations(
             if dry_run:
                 console.print("Validated without importing runtime code or calling providers.")
                 return
-            if saved is None and not require_spend_consent(
-                console,
-                root=root,
-                yes=yes,
-                estimated_cost_usd=review_cost(console, store, job),
-                cost_is_upper_bound=False,
-                command=f"exp eval {project} --continuations {spec_path}",
-                non_interactive=non_interactive,
-            ):
+            if saved is None and not context.consent(job):
                 return
             result = saved or execute_continuation_job(store, job, code_revision=revision)
             console.print_json(
