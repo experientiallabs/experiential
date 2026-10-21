@@ -1,5 +1,6 @@
 """Pre-outcome success predictions using only a checkpoint's actor-visible information."""
 
+import json
 from datetime import UTC, datetime
 
 from filelock import FileLock
@@ -131,7 +132,6 @@ def critic_request(store: ArtifactStore, spec: CriticSpec) -> ModelRequest:
         "actor_temperature": spec.temperature,
         "actor_output_tokens": spec.actor_output_tokens,
     }
-    import json
 
     request = ModelRequest(
         messages=(
