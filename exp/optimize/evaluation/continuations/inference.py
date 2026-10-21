@@ -63,6 +63,8 @@ class CellOutcomes(ContractModel):
         outcomes: Known binary outcomes (1 success, 0 failure).
         forecast: Prospective critic probability recorded before outcomes, if any.
         failed: Whether the cell produced no study at all.
+        critic_failure: Why the registered critic produced no forecast for this cell, if it
+            failed; None when it forecast or when no critic was registered.
     """
 
     arm: str
@@ -73,6 +75,7 @@ class CellOutcomes(ContractModel):
     outcomes: tuple[int, ...]
     forecast: float | None = Field(default=None, ge=0, le=1, allow_inf_nan=False)
     failed: bool = False
+    critic_failure: str | None = None
 
 
 def experiment_cells(
@@ -104,6 +107,7 @@ def experiment_cells(
                 if study is None
                 else study.spec.predicted_success,
                 failed=cell.result is None,
+                critic_failure=cell.critic_failure,
             )
         )
     return tuple(cells)
@@ -291,10 +295,19 @@ def _known(study: ContinuationStudy) -> tuple[int, ...]:
 
 
 def _critic(group: Sequence[CellOutcomes], base_rate: BaseRate | None) -> JsonObject:
-    """Outcome-level Brier scores of forecasts beside the base-rate forecast on equal outcomes."""
+    """Outcome-level Brier scores of forecasts beside the base-rate forecast on equal outcomes.
+
+    Checkpoints where the critic failed are counted as critic failures, not dropped as if the
+    critic had abstained; they have no forecast, so they carry no Brier score.
+    """
     forecast = [cell for cell in group if cell.forecast is not None and cell.outcomes]
+    failures = sum(cell.critic_failure is not None for cell in group)
     if not forecast:
-        return {"forecast_checkpoints": 0, "status": "no forecast with known outcomes"}
+        return {
+            "forecast_checkpoints": 0,
+            "critic_failures": failures,
+            "status": "no forecast with known outcomes",
+        }
     critic = [
         sum((cell.forecast - y) ** 2 for y in cell.outcomes) / len(cell.outcomes)
         for cell in forecast
@@ -302,6 +315,7 @@ def _critic(group: Sequence[CellOutcomes], base_rate: BaseRate | None) -> JsonOb
     ]
     result: JsonObject = {
         "forecast_checkpoints": len(forecast),
+        "critic_failures": failures,
         "mean_checkpoint_brier": sum(critic) / len(critic),
         "checkpoint_brier": critic,
     }

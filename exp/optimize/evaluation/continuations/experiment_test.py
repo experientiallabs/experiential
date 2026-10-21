@@ -8,18 +8,21 @@ import pytest
 from filelock import Timeout
 from pydantic import BaseModel
 
-from exp.common.core.artifacts import ArtifactEnvelope, ArtifactInput, JsonValue
+from exp.common.core.artifacts import ArtifactEnvelope, ArtifactInput, JsonValue, sha256_json
 from exp.common.project import ArtifactManifest, ProjectStore
 from exp.optimize.evaluation.continuations import experiment as owner
+from exp.optimize.evaluation.continuations.critic import CriticSpec
 from exp.optimize.evaluation.continuations.experiment import (
     CheckpointExperimentSpec,
     ExperimentCell,
     run_checkpoint_experiment,
 )
+from exp.optimize.evaluation.continuations.inference import experiment_inference
 from exp.optimize.evaluation.continuations.job import ContinuationJob, continuation_result_reference
 from exp.optimize.evaluation.continuations.selection import persist_selection_plan
 from exp.optimize.evaluation.continuations.selection_test import selection_fixture
 from exp.optimize.evaluation.continuations.study import ContinuationStudy
+from exp.runtime.models.providers.transport import JsonHttpResponse, ScriptedJsonTransport
 from exp.simulation.continuations import load_continuation_checkpoint
 
 
@@ -192,4 +195,148 @@ def test_deferred_child_resumes_the_same_registered_cell(
     assert not project.artifacts.exists(spec.identity("test") + "-cell-0")
     report = run_checkpoint_experiment(project, spec, code_revision="test")
     assert report.cells[0].result is not None and report.cells[0].failure is None
+    assert run_checkpoint_experiment(project, spec, code_revision="test") == report
+
+
+def _truncated_critic(
+    selection_job: ContinuationJob, monkeypatch: pytest.MonkeyPatch
+) -> tuple[CriticSpec, ScriptedJsonTransport]:
+    """A critic whose every draw ends at its output limit while reasoning, with no estimate."""
+    critic = CriticSpec(
+        checkpoint=selection_job.study.checkpoint,
+        actor_model=selection_job.study.actor_model,
+        verifier_sha256=sha256_json(selection_job.study.verifier),
+        probe_sha256=selection_job.study.probe_sha256,
+        maximum_model_calls=selection_job.maximum_model_calls,
+        system_prompt=selection_job.system_prompt,
+        temperature=selection_job.study.temperature,
+        actor_output_tokens=selection_job.study.maximum_output_tokens,
+        critic_alias=selection_job.actor_alias,
+        critic_model=selection_job.study.actor_model,
+        catalog_sha256=selection_job.catalog_sha256,
+        deadline=selection_job.deadline,
+    )
+    truncated = JsonHttpResponse(
+        status_code=200,
+        body={
+            "id": "truncated",
+            "model": "world-v1",
+            "choices": [
+                {
+                    "index": 0,
+                    "finish_reason": "length",
+                    "message": {"role": "assistant", "content": "Weighing the visible prefix"},
+                }
+            ],
+        },
+    )
+    transport = ScriptedJsonTransport((truncated, truncated))
+    monkeypatch.setattr(
+        "exp.optimize.evaluation.continuations.critic.HttpxJsonTransport", lambda: transport
+    )
+    return critic, transport
+
+
+def test_a_failed_critic_still_measures_its_cell_and_counts_as_a_critic_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An estimate cut off at its output limit leaves the arms measured and the miss counted."""
+    project, selection = selection_fixture(tmp_path, monkeypatch)
+    critic, transport = _truncated_critic(selection.base, monkeypatch)
+    reference = persist_selection_plan(
+        project, selection, created_at=datetime.now(UTC), code_revision="test"
+    )
+    spec = CheckpointExperimentSpec(selection=reference, critic=critic)
+    report = run_checkpoint_experiment(project, spec, code_revision="test")
+    for cell in report.cells:
+        assert cell.result is not None and cell.failure is None
+        assert cell.critic_failure == "finish_reason:length"
+        assert cell.job.study.critic_prediction is None
+        assert cell.job.study.predicted_success is None
+    for arm in ("proposed", "random"):
+        metrics = report.metrics[arm]
+        assert isinstance(metrics, dict)
+        assert metrics["critic_failures"] == 1
+        assert metrics["critic_failure_kinds"] == {"finish_reason:length": 1}
+        assert metrics["critic_assessable_checkpoints"] == 0
+        arms = experiment_inference(project, report)["arms"]
+        assert isinstance(arms, dict) and isinstance(arms[arm], dict)
+        assert arms[arm]["critic"] == {
+            "forecast_checkpoints": 0,
+            "critic_failures": 1,
+            "status": "no forecast with known outcomes",
+        }
+    assert len(transport.requests) == 2
+    selection.base.runtime_file.unlink()
+    assert run_checkpoint_experiment(project, spec, code_revision="test") == report
+    assert len(transport.requests) == 2
+
+
+def test_a_saved_critic_failure_cannot_be_dropped_from_a_measured_cell(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Replay refuses a report whose measured cell no longer carries its critic failure."""
+    project, selection = selection_fixture(tmp_path, monkeypatch)
+    critic, _ = _truncated_critic(selection.base, monkeypatch)
+    reference = persist_selection_plan(
+        project, selection, created_at=datetime.now(UTC), code_revision="test"
+    )
+    spec = CheckpointExperimentSpec(selection=reference, critic=critic)
+    report = run_checkpoint_experiment(project, spec, code_revision="test")
+    erased_cell = report.cells[0].model_copy(update={"critic_failure": None})
+    erased = report.model_copy(update={"cells": (erased_cell, *report.cells[1:])})
+    identity = spec.identity("test")
+    forged = {
+        (identity + "-result", "report.json"): erased.model_dump_json().encode(),
+        (identity + "-cell-0", "cell.json"): erased_cell.model_dump_json().encode(),
+    }
+    read_bytes = project.artifacts.read_bytes
+    monkeypatch.setattr(
+        project.artifacts,
+        "read_bytes",
+        lambda artifact_id, path: forged.get((artifact_id, path)) or read_bytes(artifact_id, path),
+    )
+    with pytest.raises(ValueError, match="without its critic estimate or failure"):
+        owner.saved_checkpoint_experiment(project, spec, code_revision="test")
+
+
+def test_parent_crash_after_a_critic_failure_keeps_the_failure_without_redrawing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A measured child whose critic failed is adopted with the same saved failure reason."""
+    project, selection = selection_fixture(tmp_path, monkeypatch)
+    critic, transport = _truncated_critic(selection.base, monkeypatch)
+    reference = persist_selection_plan(
+        project, selection, created_at=datetime.now(UTC), code_revision="test"
+    )
+    spec = CheckpointExperimentSpec(selection=reference, critic=critic)
+    write = project.artifacts.write_json
+    lost: list[ExperimentCell] = []
+
+    def lose_parent(
+        *,
+        artifact_id: str,
+        artifact_type: str,
+        envelope: ArtifactEnvelope,
+        files: Mapping[str, BaseModel | JsonValue],
+    ) -> ArtifactManifest:
+        """Fail once after a complete continuation result already exists."""
+        if artifact_type == "checkpoint-experiment-cell" and not lost:
+            cell = files["cell.json"]
+            assert isinstance(cell, ExperimentCell)
+            lost.append(cell)
+            raise OSError("lost parent publication")
+        return write(
+            artifact_id=artifact_id, artifact_type=artifact_type, envelope=envelope, files=files
+        )
+
+    monkeypatch.setattr(project.artifacts, "write_json", lose_parent)
+    with pytest.raises(OSError, match="lost parent"):
+        run_checkpoint_experiment(project, spec, code_revision="test")
+    monkeypatch.setattr(project.artifacts, "write_json", write)
+    report = run_checkpoint_experiment(project, spec, code_revision="test")
+    assert report.cells[0] == lost[0]
+    assert report.cells[0].critic_failure == "finish_reason:length"
+    assert report.cells[0].result is not None and report.cells[0].failure is None
+    assert len(transport.requests) == 2
     assert run_checkpoint_experiment(project, spec, code_revision="test") == report

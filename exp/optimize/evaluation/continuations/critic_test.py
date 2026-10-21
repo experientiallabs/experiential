@@ -177,3 +177,64 @@ def test_critic_oversized_public_context_refuses_before_any_intent_or_call(
         predict_success(project, spec, code_revision="test")
     assert not transport.requests
     assert not project.artifacts.exists(spec.identity("test") + "-intent")
+
+
+def test_critic_reasoning_effort_reaches_the_request_and_keys_the_draw(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A registered effort is sent with the estimate; unset, the earlier identity is kept."""
+    project, _, spec, _ = critic_fixture(tmp_path, monkeypatch)
+    assert "reasoning_effort" not in spec.model_dump(mode="json")
+    assert critic_request(project.artifacts, spec).reasoning_effort is None
+    low = spec.model_copy(update={"reasoning_effort": "low"})
+    assert critic_request(project.artifacts, low).reasoning_effort == "low"
+    assert low.identity("test") != spec.identity("test")
+
+
+def test_critic_reasoning_effort_must_be_declared_by_its_deployment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An effort the critic deployment cannot preserve refuses before any intent or call."""
+    project, _, spec, transport = critic_fixture(tmp_path, monkeypatch)
+    low = spec.model_copy(update={"reasoning_effort": "low"})
+    with pytest.raises(ValueError, match="reasoning effort 'low' is not supported"):
+        actor_critic.preflight_critic(project, low)
+    with pytest.raises(ValueError, match="reasoning effort 'low' is not supported"):
+        predict_success(project, low, code_revision="test")
+    assert not transport.requests
+    assert not project.artifacts.exists(low.identity("test") + "-intent")
+
+
+def test_critic_failure_names_the_saved_defect_or_the_lost_dispatch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A refused estimate is classified from saved evidence, so its reason replays exactly."""
+    project, _, spec, _ = critic_fixture(tmp_path, monkeypatch, probability=2)
+    with pytest.raises(ValueError) as invalid:
+        predict_success(project, spec, code_revision="test")
+    assert (
+        actor_critic.critic_failure(
+            project.artifacts, spec, code_revision="test", error=invalid.value
+        )
+        == "invalid_typed_estimate"
+    )
+    lost = spec.model_copy(update={"critic_output_tokens": 512})
+    monkeypatch.setattr(actor_critic, "HttpxJsonTransport", lambda: ScriptedJsonTransport(()))
+    with pytest.raises((AssertionError, RuntimeError)) as dispatch:
+        predict_success(project, lost, code_revision="test")
+    assert isinstance(dispatch.value, Exception)
+    assert (
+        actor_critic.critic_failure(
+            project.artifacts, lost, code_revision="test", error=dispatch.value
+        )
+        == "unknown_dispatch_outcome"
+    )
+    early = spec.model_copy(update={"maximum_input_bytes": 512})
+    with pytest.raises(ValueError) as refused:
+        predict_success(project, early, code_revision="test")
+    assert (
+        actor_critic.critic_failure(
+            project.artifacts, early, code_revision="test", error=refused.value
+        )
+        == "ValueError"
+    )

@@ -19,6 +19,7 @@ from exp.common.models import (
     ModelRequest,
     ModelResponse,
     ModelSnapshot,
+    ReasoningEffort,
     ToolChoice,
     load_model_catalog,
 )
@@ -49,6 +50,10 @@ class CriticSpec(ContractModel):
         critic_model: Exact estimator snapshot.
         catalog_sha256: Credential-free catalog identity.
         critic_output_tokens: Estimator output ceiling.
+        reasoning_effort: Requested estimator reasoning effort, or None for the model's catalog
+            default; it must be one the critic deployment declares it can preserve. A lower
+            effort leaves the output ceiling for the typed estimate instead of spending it on
+            reasoning.
         maximum_input_bytes: Hard whole-request byte allowance; context is never truncated.
         maximum_physical_attempts: Durable attempt ceiling including transport retries.
         deadline: Latest permitted provider dispatch and response timeout boundary.
@@ -66,6 +71,9 @@ class CriticSpec(ContractModel):
     critic_model: ModelSnapshot
     catalog_sha256: Sha256
     critic_output_tokens: int = Field(default=1024, ge=1, le=4096)
+    reasoning_effort: ReasoningEffort | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
     maximum_input_bytes: int = Field(default=128_000, ge=512, le=512_000)
     maximum_physical_attempts: int = Field(default=3, ge=1, le=10)
     deadline: AwareDatetime
@@ -144,6 +152,7 @@ def critic_request(store: ArtifactStore, spec: CriticSpec) -> ModelRequest:
         ),
         tool_choice=ToolChoice(name="estimate_success"),
         maximum_output_tokens=spec.critic_output_tokens,
+        reasoning_effort=spec.reasoning_effort,
     )
     if len(request.model_dump_json().encode()) > spec.maximum_input_bytes:
         raise ValueError("critic public context exceeds its frozen byte allowance")
@@ -160,6 +169,12 @@ def preflight_critic(project: ProjectStore, spec: CriticSpec) -> None:
     snapshot, capabilities = registry.snapshot(spec.critic_alias)
     if snapshot != spec.critic_model or capabilities.supports_tools is not True:
         raise ValueError("critic requires its registered snapshot and typed tool output support")
+    efforts = tuple(catalog.models[spec.critic_alias].supported_reasoning_efforts or ())
+    if spec.reasoning_effort is not None and spec.reasoning_effort not in efforts:
+        raise ValueError(
+            f"critic reasoning effort {spec.reasoning_effort!r} is not supported by "
+            f"{spec.critic_alias}; choose one of {', '.join(efforts) or 'none declared'}"
+        )
     if (
         capabilities.maximum_output_tokens is not None
         and spec.critic_output_tokens > capabilities.maximum_output_tokens
@@ -229,6 +244,46 @@ def _estimate(response: ModelResponse, spec: CriticSpec) -> SuccessEstimate:
     if len(calls) != 1 or calls[0].name != "estimate_success":
         raise ValueError("critic must return exactly one typed estimate")
     return SuccessEstimate.model_validate(calls[0].arguments)
+
+
+def critic_failure(
+    store: ArtifactStore, spec: CriticSpec, *, code_revision: str, error: Exception
+) -> str:
+    """Name why a critic produced no estimate, preferring the defect in its saved response.
+
+    Args:
+        store: Store holding the critic's saved draw, if any.
+        spec: Critic whose ``predict_success`` refused.
+        code_revision: Revision the draw was keyed under.
+        error: The refusal raised by ``predict_success``.
+
+    Returns:
+        ``finish_reason:<reason>`` for an incomplete response, ``model_mismatch``,
+        ``no_typed_estimate`` or ``invalid_typed_estimate`` for a completed but unusable one,
+        ``unknown_dispatch_outcome`` for a dispatch with no saved response, and otherwise the
+        refusal's exception type, such as a preflight refusal before any dispatch.
+    """
+    identity = spec.identity(code_revision)
+    response_id = identity + "-response"
+    if not store.exists(response_id):
+        return (
+            "unknown_dispatch_outcome"
+            if store.exists(identity + "-intent")
+            else type(error).__name__
+        )
+    response = ModelResponse.model_validate_json(store.read_bytes(response_id, "response.json"))
+    if response.model != spec.critic_model:
+        return "model_mismatch"
+    if response.finish_reason.value != "completed":
+        return f"finish_reason:{response.finish_reason.value}"
+    calls = response.output.tool_calls
+    if len(calls) != 1 or calls[0].name != "estimate_success":
+        return "no_typed_estimate"
+    try:
+        SuccessEstimate.model_validate(calls[0].arguments)
+    except ValueError:
+        return "invalid_typed_estimate"
+    return type(error).__name__
 
 
 def predict_success(

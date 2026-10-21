@@ -1,8 +1,10 @@
 """Execute matched checkpoint studies with prospective critics and complete branch accounting."""
 
+import json
 from datetime import UTC, datetime
 
 from filelock import FileLock, Timeout
+from pydantic import Field
 
 from exp.common.core.artifacts import (
     ArtifactEnvelope,
@@ -15,6 +17,7 @@ from exp.common.core.artifacts import (
 from exp.common.project import ProjectStore, artifact_input
 from exp.optimize.evaluation.continuations.critic import (
     CriticSpec,
+    critic_failure,
     load_critic_prediction,
     predict_success,
     preflight_critic,
@@ -60,13 +63,17 @@ class ExperimentCell(ContractModel):
         arm: Selector-proposed checkpoint or matched random control.
         job: Exact continuation settings, including a saved critic when obtained.
         result: Complete immutable study reference, including unavailable branches.
-        failure: Sanitized setup/estimator failure if execution could not produce a study.
+        failure: Sanitized setup/continuation failure if execution could not produce a study.
+        critic_failure: Sanitized reason the registered critic produced no estimate, such as
+            ``finish_reason:length``. The cell's continuations still run without a forecast,
+            and the critic is scored as having failed on this cell rather than abstained.
     """
 
     arm: str
     job: ContinuationJob
     result: ArtifactInput | None = None
     failure: str | None = None
+    critic_failure: str | None = Field(default=None, exclude_if=lambda value: value is None)
 
 
 class CheckpointExperiment(ContractModel):
@@ -154,6 +161,12 @@ def _metrics(project: ProjectStore, cells: tuple[ExperimentCell, ...]) -> JsonOb
             brier = result.metrics()["brier"]
             if isinstance(brier, (float, int)):
                 briers.append(float(brier))
+        critic_failures: dict[str, int] = {}
+        for cell in group:
+            if cell.critic_failure is not None:
+                critic_failures[cell.critic_failure] = (
+                    critic_failures.get(cell.critic_failure, 0) + 1
+                )
         metrics[arm] = {
             "checkpoints": len(group),
             "planned_branches": planned,
@@ -165,6 +178,8 @@ def _metrics(project: ProjectStore, cells: tuple[ExperimentCell, ...]) -> JsonOb
             else [passed / planned, (passed + planned - known) / planned],
             "checkpoints_with_both_success_and_failure": mixed,
             "critic_assessable_checkpoints": len(briers),
+            "critic_failures": sum(critic_failures.values()),
+            "critic_failure_kinds": dict(sorted(critic_failures.items())),
             "mean_checkpoint_brier": sum(briers) / len(briers) if briers else None,
             "actor_logical_requests": actor_requests,
         }
@@ -222,9 +237,25 @@ def saved_checkpoint_experiment(
         }
         if cell.job.study.critic_prediction is not None:
             prediction = load_critic_prediction(store, cell.job.study.critic_prediction)
-            if spec.critic is None or prediction.spec != _critic(spec.critic, base):
+            if (
+                spec.critic is None
+                or cell.critic_failure is not None
+                or prediction.spec != _critic(spec.critic, base)
+            ):
                 raise ValueError("checkpoint cell changed its registered critic")
             inputs.add(cell.job.study.critic_prediction)
+        elif cell.critic_failure is not None:
+            failure_id = manifest.artifact_id + "-critic-failure"
+            if (
+                spec.critic is None
+                or store.exists(_critic(spec.critic, base).identity(code_revision))
+                or not store.exists(failure_id)
+                or _saved_critic_failure(project, failure_id) != cell.critic_failure
+            ):
+                raise ValueError("checkpoint cell lost its critic failure")
+            inputs.add(artifact_input(store.read(failure_id).manifest))
+        elif spec.critic is not None and cell.result is not None:
+            raise ValueError("checkpoint cell continued without its critic estimate or failure")
         if cell.result is not None:
             if (
                 cell.failure is not None
@@ -246,18 +277,103 @@ def saved_checkpoint_experiment(
     return report
 
 
+def _saved_critic_failure(project: ProjectStore, failure_id: str) -> str:
+    """Read the reason a cell's critic produced no estimate from its durable record."""
+    record = json.loads(project.artifacts.read_bytes(failure_id, "failure.json"))
+    if not isinstance(record, dict) or not isinstance(record.get("failure"), str):
+        raise ValueError("checkpoint critic failure record is malformed")
+    return record["failure"]
+
+
+def _predict(
+    project: ProjectStore,
+    template: CriticSpec,
+    job: ContinuationJob,
+    key: str,
+    envelope: ArtifactEnvelope,
+    *,
+    code_revision: str,
+) -> tuple[ContinuationJob, str | None]:
+    """Attach the cell's estimate, or durably record why the critic produced none.
+
+    A failed critic, for example one that spends its output allowance before a typed estimate,
+    leaves the job without a forecast so the cell's continuations still measure both arms. The
+    failure is saved before any continuation runs and reused on resume, so its reason never
+    changes and no critic draw is repeated.
+
+    Args:
+        project: Project owning the critic draw and the cell.
+        template: Registered critic template.
+        job: The cell's continuation job without a forecast.
+        key: The cell's artifact identity.
+        envelope: Experiment provenance for the failure record.
+        code_revision: Revision the critic draw is keyed under.
+
+    Returns:
+        The job with its saved estimate attached and no failure, or the unchanged job and the
+        critic failure reason.
+
+    Raises:
+        Timeout: The critic's lease is held elsewhere; the cell is deferred, not failed.
+    """
+    store, critic = project.artifacts, _critic(template, job)
+    failure_id = key + "-critic-failure"
+    if store.exists(failure_id):
+        return job, _saved_critic_failure(project, failure_id)
+    try:
+        reference = predict_success(project, critic, code_revision=code_revision)
+    except Timeout:
+        raise
+    except (ValueError, OSError, RuntimeError) as exc:
+        reason = critic_failure(store, critic, code_revision=code_revision, error=exc)
+        identity = critic.identity(code_revision)
+        evidence = next(
+            (
+                artifact_input(store.read(identity + suffix).manifest)
+                for suffix in ("-response", "-intent")
+                if store.exists(identity + suffix)
+            ),
+            None,
+        )
+        store.write_json(
+            artifact_id=failure_id,
+            artifact_type="checkpoint-experiment-critic-failure",
+            envelope=envelope.model_copy(
+                update={
+                    "inputs": tuple(
+                        sorted(
+                            {*envelope.inputs, *(() if evidence is None else (evidence,))},
+                            key=lambda ref: ref.artifact_id,
+                        )
+                    )
+                }
+            ),
+            files={"failure.json": {"failure": reason}},
+        )
+        return job, reason
+    probability = load_critic_prediction(store, reference).estimate.probability
+    study = job.study.model_copy(
+        update={"critic_prediction": reference, "predicted_success": probability}
+    )
+    return job.model_copy(update={"study": study}), None
+
+
 def _recover_cell(
     project: ProjectStore,
     spec: CheckpointExperimentSpec,
     arm: str,
     job: ContinuationJob,
+    key: str,
     *,
     code_revision: str,
 ) -> ExperimentCell:
     """Adopt a fully saved child after parent interruption without buying any new draw."""
+    reason = None
     if spec.critic is not None:
         identity = _critic(spec.critic, job).identity(code_revision)
-        if project.artifacts.exists(identity):
+        if project.artifacts.exists(key + "-critic-failure"):
+            reason = _saved_critic_failure(project, key + "-critic-failure")
+        elif project.artifacts.exists(identity):
             reference = artifact_input(project.artifacts.read(identity).manifest)
             prediction = load_critic_prediction(project.artifacts, reference)
             job = job.model_copy(
@@ -277,14 +393,22 @@ def _recover_cell(
             arm=arm,
             job=job,
             result=continuation_result_reference(project, job, code_revision=code_revision),
+            critic_failure=reason,
         )
-    return ExperimentCell(arm=arm, job=job, failure="UnfinishedDispatchIntent")
+    return ExperimentCell(
+        arm=arm, job=job, failure="UnfinishedDispatchIntent", critic_failure=reason
+    )
 
 
 def run_checkpoint_experiment(
     project: ProjectStore, spec: CheckpointExperimentSpec, *, code_revision: str
 ) -> CheckpointExperiment:
-    """Run paired cells once under a lease; failed/unknown cells never disappear or redraw."""
+    """Run paired cells once under a lease; failed/unknown cells never disappear or redraw.
+
+    A critic that produces no estimate does not fail its cell: the continuations run without a
+    forecast and the cell records ``critic_failure``, so selected-versus-random outcomes are
+    still measured and the critic is counted as failing there, not as abstaining.
+    """
     store = project.artifacts
     identity = spec.identity(code_revision)
     with FileLock(store.project_directory / (identity + ".lock"), timeout=0):
@@ -314,7 +438,7 @@ def run_checkpoint_experiment(
             else:
                 cell = ExperimentCell(arm=arm, job=job)
                 if store.exists(key + "-intent") and not deferred_execution(store, key):
-                    cell = _recover_cell(project, spec, arm, job, code_revision=code_revision)
+                    cell = _recover_cell(project, spec, arm, job, key, code_revision=code_revision)
                 else:
                     if not store.exists(key + "-intent"):
                         store.write_json(
@@ -325,23 +449,15 @@ def run_checkpoint_experiment(
                         )
                     try:
                         if spec.critic is not None:
-                            reference = predict_success(
-                                project, _critic(spec.critic, job), code_revision=code_revision
+                            job, reason = _predict(
+                                project,
+                                spec.critic,
+                                job,
+                                key,
+                                envelope,
+                                code_revision=code_revision,
                             )
-                            probability = load_critic_prediction(
-                                store, reference
-                            ).estimate.probability
-                            job = job.model_copy(
-                                update={
-                                    "study": job.study.model_copy(
-                                        update={
-                                            "critic_prediction": reference,
-                                            "predicted_success": probability,
-                                        }
-                                    )
-                                }
-                            )
-                            cell = cell.model_copy(update={"job": job})
+                            cell = cell.model_copy(update={"job": job, "critic_failure": reason})
                         if (
                             saved_continuation_job(project, job, code_revision=code_revision)
                             is None
@@ -364,6 +480,8 @@ def run_checkpoint_experiment(
                     inputs.add(cell.result)
                 if cell.job.study.critic_prediction is not None:
                     inputs.add(cell.job.study.critic_prediction)
+                if cell.critic_failure is not None:
+                    inputs.add(artifact_input(store.read(key + "-critic-failure").manifest))
                 store.write_json(
                     artifact_id=key,
                     artifact_type="checkpoint-experiment-cell",
