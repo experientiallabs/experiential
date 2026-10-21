@@ -1,5 +1,7 @@
 """Frozen executable task contracts shared by continuation studies and Harbor delivery."""
 
+import tempfile
+import tomllib
 from datetime import datetime
 from pathlib import Path
 
@@ -16,7 +18,11 @@ from exp.common.core.artifacts import (
 )
 from exp.common.project import ProjectStore, artifact_input
 from exp.optimize.evaluation.continuations.job import ContinuationJob
-from exp.optimize.evaluation.harbor.export import preflight_harbor_destination, write_harbor_package
+from exp.optimize.evaluation.harbor.export import (
+    preflight_harbor_destination,
+    verify_harbor_export,
+    write_harbor_package,
+)
 from exp.simulation.capability_briefs import load_capability_brief
 from exp.simulation.continuations import ContinuationCheckpoint, load_continuation_checkpoint
 from exp.simulation.development_scope import require_development_task
@@ -142,6 +148,7 @@ def export_executable_harbor(
     diagnostic: bool = False,
 ) -> Path:
     """Use the common Harbor package with a private executable checkpoint backend."""
+    # qualification imports this module's task loaders, so this import breaks a real cycle.
     from exp.optimize.evaluation.executable.qualification import load_executable_qualification
 
     preflight_harbor_destination(destination, name=name)
@@ -189,11 +196,6 @@ def verify_executable_package(project: ProjectStore, directory: Path) -> Artifac
     The local binding JSON is not a trust root. Both its references and all public files must
     reproduce the same export, so editing a binding cannot attach different grading or state.
     """
-    import tempfile
-    import tomllib
-
-    from exp.optimize.evaluation.harbor.export import verify_harbor_export
-
     binding = verify_harbor_export(directory)
     if binding.get("backend") != "executable-checkpoint":
         raise ValueError("package does not name the executable checkpoint backend")
