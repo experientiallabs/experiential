@@ -6,6 +6,7 @@ from exp.common.evaluations.uncertainty import (
     Z95_ONE_SIDED,
     missing_outcome_bounds,
     proportion_summary,
+    unit_difference_summary,
     unit_mean_summary,
     wilson_interval,
 )
@@ -50,6 +51,24 @@ def test_unit_means_average_repeats_before_estimating_across_units() -> None:
     assert isinstance(interval, list)
     assert interval == list(wilson_interval((7 / 8) / 2, 2))
     assert unit_mean_summary({})["estimate"] is None
+
+
+def test_unit_differences_pair_units_before_averaging_and_rescale_the_interval() -> None:
+    """Differences are taken within units, weigh units equally and keep the [-1, 1] scale."""
+    summary = unit_difference_summary(
+        {"a": [1, 1, 1, 0], "b": [0, 0], "c": [1]},
+        {"a": [1, 1], "b": [1], "d": [0]},
+    )
+    assert summary["unit_differences"] == {"a": pytest.approx(-0.25), "b": -1.0}
+    assert summary["independent_units"] == 2 and summary["units_without_paired_outcomes"] == 2
+    assert summary["estimate"] == pytest.approx(-0.625)
+    low, high = wilson_interval((1 - 0.625) / 2, 2)
+    assert summary["wilson_95"] == [pytest.approx(2 * low - 1), pytest.approx(2 * high - 1)]
+    identical = unit_difference_summary({"a": [1]}, {"a": [1]})
+    interval = identical["wilson_95"]
+    assert isinstance(interval, list) and interval[0] < 0
+    assert interval[0] == pytest.approx(-interval[1])
+    assert unit_difference_summary({"a": []}, {"a": [1]})["estimate"] is None
 
 
 def test_missing_outcomes_are_bounds_not_intervals() -> None:

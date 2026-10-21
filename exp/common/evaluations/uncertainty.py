@@ -78,6 +78,11 @@ def proportion_summary(successes: int, trials: int, *, units: int | None = None)
     }
 
 
+def _unit_means(outcomes: Mapping[str, Sequence[float]]) -> dict[str, float]:
+    """Average each unit's known outcomes, skipping units without any, in unit order."""
+    return {unit: sum(values) / len(values) for unit, values in sorted(outcomes.items()) if values}
+
+
 def unit_mean_summary(outcomes: Mapping[str, Sequence[float]]) -> JsonObject:
     """Average repeats within each independent unit, then estimate across units.
 
@@ -89,7 +94,7 @@ def unit_mean_summary(outcomes: Mapping[str, Sequence[float]]) -> JsonObject:
         The equal-weight unit mean, the per-unit means, the unit count and a two-sided 95
         percent Wilson interval at that count, or None estimates without a measured unit.
     """
-    means = {unit: sum(values) / len(values) for unit, values in sorted(outcomes.items()) if values}
+    means = _unit_means(outcomes)
     estimate = sum(means.values()) / len(means) if means else None
     return {
         "independent_units": len(means),
@@ -97,6 +102,44 @@ def unit_mean_summary(outcomes: Mapping[str, Sequence[float]]) -> JsonObject:
         "unit_means": means,
         "estimate": estimate,
         "wilson_95": None if estimate is None else list(wilson_interval(estimate, len(means))),
+    }
+
+
+def unit_difference_summary(
+    first: Mapping[str, Sequence[float]], second: Mapping[str, Sequence[float]]
+) -> JsonObject:
+    """Average repeats within each unit under two paired conditions, then estimate the difference.
+
+    A unit enters when both conditions have known outcomes for it. Its difference of unit means
+    lies in [-1, 1], so ``(d + 1) / 2`` is a [0, 1] unit mean and the Wilson interval at the unit
+    count bounds it exactly as in ``unit_mean_summary``; the endpoints are mapped back to the
+    difference scale. Pairing by unit keeps the comparison within units instead of treating the
+    two conditions as independent samples.
+
+    Args:
+        first: Known outcomes in [0, 1] keyed by independent unit, the minuend condition.
+        second: Known outcomes in [0, 1] keyed by the same units, the subtrahend condition.
+
+    Returns:
+        The equal-weight mean of per-unit differences, the per-unit differences, the paired unit
+        count, the units missing an outcome under either condition and a two-sided 95 percent
+        interval on the difference scale, or None estimates without a paired unit.
+    """
+    left, right = _unit_means(first), _unit_means(second)
+    differences = {unit: left[unit] - right[unit] for unit in sorted(left.keys() & right.keys())}
+    units = len(differences)
+    estimate = sum(differences.values()) / units if units else None
+    interval = (
+        None
+        if estimate is None
+        else [2 * bound - 1 for bound in wilson_interval((estimate + 1) / 2, units)]
+    )
+    return {
+        "independent_units": units,
+        "units_without_paired_outcomes": len(first.keys() | second.keys()) - units,
+        "unit_differences": differences,
+        "estimate": estimate,
+        "wilson_95": interval,
     }
 
 
