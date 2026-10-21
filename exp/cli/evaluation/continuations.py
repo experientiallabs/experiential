@@ -83,7 +83,7 @@ from exp.optimize.evaluation.factory.candidates import CandidateBatchSpec
 from exp.optimize.evaluation.factory.proposals import TaskProposalSpec
 from exp.optimize.evaluation.factory.scenario_search import ScenarioSearchSpec
 from exp.optimize.evaluation.factory.variants import TaskVariantSpec
-from exp.optimize.evaluation.learning.repair import LearningRepairSpec
+from exp.optimize.evaluation.learning.lessons import LearningRepair
 from exp.simulation.capability_briefs import CapabilityBrief
 
 
@@ -180,7 +180,7 @@ class ContinuationCommand(ContractModel):
         research: Check cited counterexample outcomes and retain a provisional research revision.
         checkpoint_proposals: Retrospective point selector producing an existing matched plan.
         campaign: Registered source attempts, selectors, prospective critics and continuations.
-        learning_repair: Explicit observation-only settlement of failed learning.
+        learning_repair: Failed-learning settlement, lesson screening or library evolution.
         equivalence: Paired executable reference/candidate studies and diagnostic trace council.
     """
 
@@ -214,7 +214,7 @@ class ContinuationCommand(ContractModel):
     research: FailureResearchSpec | None = None
     checkpoint_proposals: CheckpointProposalSpec | None = None
     campaign: ContinuationCampaignSpec | None = None
-    learning_repair: LearningRepairSpec | None = None
+    learning_repair: LearningRepair | None = None
     equivalence: EquivalenceSpec | None = None
 
     @model_validator(mode="after")
