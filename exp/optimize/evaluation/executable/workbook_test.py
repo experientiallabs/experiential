@@ -7,15 +7,17 @@ from pathlib import Path
 import pytest
 from openpyxl import Workbook, load_workbook
 
-from exp.common.core.artifacts import ArtifactEnvelope, JsonObject
+from exp.common.core.artifacts import ArtifactEnvelope, JsonObject, sha256_json
 from exp.common.models import ToolCall
 from exp.common.project import ProjectStore, artifact_input
 from exp.common.tasks import TaskCase, ToolSchema
 from exp.optimize.evaluation.executable.workbook import (
+    PRIVATE_VIEWS_PROTOCOL,
     WorkbookRuntimeDefinition,
     WorkbookStateView,
     continuation_runtime,
 )
+from exp.runtime.environments.workbook_edits import WorkbookEditAdapter
 from exp.runtime.environments.worlds import (
     ExecutableWorldRuntime,
     StateDomain,
@@ -362,3 +364,15 @@ def test_an_unwritten_output_is_unavailable_rather_than_the_unchanged_input(
     assert grade(predicate, outcome).goal.status == "unassessable"
     with pytest.raises(ValueError, match="output_file"):
         WorkbookStateView(input_file="input.xlsx", baseline_until_written=True)
+
+
+def test_probe_identity_binds_the_view_protocol_not_this_source_file(tmp_path: Path) -> None:
+    """Reformatting the adapter module cannot re-key every saved task profile."""
+    _, spec, _ = workbook_definition(tmp_path)
+    assert spec.probe_sha256 == sha256_json(
+        {
+            "protocol": PRIVATE_VIEWS_PROTOCOL,
+            "definition": spec.model_dump(mode="json"),
+            "adapter": WorkbookEditAdapter().definition,
+        }
+    )

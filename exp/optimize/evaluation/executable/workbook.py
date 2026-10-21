@@ -7,7 +7,6 @@ to the verifier. Task authors must still define the intended behavior and qualif
 """
 
 from operator import not_
-from pathlib import Path
 from typing import Self
 
 from pydantic import Field, model_validator
@@ -38,6 +37,11 @@ from exp.runtime.environments.worlds import (
 )
 from exp.simulation.continuations import WorldCheckpoint
 from exp.simulation.world_construction import load_construction
+
+# Saved probes and the task profiles that contain them bind to this protocol, not to this
+# file's bytes. Bump it whenever projection semantics change; exp/tests/code_protocols_test.py
+# records the covered source so the choice between a bump and a refactor stays explicit.
+PRIVATE_VIEWS_PROTOCOL = "private-workbook-views-v2"
 
 
 class WorkbookStateView(ContractModel):
@@ -129,12 +133,11 @@ class WorkbookRuntimeDefinition(ContractModel):
 
     @property
     def probe_sha256(self) -> Sha256:
-        """Bind projections to this implementation, adapter dependencies and exact configuration."""
+        """Bind projections to the view protocol, adapter dependencies and exact configuration."""
         return sha256_json(
             {
-                "protocol": "private-workbook-views-v2",
+                "protocol": PRIVATE_VIEWS_PROTOCOL,
                 "definition": self.model_dump(mode="json"),
-                "implementation": sha256_bytes(Path(__file__).read_bytes()),
                 "adapter": WorkbookEditAdapter().definition,
             }
         )

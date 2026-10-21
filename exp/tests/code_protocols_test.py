@@ -1,10 +1,10 @@
 """Protocol versions stand in for source text in saved-result identities; this guards them.
 
-Calibration, the actor council, task refinement and the restorable environment backends bind
-their saved results to a protocol constant instead of hashing their own source. Saved results then
-survive moves, formatting and unrelated edits, and re-key only when the protocol is bumped.
-Provider attempt timeouts follow the same rule: each admitted physical attempt records the
-protocol of the derivation that bounded it.
+Calibration, the actor council, task refinement, private workbook views and the restorable
+environment backends bind their saved results to a protocol constant instead of hashing their own
+source. Saved results then survive moves, formatting and unrelated edits, and re-key only when the
+protocol is bumped. Provider attempt timeouts follow the same rule: each admitted physical attempt
+records the protocol of the derivation that bounded it.
 
 This test keeps that honest. Each protocol lists the source that decides its behavior, with that
 source's digest at the protocol's current value. When the covered source changes, the test fails
@@ -114,6 +114,12 @@ PROTOCOLS = (
         "artifact-world-v2",
         ("exp.runtime.environments.artifact_world",),
         "b57a74dbfb1482e69a5f11e2e70a60a0c24bbc2bcf8d1beac229fe0d754b0710",
+    ),
+    Protocol(
+        "exp.optimize.evaluation.executable.workbook:PRIVATE_VIEWS_PROTOCOL",
+        "private-workbook-views-v2",
+        ("exp.optimize.evaluation.executable.workbook",),
+        "32ed1106318b367d2486290d4dbd9df0510aeeb6ba8f3103d16764bf070888e5",
     ),
     Protocol(
         "exp.runtime.environments.record_world:RECORD_WORLD_PROTOCOL",
