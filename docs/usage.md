@@ -907,7 +907,14 @@ optional exact `EvaluationMemory`, task, manifest, initial domain state, private
 deadline and cumulative physical-attempt ceiling. Its predictor, query embeddings and memory
 readers share admission. Provider SDKs bypassing that transport are refused. Projections from
 this factory have simulated authority; they do not establish native truth. Missing memory means
-no learned memory is delivered. `workbook_runtime.py` binds immutable XLSX inputs and private worksheet
+no learned memory is delivered. Optional `facts` (`ReplayFacts`: the same validated, provenance-bearing
+`InstanceFacts` and held-out reservation rules as fidelity replay, with `first_version` the start's state
+version) condition every simulated prediction in the separate `instance_facts` channel with the same
+guidance, beside native read receipts. Facts are not state: they are never a writable domain or part of
+a checkpoint image, and nothing is derived from native state. Only starting-state facts are accepted, and
+the `native-read/` key prefix is reserved. Facts re-key the definition, ledger and backend digest, so a
+checkpoint restores only under the same facts; definitions without facts keep their identities. Declare
+them under `simulated` in the mixed definition, or in any continuation or `compare-environments` job. `workbook_runtime.py` binds immutable XLSX inputs and private worksheet
 digest views. `mixed_runtime.py` combines a native factory with this simulator and real/simulated routes under one
 manifest; private projections stay under separate `native` and `simulated` keys. Execution receipts
 bind release plus installed EXP source/resource digest; code changes require fresh qualification. Third-party dependencies remain host-owned. Owned executable-world shadow routes refuse at setup until an independent mirror contract exists; cross-owner writes remain unsupported.
