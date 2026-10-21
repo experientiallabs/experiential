@@ -155,7 +155,9 @@ the tier is ours, so the request gets more of the GPU:
   `refuse` lane both limits are hard, even for a priority overflow (a single-rung lane refuses Pro
   past the regular share). On an `overflow` lane they stay soft: a request past them spills to the
   next rung first, so fast has first claim on the kept slots, and admits on the forced pass exactly
-  as an overflow bound does today, never a refusal. Fair share (each organization's regular
+  as an overflow bound does today, never a refusal (a forced pass, a forced rate redial included,
+  is judged against the full bound). A forced fast request on an overflow lane is uncapped, like a
+  free overflow, and counts toward a priority caller's first-dial overflow ceiling. Fair share (each organization's regular
   reservations only), the fresh-session threshold, trial headroom and pacing saturation of other
   traffic read the regular share. Under heavy regular load on a refuse lane fast has the reserve
   alone. Per worker, like the bound;

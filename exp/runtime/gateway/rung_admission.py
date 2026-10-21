@@ -359,8 +359,11 @@ class RungLoadRegistry:
             # Under a reserve every other reservation lives in the regular
             # share: its bound, fresh spill and fair share read the regular
             # count against ``bound - fast_reserve``, never the slots :fast holds.
+            # A forced pass on an overflow lane (a forced rate redial included)
+            # is judged against the full bound, as today: the soft reserve
+            # never ends in a refusal there.
             occupied = rung.total
-            if bound is not None and fast_reserve is not None:
+            if bound is not None and fast_reserve is not None and (fast_reserve_hard or not force):
                 bound, occupied = bound - fast_reserve, rung.total - rung.fast
             if hard_bound and bound is not None and occupied >= bound:
                 return RungShed("queue_bound")
@@ -392,7 +395,7 @@ class RungLoadRegistry:
                     fresh_spill_fraction=fresh_spill_fraction,
                     skip_rate=rate_retry,
                     occupied=occupied,
-                    regular_only=fast_reserve is not None,
+                    regular_only=fast_reserve is not None and (fast_reserve_hard or not force),
                 )
                 if shed is not None:
                     return shed

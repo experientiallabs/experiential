@@ -249,7 +249,9 @@ class GatewayRungDispatchPolicy(ContractModel):
     both limits are hard, even for a priority overflow. Under ``"overflow"``
     they stay soft: a request past them spills to the next rung first (so
     ``:fast`` has first claim on the kept slots) and admits on the forced pass
-    exactly as an overflow bound does today, never a refusal. ``None`` keeps
+    exactly as an overflow bound does today, never a refusal (a forced pass is
+    judged against the full bound; a forced ``:fast`` request is uncapped and
+    counts toward a priority caller's first-dial ceiling). ``None`` keeps
     the in-flight split. Requires ``concurrency_bound``; per worker, like the
     bound. Fair share, the fresh-session threshold and pacing saturation of
     other traffic read the regular share, and fair share counts each

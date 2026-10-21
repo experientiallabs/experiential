@@ -540,6 +540,34 @@ def test_on_an_overflow_lane_the_reserve_is_soft_and_fast_has_first_claim() -> N
     assert isinstance(take(fast=True, force=True), str)
 
 
+def test_a_forced_rate_redial_on_an_overflow_lane_is_judged_on_the_full_bound() -> None:
+    """The forced pass of a rate redial rechecks windows, never the soft regular share."""
+    loads = RungLoadRegistry()
+    for _ in range(3):
+        ticket = loads.reserve(
+            rung_load_key(_rung()),
+            organization_id="org",
+            weight=1,
+            bound=4,
+            fair_share=True,
+            fast_reserve=1,
+            fast_reserve_hard=False,
+        )
+        assert isinstance(ticket, str)
+    redial = loads.reserve(
+        rung_load_key(_rung()),
+        organization_id="org",
+        weight=1,
+        bound=4,
+        fair_share=True,
+        force=True,
+        rate_retry=True,
+        fast_reserve=1,
+        fast_reserve_hard=False,
+    )
+    assert isinstance(redial, str)  # 3 regular at the share: admitted, as a 64-of-64 bound would
+
+
 def test_holding_fast_never_costs_an_organization_its_regular_share() -> None:
     """Fair share under a reserve counts each organization's regular reservations only."""
     loads = RungLoadRegistry()
