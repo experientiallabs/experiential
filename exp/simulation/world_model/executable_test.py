@@ -5,13 +5,20 @@ from collections.abc import Sequence
 
 import pytest
 
-from exp.common.core.artifacts import JsonObject
+from exp.common.core.artifacts import JsonObject, canonical_json_bytes, sha256_json
 from exp.common.models import (
     AssistantAction,
     ModelCapabilities,
     ModelResponse,
     OperationEconomics,
     ToolCall,
+)
+from exp.common.tasks.facts import (
+    ConditioningFacts,
+    FactProvenance,
+    FactValidation,
+    InstanceFact,
+    InstanceFacts,
 )
 from exp.runtime.environments.tests.world_conformance_test import _task
 from exp.runtime.environments.world_contracts import (
@@ -23,6 +30,7 @@ from exp.runtime.environments.world_contracts import (
 from exp.runtime.environments.world_responses import ReplyStateBinding
 from exp.runtime.environments.worlds import ExecutableWorldRuntime
 from exp.runtime.gateway.decisions_contracts import DecisionRequest
+from exp.simulation.engines.text.prompt import INSTANCE_FACTS_GUIDANCE
 from exp.simulation.retrieval.evidence_reading import EvidenceReader, ReadingPolicy
 from exp.simulation.world_model.executable import GroundedWorldFactory, PredictorEvent
 from exp.simulation.world_model.grounded_session import GroundedTransitionEngine
@@ -39,6 +47,8 @@ def world_fixture(
     prediction_reader: PredictionResolver | None = None,
     state_schema: JsonObject | None = None,
     maximum_reasks: int = 0,
+    facts: InstanceFacts | None = None,
+    facts_version: int = 0,
 ) -> tuple[ExecutableWorldRuntime, list[PredictorEvent], list[JsonObject]]:
     """Use the real grounded prompt/parser with scripted provider responses, never native truth."""
     predictor, _, _ = _runtime("", capabilities=ModelCapabilities(supports_tools=True))
@@ -49,6 +59,8 @@ def world_fixture(
         maximum_output_tokens=1024,
         output_protocol="json-tool",
         prediction_reader=prediction_reader,
+        facts=facts,
+        facts_version=facts_version,
     )
     manifest = WorldManifest(
         domains=tuple(
@@ -564,3 +576,233 @@ def test_declared_reply_state_relation_rejects_a_schema_valid_lie(change: bool) 
     assert "null at or beyond the end" in json.dumps(requests[0])
     if not change:
         assert 'reply field ["status"]' in str(events[-1].payload["reason"])
+
+
+def _fact(
+    key: str,
+    value: JsonObject | str | float | None,
+    *,
+    adapter: str,
+    visibility: str = "conditioning",
+) -> InstanceFact:
+    """Return one validated starting-state fact from a named fixture adapter."""
+    return InstanceFact.model_validate(
+        {
+            "key": key,
+            "value": value,
+            "visibility": visibility,
+            "provenance": FactProvenance(
+                adapter=adapter,
+                source="fixture/" + adapter + ".json",
+                validation=FactValidation(status="validated", method="re-read from source"),
+                state_version=0,
+            ).model_dump(mode="json"),
+        }
+    )
+
+
+def record_facts(priority: str = "high") -> InstanceFacts:
+    """Record/table-shaped facts, including an evaluator-only answer and a null observation."""
+    adapter = "ticket-snapshot-v1"
+    return InstanceFacts(
+        facts=(
+            _fact("tickets/T-1/priority", priority, adapter=adapter),
+            _fact("tickets/T-1/requester", "Zoë 東京", adapter=adapter),
+            _fact("tickets/T-1/assignee", None, adapter=adapter),
+            _fact("tickets/T-1/sla_hours", 1.5, adapter=adapter),
+            _fact(
+                "tickets/T-1/expected_resolution",
+                "private-answer-7731",
+                adapter=adapter,
+                visibility="verifier_private",
+            ),
+        )
+    )
+
+
+def workbook_facts() -> InstanceFacts:
+    """Workbook-shaped facts: typed starting cells of the native input file."""
+    adapter = "xlsx-cells-v1"
+    return InstanceFacts(
+        facts=(
+            _fact("input.xlsx/Orders/A1", {"value": "id", "data_type": "s"}, adapter=adapter),
+            _fact("input.xlsx/Orders/A2", {"value": 2, "data_type": "n"}, adapter=adapter),
+            _fact("input.xlsx/Orders/B2", {"value": "PQTW1", "data_type": "s"}, adapter=adapter),
+        )
+    )
+
+
+def _payload(request: JsonObject) -> JsonObject:
+    """Decode the predictor's user payload from one recorded provider request."""
+    messages = request["messages"]
+    assert isinstance(messages, list) and isinstance(messages[1], dict)
+    payload = json.loads(str(messages[1]["content"]))
+    assert isinstance(payload, dict)
+    return payload
+
+
+def _assert_delivered(request: JsonObject, expected: ConditioningFacts) -> None:
+    """Facts reach the request in their own channel, byte-identical to their registration."""
+    payload = _payload(request)
+    channel = payload["instance_facts"]
+    assert canonical_json_bytes(channel) == canonical_json_bytes(expected.rendered())
+    assert isinstance(channel, dict) and isinstance(channel["facts"], list)
+    for row, fact in zip(channel["facts"], expected.facts, strict=True):
+        assert canonical_json_bytes(row) == canonical_json_bytes(fact.rendered())
+    messages = request["messages"]
+    assert isinstance(messages, list) and isinstance(messages[0], dict)
+    assert INSTANCE_FACTS_GUIDANCE in str(messages[0]["content"])
+    state = payload["environment_state"]
+    assert isinstance(state, dict) and "instance_facts" not in json.dumps(state)
+
+
+def test_record_facts_condition_every_prediction_and_survive_restore_without_state() -> None:
+    """Facts are a conditioning channel: never a domain, never in the image, kept on restore."""
+    facts = record_facts()
+    runtime, _, requests = world_fixture(
+        [[{"op": "set", "path": ["domains", "tickets", "status"], "value": "escalated"}], []],
+        facts=facts,
+    )
+    task = _task("escalate")
+    action = ToolCall(name="escalate", call_id="call", arguments={})
+    with runtime.open(task) as world:
+        world.execute(action)
+        saved = world.checkpoint()
+    first = facts.conditioning(0)
+    assert first is not None and len(first.facts) == 4
+    _assert_delivered(requests[0], first)
+    assert "private-answer-7731" not in json.dumps(requests[0])
+    assert set(saved.image.parts) == {"predictor.json"}
+    assert set(saved.image.domains) == {"tickets", "archive"}
+    assert b"T-1" not in saved.image.parts["predictor.json"]
+    with runtime.restore(task, saved) as resumed:
+        resumed.execute(action)
+    later = facts.conditioning(1)
+    assert later is not None and later.state_version == 1
+    _assert_delivered(requests[1], later)
+
+
+def test_facts_change_the_backend_identity_and_fact_free_definitions_are_unchanged() -> None:
+    """Any fact or version change re-keys the backend; a checkpoint keeps its own binding."""
+    plain, _, _ = world_fixture([[]])
+    bound, _, _ = world_fixture([[]], facts=record_facts())
+    changed, _, _ = world_fixture([[]], facts=record_facts("low"))
+    shifted, _, _ = world_fixture([[]], facts=record_facts(), facts_version=1)
+    digests = {row.backend_sha256 for row in (plain, bound, changed, shifted)}
+    assert len(digests) == 4
+    assert set(plain.factory.definition) == {
+        "implementation",
+        "engine",
+        "memory",
+        "manifest",
+        "initial_state",
+        "maximum_reasks",
+    }
+    assert bound.factory.definition["facts_prompt_sha256"] == sha256_json(INSTANCE_FACTS_GUIDANCE)
+    task = _task("escalate")
+    with bound.open(task) as world:
+        saved = world.checkpoint()
+    for other in (plain, changed, shifted):
+        with pytest.raises(ValueError, match="another backend definition"):
+            with other.restore(task, saved):
+                pass
+    same, _, _ = world_fixture([[]], facts=record_facts())
+    with same.restore(task, saved) as restored:
+        assert restored.checkpoint() == saved
+    assert isinstance(bound.factory, GroundedWorldFactory)
+    bound.factory.engine.facts = None
+    with pytest.raises(ValueError, match="changed after freezing"):
+        with bound.open(task):
+            pass
+
+
+def test_workbook_facts_and_native_read_receipts_share_one_channel_in_a_mixed_world() -> None:
+    """Declared starting cells precede current native receipts; native state stays native."""
+    from exp.runtime.environments.mixed import (
+        MixedRealityEnvironmentRuntime,
+        MixedRealityPolicy,
+        ToolRoute,
+    )
+    from exp.runtime.environments.tests.world_conformance_test import workbook_case
+    from exp.runtime.environments.world_grounding import NativeReadBridge
+
+    facts = workbook_facts()
+    original, _, requests = world_fixture([[], []])
+    old = original.factory
+    assert isinstance(old, GroundedWorldFactory)
+    workbook = workbook_case()
+    task = _task("edit_workbook", "escalate")
+    manifest = WorldManifest(
+        domains=(
+            *original.manifest.domains,
+            StateDomain(name="input.xlsx", owner="native"),
+            StateDomain(name="output.xlsx", owner="native"),
+        ),
+        tools=(
+            *original.manifest.tools,
+            workbook.runtime.manifest.tool("edit_workbook"),
+            ToolEffectPolicy(name="inspect_workbook", reads=("output.xlsx",), duration=0),
+        ),
+        native_reads=(
+            NativeReadBridge(
+                name="workbook-context",
+                target_tool="escalate",
+                probe_tool="inspect_workbook",
+                arguments={"sheet": "Orders", "row_count": 2, "column_count": 2},
+                argument_keys={"source": "workbook"},
+            ),
+        ),
+    )
+    factory = GroundedWorldFactory(
+        GroundedTransitionEngine(
+            old.engine.runtime,
+            task,
+            maximum_output_tokens=1024,
+            output_protocol="json-tool",
+            facts=facts,
+        ),
+        manifest,
+        old.initial_state,
+        complete=old.complete,
+        record=old.record,
+    )
+    native = ExecutableWorldRuntime(manifest, workbook.runtime.factory)
+    candidate = ExecutableWorldRuntime(manifest, factory, owner="simulated")
+    runtime = MixedRealityEnvironmentRuntime(
+        policy=MixedRealityPolicy(
+            world=manifest,
+            native_identity=native.backend_sha256,
+            candidate_identity=candidate.backend_sha256,
+            routes=(
+                ToolRoute(name="edit_workbook", mode="real", effect="write"),
+                ToolRoute(name="escalate", mode="simulated", effect="write"),
+            ),
+        ),
+        native=native,
+        candidate=candidate,
+        record=lambda event: None,
+    )
+    action = ToolCall(name="escalate", call_id="call", arguments={"workbook": "output.xlsx"})
+    with runtime.open(task) as world:
+        world.execute(workbook.first)
+        world.execute(action)
+        saved = world.checkpoint()
+    with runtime.restore(task, saved) as restored:
+        restored.execute(action)
+    for index, request in enumerate(requests):
+        channel = _payload(request)["instance_facts"]
+        assert isinstance(channel, dict) and channel["state_version"] == index
+        rows = channel["facts"]
+        assert isinstance(rows, list) and len(rows) == len(facts.facts) + 1
+        declared = facts.conditioning(index)
+        assert declared is not None
+        assert canonical_json_bytes(rows[: len(facts.facts)]) == canonical_json_bytes(
+            [fact.rendered() for fact in declared.facts]
+        )
+        receipt = rows[-1]
+        assert isinstance(receipt, dict) and str(receipt["key"]).startswith("native-read/")
+        domains = _payload(request)["environment_state"]
+        assert isinstance(domains, dict) and set(domains["domains"]) <= {"tickets", "archive"}
+    assert len(requests) == 2
+    assert saved.candidate is not None
+    assert b"PQTW1" not in saved.candidate.image.parts["predictor.json"]
