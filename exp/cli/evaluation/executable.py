@@ -173,9 +173,28 @@ def run_executable_command(
     yes: bool,
     non_interactive: bool,
     code_revision: str,
+    spec_path: Path | None = None,
 ) -> None:
-    """Publish immutable artifacts or explicitly serve a bounded trusted environment runtime."""
+    """Publish immutable artifacts or explicitly serve a bounded trusted environment runtime.
+
+    Args:
+        project: Project store that owns every task, qualification and package artifact.
+        command: One validated executable operation.
+        console: Command-owned output console.
+        dry_run: Check sources and destinations without publication, execution or serving.
+        yes: Explicit authorization of the displayed estimate.
+        non_interactive: Fail rather than prompt when paid work lacks authorization.
+        code_revision: Installed execution revision recorded in published artifacts.
+        spec_path: The ``--continuations`` spec file named in spend prompts. Python callers
+            without a spec file leave it unset, and prompts then name no file.
+
+    Returns:
+        None. Results are printed to ``console``.
+    """
     now = datetime.now(UTC)
+    consent_command = f"exp eval {project.paths.project_id} --continuations"
+    if spec_path is not None:
+        consent_command = f"{consent_command} {spec_path}"
     if command.action == "propose-worlds":
         spec = command.world_proposals
         if spec is None:
@@ -199,7 +218,7 @@ def run_executable_command(
             estimated_cost_usd=review_cost(console, project, spec),
             cost_is_upper_bound=False,
             non_interactive=non_interactive,
-            command=f"exp eval {project.paths.project_id} --continuations propose-worlds.json",
+            command=consent_command,
         ):
             return
         console.print_json(
@@ -375,7 +394,7 @@ def run_executable_command(
         ),
         cost_is_upper_bound=False,
         non_interactive=non_interactive,
-        command=f"exp eval {project.paths.project_id} --continuations executable-serve.json",
+        command=consent_command,
     ):
         return
     task = verify_executable_package(project, command.directory)

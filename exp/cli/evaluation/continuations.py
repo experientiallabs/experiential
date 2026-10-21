@@ -878,6 +878,7 @@ def run_continuations(
                 yes=yes,
                 non_interactive=non_interactive,
                 code_revision=revision,
+                spec_path=spec_path,
             )
             return
         if command.framing is not None:
