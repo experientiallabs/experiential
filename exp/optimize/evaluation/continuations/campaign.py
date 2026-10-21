@@ -33,6 +33,7 @@ from exp.optimize.evaluation.continuations.job import (
 )
 from exp.optimize.evaluation.continuations.proposals import (
     CheckpointProposalSpec,
+    SourceBranchPolicy,
     propose_checkpoints,
 )
 from exp.runtime.models.registry import RuntimeModelCatalog
@@ -65,6 +66,9 @@ class ContinuationCampaignSpec(ContractModel):
         continuations: Equal repeat count per selected and random point, default eight.
         continuation_physical_attempts: Finite per-point actor HTTP ceiling, including retries.
         selector_input_bytes: Complete retrospective packet ceiling, with no truncation.
+        selector_source_branches: Registered selector packet policy: ``complete`` refuses above
+            the ceiling; ``registered_prefix`` sends the longest registered-order prefix of whole
+            source branches that fits and names every omitted branch.
         seed: Registered seed offset for each selector's random control draw.
         horizon_tolerance: Remaining-call tolerance for matched points.
     """
@@ -76,6 +80,7 @@ class ContinuationCampaignSpec(ContractModel):
     continuations: int = Field(default=8, ge=1, le=100, strict=True)
     continuation_physical_attempts: int = Field(default=64, ge=1, le=10000, strict=True)
     selector_input_bytes: int = Field(default=128000, ge=512, le=512000, strict=True)
+    selector_source_branches: SourceBranchPolicy = "complete"
     seed: int = Field(default=0, ge=0, le=2**32 - 9, strict=True)
     horizon_tolerance: int = Field(default=0, ge=0, le=10, strict=True)
 
@@ -202,6 +207,7 @@ def _selector(
         points=spec.points,
         output_tokens=row.output_tokens,
         maximum_input_bytes=spec.selector_input_bytes,
+        source_branches=spec.selector_source_branches,
         deadline=spec.initial.deadline,
         seed=spec.seed + index,
         horizon_tolerance=spec.horizon_tolerance,

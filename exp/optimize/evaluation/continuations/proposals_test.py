@@ -391,3 +391,84 @@ def test_reserved_reference_shape_in_source_evidence_refuses() -> None:
     """Evidence that already looks like a reference is refused instead of being misread."""
     with pytest.raises(ValueError, match="reserved \\$shared"):
         owner._shared_values({"checkpoints": [{"$shared": 0}]})
+
+
+def _encoded_size(project: ProjectStore, spec: CheckpointProposalSpec) -> int:
+    """Bytes of the complete selector request rendered for one registration."""
+    return len(owner._packet(project, spec)[2].model_dump_json().encode())
+
+
+def test_registered_prefix_sends_whole_branches_and_names_every_omitted_one(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A packet over its allowance keeps whole leading branches, never a cut or summarized one.
+
+    SpreadsheetBench 165-23 rendered 560 to 966 KB packets against the 512000 byte maximum.
+    """
+    project, spec, transport = selector_fixture(tmp_path, monkeypatch)
+    complete = spec.model_copy(update={"source_branches": "registered_prefix"})
+    full_pool, full_excluded, _ = owner._packet(project, complete)
+    assert owner._packet(project, spec)[:2] == (full_pool, full_excluded), "fits: nothing omitted"
+    allowance = _encoded_size(project, spec) - 1
+    prefix = complete.model_copy(update={"maximum_input_bytes": allowance})
+    pool, excluded, request = owner._packet(project, prefix)
+    assert len(request.model_dump_json().encode()) <= allowance
+    content = request.messages[1].content
+    assert content is not None
+    packet = expanded(json.loads(content))
+    assert isinstance(packet, dict) and packet["protocol"] == SELECTOR_REQUEST_PROTOCOL
+    study = load_study(project.artifacts, spec.studies[0])
+    sent = packet["source_studies"][0]["branches"]
+    assert sent == [branch.model_dump(mode="json") for branch in study.branches[: len(sent)]]
+    assert 1 <= len(sent) < len(study.branches)
+    omitted = study.branches[len(sent) :]
+    assert packet["source_branches"] == {
+        "policy": "registered_prefix",
+        "omitted": [
+            {"source": spec.studies[0].model_dump(mode="json"), "branch": row.index}
+            for row in omitted
+        ],
+    }
+    dropped = {point for row in omitted for point in row.checkpoints}
+    assert dropped and not dropped & set(pool), "omitted branches leave the pool for both arms"
+    assert set(pool) <= set(full_pool)
+    for point in dropped:
+        row = {"checkpoint": point.model_dump(mode="json"), "reason": "source_branch_omitted"}
+        assert row in excluded
+    assert prefix.identity("test") != spec.identity("test")
+    with pytest.raises(ValueError, match="register source_branches=registered_prefix"):
+        owner._packet(project, spec.model_copy(update={"maximum_input_bytes": allowance}))
+    assert not transport.requests
+
+
+def test_registered_prefix_still_refuses_when_one_whole_branch_does_not_fit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The prefix policy never cuts inside a branch; below one branch it refuses before intent."""
+    project, spec, transport = selector_fixture(tmp_path, monkeypatch)
+    spec = spec.model_copy(
+        update={"source_branches": "registered_prefix", "maximum_input_bytes": 512}
+    )
+    with pytest.raises(ValueError, match="even with one whole source branch"):
+        propose_checkpoints(project, spec, code_revision="test")
+    assert not transport.requests
+    assert not project.artifacts.exists(spec.identity("test") + "-intent")
+
+
+def test_a_registered_prefix_draw_matches_controls_only_inside_its_pool(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Selected and random arms share the reduced pool, and the saved draw replays exactly."""
+    project, spec, transport = selector_fixture(tmp_path, monkeypatch)
+    allowance = _encoded_size(project, spec) - 1
+    spec = spec.model_copy(
+        update={"source_branches": "registered_prefix", "maximum_input_bytes": allowance}
+    )
+    report = propose_checkpoints(project, spec, code_revision="test")
+    assert report is not None and report.selection is not None
+    plan = load_selection_plan(project, report.selection)
+    assert plan.spec.pool == report.pool
+    assert all(match.control is None or match.control in report.pool for match in plan.matches)
+    assert any(row["reason"] == "source_branch_omitted" for row in report.excluded)
+    assert propose_checkpoints(project, spec, code_revision="test") == report
+    assert len(transport.requests) == 1

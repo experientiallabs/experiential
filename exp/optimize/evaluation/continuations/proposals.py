@@ -6,8 +6,10 @@ existing owner: no selector packet, future outcome or private state is forwarded
 
 import json
 from collections import Counter
+from collections.abc import Callable
 from datetime import UTC, datetime
-from typing import Self
+from functools import cache
+from typing import Literal, Self
 
 from filelock import FileLock
 from pydantic import AwareDatetime, Field, JsonValue, model_validator
@@ -29,7 +31,7 @@ from exp.common.models import (
     ToolChoice,
     load_model_catalog,
 )
-from exp.common.project import ProjectStore, artifact_input
+from exp.common.project import ArtifactStore, ProjectStore, artifact_input
 from exp.common.tasks import ToolSchema
 from exp.optimize.evaluation.continuations.job import ContinuationJob
 from exp.optimize.evaluation.continuations.records import load_study
@@ -40,19 +42,23 @@ from exp.optimize.evaluation.continuations.selection import (
     match_checkpoints,
     persist_selection_plan,
 )
+from exp.optimize.evaluation.continuations.study import ContinuationStudy
 from exp.runtime.agents.chat import ChatAgentRuntime
 from exp.runtime.models.call_evidence import canonical_call
 from exp.runtime.models.providers.admitted_transport import AdmittedJsonTransport
 from exp.runtime.models.providers.transport import HttpxJsonTransport
 from exp.runtime.models.registry import RuntimeModelCatalog
 from exp.runtime.sessions.dispatch_ledger import DispatchLedger
-from exp.simulation.continuations import load_continuation_checkpoint
+from exp.simulation.continuations import ContinuationCheckpoint, load_continuation_checkpoint
 from exp.simulation.development_scope import require_development_task
 
 # Identity of the code that renders the selector request, in place of its source text. Bump it
 # when the request changes. exp/tests/code_protocols_test.py fails when the covered source
 # changes until it is bumped or, for a pure refactor, its digest is updated.
-SELECTOR_REQUEST_PROTOCOL = "checkpoint-selector-request-v1"
+SELECTOR_REQUEST_PROTOCOL = "checkpoint-selector-request-v2"
+
+SourceBranchPolicy = Literal["complete", "registered_prefix"]
+"""Whether a selector packet holds every source branch or a registered-order prefix of them."""
 
 # Reserved key of a shared-value reference; evidence that already contains one is refused.
 _SHARED = "$shared"
@@ -75,6 +81,10 @@ class CheckpointProposalSpec(ContractModel):
         deadline: Last permitted new inference, not a deadline for saved publication.
         seed: Fixed random-control draw, set before selector or continuation outcomes.
         horizon_tolerance: Maximum remaining-call difference for matched controls.
+        source_branches: ``complete`` sends every source branch or refuses above the byte
+            allowance. ``registered_prefix`` sends the longest registered-order prefix of whole
+            source branches that fits and lists every omitted branch; no branch is cut or
+            summarized, and omitted branches' checkpoints leave the pool for both arms.
     """
 
     base: ContinuationJob
@@ -88,6 +98,7 @@ class CheckpointProposalSpec(ContractModel):
     deadline: AwareDatetime
     seed: int = Field(default=0, ge=0, le=2**32 - 1, strict=True)
     horizon_tolerance: int = Field(default=0, ge=0, le=10, strict=True)
+    source_branches: SourceBranchPolicy = "complete"
 
     @model_validator(mode="after")
     def sources(self) -> Self:
@@ -230,10 +241,12 @@ def _shared_values(payload: JsonObject) -> JsonObject:
 def _packet(
     project: ProjectStore, spec: CheckpointProposalSpec
 ) -> tuple[tuple[ArtifactInput, ...], tuple[JsonObject, ...], ModelRequest]:
-    """Inventory all source attempts and preserve full evidence within a hard byte ceiling.
+    """Inventory all source attempts and preserve whole branches within a hard byte ceiling.
 
-    Every pool checkpoint keeps its index, reference and complete public prefix, and every
-    source branch keeps its complete record; repeated values are shared, never dropped.
+    Every pool checkpoint keeps its index, reference and complete public prefix, and every sent
+    source branch keeps its complete record; repeated values are shared, never dropped. Under the
+    ``registered_prefix`` policy the packet holds the longest registered-order prefix of whole
+    branches that fits, and every later branch is named as omitted with its checkpoints excluded.
     """
     store = project.artifacts
     actor = ChatAgentRuntime(
@@ -241,8 +254,8 @@ def _packet(
     )
     base = load_continuation_checkpoint(store, spec.base.study.checkpoint)
     require_development_task(store, base.task)
-    pool, excluded, seen, studies = [], [], set(), []
-    refs: set[ArtifactInput] = set()
+    checkpoint = cache(lambda reference: load_continuation_checkpoint(store, reference))
+    sources = []
     for reference in spec.studies:
         study = load_study(store, reference)
         if (
@@ -253,41 +266,102 @@ def _packet(
             raise ValueError(
                 "source study policy differs; select studies for the same actor and task"
             )
+        sources.append((reference, study))
+    registered = sum(len(study.branches) for _, study in sources)
+    counts = (
+        range(registered, 0, -1) if spec.source_branches == "registered_prefix" else (registered,)
+    )
+    size = 0
+    for count in counts:
+        pool, excluded, request = _render(store, spec, sources, count, actor, base, checkpoint)
+        size = len(request.model_dump_json().encode())
+        if size <= spec.maximum_input_bytes:
+            return pool, excluded, request
+    if spec.source_branches == "registered_prefix":
+        raise ValueError(
+            f"selector evidence exceeds byte allowance even with one whole source branch ({size} "
+            f"> {spec.maximum_input_bytes} bytes); raise the allowance (at most 512000)"
+        )
+    raise ValueError(
+        f"selector complete evidence exceeds byte allowance ({size} > "
+        f"{spec.maximum_input_bytes} bytes); raise the allowance (at most 512000), "
+        "reduce registered studies or register source_branches=registered_prefix"
+    )
+
+
+def _render(
+    store: ArtifactStore,
+    spec: CheckpointProposalSpec,
+    sources: list[tuple[ArtifactInput, ContinuationStudy]],
+    count: int,
+    actor: ChatAgentRuntime,
+    base: ContinuationCheckpoint,
+    checkpoint: Callable[[ArtifactInput], ContinuationCheckpoint],
+) -> tuple[tuple[ArtifactInput, ...], tuple[JsonObject, ...], ModelRequest]:
+    """Render the request for the first ``count`` registered source branches, all others omitted.
+
+    Args:
+        store: Project artifacts holding every checkpoint.
+        spec: Frozen selector registration.
+        sources: Every registered source study, in registered order.
+        count: Number of whole branches sent, counted across studies in registered order.
+        actor: Actor runtime that decides each checkpoint's remaining calls.
+        base: The registered base checkpoint every source shares.
+        checkpoint: Cached checkpoint loader.
+
+    Returns:
+        The pool, the excluded checkpoints with reasons, and the complete selector request.
+    """
+    pool, excluded, seen, studies = [], [], set(), []
+    omitted: list[JsonObject] = []
+    sent_points: list[ArtifactInput] = []
+    omitted_points: list[ArtifactInput] = []
+    unsent = count
+    for reference, study in sources:
+        sent, rest = study.branches[: max(0, unsent)], study.branches[max(0, unsent) :]
+        unsent -= len(sent)
         studies.append(
             {
                 "source": reference.model_dump(mode="json"),
-                "branches": [row.model_dump(mode="json") for row in study.branches],
+                "branches": [row.model_dump(mode="json") for row in sent],
             }
         )
-        for point_ref in (
-            study.spec.checkpoint,
-            *(p for b in study.branches for p in b.checkpoints),
-        ):
-            if point_ref in refs:
-                continue
+        omitted.extend(
+            {"source": reference.model_dump(mode="json"), "branch": row.index} for row in rest
+        )
+        sent_points.extend((study.spec.checkpoint, *(p for b in sent for p in b.checkpoints)))
+        omitted_points.extend(p for b in rest for p in b.checkpoints)
+    refs: set[ArtifactInput] = set()
+    for point_ref in sent_points:
+        if point_ref in refs:
+            continue
+        refs.add(point_ref)
+        point = checkpoint(point_ref)
+        require_development_task(store, point.task)
+        if point.task != base.task or point.world_task != base.world_task:
+            raise ValueError("selector studies must share the exact task and world task")
+        remaining = actor.remaining_calls(point.actor)
+        world = point.world.model_dump(mode="json")
+        world.pop("episode_id", None)
+        digest = sha256_json(
+            {
+                "task": point.task.model_dump(mode="json"),
+                "actor": point.actor.model_dump(mode="json"),
+                "world": world,
+            }
+        )
+        reason = "terminal" if remaining <= 0 else "duplicate_content" if digest in seen else None
+        if reason is not None:
+            excluded.append({"checkpoint": point_ref.model_dump(mode="json"), "reason": reason})
+            continue
+        seen.add(digest)
+        pool.append(point_ref)
+    for point_ref in omitted_points:
+        if point_ref not in refs:
             refs.add(point_ref)
-            point = load_continuation_checkpoint(store, point_ref)
-            require_development_task(store, point.task)
-            if point.task != base.task or point.world_task != base.world_task:
-                raise ValueError("selector studies must share the exact task and world task")
-            remaining = actor.remaining_calls(point.actor)
-            world = point.world.model_dump(mode="json")
-            world.pop("episode_id", None)
-            digest = sha256_json(
-                {
-                    "task": point.task.model_dump(mode="json"),
-                    "actor": point.actor.model_dump(mode="json"),
-                    "world": world,
-                }
+            excluded.append(
+                {"checkpoint": point_ref.model_dump(mode="json"), "reason": "source_branch_omitted"}
             )
-            reason = (
-                "terminal" if remaining <= 0 else "duplicate_content" if digest in seen else None
-            )
-            if reason is not None:
-                excluded.append({"checkpoint": point_ref.model_dump(mode="json"), "reason": reason})
-                continue
-            seen.add(digest)
-            pool.append(point_ref)
     if not 2 <= len(pool) <= 256:
         raise ValueError(
             "selector needs 2 to 256 distinct nonterminal checkpoints; adjust source studies"
@@ -301,13 +375,13 @@ def _packet(
                 "index": i,
                 "reference": ref.model_dump(mode="json"),
                 "public_prefix": [
-                    m.model_dump(mode="json")
-                    for m in load_continuation_checkpoint(store, ref).actor.messages
+                    m.model_dump(mode="json") for m in checkpoint(ref).actor.messages
                 ],
             }
             for i, ref in enumerate(pool)
         ],
         "source_studies": studies,
+        "source_branches": {"policy": spec.source_branches, "omitted": omitted},
     }
     request = ModelRequest(
         messages=(
@@ -325,7 +399,10 @@ def _packet(
                     "Do not declare causal blame, correctness, independence or training approval. "
                     'Repeated values appear once: each {"$shared": k} object stands for exactly '
                     "shared_values[k], whose entries may reference earlier entries. Expand them "
-                    "to read the complete evidence, including every checkpoint's public prefix."
+                    "to read the complete evidence, including every checkpoint's public prefix. "
+                    "source_branches.omitted names registered source branches left out whole to "
+                    "fit the packet allowance; nothing in a sent branch is cut or summarized, and "
+                    "omitted branches' checkpoints are not in the pool."
                 ),
             ),
             ModelMessage(role="user", content=_canonical(_shared_values(payload))),
@@ -340,13 +417,6 @@ def _packet(
         tool_choice=ToolChoice(name="select_points"),
         maximum_output_tokens=spec.output_tokens,
     )
-    size = len(request.model_dump_json().encode())
-    if size > spec.maximum_input_bytes:
-        raise ValueError(
-            f"selector complete evidence exceeds byte allowance ({size} > "
-            f"{spec.maximum_input_bytes} bytes); raise the allowance (at most 512000) "
-            "or reduce registered studies"
-        )
     return tuple(pool), tuple(excluded), request
 
 

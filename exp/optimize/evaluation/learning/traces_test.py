@@ -48,6 +48,7 @@ from exp.optimize.evaluation.learning.traces import (
     reserve_held_out,
 )
 from exp.runtime.models import RuntimeModelCatalog
+from exp.runtime.models.providers.async_transport import ProviderDeadlineExceeded
 from exp.runtime.models.providers.transport import (
     JsonHttpResponse,
     ProviderTransportError,
@@ -704,6 +705,45 @@ def test_an_embedding_failure_in_a_configured_build_stops_readably(
     assert "a provider request failed" in output
     assert "Run the same exp build command again to resume" in output
     assert not isinstance(result.exception, ProviderTransportError | AssertionError)
+
+
+def test_a_learning_request_that_runs_out_of_time_stops_the_build_readably(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`exp build` reports a provider deadline like other provider failures, not a traceback.
+
+    The SpreadsheetBench wide pilot's simulator build printed a raw ProviderDeadlineExceeded
+    traceback when one learning request ran out of time.
+    """
+    provider = SimulatedProvider([episode(i) for i in range(USERS)], learnable=True)
+    root = tmp_path / ".exp"
+    root.mkdir()
+    write_catalog(root, recall=True)
+    package = tmp_path / "package.jsonl"
+    rows = package_rows([episode(i) for i in range(USERS)])
+    package.write_text("".join(json.dumps(row) + "\n" for row in rows))
+    monkeypatch.setenv("HELD_OUT_TEST_KEY", "fixture-only")
+    monkeypatch.setenv("EXP_RELEASE_REVISION", REVISION)
+    monkeypatch.setattr(
+        "exp.cli.build.app.RuntimeModelCatalog",
+        functools.partial(RuntimeModelCatalog, transport_factory=lambda: provider),
+    )
+
+    def out_of_time(*_args: object, **_kwargs: object) -> None:
+        """Fail the way the pilot's learning request failed."""
+        raise ProviderDeadlineExceeded("provider request deadline exceeded")
+
+    monkeypatch.setattr("exp.cli.evaluation.learning.learn_from_traces", out_of_time)
+    result = CliRunner().invoke(
+        app,
+        ["build", PROJECT, "-t", str(package), "--source", "otel-genai", "--root", str(root)]
+        + ["--yes", "--non-interactive"],
+    )
+    output = " ".join(result.output.split())
+    assert result.exit_code == 1, result.output
+    assert "a provider request failed: provider request deadline exceeded" in output
+    assert "run the same command with --retry-incomplete to resume it" in output
+    assert not isinstance(result.exception, ProviderDeadlineExceeded | AssertionError)
 
 
 def test_saved_dream_plan_pins_protocol_and_refuses_changed_reader(

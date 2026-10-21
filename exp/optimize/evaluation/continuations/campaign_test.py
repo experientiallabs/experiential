@@ -14,6 +14,7 @@ from exp.optimize.evaluation.continuations.campaign import (
     CampaignCell,
     CampaignSelector,
     ContinuationCampaignSpec,
+    _selector,
     run_continuation_campaign,
     saved_continuation_campaign,
 )
@@ -290,3 +291,16 @@ def test_cli_finalizes_saved_cells_without_runtime_or_credentials(
     assert result.exit_code == 0, result.output
     assert '"completed_experiments": 1' in result.output
     assert (len(selector.requests), len(critic.requests), len(actor.requests)) == (1, 2, 4)
+
+
+def test_campaign_registers_the_selector_source_branch_policy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The campaign's registered packet policy reaches every selector and keys the campaign."""
+    _, spec, *_ = campaign_fixture(tmp_path, monkeypatch)
+    assert spec.selector_source_branches == "complete"
+    prefix = spec.model_copy(update={"selector_source_branches": "registered_prefix"})
+    source = spec.initial.study.checkpoint
+    assert _selector(spec, 0, source).source_branches == "complete"
+    assert _selector(prefix, 0, source).source_branches == "registered_prefix"
+    assert prefix.identity("test") != spec.identity("test")

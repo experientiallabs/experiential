@@ -81,13 +81,14 @@ PROTOCOLS = (
     ),
     Protocol(
         "exp.optimize.evaluation.continuations.proposals:SELECTOR_REQUEST_PROTOCOL",
-        "checkpoint-selector-request-v1",
+        "checkpoint-selector-request-v2",
         (
             "exp.optimize.evaluation.continuations.proposals:_canonical",
             "exp.optimize.evaluation.continuations.proposals:_shared_values",
             "exp.optimize.evaluation.continuations.proposals:_packet",
+            "exp.optimize.evaluation.continuations.proposals:_render",
         ),
-        "6e5bfdaded2ff273dd3f46d2d89d7eff984b8ac987332807dcea25052f3e7ac9",
+        "10ab5739a9497bd76ef9bb5be6d0dc5d54d2554d020616337e0223619c952f40",
     ),
     Protocol(
         "exp.optimize.evaluation.learning.sample_count:SAMPLE_COUNT_PROTOCOL",
