@@ -1008,7 +1008,22 @@ supplies a deadline and attempt cap for supported `trial_runtime` factories, bou
 simulator ceiling. Resumes keep the same grant and counter for predictor, embedding and memory calls.
 Submission requires every declared output file; missing files leave the trial open for correction.
 Configure a reachable private endpoint for containers. Packages use Harbor 0.24.0 schema 1.4 with a separate verifier environment.
-Local HTTP and package schemas are tested; container launch needs Docker/Harbor. Runtime factories execute in the trusted operator environment. Pi uses a minimal child environment and private HOME/TMPDIR, with provider credentials kept by the coordinator; this does not establish filesystem or network confinement.
+The verifier always writes `reward.json`: `{"reward": 0 or 1, "scored": 1}` for a qualified completed
+verdict, else `{"scored": 0}` (diagnostic, unsubmitted, failed or unknown); `experiential.json` keeps
+the full verdict. Only a grading failure leaves no reward file, so Harbor reports an exception.
+Serve one Harbor trial per `trial_id` with `--n-concurrent 1`; Docker reaches the host bridge address:
+
+```bash
+exp eval PROJECT --root ROOT --continuations register.json --yes   # then qualify.json, export.json
+exp eval PROJECT --root ROOT --continuations serve.json --yes       # host "172.17.0.1", blocks
+export EXP_HARBOR_ENDPOINT=$(jq -r .EXP_HARBOR_ENDPOINT private/actor.json)  # second shell
+export EXP_HARBOR_ACTOR_TOKEN=$(jq -r .EXP_HARBOR_ACTOR_TOKEN private/actor.json)
+export EXP_HARBOR_VERIFIER_TOKEN=$(jq -r .EXP_HARBOR_VERIFIER_TOKEN private/verifier.json)
+harbor run --yes --path PACKAGE --agent AGENT --env docker --jobs-dir JOBS --n-concurrent 1
+```
+
+`exp/optimize/evaluation/harbor/tests/package_trial_test.py` runs this offline for workbook and
+record worlds (scripted actor, separate package-client processes, cleanup asserted). Runtime factories execute in the trusted operator environment. Pi uses a minimal child environment and private HOME/TMPDIR, with provider credentials kept by the coordinator; this does not establish filesystem or network confinement.
 `exp optimize model PROJECT --root ROOT --training-job training.json` accepts a `TrainingJob` from `exp.cli.optimize.training_job`. Use `action: "score-initial"` to save frozen-model losses on the accepted training partition, then `action: "train"` with `spec.tail_sft.reference` pointing to that artifact. TailSFT drops the configured fraction of the smallest current-minus-initial loss margins per batch, retaining context but weighting only target tokens. Initial/model/dataset and exact rendered target identities must match. Unknown scoring or update intents refuse implicit
 repetition. The static fraction and single-batch implementation do not claim published distributed
 schedule results. Training produces a candidate checkpoint; this path does not promote a model
