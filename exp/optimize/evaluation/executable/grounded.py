@@ -34,7 +34,10 @@ from exp.runtime.environments.worlds import (
 )
 from exp.runtime.models.budget import RequestBudget
 from exp.runtime.models.call_evidence import call_consumer
-from exp.runtime.models.providers.admitted_transport import AdmittedJsonTransport
+from exp.runtime.models.providers.admitted_transport import (
+    AdmittedJsonTransport,
+    require_admitted_transport,
+)
 from exp.runtime.models.providers.transport import HttpxJsonTransport
 from exp.runtime.models.registry import RuntimeModelCatalog
 from exp.runtime.models.structured_completion import CompletionPlan, StructuredCompletion
@@ -140,18 +143,7 @@ def _runtime(
     if embedder_alias is not None:
         aliases.append(embedder_alias)
     for alias in aliases:
-        provider = catalog.connections[catalog.models[alias].connection].provider
-        if provider not in {
-            "openai",
-            "openai-compatible",
-            "openrouter",
-            "anthropic",
-            "gemini",
-            "azure",
-        }:
-            raise ValueError(
-                "executable simulator requires a provider using the admitted HTTP transport"
-            )
+        require_admitted_transport(catalog, alias, consumer="executable simulator")
     if spec.memory is not None:
         recall = catalog.models[spec.memory.recall.jev_alias]
         if catalog.connections[recall.connection].provider != "typesafe":

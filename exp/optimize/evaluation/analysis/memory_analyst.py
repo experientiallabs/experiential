@@ -25,7 +25,10 @@ from exp.optimize.evaluation.analysis.memory_evidence import (
 from exp.optimize.evaluation.analysis.source_access import require_development_sources
 from exp.runtime.models.budget import RequestBudget
 from exp.runtime.models.call_evidence import call_consumer
-from exp.runtime.models.providers.admitted_transport import AdmittedJsonTransport
+from exp.runtime.models.providers.admitted_transport import (
+    AdmittedJsonTransport,
+    require_admitted_transport,
+)
 from exp.runtime.models.providers.transport import HttpxJsonTransport
 from exp.runtime.models.registry import RuntimeModelCatalog
 from exp.runtime.models.structured_completion import CompletionPlan, StructuredCompletion
@@ -156,16 +159,7 @@ def preflight_memory_analyst(project: ProjectStore, spec: MemoryAnalystSpec) -> 
         and spec.output_tokens > capabilities.maximum_output_tokens
     ):
         raise ValueError("memory analyst output exceeds declared capacity")
-    provider = catalog.connections[catalog.models[spec.analyst_alias].connection].provider
-    if provider not in {
-        "openai",
-        "openai-compatible",
-        "openrouter",
-        "anthropic",
-        "gemini",
-        "azure",
-    }:
-        raise ValueError("memory analyst requires admitted HTTP transport")
+    require_admitted_transport(catalog, spec.analyst_alias, consumer="memory analyst")
     return definition
 
 

@@ -384,6 +384,7 @@ uv run pytest -q
     | Local identifiers in paths | `exp/common/project/paths.py` | `validate_local_id` |
     | Atomic file writes | `exp/common/core/files.py` | `write_text_atomic` |
     | Model choice | `exp/common/models/catalog_roles.py` | Catalog roles, not new flags |
+    | Providers admitted for physical-attempt evidence | `exp/runtime/models/providers/admitted_transport.py` | `require_admitted_transport` before credentials; `ADMITTED_TRANSPORT_PROVIDERS`, never a hand-typed provider set |
     | Provider calls and retries | `exp/runtime/models/registry.py`, `exp/runtime/models/providers/transport.py` | `RuntimeModelCatalog`, `RetryPolicy` |
     | Infrastructure failures in scored workflows | `exp/simulation/evaluation/workflow.py` | `INFRASTRUCTURE_STOPS` are raised, never scored; the run stays incomplete and resumes in place |
     | Producer revision | `exp/common/release_revision.py` | `installed_release_revision` |

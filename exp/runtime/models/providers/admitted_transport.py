@@ -7,12 +7,45 @@ from copy import deepcopy
 from datetime import UTC, datetime
 
 from exp.common.core.artifacts import ArtifactEnvelope, ArtifactInput, JsonObject, sha256_json
+from exp.common.models import ModelCatalog
 from exp.common.project import ArtifactStore, ArtifactStoreError, artifact_input
 from exp.common.project.request_budget import validate_provider_response
 from exp.runtime.models.call_evidence import current_call_intent, current_consumer
 from exp.runtime.models.providers.attempt_timeouts import ATTEMPT_TIMEOUT_PROTOCOL
 from exp.runtime.models.providers.transport import JsonHttpResponse, JsonHttpTransport
 from exp.runtime.sessions.dispatch_ledger import DispatchLedger
+
+ADMITTED_TRANSPORT_PROVIDERS = frozenset(
+    {"anthropic", "azure", "gemini", "openai", "openai-compatible", "openrouter"}
+)
+"""Providers whose every completion and embedding request goes through the injected transport.
+
+The registry builds these clients on its ``transport_factory``, so wrapping that factory in
+:class:`AdmittedJsonTransport` admits, bounds and retains each physical request. The other
+registry providers fall outside it: ``bedrock`` and ``tinker`` dispatch through their own SDK
+runtimes, ``typesafe`` and ``elevenlabs`` serve no completion (the native gateway owns their
+wire), and ``vertex`` mints its OAuth bearer token over Google's own HTTP client.
+"""
+
+
+def require_admitted_transport(catalog: ModelCatalog, alias: str, *, consumer: str) -> None:
+    """Refuse a model alias whose provider sends requests outside the admitted transport.
+
+    Args:
+        catalog: Credential-free model catalog that declares ``alias``.
+        alias: Catalog model alias the consumer will call.
+        consumer: Short name of the calling role, used in the refusal message.
+
+    Raises:
+        ValueError: The alias's provider is not in :data:`ADMITTED_TRANSPORT_PROVIDERS`.
+    """
+    provider = catalog.connections[catalog.models[alias].connection].provider
+    if provider not in ADMITTED_TRANSPORT_PROVIDERS:
+        raise ValueError(
+            f"{consumer} alias {alias!r} uses provider {provider!r}, which sends requests "
+            "outside the admitted HTTP transport; point the alias at a connection whose "
+            f"provider is one of {', '.join(sorted(ADMITTED_TRANSPORT_PROVIDERS))}"
+        )
 
 
 class AdmittedJsonTransport(JsonHttpTransport):

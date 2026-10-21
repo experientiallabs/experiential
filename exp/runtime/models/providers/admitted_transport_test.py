@@ -7,10 +7,16 @@ from pathlib import Path
 import pytest
 
 from exp.common.core.artifacts import JsonObject
+from exp.common.models import ConnectionConfig, ModelCatalog, ModelRecord
 from exp.common.project import ArtifactStoreError, ProjectConfig, ProjectStore
-from exp.runtime.models.providers.admitted_transport import AdmittedJsonTransport
+from exp.runtime.models.providers.admitted_transport import (
+    ADMITTED_TRANSPORT_PROVIDERS,
+    AdmittedJsonTransport,
+    require_admitted_transport,
+)
 from exp.runtime.models.providers.attempt_timeouts import ATTEMPT_TIMEOUT_PROTOCOL
 from exp.runtime.models.providers.transport import JsonHttpResponse, ScriptedJsonTransport
+from exp.runtime.models.registry import SUPPORTED_PROVIDERS
 from exp.runtime.sessions.dispatch_ledger import DispatchCapExhaustedError, DispatchLedger
 
 
@@ -283,3 +289,39 @@ def test_each_attempt_intent_records_its_timeout_and_the_derivation_protocol(
     receipt = json.loads(project.artifacts.read_bytes(intent, "receipt.json"))
     assert receipt["timeout_seconds"] == pytest.approx(202.4)
     assert receipt["timeout_protocol"] == ATTEMPT_TIMEOUT_PROTOCOL
+
+
+def _one_alias_catalog(provider: str) -> ModelCatalog:
+    """Build an unvalidated one-alias catalog; only the connection provider is read."""
+    return ModelCatalog.model_construct(
+        connections={"primary": ConnectionConfig.model_construct(provider=provider)},
+        models={"fixture": ModelRecord.model_construct(connection="primary", model="fixture")},
+    )
+
+
+def test_every_registry_provider_is_classified_for_admission() -> None:
+    """A new registry provider fails here until its transport path is classified."""
+    assert ADMITTED_TRANSPORT_PROVIDERS <= SUPPORTED_PROVIDERS
+    assert SUPPORTED_PROVIDERS - ADMITTED_TRANSPORT_PROVIDERS == {
+        "bedrock",
+        "elevenlabs",
+        "tinker",
+        "typesafe",
+        "vertex",
+    }
+
+
+@pytest.mark.parametrize("provider", sorted(ADMITTED_TRANSPORT_PROVIDERS))
+def test_admitted_providers_pass(provider: str) -> None:
+    """Every provider built on the injected JSON transport is accepted."""
+    require_admitted_transport(_one_alias_catalog(provider), "fixture", consumer="critic")
+
+
+@pytest.mark.parametrize("provider", sorted(SUPPORTED_PROVIDERS - ADMITTED_TRANSPORT_PROVIDERS))
+def test_unadmitted_providers_refuse_with_the_remedy(provider: str) -> None:
+    """The refusal names the alias and provider, and lists the providers to switch to."""
+    with pytest.raises(ValueError) as refused:
+        require_admitted_transport(_one_alias_catalog(provider), "fixture", consumer="critic")
+    message = str(refused.value)
+    assert f"critic alias 'fixture' uses provider {provider!r}" in message
+    assert "anthropic, azure, gemini, openai, openai-compatible, openrouter" in message
