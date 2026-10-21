@@ -15,13 +15,31 @@ from exp.common.evaluations.reconstruction import (
     evaluate,
 )
 from exp.common.models import ToolCall
+from exp.common.models.client import RequestAdmissionRefused
+from exp.common.models.unknown_outcome import DispatchOutcomeUnknown
 from exp.common.progress import ProgressHook, report
 from exp.common.project import ArtifactStore
 from exp.runtime.models.budget import SpendLimitReached
 from exp.runtime.models.providers.transport import ProviderTransportError
-from exp.runtime.models.structured_completion import CompletionNotDispatched
+from exp.runtime.sessions.dispatch_ledger import DispatchCapExhaustedError
 from exp.simulation.engines.transition import Completion
 from exp.simulation.world_model.durable import DurableWorldModelSession
+
+# Failures of the execution machinery, not of the simulator, stop a workflow unscored. A scored
+# report would count the failed step and its blocked suffix as misses, so these are raised
+# instead: no report is saved, the run stays incomplete and visible, and only an explicit
+# in-place resumption can continue it. Every other step failure is simulator behavior and scores.
+INFRASTRUCTURE_STOPS: tuple[type[BaseException], ...] = (
+    ProviderTransportError,
+    # Deadlines and refusals before dispatch: ProviderDeadlineExceeded, the admitted transport's
+    # and the structured completion's deadline errors, and CompletionNotDispatched.
+    TimeoutError,
+    DispatchOutcomeUnknown,
+    DispatchCapExhaustedError,
+    # Local stops before dispatch, such as a dispatch guard's refusal. A step-level spend limit
+    # is caught first and scored as budget exhaustion.
+    RequestAdmissionRefused,
+)
 
 
 class FixedWorkflow(ContractModel):
@@ -122,7 +140,7 @@ def evaluate_workflow(
                     error_type="budget_exhausted",
                 )
             )
-        except (ProviderTransportError, CompletionNotDispatched):
+        except INFRASTRUCTURE_STOPS:
             # Infrastructure, not simulator behavior: no result is saved, so the run stays
             # incomplete (shown, exit non-zero) instead of scoring the rest as misses.
             raise
@@ -164,7 +182,7 @@ def evaluate_workflow(
                             source=reply_feedback_source,
                         )
                     )
-                except (ProviderTransportError, CompletionNotDispatched, TimeoutError):
+                except INFRASTRUCTURE_STOPS:
                     raise
                 except Exception as error:  # noqa: BLE001 - failed adaptation blocks future slots.
                     feedback_error = type(error).__name__
@@ -183,7 +201,7 @@ def evaluate_workflow(
         feedback_receipts = [row for row in settled if not isinstance(row, Exception)]
         failures = [row for row in settled if isinstance(row, Exception)]
         for failure in failures:
-            if isinstance(failure, (ProviderTransportError, CompletionNotDispatched, TimeoutError)):
+            if isinstance(failure, INFRASTRUCTURE_STOPS):
                 # Predictions and successful feedback are durable; no terminal report may
                 # hide an operational interruption from explicit in-place recovery.
                 raise failure

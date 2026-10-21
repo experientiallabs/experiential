@@ -11,14 +11,16 @@ from rich.text import Text
 from exp.cli.evaluation.fidelity import render_fidelity
 from exp.cli.evaluation.fidelity_turns import render_turns, turn_marks
 from exp.cli.shared.progress import progress_display
+from exp.common.models.client import RequestAdmissionRefused
+from exp.common.models.unknown_outcome import DispatchOutcomeUnknown
 from exp.common.progress import ProgressHook
 from exp.common.project import ProjectStore
 from exp.optimize.evaluation.fidelity.panel import execute_panel, require_resumable
 from exp.optimize.evaluation.fidelity.replay import ReplayAggregate, ReplayResult
 from exp.optimize.evaluation.fidelity.runner import PreparedFidelity
-from exp.runtime.models.providers.async_transport import ProviderDeadlineExceeded
-from exp.runtime.models.providers.transport import ProviderTransportError
 from exp.runtime.models.structured_completion import CompletionNotDispatched
+from exp.runtime.sessions.dispatch_ledger import DispatchCapExhaustedError
+from exp.simulation.evaluation.workflow import INFRASTRUCTURE_STOPS
 
 
 def run_panel(
@@ -30,14 +32,15 @@ def run_panel(
     guard: Callable[[PreparedFidelity], None] | None = None,
     resume: bool = False,
 ) -> None:
-    """Run a registered panel, explaining a provider failure.
+    """Run a registered panel, explaining an infrastructure stop.
 
     ``progress`` is the calling command's single progress line; without it, the panel owns a
     display with one row per trace.
 
     Raises:
         ValueError: A trace was interrupted and ``resume`` was not given; nothing is sent.
-        typer.Exit: A provider request failed; completed traces stay saved.
+        typer.Exit: The execution machinery stopped a trace (see ``INFRASTRUCTURE_STOPS``);
+            completed traces stay saved and the stopped one is never scored.
     """
     stopped = require_resumable(store, registrations, resume=resume)
     if stopped:
@@ -51,13 +54,31 @@ def run_panel(
     try:
         with nullcontext(progress) if progress is not None else progress_display(console) as hook:
             execute_panel(store, registrations, progress=hook, guard=guard, resume=resume)
-    except (ProviderTransportError, ProviderDeadlineExceeded, CompletionNotDispatched) as exc:
-        console.print(f"[red]error[/red] a provider request failed: {exc}")
+    except INFRASTRUCTURE_STOPS as exc:
+        console.print(f"[red]error[/red] {stop_reason(exc)}")
         console.print(
             "Completed traces are saved. The stopped trace is never bought again silently: "
             "run the same command with --retry-incomplete to resume it."
         )
         raise typer.Exit(code=1) from exc
+
+
+def stop_reason(error: BaseException) -> str:
+    """What stopped a replay or learning run, for its error line.
+
+    Args:
+        error: One of ``INFRASTRUCTURE_STOPS``.
+
+    Returns:
+        A plain reason naming the failed part of the execution machinery.
+    """
+    if isinstance(error, DispatchCapExhaustedError):
+        return f"the run spent its physical-attempt ceiling: {error}"
+    if isinstance(error, DispatchOutcomeUnknown):
+        return f"a provider request has an unknown outcome: {error}"
+    if isinstance(error, (CompletionNotDispatched, RequestAdmissionRefused)):
+        return f"a provider request was refused before dispatch: {error}"
+    return f"a provider request failed: {error}"
 
 
 def aggregate_line(total: ReplayAggregate, planned: int, title: str = "Held-out fidelity") -> str:

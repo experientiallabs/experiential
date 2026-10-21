@@ -34,6 +34,7 @@ from typing import Literal
 from filelock import FileLock
 
 from exp.common.core.artifacts import stable_id
+from exp.common.models.client import RequestAdmissionRefused
 from exp.common.project import ProjectStore
 from exp.optimize.evaluation.audit.exposure import (
     HeldOutExposure,
@@ -82,8 +83,12 @@ SELECTION_ROUNDS = 5  # concurrent audits that keep taking the chosen content
 ReservationState = Literal["active", "dispatched", "released"]
 
 
-class ReservationInactiveError(RuntimeError):
-    """Dispatch was refused: the lease is not held or the reservation is not active."""
+class ReservationInactiveError(RequestAdmissionRefused):
+    """Dispatch was refused: the lease is not held or the reservation is not active.
+
+    A local stop before dispatch, so it bypasses step-failure handling: the trace stops
+    unscored instead of counting its remaining turns as misses.
+    """
 
 
 class HeldOutAudit:

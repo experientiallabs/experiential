@@ -384,6 +384,7 @@ uv run pytest -q
     | Atomic file writes | `exp/common/core/files.py` | `write_text_atomic` |
     | Model choice | `exp/common/models/catalog_roles.py` | Catalog roles, not new flags |
     | Provider calls and retries | `exp/runtime/models/registry.py`, `exp/runtime/models/providers/transport.py` | `RuntimeModelCatalog`, `RetryPolicy` |
+    | Infrastructure failures in scored workflows | `exp/simulation/evaluation/workflow.py` | `INFRASTRUCTURE_STOPS` are raised, never scored; the run stays incomplete and resumes in place |
     | Producer revision | `exp/common/release_revision.py` | `installed_release_revision` |
 
     Keep this table current. A change that introduces an owner for a new concern adds its row in
