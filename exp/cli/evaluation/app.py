@@ -58,7 +58,12 @@ VERBOSE_OPTION = typer.Option(
 
 
 CONTINUATIONS_OPTION = typer.Option(
-    None, "--continuations", help="Run frozen continuations or export witnessed SFT targets."
+    None,
+    "--continuations",
+    help="Run one ContinuationCommand JSON spec: continuation studies, witnessed SFT export, "
+    "saved-evidence analysis, environment comparison, task-factory authoring, or executable "
+    "tasks (action harbor: propose-worlds, construct-assets, register, qualify, "
+    "prepare-training, export or serve).",
 )
 PIPELINE_OPTION = typer.Option(
     None, "--pipeline", help="Qualify and deliver a frozen multi-family task-factory manifest."
