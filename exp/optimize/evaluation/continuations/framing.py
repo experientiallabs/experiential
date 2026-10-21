@@ -6,7 +6,7 @@ awareness, certify containment, establish cue equivalence, or admit their own tr
 
 from datetime import UTC, datetime
 
-from filelock import FileLock
+from filelock import FileLock, Timeout
 from pydantic import Field, model_validator
 
 from exp.common.core.artifacts import (
@@ -27,6 +27,10 @@ from exp.optimize.evaluation.continuations.job import (
     saved_continuation_job,
 )
 from exp.optimize.evaluation.continuations.study import ContinuationStudy
+from exp.optimize.evaluation.executable.deferral import (
+    deferred_execution,
+    record_execution_deferral,
+)
 from exp.simulation.continuations import (
     load_continuation_checkpoint,
     persist_continuation_checkpoint,
@@ -190,7 +194,11 @@ def saved_framing_study(
         )
         if cell.job != spec.base.model_copy(update={"study": expected_study}):
             raise ValueError("framing cell changed its frozen job")
-        cell_inputs = {registration, cell.job.study.checkpoint}
+        cell_inputs = {
+            registration,
+            cell.job.study.checkpoint,
+            *deferred_execution(store, cell_manifest.artifact_id),
+        }
         if cell.result is not None:
             if (
                 cell.failure is not None
@@ -303,36 +311,43 @@ def run_framing_study(
                 recovered = saved_continuation_job(project, cell.job, code_revision=code_revision)
                 if recovered is not None:
                     cell = cell.model_copy(update={"result": recovered})
-                elif store.exists(key + "-intent"):
+                elif store.exists(key + "-intent") and not deferred_execution(store, key):
                     cell = cell.model_copy(update={"failure": "UnfinishedDispatchIntent"})
                 else:
-                    store.write_json(
-                        artifact_id=key + "-intent",
-                        artifact_type="framing-intent",
-                        envelope=cell_envelope,
-                        files={"job.json": cell.job},
-                    )
+                    if not store.exists(key + "-intent"):
+                        store.write_json(
+                            artifact_id=key + "-intent",
+                            artifact_type="framing-intent",
+                            envelope=cell_envelope,
+                            files={"job.json": cell.job},
+                        )
                     try:
                         result = execute_continuation_job(
                             project, cell.job, code_revision=code_revision
                         )
                         cell = cell.model_copy(update={"result": result})
+                    except Timeout:
+                        record_execution_deferral(store, key)
+                        raise
                     except (ValueError, OSError, RuntimeError) as exc:
                         cell = cell.model_copy(update={"failure": type(exc).__name__})
+                extra = deferred_execution(store, key)
                 if cell.result is not None:
-                    result_ref = continuation_result_reference(
-                        project, cell.job, code_revision=code_revision
+                    extra += (
+                        continuation_result_reference(
+                            project, cell.job, code_revision=code_revision
+                        ),
                     )
-                    cell_envelope = cell_envelope.model_copy(
-                        update={
-                            "inputs": tuple(
-                                sorted(
-                                    (*cell_envelope.inputs, result_ref),
-                                    key=lambda ref: ref.artifact_id,
-                                )
+                cell_envelope = cell_envelope.model_copy(
+                    update={
+                        "inputs": tuple(
+                            sorted(
+                                (*cell_envelope.inputs, *extra),
+                                key=lambda ref: ref.artifact_id,
                             )
-                        }
-                    )
+                        )
+                    }
+                )
                 store.write_json(
                     artifact_id=key,
                     artifact_type="framing-cell",
