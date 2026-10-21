@@ -14,6 +14,7 @@ from exp.common.core.artifacts import (
     sha256_json,
     stable_id,
 )
+from exp.common.evaluations.uncertainty import missing_outcome_bounds
 from exp.common.project import ProjectStore, artifact_input
 from exp.optimize.evaluation.continuations.critic import (
     CriticSpec,
@@ -173,9 +174,7 @@ def _metrics(project: ProjectStore, cells: tuple[ExperimentCell, ...]) -> JsonOb
             "successes": passed,
             "assessable": known,
             "unknown": planned - known,
-            "success_bounds": None
-            if not planned
-            else [passed / planned, (passed + planned - known) / planned],
+            "success_bounds": missing_outcome_bounds(passed, planned - known, planned),
             "checkpoints_with_both_success_and_failure": mixed,
             "critic_assessable_checkpoints": len(briers),
             "critic_failures": sum(critic_failures.values()),

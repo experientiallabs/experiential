@@ -14,6 +14,7 @@ from exp.common.core.artifacts import (
     sha256_json,
     stable_id,
 )
+from exp.common.evaluations.uncertainty import missing_outcome_bounds
 from exp.common.models import ToolCall
 from exp.common.project import ProjectStore, artifact_input
 from exp.optimize.evaluation.continuations.intervention import (
@@ -214,7 +215,10 @@ def _metrics(cells: tuple[ContrastCell, ...]) -> JsonObject:
             if cell.assessment is not None and cell.assessment.status != "unassessable"
         ]
         total, known, passed = len(group), len(labels), sum(labels)
-        bounds[arm] = (passed / total, (passed + total - known) / total)
+        arm_bounds = missing_outcome_bounds(passed, total - known, total)
+        if arm_bounds is None:
+            raise ValueError("action contrast metrics need every planned cell of both arms")
+        bounds[arm] = (arm_bounds[0], arm_bounds[1])
         result[arm] = {
             "planned": total,
             "assessable": known,

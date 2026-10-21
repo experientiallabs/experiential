@@ -14,6 +14,7 @@ from exp.common.core.artifacts import (
     sha256_json,
     stable_id,
 )
+from exp.common.evaluations.uncertainty import missing_outcome_bounds
 from exp.common.project import ProjectStore, artifact_input
 from exp.optimize.evaluation.continuations.action_contrast import grade_intervention_outcome
 from exp.optimize.evaluation.continuations.intervention import (
@@ -111,12 +112,15 @@ class ObservationContrast(ContractModel):
                 if row.assessment is not None and row.assessment.status != "unassessable"
             ]
             unknown = len(rows) - len(known)
+            bounds = missing_outcome_bounds(sum(known), unknown, len(rows))
+            if bounds is None:
+                raise ValueError("observation contrast metrics need every planned cell")
             result[arm] = {
                 "planned": len(rows),
                 "assessable": len(known),
                 "successes": sum(known),
                 "unknown": unknown,
-                "success_bounds": [sum(known) / len(rows), (sum(known) + unknown) / len(rows)],
+                "success_bounds": bounds,
             }
         pairs = []
         for pair in range(self.spec.pairs):

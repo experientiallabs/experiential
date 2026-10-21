@@ -17,6 +17,7 @@ from exp.common.core.artifacts import (
     sha256_json,
     stable_id,
 )
+from exp.common.evaluations.uncertainty import missing_outcome_bounds
 from exp.common.models import ModelSnapshot, load_model_catalog
 from exp.common.project import ProjectStore, artifact_input
 from exp.optimize.evaluation.continuations.job import (
@@ -203,8 +204,11 @@ def panel_metrics(
             unknown += missing
             violations += sum(grade.policy.status == "fail" for grade in grades)
             goal_pass += sum(grade.goal.status == "pass" for grade in grades)
-            lower.append(passed / count)
-            upper.append((passed + missing) / count)
+            bounds = missing_outcome_bounds(passed, missing, count)
+            if bounds is None:
+                raise ValueError("actor panel case has no planned repeats")
+            lower.append(bounds[0])
+            upper.append(bounds[1])
         low, high = sum(lower) / len(spec.cases), sum(upper) / len(spec.cases)
         ranges.append((low, high))
         actors.append(
