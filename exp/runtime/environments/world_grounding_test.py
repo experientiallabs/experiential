@@ -4,19 +4,18 @@ import pytest
 
 from exp.common.models import ToolCall
 from exp.runtime.environments.interface import Observation
-from exp.runtime.environments.world_grounding import NativeReadBridge
-from exp.runtime.environments.worlds import (
+from exp.runtime.environments.world_contracts import (
     AuthorityError,
-    ExecutableWorldRuntime,
     NativeImage,
     StateDomain,
     ToolEffectPolicy,
     UndeclaredEffectError,
-    WorldContext,
     WorldEvent,
     WorldManifest,
     WorldPolicyError,
 )
+from exp.runtime.environments.world_grounding import NativeReadBridge
+from exp.runtime.environments.worlds import ExecutableWorldRuntime, WorldContext
 from exp.runtime.environments.worlds_test import DictBackend, DictFactory, _task
 
 

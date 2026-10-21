@@ -90,13 +90,13 @@ def simulated_workbook(project: ProjectStore, configuration: JsonObject) -> Cont
         OperationEconomics,
         ToolCall,
     )
-    from exp.runtime.environments.worlds import (
+    from exp.runtime.environments.world_contracts import (
         ExecutableCheckpoint,
-        ExecutableWorldRuntime,
         StateDomain,
         ToolEffectPolicy,
         WorldManifest,
     )
+    from exp.runtime.environments.worlds import ExecutableWorldRuntime
     from exp.simulation.world_model.executable import GroundedWorldFactory, PredictorEvent
     from exp.simulation.world_model.grounded_session import GroundedTransitionEngine
     from exp.simulation.world_model.runtime_test import _runtime
@@ -226,7 +226,7 @@ def test_native_reference_and_grounded_candidate_use_actual_world_owners(
         cell = next(row for row in result.cells if row.condition == "candidate")
         assert cell.result is not None
         from exp.optimize.evaluation.continuations.records import load_study
-        from exp.runtime.environments.worlds import ExecutableCheckpoint
+        from exp.runtime.environments.world_contracts import ExecutableCheckpoint
 
         study = load_study(project.artifacts, cell.result)
         end = load_continuation_checkpoint(project.artifacts, study.branches[0].checkpoints[-1])

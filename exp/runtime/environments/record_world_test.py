@@ -10,7 +10,8 @@ from exp.common.core.artifacts import JsonObject, JsonValue
 from exp.common.models import ToolCall
 from exp.common.tasks import TaskCase
 from exp.runtime.environments.record_world import RecordTool, RecordToolError, RecordWorldFactory
-from exp.runtime.environments.worlds import WorldAccess, WorldContext
+from exp.runtime.environments.world_contracts import WorldAccess
+from exp.runtime.environments.worlds import WorldContext
 
 SCHEMA = """
 CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT NOT NULL, payload BLOB);
@@ -134,12 +135,12 @@ def schedule_then_reject(
 
 def test_business_rejection_discards_scheduled_events_and_random_draws() -> None:
     """Rolling back a DB transaction must also discard that call's kernel-side effects."""
-    from exp.runtime.environments.worlds import (
-        ExecutableWorldRuntime,
+    from exp.runtime.environments.world_contracts import (
         StateDomain,
         ToolEffectPolicy,
         WorldManifest,
     )
+    from exp.runtime.environments.worlds import ExecutableWorldRuntime
 
     runtime = ExecutableWorldRuntime(
         WorldManifest(

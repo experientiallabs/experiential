@@ -24,8 +24,8 @@ from exp.optimize.evaluation.fidelity.runner_test import source_project
 from exp.runtime.environments.mixed import MixedCheckpoint, ToolRoute
 from exp.runtime.environments.tests.world_conformance_test import workbook_case
 from exp.runtime.environments.world_artifacts import persist_world_image
+from exp.runtime.environments.world_contracts import StateDomain, ToolEffectPolicy, WorldManifest
 from exp.runtime.environments.world_grounding import NativeReadBridge
-from exp.runtime.environments.worlds import StateDomain, ToolEffectPolicy, WorldManifest
 from exp.runtime.models.providers.transport import JsonHttpResponse, ScriptedJsonTransport
 from exp.simulation.continuations import load_continuation_checkpoint
 
@@ -88,7 +88,8 @@ from exp.optimize.evaluation.continuations.study_test import probe
 from exp.runtime.environments.artifact_world import ArtifactWorldFactory
 from exp.runtime.environments.workbook_edits import WorkbookEditAdapter
 from exp.runtime.environments.world_artifacts import load_world_image
-from exp.runtime.environments.worlds import ExecutableWorldRuntime, WorldManifest
+from exp.runtime.environments.world_contracts import WorldManifest
+from exp.runtime.environments.worlds import ExecutableWorldRuntime
 
 def continuation_runtime(project, configuration):
     reference = ArtifactInput.model_validate(configuration["image"])

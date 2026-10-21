@@ -11,8 +11,8 @@ from exp.common.models import ToolCall
 from exp.runtime.environments.interface import Observation
 from exp.runtime.environments.workbook_contracts import simulated_workbook_manifest
 from exp.runtime.environments.workbook_edits import WorkbookEditAdapter, workbook_projection
+from exp.runtime.environments.world_contracts import StateDomain, ToolEffectPolicy, WorldManifest
 from exp.runtime.environments.world_responses import validate_reply_state, validate_state_projection
-from exp.runtime.environments.worlds import StateDomain, ToolEffectPolicy, WorldManifest
 
 
 def test_semantic_manifest_refuses_string_header_with_numeric_type() -> None:

@@ -26,7 +26,7 @@ from exp.common.core.artifacts import (
 )
 from exp.common.models import ToolCall
 from exp.runtime.environments.artifact_edits import MAX_ARTIFACT_BYTES, NativeArtifactOutput
-from exp.runtime.environments.worlds import WorldAccess
+from exp.runtime.environments.world_contracts import WorldAccess
 
 # Identity of the code that decides this artifact's behavior, in place of its source text.
 # Bump it when behavior changes. exp/tests/code_protocols_test.py fails when the covered

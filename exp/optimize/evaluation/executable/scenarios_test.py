@@ -19,7 +19,7 @@ from exp.optimize.evaluation.executable.scenarios import (
     prepare_record_scenario,
     prepare_record_witness,
 )
-from exp.runtime.environments.worlds import ExecutableCheckpoint
+from exp.runtime.environments.world_contracts import ExecutableCheckpoint
 from exp.simulation.continuations import load_continuation_checkpoint
 from exp.simulation.evaluation.admission import (
     EvaluationSpecification,
@@ -33,7 +33,8 @@ RUNTIME = '''"""Explicit test-only native factory; no credentials or model clien
 from functools import partial
 from exp.optimize.evaluation.continuations.job import ContinuationRuntime
 from exp.runtime.environments.record_world import RecordWorldFactory, RecordTool
-from exp.runtime.environments.worlds import ExecutableWorldRuntime, ToolEffectPolicy
+from exp.runtime.environments.world_contracts import ToolEffectPolicy
+from exp.runtime.environments.worlds import ExecutableWorldRuntime
 from exp.simulation.evaluation.record_execution import record_state
 from exp.simulation.evaluation.record_execution_test import fixture, SCHEMA, access, change
 

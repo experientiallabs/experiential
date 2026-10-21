@@ -9,7 +9,7 @@ from exp.runtime.environments.tests.world_conformance_test import (
     ticket_case,
     workbook_case,
 )
-from exp.runtime.environments.worlds import UndeclaredEffectError, WorldEvent
+from exp.runtime.environments.world_contracts import UndeclaredEffectError, WorldEvent
 from exp.runtime.environments.worlds_test import _call, _runtime, _task
 
 

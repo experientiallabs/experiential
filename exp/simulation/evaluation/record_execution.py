@@ -27,7 +27,8 @@ from exp.common.tasks import TaskCase
 from exp.runtime.environments.interface import Observation
 from exp.runtime.environments.record_world import RecordWorldFactory
 from exp.runtime.environments.world_artifacts import load_world_image, persist_world_image
-from exp.runtime.environments.worlds import ExecutableCheckpoint, ExecutableWorldRuntime
+from exp.runtime.environments.world_contracts import ExecutableCheckpoint
+from exp.runtime.environments.worlds import ExecutableWorldRuntime
 from exp.simulation.development_scope import require_development_task
 
 RECORD_RECEIPT_TYPE = "native-record-execution"

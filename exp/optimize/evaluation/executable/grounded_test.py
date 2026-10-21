@@ -15,7 +15,7 @@ from exp.optimize.evaluation.executable.grounded import (
     continuation_runtime,
 )
 from exp.optimize.evaluation.fidelity.runner_test import source_project
-from exp.runtime.environments.worlds import StateDomain, ToolEffectPolicy, WorldManifest
+from exp.runtime.environments.world_contracts import StateDomain, ToolEffectPolicy, WorldManifest
 from exp.runtime.models.providers.transport import JsonHttpResponse, ScriptedJsonTransport
 from exp.runtime.sessions.dispatch_ledger import DispatchCapExhaustedError
 from exp.simulation.world_model.prediction_reading import PredictionReading

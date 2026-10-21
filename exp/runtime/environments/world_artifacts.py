@@ -15,7 +15,7 @@ from exp.common.core.artifacts import (
 )
 from exp.common.project import ArtifactStore, artifact_input
 from exp.runtime.environments.mixed import MixedCheckpoint
-from exp.runtime.environments.worlds import ExecutableCheckpoint
+from exp.runtime.environments.world_contracts import ExecutableCheckpoint
 
 WorldCheckpoint = ExecutableCheckpoint | MixedCheckpoint
 

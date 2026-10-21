@@ -11,7 +11,7 @@ from exp.common.project import ArtifactStore, ProjectPaths
 from exp.common.project.errors import ArtifactStoreError
 from exp.runtime.environments.tests.world_conformance_test import workbook_case
 from exp.runtime.environments.world_artifacts import load_world_image, persist_world_image
-from exp.runtime.environments.worlds import NativeImage
+from exp.runtime.environments.world_contracts import NativeImage
 
 
 def test_binary_snapshot_does_not_scan_base64_as_text_but_preserves_actual_secret_checks(

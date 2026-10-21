@@ -10,7 +10,8 @@ from exp.common.models import ToolCall
 from exp.common.tasks import TaskCase
 from exp.runtime.environments.artifact_world import ArtifactWorldFactory
 from exp.runtime.environments.workbook_edits import WorkbookEditAdapter
-from exp.runtime.environments.worlds import NativeImage, WorldContext
+from exp.runtime.environments.world_contracts import NativeImage
+from exp.runtime.environments.worlds import WorldContext
 
 
 def _workbook() -> bytes:

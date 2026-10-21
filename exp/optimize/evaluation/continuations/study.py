@@ -34,15 +34,13 @@ from exp.runtime.agents.chat import ChatAgentRuntime, ChatCheckpoint, InvisibleT
 from exp.runtime.environments.interface import EnvironmentSession, Observation
 from exp.runtime.environments.mixed import MixedCheckpoint, MixedRealityEnvironmentRuntime
 from exp.runtime.environments.world_artifacts import persist_world_image
+from exp.runtime.environments.world_contracts import ExecutableCheckpoint
 from exp.runtime.environments.world_outcomes import (
     execute_with_recovery,
     execution_receipt,
     known_failed_effects,
 )
-from exp.runtime.environments.worlds import (
-    ExecutableCheckpoint,
-    ExecutableWorldRuntime,
-)
+from exp.runtime.environments.worlds import ExecutableWorldRuntime
 from exp.runtime.models.call_evidence import call_consumer, canonical_call
 from exp.simulation.continuations import (
     ContinuationCheckpoint,

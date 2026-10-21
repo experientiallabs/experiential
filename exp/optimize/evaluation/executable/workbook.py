@@ -29,12 +29,8 @@ from exp.runtime.environments.workbook_edits import (
     read_supported_workbook,
     workbook_projection,
 )
-from exp.runtime.environments.worlds import (
-    ExecutableCheckpoint,
-    ExecutableWorldRuntime,
-    WorldEvent,
-    WorldManifest,
-)
+from exp.runtime.environments.world_contracts import ExecutableCheckpoint, WorldEvent, WorldManifest
+from exp.runtime.environments.worlds import ExecutableWorldRuntime
 from exp.simulation.continuations import WorldCheckpoint
 from exp.simulation.world_construction import load_construction
 

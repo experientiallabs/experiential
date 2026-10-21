@@ -280,7 +280,7 @@ def workbook_search_fixture(
         WorkbookReadArguments,
         workbook_projection,
     )
-    from exp.runtime.environments.worlds import ToolEffectPolicy
+    from exp.runtime.environments.world_contracts import ToolEffectPolicy
     from exp.simulation.evaluation.table_relations import TableRelation
     from exp.simulation.evaluation.tasks import TaskVerifier
     from exp.simulation.world_construction import (

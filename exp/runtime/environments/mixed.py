@@ -35,6 +35,11 @@ from exp.common.core.artifacts import (
 from exp.common.models import NumericMeasurement, OperationEconomics, ToolCall, combine_economics
 from exp.common.tasks import TaskCase
 from exp.runtime.environments.interface import EnvironmentRuntime, EnvironmentSession, Observation
+from exp.runtime.environments.world_contracts import (
+    ExecutableCheckpoint,
+    RestoreError,
+    WorldManifest,
+)
 from exp.runtime.environments.world_grounding import NativeReadReceipt
 from exp.runtime.environments.world_outcomes import (
     ExecutionEvidence,
@@ -43,12 +48,9 @@ from exp.runtime.environments.world_outcomes import (
 )
 from exp.runtime.environments.worlds import (
     CheckpointableSession,
-    ExecutableCheckpoint,
     ExecutableWorld,
     ExecutableWorldRuntime,
     RestorableEnvironmentRuntime,
-    RestoreError,
-    WorldManifest,
 )
 
 ComparisonScope = Literal[

@@ -18,12 +18,8 @@ from exp.optimize.evaluation.executable.workbook import (
     continuation_runtime,
 )
 from exp.runtime.environments.workbook_edits import WorkbookEditAdapter
-from exp.runtime.environments.worlds import (
-    ExecutableWorldRuntime,
-    StateDomain,
-    ToolEffectPolicy,
-    WorldManifest,
-)
+from exp.runtime.environments.world_contracts import StateDomain, ToolEffectPolicy, WorldManifest
+from exp.runtime.environments.worlds import ExecutableWorldRuntime
 from exp.simulation.evaluation.tasks import OutcomeRule, TaskVerifier, grade
 
 
@@ -93,7 +89,7 @@ def workbook_definition(tmp_path: Path) -> tuple[ProjectStore, WorkbookRuntimeDe
 
 def test_constructed_assets_enter_existing_runtime_and_restore(tmp_path: Path) -> None:
     """Construction outputs feed the maintained state machine without a special adapter."""
-    from exp.runtime.environments.worlds import ExecutableCheckpoint
+    from exp.runtime.environments.world_contracts import ExecutableCheckpoint
     from exp.simulation.world_construction import (
         ConstructionSpec,
         SequenceColumn,

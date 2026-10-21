@@ -23,7 +23,7 @@ from exp.common.project import ArtifactStore, ProjectStore, artifact_input
 from exp.optimize.evaluation.continuations.job import ContinuationJob, preflight_continuation_job
 from exp.runtime.agents.chat import ChatAgentRuntime
 from exp.runtime.environments.mixed import MixedCheckpoint
-from exp.runtime.environments.worlds import ExecutableCheckpoint
+from exp.runtime.environments.world_contracts import ExecutableCheckpoint
 from exp.simulation.continuations import load_continuation_checkpoint
 from exp.simulation.development_scope import require_development_task
 

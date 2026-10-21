@@ -5,8 +5,8 @@ import pytest
 from exp.common.core.artifacts import JsonObject
 from exp.common.models import ToolCall
 from exp.runtime.environments.interface import Observation
+from exp.runtime.environments.world_contracts import ToolEffectPolicy
 from exp.runtime.environments.world_responses import validate_reply
-from exp.runtime.environments.worlds import ToolEffectPolicy
 
 
 def test_argument_bound_reply_checks_exact_slice_and_refuses_clamping() -> None:

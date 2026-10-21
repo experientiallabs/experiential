@@ -23,7 +23,8 @@ from exp.common.models import ToolCall
 from exp.common.tasks import TaskCase
 from exp.runtime.environments.artifact_edits import ArtifactEditAdapter
 from exp.runtime.environments.interface import Observation
-from exp.runtime.environments.worlds import NativeImage, WorldAccess, WorldContext
+from exp.runtime.environments.world_contracts import NativeImage, WorldAccess
+from exp.runtime.environments.worlds import WorldContext
 
 # Identity of the code that decides this artifact's behavior, in place of its source text.
 # Bump it when behavior changes. exp/tests/code_protocols_test.py fails when the covered

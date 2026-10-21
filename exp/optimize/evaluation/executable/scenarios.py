@@ -26,7 +26,8 @@ from exp.optimize.evaluation.continuations.capture import CaptureDefinition, pre
 from exp.optimize.evaluation.continuations.job import load_runtime_definition
 from exp.runtime.agents.chat import ChatAgentRuntime
 from exp.runtime.environments.world_artifacts import load_world_image
-from exp.runtime.environments.worlds import ExecutableCheckpoint, ExecutableWorldRuntime
+from exp.runtime.environments.world_contracts import ExecutableCheckpoint
+from exp.runtime.environments.worlds import ExecutableWorldRuntime
 from exp.simulation.continuations import (
     ContinuationCheckpoint,
     load_continuation_checkpoint,

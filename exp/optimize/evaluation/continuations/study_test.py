@@ -17,7 +17,8 @@ from exp.runtime.agents.chat_test import _Model, _response
 from exp.runtime.environments.artifact_world import ArtifactWorldFactory
 from exp.runtime.environments.tests.world_conformance_test import workbook_case
 from exp.runtime.environments.workbook_edits import WorkbookEditAdapter, read_supported_workbook
-from exp.runtime.environments.worlds import ExecutableCheckpoint, ExecutableWorldRuntime
+from exp.runtime.environments.world_contracts import ExecutableCheckpoint
+from exp.runtime.environments.worlds import ExecutableWorldRuntime
 from exp.runtime.models.call_evidence import current_call_intent, current_consumer
 from exp.simulation.continuations import (
     ContinuationCheckpoint,
