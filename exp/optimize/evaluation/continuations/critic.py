@@ -302,17 +302,6 @@ def predict_success(
         if not store.exists(response_id):
             if store.exists(intent_id):
                 raise ValueError("critic dispatch has an unknown outcome; no implicit redraw")
-            intent = store.write_json(
-                artifact_id=intent_id,
-                artifact_type="actor-critic-intent",
-                envelope=ArtifactEnvelope(
-                    schema_version=1,
-                    created_at=datetime.now(UTC),
-                    code_revision=code_revision,
-                    inputs=(spec.checkpoint,),
-                ),
-                files={"request.json": request, "spec.json": spec},
-            )
             transport = AdmittedJsonTransport(
                 HttpxJsonTransport(),
                 artifacts=store,
@@ -325,7 +314,21 @@ def predict_success(
                 ),
             )
             registry = RuntimeModelCatalog(catalog, transport_factory=lambda: transport)
-            response = registry.resolve(spec.critic_alias).client.complete(request)
+            # Resolve credentials before the intent: a refusal here dispatched nothing, so it
+            # must stay retryable rather than become an unknown-outcome draw.
+            client = registry.resolve(spec.critic_alias).client
+            intent = store.write_json(
+                artifact_id=intent_id,
+                artifact_type="actor-critic-intent",
+                envelope=ArtifactEnvelope(
+                    schema_version=1,
+                    created_at=datetime.now(UTC),
+                    code_revision=code_revision,
+                    inputs=(spec.checkpoint,),
+                ),
+                files={"request.json": request, "spec.json": spec},
+            )
+            response = client.complete(request)
             store.write_json(
                 artifact_id=response_id,
                 artifact_type="actor-critic-response",
