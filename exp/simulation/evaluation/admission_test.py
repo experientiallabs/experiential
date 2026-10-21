@@ -278,7 +278,7 @@ def test_generated_provenance_anywhere_in_the_chain_is_self_approval(
     store = ProjectStore(tmp_path, "admission")
     source = saved(store, "proposal", source_type)
     for index in range(depth - 1):
-        source = saved(store, f"derived-{index}", "curated-notes", (source,))
+        source = saved(store, f"derived-{index}", "authored-requirement", (source,))
     label = witnessed(store, specification(store, sources=(source,)), "done")
     refusal = verify_label_witness(store.artifacts, label, label="pass", compared=())
     assert refusal is not None
@@ -287,6 +287,20 @@ def test_generated_provenance_anywhere_in_the_chain_is_self_approval(
     recorded = saved(store, "recorded", "trace-dataset")
     clean = witnessed(store, specification(store, sources=(recorded,)), "done")
     assert verify_label_witness(store.artifacts, clean, label="pass", compared=()) is None
+
+
+@pytest.mark.parametrize("depth", [1, 3])
+def test_unclassified_provenance_type_is_refused(tmp_path: Path, depth: int) -> None:
+    """A type nobody classified as recorded evidence fails closed, at any depth."""
+    store = ProjectStore(tmp_path, "admission")
+    source = saved(store, "unclassified", "newly-generated-proposal")
+    for index in range(depth - 1):
+        source = saved(store, f"derived-{index}", "authored-requirement", (source,))
+    label = witnessed(store, specification(store, sources=(source,)), "done")
+    refusal = verify_label_witness(store.artifacts, label, label="pass", compared=())
+    assert refusal is not None
+    assert refusal.reason == "self_approval"
+    assert "unclassified (newly-generated-proposal)" in refusal.detail
 
 
 def test_every_partition_verdict_and_axis_needs_enough_admitted_labels() -> None:

@@ -166,7 +166,7 @@ def load_capability_brief(store: ArtifactStore, reference: ArtifactInput) -> Cap
 
 
 def _require_recorded_observations(store: ArtifactStore, brief: CapabilityBrief) -> None:
-    """Refuse a recorded observation backed by simulated or generated output.
+    """Refuse a recorded observation backed by simulated, generated or unclassified output.
 
     Raises:
         ValueError: A ``recorded_observation`` source's provenance leaves recorded evidence.
