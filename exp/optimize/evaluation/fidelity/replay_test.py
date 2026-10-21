@@ -13,6 +13,7 @@ from exp.optimize.evaluation.fidelity.replay import (
     protocol_prompts_sha256,
     recorded_exchanges,
     replay_boundary,
+    reply_kind,
 )
 from exp.optimize.evaluation.fidelity.runner import FidelityMemory
 from exp.optimize.evaluation.fidelity.runner_test import source_project
@@ -144,3 +145,29 @@ def test_native_prompt_change_addresses_a_new_native_run_only(
     monkeypatch.setattr(trace_replay, "NATIVE_ARTIFACT_PLAN_GUIDANCE", "different behavior")
     assert content_run_id(native, "native", "t", code_revision="fixture") != before
     assert content_run_id(spec, "plain", "t", code_revision="fixture") == plain
+
+
+@pytest.mark.parametrize(
+    ("reply", "kind"),
+    [
+        ("", "trivial"),
+        (None, "trivial"),
+        ({}, "trivial"),
+        ("  ok\n", "trivial"),
+        ({"status": "cancelled"}, "trivial"),
+        (0, "trivial"),
+        ("x" * 59, "trivial"),
+        ("x" * 60, "text"),
+        ("The order was cancelled and a refund of $42.10 was issued to the card.", "text"),
+        (
+            {"order_id": "#W1001", "items": [{"name": "lamp", "price": 42.1}]},
+            "structured",
+        ),
+        (["a" * 30, "b" * 30], "structured"),
+    ],
+)
+def test_reply_kinds_separate_short_fixed_outputs_from_text_and_structured_replies(
+    reply: JsonValue, kind: str
+) -> None:
+    """Short or empty replies are trivial; longer strings are text; longer JSON is structured."""
+    assert reply_kind(reply) == kind

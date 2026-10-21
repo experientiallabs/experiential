@@ -33,6 +33,7 @@ import json
 import re
 from collections.abc import Sequence
 from datetime import datetime, timedelta
+from typing import Literal
 
 from filelock import FileLock, Timeout
 from pydantic import Field, JsonValue
@@ -52,6 +53,7 @@ from exp.common.evaluations.reconstruction import (
     default_judge,
     saved_turn_outcomes,
 )
+from exp.common.evaluations.uncertainty import unit_mean_summary
 from exp.common.models import ModelCapabilities, ReasoningEffort, ToolCall, load_model_catalog
 from exp.common.project import ProjectStore
 from exp.common.tasks import TaskCase
@@ -96,6 +98,9 @@ REQUEST_RESERVATION_USD = 1.0
 PREDICTION_TOKENS = 12_288
 INVESTIGATION_TOKENS = 4_096
 JUDGING_TOKENS = 32_768
+TRIVIAL_REPLY_CHARACTERS = 60  # shorter recorded replies are fixed outputs, not world modelling
+ReplyKind = Literal["trivial", "text", "structured"]
+REPLY_KINDS: tuple[ReplyKind, ...] = ("trivial", "text", "structured")
 
 
 class RecordedExchange(ContractModel):
@@ -135,14 +140,30 @@ class ReplayCase(ContractModel):
 PROPOSAL_REASKS = 2
 
 
+class ReplyKindCount(ContractModel):
+    """Exact replies among the measured turns whose recorded reply is of one kind.
+
+    Attributes:
+        kind: Recorded-reply kind, as :func:`reply_kind` classifies it.
+        exact: Turns of this kind reproduced exactly.
+        steps: Measured turns of this kind.
+    """
+
+    kind: ReplyKind
+    exact: int = Field(ge=0)
+    steps: int = Field(ge=0)
+
+
 class ReplayResult(ContractModel):
     """Measurements of one replayed trace, read from its saved report.
 
     Attributes:
         trace_id: Recorded trace.
+        lineage: Task lineage of the trace, the independent unit of panel uncertainty.
         run_id: Content-addressed fidelity run.
         steps: Planned measured turns.
         exact: Turns whose simulated reply equals the recorded reply exactly.
+        kinds: ``exact`` and ``steps`` split by recorded-reply kind, one row per kind.
         fields_matched: Recorded reply leaf fields reproduced, over every turn with a recorded
             reply; a turn the simulator never answered reproduces none of its fields.
         fields_total: Recorded reply leaf fields compared, over the same turns.
@@ -155,9 +176,11 @@ class ReplayResult(ContractModel):
     """
 
     trace_id: str
+    lineage: str
     run_id: str
     steps: int
     exact: int
+    kinds: tuple[ReplyKindCount, ...]
     fields_matched: int
     fields_total: int
     judge_scores: tuple[int, ...]
@@ -176,14 +199,20 @@ class ReplayAggregate(ContractModel):
 
     Attributes:
         traces: Completed traces.
-        exact: Exactly reproduced replies.
-        steps: Measured turns.
+        exact: Exactly reproduced replies, pooled over every turn of every trace.
+        steps: Measured turns, pooled the same way.
         fields_matched: Matching reply leaf fields.
         fields_total: Compared reply leaf fields.
         judge_mean: Mean assessed criterion score, or None when nothing was assessed.
         judge_turns: Turns with a per-turn response score and a recorded reply.
         judge_agreements: Of those, turns where the judge's verdict (response score 4 or 5)
             agrees with exact reproduction; a calibration check on the judge, not a score.
+        kinds: Exact replies split by recorded-reply kind (see :func:`reply_kind`).
+        lineages: Independent task lineages behind the completed traces.
+        lineage_exact: Equal-weight mean over lineages of each lineage's mean per-trace
+            exact rate, or None without a completed trace.
+        lineage_interval: Two-sided 95 percent Wilson interval of ``lineage_exact`` at the
+            lineage count, from the uncertainty owner.
     """
 
     traces: int
@@ -194,6 +223,36 @@ class ReplayAggregate(ContractModel):
     judge_mean: float | None
     judge_turns: int = 0
     judge_agreements: int = 0
+    kinds: tuple[ReplyKindCount, ...] = ()
+    lineages: int = 0
+    lineage_exact: float | None = None
+    lineage_interval: tuple[float, float] | None = None
+
+
+def reply_kind(reply: JsonValue) -> ReplyKind:
+    """Classify one recorded reply for the exact-reply breakdown; the single owner of the rule.
+
+    A reply is ``trivial`` when it is empty or short: its text (the string itself, or compact
+    JSON for any other value), stripped of surrounding whitespace, has fewer than
+    ``TRIVIAL_REPLY_CHARACTERS`` (60) characters. An acknowledgement, a status word, a number
+    or an empty result is reproduced without modelling the environment, so pooling it with
+    real replies inflates the exact rate. Otherwise a string is ``text`` and any other value (a
+    JSON object or array, decoded from JSON text when recorded) is ``structured``.
+
+    Args:
+        reply: Recorded reply, decoded from JSON when it is JSON text.
+
+    Returns:
+        The reply's kind.
+    """
+    text = (
+        reply
+        if isinstance(reply, str)
+        else json.dumps(reply, ensure_ascii=False, separators=(",", ":"))
+    )
+    if len(text.strip()) < TRIVIAL_REPLY_CHARACTERS:
+        return "trivial"
+    return "text" if isinstance(reply, str) else "structured"
 
 
 def replay_boundary(trace: Trace, exchanges: int) -> int:
@@ -597,19 +656,31 @@ def replay_result(
         report: Its saved dual report.
 
     Returns:
-        Exact replies, reply-field agreement, and assessed judge scores.
+        Exact replies, overall and by recorded-reply kind, reply-field agreement, and assessed
+        judge scores.
     """
     rows = report.mechanical.get("steps")
-    exact = sum(
-        isinstance(row, dict) and row.get("trajectory_reply_exact") is True
+    reproduced = {
+        row.get("step")
         for row in (rows if isinstance(rows, list) else [])
-    )
+        if isinstance(row, dict) and row.get("trajectory_reply_exact") is True
+    }
+    kinds = [reply_kind(step.reply) for step in case.steps]
     turns = saved_turn_outcomes(project.artifacts, prepared.id + "-report", report) or ()
     return ReplayResult(
         trace_id=case.trace_id,
+        lineage=case.task.lineage_group_id,
         run_id=prepared.spec.run_id,
         steps=report.planned_steps,
-        exact=exact,
+        exact=len(reproduced),
+        kinds=tuple(
+            ReplyKindCount(
+                kind=kind,
+                exact=sum(step in reproduced for step, row in enumerate(kinds) if row == kind),
+                steps=kinds.count(kind),
+            )
+            for kind in REPLY_KINDS
+        ),
         fields_matched=sum(turn.fields_matched or 0 for turn in turns),
         fields_total=sum(turn.fields_total or 0 for turn in turns),
         turns=turns,
@@ -650,9 +721,19 @@ def aggregate(results: Sequence[ReplayResult]) -> ReplayAggregate:
         results: Completed traces.
 
     Returns:
-        Totals; the judge mean pools every assessed criterion score.
+        Pooled totals with their recorded-reply-kind split, and the per-lineage mean exact rate
+        with its interval at the lineage count; the judge mean pools every assessed criterion
+        score.
     """
     scores = [score for result in results for score in result.judge_scores]
+    by_lineage: dict[str, list[float]] = {}
+    rows = [row for result in results for row in result.kinds]
+    for result in results:
+        by_lineage.setdefault(result.lineage, []).append(
+            result.exact / result.steps if result.steps else 0.0
+        )
+    summary = unit_mean_summary(by_lineage)
+    estimate, interval = summary["estimate"], summary["wilson_95"]
     judged = [
         (score >= 4, turn.divergence == 0)
         for result in results
@@ -668,7 +749,27 @@ def aggregate(results: Sequence[ReplayResult]) -> ReplayAggregate:
         judge_mean=sum(scores) / len(scores) if scores else None,
         judge_turns=len(judged),
         judge_agreements=sum(verdict == exact for verdict, exact in judged),
+        kinds=tuple(
+            ReplyKindCount(
+                kind=kind,
+                exact=sum(row.exact for row in rows if row.kind == kind),
+                steps=sum(row.steps for row in rows if row.kind == kind),
+            )
+            for kind in REPLY_KINDS
+        ),
+        lineages=len(by_lineage),
+        lineage_exact=float(estimate) if isinstance(estimate, (int, float)) else None,
+        lineage_interval=_interval(interval),
     )
+
+
+def _interval(value: JsonValue) -> tuple[float, float] | None:
+    """The uncertainty owner's ``[low, high]`` interval as a pair, or None when absent."""
+    if isinstance(value, list) and len(value) == 2:
+        low, high = value
+        if isinstance(low, (int, float)) and isinstance(high, (int, float)):
+            return float(low), float(high)
+    return None
 
 
 def interrupted(project: ProjectStore, prepared: PreparedFidelity) -> bool:

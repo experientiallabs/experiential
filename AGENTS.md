@@ -378,6 +378,7 @@ uv run pytest -q
     | Trajectory-count selection and confirmation | `exp/optimize/evaluation/learning/sample_count.py` | Register the grid, order, metric and criterion first; select on development audits; confirm the frozen checkpoint only on an independent audit of untouched lineages |
     | Unknown recall recovery | `exp/optimize/evaluation/learning/profile.py` | Exact original intent plus an explicit single-attempt permit; preserve ambiguity and refuse a second unknown replacement |
     | Diagnostic source admission | `exp/optimize/evaluation/analysis/source_access.py` | Exact operator classifications over the complete dependency graph; unknown and protected sources refuse |
+    | Recorded-reply kinds in exact-reply breakdowns | `exp/optimize/evaluation/fidelity/replay.py` | `reply_kind`: trivial (empty or under 60 characters), text, structured |
     | Uncertainty over independent units | `exp/common/evaluations/uncertainty.py` | `wilson_interval` and summaries at the declared unit count (lineage, component or case); repeats of one unit are averaged first; unknown outcomes stay bounds, never intervals |
     | Saved-result identity | `exp/common/core/artifacts.py` | `stable_id` over content; never over paths or source files |
     | Local identifiers in paths | `exp/common/project/paths.py` | `validate_local_id` |

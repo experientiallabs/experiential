@@ -669,6 +669,12 @@ def test_source_rag_profile_measures_held_out_and_feeds_the_council_offline(
     total = aggregate(saved_held_out_results(store, panel))
     # Three traces, each replaying 3 calls after a 1-call public prefix; one tool is wrong.
     assert (total.exact, total.steps, total.judge_mean) == (6, 9, 4.0)
+    assert total.lineages == 3
+    assert total.lineage_exact == pytest.approx(2 / 3)
+    assert total.lineage_interval is not None
+    assert total.lineage_interval[0] < 2 / 3 < total.lineage_interval[1]
+    assert sum(row.steps for row in total.kinds) == 9
+    assert sum(row.exact for row in total.kinds) == 6
     # The fixture judge scores every turn 4, so it disagrees on the three wrong turns.
     assert (total.judge_agreements, total.judge_turns) == (6, 9)
     fidelity_requests = provider.requests[built:]

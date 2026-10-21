@@ -424,6 +424,7 @@ def test_the_cli_resumes_only_with_retry_incomplete_and_qualifies_its_headline(
     # stage, then the unaffected-only and affected-only scores with their denominators.
     assert "Held-out fidelity (independent, qualified: trace re-attempts) 9/9 replies" in output
     assert "· judge 4.0/5 · 3/3 traces" in output
+    assert "per-lineage mean exact 100% (95% interval" in output and "3 lineages" in output
     assert (
         "re-dispatched after an unknown outcome prediction 1 · judge 0 · investigation 0 · "
         "1 of 3 traces affected"

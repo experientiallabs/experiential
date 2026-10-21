@@ -10,6 +10,7 @@ from exp.cli.evaluation import replay_view
 from exp.common.models.client import RequestAdmissionRefused
 from exp.common.models.unknown_outcome import DispatchOutcomeUnknown
 from exp.common.project import ProjectStore
+from exp.optimize.evaluation.fidelity.replay import ReplayAggregate, ReplyKindCount
 from exp.runtime.models.providers.async_transport import ProviderDeadlineExceeded
 from exp.runtime.models.providers.transport import ProviderTransportError
 from exp.runtime.sessions.dispatch_ledger import DispatchCapExhaustedError
@@ -68,3 +69,31 @@ def test_every_infrastructure_stop_is_explained_and_never_scored(
         replay_view.run_panel(console, ProjectStore(tmp_path, "panel"), ())
     output = console.export_text()
     assert reason in output and "--retry-incomplete" in output
+
+
+def test_the_headline_states_lineage_uncertainty_and_reply_kinds() -> None:
+    """Pooled turns come with the per-lineage rate, its interval, and every denominator."""
+    total = ReplayAggregate(
+        traces=3,
+        exact=5,
+        steps=9,
+        fields_matched=20,
+        fields_total=30,
+        judge_mean=3.5,
+        kinds=(
+            ReplyKindCount(kind="trivial", exact=4, steps=4),
+            ReplyKindCount(kind="text", exact=0, steps=0),
+            ReplyKindCount(kind="structured", exact=1, steps=5),
+        ),
+        lineages=3,
+        lineage_exact=0.5,
+        lineage_interval=(0.1, 0.9),
+    )
+    line = " ".join(replay_view.aggregate_line(total, 4).split())
+    assert "5/9 replies exact (56%)" in line
+    assert "judge 3.5/5" in line
+    assert "3/4 traces" in line
+    assert "per-lineage mean exact 50% (95% interval 10% to 90%, 3 lineages)" in line
+    assert "exact by recorded reply: trivial 4/4 (100%) · structured 1/5 (20%)" in line
+    assert "text 0/0" not in line, "a kind with no turns is left out"
+    assert "under 60 characters" in line

@@ -16,7 +16,11 @@ from exp.common.models.unknown_outcome import DispatchOutcomeUnknown
 from exp.common.progress import ProgressHook
 from exp.common.project import ProjectStore
 from exp.optimize.evaluation.fidelity.panel import execute_panel, require_resumable
-from exp.optimize.evaluation.fidelity.replay import ReplayAggregate, ReplayResult
+from exp.optimize.evaluation.fidelity.replay import (
+    TRIVIAL_REPLY_CHARACTERS,
+    ReplayAggregate,
+    ReplayResult,
+)
 from exp.optimize.evaluation.fidelity.runner import PreparedFidelity
 from exp.runtime.models.structured_completion import CompletionNotDispatched
 from exp.runtime.sessions.dispatch_ledger import DispatchCapExhaustedError
@@ -82,7 +86,10 @@ def stop_reason(error: BaseException) -> str:
 
 
 def aggregate_line(total: ReplayAggregate, planned: int, title: str = "Held-out fidelity") -> str:
-    """One line: replies exact, reply-field agreement, and the judge mean.
+    """The pooled headline, then the per-lineage rate and the recorded-reply-kind split.
+
+    The headline pools every turn of every trace; the per-lineage mean weighs each independent
+    lineage equally and carries its 95 percent interval at the lineage count.
 
     Args:
         total: Sums over completed traces.
@@ -99,6 +106,22 @@ def aggregate_line(total: ReplayAggregate, planned: int, title: str = "Held-out 
     )
     judge = "judge -" if total.judge_mean is None else f"judge {total.judge_mean:.1f}/5"
     line = f"{title}  {exact} · {fields} · {judge} · {total.traces}/{planned} traces"
+    if total.lineage_exact is not None and total.lineage_interval is not None:
+        low, high = total.lineage_interval
+        line += (
+            f"\n  per-lineage mean exact {total.lineage_exact:.0%} (95% interval {low:.0%} to "
+            f"{high:.0%}, {total.lineages} {'lineage' if total.lineages == 1 else 'lineages'})"
+        )
+    kinds = [row for row in total.kinds if row.steps]
+    if kinds:
+        line += (
+            "\n  exact by recorded reply: "
+            + " · ".join(
+                f"{row.kind} {row.exact}/{row.steps} ({share(row.exact, row.steps)})"
+                for row in kinds
+            )
+            + f" (trivial: empty or under {TRIVIAL_REPLY_CHARACTERS} characters)"
+        )
     if total.judge_turns:
         line += (
             f"\n  judge agrees with exact replies on {total.judge_agreements}/{total.judge_turns} "
