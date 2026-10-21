@@ -180,6 +180,7 @@ def test_build_learned_memory_uses_admitted_native_decisions_in_executable_world
     def post(
         url: str, *, headers: Mapping[str, str], payload: JsonObject, timeout_seconds: float
     ) -> JsonHttpResponse:
+        """Script decision answers and one read-more proposal; forward the rest to the fixture."""
         questions = payload.get("questions", {})
         if isinstance(questions, dict) and set(questions) == {"support", "contradiction"}:
             provider.requests.append(RecordedRequest(url, dict(headers), payload))
