@@ -29,10 +29,20 @@ from exp.optimize.evaluation.continuations.job import (
 )
 from exp.optimize.evaluation.continuations.records import load_study
 from exp.optimize.evaluation.continuations.study import ContinuationBranch
+from exp.optimize.evaluation.equivalence.calibration import (
+    CaseScope,
+    PolicyCalibration,
+    calibrate,
+)
+from exp.optimize.evaluation.equivalence.dimensions import world_identity
 from exp.optimize.evaluation.equivalence.evidence import (
     PairMeasurement,
     equivalence_metrics,
     measure_pair,
+)
+from exp.optimize.evaluation.equivalence.policy import (
+    load_admission_policy,
+    require_policy_precedes,
 )
 from exp.optimize.evaluation.equivalence.review import (
     ReviewModel,
@@ -119,6 +129,9 @@ class EquivalenceSpec(ContractModel):
             Each planned review receives an equal integer allowance; unused capacity is not
             transferred to earlier retries at the expense of later council requests.
         deadline: Review dispatch deadline; saved evidence remains readable afterwards.
+        policy: Registered admission policy, pinned before any execution, whose margins the
+            report evaluates per dimension with family-clustered intervals. None keeps the
+            report to measurements; it then calibrates no simulated trajectory.
     """
 
     cases: tuple[EquivalenceCase, ...] = Field(min_length=1, max_length=100)
@@ -126,6 +139,7 @@ class EquivalenceSpec(ContractModel):
     analysts: tuple[ReviewModel, ...] = Field(min_length=1, max_length=10)
     maximum_review_attempts: int = Field(ge=1, le=10000)
     deadline: AwareDatetime
+    policy: ArtifactInput | None = Field(default=None, exclude_if=lambda value: value is None)
 
     @model_validator(mode="after")
     def bounded(self) -> "EquivalenceSpec":
@@ -190,6 +204,8 @@ class EquivalenceReport(ContractModel):
         metrics: Mechanical agreement, unknown bounds and source-family inventory.
         analyses: Validated evidence-citing council proposals.
         analysis_failures: Explicit reviewer failures, retained without rerolling.
+        calibration: Per-dimension verdicts against the registered policy's margins, absent
+            without a policy.
         scope: Interpretation and qualification boundaries.
     """
 
@@ -199,6 +215,9 @@ class EquivalenceReport(ContractModel):
     metrics: JsonObject
     analyses: dict[str, TraceAnalysis]
     analysis_failures: dict[str, str]
+    calibration: PolicyCalibration | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
     scope: str = (
         "development paired execution against the selected reference; "
         "declared probes and verifier; "
@@ -260,6 +279,8 @@ def _validate_cases(project: ProjectStore, spec: EquivalenceSpec) -> None:
 def preflight_equivalence(project: ProjectStore, spec: EquivalenceSpec) -> None:
     """Verify the whole frozen schedule before any actor, simulator or reviewer call."""
     _validate_cases(project, spec)
+    if spec.policy is not None:
+        load_admission_policy(project.artifacts, spec.policy)
     for case in spec.cases:
         preflight_continuation_job(project, case.reference)
         preflight_continuation_job(project, case.candidate)
@@ -326,6 +347,7 @@ def _assemble(
     base_sources = tuple(sorted(sources, key=lambda ref: ref.artifact_id))
     measurements, paired = [], {}
     families = set()
+    scopes = []
 
     def review(
         reviewer: ReviewModel, body: JsonObject, key: str, consumer: Literal["analyst", "unknown"]
@@ -355,6 +377,17 @@ def _assemble(
             project.artifacts, case.reference.study.checkpoint
         )
         families.add(checkpoint.task.lineage_group_id)
+        candidate_point = load_continuation_checkpoint(
+            project.artifacts, case.candidate.study.checkpoint
+        )
+        scopes.append(
+            CaseScope(
+                case=index,
+                lineage=checkpoint.task.lineage_group_id,
+                world=sha256_json(world_identity(candidate_point)),
+                actor=sha256_json(case.candidate.study.actor_model),
+            )
+        )
         actor_id = sha256_json(
             {
                 "checkpoint": checkpoint.actor.model_dump(mode="json"),
@@ -513,12 +546,23 @@ def _assemble(
                 errors[label] = (
                     type(error).__name__ + ": " + redact_secret_text(str(error))[0][:2000]
                 )
+    calibration = (
+        None
+        if spec.policy is None
+        else calibrate(
+            spec.policy,
+            load_admission_policy(project.artifacts, spec.policy),
+            measurements,
+            scopes,
+        )
+    )
     return EquivalenceReport(
         spec=spec,
         cells=cells,
         measurements=tuple(measurements),
         analyses=analyses,
         analysis_failures=errors,
+        calibration=calibration,
         metrics={
             **equivalence_metrics(tuple(measurements)),
             "source_families": len(families),
@@ -543,12 +587,23 @@ def _registration(
         or EquivalenceSpec.model_validate_json(store.read_bytes(identity, "spec.json")) != spec
     ):
         raise ValueError("equivalence registration differs")
-    expected_roots = {
-        job.study.checkpoint for case in spec.cases for job in (case.reference, case.candidate)
-    }
+    expected_roots = _registration_inputs(spec)
     if set(registration.inputs) != expected_roots:
         raise ValueError("equivalence registration lost its paired checkpoints")
+    if spec.policy is not None:
+        load_admission_policy(store, spec.policy)
+        require_policy_precedes(store, spec.policy, identity, subject="comparison registration")
     return artifact_input(registration)
+
+
+def _registration_inputs(spec: EquivalenceSpec) -> set[ArtifactInput]:
+    """Return the paired checkpoints and any pinned admission policy a registration binds."""
+    roots = {
+        job.study.checkpoint for case in spec.cases for job in (case.reference, case.candidate)
+    }
+    if spec.policy is not None:
+        roots.add(spec.policy)
+    return roots
 
 
 def saved_equivalence(
@@ -604,6 +659,39 @@ def saved_equivalence(
     return rebuilt
 
 
+def load_equivalence_report(project: ProjectStore, reference: ArtifactInput) -> EquivalenceReport:
+    """Reconstruct a saved report from its executions and reviews without fresh inference.
+
+    Args:
+        project: Project holding the report.
+        reference: Exact report reference ``compare-environments`` printed.
+
+    Returns:
+        The report, rebuilt from saved evidence and checked against the saved bytes.
+
+    Raises:
+        ValueError: The reference is not a saved report, lost its identity, or no longer
+            reproduces from its saved evidence.
+    """
+    store = project.artifacts
+    manifest = store.read(reference.artifact_id).manifest
+    if (
+        artifact_input(manifest) != reference
+        or manifest.artifact_type != "actor-equivalence-report"
+    ):
+        raise ValueError("comparison reference differs from the saved paired report")
+    report = EquivalenceReport.model_validate_json(
+        store.read_bytes(reference.artifact_id, "report.json")
+    )
+    if reference.artifact_id != report.spec.identity(manifest.code_revision) + "-result":
+        raise ValueError("comparison report lost its frozen identity")
+    rebuilt = saved_equivalence(project, report.spec, code_revision=manifest.code_revision)
+    # Compare canonical bytes: a rebuilt judgment holds the judge's own axis subclass.
+    if rebuilt is None or sha256_json(rebuilt) != sha256_json(report):
+        raise ValueError("comparison report no longer reproduces from saved evidence")
+    return report
+
+
 def run_equivalence(
     project: ProjectStore,
     spec: EquivalenceSpec,
@@ -625,11 +713,7 @@ def run_equivalence(
                 "actor-equivalence-registration",
                 "spec.json",
                 spec,
-                {
-                    job.study.checkpoint
-                    for case in spec.cases
-                    for job in (case.reference, case.candidate)
-                },
+                _registration_inputs(spec),
                 code_revision,
             )
         registration = _registration(project, spec, code_revision)

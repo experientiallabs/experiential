@@ -1,7 +1,7 @@
 """Paired execution through real XLSX worlds, admitted HTTP and saved trace-council reviews."""
 
 import json
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -9,12 +9,13 @@ from filelock import Timeout
 
 from exp.common.core.artifacts import ArtifactInput, JsonObject, sha256_bytes, sha256_json
 from exp.common.models import load_model_catalog, write_model_catalog
-from exp.common.project import ProjectStore
+from exp.common.project import ProjectStore, artifact_input
 from exp.optimize.evaluation.continuations.job import ContinuationJob
 from exp.optimize.evaluation.continuations.job_test import job_fixture
 from exp.optimize.evaluation.continuations.study import ContinuationStudy
 from exp.optimize.evaluation.equivalence import runner as owner
 from exp.optimize.evaluation.equivalence.evidence import PairMeasurement
+from exp.optimize.evaluation.equivalence.policy_test import fixture_policy, registered_policy
 from exp.optimize.evaluation.equivalence.review import ReviewModel
 from exp.optimize.evaluation.equivalence.runner import (
     EquivalenceCase,
@@ -23,6 +24,7 @@ from exp.optimize.evaluation.equivalence.runner import (
     run_equivalence,
     saved_equivalence,
 )
+from exp.optimize.evaluation.equivalence.verdicts import policy_calibrations
 from exp.optimize.evaluation.executable.loader import ContinuationRuntime
 from exp.runtime.environments.tests.world_conformance_test import workbook_case
 from exp.runtime.models.providers.transport import JsonHttpResponse, ScriptedJsonTransport
@@ -643,3 +645,46 @@ def test_deferred_child_resumes_the_same_registered_cell(
     report = run_equivalence(project, spec, code_revision="test")
     assert report.cells[0].result is not None and report.cells[0].failure is None
     assert run_equivalence(project, spec, code_revision="test") == report
+
+
+def test_registered_policy_calibrates_the_report_over_task_families(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A pinned policy's margins are applied per dimension; one family stays underpowered."""
+    project, spec, _, _ = equivalence_fixture(tmp_path, monkeypatch)
+    policy = registered_policy(project.artifacts)
+    spec = spec.model_copy(update={"policy": policy})
+    result = run_equivalence(project, spec, code_revision="test")
+    assert result.calibration is not None and result.calibration.policy == policy
+    assert all(len(row.dimensions) == 6 for row in result.measurements)
+    lineage = load_continuation_checkpoint(
+        project.artifacts, spec.cases[0].reference.study.checkpoint
+    ).task.lineage_group_id
+    goal = result.calibration.dimension("goal_success")
+    assert goal.units == (f"family:{lineage}",)
+    assert goal.status == "unassessable" and "underpowered: 1" in goal.reason
+    assert result.calibration.dimension("recovery").inapplicable_pairs["candidate"] == 1
+    identity = spec.identity("test")
+    assert policy in project.artifacts.read(identity).manifest.inputs
+    assert saved_equivalence(project, spec, code_revision="test") == result
+    report = artifact_input(project.artifacts.read(identity + "-result").manifest)
+    (calibration,) = policy_calibrations(project, (report,), policy)
+    assert calibration.calibration == result.calibration
+    other = registered_policy(project.artifacts, fixture_policy(margin=0.4))
+    with pytest.raises(ValueError, match="was not registered under admission policy"):
+        policy_calibrations(project, (report,), other)
+
+
+def test_a_policy_registered_after_the_comparison_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A comparison cannot cite margins registered after its own registration."""
+    project, spec, actors, _ = equivalence_fixture(tmp_path, monkeypatch)
+    late = registered_policy(
+        project.artifacts,
+        fixture_policy(margin=0.5),
+        at=datetime.now(UTC) + timedelta(hours=1),
+    )
+    with pytest.raises(ValueError, match="registered after comparison registration"):
+        run_equivalence(project, spec.model_copy(update={"policy": late}), code_revision="test")
+    assert not actors.requests
