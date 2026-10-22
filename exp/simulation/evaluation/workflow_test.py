@@ -22,7 +22,11 @@ from exp.runtime.models.providers.async_transport import ProviderDeadlineExceede
 from exp.runtime.models.providers.transport import ProviderTransportError
 from exp.runtime.models.structured_completion import CompletionNotDispatched
 from exp.runtime.sessions.dispatch_ledger import DispatchCapExhaustedError
-from exp.simulation.evaluation.workflow import FixedWorkflow, evaluate_workflow
+from exp.simulation.evaluation.workflow import (
+    FixedWorkflow,
+    deterministic_refusal,
+    evaluate_workflow,
+)
 from exp.simulation.world_model.durable import DurableWorldModelSession
 
 NOW = datetime(2030, 1, 1, tzinfo=UTC)
@@ -125,3 +129,25 @@ def test_a_simulator_failure_scores_the_failed_step_and_blocks_the_rest(
     assert [row["status"] for row in rows if isinstance(row, dict)] == ["failure", "blocked"]
     assert [turn.fields_matched for turn in report.turns] == [0, 0]
     assert project.artifacts.exists("workflow-report")
+
+
+def test_only_an_identified_registered_refusal_is_deterministic() -> None:
+    """Outages, timeouts, unknown outcomes and unidentified requests are never deterministic."""
+    refusal = ProviderTransportError(
+        "provider returned HTTP 503",
+        status_code=503,
+        error_code="invalid_provider_stream",
+        request_sha256="a" * 64,
+    )
+    assert deterministic_refusal(refusal) is refusal
+    for error in (
+        ProviderTransportError("connection reset"),
+        ProviderTransportError("busy", status_code=503, error_code="gateway_overloaded"),
+        ProviderTransportError(
+            "unidentified", status_code=503, error_code="invalid_provider_stream"
+        ),
+        ProviderDeadlineExceeded("request deadline"),
+        TimeoutError("transport deadline"),
+        DispatchOutcomeUnknown("earlier dispatch saved no response"),
+    ):
+        assert deterministic_refusal(error) is None

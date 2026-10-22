@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 import os
 import random
+import re
 import ssl
 import sys
 import time
@@ -47,6 +48,9 @@ class JsonHttpResponse:
         )
 
 
+_ERROR_CODE = re.compile(r"[a-z][a-z0-9_]{0,63}")
+
+
 class ProviderTransportError(RuntimeError):
     """A sanitized transport failure with safe retry metadata.
 
@@ -55,6 +59,10 @@ class ProviderTransportError(RuntimeError):
         retry_after_seconds: Sanitized minimum server wait.
         known_unbilled: Trusted proof this attempt was rejected before billable dispatch.
             It says nothing about earlier attempts in the same logical request.
+        error_code: The response's OpenAI-style ``error.code`` when it is a short lowercase
+            identifier (such as ``invalid_provider_stream``), else None. Never free text.
+        request_sha256: Digest of the exact request body that failed, when the raising client
+            knows it, so a caller can tell a resend of the identical request from new work.
     """
 
     def __init__(
@@ -64,12 +72,34 @@ class ProviderTransportError(RuntimeError):
         status_code: int | None = None,
         retry_after_seconds: float | None = None,
         known_unbilled: bool = False,
+        error_code: str | None = None,
+        request_sha256: str | None = None,
     ) -> None:
         """Retain only explicit safe metadata, never raw headers or provider error bodies."""
         super().__init__(message)
         self.status_code = status_code
         self.retry_after_seconds = _safe_retry_delay(retry_after_seconds)
         self.known_unbilled = known_unbilled is True and status_code == 429
+        self.error_code = (
+            error_code
+            if isinstance(error_code, str) and _ERROR_CODE.fullmatch(error_code)
+            else None
+        )
+        self.request_sha256 = request_sha256
+
+
+def public_error_code(body: JsonObject) -> str | None:
+    """The sanitized ``error.code`` identifier of an OpenAI-style error body, if any.
+
+    Args:
+        body: Decoded non-success response body.
+
+    Returns:
+        The code when it is a short lowercase identifier; None otherwise.
+    """
+    error = body.get("error")
+    code = error.get("code") if isinstance(error, dict) else None
+    return code if isinstance(code, str) and _ERROR_CODE.fullmatch(code) else None
 
 
 @dataclass(frozen=True)
@@ -708,4 +738,5 @@ def _successful_body(response: JsonHttpResponse) -> JsonObject:
         status_code=response.status_code,
         retry_after_seconds=response.retry_after_seconds,
         known_unbilled=response.known_unbilled,
+        error_code=public_error_code(response.body),
     )
