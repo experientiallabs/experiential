@@ -7,15 +7,18 @@ only, so a break between two stages fails here even when every stage's own tests
    and learns from every trace.
 2. ``exp eval --audit`` measures the simulator on held-out traces with frozen fit-only memory,
    then replays the saved audit without a provider call.
-3. ``compare-environments`` runs the native world and the built simulator, conditioned on
-   instance facts, on one captured fit task under one actor policy.
-4. ``capture`` and ``run`` fork native branches from the captured checkpoint.
+3. ``development-tasks`` chooses a fit task of the build, ``ground-runtime`` grounds the built
+   simulator with its learned memory and the trace's instance facts, and
+   ``compare-environments`` runs the native world and that simulator on the captured task under
+   one actor policy.
+4. ``register-specification`` saves an independent acceptance specification, and ``capture``
+   and ``run`` fork native branches from the captured checkpoint.
 5. ``export-traces`` turns those trajectories into imports: native ones are learned by
    ``exp build --import-id``; simulated ones are refused.
 6. ``repair-learning`` screens learning misses into lessons, and the audit compares the three
    memory profiles.
-7. ``harbor`` registers the native task, qualifies it, exports and verifies the package, and
-   serves an offline trial to separate actor and verifier processes.
+7. ``harbor`` registers the native task, witnesses its controls, qualifies it, exports and
+   verifies the package, and serves an offline trial to separate actor and verifier processes.
 
 Finally the trajectories are exported to their default destination, the source project
 itself, and ``exp build`` runs the command the export prints.
@@ -65,24 +68,17 @@ from exp.optimize.evaluation.audit.panel_test import (
 )
 from exp.optimize.evaluation.continuations.capture import CaptureDefinition
 from exp.optimize.evaluation.continuations.job import ContinuationJob
-from exp.optimize.evaluation.continuations.records import load_study
 from exp.optimize.evaluation.continuations.study import ContinuationStudySpec
 from exp.optimize.evaluation.equivalence.review import ReviewModel
 from exp.optimize.evaluation.equivalence.runner import EquivalenceCase, EquivalenceSpec
-from exp.optimize.evaluation.executable import grounded as grounded_runtime
 from exp.optimize.evaluation.executable import workbook as workbook_runtime
-from exp.optimize.evaluation.executable.grounded import GroundedRuntimeDefinition
 from exp.optimize.evaluation.executable.loader import ContinuationRuntime
-from exp.optimize.evaluation.executable.package import verify_executable_package
-from exp.optimize.evaluation.executable.qualification import ExecutableQualificationSpec
 from exp.optimize.evaluation.executable.task import ExecutableTask
 from exp.optimize.evaluation.executable.workbook import (
     WorkbookRuntimeDefinition,
     WorkbookStateView,
 )
 from exp.optimize.evaluation.fidelity import runner as fidelity
-from exp.optimize.evaluation.fidelity.instance_facts import ReplayFacts
-from exp.optimize.evaluation.harbor.export import verify_harbor_export
 from exp.optimize.evaluation.harbor.tests.package_trial_test import _run_trial
 from exp.optimize.evaluation.learning import lesson_evolution, screening
 from exp.optimize.evaluation.learning.lessons import (
@@ -90,7 +86,6 @@ from exp.optimize.evaluation.learning.lessons import (
     load_lesson_set,
     screening_plan,
 )
-from exp.optimize.evaluation.learning.profile import learned_evaluation_memory
 from exp.optimize.evaluation.learning.traces import learning_plan
 from exp.runtime.environments.artifact_world import ArtifactWorldFactory
 from exp.runtime.environments.record_world import RecordTool, RecordToolError, RecordWorldFactory
@@ -117,12 +112,9 @@ from exp.runtime.models.providers.transport import (
 from exp.simulation.continuations import WorldCheckpoint
 from exp.simulation.evaluation.admission import (
     EvaluationSpecification,
-    persist_specification,
-    record_label_witness,
 )
-from exp.simulation.evaluation.calibration import CalibrationCase
 from exp.simulation.evaluation.record_execution import record_state
-from exp.simulation.evaluation.tasks import OutcomeRule, TaskVerifier, VerifierChallenge
+from exp.simulation.evaluation.tasks import OutcomeRule, TaskVerifier
 from exp.simulation.mining.bindings import load_task_set_lineage_bindings
 from exp.simulation.world_construction import (
     ConstructionSpec,
@@ -490,12 +482,35 @@ def task_of(world: World, episode: Episode) -> TaskCase:
     )
 
 
+def starting_fact(world: World, index: int) -> InstanceFact:
+    """One validated fact about an episode's starting world, read from the native world.
+
+    Records state the task order's status; the workbook states the duplicated row's order.
+    """
+    if world.kind == "records":
+        key, value = f"orders/#W{1000 + index}/status", "pending" if index % 3 else "delivered"
+    else:
+        key, value = "input.xlsx/Orders/A2", f"#W{1000 + 10 * index + 1}"
+    return InstanceFact(
+        key=key,
+        value=value,
+        visibility="conditioning",
+        provenance=FactProvenance(
+            adapter=f"acceptance-{world.kind}",
+            source="native world before the recorded episode",
+            validation=FactValidation(status="validated", method="read from the native world"),
+            state_version=0,
+        ),
+    )
+
+
 def recorded_conversation(world: World, index: int) -> JsonObject:
     """Execute one episode in its native world and record it as a chat-json conversation.
 
     The conversation declares no tool list, like most chat dumps: the build learns tool
     signatures from the recorded calls. Identical declared schemas would dominate every
-    request descriptor, so the build would join all traces into one leakage group.
+    request descriptor, so the build would join all traces into one leakage group. Its
+    request context supplies the starting world's instance facts, as a trace package does.
     """
     episode = world.episodes[index]
     messages: list[JsonValue] = [{"role": "user", "content": episode.instruction}]
@@ -537,7 +552,13 @@ def recorded_conversation(world: World, index: int) -> JsonObject:
         # path the export is read from.
         "exp.customer.id": "acceptance-customer",
         "exp.conversation.id": episode.lineage,
-        "exp.request.context": {"task_lineage": episode.lineage, "replay_from": 1},
+        "exp.request.context": {
+            "task_lineage": episode.lineage,
+            "replay_from": 1,
+            "instance_facts": InstanceFacts(facts=(starting_fact(world, index),)).model_dump(
+                mode="json"
+            ),
+        },
     }
 
 
@@ -744,6 +765,15 @@ class Pipeline:
         path.write_text(json.dumps(operation))
         return self.eval("--continuations", str(path), "--non-interactive", *flags)
 
+    def refused(self, name: str, operation: JsonObject) -> str:
+        """Run one ``exp eval --continuations`` operation that must fail; return its output."""
+        path = self.tmp / f"{name}.json"
+        path.write_text(json.dumps(operation))
+        project, root = self.project.paths.project_id, str(self.root)
+        return refused(
+            "eval", project, "--root", root, "--continuations", str(path), "--non-interactive"
+        )
+
 
 def offline_pipeline(
     world: World, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -878,13 +908,11 @@ class Simulated:
         manifest: Simulated ownership of the same tools.
         initial_state: Starting value of every simulated domain.
         probe_paths: Projection names mapped to pointers into simulated state.
-        facts: Validated instance facts about the starting world.
     """
 
     manifest: WorldManifest
     initial_state: JsonObject
     probe_paths: dict[str, str]
-    facts: ReplayFacts
 
 
 @dataclass(frozen=True)
@@ -897,7 +925,8 @@ class Contract:
         paired: Material paths compared across native and simulated worlds.
         verifier: Development verifier over the native projection.
         acceptance: Independent specification the qualification witnesses grade.
-        controls: Mutations of a passing outcome into goal-miss and side-effect controls.
+        controls: Edits of a passing outcome into a goal-miss or side-effect control, per
+            control kind and partition.
     """
 
     plans: tuple[tuple[ToolCall, ...], ...]
@@ -905,7 +934,7 @@ class Contract:
     paired: tuple[str, ...]
     verifier: TaskVerifier
     acceptance: TaskVerifier
-    controls: Callable[[JsonObject, str, str], None]
+    controls: Callable[[str, str], list[JsonValue]]
 
 
 def episode_index(world: World, task: TaskCase) -> int:
@@ -914,37 +943,61 @@ def episode_index(world: World, task: TaskCase) -> int:
     return next(index for index, row in enumerate(world.episodes) if row.lineage == lineage)
 
 
-def development_task(pipeline: Pipeline) -> tuple[TaskCase, int]:
-    """Derive a development task from a fit task of the build, keeping its source lineage.
+def development_task(pipeline: Pipeline) -> tuple[TaskCase, int, ArtifactInput]:
+    """Choose a fit task of the build through ``development-tasks``, keeping its lineage.
 
-    The recorded conversations declared no tools, so the derived task publishes the world's
-    tool schemas. Records need an order that is still pending, so its cancellation changes
-    native state.
+    The action lists only fit tasks and refuses a held-out one by ID. The recorded
+    conversations declared no tools, so the chosen task publishes the world's tool schemas.
+    Records need an order that is still pending, so its cancellation changes native state.
 
     Returns:
-        The development task and the recorded episode it was mined from.
+        The development task, the recorded episode it was mined from, and the build's trace
+        dataset, which the native capture and the specification cite as their evidence.
     """
-    project, world = pipeline.project, pipeline.world
-    build = project.load_project().build
+    world = pipeline.world
+    listed = json_tail(
+        pipeline.operation("tasks", {"action": "development-tasks", "development_tasks": {}})
+    )
+    tasks = [TaskCase.model_validate(row) for row in _arr(listed["tasks"])]
+    assert tasks and {task.partition for task in tasks} == {"fit"}, listed
+    # The store is read only to name a held-out task the action must refuse.
+    build = pipeline.project.load_project().build
     assert build is not None
-    for task in load_task_set(project.artifacts, build.task_set.artifact_id).tasks:
+    held_out = next(
+        task.task_id
+        for task in load_task_set(pipeline.project.artifacts, build.task_set.artifact_id).tasks
+        if task.partition == "held_out"
+    )
+    query: JsonObject = {"task_id": held_out}
+    reserved = pipeline.refused(
+        "held-out-task", {"action": "development-tasks", "development_tasks": query}
+    )
+    assert f"build task {held_out} is held out" in reserved, reserved
+    for task in tasks:
         index = episode_index(world, task)
-        if task.partition == "fit" and (world.kind != "records" or index % 3):
-            return task.model_copy(update={"tools": world.tools}), index
+        if world.kind != "records" or index % 3:
+            query = {
+                "task_id": task.task_id,
+                "tools": [tool.model_dump(mode="json") for tool in world.tools],
+            }
+            chosen = json_tail(
+                pipeline.operation(
+                    "task", {"action": "development-tasks", "development_tasks": query}
+                )
+            )
+            (published,) = _arr(chosen["tasks"])
+            evidence = ArtifactInput.model_validate(_at(chosen, "build", "trace_dataset"))
+            return TaskCase.model_validate(published), index, evidence
     raise AssertionError("the build kept no usable fit task")
 
 
-def native_side(pipeline: Pipeline, index: int) -> Native:
+def native_side(pipeline: Pipeline, index: int, evidence: ArtifactInput) -> Native:
     """Publish the native world's inputs through the CLI and bind its runtime."""
     if pipeline.world.kind == "records":
         runtime = pipeline.tmp / "record_runtime.py"
         runtime.write_text(RECORD_RUNTIME)
-        build = pipeline.project.load_project().build
-        assert build is not None
         order = f"#W{1000 + index}"
-        return Native(
-            runtime, {"order_id": order}, record_probe_sha256(order), (build.trace_dataset,)
-        )
+        return Native(runtime, {"order_id": order}, record_probe_sha256(order), (evidence,))
     command = ExecutableCommand(action="construct-assets", construction=orders_construction(index))
     published = pipeline.operation(
         "construct", {"action": "harbor", "harbor": command.model_dump(mode="json")}
@@ -981,24 +1034,8 @@ def native_side(pipeline: Pipeline, index: int) -> Native:
     )
 
 
-def fact(key: str, value: JsonValue, task: TaskCase, adapter: str) -> InstanceFact:
-    """One validated starting-world fact derived from the task's own source trace."""
-    return InstanceFact(
-        key=key,
-        value=value,
-        visibility="conditioning",
-        provenance=FactProvenance(
-            adapter=adapter,
-            source="recorded native reply",
-            derived_from_traces=task.source_trace_ids,
-            validation=FactValidation(status="validated", method="read from the native world"),
-            state_version=0,
-        ),
-    )
-
-
-def simulated_side(world: World, task: TaskCase, index: int) -> Simulated:
-    """Declare the simulated domains, their projection and the starting world's facts."""
+def simulated_side(world: World, index: int) -> Simulated:
+    """Declare the simulated domains and their projection; facts come from the trace."""
     simulated = world.manifest.model_copy(
         update={
             "domains": tuple(
@@ -1012,11 +1049,6 @@ def simulated_side(world: World, task: TaskCase, index: int) -> Simulated:
             manifest=simulated,
             initial_state={"users": {}, "orders": {order: {"status": "pending"}}},
             probe_paths={"status": f"/orders/{order}/status"},
-            facts=ReplayFacts(
-                facts=InstanceFacts(
-                    facts=(fact(f"orders/{order}/status", "pending", task, "acceptance-records"),)
-                )
-            ),
         )
     sheets = workbook_projection(read_supported_workbook(orders_workbook(index)))["sheets"]
     audit = next(row for row in _arr(sheets) if _obj(row)["name"] == "Audit")
@@ -1027,18 +1059,6 @@ def simulated_side(world: World, task: TaskCase, index: int) -> Simulated:
             "output.xlsx": {},
         },
         probe_paths={"views": "/input.xlsx/views"},
-        facts=ReplayFacts(
-            facts=InstanceFacts(
-                facts=(
-                    fact(
-                        "input.xlsx/Orders/A2",
-                        f"#W{1000 + 10 * index + 1}",
-                        task,
-                        "acceptance-workbook",
-                    ),
-                )
-            )
-        ),
     )
 
 
@@ -1050,14 +1070,16 @@ def contract(world: World, index: int) -> Contract:
         lookup, _, profile, cancel = episode.actions[0:4]
         rules = (OutcomeRule(path="/final_state/status", operator="equals", value="cancelled"),)
 
-        def record_controls(outcome: JsonObject, kind: str, partition: str) -> None:
+        others = sorted(f"#W{1000 + row}" for row in range(EPISODES) if row != index)
+
+        def record_controls(kind: str, partition: str) -> list[JsonValue]:
             """Leave the order pending, or cancel another customer's order too."""
-            final_state = _obj(outcome["final_state"])
             if kind == "goal-miss":
-                final_state["status"] = "pending " + partition
-            else:
-                others = _obj(final_state["others"])
-                others[sorted(others)[0 if partition == "development" else 1]] = "cancelled"
+                status = "pending " + partition
+                return [{"op": "set", "path": ["final_state", "status"], "value": status}]
+            other = others[0 if partition == "development" else 1]
+            path: list[JsonValue] = ["final_state", "others", other]
+            return [{"op": "set", "path": path, "value": "cancelled"}]
 
         return Contract(
             plans=(
@@ -1088,16 +1110,14 @@ def contract(world: World, index: int) -> Contract:
     rules = (OutcomeRule(path=goal, operator="equals", value=kept),)
     _, describe, row, edit = episode.actions
 
-    def workbook_controls(outcome: JsonObject, kind: str, partition: str) -> None:
+    def workbook_controls(kind: str, partition: str) -> list[JsonValue]:
         """Delete the wrong row, or change the protected audit sheet."""
-        views = _obj(_obj(outcome["final_state"])["views"])
         if kind == "goal-miss":
-            orders = _obj(views["orders"])
-            first = _obj(_arr(orders["sheets"])[0])
-            cell = _obj(_arr(_arr(first["rows"])[1])[0])
-            cell["value"] = "#W-wrong-" + partition
-        else:
-            _obj(views["audit"])["sha256"] = "0" * 63 + ("1" if partition == "development" else "2")
+            cell: list[JsonValue] = ["final_state", "views", "orders", "sheets", 0, "rows", 1, 0]
+            return [{"op": "set", "path": [*cell, "value"], "value": "#W-wrong-" + partition}]
+        digest = "0" * 63 + ("1" if partition == "development" else "2")
+        path: list[JsonValue] = ["final_state", "views", "audit", "sha256"]
+        return [{"op": "set", "path": path, "value": digest}]
 
     return Contract(
         plans=((row, edit), (describe, edit)),
@@ -1248,6 +1268,7 @@ class Development:
         contract: The task's plans, verifier and controls.
         checkpoint: Native capture at the actor's initial turn.
         catalog_sha256: Frozen model catalog.
+        evidence: The build's trace dataset, which the task's contract derives from.
     """
 
     task: TaskCase
@@ -1256,6 +1277,7 @@ class Development:
     contract: Contract
     checkpoint: ArtifactInput
     catalog_sha256: str
+    evidence: ArtifactInput
 
 
 def capture(pipeline: Pipeline, name: str, definition: CaptureDefinition) -> ArtifactInput:
@@ -1308,9 +1330,9 @@ def compare_environments(
 ) -> tuple[Development, ArtifactInput]:
     """Stage 3: pair the native world with the built simulator on one captured fit task."""
     world, project = pipeline.world, pipeline.project
-    task, index = development_task(pipeline)
+    task, index, evidence = development_task(pipeline)
     pipeline.provider.aliases[task.lineage_group_id] = world.episodes[index].lineage
-    native = native_side(pipeline, index)
+    native = native_side(pipeline, index, evidence)
     terms = contract(world, index)
     catalog = load_model_catalog(project.model_catalog_path)
     development = Development(
@@ -1332,36 +1354,46 @@ def compare_environments(
             ),
         ),
         catalog_sha256=sha256_json(catalog.model_dump(mode="json")),
+        evidence=evidence,
     )
-    memory = learned_evaluation_memory(project, catalog)
-    assert memory is not None
-    simulated = simulated_side(world, task, index)
-    grounded = GroundedRuntimeDefinition(
-        task=task,
-        world_model=memory.world_model,
-        catalog_sha256=development.catalog_sha256,
-        manifest=simulated.manifest,
-        initial_state=simulated.initial_state,
-        facts=simulated.facts,
-        memory=memory,
-        probe_paths=simulated.probe_paths,
-        maximum_physical_attempts=64,
-        deadline=DEADLINE,
+    # The build's simulator, memory and catalog are grounded through the CLI; the starting
+    # world's facts come from the task's own source trace.
+    simulated = simulated_side(world, index)
+    grounding: JsonObject = {
+        "task_id": task.task_id,
+        "tools": [tool.model_dump(mode="json") for tool in world.tools],
+        "manifest": simulated.manifest.model_dump(mode="json"),
+        "initial_state": simulated.initial_state,
+        "probe_paths": simulated.probe_paths,
+        "trace_facts": True,
+        "maximum_model_calls": ACTOR_CALLS,
+        "maximum_physical_attempts": 64,
+        "deadline": DEADLINE.isoformat(),
+        "operation_file": str(pipeline.tmp / "capture-simulated.json"),
+    }
+    calls = len(pipeline.provider.requests)
+    grounded = json_tail(
+        pipeline.operation("ground", {"action": "ground-runtime", "grounded": grounding})
     )
-    grounded_file = Path(grounded_runtime.__file__)
-    candidate_checkpoint = capture(
-        pipeline,
-        "capture-simulated",
-        CaptureDefinition(
-            task=task,
-            sources=(memory.world_model,),
-            runtime_file=grounded_file,
-            runtime_sha256=sha256_bytes(grounded_file.read_bytes()),
-            configuration=grounded.model_dump(mode="json"),
-            probe_sha256=grounded.probe_sha256,
-            maximum_model_calls=ACTOR_CALLS,
-        ),
+    assert len(pipeline.provider.requests) == calls, "grounding makes no model call"
+    simulated_capture = CaptureDefinition.model_validate(grounded["capture"])
+    assert simulated_capture.task == task
+    assert json.loads((pipeline.tmp / "capture-simulated.json").read_text()) == grounded
+    configuration = simulated_capture.configuration
+    assert _at(configuration, "memory", "version"), "the build's learned memory is pinned"
+    expected_fact = starting_fact(world, index)
+    assert _at(configuration, "facts", "facts", "facts", 0, "key") == expected_fact.key
+    candidate_checkpoint = ArtifactInput.model_validate(
+        json_tail(
+            pipeline.eval(
+                "--continuations",
+                str(pipeline.tmp / "capture-simulated.json"),
+                "--non-interactive",
+                "--yes",
+            )
+        )
     )
+    assert len(pipeline.provider.requests) == calls, "capture makes no model call"
     if world.kind == "records":
         order = f"#W{1000 + index}"
 
@@ -1405,9 +1437,9 @@ def compare_environments(
         pipeline,
         development,
         checkpoint=candidate_checkpoint,
-        runtime_file=grounded_file,
-        configuration=grounded.model_dump(mode="json"),
-        probe_sha256=grounded.probe_sha256,
+        runtime_file=simulated_capture.runtime_file,
+        configuration=configuration,
+        probe_sha256=simulated_capture.probe_sha256,
         verifier=paired,
         repeats=1,
     )
@@ -1459,9 +1491,8 @@ def compare_environments(
         and _is_executable(_user_content(row.payload))
     ]
     assert predictions and all(
-        _at(row, "instance_facts", "facts", 0, "key") == simulated.facts.facts.facts[0].key
-        for row in predictions
-    ), "every simulated turn is conditioned on the declared instance facts"
+        _at(row, "instance_facts", "facts", 0, "key") == expected_fact.key for row in predictions
+    ), "every simulated turn is conditioned on the trace's instance facts"
     assert all(row["research_history"] for row in predictions), "the frozen memory is read"
     calls = (len(actor.requests), len(reviews.requests), len(pipeline.provider.requests))
     assert json_tail(pipeline.operation("equivalence", operation, "--yes")) == report
@@ -1478,21 +1509,21 @@ def fork_native_branches(
         The frozen job, its saved result, and every study result the stage produced.
     """
     native, terms = development.native, development.contract
-    build = pipeline.project.load_project().build
-    assert build is not None
-    specification = persist_specification(
-        pipeline.project.artifacts,
-        EvaluationSpecification(
+    registration: JsonObject = {
+        "specification": EvaluationSpecification(
             description=terms.acceptance.description,
             predicate=terms.acceptance,
             subject="outcome",
-        ),
+        ).model_dump(mode="json"),
         # The acceptance contract derives from the recorded traces the task came from, not
         # from the constructed world it is checked against.
-        sources=(build.trace_dataset,),
-        created_at=datetime.now(UTC),
-        code_revision=REVISION,
-    )
+        "sources": [development.evidence.model_dump(mode="json")],
+    }
+    operation: JsonObject = {"action": "register-specification", "specification": registration}
+    assert "Nothing saved" in pipeline.operation("specification", operation, "--dry-run")
+    registered = json_tail(pipeline.operation("specification", operation))
+    specification = ArtifactInput.model_validate(registered["reference"])
+    assert json_tail(pipeline.operation("specification", operation)) == registered
     forked = job(
         pipeline,
         development,
@@ -1682,58 +1713,62 @@ def package_and_trial(
         )
     )
     # Witnessed controls over the feasibility study's own native outcomes: both routes pass,
-    # mutated copies miss the goal or change protected state, and erased evidence is unknown.
-    assert forked.study.training_specification is not None
-    branches = load_study(project.artifacts, feasibility).branches
-    cases = []
+    # edited copies miss the goal or change protected state, and erased evidence is unknown.
+    # Each is graded by the job's independent specification, the same check qualification runs.
+    controls: list[JsonValue] = []
     for partition, offset in (("development", 0), ("confirmation", 10)):
         for index, kind in enumerate(
             ("valid-one", "valid-two", "goal-miss", "side-effect", "unknown")
         ):
-            outcome = deepcopy(branches[1 if kind == "valid-two" else 0].outcome)
-            step = _obj(_arr(outcome["steps"])[0])
-            _obj(_obj(step["action"])["arguments"])["control"] = f"{partition}-{index}"
+            marker: list[JsonValue] = ["steps", 0, "action", "arguments", "control"]
+            edits: list[JsonValue] = [
+                {"op": "set", "path": marker, "value": f"{partition}-{index}"}
+            ]
             if kind in ("goal-miss", "side-effect"):
-                terms.controls(outcome, kind, partition)
+                edits.extend(terms.controls(kind, partition))
             elif kind == "unknown":
-                if partition == "development":
-                    outcome["steps"] = None
-                else:
-                    outcome["stop_reason"] = "failure"
-            cases.append(
-                CalibrationCase(
-                    challenge=VerifierChallenge(
-                        id=f"{partition}-{kind}",
-                        outcome=outcome,
-                        expected="pass"
-                        if kind.startswith("valid")
-                        else "unassessable"
-                        if kind == "unknown"
-                        else "fail",
-                        authority="synthetic_specification",
-                        witness=record_label_witness(
-                            project.artifacts,
-                            specification=forked.study.training_specification,
-                            outcome=outcome,
-                            created_at=datetime.now(UTC),
-                            code_revision=REVISION,
-                        ),
-                        rationale="Authored control over the feasibility study's native outcome.",
-                    ),
-                    lineage=f"acceptance-control-{offset + index}",
-                    partition=partition,
-                )
+                erased = ["steps"] if partition == "development" else ["stop_reason"]
+                value = None if partition == "development" else "failure"
+                edits.append({"op": "set", "path": erased, "value": value})
+            controls.append(
+                {
+                    "id": f"{partition}-{kind}",
+                    "lineage": f"acceptance-control-{offset + index}",
+                    "partition": partition,
+                    "expected": "pass"
+                    if kind.startswith("valid")
+                    else "unassessable"
+                    if kind == "unknown"
+                    else "fail",
+                    "branch": 1 if kind == "valid-two" else 0,
+                    "edits": edits,
+                    "rationale": "Authored control over the feasibility study's native outcome.",
+                }
             )
+    witnessing: JsonObject = {
+        "action": "witness-controls",
+        "controls": {
+            "task": task.model_dump(mode="json"),
+            "feasibility": feasibility.model_dump(mode="json"),
+            "controls": controls,
+        },
+        "operation_file": str(pipeline.tmp / "qualify.json"),
+    }
+    witness: JsonObject = {"action": "harbor", "harbor": witnessing}
+    planned = pipeline.operation("controls", witness, "--dry-run")
+    assert "10 control outcomes resolved" in planned, planned
+    assert not (pipeline.tmp / "qualify.json").exists(), "a dry run saves no operation"
+    # A control whose label the specification contradicts is refused before qualification.
+    mislabeled = deepcopy(witnessing)
+    _obj(_arr(_obj(mislabeled["controls"])["controls"])[2])["expected"] = "pass"
+    del mislabeled["operation_file"]
+    wrong = pipeline.refused("mislabeled", {"action": "harbor", "harbor": mislabeled})
+    assert "the witness establishes fail, but the label declares pass" in wrong, wrong
+    witnessed = json_tail(pipeline.operation("controls", witness))
+    assert json.loads((pipeline.tmp / "qualify.json").read_text()) == witnessed
     qualified = json_tail(
-        harbor(
-            pipeline,
-            "qualify",
-            ExecutableCommand(
-                action="qualify",
-                qualification_spec=ExecutableQualificationSpec(
-                    task=task, feasibility=feasibility, cases=tuple(cases)
-                ),
-            ),
+        pipeline.eval(
+            "--continuations", str(pipeline.tmp / "qualify.json"), "--non-interactive", "--yes"
         )
     )
     assert qualified["qualified"] is True, qualified["refusals"]
@@ -1750,8 +1785,11 @@ def package_and_trial(
         ),
     )
     assert "Harbor package:" in exported and str(package) in exported.replace(" ", "")
-    assert verify_executable_package(project, package) == task
-    assert verify_harbor_export(package)["qualification"] == "qualified_observable_contract"
+    verified = json_tail(
+        harbor(pipeline, "verify", ExecutableCommand(action="verify", directory=package))
+    )
+    assert ArtifactInput.model_validate(verified["task"]) == task
+    assert verified["qualification"] == "qualified_observable_contract"
     assert 'environment_mode = "separate"' in (package / "task.toml").read_text()
     passing = terms.plans[0][-1:]
     rewards, verdict, result, _ = _run_trial(
