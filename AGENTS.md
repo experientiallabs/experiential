@@ -407,6 +407,7 @@ uv run pytest -q
     | Task validity before a factory task is kept | `exp/optimize/evaluation/factory/validity.py`, `exp/optimize/evaluation/factory/leakage.py` | `run_task_validity` (controls, `produced_values` leak check, quoted judge, closed-book draws) from the `check-task-validity` continuation; never tunes a verifier |
 | Hardening saturated factory worlds | `exp/optimize/evaluation/factory/hardening.py`, `exp/optimize/evaluation/factory/difficulty.py` | `run_task_hardening` from the `harden-tasks` continuation; `panel_difficulty` applies the registered `SaturationRule` and reports the `PassBand`; variants keep the seed lineage |
 | Generated trajectories as trace evidence | `exp/optimize/evaluation/continuations/traces.py` | `export_trajectory_traces` over saved continuation studies; only native-owned replies become learning evidence, and the build refuses simulation provenance |
+| Instance facts from task input files | `exp/runtime/environments/facts_derivers.py`, `exp/optimize/evaluation/fidelity/fact_derivation.py` | A backend declares one `InstanceFactsDeriver` (the workbook backend's is `workbook_facts.WorkbookFactsDeriver`) and joins `FactsDeriverDefinition`; the `derive-facts` continuation attaches validated facts to a chat JSON trace package and saves `ReplayFacts` for runtime definitions; unrepresentable content is refused or listed, never dropped |
 
     Keep this table current. A change that introduces an owner for a new concern adds its row in
     the same commit.

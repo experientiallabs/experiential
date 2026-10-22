@@ -64,6 +64,7 @@ from exp.cli.evaluation.hill_climb import (
     handle_propose_edits,
 )
 from exp.cli.evaluation.judge_challenges import handle_challenge_judges
+from exp.cli.evaluation.instance_facts import handle_derive_facts
 from exp.cli.evaluation.learning_repair import handle_repair_learning
 from exp.cli.evaluation.memory_forget import handle_forget_summary
 from exp.cli.evaluation.sample_count import handle_sample_count
@@ -106,6 +107,7 @@ from exp.optimize.evaluation.hillclimb.proposals import EditProposalSpec
 from exp.optimize.evaluation.hillclimb.report import ClimbReportSpec
 from exp.optimize.evaluation.hillclimb.rounds import ClimbRound
 from exp.optimize.evaluation.learning.forgetting import SummaryForget
+from exp.optimize.evaluation.fidelity.fact_derivation import FactsDerivation
 from exp.optimize.evaluation.learning.lessons import LearningRepair
 from exp.optimize.evaluation.learning.sample_count import SampleCountRequest
 from exp.optimize.evaluation.tasks.challenge_runs import ChallengeRunSpec
@@ -170,6 +172,7 @@ CONTINUATION_ACTIONS = (
     ContinuationAction("climb-report", "climb_report", handle_climb_report),
     ContinuationAction("check-task-validity", "task_validity", handle_check_task_validity),
     ContinuationAction("harden-tasks", "hardening", handle_harden_tasks),
+    ContinuationAction("derive-facts", "facts", handle_derive_facts),
 )
 _ACTIONS_BY_NAME = {action.name: action for action in CONTINUATION_ACTIONS}
 
@@ -229,6 +232,7 @@ class ContinuationCommand(ContractModel):
         climb_report: Baseline against the best kept prompt on fresh test repeats.
         task_validity: Leak, closed-book and control checks for one qualified variant.
         hardening: Bounded harder-world levels for one qualified seed until a panel separates.
+        facts: Backend-derived instance facts for declared task input files.
     """
 
     action: ContinuationActionName
@@ -274,6 +278,7 @@ class ContinuationCommand(ContractModel):
     climb_report: ClimbReportSpec | None = None
     task_validity: TaskValiditySpec | None = None
     hardening: TaskHardeningSpec | None = None
+    facts: FactsDerivation | None = None
 
     @model_validator(mode="after")
     def exact_payload(self) -> "ContinuationCommand":
