@@ -1,11 +1,11 @@
 """Protocol versions stand in for source text in saved-result identities; this guards them.
 
-Calibration, the actor council, task refinement, private workbook views, the restorable
-environment backends and local process containment bind their saved results to a protocol
-constant instead of hashing their own source. Saved results then survive moves, formatting and
-unrelated edits, and re-key only when the protocol is bumped. Provider attempt timeouts follow
-the same rule: each admitted physical attempt records the protocol of the derivation that
-bounded it.
+Calibration, the actor council, task refinement, prompt hill climbing, private workbook views, the
+restorable environment backends and local process containment bind their saved results to a
+protocol constant instead of hashing their own source. Saved results then survive moves,
+formatting and unrelated edits, and re-key only when the protocol is bumped. Provider attempt
+timeouts follow the same rule: each admitted physical attempt records the protocol of the
+derivation that bounded it.
 
 This test keeps that honest. Each protocol lists the source that decides its behavior, with that
 source's digest at the protocol's current value. When the covered source changes, the test fails
@@ -126,6 +126,27 @@ PROTOCOLS = (
             "exp.optimize.evaluation.learning.lesson_evolution:evolve_lessons",
         ),
         "89ba387276193e7a3435a0e5617821c0b37db5ad2654aff1509f2a00051f0a74",
+    ),
+    Protocol(
+        "exp.optimize.evaluation.hillclimb.design:HILL_CLIMB_PROTOCOL",
+        "hill-climb-v1",
+        (
+            "exp.optimize.evaluation.hillclimb.design:climb_split",
+            "exp.optimize.evaluation.hillclimb.measurement",
+            "exp.optimize.evaluation.hillclimb.stages",
+            "exp.optimize.evaluation.hillclimb.rounds:run_climb_round",
+        ),
+        "b688caac96e1afc123f461d66bd58a39f67104749e6381f5d74a0b9b72d475a0",
+    ),
+    Protocol(
+        "exp.optimize.evaluation.hillclimb.proposals:EDIT_PROPOSAL_PROTOCOL",
+        "prompt-edit-proposal-v1",
+        (
+            "exp.optimize.evaluation.hillclimb.proposals:train_evidence",
+            "exp.optimize.evaluation.hillclimb.proposals:proposal_request",
+            "exp.optimize.evaluation.hillclimb.proposals:_validate",
+        ),
+        "8b96977f5e07a23d8466599ca270d36d70a767474aa2f508853961e3ca03b172",
     ),
     Protocol(
         "exp.runtime.models.providers.attempt_timeouts:ATTEMPT_TIMEOUT_PROTOCOL",
