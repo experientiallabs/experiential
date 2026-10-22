@@ -33,6 +33,7 @@ from exp.optimize.evaluation.continuations.proposals import CheckpointProposalSp
 from exp.optimize.evaluation.continuations.selection import load_selection_plan, selection_jobs
 from exp.optimize.evaluation.equivalence.runner import EquivalenceSpec
 from exp.optimize.evaluation.executable import grounded as grounded_runtime
+from exp.optimize.evaluation.executable import induced as induced_runtime
 from exp.optimize.evaluation.executable import mixed as mixed_runtime
 from exp.optimize.evaluation.executable import workbook as workbook_runtime
 from exp.optimize.evaluation.executable.task import load_executable_task
@@ -52,6 +53,7 @@ from exp.optimize.evaluation.hillclimb.proposals import EditProposalSpec
 from exp.optimize.evaluation.hillclimb.report import ClimbReportSpec, report_jobs
 from exp.optimize.evaluation.hillclimb.rounds import ClimbRound, round_jobs
 from exp.optimize.evaluation.tasks.challenge_runs import ChallengeRunSpec, challenge_attempts
+from exp.optimize.evaluation.induction.service import InductionSpec
 from exp.runtime.gateway.decisions_contracts import (
     MAX_DECISION_CRITERIA,
     MAX_DECISION_INPUT_BYTES,
@@ -107,6 +109,7 @@ CostedSpec = (
     | ClimbReportSpec
     | TaskValiditySpec
     | TaskHardeningSpec
+    | InductionSpec
 )
 
 
@@ -183,6 +186,11 @@ def runtime_costs(
             *runtime_costs(project, mixed.native.runtime_sha256, mixed.native.configuration),
             *_grounded_costs(project, mixed.simulated),
         )
+    if digest == sha256_bytes(Path(induced_runtime.__file__).read_bytes()):
+        # Induced calls make no provider request; the predictor's allowance is the upper bound.
+        return _grounded_costs(
+            project, induced_runtime.InducedRuntimeDefinition.model_validate(configuration).grounded
+        )
     if digest == sha256_bytes(Path(grounded_runtime.__file__).read_bytes()):
         return _grounded_costs(
             project, grounded_runtime.GroundedRuntimeDefinition.model_validate(configuration)
@@ -246,6 +254,15 @@ def evaluation_costs(project: ProjectStore, spec: CostedSpec) -> tuple[CostCompo
                 spec.critic_alias,
                 spec.maximum_physical_attempts,
                 spec.critic_output_tokens,
+            ),
+        )
+    if isinstance(spec, InductionSpec):
+        return (
+            model_cost(
+                project,
+                spec.inducer_alias,
+                spec.maximum_physical_attempts,
+                spec.settings.maximum_output_tokens,
             ),
         )
     if isinstance(spec, MemoryAnalystSpec):
