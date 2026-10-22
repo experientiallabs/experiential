@@ -382,6 +382,7 @@ uv run pytest -q
     | Diagnostic source admission | `exp/optimize/evaluation/analysis/source_access.py` | Exact operator classifications over the complete dependency graph; unknown and protected sources refuse |
     | Recorded-reply kinds in exact-reply breakdowns | `exp/optimize/evaluation/fidelity/replay.py` | `reply_kind`: trivial (empty or under 60 characters), text, structured |
     | Uncertainty over independent units | `exp/common/evaluations/uncertainty.py` | `wilson_interval` and summaries at the declared unit count (lineage, component or case); repeats of one unit are averaged first; unknown outcomes stay bounds, never intervals |
+    | Process-local reuse of verified immutable content | `exp/common/core/verified_cache.py` | `VerifiedCache` keyed only by a digest just recomputed from the bytes in hand; only successes are kept, so changed content is fully re-verified |
     | Saved-result identity | `exp/common/core/artifacts.py` | `stable_id` over content; never over paths or source files |
     | Local identifiers in paths | `exp/common/project/paths.py` | `validate_local_id` |
     | Atomic file writes | `exp/common/core/files.py` | `write_text_atomic` |

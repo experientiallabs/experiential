@@ -10,8 +10,9 @@ from typing import cast
 from pydantic import ValidationError
 
 from exp.common.core.artifacts import JsonObject, envelope_matches_manifest
+from exp.common.core.verified_cache import VerifiedCache
 from exp.common.models import BillingSource
-from exp.common.project import ArtifactCorruptionError, ArtifactStore
+from exp.common.project import ArtifactCorruptionError, ArtifactStore, artifact_input
 from exp.common.traces.trace import Trace, TraceDataset
 
 
@@ -28,8 +29,17 @@ class LoadedTraceDataset:
     traces: tuple[Trace, ...]
 
 
+# Decoded datasets are large; a process rarely reads more than a few distinct ones.
+_DECODED: VerifiedCache[tuple[str, str], LoadedTraceDataset] = VerifiedCache(4)
+
+
 def load_trace_dataset(store: ArtifactStore, dataset_id: str) -> LoadedTraceDataset:
     """Load one immutable trace-dataset artifact and verify every retained record.
+
+    Every call reads the artifact and recomputes each payload digest against its manifest.
+    Decoding and validating the records is a pure function of those verified bytes, so a process
+    decodes each exact dataset once: the result is reused under the verified manifest digest,
+    and any changed byte changes that digest and is decoded and checked in full.
 
     Args:
         store: Project-local artifact store that owns the trace-dataset artifact.
@@ -45,6 +55,10 @@ def load_trace_dataset(store: ArtifactStore, dataset_id: str) -> LoadedTraceData
     stored = store.read(dataset_id)
     if stored.manifest.artifact_type != "trace-dataset":
         raise ArtifactCorruptionError(f"artifact {dataset_id} is not a trace-dataset")
+    key = (dataset_id, artifact_input(stored.manifest).sha256)
+    cached = _DECODED.get(key)
+    if cached is not None:
+        return cached
     try:
         dataset = TraceDataset.model_validate_json(
             store.read_bytes(dataset_id, "trace-dataset.json")
@@ -81,7 +95,9 @@ def load_trace_dataset(store: ArtifactStore, dataset_id: str) -> LoadedTraceData
         raise ArtifactCorruptionError(
             f"trace dataset {dataset_id} trace records do not match ordered trace IDs"
         )
-    return LoadedTraceDataset(dataset=dataset, traces=traces)
+    loaded = LoadedTraceDataset(dataset=dataset, traces=traces)
+    _DECODED.put(key, loaded)
+    return loaded
 
 
 def _decode_trace_record(payload: str, *, legacy: bool) -> Trace:
