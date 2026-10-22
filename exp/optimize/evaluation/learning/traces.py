@@ -97,10 +97,12 @@ from exp.simulation.retrieval.evidence_reading import ReadingPolicy
 from exp.simulation.retrieval.jev import JEVCueSelector, JEVPolicy
 from exp.simulation.world_model.dreaming import DreamPolicy
 from exp.simulation.world_model.experience_memory import (
-    consumed_trajectory_digest,
     memory_head,
     memory_lock,
     reserve_task_lineage,
+)
+from exp.simulation.world_model.experience_sources import (
+    consumed_trajectory_digest,
 )
 from exp.simulation.world_model.session_research import OnlineResearchPolicy
 

@@ -35,6 +35,11 @@ from exp.simulation.reconstruction.library import (
     resolve_library_entry,
 )
 from exp.simulation.world_model.artifact import GroundedWorldModelArtifact
+from exp.simulation.world_model.experience_sources import (
+    consumed_trajectory_digest,
+    persist_trajectory_source,
+    require_consumed_trajectory,
+)
 from exp.simulation.world_model.memory_tree import (
     Block,
     LineDraft,
@@ -43,6 +48,7 @@ from exp.simulation.world_model.memory_tree import (
     containing_blocks,
     line_id,
     read_line,
+    summary_id,
 )
 from exp.simulation.world_model.runtime import load_grounded_world_model_artifact
 
@@ -129,13 +135,15 @@ def forget_summary(
     reason: str,
     created_at: datetime,
     code_revision: str,
+    dry_run: bool = False,
 ) -> str:
     """Record an operator decision to forget one block summary and rebuild it.
 
-    The record is pinned to the current head. A published checkpoint never changes, so the
-    forget takes effect in the next published version, which raises the generation of the
-    block and of every ancestor; the next maintenance rebuilds them. Repeating the same
-    forget against the same head is a no-op.
+    The record is pinned to the current head and binds the head version and the exact summary
+    generation it forgets. A published checkpoint never changes, so the forget takes effect in
+    the next published version, which raises the generation of the block and of every
+    ancestor; the next maintenance rebuilds them from the block's eligible lines. Repeating the
+    same forget against the same head is a no-op.
 
     Args:
         store: Project artifact owner.
@@ -144,39 +152,66 @@ def forget_summary(
         reason: Operator explanation, kept with the record.
         created_at: Aware record time.
         code_revision: Recording implementation identity.
+        dry_run: Check eligibility and return the record identity without writing it.
 
     Returns:
         The forget record's artifact identity.
 
     Raises:
-        ValueError: The block is not an aligned power-of-two block of the head's log.
+        ValueError: The block is not an aligned power-of-two block of the head's log, its
+            current summary generation is not built (nothing to forget, or already forgotten
+            and awaiting rebuild), or the same forget was recorded for another reason.
     """
     lo, hi = block
     size = hi - lo
     with memory_lock(store, lineage):
         head = memory_head(store, lineage)
         total = 0 if head is None else head.log_length or 0
-        if size < 2 or size & (size - 1) or lo % size or hi > total:
+        if head is None or size < 2 or size & (size - 1) or lo % size or hi > total:
             raise ValueError(
                 f"block #{lo}-{hi - 1} is not a complete aligned block of memory {lineage!r}"
             )
-        base = 0 if head is None else head.version
+        generation = summary_generations(head).get(block, 0)
+        summary = summary_id(lineage, lo, hi, generation)
+        if not store.exists(summary):
+            raise ValueError(
+                f"block #{lo}-{hi - 1} of memory {lineage!r} has no built summary at version "
+                f"{head.version} (generation {generation}): there is nothing to forget until "
+                "maintenance builds it"
+            )
         identity = stable_id(
-            "memory-forget", {"lineage": lineage, "base_version": base, "lo": lo, "hi": hi}
+            "memory-forget",
+            {"lineage": lineage, "base_version": head.version, "lo": lo, "hi": hi},
         )
-        if not store.exists(identity):
+        if store.exists(identity):
+            saved = json.loads(store.read_bytes(identity, "forget.json"))
+            if saved.get("reason") != reason:
+                raise ValueError(
+                    f"block #{lo}-{hi - 1} was already forgotten against version {head.version} "
+                    f"for another reason: {saved.get('reason')!r}"
+                )
+        elif not dry_run:
             store.write_json(
                 artifact_id=identity,
                 artifact_type="memory-forget",
                 envelope=ArtifactEnvelope(
-                    schema_version=1, created_at=created_at, code_revision=code_revision
+                    schema_version=1,
+                    created_at=created_at,
+                    code_revision=code_revision,
+                    inputs=(
+                        artifact_input(
+                            store.read(memory_version_id(lineage, head.version)).manifest
+                        ),
+                        artifact_input(store.read(summary).manifest),
+                    ),
                 ),
                 files={
                     "forget.json": {
                         "lineage": lineage,
-                        "base_version": base,
+                        "base_version": head.version,
                         "lo": lo,
                         "hi": hi,
+                        "generation": generation,
                         "reason": reason,
                     }
                 },
@@ -656,11 +691,6 @@ def _consumed(store: ArtifactStore, digest: str | None) -> JsonObject | None:
     return trajectory if isinstance(trajectory, dict) else None
 
 
-def consumed_trajectory_digest(trajectory: JsonObject) -> Sha256:
-    """Identify a completed trajectory by its public actions and disclosed outcomes only."""
-    return sha256_json(trajectory)
-
-
 def publish_trajectory(
     store: ArtifactStore,
     *,
@@ -701,7 +731,7 @@ def publish_trajectory(
         ValueError: The trajectory lacks a task lineage, or its actions and replies are
             malformed or unequal in number.
     """
-    _require_admissible(trajectory)
+    require_consumed_trajectory(trajectory)
     artifact = load_grounded_world_model_artifact(store, world_model)
     with memory_lock(store, lineage):
         return _publish(
@@ -718,27 +748,6 @@ def publish_trajectory(
             code_revision=code_revision,
             publisher=publisher,
         )
-
-
-def _require_admissible(trajectory: JsonObject) -> None:
-    """Refuse a trajectory whose ownership or inventory a later reader could not trust."""
-    lineage = trajectory.get("task_lineage")
-    if not isinstance(lineage, str) or not lineage.strip():
-        raise ValueError("a consumed trajectory requires its task lineage")
-    actions, replies = trajectory.get("actions"), trajectory.get("observed_replies")
-    if not isinstance(actions, list) or not isinstance(replies, list):
-        raise ValueError("a consumed trajectory requires action and reply lists")
-    if len(actions) != len(replies):
-        raise ValueError("a consumed trajectory requires one disclosed reply per action")
-    for action in actions:
-        if (
-            not isinstance(action, dict)
-            or set(action) != {"name", "arguments"}
-            or not isinstance(action["name"], str)
-            or not action["name"]
-            or not isinstance(action["arguments"], dict)
-        ):
-            raise ValueError("each consumed action is exactly {name, arguments}")
 
 
 class ReservedTaskError(ValueError):
@@ -873,29 +882,6 @@ def _publish(
     )
     _materialize(store, persisted)
     return persisted, True
-
-
-def persist_trajectory_source(
-    store: ArtifactStore, trajectory: JsonObject, *, created_at: datetime, code_revision: str
-) -> ArtifactInput:
-    """Persist disclosed source observations without publishing a memory version."""
-    _require_admissible(trajectory)
-    digest = consumed_trajectory_digest(trajectory)
-    source_id = stable_id("consumed-trajectory", {"digest": digest})
-    payload: JsonObject = {
-        "trajectory": trajectory,
-        "authority": "Disclosed native replies after prediction; not a behavioral rule",
-    }
-    if not store.exists(source_id):
-        store.write_json(
-            artifact_id=source_id,
-            artifact_type="consumed-trajectory",
-            envelope=ArtifactEnvelope(
-                schema_version=1, created_at=created_at, code_revision=code_revision
-            ),
-            files={"trajectory.json": payload},
-        )
-    return artifact_input(store.read(source_id).manifest)
 
 
 def _entry(

@@ -47,9 +47,11 @@ from exp.runtime.models.providers.transport import (
     RecordedRequest,
 )
 from exp.simulation.world_model.experience_memory import (
-    consumed_trajectory_digest,
     is_reserved,
     memory_head,
+)
+from exp.simulation.world_model.experience_sources import (
+    consumed_trajectory_digest,
 )
 
 STREAM_REFUSAL: JsonObject = {
