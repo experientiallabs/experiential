@@ -42,6 +42,9 @@ from exp.optimize.evaluation.factory.proposals import load_task_proposals
 from exp.optimize.evaluation.factory.runner import TaskFactorySpec
 from exp.optimize.evaluation.factory.variants import load_task_variant
 from exp.optimize.evaluation.fidelity.retrieval_binding import index_embedder_alias
+from exp.optimize.evaluation.hillclimb.proposals import EditProposalSpec
+from exp.optimize.evaluation.hillclimb.report import ClimbReportSpec, report_jobs
+from exp.optimize.evaluation.hillclimb.rounds import ClimbRound, round_jobs
 from exp.optimize.evaluation.tasks.challenge_runs import ChallengeRunSpec, challenge_attempts
 from exp.runtime.gateway.decisions_contracts import (
     MAX_DECISION_CRITERIA,
@@ -93,6 +96,9 @@ CostedSpec = (
     | CandidateBatchSpec
     | TaskFactorySpec
     | ChallengeRunSpec
+    | ClimbRound
+    | EditProposalSpec
+    | ClimbReportSpec
 )
 
 
@@ -355,6 +361,17 @@ def evaluation_costs(project: ProjectStore, spec: CostedSpec) -> tuple[CostCompo
         return tuple(
             model_cost(project, alias, attempts, spec.output_tokens)
             for alias, attempts in challenge_attempts(spec).items()
+        )
+    if isinstance(spec, ClimbRound):
+        # Both stages, both arms: confirmation is priced although screening may stop the round.
+        return tuple(row for job in round_jobs(project, spec) for row in job_costs(project, job))
+    if isinstance(spec, ClimbReportSpec):
+        return tuple(row for job in report_jobs(project, spec) for row in job_costs(project, job))
+    if isinstance(spec, EditProposalSpec):
+        return (
+            model_cost(
+                project, spec.analyst_alias, spec.maximum_physical_attempts, spec.output_tokens
+            ),
         )
     raise ValueError(f"no cost inventory is defined for {type(spec).__name__}")
 

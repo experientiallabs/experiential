@@ -8,6 +8,7 @@ results, and plans do not live here.
 | File | Purpose |
 |---|---|
 | `usage.md` | CLI map for build, bounded optimize model, optimize router, run, config, login, and foreground macOS capture. |
+| `reference/prompt-hill-climbing.md` | Manual one-edit-per-round system-prompt hill climbing: lineage split, A/A floor, keep rule, train-only analyst proposals and the final fresh test line. |
 | `reference/learning-retirement.md` | Retiring a learning trace whose identical request is refused deterministically, or by operator: bound, evidence, reports and limits. |
 | `reference/evidence-reading.md` | Bounded objective-driven evidence reading during learning investigations: budgets, pinned policy, replay and limits. |
 | `reference/providers.md` | Catalog providers, first-build `--provider` flags, environment variables, Azure endpoint and deployment rules, the Bedrock credential chain, and OpenAI-compatible listing metadata plus identity-only operator declaration. |

@@ -58,6 +58,11 @@ from exp.cli.evaluation.factory import (
     handle_register_brief,
     handle_search_scenarios,
 )
+from exp.cli.evaluation.hill_climb import (
+    handle_climb_report,
+    handle_climb_round,
+    handle_propose_edits,
+)
 from exp.cli.evaluation.judge_challenges import handle_challenge_judges
 from exp.cli.evaluation.learning_repair import handle_repair_learning
 from exp.cli.evaluation.memory_forget import handle_forget_summary
@@ -94,6 +99,9 @@ from exp.optimize.evaluation.factory.candidates import CandidateBatchSpec
 from exp.optimize.evaluation.factory.proposals import TaskProposalSpec
 from exp.optimize.evaluation.factory.scenario_search import ScenarioSearchSpec
 from exp.optimize.evaluation.factory.variants import TaskVariantSpec
+from exp.optimize.evaluation.hillclimb.proposals import EditProposalSpec
+from exp.optimize.evaluation.hillclimb.report import ClimbReportSpec
+from exp.optimize.evaluation.hillclimb.rounds import ClimbRound
 from exp.optimize.evaluation.learning.forgetting import SummaryForget
 from exp.optimize.evaluation.learning.lessons import LearningRepair
 from exp.optimize.evaluation.learning.sample_count import SampleCountRequest
@@ -154,6 +162,9 @@ CONTINUATION_ACTIONS = (
     ContinuationAction("register-specification", "specification", handle_register_specification),
     ContinuationAction("development-tasks", "development_tasks", handle_development_tasks),
     ContinuationAction("ground-runtime", "grounded", handle_ground_runtime),
+    ContinuationAction("climb-round", "climb_round", handle_climb_round),
+    ContinuationAction("propose-edits", "edit_proposals", handle_propose_edits),
+    ContinuationAction("climb-report", "climb_report", handle_climb_report),
 )
 _ACTIONS_BY_NAME = {action.name: action for action in CONTINUATION_ACTIONS}
 
@@ -208,6 +219,9 @@ class ContinuationCommand(ContractModel):
         specification: Independent acceptance specification and its source evidence to save.
         development_tasks: Build fit tasks to print, optionally one with its public tools.
         grounded: Simulated world over the build's simulator, emitted as a capture operation.
+        climb_round: One prompt edit screened on train and confirmed on test lineages.
+        edit_proposals: Analyst edits from train failures and keep bits only, never applied.
+        climb_report: Baseline against the best kept prompt on fresh test repeats.
     """
 
     action: ContinuationActionName
@@ -248,6 +262,9 @@ class ContinuationCommand(ContractModel):
     specification: SpecificationRegistration | None = None
     development_tasks: DevelopmentTaskQuery | None = None
     grounded: GroundRuntime | None = None
+    climb_round: ClimbRound | None = None
+    edit_proposals: EditProposalSpec | None = None
+    climb_report: ClimbReportSpec | None = None
 
     @model_validator(mode="after")
     def exact_payload(self) -> "ContinuationCommand":

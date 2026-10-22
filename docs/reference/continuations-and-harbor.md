@@ -57,6 +57,7 @@ Paid operations display actor and maintained simulator dependency estimates befo
   snapshots on the same case checkpoints, rotating dispatch order across cases. Unknown branches
   contribute explicit failure/success bounds. Reported separation applies only to the fixed
   development panel; tier labels are declarations and these bounds are not confidence intervals.
+- `action: "climb-round"`, `climb_round: ClimbRound`; `action: "propose-edits"`, `edit_proposals: EditProposalSpec`; `action: "climb-report"`, `climb_report: ClimbReportSpec`: manual system-prompt hill climbing, one measured edit per round; see [prompt hill climbing](prompt-hill-climbing.md). A `compare-actors` actor may also carry a `system_prompt` with one re-instructed initial checkpoint per case (`checkpoints`).
 - `action: "export"`, `export: ContinuationExport`: independently re-grade complete studies
   against their preregistered acceptance evidence. Export only admitted post-checkpoint assistant
   tool-only targets; prose, earlier mistakes and replies stay context. Mechanical acceptance cannot approve prose. Source-bound lineages stay grouped; oversized training inputs refuse context truncation.
