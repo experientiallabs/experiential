@@ -10,6 +10,7 @@ results, and plans do not live here.
 | `usage.md` | CLI map for build, bounded optimize model, optimize router, run, config, login, and foreground macOS capture. |
 | `reference/prompt-hill-climbing.md` | Manual one-edit-per-round system-prompt hill climbing: lineage split, A/A floor, keep rule, train-only analyst proposals and the final fresh test line. |
 | `reference/learning-retirement.md` | Retiring a learning trace whose identical request is refused deterministically, or by operator: bound, evidence, reports and limits. |
+| `reference/task-hardening.md` | Task-validity checks (leakage, closed-book, controls) and bounded hardening of saturated factory worlds: specs, rules, bands and limits. |
 | `reference/evidence-reading.md` | Bounded objective-driven evidence reading during learning investigations: budgets, pinned policy, replay and limits. |
 | `reference/providers.md` | Catalog providers, first-build `--provider` flags, environment variables, Azure endpoint and deployment rules, the Bedrock credential chain, and OpenAI-compatible listing metadata plus identity-only operator declaration. |
 | `reference/gateway-architecture.md` | Operational local gateway contracts, certified exact-model routing, ownership boundaries, and compatibility locks. |
