@@ -47,6 +47,8 @@ def test_selected_and_random_points_execute_same_budget_and_replay_without_runti
     random = report.metrics["random"]
     assert isinstance(random, dict) and random["planned_branches"] == 2
     assert random["unknown"] == 2
+    # Unavailable provider replies are unknown, not an actor that spent its output allowance.
+    assert (random["actor_budget_exhausted"], random["actor_budget_exhausted_share"]) == (0, 0.0)
     selection.base.runtime_file.unlink()
     assert run_checkpoint_experiment(project, spec, code_revision="test") == report
 

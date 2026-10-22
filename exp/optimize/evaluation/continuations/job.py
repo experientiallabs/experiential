@@ -114,6 +114,12 @@ def preflight_continuation_job(project: ProjectStore, job: ContinuationJob) -> N
         and job.study.maximum_output_tokens > capabilities.maximum_output_tokens
     ):
         raise ValueError("actor output allowance exceeds model capacity")
+    efforts = tuple(catalog.models[job.actor_alias].supported_reasoning_efforts or ())
+    if job.study.reasoning_effort is not None and job.study.reasoning_effort not in efforts:
+        raise ValueError(
+            f"actor reasoning effort {job.study.reasoning_effort!r} is not supported by "
+            f"{job.actor_alias}; choose one of {', '.join(efforts) or 'none declared'}"
+        )
     checkpoint = load_continuation_checkpoint(project.artifacts, job.study.checkpoint)
     require_development_task(project.artifacts, checkpoint.task)
     actor = ChatAgentRuntime(

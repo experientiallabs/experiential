@@ -156,6 +156,9 @@ def test_actor_panel_requires_observed_difference_not_declared_labels(
     assert isinstance(comparison, list) and isinstance(comparison[0], dict)
     assert comparison[0]["difference_bounds"] == [1.0, 1.0]
     assert comparison[0]["separates_on_fixed_panel"] is True
+    actors = report.metrics["actors"]
+    assert isinstance(actors, list)
+    assert [row["actor_budget_exhausted"] for row in actors if isinstance(row, dict)] == [0, 0]
     assert len(transport.requests) == 4
 
 

@@ -136,6 +136,7 @@ def test_critic_estimate_binds_later_continuations_and_cannot_change_actor_polic
             actor_model=spec.actor_model,
             temperature=0,
             output_tokens=spec.actor_output_tokens,
+            reasoning_effort=spec.actor_reasoning_effort,
             probability=0.75,
             verifier_sha256=spec.verifier_sha256,
             probe_sha256=spec.probe_sha256,
@@ -278,3 +279,28 @@ def test_missing_critic_credential_refuses_before_intent_and_stays_retryable(
     reference = predict_success(project, spec, code_revision="test")
     assert load_critic_prediction(project.artifacts, reference).estimate.probability == 0.75
     assert len(transport.requests) == 1
+
+
+def test_actor_reasoning_effort_is_shown_to_the_critic_and_binds_its_prediction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The critic forecasts the registered actor effort; a different effort cannot reuse it."""
+    project, _, spec, _ = critic_fixture(tmp_path, monkeypatch)
+    assert "actor_reasoning_effort" not in spec.model_dump(mode="json")
+    low = spec.model_copy(update={"actor_reasoning_effort": "low"})
+    assert low.identity("test") != spec.identity("test")
+    content = critic_request(project.artifacts, low).messages[-1].content
+    assert content is not None and json.loads(content)["actor_reasoning_effort"] == "low"
+    reference = predict_success(project, low, code_revision="test")
+    binding = {
+        "checkpoint": low.checkpoint,
+        "actor_model": low.actor_model,
+        "temperature": low.temperature,
+        "output_tokens": low.actor_output_tokens,
+        "probability": 0.75,
+        "verifier_sha256": low.verifier_sha256,
+        "probe_sha256": low.probe_sha256,
+    }
+    require_prediction_binding(project.artifacts, reference, reasoning_effort="low", **binding)
+    with pytest.raises(ValueError, match="continuation policy"):
+        require_prediction_binding(project.artifacts, reference, reasoning_effort=None, **binding)

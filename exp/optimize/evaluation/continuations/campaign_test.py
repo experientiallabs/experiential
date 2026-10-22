@@ -255,6 +255,13 @@ def test_campaign_rejects_critic_target_drift_before_source_execution(
     data["critics"][0]["actor_output_tokens"] += 1
     with pytest.raises(ValueError, match="actor/verifier/deadline"):
         ContinuationCampaignSpec.model_validate(data)
+    data = spec.model_dump(mode="json")
+    data["initial"]["study"]["reasoning_effort"] = "low"
+    with pytest.raises(ValueError, match="actor/verifier/deadline"):
+        ContinuationCampaignSpec.model_validate(data)
+    for row in data["critics"]:
+        row["actor_reasoning_effort"] = "low"
+    assert ContinuationCampaignSpec.model_validate(data).initial.study.reasoning_effort == "low"
     assert not selector.requests and not critic.requests and not actor.requests
 
 

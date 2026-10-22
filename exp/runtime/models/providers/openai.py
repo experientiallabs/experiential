@@ -221,7 +221,8 @@ def openai_responses_response(
         action = AssistantAction(content=content, tool_calls=tuple(tool_calls))
     except ValueError as exc:
         raise ProviderRetryableResponseError(
-            "OpenAI Responses output has no text or tool call"
+            "OpenAI Responses output has no text or tool call",
+            hit_length_limit=status == "incomplete",
         ) from exc
     return ModelResponse.completed(
         output=action,

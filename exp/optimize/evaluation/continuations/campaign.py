@@ -113,6 +113,7 @@ class ContinuationCampaignSpec(ContractModel):
                 or critic.system_prompt != job.system_prompt
                 or critic.temperature != job.study.temperature
                 or critic.actor_output_tokens != job.study.maximum_output_tokens
+                or critic.actor_reasoning_effort != job.study.reasoning_effort
                 or critic.verifier_sha256 != sha256_json(job.study.verifier)
                 or critic.probe_sha256 != job.study.probe_sha256
                 or critic.deadline != job.deadline

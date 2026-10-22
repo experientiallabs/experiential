@@ -80,7 +80,14 @@ class EquivalenceCase(ContractModel):
                 raise ValueError(
                     f"paired actor policies differ at {name}; freeze the same actor policy"
                 )
-        for name in ("actor_model", "verifier", "repeats", "temperature", "maximum_output_tokens"):
+        for name in (
+            "actor_model",
+            "verifier",
+            "repeats",
+            "temperature",
+            "maximum_output_tokens",
+            "reasoning_effort",
+        ):
             if getattr(self.reference.study, name) != getattr(self.candidate.study, name):
                 raise ValueError(
                     f"paired actor studies differ at {name}; use the same evaluation contract"
@@ -354,6 +361,11 @@ def _assemble(
                 "model": case.reference.study.actor_model.model_dump(mode="json"),
                 "temperature": case.reference.study.temperature,
                 "output_tokens": case.reference.study.maximum_output_tokens,
+                **(
+                    {}
+                    if case.reference.study.reasoning_effort is None
+                    else {"reasoning_effort": case.reference.study.reasoning_effort}
+                ),
                 "execution_policy": case.reference.model_dump(
                     mode="json",
                     exclude={"study", "runtime_file", "runtime_sha256", "configuration"},

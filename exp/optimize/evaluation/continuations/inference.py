@@ -29,7 +29,7 @@ from exp.common.project import ProjectStore
 from exp.optimize.evaluation.continuations.campaign import ContinuationCampaign
 from exp.optimize.evaluation.continuations.experiment import CheckpointExperiment
 from exp.optimize.evaluation.continuations.records import load_study
-from exp.optimize.evaluation.continuations.study import known_outcomes
+from exp.optimize.evaluation.continuations.study import actor_budget_exhausted, known_outcomes
 from exp.simulation.continuations import load_continuation_checkpoint
 
 
@@ -61,6 +61,8 @@ class CellOutcomes(ContractModel):
         lineage: Independent task lineage of the checkpoint.
         planned: Planned continuations, including unknown outcomes.
         outcomes: Known binary outcomes (1 success, 0 failure).
+        actor_budget_exhausted: Planned continuations whose actor spent its output allowance
+            without a complete tool call, reported beside the unknown count.
         forecast: Prospective critic probability recorded before outcomes, if any.
         failed: Whether the cell produced no study at all.
         critic_failure: Why the registered critic produced no forecast for this cell, if it
@@ -73,6 +75,7 @@ class CellOutcomes(ContractModel):
     lineage: str | None
     planned: int = Field(ge=0)
     outcomes: tuple[int, ...]
+    actor_budget_exhausted: int = Field(default=0, ge=0)
     forecast: float | None = Field(default=None, ge=0, le=1, allow_inf_nan=False)
     failed: bool = False
     critic_failure: str | None = None
@@ -105,6 +108,9 @@ def experiment_cells(
                 outcomes=()
                 if study is None
                 else known_outcomes(row.assessment for row in study.branches),
+                actor_budget_exhausted=0
+                if study is None
+                else actor_budget_exhausted(study.branches),
                 forecast=cell.job.study.predicted_success
                 if study is None
                 else study.spec.predicted_success,
@@ -151,6 +157,7 @@ def cell_inference(cells: Sequence[CellOutcomes], *, base_rate: BaseRate | None)
         successes = sum(sum(cell.outcomes) for cell in group)
         known = sum(len(cell.outcomes) for cell in group)
         planned = sum(cell.planned for cell in group)
+        exhausted = sum(cell.actor_budget_exhausted for cell in group)
         by_lineage: dict[str, list[float]] = {}
         for cell in group:
             if cell.outcomes and cell.lineage is not None:
@@ -164,6 +171,7 @@ def cell_inference(cells: Sequence[CellOutcomes], *, base_rate: BaseRate | None)
                     "lineage": cell.lineage,
                     "planned": cell.planned,
                     "unknown": cell.planned - len(cell.outcomes),
+                    "actor_budget_exhausted": cell.actor_budget_exhausted,
                     "repeated_attempts": proportion_summary(sum(cell.outcomes), len(cell.outcomes)),
                     "missing_outcome_bounds": missing_outcome_bounds(
                         sum(cell.outcomes), cell.planned - len(cell.outcomes), cell.planned
@@ -172,6 +180,8 @@ def cell_inference(cells: Sequence[CellOutcomes], *, base_rate: BaseRate | None)
                 for cell in group
             ],
             "missing_outcome_bounds": missing_outcome_bounds(successes, planned - known, planned),
+            "actor_budget_exhausted": exhausted,
+            "actor_budget_exhausted_share": exhausted / planned if planned else None,
             "across_lineages": unit_mean_summary(by_lineage),
             "critic": _critic(group, base_rate),
         }
@@ -200,6 +210,7 @@ def campaign_inference(project: ProjectStore, report: ContinuationCampaign) -> J
     source = load_study(project.artifacts, report.source)
     known = known_outcomes(row.assessment for row in source.branches)
     planned = len(source.branches)
+    exhausted = actor_budget_exhausted(source.branches)
     lineage = load_continuation_checkpoint(
         project.artifacts, source.spec.checkpoint
     ).task.lineage_group_id
@@ -237,6 +248,8 @@ def campaign_inference(project: ProjectStore, report: ContinuationCampaign) -> J
             "lineage": lineage,
             "planned": planned,
             "unknown": planned - len(known),
+            "actor_budget_exhausted": exhausted,
+            "actor_budget_exhausted_share": exhausted / planned if planned else None,
             "repeated_attempts": proportion_summary(sum(known), len(known)),
             "missing_outcome_bounds": missing_outcome_bounds(
                 sum(known), planned - len(known), planned

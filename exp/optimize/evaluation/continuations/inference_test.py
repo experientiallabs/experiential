@@ -50,6 +50,7 @@ def cells() -> tuple[CellOutcomes, ...]:
             lineage="task-a",
             planned=8,
             outcomes=(1, 0, 0, 0, 1, 0),
+            actor_budget_exhausted=1,
             forecast=0.2,
         ),
         CellOutcomes(
@@ -100,6 +101,9 @@ def test_repeats_estimate_one_checkpoint_and_lineages_estimate_tasks() -> None:
     assert isinstance(random, dict)
     assert random["missing_outcome_bounds"] == [2 / 16, 4 / 16]
     assert field(random, "checkpoints", 0, "unknown") == 2
+    assert field(random, "checkpoints", 0, "actor_budget_exhausted") == 1
+    assert (random["actor_budget_exhausted"], random["actor_budget_exhausted_share"]) == (1, 1 / 16)
+    assert field(report, "arms", "proposed", "actor_budget_exhausted") == 0
 
 
 def test_critic_brier_is_outcome_level_and_compared_with_a_disjoint_base_rate() -> None:

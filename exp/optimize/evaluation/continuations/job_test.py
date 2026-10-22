@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 from exp.common.core.artifacts import sha256_bytes, sha256_json
-from exp.common.models import load_model_catalog
+from exp.common.models import load_model_catalog, write_model_catalog
 from exp.common.project import ProjectStore
 from exp.optimize.evaluation.audit.panel_test import write_catalog
 from exp.optimize.evaluation.continuations.admission import ContinuationAdmission
@@ -181,3 +181,70 @@ def test_one_physical_attempt_ceiling_bounds_jobs_and_composed_panels(
     )
     with pytest.raises(ValueError, match="physical-attempt ceiling"):
         FramingStudySpec(base=largest, intervention="Evaluation", equivalence_rationale="cue")
+
+
+def test_actor_reasoning_effort_must_be_declared_by_its_deployment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An effort the actor deployment cannot preserve refuses before code or provider calls."""
+    project, job, transport = job_fixture(tmp_path, monkeypatch)
+    low = job.model_copy(update={"study": job.study.model_copy(update={"reasoning_effort": "low"})})
+    with pytest.raises(ValueError, match="actor reasoning effort 'low' is not supported by world"):
+        preflight_continuation_job(project, low)
+    with pytest.raises(ValueError, match="none declared"):
+        execute_continuation_job(project, low, code_revision="test")
+    assert not transport.requests
+
+
+def test_actor_spending_its_allowance_is_sent_its_effort_and_counted_as_exhausted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Empty length-terminated replies end each branch as a counted budget exhaustion."""
+    project, job, _ = job_fixture(tmp_path, monkeypatch)
+    catalog = load_model_catalog(project.model_catalog_path)
+    world = catalog.models["world"]
+    assert world.capabilities is not None
+    world = world.model_copy(
+        update={
+            "capabilities": world.capabilities.model_copy(update={"supports_reasoning": True}),
+            "supported_reasoning_efforts": ("low", "medium", "high"),
+        }
+    )
+    catalog = catalog.model_copy(update={"models": {**catalog.models, "world": world}})
+    write_model_catalog(project.model_catalog_path, catalog)
+    snapshot = RuntimeModelCatalog(catalog).resolve("world").snapshot
+    job = job.model_copy(
+        update={
+            "study": job.study.model_copy(
+                update={"reasoning_effort": "low", "actor_model": snapshot}
+            ),
+            "catalog_sha256": sha256_json(catalog.model_dump(mode="json")),
+            "maximum_physical_attempts": 20,
+        }
+    )
+    empty = JsonHttpResponse(
+        status_code=200,
+        body={
+            "id": "reply",
+            "model": "world-v1",
+            "choices": [
+                {
+                    "index": 0,
+                    "finish_reason": "length",
+                    "message": {"role": "assistant", "content": None},
+                }
+            ],
+        },
+    )
+    transport = OutageTransport(tuple(empty for _ in range(20)))
+    monkeypatch.setattr(
+        "exp.optimize.evaluation.continuations.job.HttpxJsonTransport", lambda: transport
+    )
+    result = execute_continuation_job(project, job, code_revision="test")
+    assert transport.requests
+    assert all(request.payload["reasoning_effort"] == "low" for request in transport.requests)
+    assert [row.actor_stop for row in result.branches] == ["actor_budget_exhausted"] * 2
+    assert [row.failure for row in result.branches] == ["ProviderRetryableResponseError"] * 2
+    metrics = result.metrics()
+    assert (metrics["assessable"], metrics["actor_budget_exhausted"]) == (0, 2)
+    assert metrics["actor_budget_exhausted_share"] == 1.0

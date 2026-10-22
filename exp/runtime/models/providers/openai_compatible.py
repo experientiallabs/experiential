@@ -345,7 +345,8 @@ def openai_compatible_response(
         output = AssistantAction(content=content, tool_calls=tool_calls)
     except ValueError as exc:
         raise ProviderRetryableResponseError(
-            "OpenAI-compatible response has neither text nor a complete tool call"
+            "OpenAI-compatible response has neither text nor a complete tool call",
+            hit_length_limit=choice.get("finish_reason") == "length",
         ) from exc
     return ModelResponse.completed(
         output=output,

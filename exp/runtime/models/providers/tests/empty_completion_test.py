@@ -86,6 +86,26 @@ def test_empty_chat_response_stops_at_the_retry_bound() -> None:
         transport=transport,
         retry_policy=RetryPolicy(maximum_attempts=2, initial_delay_seconds=0),
     )
-    with pytest.raises(ProviderRetryableResponseError):
+    with pytest.raises(ProviderRetryableResponseError) as raised:
         client.complete(_request())
+    assert raised.value.hit_length_limit is False
+    assert len(transport.requests) == 2
+
+
+def test_empty_chat_response_at_the_output_allowance_reports_the_length_limit() -> None:
+    """An empty response that stopped at the allowance says so, after the bounded retries."""
+    empty: JsonObject = {"choices": [{"finish_reason": "length", "message": {"content": None}}]}
+    transport = ScriptedJsonTransport(
+        [JsonHttpResponse(status_code=200, body=empty) for _ in range(2)]
+    )
+    client = OpenAICompatibleClient(
+        model=_snapshot(),
+        base_url="https://example.test/v1",
+        api_key="fixture",
+        transport=transport,
+        retry_policy=RetryPolicy(maximum_attempts=2, initial_delay_seconds=0),
+    )
+    with pytest.raises(ProviderRetryableResponseError) as raised:
+        client.complete(_request())
+    assert raised.value.hit_length_limit is True
     assert len(transport.requests) == 2

@@ -51,6 +51,8 @@ class CriticSpec(ContractModel):
         system_prompt: Original actor instruction, checked against the captured policy.
         temperature: Frozen continuation sampling temperature.
         actor_output_tokens: Output allowance for each future actor call.
+        actor_reasoning_effort: Reasoning effort registered for each future actor call, or None
+            for the actor model's catalog default; shown to the estimator only when set.
         critic_alias: Catalog entry selected for the estimator.
         critic_model: Exact estimator snapshot.
         catalog_sha256: Credential-free catalog identity.
@@ -72,6 +74,9 @@ class CriticSpec(ContractModel):
     system_prompt: str | None = None
     temperature: float = Field(default=1, ge=0, le=2, allow_inf_nan=False)
     actor_output_tokens: int = Field(default=4096, ge=1, le=65536)
+    actor_reasoning_effort: ReasoningEffort | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
     critic_alias: str = Field(min_length=1)
     critic_model: ModelSnapshot
     catalog_sha256: Sha256
@@ -132,6 +137,8 @@ def critic_request(store: ArtifactStore, spec: CriticSpec) -> ModelRequest:
         "actor_temperature": spec.temperature,
         "actor_output_tokens": spec.actor_output_tokens,
     }
+    if spec.actor_reasoning_effort is not None:
+        public["actor_reasoning_effort"] = spec.actor_reasoning_effort
 
     request = ModelRequest(
         messages=(
@@ -366,6 +373,7 @@ def require_prediction_binding(
     actor_model: ModelSnapshot,
     temperature: float,
     output_tokens: int,
+    reasoning_effort: ReasoningEffort | None,
     probability: float | None,
     verifier_sha256: Sha256,
     probe_sha256: Sha256,
@@ -380,6 +388,7 @@ def require_prediction_binding(
         or spec.actor_model != actor_model
         or spec.temperature != temperature
         or spec.actor_output_tokens != output_tokens
+        or spec.actor_reasoning_effort != reasoning_effort
         or prediction.estimate.probability != probability
     ):
         raise ValueError("critic prediction differs from the continuation policy or probability")
