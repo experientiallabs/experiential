@@ -200,6 +200,8 @@ PROTOCOLS = (
             "exp.runtime.environments.containment.darwin_gate",
         ),
         "693bb76a1249204e492feaca8ae8508ed914ade3334792a6b008048dfcbf0375",
+    ),
+    Protocol(
         "exp.runtime.agents.cascade:CASCADE_VERSION",
         "decision-cascade-v1",
         (
