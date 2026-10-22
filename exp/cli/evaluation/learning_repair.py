@@ -1,11 +1,12 @@
 """The ``repair-learning`` continuation action: settle, screen or evolve learned memory.
 
-One action, three explicit resolutions of its ``learning_repair`` payload:
+One action, four explicit resolutions of its ``learning_repair`` payload:
 
 - ``retain-observations`` settles a failed learning run from saved observations, without calls;
 - ``screen-lessons`` screens a learned checkpoint's misses into a lesson set (one native
   decision per new miss);
-- ``evolve-lessons`` proposes one lesson-library edit and keeps it only on held-out gain.
+- ``evolve-lessons`` proposes one lesson-library edit and keeps it only on held-out gain;
+- ``retire-trace`` records that one named trace will never be learned, without calls.
 
 Paid resolutions print their preflight first, stop there on ``--dry-run``, and ask for spend
 consent before any credential or provider client is built. Completed work replays without calls.
@@ -28,7 +29,12 @@ from exp.optimize.evaluation.learning.lessons import (
     preflight_screening,
     screen_lessons,
 )
-from exp.optimize.evaluation.learning.repair import LearningRepairSpec, repair_learning
+from exp.optimize.evaluation.learning.repair import (
+    LearningRepairSpec,
+    TraceRetirementRequest,
+    repair_learning,
+    retire_trace,
+)
 
 
 def handle_repair_learning(context: ContinuationContext, spec: LearningRepair) -> None:
@@ -58,6 +64,9 @@ def handle_repair_learning(context: ContinuationContext, spec: LearningRepair) -
         console.print_json(
             data=repair_learning(store, spec, code_revision=revision, dry_run=dry_run)
         )
+        return
+    if isinstance(spec, TraceRetirementRequest):
+        console.print_json(data=retire_trace(store, spec, code_revision=revision, dry_run=dry_run))
         return
     if isinstance(spec, LessonEvolutionRequest):
         plan = preflight_evolution(store, spec)

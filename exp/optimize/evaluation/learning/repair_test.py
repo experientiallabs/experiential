@@ -2,23 +2,27 @@
 
 import json
 from collections.abc import Mapping
+from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import Mock
 
 import pytest
 from pydantic import BaseModel
-from typer.testing import CliRunner
+from typer.testing import CliRunner, Result
 
 from exp.cli.app import app
 from exp.cli.evaluation.continuations import ContinuationCommand
 from exp.common.core.artifacts import ArtifactEnvelope, JsonValue
 from exp.common.project import ProjectStore, artifact_input
 from exp.common.project.manifests import ArtifactManifest
+from exp.optimize.evaluation.audit.panel import plan_held_out_panel
 from exp.optimize.evaluation.audit.panel_test import REVISION, build_project, episode
 from exp.optimize.evaluation.fidelity.memory import saved_memory_receipt, trajectory_record
 from exp.optimize.evaluation.fidelity.runner import PreparedFidelity
 from exp.optimize.evaluation.learning import repair as learning_repair
 from exp.optimize.evaluation.learning.repair import LearningRepairSpec, repair_learning
+from exp.optimize.evaluation.learning.retirement import retirement_of
+from exp.optimize.evaluation.learning.retirement_test import OUTAGE, learn, refusing_project
 from exp.optimize.evaluation.learning.traces import (
     _saved_attempts,
     learn_from_traces,
@@ -27,6 +31,7 @@ from exp.optimize.evaluation.learning.traces import (
     learning_plan,
 )
 from exp.optimize.evaluation.tests.replay_retirement_test import RedrawnPrediction, now
+from exp.runtime.models.providers.transport import ProviderTransportError
 from exp.simulation.world_model.experience_memory import (
     Eligibility,
     memory_catalog,
@@ -234,3 +239,72 @@ def test_observation_only_repair_never_admits_candidate_text_as_original_evidenc
     observations = [row for row in records.values() if row.get("kind") == "original-observation"]
     assert len(observations) == 12
     assert project.artifacts.read_bytes(prepared.id + "-report", "report.json") == report
+
+
+def test_an_operator_retires_a_stuck_trace_and_learning_continues(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A trace an outage keeps blocking is retired by name, recorded, and skipped thereafter.
+
+    The retirement makes no call and edits no memory. It refuses a learned trace and a held-out
+    trace, and the audit checkpoint and learning curve both name and count it as not learned.
+    """
+    store, provider, trace_id = refusing_project(tmp_path, monkeypatch, OUTAGE)
+    with pytest.raises(ProviderTransportError):
+        learn(store)
+    lineage = learning_plan(store, scope="fit").lineage
+    head = memory_head(store.artifacts, lineage)
+    learned_id = learning_cases(store, "fit")[0].trace_id
+    held_id = next(
+        case.trace_id
+        for case in learning_cases(store, "all")
+        if case.trace_id not in {row.trace_id for row in learning_cases(store, "fit")}
+    )
+
+    def retire(trace: str, *suffix: str) -> Result:
+        """Run the public repair-learning retirement for one trace."""
+        command = tmp_path / "retire.json"
+        command.write_text(
+            json.dumps(
+                {
+                    "action": "repair-learning",
+                    "learning_repair": {
+                        "resolution": "retire-trace",
+                        "trace_id": trace,
+                        "reason": "gateway outage on this trace only; investigated separately",
+                    },
+                }
+            )
+        )
+        args = ["eval", store.paths.project_id, "--root", str(store.paths.root)]
+        return CliRunner().invoke(app, [*args, "--continuations", str(command), *suffix])
+
+    calls = len(provider.requests)
+    for refused, why in ((learned_id, "already learned"), (held_id, "held-out traces")):
+        result = retire(refused, "--non-interactive")
+        assert result.exit_code != 0 and why in " ".join(result.output.split()), result.output
+    dry = retire(trace_id, "--dry-run")
+    assert dry.exit_code == 0, dry.output
+    assert retirement_of(store, lineage, trace_id) is None, "a dry run writes nothing"
+    for _ in range(2):  # the second identical retirement replays
+        result = retire(trace_id, "--non-interactive")
+        assert result.exit_code == 0, (result.output, result.exception)
+    assert len(provider.requests) == calls, "retirement makes no model call"
+    assert memory_head(store.artifacts, lineage) == head, "retirement never edits memory"
+    retirement = retirement_of(store, lineage, trace_id)
+    assert retirement is not None and retirement.cause == "operator"
+    assert retirement.run is not None and retirement.refusals == ()
+    provider.task_id = None  # the outage would end, but the trace is never sent again
+    outcome = learn(store, retry_incomplete=True)
+    cases = learning_cases(store, "fit")
+    assert (outcome.learned, outcome.retired, outcome.stopped) == (len(cases) - 1, 1, None)
+    assert learning_plan(store, scope="fit").lineage == lineage
+    curve = learning_curve(store, "fit")
+    assert curve is not None and curve.retired == 1 and len(curve.points) == len(cases) - 1
+    planned = plan_held_out_panel(
+        store, 3, profile="memory", code_revision=REVISION, clock=lambda: datetime.now(UTC)
+    )
+    assert planned.checkpoint is not None
+    (row,) = planned.checkpoint.retired
+    assert (row.trace_id, row.cause) == (trace_id, "operator")
+    assert planned.checkpoint.fit_traces_learned == len(cases) - 1

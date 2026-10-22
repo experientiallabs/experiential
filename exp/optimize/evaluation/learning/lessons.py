@@ -40,7 +40,7 @@ from exp.optimize.evaluation.fidelity.memory_policy import (
     load_lesson_selection,
 )
 from exp.optimize.evaluation.fidelity.replay import DEADLINE
-from exp.optimize.evaluation.learning.repair import LearningRepairSpec
+from exp.optimize.evaluation.learning.repair import LearningRepairSpec, TraceRetirementRequest
 from exp.optimize.evaluation.learning.screening import (
     SCREENING_PROTOCOL,
     LearningMiss,
@@ -188,7 +188,8 @@ def _resolution(value: object) -> str | None:
 LearningRepair = Annotated[
     Annotated[LearningRepairSpec, Tag("retain-observations")]
     | Annotated[LessonScreeningSpec, Tag("screen-lessons")]
-    | Annotated[LessonEvolutionRequest, Tag("evolve-lessons")],
+    | Annotated[LessonEvolutionRequest, Tag("evolve-lessons")]
+    | Annotated[TraceRetirementRequest, Tag("retire-trace")],
     Discriminator(_resolution),
 ]
 
