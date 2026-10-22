@@ -131,7 +131,9 @@ immutable, preserving the evidence pinned by earlier evaluations. Preparation al
 evaluation or HTML report; those are outputs of running and judging candidate rollouts.
 
 Select an exact stored corpus with `exp build PROJECT --import-id IMPORT_ID --root ROOT`.
-The build pins that import in its configuration and does not reread the original source.
+The build pins that import and its declared format in its configuration and does not reread the
+original source. A later build may select an import of another format, such as trajectories
+exported from the project's own continuation studies.
 
 ## Authorized PostHog HogQL pull
 
