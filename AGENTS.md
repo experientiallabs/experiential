@@ -393,6 +393,7 @@ uv run pytest -q
     | Infrastructure failures in scored workflows | `exp/simulation/evaluation/workflow.py` | `INFRASTRUCTURE_STOPS` are raised, never scored; the run stays incomplete and resumes in place |
     | Producer revision | `exp/common/release_revision.py` | `installed_release_revision` |
     | Generated trajectories as trace evidence | `exp/optimize/evaluation/continuations/traces.py` | `export_trajectory_traces` over saved continuation studies; only native-owned replies become learning evidence, and the build refuses simulation provenance |
+| Development tasks of a build | `exp/simulation/development_scope.py` | `development_tasks` lists fit tasks and `development_task` refuses held-out ones by ID; every consumer checks `require_development_task` |
 
     Keep this table current. A change that introduces an owner for a new concern adds its row in
     the same commit.

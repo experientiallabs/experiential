@@ -1,7 +1,7 @@
 """Build-owned task provenance checks before development sampling or training export."""
 
 from exp.common.project import ArtifactStore, ProjectStore
-from exp.common.tasks import TaskCase
+from exp.common.tasks import TaskCase, load_task_set
 from exp.simulation.mining.bindings import load_task_set_lineage_bindings
 
 
@@ -41,3 +41,62 @@ def require_development_task(store: ArtifactStore, task: TaskCase) -> None:
                 "development task lineage differs from its sources in the frozen build; "
                 "preserve the source lineage when deriving a task"
             )
+
+
+def development_tasks(project: ProjectStore) -> tuple[TaskCase, ...]:
+    """The fit tasks of the project's completed build, each checked for development use.
+
+    Held-out tasks are withheld rather than listed, so a caller choosing a development task
+    never sees a reserved one.
+
+    Args:
+        project: Project with a completed build.
+
+    Returns:
+        Fit tasks in build order, each passing :func:`require_development_task`.
+
+    Raises:
+        ValueError: The project has no completed build, or a fit task fails its provenance check.
+    """
+    tasks = load_task_set(project.artifacts, _build_task_set(project)).tasks
+    kept = tuple(task for task in tasks if task.partition == "fit")
+    for task in kept:
+        require_development_task(project.artifacts, task)
+    return kept
+
+
+def development_task(project: ProjectStore, task_id: str) -> TaskCase:
+    """One task of the project's completed build, refused unless development may consume it.
+
+    Args:
+        project: Project with a completed build.
+        task_id: Task identity in the build's task set.
+
+    Returns:
+        The build task, unchanged.
+
+    Raises:
+        ValueError: The build has no such task, or the task is held out or its lineage reserved.
+    """
+    for task in load_task_set(project.artifacts, _build_task_set(project)).tasks:
+        if task.task_id == task_id:
+            if task.partition != "fit":
+                raise ValueError(
+                    f"build task {task_id} is held out; development may use fit tasks only, "
+                    "so choose one the development-tasks action lists"
+                )
+            require_development_task(project.artifacts, task)
+            return task
+    raise ValueError(
+        f"the build has no task {task_id!r}; the development-tasks action lists its fit tasks"
+    )
+
+
+def _build_task_set(project: ProjectStore) -> str:
+    """The task-set artifact ID of the project's completed build."""
+    build = project.load_project().build if project.exists() else None
+    if build is None:
+        raise ValueError(
+            f"project {project.paths.project_id} has no completed build; run exp build first"
+        )
+    return build.task_set.artifact_id
