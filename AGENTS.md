@@ -404,6 +404,8 @@ uv run pytest -q
 | Simulated worlds grounded in a build | `exp/optimize/evaluation/executable/grounding.py` | `grounded_capture` fills the world model, learned memory, catalog digest and optional trace facts into a capture of the built-in grounded runtime |
 | Independent specifications and witnessed qualification controls | `exp/optimize/evaluation/executable/controls.py` | `register_specification`; `witness_controls` records each control's witness and re-verifies it with qualification's admission check |
 | Prepared continuation operations | `exp/cli/evaluation/continuation_context.py` | `emit_operation` prints a ready operation and saves it to a new operation file after `require_new_operation_file` |
+    | Task validity before a factory task is kept | `exp/optimize/evaluation/factory/validity.py`, `exp/optimize/evaluation/factory/leakage.py` | `run_task_validity` (controls, `produced_values` leak check, quoted judge, closed-book draws) from the `check-task-validity` continuation; never tunes a verifier |
+| Generated trajectories as trace evidence | `exp/optimize/evaluation/continuations/traces.py` | `export_trajectory_traces` over saved continuation studies; only native-owned replies become learning evidence, and the build refuses simulation provenance |
 
     Keep this table current. A change that introduces an owner for a new concern adds its row in
     the same commit.
