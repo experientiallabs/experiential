@@ -32,6 +32,7 @@ results, and plans do not live here.
 | `reference/gateway-latency.md` | Routine CI gateway-latency report against a local mock: schedule, artifact schema, and numeric latency badge. |
 | `reference/openai-compatible-recipes.md` | Verified Fireworks, Modal, and Experiential Cloud connection recipes through the openai-compatible provider family. |
 | `reference/ingest.md` | Current declared local trace source contract for every supported source. |
+| `reference/incremental-session-state.md` | Incremental session state: content-addressed nodes, immutable event log, structural edits, retention pins, collection, measured effect and the schema 4 cutover. |
 | `reference/immutable-real-trace-rag.md` | Immutable real-trace retrieval provenance, leakage, persistence, and historical restoration contract. |
 | `reference/induced-transitions.md` | Exact per-tool transition programs induced from fit traces: induce and validate actions, validation rules, sandboxed execution, serving with the grounded simulator and paired replay measurement. |
 | `reference/router_optimization_config.md` | Exact completed-evidence configuration recipe for router optimization. |

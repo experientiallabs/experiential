@@ -389,6 +389,7 @@ uv run pytest -q
     | Deterministic held-out split of independent units | `exp/common/evaluations/splits.py` | `held_out_count` and `salted_order` over whole lineages or leakage components; never split a unit |
 | Uncertainty over independent units | `exp/common/evaluations/uncertainty.py` | `wilson_interval` and summaries at the declared unit count (lineage, component or case), or `paired_bootstrap_summary` for a paired case bootstrap; repeats of one unit are averaged first; unknown outcomes stay bounds, never intervals |
     | Process-local reuse of verified immutable content | `exp/common/core/verified_cache.py` | `VerifiedCache` keyed only by a digest just recomputed from the bytes in hand; only successes are kept, so changed content is fully re-verified |
+    | Durable candidate state and its history | `exp/runtime/sessions/store.py`, `exp/runtime/sessions/edits.py` | `SessionStore` commits ordered structural edits (set, delete, append, copy; the interpreter is `apply_edits`) and hands out revision-bound state references; read one path of one revision, pin history before exposing it, collect only unowned nodes; never a second state codec or a parallel full-state column |
     | Saved-result identity | `exp/common/core/artifacts.py` | `stable_id` over content; never over paths or source files |
     | Local identifiers in paths | `exp/common/project/paths.py` | `validate_local_id` |
     | Atomic file writes | `exp/common/core/files.py` | `write_text_atomic` |
