@@ -6,6 +6,11 @@ protocol constant instead of hashing their own source. Saved results then surviv
 formatting and unrelated edits, and re-key only when the protocol is bumped. Provider attempt
 timeouts follow the same rule: each admitted physical attempt records the protocol of the
 derivation that bounded it.
+Calibration, the actor council, task refinement, private workbook views, workbook instance facts
+and the restorable environment backends bind their saved results to a protocol constant instead
+of hashing their own source. Saved results then survive moves, formatting and unrelated edits,
+and re-key only when the protocol is bumped. Provider attempt timeouts follow the same rule:
+each admitted physical attempt records the protocol of the derivation that bounded it.
 
 This test keeps that honest. Each protocol lists the source that decides its behavior, with that
 source's digest at the protocol's current value. When the covered source changes, the test fails
@@ -159,6 +164,12 @@ PROTOCOLS = (
         "xlsx-row-edits-v3",
         ("exp.runtime.environments.workbook_edits",),
         "977a23f451e187c67db9052c5eaa226a49b433727821a904d3708ea648ff6242",
+    ),
+    Protocol(
+        "exp.runtime.environments.workbook_facts:WORKBOOK_FACTS_PROTOCOL",
+        "xlsx-instance-facts-v1",
+        ("exp.runtime.environments.workbook_facts",),
+        "ec81b006c8fb988e53ef5fcff1b001fc3648ed7604be31c9fa1b378f597392d2",
     ),
     Protocol(
         "exp.runtime.environments.artifact_world:ARTIFACT_WORLD_PROTOCOL",
