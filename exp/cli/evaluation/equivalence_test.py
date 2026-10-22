@@ -1,5 +1,6 @@
 """The public CLI executes and replays paired measurements and trace-council analysis."""
 
+import json
 from pathlib import Path
 
 import pytest
@@ -7,13 +8,19 @@ from typer.testing import CliRunner
 
 from exp.cli.app import app
 from exp.cli.evaluation.continuations import ContinuationCommand
+from exp.common.core.artifacts import ArtifactInput
+from exp.common.project import artifact_input
+from exp.optimize.evaluation.continuations.traces import trajectory_studies
 from exp.optimize.evaluation.equivalence.runner_test import equivalence_fixture
 
 
 def test_public_cli_compares_environments_and_runs_its_council(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Dry-run is inert, execution saves complete evidence, and replay needs no provider setup."""
+    """Dry-run is inert, execution saves complete evidence, and replay needs no provider setup.
+
+    The printed reference names the saved report, the generator export-traces consumes.
+    """
     project, spec, actors, reviews = equivalence_fixture(tmp_path, monkeypatch)
     request = tmp_path / "equivalence.json"
     request.write_text(
@@ -41,6 +48,11 @@ def test_public_cli_compares_environments_and_runs_its_council(
         result.output.split()
     )
     assert len(actors.requests) == 6 and len(reviews.requests) == 3
+    # The printed reference is the saved report itself, so export-traces can consume it.
+    printed = json.loads(result.output[result.output.index("{") : result.output.rindex("}") + 1])
+    reference = ArtifactInput.model_validate(printed["reference"])
+    assert reference == artifact_input(project.artifacts.read(reference.artifact_id).manifest)
+    assert len(trajectory_studies(project.artifacts, reference)) == 3
     spec.cases[0].reference.runtime_file.unlink()
     project.model_catalog_path.unlink()
     monkeypatch.delenv("HELD_OUT_TEST_KEY")
