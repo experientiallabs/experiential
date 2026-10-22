@@ -67,6 +67,7 @@ from exp.cli.evaluation.judge_challenges import handle_challenge_judges
 from exp.cli.evaluation.learning_repair import handle_repair_learning
 from exp.cli.evaluation.memory_forget import handle_forget_summary
 from exp.cli.evaluation.sample_count import handle_sample_count
+from exp.cli.evaluation.task_hardening import handle_check_task_validity, handle_harden_tasks
 from exp.cli.evaluation.trajectory_traces import handle_export_traces
 from exp.cli.shared.options import usage_error
 from exp.cli.shared.theme import EXP_THEME
@@ -96,8 +97,10 @@ from exp.optimize.evaluation.equivalence.runner import EquivalenceSpec
 from exp.optimize.evaluation.executable.controls import SpecificationRegistration
 from exp.optimize.evaluation.executable.scenarios import RecordScenarioSpec, RecordWitnessSpec
 from exp.optimize.evaluation.factory.candidates import CandidateBatchSpec
+from exp.optimize.evaluation.factory.hardening import TaskHardeningSpec
 from exp.optimize.evaluation.factory.proposals import TaskProposalSpec
 from exp.optimize.evaluation.factory.scenario_search import ScenarioSearchSpec
+from exp.optimize.evaluation.factory.validity import TaskValiditySpec
 from exp.optimize.evaluation.factory.variants import TaskVariantSpec
 from exp.optimize.evaluation.hillclimb.proposals import EditProposalSpec
 from exp.optimize.evaluation.hillclimb.report import ClimbReportSpec
@@ -165,6 +168,8 @@ CONTINUATION_ACTIONS = (
     ContinuationAction("climb-round", "climb_round", handle_climb_round),
     ContinuationAction("propose-edits", "edit_proposals", handle_propose_edits),
     ContinuationAction("climb-report", "climb_report", handle_climb_report),
+    ContinuationAction("check-task-validity", "task_validity", handle_check_task_validity),
+    ContinuationAction("harden-tasks", "hardening", handle_harden_tasks),
 )
 _ACTIONS_BY_NAME = {action.name: action for action in CONTINUATION_ACTIONS}
 
@@ -222,6 +227,8 @@ class ContinuationCommand(ContractModel):
         climb_round: One prompt edit screened on train and confirmed on test lineages.
         edit_proposals: Analyst edits from train failures and keep bits only, never applied.
         climb_report: Baseline against the best kept prompt on fresh test repeats.
+        task_validity: Leak, closed-book and control checks for one qualified variant.
+        hardening: Bounded harder-world levels for one qualified seed until a panel separates.
     """
 
     action: ContinuationActionName
@@ -265,6 +272,8 @@ class ContinuationCommand(ContractModel):
     climb_round: ClimbRound | None = None
     edit_proposals: EditProposalSpec | None = None
     climb_report: ClimbReportSpec | None = None
+    task_validity: TaskValiditySpec | None = None
+    hardening: TaskHardeningSpec | None = None
 
     @model_validator(mode="after")
     def exact_payload(self) -> "ContinuationCommand":
