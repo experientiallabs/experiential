@@ -8,6 +8,7 @@ randomness. The kernel in :mod:`exp.runtime.environments.worlds` executes agains
 
 from __future__ import annotations
 
+from collections.abc import Iterable, Mapping
 from typing import Literal, Self
 
 from pydantic import ConfigDict, Field, model_validator
@@ -112,6 +113,23 @@ class ToolEffectPolicy(ContractModel):
         return frozenset(self.reads) | frozenset(self.writes)
 
 
+def spanning_tools(tools: Iterable[ToolEffectPolicy], owners: Mapping[str, str]) -> tuple[str, ...]:
+    """Return the tools whose declared domains belong to more than one owner.
+
+    This is the single ownership rule for routed execution: a tool executes on exactly one
+    owner, so every domain it reads or writes must share that owner. Callers that partition
+    domains between other executors (such as induced code and a predictor) apply it too.
+
+    Args:
+        tools: Declared tool effect policies.
+        owners: Owner label of every domain the tools declare.
+
+    Returns:
+        Names of tools that span owners, in declaration order.
+    """
+    return tuple(tool.name for tool in tools if len({owners[name] for name in tool.domains()}) > 1)
+
+
 class WorldManifest(ContractModel):
     """State domains and per-tool effect policies frozen before an episode.
 
@@ -152,11 +170,11 @@ class WorldManifest(ContractModel):
                 raise ValueError(
                     "reply state bindings must stay inside the tool's declared domains"
                 )
-            if len({owners[name] for name in tool.domains()}) > 1:
-                raise ValueError(
-                    f"tool {tool.name!r} spans native and simulated domains; split the tool or "
-                    "give its domains one owner"
-                )
+        if spanning := spanning_tools(self.tools, owners):
+            raise ValueError(
+                f"tool {spanning[0]!r} spans native and simulated domains; split the tool or "
+                "give its domains one owner"
+            )
         if len({bridge.name for bridge in self.native_reads}) != len(self.native_reads):
             raise ValueError("native read bridge names must be unique")
         for bridge in self.native_reads:

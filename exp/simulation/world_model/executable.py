@@ -339,6 +339,27 @@ class _GroundedWorldBackend:
             return observation
         raise RuntimeError("bounded proposal loop ended without a result")
 
+    def adopt(self, action: ToolCall, observation: Observation, state: JsonObject) -> None:
+        """Commit one exact transition computed outside the predictor, such as induced code.
+
+        The new state replaces this owner's domains and the call joins the visible history,
+        so later predictions see every applied action and their instance-fact versions keep
+        counting applied actions. The outer kernel still verifies effects before commit.
+
+        Raises:
+            ValueError: The state names other domains or violates a declared state schema.
+        """
+        if self._closed:
+            raise RuntimeError("grounded world is closed")
+        self.factory._check_state(state)
+        self.state = deepcopy(state)
+        self.history += (
+            {
+                "actions": [action.model_dump(mode="json")],
+                "observations": [observation.model_dump(mode="json")],
+            },
+        )
+
     def _validate_proposal(
         self,
         raw: JsonObject,

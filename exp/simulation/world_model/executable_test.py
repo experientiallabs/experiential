@@ -20,6 +20,7 @@ from exp.common.tasks.facts import (
     InstanceFact,
     InstanceFacts,
 )
+from exp.runtime.environments.interface import Observation
 from exp.runtime.environments.tests.world_conformance_test import _task
 from exp.runtime.environments.world_contracts import (
     StateDomain,
@@ -806,3 +807,18 @@ def test_workbook_facts_and_native_read_receipts_share_one_channel_in_a_mixed_wo
     assert len(requests) == 2
     assert saved.candidate is not None
     assert b"PQTW1" not in saved.candidate.image.parts["predictor.json"]
+
+
+def test_adopted_transitions_join_state_and_history_without_a_prediction() -> None:
+    """An exact transition computed elsewhere is committed and shown to later predictions."""
+    runtime, events, requests = world_fixture([[]])
+    assert isinstance(runtime.factory, GroundedWorldFactory)
+    backend = runtime.factory.create(_task("escalate"))
+    action = ToolCall(name="escalate", call_id="exact", arguments={})
+    observation = Observation(content="done")
+    backend.adopt(action, observation, {"tickets": {"status": "escalated"}, "archive": {}})
+    assert backend.state_projection()["tickets"] == {"status": "escalated"}
+    assert backend.history[-1]["actions"] == [action.model_dump(mode="json")]
+    with pytest.raises(ValueError, match="exactly its simulated domains"):
+        backend.adopt(action, observation, {"tickets": {}})
+    assert not events and not requests
