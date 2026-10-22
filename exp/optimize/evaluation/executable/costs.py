@@ -15,9 +15,14 @@ from exp.common.models.pricing import completion_cost_reservation
 from exp.common.models.token_cost import schedule_maximum_cost_nano_usd
 from exp.common.project import ProjectStore
 from exp.optimize.evaluation.analysis.actor_decisions import ActorDecisionSpec
+from exp.optimize.evaluation.analysis.cascade_confirmation import (
+    CascadeConfirmationSpec,
+    confirmation_panel,
+)
+from exp.optimize.evaluation.analysis.decision_cascade import CascadeFitSpec
 from exp.optimize.evaluation.analysis.memory_analyst import MemoryAnalystSpec
 from exp.optimize.evaluation.continuations.action_contrast import ActionContrastSpec
-from exp.optimize.evaluation.continuations.actors import ActorPanelSpec
+from exp.optimize.evaluation.continuations.actors import ActorPanelSpec, panel_jobs
 from exp.optimize.evaluation.continuations.campaign import ContinuationCampaignSpec
 from exp.optimize.evaluation.continuations.capture import CaptureDefinition
 from exp.optimize.evaluation.continuations.critic import CriticSpec
@@ -54,6 +59,7 @@ from exp.optimize.evaluation.hillclimb.report import ClimbReportSpec, report_job
 from exp.optimize.evaluation.hillclimb.rounds import ClimbRound, round_jobs
 from exp.optimize.evaluation.induction.service import InductionSpec
 from exp.optimize.evaluation.tasks.challenge_runs import ChallengeRunSpec, challenge_attempts
+from exp.runtime.agents.cascade import DeciderDefinition
 from exp.runtime.gateway.decisions_contracts import (
     MAX_DECISION_CRITERIA,
     MAX_DECISION_INPUT_BYTES,
@@ -110,6 +116,8 @@ CostedSpec = (
     | TaskValiditySpec
     | TaskHardeningSpec
     | InductionSpec
+    | CascadeFitSpec
+    | CascadeConfirmationSpec
 )
 
 
@@ -228,13 +236,33 @@ def _grounded_costs(
 
 
 def job_costs(project: ProjectStore, job: ContinuationJob) -> tuple[CostComponent, ...]:
-    """Include actor attempts and the runtime's independent lifetime allowance."""
+    """Include actor attempts, any cascade decider and the runtime's lifetime allowance."""
     return (
         model_cost(
             project, job.actor_alias, job.maximum_physical_attempts, job.study.maximum_output_tokens
         ),
+        *decider_costs(
+            project,
+            None if job.study.cascade is None else job.study.cascade.decider,
+            job.maximum_physical_attempts,
+        ),
         *runtime_costs(project, job.runtime_sha256, job.configuration),
     )
+
+
+def decider_costs(
+    project: ProjectStore, decider: DeciderDefinition | None, attempts: int
+) -> tuple[CostComponent, ...]:
+    """Price a cascade decider at the attempt ceiling its decisions draw from.
+
+    In an episode the actor and its decider share one ledger, so pricing each at the whole
+    ceiling overestimates the mixture but cannot assume a favorable split of the attempts.
+    """
+    if decider is None:
+        return ()
+    if decider.kind == "systemone":
+        return (decision_cost(project, decider.alias, attempts),)
+    return (model_cost(project, decider.alias, attempts, decider.maximum_output_tokens),)
 
 
 def evaluation_costs(project: ProjectStore, spec: CostedSpec) -> tuple[CostComponent, ...]:
@@ -302,11 +330,12 @@ def evaluation_costs(project: ProjectStore, spec: CostedSpec) -> tuple[CostCompo
         return tuple(row.scaled(2 * spec.pairs) for row in job_costs(project, effect.spec.base))
     if isinstance(spec, ActorPanelSpec):
         return tuple(
-            row
-            for job in spec.cases
-            for actor in spec.actors
-            for row in job_costs(project, job.model_copy(update={"actor_alias": actor.alias}))
+            row for cell in panel_jobs(spec, "estimate") for row in job_costs(project, cell.job)
         )
+    if isinstance(spec, CascadeFitSpec):
+        return decider_costs(project, spec.decider, spec.maximum_physical_attempts)
+    if isinstance(spec, CascadeConfirmationSpec):
+        return evaluation_costs(project, confirmation_panel(project, spec)[1])
     if isinstance(spec, CheckpointExperimentSpec):
         plan = load_selection_plan(project, spec.selection)
         revision = project.artifacts.read(spec.selection.artifact_id).manifest.code_revision

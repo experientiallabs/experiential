@@ -10,6 +10,7 @@ an interrupted branch is retained as outcome-unknown and is never silently rerol
 from collections.abc import Callable, Iterable
 from contextlib import AbstractContextManager
 from datetime import UTC, datetime
+from operator import not_
 from typing import Literal, Protocol
 
 from filelock import FileLock
@@ -30,6 +31,13 @@ from exp.common.models import ModelClient, ModelRequest, ModelResponse, ModelSna
 from exp.common.project import ArtifactStore, artifact_input
 from exp.common.tasks import TaskCase
 from exp.optimize.evaluation.continuations.critic import require_prediction_binding
+from exp.optimize.evaluation.continuations.deciders import RecordedDecider
+from exp.runtime.agents.cascade import (
+    CascadeDecisionRecord,
+    CascadeModelClient,
+    CascadePolicy,
+    NextActionDecider,
+)
 from exp.runtime.agents.chat import ChatAgentRuntime, ChatCheckpoint, InvisibleToolCallError
 from exp.runtime.environments.interface import EnvironmentSession, Observation
 from exp.runtime.environments.mixed import MixedCheckpoint, MixedRealityEnvironmentRuntime
@@ -98,6 +106,8 @@ class ContinuationStudySpec(ContractModel):
             outcomes. Its absence keeps every branch ineligible for supervised export.
         training_evidence: Optional qualified-task and paired measurement handoff. Without it,
             admission checks observed outcomes only and carries no task qualification.
+        cascade: Opt-in decision cascade over the actor model, off when absent. Its decider
+            decides accepted steps; the actor model stays responsible for every other step.
     """
 
     checkpoint: ArtifactInput
@@ -113,6 +123,16 @@ class ContinuationStudySpec(ContractModel):
     maximum_output_tokens: int = Field(default=1024, gt=0, strict=True)
     training_specification: ArtifactInput | None = None
     training_evidence: TrainingEvidence | None = None
+    cascade: CascadePolicy | None = Field(default=None, exclude_if=lambda value: value is None)
+
+    @model_validator(mode="after")
+    def cascade_measures_behavior(self) -> "ContinuationStudySpec":
+        """Keep cascade episodes out of supervised training admission."""
+        if self.cascade is not None and (
+            self.training_specification is not None or self.training_evidence is not None
+        ):
+            raise ValueError("cascade episodes measure behavior; training admission is separate")
+        return self
 
 
 def study_identity(spec: ContinuationStudySpec, code_revision: str) -> str:
@@ -154,6 +174,8 @@ class ContinuationBranch(ContractModel):
         final_world: Exact restored-world result for independent later inspection, when captured.
         checkpoints: Durable paired boundaries after fully observed tool turns, in call order.
         actor_calls: Durable final actor inputs and returned responses, including interrupted calls.
+        cascade_decisions: With a cascade, which model decided each actor step and the decider's
+            confidence, in step order. Empty without a cascade.
     """
 
     index: int
@@ -165,6 +187,7 @@ class ContinuationBranch(ContractModel):
     final_world: ArtifactInput | None = None
     checkpoints: tuple[ArtifactInput, ...] = ()
     actor_calls: tuple[ArtifactInput, ...] = ()
+    cascade_decisions: tuple[CascadeDecisionRecord, ...] = Field(default=(), exclude_if=not_)
 
     def grading_outcome(self) -> JsonObject:
         """Keep saved execution status authoritative over a promising partial observation."""
@@ -353,6 +376,7 @@ def run_continuation_study(
     probe: Callable[[WorldCheckpoint], JsonObject],
     probe_sha256: Sha256,
     code_revision: str,
+    decider: NextActionDecider | None = None,
 ) -> ContinuationStudy:
     """Run or replay a frozen development study using existing actor and world execution.
 
@@ -365,11 +389,18 @@ def run_continuation_study(
         probe: Evaluator-only projection of checkpoint state, never actor-visible.
         probe_sha256: Actual probe definition identity, required to match registration.
         code_revision: Exact producing implementation identity, part of study identity.
+        decider: Caller-admitted cheap decider, required exactly when the spec has a cascade.
 
     Returns:
         Every planned branch. Unknown outcomes remain unknown; there is no automatic retry.
     """
     spec = ContinuationStudySpec.model_validate_json(spec.model_dump_json())
+    if (spec.cascade is None) != (decider is None) or (
+        spec.cascade is not None
+        and decider is not None
+        and decider.definition != spec.cascade.decider
+    ):
+        raise ValueError("a cascade study needs exactly its policy's frozen decider")
     checkpoint = load_continuation_checkpoint(store, spec.checkpoint)
     require_development_task(store, checkpoint.task)
     if spec.selection_plan is not None:
@@ -480,6 +511,7 @@ def run_continuation_study(
                     store,
                     code_revision,
                     branch_id,
+                    decider,
                 )
                 _save(
                     store,
@@ -514,12 +546,28 @@ def _run_branch(
     store: ArtifactStore,
     code_revision: str,
     branch_id: str,
+    decider: NextActionDecider | None,
 ) -> ContinuationBranch:
     """Restore one isolated world and retain failure as an explicit branch outcome."""
     outcome: JsonObject = {"steps": [], "stop_reason": "failure"}
     final_world: ArtifactInput | None = None
     points: list[ArtifactInput] = []
     intent = artifact_input(store.read(branch_id + "-intent").manifest)
+    actor_model: ModelClient = _PinnedModel(model, spec, outcome, store, branch_id, code_revision)
+    decisions: list[CascadeDecisionRecord] = []
+    if spec.cascade is not None and decider is not None:
+        actor_model = CascadeModelClient(
+            main=actor_model,
+            decider=RecordedDecider(
+                decider,
+                store=store,
+                prefix=branch_id,
+                inputs=(intent, spec.checkpoint),
+                code_revision=code_revision,
+            ),
+            policy=spec.cascade,
+            record=decisions.append,
+        )
     outcome["execution_phase"] = "world_restore"
     try:
         with restore_continuation_world(world, checkpoint.world_task, checkpoint.world) as session:
@@ -560,7 +608,7 @@ def _run_branch(
             episode = actor.resume(
                 checkpoint.task,
                 checkpoint.actor,
-                model=_PinnedModel(model, spec, outcome, store, branch_id, code_revision),
+                model=actor_model,
                 environment=observed,
                 on_checkpoint=capture_turn,
             )
@@ -584,6 +632,7 @@ def _run_branch(
             final_world=final_world,
             checkpoints=tuple(points),
             actor_calls=saved_actor_call_evidence(store, branch_id),
+            cascade_decisions=tuple(decisions),
         )
     except (ValueError, OSError, RuntimeError) as error:
         # Runtime, environment and provider failures become retained branch outcomes. Any other
@@ -613,6 +662,7 @@ def _run_branch(
             final_world=final_world,
             checkpoints=tuple(points),
             actor_calls=saved_actor_call_evidence(store, branch_id),
+            cascade_decisions=tuple(decisions),
             failure=type(error).__name__,
             failure_detail=StructuredFailure(
                 code=FailureCode.TIMEOUT

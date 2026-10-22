@@ -14,6 +14,7 @@ from exp.common.core.artifacts import ArtifactInput, ContractModel, JsonObject, 
 from exp.common.evaluations.uncertainty import Z95_ONE_SIDED, wilson_interval
 from exp.common.project import ArtifactStore, artifact_input
 from exp.optimize.evaluation.analysis.memory_evidence import EvidenceLocator, located_value
+from exp.runtime.agents.cascade import delegates
 
 
 class DecisionDefinition(ContractModel):
@@ -263,11 +264,11 @@ def _measure(
             briers.append(
                 sum((p - int(key == target)) ** 2 for key, p in prediction.probabilities.items())
             )
-        if (
-            prediction
-            and case.hard_allowed
-            and prediction.selected != "OTHER"
-            and prediction.probabilities[prediction.selected] >= threshold
+        if prediction and delegates(
+            prediction.selected,
+            prediction.probabilities[prediction.selected],
+            threshold=threshold,
+            allowed=case.candidates if case.hard_allowed else (),
         ):
             accepted += 1
             if target is not None:

@@ -20,6 +20,7 @@ from exp.common.core.artifacts import (
 )
 from exp.common.models import load_model_catalog
 from exp.common.project import ProjectStore, artifact_input
+from exp.optimize.evaluation.continuations.deciders import admitted_decider, preflight_decider
 from exp.optimize.evaluation.continuations.records import load_study
 from exp.optimize.evaluation.continuations.study import (
     ContinuationStudy,
@@ -60,7 +61,8 @@ class ContinuationJob(ContractModel):
         catalog_sha256: Complete catalog definition pinned before dispatch.
         maximum_model_calls: Original actor policy ceiling, including prefix calls.
         system_prompt: Original actor policy instruction.
-        maximum_physical_attempts: Shared durable provider-attempt ceiling.
+        maximum_physical_attempts: Shared durable provider-attempt ceiling, including the
+            attempts of any cascade decider.
         deadline: Frozen aware deadline for all actor provider calls.
     """
 
@@ -105,6 +107,8 @@ def preflight_continuation_job(project: ProjectStore, job: ContinuationJob) -> N
     if snapshot != job.study.actor_model:
         raise ValueError("actor alias differs from the registered model snapshot")
     require_admitted_transport(catalog, job.actor_alias, consumer="continuation actor")
+    if job.study.cascade is not None:
+        preflight_decider(catalog, job.study.cascade.decider)
     if (
         capabilities.maximum_output_tokens is not None
         and job.study.maximum_output_tokens > capabilities.maximum_output_tokens
@@ -174,6 +178,11 @@ def execute_continuation_job(
     model = catalog.resolve(job.actor_alias)
     if model.snapshot != job.study.actor_model:
         raise ValueError("actor alias differs from the registered model snapshot")
+    decider = (
+        None
+        if job.study.cascade is None
+        else admitted_decider(catalog, job.study.cascade.decider, transport, job.deadline)
+    )
     runtime = load_continuation_runtime(project, job)
     return run_continuation_study(
         project.artifacts,
@@ -186,6 +195,7 @@ def execute_continuation_job(
         probe=runtime.probe,
         probe_sha256=runtime.probe_sha256,
         code_revision=revision,
+        decider=decider,
     )
 
 

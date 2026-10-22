@@ -223,3 +223,31 @@ def test_one_model_under_two_system_prompts_is_a_panel_of_policies(
     stale = edited.model_copy(update={"checkpoints": (case.study.checkpoint,)})
     with pytest.raises(ValueError, match="initial checkpoint under that system prompt"):
         preflight_actor_panel(project, spec.model_copy(update={"actors": (actor, stale)}))
+
+
+def test_one_model_may_appear_with_and_without_a_cascade(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The cascade is part of the actor binding; an exact duplicate binding is still refused."""
+    from exp.runtime.agents.cascade import CascadePolicy, DeciderDefinition
+
+    project, spec, _ = panel_fixture(tmp_path, monkeypatch)
+    catalog = RuntimeModelCatalog(load_model_catalog(project.model_catalog_path), environment={})
+    plain = spec.actors[0]
+    cascade = plain.model_copy(
+        update={
+            "label": "with cascade",
+            "cascade": CascadePolicy(
+                decider=DeciderDefinition(
+                    kind="systemone", alias="jev", model=catalog.snapshot("jev")[0]
+                ),
+                threshold=0.8,
+            ),
+        }
+    )
+    paired = ActorPanelSpec(cases=spec.cases, actors=(plain, cascade))
+    cells = panel_jobs(paired, "test")
+    assert [cell.job.study.cascade for cell in cells] == [None, cascade.cascade]
+    assert "cascade" not in plain.model_dump(mode="json")
+    with pytest.raises(ValueError, match="distinct aliases"):
+        ActorPanelSpec(cases=spec.cases, actors=(plain, plain))

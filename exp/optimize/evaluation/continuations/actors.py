@@ -33,6 +33,7 @@ from exp.optimize.evaluation.executable.deferral import (
     deferred_execution,
     record_execution_deferral,
 )
+from exp.runtime.agents.cascade import CascadePolicy
 from exp.runtime.agents.chat import ChatAgentRuntime
 from exp.runtime.models.registry import RuntimeModelCatalog
 from exp.simulation.continuations import ContinuationCheckpoint, load_continuation_checkpoint
@@ -50,6 +51,7 @@ class PanelActor(ContractModel):
         checkpoints: With a system prompt, each case's initial checkpoint re-instructed by
             ``instructed_checkpoint``, in case order. The instruction is part of the actor's
             saved context, so a changed instruction starts from its own saved checkpoint.
+        cascade: Opt-in decision cascade over this actor model, off when absent.
     """
 
     alias: str = Field(min_length=1)
@@ -59,6 +61,7 @@ class PanelActor(ContractModel):
     checkpoints: tuple[ArtifactInput, ...] | None = Field(
         default=None, exclude_if=lambda value: value is None
     )
+    cascade: CascadePolicy | None = Field(default=None, exclude_if=lambda value: value is None)
 
 
 class ActorPanelSpec(ContractModel):
@@ -79,11 +82,17 @@ class ActorPanelSpec(ContractModel):
     @model_validator(mode="after")
     def finite(self) -> "ActorPanelSpec":
         """Reject duplicate comparisons and bound the complete pre-registered provider schedule."""
-        aliases = {(actor.alias, actor.system_prompt) for actor in self.actors}
-        models = {(sha256_json(actor.model), actor.system_prompt) for actor in self.actors}
-        if len(aliases) != len(self.actors) or len(models) != len(self.actors):
+        bindings = [
+            (actor.alias, actor.system_prompt, sha256_json(actor.cascade)) for actor in self.actors
+        ]
+        models = [
+            (sha256_json(actor.model), actor.system_prompt, sha256_json(actor.cascade))
+            for actor in self.actors
+        ]
+        if len(set(bindings)) != len(self.actors) or len(set(models)) != len(self.actors):
             raise ValueError(
-                "actor panel requires distinct aliases and frozen models for each system prompt"
+                "actor panel requires distinct aliases and frozen models for each system prompt "
+                "and cascade"
             )
         for actor in self.actors:
             if (actor.system_prompt is None) != (actor.checkpoints is None) or (
@@ -159,6 +168,7 @@ def panel_jobs(spec: ActorPanelSpec, code_revision: str) -> tuple[PanelCell, ...
                     if actor.checkpoints is None
                     else actor.checkpoints[case],
                     "actor_model": actor.model,
+                    "cascade": actor.cascade,
                     "predicted_success": None,
                     "critic_prediction": None,
                     "selection_plan": None,

@@ -722,3 +722,64 @@ def test_programming_error_propagates_and_leaves_the_branch_unknown(tmp_path: Pa
     assert result.branches[0].status == "outcome_unknown"
     assert result.branches[0].failure == "UnfinishedDispatchIntent"
     assert not model.requests
+
+
+def test_cascade_branches_record_who_decided_each_step(tmp_path: Path) -> None:
+    """Accepted decisions force the main model; each step is recorded and receipted."""
+    from exp.common.project import ProjectStore
+    from exp.optimize.evaluation.analysis.decision_points_test import (
+        ScriptedMain,
+        capture,
+        continuation_runtime,
+        world,
+    )
+    from exp.runtime.agents.cascade import RESPOND, CascadePolicy
+    from exp.runtime.agents.cascade_test import Decider, ranked
+
+    project = ProjectStore(tmp_path, "case")
+    store = project.artifacts
+    checkpoint = capture(store, "tickets", "c1")
+    tools = ("open_ticket", "escalate_ticket", "close_ticket", "refund_ticket", RESPOND)
+    decider = Decider(
+        "systemone", [ranked("close_ticket", 0.95, tools), ranked(RESPOND, 0.5, tools)]
+    )
+    model = _response(AssistantAction(content="done")).model
+    spec = ContinuationStudySpec(
+        checkpoint=checkpoint,
+        actor_model=model,
+        verifier=world("tickets").verifier,
+        probe_sha256=world("tickets").probe_sha256,
+        repeats=1,
+        selector="cascade fixture",
+        cascade=CascadePolicy(decider=decider.definition, threshold=0.9),
+    )
+    runtime = continuation_runtime(project, {"world": "tickets"})
+
+    def run(main: ScriptedMain, cheap: Decider | None) -> ContinuationStudy:
+        """Run the cascade study with the given main model and decider."""
+        return run_continuation_study(
+            store,
+            spec,
+            actor=ChatAgentRuntime(maximum_model_calls=4),
+            model=main,
+            world=runtime.world,
+            probe=runtime.probe,
+            probe_sha256=runtime.probe_sha256,
+            code_revision="test",
+            decider=cheap,
+        )
+
+    with pytest.raises(ValueError, match="frozen decider"):
+        run(ScriptedMain("tickets", model), None)
+    main = ScriptedMain("tickets", model)
+    branch = run(main, decider).branches[0]
+    assert branch.assessment is not None and branch.assessment.status == "pass"
+    assert [(row.decided_by, row.note) for row in branch.cascade_decisions] == [
+        ("decider", None),
+        ("main", "below_threshold"),
+    ]
+    assert main.requests[0].tool_choice not in (None, "auto")
+    assert "cascade_decisions" not in branch.outcome
+    receipts = sorted(store.list_ids(artifact_type="cascade-decision"))
+    assert [row.rsplit("-", 2)[-2:] for row in receipts] == [["decision", "0"], ["decision", "1"]]
+    assert "cascade" not in spec.model_copy(update={"cascade": None}).model_dump(mode="json")
