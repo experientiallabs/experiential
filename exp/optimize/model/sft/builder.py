@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
-import math
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from datetime import datetime
@@ -21,6 +19,7 @@ from exp.common.core.artifacts import (
     stable_id,
 )
 from exp.common.core.union_find import UnionFind
+from exp.common.evaluations.splits import held_out_count, salted_order
 from exp.common.project import (
     ArtifactAlreadyExistsError,
     ArtifactCorruptionError,
@@ -600,17 +599,10 @@ def _build_partitions(
         )
         components.append((component_id, lineage_group_ids, fingerprints))
 
-    held_out_component_count = _held_out_component_count(len(components), spec.held_out_fraction)
-    ranked_components = sorted(
-        components,
-        key=lambda item: hashlib.sha256(f"{spec.split_salt}:{item[0]}".encode()).hexdigest(),
+    ranked_component_ids = salted_order((item[0] for item in components), spec.split_salt)
+    held_out_component_ids = set(
+        ranked_component_ids[: held_out_count(len(components), spec.held_out_fraction)]
     )
-    held_out_component_ids = {
-        component_id
-        for component_id, _lineage_group_ids, _fingerprints in ranked_components[
-            :held_out_component_count
-        ]
-    }
     group_partitions: dict[ArtifactId, Literal["train", "held_out"]] = {}
     partitions: list[SFTPartition] = []
     for component_id, lineage_group_ids, fingerprints in components:
@@ -628,22 +620,6 @@ def _build_partitions(
             )
         )
     return group_partitions, tuple(partitions)
-
-
-def _held_out_component_count(component_count: int, held_out_fraction: float) -> int:
-    """Choose the deterministic held-out count, including an explicit all-train mode.
-
-    Args:
-        component_count: Number of complete leakage components eligible for partitioning.
-        held_out_fraction: Persisted fraction, where exactly zero explicitly selects all training.
-
-    Returns:
-        Held-out component count that preserves at least one training component.
-    """
-    if component_count < 2 or held_out_fraction == 0:
-        return 0
-    target = math.floor(component_count * held_out_fraction + 0.5)
-    return min(component_count - 1, max(1, target))
 
 
 def _expand_scanned_actions(
