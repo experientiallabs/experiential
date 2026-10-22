@@ -10,11 +10,17 @@ related cases), the estimate is the equal-weight mean over units and the interva
 interval at the unit count. A [0, 1] unit mean with mean p has variance at most p(1-p), so this
 bounds the between-unit spread by the Bernoulli case instead of treating every repeat as new
 evidence. Planned slots with unknown outcomes are reported as bounds, never as intervals.
+
+A paired difference can instead be summarized by a case bootstrap: whole units are resampled with
+replacement and the percentile interval of the resampled mean difference is reported. It assumes
+nothing about the outcome scale, but with few units it is narrower than the Wilson bound and
+should be read alongside the unit count.
 """
 
 from __future__ import annotations
 
 import math
+import random
 from collections.abc import Mapping, Sequence
 
 from exp.common.core.artifacts import JsonObject
@@ -140,6 +146,59 @@ def unit_difference_summary(
         "unit_differences": differences,
         "estimate": estimate,
         "wilson_95": interval,
+    }
+
+
+def paired_bootstrap_summary(
+    first: Mapping[str, Sequence[float]],
+    second: Mapping[str, Sequence[float]],
+    *,
+    resamples: int = 2000,
+    seed: int = 0,
+) -> JsonObject:
+    """Bootstrap the mean paired difference by resampling whole independent units.
+
+    Repeats are averaged within each unit first, exactly as in ``unit_difference_summary``, so a
+    unit is resampled with all of its repeats. The interval is the 2.5 and 97.5 percentiles of the
+    resampled mean difference, drawn from a seeded generator so the summary reproduces.
+
+    Args:
+        first: Known outcomes in [0, 1] keyed by independent unit, the minuend condition.
+        second: Known outcomes in [0, 1] keyed by the same units, the subtrahend condition.
+        resamples: Bootstrap resamples; at least 100.
+        seed: Generator seed recorded with the summary.
+
+    Returns:
+        The equal-weight mean of per-unit differences, the per-unit differences, the paired unit
+        count, the units missing an outcome under either condition, the resample count and seed,
+        and a two-sided 95 percent percentile interval, or None estimates without a paired unit.
+
+    Raises:
+        ValueError: Fewer than 100 resamples were requested.
+    """
+    if resamples < 100:
+        raise ValueError("a paired bootstrap needs at least 100 resamples")
+    left, right = _unit_means(first), _unit_means(second)
+    differences = {unit: left[unit] - right[unit] for unit in sorted(left.keys() & right.keys())}
+    units = len(differences)
+    estimate = sum(differences.values()) / units if units else None
+    interval: list[float] | None = None
+    if units:
+        values = list(differences.values())
+        generator = random.Random(seed)
+        means = sorted(sum(generator.choices(values, k=units)) / units for _ in range(resamples))
+        interval = [
+            means[math.floor(0.025 * (resamples - 1))],
+            means[math.ceil(0.975 * (resamples - 1))],
+        ]
+    return {
+        "independent_units": units,
+        "units_without_paired_outcomes": len(first.keys() | second.keys()) - units,
+        "unit_differences": differences,
+        "estimate": estimate,
+        "resamples": resamples,
+        "seed": seed,
+        "bootstrap_95": interval,
     }
 
 
