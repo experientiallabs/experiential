@@ -27,16 +27,16 @@ from exp.common.models.unknown_outcome import resume_unknown
 from exp.common.project import ArtifactStore, artifact_input
 from exp.runtime.environments import Observation
 from exp.runtime.models.call_evidence import call_consumer
-from exp.runtime.sessions.store import (
+from exp.runtime.sessions.edits import AppendValue, CopyValue, StateEdit, prefixed
+from exp.runtime.sessions.errors import (
     ProviderBudgetExhaustedError,
-    SessionBinding,
     SessionNotFoundError,
-    SessionRecord,
-    SessionStore,
     StepAmbiguousError,
     StepInFlightError,
-    StepStatus,
 )
+from exp.runtime.sessions.projection import StateRef
+from exp.runtime.sessions.records import SessionBinding, SessionRecord, StepStatus
+from exp.runtime.sessions.store import SessionStore
 from exp.simulation.engines.reasks import reask_proposal
 from exp.simulation.engines.reconstructed import InformationChannels, ReconstructedTextEngine
 from exp.simulation.engines.transition import Completion, PreparedPrediction, TransitionEngine
@@ -171,12 +171,14 @@ class DurableWorldModelSession:
     @property
     def state(self) -> JsonObject:
         """Return a detached evaluator-visible state, never an actor capability."""
-        return copy.deepcopy(self._snapshot().business_state)
+        return _business_state(self._store, self._store.read_head(self.session_id).state)
 
     @property
     def transitions(self) -> tuple[JsonObject, ...]:
         """Read committed operations with their ordered observations and evidence receipts."""
-        return tuple(copy.deepcopy(self._snapshot().transitions))
+        return _objects(
+            self._store.read_state(self._store.read_head(self.session_id).state, ("transitions",))
+        )
 
     def committed_record(self) -> SessionRecord:
         """Return a detached authoritative record for provider-free checkpoint projection."""
@@ -197,10 +199,6 @@ class DurableWorldModelSession:
             False does not identify the cause of a preparation or transport failure.
         """
         return self._store.proposal(self.session_id, operation_id) is not None
-
-    def _snapshot(self) -> SessionSnapshot:
-        """Read the current complete session envelope from the authoritative store."""
-        return SessionSnapshot.model_validate(self._store.read_session(self.session_id).state)
 
     def outcome_unknown(self, operation_id: str) -> bool:
         """Whether one logical operation was left open after dispatch with no known outcome.
@@ -246,7 +244,7 @@ class DurableWorldModelSession:
             }
         )
         with self._lock:
-            current = self._store.read_session(self.session_id)
+            current = self._store.read_head(self.session_id)
             left: StepStatus | None = None
             try:
                 decision = self._store.begin_step(
@@ -263,8 +261,8 @@ class DurableWorldModelSession:
                     return _observations(decision.completed.response)
                 assert decision.claim is not None
                 claim = decision.claim
-            snapshot = SessionSnapshot.model_validate(current.state)
-            state, history = snapshot.business_state, snapshot.history
+            state = _business_state(self._store, current.state)
+            history = _objects(self._store.read_state(current.state, ("history",)))
             scope = stable_id(
                 "world-operation",
                 {
@@ -330,7 +328,7 @@ class DurableWorldModelSession:
                     proposal_input = self._save(logical + "-proposal", {"proposal": raw}, (intent,))
                 try:
                     proposal = self._engine.parse(raw, actions, current_state=copy.deepcopy(state))
-                    next_state = proposal.next_state(state)
+                    next_state, state_edits = proposal.state_edits(state)
                     self._validate(next_state)
                     observations = []
                     for row in proposal.observations:
@@ -377,8 +375,8 @@ class DurableWorldModelSession:
                 "operation_id": operation_id,
                 "actions": [a.model_dump(mode="json") for a in actions],
                 "replies": [row.reply for row in proposal.observations],
-                "before": state,
-                "after": next_state,
+                "before": None,
+                "after": None,
                 "observations": response["observations"],
                 "evidence": {**prepared.evidence, "refused_proposals": refusals}
                 if refusals
@@ -387,17 +385,7 @@ class DurableWorldModelSession:
             }
             self._store.complete_step(
                 claim,
-                {
-                    "business_state": next_state,
-                    "history": [
-                        *history,
-                        {
-                            "actions": transition["actions"],
-                            "observations": response["observations"],
-                        },
-                    ],
-                    "transitions": [*snapshot.transitions, transition],
-                },
+                _commit_edits(current.version, transition, state_edits),
                 response,
                 window=None if self._resumption is None else self._resumption.window,
             )
@@ -442,6 +430,52 @@ class DurableWorldModelSession:
             files={"record.json": payload},
         )
         return artifact_input(self._artifacts.read(identity).manifest)
+
+
+def _commit_edits(
+    revision: int, transition: JsonObject, state_edits: Sequence[StateEdit]
+) -> tuple[StateEdit, ...]:
+    """Translate one validated transition into structural edits of the session envelope.
+
+    The envelope keeps ``business_state``, ``history`` and ``transitions`` in that order, and
+    every committed revision appends exactly one transition, so the new transition's index is
+    the base revision. Its ``before`` and ``after`` states are structural copies of the business
+    state around the proposal's own edits, so the store shares their unchanged subtrees.
+
+    Args:
+        revision: Base revision the step was claimed against.
+        transition: Transition record with ``before`` and ``after`` placeholders.
+        state_edits: The proposal's edits relative to the business state.
+
+    Returns:
+        Ordered edits that publish the business state, the history entry and the transition.
+    """
+    record = ("transitions", revision)
+    return (
+        AppendValue(path=("transitions",), value=transition),
+        CopyValue(path=(*record, "before"), source=("business_state",)),
+        *prefixed(("business_state",), state_edits),
+        CopyValue(path=(*record, "after"), source=("business_state",)),
+        AppendValue(
+            path=("history",),
+            value={"actions": transition["actions"], "observations": transition["observations"]},
+        ),
+    )
+
+
+def _business_state(store: SessionStore, ref: StateRef) -> JsonObject:
+    """Materialize only the business state of one committed envelope revision."""
+    state = store.read_state(ref, ("business_state",))
+    if not isinstance(state, dict):
+        raise ValueError("committed session business state is not an object")
+    return state
+
+
+def _objects(value: JsonValue) -> tuple[JsonObject, ...]:
+    """Narrow one stored envelope list of objects, refusing any other shape."""
+    if not isinstance(value, list) or not all(isinstance(row, dict) for row in value):
+        raise ValueError("committed session history or transitions are not a list of objects")
+    return tuple(row for row in value if isinstance(row, dict))
 
 
 def _proposal(record: JsonObject) -> JsonObject:

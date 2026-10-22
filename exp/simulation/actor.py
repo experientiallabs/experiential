@@ -11,7 +11,7 @@ from exp.common.project import ArtifactStore
 from exp.common.tasks import TaskCase
 from exp.runtime.agents import AgentEpisode, AgentRuntime
 from exp.runtime.environments import Observation
-from exp.runtime.sessions.store import ProviderBudgetExhaustedError
+from exp.runtime.sessions.errors import ProviderBudgetExhaustedError
 from exp.simulation.world_model.durable import DurableWorldModelSession
 
 

@@ -19,7 +19,8 @@ from exp.optimize.evaluation.fidelity.runner import (
 from exp.optimize.evaluation.fidelity.runner_test import source_project, transition_reply
 from exp.runtime.gateway.decisions_contracts import DecisionRequest
 from exp.runtime.models.providers.transport import JsonHttpResponse, ScriptedJsonTransport
-from exp.runtime.sessions.store import SessionBinding, SessionNotFoundError, SessionStore
+from exp.runtime.sessions.errors import SessionNotFoundError
+from exp.runtime.sessions.store import SessionBinding, SessionStore
 from exp.simulation.engines.transition import Completion
 from exp.simulation.retrieval.evidence_reading import EvidenceReader, ReadingPolicy
 from exp.simulation.retrieval.jev import JEVCueSelector, JEVPolicy
