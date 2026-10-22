@@ -16,6 +16,7 @@ from exp.common.evaluations.uncertainty import (
 )
 from exp.common.models import ModelRequest
 from exp.optimize.evaluation.continuations.study import ContinuationBranch
+from exp.optimize.evaluation.equivalence.dimensions import PairDimension, pair_dimensions
 from exp.runtime.environments.interface import Observation
 from exp.simulation.continuations import ContinuationCheckpoint
 from exp.simulation.evaluation.tasks import TaskVerifier, grade
@@ -33,6 +34,8 @@ class PairMeasurement(ContractModel):
         material_agreement: Equality on declared outcomes and consequences, or unavailable.
         differences: Failed or missing prerequisites and differing material properties.
         judgment: Optional semantic ratings, never an independent truth certificate.
+        dimensions: Every admission dimension observed on both sides, in policy order. These
+            are measurements; only a registered policy turns them into calibration verdicts.
     """
 
     case: int
@@ -42,6 +45,7 @@ class PairMeasurement(ContractModel):
     material_agreement: Literal["match", "different", "unassessable"]
     differences: tuple[str, ...] = ()
     judgment: ActorEquivalenceReport | None = None
+    dimensions: tuple[PairDimension, ...] = ()
 
 
 def _object(value: JsonObject, key: str) -> JsonObject | None:
@@ -195,17 +199,27 @@ def measure_pair(
         reference_assessment=left,
         candidate_assessment=right,
     )
+    agreement: Literal["match", "different", "unassessable"] = (
+        "unassessable"
+        if incomparable or (candidate_missing and not failed)
+        else "different"
+        if failed or differences
+        else "match"
+    )
     return PairMeasurement(
         case=case,
         repeat=repeat,
         condition=condition,
         comparison=comparison,
-        material_agreement="unassessable"
-        if incomparable or (candidate_missing and not failed)
-        else "different"
-        if failed or differences
-        else "match",
+        material_agreement=agreement,
         differences=tuple(differences),
+        dimensions=pair_dimensions(
+            reference,
+            candidate,
+            verifier=verifier,
+            tools=checkpoint.task.tools,
+            material_agreement=agreement,
+        ),
     )
 
 
