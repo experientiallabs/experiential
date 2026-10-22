@@ -190,6 +190,19 @@ def test_cli_exports_and_serves_qualified_workbook_without_leaking_credentials(
     runner = CliRunner()
     exported = runner.invoke(app, args)
     assert exported.exit_code == 0, exported.output
+    path.write_text(
+        ContinuationCommand(
+            action="harbor", harbor=ExecutableCommand(action="verify", directory=package)
+        ).model_dump_json()
+    )
+    preview = runner.invoke(app, [*args, "--dry-run"])
+    assert preview.exit_code == 0 and "file inventory verified" in preview.output, preview.output
+    verified = runner.invoke(app, args)
+    assert verified.exit_code == 0, verified.output
+    report = json.loads(verified.output)
+    assert report["task"] == task.model_dump(mode="json")
+    assert report["qualification"] == "qualified_observable_contract"
+    assert report["qualification_evidence"] == qualification.model_dump(mode="json")
     actor_file, verifier_file = tmp_path / "actor.json", tmp_path / "verifier.json"
     command = ExecutableCommand(
         action="serve",
@@ -227,6 +240,14 @@ def test_cli_exports_and_serves_qualified_workbook_without_leaking_credentials(
     assert responses[0]["reward"] == 1
     assert not actor_file.exists() and not verifier_file.exists()
     assert "Bearer" not in served.output
+    (package / "task.toml").write_text((package / "task.toml").read_text() + "\n")
+    path.write_text(
+        ContinuationCommand(
+            action="harbor", harbor=ExecutableCommand(action="verify", directory=package)
+        ).model_dump_json()
+    )
+    tampered = runner.invoke(app, args)
+    assert tampered.exit_code != 0 and "changed after export" in tampered.output
 
 
 def test_executable_command_rejects_ignored_or_conflicting_payloads(tmp_path: Path) -> None:
@@ -251,6 +272,80 @@ def test_executable_command_rejects_ignored_or_conflicting_payloads(tmp_path: Pa
         )
     with pytest.raises(ValueError, match="requires"):
         ExecutableCommand(action="qualify")
+    with pytest.raises(ValueError, match="verify does not accept task"):
+        ExecutableCommand(action="verify", directory=tmp_path, task=reference)
+    with pytest.raises(ValueError, match="witness-controls requires controls"):
+        ExecutableCommand(action="witness-controls")
+
+
+def test_cli_registers_a_specification_and_witnesses_controls_for_qualification(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Specification and controls go through the CLI; the saved qualify operation qualifies."""
+    from exp.common.core.artifacts import ArtifactInput
+    from exp.optimize.evaluation.executable.controls import (
+        ControlWitnessSpec,
+        SpecificationRegistration,
+    )
+    from exp.optimize.evaluation.executable.controls_test import declared
+    from exp.optimize.evaluation.executable.task import load_executable_task
+    from exp.simulation.evaluation.admission import EvaluationSpecification
+
+    monkeypatch.setattr(
+        "exp.cli.evaluation.continuations.installed_execution_revision", lambda: "test"
+    )
+    project, task, spec = qualified_fixture(tmp_path, monkeypatch)
+    path, runner = tmp_path / "operation.json", CliRunner()
+    args = [
+        "eval",
+        project.paths.project_id,
+        "--root",
+        str(project.paths.root),
+        "--continuations",
+        str(path),
+        "--non-interactive",
+    ]
+    verifier = load_executable_task(project, task).job.study.verifier
+    registration = SpecificationRegistration(
+        specification=EvaluationSpecification(
+            description="Independent rows check.",
+            predicate=verifier.model_copy(update={"description": "Independent rows check."}),
+            subject="outcome",
+        )
+    )
+    path.write_text(
+        ContinuationCommand(
+            action="register-specification", specification=registration
+        ).model_dump_json()
+    )
+    before = project.artifacts.list_ids(artifact_type="evaluation-specification")
+    preview = runner.invoke(app, [*args, "--dry-run"])
+    assert preview.exit_code == 0 and "Nothing saved" in preview.output, preview.output
+    assert project.artifacts.list_ids(artifact_type="evaluation-specification") == before
+    saved = runner.invoke(app, args)
+    assert saved.exit_code == 0, saved.output
+    assert ArtifactInput.model_validate(json.loads(saved.output)["reference"])
+
+    qualify = tmp_path / "qualify.json"
+    controls = ControlWitnessSpec(task=task, feasibility=spec.feasibility, controls=declared(spec))
+    command = ExecutableCommand(
+        action="witness-controls", controls=controls, operation_file=qualify
+    )
+    path.write_text(ContinuationCommand(action="harbor", harbor=command).model_dump_json())
+    planned = runner.invoke(app, [*args, "--dry-run"])
+    assert planned.exit_code == 0 and "10 control outcomes resolved" in planned.output
+    assert not qualify.exists()
+    witnessed = runner.invoke(app, args)
+    assert witnessed.exit_code == 0, witnessed.output
+    operation = ContinuationCommand.model_validate_json(qualify.read_text())
+    assert operation.harbor is not None and operation.harbor.qualification_spec is not None
+    assert all(case.challenge.witness for case in operation.harbor.qualification_spec.cases)
+    again = runner.invoke(app, args)
+    assert again.exit_code != 0 and "operation_file needs a new file" in again.output
+    path.write_text(qualify.read_text())
+    qualified = runner.invoke(app, args)
+    assert qualified.exit_code == 0, qualified.output
+    assert json.loads(qualified.output)["qualified"] is True
 
 
 @pytest.mark.parametrize("dry_run", [True, False])

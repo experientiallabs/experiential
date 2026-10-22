@@ -396,6 +396,7 @@ uv run pytest -q
 | Development tasks of a build | `exp/simulation/development_scope.py` | `development_tasks` lists fit tasks and `development_task` refuses held-out ones by ID; every consumer checks `require_development_task` |
 | Simulated worlds grounded in a build | `exp/optimize/evaluation/executable/grounding.py` | `grounded_capture` fills the world model, learned memory, catalog digest and optional trace facts into a capture of the built-in grounded runtime |
 | Independent specifications and witnessed qualification controls | `exp/optimize/evaluation/executable/controls.py` | `register_specification`; `witness_controls` records each control's witness and re-verifies it with qualification's admission check |
+| Prepared continuation operations | `exp/cli/evaluation/continuation_context.py` | `emit_operation` prints a ready operation and saves it to a new operation file after `require_new_operation_file` |
 
     Keep this table current. A change that introduces an owner for a new concern adds its row in
     the same commit.

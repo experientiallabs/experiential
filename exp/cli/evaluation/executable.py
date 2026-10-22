@@ -10,13 +10,25 @@ from typing import Literal
 from pydantic import Field, model_validator
 from rich.console import Console
 
-from exp.cli.evaluation.continuation_context import ContinuationContext
+from exp.cli.evaluation.continuation_context import (
+    ContinuationContext,
+    emit_operation,
+    require_new_operation_file,
+)
 from exp.cli.evaluation.spend import review_components, review_cost
 from exp.cli.shared.consent import require_spend_consent
-from exp.common.core.artifacts import ArtifactInput, ContractModel
+from exp.common.core.artifacts import ArtifactInput, ContractModel, JsonObject
 from exp.common.project import ProjectStore
 from exp.optimize.evaluation.continuations.capture import preflight_capture
 from exp.optimize.evaluation.continuations.evidence import qualified_training_job
+from exp.optimize.evaluation.executable.controls import (
+    ControlWitnessSpec,
+    SpecificationRegistration,
+    preflight_controls,
+    preflight_specification,
+    register_specification,
+    witness_controls,
+)
 from exp.optimize.evaluation.executable.costs import runtime_costs
 from exp.optimize.evaluation.executable.package import (
     export_executable_harbor,
@@ -63,18 +75,21 @@ class ExecutableCommand(ContractModel):
     """A single frozen executable task operation through the existing eval command.
 
     Attributes:
-        action: Construct assets, register, qualify, prepare training, export, or serve.
+        action: Construct assets, register, witness controls, qualify, prepare training,
+            export, verify, or serve.
         world_proposals: Cited author experiment feeding frozen worlds into native challenges.
         construction: Bounded declarative initial assets, with unqualified generated authority.
         definition: Task definition for registration only.
         task: Exact registered task for export.
+        controls: Declared control outcomes to witness against an independent specification.
         qualification_spec: Independent control evidence for qualification only.
         qualification: Saved scoped qualification for export, absent for diagnostics.
         comparison: Optional saved paired report for prepare-training, retained as measurements.
         comparison_case: Exact applicable candidate case in that report.
-        operation_file: Optional new JSON file for the prepared continuation command.
+        operation_file: Optional new JSON file for the prepared continuation command, from
+            prepare-training or witness-controls.
             Existing files are never overwritten; dry-run does not create it.
-        directory: New package path for export or immutable package to serve.
+        directory: New package path for export, or an immutable package to verify or serve.
         name: Organization/name used for export.
         diagnostic: Explicit opt-in to a non-reward package.
         trial_id: Caller-selected identity; exact re-entry restores committed state.
@@ -90,15 +105,18 @@ class ExecutableCommand(ContractModel):
         "propose-worlds",
         "construct-assets",
         "register",
+        "witness-controls",
         "qualify",
         "prepare-training",
         "export",
+        "verify",
         "serve",
     ]
     world_proposals: WorldProposalSpec | None = None
     construction: ConstructionSpec | None = None
     definition: ExecutableTask | None = None
     task: ArtifactInput | None = None
+    controls: ControlWitnessSpec | None = None
     qualification_spec: ExecutableQualificationSpec | None = None
     qualification: ArtifactInput | None = None
     comparison: ArtifactInput | None = None
@@ -129,6 +147,7 @@ class ExecutableCommand(ContractModel):
             "propose-worlds": {"world_proposals"},
             "construct-assets": {"construction"},
             "register": {"definition"},
+            "witness-controls": {"controls", "operation_file"},
             "qualify": {"qualification_spec"},
             "prepare-training": {
                 "qualification",
@@ -137,6 +156,7 @@ class ExecutableCommand(ContractModel):
                 "operation_file",
             },
             "export": {"task", "qualification", "directory", "name", "diagnostic"},
+            "verify": {"directory"},
             "serve": {
                 "directory",
                 "trial_id",
@@ -152,9 +172,11 @@ class ExecutableCommand(ContractModel):
             "propose-worlds": {"world_proposals"},
             "construct-assets": {"construction"},
             "register": {"definition"},
+            "witness-controls": {"controls"},
             "qualify": {"qualification_spec"},
             "prepare-training": {"qualification"},
             "export": {"task", "directory"},
+            "verify": {"directory"},
             "serve": {"directory", "actor_connection_file", "verifier_connection_file"},
         }[self.action]
         for field, definition in type(self).model_fields.items():
@@ -279,21 +301,33 @@ def run_executable_command(
     if command.action == "prepare-training":
         if command.qualification is None:
             raise ValueError("prepare-training requires qualification")
-        output = command.operation_file
-        if output is not None and (output.exists() or not output.parent.is_dir()):
-            raise ValueError("operation_file needs a new file in an existing directory")
+        require_new_operation_file(command.operation_file)
         job = qualified_training_job(
             project,
             qualification=command.qualification,
             comparison=command.comparison,
             comparison_case=command.comparison_case,
         )
-        operation = {"action": "run", "job": job.model_dump(mode="json")}
-        if output is not None and not dry_run:
-            with output.open("x", encoding="utf-8") as stream:
-                json.dump(operation, stream, indent=2)
-                stream.write("\n")
-        console.print_json(data=operation)
+        operation: JsonObject = {"action": "run", "job": job.model_dump(mode="json")}
+        emit_operation(console, operation, command.operation_file, dry_run=dry_run)
+        return
+    if command.action == "witness-controls":
+        if command.controls is None:
+            raise ValueError("witness-controls requires controls")
+        require_new_operation_file(command.operation_file)
+        if dry_run:
+            planned = preflight_controls(project, command.controls)
+            console.print(
+                f"{len(planned.cases)} control outcomes resolved and their partitions checked. "
+                "No witness recorded."
+            )
+            return
+        spec = witness_controls(
+            project, command.controls, created_at=now, code_revision=code_revision
+        )
+        qualify = ExecutableCommand(action="qualify", qualification_spec=spec)
+        operation = {"action": "harbor", "harbor": qualify.model_dump(mode="json")}
+        emit_operation(console, operation, command.operation_file, dry_run=dry_run)
         return
     if command.action == "register":
         if command.definition is None:
@@ -327,7 +361,7 @@ def run_executable_command(
         )
         return
     if command.directory is None:
-        raise ValueError("export and serve require a package directory")
+        raise ValueError("export, verify and serve require a package directory")
     if command.action == "export":
         if command.task is None:
             raise ValueError("export requires an exact task reference")
@@ -356,6 +390,24 @@ def run_executable_command(
             diagnostic=command.diagnostic,
         )
         console.print(f"Harbor package: {path}")
+        return
+    if command.action == "verify":
+        binding = verify_harbor_export(command.directory)
+        if dry_run:
+            console.print(
+                "Package file inventory verified. Its reproduction from trusted artifacts is "
+                "checked without --dry-run."
+            )
+            return
+        task = verify_executable_package(project, command.directory)
+        console.print_json(
+            data={
+                "task": task.model_dump(mode="json"),
+                "qualification": binding.get("qualification"),
+                "qualification_evidence": binding.get("qualification_evidence"),
+                "status": "reproduces its trusted executable task",
+            }
+        )
         return
     binding = verify_harbor_export(command.directory)
     if binding.get("backend") != "executable-checkpoint":
@@ -517,4 +569,31 @@ def handle_witness_record(context: ContinuationContext, witness: RecordWitnessSp
         return
     context.console.print_json(
         data=prepare_record_witness(context.store, witness, code_revision=context.revision)
+    )
+
+
+def handle_register_specification(
+    context: ContinuationContext, registration: SpecificationRegistration
+) -> None:
+    """Save an independent evaluation specification, or check its sources on a dry run.
+
+    Args:
+        context: Validated ``--continuations`` invocation.
+        registration: Predicate, subject and source evidence.
+
+    Returns:
+        None. The saved reference is printed to the console.
+    """
+    preflight_specification(context.store, registration)
+    if context.dry_run:
+        context.console.print("Specification sources checked. Nothing saved.")
+        return
+    reference = register_specification(
+        context.store, registration, created_at=datetime.now(UTC), code_revision=context.revision
+    )
+    context.console.print_json(
+        data={
+            "reference": reference.model_dump(mode="json"),
+            "subject": registration.specification.subject,
+        }
     )

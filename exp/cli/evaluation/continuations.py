@@ -37,11 +37,18 @@ from exp.cli.evaluation.continuation_studies import (
     handle_run_continuation_campaign,
     handle_run_selection,
 )
+from exp.cli.evaluation.development import (
+    DevelopmentTaskQuery,
+    GroundRuntime,
+    handle_development_tasks,
+    handle_ground_runtime,
+)
 from exp.cli.evaluation.equivalence import handle_admit_actor_prefix, handle_compare_environments
 from exp.cli.evaluation.executable import (
     ExecutableCommand,
     handle_harbor,
     handle_prepare_scenario,
+    handle_register_specification,
     handle_witness_record,
 )
 from exp.cli.evaluation.factory import (
@@ -78,6 +85,7 @@ from exp.optimize.evaluation.continuations.selection import CheckpointSelectionS
 from exp.optimize.evaluation.continuations.traces import TrajectoryTraceExport
 from exp.optimize.evaluation.equivalence.prefixes import ActorPrefixSpec
 from exp.optimize.evaluation.equivalence.runner import EquivalenceSpec
+from exp.optimize.evaluation.executable.controls import SpecificationRegistration
 from exp.optimize.evaluation.executable.scenarios import RecordScenarioSpec, RecordWitnessSpec
 from exp.optimize.evaluation.factory.candidates import CandidateBatchSpec
 from exp.optimize.evaluation.factory.proposals import TaskProposalSpec
@@ -134,6 +142,9 @@ CONTINUATION_ACTIONS = (
     ContinuationAction("prepare-scenario", "scenario", handle_prepare_scenario),
     ContinuationAction("search-scenarios", "scenario_search", handle_search_scenarios),
     ContinuationAction("witness-record", "record_witness", handle_witness_record),
+    ContinuationAction("register-specification", "specification", handle_register_specification),
+    ContinuationAction("development-tasks", "development_tasks", handle_development_tasks),
+    ContinuationAction("ground-runtime", "grounded", handle_ground_runtime),
 )
 _ACTIONS_BY_NAME = {action.name: action for action in CONTINUATION_ACTIONS}
 
@@ -182,6 +193,9 @@ class ContinuationCommand(ContractModel):
         campaign: Registered source attempts, selectors, prospective critics and continuations.
         learning_repair: Failed-learning settlement, lesson screening or library evolution.
         equivalence: Paired executable reference/candidate studies and diagnostic trace council.
+        specification: Independent acceptance specification and its source evidence to save.
+        development_tasks: Build fit tasks to print, optionally one with its public tools.
+        grounded: Simulated world over the build's simulator, emitted as a capture operation.
     """
 
     action: ContinuationActionName
@@ -216,6 +230,9 @@ class ContinuationCommand(ContractModel):
     campaign: ContinuationCampaignSpec | None = None
     learning_repair: LearningRepair | None = None
     equivalence: EquivalenceSpec | None = None
+    specification: SpecificationRegistration | None = None
+    development_tasks: DevelopmentTaskQuery | None = None
+    grounded: GroundRuntime | None = None
 
     @model_validator(mode="after")
     def exact_payload(self) -> "ContinuationCommand":
