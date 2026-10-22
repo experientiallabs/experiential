@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC
 
 from exp.common.core.artifacts import stable_id
 from exp.common.core.text import normalize_durable_text
+from exp.common.core.union_find import UnionFind
 from exp.common.traces import Trace
 from exp.common.traces.ingest.vendor_trace import SYNTHETIC_TIME_ATTRIBUTE
 
@@ -25,6 +26,7 @@ class LineageAssignment:
         conversation_id: Captured conversation boundary, when supplied.
         time_bucket: Observed UTC bucket without a conversation identity, or ``None`` when
             only synthetic ordering timestamps are available.
+        task_lineage: Source-declared task identity scoped to its source and customer, if present.
     """
 
     trace_id: str
@@ -32,6 +34,7 @@ class LineageAssignment:
     customer_id: str
     conversation_id: str | None
     time_bucket: int | None
+    task_lineage: str | None = None
 
 
 def assign_source_lineages(
@@ -45,7 +48,9 @@ def assign_source_lineages(
     ID, an observed customer-specific UTC time bucket keeps adjacent anonymous activity together.
     Synthetic ordering timestamps provide no temporal evidence, so traces without a measured
     timestamp use their source-trace boundary. Exact and semantic duplicate unions still run
-    before partitioning.
+    before partitioning. A non-empty ``task_lineage`` declaration joins source groups within
+    the same source and customer, preserving conversations transitively without relying on
+    instruction similarity. Such declarations are local identifiers, not cross-source IDs.
 
     Args:
         traces: Canonical traces with measured or explicitly synthetic timestamps.
@@ -69,7 +74,7 @@ def assign_source_lineages(
         if conversation_id is not None:
             time_bucket = None
             material = {
-                "version": "source-lineage-v1",
+                "version": "source-lineage-v2",
                 "customer_id": customer_id,
                 "conversation_id": conversation_id,
             }
@@ -85,7 +90,7 @@ def assign_source_lineages(
             if started_at is None:
                 time_bucket = None
                 material = {
-                    "version": "source-lineage-v1",
+                    "version": "source-lineage-v2",
                     "customer_id": customer_id,
                     "source_id": trace.source.identity.source_id,
                     "trace_id": trace.trace_id,
@@ -93,7 +98,7 @@ def assign_source_lineages(
             else:
                 time_bucket = int(started_at.timestamp()) // time_bucket_seconds
                 material = {
-                    "version": "source-lineage-v1",
+                    "version": "source-lineage-v2",
                     "customer_id": customer_id,
                     "time_bucket_seconds": time_bucket_seconds,
                     "time_bucket": time_bucket,
@@ -105,9 +110,58 @@ def assign_source_lineages(
                 customer_id=customer_id,
                 conversation_id=conversation_id,
                 time_bucket=time_bucket,
+                task_lineage=_declared_task_identity(trace),
             )
         )
-    return tuple(assignments)
+    return _join_declared_task_lineages(traces, assignments)
+
+
+def _declared_task_identity(trace: Trace) -> str | None:
+    """Read a non-empty source-declared task identity without inferring one from task content."""
+    value = trace.initial_context.get("task_lineage")
+    return value if isinstance(value, str) and value.strip() else None
+
+
+def _join_declared_task_lineages(
+    traces: Sequence[Trace], assignments: Sequence[LineageAssignment]
+) -> tuple[LineageAssignment, ...]:
+    """Union source groups sharing a source-local customer task declaration.
+
+    Args:
+        traces: Canonical traces aligned with assignments.
+        assignments: Existing conversation, observed-time or source-trace boundaries.
+
+    Returns:
+        Assignments preserving every existing boundary and every declared task connection.
+    """
+    union = UnionFind(assignment.lineage_group_id for assignment in assignments)
+    declared: dict[tuple[str, str, str], str] = {}
+    for trace, assignment in zip(traces, assignments, strict=True):
+        if assignment.task_lineage is None:
+            continue
+        key = (trace.source.identity.source_id, assignment.customer_id, assignment.task_lineage)
+        prior = declared.setdefault(key, assignment.lineage_group_id)
+        union.union(prior, assignment.lineage_group_id)
+    members: dict[str, set[str]] = {}
+    for assignment in assignments:
+        members.setdefault(union.find(assignment.lineage_group_id), set()).add(
+            assignment.lineage_group_id
+        )
+    joined = {
+        root: (
+            next(iter(group))
+            if len(group) == 1
+            else stable_id(
+                "lineage",
+                {"version": "source-lineage-v2", "source_lineage_group_ids": sorted(group)},
+            )
+        )
+        for root, group in members.items()
+    }
+    return tuple(
+        replace(assignment, lineage_group_id=joined[union.find(assignment.lineage_group_id)])
+        for assignment in assignments
+    )
 
 
 def _customer_id(trace: Trace) -> str:

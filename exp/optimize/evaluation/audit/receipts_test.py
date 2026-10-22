@@ -114,9 +114,10 @@ def test_the_audit_command_refuses_an_exhausted_panel_before_fit_learning(
 def test_exposure_follows_content_across_projects_imports_and_regrouping(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Exposed A grouped with B in one build; C later groups only with B: C is exposed."""
+    """Exposed A's lineage holds B; C later groups only with B's content: C is exposed."""
     # Every customer also has a follow-up trace (B) in its own conversation that declares the
-    # same task identity as the original (A), so whichever A is exposed has a grouped B.
+    # same task identity as the original (A). The build joins declared identities within one
+    # source and customer, so whichever A is exposed shares its held-out lineage with B.
     follow_ups: list[JsonObject] = [
         {
             **episode(i),
@@ -160,11 +161,29 @@ def test_exposure_follows_content_across_projects_imports_and_regrouping(
         for t in by_content.values()
         if t.initial_context["task_lineage"] == "regrouped" and "#W1013" in t.task
     )
+    # Per-trace detail exposed every member of A's lineage, so B's content is exposed itself:
+    # C reaches it in one step through its new declared identity in the second project, the
+    # retail build's declared edge still joins B to A, and the same report marked both.
+    b = next(
+        vertex(t)
+        for t in traces.values()
+        if t.initial_context["task_lineage"] == customer and t.trace_id != exposed_trace.trace_id
+    )
     found = snapshot.exposure((vertex(c_trace),))
-    assert found is not None and found.exposed_node == a
-    assert found.path[0].reason == "declared-task-identity"
-    assert (found.path[0].task_lineage, found.path[0].project) == ("regrouped", "second")
-    assert found.path[-1].project == "retail" and len(found.path) == 2
+    assert found is not None and found.exposed_node == b
+    [step] = found.path
+    assert (step.reason, step.task_lineage, step.project) == (
+        "declared-task-identity",
+        "regrouped",
+        "second",
+    )
+    [shown] = [item for item in snapshot.records.exposures if item.record_id in found.by]
+    assert {a, b} <= set(shown.vertices) and shown.project == "retail"
+    assert any(
+        edge.reason == "declared-task-identity" and {edge.left, edge.right} == {a, b}
+        for edge in snapshot.records.edges
+        if edge.project == "retail"
+    )
     assert found.component_size >= 3
     assert a not in by_content, "A left the later import"
     neighbour = f"user_{(index + 1) % USERS:02d}"

@@ -9,6 +9,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
+from pydantic import JsonValue
 
 import exp
 import exp.runtime.models.registry as runtime_model_registry
@@ -28,7 +29,13 @@ from exp.common.project.paths import ProjectPaths
 from exp.common.project.testing import RawArtifact
 from exp.common.traces import Trace, TraceSource, TraceSpan
 from exp.common.traces.ingest.otlp import TraceNormalizationIssue, TraceNormalizationResult
-from exp.simulation.build import build_project, build_task_set
+from exp.simulation.build import (
+    SupersededBuildReviewError,
+    build_project,
+    build_task_set,
+    parse_build_review,
+    select_build_review,
+)
 from exp.simulation.mining.service import MiningSpec
 
 _PROVIDER_FREE_REVISION = "a" * 40
@@ -524,3 +531,83 @@ def test_build_project_keeps_unselected_candidates_local_and_verifies_replay_pay
             code_revision="test-revision",
             mining_spec=MiningSpec(fit_task_budget=1, held_out_task_budget=1),
         )
+
+
+def _superseded_review(
+    tmp_path: Path, version: str = "hashing-descriptor-v1"
+) -> tuple[ProjectStore, build_module.BuildReviewReadiness]:
+    """Store a review recorded under an earlier descriptor grouping, beside a current one.
+
+    Returns:
+        The project store holding the earlier review with build-scoped judge state, and a
+        review freshly mined under the current version.
+    """
+    store = ProjectStore(tmp_path, "project-a")
+    store.initialize(ProjectConfig(project_id="project-a"))
+    current = build_project(
+        TraceNormalizationResult(traces=tuple(_trace(index) for index in range(100)), issues=()),
+        store,
+        created_at=datetime(2026, 8, 11, tzinfo=UTC),
+        code_revision="test-revision",
+        mining_spec=MiningSpec(fit_task_budget=1, held_out_task_budget=1),
+    ).review
+    binding = current.model_dump(mode="json", exclude={"readiness_id"})
+    binding["descriptor_embedder"] = version
+    earlier = {**binding, "readiness_id": build_module._build_review_id(binding)}
+    store.write_review({"build_review": earlier, "manual_judge": {"bound": "earlier"}})
+    return store, current
+
+
+@pytest.mark.parametrize("version", ["hashing-descriptor-v1", "hashing-descriptor-v2"])
+def test_a_review_grouped_under_another_descriptor_version_is_refused_with_the_remedy(
+    tmp_path: Path,
+    version: str,
+) -> None:
+    """An earlier build's lineages are never reused or silently relabeled as current."""
+    store, current = _superseded_review(tmp_path, version)
+    stored = store.read_review()
+    assert isinstance(stored, dict)
+
+    with pytest.raises(SupersededBuildReviewError) as refused:
+        parse_build_review(stored["build_review"])
+
+    message = str(refused.value)
+    assert version in message and "hashing-descriptor-v3" in message
+    assert "run exp build" in message
+    assert parse_build_review(current.model_dump(mode="json")) == current
+
+
+def test_only_a_freshly_mined_review_replaces_one_grouped_under_another_version(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A rebuild replaces the earlier review and its judge state; a relabel is refused."""
+    store, current = _superseded_review(tmp_path)
+    monkeypatch.setattr(build_module, "_completed_build_matches_review", lambda *_: True)
+
+    with pytest.raises(SupersededBuildReviewError, match="run exp build"):
+        select_build_review(store, current)
+    stored = store.read_review()
+    assert isinstance(stored, dict)
+    assert stored["build_review"]["descriptor_embedder"] == "hashing-descriptor-v1"
+
+    select_build_review(store, current, replace_superseded=True)
+
+    assert store.read_review() == {"build_review": current.model_dump(mode="json")}
+
+
+@pytest.mark.parametrize("include_pin,pin", [(False, None), (True, None), (True, 7)])
+def test_stored_review_requires_an_explicit_descriptor_grouping_version(
+    tmp_path: Path, include_pin: bool, pin: JsonValue
+) -> None:
+    """A missing or invalid stored pin cannot inherit the fresh-construction default."""
+    _, current = _superseded_review(tmp_path)
+    binding = current.model_dump(mode="json")
+    if include_pin:
+        binding["descriptor_embedder"] = pin
+    else:
+        binding.pop("descriptor_embedder")
+
+    with pytest.raises(
+        SupersededBuildReviewError, match="no valid descriptor grouping.*run exp build"
+    ):
+        parse_build_review(binding)

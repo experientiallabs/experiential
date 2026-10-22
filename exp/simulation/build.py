@@ -45,7 +45,12 @@ from exp.simulation.mining.bindings import (
     bindings_for_mining,
     task_set_content_id,
 )
-from exp.simulation.mining.descriptors import DescriptorEmbedder, HashingDescriptorEmbedder
+from exp.simulation.mining.descriptors import (
+    DESCRIPTOR_EMBEDDING,
+    DescriptorEmbedder,
+    DescriptorEmbedding,
+    HashingDescriptorEmbedder,
+)
 from exp.simulation.mining.exposure_ledger import ExposureLedger
 from exp.simulation.mining.service import MiningSpec, TaskMiningResult, mine_tasks, persist_task_set
 
@@ -86,7 +91,7 @@ class BuildReviewReadiness(ContractModel):
     project_config: ProjectConfig
     source: SourceIdentity
     mining_spec: MiningSpec
-    descriptor_embedder: Literal["hashing-descriptor-v1"] = "hashing-descriptor-v1"
+    descriptor_embedder: DescriptorEmbedding = DESCRIPTOR_EMBEDDING
     descriptor_dimensions: int = Field(ge=8)
     code_revision: str = Field(min_length=1, max_length=256)
     paid_calls_made: Literal[0] = 0
@@ -98,6 +103,44 @@ class BuildReviewReadiness(ContractModel):
         if self.readiness_id != expected:
             raise ValueError("build review readiness ID differs from its complete binding")
         return self
+
+
+class SupersededBuildReviewError(ValueError):
+    """A build review cannot establish grouping under the current descriptor version."""
+
+
+def parse_build_review(value: JsonValue) -> BuildReviewReadiness:
+    """Validate a stored build review, refusing one grouped under another descriptor version.
+
+    A build's leakage lineages and fit/held-out split come from its descriptor grouping. A
+    review recorded under another version names tasks this code would group differently, so it
+    is refused with the remedy instead of being reused or silently regrouped.
+
+    Args:
+        value: Stored ``build_review`` JSON.
+
+    Returns:
+        The validated review.
+
+    Raises:
+        SupersededBuildReviewError: The review records another descriptor grouping version.
+        ValueError: The review is otherwise malformed.
+    """
+    recorded = value.get("descriptor_embedder") if isinstance(value, dict) else None
+    if not isinstance(recorded, str):
+        raise SupersededBuildReviewError(
+            "this project's build has no valid descriptor grouping version, so its lineages "
+            "and fit/held-out split cannot be reused; run exp build for this project again "
+            "(pass --import-id to reuse its stored traces) to rebuild its tasks"
+        )
+    if recorded != DESCRIPTOR_EMBEDDING:
+        raise SupersededBuildReviewError(
+            f"this project's build grouped traces into lineages under {recorded}, and this "
+            f"version of exp groups them under {DESCRIPTOR_EMBEDDING}, so it will not reuse "
+            "that build or its fit/held-out split; run exp build for this project again (pass "
+            "--import-id to reuse its stored traces) to rebuild its tasks"
+        )
+    return BuildReviewReadiness.model_validate(value)
 
 
 @dataclass(frozen=True)
@@ -247,7 +290,7 @@ def provider_free_build_review(store: ProjectStore) -> BuildReviewReadiness:
         "project_config": provider_free_config.model_dump(mode="json"),
         "source": source.model_dump(mode="json"),
         "mining_spec": mining_spec.model_dump(mode="json"),
-        "descriptor_embedder": "hashing-descriptor-v1",
+        "descriptor_embedder": DESCRIPTOR_EMBEDDING,
         "descriptor_dimensions": settings.descriptor_dimensions,
         "code_revision": task_stored.manifest.code_revision,
         "paid_calls_made": 0,
@@ -444,7 +487,7 @@ def build_project(
         "project_config": project_config.model_dump(mode="json"),
         "source": source.model_dump(mode="json"),
         "mining_spec": resolved_spec.model_dump(mode="json"),
-        "descriptor_embedder": "hashing-descriptor-v1",
+        "descriptor_embedder": DESCRIPTOR_EMBEDDING,
         "descriptor_dimensions": descriptor_dimensions,
         "code_revision": code_revision,
         "paid_calls_made": 0,
@@ -456,7 +499,7 @@ def build_project(
         project_config=project_config,
         source=source,
         mining_spec=resolved_spec,
-        descriptor_embedder="hashing-descriptor-v1",
+        descriptor_embedder=DESCRIPTOR_EMBEDDING,
         descriptor_dimensions=descriptor_dimensions,
         code_revision=code_revision,
     )
@@ -503,6 +546,9 @@ def select_completed_build(
         trace_import_id: Stored corpus to pin with this build, or None for direct normalized input.
         trace_source: Declared format of that corpus, or None to keep the recorded format.
 
+    A review recorded under an earlier descriptor grouping version is replaced, like any other
+    previous build: ``review`` comes from mining under the current version.
+
     Raises:
         ValueError: The proposed graph and review name different trace or task artifacts.
     """
@@ -513,7 +559,7 @@ def select_completed_build(
             store.bind_completed_build(
                 build, trace_import_id=trace_import_id, trace_source=trace_source
             )
-            select_build_review(store, review)
+            select_build_review(store, review, replace_superseded=True)
 
 
 def select_build_task_set(store: ProjectStore, task_set: ArtifactInput) -> None:
@@ -538,7 +584,7 @@ def select_build_task_set(store: ProjectStore, task_set: ArtifactInput) -> None:
         current = store.read_review()
         if build is None or not isinstance(current, dict) or "build_review" not in current:
             raise ValueError("project has no completed build review; run exp build first")
-        review = BuildReviewReadiness.model_validate(current["build_review"])
+        review = parse_build_review(current["build_review"])
         if review.trace_dataset != build.trace_dataset or review.task_set != build.task_set:
             raise ValueError("project build review differs from its selected build; rebuild it")
         if task_set == build.task_set:
@@ -594,7 +640,9 @@ def coordinate_selected_build_review(
         if not isinstance(current, dict) or "build_review" not in current:
             raise ValueError("project has no completed build review")
         try:
-            review = BuildReviewReadiness.model_validate(current["build_review"])
+            review = parse_build_review(current["build_review"])
+        except SupersededBuildReviewError:
+            raise
         except ValueError as exc:
             raise ValueError("project build review is invalid") from exc
         if review.trace_dataset != trace_dataset or review.task_set != task_set:
@@ -618,7 +666,12 @@ def _build_review_coordination(store: ProjectStore) -> Iterator[None]:
         yield
 
 
-def select_build_review(store: ProjectStore, review: BuildReviewReadiness) -> None:
+def select_build_review(
+    store: ProjectStore,
+    review: BuildReviewReadiness,
+    *,
+    replace_superseded: bool = False,
+) -> None:
     """Advance review readiness after the exact completed build has been selected.
 
     The completed-build selection is written first. If execution stops before this function
@@ -627,8 +680,14 @@ def select_build_review(store: ProjectStore, review: BuildReviewReadiness) -> No
     Args:
         store: Project store owning the selected build and mutable review handoff.
         review: Exact readiness record derived from the selected trace and task artifacts.
+        replace_superseded: Whether ``review`` comes from mining just completed under the current
+            descriptor grouping, so a prior review recorded under an earlier version is replaced
+            as a previous build. Otherwise such a prior review is refused, since relabeling it
+            would claim a grouping its tasks were never mined under.
 
     Raises:
+        SupersededBuildReviewError: The prior review records another descriptor grouping version
+            and ``replace_superseded`` is false.
         ValueError: The selected completed build does not match the proposed review.
     """
     if not _completed_build_matches_review(store, review):
@@ -646,11 +705,11 @@ def select_build_review(store: ProjectStore, review: BuildReviewReadiness) -> No
         root_review = _review_object(current)
         prior_value = root_review.get("build_review")
         try:
-            prior = (
-                BuildReviewReadiness.model_validate(prior_value)
-                if prior_value is not None
-                else None
-            )
+            prior = parse_build_review(prior_value) if prior_value is not None else None
+        except SupersededBuildReviewError:
+            if not replace_superseded:
+                raise
+            prior = None
         except ValueError as exc:
             raise ValueError("review.json contains invalid build readiness") from exc
         return _advance_build_review(root_review, prior=prior, review=review)

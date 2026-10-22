@@ -396,7 +396,10 @@ def test_twenty_distinct_company_cases_survive_shared_instructions(
     assert len(result.tasks) == 20
     assert len(result.analysis.candidates) == 20
     assert result.coverage.duplicate_trace_count == 1
-    assert any(edge.kind == "semantic" for edge in result.analysis.edges)
+    if case_in_context:
+        assert any(edge.kind == "semantic" for edge in result.analysis.edges)
+    else:
+        assert all(edge.kind == "exact" for edge in result.analysis.edges)
     duplicated = next(task for task in result.tasks if "trace-repeat" in task.source_trace_ids)
     assert duplicated.source_trace_ids == ("trace-0", "trace-repeat")
     assert duplicated.workload_weight == pytest.approx(2 / 21)
@@ -629,3 +632,223 @@ def test_persisted_task_set_reuses_the_w2_task_and_artifact_contracts(tmp_path: 
     assert task_set.task_ids == tuple(task.task_id for task in result.tasks)
     assert store.read("tasks-a").manifest.artifact_type == "task-set"
     assert TaskSet.model_validate_json(store.read_bytes("tasks-a", "task-set.json")) == task_set
+
+
+def _catalogue(*, extra: str | None = None) -> tuple[ToolSchema, ...]:
+    """A realistic shared tool catalogue, much longer than any one task instruction."""
+    names = ["find_user_id_by_email", "get_order_details", "get_user_details", "cancel_order"]
+    if extra is not None:
+        names.append(extra)
+    return tuple(
+        ToolSchema(
+            name=name,
+            description=f"Retail service operation {name}; read the policy before acting.",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "order_id": {"type": "string", "description": "Order such as #W1001."},
+                    "user_id": {"type": "string", "description": "Customer account ID."},
+                    "reason": {"type": "string", "enum": ["no longer needed", "by mistake"]},
+                },
+                "required": ["order_id"],
+            },
+        )
+        for name in names
+    )
+
+
+def _task_trace(index: int, task: str, *, tools: tuple[ToolSchema, ...] | None = None) -> Trace:
+    """One recorded task in its own conversation, declaring the shared catalogue."""
+    return _trace(index, task=task).model_copy(
+        update={
+            "tools": _catalogue() if tools is None else tools,
+            "initial_context": {"task_lineage": f"task-{index}", "replay_from": 1},
+        }
+    )
+
+
+def _cancellation(index: int) -> str:
+    """A templated instruction naming one customer's own order."""
+    return f"I am user_{index:02d}. Please cancel order #W{1000 + index} if it has not shipped."
+
+
+def test_a_shared_tool_catalogue_does_not_join_distinct_tasks_into_one_lineage() -> None:
+    """Every trace declares the same tools, as real agent traces do; the tasks stay distinct."""
+    traces = tuple(_task_trace(index, _cancellation(index)) for index in range(10))
+
+    result = mine_tasks(
+        traces,
+        MiningSpec(fit_task_budget=8, held_out_task_budget=2),
+        embedder=HashingDescriptorEmbedder(),
+    )
+
+    assert result.analysis.edges == ()
+    assert len(result.analysis.leakage_groups) == 10
+    assert len(result.partition.held_out_lineage_group_ids) == 2
+    assert sum(task.partition == "held_out" for task in result.tasks) == 2
+    assert all(task.tools == _catalogue() for task in result.tasks)
+
+
+def test_forks_and_variants_of_one_task_still_share_a_lineage_beside_distinct_tasks() -> None:
+    """Without the catalogue, related requests still group while distinct tasks stay apart.
+
+    The fork replays the same request from a later turn in another conversation; the variant
+    re-asks one instruction with different casing and punctuation under another declared task.
+    """
+    fork = _task_trace(20, _cancellation(3)).model_copy(
+        update={"initial_context": {"task_lineage": "task-3", "replay_from": 2}}
+    )
+    variant = _task_trace(21, _cancellation(4).replace("Please cancel", "please, cancel"))
+    traces = (*(_task_trace(index, _cancellation(index)) for index in range(10)), fork, variant)
+
+    result = mine_tasks(traces, embedder=HashingDescriptorEmbedder())
+
+    by_trace = {
+        trace_id: group.lineage_group_id
+        for group in result.analysis.leakage_groups
+        for trace_id in group.source_trace_ids
+    }
+    assert by_trace["trace-20"] == by_trace["trace-3"]
+    assert by_trace["trace-21"] == by_trace["trace-4"]
+    assert len(result.analysis.leakage_groups) == 10
+    assert {edge.kind for edge in result.analysis.edges} == {"semantic"}
+
+
+def test_a_different_tool_catalogue_cannot_separate_one_task() -> None:
+    """The same request under another catalogue is still the same task for leakage."""
+    first = _task_trace(1, _cancellation(1))
+    second = _task_trace(2, _cancellation(1), tools=_catalogue(extra="escalate_to_human"))
+    second = second.model_copy(update={"initial_context": first.initial_context})
+
+    result = mine_tasks((first, second), embedder=HashingDescriptorEmbedder())
+
+    assert [(edge.kind, edge.similarity) for edge in result.analysis.edges] == [
+        ("semantic", pytest.approx(1.0))
+    ]
+    assert len(result.analysis.leakage_groups) == 1
+    assert len(result.analysis.candidates) == 2
+
+
+def test_short_replay_forks_stay_together_without_tool_similarity() -> None:
+    """A replay index cannot split one short request across fit and held-out evidence."""
+    first = _task_trace(1, "Cancel my order")
+    fork = _task_trace(2, "Cancel my order", tools=_catalogue(extra="escalate_to_human"))
+    fork = fork.model_copy(update={"initial_context": {"task_lineage": "task-1", "replay_from": 2}})
+    unrelated = _task_trace(3, "Find a laptop charger")
+
+    result = mine_tasks((first, fork, unrelated), embedder=HashingDescriptorEmbedder())
+
+    groups = {
+        trace_id: group.lineage_group_id
+        for group in result.analysis.leakage_groups
+        for trace_id in group.source_trace_ids
+    }
+    assert groups["trace-1"] == groups["trace-2"]
+    assert groups["trace-1"] != groups["trace-3"]
+    assert {task.partition for task in result.tasks} == {"fit", "held_out"}
+    tools_by_trace = {trace.trace_id: trace.tools for trace in (first, fork, unrelated)}
+    assert all(task.tools == tools_by_trace[task.source_trace_ids[0]] for task in result.tasks)
+
+
+def test_shared_policy_context_cannot_join_unrelated_tasks() -> None:
+    """Static request context cannot overwhelm distinct instructions and remove held-out tasks."""
+    policy = (
+        "Customer support policy: verify order ownership before any modifications. "
+        "Read shipment status before cancellation. "
+    ) * 20
+    traces = tuple(
+        _task_trace(index, instruction).model_copy(update={"initial_context": {"policy": policy}})
+        for index, instruction in enumerate(
+            (
+                "Cancel my order",
+                "Return my shoes",
+                "Update my email address",
+                "Find a laptop charger",
+            )
+        )
+    )
+
+    result = mine_tasks(
+        traces,
+        MiningSpec(fit_task_budget=2, held_out_task_budget=2),
+        embedder=HashingDescriptorEmbedder(),
+    )
+
+    assert len(result.analysis.leakage_groups) == 4
+    assert len(result.partition.fit_lineage_group_ids) == 2
+    assert len(result.partition.held_out_lineage_group_ids) == 2
+    assert all(task.tools == _catalogue() for task in result.tasks)
+    assert all(task.initial_context == {"policy": policy} for task in result.tasks)
+
+
+def test_declared_task_identity_groups_paraphrases_without_semantic_similarity() -> None:
+    """A source-declared task keeps its rephrased replay together independently of geometry."""
+    first = _task_trace(1, "Cancel my order")
+    variant = _task_trace(2, "Please stop shipment of my purchase").model_copy(
+        update={"initial_context": {"task_lineage": "task-1", "replay_from": 2}}
+    )
+    unrelated = _task_trace(3, "Find a laptop charger")
+
+    result = mine_tasks((first, variant, unrelated), embedder=HashingDescriptorEmbedder())
+
+    groups = {
+        trace_id: group.lineage_group_id
+        for group in result.analysis.leakage_groups
+        for trace_id in group.source_trace_ids
+    }
+    assert result.analysis.edges == ()
+    assert groups["trace-1"] == groups["trace-2"]
+    assert groups["trace-1"] != groups["trace-3"]
+    assert {task.partition for task in result.tasks} == {"fit", "held_out"}
+
+
+@pytest.mark.parametrize("boundary", ["customer", "source"])
+def test_declared_task_names_are_local_to_their_source_and_customer(boundary: str) -> None:
+    """Two customers or sources may independently name an unrelated task task-1."""
+    first = _task_trace(1, "Cancel my order")
+    second = _task_trace(2, "Find a laptop charger").model_copy(
+        update={"initial_context": first.initial_context}
+    )
+    if boundary == "customer":
+        span = second.spans[0].model_copy(
+            update={"attributes": {**second.spans[0].attributes, "exp.customer.id": "customer-2"}}
+        )
+        second = second.model_copy(update={"spans": (span,)})
+    else:
+        identity = second.source.identity.model_copy(update={"source_id": "another-source"})
+        second = second.model_copy(
+            update={"source": second.source.model_copy(update={"identity": identity})}
+        )
+
+    result = mine_tasks((first, second), embedder=HashingDescriptorEmbedder())
+
+    assert result.analysis.edges == ()
+    assert len(result.analysis.leakage_groups) == 2
+    assert {task.partition for task in result.tasks} == {"fit", "held_out"}
+
+
+def test_declared_task_identity_without_customer_uses_the_existing_source_boundary() -> None:
+    """Anonymous requests can still declare replay identity within one stable source."""
+    traces = []
+    for index, instruction in enumerate(("Cancel my order", "Please stop shipment of my purchase")):
+        trace = _task_trace(index, instruction).model_copy(
+            update={"initial_context": {"task_lineage": "task-1", "replay_from": index + 1}}
+        )
+        attributes = {
+            key: value
+            for key, value in trace.spans[0].attributes.items()
+            if key != "exp.customer.id"
+        }
+        traces.append(
+            trace.model_copy(
+                update={"spans": (trace.spans[0].model_copy(update={"attributes": attributes}),)}
+            )
+        )
+
+    result = mine_tasks(traces, embedder=HashingDescriptorEmbedder())
+
+    assert result.analysis.edges == ()
+    assert len(result.analysis.leakage_groups) == 1
+    assert all(
+        assignment.customer_id == "source:fixture" for assignment in result.lineage_assignments
+    )
