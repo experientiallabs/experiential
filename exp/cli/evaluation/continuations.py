@@ -63,9 +63,9 @@ from exp.cli.evaluation.hill_climb import (
     handle_climb_round,
     handle_propose_edits,
 )
-from exp.cli.evaluation.judge_challenges import handle_challenge_judges
-from exp.cli.evaluation.instance_facts import handle_derive_facts
 from exp.cli.evaluation.induction import handle_induce_transitions, handle_validate_transitions
+from exp.cli.evaluation.instance_facts import handle_derive_facts
+from exp.cli.evaluation.judge_challenges import handle_challenge_judges
 from exp.cli.evaluation.learning_repair import handle_repair_learning
 from exp.cli.evaluation.memory_forget import handle_forget_summary
 from exp.cli.evaluation.sample_count import handle_sample_count
@@ -104,12 +104,12 @@ from exp.optimize.evaluation.factory.proposals import TaskProposalSpec
 from exp.optimize.evaluation.factory.scenario_search import ScenarioSearchSpec
 from exp.optimize.evaluation.factory.validity import TaskValiditySpec
 from exp.optimize.evaluation.factory.variants import TaskVariantSpec
+from exp.optimize.evaluation.fidelity.fact_derivation import FactsDerivation
 from exp.optimize.evaluation.hillclimb.proposals import EditProposalSpec
 from exp.optimize.evaluation.hillclimb.report import ClimbReportSpec
 from exp.optimize.evaluation.hillclimb.rounds import ClimbRound
-from exp.optimize.evaluation.learning.forgetting import SummaryForget
-from exp.optimize.evaluation.fidelity.fact_derivation import FactsDerivation
 from exp.optimize.evaluation.induction.service import InductionSpec, TransitionValidationSpec
+from exp.optimize.evaluation.learning.forgetting import SummaryForget
 from exp.optimize.evaluation.learning.lessons import LearningRepair
 from exp.optimize.evaluation.learning.sample_count import SampleCountRequest
 from exp.optimize.evaluation.tasks.challenge_runs import ChallengeRunSpec

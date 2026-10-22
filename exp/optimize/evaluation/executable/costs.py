@@ -52,8 +52,8 @@ from exp.optimize.evaluation.fidelity.retrieval_binding import index_embedder_al
 from exp.optimize.evaluation.hillclimb.proposals import EditProposalSpec
 from exp.optimize.evaluation.hillclimb.report import ClimbReportSpec, report_jobs
 from exp.optimize.evaluation.hillclimb.rounds import ClimbRound, round_jobs
-from exp.optimize.evaluation.tasks.challenge_runs import ChallengeRunSpec, challenge_attempts
 from exp.optimize.evaluation.induction.service import InductionSpec
+from exp.optimize.evaluation.tasks.challenge_runs import ChallengeRunSpec, challenge_attempts
 from exp.runtime.gateway.decisions_contracts import (
     MAX_DECISION_CRITERIA,
     MAX_DECISION_INPUT_BYTES,
