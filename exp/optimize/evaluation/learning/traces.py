@@ -12,7 +12,10 @@ exists. A trace whose package supplies instance facts (its starting world) deliv
 each of its predictions, as a held-out replay does; they key each run and the memory lineage.
 A rerun replays completed traces without provider calls and continues where it stopped; a
 trace interrupted mid-run resumes in place with ``retry_incomplete``, so its first saved
-measurement is still the one scored.
+measurement is still the one scored. A trace whose identical request the gateway refuses
+deterministically is retired after a bounded number of refusals
+(:mod:`exp.optimize.evaluation.learning.retirement`): it is recorded as not learned, never
+scored, and the pass continues with the next trace.
 
 Measurement is test-then-train: each trace is predicted whole on the memory pinned before it,
 with none of its own feedback or investigations, and with memory from earlier traces of the
@@ -83,6 +86,12 @@ from exp.optimize.evaluation.learning.lineage import (
     plan_world_model,
 )
 from exp.optimize.evaluation.learning.repeats import require_unlearned
+from exp.optimize.evaluation.learning.retirement import (
+    retired_traces,
+    retirement_of,
+    settle_refusal,
+)
+from exp.simulation.evaluation.workflow import INFRASTRUCTURE_STOPS
 from exp.simulation.retrieval.build_inputs import load_completed_build_rag_lineage_bindings
 from exp.simulation.retrieval.evidence_reading import ReadingPolicy
 from exp.simulation.retrieval.jev import JEVCueSelector, JEVPolicy
@@ -155,6 +164,8 @@ class LearningOutcome(ContractModel):
         learned: Traces consumed into memory (published, or already consumed).
         incomplete: Traces not consumed after their allowed attempts. Their predictions can
             still be complete when an investigation fails; the pass reports them separately.
+        retired: Traces retired from this memory and never learned or scored, whether retired
+            during this pass or earlier.
         head_version: Memory version after the pass; 0 before any publication.
         attempts_used: Physical attempts this invocation claimed.
         stopped: Why the pass stopped early, or None when every trace was visited.
@@ -164,6 +175,7 @@ class LearningOutcome(ContractModel):
     traces: int
     learned: int
     incomplete: int = 0
+    retired: int = 0
     head_version: int
     attempts_used: int
     stopped: str | None = None
@@ -198,7 +210,9 @@ class LearningCurve(ContractModel):
             replace an existing measurement, whether or not they publish memory.
         quarters: Four windows of scored traces in canonical dataset order.
         halves: First and second half of scored traces, independent of learning success.
-        incomplete: Traces not learned into memory (scored when their predictions completed).
+        incomplete: Traces not learned into memory (scored when their predictions completed),
+            retired traces included.
+        retired: Retired traces: never learned, never scored, counted in ``incomplete``.
         qualification: Present when any scored trace resumed with unknown-outcome retries.
     """
 
@@ -206,6 +220,7 @@ class LearningCurve(ContractModel):
     quarters: tuple[CurveWindow, ...]
     halves: tuple[CurveWindow, ...]
     incomplete: int = 0
+    retired: int = 0
     qualification: Qualification | None = None
 
     def headline(self) -> str:
@@ -233,6 +248,8 @@ class LearningCurve(ContractModel):
         )
         if self.incomplete:
             line += f" · {self.incomplete} trace(s) not learned"
+            if self.retired:
+                line += f" ({self.retired} retired, unscored)"
         if self.qualification is not None:
             line += f" · {QUALIFICATION}\n" + "\n".join(self.qualification.lines())
         if self.quarters:
@@ -648,12 +665,17 @@ def learn_from_traces(
         clock: Aware clock for deadlines.
         progress: Shared progress display; reports ``Learning from traces k/n``.
         retry_incomplete: Resume a trace that was interrupted mid-run: saved work replays,
-            and a request lost in flight is sent again and reported.
+            and a request lost in flight is sent again and reported. A request the gateway
+            refused deterministically is resent in place until its trace is retired.
         evidence_reading: Enable bounded readers, or follow the recorded learning plan.
         dream_every: Consolidation interval, or follow the recorded learning plan.
 
     Returns:
         The outcome; ``stopped`` explains an early stop.
+
+    Raises:
+        Exception: One of ``INFRASTRUCTURE_STOPS`` stopped a trace; a deterministic refusal
+            propagates only below the retirement bound without ``retry_incomplete``.
     """
     plan = learning_plan(
         project,
@@ -666,11 +688,15 @@ def learn_from_traces(
     if scope == "fit":
         reserve_held_out(project, plan, code_revision=code_revision)
     cases = learning_cases(project, scope)
-    used, learned, incomplete, stopped = 0, 0, 0, None
+    used, learned, incomplete, retired, stopped = 0, 0, 0, 0, None
     earlier: set[str] = set()  # trajectories of the traces before this one in the pass
     for index, case in enumerate(cases):
         report(progress, "Learning from traces", completed=index, total=len(cases))
+        if retirement_of(project, plan.lineage, case.trace_id) is not None:
+            retired += 1
+            continue
         attempted: set[str] = set()
+        retiring = False
         while True:
             now = clock()
             spec = learning_spec(project, plan, case, deadline=now + DEADLINE)
@@ -696,14 +722,34 @@ def learn_from_traces(
                     )
                     break
                 before = attempts_used(project, prepared)
-                execute_fidelity_evaluation(
-                    project,
-                    prepared,
-                    clock=clock,
-                    resume_until=now + DEADLINE if retry_incomplete else None,
-                    progress=_inside(progress, index, cases),
-                )
-                used += attempts_used(project, prepared) - before
+                try:
+                    execute_fidelity_evaluation(
+                        project,
+                        prepared,
+                        clock=clock,
+                        resume_until=now + DEADLINE if retry_incomplete else None,
+                        progress=_inside(progress, index, cases),
+                    )
+                except INFRASTRUCTURE_STOPS as error:
+                    settled = settle_refusal(
+                        project,
+                        plan.lineage,
+                        case.trace_id,
+                        prepared,
+                        error,
+                        now=clock(),
+                        code_revision=code_revision,
+                        retry_incomplete=retry_incomplete,
+                    )
+                    if settled is None:
+                        raise
+                    if settled:
+                        retiring = True
+                        break
+                    attempted.discard(prepared.id)  # resend the identical request in place
+                    continue
+                finally:
+                    used += attempts_used(project, prepared) - before
             else:
                 # Replay completes any interrupted publication without provider calls.
                 execute_fidelity_evaluation(project, prepared, clock=clock)
@@ -713,6 +759,9 @@ def learn_from_traces(
         if stopped is not None:
             break
         earlier.add(consumed_trajectory_digest(trajectory_record(spec)))
+        if retiring:
+            retired += 1
+            continue
         receipt = saved_memory_receipt(project, prepared)
         if receipt is not None and receipt.get("reason") in ("consumed", DUPLICATE):
             learned += 1
@@ -726,6 +775,7 @@ def learn_from_traces(
         traces=len(cases),
         learned=learned,
         incomplete=incomplete,
+        retired=retired,
         head_version=0 if head is None else head.version,
         attempts_used=used,
         stopped=stopped,
@@ -742,15 +792,18 @@ def learning_curve(project: ProjectStore, scope: Scope | None = None) -> Learnin
     Returns:
         The curve over scored traces, or None before any measurement was saved.
     """
-    runs, unscored = learning_progress(project, learning_plan(project, None, scope))
+    plan = learning_plan(project, None, scope)
+    runs, unscored = learning_progress(project, plan)
     points = [result for _, _, result, _ in runs]
     if not points:
         return None
+    retired = len(retired_traces(project, plan.lineage, _trace_ids(project, plan.scope)))
     return LearningCurve(
         points=tuple(points),
         quarters=_windows(points, 4),
         halves=_windows(points, 2) if len(points) > 1 else (),
-        incomplete=sum(not learned for *_, learned in runs) + len(unscored),
+        incomplete=sum(not learned for *_, learned in runs) + len(unscored) + retired,
+        retired=retired,
         qualification=qualify([(row.unknown_outcomes, row.exact, row.steps) for row in points]),
     )
 
@@ -782,7 +835,8 @@ def learning_progress(
     saved report fixes that trace's measurement. Later attempts can complete learning, but
     cannot replace the score with a different prediction draw. Whether any attempt consumed
     the trace determines only its learning status and eligibility for a retention retest.
-    Reading stops at the first trace no attempt has run for.
+    Retired traces are neither scored nor unscored: :func:`retired_traces` counts them.
+    Reading stops at the first other trace no attempt has run for.
 
     Args:
         project: Project with a recorded learning plan.
@@ -795,6 +849,8 @@ def learning_progress(
     scored: list[tuple[ReplayCase, PreparedFidelity, ReplayResult, bool]] = []
     unscored: list[ReplayCase] = []
     for case in learning_cases(project, plan.scope):
+        if retirement_of(project, plan.lineage, case.trace_id) is not None:
+            continue
         attempts = _saved_attempts(project, plan, case)
         if not attempts:
             if _registered(project, plan, case):
@@ -831,25 +887,32 @@ def _intent_of(project: ProjectStore, plan_id: str) -> str:
     return prepared.id + "-execution"
 
 
-def _saved_attempts(
+def registered_attempts(
     project: ProjectStore, plan: LearningPlan, case: ReplayCase
-) -> list[tuple[PreparedFidelity, DualReport]]:
-    """Every attempt of one case that has a saved report, in attempt order, without writing."""
+) -> list[PreparedFidelity]:
+    """Every registered attempt of one case, in attempt order, read without writing."""
     spec = learning_spec(project, plan, case, deadline=datetime.now().astimezone())
-    attempts: list[tuple[PreparedFidelity, DualReport]] = []
-    generation = 1
+    attempts: list[PreparedFidelity] = []
     while True:
+        generation = len(attempts) + 1
         run_id = content_run_id(spec, LABEL, case.trace_id, generation, code_revision=None)
         plan_id = stable_id("fidelity", {"run_id": run_id})
         if not project.artifacts.exists(plan_id):
             return attempts
-        prepared = PreparedFidelity.model_validate_json(
-            project.artifacts.read_bytes(plan_id, "plan.json")
+        attempts.append(
+            PreparedFidelity.model_validate_json(project.artifacts.read_bytes(plan_id, "plan.json"))
         )
-        saved = saved_fidelity_report(project, prepared)
-        if saved is not None:
-            attempts.append((prepared, saved))
-        generation += 1
+
+
+def _saved_attempts(
+    project: ProjectStore, plan: LearningPlan, case: ReplayCase
+) -> list[tuple[PreparedFidelity, DualReport]]:
+    """Every attempt of one case that has a saved report, in attempt order, without writing."""
+    return [
+        (prepared, saved)
+        for prepared in registered_attempts(project, plan, case)
+        if (saved := saved_fidelity_report(project, prepared)) is not None
+    ]
 
 
 def _windows(points: list[ReplayResult], parts: int) -> tuple[CurveWindow, ...]:
@@ -893,3 +956,8 @@ def _inside(
         return None
     detail = f"trace {index + 1}/{len(cases)}"
     return lambda event: progress(replace(event, detail=event.detail or detail))
+
+
+def _trace_ids(project: ProjectStore, scope: Scope) -> tuple[str, ...]:
+    """Trace IDs of the scope's learning cases, in learning order."""
+    return tuple(case.trace_id for case in learning_cases(project, scope))
