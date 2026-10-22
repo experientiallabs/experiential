@@ -18,6 +18,12 @@ lineage, trace, fidelity run, request digest, status, code and time.
 - `--retry-incomplete` resends the identical request in place. After three recorded refusals of
   that identical request (the original and two resends), the trace is retired and the pass
   continues with the next trace.
+- At most 10% of a lineage's learning traces (and at least one) are retired automatically.
+  Past that bound the refusals look systemic, so the pass stops instead: the message names the
+  code and the affected traces, the trace that tripped the bound keeps its recorded refusals and
+  stays resumable, and nothing more is retired. Check the provider or model settings (for
+  example the output allowance or reasoning effort), then resume with `--retry-incomplete`, or
+  retire specific traces explicitly (below). Operator retirements do not count toward the bound.
 - Transport outages, timeouts, overload (`gateway_overloaded`), conflicts, unknown outcomes and
   any unregistered code are never retired automatically. They stay resumable.
 

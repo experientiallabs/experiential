@@ -21,10 +21,15 @@ from exp.optimize.evaluation.audit.panel_test import (
 )
 from exp.optimize.evaluation.fidelity.memory import trajectory_record
 from exp.optimize.evaluation.fidelity.replay import DEADLINE
+from exp.optimize.evaluation.learning.repair import TraceRetirementRequest, retire_trace
 from exp.optimize.evaluation.learning.retirement import (
     REFUSAL_TYPE,
     RETIREMENT_FAILURES,
     RETIREMENT_TYPE,
+    RefusalObservation,
+    SystemicRefusalError,
+    automatic_retirement_limit,
+    refusals,
     retired_traces,
     retirement_of,
 )
@@ -62,6 +67,7 @@ class RefusingProvider(SimulatedProvider):
 
     Attributes:
         task_id: Learning task whose predictions are refused, or None to refuse nothing.
+        refuse_all: Refuse every prediction of every task.
         body: Error body of the refusal.
         refused: Every refused request body, in order (retries included).
     """
@@ -70,6 +76,7 @@ class RefusingProvider(SimulatedProvider):
         """Route like the fake; refuse nothing until a task is named."""
         super().__init__(episodes, learnable=True)
         self.task_id: str | None = None
+        self.refuse_all = False
         self.body: JsonObject = STREAM_REFUSAL
         self.refused: list[JsonObject] = []
 
@@ -83,10 +90,12 @@ class RefusingProvider(SimulatedProvider):
     ) -> JsonHttpResponse:
         """Refuse the target task's predictions; route everything else normally."""
         if (
-            self.task_id is not None
-            and url.endswith("/chat/completions")
+            url.endswith("/chat/completions")
             and _at(payload, "tool_choice", "function", "name") == "submit_transition"
-            and f'"{self.task_id}-' in json.dumps(payload)
+            and (
+                self.refuse_all
+                or (self.task_id is not None and f'"{self.task_id}-' in json.dumps(payload))
+            )
         ):
             self.requests.append(RecordedRequest(url, dict(headers), payload))
             self.refused.append(payload)
@@ -197,3 +206,63 @@ def test_a_refusal_below_the_bound_stops_without_a_resumption(
     assert len(provider.refused) == sent
     lineage = learning_plan(store, scope="fit").lineage
     assert retirement_of(store, lineage, trace_id) is None
+
+
+def test_systemic_refusals_stop_the_pass_instead_of_retiring_every_trace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every trace refused: retirement stops at the registered bound and the rest stay resumable.
+
+    An operator retirement does not count toward the bound. The stopping message names the
+    code and the affected traces and says what to do; the trace that tripped the bound keeps
+    its recorded refusals, is not retired, and learns once the provider recovers.
+    """
+    store, provider, _ = refusing_project(tmp_path, monkeypatch, STREAM_REFUSAL)
+    provider.task_id, provider.refuse_all = None, True
+    cases = learning_cases(store, "fit")
+    assert automatic_retirement_limit(len(cases)) == 1 < len(cases) - 2
+    lineage = learning_plan(store, "jev", "fit", record=True).lineage
+    operator, automatic, tripped = (case.trace_id for case in cases[:3])
+    retire_trace(
+        store,
+        TraceRetirementRequest(resolution="retire-trace", trace_id=operator, reason="known bad"),
+        code_revision=REVISION,
+    )
+    with pytest.raises(ProviderTransportError):
+        learn(store)
+    with pytest.raises(SystemicRefusalError) as stopped:
+        learn(store, retry_incomplete=True)
+    message = str(stopped.value)
+    for text in (
+        "refusals look systemic",
+        "invalid_provider_stream",
+        f"affected traces: {automatic}, {tripped}",
+        "provider or model settings",
+        "repair-learning retire-trace",
+    ):
+        assert text in message, message
+    first = retirement_of(store, lineage, automatic)
+    assert first is not None and first.cause == "deterministic-refusal"
+    assert retirement_of(store, lineage, tripped) is None, "nothing past the bound is retired"
+    assert memory_head(store.artifacts, lineage) is None
+    recorded = [
+        row
+        for identity in store.artifacts.list_ids(artifact_type=REFUSAL_TYPE)
+        if (row := refusals_of(store, identity)).trace_id == tripped
+    ]
+    assert len(recorded) == RETIREMENT_FAILURES, "the tripping refusals stay recorded"
+    assert refusals(store, lineage, tripped, recorded[0].run, recorded[0].request_sha256) == tuple(
+        sorted(recorded, key=lambda row: row.ordinal)
+    )
+    assert len(store.artifacts.list_ids(artifact_type=RETIREMENT_TYPE)) == 2
+    provider.refuse_all = False  # the provider recovers
+    outcome = learn(store, retry_incomplete=True)
+    assert (outcome.learned, outcome.retired, outcome.stopped) == (len(cases) - 2, 2, None)
+    assert learning_plan(store, scope="fit").lineage == lineage
+
+
+def refusals_of(store: ProjectStore, identity: str) -> RefusalObservation:
+    """Read one recorded refusal."""
+    return RefusalObservation.model_validate_json(
+        store.artifacts.read_bytes(identity, "refusal.json")
+    )

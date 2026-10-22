@@ -20,7 +20,11 @@ from exp.cli.shared.progress import progress_display
 from exp.common.progress import ProgressHook
 from exp.common.project import ProjectStore
 from exp.optimize.evaluation.fidelity.replay import DEADLINE
-from exp.optimize.evaluation.learning.retirement import RETIREMENT_FAILURES, retired_traces
+from exp.optimize.evaluation.learning.retirement import (
+    RETIREMENT_FAILURES,
+    SystemicRefusalError,
+    retired_traces,
+)
 from exp.optimize.evaluation.learning.traces import (
     LearningOutcome,
     Scope,
@@ -157,6 +161,10 @@ def run_learning(
                 evidence_reading=evidence_reading,
                 dream_every=dream_every,
             )
+    except SystemicRefusalError as exc:
+        screen.print(f"[red]error[/red] {exc}")
+        screen.print("Learned and retired traces are saved; nothing more was retired.")
+        raise typer.Exit(code=1) from exc
     except INFRASTRUCTURE_STOPS as exc:
         screen.print(f"[red]error[/red] {stop_reason(exc)}")
         refusal = deterministic_refusal(exc)

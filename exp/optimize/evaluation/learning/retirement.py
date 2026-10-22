@@ -42,9 +42,26 @@ from exp.simulation.world_model.experience_memory import memory_head, memory_loc
 RETIREMENT_FAILURES = 3
 if not 1 < RETIREMENT_FAILURES <= 1 + MAXIMUM_REDISPATCHES:
     raise ValueError("retirement bound must be reachable within the allowed re-dispatches")
+# At most this share of a lineage's traces (and at least one trace) is retired automatically.
+# More identical refusals than that look systemic (a provider or model setting), not one bad
+# trace, so the pass stops instead of quietly retiring the rest. Operator retirements are not
+# counted.
+AUTOMATIC_RETIREMENT_SHARE_PERCENT = 10
 REFUSAL_TYPE = "trace-learning-refusal"
 RETIREMENT_TYPE = "trace-learning-retirement"
 Cause = Literal["deterministic-refusal", "operator"]
+
+
+class SystemicRefusalError(ValueError):
+    """Deterministic refusals exceed the automatic-retirement bound: the pass stops.
+
+    The refusal that tripped the bound is recorded; its trace stays unretired and resumable.
+    """
+
+
+def automatic_retirement_limit(traces: int) -> int:
+    """Automatic retirements allowed in a lineage over ``traces`` learning traces."""
+    return max(1, traces * AUTOMATIC_RETIREMENT_SHARE_PERCENT // 100)
 
 
 class RefusalObservation(ContractModel):
@@ -200,6 +217,7 @@ def retire(
     now: datetime,
     code_revision: str,
     unconsumed: Sha256 | None = None,
+    automatic_limit: int | None = None,
 ) -> ArtifactInput:
     """Record one retirement; an identical retirement replays, a different one is refused.
 
@@ -210,14 +228,33 @@ def retire(
         code_revision: Recording implementation identity.
         unconsumed: Consumed-trajectory digest of the trace, checked against the memory head
             under the lineage lock so a trace is never both learned and retired.
+        automatic_limit: For an automatic retirement, how many the lineage may hold; checked
+            under the lineage lock.
 
     Returns:
         Reference to the immutable retirement record.
 
     Raises:
         ValueError: The trace is already learned, or already retired for a different reason.
+        SystemicRefusalError: An automatic retirement would exceed ``automatic_limit``.
     """
     with memory_lock(project.artifacts, retirement.lineage):
+        if automatic_limit is not None and not project.artifacts.exists(
+            retirement_id(retirement.lineage, retirement.trace_id)
+        ):
+            earlier = _automatic(project, retirement.lineage)
+            if len(earlier) >= automatic_limit:
+                traces = ", ".join([*(row.trace_id for row in earlier), retirement.trace_id])
+                raise SystemicRefusalError(
+                    f"refusals look systemic: trace {retirement.trace_id} hit "
+                    f"{retirement.reason}, and {len(earlier)} automatic retirement(s) "
+                    f"already reached the bound of {automatic_limit} for memory "
+                    f"{retirement.lineage} (affected traces: {traces}). The trace was not "
+                    "retired and stays resumable. Check the provider or model settings (for "
+                    "example the output allowance or reasoning effort) and resume with "
+                    "--retry-incomplete, or retire specific traces explicitly with the "
+                    "repair-learning retire-trace resolution"
+                )
         head = memory_head(project.artifacts, retirement.lineage)
         if unconsumed is not None and head is not None and unconsumed in head.consumed:
             raise ValueError(
@@ -262,6 +299,7 @@ def settle_refusal(
     prepared: PreparedFidelity,
     error: BaseException,
     *,
+    traces: int,
     now: datetime,
     code_revision: str,
     retry_incomplete: bool,
@@ -274,6 +312,7 @@ def settle_refusal(
         trace_id: Trace the run learns.
         prepared: The learning run that stopped.
         error: What stopped it.
+        traces: Learning traces in the lineage's scope, which set the automatic bound.
         now: Aware recording time.
         code_revision: Recording implementation identity.
         retry_incomplete: The pass may resend the identical request in place.
@@ -282,6 +321,10 @@ def settle_refusal(
         True when the trace is now retired, False when the identical request may be resent in
         place, and None when the stop must propagate unchanged: any other stop, a run that
         already saved its report, or a refusal below the bound without a resumption.
+
+    Raises:
+        SystemicRefusalError: Retiring this trace would exceed
+            :func:`automatic_retirement_limit`; nothing more is retired.
     """
     refusal = deterministic_refusal(error)
     if refusal is None or saved_fidelity_report(project, prepared) is not None:
@@ -312,6 +355,7 @@ def settle_refusal(
         ),
         now=now,
         code_revision=code_revision,
+        automatic_limit=automatic_retirement_limit(traces),
     )
     return True
 
@@ -354,6 +398,17 @@ def retired_traces(
                 )
             )
     return tuple(rows)
+
+
+def _automatic(project: ProjectStore, lineage: str) -> tuple[TraceRetirement, ...]:
+    """Automatic retirements recorded in one lineage, in identity order."""
+    rows = (
+        _read(project, identity)
+        for identity in project.artifacts.list_ids(artifact_type=RETIREMENT_TYPE)
+    )
+    return tuple(
+        row for row in rows if row.lineage == lineage and row.cause == "deterministic-refusal"
+    )
 
 
 def _read(project: ProjectStore, identity: str) -> TraceRetirement:

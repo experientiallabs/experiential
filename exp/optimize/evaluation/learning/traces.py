@@ -737,6 +737,7 @@ def learn_from_traces(
                         case.trace_id,
                         prepared,
                         error,
+                        traces=len(cases),
                         now=clock(),
                         code_revision=code_revision,
                         retry_incomplete=retry_incomplete,
