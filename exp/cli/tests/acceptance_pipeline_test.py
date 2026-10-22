@@ -533,6 +533,9 @@ def recorded_conversation(world: World, index: int) -> JsonObject:
         "provider": "recording",
         "model": "recorded-agent",
         "messages": messages,
+        # A declared customer keeps lineage identity, and so the split, independent of the
+        # path the export is read from.
+        "exp.customer.id": "acceptance-customer",
         "exp.conversation.id": episode.lineage,
         "exp.request.context": {"task_lineage": episode.lineage, "replay_from": 1},
     }
