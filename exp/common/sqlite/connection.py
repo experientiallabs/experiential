@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import os
 import sqlite3
 import threading
 import time
+from collections import OrderedDict
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -33,15 +35,31 @@ def connect_database(
     return connection
 
 
+MAXIMUM_IDLE_CONNECTIONS = 16
+"""Idle connections one thread keeps; the least recently used one beyond this closes."""
+
+
 class _ThreadConnectionCache(threading.local):
-    """Per-thread idle SQLite connections keyed by path and busy timeout."""
+    """Per-thread idle SQLite connections keyed by path and busy timeout, in recency order."""
 
     def __init__(self) -> None:
-        """Start each thread with an empty idle-connection map."""
-        self.idle: dict[tuple[str, int], sqlite3.Connection] = {}
+        """Start each thread with an empty idle-connection map owned by this process."""
+        self.idle: OrderedDict[tuple[str, int], sqlite3.Connection] = OrderedDict()
+        self.pid = os.getpid()
 
 
 _connection_cache = _ThreadConnectionCache()
+
+
+def _idle_connections() -> OrderedDict[tuple[str, int], sqlite3.Connection]:
+    """Return this thread's idle map, forgetting connections inherited across a fork.
+
+    A forked child must never use or close its parent's SQLite handles, so it starts empty.
+    """
+    if _connection_cache.pid != os.getpid():
+        _connection_cache.idle = OrderedDict()
+        _connection_cache.pid = os.getpid()
+    return _connection_cache.idle
 
 
 @contextmanager
@@ -51,10 +69,12 @@ def persistent_connection(
     """Yield one reusable per-thread connection for repeated database operations.
 
     Opening a SQLite connection pays file open, pragma, and WAL setup costs on
-    every call, which dominates hot request paths. This checkout keeps one idle
+    every call, and closing the last connection to a WAL database checkpoints and
+    syncs it, which dominates hot request paths. This checkout keeps one idle
     connection per thread, path, and timeout so sequential operations reuse it,
     while overlapping checkouts on the same thread fall back to a fresh
-    connection instead of sharing an in-flight transaction.
+    connection instead of sharing an in-flight transaction. A thread keeps at most
+    ``MAXIMUM_IDLE_CONNECTIONS`` idle connections, closing the least recently used.
 
     Args:
         path: Database path.
@@ -64,7 +84,8 @@ def persistent_connection(
         A configured connection; it returns to the idle cache on clean exit.
     """
     key = (str(path), busy_timeout_ms)
-    connection = _connection_cache.idle.pop(key, None)
+    idle = _idle_connections()
+    connection = idle.pop(key, None)
     if connection is None:
         connection = connect_database(path, busy_timeout_ms=busy_timeout_ms)
     try:
@@ -72,14 +93,12 @@ def persistent_connection(
     except BaseException:
         connection.close()
         raise
-    if connection.in_transaction:
+    if connection.in_transaction or key in idle:
         connection.close()
         return
-    previous = _connection_cache.idle.get(key)
-    if previous is not None:
-        connection.close()
-        return
-    _connection_cache.idle[key] = connection
+    idle[key] = connection
+    while len(idle) > MAXIMUM_IDLE_CONNECTIONS:
+        idle.popitem(last=False)[1].close()
 
 
 def close_idle_connections() -> int:
@@ -93,7 +112,7 @@ def close_idle_connections() -> int:
     Returns:
         Number of connections closed.
     """
-    idle = _connection_cache.idle
+    idle = _idle_connections()
     closed = len(idle)
     for connection in idle.values():
         connection.close()
