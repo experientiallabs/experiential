@@ -23,7 +23,7 @@ from exp.common.core.artifacts import (
     Sha256,
     sha256_json,
 )
-from exp.common.models import ModelRequest, load_model_catalog
+from exp.common.models import ModelCatalog, ModelRequest, load_model_catalog
 from exp.common.project import ProjectStore
 from exp.common.release_revision import installed_execution_revision
 from exp.common.tasks import TaskCase
@@ -50,6 +50,7 @@ from exp.simulation.development_scope import require_development_task
 from exp.simulation.reconstruction.models import resolve
 from exp.simulation.retrieval import RAGEmbedderBinding
 from exp.simulation.retrieval.evidence_reading import EvidenceReader
+from exp.simulation.world_model.artifact import GroundedWorldModelArtifact
 from exp.simulation.world_model.executable import GroundedWorldFactory, PredictorEvent
 from exp.simulation.world_model.grounded_session import GroundedTransitionEngine
 from exp.simulation.world_model.prediction_reading import PredictionReading, PredictionResolver
@@ -149,12 +150,24 @@ def trial_runtime(
     return _runtime(project, spec, provider_grant)
 
 
-def _runtime(
-    project: ProjectStore,
-    spec: GroundedRuntimeDefinition,
-    provider_grant: ProviderGrant | None = None,
-) -> ContinuationRuntime:
-    """Compose identical state/predictor definitions under one explicitly selected call ledger."""
+def preflight_grounded_runtime(project: ProjectStore, spec: GroundedRuntimeDefinition) -> None:
+    """Check a definition against the project without credentials, runtime state or calls.
+
+    Args:
+        project: Project whose build, catalog and artifacts the definition pins.
+        spec: Frozen simulator definition.
+
+    Raises:
+        ValueError: The task is not development data, the state or probe disagrees with the
+            manifest, the catalog changed, or a provider wire is not admitted.
+    """
+    _checked(project, spec)
+
+
+def _checked(
+    project: ProjectStore, spec: GroundedRuntimeDefinition
+) -> tuple[ModelCatalog, GroundedWorldModelArtifact, str | None]:
+    """Run every credential-free check and return the catalog, simulator and embedder alias."""
     require_development_task(project.artifacts, spec.task)
     if spec.task.reference_answer is not None:
         raise ValueError("grounded executable tasks must not contain private expected answers")
@@ -179,7 +192,7 @@ def _runtime(
         recall = catalog.models[spec.memory.recall.jev_alias]
         if catalog.connections[recall.connection].provider != "typesafe":
             raise ValueError("executable memory recall requires the admitted native decision wire")
-        # bind_evaluation_memory dispatches this wire through decision_transport below;
+        # _runtime binds this memory with bind_evaluation_memory over its decision transport;
         # TypeSafeClient supplies endpoint/auth facts and never performs a completion.
     if spec.prediction_reading is not None:
         alias = catalog.models[spec.prediction_reading.reader_alias]
@@ -187,6 +200,16 @@ def _runtime(
             raise ValueError("prediction reader requires the admitted native decision wire")
         if spec.prediction_reading.policy.rounds > 2:
             raise ValueError("prediction reading permits at most two rounds")
+    return catalog, artifact, embedder_alias
+
+
+def _runtime(
+    project: ProjectStore,
+    spec: GroundedRuntimeDefinition,
+    provider_grant: ProviderGrant | None = None,
+) -> ContinuationRuntime:
+    """Compose identical state/predictor definitions under one explicitly selected call ledger."""
+    catalog, artifact, embedder_alias = _checked(project, spec)
     revision = installed_execution_revision()
     identity_fields: JsonObject = {"definition": spec.model_dump(mode="json"), "code": revision}
     if provider_grant is not None:
