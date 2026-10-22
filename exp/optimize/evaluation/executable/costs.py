@@ -38,8 +38,14 @@ from exp.optimize.evaluation.executable import workbook as workbook_runtime
 from exp.optimize.evaluation.executable.task import load_executable_task
 from exp.optimize.evaluation.factory.authoring import AuthorSettings
 from exp.optimize.evaluation.factory.candidates import CandidateBatchSpec
+from exp.optimize.evaluation.factory.hardening import (
+    TaskHardeningSpec,
+    hardening_panel,
+    seed_proposals,
+)
 from exp.optimize.evaluation.factory.proposals import load_task_proposals
 from exp.optimize.evaluation.factory.runner import TaskFactorySpec
+from exp.optimize.evaluation.factory.validity import TaskValiditySpec, ValiditySettings
 from exp.optimize.evaluation.factory.variants import load_task_variant
 from exp.optimize.evaluation.fidelity.retrieval_binding import index_embedder_alias
 from exp.optimize.evaluation.hillclimb.proposals import EditProposalSpec
@@ -99,6 +105,8 @@ CostedSpec = (
     | ClimbRound
     | EditProposalSpec
     | ClimbReportSpec
+    | TaskValiditySpec
+    | TaskHardeningSpec
 )
 
 
@@ -373,7 +381,38 @@ def evaluation_costs(project: ProjectStore, spec: CostedSpec) -> tuple[CostCompo
                 project, spec.analyst_alias, spec.maximum_physical_attempts, spec.output_tokens
             ),
         )
+    if isinstance(spec, TaskValiditySpec):
+        return _validity_costs(project, spec)
+    if isinstance(spec, TaskHardeningSpec):
+        # Level zero checks one seed candidate; each harder level buys one author draw and
+        # may qualify all four proposed worlds, each priced at the seed variant's actor job.
+        seed = seed_proposals(project, spec)
+        candidate = (
+            *_validity_costs(project, spec.validity),
+            *evaluation_costs(project, hardening_panel(project, spec)),
+        )
+        level = (
+            *evaluation_costs(project, spec.author),
+            *runtime_costs(
+                project,
+                seed.spec.template.capture.runtime_sha256,
+                seed.spec.template.capture.configuration,
+            ),
+            *(row.scaled(4) for row in candidate),
+        )
+        return (*candidate, *(row.scaled(spec.maximum_levels) for row in level))
     raise ValueError(f"no cost inventory is defined for {type(spec).__name__}")
+
+
+def _validity_costs(project: ProjectStore, spec: ValiditySettings) -> tuple[CostComponent, ...]:
+    """One leak-judge draw plus every registered closed-book attempt."""
+    return (
+        *evaluation_costs(project, spec.leak_judge),
+        *(
+            row.scaled(spec.closed_book_attempts)
+            for row in evaluation_costs(project, spec.closed_book)
+        ),
+    )
 
 
 def total_cost(components: tuple[CostComponent, ...]) -> float | None:
