@@ -15,7 +15,8 @@ during a session. A step is one caller operation keyed by ``step_id``:
 State is stored incrementally (see ``projection``): each revision is an immutable event plus a
 root of content-addressed nodes, so a commit writes only the containers its edits change, and
 unchanged subtrees are shared across revisions. Callers hold revision-bound ``StateRef`` values
-and materialize JSON explicitly with ``read_state`` or ``read_session``.
+and materialize JSON explicitly with ``read_state`` or ``read_session``. Historical revisions
+stay readable while a retention pin owns them; ``collect_garbage`` reclaims the rest.
 
 One connection per thread and database is reused across operations, so a step pays one durable
 WAL sync per transaction rather than a connection setup and a checkpoint on every close. Every
@@ -75,6 +76,13 @@ from exp.runtime.sessions.records import (
     StepClaim,
     StepDecision,
     StepStatus,
+)
+from exp.runtime.sessions.retention import (
+    CollectionReport,
+    RetentionPin,
+    collect,
+    pin_revisions,
+    release_pin,
 )
 from exp.runtime.sessions.schema import open_schema, refuse_stale_schema
 from exp.runtime.sessions.steps import (
@@ -248,7 +256,8 @@ class SessionStore:
         """Materialize one revision's state, or the value at ``path`` inside it, as fresh JSON.
 
         Only the containers on ``path`` and the selected subtree are read. The reference must
-        come from this store, and the revision must still be materialized.
+        come from this store, and the revision must still be materialized: the head always is,
+        and older revisions are while a retention pin owns them.
 
         Args:
             ref: Revision-bound state reference issued by this store.
@@ -744,6 +753,50 @@ class SessionStore:
             ).fetchall()
         return tuple(row["step_id"] for row in rows)
 
+    def pin_revisions(
+        self, owner_id: str, session_id: str, start_revision: int, end_revision: int
+    ) -> RetentionPin:
+        """Durably retain revisions ``[start_revision, end_revision)`` for one named owner.
+
+        Register the pin before exposing a historical revision or beginning to read it. It lasts
+        until ``release_pin``; a stopped process does not release it.
+
+        Args:
+            owner_id: Stable owner, such as a checkpoint, fork or frozen evaluation identity.
+            session_id: Session whose history is retained.
+            start_revision: First retained revision.
+            end_revision: First revision after the range; at most the head version plus one.
+
+        Returns:
+            The registered pin.
+
+        Raises:
+            SessionNotFoundError: If the session does not exist.
+            RetentionConflictError: If the owner pins another range or the range is invalid.
+            StateUnavailableError: If a revision in the range was already reclaimed.
+        """
+        pin = RetentionPin(
+            owner_id=owner_id,
+            session_id=session_id,
+            start_revision=start_revision,
+            end_revision=end_revision,
+        )
+        with self._transaction() as connection:
+            return pin_revisions(connection, pin)
+
+    def release_pin(self, owner_id: str, session_id: str) -> bool:
+        """Release one owner's pin; other owners and the head keep what they retain.
+
+        Args:
+            owner_id: Owner that registered the pin.
+            session_id: Pinned session.
+
+        Returns:
+            Whether a pin was released.
+        """
+        with self._transaction() as connection:
+            return release_pin(connection, owner_id, session_id)
+
     def ref_at(self, session_id: str, revision: int) -> StateRef:
         """Return the reference to one committed revision, whether or not it is still retained.
 
@@ -767,6 +820,38 @@ class SessionStore:
             revision=revision,
             root_sha256=root.hex(),
         )
+
+    def collect_garbage(
+        self, *, batch_size: int = 500, maximum_batches: int | None = None
+    ) -> CollectionReport:
+        """Reclaim state nodes that no session head and no retention pin reaches.
+
+        Events are never reclaimed. An interrupted or bounded run resumes from its durable
+        cursor on the next call.
+
+        Args:
+            batch_size: Node rows examined per write transaction.
+            maximum_batches: Stop after this many batches; None runs to completion.
+
+        Returns:
+            Reclaimed and retained counts for this run.
+        """
+        if batch_size < 1:
+            raise ValueError("collection batches examine at least one node")
+        with self._connect() as connection:
+            report = collect(
+                connection,
+                self._transaction,
+                batch_size=batch_size,
+                maximum_batches=maximum_batches,
+            )
+        logger.info(
+            "session state collection reclaimed=%d bytes=%d complete=%s",
+            report.reclaimed_nodes,
+            report.reclaimed_bytes,
+            report.complete,
+        )
+        return report
 
     def verify_history(self, session_id: str) -> tuple[StateRef, ...]:
         """Rebuild every revision from the recorded genesis and edits alone, and check it.

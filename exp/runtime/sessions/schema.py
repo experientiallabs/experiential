@@ -1,9 +1,10 @@
 """Schema identity of the durable session database, created once and refused when stale.
 
 Schema 4 stores candidate state incrementally: immutable content-addressed nodes, an immutable
-per-session event log from genesis, and revision-bound heads. Earlier schemas kept one complete
-state document per session and recorded no replayable genesis or effects, so they cannot be
-converted without inventing history; they are refused with an explicit instruction instead.
+per-session event log from genesis, revision-bound heads, retention pins and a resumable
+collection cursor. Earlier schemas kept one complete state document per session and recorded no
+replayable genesis or effects, so they cannot be converted without inventing history; they are
+refused with an explicit instruction instead.
 """
 
 from __future__ import annotations
@@ -56,6 +57,18 @@ _SCHEMA_STATEMENTS = (
     BEGIN SELECT RAISE(ABORT, 'state events are immutable'); END""",
     """CREATE TRIGGER state_events_no_delete BEFORE DELETE ON state_events
     BEGIN SELECT RAISE(ABORT, 'state events are immutable'); END""",
+    """CREATE TABLE state_pins (
+        owner_id TEXT NOT NULL,
+        session_id TEXT NOT NULL REFERENCES sessions(session_id),
+        start_revision INTEGER NOT NULL CHECK (start_revision >= 0),
+        end_revision INTEGER NOT NULL CHECK (end_revision > start_revision),
+        PRIMARY KEY (owner_id, session_id)
+    ) STRICT""",
+    """CREATE TABLE state_collection (
+        singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+        high_water INTEGER NOT NULL,
+        cursor INTEGER NOT NULL
+    ) STRICT""",
     """CREATE TABLE steps (
         session_id TEXT NOT NULL REFERENCES sessions(session_id),
         step_id TEXT NOT NULL,

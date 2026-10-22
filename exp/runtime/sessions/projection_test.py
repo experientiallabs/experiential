@@ -162,6 +162,8 @@ def test_stored_revisions_equal_the_full_state_reducer_on_random_edit_sequences(
         _commit(store, "s", f"step-{step}", edits)
         oracle = candidate
         expected.append(declared_text(oracle))
+    store.pin_revisions("audit", "s", 0, store.read_head("s").version + 1)
+    assert store.collect_garbage().complete
     assert declared_text(store.read_session("s").state) == expected[-1]
     for revision, text in enumerate(expected):
         assert declared_text(store.read_state(store.ref_at("s", revision))) == text
