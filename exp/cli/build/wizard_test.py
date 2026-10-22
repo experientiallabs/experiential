@@ -1069,6 +1069,7 @@ def test_explicit_and_wizard_paths_select_the_same_grounded_build_artifacts(
         maximum_build_cost_usd: float,
         provider_spend_authorized: bool,
         trace_import_id: str | None = None,
+        trace_source: str | None = None,
         progress: build_command.ProgressHook | None = None,
     ) -> build_command.GroundedBuildCompletion:
         """Record both adapters using the shared typed execution seam.
@@ -1084,6 +1085,8 @@ def test_explicit_and_wizard_paths_select_the_same_grounded_build_artifacts(
             estimate: Conservative embedding estimate.
             maximum_build_cost_usd: Strict embedding ceiling.
             provider_spend_authorized: Whether paid embedding work is authorized.
+            trace_import_id: Stored corpus selected with the build, forwarded unchanged.
+            trace_source: Declared format of that corpus, forwarded unchanged.
             progress: Optional stage observer forwarded unchanged.
 
         Returns:
@@ -1102,6 +1105,7 @@ def test_explicit_and_wizard_paths_select_the_same_grounded_build_artifacts(
             maximum_build_cost_usd=maximum_build_cost_usd,
             provider_spend_authorized=provider_spend_authorized,
             trace_import_id=trace_import_id,
+            trace_source=trace_source,
             progress=progress,
         )
 

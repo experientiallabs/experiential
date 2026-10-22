@@ -489,6 +489,7 @@ def select_completed_build(
     review: BuildReviewReadiness,
     *,
     trace_import_id: ArtifactId | None = None,
+    trace_source: str | None = None,
 ) -> None:
     """Select a completed graph before advancing its recoverable review handoff.
 
@@ -500,6 +501,7 @@ def select_completed_build(
         build: Verified immutable trace, task, RAG, and world-model graph.
         review: Exact readiness record derived from the graph's trace and task artifacts.
         trace_import_id: Stored corpus to pin with this build, or None for direct normalized input.
+        trace_source: Declared format of that corpus, or None to keep the recorded format.
 
     Raises:
         ValueError: The proposed graph and review name different trace or task artifacts.
@@ -508,7 +510,9 @@ def select_completed_build(
         raise ValueError("completed build does not match proposed build review")
     with _build_review_coordination(store):
         with project_connection(store.paths.root, write=True):
-            store.bind_completed_build(build, trace_import_id=trace_import_id)
+            store.bind_completed_build(
+                build, trace_import_id=trace_import_id, trace_source=trace_source
+            )
             select_build_review(store, review)
 
 

@@ -567,13 +567,19 @@ class ProjectStore(HostedProjectStoreMixin):
             raise ValueError("provider-free trace and task manifest revisions differ")
 
     def bind_completed_build(
-        self, build: ProjectBuildArtifacts, *, trace_import_id: ArtifactId | None = None
+        self,
+        build: ProjectBuildArtifacts,
+        *,
+        trace_import_id: ArtifactId | None = None,
+        trace_source: str | None = None,
     ) -> ProjectConfig:
         """Atomically select a fully verified immutable build for future project workflows.
 
         Args:
             build: Exact trace, task, RAG, and world-model artifact manifest references.
             trace_import_id: Optional exact stored corpus backing the selected graph.
+            trace_source: Declared format of that corpus, selected with it; None keeps the
+                recorded format.
 
         Returns:
             Updated project configuration naming the completed build.
@@ -616,7 +622,11 @@ class ProjectStore(HostedProjectStoreMixin):
                         )
                 existing = load_project_config(self.paths)
                 updated = existing.model_copy(
-                    update={"build": build, "trace_import_id": trace_import_id}
+                    update={
+                        "build": build,
+                        "trace_import_id": trace_import_id,
+                        "trace_source": trace_source or existing.trace_source,
+                    }
                 )
                 write_project_config(self.paths, updated)
             except (ArtifactCorruptionError, ValueError) as exc:

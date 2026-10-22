@@ -238,6 +238,7 @@ def run_build_wizard(
                 maximum_build_cost_usd=max(maximum_build_cost_usd, build_estimate or 0.0),
                 provider_spend_authorized=True,
                 trace_import_id=plan.trace_import_id,
+                trace_source=plan.source,
                 progress=progress,
             )
     else:

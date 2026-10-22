@@ -1801,3 +1801,38 @@ def test_replacement_import_is_selected_with_its_completed_build(tmp_path: Path)
     assert store.load_project().trace_import_id == second.import_id
     assert store.load_project().build != original.build
     assert frozen.load_project() == original
+
+
+def test_replacement_import_of_another_format_is_selected_with_its_build(
+    tmp_path: Path,
+) -> None:
+    """An import's declared format is a build pointer, selected with the import it describes.
+
+    Trajectories exported from a project's own continuation studies arrive as an import of
+    another format; rebuilding the project from it must not be refused as a changed
+    configuration.
+    """
+    root = tmp_path / ".exp"
+    root.mkdir()
+    _catalog(root)
+    _, first = ingest_traces(
+        "support", root=root, source_format="otlp", path=_otlp_export(tmp_path)
+    )
+    _, second = ingest_traces(
+        "support", root=root, source_format="chat-json", path=_chat_json_export(tmp_path)
+    )
+    assert first is not None and second is not None
+    command = ["build", "support", "--root", str(root), "--import-id"]
+    result = _RUNNER.invoke(app, [*command, first.import_id])
+    assert result.exit_code == 0, result.output
+    store = ProjectStore(root, "support")
+    original = store.load_project()
+    assert original.trace_source == "otlp"
+    preflight = _RUNNER.invoke(app, [*command, second.import_id, "--dry-run"])
+    assert preflight.exit_code == 0, preflight.output
+    assert store.load_project() == original, "a dry run selects nothing"
+    replaced = _RUNNER.invoke(app, [*command, second.import_id])
+    assert replaced.exit_code == 0, replaced.output
+    rebuilt = store.load_project()
+    assert (rebuilt.trace_import_id, rebuilt.trace_source) == (second.import_id, "chat-json")
+    assert rebuilt.build != original.build
