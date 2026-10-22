@@ -200,6 +200,14 @@ PROTOCOLS = (
             "exp.runtime.environments.containment.darwin_gate",
         ),
         "693bb76a1249204e492feaca8ae8508ed914ade3334792a6b008048dfcbf0375",
+        "exp.runtime.agents.cascade_deciders:DECIDER_PROTOCOL",
+        "cascade-decider-v1",
+        (
+            "exp.runtime.agents.cascade_deciders:next_action_request",
+            "exp.runtime.agents.cascade_deciders:next_action_answer",
+            "exp.runtime.agents.cascade_deciders:SampledDraftDecider.decide",
+        ),
+        "0adbb5717f465ad401271fc664c2270658049130acec59e248c986caaf6d7651",
     ),
     Protocol(
         "exp.runtime.environments.record_world:RECORD_WORLD_PROTOCOL",
