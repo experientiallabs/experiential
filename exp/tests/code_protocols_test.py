@@ -207,6 +207,22 @@ PROTOCOLS = (
         ("exp.runtime.environments.record_world",),
         "8fb247418212f90d8963088e1323a0b4581dbaf937fc8cda590d784a31867b99",
     ),
+    Protocol(
+        "exp.simulation.induction.runner:RUNNER_PROTOCOL",
+        "induced-program-runner-v1",
+        ("exp.simulation.induction.runner", "exp.simulation.induction.sandbox"),
+        "ad5e1a36edbe778c8c967c56fc7999594b62377fd382a0f69702f795fd0ecd6e",
+    ),
+    Protocol(
+        "exp.simulation.induction.backend:INDUCED_WORLD_PROTOCOL",
+        "induced-world-v1",
+        (
+            "exp.simulation.induction.backend",
+            "exp.simulation.induction.contracts:ProgramDomain",
+            "exp.simulation.induction.validation:induced_partition",
+        ),
+        "9b738d7a815e3b23db372a80bb2c8f848a14c2d7d768b88e3b7d2bc4cca70f4e",
+    ),
 )
 
 
