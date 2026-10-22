@@ -2,14 +2,17 @@
 
 import io
 import json
+from collections.abc import Mapping
 from pathlib import Path
 
 import pytest
 from openpyxl import Workbook
+from pydantic import BaseModel, JsonValue
 
-from exp.common.core.artifacts import JsonObject, sha256_json
+from exp.common.core.artifacts import ArtifactEnvelope, JsonObject, sha256_json
 from exp.common.models import load_model_catalog
 from exp.common.project import ProjectStore, artifact_input
+from exp.common.project.manifests import ArtifactManifest
 from exp.optimize.evaluation.continuations.actors import PanelActor
 from exp.optimize.evaluation.executable.task import load_executable_task
 from exp.optimize.evaluation.factory.authoring import AuthorSettings
@@ -286,6 +289,27 @@ def test_level_limit_stops_a_world_that_stays_saturated(
     actor = ScriptedJsonTransport(tuple(reply for turn in turns for reply in turn))
     monkeypatch.setattr(AUTHOR, lambda: author)
     monkeypatch.setattr(ACTOR, lambda: actor)
+    write = project.artifacts.write_json
+
+    def interrupt(
+        *,
+        artifact_id: str,
+        artifact_type: str,
+        envelope: ArtifactEnvelope,
+        files: Mapping[str, BaseModel | JsonValue],
+    ) -> ArtifactManifest:
+        """Crash after every level is saved, before the report is published."""
+        if artifact_type == "task-hardening-report":
+            raise KeyboardInterrupt("report interrupted")
+        return write(
+            artifact_id=artifact_id, artifact_type=artifact_type, envelope=envelope, files=files
+        )
+
+    with monkeypatch.context() as patch:
+        patch.setattr(project.artifacts, "write_json", interrupt)
+        with pytest.raises(KeyboardInterrupt):
+            run_task_hardening(project, spec, code_revision="test")
+    assert len(author.requests) == 7 and len(actor.requests) == 12
     report = run_task_hardening(project, spec, code_revision="test")
     assert report.status == "saturated_at_limit", report.model_dump_json()
     assert [row.disposition for level in report.levels for row in level.candidates] == [

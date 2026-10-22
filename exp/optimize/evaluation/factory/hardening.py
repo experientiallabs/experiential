@@ -519,6 +519,22 @@ def saved_task_hardening(
         )
         if saved != level or level.level != index:
             raise ValueError("saved hardening level differs from its report")
+        if index:
+            previous = report.levels[index - 1]
+            expected = None
+            if previous.proposals is not None:
+                expected = _next_spec(
+                    spec, seed.spec, _proposals(project, previous.proposals), previous
+                )
+            if (
+                expected is None
+                or level.source != expected[1]
+                or (
+                    level.proposals is not None
+                    and _proposals(project, level.proposals).spec != expected[0]
+                )
+            ):
+                raise ValueError("saved hardening level did not harden its registered source")
         _verify_level(project, spec, level, report.lineage, code_revision)
     if _report(spec, report.lineage, report.levels) != report:
         raise ValueError("saved hardening report does not reproduce its levels")
