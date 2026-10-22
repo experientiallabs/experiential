@@ -1,16 +1,18 @@
 """Actor panels keep identical task inputs, complete denominators and explicit unknown bounds."""
 
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 from filelock import FileLock, Timeout
 
 from exp.common.core.artifacts import sha256_json
-from exp.common.models import load_model_catalog, write_model_catalog
+from exp.common.models import ModelMessage, load_model_catalog, write_model_catalog
 from exp.common.project import ProjectStore
 from exp.optimize.evaluation.continuations.actors import (
     ActorPanelSpec,
     PanelActor,
+    instructed_checkpoint,
     panel_jobs,
     preflight_actor_panel,
     run_actor_panel,
@@ -19,6 +21,7 @@ from exp.optimize.evaluation.continuations.job_test import job_fixture
 from exp.optimize.evaluation.continuations.study import study_identity
 from exp.runtime.models.providers.transport import ScriptedJsonTransport
 from exp.runtime.models.registry import RuntimeModelCatalog
+from exp.simulation.continuations import persist_continuation_checkpoint
 
 
 def panel_fixture(
@@ -188,3 +191,35 @@ def test_every_actor_capacity_is_checked_before_any_panel_call(
     with pytest.raises(ValueError, match="output allowance exceeds"):
         run_actor_panel(project, spec, code_revision="test")
     assert not transport.requests
+
+
+def test_one_model_under_two_system_prompts_is_a_panel_of_policies(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Each prompted cell starts from its re-instructed checkpoint; duplicates still refuse."""
+    project, spec, _ = panel_fixture(tmp_path, monkeypatch)
+    actor, case = spec.actors[0], spec.cases[0]
+    variant = instructed_checkpoint(project, case, "Check twice.")
+    assert variant.actor.messages[0] == ModelMessage(role="system", content="Check twice.")
+    reference = persist_continuation_checkpoint(
+        project.artifacts, variant, created_at=datetime.now(UTC), code_revision="test"
+    )
+    edited = actor.model_copy(
+        update={"label": "edited", "system_prompt": "Check twice.", "checkpoints": (reference,)}
+    )
+    policies = spec.model_copy(update={"actors": (actor, edited)})
+    cells = panel_jobs(policies, "test")
+    assert [cell.job.system_prompt for cell in cells] == [case.system_prompt, "Check twice."]
+    assert [cell.job.study.checkpoint for cell in cells] == [case.study.checkpoint, reference]
+    assert {cell.job.actor_alias for cell in cells} == {actor.alias}
+    preflight_actor_panel(project, policies)
+    assert "system_prompt" not in actor.model_dump(mode="json")
+    with pytest.raises(ValueError, match="distinct aliases and frozen models"):
+        ActorPanelSpec(cases=spec.cases, actors=(actor, actor.model_copy(update={"label": "x"})))
+    with pytest.raises(ValueError, match="one re-instructed checkpoint per case"):
+        ActorPanelSpec(
+            cases=spec.cases, actors=(actor, edited.model_copy(update={"checkpoints": None}))
+        )
+    stale = edited.model_copy(update={"checkpoints": (case.study.checkpoint,)})
+    with pytest.raises(ValueError, match="initial checkpoint under that system prompt"):
+        preflight_actor_panel(project, spec.model_copy(update={"actors": (actor, stale)}))
