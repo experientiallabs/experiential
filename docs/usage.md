@@ -709,7 +709,9 @@ A fact may list `derived_from_traces`; one derived from another held-out trace i
 held-out-derived facts condition only that trace's own replay. Domain decoding (for example
 reading a workbook) belongs in an environment adapter outside the core; in Python, an adapter
 implementing `InstanceFactsProvider.initial_facts(task)` can also pass facts to
-`replay_case(..., facts=adapter)`.
+`replay_case(..., facts=adapter)`. For workbooks, `exp eval PROJECT --continuations SPEC.json` with `action:
+"derive-facts"` derives validated facts from each task's declared input file and writes them into
+a copy of a chat JSON trace package ([instance facts](reference/instance-facts.md)).
 
 ### Simulated tool observations
 
