@@ -12,6 +12,7 @@ results, and plans do not live here.
 | `reference/learning-retirement.md` | Retiring a learning trace whose identical request is refused deterministically, or by operator: bound, evidence, reports and limits. |
 | `reference/task-hardening.md` | Task-validity checks (leakage, closed-book, controls) and bounded hardening of saturated factory worlds: specs, rules, bands and limits. |
 | `reference/instance-facts.md` | Backend-derived instance facts from task input files: the `derive-facts` action, the typed lossless workbook encoding, validation, refusals, bounds and views. |
+| `reference/decision-cascade.md` | Cheap next-action decisions with the main model as fallback: labels on reached states, threshold fit by a registered objective, held-out closed-loop confirmation and the versioned runtime policy. |
 | `reference/evidence-reading.md` | Bounded objective-driven evidence reading during learning investigations: budgets, pinned policy, replay and limits. |
 | `reference/providers.md` | Catalog providers, first-build `--provider` flags, environment variables, Azure endpoint and deployment rules, the Bedrock credential chain, and OpenAI-compatible listing metadata plus identity-only operator declaration. |
 | `reference/gateway-architecture.md` | Operational local gateway contracts, certified exact-model routing, ownership boundaries, and compatibility locks. |

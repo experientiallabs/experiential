@@ -16,6 +16,8 @@ from exp.cli.evaluation.analysis import (
     handle_analyse_failures,
     handle_analyse_memory,
     handle_check_failure_research,
+    handle_confirm_decision_cascade,
+    handle_fit_decision_cascade,
     handle_inspect_memory,
     handle_measure_decisions,
     handle_probe_actor_decisions,
@@ -77,7 +79,9 @@ from exp.common.core.artifacts import ArtifactInput, ContractModel
 from exp.common.project import ArtifactStoreError, ProjectStore
 from exp.common.release_revision import installed_execution_revision
 from exp.optimize.evaluation.analysis.actor_decisions import ActorDecisionSpec
+from exp.optimize.evaluation.analysis.cascade_confirmation import CascadeConfirmationSpec
 from exp.optimize.evaluation.analysis.decision_calibration import DecisionCalibration
+from exp.optimize.evaluation.analysis.decision_cascade import CascadeFitSpec
 from exp.optimize.evaluation.analysis.memory_analyst import MemoryAnalystSpec
 from exp.optimize.evaluation.analysis.memory_evidence import MemoryInspection
 from exp.optimize.evaluation.analysis.research import FailureResearchSpec
@@ -144,6 +148,10 @@ CONTINUATION_ACTIONS = (
     ContinuationAction("forget-summary", "forget", handle_forget_summary),
     ContinuationAction("measure-decisions", "decisions", handle_measure_decisions),
     ContinuationAction("challenge-judges", "challenge", handle_challenge_judges),
+    ContinuationAction("fit-decision-cascade", "cascade_fit", handle_fit_decision_cascade),
+    ContinuationAction(
+        "confirm-decision-cascade", "cascade_confirmation", handle_confirm_decision_cascade
+    ),
     ContinuationAction("analyse-memory", "memory_analyst", handle_analyse_memory),
     ContinuationAction("analyse-failures", "analysis", handle_analyse_failures),
     ContinuationAction("compare-observations", "observations", handle_compare_observations),
@@ -221,6 +229,8 @@ class ContinuationCommand(ContractModel):
         forget: One stale memory summary to forget from the next version, with its reason.
         decisions: Frozen fixed-question calibration inventory, never a serving approval.
         challenge: Registered fixed-output judge challenge study with one model per arm.
+        cascade_fit: Development trajectories, decider, grid and objective for a cascade fit.
+        cascade_confirmation: Saved cascade fit and held-out cases for closed-loop confirmation.
         memory_analyst: Opt-in bounded diagnostic using the existing trace-analysis rubric.
         actor_decisions: Trace-only next-decision probes with a repeated-reference control.
         prefix: Extract a complete retained actor input and bind a saved simulator observation.
@@ -269,6 +279,8 @@ class ContinuationCommand(ContractModel):
     forget: SummaryForget | None = None
     decisions: DecisionCalibration | None = None
     challenge: ChallengeRunSpec | None = None
+    cascade_fit: CascadeFitSpec | None = None
+    cascade_confirmation: CascadeConfirmationSpec | None = None
     memory_analyst: MemoryAnalystSpec | None = None
     actor_decisions: ActorDecisionSpec | None = None
     prefix: ActorPrefixSpec | None = None
