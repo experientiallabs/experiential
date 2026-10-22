@@ -23,9 +23,10 @@ A development-selected checkpoint is never reported as confirmation: reusing a d
 receipt or lineage, a re-audit, a changed configuration or an invalidated receipt is refused.
 """
 
+import json
 from collections.abc import Sequence
 from datetime import datetime
-from typing import Literal, Self
+from typing import Annotated, Literal, Self
 
 from pydantic import AwareDatetime, Field, model_validator
 
@@ -41,16 +42,24 @@ from exp.common.core.artifacts import (
 from exp.common.evaluations.uncertainty import unit_mean_summary
 from exp.common.project import ProjectStore, artifact_input
 from exp.common.tasks.store import load_task_set
-from exp.optimize.evaluation.audit.panel import PlannedPanel
-from exp.optimize.evaluation.audit.receipts import Basis, ReceiptView
+from exp.optimize.evaluation.audit.panel import PlannedPanel, saved_held_out_results
+from exp.optimize.evaluation.audit.receipts import (
+    Basis,
+    ReceiptView,
+    find_receipt,
+    receipt_panel,
+    receipt_view,
+)
 from exp.optimize.evaluation.fidelity.replay import ReplayResult
 from exp.optimize.evaluation.learning.traces import fit_cases, learning_plan
 
 # Identity of the code that decides this artifact's behavior, in place of its source text.
 # Bump it when behavior changes. exp/tests/code_protocols_test.py fails when the covered
 # source changes until it is bumped or, for a pure refactor, its digest is updated.
-SAMPLE_COUNT_PROTOCOL = "sample-count-v1"
+SAMPLE_COUNT_PROTOCOL = "sample-count-v2"
 REGISTRATION_TYPE = "sample-count-registration"
+SELECTION_TYPE = "sample-count-selection"
+CONFIRMATION_TYPE = "sample-count-confirmation"
 ESTIMAND = "equal-weight mean over lineages of each lineage's exact-reply share"
 
 # Every fidelity-spec field that varies by case rather than by frozen configuration.
@@ -236,6 +245,65 @@ def register_sample_count_study(
         ValueError: A count exceeds the fit traces, a lineage is not held out, or a different
             registration already exists under the same identity.
     """
+    registration = plan_sample_count_study(
+        project,
+        grid=grid,
+        threshold=threshold,
+        criterion=criterion,
+        development_lineages=development_lineages,
+        registered_at=registered_at,
+    )
+    identity = registration.identity
+    if project.artifacts.exists(identity):
+        saved = SampleCountRegistration.model_validate_json(
+            project.artifacts.read_bytes(identity, "registration.json")
+        )
+        if saved != registration:
+            raise ValueError("a different sample-count registration has this identity")
+        return saved, artifact_input(project.artifacts.read(identity).manifest)
+    build = project.load_project().build
+    if build is None:
+        raise ValueError("register after a completed build")
+    manifest = project.artifacts.write_json(
+        artifact_id=identity,
+        artifact_type=REGISTRATION_TYPE,
+        envelope=ArtifactEnvelope(
+            schema_version=1,
+            created_at=registered_at,
+            code_revision=code_revision,
+            inputs=(build.task_set,),
+        ),
+        files={"registration.json": registration.model_dump(mode="json")},
+    )
+    return registration, artifact_input(manifest)
+
+
+def plan_sample_count_study(
+    project: ProjectStore,
+    *,
+    grid: tuple[int, ...],
+    threshold: float,
+    criterion: Literal["point_estimate", "wilson_lower_bound"],
+    development_lineages: Sequence[str],
+    registered_at: datetime,
+) -> SampleCountRegistration:
+    """Validate a registration against the project's build and fit order, writing nothing.
+
+    Args:
+        project: Project with a completed build and a recorded fit-only learning plan.
+        grid: Whole-trajectory counts to evaluate, strictly increasing.
+        threshold: Accuracy the selected count must exceed.
+        criterion: Whether the development estimate or its Wilson lower bound must exceed it.
+        development_lineages: Held-out lineages reserved for selection.
+        registered_at: Registration time.
+
+    Returns:
+        The registration :func:`register_sample_count_study` would save.
+
+    Raises:
+        ValueError: A count exceeds the fit traces, a lineage is not held out, or no held-out
+            lineage is left untouched for confirmation.
+    """
     order = fit_cases(project)
     registration = SampleCountRegistration(
         project=project.paths.project_id,
@@ -264,26 +332,7 @@ def register_sample_count_study(
         raise ValueError("development lineages must be held-out lineages the memory never learns")
     if len(held_out) <= len(registration.development_lineages):
         raise ValueError("leave held-out lineages untouched for confirmation")
-    identity = registration.identity
-    if project.artifacts.exists(identity):
-        saved = SampleCountRegistration.model_validate_json(
-            project.artifacts.read_bytes(identity, "registration.json")
-        )
-        if saved != registration:
-            raise ValueError("a different sample-count registration has this identity")
-        return saved, artifact_input(project.artifacts.read(identity).manifest)
-    manifest = project.artifacts.write_json(
-        artifact_id=identity,
-        artifact_type=REGISTRATION_TYPE,
-        envelope=ArtifactEnvelope(
-            schema_version=1,
-            created_at=registered_at,
-            code_revision=code_revision,
-            inputs=(build.task_set,),
-        ),
-        files={"registration.json": registration.model_dump(mode="json")},
-    )
-    return registration, artifact_input(manifest)
+    return registration
 
 
 def audit_measurement(
@@ -497,6 +546,277 @@ def confirm_sample_count(
             "confirmation is an estimate for the frozen checkpoint, over the audited lineages"
         ),
     }
+
+
+class SampleCountRegister(ContractModel):
+    """Register the procedure before any development measurement is read.
+
+    Attributes:
+        resolution: ``register``.
+        grid: Whole-trajectory counts to evaluate, strictly increasing.
+        threshold: Accuracy the selected count must exceed.
+        criterion: ``point_estimate`` or ``wilson_lower_bound``.
+        development_lineages: Held-out lineages reserved for selection; the rest stay
+            untouched for confirmation.
+    """
+
+    resolution: Literal["register"]
+    grid: tuple[int, ...] = Field(min_length=1)
+    threshold: float = Field(gt=0, lt=1, allow_inf_nan=False)
+    criterion: Literal["point_estimate", "wilson_lower_bound"]
+    development_lineages: tuple[str, ...] = Field(min_length=1)
+
+
+class SampleCountSelect(ContractModel):
+    """Select a count from development audits of the registered grid.
+
+    Attributes:
+        resolution: ``select``.
+        registration: The saved registration.
+        development: Audit receipt IDs, one per measured grid count, each over exactly the
+            development lineages.
+    """
+
+    resolution: Literal["select"]
+    registration: ArtifactInput
+    development: tuple[str, ...] = Field(min_length=1)
+
+
+class SampleCountConfirm(ContractModel):
+    """Confirm the frozen selected checkpoint on one independent audit of untouched lineages.
+
+    Attributes:
+        resolution: ``confirm``.
+        selection: The saved development selection.
+        confirmation: Audit receipt ID of the independent confirmation audit.
+    """
+
+    resolution: Literal["confirm"]
+    selection: ArtifactInput
+    confirmation: str = Field(min_length=1)
+
+
+SampleCountRequest = Annotated[
+    SampleCountRegister | SampleCountSelect | SampleCountConfirm,
+    Field(discriminator="resolution"),
+]
+
+
+def register_sample_count(
+    project: ProjectStore,
+    request: SampleCountRegister,
+    *,
+    registered_at: datetime,
+    code_revision: str,
+    dry_run: bool = False,
+) -> tuple[SampleCountRegistration, ArtifactInput | None]:
+    """Register the procedure once; the same procedure registered again replays the first.
+
+    A registration's time decides which audits may count, so registering an unchanged
+    procedure again keeps the earlier registration instead of moving its time past results.
+
+    Args:
+        project: Project with a completed build and a recorded fit-only learning plan.
+        request: Grid, threshold, criterion and development lineages.
+        registered_at: Registration time of a new registration.
+        code_revision: Producing implementation identity.
+        dry_run: Validate and return the registration without saving it.
+
+    Returns:
+        The registration and its artifact (None on a dry run of a new registration).
+    """
+    planned = plan_sample_count_study(
+        project,
+        grid=request.grid,
+        threshold=request.threshold,
+        criterion=request.criterion,
+        development_lineages=request.development_lineages,
+        registered_at=registered_at,
+    )
+    procedure = planned.model_dump(exclude={"registered_at"})
+    for identity in project.artifacts.list_ids(artifact_type=REGISTRATION_TYPE):
+        saved = SampleCountRegistration.model_validate_json(
+            project.artifacts.read_bytes(identity, "registration.json")
+        )
+        if saved.model_dump(exclude={"registered_at"}) == procedure:
+            return saved, artifact_input(project.artifacts.read(identity).manifest)
+    if dry_run:
+        return planned, None
+    return register_sample_count_study(
+        project,
+        grid=planned.grid,
+        threshold=planned.threshold,
+        criterion=planned.criterion,
+        development_lineages=planned.development_lineages,
+        registered_at=registered_at,
+        code_revision=code_revision,
+    )
+
+
+def receipt_measurement(project: ProjectStore, receipt_id: str) -> CheckpointMeasurement:
+    """Measure one saved memory-profile audit receipt from its saved results, without calls.
+
+    Args:
+        project: Project holding the receipt, its registrations and their saved reports.
+        receipt_id: Audit receipt identity.
+
+    Returns:
+        The receipt's checkpoint measurement; traces without a saved result stay unmeasured.
+    """
+    receipt = find_receipt(project, receipt_id)
+    panel = receipt_panel(project, receipt)
+    return audit_measurement(
+        receipt_view(project, receipt), panel, saved_held_out_results(project, panel)
+    )
+
+
+def record_sample_count_selection(
+    project: ProjectStore,
+    request: SampleCountSelect,
+    *,
+    created_at: datetime,
+    code_revision: str,
+    dry_run: bool = False,
+) -> tuple[SampleCountSelection, ArtifactInput | None]:
+    """Select on the named development audits and save the decision with its measurements.
+
+    Args:
+        project: Project holding the registration and the audit receipts.
+        request: Registration reference and development receipt IDs.
+        created_at: Record time.
+        code_revision: Producing implementation identity.
+        dry_run: Select without saving.
+
+    Returns:
+        The selection and its artifact (None on a dry run of a new selection).
+
+    Raises:
+        ValueError: The registration is not the saved one, a receipt is not admissible
+            development evidence, or a different count was already selected.
+    """
+    registration = _load(project, request.registration, REGISTRATION_TYPE, "registration.json")
+    registered = SampleCountRegistration.model_validate_json(registration)
+    measurements = tuple(receipt_measurement(project, row) for row in request.development)
+    selection = select_sample_count(registered, measurements)
+    identity = stable_id(
+        SELECTION_TYPE,
+        {"selection": sha256_json(selection), "protocol": SAMPLE_COUNT_PROTOCOL},
+    )
+    for saved_id in project.artifacts.list_ids(artifact_type=SELECTION_TYPE):
+        saved = SampleCountSelection.model_validate_json(
+            project.artifacts.read_bytes(saved_id, "selection.json")
+        )
+        if (
+            saved_id != identity
+            and saved.registration == registered.identity
+            and saved.status == "selected"
+        ):
+            raise ValueError(
+                f"registration {registered.identity} already selected {saved.selected_count} "
+                f"trajectories ({saved_id}); confirm that selection, or register a new procedure"
+            )
+    if project.artifacts.exists(identity):
+        return selection, artifact_input(project.artifacts.read(identity).manifest)
+    if dry_run:
+        return selection, None
+    manifest = project.artifacts.write_json(
+        artifact_id=identity,
+        artifact_type=SELECTION_TYPE,
+        envelope=ArtifactEnvelope(
+            schema_version=1,
+            created_at=created_at,
+            code_revision=code_revision,
+            inputs=(request.registration,),
+        ),
+        files={
+            "selection.json": selection.model_dump(mode="json"),
+            "measurements.json": [row.model_dump(mode="json") for row in measurements],
+        },
+    )
+    return selection, artifact_input(manifest)
+
+
+def record_sample_count_confirmation(
+    project: ProjectStore,
+    request: SampleCountConfirm,
+    *,
+    created_at: datetime,
+    code_revision: str,
+    dry_run: bool = False,
+) -> tuple[JsonObject, ArtifactInput | None]:
+    """Confirm a saved selection on one independent audit and save the report.
+
+    A selection is confirmed on one receipt only: trying further confirmation audits until
+    one passes would be another search.
+
+    Args:
+        project: Project holding the selection and the confirmation receipt.
+        request: Selection reference and confirmation receipt ID.
+        created_at: Record time.
+        code_revision: Producing implementation identity.
+        dry_run: Report without saving.
+
+    Returns:
+        The confirmation report and its artifact (None on a dry run of a new confirmation).
+
+    Raises:
+        ValueError: The selection is not saved, the audit opened before or at the saved selection,
+            or the selection was already confirmed on another receipt.
+    """
+    selection = SampleCountSelection.model_validate_json(
+        _load(project, request.selection, SELECTION_TYPE, "selection.json")
+    )
+    selection_manifest = project.artifacts.read(request.selection.artifact_id).manifest
+    registration_ref = selection_manifest.inputs[0]
+    registration = SampleCountRegistration.model_validate_json(
+        _load(project, registration_ref, REGISTRATION_TYPE, "registration.json")
+    )
+    for saved_id in project.artifacts.list_ids(artifact_type=CONFIRMATION_TYPE):
+        saved = project.artifacts.read(saved_id).manifest
+        receipt = json.loads(project.artifacts.read_bytes(saved_id, "confirmation.json"))
+        if request.selection in saved.inputs and receipt["confirmation"]["receipt"] != (
+            request.confirmation
+        ):
+            raise ValueError(
+                f"selection {request.selection.artifact_id} was confirmed on another audit "
+                f"({saved_id}); a selection is confirmed once"
+            )
+    measurement = receipt_measurement(project, request.confirmation)
+    if measurement.opened_at <= selection_manifest.created_at:
+        raise ValueError("confirmation must be opened after the saved sample-count selection")
+    report = confirm_sample_count(registration, selection, measurement)
+    identity = stable_id(
+        CONFIRMATION_TYPE, {"report": sha256_json(report), "protocol": SAMPLE_COUNT_PROTOCOL}
+    )
+    if project.artifacts.exists(identity):
+        return report, artifact_input(project.artifacts.read(identity).manifest)
+    if dry_run:
+        return report, None
+    manifest = project.artifacts.write_json(
+        artifact_id=identity,
+        artifact_type=CONFIRMATION_TYPE,
+        envelope=ArtifactEnvelope(
+            schema_version=1,
+            created_at=created_at,
+            code_revision=code_revision,
+            inputs=(request.selection,),
+        ),
+        files={"confirmation.json": report},
+    )
+    return report, artifact_input(manifest)
+
+
+def _load(project: ProjectStore, reference: ArtifactInput, kind: str, path: str) -> bytes:
+    """Read one saved file of an exact artifact of the expected type.
+
+    Raises:
+        ValueError: The artifact is missing, of another type, or differs from its reference.
+    """
+    if project.artifacts.exists(reference.artifact_id):
+        manifest = project.artifacts.read(reference.artifact_id).manifest
+        if manifest.artifact_type == kind and artifact_input(manifest) == reference:
+            return project.artifacts.read_bytes(reference.artifact_id, path)
+    raise ValueError(f"{reference.artifact_id} is not the saved {kind} it names")
 
 
 def _meets(registration: SampleCountRegistration, summary: JsonObject) -> bool:

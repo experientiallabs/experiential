@@ -14,6 +14,7 @@ from exp.optimize.evaluation.tasks.challenges import (
     CHALLENGE_PROTOCOL,
     ChallengeJudge,
     ChallengePanel,
+    DeclaredDefect,
     DeclaredInvariance,
     JudgeChallengeStudy,
     OutputEdit,
@@ -180,6 +181,34 @@ INVARIANCES = (
 )
 
 
+DEFECTS = (
+    DeclaredDefect(
+        kind="wrong_cell",
+        check="changed_value",
+        pointers=("/actions",),
+        rationale="A written value the request does not ask for.",
+    ),
+    DeclaredDefect(
+        kind="wrong_cell_persuasive",
+        check="defended_change",
+        pointers=("/actions",),
+        rationale="The same wrong value, defended by prose that cites no evidence.",
+    ),
+    DeclaredDefect(
+        kind="unauthorized_write",
+        check="added_entry",
+        pointers=("/actions", "/observed"),
+        rationale="Only A1 and B2 may be written.",
+    ),
+    DeclaredDefect(
+        kind="wrong_json_type",
+        check="changed_json_type",
+        pointers=("/final_answer",),
+        rationale="The reported total is a number in the output contract.",
+    ),
+)
+
+
 def config(model: str) -> JudgeConfig:
     """A judge arm configuration for one scripted model."""
     return actor_judge(model)
@@ -190,6 +219,7 @@ def study(*, repeats: int = 1) -> JudgeChallengeStudy:
     return JudgeChallengeStudy(
         pack=pack(),
         invariances=INVARIANCES,
+        defects=DEFECTS,
         perturbations=perturbations("case-a") + perturbations("case-b"),
         judges=(
             ChallengeJudge(arm_id="careful", config=config("careful")),
@@ -424,12 +454,12 @@ def test_invariance_edits_must_stay_inside_declared_irrelevant_locations() -> No
         (
             "unauthorized_write",
             (OutputEdit(pointer="/actions/0/value", value="Sum"),),
-            "appends",
+            "appends or adds an entry",
         ),
         (
             "wrong_cell",
             (OutputEdit(pointer="/actions/1/value", value=42),),
-            "replaces values with different ones",
+            "replaces values at its declared locations with different ones",
         ),
         (
             "unauthorized_write",
@@ -457,6 +487,55 @@ def test_defects_must_change_what_their_kind_names(
     }
     with pytest.raises(ValidationError, match=message):
         JudgeChallengeStudy.model_validate({**base.model_dump(), "perturbations": (row,)})
+
+
+def test_defect_kinds_are_declared_by_the_study_not_by_the_challenge_owner() -> None:
+    """Any declared name and location works; undeclared, misplaced or clashing kinds refuse."""
+    base = study()
+    invoice = DeclaredDefect(
+        kind="wrong_total",
+        check="changed_value",
+        pointers=("/final_answer/value",),
+        rationale="The invoice total must equal the observed total.",
+    )
+    total = Perturbation(
+        perturbation_id="case-a-total",
+        base_case_id="case-a",
+        factor="wrong_total",
+        edits=(OutputEdit(pointer="/final_answer/value", value=40),),
+        description="A different reported total.",
+    )
+    registered = JudgeChallengeStudy.model_validate(
+        {
+            **base.model_dump(),
+            "defects": (*base.defects, invoice),
+            "perturbations": (*base.perturbations, total),
+        }
+    )
+    assert "case-a-total" in {item.item_id for item in study_items(registered)}
+    with pytest.raises(ValidationError, match="neither an irrelevant factor nor a defect kind"):
+        JudgeChallengeStudy.model_validate(
+            {**base.model_dump(), "perturbations": (*base.perturbations, total)}
+        )
+    elsewhere = total.model_copy(
+        update={"edits": (OutputEdit(pointer="/observed/value", value=40),)}
+    )
+    with pytest.raises(ValidationError, match="at its declared locations"):
+        JudgeChallengeStudy.model_validate(
+            {
+                **base.model_dump(),
+                "defects": (*base.defects, invoice),
+                "perturbations": (*base.perturbations, elsewhere),
+            }
+        )
+    with pytest.raises(ValidationError, match="declare each defect kind once"):
+        JudgeChallengeStudy.model_validate(
+            {**base.model_dump(), "defects": (*base.defects, base.defects[0])}
+        )
+    with pytest.raises(ValidationError, match="names an irrelevant factor"):
+        DeclaredDefect(
+            kind="actor_identity", check="changed_value", pointers=("/actor",), rationale="x"
+        )
 
 
 def test_registration_refuses_unknown_bases_panels_and_missing_thresholds() -> None:

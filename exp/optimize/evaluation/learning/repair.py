@@ -50,11 +50,13 @@ from exp.optimize.evaluation.learning.traces import (
 )
 from exp.simulation.world_model.experience_memory import (
     MemoryVersion,
-    consumed_trajectory_digest,
     memory_head,
     publish_trajectory,
     read_memory_version,
     require_memory_scope,
+)
+from exp.simulation.world_model.experience_sources import (
+    consumed_trajectory_digest,
 )
 from exp.simulation.world_model.runtime import load_grounded_world_model_artifact
 

@@ -507,10 +507,9 @@ def starting_fact(world: World, index: int) -> InstanceFact:
 def recorded_conversation(world: World, index: int) -> JsonObject:
     """Execute one episode in its native world and record it as a chat-json conversation.
 
-    The conversation declares no tool list, like most chat dumps: the build learns tool
-    signatures from the recorded calls. Identical declared schemas would dominate every
-    request descriptor, so the build would join all traces into one leakage group. Its
-    request context supplies the starting world's instance facts, as a trace package does.
+    Every conversation declares the same complete tool catalogue, as real agent traces do.
+    Shared schemas must not collapse independent tasks into one leakage group. Request
+    context supplies the starting world's instance facts, as a trace package does.
     """
     episode = world.episodes[index]
     messages: list[JsonValue] = [{"role": "user", "content": episode.instruction}]
@@ -547,6 +546,7 @@ def recorded_conversation(world: World, index: int) -> JsonObject:
         "id": f"{world.kind}-{episode.lineage}",
         "provider": "recording",
         "model": "recorded-agent",
+        "tools": [tool.model_dump(mode="json") for tool in world.tools],
         "messages": messages,
         # A declared customer keeps lineage identity, and so the split, independent of the
         # path the export is read from.
@@ -832,6 +832,11 @@ def build_and_audit(pipeline: Pipeline, traces: Path) -> None:
     assert learned.group(1) == learned.group(2) == learned.group(3)
     assert re.search(r"split \d+ fit / [1-9]\d* held out", built), built
     assert "Report:" in built
+    selected = pipeline.project.load_project().build
+    assert selected is not None
+    tasks = load_task_set(pipeline.project.artifacts, selected.task_set.artifact_id).tasks
+    expected_tools = tuple(sorted(pipeline.world.tools, key=lambda tool: tool.name))
+    assert tasks and all(task.tools == expected_tools for task in tasks)
 
     audit = ("--audit", str(AUDITED), "--yes", "--non-interactive")
     audited = pipeline.eval(*audit)

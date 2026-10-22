@@ -6,8 +6,10 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from exp.common.core.artifacts import JsonObject
+import exp.optimize.evaluation.learning.sample_count as sample_count
+from exp.common.core.artifacts import ArtifactEnvelope, JsonObject
 from exp.common.evaluations.uncertainty import wilson_interval
+from exp.common.project import ProjectConfig, ProjectStore, artifact_input
 from exp.optimize.evaluation.audit.lifecycle import open_held_out_audit
 from exp.optimize.evaluation.audit.lifecycle_test import clock, run
 from exp.optimize.evaluation.audit.panel import plan_held_out_panel, saved_held_out_results
@@ -308,3 +310,64 @@ def test_the_procedure_runs_on_held_out_audits_of_the_learned_memory(
         )
     with pytest.raises(ValueError, match="cannot be reported|independent audit"):
         confirm_sample_count(registered, selection, again)
+
+
+@pytest.mark.parametrize("confirmation_minute", [30, 40, 50])
+def test_confirmation_must_open_after_the_saved_selection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, confirmation_minute: int
+) -> None:
+    """A late selection cannot certify an audit opened before its durable freeze."""
+    project = ProjectStore(tmp_path, "retail")
+    project.initialize(ProjectConfig(project_id="retail"))
+    registered = registration()
+    manifest = project.artifacts.write_json(
+        artifact_id=registered.identity,
+        artifact_type=sample_count.REGISTRATION_TYPE,
+        envelope=ArtifactEnvelope(
+            schema_version=1, created_at=REGISTERED, code_revision="timing-probe"
+        ),
+        files={"registration.json": registered.model_dump(mode="json")},
+    )
+    held = confirmation().model_copy(
+        update={"opened_at": REGISTERED + timedelta(minutes=confirmation_minute)}
+    )
+    measurements = {row.receipt_id: row for row in (DEV_4, DEV_8, DEV_16, held)}
+    monkeypatch.setattr(
+        sample_count, "receipt_measurement", lambda project, receipt: measurements[receipt]
+    )
+    selection, reference = sample_count.record_sample_count_selection(
+        project,
+        sample_count.SampleCountSelect(
+            resolution="select",
+            registration=artifact_input(manifest),
+            development=(DEV_4.receipt_id, DEV_8.receipt_id, DEV_16.receipt_id),
+        ),
+        created_at=REGISTERED + timedelta(minutes=40),
+        code_revision="timing-probe",
+    )
+    assert reference is not None
+    saved_selection = project.artifacts.read(reference.artifact_id).manifest
+    assert selection.last_development_at is not None
+    assert selection.last_development_at == REGISTERED + timedelta(minutes=3)
+    assert saved_selection.created_at == REGISTERED + timedelta(minutes=40)
+    request = sample_count.SampleCountConfirm(
+        resolution="confirm", selection=reference, confirmation=held.receipt_id
+    )
+    if confirmation_minute <= 40:
+        assert selection.last_development_at < held.opened_at <= saved_selection.created_at
+        with pytest.raises(ValueError, match="after.*selection|selection.*before"):
+            sample_count.record_sample_count_confirmation(
+                project,
+                request,
+                created_at=REGISTERED + timedelta(minutes=60),
+                code_revision="timing-probe",
+            )
+    else:
+        report, confirmed = sample_count.record_sample_count_confirmation(
+            project,
+            request,
+            created_at=REGISTERED + timedelta(minutes=60),
+            code_revision="timing-probe",
+        )
+        assert confirmed is not None
+        assert report["criterion_met_on_confirmation"] is True

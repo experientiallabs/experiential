@@ -32,6 +32,7 @@ from pydantic import AwareDatetime, Field
 
 from exp.common.core.artifacts import ArtifactEnvelope, ArtifactInput, ContractModel, stable_id
 from exp.common.project import ProjectStore
+from exp.common.traces.store import load_trace_dataset
 from exp.optimize.evaluation.audit.exposure import LineageExposure, held_out_members
 from exp.optimize.evaluation.audit.panel import (
     AuditCheckpoint,
@@ -45,6 +46,7 @@ from exp.optimize.evaluation.fidelity.recovery import (
     UnknownOutcome,
     stage_counts,
 )
+from exp.optimize.evaluation.fidelity.replay import replay_case
 from exp.optimize.evaluation.fidelity.runner import PreparedFidelity, unknown_outcomes
 from exp.simulation.mining.exposure_ledger import ExposureLedger, LedgerExposure
 from exp.simulation.mining.fingerprint import SchemeIdentity
@@ -365,6 +367,82 @@ def receipt_view(project: ProjectStore, receipt: AuditReceipt) -> ReceiptView:
             sorted((item for item in reports if item.receipt == receipt_id), key=lambda r: r.at)
         ),
     )
+
+
+def find_receipt(project: ProjectStore, receipt_id: str) -> AuditReceipt:
+    """The saved root receipt with this identity.
+
+    Args:
+        project: Project holding the receipts.
+        receipt_id: Receipt identity, as audit reports print it.
+
+    Returns:
+        The receipt.
+
+    Raises:
+        ValueError: The project has no such audit receipt.
+    """
+    if project.artifacts.exists(receipt_id):
+        manifest = project.artifacts.read(receipt_id).manifest
+        if manifest.artifact_type == RECEIPT_TYPE:
+            return AuditReceipt.model_validate_json(
+                project.artifacts.read_bytes(receipt_id, "receipt.json")
+            )
+    raise ValueError(
+        f"no held-out audit receipt {receipt_id!r} in this project; exp eval PROJECT --audit N "
+        "prints each receipt it opens"
+    )
+
+
+def receipt_panel(project: ProjectStore, receipt: AuditReceipt) -> HeldOutPanel:
+    """Rebuild a receipt's registered panel from its saved registrations, without calls.
+
+    Each case's current registration is the latest saved generation of its first-generation
+    run, and the case replays the public task that registration froze. The rebuilt panel must
+    reproduce the receipt's panel identity, so a changed build or a lost registration refuses
+    instead of measuring other runs.
+
+    Args:
+        project: Project holding the receipt's registrations and the build's traces.
+        receipt: Root receipt.
+
+    Returns:
+        The panel whose saved results the receipt measures.
+
+    Raises:
+        ValueError: A case has no saved registration or trace, or the rebuilt panel differs.
+    """
+    build = project.load_project().build
+    if build is None:
+        raise ValueError("audit receipts are read against a completed build; run exp build")
+    dataset = load_trace_dataset(project.artifacts, build.trace_dataset.artifact_id)
+    traces = {trace.trace_id: trace for trace in dataset.traces}
+    cases, prepared = [], []
+    for case in receipt.cases:
+        current = current_registration(project, case.base_run)
+        trace = traces.get(case.trace_id)
+        replay = (
+            None if trace is None or current is None else replay_case(current.spec.task, trace, ())
+        )
+        if current is None or replay is None:
+            raise ValueError(
+                f"audit receipt {receipt.receipt_id} lost the registration or trace of "
+                f"{case.trace_id}; measure receipts of the current build only"
+            )
+        cases.append(replay.model_copy(update={"task": current.spec.task}))
+        prepared.append(current)
+    panel = HeldOutPanel(
+        profile=receipt.request.profile,
+        world_model=receipt.world_model,
+        checkpoint=receipt.checkpoint,
+        cases=tuple(cases),
+        specs=tuple(row.spec for row in prepared),
+        code_revision=receipt.code_revision,
+        prepared=tuple(prepared),
+    )
+    if panel.identity != receipt.panel:
+        raise ValueError(f"audit receipt {receipt.receipt_id} no longer matches its saved runs")
+    return panel
 
 
 def current_registration(project: ProjectStore, base_run: str) -> PreparedFidelity | None:

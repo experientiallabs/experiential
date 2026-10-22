@@ -16,6 +16,7 @@ from exp.common.traces import Trace
 from exp.common.traces.store import load_trace_dataset
 from exp.optimize.evaluation.audit.exposure import LineageExposure, held_out_exposure
 from exp.optimize.evaluation.audit.lifecycle_test import FailingOnce, audit, clock, run
+from exp.optimize.evaluation.audit.panel import saved_held_out_results
 from exp.optimize.evaluation.audit.panel_test import (
     PROJECT,
     USERS,
@@ -31,6 +32,8 @@ from exp.optimize.evaluation.audit.receipts import (
     QUALIFIED,
     AuditNotice,
     audit_receipts,
+    find_receipt,
+    receipt_panel,
     receipt_view,
     record_notice,
     record_report,
@@ -336,3 +339,25 @@ def _dataset(store: ProjectStore) -> str:
 def _traces(store: ProjectStore) -> tuple[Trace, ...]:
     """Every trace of the project's build."""
     return load_trace_dataset(store.artifacts, _dataset(store)).traces
+
+
+def test_a_saved_receipt_rebuilds_its_panel_and_unknown_receipts_refuse(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The rebuilt panel has the receipt's identity, runs and saved results; no calls are made."""
+    provider = SimulatedProvider([episode(i) for i in range(USERS)])
+    _, store, _ = build_project(tmp_path, monkeypatch, provider)
+    with audit(store, 2) as opened:
+        run(store, opened)
+        receipt, panel = opened.receipt, opened.panel
+    calls = len(provider.requests)
+    rebuilt = receipt_panel(store, find_receipt(store, receipt.receipt_id))
+    assert rebuilt.identity == receipt.panel == panel.identity
+    assert rebuilt.prepared == panel.prepared and rebuilt.cases == panel.cases
+    assert saved_held_out_results(store, rebuilt) == saved_held_out_results(store, panel)
+    assert len(provider.requests) == calls
+    with pytest.raises(ValueError, match="no held-out audit receipt 'absent'"):
+        find_receipt(store, "absent")
+    foreign = receipt.model_copy(update={"panel": "another-panel"})
+    with pytest.raises(ValueError, match="no longer matches its saved runs"):
+        receipt_panel(store, foreign)

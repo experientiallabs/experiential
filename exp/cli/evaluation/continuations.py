@@ -58,7 +58,10 @@ from exp.cli.evaluation.factory import (
     handle_register_brief,
     handle_search_scenarios,
 )
+from exp.cli.evaluation.judge_challenges import handle_challenge_judges
 from exp.cli.evaluation.learning_repair import handle_repair_learning
+from exp.cli.evaluation.memory_forget import handle_forget_summary
+from exp.cli.evaluation.sample_count import handle_sample_count
 from exp.cli.evaluation.trajectory_traces import handle_export_traces
 from exp.cli.shared.options import usage_error
 from exp.cli.shared.theme import EXP_THEME
@@ -91,7 +94,10 @@ from exp.optimize.evaluation.factory.candidates import CandidateBatchSpec
 from exp.optimize.evaluation.factory.proposals import TaskProposalSpec
 from exp.optimize.evaluation.factory.scenario_search import ScenarioSearchSpec
 from exp.optimize.evaluation.factory.variants import TaskVariantSpec
+from exp.optimize.evaluation.learning.forgetting import SummaryForget
 from exp.optimize.evaluation.learning.lessons import LearningRepair
+from exp.optimize.evaluation.learning.sample_count import SampleCountRequest
+from exp.optimize.evaluation.tasks.challenge_runs import ChallengeRunSpec
 from exp.simulation.capability_briefs import CapabilityBrief
 
 
@@ -113,13 +119,16 @@ class ContinuationAction[Payload]:
 CONTINUATION_ACTIONS = (
     ContinuationAction("compare-environments", "equivalence", handle_compare_environments),
     ContinuationAction("repair-learning", "learning_repair", handle_repair_learning),
+    ContinuationAction("sample-count", "sample_count", handle_sample_count),
     ContinuationAction("admit-actor-prefix", "prefix", handle_admit_actor_prefix),
     ContinuationAction("check-failure-research", "research", handle_check_failure_research),
     ContinuationAction("propose-checkpoints", "checkpoint_proposals", handle_propose_checkpoints),
     ContinuationAction("run-continuation-campaign", "campaign", handle_run_continuation_campaign),
     ContinuationAction("probe-actor-decisions", "actor_decisions", handle_probe_actor_decisions),
     ContinuationAction("inspect-memory", "memory", handle_inspect_memory),
+    ContinuationAction("forget-summary", "forget", handle_forget_summary),
     ContinuationAction("measure-decisions", "decisions", handle_measure_decisions),
+    ContinuationAction("challenge-judges", "challenge", handle_challenge_judges),
     ContinuationAction("analyse-memory", "memory_analyst", handle_analyse_memory),
     ContinuationAction("analyse-failures", "analysis", handle_analyse_failures),
     ContinuationAction("compare-observations", "observations", handle_compare_observations),
@@ -184,7 +193,9 @@ class ContinuationCommand(ContractModel):
         scenario_search: Bounded native constructions and discriminating control scripts.
         record_witness: Explicit native script and independent predicate for witness-record.
         memory: Saved canonical calls to inspect without model calls or memory mutation.
+        forget: One stale memory summary to forget from the next version, with its reason.
         decisions: Frozen fixed-question calibration inventory, never a serving approval.
+        challenge: Registered fixed-output judge challenge study with one model per arm.
         memory_analyst: Opt-in bounded diagnostic using the existing trace-analysis rubric.
         actor_decisions: Trace-only next-decision probes with a repeated-reference control.
         prefix: Extract a complete retained actor input and bind a saved simulator observation.
@@ -192,6 +203,7 @@ class ContinuationCommand(ContractModel):
         checkpoint_proposals: Retrospective point selector producing an existing matched plan.
         campaign: Registered source attempts, selectors, prospective critics and continuations.
         learning_repair: Failed-learning settlement, lesson screening or library evolution.
+        sample_count: Trajectory-count registration, development selection or confirmation.
         equivalence: Paired executable reference/candidate studies and diagnostic trace council.
         specification: Independent acceptance specification and its source evidence to save.
         development_tasks: Build fit tasks to print, optionally one with its public tools.
@@ -221,7 +233,9 @@ class ContinuationCommand(ContractModel):
     scenario_search: ScenarioSearchSpec | None = None
     record_witness: RecordWitnessSpec | None = None
     memory: MemoryInspection | None = None
+    forget: SummaryForget | None = None
     decisions: DecisionCalibration | None = None
+    challenge: ChallengeRunSpec | None = None
     memory_analyst: MemoryAnalystSpec | None = None
     actor_decisions: ActorDecisionSpec | None = None
     prefix: ActorPrefixSpec | None = None
@@ -229,6 +243,7 @@ class ContinuationCommand(ContractModel):
     checkpoint_proposals: CheckpointProposalSpec | None = None
     campaign: ContinuationCampaignSpec | None = None
     learning_repair: LearningRepair | None = None
+    sample_count: SampleCountRequest | None = None
     equivalence: EquivalenceSpec | None = None
     specification: SpecificationRegistration | None = None
     development_tasks: DevelopmentTaskQuery | None = None

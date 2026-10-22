@@ -3,9 +3,10 @@
 A challenge study registers saved, independently labeled outputs from a calibration pack, the
 presentation factors its task declares irrelevant, and exact JSON edits of those outputs. Each
 edit either varies one declared-irrelevant factor (actor identity, candidate order, explanation
-length, a valid alternative action order) or injects one real defect (a wrong cell, the same
-wrong cell defended by persuasive prose, an unauthorized extra write, a value of the wrong JSON
-type). Every judge arm
+length, a valid alternative action order) or injects one real defect of a kind the study
+declares: a changed value at a declared JSON pointer, the same change defended by persuasive
+prose, an added entry such as an unauthorized write, or a value of the wrong JSON type, each
+under the study's own name (``wrong_cell``, ``wrong_total`` or any other). Every judge arm
 then assesses the same blinded outputs through the existing evaluator callback, and the study
 reports how often a judgment stays stable where nothing relevant changed and how often it
 detects the injected defect, for single judges, repeated same-model judges and panels. A
@@ -25,6 +26,7 @@ from pydantic import Field, JsonValue, model_validator
 
 from exp.common.core.artifacts import (
     ArtifactEnvelope,
+    ArtifactId,
     ArtifactInput,
     ContractModel,
     JsonObject,
@@ -48,23 +50,17 @@ from exp.simulation.reconstruction.models import path_parts, resolve
 # Identity of the code that decides this artifact's behavior, in place of its source text.
 # Bump it when behavior changes. exp/tests/code_protocols_test.py fails when the covered
 # source changes until it is bumped or, for a pure refactor, its digest is updated.
-CHALLENGE_PROTOCOL = "judge-challenge-v6"
+CHALLENGE_PROTOCOL = "judge-challenge-v8"
 
 IrrelevantFactor = Literal[
     "actor_identity", "candidate_order", "explanation_length", "action_order"
 ]
-DefectKind = Literal["wrong_cell", "wrong_cell_persuasive", "unauthorized_write", "wrong_json_type"]
+DefectCheck = Literal["changed_value", "defended_change", "added_entry", "changed_json_type"]
 INVARIANCE_FACTORS: tuple[IrrelevantFactor, ...] = (
     "actor_identity",
     "candidate_order",
     "explanation_length",
     "action_order",
-)
-DEFECT_KINDS: tuple[DefectKind, ...] = (
-    "wrong_cell",
-    "wrong_cell_persuasive",
-    "unauthorized_write",
-    "wrong_json_type",
 )
 
 
@@ -90,6 +86,43 @@ class DeclaredInvariance(ContractModel):
         return self
 
 
+class DeclaredDefect(ContractModel):
+    """One real defect kind the study injects, its check and where it lands in the output.
+
+    Attributes:
+        kind: Study-chosen name the report measures sensitivity under (for example
+            ``wrong_cell`` for a spreadsheet, ``wrong_total`` for an invoice).
+        check: What the defect's edits must do. ``changed_value``: every edit replaces a value
+            at a declared location with a different one. ``defended_change``: two or more
+            replacements with different values, at least one at a declared location and at
+            least one of them text defending it. ``added_entry``: at least one edit appends an
+            element or adds a member at a declared location, such as an unauthorized write or
+            effect. ``changed_json_type``: at least one replacement at a declared location
+            changes the value's JSON type.
+        pointers: JSON pointers (RFC 6901) into the saved outcome where the defect lands;
+            descendants are included.
+        rationale: Why the change is a real defect under the public task contract.
+    """
+
+    kind: str = Field(pattern=r"^[a-z][a-z0-9_-]{0,63}$")
+    check: DefectCheck
+    pointers: tuple[str, ...] = Field(min_length=1)
+    rationale: str = Field(min_length=1, max_length=2000)
+
+    @model_validator(mode="after")
+    def rooted(self) -> Self:
+        """Require nonroot pointers and a name apart from every irrelevant factor."""
+        if any(not pointer.startswith("/") or pointer == "/" for pointer in self.pointers):
+            raise ValueError("declared defect locations must be nonroot JSON pointers")
+        if self.kind in INVARIANCE_FACTORS:
+            raise ValueError(f"defect kind {self.kind} names an irrelevant factor")
+        return self
+
+    def covers(self, pointer: str) -> bool:
+        """Whether an edit at ``pointer`` lands inside the declared locations."""
+        return any(pointer == root or pointer.startswith(root + "/") for root in self.pointers)
+
+
 class OutputEdit(ContractModel):
     """One exact edit of a saved outcome.
 
@@ -112,14 +145,15 @@ class Perturbation(ContractModel):
     Attributes:
         perturbation_id: Unique identity within the study.
         base_case_id: Calibration case whose saved outcome is edited.
-        factor: Declared-irrelevant factor varied, or the defect injected.
-        edits: Exact edits; invariance edits stay inside the factor's declared locations.
+        factor: Declared-irrelevant factor varied, or the declared defect kind injected.
+        edits: Exact edits; invariance edits stay inside the factor's declared locations and
+            defect edits satisfy their kind's declared check.
         description: What changed, for reviewers reading the report.
     """
 
     perturbation_id: str = Field(min_length=1, max_length=128)
     base_case_id: str = Field(min_length=1)
-    factor: IrrelevantFactor | DefectKind
+    factor: str = Field(min_length=1, max_length=64)
     edits: tuple[OutputEdit, ...] = Field(min_length=1)
     description: str = Field(min_length=1, max_length=2000)
 
@@ -166,6 +200,7 @@ class JudgeChallengeStudy(ContractModel):
         pack: Frozen task, verifier, labels and criterion thresholds; its outcomes are the
             saved outputs every arm assesses.
         invariances: Factors the task declares irrelevant, with their locations.
+        defects: Defect kinds the study injects, each with its check and locations.
         perturbations: Registered invariance and defect edits.
         judges: Single-judge arms, each run on every output.
         panels: Decision rules over judge arms on the same outputs.
@@ -174,6 +209,7 @@ class JudgeChallengeStudy(ContractModel):
 
     pack: CalibrationPack
     invariances: tuple[DeclaredInvariance, ...] = ()
+    defects: tuple[DeclaredDefect, ...] = ()
     perturbations: tuple[Perturbation, ...] = Field(min_length=1)
     judges: tuple[ChallengeJudge, ...] = Field(min_length=1)
     panels: tuple[ChallengePanel, ...] = ()
@@ -187,16 +223,24 @@ class JudgeChallengeStudy(ContractModel):
         cases = {case.challenge.id: case for case in self.pack.cases}
         if len({row.factor for row in self.invariances}) != len(self.invariances):
             raise ValueError("declare each irrelevant factor once")
+        if len({row.kind for row in self.defects}) != len(self.defects):
+            raise ValueError("declare each defect kind once")
         declared: dict[str, tuple[str, ...]] = {
             row.factor: row.pointers for row in self.invariances
         }
+        defects = {row.kind: row for row in self.defects}
         if len({row.perturbation_id for row in self.perturbations}) != len(self.perturbations):
             raise ValueError("perturbation IDs must be unique")
         for row in self.perturbations:
             case = cases.get(row.base_case_id)
             if case is None:
                 raise ValueError(f"perturbation {row.perturbation_id} names an unknown case")
-            _variant(case, row, declared)
+            if row.kind == "defect" and row.factor not in defects:
+                raise ValueError(
+                    f"perturbation {row.perturbation_id} injects {row.factor}, which is neither "
+                    "an irrelevant factor nor a defect kind the study declares"
+                )
+            _variant(case, row, declared, defects)
         arms = [row.arm_id for row in self.judges]
         panels = [row.panel_id for row in self.panels]
         if len(set(arms + panels)) != len(arms) + len(panels):
@@ -258,6 +302,7 @@ def study_items(study: JudgeChallengeStudy) -> tuple[ChallengeOutput, ...]:
     """
     cases = {case.challenge.id: case for case in study.pack.cases}
     declared: dict[str, tuple[str, ...]] = {row.factor: row.pointers for row in study.invariances}
+    defects = {row.kind: row for row in study.defects}
     bases = dict.fromkeys(row.base_case_id for row in study.perturbations)
     return tuple(
         ChallengeOutput(
@@ -272,7 +317,7 @@ def study_items(study: JudgeChallengeStudy) -> tuple[ChallengeOutput, ...]:
             item_id=row.perturbation_id,
             case=cases[row.base_case_id],
             perturbation=row,
-            outcome=_variant(cases[row.base_case_id], row, declared),
+            outcome=_variant(cases[row.base_case_id], row, declared, defects),
         )
         for row in study.perturbations
     )
@@ -428,6 +473,7 @@ def assess_challenge_study(
         "task": study.pack.task.model_dump(mode="json"),
         "pack_sha256": sha256_json(study.pack),
         "declared_invariances": [row.model_dump(mode="json") for row in study.invariances],
+        "declared_defects": [row.model_dump(mode="json") for row in study.defects],
         "outputs": {
             "bases": sum(item.perturbation is None for item in items),
             "invariance": sum(
@@ -457,6 +503,8 @@ def record_challenge_study(
     judgments: Sequence[ChallengeJudgment],
     *,
     code_revision: str,
+    artifact_id: ArtifactId | None = None,
+    registration: ArtifactInput | None = None,
 ) -> ArtifactInput:
     """Persist the registered study, its saved judgments and the replayable report.
 
@@ -465,6 +513,8 @@ def record_challenge_study(
         study: Registered study.
         judgments: Saved judgments of every arm.
         code_revision: Producing implementation identity.
+        artifact_id: Run-owned result namespace, or the study identity for callback-only studies.
+        registration: Immutable run configuration included in the result provenance, if supplied.
 
     Returns:
         The immutable result reference; an identical earlier result is returned unchanged.
@@ -475,12 +525,14 @@ def record_challenge_study(
     """
     report = assess_challenge_study(study, judgments)
     saved = tuple(judgments)
-    identity = study.identity
+    identity = artifact_id or study.identity
     if project.artifacts.exists(identity):
-        if saved_challenge_judgments(project, study) != saved:
+        if saved_challenge_judgments(project, study, artifact_id=identity) != saved:
             raise ValueError("challenge study already holds different saved judgments")
         return artifact_input(project.artifacts.read(identity).manifest)
     inputs = {study.pack.task, *(row.judgment.report for row in saved)}
+    if registration is not None:
+        inputs.add(registration)
     manifest = project.artifacts.write_json(
         artifact_id=identity,
         artifact_type="judge-challenge-study",
@@ -500,13 +552,17 @@ def record_challenge_study(
 
 
 def saved_challenge_judgments(
-    project: ProjectStore, study: JudgeChallengeStudy
+    project: ProjectStore,
+    study: JudgeChallengeStudy,
+    *,
+    artifact_id: ArtifactId | None = None,
 ) -> tuple[ChallengeJudgment, ...] | None:
     """Read a saved study's judgments after proving its registration and report reproduce.
 
     Args:
         project: Project that may own the result.
         study: Registered study.
+        artifact_id: Run-owned result namespace, or the study identity for callback-only studies.
 
     Returns:
         The saved judgments, or None when the study has no saved result.
@@ -515,7 +571,7 @@ def saved_challenge_judgments(
         ValueError: The saved registration differs or its judgments no longer reproduce the
             saved report.
     """
-    store, identity = project.artifacts, study.identity
+    store, identity = project.artifacts, artifact_id or study.identity
     if not store.exists(identity):
         return None
     if JudgeChallengeStudy.model_validate_json(store.read_bytes(identity, "study.json")) != study:
@@ -620,7 +676,7 @@ def _measure(
         if rows:
             invariance[factor] = _stability(study, rows, decisions)
     sensitivity: JsonObject = {}
-    for kind in DEFECT_KINDS:
+    for kind in (row.kind for row in study.defects):
         rows = _variants(items, kind)
         if rows:
             sensitivity[kind] = _sensitivity(rows, decisions)
@@ -729,6 +785,7 @@ def _variant(
     case: CalibrationCase,
     perturbation: Perturbation,
     declared: dict[str, tuple[str, ...]],
+    defects: dict[str, DeclaredDefect],
 ) -> WorkflowEvidence | JsonObject:
     """Apply one registered perturbation after checking it varies only what it claims to.
 
@@ -760,7 +817,7 @@ def _variant(
     if perturbation.kind == "defect":
         if case.label != "pass":
             raise ValueError("defects are injected into outputs labeled valid")
-        _require_defect(perturbation, case)
+        _require_defect(perturbation, defects[factor], case)
     if not isinstance(document, dict):
         raise ValueError("perturbed outcomes must remain JSON objects")
     if sha256_json(document) == sha256_json(
@@ -789,41 +846,49 @@ def _require_invariant(factor: str, edit: OutputEdit, before: JsonValue, name: s
         raise ValueError(f"{name}: an explanation-length change replaces text with text")
 
 
-def _require_defect(perturbation: Perturbation, case: CalibrationCase) -> None:
-    """Check a defect edit changes what its kind names."""
+def _require_defect(
+    perturbation: Perturbation, defect: DeclaredDefect, case: CalibrationCase
+) -> None:
+    """Check a defect's edits do what its declared kind requires, where it is declared."""
     original = case.challenge.outcome
     document: JsonValue = (
         original.model_dump(mode="json")
         if isinstance(original, WorkflowEvidence)
         else dict(original)
     )
-    befores = [_before(document, edit) for edit in perturbation.edits]
-    edits = perturbation.edits
-    name = perturbation.perturbation_id
-    if perturbation.factor == "wrong_json_type" and not any(
-        edit.operation == "replace" and _json_type(before) != _json_type(edit.value)
-        for edit, before in zip(edits, befores, strict=True)
-    ):
-        raise ValueError(f"{name}: a wrong-type defect must change a value's JSON type")
-    if perturbation.factor == "unauthorized_write" and not any(
-        edit.operation in ("append", "add") for edit in edits
-    ):
-        raise ValueError(f"{name}: an unauthorized write appends or adds an extra action or effect")
-    if perturbation.factor == "wrong_cell" and any(
-        edit.operation != "replace" or edit.value == before
-        for edit, before in zip(edits, befores, strict=True)
-    ):
-        raise ValueError(f"{name}: a wrong-cell defect replaces values with different ones")
-    if perturbation.factor == "wrong_cell_persuasive" and (
-        len(edits) < 2
-        or not any(isinstance(edit.value, str) and edit.operation == "replace" for edit in edits)
-        or any(
-            edit.operation != "replace" or edit.value == before
-            for edit, before in zip(edits, befores, strict=True)
-        )
+    pairs = [(edit, _before(document, edit)) for edit in perturbation.edits]
+    name, kind = perturbation.perturbation_id, defect.kind
+    replaced = all(edit.operation == "replace" and edit.value != before for edit, before in pairs)
+    if defect.check == "changed_value" and not (
+        replaced and all(defect.covers(edit.pointer) for edit, _ in pairs)
     ):
         raise ValueError(
-            f"{name}: a persuasive wrong-cell defect changes a value and the prose defending it"
+            f"{name}: a {kind} defect replaces values at its declared locations with different ones"
+        )
+    if defect.check == "defended_change" and (
+        len(pairs) < 2
+        or not replaced
+        or not any(defect.covers(edit.pointer) for edit, _ in pairs)
+        or not any(isinstance(edit.value, str) for edit, _ in pairs)
+    ):
+        raise ValueError(
+            f"{name}: a {kind} defect changes a value at its declared locations and the prose "
+            "defending it"
+        )
+    if defect.check == "added_entry" and not any(
+        edit.operation in ("append", "add") and defect.covers(edit.pointer) for edit, _ in pairs
+    ):
+        raise ValueError(
+            f"{name}: a {kind} defect appends or adds an entry at its declared locations"
+        )
+    if defect.check == "changed_json_type" and not any(
+        edit.operation == "replace"
+        and defect.covers(edit.pointer)
+        and _json_type(before) != _json_type(edit.value)
+        for edit, before in pairs
+    ):
+        raise ValueError(
+            f"{name}: a {kind} defect changes a value's JSON type at its declared locations"
         )
 
 

@@ -1,10 +1,11 @@
 """Protocol versions stand in for source text in saved-result identities; this guards them.
 
-Calibration, the actor council, task refinement, private workbook views and the restorable
-environment backends bind their saved results to a protocol constant instead of hashing their own
-source. Saved results then survive moves, formatting and unrelated edits, and re-key only when the
-protocol is bumped. Provider attempt timeouts follow the same rule: each admitted physical attempt
-records the protocol of the derivation that bounded it.
+Calibration, the actor council, task refinement, private workbook views, the restorable
+environment backends and local process containment bind their saved results to a protocol
+constant instead of hashing their own source. Saved results then survive moves, formatting and
+unrelated edits, and re-key only when the protocol is bumped. Provider attempt timeouts follow
+the same rule: each admitted physical attempt records the protocol of the derivation that
+bounded it.
 
 This test keeps that honest. Each protocol lists the source that decides its behavior, with that
 source's digest at the protocol's current value. When the covered source changes, the test fails
@@ -41,6 +42,15 @@ class Protocol:
 
 PROTOCOLS = (
     Protocol(
+        "exp.simulation.mining.descriptors:DESCRIPTOR_EMBEDDING",
+        "hashing-descriptor-v3",
+        (
+            "exp.simulation.mining.descriptors",
+            "exp.simulation.mining.lineage",
+        ),
+        "6f73c03012822be35706a703429b1c9b2941321e5c0c97ad1528db6464c7786d",
+    ),
+    Protocol(
         "exp.optimize.evaluation.tasks.calibration:CALIBRATION_PROTOCOL",
         "task-calibration-v7",
         (
@@ -54,9 +64,10 @@ PROTOCOLS = (
     ),
     Protocol(
         "exp.optimize.evaluation.tasks.challenges:CHALLENGE_PROTOCOL",
-        "judge-challenge-v6",
+        "judge-challenge-v8",
         (
             "exp.optimize.evaluation.tasks.challenges",
+            "exp.optimize.evaluation.tasks.challenge_runs",
             "exp.simulation.evaluation.calibration:task_decision",
             "exp.simulation.evaluation.calibration:blinded_case",
         ),
@@ -93,9 +104,9 @@ PROTOCOLS = (
     ),
     Protocol(
         "exp.optimize.evaluation.learning.sample_count:SAMPLE_COUNT_PROTOCOL",
-        "sample-count-v1",
+        "sample-count-v2",
         ("exp.optimize.evaluation.learning.sample_count",),
-        "0d6a436e42eb2fafe530930865ad937351745c78d81aa83495007a1c753daef8",
+        "58a3f21cb64df2b3e5795dc7c82a14c4ba22bfa247584378cf4c4e4e8b8a4ecc",
     ),
     Protocol(
         "exp.optimize.evaluation.learning.screening:SCREENING_PROTOCOL",
@@ -139,6 +150,24 @@ PROTOCOLS = (
         "private-workbook-views-v2",
         ("exp.optimize.evaluation.executable.workbook",),
         "e14d471c25cadda4e5cc1750bf8784a8f3576d87b37589c8d70a4561a0ed8881",
+    ),
+    Protocol(
+        "exp.runtime.environments.containment.linux:LINUX_CONTAINMENT_PROTOCOL",
+        "linux-namespaces-v2",
+        (
+            "exp.runtime.environments.containment.linux",
+            "exp.runtime.environments.containment.linux_gate",
+        ),
+        "e012412f1ce9ae0a15454cdafcfda11438e87cc78fac39197d7dc6fd223fa44d",
+    ),
+    Protocol(
+        "exp.runtime.environments.containment.darwin:DARWIN_CONTAINMENT_PROTOCOL",
+        "darwin-kqueue-v1",
+        (
+            "exp.runtime.environments.containment.darwin",
+            "exp.runtime.environments.containment.darwin_gate",
+        ),
+        "693bb76a1249204e492feaca8ae8508ed914ade3334792a6b008048dfcbf0375",
     ),
     Protocol(
         "exp.runtime.environments.record_world:RECORD_WORLD_PROTOCOL",
