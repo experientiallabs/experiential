@@ -475,6 +475,7 @@ def build_project(
         build=artifacts.task_set.task_set_id,
         dataset=artifact_input(trace_stored.manifest),
         traces=artifacts.trace_dataset.traces,
+        lineages=artifacts.mining.lineage_assignments,
         near_duplicates=artifacts.mining.analysis.edges,
     )
     task_stored = store.artifacts.read(artifacts.task_set.task_set_id)

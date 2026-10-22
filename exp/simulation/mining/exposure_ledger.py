@@ -10,9 +10,11 @@ SQLite file, and keys everything on content (:mod:`exp.simulation.mining.fingerp
   and any declared task identity (``task_lineage``). A trace a scheme cannot fingerprint is an
   unresolved node, still linked by grouping edges.
 - Edges are grouping relationships recorded for every build, whether or not anything is exposed:
-  two traces that declare the same task identity, or the build's own near-duplicate union with
-  its similarity. Each edge names the project and build that produced it. Nothing weaker (a
-  shared customer, conversation or time bucket) is an edge.
+  two traces that declare the same task identity within one source and customer, exactly as the
+  build's own partition scopes declarations (:mod:`exp.simulation.mining.lineage`), or the
+  build's near-duplicate union with its similarity. Each edge names the project and build that
+  produced it. Nothing weaker (a shared customer, conversation or time bucket, or a declared
+  name reused by another source or customer) is an edge.
 - Equivalence links join the nodes of one verified source under every scheme that fingerprinted
   it, for unexposed traces too, so edges recorded under any scheme stay valid.
 - Exposures mark nodes a person has seen, with the panel, receipt and report that showed them.
@@ -54,6 +56,7 @@ from exp.common.sqlite.connection import connect_database
 from exp.common.traces import Trace
 from exp.simulation.mining.deduplicate import DuplicateEdge
 from exp.simulation.mining.fingerprint import SCHEMES, Scheme, SchemeIdentity
+from exp.simulation.mining.lineage import LineageAssignment
 
 LEDGER_DIRECTORY = "exposure-ledger"
 LEDGER_FILE = "ledger.sqlite"
@@ -590,17 +593,23 @@ class ExposureLedger:
         build: str,
         dataset: ArtifactInput,
         traces: Sequence[Trace],
+        lineages: Sequence[LineageAssignment],
         near_duplicates: Sequence[DuplicateEdge],
     ) -> LedgerBuild:
         """Record one build's nodes, equivalences and grouping edges, idempotently.
 
-        Every trace is fingerprinted under every computable scheme; edges use the newest.
+        Every trace is fingerprinted under every computable scheme; edges use the newest. A
+        declared-task-identity edge joins traces that declare one task identity within one
+        source and customer, the scope the build's own partition gives declarations, so a
+        task name reused by an unrelated source or customer never links their content.
 
         Args:
             project: Project that built.
             build: Build (task-set artifact) identity.
             dataset: Trace dataset the traces come from.
             traces: Every trace the build mined.
+            lineages: The build's source lineage assignments, one per trace, which carry the
+                customer scope and the declared task identity the build partitioned by.
             near_duplicates: The build's exact and semantic duplicate unions.
 
         Returns:
@@ -608,7 +617,8 @@ class ExposureLedger:
 
         Raises:
             SchemeConflictError: A scheme's specification changed without a version bump.
-            ValueError: No scheme is computable on this machine.
+            ValueError: No scheme is computable on this machine, or a trace has no lineage
+                assignment.
         """
         if not self.computable:
             raise ValueError(
@@ -619,11 +629,9 @@ class ExposureLedger:
         nodes = _nodes(self, project, build, dataset, traces)
         by_trace = {node.source.trace_id: node for node in nodes if node.scheme == primary}
         edges: list[LedgerEdge] = []
-        declared: dict[str, set[Vertex]] = defaultdict(set)
-        for node in by_trace.values():
-            if node.task_lineage is not None:
-                declared[node.task_lineage].add(node.vertex)
-        for task_lineage, members in sorted(declared.items()):
+        for (_, _, task_lineage), members in sorted(
+            _declared_partitions(traces, lineages, by_trace).items()
+        ):
             chain = sorted(members)
             edges.extend(
                 LedgerEdge(
@@ -790,6 +798,31 @@ def declared_task_identity(trace: Trace) -> str | None:
     """The task identity a trace declares in its request context, if any."""
     value = trace.initial_context.get(TASK_LINEAGE_KEY)
     return value if isinstance(value, str) and value else None
+
+
+def _declared_partitions(
+    traces: Sequence[Trace],
+    lineages: Sequence[LineageAssignment],
+    by_trace: Mapping[str, LedgerNode],
+) -> dict[tuple[str, str, str], set[Vertex]]:
+    """Group declaring traces' vertices by the build's ``(source, customer, task)`` scope.
+
+    Raises:
+        ValueError: A trace has no lineage assignment, so its declaration scope is unknown.
+    """
+    assigned = {assignment.trace_id: assignment for assignment in lineages}
+    declared: dict[tuple[str, str, str], set[Vertex]] = defaultdict(set)
+    for trace in traces:
+        assignment = assigned.get(trace.trace_id)
+        if assignment is None:
+            raise ValueError(
+                f"trace {trace.trace_id} has no source lineage assignment, so its declared "
+                "task identity cannot be scoped in the exposure ledger"
+            )
+        if assignment.task_lineage is not None:
+            key = (trace.source.identity.source_id, assignment.customer_id, assignment.task_lineage)
+            declared[key].add(by_trace[trace.trace_id].vertex)
+    return declared
 
 
 def _nodes(
