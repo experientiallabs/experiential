@@ -31,6 +31,7 @@ results, and plans do not live here.
 | `reference/openai-compatible-recipes.md` | Verified Fireworks, Modal, and Experiential Cloud connection recipes through the openai-compatible provider family. |
 | `reference/ingest.md` | Current declared local trace source contract for every supported source. |
 | `reference/immutable-real-trace-rag.md` | Immutable real-trace retrieval provenance, leakage, persistence, and historical restoration contract. |
+| `reference/induced-transitions.md` | Exact per-tool transition programs induced from fit traces: induce and validate actions, validation rules, sandboxed execution, serving with the grounded simulator and paired replay measurement. |
 | `reference/router_optimization_config.md` | Exact completed-evidence configuration recipe for router optimization. |
 | `release-scope.md` | Supported and explicitly excluded release claims. |
 | `gitlab-ci.md` | GitLab CI pipeline areas, triggers, runners, releases, and PyPI publishing. |

@@ -65,6 +65,7 @@ from exp.cli.evaluation.hill_climb import (
 )
 from exp.cli.evaluation.judge_challenges import handle_challenge_judges
 from exp.cli.evaluation.instance_facts import handle_derive_facts
+from exp.cli.evaluation.induction import handle_induce_transitions, handle_validate_transitions
 from exp.cli.evaluation.learning_repair import handle_repair_learning
 from exp.cli.evaluation.memory_forget import handle_forget_summary
 from exp.cli.evaluation.sample_count import handle_sample_count
@@ -108,6 +109,7 @@ from exp.optimize.evaluation.hillclimb.report import ClimbReportSpec
 from exp.optimize.evaluation.hillclimb.rounds import ClimbRound
 from exp.optimize.evaluation.learning.forgetting import SummaryForget
 from exp.optimize.evaluation.fidelity.fact_derivation import FactsDerivation
+from exp.optimize.evaluation.induction.service import InductionSpec, TransitionValidationSpec
 from exp.optimize.evaluation.learning.lessons import LearningRepair
 from exp.optimize.evaluation.learning.sample_count import SampleCountRequest
 from exp.optimize.evaluation.tasks.challenge_runs import ChallengeRunSpec
@@ -173,6 +175,10 @@ CONTINUATION_ACTIONS = (
     ContinuationAction("check-task-validity", "task_validity", handle_check_task_validity),
     ContinuationAction("harden-tasks", "hardening", handle_harden_tasks),
     ContinuationAction("derive-facts", "facts", handle_derive_facts),
+    ContinuationAction("induce-transitions", "induction", handle_induce_transitions),
+    ContinuationAction(
+        "validate-transitions", "transition_validation", handle_validate_transitions
+    ),
 )
 _ACTIONS_BY_NAME = {action.name: action for action in CONTINUATION_ACTIONS}
 
@@ -233,6 +239,8 @@ class ContinuationCommand(ContractModel):
         task_validity: Leak, closed-book and control checks for one qualified variant.
         hardening: Bounded harder-world levels for one qualified seed until a panel separates.
         facts: Backend-derived instance facts for declared task input files.
+        induction: Fit-evidence induction of exact per-tool transition programs.
+        transition_validation: Provider-free re-validation of saved programs on fit evidence.
     """
 
     action: ContinuationActionName
@@ -279,6 +287,8 @@ class ContinuationCommand(ContractModel):
     task_validity: TaskValiditySpec | None = None
     hardening: TaskHardeningSpec | None = None
     facts: FactsDerivation | None = None
+    induction: InductionSpec | None = None
+    transition_validation: TransitionValidationSpec | None = None
 
     @model_validator(mode="after")
     def exact_payload(self) -> "ContinuationCommand":
