@@ -85,6 +85,7 @@ from exp.optimize.evaluation.continuations.selection import (
     persist_selection_plan,
     selection_jobs,
 )
+from exp.optimize.evaluation.equivalence.policy import load_admission_policy
 from exp.optimize.model.sft.builder import build_sft_dataset, write_sft_dataset
 from exp.optimize.model.sft.contracts import SFTBuildSpec
 
@@ -94,10 +95,13 @@ class ContinuationExport(ContractModel):
 
     Attributes:
         studies: Exact complete results; every branch remains in their admission reports.
+        policy: Registered admission policy, registered before every study; each branch's
+            per-dimension verdicts are saved with its admission.
         dataset: Existing SFT split controls. Related continuations share one leakage group.
     """
 
     studies: tuple[ArtifactInput, ...] = Field(min_length=1)
+    policy: ArtifactInput
     dataset: SFTBuildSpec = Field(default_factory=SFTBuildSpec)
 
 
@@ -469,6 +473,7 @@ def handle_export(context: ContinuationContext, export: ContinuationExport) -> N
         None. Admission scopes and the published dataset are printed to the console.
     """
     store, console, revision = context.store, context.console, context.revision
+    load_admission_policy(store.artifacts, export.policy)
     for reference in export.studies:
         load_study(store.artifacts, reference)
     if context.dry_run:
@@ -476,7 +481,11 @@ def handle_export(context: ContinuationContext, export: ContinuationExport) -> N
         return
     accepted = tuple(
         admit_continuations(
-            store.artifacts, reference, created_at=datetime.now(UTC), code_revision=revision
+            store.artifacts,
+            reference,
+            policy=export.policy,
+            created_at=datetime.now(UTC),
+            code_revision=revision,
         )
         for reference in export.studies
     )
@@ -489,6 +498,13 @@ def handle_export(context: ContinuationContext, export: ContinuationExport) -> N
             f"{sum(row.admitted for row in report.branches)}/{len(report.branches)} branches"
         )
         console.print(report.scope)
+        verdicts = [row.policy.status for row in report.branches]
+        console.print(
+            f"Admission policy {export.policy.artifact_id}: "
+            + ", ".join(f"{verdicts.count(name)} {name}" for name in sorted(set(verdicts)))
+            + "; per-dimension verdicts saved with the admission.",
+            markup=False,
+        )
         if report.evidence is None:
             console.print("No task qualification attached; observed-outcome checks only.")
         else:

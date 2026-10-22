@@ -26,6 +26,13 @@ def handle_export_traces(context: ContinuationContext, spec: TrajectoryTraceExpo
         f"collapsed, {len(summary.skipped)} skipped. No provider calls.",
         markup=False,
     )
+    counts = summary.admission
+    console.print(
+        f"Admission policy {summary.policy.artifact_id}: {counts['admitted']} admitted, "
+        f"{counts['refused']} refused, {counts['unassessable']} unassessable branches; "
+        "per-dimension verdicts are in each trace occurrence's provenance.",
+        markup=False,
+    )
     for skip in summary.skipped:
         console.print(f"Skipped {skip.study} branch {skip.branch}: {skip.reason}", markup=False)
     for row in summary.imports:

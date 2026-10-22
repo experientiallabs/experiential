@@ -51,7 +51,11 @@ def resolve_continuation_source(
         store.read_bytes(reference.artifact_id, "admission.json")
     )
     verified = admit_continuations(
-        store, admission.study, created_at=manifest.created_at, code_revision=manifest.code_revision
+        store,
+        admission.study,
+        policy=admission.policy,
+        created_at=manifest.created_at,
+        code_revision=manifest.code_revision,
     )
     if verified != reference:
         raise SFTSourceVerificationError("continuation admission no longer re-derives")

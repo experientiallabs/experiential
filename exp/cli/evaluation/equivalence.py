@@ -1,10 +1,15 @@
-"""Continuation actions owned by actor equivalence: paired comparison and retained prefixes."""
+"""Continuation actions owned by actor equivalence: policies, paired comparison and prefixes."""
 
 from datetime import UTC, datetime
 
 from exp.cli.evaluation.continuation_context import ContinuationContext
 from exp.common.progress import ProgressEvent
 from exp.common.project import artifact_input
+from exp.optimize.evaluation.equivalence.policy import (
+    AdmissionPolicy,
+    policy_identity,
+    register_admission_policy,
+)
 from exp.optimize.evaluation.equivalence.prefixes import (
     ActorPrefixSpec,
     admit_actor_prefix,
@@ -80,6 +85,15 @@ def handle_compare_environments(context: ContinuationContext, spec: EquivalenceS
                 alias: review.model_dump(mode="json") for alias, review in result.analyses.items()
             },
             "analysis_failures": result.analysis_failures,
+            "calibration": None
+            if result.calibration is None
+            else {
+                "policy": result.calibration.policy.artifact_id,
+                "dimensions": {
+                    row.dimension: {"status": row.status, "reason": row.reason}
+                    for row in result.calibration.dimensions
+                },
+            },
         }
     )
     console.print(f"Saved paired evidence: {reference.artifact_id}. No training or promotion.")
@@ -105,3 +119,34 @@ def handle_admit_actor_prefix(context: ContinuationContext, spec: ActorPrefixSpe
             code_revision=context.revision,
         )
         context.console.print_json(data={"saved_prefix": reference.model_dump(mode="json")})
+
+
+def handle_register_admission_policy(context: ContinuationContext, policy: AdmissionPolicy) -> None:
+    """Register an admission policy before the results it will judge, or replay it.
+
+    Args:
+        context: Validated ``--continuations`` invocation; ``dry_run`` registers nothing.
+        policy: Complete per-dimension policy.
+
+    Returns:
+        None. The policy reference, or its would-be identity in a dry run, is printed.
+    """
+    console = context.console
+    if context.dry_run:
+        console.print(
+            f"Admission policy validated: {policy_identity(policy)}. Dry run: not registered.",
+            markup=False,
+        )
+        return
+    reference = register_admission_policy(
+        context.store.artifacts,
+        policy,
+        created_at=datetime.now(UTC),
+        code_revision=context.revision,
+    )
+    console.print_json(data={"policy": reference.model_dump(mode="json")})
+    console.print(
+        "Registered before results: pass this reference as compare-environments "
+        "equivalence.policy and as the export or export-traces policy.",
+        markup=False,
+    )

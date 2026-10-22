@@ -1,4 +1,7 @@
-"""Independent acceptance refuses self-approval and retains failed native workbook branches."""
+"""Independent acceptance refuses self-approval and retains failed native workbook branches.
+
+Every admission applies a registered policy; per-dimension verdicts stay with each branch.
+"""
 
 from datetime import UTC, datetime
 from pathlib import Path
@@ -17,6 +20,8 @@ from exp.optimize.evaluation.continuations.study import (
     run_continuation_study,
 )
 from exp.optimize.evaluation.continuations.study_test import probe, workbook_runtime
+from exp.optimize.evaluation.equivalence.policy import AdmissionPolicy
+from exp.optimize.evaluation.equivalence.policy_test import fixture_policy, registered_policy
 from exp.runtime.agents.chat_test import _Model, _response
 from exp.runtime.environments.tests.world_conformance_test import workbook_case
 from exp.simulation.continuations import persist_continuation_checkpoint
@@ -35,9 +40,14 @@ def admitted_workbook_study(
     followup_action: bool = False,
     actor_actions: tuple[AssistantAction, ...] | None = None,
     policy_only_schema: JsonObject | None = None,
+    policy: AdmissionPolicy | None = None,
 ) -> ArtifactInput:
-    """Execute two native branches against independently specified workbook acceptance."""
+    """Execute two native branches against independently specified workbook acceptance.
+
+    The admission policy is registered first, before the study it judges.
+    """
     store = project.artifacts
+    policy_ref = registered_policy(store, policy)
     checkpoint, actor = capsule(store)
     reference = persist_continuation_checkpoint(
         store, checkpoint, created_at=datetime.now(UTC), code_revision="test"
@@ -131,6 +141,7 @@ def admitted_workbook_study(
     return admit_continuations(
         store,
         artifact_input(store.read(result).manifest),
+        policy=policy_ref,
         created_at=datetime.now(UTC),
         code_revision="test",
     )
@@ -174,3 +185,57 @@ def test_policy_only_specification_cannot_admit_a_passing_trajectory(
     )
     assert not any(branch.admitted for branch in report.branches)
     assert "outcome predicate" in report.branches[0].reason
+
+
+def test_branch_admission_records_every_dimension_under_the_registered_policy(
+    tmp_path: Path,
+) -> None:
+    """The passing native branch is admitted on every gating dimension; the failure is kept."""
+    project = ProjectStore(tmp_path, "case")
+    report = ContinuationAdmission.model_validate_json(
+        project.artifacts.read_bytes(admitted_workbook_study(project).artifact_id, "admission.json")
+    )
+    assert report.policy == report.branches[0].policy.policy
+    passed, failed = (row.policy for row in report.branches)
+    assert passed.status == "admitted" and not passed.simulated
+    assert {row.dimension: row.status for row in passed.dimensions} == {
+        "goal_success": "admitted",
+        "policy_compliance": "admitted",
+        "forbidden_effects": "admitted",
+        "state_fidelity": "admitted",
+        "tool_validity": "admitted",
+        "recovery": "unassessable",
+    }
+    assert failed.status == "refused" and failed.reasons[0].startswith("goal_success refused")
+
+
+def test_a_required_dimension_that_does_not_apply_is_never_silently_passed(
+    tmp_path: Path,
+) -> None:
+    """Requiring recovery on a trajectory without errors withholds admission."""
+    project = ProjectStore(tmp_path, "case")
+    reference = admitted_workbook_study(
+        project, policy=fixture_policy(gates={"recovery": "required"})
+    )
+    report = ContinuationAdmission.model_validate_json(
+        project.artifacts.read_bytes(reference.artifact_id, "admission.json")
+    )
+    assert not any(row.admitted for row in report.branches)
+    assert report.branches[0].reason.startswith("admission policy unassessable: recovery")
+
+
+def test_a_policy_registered_after_the_study_cannot_admit_it(tmp_path: Path) -> None:
+    """Margins and gates chosen after sampling refuse with an actionable message."""
+    project = ProjectStore(tmp_path, "case")
+    admission = ContinuationAdmission.model_validate_json(
+        project.artifacts.read_bytes(admitted_workbook_study(project).artifact_id, "admission.json")
+    )
+    late = registered_policy(project.artifacts, fixture_policy(margin=0.4))
+    with pytest.raises(ValueError, match="register it first and generate fresh results"):
+        admit_continuations(
+            project.artifacts,
+            admission.study,
+            policy=late,
+            created_at=datetime.now(UTC),
+            code_revision="test",
+        )

@@ -11,6 +11,8 @@ from exp.cli.evaluation.continuations import ContinuationCommand
 from exp.common.project import artifact_input
 from exp.optimize.evaluation.continuations.job_test import job_fixture
 from exp.optimize.evaluation.continuations.observation_contrast_test import observation_fixture
+from exp.optimize.evaluation.equivalence.policy import policy_identity
+from exp.optimize.evaluation.equivalence.policy_test import fixture_policy
 from exp.optimize.model.sft.builder import (
     SFTBuildError,
     load_sft_dataset,
@@ -334,6 +336,21 @@ def test_cli_run_and_export_with_private_native_state(
         "--non-interactive",
     ]
     runner = CliRunner()
+    # The admission policy is registered through the CLI before any result it judges.
+    policy = fixture_policy(margin=0.6)
+    request.write_text(
+        ContinuationCommand(
+            action="register-admission-policy", admission_policy=policy
+        ).model_dump_json()
+    )
+    preview = runner.invoke(app, [*command, "--dry-run"])
+    assert preview.exit_code == 0 and "Dry run: not registered" in " ".join(preview.output.split())
+    assert not project.artifacts.exists(policy_identity(policy))
+    registered = runner.invoke(app, command)
+    assert registered.exit_code == 0, registered.output
+    policy_ref = artifact_input(project.artifacts.read(policy_identity(policy)).manifest)
+    assert policy_ref.artifact_id in registered.output
+    request.write_text(ContinuationCommand(action="run", job=job).model_dump_json())
     dry = runner.invoke(app, [*command, "--dry-run"])
     assert dry.exit_code == 0, dry.output
     assert not transport.requests
@@ -356,6 +373,7 @@ def test_cli_run_and_export_with_private_native_state(
             action="export",
             export=ContinuationExport(
                 studies=(artifact_input(project.artifacts.read(study).manifest),),
+                policy=policy_ref,
                 dataset=SFTBuildSpec(held_out_fraction=0),
             ),
         ).model_dump_json()
@@ -363,6 +381,7 @@ def test_cli_run_and_export_with_private_native_state(
     exported = runner.invoke(app, command)
     assert exported.exit_code == 0, exported.output
     assert "1/2 branches" in exported.output and "Assistant targets: 1" in exported.output
+    assert f"Admission policy {policy_ref.artifact_id}: 1 admitted, 1 refused" in exported.output
     assert len(transport.requests) == 3
     dataset = project.artifacts.list_ids(artifact_type="sft-dataset")[0]
     assert "(diagnostic)" in exported.output

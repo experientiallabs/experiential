@@ -46,6 +46,11 @@ from exp.cli.evaluation.development import (
     handle_ground_runtime,
 )
 from exp.cli.evaluation.equivalence import handle_admit_actor_prefix, handle_compare_environments
+from exp.cli.evaluation.equivalence import (
+    handle_admit_actor_prefix,
+    handle_compare_environments,
+    handle_register_admission_policy,
+)
 from exp.cli.evaluation.executable import (
     ExecutableCommand,
     handle_harbor,
@@ -98,6 +103,7 @@ from exp.optimize.evaluation.continuations.observation_contrast import Observati
 from exp.optimize.evaluation.continuations.proposals import CheckpointProposalSpec
 from exp.optimize.evaluation.continuations.selection import CheckpointSelectionSpec
 from exp.optimize.evaluation.continuations.traces import TrajectoryTraceExport
+from exp.optimize.evaluation.equivalence.policy import AdmissionPolicy
 from exp.optimize.evaluation.equivalence.prefixes import ActorPrefixSpec
 from exp.optimize.evaluation.equivalence.runner import EquivalenceSpec
 from exp.optimize.evaluation.executable.controls import SpecificationRegistration
@@ -137,6 +143,9 @@ class ContinuationAction[Payload]:
 
 CONTINUATION_ACTIONS = (
     ContinuationAction("compare-environments", "equivalence", handle_compare_environments),
+    ContinuationAction(
+        "register-admission-policy", "admission_policy", handle_register_admission_policy
+    ),
     ContinuationAction("repair-learning", "learning_repair", handle_repair_learning),
     ContinuationAction("sample-count", "sample_count", handle_sample_count),
     ContinuationAction("admit-actor-prefix", "prefix", handle_admit_actor_prefix),
@@ -251,6 +260,7 @@ class ContinuationCommand(ContractModel):
         facts: Backend-derived instance facts for declared task input files.
         induction: Fit-evidence induction of exact per-tool transition programs.
         transition_validation: Provider-free re-validation of saved programs on fit evidence.
+        admission_policy: Per-dimension trajectory admission policy to register before results.
     """
 
     action: ContinuationActionName
@@ -301,6 +311,7 @@ class ContinuationCommand(ContractModel):
     facts: FactsDerivation | None = None
     induction: InductionSpec | None = None
     transition_validation: TransitionValidationSpec | None = None
+    admission_policy: AdmissionPolicy | None = None
 
     @model_validator(mode="after")
     def exact_payload(self) -> "ContinuationCommand":

@@ -41,6 +41,7 @@ from exp.optimize.evaluation.continuations.traces_test import (
     ticket_studies,
     ticket_task,
 )
+from exp.optimize.evaluation.equivalence.policy_test import registered_policy
 from exp.optimize.evaluation.fidelity import runner as fidelity
 from exp.optimize.evaluation.learning.traces import learning_cases
 from exp.runtime.models import RuntimeModelCatalog
@@ -124,6 +125,7 @@ def test_export_traces_dry_runs_imports_and_exp_build_learns_with_forks_grouped(
     root.mkdir()
     project = ProjectStore(root, "case")
     store = project.artifacts
+    policy = registered_policy(store)
     native = ticket_studies(store, tasks=TASKS, forks=FORKS)
     reference, _ = capture(store, simulated_tickets(), ticket_task(99))
     simulated = study(store, reference, simulated_tickets(), [ticket_fork(99, 0)])
@@ -132,7 +134,7 @@ def test_export_traces_dry_runs_imports_and_exp_build_learns_with_forks_grouped(
     request.write_text(
         ContinuationCommand(
             action="export-traces",
-            traces=TrajectoryTraceExport(generators=(generator,), project="learner"),
+            traces=TrajectoryTraceExport(policy=policy, generators=(generator,), project="learner"),
         ).model_dump_json()
     )
     counts = (
@@ -263,7 +265,9 @@ def test_export_traces_dry_runs_imports_and_exp_build_learns_with_forks_grouped(
     request.write_text(
         ContinuationCommand(
             action="export-traces",
-            traces=TrajectoryTraceExport(generators=(generator,), project="simulated-learner"),
+            traces=TrajectoryTraceExport(
+                policy=policy, generators=(generator,), project="simulated-learner"
+            ),
         ).model_dump_json()
     )
     code, output = eval_command(root, request)
