@@ -24,6 +24,7 @@ from exp.common.project import (
 from exp.common.project.project import write_project_config
 from exp.optimize.evaluation.fidelity.runner_test import source_project
 from exp.runtime.models import RuntimeModelCatalog
+from exp.runtime.sessions.errors import StateUnavailableError
 from exp.runtime.sessions.store import SessionStore
 from exp.simulation.world_model.checkpoints import (
     capture_stored_world_checkpoint,
@@ -135,6 +136,16 @@ def test_committed_prefix_forks_two_independent_worlds_without_calls(tmp_path: P
     assert len(calls) == before
     assert all(fork.state == {"count": 1} and fork.transitions == () for fork in forks)
     assert source.state == {"count": 3} and len(source.transitions) == 3
+    # The checkpoint owns revisions 0..1 of the source; collection keeps them, reclaims 2.
+    assert store.collect_garbage().complete
+    assert store.read_state(store.ref_at("source", 1), ("business_state",)) == {"count": 1}
+    with pytest.raises(StateUnavailableError):
+        store.read_state(store.ref_at("source", 2))
+    assert store.release_pin(checkpoint.artifact_id, "source")
+    store.collect_garbage()
+    with pytest.raises(StateUnavailableError):
+        store.read_state(store.ref_at("source", 1))
+    assert load_world_checkpoint(project.artifacts, ref) == checkpoint
     forks[0].step(
         (ToolCall(call_id="call", name="inspect", arguments={"key": "current"}),),
         operation_id="branch",

@@ -184,6 +184,15 @@ class DurableWorldModelSession:
         """Return a detached authoritative record for provider-free checkpoint projection."""
         return self._store.read_session(self.session_id).model_copy(deep=True)
 
+    def retain_history(self, owner_id: str, end_revision: int) -> None:
+        """Durably retain committed revisions ``[0, end_revision)`` for a named owner.
+
+        Args:
+            owner_id: Checkpoint or evaluation identity that owns the retained history.
+            end_revision: First revision after the retained range.
+        """
+        self._store.pin_revisions(owner_id, self.session_id, 0, end_revision)
+
     def recorded_proposal(self, operation_id: str) -> JsonObject | None:
         """Return one saved simulator proposal without changing its operation status."""
         return self._store.proposal(self.session_id, operation_id)
