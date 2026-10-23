@@ -332,12 +332,29 @@ def test_choice_validation_matches_the_gateway_vectors(
         ([0.0, 0.87, 0.13, 0.0, 0.0], 4.01, False),
         ([0.5, 0.5], 0.52, False),
         ([0.1, 0.3, 0.6], 1.50001, False),
+        ([0.33, 0.33, 0.33], 1.001, True),
+        ([0.33, 0.33, 0.33], 0.995, True),
+        ([0.33, 0.33, 0.33], 1.005, True),
+        ([0.33, 0.33, 0.33], 1.006, False),
+        ([0.33, 0.33, 0.33], 0.994, False),
+        ([0.33, 0.33, 0.33], 1.0001, False),
+        ([0.333, 0.333, 0.334], 1.001, True),
+        ([0.333, 0.333, 0.334], 1.002, False),
+        ([0.0, 0.01, 0.01, 0.08, 0.9], 3.9, True),
+        ([0.0, 0.01, 0.01, 0.08, 0.9], 3.8, True),
+        ([0.0, 0.01, 0.01, 0.08, 0.9], 3.7, False),
+        ([0.0, 0.01, 0.01, 0.08, 0.9], 4.0, False),
+        ([0.0, 0.01, 0.01, 0.08, 0.9], 3.89, True),
+        ([0.0, 0.01, 0.01, 0.08, 0.9], 3.91, False),
     ],
 )
 def test_score_validation_matches_the_gateway_vectors(
     probabilities: list[float], score: float, valid: bool
 ) -> None:
-    """A score must equal its weighted level, within one unit distribution's rounding."""
+    """A score must equal its weighted level, within its own and its bins' rounding.
+
+    The vectors are the gateway's, including a tenths-rounded TypeSafe score.
+    """
     levels = tuple(f"Level {index}" for index in range(len(probabilities)))
     answer: JsonObject = {
         "type": "score",

@@ -542,7 +542,21 @@ def _unit_total(probabilities: Sequence[float]) -> bool:
 
 def _hundredths(value: float) -> int | None:
     """Return a value in hundredths when it is decimal hundredths, allowing float residue."""
-    scaled = value * 100.0
+    return _decimal_units(value, 100)
+
+
+def _decimal_units(value: float, scale: int) -> int | None:
+    """Return a value in units of ``1 / scale`` when it has at most that decimal precision.
+
+    Args:
+        value: The number as reported.
+        scale: 10, 100 or 1000 for tenths, hundredths or thousandths.
+
+    Returns:
+        The value in those units, allowing binary floating-point residue, or None when it
+        carries finer precision.
+    """
+    scaled = value * scale
     rounded = round(scaled)
     roundoff = 2.0 * sys.float_info.epsilon * abs(scaled)
     return rounded if abs(scaled - rounded) <= roundoff else None
@@ -584,20 +598,35 @@ def _choice_can_be_highest(selected: int, probabilities: Sequence[float]) -> boo
 
 
 def _score_matches(score: float, probabilities: Sequence[float]) -> bool:
-    """Return whether a score equals the weighted level, within rounding of the bins."""
+    """Return whether a score equals the weighted level, within rounding of score and bins.
+
+    The score stands for half a unit either side of the last decimal place it was reported
+    to (tenths at the coarsest, so a whole number reads at tenths; thousandths at the finest).
+    It matches when that interval meets the expectations of every unit distribution whose
+    bins round to the reported hundredth bins, as the gateway checks it.
+    """
     expected = sum(index * value for index, value in enumerate(probabilities))
     if abs(score - expected) <= _PROBABILITY_TOLERANCE:
         return True
-    score_hundredths = _hundredths(score)
+    precision = next(
+        (
+            (units, scale)
+            for scale in (10, 100, 1000)
+            if (units := _decimal_units(score, scale)) is not None
+        ),
+        None,
+    )
     bounds = _rounding_bounds(probabilities)
-    if score_hundredths is None or bounds is None or not _admits_unit_total(bounds):
+    if precision is None or bounds is None or not _admits_unit_total(bounds):
         return False
+    units, scale = precision
     spare = 200 - sum(low for low, _ in bounds)
     base = sum(index * low for index, (low, _) in enumerate(bounds))
     indexed = list(enumerate(bounds))
     minimum = _extreme_expectation(base, spare, indexed)
     maximum = _extreme_expectation(base, spare, indexed[::-1])
-    return 2 * score_hundredths + 1 >= minimum and 2 * score_hundredths - 1 <= maximum
+    # The envelope is in half-hundredths; the score interval is [(2u-1)/(2s), (2u+1)/(2s)].
+    return (2 * units + 1) * 100 >= minimum * scale and (2 * units - 1) * 100 <= maximum * scale
 
 
 def _extreme_expectation(
