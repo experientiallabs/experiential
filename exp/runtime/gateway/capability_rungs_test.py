@@ -838,6 +838,8 @@ def _claude_code_messages(**extra: object) -> GatewayRequest:
         ],
     }
     body.update(cast(JsonObject, extra))
+    if body["tools"] == []:
+        del body["tools"]
     return decode_messages(body).request
 
 
@@ -953,3 +955,40 @@ def test_an_unrestricted_tool_rung_dials_first_ahead_of_a_failover_only_one() ->
     narrowed, _public, _provider, _recorded = _admit(route, wires, _copilot_chat())
     assert _ids(narrowed) == ("openai", "openai-two")
     assert eligible_ladder(narrowed, None) == (1,)
+
+
+def _sampling_only_requests() -> dict[str, GatewayRequest]:
+    """One tool-free turn per surface carrying a ``temperature`` only Novita takes."""
+    return {
+        "chat": _copilot_chat(tools=False),
+        "responses": decode_responses(
+            {"model": "public-model", "input": "go on", "stream": True, "temperature": 0.1}
+        ).request,
+        "messages": _claude_code_messages(temperature=0.1, tools=[]),
+    }
+
+
+@pytest.mark.parametrize("surface", ["chat", "responses", "messages"])
+def test_a_reasoning_pin_keeps_its_issuer_over_a_sampling_exact_rung(surface: str) -> None:
+    """A continuation pinned to the openai rung that sealed its reasoning sent a
+    ``temperature`` only the Novita rung takes. The sampling ranking used to keep
+    Novita alone, dropping the issuer and the conversation's reasoning. The issuer
+    now leads: continuity wins, and the temperature it cannot take is dropped,
+    disclosed, as on any rung that cannot honor it."""
+    route, wires = _astra_route(("openai", "novita", "azure_openai"))
+    pinned = route.model_copy(update={"reasoning_pinned_deployment_id": "openai"})
+    narrowed, public, provider, _recorded = _admit(
+        pinned, wires, _sampling_only_requests()[surface]
+    )
+    assert _ids(narrowed)[0] == "openai"
+    assert not narrowed.requires_reasoning_strip(narrowed.deployments[0])
+    assert provider.temperature is None
+    assert "temperature->dropped(unsupported_by_provider)" in public.ignored_parameters
+
+
+def test_without_a_pin_the_sampling_exact_rung_still_wins() -> None:
+    """Unpinned, the same turn keeps the rung that honors the temperature exactly."""
+    route, wires = _astra_route(("openai", "novita", "azure_openai"))
+    narrowed, _public, provider, _recorded = _admit(route, wires, _sampling_only_requests()["chat"])
+    assert _ids(narrowed) == ("novita",)
+    assert provider.temperature == 0.1

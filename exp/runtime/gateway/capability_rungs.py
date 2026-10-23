@@ -220,6 +220,22 @@ def _reasoning_indexes(
     return reasoning
 
 
+def live_issuer_index(route: GatewayRoute) -> int | None:
+    """The route position of a live reasoning pin's issuing rung, else ``None``.
+
+    Live means the issuing rung is still on the route and the caller did not
+    pin a route of their own. Admission keeps that rung through every soft
+    preference (sampling exactness), so reasoning continuity wins and the
+    caller's sampling adapts or drops on it, disclosed, as on any rung that
+    cannot honor it.
+    """
+    if route.resolved_route_id is not None:
+        return None
+    pinned = route.reasoning_pinned_deployment_id
+    ids = [deployment.deployment_id for deployment in route.deployments]
+    return ids.index(pinned) if pinned in ids else None
+
+
 def narrow_to_capable_rungs(
     route: GatewayRoute, resolved_wires: _ResolvedWires, request: GatewayRequest
 ) -> tuple[GatewayRoute, _ResolvedWires, tuple[str, ...]]:
@@ -290,8 +306,7 @@ def narrow_to_capable_rungs(
             + STRUCTURED_OUTPUT_RUNG_SUFFIX,
             disclosures,
         )
-    pinned = route.reasoning_pinned_deployment_id
-    if any(deployment.deployment_id == pinned for deployment in route.deployments):
+    if live_issuer_index(route) is not None:
         # The issuing rung carries every content feature above; it leads.
         return route, resolved_wires, tuple(disclosures)
     if requests_thinking(request):
