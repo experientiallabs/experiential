@@ -34,8 +34,10 @@ from exp.optimize.evaluation.fidelity.knowledge_exposure import require_unexpose
 from exp.optimize.evaluation.fidelity.memory import (
     check_partition,
     consume_trajectory,
+    establish_reservation,
     maintain_memory,
     trajectory_record,
+    validate_memory,
 )
 from exp.optimize.evaluation.fidelity.memory_outcomes import record_memory_outcomes
 from exp.optimize.evaluation.fidelity.memory_policy import (
@@ -332,8 +334,8 @@ def prepare_fidelity_evaluation(
         # A registration may predate a guard: recheck what the predictor could see.
         _require_unexposed(project, artifact, spec)
         if spec.memory is not None and spec.memory.reserved:
-            _validate_memory(project, spec, artifact)
-            _establish_reservation(project, spec, code_revision)
+            validate_memory(project, spec, artifact)
+            establish_reservation(project, spec, code_revision)
         return saved
     manifest = project.artifacts.read(spec.world_model.artifact_id).manifest
     if artifact_input(manifest) != spec.world_model:
@@ -366,7 +368,7 @@ def prepare_fidelity_evaluation(
         record = catalog.models.get(spec.retrieval.jev_alias)
         if record is None or catalog.connections[record.connection].provider != "typesafe":
             raise ValueError("JEV retrieval requires a configured native decision-model alias")
-    _validate_memory(project, spec, artifact)
+    validate_memory(project, spec, artifact)
     _require_unexposed(project, artifact, spec)
     prepared = PreparedFidelity(
         id=plan_id,
@@ -386,41 +388,8 @@ def prepare_fidelity_evaluation(
         ),
         files={"plan.json": prepared.model_dump(mode="json")},
     )
-    _establish_reservation(project, spec, code_revision)
+    establish_reservation(project, spec, code_revision)
     return prepared
-
-
-def _validate_memory(
-    project: ProjectStore, spec: FidelitySpec, artifact: GroundedWorldModelArtifact
-) -> None:
-    """Check partition, checkpoint and knowledge before anything is written."""
-    if spec.memory is None:
-        return
-    check_partition(project, spec)
-    pinned = (
-        memory_head(project.artifacts, spec.memory.lineage)
-        if spec.memory.checkpoint is None
-        else read_memory_version(project.artifacts, spec.memory.lineage, spec.memory.checkpoint)
-    )
-    require_memory_scope(
-        pinned,
-        world_model=spec.world_model,
-        artifact=artifact,
-        selection_policy_sha256=str(spec.memory_selection_identity),
-    )
-
-
-def _establish_reservation(project: ProjectStore, spec: FidelitySpec, code_revision: str) -> None:
-    """Register a declared held-out panel only after validation, under the lineage lock."""
-    if spec.memory is None or not spec.memory.reserved:
-        return
-    reserve_task_lineage(
-        project.artifacts,
-        spec.memory.lineage,
-        spec.task.lineage_group_id,
-        created_at=datetime.now(UTC),
-        code_revision=code_revision,
-    )
 
 
 INTERRUPTED = (

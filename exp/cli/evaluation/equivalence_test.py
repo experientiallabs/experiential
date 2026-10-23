@@ -17,6 +17,7 @@ from exp.optimize.evaluation.equivalence import rubric as rubric_owner
 from exp.optimize.evaluation.equivalence.rubric import RubricReview
 from exp.optimize.evaluation.equivalence.rubric_test import derivation_fixture
 from exp.optimize.evaluation.equivalence.runner_test import equivalence_fixture
+from exp.optimize.evaluation.spending import SpendPolicy
 
 
 def test_public_cli_compares_environments_and_runs_its_council(
@@ -79,7 +80,9 @@ def test_public_cli_derives_reviews_freezes_and_replays_rubric(
     request = tmp_path / "rubric.json"
     request.write_text(
         ContinuationCommand(
-            action="derive-equivalence-rubric", rubric_derivation=spec
+            action="derive-equivalence-rubric",
+            rubric_derivation=spec,
+            spend=SpendPolicy(unpriced_attempts=spec.maximum_attempts),
         ).model_dump_json()
     )
     command = [
