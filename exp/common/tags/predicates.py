@@ -37,7 +37,6 @@ from exp.common.tags.records import TagSummary
 
 DEFAULT_THRESHOLD = 0.5
 MAX_RULE_CHARS = 4096
-MAX_RULE_DEPTH = 32
 
 Comparison = Literal[">", ">=", "<", "<="]
 Aggregate = Literal["max", "min"]
@@ -294,7 +293,7 @@ class _Parser:
         Raises:
             TagRuleError: The rule is malformed or names an unknown tag.
         """
-        node = self._or(0)
+        node = self._or()
         token = self._peek()
         if token.kind != "end":
             raise self._fail(
@@ -336,72 +335,43 @@ class _Parser:
         """
         return _error(self._source, token.position, message)
 
-    def _or(self, depth: int) -> RuleNode:
+    def _or(self) -> RuleNode:
         """Parse ``and ("OR" and)*``.
-
-        Args:
-            depth: Current parenthesis and NOT nesting depth.
 
         Returns:
             One node, or an ``OrRule`` over two or more.
         """
-        operands = [self._and(depth)]
+        operands = [self._and()]
         while self._keyword("or"):
             self._advance()
-            operands.append(self._and(depth))
+            operands.append(self._and())
         return operands[0] if len(operands) == 1 else OrRule(operands=tuple(operands))
 
-    def _and(self, depth: int) -> RuleNode:
+    def _and(self) -> RuleNode:
         """Parse ``unary ("AND" unary)*``.
-
-        Args:
-            depth: Current parenthesis and NOT nesting depth.
 
         Returns:
             One node, or an ``AndRule`` over two or more.
         """
-        operands = [self._unary(depth)]
+        operands = [self._unary()]
         while self._keyword("and"):
             self._advance()
-            operands.append(self._unary(depth))
+            operands.append(self._unary())
         return operands[0] if len(operands) == 1 else AndRule(operands=tuple(operands))
 
-    def _nest(self, token: _Token, depth: int) -> int:
-        """Return the next depth, rejecting rules nested too deeply.
-
-        Args:
-            token: Token opening the new level.
-            depth: Current depth.
-
-        Returns:
-            ``depth + 1``.
-
-        Raises:
-            TagRuleError: The new depth exceeds ``MAX_RULE_DEPTH``.
-        """
-        if depth >= MAX_RULE_DEPTH:
-            raise self._fail(token, f"rule nests deeper than {MAX_RULE_DEPTH} levels")
-        return depth + 1
-
-    def _unary(self, depth: int) -> RuleNode:
+    def _unary(self) -> RuleNode:
         """Parse ``"NOT" unary | atom``.
-
-        Args:
-            depth: Current parenthesis and NOT nesting depth.
 
         Returns:
             The parsed node.
         """
         if self._keyword("not"):
-            token = self._advance()
-            return NotRule(operand=self._unary(self._nest(token, depth)))
-        return self._atom(depth)
+            self._advance()
+            return NotRule(operand=self._unary())
+        return self._atom()
 
-    def _atom(self, depth: int) -> RuleNode:
+    def _atom(self) -> RuleNode:
         """Parse a parenthesized expression or one tag condition.
-
-        Args:
-            depth: Current parenthesis and NOT nesting depth.
 
         Returns:
             The parsed node.
@@ -412,7 +382,7 @@ class _Parser:
         token = self._peek()
         if token.kind == "paren" and token.text == "(":
             self._advance()
-            node = self._or(self._nest(token, depth))
+            node = self._or()
             self._expect_close(f"to match the '(' at position {token.position}")
             return node
         aggregate: Aggregate = "max"
@@ -610,7 +580,6 @@ def evaluate_rule(rule: TagRule, summary: TagSummary) -> bool:
 __all__ = [
     "DEFAULT_THRESHOLD",
     "MAX_RULE_CHARS",
-    "MAX_RULE_DEPTH",
     "AndRule",
     "NotRule",
     "OrRule",
