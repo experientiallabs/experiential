@@ -86,6 +86,9 @@ pub struct CommittedAttempt {
     /// semantic output: the rung committed on that output and the call was
     /// dropped (disclosed as `tool_search->dropped(after_output)`).
     pub tool_search_dropped_after_output: bool,
+    /// The streamed-output pace the control plane set for this attempt
+    /// (`output_pacing`); `None` streams unpaced, as every attempt did before.
+    pub pace: Option<f64>,
 }
 
 /// One attempt whose terminal was reached and settled before commitment.
@@ -149,6 +152,10 @@ pub(crate) struct StartResponse {
     /// A durable zero-attempt certificate from the trusted accounting callback.
     #[serde(default)]
     pub(crate) known_unbilled: bool,
+    /// The reserved attempt's output pace; absent unless a self-hosted rung
+    /// is paced for this request's class (`output_pacing`).
+    #[serde(default)]
+    pub(crate) output_tokens_per_second: Option<f64>,
 }
 
 /// One pre-commit attempt outcome, private to the waterfall loop.
@@ -273,6 +280,7 @@ pub async fn acquire_attempt(ctx: &WaterfallContext<'_>, guard: &mut AttemptGuar
                 // A throttle's stated wait survives too, so an exhausted
                 // throttle ladder advertises it as `Retry-After`.
                 "retry_after_seconds": failure.retry_after_seconds,
+                "header_timeout": failure.header_timeout.map(|phase| phase.as_str()),
             })),
         }));
         let started_text = match ctx.bridge.call("start_attempt", argument).await {
@@ -312,6 +320,7 @@ pub async fn acquire_attempt(ctx: &WaterfallContext<'_>, guard: &mut AttemptGuar
             error.known_unbilled = started.known_unbilled;
             return Won::Failed(error);
         }
+        let attempt_pace = started.output_tokens_per_second;
         let (Some(attempt_id), Some(depth)) = (started.attempt_id, started.route_depth) else {
             guard
                 .abandon(&Failure::new(
@@ -369,7 +378,7 @@ pub async fn acquire_attempt(ctx: &WaterfallContext<'_>, guard: &mut AttemptGuar
         // A rung a tool-search round rebuilt dials its rebuilt wire; the
         // route's own entry still answers every policy question above.
         let dial_wire = search_wires[depth].as_ref().unwrap_or(wire);
-        let end = run_attempt(
+        let mut end = run_attempt(
             ctx,
             guard,
             dial_wire,
@@ -379,6 +388,11 @@ pub async fn acquire_attempt(ctx: &WaterfallContext<'_>, guard: &mut AttemptGuar
             &tool_search_rounds,
         )
         .await;
+        // Every pre-commit failure of a tenant origin answers opaquely; the
+        // relay marks the failures it yields after an open the same way.
+        if let AttemptEnd::Ladder { failure, .. } | AttemptEnd::Repair { failure, .. } = &mut end {
+            failure.tenant_origin |= dial_wire.tenant_origin;
+        }
         if guard.input_gate.is_some() {
             if let AttemptEnd::Ladder { failure, .. } | AttemptEnd::Repair { failure, .. } = &end {
                 // Gate rejection can drop settlement while it awaits the same input verdict.
@@ -394,6 +408,7 @@ pub async fn acquire_attempt(ctx: &WaterfallContext<'_>, guard: &mut AttemptGuar
                 // is known here; settle it with whatever outcome follows.
                 guard.record_upstream_provider(committed.relay.upstream_provider());
                 committed.tool_search_rounds = std::mem::take(&mut tool_search_rounds);
+                committed.pace = attempt_pace;
                 return Won::Committed(committed);
             }
             AttemptEnd::Settled(mut settled) => {
@@ -554,6 +569,7 @@ pub async fn acquire_attempt(ctx: &WaterfallContext<'_>, guard: &mut AttemptGuar
                         total_attempts,
                         counts[depth],
                         depth,
+                        &physical_counts,
                         &failure,
                         refusal_eligible,
                     );
@@ -657,7 +673,11 @@ mod commit;
 pub(crate) use commit::is_semantic;
 mod fallback_rules;
 mod wire;
-pub(crate) use wire::{first_byte_allowance, first_token_allowance, open_phase_bound};
+pub(crate) use wire::{
+    approximate_input_tokens, attribute_header_timeout, first_byte_allowance,
+    first_token_allowance, open_phase_bound, pre_first_byte_budget, PRE_FIRST_BYTE_MAX,
+    PRE_FIRST_BYTE_RESERVE,
+};
 pub use wire::{DeploymentWire, RoutePolicy, WaterfallContext};
 
 mod empty;
@@ -681,6 +701,10 @@ mod ladder_tests;
 mod progress_tests;
 #[cfg(test)]
 mod repair_ladder_tests;
+#[cfg(test)]
+mod revisit_ladder_tests;
+#[cfg(test)]
+mod tenant_ladder_tests;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]

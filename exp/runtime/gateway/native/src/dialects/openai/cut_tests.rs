@@ -165,6 +165,30 @@ fn a_nameless_argument_free_placeholder_is_dropped_not_failed() {
 }
 
 #[test]
+fn a_nameless_empty_object_entry_is_dropped_like_a_placeholder() {
+    // vLLM's glm47 parser, no tools declared: a nameless call whose only
+    // argument bytes are `{}` (2026-10-21) is no call, not a malformed stream.
+    for arguments in ["{}", " { } "] {
+        let mut normalizer = Normalizer::new(Dialect::OpenAiCompatible);
+        let phantom = normalizer
+            .feed(&compatible_chunk(
+                serde_json::json!({"tool_calls": [{
+                    "index": 0, "type": "function",
+                    "function": {"name": "", "arguments": arguments},
+                }]}),
+                Some("tool_calls"),
+            ))
+            .expect("a nameless empty object accumulates silently");
+        assert!(phantom.is_empty(), "nothing is started for it: {phantom:?}");
+        let events = normalizer.feed(&done()).expect("the phantom is dropped");
+        assert!(
+            matches!(events.as_slice(), [Event::Completed]),
+            "{arguments:?}: {events:?}"
+        );
+    }
+}
+
+#[test]
 fn a_nameless_entry_that_argues_still_fails_closed() {
     // A name cannot be invented: arguments with no call to attach them to
     // keep the strict contract.

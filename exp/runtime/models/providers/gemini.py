@@ -84,7 +84,7 @@ def gemini_generate_response(
         if isinstance(text, str):
             text_parts.append(text)
         elif function_call is not None:
-            tool_calls.append(_gemini_tool_call(function_call, index))
+            tool_calls.append(_gemini_tool_call(function_call, index, part.get("thoughtSignature")))
         else:
             raise ProviderResponseError(f"Gemini content part {index} is unsupported")
     output_text = "".join(text_parts) if text_parts else None
@@ -151,6 +151,7 @@ class GeminiClient(ProviderHttpClient):
         return GatewayWireProfile(
             dialect="gemini_generate_content",
             url=f"{self._base_url}/models/{model_id}:streamGenerateContent?alt=sse",
+            videos_url=f"{self._base_url}/models/{model_id}:predictLongRunning",
             headers=self._headers(),
             model_id=self._model.model_id,
             timeout_seconds=self._timeout_seconds,
@@ -230,9 +231,24 @@ class GeminiClient(ProviderHttpClient):
         )
 
 
-def _gemini_tool_call(value: JsonValue, index: int) -> ToolCall:
-    """Map one native Gemini function call with a deterministic local call ID fallback."""
+def _gemini_tool_call(value: JsonValue, index: int, signature: JsonValue = None) -> ToolCall:
+    """Map one native Gemini function call with a deterministic local call ID fallback.
+
+    Args:
+        value: The part's ``functionCall`` object.
+        index: The part's position, named in errors and the fallback call ID.
+        signature: The part's ``thoughtSignature``, kept on the call so the
+            next turn replays it (Gemini signs only the first parallel call).
+
+    Returns:
+        The canonical tool call.
+
+    Raises:
+        ProviderResponseError: The call or its signature is malformed.
+    """
     call = require_object(value, f"Gemini functionCall[{index}]")
+    if signature is not None and not (isinstance(signature, str) and signature):
+        raise ProviderResponseError(f"Gemini part {index} thoughtSignature must be nonempty text")
     name = require_string(call.get("name"), f"Gemini functionCall[{index}].name")
     arguments = call.get("args", {})
     if not isinstance(arguments, dict):
@@ -242,6 +258,7 @@ def _gemini_tool_call(value: JsonValue, index: int) -> ToolCall:
         call_id=call_id if isinstance(call_id, str) and call_id else f"gemini-call-{index}",
         name=name,
         arguments=arguments,
+        provider_thought_signature=signature if isinstance(signature, str) else None,
     )
 
 

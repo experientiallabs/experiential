@@ -68,7 +68,7 @@ def test_guarded_uninspectable_surfaces_refuse_before_acceptance(
         engine = _engine(detector)
         authority = _authorization(components, key)
         if scope == "identity":
-            policy = engine.policies_for(authority.organization_id, authority.identity_id)[0]
+            policy = engine.policies_for(authority)[0]
             engine._store = MappingGuardrailStore(
                 (
                     policy.model_copy(

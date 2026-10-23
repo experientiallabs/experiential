@@ -20,6 +20,7 @@ from exp.optimize.evaluation.contracts import EvaluationBudget, EvaluationServic
 from exp.optimize.evaluation.judge import DurableEvaluationJudge
 from exp.optimize.evaluation.judging_resume import revised_judge_setup
 from exp.optimize.evaluation.judging_spend import judge_request_coordinates
+from exp.optimize.evaluation.learned_memory import bind_evaluation_memory
 from exp.optimize.evaluation.planning import estimate_model_evaluation
 from exp.optimize.evaluation.prepare import PreparedModelEvaluation, read_evaluation_judge
 from exp.optimize.evaluation.service import ModelEvaluationResult, evaluate_models
@@ -34,6 +35,7 @@ from exp.simulation.engines.text import WorldModelSimulator
 from exp.simulation.retrieval import RAGEmbedderBinding, load_fit_rag_retriever
 from exp.simulation.specs import load_simulation_completion_contract
 from exp.simulation.world_model import bind_fit_grounded_world_model
+from exp.simulation.world_model.experience_memory import memory_version_id
 
 
 def run_prepared_model_evaluation(
@@ -57,6 +59,8 @@ def run_prepared_model_evaluation(
         budget: Optional total provider allowance and finite judgment count. Changing only the
             allowance resumes the same plan and replays completed provider responses for free.
             None removes the aggregate cap while preserving finite request reservations.
+            Learned-memory evaluations require None, including replay and judging revisions,
+            until native recall has a frozen price bound.
         provider_spend_consented: Explicit consent after the host's atomic credit reservation.
         created_at: Stable run timestamp.
         code_revision: Exact engine revision.
@@ -112,6 +116,11 @@ def run_prepared_model_evaluation(
     if judging_revision is not None:
         selected, judge_request, judging_protocol = revised_judge_setup(
             project, prepared, judging_revision
+        )
+    if budget.maximum_cost_usd is not None and prepared.memory is not None:
+        raise ValueError(
+            "a finite spending limit cannot cover unpriced memory recall; "
+            "prepare and approve maximum_cost_usd=None for uncapped execution"
         )
     if budget.maximum_cost_usd is not None and (
         not quote.maximum_is_upper_bound or not judge_request.maximum_is_upper_bound()
@@ -255,6 +264,18 @@ def run_prepared_model_evaluation(
         capabilities=world.capabilities,
         fit_retriever=retriever,
     )
+    memory = None
+    if prepared.memory is not None:
+        report(progress, "Loading simulator memory")
+        memory = bind_evaluation_memory(
+            project,
+            prepared.memory,
+            catalog=catalog,
+            artifact=grounded.artifact,
+            world_model=completed.world_model,
+            created_at=created_at,
+            code_revision=code_revision,
+        )
 
     def simulator_factory(project: ProjectStore, plan: EvaluationPlan) -> WorldModelSimulator:
         """Bind one fresh simulator to the exact persisted evaluation matrix."""
@@ -277,6 +298,7 @@ def run_prepared_model_evaluation(
             redacted_field_names=prepared.redacted_field_names,
             progress=progress,
             request_budget=ledger,
+            memory=memory,
         )
 
     coordinates_by_rollouts: dict[tuple[str, ...], tuple[tuple[str, str, int], ...]] = {}
@@ -330,6 +352,17 @@ def _persist_runtime_contract(
         project.artifacts.read(setup.simulation_protocol.judge_calibration_id).manifest
     )
     pricing = artifact_input(project.artifacts.read(setup.pricing_snapshot_id).manifest)
+    memory = (
+        ()
+        if prepared.memory is None
+        else (
+            artifact_input(
+                project.artifacts.read(
+                    memory_version_id(prepared.memory.lineage, prepared.memory.version)
+                ).manifest
+            ),
+        )
+    )
     contract = EvaluationRuntimeContract(
         schema_version=1,
         created_at=created_at,
@@ -343,6 +376,7 @@ def _persist_runtime_contract(
             setup.simulation_completion_input,
             calibration,
             pricing,
+            *memory,
         ),
         contract_id=stable_id(
             "evaluation-runtime",

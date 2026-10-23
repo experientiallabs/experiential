@@ -38,7 +38,7 @@ class _Response(ContractModel):
     payload: str
 
 
-def _validate_response(payload: str) -> None:
+def validate_provider_response(payload: str) -> None:
     """Validate encoded output using its matching structured or plain-text boundary.
 
     Args:
@@ -82,13 +82,35 @@ def _response_object(pairs: list[tuple[str, JsonValue]]) -> dict[str, JsonValue]
     return value
 
 
-def _response_json(payload: str) -> JsonValue:
+def _response_validation_object(pairs: list[tuple[str, JsonValue]]) -> dict[str, JsonValue]:
+    """Keep every nested duplicate value for credential inspection, without changing saved bytes.
+
+    Model-generated text may be malformed JSON. The outer encoded receipt still requires
+    unique keys, but its string leaves are output data. Folding repeated values into a
+    validation-only list prevents both secret hiding and loss of paid invalid output.
+    """
+    value: dict[str, JsonValue] = {}
+    for key, nested in pairs:
+        value[key] = [value[key], nested] if key in value else nested
+    return value
+
+
+def _response_json(payload: str, *, preserve_nested_duplicates: bool = False) -> JsonValue:
     """Decode fields and string content without discarding duplicate object members.
 
     Integer literals stay as digit strings in this validation-only view, avoiding Python's
     integer-conversion limit. Persistence retains the original response, including number types.
     """
-    return cast(JsonValue, json.loads(payload, object_pairs_hook=_response_object, parse_int=str))
+    return cast(
+        JsonValue,
+        json.loads(
+            payload,
+            object_pairs_hook=(
+                _response_validation_object if preserve_nested_duplicates else _response_object
+            ),
+            parse_int=str,
+        ),
+    )
 
 
 def _validate_response_values(value: JsonValue) -> None:
@@ -105,7 +127,7 @@ def _validate_response_values(value: JsonValue) -> None:
         elif isinstance(current, str):
             assert_prose_secret_free(current)
             try:
-                nested = _response_json(current)
+                nested = _response_json(current, preserve_nested_duplicates=True)
             except json.JSONDecodeError:
                 continue
             if nested != current:
@@ -255,7 +277,7 @@ class RequestBudgetStore:
             previous = self.read(key)
             if previous is None or previous.state != "pending":
                 raise ValueError("provider request does not have a pending reservation")
-            _validate_response(payload)
+            validate_provider_response(payload)
             manifest = self._project.artifacts.write(
                 artifact_id=stable_id("request-response", {"budget": self._identity, "key": key}),
                 artifact_type="provider-response",

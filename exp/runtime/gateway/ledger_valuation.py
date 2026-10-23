@@ -66,6 +66,8 @@ def estimated_cost_nano_usd(
     cache_creation_1h_input_rate: int | None = None,
     output_rate: int | None,
     reasoning_rate: int | None,
+    image_output_rate: int | None = None,
+    cache_creation_12h_input_rate: int | None = None,
 ) -> int | None:
     """Compute attributed integer nano-USD or preserve unknown pricing.
 
@@ -89,6 +91,10 @@ def estimated_cost_nano_usd(
         cache_creation_1h_input_rate: Nano-USD per million observed one-hour writes.
         output_rate: Nano-USD per million non-reasoning output tokens.
         reasoning_rate: Nano-USD per million reasoning tokens.
+        image_output_rate: Nano-USD per million generated-image output tokens, or
+            None to keep them priced as ordinary output.
+        cache_creation_12h_input_rate: Nano-USD per million observed OpenAI 12-hour
+            writes, or None to price them at 2.5 times ``input_rate``.
 
     Returns:
         Rounded nano-USD, or None when usage, TTL evidence, or a required rate is missing.
@@ -113,6 +119,10 @@ def estimated_cost_nano_usd(
         cache_creation_1h_input_rate=cache_creation_1h_input_rate,
         output_rate=output_rate,
         reasoning_rate=reasoning_rate,
+        image_output_tokens=usage.image_output_tokens,
+        image_output_rate=image_output_rate,
+        cache_write_12h_input_tokens=usage.cache_creation_12h_input_tokens,
+        cache_creation_12h_input_rate=cache_creation_12h_input_rate,
     )
     return None if cost is None else require_representable_nano_usd(cost, what="attempt cost")
 

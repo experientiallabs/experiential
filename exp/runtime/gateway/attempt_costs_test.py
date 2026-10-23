@@ -84,3 +84,16 @@ def test_token_priced_audio_reserves_at_a_reachable_long_context_schedule() -> N
         }
     )
     assert attempt_costs.maximum_attempt_cost_nano_usd(request, unpriced) is None
+
+
+def test_a_twelve_hour_request_reserves_its_whole_input_at_the_twelve_hour_rate() -> None:
+    """A 12-hour request may write every input token at 2.5 times input, so the
+    reservation ceiling covers that even when the card authors no 12-hour rate."""
+    deployment = _deployment()
+    request = _request("hi").model_copy(update={"maximum_output_tokens": 1})
+    twelve = request.model_copy(update={"prompt_cache_ttl": "12h"})
+    ordinary = attempt_costs.maximum_attempt_cost_nano_usd(request, deployment, input_tokens=1_000)
+    reserved = attempt_costs.maximum_attempt_cost_nano_usd(twelve, deployment, input_tokens=1_000)
+    # Input $1/M: ordinary input 1,000 nano-USD; 12-hour writes 2,500; plus 1 output token.
+    assert ordinary == 1_000 + 2
+    assert reserved == 2_500 + 2

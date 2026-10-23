@@ -13,7 +13,6 @@ from exp.common.models.gateway_catalog import ExactModelDeployment
 from exp.runtime.gateway.contracts import (
     AuthorizationSnapshot,
     DirectTarget,
-    ExecutionSnapshot,
     ExposedReasoningContentBlock,
     GatewayApiSurface,
     GatewayMessage,
@@ -21,6 +20,7 @@ from exp.runtime.gateway.contracts import (
     OpaqueReasoningContentBlock,
     SealedReasoningContentBlock,
 )
+from exp.runtime.gateway.execution_snapshot import ExecutionSnapshot
 from exp.runtime.gateway.native_components import NativeGatewayComponents
 from exp.runtime.gateway.native_reasoning import (
     authenticate_reasoning_history,

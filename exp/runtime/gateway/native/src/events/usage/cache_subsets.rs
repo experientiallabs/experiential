@@ -5,13 +5,39 @@ use serde_json::{Map, Value};
 use super::super::Usage;
 use super::{bounded_ledger_sum, optional_usage_detail};
 
-pub(super) fn validate_cache_subsets(usage: &Usage) -> Result<(), String> {
+/// Check the cache-write TTL subsets and fit the input total to the cache
+/// subsets.
+///
+/// Reads and writes are disjoint subsets of input, so a report whose reads
+/// plus writes exceed its input total is internally inconsistent. Moonshot's
+/// Kimi wire relayed by Novita sends such reports (2026-10-21..22: 37 of
+/// ~2,800 kimi-k3 attempts in three hours, the same prompt failing on every
+/// retry), and the provider has already generated and billed the answer by the
+/// time usage arrives. Failing the attempt threw that answer away and settled
+/// nothing. Instead every token the provider placed in a cache leg keeps its
+/// leg, and the input total is raised to cover them (no fresh remainder): no
+/// reported read or write is dropped or repriced lower, so the attempt is never
+/// under-billed against the provider's own legs, and an overlap is priced once
+/// in each leg it was reported in. A provider that reads its writes back in
+/// the same call should still be configured `writes_within_reads`, which
+/// prices that overlap once at its combined rate. The adjustment is logged
+/// with the counts so the shape stays visible.
+pub(super) fn fit_cache_subsets(usage: &mut Usage) -> Result<(), String> {
     if let (Some(hour), Some(written)) = (
         usage.cache_creation_1h_input_tokens,
         usage.cache_creation_input_tokens,
     ) {
         if hour > written {
             return Err("one-hour cache writes exceed total cache writes".into());
+        }
+    }
+    if let Some(half_day) = usage.cache_creation_12h_input_tokens {
+        let timed = half_day.saturating_add(usage.cache_creation_1h_input_tokens.unwrap_or(0));
+        if usage
+            .cache_creation_input_tokens
+            .is_none_or(|written| timed > written)
+        {
+            return Err("12-hour cache writes exceed total cache writes".into());
         }
     }
     let subsets = bounded_ledger_sum(
@@ -21,20 +47,27 @@ pub(super) fn validate_cache_subsets(usage: &Usage) -> Result<(), String> {
         ],
         "cache subsets",
     )?;
-    if usage.input_tokens.is_some_and(|input| subsets > input) {
-        return Err("cache read and write tokens exceed total input tokens".into());
+    if let Some(input) = usage.input_tokens.filter(|input| subsets > *input) {
+        let line = serde_json::json!({
+            "event": "cache_subsets_exceed_input",
+            "input_tokens": input,
+            "cached_input_tokens": usage.cached_input_tokens,
+            "cache_creation_input_tokens": usage.cache_creation_input_tokens,
+            "settled_input_tokens": subsets,
+        });
+        eprintln!("exp-gateway-native: {line}");
+        usage.input_tokens = Some(subsets);
     }
     Ok(())
 }
 
-/// Read the cache subsets of OpenAI-shaped total input. Disjoint reads and
-/// writes must fit input together; writes reported within reads must fit the
-/// reads, which must fit input.
+/// Read the cache subsets of OpenAI-shaped total input. Their fit against
+/// input is decided once over the coalesced report (`fit_cache_subsets`),
+/// after a `writes_within_reads` rung's written reads are separated; only an
+/// unpersistable sum fails here.
 pub(super) fn cache_subsets(
     object: &Map<String, Value>,
     detail_key: &str,
-    input_tokens: Option<u64>,
-    writes_within_reads: bool,
 ) -> Result<(Option<u64>, Option<u64>), String> {
     let reads = optional_usage_detail(object, detail_key, "cached_tokens", "cached_tokens")?;
     let writes = optional_usage_detail(
@@ -43,25 +76,13 @@ pub(super) fn cache_subsets(
         "cache_write_tokens",
         "cache_write_tokens",
     )?;
-    // A write not covered by its read count is reported the ordinary disjoint
-    // way; it must then fit input like any other rung. Usage arrives after the
-    // content already streamed, so a placeable report never fails the stream.
-    if writes_within_reads && writes.unwrap_or(0) <= reads.unwrap_or(0) {
-        if input_tokens.is_some_and(|input| reads.unwrap_or(0) > input) {
-            return Err("cache read tokens exceed total input tokens".to_string());
-        }
-        return Ok((reads, writes));
-    }
-    let subsets = bounded_ledger_sum(&[reads.unwrap_or(0), writes.unwrap_or(0)], "cache subsets")?;
-    if input_tokens.is_some_and(|input| subsets > input) {
-        return Err("cache read and write tokens exceed total input tokens".to_string());
-    }
+    bounded_ledger_sum(&[reads.unwrap_or(0), writes.unwrap_or(0)], "cache subsets")?;
     Ok((reads, writes))
 }
 
 /// Move tokens written and read back in one call out of the read leg, so the
 /// coalesced counts satisfy the disjoint contract every settlement prices.
-/// A write without a covering read count cannot be placed and is malformed.
+/// A write without a covering read count is left as a disjoint write.
 pub(super) fn separate_written_reads(usage: &mut Usage) -> Result<(), String> {
     let writes = usage.cache_creation_input_tokens.unwrap_or(0);
     if writes == 0 {

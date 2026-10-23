@@ -75,6 +75,7 @@ from exp.simulation.engines.text.leases import (
     TextCellLeaseStore,
 )
 from exp.simulation.engines.text.lineage_spend import prefix_retry_credit, resolution_spend
+from exp.simulation.engines.text.memory import TaskMemory
 from exp.simulation.engines.text.prompt import WORLD_MODEL_TEXT_PROMPT_VERSION
 from exp.simulation.engines.text.recording import RecordingCandidateClient, text_prompt_digest
 from exp.simulation.engines.text.redaction import redact_rollout_secrets, redacted_field_set
@@ -135,6 +136,7 @@ class WorldModelSimulator:
         token_counter: TokenCounter | None = None,
         progress: ProgressHook | None = None,
         request_budget: RequestBudget | None = None,
+        memory: TaskMemory | None = None,
     ) -> None:
         """Bind one immutable plan and all explicit runtime dependencies.
 
@@ -156,6 +158,8 @@ class WorldModelSimulator:
             token_counter: Full-request counter used before each provider call.
             progress: Optional observer of exact per-cell completion counts.
             request_budget: Optional shared request admission and replay ledger.
+            memory: Frozen learned memory delivered to world-model turns. Each task reads
+                only its own eligible view; the plan's identity must already pin the memory.
 
         Raises:
             SimulationConfigurationError: The supplied plan input does not name this plan.
@@ -186,6 +190,7 @@ class WorldModelSimulator:
         self._token_counter = token_counter or Utf8UpperBoundTokenCounter()
         self._progress = progress
         self._request_budget = request_budget
+        self._memory = memory
         self._rollout_builder = GroundedRolloutBuilder(
             plan_input=self._plan_input,
             task_set_input=self._task_set_input,
@@ -736,6 +741,7 @@ class WorldModelSimulator:
             candidate=candidate,
             world_model=world_model,
         )
+        memory = None if self._memory is None else self._memory.for_task(task)
         # The reference answer is judge-only: the recorder (the agent's injected model) and the
         # episode loop receive the task without it.
         task = task.model_copy(update={"reference_answer": None})
@@ -765,6 +771,7 @@ class WorldModelSimulator:
             redacted_field_names=self._redacted_field_names,
             clock=self._clock,
             token_counter=self._token_counter,
+            memory=memory,
         )
         if parent is not None and parent.text_checkpoint is not None:
             recorder.restore(parent.text_checkpoint, parent.spans)

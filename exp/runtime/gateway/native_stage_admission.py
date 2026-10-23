@@ -9,9 +9,11 @@ import time
 from exp.runtime.gateway.affinity import (
     affinity_fingerprint,
     affinity_seed_material,
+    house_aggregator_last,
     rendezvous_order,
 )
 from exp.runtime.gateway.attempt_tokens import worst_case_input_tokens, worst_case_output_tokens
+from exp.runtime.gateway.class_throttles import fast_on_rung, fast_reserve_slots
 from exp.runtime.gateway.contracts import AuthorizationSnapshot, GatewayRequest
 from exp.runtime.gateway.native_accounting import NativeAttemptAccounting
 from exp.runtime.gateway.native_execution import (
@@ -29,6 +31,7 @@ from exp.runtime.gateway.recovery_binding import validated_recovery_binding
 from exp.runtime.gateway.routing import GatewayRoute, GatewayRoutingError
 from exp.runtime.gateway.sticky_affinity import AffinityPlacement
 from exp.runtime.models.providers.base import GatewayWireProfile
+from exp.runtime.models.providers.prompt_cache_options import honors_markers
 from exp.runtime.models.providers.protocol import NativeWireClient
 
 _logger = logging.getLogger(__name__)
@@ -93,8 +96,10 @@ def stage_affinity_ordered_rungs(
     order: list[int] = []
     offset = 0
     stages = route.snapshot.model_stages or (route.snapshot.stage_for_depth(0),)
+    profiles = [profile for profile, _client in wires]
     for stage in stages:
-        indexes = tuple(range(offset, offset + len(stage.deployment_ids)))
+        authored = tuple(range(offset, offset + len(stage.deployment_ids)))
+        indexes = authored
         if stage.failover_mode == "maximize_cache_affinity":
             weighted = tuple(
                 (
@@ -111,9 +116,16 @@ def stage_affinity_ordered_rungs(
         if stage.failover_mode != "maximize_availability" and request_carries_cache_markers(
             request
         ):
-            indexes = tuple(i for i in indexes if wires[i][0].preserves_cache_control) + tuple(
-                i for i in indexes if not wires[i][0].preserves_cache_control
+            honors = {i for i in indexes if honors_markers(wires[i][0], request)}
+            indexes = tuple(i for i in indexes if i in honors) + tuple(
+                i for i in indexes if i not in honors
             )
+        if indexes != authored:
+            # Neither the rendezvous nor the marker grouping may lead a stage
+            # with a host-funded OpenRouter rung (owner rule: OpenRouter is
+            # never the first lane). A stage this scheduler did not reorder
+            # keeps its authored order, so an org's own chain stays as written.
+            indexes = house_aggregator_last(indexes, route.deployments, profiles)
         order.extend(indexes)
         offset += len(stage.deployment_ids)
     route = reorder_route_deployments(route, tuple(order))
@@ -199,6 +211,10 @@ def stage_affinity_ordered_rungs(
             bound=accounting.loads.default_bound
             if policy is None or policy.concurrency_bound is None
             else policy.concurrency_bound,
+            # An ordinary trial never counts the slots kept for :fast as headroom.
+            fast_reserve=None
+            if fast_on_rung(authorization, deployment)
+            else fast_reserve_slots(deployment),
             fair_share=True,
             requests_per_minute=None if policy is None else policy.requests_per_minute,
             tokens_per_minute=None if policy is None else policy.tokens_per_minute,
@@ -213,8 +229,8 @@ def stage_affinity_ordered_rungs(
         for deployment_id, _scope in candidates:
             depth = route.snapshot.deployment_ids.index(deployment_id)
             stage = route.snapshot.stage_for_depth(depth)
-            if wires[depth][0].preserves_cache_control or not any(
-                wires[prior][0].preserves_cache_control
+            if honors_markers(wires[depth][0], request) or not any(
+                honors_markers(wires[prior][0], request)
                 and route.snapshot.stage_for_depth(prior).stage_index == stage.stage_index
                 and eligible(route.deployments[prior].deployment_id)
                 and headroom(route.deployments[prior].deployment_id)

@@ -37,6 +37,7 @@ from exp.runtime.gateway.guardrails.native import (
     enforce_native_output_segment,
     native_output_mode,
     parse_output_payload,
+    require_unguarded_surface,
     upstream_requests_reasoning,
 )
 from exp.runtime.gateway.guardrails.regex import (
@@ -46,24 +47,9 @@ from exp.runtime.gateway.guardrails.regex import (
 )
 from exp.runtime.gateway.guardrails.session import GuardrailSession
 from exp.runtime.gateway.guardrails.store import MappingGuardrailStore
+from exp.runtime.gateway.guardrails.store_test import _authorization
+from exp.runtime.gateway.native_accounting_errors import NativeBridgeError
 from exp.runtime.gateway.tests.mandatory_guardrails_test import _Guard
-
-
-def _authorization() -> AuthorizationSnapshot:
-    """Return one identity-scoped authority snapshot."""
-    return AuthorizationSnapshot(
-        request_id="request-one",
-        organization_id="organization-one",
-        identity_id="identity-one",
-        virtual_key_id="key-one",
-        alias="public-model",
-        alias_revision_id="revision-one",
-        target=DirectTarget(pool_id="pool-one"),
-        surface=GatewayApiSurface.CHAT_COMPLETIONS,
-        catalog_sha256="a" * 64,
-        canonical_request_sha256="b" * 64,
-        deadline_monotonic=200.0,
-    )
 
 
 def _engine() -> GuardrailEngine:
@@ -152,6 +138,35 @@ def test_unguarded_native_input_does_not_call_classifiers() -> None:
 
     assert unchanged is request
     assert policy is None
+
+
+def test_pool_scoped_platform_policy_fences_only_its_target_pool() -> None:
+    """A store that reads the alias target guards one exact-model pool and not another."""
+    platform = GuardrailPolicy(policy_id="pool-content-safety", protected=True)
+
+    class PoolScopedStore:
+        """Apply the platform policy only to aliases that target the guarded pool."""
+
+        def policies_for(self, authorization: AuthorizationSnapshot) -> tuple[GuardrailPolicy, ...]:
+            """Bind the platform policy when the alias targets ``guarded-pool``."""
+            target = authorization.target
+            if not isinstance(target, DirectTarget) or target.pool_id != "guarded-pool":
+                return ()
+            return (platform.bind(authorization.organization_id, authorization.identity_id),)
+
+    engine = GuardrailEngine(
+        store=PoolScopedStore(),
+        client=DirectClassifierClient(ClassifierRegistry()),
+        monotonic=lambda: 0.0,
+    )
+    guarded = _authorization(pool_id="guarded-pool")
+    unguarded = _authorization(pool_id="standard-pool")
+
+    assert engine.open_request(guarded, deadline_monotonic=200.0) is not None
+    assert engine.open_request(unguarded, deadline_monotonic=200.0) is None
+    with pytest.raises(NativeBridgeError, match="do not support native images"):
+        require_unguarded_surface(engine, guarded, "images")
+    require_unguarded_surface(engine, unguarded, "images")
 
 
 def test_mandatory_policy_checks_customer_rewrites_before_dispatch() -> None:
@@ -250,7 +265,7 @@ def test_customer_rewrite_cannot_erase_or_introduce_blocked_intent(blocked_stage
             ),
         )
     )
-    policy = _engine().policies_for("organization-one", "identity-one")[0]
+    policy = _engine().policies_for(_authorization())[0]
     assert policy is not None
     policy = policy.model_copy(
         update={
@@ -288,7 +303,7 @@ def test_native_output_payload_round_trips_tool_calls() -> None:
 def test_native_output_block_returns_sanitized_failure_json() -> None:
     """A blocked output chain returns action plus a content-free failure."""
     engine = _engine()
-    policy = engine.policies_for("organization-one", "identity-one")[0]
+    policy = engine.policies_for(_authorization())[0]
     decision = json.loads(
         enforce_native_output(
             _session(engine, policy, 200.0), json.dumps({"text": "unsafe", "tool_calls": []})

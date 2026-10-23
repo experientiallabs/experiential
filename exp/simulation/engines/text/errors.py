@@ -4,6 +4,7 @@ from exp.common.core.artifacts import FailureAttribution, FailureCode, JsonObjec
 from exp.common.rollouts import (
     UNKNOWN_DISPATCH_IS_UPPER_BOUND_KEY,
     UNKNOWN_DISPATCH_RESERVED_COST_KEY,
+    StopReason,
 )
 from exp.runtime.models.providers.errors import (
     ProviderPricingUnavailableError,
@@ -111,4 +112,48 @@ def provider_call_failure(
         exception_type=type(exception).__name__,
         attribution=FailureAttribution.ENVIRONMENT if infrastructure else FailureAttribution.MODEL,
         details=details,
+    )
+
+
+class TextSimulationError(RuntimeError):
+    """A text simulator boundary failed with an artifact-safe terminal classification."""
+
+    def __init__(self, stop_reason: StopReason, failure: StructuredFailure) -> None:
+        super().__init__(failure.message)
+        self.stop_reason = stop_reason
+        self.failure = failure
+
+
+def text_failure(
+    stop_reason: StopReason,
+    code: FailureCode,
+    message: str,
+    *,
+    phase: str,
+    exception_type: str | None = None,
+    retryable: bool = False,
+) -> TextSimulationError:
+    """Build one non-secret structured simulator failure with a stable phase label.
+
+    Args:
+        stop_reason: Terminal classification recorded with the failed episode.
+        code: Structured failure code persisted with the evidence.
+        message: Non-secret operator-facing failure description.
+        phase: Stable simulator phase label persisted in the failure details.
+        exception_type: Optional exception class name retained for diagnostics.
+        retryable: Whether resume may supersede this failure with a fresh attempt.
+
+    Returns:
+        One artifact-safe terminal simulator error.
+    """
+    return TextSimulationError(
+        stop_reason,
+        StructuredFailure(
+            code=code,
+            message=message,
+            retryable=retryable,
+            exception_type=exception_type,
+            attribution=FailureAttribution.MODEL,
+            details={"phase": phase},
+        ),
     )

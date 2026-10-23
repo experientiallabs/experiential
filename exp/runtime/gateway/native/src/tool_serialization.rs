@@ -92,6 +92,7 @@ mod tests {
             name: "lookup".to_string(),
             namespace: None,
             caller: None,
+            thought_signature: None,
         }
     }
 
@@ -107,6 +108,7 @@ mod tests {
                 provider_status: None,
                 raw_arguments: "{}".to_string(),
                 custom: false,
+                thought_signature: None,
             },
         }
     }

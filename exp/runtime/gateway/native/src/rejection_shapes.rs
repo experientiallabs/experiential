@@ -376,16 +376,39 @@ pub struct FilteredCompletion {
 /// error, and the nested code names the category. Only the OpenAI-compatible
 /// chat wire is read; other dialects state their verdicts in their own
 /// envelopes.
+///
+/// A STREAMING request gets the same verdict as an SSE body under the 4xx
+/// (live 2026-10-17, 29 events in five hours): `data: {"object":
+/// "chat.completion.chunk","choices":[{"delta":{},"finish_reason":
+/// "content_filter","content_filter_results":{"error":{...}}}]}`. That body
+/// is no JSON document, so it fell to the plain-text relay and the caller got
+/// the raw frame as an `invalid_request`. Each `data:` frame is read as a
+/// chunk; the first carrying a verdict decides.
 pub fn content_filtered_completion(dialect: Dialect, body: &str) -> Option<FilteredCompletion> {
     if dialect != Dialect::OpenAiCompatible {
         return None;
     }
-    let value = parse_error_document(body)?;
-    let choice = value.get("choices")?.as_array()?.first()?.as_object()?;
-    let finish = choice.get("finish_reason")?.as_str()?;
-    if !matches!(finish, "content_filter" | "safety") {
-        return None;
+    if let Some(value) = parse_error_document(body) {
+        return filtered_choice(&value);
     }
+    body.lines()
+        .filter_map(|line| line.trim_start().strip_prefix("data:"))
+        .filter_map(|frame| serde_json::from_str::<Value>(frame.trim()).ok())
+        .find_map(|chunk| filtered_choice(&chunk))
+}
+
+/// The content-filter verdict on one completion or chunk's first choice.
+///
+/// A `content_filter`/`safety` finish is the verdict; so is a
+/// `content_filter_results.error` whose code is a refusal code, which Azure
+/// can carry on a chunk before the finish arrives. Per-category severity
+/// annotations without an `error` are not a verdict.
+fn filtered_choice(value: &Value) -> Option<FilteredCompletion> {
+    let choice = value.get("choices")?.as_array()?.first()?.as_object()?;
+    let finish = choice
+        .get("finish_reason")
+        .and_then(Value::as_str)
+        .filter(|finish| matches!(*finish, "content_filter" | "safety"));
     let verdict = choice
         .get("content_filter_results")
         .and_then(|results| results.get("error"))
@@ -395,14 +418,38 @@ pub fn content_filtered_completion(dialect: Dialect, body: &str) -> Option<Filte
         .and_then(Value::as_str)
         .filter(|code| is_refusal_code(Some(code)))
         .map(str::to_string);
+    if finish.is_none() && nested_code.is_none() {
+        return None;
+    }
     Some(FilteredCompletion {
-        code: nested_code.unwrap_or_else(|| finish.to_string()),
+        code: nested_code.or_else(|| finish.map(str::to_string))?,
         message: verdict
             .and_then(|error| error.get("message"))
             .and_then(Value::as_str)
             .filter(|message| !message.trim().is_empty())
             .map(str::to_string),
     })
+}
+
+/// The sentence OpenAI answers once it has blocked the calling ACCOUNT for an
+/// earlier policy violation ("Policy Violation: this user has been blocked for
+/// a previous policy violation"), relayed by OpenRouter under the generic
+/// `invalid_prompt` code (400, and in-stream) or a 403. It carries no code of
+/// its own, so the sentence is the only discriminator.
+const ACCOUNT_POLICY_BLOCK_SENTENCE: &str = "has been blocked for a previous policy violation";
+
+/// Whether one provider text names an account-level policy block.
+///
+/// The block is a verdict on the house or BYOK account, never on this
+/// caller's content: the same request on another rung (another account)
+/// serves, so it is filed as `provider_authentication`, fails over, and lets
+/// the platform demote the lane instead of handing one tenant a 400 that
+/// reads as their own mistake. Matching is on the raw text (case-insensitive),
+/// which also finds the sentence inside an aggregator's JSON-string
+/// `metadata.raw` envelope.
+pub(crate) fn names_account_policy_block(text: &str) -> bool {
+    text.to_ascii_lowercase()
+        .contains(ACCOUNT_POLICY_BLOCK_SENTENCE)
 }
 
 #[cfg(test)]
@@ -655,6 +702,20 @@ mod tests {
         assert!(!rejected_encrypted_reasoning(
             Dialect::OpenAiResponses,
             text
+        ));
+    }
+
+    #[test]
+    fn an_account_policy_block_is_named_in_every_relayed_shape() {
+        // OpenRouter's relay of OpenAI's account block (gpt-6.1-sol, 131
+        // attempts over two days): the sentence sits in metadata.raw as a JSON
+        // string under the generic invalid_prompt code, or flat under a 403.
+        let relayed = r#"{"error":{"message":"Provider returned error","code":400,"metadata":{"raw":"{\"error\":{\"message\":\"Policy Violation: this user has been blocked for a previous policy violation\",\"type\":\"invalid_request_error\",\"param\":null,\"code\":\"invalid_prompt\"}}","provider_name":"OpenAI"}}}"#;
+        let flat = r#"{"error":{"message":"Policy Violation: this user has been blocked for a previous policy violation","code":403}}"#;
+        assert!(names_account_policy_block(relayed));
+        assert!(names_account_policy_block(flat));
+        assert!(!names_account_policy_block(
+            r#"{"error":{"message":"Invalid prompt: we've limited access to this content.","code":"invalid_prompt"}}"#
         ));
     }
 }

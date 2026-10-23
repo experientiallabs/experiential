@@ -1079,8 +1079,15 @@ def test_classification_memo_invalidates_both_secure_view_generations(
             replacement.replace(path)
         elif mutation == "rewrite":
             stamp = path.stat()
-            path.write_text('{"model_chains":{}}')
-            os.utime(path, ns=(stamp.st_atime_ns, stamp.st_mtime_ns))
+            # Same size and restored mtime leave only the change time to differ.
+            # Kernels advance it on a coarse clock tick, so rewrite until it moves.
+            give_up = time.monotonic() + 5
+            while True:
+                path.write_text('{"model_chains":{}}')
+                os.utime(path, ns=(stamp.st_atime_ns, stamp.st_mtime_ns))
+                if path.stat().st_ctime_ns != stamp.st_ctime_ns or time.monotonic() > give_up:
+                    break
+                time.sleep(0.005)
         elif mutation == "sidecar_add":
             sidecar.write_text('{"gateway_model_chains":[]}')
         elif mutation == "sidecar_remove":

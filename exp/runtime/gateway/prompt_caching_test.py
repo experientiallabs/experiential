@@ -191,3 +191,16 @@ def test_best_effort_is_disclosed_unless_every_rung_caches_only_on_request() -> 
         disclose_best_effort_caching(request, (_deployment("g", "vertex"),), (gemini,), on)
         is request
     )
+
+
+def test_caching_off_drops_the_twelve_hour_lifetime_with_disclosure() -> None:
+    """An organization with caching off never asks OpenAI for a 12-hour write."""
+    request = GatewayRequest(
+        surface=GatewayApiSurface.RESPONSES,
+        messages=(GatewayMessage(role="user", content="hi"),),
+        prompt_cache_ttl="12h",
+    )
+    stripped = without_prompt_caching(request, _authorization(disabled=True))
+    assert stripped.prompt_cache_ttl is None
+    assert stripped.ignored_parameters == (f"prompt_cache_options.ttl{PROMPT_CACHING_OFF_SUFFIX}",)
+    assert without_prompt_caching(request, _authorization(disabled=False)) is request

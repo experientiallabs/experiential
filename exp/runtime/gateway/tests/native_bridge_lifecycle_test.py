@@ -45,8 +45,9 @@ _BURST_CLIENT_THREADS = 12
 _IDLE_SECONDS = 12.0
 # Each cached SQLite connection holds the database plus WAL descriptors, so
 # the fixed pool bounds the count at two per worker plus the group-commit
-# writer's dedicated connection and the driver main thread's setup cache.
-_DESCRIPTOR_CEILING = 2 * (_CALLBACK_PERMITS + 3)
+# writer's dedicated connection, the driver main thread's setup cache, and the
+# video settlement poller's one long-lived thread.
+_DESCRIPTOR_CEILING = 2 * (_CALLBACK_PERMITS + 4)
 
 _DRIVER_SOURCE = textwrap.dedent(
     '''
