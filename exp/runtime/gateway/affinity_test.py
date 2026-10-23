@@ -4,12 +4,16 @@ from __future__ import annotations
 
 import pytest
 
+from exp.common.models.catalog import BillingSource
+from exp.common.models.gateway_catalog import ExactModelDeployment
 from exp.runtime.gateway.affinity import (
     affinity_fingerprint,
     affinity_seed_material,
+    house_aggregator_last,
     rendezvous_order,
 )
 from exp.runtime.gateway.contracts import GatewayApiSurface, GatewayMessage, GatewayRequest
+from exp.runtime.models.providers.base import GatewayWireProfile
 
 _RUNGS = (("dep-house", 10.0), ("dep-fireworks", 3.0), ("dep-openrouter", 1.0))
 
@@ -158,3 +162,41 @@ class TestRendezvousOrder:
         for weight in (0.0, -1.0, float("inf"), float("nan")):
             with pytest.raises(ValueError, match="positive and finite"):
                 rendezvous_order(fingerprint, (("dep-a", weight), ("dep-b", 1.0)))
+
+
+def _rung(deployment_id: str, provider: str, billing: BillingSource) -> ExactModelDeployment:
+    """Build one exact deployment for the aggregator partition."""
+    return ExactModelDeployment(
+        deployment_id=deployment_id,
+        source_alias=deployment_id,
+        exact_model_id="exact-one",
+        connection=f"connection-{deployment_id}",
+        provider=provider,
+        provider_model="provider-model",
+        connection_sha256="b" * 64,
+        capabilities_sha256="c" * 64,
+        billing_source=billing,
+    )
+
+
+def test_house_aggregator_last_is_a_stable_partition() -> None:
+    """House OpenRouter rungs trail in their own order; the rest keep theirs."""
+    house = BillingSource.HOST_MANAGED
+    deployments = (
+        _rung("router-1", "openrouter", house),
+        _rung("direct", "vertex", house),
+        _rung("router-2", "openrouter", house),
+        _rung("byok-router", "openrouter", BillingSource.CUSTOMER_MANAGED),
+        _rung("other", "novita", house),
+    )
+    profiles = tuple(
+        GatewayWireProfile(dialect="openai_compatible", url=f"https://{item.deployment_id}.test")
+        for item in deployments
+    )
+
+    assert house_aggregator_last((2, 0, 3, 1, 4), deployments, profiles) == (3, 1, 4, 2, 0)
+    # Only house OpenRouter rungs: the order is untouched.
+    assert house_aggregator_last((1, 0), deployments[:1] + deployments[2:3], profiles[:2]) == (
+        1,
+        0,
+    )

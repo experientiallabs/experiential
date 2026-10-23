@@ -12,12 +12,12 @@ from exp.common.models.gateway_catalog import ExactModelDeployment, FailoverMode
 from exp.runtime.gateway.contracts import (
     AuthorizationSnapshot,
     DirectTarget,
-    ExecutionSnapshot,
     GatewayApiSurface,
     GatewayFailure,
     GatewayFailureClass,
     GatewayRequest,
 )
+from exp.runtime.gateway.execution_snapshot import ExecutionSnapshot
 from exp.runtime.gateway.health import DeploymentHealthKey, DeploymentHealthRegistry
 from exp.runtime.gateway.native_execution import (
     THROTTLE_BACKOFF,
@@ -141,32 +141,6 @@ def test_select_route_deployments_rejects_invalid_indexes(indexes: tuple[int, ..
     """An invalid compatibility selection cannot corrupt waterfall accounting."""
     with pytest.raises(ValueError):
         select_route_deployments(_route(), indexes)
-
-
-def test_admission_dead_failure_mirrors_runtime_circuit_classes() -> None:
-    """A dead-at-admission rung feeds the circuit like the runtime failure it mirrors."""
-    from exp.runtime.gateway.native_execution import _admission_dead_failure
-    from exp.runtime.models import ModelConnectionError
-    from exp.runtime.models.credentials import MissingModelCredentialError, ModelCredentialError
-    from exp.runtime.models.providers.errors import ProviderCapabilityError
-
-    # A missing credential opens the circuit at once, like a runtime 401.
-    for credential_error in (
-        ModelCredentialError("no key"),
-        MissingModelCredentialError("TEST_KEY", connection_id="conn"),
-    ):
-        failure = _admission_dead_failure(credential_error)
-        assert failure.failure_class == GatewayFailureClass.PROVIDER_AUTHENTICATION
-
-    # A connection or capability drift is operational, like a runtime transport failure.
-    assert (
-        _admission_dead_failure(ModelConnectionError("drifted")).failure_class
-        == GatewayFailureClass.TRANSPORT
-    )
-    assert (
-        _admission_dead_failure(ProviderCapabilityError(capability="reasoning")).failure_class
-        == GatewayFailureClass.TRANSPORT
-    )
 
 
 def test_claim_ladder_prefers_healthy_then_probe_then_forced() -> None:
@@ -712,6 +686,17 @@ def test_wire_entry_names_customer_managed_billing_for_the_data_plane() -> None:
     assert not deployment_wire_entry(route, route.deployment, house, {})["billing_customer_managed"]
 
 
+def test_wire_entry_names_a_tenant_origin_for_the_data_plane() -> None:
+    """A tenant origin's entry says so, so the data plane answers it opaquely."""
+    route = _route()
+    tenant = GatewayWireProfile(
+        dialect="openai_compatible", url="https://tenant.example.test", tenant_origin=True
+    )
+    house = GatewayWireProfile(dialect="openai_compatible", url="https://provider.test")
+    assert deployment_wire_entry(route, route.deployment, tenant, {})["tenant_origin"] is True
+    assert deployment_wire_entry(route, route.deployment, house, {})["tenant_origin"] is False
+
+
 @pytest.mark.parametrize(
     ("failover_mode", "expected"),
     (
@@ -1173,3 +1158,90 @@ def test_wire_entry_carries_the_codex_native_tool_translation_map() -> None:
     assert (
         deployment_wire_entry(route, route.deployment, profile, {})["native_tool_translation"] == {}
     )
+
+
+_THREE_KEYS: tuple[DeploymentHealthKey, ...] = (
+    *_KEYS,
+    ("catalog" + "0" * 57, "deployment-c", "connection-c"),
+)
+
+
+def test_a_failover_revisits_an_untried_earlier_rung_in_route_order() -> None:
+    """Depth 0 was skipped (shed) and depth 1 failed: depth 0 serves next, before depth 2."""
+    health = DeploymentHealthRegistry()
+    candidate = next_route_candidate(
+        health=health,
+        keys=_THREE_KEYS,
+        failure=_failover_only(),
+        current_depth=1,
+        attempt_counts=[0, 1, 0],
+        total_attempts=1,
+        refusal_failover=False,
+    )
+    assert candidate == 0
+    # Once depth 0 was dispatched too, the walk continues to depth 2.
+    candidate = next_route_candidate(
+        health=health,
+        keys=_THREE_KEYS,
+        failure=_failover_only(),
+        current_depth=0,
+        attempt_counts=[1, 1, 0],
+        total_attempts=2,
+        refusal_failover=False,
+    )
+    assert candidate == 2
+
+
+def test_a_failover_never_redials_a_rung_this_request_already_dispatched() -> None:
+    """Every other rung dispatched: the ladder ends instead of dialing a failed rung again."""
+    health = DeploymentHealthRegistry()
+    assert (
+        next_route_candidate(
+            health=health,
+            keys=_THREE_KEYS,
+            failure=_failover_only(),
+            current_depth=2,
+            attempt_counts=[1, 1, 1],
+            total_attempts=3,
+            refusal_failover=False,
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize(
+    ("failure_class", "retryable", "eligible", "expected"),
+    [
+        # 502/503/504 and refused connections: provider_internal / transport.
+        (GatewayFailureClass.PROVIDER_INTERNAL, True, True, 1),
+        (GatewayFailureClass.TRANSPORT, True, True, 1),
+        (GatewayFailureClass.TIMEOUT, False, True, 1),
+        # 401/403, 402 and a provider 404 are operator deadness: they advance.
+        (GatewayFailureClass.PROVIDER_AUTHENTICATION, False, True, 1),
+        (GatewayFailureClass.PROVIDER_QUOTA, False, True, 1),
+        (GatewayFailureClass.PROVIDER_NOT_FOUND, False, True, 1),
+        # A client 400/404/422 is the caller's request: never another rung.
+        (GatewayFailureClass.INVALID_REQUEST, False, False, None),
+    ],
+)
+def test_failover_eligibility_matrix_follows_the_classifier_flags(
+    failure_class: GatewayFailureClass, retryable: bool, eligible: bool, expected: int | None
+) -> None:
+    """The control plane advances exactly the failures the data plane marked failover-eligible."""
+    failure = GatewayFailure(
+        failure_class=failure_class,
+        safe_message="classified",
+        retryable_same_deployment=retryable,
+        failover_eligible=eligible,
+    )
+    candidate = next_route_candidate(
+        health=DeploymentHealthRegistry(),
+        keys=_KEYS,
+        failure=failure,
+        current_depth=0,
+        attempt_counts=[1, 0],
+        total_attempts=1,
+        refusal_failover=False,
+        maximum_same_deployment_attempts=1,
+    )
+    assert candidate == expected

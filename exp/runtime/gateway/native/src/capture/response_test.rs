@@ -56,6 +56,7 @@ fn collector_with_relay(
                 asynchronous_delivery: true,
                 capture_hidden_reasoning: true,
                 capture_logprobs: false,
+                spill: None,
             },
             MemorySink(sender),
         )
@@ -138,6 +139,7 @@ async fn stalled_writer_only_backpressures_when_response_memory_is_reserved() {
                     asynchronous_delivery: true,
                     capture_hidden_reasoning: true,
                     capture_logprobs: false,
+                    spill: None,
                 },
                 HeldSink {
                     entered: Some(started),
@@ -313,6 +315,7 @@ async fn numeric_sources_preserve_wide_integers_in_json_sse_and_wire() {
                 assert_eq!(frames.len(), 2);
                 frames[0].get().to_owned()
             }
+            CapturedResponse::Spilled(_) => unreachable!("in-memory capture"),
         };
         assert_eq!(source, SOURCE);
     }

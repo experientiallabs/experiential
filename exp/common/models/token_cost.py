@@ -6,6 +6,30 @@ from exp.common.models.catalog_prices import GatewayLongContextTier, GatewayToke
 from exp.common.models.model import Usage
 
 
+def twelve_hour_write_rate(explicit_rate: int | None, input_rate: int | None) -> int | None:
+    """Return the rate for OpenAI 12-hour cache writes on one schedule.
+
+    OpenAI bills a 12-hour write at 2.5 times the uncached input rate, a total
+    rate rather than a surcharge
+    (https://developers.openai.com/api/docs/guides/prompt-caching). An authored
+    rate wins; without one the published multiple of the schedule's own input
+    rate applies, rounded up so a derived rate never undercharges. It is never
+    the shorter-lifetime write rate.
+
+    Args:
+        explicit_rate: The card's authored 12-hour write rate, or None.
+        input_rate: The same card's uncached input rate, or None when unknown.
+
+    Returns:
+        Nano-USD per million 12-hour write tokens, or None when neither is known.
+    """
+    if explicit_rate is not None:
+        return explicit_rate
+    if input_rate is None:
+        return None
+    return (input_rate * 5 + 1) // 2
+
+
 def token_cost_nano_usd(
     *,
     input_tokens: int,
@@ -20,6 +44,10 @@ def token_cost_nano_usd(
     cache_creation_1h_input_rate: int | None,
     output_rate: int | None,
     reasoning_rate: int | None,
+    image_output_tokens: int | None = None,
+    image_output_rate: int | None = None,
+    cache_write_12h_input_tokens: int | None = None,
+    cache_creation_12h_input_rate: int | None = None,
 ) -> int | None:
     """Price disjoint input/output subsets with half-up nano-USD rounding.
 
@@ -27,6 +55,17 @@ def token_cost_nano_usd(
     without its one-hour split is priceable only when both write rates are known
     and equal. Missing rates for positive dimensions preserve unknown cost.
     Gateway-normalized counts are clamped to their containing totals.
+
+    OpenAI's 12-hour writes are a third disjoint write subset, reported only by a
+    provider that wrote at that lifetime; absent means none. They price at
+    :func:`twelve_hour_write_rate`, so a card without an authored rate still
+    charges 2.5 times its input rate for them.
+
+    With an image-output rate, generated-image tokens are carved out of the
+    output first and the reasoning subset is clamped to what remains (Gemini 3
+    Pro Image counts its image inside its thoughts). Without one, image tokens
+    stay in the output exactly as before the rate existed. A rate that differs
+    from the output rate with no reported image count leaves cost unknown.
     """
     cached = min(cached_input_tokens or 0, input_tokens)
     written = min(cache_write_input_tokens or 0, input_tokens - cached)
@@ -40,14 +79,26 @@ def token_cost_nano_usd(
     ):
         return None
     hour = min(cache_write_1h_input_tokens or 0, written)
-    reasoning = min(reasoning_tokens or 0, output_tokens)
+    half_day = min(cache_write_12h_input_tokens or 0, written - hour)
+    if (
+        image_output_tokens is None
+        and output_tokens > 0
+        and image_output_rate is not None
+        and image_output_rate != output_rate
+    ):
+        # Every split of the output between text and image prices differently.
+        return None
+    image = min(image_output_tokens or 0, output_tokens) if image_output_rate is not None else 0
+    reasoning = min(reasoning_tokens or 0, output_tokens - image)
     dimensions = (
         (input_tokens - cached - written, input_rate),
         (cached, cached_input_rate),
-        (written - hour, cache_creation_input_rate),
+        (written - hour - half_day, cache_creation_input_rate),
         (hour, cache_creation_1h_input_rate),
-        (output_tokens - reasoning, output_rate),
+        (half_day, twelve_hour_write_rate(cache_creation_12h_input_rate, input_rate)),
+        (output_tokens - image - reasoning, output_rate),
         (reasoning, reasoning_rate),
+        (image, image_output_rate),
     )
     if any(tokens > 0 and rate is None for tokens, rate in dimensions):
         return None
@@ -76,7 +127,8 @@ def schedule_usage_cost_nano_usd(prices: GatewayTokenPrices, usage: Usage) -> in
     if (
         (usage.cached_input_tokens or 0) + (usage.cache_write_input_tokens or 0)
         > usage.input_tokens
-        or (usage.cache_write_1h_input_tokens or 0) > (usage.cache_write_input_tokens or 0)
+        or (usage.cache_write_1h_input_tokens or 0) + (usage.cache_write_12h_input_tokens or 0)
+        > (usage.cache_write_input_tokens or 0)
         or (usage.reasoning_tokens or 0) > usage.output_tokens
     ):
         return None
@@ -107,6 +159,15 @@ def schedule_usage_cost_nano_usd(prices: GatewayTokenPrices, usage: Usage) -> in
         != schedule.output_nano_usd_per_million_tokens
     ):
         return None
+    # The model-client usage carries no image subset, so a card that prices
+    # images apart from text cannot value any output.
+    if (
+        usage.output_tokens > 0
+        and schedule.image_output_nano_usd_per_million_tokens is not None
+        and schedule.image_output_nano_usd_per_million_tokens
+        != schedule.output_nano_usd_per_million_tokens
+    ):
+        return None
     return token_cost_nano_usd(
         input_tokens=usage.input_tokens,
         output_tokens=usage.output_tokens,
@@ -120,6 +181,8 @@ def schedule_usage_cost_nano_usd(prices: GatewayTokenPrices, usage: Usage) -> in
         cache_creation_1h_input_rate=schedule.cache_creation_1h_input_nano_usd_per_million_tokens,
         output_rate=schedule.output_nano_usd_per_million_tokens,
         reasoning_rate=schedule.reasoning_nano_usd_per_million_tokens,
+        cache_write_12h_input_tokens=usage.cache_write_12h_input_tokens,
+        cache_creation_12h_input_rate=schedule.cache_creation_12h_input_nano_usd_per_million_tokens,
     )
 
 
@@ -164,6 +227,7 @@ def schedule_maximum_cost_nano_usd(
                 for rate in (
                     schedule.output_nano_usd_per_million_tokens,
                     schedule.reasoning_nano_usd_per_million_tokens,
+                    schedule.image_output_nano_usd_per_million_tokens,
                 )
                 if rate is not None
             ),

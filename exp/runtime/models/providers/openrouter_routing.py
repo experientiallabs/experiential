@@ -2,7 +2,9 @@
 
 OpenRouter load-balances one model id across upstream providers and accepts a
 request-level ``provider`` object that narrows the candidates. The gateway
-uses exactly one such preference: the zero-data-retention constraint, which
+sets two such preferences. The reasoning-off constraint keeps a request that
+turns reasoning off away from upstreams observed to think anyway. The
+zero-data-retention constraint
 restricts the request to OpenRouter's published ZDR endpoint list (the public
 ``GET /api/v1/endpoints/zdr``) and denies data collection, so the aggregator
 serves from a retention-free upstream or refuses. The constraint TIGHTENS only:
@@ -16,9 +18,9 @@ the response, which the data plane records per attempt as the settlement's
 
 from __future__ import annotations
 
-from typing import Final, Literal
+from typing import Annotated, Final, Literal
 
-from pydantic import BaseModel, ConfigDict, StrictBool
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, StringConstraints
 
 from exp.common.core.artifacts import JsonObject, JsonValue
 
@@ -35,6 +37,9 @@ GOOGLE_MODEL_PREFIX: Final = "google/gemini"
 The wider ``google/`` namespace also holds Gemma, which third parties serve with
 ordinary disjoint cache accounting, so it keeps the default contract."""
 
+ProviderName = Annotated[str, StringConstraints(strict=True, min_length=1, max_length=128)]
+"""One provider name in a routing preference list."""
+
 ZDR_PROVIDER_PREFERENCES: Final[JsonObject] = {"zdr": True, "data_collection": "deny"}
 """The strict values the constraint forces onto ``payload["provider"]``."""
 
@@ -43,20 +48,32 @@ class ProviderRoutingPreferences(BaseModel):
     """The caller's top-level ``provider`` object, OpenRouter's routing-preference shape.
 
     Accepted on every gateway surface (Chat Completions, Responses, Messages).
-    ``zdr: true`` is the one field the gateway acts on itself: it DEMANDS
-    zero-data-retention routing for the request (the host's route filter
-    applies the same posture filter as an organization ``require_zdr``, and
-    the request can only tighten an organization policy, never loosen it).
-    Every other key (``data_collection``, ``order``, ``only``, ...) is
-    forwarded to OpenRouter rungs verbatim, tightened by the constraint when
-    the route is constrained, and dropped on every other wire, which has no
-    such field.
+    ``zdr: true`` DEMANDS zero-data-retention routing for the request (the
+    host's route filter applies the same posture filter as an organization
+    ``require_zdr``, and the request can only tighten an organization policy).
+    ``order``, ``only``, ``ignore`` and ``allow_fallbacks`` are resolved
+    against the gateway's own rungs at admission. ``data_collection`` (and
+    ``zdr``) are forwarded to OpenRouter rungs; every other key is disclosed
+    as ignored.
+
+    Attributes:
+        zdr: Demand zero-data-retention routing.
+        data_collection: OpenRouter's upstream data-collection policy.
+        order: Provider names to try first, in order.
+        only: Provider names allowed to serve.
+        ignore: Provider names never allowed to serve.
+        allow_fallbacks: Whether providers outside ``order`` (or after the first
+            rung) may serve.
     """
 
     model_config = ConfigDict(extra="allow", frozen=True)
 
     zdr: StrictBool | None = None
     data_collection: Literal["allow", "deny"] | None = None
+    order: tuple[ProviderName, ...] | None = Field(default=None, max_length=32)
+    only: tuple[ProviderName, ...] | None = Field(default=None, max_length=32)
+    ignore: tuple[ProviderName, ...] | None = Field(default=None, max_length=32)
+    allow_fallbacks: StrictBool | None = None
 
     @property
     def demands_zdr(self) -> bool:
@@ -64,19 +81,33 @@ class ProviderRoutingPreferences(BaseModel):
         return self.zdr is True
 
 
+FORWARDED_PREFERENCE_KEYS: Final = frozenset({"zdr", "data_collection"})
+"""The only caller preference keys an OpenRouter upstream receives.
+
+Routing keys (``order``, ``only``, ``ignore``, ``allow_fallbacks``) name the
+gateway's own providers and are resolved at admission
+(``exp.runtime.gateway.provider_preferences``); forwarding them made OpenRouter
+look for providers it does not have (a pin on ``experiential_cloud`` answered
+404). Other keys are disclosed as ignored, never forwarded."""
+
+
 def forward_provider_preferences(payload: JsonObject, preferences: JsonObject) -> JsonObject:
-    """Return ``payload`` carrying the caller's ``provider`` object for an OpenRouter rung.
+    """Return ``payload`` carrying the caller's data-policy preferences for an OpenRouter rung.
 
     Args:
         payload: A built Chat Completions payload for an OpenRouter rung.
         preferences: The caller's validated ``provider`` object.
 
     Returns:
-        A new payload whose ``provider`` is a copy of ``preferences``; the
+        A new payload whose ``provider`` holds only the caller's ``zdr`` and
+        ``data_collection`` keys (unchanged when the caller sent neither); the
         constraint (:func:`constrain_openrouter_zero_data_retention`) tightens
         on top when the rung is flagged. The input is never mutated.
     """
-    forwarded: JsonValue = dict(preferences)
+    kept = {key: value for key, value in preferences.items() if key in FORWARDED_PREFERENCE_KEYS}
+    if not kept:
+        return payload
+    forwarded: JsonValue = kept
     return {**payload, "provider": forwarded}
 
 
@@ -98,6 +129,46 @@ def constrain_openrouter_zero_data_retention(payload: JsonObject) -> JsonObject:
     preferences.update(ZDR_PROVIDER_PREFERENCES)
     tightened: JsonValue = preferences
     return {**payload, "provider": tightened}
+
+
+OPENROUTER_REASONING_OFF_IGNORED: Final[tuple[str, ...]] = ("atlas-cloud",)
+"""OpenRouter upstreams that keep thinking when the request turns reasoning off.
+
+AtlasCloud served z-ai/glm-5.1 with ``reasoning: {"effort": "none"}`` and
+returned 129 reasoning tokens (production, 2026-10-19, request
+request-83fbbf3e7d2b4ee09700226dfaecbc07, settled ``upstream_provider``
+AtlasCloud), while Novita honored the same wire with zero reasoning tokens on
+45 of 45 requests. OpenRouter's reasoning reference documents ``effort: "none"``
+as "disables reasoning entirely" without naming the upstreams that comply, so
+the upstreams seen to ignore it are excluded for that request only."""
+
+
+def constrain_openrouter_reasoning_off(payload: JsonObject) -> JsonObject:
+    """Return ``payload`` routed away from upstreams that ignore reasoning off.
+
+    Args:
+        payload: A built Chat Completions payload for an OpenRouter rung.
+
+    Returns:
+        The input unchanged unless it carries ``reasoning: {"effort": "none"}``;
+        then a new payload whose ``provider.ignore`` also lists
+        :data:`OPENROUTER_REASONING_OFF_IGNORED`. Other ``provider`` keys survive
+        and an existing ``ignore`` list keeps its names. If every remaining
+        upstream is unavailable OpenRouter refuses, which the gateway answers
+        like any rung failure instead of serving reasoning the caller turned off.
+        The input is never mutated.
+    """
+    reasoning = payload.get("reasoning")
+    if not isinstance(reasoning, dict) or reasoning.get("effort") != "none":
+        return payload
+    existing = payload.get("provider")
+    preferences: JsonObject = dict(existing) if isinstance(existing, dict) else {}
+    current = preferences.get("ignore")
+    ignored: list[JsonValue] = list(current) if isinstance(current, list) else []
+    ignored.extend(name for name in OPENROUTER_REASONING_OFF_IGNORED if name not in ignored)
+    preferences["ignore"] = ignored
+    narrowed: JsonValue = preferences
+    return {**payload, "provider": narrowed}
 
 
 def openrouter_metadata_headers(headers: dict[str, str]) -> dict[str, str]:

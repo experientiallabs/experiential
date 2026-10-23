@@ -175,3 +175,84 @@ def test_asgi_disconnect_after_terminal_send_is_not_a_client_abort() -> None:
 def test_custom_credential_headers_are_not_persisted(header: bytes) -> None:
     """Credential-bearing header variants do not enter transport records."""
     assert redact_headers([(header, b"private")]) == [[header.decode(), "<redacted>"]]
+
+
+def test_concurrent_requests_share_one_wire_budget() -> None:
+    """Concurrency cannot multiply the per-request bound: the shared budget truncates."""
+    body = b"x" * 1000
+    collectors: list[tuple[str, JsonObject, bytes]] = []
+    release = asyncio.Event()
+
+    class _Shared:
+        """Admit every request and record what it handed off."""
+
+        def claim_relay(self, request_id: str) -> bool:
+            return True
+
+        def finish_relay(self, request_id: str, metadata_json: str, payload: bytes) -> bool:
+            collectors.append((request_id, json.loads(metadata_json), payload))
+            return True
+
+    async def run() -> CaptureRelay:
+        relay: CaptureRelay
+
+        async def app(
+            scope: dict[str, object],
+            receive: Callable[[], Awaitable[object]],
+            send: Callable[[object], Awaitable[None]],
+        ) -> None:
+            """Hold every request open until all have read their bodies."""
+            await receive()
+            await release.wait()
+            request_id = cast("bytes", scope["request_id"])
+            await send(
+                {
+                    "type": "http.response.start",
+                    "status": 200,
+                    "headers": [(b"x-request-id", request_id)],
+                }
+            )
+            await send({"type": "http.response.body", "body": b"{}"})
+
+        relay = CaptureRelay(
+            app,
+            cast("CaptureCollector", _Shared()),
+            wire_capture=True,
+            wire_maximum_bytes=4096,
+            wire_budget_bytes=2500,
+        )
+
+        async def one(index: int) -> None:
+            async def receive() -> object:
+                return {"type": "http.request", "body": body}
+
+            async def send(_event: object) -> None:
+                return None
+
+            scope: dict[str, object] = {
+                "type": "http",
+                "method": "POST",
+                "path": "/v1/chat/completions",
+                "headers": [],
+                "request_id": f"request-{index}".encode(),
+            }
+            await relay(scope, receive, send)
+
+        tasks = [asyncio.create_task(one(index)) for index in range(4)]
+        await asyncio.sleep(0.05)
+        assert relay.wire_budget is not None
+        assert relay.wire_budget.held == 2000
+        release.set()
+        await asyncio.gather(*tasks)
+        return relay
+
+    relay = asyncio.run(run())
+    kept = [payload for _, _, payload in collectors if payload]
+    truncated = [
+        metadata
+        for _, metadata, _ in collectors
+        if cast("JsonObject", metadata["wire_request"])["truncated"]
+    ]
+    assert len(kept) == 2 and len(truncated) == 2
+    # Every retained byte returns to the budget once the requests finish.
+    assert relay.wire_budget is not None and relay.wire_budget.held == 0

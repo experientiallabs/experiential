@@ -292,6 +292,31 @@ def public_failure_error(
     )
 
 
+def validated_operation_headers(
+    idempotency_key: str | None, client_request_id: str | None
+) -> tuple[str | None, str | None]:
+    """Validate the two caller identity headers as independent concepts.
+
+    ``Idempotency-Key`` names one retriable operation and is the only header
+    that keys replay and duplicate detection. ``X-Client-Request-Id`` is a
+    caller correlation identity: Codex sends its session id there on every
+    request of a session (captured live 2026-08-29), and the provider serves
+    those requests without deduplication, so treating it as an operation key
+    would reject the second request of every real session as a conflict. It
+    is echoed on responses and scopes route affinity only, and the two
+    headers may therefore carry different values.
+    """
+    for name, value in (
+        ("Idempotency-Key", idempotency_key),
+        ("X-Client-Request-Id", client_request_id),
+    ):
+        if value is not None and (
+            not value or len(value) > 512 or any(ord(char) < 32 for char in value)
+        ):
+            raise invalid_field(name, f"{name} must be a non-empty display-safe value.")
+    return idempotency_key, client_request_id
+
+
 def _next_utc_month_start(moment: datetime) -> datetime:
     """Return the start of the UTC calendar month strictly after ``moment``.
 

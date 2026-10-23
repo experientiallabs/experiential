@@ -75,9 +75,12 @@ pub(crate) async fn read_upload(
 /// with the measured upload.
 pub(crate) async fn measure_upload(
     mut fields: Map<String, Value>,
-    upload: AudioUpload,
+    mut upload: AudioUpload,
     permit: OwnedSemaphorePermit,
 ) -> Result<(Map<String, Value>, AudioUpload, OwnedSemaphorePermit), PublicError> {
+    // A streamed WAV's placeholder sizes are settled first, so the measured,
+    // digested and forwarded bytes are the same self-consistent file.
+    audio_duration::settle_streamed_wav_sizes(&mut upload.bytes);
     let extension = upload
         .filename
         .rsplit('.')

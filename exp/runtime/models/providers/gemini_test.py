@@ -270,3 +270,47 @@ def test_gemini_completion_bills_thoughts_over_loopback(asynchronous: bool) -> N
             server.shutdown()
             thread.join(timeout=5)
             assert not thread.is_alive()
+
+
+def test_a_function_call_keeps_its_thought_signature_for_the_next_turn() -> None:
+    """The signed call carries its signature; Gemini's unsigned sibling has none."""
+    response = gemini_generate_response(
+        {
+            "candidates": [
+                {
+                    "content": {
+                        "parts": [
+                            {
+                                "functionCall": {"name": "lookup", "args": {"q": "a"}},
+                                "thoughtSignature": "c2lnbmF0dXJlLWE=",
+                            },
+                            {"functionCall": {"name": "lookup", "args": {"q": "b"}}},
+                        ]
+                    }
+                }
+            ]
+        },
+        configured_model=_snapshot(),
+        latency_seconds=0.1,
+    )
+    assert response.output is not None
+    calls = response.output.tool_calls
+    assert [call.provider_thought_signature for call in calls] == ["c2lnbmF0dXJlLWE=", None]
+
+
+def test_a_non_text_thought_signature_is_a_provider_response_error() -> None:
+    """A signature that is not nonempty text cannot be replayed and fails loud."""
+    with pytest.raises(ProviderResponseError):
+        gemini_generate_response(
+            {
+                "candidates": [
+                    {
+                        "content": {
+                            "parts": [{"functionCall": {"name": "lookup"}, "thoughtSignature": 7}]
+                        }
+                    }
+                ]
+            },
+            configured_model=_snapshot(),
+            latency_seconds=0.1,
+        )

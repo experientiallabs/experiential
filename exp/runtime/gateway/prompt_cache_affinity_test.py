@@ -6,6 +6,7 @@ from exp.runtime.gateway.contracts import GatewayApiSurface, GatewayMessage, Gat
 from exp.runtime.gateway.prompt_cache_affinity import (
     conversation_stem,
     provider_prompt_cache_key,
+    provider_session_id,
 )
 
 _TENANT = {"organization_id": "org-a", "identity_id": "identity-a"}
@@ -132,3 +133,45 @@ def test_conversation_stem_is_the_leading_system_and_developer_messages() -> Non
     )
     key = provider_prompt_cache_key(long, **_TENANT)
     assert key is not None and len(key) == len("xpl-") + 48
+
+
+def test_session_id_is_stable_across_one_growing_conversation() -> None:
+    """Every turn of one conversation names the same Novita session."""
+    task = GatewayMessage(role="user", content="Task: list the files.")
+    turn_1 = _request(_SYSTEM, task)
+    turn_2 = _request(
+        _SYSTEM,
+        task,
+        GatewayMessage(role="assistant", content='{"command": "ls"}'),
+        GatewayMessage(role="user", content="Output: a.txt b.txt"),
+    )
+    ids = {provider_session_id(turn, **_TENANT) for turn in (turn_1, turn_2)}
+    assert len(ids) == 1
+    (session,) = ids
+    assert session is not None and session.startswith("xpls-")
+
+
+def test_session_id_separates_conversations_sharing_a_system_prompt() -> None:
+    """One agent's sessions share a stem but must not share a pinned server."""
+    first = _request(_SYSTEM, GatewayMessage(role="user", content="Task: fix the build."))
+    second = _request(_SYSTEM, GatewayMessage(role="user", content="Task: write the docs."))
+    assert provider_prompt_cache_key(first, **_TENANT) == provider_prompt_cache_key(
+        second, **_TENANT
+    )
+    assert provider_session_id(first, **_TENANT) != provider_session_id(second, **_TENANT)
+
+
+def test_session_id_prefers_the_caller_key_and_stays_tenant_scoped() -> None:
+    """A caller key names the session; the raw key never leaves and tenants differ."""
+    one = _request(GatewayMessage(role="user", content="a"), prompt_cache_key="session-7")
+    other_opening = _request(GatewayMessage(role="user", content="b"), prompt_cache_key="session-7")
+    session = provider_session_id(one, **_TENANT)
+    assert session is not None and "session-7" not in session
+    assert session == provider_session_id(other_opening, **_TENANT)
+    assert session != provider_session_id(one, organization_id="org-b", identity_id="identity-a")
+    assert session != provider_prompt_cache_key(one, **_TENANT)
+
+
+def test_session_id_needs_a_user_turn() -> None:
+    """A conversation with no user turn has no opening to name."""
+    assert provider_session_id(_request(_SYSTEM), **_TENANT) is None

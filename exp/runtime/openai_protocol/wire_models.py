@@ -27,6 +27,7 @@ from exp.common.models.content import (
 from exp.common.models.model import MAXIMUM_TOOL_CALL_ID_CHARACTERS, ReasoningEffort
 from exp.runtime.gateway.reasoning_carrier import MAXIMUM_REASONING_CARRIER_BYTES
 from exp.runtime.gateway.request_policy import GatewayRequestPolicy
+from exp.runtime.gateway.sampling_extras import SamplingExtraFields
 from exp.runtime.gateway.service_tiers import ServiceTier
 from exp.runtime.models.providers.openrouter_routing import ProviderRoutingPreferences
 from exp.runtime.openai_protocol.cache_control import EphemeralCacheControl
@@ -37,7 +38,12 @@ from exp.runtime.openai_protocol.custom_tool_wire import (
 )
 from exp.runtime.openai_protocol.custom_tool_wire import EchoedItemStatus as _EchoedItemStatus
 from exp.runtime.openai_protocol.native_tools import NativeResponseTool
+from exp.runtime.openai_protocol.prompt_cache_controls import (
+    ChatPromptCacheOptions,
+    ResponsesPromptCacheOptions,
+)
 from exp.runtime.openai_protocol.reasoning_replay import ReasoningDetail
+from exp.runtime.openai_protocol.tool_call_extra_content import ToolCallExtraContent
 from exp.runtime.openai_protocol.web_search import ChatPlugin, WebSearchOptions
 
 
@@ -257,13 +263,15 @@ class _AssistantToolCall(_WireModel):
     OpenCode-style callers attach an Anthropic ``cache_control`` to the last
     content part of recent messages; when that part is a tool call the hint
     lands inside this entry, so the supported ephemeral form is accepted and
-    carried for the one wire that can honor it.
+    carried for the one wire that can honor it. ``extra_content`` carries
+    Gemini's thought signature back with the call it was issued for.
     """
 
     id: str = Field(min_length=1, max_length=MAXIMUM_TOOL_CALL_ID_CHARACTERS)
     type: Literal["function"] = "function"
     function: _FunctionCall
     cache_control: EphemeralCacheControl | None = None
+    extra_content: ToolCallExtraContent | None = None
     index: int | None = Field(default=None, ge=0)
     """Streaming delta ordinal, validated and dropped.
 
@@ -537,12 +545,15 @@ class _ChatTemplateKwargs(_WireModel):
     """vLLM/Hunyuan-native ``chat_template_kwargs`` on a Chat request.
 
     Only ``enable_thinking`` is recognized and translated to the canonical
-    reasoning control; the field is never forwarded verbatim to any wire."""
+    reasoning control; the field is never forwarded verbatim to any wire.
+    ``preserve_thinking`` (Qwen's keep-prior-reasoning template switch) is
+    accepted and disclosed as ignored, because no wire receives the object."""
 
     enable_thinking: bool | None = None
+    preserve_thinking: bool | None = None
 
 
-class _ChatRequest(_WireModel):
+class _ChatRequest(SamplingExtraFields, _WireModel):
     """Closed gateway Chat Completions request profile.
 
     Attributes:
@@ -610,6 +621,7 @@ class _ChatRequest(_WireModel):
     safety_identifier: str | None = Field(default=None, max_length=1024)
     user: str | None = Field(default=None, max_length=1024)
     prompt_cache_key: str | None = Field(default=None, max_length=1024)
+    prompt_cache_options: ChatPromptCacheOptions | None = None
     service_tier: ServiceTier | None = None
     provider: ProviderRoutingPreferences | None = None
     gateway: GatewayRequestPolicy | None = None
@@ -625,19 +637,11 @@ class _ChatRequest(_WireModel):
 
     @model_validator(mode="after")
     def _require_coherent_options(self) -> _ChatRequest:
-        """Reject conflicting token ceilings and non-stream usage options."""
-        if (
-            sum(
-                v is not None
-                for v in (self.max_tokens, self.max_completion_tokens, self.max_output_tokens)
-            )
-            > 1
-        ):
-            raise ValueError(
-                "max_tokens, max_completion_tokens and max_output_tokens are mutually exclusive"
-            )
-        if self.stream_options is not None and not self.stream:
-            raise ValueError("stream_options requires stream=true")
+        """Reject orphaned logprob options.
+
+        Several output-limit spellings together are reconciled after validation
+        (``client_field_repairs.chat_output_cap``), and ``stream_options`` on a
+        non-streaming call is removed with disclosure before it."""
         if self.top_logprobs is not None and self.logprobs is not True:
             raise ValueError("top_logprobs requires logprobs=true")
         return self
@@ -675,6 +679,8 @@ class _ResponseFunctionCall(_WireModel):
         caller: Optional opaque programmatic-call attribution, preserved verbatim.
         arguments: Required JSON argument text, at most four million characters.
         status: Optional echoed lifecycle marker retained for exact replay.
+        extra_content: Optional echoed vendor block carrying Gemini's thought
+            signature, replayed with the call on Gemini wires.
     """
 
     type: Literal["function_call"]
@@ -685,6 +691,7 @@ class _ResponseFunctionCall(_WireModel):
     caller: JsonObject | None = None
     arguments: str = Field(max_length=4_000_000)
     status: _EchoedItemStatus | None = None
+    extra_content: ToolCallExtraContent | None = None
 
 
 class _ResponseFunctionOutput(_WireModel):
@@ -749,15 +756,18 @@ class _ResponseReasoningItem(_WireModel):
 class _ResponseFormat(_WireModel):
     """Supported Responses text format.
 
+    ``json_object`` is the schema-free JSON mode, carried like the Chat
+    ``response_format`` spelling; it takes no name or schema.
+
     Attributes:
-        type: Required text or JSON-schema discriminator.
+        type: Required text, JSON-object, or JSON-schema discriminator.
         name: Optional nonempty name, required for structured output and at most 256 characters.
         description: Optional format instructions, at most 65,536 characters.
         schema_: Optional public schema object, required for structured output.
         strict: Whether strict output validation is requested, true by default.
     """
 
-    type: Literal["text", "json_schema"]
+    type: Literal["text", "json_object", "json_schema"]
     name: str | None = Field(default=None, min_length=1, max_length=256)
     description: str | None = Field(default=None, max_length=_MAXIMUM_FORMAT_DESCRIPTION_CHARACTERS)
     schema_: JsonObject | None = Field(default=None, alias="schema")
@@ -909,20 +919,6 @@ _ResponsesOutputItem = Annotated[
 _ResponsesInputItem = _ResponseMessage | _ResponsesOutputItem
 
 
-class _PromptCacheOptions(_WireModel):
-    """Responses prompt-cache selector, accepted only in its implicit mode.
-
-    VS Code Copilot's custom-endpoint provider hardcodes
-    ``{"mode": "implicit"}`` on every Responses request (wire-captured
-    2026-09-02). Implicit prefix caching is exactly what served routes
-    already do, so the value is accepted as already satisfied; any other
-    mode names behavior this gateway does not provide and stays a closed
-    rejection.
-    """
-
-    mode: Literal["implicit"]
-
-
 class _ResponsesRequest(_WireModel):
     """Closed gateway Responses request profile.
 
@@ -957,7 +953,7 @@ class _ResponsesRequest(_WireModel):
             raise ValueError("supported only as 'disabled': this gateway never truncates context")
         return value
 
-    prompt_cache_options: _PromptCacheOptions | None = None
+    prompt_cache_options: ResponsesPromptCacheOptions | None = None
     stream: bool = False
     client_metadata: JsonObject | None = None
     metadata: JsonObject = Field(default_factory=dict)

@@ -22,13 +22,13 @@ from exp.runtime.gateway.budgets import (
 from exp.runtime.gateway.contracts import (
     AttemptId,
     AuthorizationSnapshot,
-    ExecutionSnapshot,
     GatewayApiSurface,
     GatewayEvent,
     GatewayFailure,
     GatewayServiceTierAdmission,
     GatewayServiceTierSettlement,
 )
+from exp.runtime.gateway.execution_snapshot import ExecutionSnapshot
 from exp.runtime.gateway.interfaces import GatewayClock
 from exp.runtime.gateway.ledger_errors import (
     AttemptRejectedError as AttemptRejectedError,

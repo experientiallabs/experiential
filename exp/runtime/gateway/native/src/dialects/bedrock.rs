@@ -130,6 +130,7 @@ impl Normalizer {
             name,
             namespace: None,
             caller: None,
+            thought_signature: None,
         }])
     }
 

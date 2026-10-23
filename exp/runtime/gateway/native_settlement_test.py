@@ -12,6 +12,7 @@ from exp.runtime.gateway.contracts import (
     GatewayEventKind,
     GatewayFailure,
     GatewayFailureClass,
+    GatewayHeaderTimeout,
     GatewayRefusalReason,
     GatewayUsage,
 )
@@ -22,6 +23,7 @@ from exp.runtime.gateway.native_settlement import (
     _usage_from_payload,  # noqa: PLC2701 - direct unit coverage for normalization.
     accepts_keyword,
     exhausted_attempt_payload,
+    failure_from_boundary_payload,
     first_token_at_from_settlement,
     settlement_metadata,
     settlement_rate_limit,
@@ -32,9 +34,11 @@ from exp.runtime.gateway.native_settlement import (
     tool_search_requests_kwarg,
     upstream_provider_from_settlement,
     upstream_provider_kwarg,
+    web_search_cost_from_settlement,
     web_search_requests_from_settlement,
     web_search_requests_from_terminal,
     web_search_requests_kwarg,
+    web_search_results_from_settlement,
 )
 
 
@@ -297,6 +301,27 @@ def test_terminal_from_settlement_preserves_cache_write_usage_and_upstream_provi
     assert terminal.usage.cache_creation_input_tokens == 600
     assert terminal.usage.cache_creation_1h_input_tokens == 200
     assert upstream_provider_from_settlement(payload) == "Azure"
+
+
+def test_terminal_from_settlement_preserves_the_twelve_hour_write_subset() -> None:
+    """The 12-hour subset reaches GatewayUsage; its absence stays unreported."""
+    payload: JsonObject = {
+        "outcome": "completed",
+        "usage": {
+            "input_tokens": 3_250,
+            "output_tokens": 5,
+            "cache_creation_input_tokens": 3_247,
+            "cache_creation_12h_input_tokens": 3_247,
+        },
+        "tool_names": [],
+        "failure": None,
+    }
+    terminal, _failure = terminal_from_settlement(payload)
+    assert terminal.usage is not None
+    assert terminal.usage.cache_creation_12h_input_tokens == 3_247
+    usage = _usage_from_payload({"input_tokens": 10, "output_tokens": 1}, [])
+    assert usage is not None
+    assert usage.cache_creation_12h_input_tokens is None
 
 
 def test_terminal_from_settlement_normalizes_usage_and_tools() -> None:
@@ -686,6 +711,48 @@ def test_web_search_requests_ride_on_the_settled_usage() -> None:
     )
 
 
+def test_web_search_results_and_vendor_cost_ride_beside_the_count() -> None:
+    """Results and vendor cost settle on the usage only beside a positive search count."""
+    tokens: JsonObject = {"input_tokens": 8, "output_tokens": 3}
+    terminal, _failure = terminal_from_settlement(
+        {
+            "outcome": "completed",
+            "usage": tokens,
+            "tool_names": [],
+            "web_search_requests": 1,
+            "web_search_results": 5,
+            "web_search_cost_nano_usd": 12_000_000,
+        }
+    )
+    assert terminal.usage is not None
+    assert terminal.usage.web_search_results == 5
+    assert terminal.usage.web_search_cost_nano_usd == 12_000_000
+
+    # An engine predating the fields (count only) leaves both unknown.
+    legacy, _failure = terminal_from_settlement(
+        {"outcome": "completed", "usage": tokens, "tool_names": [], "web_search_requests": 1}
+    )
+    assert legacy.usage is not None
+    assert legacy.usage.web_search_results is None
+    assert legacy.usage.web_search_cost_nano_usd is None
+
+    # Without a positive count, or with unusable values, both read as unknown.
+    assert web_search_results_from_settlement({"web_search_results": 5}) is None
+    assert web_search_cost_from_settlement({"web_search_cost_nano_usd": 7}) is None
+    assert web_search_results_from_settlement(None) is None
+    for bad in (-1, "5", True, None, 1.5):
+        payload: JsonObject = {
+            "web_search_requests": 1,
+            "web_search_results": bad,
+            "web_search_cost_nano_usd": bad,
+        }
+        assert web_search_results_from_settlement(payload) is None
+        assert web_search_cost_from_settlement(payload) is None
+    assert (
+        web_search_results_from_settlement({"web_search_requests": 1, "web_search_results": 0}) == 0
+    )
+
+
 def test_web_search_requests_kwarg_is_withheld_at_zero_and_from_a_legacy_ledger() -> None:
     """Same seam as ``upstream_provider_kwarg``, plus: a zero count sends nothing at all."""
 
@@ -812,3 +879,47 @@ def test_settle_payload_carries_billed_units_with_or_without_tokens() -> None:
     )
     # Zero tokens beside billed units is the per-unit shape, not a missing meter.
     assert _credible_usage(GatewayEventKind.COMPLETED, both) == both
+
+
+def test_settlement_usage_carries_the_image_output_subset() -> None:
+    """The native meter's image subset reaches the typed settlement usage."""
+    usage = _usage_from_payload(
+        {"input_tokens": 17, "output_tokens": 1126, "image_output_tokens": 1120}, []
+    )
+    assert usage is not None and usage.image_output_tokens == 1120
+    plain = _usage_from_payload({"input_tokens": 17, "output_tokens": 6}, [])
+    assert plain is not None and plain.image_output_tokens is None
+
+
+def test_a_reported_zero_image_count_survives_settlement_parsing() -> None:
+    """A provider's explicit 0 stays 0 (text-rate output), distinct from unknown."""
+    usage = _usage_from_payload(
+        {"input_tokens": 10, "output_tokens": 3, "image_output_tokens": 0}, []
+    )
+    assert usage is not None and usage.image_output_tokens == 0
+
+
+@pytest.mark.parametrize(
+    ("token", "expected"),
+    [
+        ("allowance", GatewayHeaderTimeout.ALLOWANCE),
+        ("budget", GatewayHeaderTimeout.BUDGET),
+        ("someday", None),
+        (None, None),
+    ],
+)
+def test_the_header_timeout_phase_crosses_both_boundaries_typed(
+    token: str | None, expected: GatewayHeaderTimeout | None
+) -> None:
+    """Settlement and reservation payloads both carry the typed phase; unknown fails closed."""
+    payload: JsonObject = {
+        "failure_class": "timeout",
+        "safe_message": "provider did not send response headers in time",
+        "failover_eligible": True,
+    }
+    if token is not None:
+        payload["header_timeout"] = token
+    _, settled = terminal_from_settlement({"outcome": "failed", "usage": None, "failure": payload})
+    assert settled is not None and settled.header_timeout is expected
+    reserved = failure_from_boundary_payload(payload)
+    assert reserved is not None and reserved.header_timeout is expected

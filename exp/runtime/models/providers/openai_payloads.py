@@ -8,9 +8,11 @@ OpenAI-compatible Chat builders live here; ``dialect_stream_payload`` in
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+
 from exp.common.core.artifacts import JsonObject, JsonValue
 from exp.common.models import ChatMaxTokensField
-from exp.runtime.gateway.contracts import GatewayRequest
+from exp.runtime.gateway.contracts import GatewayMessage, GatewayRequest
 from exp.runtime.gateway.json_object import JSON_OBJECT_SYSTEM_INSTRUCTION
 from exp.runtime.models.providers.deepseek import is_deepseek_model_id
 from exp.runtime.models.providers.errors import (
@@ -21,14 +23,22 @@ from exp.runtime.models.providers.instruction_turns import (
     fold_instruction_turns_after_the_first,
     fold_trailing_instruction_turns,
 )
+from exp.runtime.models.providers.openai_item_ids import openai_issued_item_id
+from exp.runtime.models.providers.prompt_cache_breakpoints import (
+    carries_breakpoints,
+    chat_breakpoints,
+    responses_breakpoints,
+)
+from exp.runtime.models.providers.prompt_cache_options import prompt_cache_options_payload
 from exp.runtime.models.providers.reasoning_compat import (
+    anthropic_reasoning_effort,
     openai_reasoning_effort,
     reasoning_display_enabled,
     require_sampling_reasoning_compatibility,
 )
 from exp.runtime.models.providers.wire_messages import (
     add_openai_tools,
-    fold_tool_result_images,
+    fold_tool_result_attachments,
     openai_chat_message,
     responses_items,
 )
@@ -67,7 +77,13 @@ def _replayable_native_item(item: JsonObject) -> JsonObject | None:
     """
     shaped = _without_probability_metadata(item)
     item_id = shaped.get("id")
-    if isinstance(item_id, str) and item_id.startswith(_FOREIGN_ITEM_ID_PREFIX):
+    item_type = shaped.get("type")
+    if isinstance(item_id, str) and (
+        item_id.startswith(_FOREIGN_ITEM_ID_PREFIX)
+        or not openai_issued_item_id(
+            item_id, item_type if isinstance(item_type, str) else "message"
+        )
+    ):
         if shaped.get("type") == "reasoning" and "encrypted_content" not in shaped:
             return None
         shaped = {key: value for key, value in shaped.items() if key != "id"}
@@ -95,6 +111,7 @@ def openai_responses_stream_payload(
     sampling_requires_reasoning_none: bool = False,
     forwards_service_tier: bool = False,
     forwards_prompt_cache_key: bool = False,
+    forwards_prompt_cache_options: bool = False,
     omits_output_token_limit: bool = False,
     requests_reasoning_summary: bool = False,
     forwards_web_search_sources: bool = True,
@@ -117,6 +134,10 @@ def openai_responses_stream_payload(
             ``web_search_call.action.sources`` include selector. OpenRouter's
             Responses endpoint relays OpenAI's web search but refuses the
             selector ("Invalid Responses API request"), so it is left off there.
+        forwards_prompt_cache_options: Whether this origin carries
+            ``prompt_cache_options.mode`` and ``prompt_cache_breakpoint``. A
+            marked instruction then rides an input item, since top-level
+            ``instructions`` cannot hold a breakpoint.
 
     Returns:
         Native Responses request with storage disabled and streaming enabled.
@@ -131,6 +152,13 @@ def openai_responses_stream_payload(
     instructions: list[str] = []
     instruction_roles: list[str] = []
     items: list[JsonObject] = []
+    # A tool-returned document rides a following user turn: this wire's
+    # function_call_output list carries text and image parts only, while a
+    # user turn carries the document natively (see the fold's docstring).
+    request = request.model_copy(
+        update={"messages": fold_tool_result_attachments(request.messages, kinds=("document",))}
+    )
+    breakpoints = forwards_prompt_cache_options and request.prompt_cache_breakpoints
     for message in request.messages:
         if message.provider_native_item is not None:
             # Codex-native input items (tool namespaces, freeform tool
@@ -148,12 +176,17 @@ def openai_responses_stream_payload(
             if message.content is None:
                 raise ProviderResponseError("instruction messages require text")
             # Leading instructions ride the instructions field; one arriving
-            # after conversation began keeps its position as an input item.
-            if items:
-                items.append({"role": message.role, "content": message.content})
+            # after conversation began, or carrying a cache breakpoint, keeps its
+            # position as an input item.
+            if items or (breakpoints and carries_breakpoints(message)):
+                item: JsonObject = {"role": message.role, "content": message.content}
+                items.append(responses_breakpoints(message, item) if breakpoints else item)
             else:
                 instructions.append(message.content)
                 instruction_roles.append(message.role)
+        elif breakpoints and message.role in {"user", "tool"}:
+            # One input item each; assistant history carries no input breakpoints.
+            items.extend(responses_breakpoints(message, item) for item in responses_items(message))
         else:
             items.extend(responses_items(message))
     if not items and instructions:
@@ -253,6 +286,15 @@ def openai_responses_stream_payload(
         # changes cache-hit cost, never semantics, so rungs that do not route
         # by it omit it structurally with no decline and no disclosure.
         payload["prompt_cache_key"] = request.provider_prompt_cache_key
+    # Admission reaches this wire with a lifetime only on a rung declaring
+    # ``supports_prompt_cache_ttl_12h``; the defaults ("implicit", "30m") are never sent.
+    cache_options = prompt_cache_options_payload(
+        mode=request.prompt_cache_mode,
+        ttl=request.prompt_cache_ttl,
+        forwards_options=forwards_prompt_cache_options,
+    )
+    if cache_options is not None:
+        payload["prompt_cache_options"] = cache_options
     # Native OpenAI Responses has no top-k request field. Never trust a
     # mistaken route declaration to send this extension to the API.
     del supports_top_k
@@ -303,6 +345,11 @@ def openai_compatible_stream_payload(
     forwards_service_tier: bool = False,
     forwards_prompt_cache_key: bool = False,
     forwards_cache_control: bool = False,
+    forwards_prompt_cache_options: bool = False,
+    reasoning_off_via_chat_template: bool = False,
+    reasoning_via_thinking_toggle: bool = False,
+    reasoning_off_via_thinking_disabled: bool = False,
+    anthropic_thinking_model: str | None = None,
 ) -> JsonObject:
     """Translate one canonical request to streaming Chat Completions JSON.
 
@@ -316,6 +363,25 @@ def openai_compatible_stream_payload(
         supports_reasoning: Whether this exact model accepts a reasoning control.
         reasoning_wire_format: Provider field used for normalized reasoning effort.
         reasoning_effort: Optional catalog-pinned reasoning effort.
+        reasoning_off_via_chat_template: Whether this origin turns thinking off only
+            through ``chat_template_kwargs`` (Vertex MaaS GLM rejects
+            ``reasoning_effort: "none"``), so effort ``none`` is sent as
+            ``{"enable_thinking": false}`` and no ``reasoning_effort`` field.
+        reasoning_via_thinking_toggle: Whether this origin controls reasoning with
+            Z.ai's ``thinking: {"type": "enabled" | "disabled"}`` and no effort
+            levels, so effort ``none`` is sent as ``disabled``, any other effort as
+            ``enabled``, and no ``reasoning_effort`` field.
+        reasoning_off_via_thinking_disabled: Whether this origin turns thinking
+            off with ``thinking: {"type": "disabled"}`` while its other efforts
+            stay ``reasoning_effort`` (Huawei MaaS DeepSeek-V4), so effort
+            ``none`` is sent as that switch and no ``reasoning_effort`` field.
+        anthropic_thinking_model: The Anthropic model id when this origin is a
+            Claude passthrough that takes Anthropic's own thinking fields
+            (Novita ``pa/claude-*-hs``): an effort other than ``none`` is sent as
+            ``thinking: {type: adaptive}`` (with ``display: summarized`` unless
+            the display kill switch is off) and ``output_config.effort``, and
+            no ``reasoning_effort`` field. See ``anthropic_thinking_fields`` for
+            the requests that keep thinking off.
         reasoning_output_exposed: Whether this rung replays the caller's plaintext
             ``reasoning_content`` history verbatim (exposure-gated Tencent/DeepSeek rung).
         deepseek_reasoning_history: Whether this rung is DeepSeek's own origin,
@@ -327,6 +393,9 @@ def openai_compatible_stream_payload(
             system message only as the very first message (the official Qwen3.6+
             template raises otherwise), so every other instruction turn is folded
             into user text; see ``fold_instruction_turns_after_the_first``.
+        forwards_prompt_cache_options: Whether this origin carries
+            ``prompt_cache_options.mode`` and ``prompt_cache_breakpoint``; caller
+            breakpoints then re-emit in that spelling instead of ``cache_control``.
 
     Returns:
         Chat Completions request that always asks the provider for terminal usage.
@@ -344,22 +413,30 @@ def openai_compatible_stream_payload(
         # ends on an instruction; see fold_trailing_instruction_turns.
         messages = fold_trailing_instruction_turns(messages)
     # Chat tool messages are text-only on every server behind this wire, so a
-    # tool screenshot rides a following user turn (see the fold's docstring).
-    messages = fold_tool_result_images(messages)
+    # tool screenshot or tool-returned document rides a following user turn
+    # (see the fold's docstring).
+    messages = fold_tool_result_attachments(messages, kinds=("image", "document"))
     if system_messages_leading_only:
         # The rung's template 400s on any system turn past the first; the
         # text stays where the caller put it, as user text.
         messages = fold_instruction_turns_after_the_first(messages)
+    breakpoints = forwards_prompt_cache_options and request.prompt_cache_breakpoints
     wire_messages = [
         openai_chat_message(
             message,
             reasoning_route_sha256=reasoning_route_sha256,
             reasoning_output_exposed=reasoning_output_exposed,
             deepseek_reasoning_history=deepseek_reasoning_history,
-            forwards_cache_control=forwards_cache_control,
+            # The caller's breakpoints re-emit in their own spelling below.
+            forwards_cache_control=forwards_cache_control and not breakpoints,
         )
         for message in messages
     ]
+    if breakpoints:
+        wire_messages = [
+            chat_breakpoints(message, wire)
+            for message, wire in zip(messages, wire_messages, strict=True)
+        ]
     if request.json_object_output:
         _instruct_json_object(wire_messages)
     payload: JsonObject = {
@@ -422,14 +499,96 @@ def openai_compatible_stream_payload(
     if request.provider_prompt_cache_key is not None and forwards_prompt_cache_key:
         # Cache-affinity key, matching the native Responses lane.
         payload["prompt_cache_key"] = request.provider_prompt_cache_key
+    # Chat's only lifetime is the "30m" default (decode refuses "12h").
+    cache_options = prompt_cache_options_payload(
+        mode=request.prompt_cache_mode, ttl=None, forwards_options=forwards_prompt_cache_options
+    )
+    if cache_options is not None:
+        payload["prompt_cache_options"] = cache_options
     if supports_reasoning and effective_reasoning_effort is not None:
-        if reasoning_wire_format == "reasoning":
+        if reasoning_via_thinking_toggle:
+            payload["thinking"] = {
+                "type": "disabled" if effective_reasoning_effort == "none" else "enabled"
+            }
+        elif effective_reasoning_effort == "none" and reasoning_off_via_thinking_disabled:
+            payload["thinking"] = {"type": "disabled"}
+        elif effective_reasoning_effort == "none" and reasoning_off_via_chat_template:
+            template_kwargs = payload.get("chat_template_kwargs")
+            payload["chat_template_kwargs"] = {
+                **(template_kwargs if isinstance(template_kwargs, dict) else {}),
+                "enable_thinking": False,
+            }
+        elif anthropic_thinking_model is not None:
+            payload.update(
+                anthropic_thinking_fields(
+                    anthropic_thinking_model, effective_reasoning_effort, request
+                )
+            )
+        elif reasoning_wire_format == "reasoning":
             payload["reasoning"] = {"effort": effective_reasoning_effort}
         elif reasoning_wire_format == "reasoning_effort":
             payload["reasoning_effort"] = openai_reasoning_effort(
                 model_id, effective_reasoning_effort
             )
     return payload
+
+
+def anthropic_thinking_fields(model_id: str, effort: str, request: GatewayRequest) -> JsonObject:
+    """Return the Anthropic thinking fields one Claude-passthrough chat request carries.
+
+    ``none`` sends nothing: the adaptive generations served this way run
+    without thinking when no config is sent. Any other effort turns adaptive
+    thinking on at that effort, validated against the model's own ladder.
+
+    Two requests keep today's shape (no thinking) rather than fail, because
+    Anthropic refuses them with thinking on and the provider error is not one
+    a failover recovers from:
+
+    * an open tool loop: Anthropic requires the signed thinking block that
+      preceded a tool call on the last assistant turn, and a chat history has
+      no place to carry it back to this host, so the turns after the first
+      tool call of a user turn send no thinking;
+    * sampling Anthropic forbids beside thinking: ``temperature`` other than
+      1, any ``top_k``, or ``top_p`` below 0.95.
+
+    Args:
+        model_id: Exact Anthropic model identifier behind the lane.
+        effort: The effective canonical effort.
+        request: The canonical request.
+
+    Returns:
+        The top-level fields to merge into the chat payload, possibly empty.
+    """
+    if (
+        effort == "none"
+        or _in_open_tool_loop(request.messages)
+        or _sampling_forbids_thinking(request)
+    ):
+        return {}
+    display = {"display": "summarized"} if reasoning_display_enabled() else {}
+    return {
+        "thinking": {"type": "adaptive", **display},
+        "output_config": {"effort": anthropic_reasoning_effort(model_id, effort)},
+    }
+
+
+def _sampling_forbids_thinking(request: GatewayRequest) -> bool:
+    """Whether the request samples in a way Anthropic refuses beside thinking."""
+    return (
+        (request.temperature is not None and request.temperature != 1)
+        or request.top_k is not None
+        or (request.top_p is not None and request.top_p < 0.95)
+    )
+
+
+def _in_open_tool_loop(messages: Sequence[GatewayMessage]) -> bool:
+    """Whether an assistant tool call follows the conversation's last user message."""
+    for message in reversed(messages):
+        if message.role == "user":
+            return False
+        if message.role == "assistant" and message.tool_calls:
+            return True
+    return False
 
 
 def _instruct_json_object(messages: list[JsonObject]) -> None:

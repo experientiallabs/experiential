@@ -306,6 +306,7 @@ def load_run(project: ProjectStore, run_id: str) -> EvaluationRun:
         run = EvaluationRun.model_validate_json(payload)
     except ValidationError as exc:
         new_fields = {
+            ("prepared", "memory"),
             ("spending_limit_usd",),
             ("prepared", "cost", "captured_turns"),
             ("prepared", "cost", "measured_turns"),
@@ -313,7 +314,8 @@ def load_run(project: ProjectStore, run_id: str) -> EvaluationRun:
         }
         if all(error["type"] == "missing" and error["loc"] in new_fields for error in exc.errors()):
             raise EvaluationPreparationOutdated(
-                "saved evaluation needs a new cost plan; choose New evaluation in exp eval. "
+                "saved evaluation needs a new cost and memory plan; "
+                "choose New evaluation in exp eval. "
                 "The existing build is ready to reuse."
             ) from None
         raise

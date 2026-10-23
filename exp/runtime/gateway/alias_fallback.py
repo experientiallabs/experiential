@@ -14,7 +14,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 
 from exp.common.models import NormalizedGatewayCatalog
-from exp.runtime.gateway.contracts import ExecutionSnapshot
+from exp.runtime.gateway.execution_snapshot import ExecutionSnapshot
 from exp.runtime.gateway.management import GatewayAliasView, GatewayManagement
 from exp.runtime.gateway.project_activation import (
     ProjectActivationError,

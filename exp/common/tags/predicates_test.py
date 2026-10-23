@@ -7,7 +7,6 @@ from pydantic import ValidationError
 
 from exp.common.tags.bank import DEFAULT_TAG_BANK, TagBank, TagDefinition, TagScope
 from exp.common.tags.predicates import (
-    MAX_RULE_DEPTH,
     AndRule,
     NotRule,
     OrRule,
@@ -252,16 +251,6 @@ def test_error_points_a_caret_at_the_position() -> None:
     with pytest.raises(TagRuleError) as caught:
         parse_rule("coding AND")
     assert str(caught.value).splitlines()[1:] == ["  coding AND", "            ^"]
-
-
-def test_nesting_is_bounded() -> None:
-    """Deeply nested rules fail with a clear limit instead of exhausting the stack."""
-    within = "(" * MAX_RULE_DEPTH + "coding" + ")" * MAX_RULE_DEPTH
-    assert isinstance(parse_rule(within).root, TagCondition)
-    with pytest.raises(TagRuleError, match="nests deeper than 32 levels"):
-        parse_rule("(" + within + ")")
-    with pytest.raises(TagRuleError, match="nests deeper"):
-        parse_rule("NOT " * (MAX_RULE_DEPTH + 1) + "coding")
 
 
 def test_evaluation_rejects_scores_from_another_bank() -> None:

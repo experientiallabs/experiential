@@ -52,6 +52,46 @@ class CaptureDeliveryLimits(ContractModel):
         return self
 
 
+class CaptureSpillConfiguration(ContractModel):
+    """Disk spill for content past the in-memory window, delivered as split records.
+
+    A destination given a spilling collector receives, for a capture that does
+    not fit in memory, ``("split", skeleton, marker, parts)`` instead of one
+    encoded record: ``skeleton`` is the record JSON with each large value
+    replaced by ``{marker: index}``, and ``parts[index]`` is ``(kind, path,
+    bytes)`` where ``kind`` is ``"json"`` (the value's exact JSON text) or
+    ``"frames"`` (a stream's frames, one compact JSON value per line). The
+    files exist until the destination acknowledges the record.
+
+    Attributes:
+        directory: A directory the collector owns; stale capture files in it
+            are removed at start.
+        maximum_bytes: Capture files held on disk at once, defaulting to 8 GiB.
+            A capture that would cross it is marked truncated rather than trimmed.
+        maximum_queued_bytes: Relay bytes queued for the spill writer, defaulting
+            to 64 MiB. The relay never waits; a full queue marks that capture truncated.
+        maximum_inflight_bytes: Parsed request memory background part writers
+            may hold at once, defaulting to 64 MiB. A request that does not fit
+            falls back to the pending budget, which may skip it (counted).
+        part_threshold_bytes: Strings at least this long leave the skeleton as
+            their own part, defaulting to 1 MiB.
+    """
+
+    directory: Annotated[str, Field(min_length=1)]
+    maximum_bytes: int = Field(default=8 * 1024**3, strict=True, ge=1024 * 1024)
+    maximum_queued_bytes: int = Field(
+        default=64 * 1024 * 1024, strict=True, ge=64 * 1024, le=1024**3
+    )
+    maximum_inflight_bytes: int = Field(default=64 * 1024 * 1024, strict=True, ge=0, le=1024**3)
+    part_threshold_bytes: int = Field(
+        default=1024 * 1024, strict=True, ge=4 * 1024, le=64 * 1024 * 1024
+    )
+
+
+# A context document can exceed the 64 MiB body serving accepts.
+MAXIMUM_SPILLED_REQUEST_BYTES = 128 * 1024 * 1024
+
+
 class CaptureConfiguration(ContractModel):
     """Bounded native collection, with hosted settlement eligibility enabled by default.
 
@@ -80,6 +120,9 @@ class CaptureConfiguration(ContractModel):
             them as ``provider_logprobs``, false by default. The caller's answer,
             usage and settlement are unchanged; a rung that refuses the field is
             re-dialed without it and never asked again by this worker.
+        spill: Disk spill for content past the in-memory window, absent by
+            default. With it a request may be up to 128 MiB and is never
+            trimmed, and ``maximum_response_bytes`` is only the in-memory window.
     """
 
     delivery: CaptureDeliveryLimits = Field(default_factory=CaptureDeliveryLimits)
@@ -88,7 +131,7 @@ class CaptureConfiguration(ContractModel):
         default=64 * 1024 * 1024, strict=True, ge=1, le=256 * 1024 * 1024
     )
     maximum_request_bytes: int = Field(
-        default=4 * 1024 * 1024, strict=True, ge=1, le=8 * 1024 * 1024
+        default=4 * 1024 * 1024, strict=True, ge=1, le=MAXIMUM_SPILLED_REQUEST_BYTES
     )
     maximum_response_bytes: int = Field(default=3_670_016, strict=True, ge=1, le=4 * 1024 * 1024)
     ttl_seconds: int = Field(default=1800, strict=True, ge=1, le=3600)
@@ -98,13 +141,19 @@ class CaptureConfiguration(ContractModel):
     truncate_request: bool = False
     capture_hidden_reasoning: bool = False
     capture_logprobs: bool = False
+    spill: CaptureSpillConfiguration | None = None
 
     @model_validator(mode="after")
     def _validate_pending_budget(self) -> CaptureConfiguration:
         """Require room for one complete input and one reserved response buffer."""
-        if self.maximum_pending_bytes < max(
-            self.maximum_request_bytes, self.maximum_response_bytes
-        ):
+        if self.spill is None and self.maximum_request_bytes > 8 * 1024 * 1024:
+            raise ValueError("a request above 8 MiB needs a spilling collector")
+        # A spilling collector writes large requests to disk in the background,
+        # so its pending budget need not hold one whole.
+        largest = self.maximum_response_bytes
+        if self.spill is None:
+            largest = max(largest, self.maximum_request_bytes)
+        if self.maximum_pending_bytes < largest:
             raise ValueError("capture pending budget must fit one request or response")
         return self
 
@@ -187,6 +236,7 @@ class CaptureUsage(ContractModel):
         reasoning_tokens: Observed reasoning subset, otherwise None.
         cache_creation_input_tokens: Cache-write subset, otherwise None.
         cache_creation_1h_input_tokens: One-hour cache-write subset, otherwise None.
+        cache_creation_12h_input_tokens: OpenAI 12-hour cache-write subset, otherwise None.
     """
 
     input_tokens: int | None = Field(ge=0)
@@ -195,6 +245,7 @@ class CaptureUsage(ContractModel):
     reasoning_tokens: int | None = Field(ge=0)
     cache_creation_input_tokens: int | None = Field(default=None, ge=0)
     cache_creation_1h_input_tokens: int | None = Field(default=None, ge=0)
+    cache_creation_12h_input_tokens: int | None = Field(default=None, ge=0)
 
 
 class CaptureMetrics(ContractModel):
