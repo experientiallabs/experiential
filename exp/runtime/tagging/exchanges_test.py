@@ -1204,6 +1204,32 @@ def test_image_typed_arguments_without_media_stay_readable() -> None:
     assert "landscape" in call.tool_calls[0].function.arguments
 
 
+def test_serialized_results_with_lone_surrogates_stay_taggable() -> None:
+    """A JSON-encoded result escaping a lone surrogate still renders into windows."""
+    result = '{"note":"\\ud800","content":[{"type":"image","data":"QUJD","mimeType":"image/png"}]}'
+    exchange = exchange_from_capture_parts(
+        exchange_id="request-11",
+        protocol="chat_completions",
+        messages=[
+            {"role": "user", "content": "Shoot"},
+            {
+                "role": "assistant",
+                "provider_native_item": {
+                    "type": "mcp_call",
+                    "id": "m4",
+                    "name": "screenshot",
+                    "arguments": "{}",
+                    "output": result,
+                },
+            },
+        ],
+        request=None,
+        response={"kind": "json", "status": 200, "body": CHAT_BODY},
+    )
+    assert "\ufffd" in exchange.messages[1].tool_calls[0].function.arguments
+    assert turn_windows(exchange)
+
+
 def test_messages_tool_input_cut_off_by_the_length_limit_is_kept() -> None:
     """A tool use cut off mid-input keeps its partial text and marks truncation."""
     body: JsonObject = {

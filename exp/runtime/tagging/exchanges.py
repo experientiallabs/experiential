@@ -65,6 +65,7 @@ _IMAGE_TYPES: Final = frozenset({"image", "input_image", "computer_screenshot"})
 _BLOCK_OUTPUT_FIELDS: Final = frozenset({"caller", "capture_partial_input"})
 # Fields that carry an image itself; an image-typed object without one is ordinary data.
 _MEDIA_FIELDS: Final = frozenset({"data", "image_url", "url", "source", "file_id"})
+_SURROGATE: Final = re.compile("[\ud800-\udfff]")
 _DATA_URL: Final = re.compile(r"data:[\w.+-]+/[\w.+-]+(?:;[\w.+-]+=[\w.+-]+)*;base64,")
 _TEXT_PARTS: Final = frozenset({"text", "input_text", "output_text"})
 _IMAGE_PARTS: Final = frozenset({"image", "image_url", "input_image"})
@@ -686,8 +687,13 @@ def _readable_serialized(text: str) -> tuple[JsonValue, int]:
 
 
 def _compact_json(value: JsonValue) -> str:
-    """Render a JSON value compactly for a window."""
-    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    """Render a JSON value compactly, replacing lone surrogates with U+FFFD.
+
+    Payload text that serializes JSON is decoded here, and a producer that cut a surrogate
+    pair leaves an escaped half that decodes to a lone surrogate. Replacing it keeps every
+    exchange valid Unicode, so its opening key can be hashed and its windows rendered.
+    """
+    return _SURROGATE.sub("\ufffd", json.dumps(value, ensure_ascii=False, separators=(",", ":")))
 
 
 def _content(value: JsonObject) -> str | tuple[TagContentPart, ...] | None:
