@@ -46,7 +46,6 @@ import sqlite3
 from collections import defaultdict, deque
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
-from datetime import datetime
 from pathlib import Path
 from typing import Final, Literal, Self
 
@@ -200,7 +199,7 @@ class LedgerExposure(ContractModel):
         receipt: Audit receipt recording the report.
         report: Report that showed per-trace results.
         project: Project the report ran in.
-        at: When the report was recorded.
+        at: When the report was recorded, by the recording host's clock; informational only.
     """
 
     vertices: tuple[Vertex, ...] = Field(min_length=1)
@@ -359,20 +358,25 @@ class LedgerSnapshot:
         return receipt in self.reservations and receipt not in self.released
 
     def exposure(
-        self, vertices: Iterable[Vertex], *, before: datetime | None = None
+        self,
+        vertices: Iterable[Vertex],
+        *,
+        counts: Callable[[LedgerExposure], bool] | None = None,
     ) -> ExposurePath | None:
         """The shortest path from any of ``vertices`` to exposed content, if one exists.
 
         Args:
             vertices: Content of one lineage's member traces, under every computable scheme.
-            before: Count only exposures recorded before this time.
+            counts: Which exposure records count, such as only those not provably recorded
+                after an audit receipt (late-link reassessment); every record when omitted.
+                Exposure times (``at``) are informational and never decide this.
 
         Returns:
             The path, or None when no member shares a component with exposed content.
         """
         marked: dict[Vertex, list[str]] = defaultdict(list)
         for item in self.records.exposures:
-            if before is None or item.at < before:
+            if counts is None or counts(item):
                 for vertex in item.vertices:
                     marked[vertex].append(item.record_id)
         return self._nearest(vertices, marked)

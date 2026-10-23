@@ -35,7 +35,7 @@ from filelock import FileLock
 
 from exp.common.core.artifacts import stable_id
 from exp.common.models.client import RequestAdmissionRefused
-from exp.common.project import ProjectStore
+from exp.common.project import ArtifactStoreError, ProjectStore
 from exp.optimize.evaluation.audit.exposure import (
     HeldOutExposure,
     LineageExposure,
@@ -56,6 +56,7 @@ from exp.optimize.evaluation.audit.panel import (
     run_slots,
 )
 from exp.optimize.evaluation.audit.receipts import (
+    RECEIPT_TYPE,
     AuditCase,
     AuditNotice,
     AuditReceipt,
@@ -75,6 +76,7 @@ from exp.optimize.evaluation.fidelity.runner import PreparedFidelity, saved_fide
 from exp.optimize.evaluation.learning.traces import fit_calls
 from exp.simulation.mining.exposure_ledger import (
     ExposureLedger,
+    LedgerExposure,
     LedgerRelease,
     LedgerReservation,
     LedgerSnapshot,
@@ -138,8 +140,9 @@ class HeldOutAudit:
     def reassess(self, clock: Callable[[], datetime]) -> bool:
         """Append an invalidation notice if links recorded since reservation reveal exposure.
 
-        Only exposure recorded before the receipt was minted counts; exposure after it never
-        invalidates the audit. Before any dispatch the next opening blocks instead.
+        Only exposure that does not provably follow the receipt counts (see
+        :func:`late_exposure`); exposure after it never invalidates the audit. Before any
+        dispatch the next opening blocks instead.
 
         Args:
             clock: Aware clock.
@@ -385,6 +388,13 @@ def late_exposure(
 ) -> tuple[LineageExposure, ...]:
     """Audited lineages now linked to exposure that predates an independent receipt.
 
+    Order is causal, never read from exposure times. An exposure predates the receipt when it
+    was in the ledger snapshot the receipt was minted against (``prior_exposures``). One that
+    was not counts as later only when this root recorded it: an exposure shown by a report of a
+    receipt saved under this root, which the ledger's transaction serialized after the
+    reservation. An exposure merged from another ledger, whose order against this receipt
+    nothing proves, still counts, so skew between hosts can never clear an audit.
+
     Args:
         project: Project of the receipt.
         ledger: Ledger whose schemes to use.
@@ -396,14 +406,32 @@ def late_exposure(
     """
     if receipt.basis != "independent":
         return ()
+    prior = frozenset(receipt.prior_exposures)
+
+    def predates(item: LedgerExposure) -> bool:
+        """Whether this exposure is not provably recorded here after the receipt."""
+        return item.record_id in prior or not _recorded_here(project, item)
+
     exposure = held_out_exposure(
-        project, snapshot, receipt.receipt_id, ledger=ledger, before=receipt.opened_at
+        project, snapshot, receipt.receipt_id, ledger=ledger, counts=predates
     )
     return tuple(
         item
         for item in exposure.exposed
         if item.kind == "exposed" and item.lineage in receipt.lineages
     )
+
+
+def _recorded_here(project: ProjectStore, exposure: LedgerExposure) -> bool:
+    """Whether a report of a receipt saved under this root recorded the exposure."""
+    try:
+        store = ProjectStore(project.paths.root, exposure.project)
+        return (
+            store.artifacts.exists(exposure.receipt)
+            and store.artifacts.read(exposure.receipt).manifest.artifact_type == RECEIPT_TYPE
+        )
+    except (OSError, ValueError, ArtifactStoreError):
+        return False
 
 
 def _blocked(receipt: AuditReceipt, blocked: tuple[LineageExposure, ...]) -> str:
@@ -532,6 +560,7 @@ def _reserve(
             ),
             schemes=exposure.schemes,
             ledger=snapshot.identity,
+            prior_exposures=tuple(sorted(item.record_id for item in snapshot.records.exposures)),
             exposed=exposure.exposed,
             reaudited=touched,
             follows=follows[0].receipt_id if follows else None,

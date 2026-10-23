@@ -29,7 +29,7 @@ from contextlib import contextmanager
 from datetime import datetime
 from typing import Literal
 
-from pydantic import AwareDatetime, Field
+from pydantic import AwareDatetime, Field, ValidationError
 
 from exp.common.core.artifacts import ArtifactEnvelope, ArtifactInput, ContractModel, stable_id
 from exp.common.project import ProjectStore, artifact_input
@@ -101,8 +101,10 @@ class AuditReceipt(ContractModel):
     """The immutable root record of one held-out audit.
 
     Attributes:
-        sequence: Position among the project's receipts, from 1.
-        opened_at: When the receipt and its reservation were committed.
+        sequence: Position among the project's receipts, from 1, assigned inside the root
+            exposure ledger's transaction; it, not ``opened_at``, orders receipts.
+        opened_at: When the receipt and its reservation were committed, by the minting host's
+            clock; informational and part of the receipt identity only.
         project: Project audited.
         request: What the minting invocation asked for.
         basis: ``independent`` or ``development-re-audit``, fixed at minting.
@@ -113,6 +115,9 @@ class AuditReceipt(ContractModel):
         cases: Audited cases, in panel order.
         schemes: Full identity of every fingerprint scheme the exposure match used.
         ledger: Ledger snapshot identity the reservation was decided and committed against.
+        prior_exposures: Record IDs of every exposure in that snapshot, sorted: the exposure
+            already recorded when the receipt was minted. Late-link reassessment counts these,
+            and any exposure it cannot prove was recorded here after them.
         exposed: Every exposed or reserved held-out lineage at decision time, with its
             component size and the edge path to marked content.
         reaudited: Audited lineages that were exposed or reserved by another receipt.
@@ -133,6 +138,7 @@ class AuditReceipt(ContractModel):
     cases: tuple[AuditCase, ...] = Field(min_length=1)
     schemes: tuple[SchemeIdentity, ...] = Field(min_length=1)
     ledger: str
+    prior_exposures: tuple[str, ...]
     exposed: tuple[LineageExposure, ...] = ()
     reaudited: tuple[str, ...] = ()
     follows: str | None = None
@@ -324,6 +330,20 @@ def _dispatches(attempt: AuditAttempt | None) -> tuple[int, int]:
     return (sum(row.attempts for row in attempt.redispatched), len(attempt.redispatched))
 
 
+def _load_receipt(project: ProjectStore, identity: str) -> AuditReceipt:
+    """Parse one saved receipt; a receipt of an older contract fails closed with what to do."""
+    try:
+        return AuditReceipt.model_validate_json(
+            project.artifacts.read_bytes(identity, "receipt.json")
+        )
+    except ValidationError as error:
+        raise ValueError(
+            f"held-out audit receipt {identity} was saved under an older receipt contract that "
+            "did not record the exposure it was decided against, so its independence cannot be "
+            "reassessed; audit this build in a fresh project (exp build) to mint current receipts"
+        ) from error
+
+
 def audit_receipts(project: ProjectStore) -> tuple[AuditReceipt, ...]:
     """Every receipt of the project, in sequence order.
 
@@ -334,7 +354,7 @@ def audit_receipts(project: ProjectStore) -> tuple[AuditReceipt, ...]:
         Root receipts ordered by sequence; ``opened_at`` never orders them.
     """
     receipts = (
-        AuditReceipt.model_validate_json(project.artifacts.read_bytes(identity, "receipt.json"))
+        _load_receipt(project, identity)
         for identity in project.artifacts.list_ids(artifact_type=RECEIPT_TYPE)
     )
     return tuple(sorted(receipts, key=lambda receipt: (receipt.sequence, receipt.receipt_id)))
@@ -432,9 +452,7 @@ def find_receipt(project: ProjectStore, receipt_id: str) -> AuditReceipt:
     if project.artifacts.exists(receipt_id):
         manifest = project.artifacts.read(receipt_id).manifest
         if manifest.artifact_type == RECEIPT_TYPE:
-            return AuditReceipt.model_validate_json(
-                project.artifacts.read_bytes(receipt_id, "receipt.json")
-            )
+            return _load_receipt(project, receipt_id)
     raise ValueError(
         f"no held-out audit receipt {receipt_id!r} in this project; exp eval PROJECT --audit N "
         "prints each receipt it opens"

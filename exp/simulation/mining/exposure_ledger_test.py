@@ -147,8 +147,10 @@ def test_exposure_flows_transitively_and_backward_through_recorded_grouping(
     direct = snapshot.exposure((vertex(ledger, a),))
     assert direct is not None and direct.path == ()
     assert snapshot.exposure((vertex(ledger, d),)) is None
-    # Late-link reassessment counts only exposure recorded before a cutoff.
-    assert snapshot.exposure((vertex(ledger, c),), before=AT) is None
+    # Late-link reassessment counts only the exposure records its caller's predicate admits.
+    assert snapshot.exposure((vertex(ledger, c),), counts=lambda item: False) is None
+    counted = snapshot.exposure((vertex(ledger, c),), counts=lambda item: item == exposure)
+    assert counted is not None and counted.by == (exposure.record_id,)
 
 
 def test_declared_task_edges_stay_within_one_source_and_customer(tmp_path: Path) -> None:

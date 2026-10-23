@@ -9,7 +9,7 @@ import os
 import threading
 from collections.abc import Callable, Collection, Iterator, Mapping
 from contextlib import AbstractContextManager, contextmanager
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from functools import partial
 from multiprocessing.synchronize import Event
 from pathlib import Path
@@ -597,8 +597,8 @@ def test_locks_are_always_taken_in_one_order(
 OUTSIDE = f"{TRACE_CONTENT.identity.key}:{'e' * 64}"
 
 
-def expose_outside(store: ProjectStore) -> None:
-    """Expose content no held-out lineage is linked to yet."""
+def expose_outside(store: ProjectStore, *, at: datetime | None = None) -> None:
+    """Expose content no held-out lineage is linked to yet, as a merge from another ledger."""
     ExposureLedger(store.paths.root).record_exposure(
         LedgerExposure(
             vertices=(OUTSIDE,),
@@ -607,20 +607,20 @@ def expose_outside(store: ProjectStore) -> None:
             receipt="held-out-audit-receipt-elsewhere",
             report="exp eval --audit --verbose",
             project="elsewhere",
-            at=clock(),
+            at=at or clock(),
         )
     )
 
 
-def link_late(store: ProjectStore, lineage: str) -> None:
+def link_late(store: ProjectStore, lineage: str, target: str = OUTSIDE) -> None:
     """A later build records a grouping link from the lineage to the exposed content."""
     member = held_out_members(store)[lineage].vertices[0]
     with ExposureLedger(store.paths.root).transaction() as transaction:
         transaction.record(
             "edge",
             LedgerEdge(
-                left=min(member, OUTSIDE),
-                right=max(member, OUTSIDE),
+                left=min(member, target),
+                right=max(member, target),
                 reason="declared-task-identity",
                 task_lineage="late",
                 project="later",
@@ -677,6 +677,76 @@ def test_late_links_after_dispatch_append_a_notice_and_later_exposure_never_does
     with audit(store, 2) as resumed:
         assert resumed.receipt == second.receipt and len(resumed.view.notices) == 1
     assert store.artifacts.read_bytes(opened.receipt.receipt_id, "receipt.json") == stored
+
+
+def skewed(offset: timedelta) -> Callable[[], datetime]:
+    """An aware clock running ``offset`` away from this host's clock."""
+    return lambda: datetime.now(UTC) + offset
+
+
+def test_exposure_already_recorded_counts_even_when_its_clock_claims_later(
+    built: tuple[ProjectStore, FailingOnce],
+) -> None:
+    """Exposure in the snapshot a receipt was minted against predates it, whatever its time."""
+    store, _ = built
+    with audit(store) as first:
+        run(store, first)
+        record_report(
+            store,
+            first.receipt,
+            first.panel,
+            kind="evaluation",
+            detail_shown=True,
+            clock=skewed(timedelta(days=10)),
+        )
+    exposed = held_out_members(store)[first.receipt.lineages[0]].vertices[0]
+    with audit(store, 2) as second:
+        assert second.receipt.basis == "independent"
+        (shown,) = ExposureLedger(store.paths.root).snapshot().records.exposures
+        assert shown.at > second.receipt.opened_at, "the exposing host's clock runs ahead"
+        assert second.receipt.prior_exposures == (shown.record_id,)
+        run(store, second)
+        link_late(store, second.receipt.lineages[0], exposed)
+        assert second.reassess(clock)
+        [notice] = second.view.notices
+        assert notice.exposed[0].path is not None and notice.exposed[0].path.by == (
+            shown.record_id,
+        )
+
+
+def test_exposure_recorded_here_after_minting_never_counts_even_when_its_clock_claims_earlier(
+    built: tuple[ProjectStore, FailingOnce],
+) -> None:
+    """A report of this root recorded after the receipt follows it, whatever its time says."""
+    store, _ = built
+    with audit(store) as opened:
+        run(store, opened)
+        record_report(
+            store,
+            opened.receipt,
+            opened.panel,
+            kind="evaluation",
+            detail_shown=True,
+            clock=skewed(timedelta(days=-10)),
+        )
+        (shown,) = ExposureLedger(store.paths.root).snapshot().records.exposures
+        assert shown.at < opened.receipt.opened_at, "the reporting host's clock runs behind"
+        assert not opened.reassess(clock) and opened.view.notices == ()
+
+
+def test_merged_exposure_without_causal_order_counts_even_when_its_clock_claims_later(
+    built: tuple[ProjectStore, FailingOnce],
+) -> None:
+    """Exposure merged from another ledger cannot be shown to follow the receipt, so it counts."""
+    store, _ = built
+    with audit(store) as opened:
+        run(store, opened)
+        expose_outside(store, at=opened.receipt.opened_at + timedelta(days=1))
+        link_late(store, opened.receipt.lineages[0])
+        assert opened.reassess(clock)
+        [notice] = opened.view.notices
+        assert notice.exposed[0].path is not None
+        assert notice.exposed[0].path.exposed_node == OUTSIDE
 
 
 def _resume_and_hold(root: str, holding: Event, done: Event) -> None:
