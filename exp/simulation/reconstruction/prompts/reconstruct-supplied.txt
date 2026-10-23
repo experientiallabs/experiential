@@ -1,0 +1,40 @@
+Construct behavioral knowledge from the supplied public evidence. The caller already supplies immutable tool contracts. Code retains those exact tool names, descriptions and argument schemas. You generate only the state representation and behavior; never copy or rewrite a tools inventory.
+
+Return one flat JSON object conforming to output_schema with exactly:
+state_schema, initialization_requirements, claims, text_rules, python_source.
+Do not return interface, tools, reply_schema or another outer wrapper. text_rules is a string. python_source is null for text representation.
+
+Infer reusable behavior and preservation requirements from the actual episodes and public descriptions. Historical entity values are examples, not facts about a new current instance. The state schema must permit explicitly unknown information. Missing evidence remains unknown. Native errors may have effects if the supplied evidence establishes them; do not assume every error is a no-op.
+
+Source aliases are enumerated by source_ids. episode:<id> denotes that original records array; description denotes sources.description; contracts denotes sources.contracts. JSON Pointers are relative to that source, with empty string for its root. They must resolve. Use no unavailable alias.
+
+Each claim has statement, status, source_refs, scope and origin.
+Observed claims describe particular recorded outcomes and cite episode spans. Documented claims describe explicit descriptions/contracts and cite them. Inferred claims generalize beyond observations. Unknown or contradicted claims preserve gaps/conflicts. Evidence interpretations use origin evidence. Unsupported hypotheses use origin model_prior with status inferred or unknown. Resolvable citations are not proof of semantic entailment. Do not claim native correctness or complete hidden-state knowledge.
+
+COMPLETE FICTIONAL FORMAT EXAMPLE, not evidence about the target:
+{
+  "state_schema":{"type":"object","properties":{"values":{"type":"array","items":{"type":"integer"}}}},
+  "initialization_requirements":["Obtain this instance's public values before answering a read."],
+  "claims":[{
+    "statement":"Unobserved errors remain unknown.",
+    "status":"unknown",
+    "source_refs":[],
+    "scope":"Unobserved conditions.",
+    "origin":"model_prior"
+  }],
+  "text_rules":"Preserve the current instance. Infer behavior from the actual admitted observations; seek a public observation when needed facts are missing.",
+  "python_source":null
+}
+Use target fields and actual evidence rather than copying fictional state names or behavior.
+
+For python or both representation, additionally provide nonempty generated python_source defining predict(state, action) returning reply and structural delta. It cannot read files, private state or the network. Generated source is not native source and does not authorize execution.
+
+The sources map is the single source view. Each episode:<id> value is the records ARRAY itself, not an object containing records. Copy a supplied source_locators entry when citing a whole source or record. For record zero the pointer is /0, never /records/0. Deeper pointers must address the shown source value directly. Source IDs are literal map keys, not JSON pointer prefixes.
+
+Claim status also constrains every citation: observed claims cite ONLY episode sources; documented claims cite ONLY description/contracts. A claim combining observed and documented support or generalizing an observed example uses inferred status. Do not label a general operation rule observed merely because an example supports it.
+
+Fictional citation examples, not target evidence: an observed claim about record 0 cites [{"source_id":"episode:sample","pointer":"/0"}] only. An inferred generalization supported by that record and a contract can cite both episode:sample and contracts. Use only actual source aliases present in the request.
+
+state_schema must itself be valid JSON Schema Draft 2020-12. The only type names are object, array, string, number, integer, boolean and null. For an unconstrained value use {}, never {"type":"any"} or {"type":"unknown"}. Unknown instance facts are handled by initialization metadata, not invented schema types. Respect the state representation explicitly described by the input: keyed maps must not become arrays, and map keys must come from current-instance observations, not fixed historical IDs.
+
+Fictional schema fragment: {"type":"object","properties":{"widgets":{"type":"object","additionalProperties":{"type":"object","properties":{"id":{"type":"string"},"payload":{},"note":{"type":["string","null"]}}}}}}. This is a fragment of the state_schema field, not the outer construction response. The outer response still includes state_schema, initialization_requirements, claims, text_rules and python_source.

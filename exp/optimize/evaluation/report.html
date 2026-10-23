@@ -139,7 +139,7 @@
     $("summary").textContent =
       `${d.project} · ${d.tasks.length} distinct scenarios · ${models.length} models · ${d.report.compared_cells} shared valid scenario/repeat pairs · ${d.report.excluded_cells} excluded pairs`;
     $("method").textContent =
-      `Simulated environment: ${d.world_model} · Judge: ${d.judge_model} (${d.judgment_status})`;
+      `Simulated environment: ${d.world_model} · ${d.simulator_memory} · Judge: ${d.judge_model} (${d.judgment_status})`;
     const dollars = (value) =>
       value == null ? "unavailable" : "$" + cost(value);
     $("spend").textContent =

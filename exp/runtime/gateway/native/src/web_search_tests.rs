@@ -29,6 +29,7 @@ fn admission() -> WebSearchAdmission {
             },
         ],
         include_sources: false,
+        cost_nano_usd: None,
     }
 }
 
@@ -196,6 +197,14 @@ fn admission_decodes_the_contract_shape_and_defaults_missing_fields() {
     .expect("decodes");
     assert_eq!(decoded.requests, 1);
     assert_eq!(decoded.results[0].title, "A");
+    // An admission from a control plane predating the vendor cost decodes as unreported.
+    assert_eq!(decoded.cost_nano_usd, None);
+    let costed: WebSearchAdmission = serde_json::from_value(json!({
+        "requests": 1,
+        "cost_nano_usd": 12_000_000,
+    }))
+    .expect("decodes");
+    assert_eq!(costed.cost_nano_usd, Some(12_000_000));
     let sparse: WebSearchAdmission = serde_json::from_value(json!({})).expect("defaults");
     assert_eq!(sparse.requests, 0);
     assert!(sparse.results.is_empty());

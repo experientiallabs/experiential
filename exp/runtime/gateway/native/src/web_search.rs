@@ -49,6 +49,20 @@ pub struct WebSearchAdmission {
     /// The caller asked for `web_search_call.action.sources` (Responses).
     #[serde(default)]
     pub include_sources: bool,
+    /// The vendor's own price for the search in whole nano-USD (Exa's
+    /// `costDollars.total`), absent when the backend reported none.
+    #[serde(default)]
+    pub cost_nano_usd: Option<u64>,
+}
+
+/// The request-level web-search meter the finalizing settlement bills: how
+/// many searches ran, how many results they returned, and the vendor's own
+/// cost when it reported one.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WebSearchMeter {
+    pub requests: u32,
+    pub results: u32,
+    pub cost_nano_usd: Option<u64>,
 }
 
 /// Which public citation object shape to render.
@@ -300,6 +314,7 @@ pub fn web_search_prelude_events(web_search: &WebSearchAdmission, request_id: &s
                 provider_status: None,
                 raw_arguments: input,
                 custom: false,
+                thought_signature: None,
             },
         },
         Event::ServerToolResult {

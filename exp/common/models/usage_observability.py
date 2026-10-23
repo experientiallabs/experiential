@@ -43,8 +43,9 @@ def unreported_token_details(usage: JsonObject, *, responses: bool = False) -> f
     Raises:
         ValueError: A marker is malformed, repeats a name, or contradicts a nonzero meter.
     """
+    estimated = _estimated_token_details(usage)
     if "unreported_token_details" not in usage:
-        return frozenset()
+        return estimated
     marker = usage["unreported_token_details"]
     if (
         not isinstance(marker, list)
@@ -74,4 +75,23 @@ def unreported_token_details(usage: JsonObject, *, responses: bool = False) -> f
         count = usage.get("reasoning_tokens")
         if count is not None and (type(count) is not int or count != 0):
             raise ValueError("unreported token detail contradicts its compatibility placeholder")
-    return names
+    return names | estimated
+
+
+def _estimated_token_details(usage: JsonObject) -> frozenset[str]:
+    """Read a gateway relay's estimated-count marker as an unknown meter.
+
+    A gateway reports an estimated ``reasoning_tokens`` on lanes that bill
+    thinking without counting it, and marks it ``estimated_token_details``.
+    The estimate is display only, so a downstream hop treats it as unknown and
+    never values it as a reasoning subset.
+
+    Raises:
+        ValueError: The marker is not a list naming only ``reasoning_tokens``.
+    """
+    marker = usage.get("estimated_token_details")
+    if marker is None:
+        return frozenset()
+    if not isinstance(marker, list) or any(name != "reasoning_tokens" for name in marker):
+        raise ValueError("usage.estimated_token_details may only name reasoning_tokens")
+    return frozenset({"reasoning_tokens"}) if marker else frozenset()

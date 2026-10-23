@@ -10,15 +10,16 @@ from exp.common.models.gateway_catalog import ExactModelDeployment
 from exp.runtime.gateway.contracts import (
     AttemptId,
     AuthorizationSnapshot,
-    ExecutionSnapshot,
     GatewayEvent,
     GatewayFailure,
     GatewayServiceTierAdmission,
     GatewayServiceTierSettlement,
 )
+from exp.runtime.gateway.execution_snapshot import ExecutionSnapshot
 from exp.runtime.gateway.group_commit import GroupCommitAttemptLedger
 from exp.runtime.gateway.interfaces import GatewayControlStore
 from exp.runtime.gateway.routing import CatalogRouteResolver
+from exp.runtime.gateway.video.store import VideoJobStore
 from exp.runtime.models import RuntimeModelCatalog
 
 
@@ -150,6 +151,19 @@ class NativeGatewayComponents(Protocol):
         not-enabled error. The returned object is a
         ``exp.runtime.gateway.batch.BatchControlPlane``; the loose annotation
         keeps the synchronous components importable without the batch package.
+        """
+        ...
+
+    @property
+    def video_jobs(self) -> VideoJobStore | None:
+        """Return the optional durable store enabling ``/v1/videos``.
+
+        Hosts without it return ``None`` (or omit the attribute) and every
+        video route answers a uniform 404. A host serving several workers
+        must back it with storage every worker shares, since any worker may
+        answer a poll for a job another worker created; every worker's
+        background poller then polls the same open jobs, which settlement's
+        exactly-once ledger write and the store's compare-and-set absorb.
         """
         ...
 

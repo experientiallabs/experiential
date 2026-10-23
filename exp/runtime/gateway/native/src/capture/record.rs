@@ -86,6 +86,9 @@ pub(crate) enum Response {
         client_disconnected: bool,
         source_json: Option<String>,
     },
+    /// A body kept on disk; only a split record can carry it.
+    #[serde(skip)]
+    Spilled(super::split::SpilledResponse),
 }
 
 impl Response {
@@ -105,6 +108,8 @@ impl Response {
                     + if *client_disconnected { 4 } else { 5 }
                     + optional_string_bytes(source_json.as_deref())
             }
+            // The skeleton reference and the stream facts; the body is on disk.
+            Self::Spilled(_) => 256,
         }
     }
 
@@ -122,6 +127,7 @@ impl Response {
                     + frames.iter().map(budget::heap_bytes).sum::<usize>()
                     + source_json.as_ref().map_or(0, String::capacity)
             }
+            Self::Spilled(_) => std::mem::size_of::<super::split::SpilledResponse>() + 64,
         }
     }
 }
@@ -154,6 +160,14 @@ pub(crate) struct Record<R = Response> {
     /// only when the dial injected them (see `super::logprobs`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_logprobs: Option<super::logprobs::Captured>,
+    /// The caller's raw body when it is too large to decode in memory; a split
+    /// record writes it as the wire request's body part.
+    #[serde(skip)]
+    pub transport_body: Option<Vec<u8>>,
+    /// The request's messages, written to disk at admission; the context then
+    /// holds every other field. Only a split record can carry it.
+    #[serde(skip)]
+    pub messages_part: Option<Arc<super::spill::PendingPart>>,
 }
 
 /// Borrow ordinary reasoning; materialize a lossless projection only for NUL text.
@@ -281,6 +295,48 @@ impl<R: Serialize> Record<R> {
             record.serialize_field("provider_logprobs", logprobs)?;
         }
         record.end()
+    }
+}
+
+impl Record {
+    /// The record as a JSON tree with `context` in place of the request's
+    /// context and no spilled response; the split builder fills references in.
+    pub(crate) fn skeleton_value(&self, context: Value) -> Option<Value> {
+        let copy = Record {
+            checkpointed: false,
+            schema_version: self.schema_version,
+            request: Request {
+                request_id: self.request.request_id.clone(),
+                scope: self.request.scope.clone(),
+                protocol: self.request.protocol,
+                model_id: self.request.model_id.clone(),
+                context: Arc::new(context),
+            },
+            response: match &self.response {
+                Some(Response::Spilled(_)) | None => None,
+                Some(response) => Some(response.clone()),
+            },
+            transport: self.transport.clone(),
+            provider_reasoning: self.provider_reasoning.clone(),
+            provider_reasoning_source_json: self.provider_reasoning_source_json.clone(),
+            provider_tool_calls_json: self.provider_tool_calls_json.clone(),
+            deployment_id: self.deployment_id.clone(),
+            metrics: self.metrics.clone(),
+            gemini_thought_parts: self.gemini_thought_parts.clone(),
+            gemini_thought_parts_source_json: self.gemini_thought_parts_source_json.clone(),
+            captured_at: self.captured_at,
+            provider_logprobs: self.provider_logprobs.clone(),
+            transport_body: None,
+            messages_part: None,
+        };
+        serde_json::to_value(&copy).ok()
+    }
+
+    /// Whether only a split record can carry this record.
+    pub(crate) fn requires_split(&self) -> bool {
+        self.transport_body.is_some()
+            || self.messages_part.is_some()
+            || matches!(self.response, Some(Response::Spilled(_)))
     }
 }
 

@@ -179,7 +179,7 @@ def router(
         return
     with (
         usage_error(OSError, ValueError),
-        progress_display(_console, single_line=True) as progress,
+        progress_display(_console) as progress,
     ):
         result = optimize_project_router(
             store,

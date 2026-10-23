@@ -5,12 +5,15 @@ from __future__ import annotations
 from urllib.parse import urlsplit
 
 from exp.common.models import BillingSource, ModelRequest, ModelResponse, ModelSnapshot
+from exp.runtime.gateway.organization_tag import organization_tag_key
 from exp.runtime.models.providers.async_transport import AsyncJsonHttpTransport
 from exp.runtime.models.providers.base import GatewayWireProfile
 from exp.runtime.models.providers.errors import ProviderCapabilityError
 from exp.runtime.models.providers.transport import JsonHttpTransport
 
 TYPESAFE_BASE_URL = "https://api.typesafe.ai/v1"
+TYPESAFE_IMAGES_HEADER = "TypeSafe-Danger-Zone-Images"
+"""Opt-in header TypeSafe requires on every request that carries an image asset."""
 
 
 class TypeSafeClient:
@@ -70,8 +73,14 @@ class TypeSafeClient:
         raise ProviderCapabilityError(capability="completions")
 
     def gateway_wire_profile(self) -> GatewayWireProfile:
-        """Return the native decision endpoint and bearer-authenticated wire facts."""
+        """Return the native decision endpoint and bearer-authenticated wire facts.
+
+        A catalog-approved origin other than the official API is a self-hosted
+        SystemOne server, which fair-queues by organization, so its profile
+        carries the private key for the per-organization scheduling tag.
+        """
         url = f"{self._base_url}/systemone"
+        self_hosted = self._base_url != TYPESAFE_BASE_URL
         return GatewayWireProfile(
             dialect="typesafe_systemone",
             url=url,
@@ -84,4 +93,5 @@ class TypeSafeClient:
             billing_customer_managed=self._model.billing_source == BillingSource.CUSTOMER_MANAGED,
             supports_temperature=False,
             supports_top_p=False,
+            organization_tag_key=organization_tag_key(self._api_key) if self_hosted else None,
         )

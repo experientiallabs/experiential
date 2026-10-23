@@ -39,9 +39,9 @@ from exp.runtime.gateway.catalog_authority import (
 from exp.runtime.gateway.contracts import (
     AuthorizationSnapshot,
     DirectTarget,
-    ExecutionSnapshot,
     GatewayApiSurface,
 )
+from exp.runtime.gateway.execution_snapshot import ExecutionSnapshot
 from exp.runtime.gateway.lifecycle import (
     GatewayLifecycleError,
     LocalGatewayComponents,

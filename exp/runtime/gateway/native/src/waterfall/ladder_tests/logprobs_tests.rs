@@ -134,3 +134,28 @@ fn empty_probability_prefix_is_bounded_without_committing() {
         assert!(committed.relay.first_token_at().is_none());
     });
 }
+
+#[test]
+fn private_reasoning_with_null_probabilities_commits_after_a_long_think() {
+    // A reasoning model sends `"logprobs": null` beside each private
+    // reasoning chunk; hundreds of them before the first answer token
+    // overflowed the withheld bound and failed the request (2026-10-19).
+    const THINK: &str =
+        r#"{"choices":[{"index":0,"delta":{"reasoning_content":"r"},"logprobs":null}]}"#;
+    let mut frames: Vec<&str> = vec![THINK; 600];
+    frames.extend([CONTENT, FINISH]);
+    let frames: &'static [&'static str] = Box::leak(frames.into_boxed_slice());
+    block_on(async {
+        let harness = Harness::new();
+        let only = spawn_rung(vec![Answer::Stream(frames)]).await;
+        let route = [probability_wire("a", &only.url)];
+        let (won, guard) = run_probabilities(&harness, &route).await;
+        let Won::Committed(committed) = finish(guard, won).await else {
+            panic!("the only rung must commit");
+        };
+        assert_eq!(committed.depth, 0);
+        assert!(committed.prefix.iter().any(|event| matches!(event,
+            Event::ChoiceLogprobsDelta(delta)
+            if delta.logprobs.as_ref().and_then(|v| v.content.as_ref()).is_some_and(|v| v.len() == 1))));
+    });
+}

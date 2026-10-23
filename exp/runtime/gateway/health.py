@@ -1,14 +1,20 @@
-"""Bounded per-deployment circuit and throttle state for exact-model waterfalls."""
+"""Bounded per-deployment circuit and throttle state for exact-model waterfalls.
+
+The registry also owns the per-lane dead-box ejection (``lane_ejection``): the
+same settled outcomes feed it, and claim walks read it to order an ejected
+lane last (``order``).
+"""
 
 from __future__ import annotations
 
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Literal
 
 from exp.runtime.gateway.contracts import GatewayFailure, GatewayFailureClass
+from exp.runtime.gateway.lane_ejection import LaneEjectionPolicy, LaneEjections, LaneKey
 
 DeploymentHealthKey = tuple[str, str, str]
 
@@ -64,6 +70,11 @@ def health_failure_cause(
     return None
 
 
+def _lane(key: DeploymentHealthKey) -> LaneKey:
+    """The physical lane behind a health key: ``(deployment_id, connection_sha256)``."""
+    return (key[1], key[2])
+
+
 @dataclass
 class _DeploymentHealth:
     """Mutable content-free health state protected by the registry lock."""
@@ -85,6 +96,7 @@ class DeploymentHealthRegistry:
         failure_threshold: int = 2,
         open_seconds: float = 30.0,
         throttle_seconds: float = 30.0,
+        lane_ejection: LaneEjectionPolicy | None = None,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         """Initialize finite in-process deployment health policy.
@@ -93,6 +105,8 @@ class DeploymentHealthRegistry:
             failure_threshold: Consecutive operational failures that open one circuit.
             open_seconds: Circuit cooldown before one half-open probe.
             throttle_seconds: Independent suppression window after provider throttling.
+            lane_ejection: Per-lane dead-box ejection thresholds; ``None`` reads
+                the operator's environment overrides over the defaults.
             clock: Injectable monotonic clock.
 
         Raises:
@@ -107,7 +121,33 @@ class DeploymentHealthRegistry:
         self._throttle_seconds = throttle_seconds
         self._clock = clock
         self._states: dict[DeploymentHealthKey, _DeploymentHealth] = {}
+        self._lanes = LaneEjections(lane_ejection or LaneEjectionPolicy.from_environ())
         self._lock = threading.Lock()
+
+    def order(self, keys: tuple[DeploymentHealthKey, ...], candidates: Sequence[int]) -> list[int]:
+        """Return ``candidates`` with every ejected lane moved last, order otherwise kept.
+
+        Args:
+            keys: One health key per ordered route deployment.
+            candidates: Route indexes in the walk's preference order.
+
+        Returns:
+            The same indexes, live lanes first, ejected lanes after them.
+        """
+        now = self._clock()
+        with self._lock:
+            ejected = {
+                index for index in candidates if self._lanes.ejected(_lane(keys[index]), now)
+            }
+        return [index for index in candidates if index not in ejected] + [
+            index for index in candidates if index in ejected
+        ]
+
+    def lane_ejected(self, key: DeploymentHealthKey) -> bool:
+        """Whether the lane behind ``key`` is ejected on this worker right now."""
+        now = self._clock()
+        with self._lock:
+            return self._lanes.ejected(_lane(key), now)
 
     def claim(self, key: DeploymentHealthKey) -> bool:
         """Reserve one eligible route or half-open probe.
@@ -126,10 +166,12 @@ class DeploymentHealthRegistry:
             if state.open_until > now:
                 return False
             if state.consecutive_failures < self._failure_threshold:
+                self._lanes.claimed(_lane(key), now)
                 return True
             if state.half_open_probe:
                 return False
             state.half_open_probe = True
+            self._lanes.claimed(_lane(key), now)
             return True
 
     def claim_last_resort(self, key: DeploymentHealthKey) -> bool:
@@ -155,6 +197,7 @@ class DeploymentHealthRegistry:
             if state.last_resort_probe:
                 return False
             state.last_resort_probe = True
+            self._lanes.claimed(_lane(key), now)
             return True
 
     def claim_forced(self, key: DeploymentHealthKey) -> bool:
@@ -177,7 +220,10 @@ class DeploymentHealthRegistry:
         now = self._clock()
         with self._lock:
             state = self._states.setdefault(key, _DeploymentHealth())
-            return state.throttle_until <= now
+            if state.throttle_until > now:
+                return False
+            self._lanes.claimed(_lane(key), now)
+            return True
 
     def claim_throttle_redial(self, key: DeploymentHealthKey) -> bool:
         """Admit one post-backoff redial of a rung inside its own throttle window.
@@ -216,6 +262,7 @@ class DeploymentHealthRegistry:
             state.open_until = 0.0
             state.half_open_probe = False
             state.last_resort_probe = False
+            self._lanes.succeeded(_lane(key))
 
     def succeeded(self, key: DeploymentHealthKey) -> None:
         """Close one circuit after a successful terminal provider result.
@@ -229,6 +276,7 @@ class DeploymentHealthRegistry:
             state.open_until = 0.0
             state.half_open_probe = False
             state.last_resort_probe = False
+            self._lanes.succeeded(_lane(key))
 
     def failed(self, key: DeploymentHealthKey, failure: GatewayFailure) -> None:
         """Apply one normalized provider outcome to circuit or throttle state.
@@ -243,6 +291,7 @@ class DeploymentHealthRegistry:
             state = self._states.setdefault(key, _DeploymentHealth())
             state.half_open_probe = False
             state.last_resort_probe = False
+            self._lanes.failed(_lane(key), failure, now)
             if cause == "throttle":
                 state.throttle_until = max(
                     state.throttle_until,
@@ -364,3 +413,4 @@ class DeploymentHealthRegistry:
             if state is not None:
                 state.half_open_probe = False
                 state.last_resort_probe = False
+            self._lanes.released(_lane(key))

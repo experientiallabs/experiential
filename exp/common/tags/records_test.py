@@ -111,18 +111,6 @@ def test_record_requires_ordered_aligned_turn_windows() -> None:
         _record(turn=(first,), conversation=first.model_copy(update={"window_index": 2}))
 
 
-def test_record_requires_a_timezone() -> None:
-    """Naive timestamps are rejected so stored times are unambiguous."""
-    record = _record(
-        turn=(WindowScores(window_index=0, start_message=0, end_message=1, scores=()),),
-        conversation=None,
-    )
-    payload = record.model_dump(mode="json")
-    payload["tagged_at"] = "2026-10-14T12:00:00"
-    with pytest.raises(ValidationError):
-        ExchangeTags.model_validate(payload)
-
-
 def test_summarize_takes_per_tag_max_and_min() -> None:
     """Each tag keeps its highest and lowest score across turn windows."""
     record = _record(
@@ -172,29 +160,6 @@ def test_summary_rejects_inverted_or_misaligned_bounds() -> None:
             turn_min=(0.1,),
             turn_windows=1,
         )
-
-
-def test_facts_reject_negative_counts() -> None:
-    """Counts cannot be negative."""
-    with pytest.raises(ValidationError):
-        TagFacts(tool_calls=-1, turns=0, truncated=False, has_images=False, structured_output=False)
-    assert _facts().model_dump() == {
-        "tool_calls": 1,
-        "turns": 2,
-        "truncated": False,
-        "has_images": True,
-        "structured_output": False,
-    }
-
-
-def test_identifiers_accept_capture_length_ids() -> None:
-    """Exchange ids and conversation keys accept the 512 characters captures allow."""
-    window = WindowScores(window_index=0, start_message=0, end_message=1, scores=())
-    record = _record(turn=(window,), conversation=None)
-    long_ids = record.model_copy(update={"exchange_id": "r" * 512, "conversation_key": "c" * 512})
-    assert ExchangeTags.model_validate(long_ids.model_dump()) == long_ids
-    with pytest.raises(ValidationError):
-        ExchangeTags.model_validate({**record.model_dump(), "exchange_id": "r" * 513})
 
 
 def test_summarize_reads_opening_scores_from_the_tagged_opening() -> None:

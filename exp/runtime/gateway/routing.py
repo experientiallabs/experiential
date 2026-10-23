@@ -22,12 +22,12 @@ from exp.common.routing.policy import RoutingDecision
 from exp.runtime.gateway.contracts import (
     AuthorizationSnapshot,
     DirectTarget,
-    ExecutionSnapshot,
     GatewayRequest,
     ProjectSelection,
     ProjectTarget,
 )
 from exp.runtime.gateway.discovery import PublishedAliasMetadata, published_alias_metadata
+from exp.runtime.gateway.execution_snapshot import ExecutionSnapshot
 from exp.runtime.gateway.interfaces import ProjectTargetResolver
 from exp.runtime.gateway.model_plan import (
     _CatalogView,

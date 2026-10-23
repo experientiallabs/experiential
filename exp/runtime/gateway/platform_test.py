@@ -63,7 +63,8 @@ from exp.runtime.gateway import (
     UsageTerminalCount,
     VirtualKeyRecord,
 )
-from exp.runtime.gateway.contracts import AuthorizationSnapshot, ExecutionSnapshot
+from exp.runtime.gateway.contracts import AuthorizationSnapshot
+from exp.runtime.gateway.execution_snapshot import ExecutionSnapshot
 
 
 def test_external_management_call_site_separates_receipts_from_one_time_secrets() -> None:

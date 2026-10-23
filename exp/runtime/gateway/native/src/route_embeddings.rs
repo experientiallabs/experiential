@@ -115,14 +115,14 @@ pub(crate) async fn embeddings(
         METRICS.record_escalation(classify_escalation(reason.as_str().unwrap_or_default()));
         // The accepted request is already finalized control-plane side;
         // startup validation guarantees native servability, so fail closed.
-        return error_response(&escalation_error());
+        return error_response(&escalation_error(reason.as_str().unwrap_or_default()));
     }
     let admission: EmbeddingsAdmission = match serde_json::from_value(admission_value.clone()) {
         Ok(admission) => admission,
         Err(_) => return wire_drift_response(&state, &admission_value, started).await,
     };
     let mut guard = new_guard(&state, admission.request_id.clone(), started);
-    let permit = match acquire_permit(&state, &mut guard, deadline).await {
+    let permit = match acquire_permit(&state, &mut guard, deadline, None).await {
         Ok(permit) => permit,
         Err(response) => return *response,
     };
@@ -234,9 +234,11 @@ async fn run_ladder(
         guard.rebind(attempt_id);
         total_attempts += 1;
         counts[depth] += 1;
-        match dispatch(&state.http, wire, deadline, admission).await {
+        let http = state.http.for_origin(wire.tenant_origin);
+        match dispatch(http, wire, deadline, admission).await {
             Ok((body, usage)) => return Ok(Served { depth, body, usage }),
             Err((failure, opened)) => {
+                let failure = failure.with_tenant_origin(wire.tenant_origin);
                 if opened {
                     guard.mark_opened();
                 }
@@ -248,6 +250,7 @@ async fn run_ladder(
                     total_attempts,
                     counts[depth],
                     depth,
+                    &counts,
                     &failure,
                     false,
                 );
@@ -433,9 +436,11 @@ fn public_embeddings(
         cached_input_tokens: None,
         cache_creation_input_tokens: None,
         cache_creation_1h_input_tokens: None,
+        cache_creation_12h_input_tokens: None,
         reasoning_tokens: None,
         billed_units: None,
         cache_writes_read_back: false,
+        image_output_tokens: None,
     };
     Ok((Value::Object(public), usage))
 }

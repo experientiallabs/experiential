@@ -250,3 +250,27 @@ def test_failed_settlement_rolls_back_receipt_total_and_response(
     assert restored.total() == 2
     assert not restored.has_unbounded_liability()
     assert project.artifacts.list_ids() == ()
+
+
+def test_duplicate_members_in_output_text_are_retained_without_hiding_credentials(
+    tmp_path: Path,
+) -> None:
+    """Protocol-invalid text is replayable, but all duplicate values remain security-checked."""
+    project = ProjectStore(tmp_path, "nested-output")
+    ledger = RequestBudgetStore(project, "run")
+    ledger.write("safe", RequestReceipt(fingerprint="safe", charge=2, state="pending"))
+    payload = json.dumps({"output": '{"a":1,"a":2}'})
+    ledger.complete("safe", None, payload)
+    receipt = ledger.read("safe")
+    assert receipt is not None and receipt.response is not None
+    assert ledger.response(receipt) == payload
+    for index, text in enumerate(
+        (
+            '{"a":{"api_key":"hidden"},"a":{}}',
+            '{"a":{},"a":{"api_key":"hidden"}}',
+        )
+    ):
+        key = f"unsafe-{index}"
+        ledger.write(key, RequestReceipt(fingerprint=key, charge=2, state="pending"))
+        with pytest.raises(ArtifactStoreError, match="secret boundary"):
+            ledger.complete(key, None, json.dumps({"output": text}))

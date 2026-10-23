@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import importlib
 import json
-from collections.abc import Callable
+import os
+from collections.abc import Callable, Mapping
 from typing import TYPE_CHECKING, Protocol, cast
 
 from exp.runtime.gateway.guardrails.deterministic import NativeDetector
@@ -33,6 +34,66 @@ class NativeGatewayServerError(RuntimeError):
     """The native extension could not serve."""
 
 
+PRE_FIRST_BYTE_RESERVE_ENV = "EXP_GATEWAY_PRE_FIRST_BYTE_RESERVE_SECONDS"
+"""Operator override of what a raised pre-first-byte budget keeps past the authored allowance."""
+
+
+def pre_first_byte_reserve_seconds(environ: Mapping[str, str] | None = None) -> float | None:
+    """Read the operator's pre-first-byte reserve override, if one is set.
+
+    A request whose route authors a first-byte allowance longer than the
+    configured budget gets that allowance plus this reserve (the data plane's
+    default is 15 s), so a rung that stalls out its whole allowance still
+    leaves a successor time to answer.
+
+    Args:
+        environ: The environment to read; ``None`` reads ``os.environ``.
+
+    Returns:
+        The override in seconds, or ``None`` to keep the data plane's default.
+
+    Raises:
+        ValueError: The override does not parse or is negative.
+    """
+    raw = (os.environ if environ is None else environ).get(PRE_FIRST_BYTE_RESERVE_ENV)
+    if not raw:
+        return None
+    seconds = float(raw)
+    if seconds < 0:
+        raise ValueError(f"{PRE_FIRST_BYTE_RESERVE_ENV} must not be negative")
+    return seconds
+
+
+PRE_FIRST_BYTE_MAX_ENV = "EXP_GATEWAY_PRE_FIRST_BYTE_MAX_SECONDS"
+"""Operator override of the ceiling on a pre-first-byte budget an authored allowance raised."""
+
+
+def pre_first_byte_max_seconds(environ: Mapping[str, str] | None = None) -> float | None:
+    """Read the operator's ceiling on a raised pre-first-byte budget, if one is set.
+
+    An authored first-byte allowance raises a request's budget (see
+    ``pre_first_byte_reserve_seconds``) to at most this many seconds (the data
+    plane's default is 600 s); it never lowers the configured budget. Zero
+    removes the ceiling.
+
+    Args:
+        environ: The environment to read; ``None`` reads ``os.environ``.
+
+    Returns:
+        The override in seconds, or ``None`` to keep the data plane's default.
+
+    Raises:
+        ValueError: The override does not parse or is negative.
+    """
+    raw = (os.environ if environ is None else environ).get(PRE_FIRST_BYTE_MAX_ENV)
+    if not raw:
+        return None
+    seconds = float(raw)
+    if seconds < 0:
+        raise ValueError(f"{PRE_FIRST_BYTE_MAX_ENV} must not be negative")
+    return seconds
+
+
 def serve_native_gateway(
     control_plane: NativeServerControlPlane,
     *,
@@ -47,6 +108,7 @@ def serve_native_gateway(
     time_to_first_token_seconds: float = 120.0,
     pre_first_byte_budget_seconds: float = 90.0,
     native_usage_enabled: bool = True,
+    maximum_retained_output_bytes: int | None = None,
     capture: CaptureCollector | None = None,
     shutdown: ShutdownHandle | None = None,
     on_listening: Callable[[], None] | None = None,
@@ -93,7 +155,10 @@ def serve_native_gateway(
             request's start. Kept under an edge proxy's origin timeout
             (Cloudflare's is 100 s) so a chain of slow dials ends in the
             gateway's own retryable 503 instead of the proxy's 504 page. Zero
-            disables it.
+            disables it. A request whose route AUTHORS a longer first-byte
+            allowance gets that allowance plus a reserve instead (15 s, or
+            ``EXP_GATEWAY_PRE_FIRST_BYTE_RESERVE_SECONDS``), so an authored
+            self-hosted lane is never cut at the default.
         public_upstreams_only: Restrict native provider connections to public HTTPS
             addresses, including connection-time DNS checks and proxy bypass.
             Hosted embedders accepting customer endpoints must enable this. It
@@ -102,6 +167,15 @@ def serve_native_gateway(
         native_usage_enabled: Whether Rust owns ``/usage.json``. Hosted,
             multi-tenant callers should disable it so their own surface owns
             usage.
+        maximum_retained_output_bytes: Worker-wide bound on provider output
+            retained across all in-flight streams (tool arguments, buffered
+            Messages blocks, non-streaming aggregations, Responses
+            continuations). A stream that would cross it fails with a
+            retryable 503 instead of growing worker memory; a continuation
+            that would cross it is simply not retained. None (the default)
+            leaves the budget off, which is the behavior before this
+            setting existed; 1 GiB (a quarter of a 4 GiB worker) is the
+            suggested value when enabling it.
         capture: The collector shared with the admission controller; None retains no content.
         shutdown: Optional embedder-owned stop handle from
             ``exp_gateway_native.shutdown_handle()``. A host serving on a
@@ -138,6 +212,14 @@ def serve_native_gateway(
         "pre_first_byte_budget_seconds": pre_first_byte_budget_seconds,
         "native_usage_enabled": native_usage_enabled,
     }
+    if maximum_retained_output_bytes is not None:
+        config["maximum_retained_output_bytes"] = maximum_retained_output_bytes
+    ceiling = pre_first_byte_max_seconds()
+    if ceiling is not None:
+        config["pre_first_byte_max_seconds"] = ceiling
+    reserve = pre_first_byte_reserve_seconds()
+    if reserve is not None:
+        config["pre_first_byte_reserve_seconds"] = reserve
     try:
         native.serve(
             cast("NativeControlPlane", control_plane),

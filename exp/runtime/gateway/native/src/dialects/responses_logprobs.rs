@@ -23,6 +23,16 @@ pub(crate) fn records_are_bounded(records: &Value, optional_alternatives: bool) 
             .all(|record| valid_record(record, optional_alternatives))
 }
 
+/// Count one value's JSON bytes without allocating a serialized copy or
+/// applying the probability-record bound; callers charge the count to their
+/// own retention budget.
+pub(crate) fn json_retained_bytes(value: &Value) -> usize {
+    let mut counter = ByteCounter { size: 0 };
+    // Serializing a `Value` into a counter cannot fail.
+    let _ = serde_json::to_writer(&mut counter, value);
+    counter.size
+}
+
 /// Count JSON bytes without allocating a serialized copy.
 pub(crate) fn records_retained_bytes(records: &Value) -> Option<usize> {
     let mut counter = ByteCounter { size: 0 };
@@ -117,6 +127,15 @@ fn validate(records: &Value) -> Result<(), Failure> {
         })
 }
 
+/// Map unusable provider logprob values onto the contract's negligible value
+/// before the shape check, so a probability value never fails the answer
+/// (see `crate::logprobs::logprob_value`); structure is still validated.
+fn normalized(records: &Value, keep_null_alternatives: bool) -> Value {
+    let mut records = records.clone();
+    crate::logprobs::normalize_records_value(&mut records, keep_null_alternatives, "responses");
+    records
+}
+
 /// Extract probability records from a Responses output text event.
 pub(crate) fn payload_records(payload: &Map<String, Value>) -> Option<Value> {
     payload
@@ -152,13 +171,14 @@ pub(crate) fn item_done_events(
         let Some(records) = part.as_object().and_then(|part| part.get("logprobs")) else {
             continue;
         };
-        validate(records)?;
+        let records = normalized(records, false);
+        validate(&records)?;
         events.push(Event::ProviderResponsesLogprobs {
             output_index,
             item_id: item_id.to_string(),
             content_index: bounded_position(content_index, "OpenAI content_index")?,
             phase: "item_done".to_string(),
-            records: records.clone(),
+            records,
         });
     }
     Ok(events)
@@ -192,13 +212,14 @@ pub(crate) fn terminal_events(response: &Map<String, Value>) -> Result<Vec<Event
             let Some(records) = part.as_object().and_then(|part| part.get("logprobs")) else {
                 continue;
             };
-            validate(records)?;
+            let records = normalized(records, false);
+            validate(&records)?;
             events.push(Event::ProviderResponsesLogprobs {
                 output_index,
                 item_id: item_id.to_string(),
                 content_index: bounded_position(content_index, "OpenAI content_index")?,
                 phase: "terminal".to_string(),
-                records: records.clone(),
+                records,
             });
         }
     }
@@ -244,6 +265,7 @@ impl Normalizer {
             .then(|| payload_records(payload))
             .flatten()
         {
+            let records = normalized(&records, true);
             if !records_are_bounded(&records, true) {
                 return Err(malformed(
                     "OpenAI Responses probability records are invalid",
@@ -284,6 +306,7 @@ impl Normalizer {
             .then(|| payload_records(payload))
             .flatten()
         {
+            let records = normalized(&records, event_type == "response.output_text.done");
             if !(records_are_bounded(&records, event_type == "response.output_text.done")
                 || (records.is_null() && event_type == "response.content_part.done"))
             {

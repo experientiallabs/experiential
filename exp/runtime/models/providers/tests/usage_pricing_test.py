@@ -150,6 +150,54 @@ def test_openai_usage_subsets_survive_sdk_conversion(hour: int | None, responses
     )
 
 
+@pytest.mark.parametrize("split", [None, {"ttl_30m_tokens": 10, "ttl_12h_tokens": 20}])
+def test_responses_twelve_hour_write_subset_survives_sdk_conversion(
+    split: JsonObject | None,
+) -> None:
+    """OpenAI's ``cache_write_tokens_details.ttl_12h_tokens`` lands on the write subset."""
+    details: JsonObject = {"cached_tokens": 10, "cache_write_tokens": 30}
+    if split is not None:
+        details["cache_write_tokens_details"] = split
+    payload: JsonObject = {
+        "id": "resp_fixture",
+        "object": "response",
+        "created_at": 1.0,
+        "status": "completed",
+        "model": "fixture",
+        "parallel_tool_calls": True,
+        "tool_choice": "auto",
+        "tools": [],
+        "output": [
+            {
+                "type": "message",
+                "id": "msg_fixture",
+                "role": "assistant",
+                "status": "completed",
+                "content": [{"type": "output_text", "text": "done", "annotations": []}],
+            }
+        ],
+        "usage": {
+            "input_tokens": 100,
+            "output_tokens": 20,
+            "total_tokens": 120,
+            "input_tokens_details": details,
+            "output_tokens_details": {"reasoning_tokens": 7},
+        },
+    }
+    response = openai_responses_response(payload, configured_model=_snapshot(), latency_seconds=1)
+    assert response.economics.usage is not None
+    assert response.economics.usage.cache_write_12h_input_tokens == (None if split is None else 20)
+    # A 12-hour request bills split-less writes at 12 hours, as the native parser does.
+    requested = openai_responses_response(
+        payload,
+        configured_model=_snapshot(),
+        latency_seconds=1,
+        twelve_hour_writes_requested=True,
+    )
+    assert requested.economics.usage is not None
+    assert requested.economics.usage.cache_write_12h_input_tokens == (30 if split is None else 20)
+
+
 @pytest.mark.parametrize(
     ("nested", "expected"),
     [(None, 18), ({"reasoning_tokens": 12}, 12)],

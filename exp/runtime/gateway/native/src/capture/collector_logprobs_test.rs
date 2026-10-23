@@ -104,6 +104,7 @@ fn probabilities_never_outgrow_the_destination_record_ceiling() {
     // The default test ceiling (8 KiB) leaves no room beside a full response.
     let (collector, receiver) = collector(Configuration {
         capture_logprobs: true,
+        spill: None,
         ..config()
     });
     assert!(collector.begin(request("ceiling")));

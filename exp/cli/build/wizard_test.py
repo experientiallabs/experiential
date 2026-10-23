@@ -411,6 +411,8 @@ def test_default_build_prepares_saved_scenarios_without_rollouts(
     assert result.exit_code == 0, result.output
     assert "Scenarios and world-model grounding are ready" in unstyle(result.output)
     assert state.embedding_calls and not state.completion_calls
+    # The guided build reaches the learning stage; this catalog has no recall model for it.
+    assert "built without learning" in " ".join(unstyle(result.output).split())
     store = wizard.ProjectStore(root, "support")
     selected = store.load_project().build
     assert selected is not None
