@@ -101,14 +101,14 @@ async def _measure(
         SystemOneRequestError: A sample window breaks the decision contract.
     """
     latencies: list[float] = []
-    tokens = 0
-    errors: list[str] = []  # bounded by the level's duration
+    tokens = errors = 0
+    first_error: str | None = None
     cursor = itertools.cycle(windows)
     start = clock()
 
     async def worker() -> None:
         """Start one decision after another until the level's time is up."""
-        nonlocal tokens
+        nonlocal tokens, errors, first_error
         while clock() - start < seconds:
             began = clock()
             try:
@@ -116,7 +116,8 @@ async def _measure(
             except SystemOneError as error:
                 if isinstance(error, SystemOneRequestError):
                     raise
-                errors.append(str(error))
+                errors += 1
+                first_error = first_error or str(error)
                 continue
             latencies.append(clock() - began)
             tokens += decision.usage.input_tokens
@@ -133,13 +134,13 @@ async def _measure(
     return LevelMeasurement(
         in_flight=tagger.max_in_flight,
         completed=len(latencies),
-        errors=len(errors),
+        errors=errors,
         elapsed_seconds=elapsed,
         windows_per_second=len(latencies) / elapsed if elapsed > 0 else 0.0,
         input_tokens_per_second=tokens / elapsed if elapsed > 0 else 0.0,
         p50_latency_seconds=_percentile(latencies, 0.50),
         p95_latency_seconds=_percentile(latencies, 0.95),
-        first_error=errors[0] if errors else None,
+        first_error=first_error,
     )
 
 
