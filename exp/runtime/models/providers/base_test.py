@@ -87,6 +87,8 @@ def _ok_transport() -> ScriptedJsonTransport:
 class _EchoClient(ProviderHttpClient):
     """Minimal concrete client that exposes exactly what the base template supplies."""
 
+    # This timing/economics fixture models a protocol with a defined deduplication header.
+    supports_idempotency_key: ClassVar[bool] = True
     default_headers: ClassVar[Mapping[str, str]] = {"X-Fixture": "echo"}
 
     def _completion_path(self) -> str:

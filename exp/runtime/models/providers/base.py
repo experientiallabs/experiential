@@ -685,16 +685,6 @@ class ProviderHttpClient(abc.ABC):
                 raise
             if not 200 <= response.status_code < 300:
                 unbilled_attempts += int(response.known_unbilled)
-                error = response.body.get("error")
-                if (
-                    idempotency_key is None
-                    and response.status_code == 409
-                    and isinstance(error, dict)
-                    and error.get("code") == "idempotency_replay_unavailable"
-                ):
-                    # The gateway confirms this completed operation cannot be replayed. A new
-                    # client-owned attempt gets a new key and remains inside the retry allowance.
-                    request_headers["Idempotency-Key"] = f"exp-{uuid4().hex}"
                 raise ProviderTransportError(
                     f"provider returned HTTP {response.status_code}",
                     status_code=response.status_code,
@@ -802,6 +792,9 @@ class ProviderHttpClient(abc.ABC):
             retry_policy=self._retry_policy,
             idempotency_key=idempotency_key or self._intent_idempotency_key(url, payload),
             attempt_timeout_seconds=self._timeout_seconds,
+            classify=classify_retry
+            if self.supports_idempotency_key
+            else classify_unrepeatable_retry,
         )
 
     def _request_path(self, path: str) -> str:
@@ -848,8 +841,8 @@ def _classify_unrepeatable_complete_retry(exception: Exception) -> RetryClassifi
     """Classify failures on a wire without an idempotency contract.
 
     An empty output without a length stop may be retried. A known output-allowance stop is
-    terminal; an attempt without an HTTP status may have executed and is never resent (see
-    `classify_unrepeatable_retry`).
+    terminal; any unproven transport or HTTP failure may have executed and is never resent
+    (see `classify_unrepeatable_retry`).
 
     Args:
         exception: Error raised by one post-and-parse attempt.

@@ -323,3 +323,174 @@ def test_already_admitted_injection_refuses_before_either_owner_claims(tmp_path:
     )
     assert not receipt["roles"] and receipt["accounted_usd"] == 0
     assert not [i for i in store.artifacts.list_ids() if i.startswith("provider-")]
+
+
+def unknown_runtime(store: ProjectStore, runtime: RuntimeModelCatalog) -> RuntimeModelCatalog:
+    """Remove only tariff metadata; keep the exact provider and injected HTTP transport."""
+    from exp.common.models import load_model_catalog
+
+    catalog = load_model_catalog(store.model_catalog_path)
+    model = catalog.models["fixture-model"]
+    assert model.capabilities is not None
+    unknown = model.model_copy(
+        update={
+            "capabilities": model.capabilities.model_copy(
+                update={
+                    "input_cost_per_million_tokens_usd": None,
+                    "output_cost_per_million_tokens_usd": None,
+                }
+            )
+        }
+    )
+    catalog = catalog.model_copy(update={"models": {"fixture-model": unknown}})
+    write_model_catalog(store.model_catalog_path, catalog)
+    return runtime.with_catalog(catalog)
+
+
+def test_explicit_unknown_consent_authorizes_only_finite_physical_schedule(tmp_path: Path) -> None:
+    """Unknown prices retain manual consent while actual unpriced sends are bounded and counted."""
+    store, completed, runtime, inner = prepared(tmp_path)
+    runtime = unknown_runtime(store, runtime)
+    snapshot, caps = runtime.snapshot("fixture-model")
+    assert _embedding_cost_ceiling(completed, caps) is None
+    result = _complete_grounded_build(
+        store,
+        completed,
+        selected=ProjectModelConfiguration(
+            world_model="fixture-model", judge="fixture-model", embedder="fixture-model"
+        ),
+        runtime_catalog=runtime,
+        world_snapshot=snapshot,
+        embedder_snapshot=snapshot,
+        top_k=5,
+        estimate=None,
+        maximum_build_cost_usd=5,
+        provider_spend_authorized=True,
+    )
+    assert result.artifacts.world_model and len(inner.requests) == 1
+    receipt = json.loads(
+        next(
+            store.paths.runtime_directory.glob("spend/build-embeddings-*/receipt.json")
+        ).read_text()
+    )
+    assert receipt["ceiling_usd"] == 0 and receipt["unpriced_attempt_ceiling"] == 3
+    assert receipt["unpriced_attempts"] == 1 and receipt["roles"][0]["unpriced_attempts"] == 1
+
+
+def test_unknown_without_consent_and_inherited_unpriced_zero_both_refuse(tmp_path: Path) -> None:
+    """A local manual grant cannot bypass the caller's false flag or an enclosing zero cap."""
+    from exp.runtime.models.spend_ceiling import UnpricedDispatchRefused
+
+    store, completed, runtime, inner = prepared(tmp_path)
+    runtime = unknown_runtime(store, runtime)
+    snapshot, _ = runtime.snapshot("fixture-model")
+
+    def invoke(authorized: bool) -> GroundedBuildCompletion:
+        return _complete_grounded_build(
+            store,
+            completed,
+            selected=ProjectModelConfiguration(
+                world_model="fixture-model", judge="fixture-model", embedder="fixture-model"
+            ),
+            runtime_catalog=runtime,
+            world_snapshot=snapshot,
+            embedder_snapshot=snapshot,
+            top_k=5,
+            estimate=None,
+            maximum_build_cost_usd=5,
+            provider_spend_authorized=authorized,
+        )
+
+    with pytest.raises(ValueError, match="explicit authorization"):
+        invoke(False)
+    assert not inner.requests
+    outer = operation_spend_ceiling(store, "unknown-zero")
+    outer.authorize("unknown-zero", ceiling_usd=0, unpriced_attempts=0)
+    with operation_spend_scope():
+        install_spend_ceiling(outer)
+        with pytest.raises(UnpricedDispatchRefused):
+            invoke(True)
+    assert not inner.requests and outer.summary().unpriced_attempt_ceiling == 0
+    assert not outer.summary().roles
+
+
+@pytest.mark.parametrize("yes", [False, True])
+def test_actual_cli_unknown_quote_requires_manual_yes_before_wire(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, yes: bool
+) -> None:
+    """The real command retains unknown-price consent and then uses finite admitted HTTP."""
+    from typer.testing import CliRunner
+
+    from exp.cli.app import app
+    from exp.cli.build import app as command
+    from exp.common.models import load_model_catalog
+
+    store, _, runtime, inner = prepared(tmp_path)
+    unknown_runtime(store, runtime)
+    catalog = load_model_catalog(store.model_catalog_path)
+    from exp.common.models import ModelRoles
+
+    catalog = catalog.model_copy(
+        update={
+            "roles": ModelRoles(
+                world_model="fixture-model", judge="fixture-model", embedder="fixture-model"
+            )
+        }
+    )
+    model = catalog.models["fixture-model"]
+    assert model.capabilities is not None
+    catalog = catalog.model_copy(
+        update={
+            "models": {
+                "fixture-model": model.model_copy(
+                    update={
+                        "capabilities": model.capabilities.model_copy(
+                            update={"supports_structured_output": True}
+                        )
+                    }
+                )
+            }
+        }
+    )
+    write_model_catalog(store.model_catalog_path, catalog)
+    monkeypatch.setattr(
+        command,
+        "RuntimeModelCatalog",
+        lambda _catalog: RuntimeModelCatalog(
+            catalog, environment={"FIXTURE_API_KEY": "secret"}, transport_factory=lambda: inner
+        ),
+    )
+    monkeypatch.setattr(command, "capture_build_completed", lambda **_kwargs: None)
+    args = [
+        "build",
+        "cli-unknown",
+        "--root",
+        str(tmp_path),
+        "--traces",
+        str(tmp_path / "traces.json"),
+        "--source",
+        "chat-json",
+        "--world-model",
+        "fixture-model",
+        "--judge",
+        "fixture-model",
+        "--embedder",
+        "fixture-model",
+        "--non-interactive",
+    ]
+    if yes:
+        args.append("--yes")
+    result = CliRunner().invoke(app, args)
+    if not yes:
+        assert result.exit_code != 0 and not inner.requests
+        return
+    assert result.exit_code == 0, result.output
+    assert len(inner.requests) == 1
+    actual = ProjectStore(tmp_path, "cli-unknown")
+    assert actual.load_project().build is not None
+    receipt = json.loads(
+        next(
+            actual.paths.runtime_directory.glob("spend/build-embeddings-*/receipt.json")
+        ).read_text()
+    )
+    assert receipt["unpriced_attempt_ceiling"] == 3 and receipt["unpriced_attempts"] == 1

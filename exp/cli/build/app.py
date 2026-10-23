@@ -831,6 +831,7 @@ def _complete_grounded_build(
                 1
             ].context_window_tokens,
             estimate=estimate,
+            provider_spend_authorized=provider_spend_authorized,
         ) as admitted_catalog:
             resolved_embedder = admitted_catalog.preflight(
                 selected.embedder,

@@ -16,6 +16,7 @@ from exp.runtime.models.providers.openai_compatible import OpenAICompatibleClien
 from exp.runtime.models.providers.openai_compatible_test import _request, _snapshot
 from exp.runtime.models.providers.transport import (
     JsonHttpResponse,
+    ProviderTransportError,
     RetryPolicy,
     ScriptedJsonTransport,
 )
@@ -53,8 +54,8 @@ def test_empty_chat_response_retries_then_returns_real_output(empty: JsonObject)
 
 
 @pytest.mark.parametrize("explicit_key", [None, "caller-owned-operation"])
-def test_lost_completed_replay_rotates_only_client_owned_keys(explicit_key: str | None) -> None:
-    """A lost replay can start a fresh accounted attempt without rewriting caller identity."""
+def test_lost_completed_replay_stops_without_rotating_any_key(explicit_key: str | None) -> None:
+    """A lost completed result is unknown; neither generated nor explicit keys authorize redraw."""
     transport = ScriptedJsonTransport(
         [
             JsonHttpResponse(
@@ -70,15 +71,15 @@ def test_lost_completed_replay_rotates_only_client_owned_keys(explicit_key: str 
         transport=transport,
         retry_policy=RetryPolicy(maximum_attempts=2, initial_delay_seconds=0),
     )
-    response = (
-        client.complete(_request())
-        if explicit_key is None
-        else asyncio.run(client.complete_async(_request(), idempotency_key=explicit_key))
-    )
-    assert response.output.content == "done"
-    assert response.economics.provider_attempts == 2
-    keys = [request.headers["Idempotency-Key"] for request in transport.requests]
-    assert (keys[0] == keys[1]) is (explicit_key is not None)
+    with pytest.raises(ProviderTransportError) as failure:
+        if explicit_key is None:
+            client.complete(_request())
+        else:
+            asyncio.run(client.complete_async(_request(), idempotency_key=explicit_key))
+    assert failure.value.error_code == "idempotency_replay_unavailable"
+    assert len(transport.requests) == 1
+    if explicit_key is not None:
+        assert transport.requests[0].headers["Idempotency-Key"] == explicit_key
 
 
 def test_empty_chat_response_stops_at_the_retry_bound() -> None:

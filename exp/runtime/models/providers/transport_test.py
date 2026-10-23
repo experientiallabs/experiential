@@ -167,8 +167,15 @@ def test_retry_classification_is_transport_specific(exception: Exception, retrya
 @pytest.mark.parametrize(
     ("exception", "retryable"),
     [
-        (ProviderTransportError("unavailable", status_code=503), True),
-        (ProviderTransportError("rate limited", status_code=429), True),
+        (ProviderTransportError("unavailable", status_code=503), False),
+        (ProviderTransportError("rate limited", status_code=429), False),
+        (ProviderTransportError("certified refusal", status_code=429, known_unbilled=True), True),
+        (
+            ProviderTransportError(
+                "lost keyed result", status_code=409, error_code="idempotency_replay_unavailable"
+            ),
+            False,
+        ),
         (ProviderTransportError("bad request", status_code=400), False),
         (ProviderTransportError("network"), False),
         (TimeoutError("slow"), False),
@@ -179,7 +186,7 @@ def test_retry_classification_is_transport_specific(exception: Exception, retrya
 def test_an_unrepeatable_wire_never_resends_an_unknown_outcome(
     exception: Exception, retryable: bool
 ) -> None:
-    """Without an idempotency contract only a definite HTTP answer is retried."""
+    """Without deduplication, an HTTP error alone cannot establish a safe resend."""
     assert classify_unrepeatable_retry(exception).retryable is retryable
 
 

@@ -580,6 +580,8 @@ def classify_retry(exception: Exception) -> RetryClassification:
         A stable retry decision and concise reason.
     """
     if isinstance(exception, ProviderTransportError):
+        if exception.error_code == "idempotency_replay_unavailable":
+            return RetryClassification(retryable=False, reason="outcome_unknown")
         if exception.status_code is None:
             return RetryClassification(retryable=True, reason="transport")
         if exception.status_code in _RETRYABLE_STATUS_CODES:
@@ -595,11 +597,9 @@ def classify_retry(exception: Exception) -> RetryClassification:
 def classify_unrepeatable_retry(exception: Exception) -> RetryClassification:
     """Classify one error for a wire that cannot deduplicate a resend of the same request.
 
-    A failure that carries no HTTP status (a lost connection, a timeout, a socket error) may
-    follow dispatch, so its outcome is unknown. Without an idempotency contract a resend could
-    execute the request twice and keep the second draw, so it is never retried in process; the
-    error reaches the durable owner, which keeps the outcome unknown. A definite HTTP answer is
-    classified as :func:`classify_retry` classifies it.
+    A timeout, transport failure or retryable HTTP answer does not prove that a request
+    was never executed. Without deduplication, only a trusted certified non-dispatch refusal
+    may retry. A lost completed keyed result remains unknown under either wire policy.
 
     Args:
         exception: Error raised by one request attempt.
@@ -607,13 +607,10 @@ def classify_unrepeatable_retry(exception: Exception) -> RetryClassification:
     Returns:
         A stable retry decision and concise reason.
     """
-    if isinstance(exception, ProviderTransportError):
-        if exception.status_code is None:
-            return RetryClassification(retryable=False, reason="outcome_unknown")
-        return classify_retry(exception)
-    if isinstance(exception, OSError):
+    classification = classify_retry(exception)
+    if classification.retryable and not is_unbilled_attempt(exception):
         return RetryClassification(retryable=False, reason="outcome_unknown")
-    return classify_retry(exception)
+    return classification
 
 
 def run_with_retry[ResultT](

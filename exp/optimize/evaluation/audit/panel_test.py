@@ -31,7 +31,7 @@ from exp.common.models import (
     write_model_catalog,
 )
 from exp.common.models.catalog_roles import ModelRoles
-from exp.common.project import ProjectStore
+from exp.common.project import ProjectStore, artifact_input
 from exp.common.tasks.store import load_task_set
 from exp.optimize.evaluation.audit import panel as held_out_panel
 from exp.optimize.evaluation.audit.panel import (
@@ -670,6 +670,40 @@ def test_source_rag_profile_measures_held_out_and_feeds_the_council_offline(
     provider = SimulatedProvider(episodes, wrong=frozenset({"get_user_details"}))
     _, store, _ = build_project(tmp_path, monkeypatch, provider)
     built = len(provider.requests)
+    build_intents = {
+        a
+        for a in store.artifacts.list_ids(artifact_type="provider-physical-attempt")
+        if a.endswith("-intent")
+    }
+    assert len(build_intents) == built == 1
+    build_receipt = _obj(
+        json.loads(store.artifacts.read_bytes(next(iter(build_intents)), "receipt.json"))
+    )
+    canonical = _obj(build_receipt["canonical_request"])
+    canonical_id = canonical["artifact_id"]
+    assert isinstance(canonical_id, str)
+    canonical_manifest = store.artifacts.read(canonical_id).manifest
+    assert canonical == artifact_input(canonical_manifest).model_dump(mode="json")
+    phase = _obj(json.loads(store.artifacts.read_bytes(canonical_id, "request.json")))
+    assert phase["protocol"] == "build-embedding-admission-v1"
+    build = store.load_project().build
+    assert build is not None
+    assert phase["trace_dataset"] == build.trace_dataset.model_dump(mode="json")
+    assert phase["task_set"] == build.task_set.model_dump(mode="json")
+    assert store.artifacts.read(build.task_set.artifact_id).manifest.inputs == (
+        build.trace_dataset,
+    )
+    assert {item.artifact_id for item in canonical_manifest.inputs} == {
+        _obj(phase["trace_dataset"])["artifact_id"],
+        _obj(phase["task_set"])["artifact_id"],
+    }
+    for key in ("trace_dataset", "task_set"):
+        reference = _obj(phase[key])
+        artifact_id = reference["artifact_id"]
+        assert isinstance(artifact_id, str)
+        assert reference == artifact_input(store.artifacts.read(artifact_id).manifest).model_dump(
+            mode="json"
+        )
     customers = held_out_customers(store)
     panel = register_held_out_fidelity(
         store, 3, profile="source-rag", code_revision=REVISION, clock=lambda: datetime.now(UTC)
@@ -692,7 +726,10 @@ def test_source_rag_profile_measures_held_out_and_feeds_the_council_offline(
     embeddings = [r for r in fidelity_requests if r.url.endswith("/embeddings")]
     assert len(embeddings) == 9, "one budgeted query embedding per simulated turn"
     attempts = store.artifacts.list_ids(artifact_type="provider-physical-attempt")
-    assert len([a for a in attempts if a.endswith("-intent")]) == len(fidelity_requests)
+    all_intents = {a for a in attempts if a.endswith("-intent")}
+    assert build_intents <= all_intents
+    fidelity_intents = all_intents - build_intents
+    assert len(fidelity_intents) == len(fidelity_requests) == 21
     for prediction in provider.predictions():
         contexts = _obj(prediction["grounding_contexts"]).values()
         lineages = {_at(context, "initial_context", "task_lineage") for context in contexts}

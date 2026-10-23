@@ -69,12 +69,17 @@ def admitted_embeddings(
     snapshot: ModelSnapshot,
     maximum_input_tokens: int | None,
     estimate: float | None,
+    provider_spend_authorized: bool,
 ) -> Iterator[RuntimeModelCatalog]:
     """Own physical admission over unadmitted inner transports and the shared input schedule.
 
     The default retry schedule bounds physical slots; a custom retry policy may stop earlier
     at this bound. Already-admitted injections are refused rather than nesting physical owners.
+    Explicit consent to an unknown local estimate permits only this finite unpriced schedule;
+    an inherited operation's unpriced allowance is never changed here.
     """
+    if not provider_spend_authorized:
+        raise ValueError("grounded build provider work requires explicit authorization")
     mining = completed.artifacts.mining
     bindings = tuple(
         RAGLineageBinding(
@@ -115,7 +120,11 @@ def admitted_embeddings(
     inherited = current_spend_ceiling()
     ceiling = inherited or operation_spend_ceiling(store, operation)
     if inherited is None:
-        ceiling.authorize(operation, ceiling_usd=estimate or 0.0, unpriced_attempts=0)
+        ceiling.authorize(
+            operation,
+            ceiling_usd=estimate or 0.0,
+            unpriced_attempts=attempts if estimate is None else 0,
+        )
     ledger = DispatchLedger(
         store.paths.runtime_directory / operation / "physical.sqlite", attempts, identity
     )

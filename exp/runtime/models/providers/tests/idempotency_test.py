@@ -124,7 +124,7 @@ def test_anthropic_messages_defines_no_idempotency_header_so_no_intent_key_is_de
 
 
 def test_a_wire_without_idempotency_never_redraws_an_ambiguous_outcome() -> None:
-    """A lost Messages call is not resent in process; a definite overload answer is retried."""
+    """Neither transport loss nor an unproven overload response authorizes another Messages draw."""
     retrying = RetryPolicy(maximum_attempts=3, initial_delay_seconds=0, maximum_delay_seconds=0)
     ok = JsonHttpResponse(status_code=200, body=_MESSAGES_OK)
 
@@ -145,8 +145,10 @@ def test_a_wire_without_idempotency_never_redraws_an_ambiguous_outcome() -> None
     overloaded = ScriptedJsonTransport(
         [JsonHttpResponse(status_code=503, body={"error": {"type": "overloaded"}}), ok]
     )
-    assert anthropic(overloaded).complete(_request()).output.content == "ok"
-    assert len(overloaded.requests) == 2
+    with pytest.raises(ProviderTransportError) as failure:
+        anthropic(overloaded).complete(_request())
+    assert failure.value.status_code == 503
+    assert len(overloaded.requests) == 1
 
 
 def test_an_idempotent_wire_resends_an_ambiguous_outcome_under_one_key() -> None:
