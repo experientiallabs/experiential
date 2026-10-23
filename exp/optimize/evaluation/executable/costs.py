@@ -51,6 +51,7 @@ from exp.optimize.evaluation.factory.hardening import (
     seed_proposals,
 )
 from exp.optimize.evaluation.factory.proposals import load_task_proposals
+from exp.optimize.evaluation.factory.quality_proxy import proxy_settings
 from exp.optimize.evaluation.factory.runner import TaskFactorySpec
 from exp.optimize.evaluation.factory.validity import TaskValiditySpec, ValiditySettings
 from exp.optimize.evaluation.factory.variants import load_task_variant
@@ -394,13 +395,40 @@ def evaluation_costs(project: ProjectStore, spec: CostedSpec) -> tuple[CostCompo
         return (
             *tuple(row for job in jobs for row in job_costs(project, job)),
             *evaluation_costs(project, ActorPanelSpec(cases=jobs, actors=spec.actors)),
+            *(
+                model_cost(
+                    project,
+                    settings.model_alias,
+                    settings.maximum_physical_attempts,
+                    settings.output_tokens,
+                )
+                for ref in proposals.variants
+                for settings in (
+                    spec.proxy_for(
+                        load_executable_task(project, load_task_variant(project, ref).task)
+                    ),
+                )
+            ),
         )
     if isinstance(spec, TaskFactorySpec):
         return tuple(
             row
             for family in spec.families
+            for settings in (
+                proxy_settings(
+                    family.quality_proxy,
+                    load_executable_task(project, family.proposal.base),
+                    spec.actors[-1],
+                ),
+            )
             for row in (
                 *evaluation_costs(project, family.proposal),
+                model_cost(
+                    project,
+                    settings.model_alias,
+                    4 * settings.maximum_physical_attempts,
+                    settings.output_tokens,
+                ),
                 *(
                     line.scaled(4)
                     for line in job_costs(

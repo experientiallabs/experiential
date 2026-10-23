@@ -48,9 +48,16 @@ from exp.optimize.evaluation.executable.qualification import (
 from exp.optimize.evaluation.executable.task import ExecutableTask, load_executable_task
 from exp.optimize.evaluation.factory.proposals import load_task_proposals
 from exp.optimize.evaluation.factory.quality import (
+    QualityDisposition,
     TaskQualityReview,
     quality_disposition,
     validate_quality_reviews,
+)
+from exp.optimize.evaluation.factory.quality_proxy import (
+    QualityProxySpec,
+    preflight_quality_proxy,
+    proxy_settings,
+    review_task_quality,
 )
 from exp.optimize.evaluation.factory.variants import load_task_variant
 from exp.optimize.evaluation.harbor.export import verify_harbor_export
@@ -69,6 +76,7 @@ class CandidateBatchSpec(ContractModel):
             Tier separation is reported independently and does not gate correctness or packaging.
         namespace: Safe Harbor organization label.
         quality_reviews: Independently attested reviews of the exact tasks and recipe.
+        quality_proxy: Optional pinned override; otherwise use the last panel model as judge.
     """
 
     proposals: ArtifactInput
@@ -78,6 +86,11 @@ class CandidateBatchSpec(ContractModel):
     destination: Path | None = None
     namespace: str = Field(default="development", pattern=r"^[a-z0-9][a-z0-9.-]*$")
     quality_reviews: tuple[TaskQualityReview, ...] = ()
+    quality_proxy: QualityProxySpec | None = None
+
+    def proxy_for(self, task: ExecutableTask) -> QualityProxySpec:
+        """Freeze the effective model/rubric policy from the declared panel and task pins."""
+        return proxy_settings(self.quality_proxy, task, self.actors[-1])
 
     def identity(self, code_revision: str) -> str:
         """Bind all prototypes, controls, models and shipping rules before execution."""
@@ -98,6 +111,7 @@ class CandidateMeasurement(ContractModel):
         failure: Sanitized operational error, when present.
         package: Immutable output directory, when publication was requested and admitted.
         failure_detail: Operator-only phase and source references without raw exception text.
+        proxy_review: Exact LLM rubric response and its request/dispatch ancestry, when used.
     """
 
     variant: ArtifactInput
@@ -117,6 +131,7 @@ class CandidateMeasurement(ContractModel):
     failure: str | None = None
     package: Path | None = None
     failure_detail: StructuredFailure | None = None
+    proxy_review: ArtifactInput | None = None
 
 
 class CandidateBatch(ContractModel):
@@ -135,7 +150,7 @@ class CandidateBatch(ContractModel):
     scope: str = (
         "development candidates from one related task family; observable-contract qualification "
         "only; fixed-panel tier separation is a separate selection signal, not a shipping gate; "
-        "task quality additionally requires an operator-attested human review; "
+        "task quality uses a frozen LLM rubric proxy or optional human attestation; "
         "no semantic-equivalence proof, independent fidelity, "
         "generalization, container-containment or full task certification; no training promotion"
     )
@@ -176,7 +191,9 @@ def preflight_candidate_batch(
         if project.artifacts.read(reference.artifact_id).manifest.code_revision != code_revision:
             raise ValueError("candidate task code revision differs; republish before measuring")
         preflight_actor_panel(project, _panel(spec, task))
+        preflight_quality_proxy(project, spec.proxy_for(task))
         attempts += task.job.maximum_physical_attempts * (1 + len(spec.actors))
+        attempts += spec.proxy_for(task).maximum_physical_attempts
     if attempts > 100_000:
         raise ValueError("candidate batch exceeds its combined actor-attempt ceiling")
     for case in spec.controls:
@@ -216,8 +233,15 @@ def _package(
     """Publish or verify the same exact qualified package, never overwrite changed output."""
     if spec.destination is None or cell.qualification is None:
         raise ValueError("candidate packaging needs a destination and a qualified candidate")
-    if quality_disposition(spec.quality_reviews, cell.task) != "accepted":
-        raise ValueError("factory packaging requires independent task-quality review")
+    quality, receipt = _quality_result(
+        project,
+        spec,
+        cell,
+        code_revision=project.artifacts.read(cell.task.artifact_id).manifest.code_revision,
+        execute=False,
+    )
+    if quality != "accepted" or receipt != cell.proxy_review:
+        raise ValueError("factory packaging requires its exact task-quality decision")
     path = spec.destination / cell.task.artifact_id
     name = f"{spec.namespace}/candidate-{index}"
     if path.exists():
@@ -234,6 +258,35 @@ def _package(
     return export_executable_harbor(
         project, cell.task, path, name=name, qualification=cell.qualification
     )
+
+
+def _quality_result(
+    project: ProjectStore,
+    spec: CandidateBatchSpec,
+    cell: CandidateMeasurement,
+    *,
+    code_revision: str,
+    execute: bool,
+) -> tuple[QualityDisposition, ArtifactInput | None]:
+    """Run the automatic rubric proxy unless an explicit human decision was supplied."""
+    if any(
+        row.task == cell.task and row.authority == "human" and row.approved
+        for row in spec.quality_reviews
+    ):
+        return quality_disposition(spec.quality_reviews, cell.task), None
+    assert cell.feasibility and cell.qualification and cell.panel
+    reference, review = review_task_quality(
+        project,
+        spec.proxy_for(load_executable_task(project, cell.task)),
+        task=cell.task,
+        proposals=spec.proposals,
+        feasibility=cell.feasibility,
+        qualification=cell.qualification,
+        panel=cell.panel,
+        code_revision=code_revision,
+        execute=execute,
+    )
+    return review.answer.disposition(), reference
 
 
 def _measure(
@@ -286,7 +339,15 @@ def _measure(
                 "status": "qualified_candidate",
             }
         )
-        quality = quality_disposition(spec.quality_reviews, cell.task)
+        phase = "quality_proxy"
+        quality, proxy_review = _quality_result(
+            project,
+            spec,
+            cell,
+            code_revision=code_revision,
+            execute=execute,
+        )
+        cell = cell.model_copy(update={"proxy_review": proxy_review})
         if quality != "accepted":
             return cell.model_copy(
                 update={"status": "rejected_quality" if quality == "rejected" else "needs_review"}
@@ -334,7 +395,7 @@ def _inputs(
                 cell.task,
                 *(
                     ref
-                    for ref in (cell.feasibility, cell.qualification, cell.panel)
+                    for ref in (cell.feasibility, cell.qualification, cell.panel, cell.proxy_review)
                     if ref is not None
                 ),
             },
@@ -445,7 +506,17 @@ def saved_candidate_batch(
             if cell.failure is not None or cell.qualification is None:
                 raise ValueError("completed candidate lacks a qualification or has an error")
             qualified = load_executable_qualification(project, cell.qualification).qualified
-            quality = quality_disposition(spec.quality_reviews, cell.task)
+            quality = "needs_review"
+            if qualified:
+                quality, receipt = _quality_result(
+                    project,
+                    spec,
+                    cell,
+                    code_revision=code_revision,
+                    execute=False,
+                )
+                if receipt != cell.proxy_review:
+                    raise ValueError("candidate quality decision changed its original receipt")
             expected = (
                 "unqualified"
                 if not qualified

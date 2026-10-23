@@ -14,6 +14,7 @@ from exp.optimize.evaluation.factory.quality import (
     TaskQualityReview,
     validate_quality_reviews,
 )
+from exp.optimize.evaluation.factory.quality_proxy_test import proxy_transport
 
 
 def review() -> TaskQualityReview:
@@ -69,6 +70,9 @@ def test_successful_actors_and_controls_do_not_replace_quality_review(
     """Review can be added without repurchasing the already saved actors or author draw."""
     project, spec, transport = batch_fixture(tmp_path, monkeypatch)
     pending = spec.model_copy(update={"quality_reviews": ()})
+    proxy_transport(
+        monkeypatch, tuple(row.task for row in spec.quality_reviews), verdict="unassessable"
+    )
     measured = run_candidate_batch(project, pending, code_revision="test")
     assert measured.counts["needs_review"] == 2
     assert all(
@@ -155,6 +159,11 @@ def test_factory_retains_missing_quality_as_pending_instead_of_rejecting(
     from exp.optimize.evaluation.factory.runner_test import factory_fixture
 
     project, spec, transport = factory_fixture(tmp_path, monkeypatch)
+    proxy_transport(
+        monkeypatch,
+        tuple(row.task for row in spec.families[0].quality_reviews),
+        verdict="unassessable",
+    )
     pending = spec.model_copy(
         update={"families": (spec.families[0].model_copy(update={"quality_reviews": ()}),)}
     )

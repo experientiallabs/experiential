@@ -145,16 +145,32 @@ denominator-preserving evidence.
 
 ## Development task factory
 
-Factory packaging requires a separate task-quality review in addition to observable-contract
-qualification. Each candidate must have an operator-attested human review bound to its exact
-task and proposal registration. `CandidateBatchSpec.quality_reviews` and
-`FactoryFamily.quality_reviews` carry evidence over prompt/verifier alignment, verifier/intent
-alignment, production prompt distribution, world sufficiency and causality, failure attribution,
-and meaningful difficulty. Missing, unapproved or revision-requested reviews remain
-`needs_review`; a human drop is `rejected_quality`. Model proposals and actor success cannot
-approve task quality. Adding review evidence starts a new registration and reuses unchanged
-saved child executions. These attestations do not establish expert-proxy calibration or general
-production fidelity. Direct mechanical qualification remains explicitly narrower.
+Factory packaging requires task-quality assessment in addition to observable-contract
+qualification. By default a separate LLM rubric proxy uses the last pinned panel model; set
+`CandidateBatchSpec.quality_proxy` or `FactoryFamily.quality_proxy` to override its frozen model,
+rubrics, deadline and physical-attempt allowance. It judges all six protected axes with cited
+findings: prompt/verifier alignment, verifier/intent alignment, production prompt distribution,
+world sufficiency and causality, failure attribution, and meaningful difficulty. All axes must
+pass to package. Repairable defects or insufficient evidence remain `needs_review`, meaning
+revision or another explicitly registered experiment, not mandatory human approval. A drop is
+`rejected_quality`. An optional operator-attested human decision can replace the proxy.
+
+Proxy requests contain public task/intent, the capability brief, the verifier, saved execution
+outcomes and development controls; confirmation labels are withheld. The complete input and
+output schema, model snapshot, rubric revisions, response and dispatch receipts are retained.
+The host derives acceptance; the model cannot set an approval flag or claim label authority.
+Catalog/attempt/deadline/capacity checks and shared spend consent apply. Missing or uncertain
+responses are not silently redrawn; completed judgments replay without new provider calls.
+Proxy approval is provisional model judgment, not independently calibrated expert agreement.
+It permits automatic factory operation without requiring human review. Direct mechanical
+qualification remains explicitly narrower.
+
+This review is the semantic gate of the packaging path (`evaluate-candidates` and the
+`--pipeline` factory). Task validity (`check-task-validity`: re-derived controls, literal and
+judged answer leakage, closed-book draws) and hardening (`harden-tasks`) remain the mechanical
+screens of scenario-search variants, documented in
+[task hardening](reference/task-hardening.md). A proxy pass does not replace a validity
+rejection, and hardening keeps variants without packaging them.
 
 World history can be materialized through `RecordScenarioSpec.setup_actions` and `finish_tick`:
 the existing kernel executes setup actions and scheduled events, replays native setup, and saves

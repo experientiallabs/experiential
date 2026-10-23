@@ -48,7 +48,7 @@ def run_pipeline(
         console.print(
             f"Task factory: {len(spec.families)} seeds, {len(planned.components)} distinct "
             f"source/workflow components, {len(spec.actors)} actors; at most "
-            f"{factory_attempt_bound(store, spec)} author/actor attempts until "
+            f"{factory_attempt_bound(store, spec)} author/actor/proxy attempts until "
             f"{spec.deadline.isoformat()}. Runtime inference has separate allowances."
         )
         console.print_json(data={"planned_coverage": planned.model_dump(mode="json")})

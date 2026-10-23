@@ -42,6 +42,11 @@ from exp.optimize.evaluation.factory.proposals import (
     saved_task_proposals,
 )
 from exp.optimize.evaluation.factory.quality import TaskQualityReview
+from exp.optimize.evaluation.factory.quality_proxy import (
+    QualityProxySpec,
+    preflight_quality_proxy,
+    proxy_settings,
+)
 from exp.simulation.capability_briefs import load_capability_brief
 from exp.simulation.continuations import load_continuation_checkpoint
 from exp.simulation.evaluation.calibration import CalibrationCase, CalibrationPack
@@ -63,6 +68,7 @@ class FactoryFamily(ContractModel):
         information: Declared information condition of this seed world.
         horizon: Declared workflow horizon, unrelated to model count or attempts.
         quality_reviews: Human task-quality attestations, separate from mechanical controls.
+        quality_proxy: Optional frozen judge override; default is the last panel model.
     """
 
     proposal: TaskProposalSpec
@@ -71,6 +77,7 @@ class FactoryFamily(ContractModel):
     information: Literal["available", "discoverable", "conflicting", "unavailable"]
     horizon: Literal["single_decision", "multi_step", "long_horizon"]
     quality_reviews: tuple[TaskQualityReview, ...] = ()
+    quality_proxy: QualityProxySpec | None = None
 
 
 class TaskFactorySpec(ContractModel):
@@ -80,7 +87,7 @@ class TaskFactorySpec(ContractModel):
         families: Seed tasks from distinct needs or workflows; related seeds remain grouped.
         distribution: Desired user/capability mix, fixed before seeing candidate outcomes.
         actors: Model panel shared across families; tier separation never grants correctness.
-        maximum_author_actor_attempts: Conservative sum of all existing child ledger ceilings.
+        maximum_author_actor_attempts: Conservative sum of author, actor and proxy ledger ceilings.
             Simulator/runtime calls retain their separately declared trusted runtime budgets.
         deadline: Outer dispatch limit; every child deadline must fit within it.
         destination: Export parent, with unique content-addressed directories per family.
@@ -153,7 +160,7 @@ class TaskFactoryResult(ContractModel):
     ]
     counts: JsonObject
     scope: str = (
-        "development observable contracts with operator-attested task quality "
+        "development observable contracts with provisional rubric-proxy task quality "
         "and declared coverage; "
         "no protected release confirmation, subjective judgment calibration, native fidelity, "
         "semantic novelty, deployed containment or training-benefit claim; author/actor budgets "
@@ -207,6 +214,12 @@ def factory_attempt_bound(project: ProjectStore, spec: TaskFactorySpec) -> int:
         + 4
         * (1 + len(spec.actors))
         * load_executable_task(project, family.proposal.base).job.maximum_physical_attempts
+        + 4
+        * proxy_settings(
+            family.quality_proxy,
+            load_executable_task(project, family.proposal.base),
+            spec.actors[-1],
+        ).maximum_physical_attempts
         for family in spec.families
     )
 
@@ -224,6 +237,7 @@ def _batch(
         destination=spec.destination / family.proposal.base.artifact_id,
         namespace=spec.namespace,
         quality_reviews=family.quality_reviews,
+        quality_proxy=family.quality_proxy,
     )
 
 
@@ -236,6 +250,9 @@ def preflight_task_factory(
         raise ValueError("factory child attempt ceilings exceed its frozen author/actor allowance")
     for family in spec.families:
         task = load_executable_task(project, family.proposal.base)
+        proxy = proxy_settings(family.quality_proxy, task, spec.actors[-1])
+        if proxy.deadline > spec.deadline:
+            raise ValueError("factory quality-proxy deadline exceeds the outer deadline")
         if task.job.deadline > spec.deadline:
             raise ValueError("factory actor deadline exceeds the outer deadline")
         if task.job.study.training_specification is not None:
@@ -261,6 +278,7 @@ def preflight_task_factory(
         if saved_task_proposals(project, family.proposal, code_revision=code_revision) is None:
             if family.quality_reviews:
                 raise ValueError("quality reviews require an existing exact proposal population")
+            preflight_quality_proxy(project, proxy)
             preflight_task_proposals(project, family.proposal)
             preflight_actor_panel(project, ActorPanelSpec(cases=(task.job,), actors=spec.actors))
         else:
