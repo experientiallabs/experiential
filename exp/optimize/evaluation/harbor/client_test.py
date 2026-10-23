@@ -144,3 +144,22 @@ def test_native_download_rejects_corrupt_bytes(tmp_path: Path) -> None:
             tmp_path / "outputs",
         )
     assert not list(tmp_path.iterdir())
+
+
+def test_explicit_unix_failure_never_falls_back_to_http(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A missing IPC endpoint is a retained failure even if HTTP credentials are available."""
+    monkeypatch.setenv("EXP_HARBOR_SOCKET", str(tmp_path / "missing.sock"))
+    monkeypatch.setenv("EXP_HARBOR_ENDPOINT", "http://localhost:1234")
+    monkeypatch.setenv("EXP_HARBOR_VERIFIER_TOKEN", "verifier")
+    monkeypatch.setattr(sys, "argv", ["tools.py", "verify", "--directory", str(tmp_path / "grade")])
+
+    def forbid_http(*args: object, **kwargs: object) -> None:
+        """No implicit HTTP dispatch is allowed for an explicit Unix selection."""
+        pytest.fail("Unix client attempted HTTP fallback")
+
+    monkeypatch.setattr(harbor_client, "urlopen", forbid_http)
+    assert harbor_client.main() == 2
+    assert not (tmp_path / "grade/reward.json").exists()
+    assert json.loads((tmp_path / "grade/experiential.json").read_text())["error"] == "URLError"

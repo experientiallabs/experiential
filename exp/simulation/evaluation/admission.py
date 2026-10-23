@@ -44,6 +44,7 @@ from exp.common.core.artifacts import (
     sha256_json,
     stable_id,
     strict_equal,
+    validate_artifact_file_path,
 )
 from exp.common.core.json_schema import expand_local_references
 from exp.common.evaluations.reconstruction import WorkflowEvidence
@@ -107,6 +108,58 @@ _WITNESS_KIND: dict[str, WitnessKind] = {
     "synthetic_specification": "specification_check",
     "native_execution": "native_execution",
 }
+
+
+class RecordedWorkbookProvenance(ContractModel):
+    """Version-one external workbook bytes, without authenticity or review authority.
+
+    Archive identity records the operator's provenance declaration. Admission separately
+    requires a file SourceIdentity and matching attached bytes, then checks every ancestor.
+    This evidence kind establishes neither native outcomes nor independently reviewed labels.
+    """
+
+    archive_sha256: Sha256
+    archive_member: str = Field(min_length=1, max_length=512)
+    raw_sha256: Sha256
+    role: Literal["initial", "reference"]
+    origin: str = Field(min_length=1)
+    exposure: str = Field(min_length=1)
+    authority: str = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def safe_member(self) -> Self:
+        """Require a canonical relative XLSX member without path traversal."""
+        member = validate_artifact_file_path(self.archive_member)
+        if member.as_posix() != self.archive_member or member.suffix != ".xlsx":
+            raise ValueError("recorded workbook member must be a safe relative .xlsx path")
+        return self
+
+
+def _recorded_workbook_source(store: ArtifactStore, reference: ArtifactInput) -> bool:
+    """Validate the exact external-workbook-source-v1 format, not its type name alone."""
+    stored = store.read(reference.artifact_id)
+    manifest = stored.manifest
+    if (
+        manifest.schema_version != 1
+        or manifest.source is None
+        or manifest.source.kind != "file"
+        or set(stored.payloads) != {"workbook.xlsx", "provenance.json"}
+    ):
+        return False
+    try:
+        provenance = RecordedWorkbookProvenance.model_validate_json(
+            stored.payloads["provenance.json"]
+        )
+    except ValueError:
+        return False
+    source_parts = manifest.source.source_id.split("!")
+    return (
+        len(source_parts) == 2
+        and bool(source_parts[0])
+        and source_parts[1] == provenance.archive_member
+        and manifest.source.sha256 == provenance.raw_sha256
+        and sha256_bytes(stored.payloads["workbook.xlsx"]) == provenance.raw_sha256
+    )
 
 
 class EvaluationSpecification(ContractModel):
@@ -363,7 +416,8 @@ def verify_label_witness(
             "self_approval",
             f"the witness specification derives from {generated}, which is not recorded "
             "evidence; author the specification from artifacts of the recorded evidence "
-            f"types ({', '.join(sorted(RECORDED_EVIDENCE_TYPES))})",
+            f"types ({', '.join(sorted(RECORDED_EVIDENCE_TYPES))}) or validated "
+            "external-workbook-source-v1 evidence",
         )
     predicate = _predicate_fingerprint(specification.predicate)
     if any(_predicate_fingerprint(row) == predicate for row in compared):
@@ -621,7 +675,11 @@ def generated_ancestor(store: ArtifactStore, reference: ArtifactInput) -> str | 
         manifest = store.read(current.artifact_id).manifest
         if artifact_input(manifest) != current:
             raise ValueError("specification provenance differs from its declared digest")
-        if manifest.artifact_type not in RECORDED_EVIDENCE_TYPES or (
+        recorded = manifest.artifact_type in RECORDED_EVIDENCE_TYPES or (
+            manifest.artifact_type == "external-workbook-source"
+            and _recorded_workbook_source(store, current)
+        )
+        if not recorded or (
             manifest.artifact_type == "evaluation-task"
             and EvaluationTask.model_validate_json(
                 store.read_bytes(current.artifact_id, "task.json")

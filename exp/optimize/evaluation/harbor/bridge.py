@@ -1,12 +1,17 @@
 """Trial-scoped HTTP transport without actor access to grading evidence or source stores."""
 
 import json
+import os
 import secrets
+import socket
+import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from threading import Thread
+from pathlib import Path
+from socketserver import ThreadingUnixStreamServer
+from threading import Lock, Thread, current_thread
 from typing import Protocol
 
 from exp.common.core.artifacts import JsonObject
@@ -50,11 +55,70 @@ class HarborEndpoint:
     url: str
     actor_token: str = field(repr=False)
     verifier_token: str = field(repr=False)
+    socket_path: Path | None = None
+
+
+class _UnixServer(ThreadingUnixStreamServer):
+    """Own accepted sockets and threads with truthful, bounded shutdown."""
+
+    def __init__(self, path: str, handler: type[BaseHTTPRequestHandler]) -> None:
+        self.workers: dict[Thread, socket.socket] = {}
+        self.worker_lock = Lock()
+        super().__init__(path, handler, bind_and_activate=False)
+
+    def process_request(
+        self, request: socket.socket | tuple[bytes, socket.socket], client_address: object
+    ) -> None:
+        """Register before starting so close cannot miss an accepted worker."""
+        if not isinstance(request, socket.socket):
+            raise TypeError("Unix Harbor transport requires a stream socket")
+        worker = Thread(target=self.process_request_thread, args=(request, client_address))
+        with self.worker_lock:
+            self.workers[worker] = request
+        try:
+            worker.start()
+        except BaseException:
+            with self.worker_lock:
+                self.workers.pop(worker)
+            self.shutdown_request(request)
+            raise
+
+    def process_request_thread(
+        self, request: socket.socket | tuple[bytes, socket.socket], client_address: object
+    ) -> None:
+        """Keep the existing request handler and always retire its ownership record."""
+        try:
+            super().process_request_thread(request, str(client_address))
+        finally:
+            with self.worker_lock:
+                self.workers.pop(current_thread(), None)
+
+    def server_close(self) -> None:
+        """Interrupt blocked reads and refuse a false cleanup claim for stuck backend work."""
+        # Avoid ThreadingMixIn's unbounded join; these exact workers are owned here instead.
+        self.block_on_close = False
+        super().server_close()
+        with self.worker_lock:
+            workers = tuple(self.workers.items())
+        for _, request in workers:
+            try:
+                request.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+        deadline = time.monotonic() + 5
+        for worker, _ in workers:
+            worker.join(timeout=max(0, deadline - time.monotonic()))
+        if any(worker.is_alive() for worker, _ in workers):
+            raise TimeoutError("Unix Harbor backend workers did not close within five seconds")
 
 
 @contextmanager
 def serve_harbor_trial(
-    trial: HarborTrialOperations, *, host: str = "127.0.0.1", port: int = 0
+    trial: HarborTrialOperations,
+    *,
+    host: str = "127.0.0.1",
+    port: int = 0,
+    socket_path: Path | None = None,
 ) -> Iterator[HarborEndpoint]:
     """Expose one existing session and close transport on exit.
 
@@ -66,6 +130,23 @@ def serve_harbor_trial(
     Yields:
         Runtime capabilities to inject separately into actor and verifier environments.
     """
+    if socket_path is not None:
+        if host != "127.0.0.1" or port != 0:
+            raise ValueError("Unix transport does not accept a TCP host or port")
+        parent = socket_path.parent
+        if (
+            not socket_path.is_absolute()
+            or parent.resolve() != parent
+            or not parent.is_dir()
+            or parent.stat().st_uid != os.geteuid()
+            or parent.stat().st_mode & 0o022
+            or socket_path.exists()
+            or socket_path.is_symlink()
+            or any(parent.iterdir())
+        ):
+            raise ValueError(
+                "Unix backend requires a fresh owned socket-only directory and absent path"
+            )
     actor_token, verifier_token = secrets.token_urlsafe(32), secrets.token_urlsafe(32)
 
     class Handler(BaseHTTPRequestHandler):
@@ -134,15 +215,44 @@ def serve_harbor_trial(
             self.end_headers()
             self.wfile.write(body)
 
-    server = ThreadingHTTPServer((host, port), Handler)
-    # Drain active handlers before the enclosing world owner releases its exclusive lease.
+    server = (
+        ThreadingHTTPServer((host, port), Handler)
+        if socket_path is None
+        else _UnixServer(str(socket_path), Handler)
+    )
     server.daemon_threads = False
     server.block_on_close = True
+    owned_inode = None
     thread = Thread(target=server.serve_forever, daemon=True)
-    thread.start()
+    started = False
+    closed = False
     try:
-        yield HarborEndpoint(f"http://{host}:{server.server_port}", actor_token, verifier_token)
+        if socket_path is not None:
+            server.server_bind()
+            owned_inode = socket_path.lstat()
+            socket_path.chmod(0o666)
+            server.server_activate()
+        thread.start()
+        started = True
+        url = (
+            f"http://{host}:{server.server_port}"
+            if isinstance(server, ThreadingHTTPServer)
+            else "http://localhost"
+        )
+        yield HarborEndpoint(url, actor_token, verifier_token, socket_path)
     finally:
-        server.shutdown()
-        server.server_close()
-        thread.join(timeout=2)
+        try:
+            if started:
+                server.shutdown()
+            server.server_close()
+            closed = True
+        finally:
+            if started:
+                thread.join(timeout=2)
+            if closed and socket_path is not None and owned_inode is not None:
+                current = socket_path.lstat() if socket_path.exists() else None
+                if current is not None and (current.st_dev, current.st_ino) == (
+                    owned_inode.st_dev,
+                    owned_inode.st_ino,
+                ):
+                    socket_path.unlink()
