@@ -9,7 +9,8 @@ joins replay identity like every other answer-changing field. After the route is
 (`exp/runtime/gateway/web_search/plan.py`): a route whose every rung serves the spelling natively
 (all-Responses for the Responses tool, all-Anthropic for the server tool) keeps the provider's own
 search untouched; otherwise the control plane runs ONE search against the configured backend
-(`exp/runtime/gateway/web_search/backend.py`; Exa when `EXA_API_KEY` is set, or a host-supplied
+(`exp/runtime/gateway/web_search/backend.py`; Exa when `EXA_API_KEY` is set, Keenable when the
+operator selects it, or a host-supplied
 backend on `NativeControlPlane(web_search=...)`), bounded by eight seconds and the request
 deadline, for the latest user turn's text. The ranked results are injected as one instruction
 `system` turn placed after the leading instructions (never `developer`: a compatible rung may lack
@@ -74,7 +75,18 @@ exclusive (the provider's rule) and are forwarded to the vendor as include/exclu
 ## Configuration and disclosure
 
 `EXA_API_KEY` binds the Exa backend (`EXA_SEARCH_URL` may point at a proxy or a loopback fixture;
-only https or loopback origins are accepted). A host may pass any `WebSearchBackend` to
+only https or loopback origins are accepted). `EXP_WEB_SEARCH_BACKEND=keenable` binds the Keenable
+backend instead, which needs no key: it posts the query and result count to
+`https://api.keenable.ai/v1/search/public` with an `X-Keenable-Title: Experiential` header.
+`KEENABLE_API_KEY` moves it to the keyed `https://api.keenable.ai/v1/search` (`X-API-Key`) for
+higher rate limits, and when `EXA_API_KEY` is unset it also selects Keenable on its own;
+`EXP_WEB_SEARCH_BACKEND=exa` keeps Exa when both keys are present. Keenable takes one `site`
+filter per call, so each allowed domain (the first five) is searched with its own concurrent
+`site` call and the ranked hits are interleaved, while blocked domains are removed from a larger
+page of hits by host name (subdomains included). Snippets are the page text, whitespace collapsed,
+bounded to 400 characters. `KEENABLE_SEARCH_URL` overrides the endpoint under the same
+https-or-loopback rule. With neither variable set, nothing changes and Keenable is never called.
+A host may pass any `WebSearchBackend` to
 `NativeControlPlane(web_search=...)`. Without a backend the ask is dropped with
 `web_search->dropped(search_unavailable)`; a vendor failure or timeout (8 s, bounded by the request
 deadline, enforced by the gateway even for a backend that ignores it) yields
