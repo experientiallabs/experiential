@@ -23,9 +23,11 @@ from __future__ import annotations
 import hashlib
 from collections.abc import Sequence
 
+from exp.common.core.artifacts import canonical_json_bytes
 from exp.runtime.gateway.contracts import GatewayMessage, GatewayRequest
 
 _KEY_PREFIX = "xpl-"
+_SESSION_PREFIX = "xpls-"
 _DIGEST_HEX_LENGTH = 48
 _FIELD_SEPARATOR = "\x1f"
 _STEM_ROLES = frozenset({"system", "developer"})
@@ -87,3 +89,62 @@ def conversation_stem(messages: Sequence[GatewayMessage]) -> str | None:
             return f"user{_FIELD_SEPARATOR}{message.content or ''}"
         return None
     return _FIELD_SEPARATOR.join(stem) if stem else None
+
+
+def provider_session_id(
+    request: GatewayRequest, *, organization_id: str, identity_id: str
+) -> str | None:
+    """Return the per-conversation session id for providers that pin by session.
+
+    Novita keeps a conversation on the server holding its prefix cache when
+    each request names the conversation in ``x-session-id`` (enabled on the
+    house account 2026-10-21; before it, a long DeepSeek conversation crossing
+    a context-length pool boundary or a failover landed on a cold server and
+    reprocessed up to 520,000 prompt tokens). Unlike
+    :func:`provider_prompt_cache_key`, the key must separate conversations: the
+    stem alone is shared by every session of one agent (one system prompt per
+    API key), and pinning all of them to one server would hot-spot it. So the
+    caller's ``prompt_cache_key`` wins, else the conversation's opening (the
+    leading system/developer messages and the first user turn), which every
+    turn of a growing conversation repeats verbatim.
+
+    Args:
+        request: Canonical request after admission coercions.
+        organization_id: Frozen organization authority for the request.
+        identity_id: Frozen identity authority for the request.
+
+    Returns:
+        A stable ``xpls-`` prefixed digest, or ``None`` when the caller sent no
+        ``prompt_cache_key`` and the conversation has no user turn to open on.
+    """
+    if request.prompt_cache_key is not None:
+        material = ("caller", request.prompt_cache_key)
+    else:
+        opening = conversation_opening(request.messages)
+        if opening is None:
+            return None
+        material = ("opening", opening)
+    digest = hashlib.sha256(
+        _FIELD_SEPARATOR.join((organization_id, identity_id, *material)).encode()
+    ).hexdigest()
+    return f"{_SESSION_PREFIX}{digest[:_DIGEST_HEX_LENGTH]}"
+
+
+def conversation_opening(messages: Sequence[GatewayMessage]) -> str | None:
+    """Return a digest of a conversation's opening, or ``None`` without a user turn.
+
+    The opening is every message up to and including the first user turn,
+    serialized whole (content parts and images included), so two
+    conversations that share a system prompt but start differently differ.
+
+    Args:
+        messages: The request's canonical messages in order.
+
+    Returns:
+        The opening's sha256 hex digest, or ``None`` when no user turn exists.
+    """
+    for index, message in enumerate(messages):
+        if message.role == "user":
+            opening = [item.model_dump(mode="json") for item in messages[: index + 1]]
+            return hashlib.sha256(canonical_json_bytes(opening)).hexdigest()
+    return None

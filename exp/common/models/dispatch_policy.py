@@ -226,6 +226,37 @@ class GatewayRungDispatchPolicy(ContractModel):
     priority_overflow_paying: float | None = Field(default=None, ge=1, le=4, allow_inf_nan=False)
     priority_overflow_pro: float | None = Field(default=None, ge=1, le=4, allow_inf_nan=False)
     upstream_priority: bool = False
+    max_prompt_tokens: int | None = Field(default=None, ge=1)
+    """The longest prompt this rung takes, by the prompt's lower-bound estimate.
+
+    A request whose prompt is at least this long skips the rung at admission,
+    the same narrowing as an undersized context window but counting the prompt
+    only (``max_tokens`` never excludes a rung here). The choice for a
+    dedicated low-batch rung (a ``:fast`` replica) that long cold prefills
+    would slow for everyone on it. When every rung of the route is capped
+    below the prompt, the capped rungs are kept rather than refusing.
+    ``None`` caps nothing.
+    """
+    fast_reserve_fraction: float | None = Field(default=None, gt=0, lt=1, allow_inf_nan=False)
+    """Share of ``concurrency_bound`` kept for ``:fast`` requests, always on.
+
+    On a self-hosted rung that carries a priority card, every other request is
+    held to the regular share, ``(1 - fraction) * bound`` rounded half up (at
+    least one), whether or not a ``:fast`` request is on the rung, and never to
+    the full bound; a ``:fast`` request admits below the bound. ``0.25`` on a
+    bound of 48 holds others to 36, on a bound of 4 to 3; a bound too small to
+    split (1, or 2 at 0.25) keeps no reserve. Under ``saturation="refuse"``
+    both limits are hard, even for a priority overflow. Under ``"overflow"``
+    they stay soft: a request past them spills to the next rung first (so
+    ``:fast`` has first claim on the kept slots) and admits on the forced pass
+    exactly as an overflow bound does today, never a refusal (a forced pass is
+    judged against the full bound; a forced ``:fast`` request is uncapped and
+    counts toward a priority caller's first-dial ceiling). ``None`` keeps
+    the in-flight split. Requires ``concurrency_bound``; per worker, like the
+    bound. Fair share, the fresh-session threshold and pacing saturation of
+    other traffic read the regular share, and fair share counts each
+    organization's regular reservations only.
+    """
 
     @model_validator(mode="after")
     def _require_coherent_authoring(self) -> GatewayRungDispatchPolicy:
@@ -244,6 +275,8 @@ class GatewayRungDispatchPolicy(ContractModel):
             and self.priority_overflow_paying > self.priority_overflow_pro
         ):
             raise ValueError("priority_overflow_paying may not exceed priority_overflow_pro")
+        if self.fast_reserve_fraction is not None and self.concurrency_bound is None:
+            raise ValueError("fast_reserve_fraction requires a concurrency_bound to reserve from")
         if self.cache_priority_alpha is not None and not self.fair_share:
             raise ValueError("cache_priority_alpha requires fair_share to weight")
         if self.fresh_session_spill_fraction is not None:

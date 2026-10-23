@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import os
 import threading
 from collections.abc import Mapping, Sequence
@@ -34,6 +35,11 @@ EXA_SEARCH_URL_ENV: Final = "EXA_SEARCH_URL"
 _MAXIMUM_RESPONSE_BYTES: Final = 262_144
 _SNIPPET_CHARACTERS: Final = 400
 _MAX_CONNECTIONS: Final = 16
+_NANO_USD_PER_USD: Final = 1_000_000_000
+_MAXIMUM_REPORTED_COST_USD: Final = 1.0
+"""A vendor-reported cost above $1 for one search is outside any published
+price; it is discarded (the host falls back to its own schedule) rather than
+billed."""
 
 _clients: WeakKeyDictionary[asyncio.AbstractEventLoop, httpx.AsyncClient] = WeakKeyDictionary()
 _clients_lock = threading.Lock()
@@ -41,6 +47,36 @@ _clients_lock = threading.Lock()
 
 class WebSearchBackendError(RuntimeError):
     """The search vendor failed, timed out, or answered outside its contract."""
+
+
+class WebSearchHits(tuple[GatewayWebSearchResult, ...]):
+    """Ranked hits plus the vendor's own cost report for the search, when it gave one.
+
+    A tuple subclass so every backend returning a plain tuple stays a valid
+    :class:`WebSearchBackend`; a plain tuple simply reports no vendor cost.
+
+    Attributes:
+        vendor_cost_nano_usd: What the vendor says this search cost, in whole
+            nano-USD (Exa's ``costDollars.total``), or ``None`` when unreported.
+    """
+
+    vendor_cost_nano_usd: int | None
+
+    def __new__(
+        cls,
+        hits: Sequence[GatewayWebSearchResult] = (),
+        *,
+        vendor_cost_nano_usd: int | None = None,
+    ) -> WebSearchHits:
+        """Bind the hits and the optional vendor cost."""
+        instance = super().__new__(cls, tuple(hits))
+        instance.vendor_cost_nano_usd = vendor_cost_nano_usd
+        return instance
+
+
+def vendor_cost_nano_usd(hits: Sequence[GatewayWebSearchResult]) -> int | None:
+    """Return the vendor-reported cost a backend attached to ``hits``, else ``None``."""
+    return hits.vendor_cost_nano_usd if isinstance(hits, WebSearchHits) else None
 
 
 class WebSearchBackend(Protocol):
@@ -121,7 +157,7 @@ class ExaWebSearchBackend:
         allowed_domains: Sequence[str],
         blocked_domains: Sequence[str],
         timeout_seconds: float,
-    ) -> tuple[GatewayWebSearchResult, ...]:
+    ) -> WebSearchHits:
         """Run one Exa search and normalize its hits.
 
         Args:
@@ -132,7 +168,8 @@ class ExaWebSearchBackend:
             timeout_seconds: Whole-call budget.
 
         Returns:
-            Ranked hits with a bounded highlight as the snippet.
+            Ranked hits with a bounded highlight as the snippet, carrying Exa's
+            ``costDollars.total`` as the vendor cost when the response reports it.
 
         Raises:
             WebSearchBackendError: Transport failure, non-2xx, oversized or
@@ -182,8 +219,26 @@ async def _read_bounded(response: httpx.Response) -> bytes:
     return b"".join(chunks)
 
 
-def _parse_exa(raw: bytes, max_results: int) -> tuple[GatewayWebSearchResult, ...]:
-    """Normalize Exa's ``results`` array; malformed entries are skipped."""
+def _exa_cost_nano_usd(payload: Mapping[str, object]) -> int | None:
+    """Return Exa's ``costDollars.total`` in whole nano-USD, ``None`` when absent or implausible.
+
+    Exa documents ``costDollars`` as an optional estimate on every ``/search``
+    response, with ``total`` covering the search and any contents (highlights)
+    it returned. A missing, non-numeric, negative, non-finite, or over-$1
+    value reads as unreported, so the host prices the search from its own
+    schedule instead of billing a malformed figure.
+    """
+    cost = payload.get("costDollars")
+    total = cost.get("total") if isinstance(cost, dict) else None
+    if isinstance(total, bool) or not isinstance(total, int | float):
+        return None
+    if not math.isfinite(total) or total < 0 or total > _MAXIMUM_REPORTED_COST_USD:
+        return None
+    return round(total * _NANO_USD_PER_USD)
+
+
+def _parse_exa(raw: bytes, max_results: int) -> WebSearchHits:
+    """Normalize Exa's ``results`` array (malformed entries skipped) and its cost report."""
     try:
         payload = json.loads(raw)
     except ValueError as exc:
@@ -217,7 +272,7 @@ def _parse_exa(raw: bytes, max_results: int) -> tuple[GatewayWebSearchResult, ..
             continue
         if len(hits) >= max_results:
             break
-    return tuple(hits)
+    return WebSearchHits(hits, vendor_cost_nano_usd=_exa_cost_nano_usd(payload))
 
 
 _LOOPBACK_HOSTS: Final = frozenset({"127.0.0.1", "::1", "localhost"})

@@ -45,3 +45,26 @@ def test_unknown_marker_cannot_hide_positive_or_malformed_usage(count: JsonValue
                 "unreported_token_details": ["cached_tokens"],
             }
         )
+
+
+@pytest.mark.parametrize("responses", [False, True])
+def test_an_estimated_reasoning_count_reads_as_unknown(responses: bool) -> None:
+    """A relay's estimated reasoning count is display only: a hop never values it."""
+    group = "output_tokens_details" if responses else "completion_tokens_details"
+    usage: dict[str, JsonValue] = {
+        group: {"reasoning_tokens": 253},
+        "estimated_token_details": ["reasoning_tokens"],
+        "unreported_token_details": ["cached_tokens"],
+    }
+    assert unreported_token_details(usage, responses=responses) == frozenset(
+        {"cached_tokens", "reasoning_tokens"}
+    )
+    del usage["unreported_token_details"]
+    assert unreported_token_details(usage, responses=responses) == frozenset({"reasoning_tokens"})
+
+
+@pytest.mark.parametrize("marker", ["reasoning_tokens", ["cached_tokens"], [1]])
+def test_a_malformed_estimate_marker_is_refused(marker: JsonValue) -> None:
+    """Only reasoning_tokens may be marked as estimated."""
+    with pytest.raises(ValueError, match="estimated_token_details"):
+        unreported_token_details({"estimated_token_details": marker})

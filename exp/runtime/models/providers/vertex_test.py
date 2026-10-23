@@ -287,7 +287,8 @@ def test_vertex_native_profile_and_payload_share_exact_generation_gates() -> Non
     assert "temperature" not in generation
     assert "topP" not in generation
     assert generation["topK"] == 32
-    assert generation["thinkingConfig"] == {"thinkingLevel": "HIGH", "includeThoughts": True}
+    # Gemini 2.5 takes no thinkingLevel (Vertex answers 400); high rides a budget.
+    assert generation["thinkingConfig"] == {"thinkingBudget": 24576, "includeThoughts": True}
     assert generation["maxOutputTokens"] == 128
     assert native_payload == payload
 

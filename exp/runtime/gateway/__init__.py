@@ -10,7 +10,6 @@ from exp.runtime.gateway.compatibility import (
 from exp.runtime.gateway.contracts import (
     AuthorizationSnapshot,
     DirectTarget,
-    ExecutionSnapshot,
     GatewayApiSurface,
     GatewayEvent,
     GatewayEventKind,
@@ -25,6 +24,7 @@ from exp.runtime.gateway.contracts import (
     ProjectTarget,
     StructuredTextFormat,
 )
+from exp.runtime.gateway.execution_snapshot import ExecutionSnapshot
 from exp.runtime.gateway.interfaces import (
     AttemptLedger,
     GatewayClock,

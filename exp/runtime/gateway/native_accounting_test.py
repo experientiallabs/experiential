@@ -31,7 +31,6 @@ from exp.runtime.gateway.budgets import (
 from exp.runtime.gateway.contracts import (
     AuthorizationSnapshot,
     DirectTarget,
-    ExecutionSnapshot,
     GatewayApiSurface,
     GatewayEvent,
     GatewayFailure,
@@ -42,6 +41,7 @@ from exp.runtime.gateway.contracts import (
     GatewayServiceTierSettlement,
     GatewayUsage,
 )
+from exp.runtime.gateway.execution_snapshot import ExecutionSnapshot
 from exp.runtime.gateway.ledger import AttemptRejectedError
 from exp.runtime.gateway.native_accounting import (
     NativeAttemptAccounting,
@@ -55,7 +55,11 @@ from exp.runtime.gateway.native_execution import (
 )
 from exp.runtime.gateway.native_recovery import record_session_outcome, session_cache_key
 from exp.runtime.gateway.native_recovery_test import RecoveryHostFake, recovery_entry
-from exp.runtime.gateway.native_settlement import failure_from_boundary_payload, ledger_failure
+from exp.runtime.gateway.native_settlement import (
+    failure_from_boundary_payload,
+    ledger_failure,
+    terminal_from_settlement,
+)
 from exp.runtime.gateway.recovery import (
     FrozenRecoveryBinding,
     RecoveryLease,
@@ -553,6 +557,88 @@ def test_opened_disconnect_estimates_cache_reads_from_the_organizations_settled_
     assert terminal.usage.input_tokens == counted
     assert terminal.usage.cached_input_tokens == int(counted * 0.9)
     assert len(ledger.finished) == 1
+
+
+@pytest.mark.parametrize(("cap", "expected_output"), [(500, 500), (None, None)])
+def test_unreported_truncation_settles_its_budget_as_an_estimate_not_unknown(
+    cap: int | None, expected_output: int | None
+) -> None:
+    """A usage-less capped stop (Meta muse, 2026-10-17) bills the dispatched output budget."""
+    registry, ledger, entry = _registry()
+    entry.request = entry.request.model_copy(update={"maximum_output_tokens": cap})
+    started = _start(registry, ordinal=0)
+    registry.settle(
+        json.dumps(
+            {
+                "request_id": entry.authorization.request_id,
+                "attempt_id": started["attempt_id"],
+                "outcome": "incomplete",
+                "usage": None,
+                "tool_names": [],
+                "failure": None,
+                "finalize": True,
+                "opened": True,
+                "dispatched": True,
+                "usage_unreported_truncation": True,
+                "streamed_output": {"text": "visible output"},
+            }
+        )
+    )
+    terminal = ledger.terminal_events[-1]
+    assert terminal is not None and terminal.usage is not None
+    assert terminal.usage_estimated is True
+    assert terminal.usage.input_tokens == counted_input_tokens(entry.request)
+    streamed = len(reservation_encoder().encode_ordinary("visible output"))
+    assert terminal.usage.output_tokens == (expected_output or streamed)
+
+
+@pytest.mark.parametrize(("cap", "expected_output"), [(16, 16), (None, 206)])
+def test_reported_output_past_the_callers_ceiling_settles_at_the_ceiling(
+    cap: int | None, expected_output: int
+) -> None:
+    """A lane that overshoots the caller's max_tokens bills the ceiling, the sweep included."""
+    registry, ledger, entry = _registry()
+    entry.request = entry.request.model_copy(update={"maximum_output_tokens": cap})
+    started = _start(registry, ordinal=0)
+    registry.settle(
+        json.dumps(
+            {
+                "request_id": entry.authorization.request_id,
+                "attempt_id": started["attempt_id"],
+                "outcome": "completed",
+                "usage": {"input_tokens": 12, "output_tokens": 206, "reasoning_tokens": 203},
+                "tool_names": [],
+                "failure": None,
+                "finalize": True,
+                "opened": True,
+                "dispatched": True,
+            }
+        )
+    )
+    terminal = ledger.terminal_events[-1]
+    assert terminal is not None and terminal.usage is not None
+    assert terminal.usage.output_tokens == expected_output
+    assert terminal.usage.reasoning_tokens == min(203, expected_output)
+    assert terminal.usage.input_tokens == 12
+
+
+def test_unreported_truncation_marker_rejects_inconsistent_evidence() -> None:
+    """Failed, completed, or undispatched work cannot claim an unreported truncation."""
+    base: JsonObject = {
+        "attempt_id": "attempt-one",
+        "outcome": "incomplete",
+        "usage": None,
+        "opened": True,
+        "dispatched": True,
+        "usage_unreported_truncation": True,
+    }
+    for patch in (
+        {"dispatched": False},
+        {"outcome": "completed"},
+        {"outcome": "failed", "failure": {"failure_class": "timeout", "safe_message": "slow"}},
+    ):
+        with pytest.raises(ValueError, match="unreported truncation"):
+            terminal_from_settlement({**base, **patch})
 
 
 @pytest.mark.parametrize("first_fraction", [0.0, 0.9])
@@ -1349,6 +1435,7 @@ def _admit(
     cache_placed_deployment_id: str | None = None,
     catalog_sha256: str = _DIGEST,
     no_paid_prework: bool = True,
+    fast: bool = False,
 ) -> InflightRequest:
     """Register one admitted request over the given rung ladder.
 
@@ -1365,6 +1452,7 @@ def _admit(
             "fair_share_weight": weight,
             "priority_admission": priority_admission,
             "deadline_monotonic": time.monotonic() + 30,
+            "fast": fast,
         }
     )
     route = GatewayRoute(
@@ -1412,6 +1500,64 @@ def _bounded_pair(
         ),
         _deployment("deployment-b", connection_sha256="c" * 64),
     )
+
+
+def _fast_lane(dispatch: GatewayRungDispatchPolicy) -> ExactModelDeployment:
+    """One self-hosted rung carrying a priority card (class_throttles.fast_on_rung)."""
+    from exp.common.models import BillingSource
+    from exp.common.models.catalog import GatewayServiceTierPrices
+
+    deployment = _deployment(
+        "deployment-a",
+        connection_sha256="b" * 64,
+        dispatch=dispatch.model_copy(update={"upstream_priority": True}),
+    )
+    card = GatewayServiceTierPrices(
+        input_nano_usd_per_million_tokens=2_000_000,
+        output_nano_usd_per_million_tokens=8_000_000,
+    )
+    return deployment.model_copy(
+        update={
+            "billing_source": BillingSource.HOST_MANAGED,
+            "gateway": deployment.gateway.model_copy(
+                update={"prices": GatewayTokenPrices(priority=card)}
+            ),
+        }
+    )
+
+
+class TestFastSplitTerminates:
+    """The :fast hard sheds end the ladder walk; they never spin to the deadline."""
+
+    def test_a_free_caller_shed_by_the_split_is_refused_at_once(self) -> None:
+        """A soft rung's lower half is full while fast is in flight: refused, not re-forced."""
+        ledger = _RecordingLedger()
+        registry = NativeAttemptAccounting(ledger)
+        only = (_fast_lane(GatewayRungDispatchPolicy(concurrency_bound=2)),)
+        _admit(registry, only, request_id="request-fast", fast=True)
+        for request_id in ("request-1", "request-2"):
+            _admit(registry, only, request_id=request_id)
+        assert _start(registry, ordinal=0, request_id="request-fast")["route_depth"] == 0
+        assert _start(registry, ordinal=0, request_id="request-1")["route_depth"] == 0
+        started = time.monotonic()
+        refused = _start(registry, ordinal=0, request_id="request-2")
+        assert time.monotonic() - started < 5
+        assert refused["exhausted"] is True
+        assert cast("JsonObject", refused["failure"])["failure_class"] == "throttled"
+
+    def test_a_fast_request_shed_on_a_rate_window_overflows_once(self) -> None:
+        """A forced fast retry skips the window it shed on, like any forced overflow."""
+        ledger = _RecordingLedger()
+        registry = NativeAttemptAccounting(ledger)
+        only = (_fast_lane(GatewayRungDispatchPolicy(concurrency_bound=4, requests_per_minute=1)),)
+        for request_id in ("request-fast-1", "request-fast-2"):
+            _admit(registry, only, request_id=request_id, fast=True)
+        assert _start(registry, ordinal=0, request_id="request-fast-1")["route_depth"] == 0
+        started = time.monotonic()
+        second = _start(registry, ordinal=0, request_id="request-fast-2")
+        assert time.monotonic() - started < 5
+        assert second["route_depth"] == 0
+        assert ledger.started[-1]["dispatch_reason"] == "saturated_overflow"
 
 
 class TestLaneSaturation:
@@ -1744,6 +1890,7 @@ class TestLaneSaturation:
             reserved_tokens: int,
             force: bool,
             rate_retry: bool = False,
+            failover: bool = False,
         ) -> str | RungShed | None:
             """Fill capacity after the initial rate decision and fail on a repeated hard refusal."""
             assert len(calls) < 2, "stale shed retried a hard-refused overflow target"
@@ -1753,6 +1900,7 @@ class TestLaneSaturation:
                 reserved_tokens=reserved_tokens,
                 force=force,
                 rate_retry=rate_retry,
+                failover=failover,
             )
             calls.append(
                 (force, rate_retry, result.reason if isinstance(result, RungShed) else "admitted")
@@ -1843,6 +1991,7 @@ class TestLaneSaturation:
             reserved_tokens: int,
             force: bool,
             rate_retry: bool = False,
+            failover: bool = False,
         ) -> str | RungShed | None:
             """Advance the deadline or durably abandon before the next selection."""
             nonlocal calls
@@ -1854,6 +2003,7 @@ class TestLaneSaturation:
                 reserved_tokens=reserved_tokens,
                 force=force,
                 rate_retry=rate_retry,
+                failover=failover,
             )
             assert isinstance(result, RungShed)
             if interruption == "deadline":

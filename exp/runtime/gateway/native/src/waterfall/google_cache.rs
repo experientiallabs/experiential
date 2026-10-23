@@ -83,7 +83,7 @@ pub(super) async fn prepare(
     repaired: bool,
 ) -> Result<Option<DeploymentWire>, Failure> {
     let prepared = execute(
-        ctx.http,
+        ctx.http.for_origin(wire.tenant_origin),
         wire,
         ctx.request_id,
         ctx.deadline,

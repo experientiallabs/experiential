@@ -17,6 +17,7 @@ from exp.cli.shared.consent import (
     NO_CONSENT_EXIT_CODE,
     SpendBudget,
     can_prompt,
+    one_cost_warning,
     require_spend_consent,
 )
 from exp.common.config.settings import set_maximum_command_cost_usd
@@ -543,3 +544,38 @@ def test_undefined_cost_noninteractive_without_yes_exits_without_spend(
 
     assert caught.value.exit_code == NO_CONSENT_EXIT_CODE
     assert "manual override" in _flat(buffer)
+
+
+def test_one_cost_warning_states_an_authorized_undefined_cost_once_per_command(
+    tmp_path: Path,
+) -> None:
+    """Inside one command scope the warning prints once; scopes never share that state."""
+    buffer = io.StringIO()
+    console = Console(file=buffer, width=200)
+
+    def authorize() -> None:
+        """One authorized stage of a command with an undefined cost."""
+        assert require_spend_consent(
+            console,
+            root=tmp_path,
+            yes=True,
+            estimated_cost_usd=None,
+            cost_is_upper_bound=False,
+            command="exp build support",
+            non_interactive=True,
+        )
+
+    def warnings() -> int:
+        """Undefined-cost warnings printed so far."""
+        return buffer.getvalue().count("the cost of this command is undefined")
+
+    authorize()
+    authorize()
+    assert warnings() == 2, "outside a command scope every call warns"
+    with one_cost_warning():
+        authorize()
+        authorize()
+    assert warnings() == 3, "one warning for the whole scoped command"
+    with one_cost_warning():
+        authorize()
+    assert warnings() == 4, "a later command warns again"

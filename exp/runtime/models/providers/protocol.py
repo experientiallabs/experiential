@@ -189,6 +189,62 @@ class GatewayDispatchSigner(Protocol):
 STOP_SEQUENCE_EMULATED_DIALECTS: frozenset[str] = frozenset({"openai_responses"})
 
 
+# Wire dialects whose payload builder carries a ``developer`` message in the
+# provider's own instruction role: ``system`` on the OpenAI Chat wire, the
+# hoisted instruction field on Anthropic Messages, Bedrock Converse and Gemini
+# (later turns fold into user text there, disclosed by ``disclose_system_fold``).
+# None of these wires defines ``developer``, so a rung on one satisfies
+# ``developer_messages`` whatever its catalog flag says; the native Responses
+# wire defines the role and still requires the declaration.
+DEVELOPER_ROLE_REWRITE_DIALECTS: frozenset[str] = frozenset(
+    {
+        "openai_compatible",
+        "anthropic_messages",
+        "bedrock_converse_stream",
+        "gemini_generate_content",
+    }
+)
+
+DEVELOPER_ROLE_REWRITE_DISCLOSURE = "messages.developer->system(rewritten_by_gateway)"
+"""Disclosure recorded when a rung that does not declare ``developer`` messages
+serves them as the instruction role its wire carries."""
+
+
+def developer_role_rewrite_disclosure(
+    dialect: str,
+    request: GatewayRequest,
+    capabilities: GatewayDeploymentCapabilities,
+) -> str | None:
+    """Name the developer-to-system rewrite one rung applies, if it applies one.
+
+    A rung whose catalog declares ``developer`` support keeps serving exactly
+    as before; one that does not is admitted on a rewriting dialect and the
+    caller reads the rewrite in ``ignored_parameters``.
+
+    Args:
+        dialect: The rung's wire dialect.
+        request: The streaming-forced provider request for this rung.
+        capabilities: The rung's deployment capability declaration.
+
+    Returns:
+        :data:`DEVELOPER_ROLE_REWRITE_DISCLOSURE`, or ``None`` when the rung
+        declares the role, its wire defines it, or no developer message is sent.
+    """
+    if capabilities.supports_developer_messages or dialect not in DEVELOPER_ROLE_REWRITE_DIALECTS:
+        return None
+    if not _carries_developer_message(request):
+        return None
+    return DEVELOPER_ROLE_REWRITE_DISCLOSURE
+
+
+def _carries_developer_message(request: GatewayRequest) -> bool:
+    """Whether the request sends a ``developer`` message the preflight would judge."""
+    return any(
+        message.role == "developer" and message.provider_native_item is None
+        for message in request.messages
+    )
+
+
 def emulated_gateway_capabilities(
     dialect: str, *, emulate_parallel_tool_calls: bool = False
 ) -> frozenset[str]:
@@ -210,6 +266,8 @@ def emulated_gateway_capabilities(
     emulated: set[str] = set()
     if dialect in STOP_SEQUENCE_EMULATED_DIALECTS:
         emulated.add("stop_sequences")
+    if dialect in DEVELOPER_ROLE_REWRITE_DIALECTS:
+        emulated.add("developer_messages")
     if emulate_parallel_tool_calls:
         emulated.add("parallel_tool_calls")
     return frozenset(emulated)
@@ -285,10 +343,7 @@ def preflight_gateway_request(
         requirements += ((request.stream, capabilities.supports_streaming, "streaming"),)
     requirements += (
         (
-            any(
-                message.role == "developer" and message.provider_native_item is None
-                for message in request.messages
-            ),
+            _carries_developer_message(request),
             capabilities.supports_developer_messages,
             "developer_messages",
         ),
@@ -331,6 +386,11 @@ def preflight_gateway_request(
             request.stream and bool(request.tools),
             capabilities.supports_streaming_tool_arguments,
             "streaming_tool_arguments",
+        ),
+        (
+            request.prompt_cache_ttl == "12h",
+            capabilities.supports_prompt_cache_ttl_12h,
+            "prompt_cache_ttl_12h",
         ),
     )
     if request.stream and not caller_stream:

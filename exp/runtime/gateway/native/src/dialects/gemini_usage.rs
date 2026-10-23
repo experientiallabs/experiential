@@ -7,7 +7,9 @@ use serde_json::Value;
 
 use super::super::{malformed, Normalizer, MAXIMUM_RETAINED_PROVIDER_ENTRIES};
 use crate::errors::Failure;
-use crate::events::{bounded_ledger_sum, count_if_present, gemini_usage, Event, Usage};
+use crate::events::{
+    bounded_ledger_sum, count_if_present, gemini_output_covering_image, gemini_usage, Event, Usage,
+};
 
 /// Parsed cumulative evidence is independent of the last publishable meter.
 /// Missing protobuf scalar fields are zero defaults, never resets of evidence.
@@ -16,6 +18,7 @@ struct MeterFields {
     input: u64,
     candidates: u64,
     thoughts: Option<u64>,
+    image: Option<u64>,
 }
 
 #[derive(Default)]
@@ -71,10 +74,15 @@ impl Normalizer {
             input: previous.input.max(input.unwrap_or(0)),
             candidates: previous.candidates.max(candidates.unwrap_or(0)),
             thoughts: previous.thoughts.max(parsed.reasoning_tokens),
+            image: previous.image.max(parsed.image_output_tokens),
         };
-        let output = bounded_ledger_sum(
-            &[fields.candidates, fields.thoughts.unwrap_or(0)],
-            "Gemini output",
+        let output = gemini_output_covering_image(
+            bounded_ledger_sum(
+                &[fields.candidates, fields.thoughts.unwrap_or(0)],
+                "Gemini output",
+            )
+            .map_err(|message| malformed(&message))?,
+            fields.image,
         )
         .map_err(|message| malformed(&message))?;
         self.gemini
@@ -112,9 +120,11 @@ impl Normalizer {
             cached_input_tokens: Some(cache - writes.unwrap_or(0)),
             cache_creation_input_tokens: writes,
             cache_creation_1h_input_tokens: writes.map(|_| 0),
+            cache_creation_12h_input_tokens: None,
             reasoning_tokens: fields.thoughts,
             billed_units: None,
             cache_writes_read_back: writes.is_some(),
+            image_output_tokens: fields.image,
         });
         Ok(())
     }

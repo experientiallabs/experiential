@@ -11,7 +11,12 @@ from unittest.mock import patch
 import pytest
 from pydantic import ValidationError
 
-from exp.runtime.gateway.contracts import GatewayApiSurface, GatewayMessage, GatewayRequest
+from exp.runtime.gateway.contracts import (
+    AuthorizationSnapshot,
+    GatewayApiSurface,
+    GatewayMessage,
+    GatewayRequest,
+)
 from exp.runtime.gateway.guardrails.classifiers import (
     ClassifierRegistry,
     KeywordClassifier,
@@ -32,9 +37,9 @@ from exp.runtime.gateway.guardrails.contracts import (
 from exp.runtime.gateway.guardrails.deterministic import compile_native_detectors
 from exp.runtime.gateway.guardrails.enforcement import GuardrailEngine
 from exp.runtime.gateway.guardrails.native import validate_guardrail_engine
-from exp.runtime.gateway.guardrails.native_test import _authorization
 from exp.runtime.gateway.guardrails.session import GuardrailSession
 from exp.runtime.gateway.guardrails.store import MappingGuardrailStore
+from exp.runtime.gateway.guardrails.store_test import _authorization
 from exp.runtime.gateway.guardrails.subjects import observation_subject_bytes
 from exp.runtime.gateway.native_capture import capture_unavailable_failure
 from exp.runtime.gateway.tests.parallel_input_guardrails_test import _Classifier, _engine
@@ -211,7 +216,7 @@ def test_every_scope_uses_the_same_parallel_approval_and_settlement(
 ) -> None:
     """Moving a check between scopes cannot change its runtime, failure, or refund semantics."""
     classifier = _Classifier(outcome)
-    template = _engine(classifier).policies_for("organization-one", "identity-one")[0]
+    template = _engine(classifier).policies_for(_authorization())[0]
     policy = (
         template
         if scope == "identity"
@@ -317,14 +322,14 @@ def test_deadline_and_disconnect_cancel_the_session() -> None:
 
 def test_empty_identity_assignment_cannot_override_platform_checks() -> None:
     """Policy resolution appends identity scope instead of replacing operator authority."""
-    platform = _engine(_Classifier("block")).policies_for("organization-one", "identity-one")[0]
+    platform = _engine(_Classifier("block")).policies_for(_authorization())[0]
     platform = platform.model_copy(update={"organization_id": None, "identity_id": None})
     empty = GuardrailPolicy(
         policy_id="identity-empty", organization_id="organization-one", identity_id="identity-one"
     )
     store = MappingGuardrailStore((empty, platform))
     for org, identity in [("organization-one", "identity-one"), ("other-org", "other-key")]:
-        policies = store.policies_for(org, identity)
+        policies = store.policies_for(_authorization(org, identity))
         assert policies[0].policy_id == platform.policy_id
         assert policies[0].organization_id == org and policies[0].identity_id == identity
         assert policies[0].checks == platform.checks
@@ -353,7 +358,7 @@ def test_replay_revision_covers_identity_policies_and_execution_settings() -> No
     """Policy identity alone cannot authorize a replay after its actual checks change."""
     classifier = _Classifier("allow")
     original = _engine(classifier)
-    policy = original.policies_for("organization-one", "identity-one")[0]
+    policy = original.policies_for(_authorization())[0]
     for changes in [
         {"revision": "changed"},
         {"input_execution": "before_dispatch"},
@@ -470,16 +475,14 @@ def test_policy_changes_cannot_remove_an_admitted_check() -> None:
     """A policy reload affects future admissions, never a request already being inspected."""
     detector = _Classifier("block")
     detector.release.set()
-    policies = _engine(detector).policies_for("organization-one", "identity-one")
+    policies = _engine(detector).policies_for(_authorization())
 
     class ReloadableStore:
         """Expose a host policy reload without changing the policy store contract."""
 
-        def policies_for(
-            self, organization_id: str, identity_id: str
-        ) -> tuple[GuardrailPolicy, ...]:
+        def policies_for(self, authorization: AuthorizationSnapshot) -> tuple[GuardrailPolicy, ...]:
             """Resolve the current operator snapshot for this admission."""
-            del organization_id, identity_id
+            del authorization
             return policies
 
     engine = GuardrailEngine(

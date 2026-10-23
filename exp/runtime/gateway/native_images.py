@@ -4,13 +4,13 @@ The images surface reuses the chat surface's authority, ledger, route
 resolution, deployment-health, and reservation seams unchanged (the same
 shape as :mod:`exp.runtime.gateway.native_embeddings`) and differs only in
 what it admits: a prompt-in, images-out request that dispatches one buffered
-OpenAI-wire ``/images/generations`` POST per attempt and bills the provider's
-reported prompt and image tokens.
+OpenAI-wire ``/images/generations`` POST per attempt. A rung whose lane carries
+an ``image`` unit card (dall-e, xAI Grok Imagine) reserves ``n`` images at the
+request's ``quality/size`` variant and settles one unit per image returned;
+every other rung bills the provider's reported prompt and image tokens.
 
-Deliberately absent on day one: image edits and variations (multipart image
-input), streaming partial images, per-image priced models (dall-e answers
-without token usage and is refused as unbilled until the typed billed-units
-ledger lands), keyed replay, and non-OpenAI wires.
+Deliberately absent: image edits and variations (multipart image input),
+streaming partial images, keyed replay, and non-OpenAI wires.
 """
 
 from __future__ import annotations
@@ -21,6 +21,7 @@ from dataclasses import replace
 from typing import Protocol
 
 from exp.common.core.artifacts import JsonObject
+from exp.common.models.catalog_prices import BilledUnitKind, GatewayTokenPrices
 from exp.runtime.gateway.client_apps import with_client_identity
 from exp.runtime.gateway.contracts import (
     AuthorizationSnapshot,
@@ -31,15 +32,18 @@ from exp.runtime.gateway.contracts import (
 from exp.runtime.gateway.guardrails.client import assert_not_internal_classification
 from exp.runtime.gateway.guardrails.enforcement import GuardrailEngine
 from exp.runtime.gateway.guardrails.native import require_unguarded_surface
-from exp.runtime.gateway.images_contracts import ImagesRequest
+from exp.runtime.gateway.images_contracts import ImagesRequest, image_variant, per_image_rate
 from exp.runtime.gateway.model_chain_authority import authorize_serving_model_chains
 from exp.runtime.gateway.native_accounting import (
     NativeAttemptAccounting,
     NativeBridgeError,
     authority_error,
 )
-from exp.runtime.gateway.native_admission import record_dead_admission_rungs
+from exp.runtime.gateway.native_admission import (
+    record_dead_admission_rungs,
+)
 from exp.runtime.gateway.native_components import NativeGatewayComponents, SyncWriteLedger
+from exp.runtime.gateway.native_dead_rungs import UNAVAILABLE_AT_ADMISSION
 from exp.runtime.gateway.native_decode import NativeDecodeError, decode_native_images_body
 from exp.runtime.gateway.native_execution import (
     MAXIMUM_SAME_DEPLOYMENT_ATTEMPTS,
@@ -54,6 +58,7 @@ from exp.runtime.gateway.native_settlement import gateway_updating_failure
 from exp.runtime.gateway.routing import GatewayRoutingError
 from exp.runtime.models.providers import require_gateway_provider
 from exp.runtime.models.providers.openai_compatible import openai_images_request
+from exp.runtime.models.providers.xai import is_xai_images_url
 from exp.runtime.openai_protocol.errors import OpenAIProtocolError
 
 
@@ -80,6 +85,24 @@ def not_an_image_model_error(alias: str) -> OpenAIProtocolError:
         ),
         param="model",
     )
+
+
+def unpriced_variant_error(variant: str) -> OpenAIProtocolError:
+    """Build the public 400 for a quality and size no per-image rung prices."""
+    return OpenAIProtocolError(
+        status_code=400,
+        code="unsupported_value",
+        message=(
+            f"This model has no price for quality/size {variant or 'default'!r}. "
+            "Choose a size and quality listed for the model."
+        ),
+        param="size",
+    )
+
+
+def _per_image(prices: GatewayTokenPrices) -> bool:
+    """Whether one lane bills images per image (an ``image`` unit card)."""
+    return prices.units is not None and prices.units.kind == BilledUnitKind.IMAGE
 
 
 def _images_rung(profile_url: str | None, supports_image_generation: bool | None) -> bool:
@@ -150,6 +173,7 @@ def _admit_accepted(
         dispatchable = dispatchable_route_profiles(
             plane._components.runtime_catalogs,  # noqa: SLF001
             route,
+            reread=lambda: plane._components.runtime_catalogs,  # noqa: SLF001
         )
     except NativeDialectUnavailableError as exc:
         return plane._escalate_accepted(authorization, str(exc))  # noqa: SLF001
@@ -166,18 +190,28 @@ def _admit_accepted(
     )
     if not dispatchable.indexes:
         return plane._escalate_accepted(  # noqa: SLF001
-            authorization, "every certified deployment was unavailable at admission"
+            authorization, UNAVAILABLE_AT_ADMISSION
         )
     serving: list[int] = []
+    unpriced = False
     for index, (profile, _client) in zip(
         dispatchable.indexes, dispatchable.resolved_wires, strict=True
     ):
         capabilities = route.deployments[index].capabilities
         supports = None if capabilities is None else capabilities.supports_image_generation
-        if _images_rung(profile.images_url, supports):
-            serving.append(index)
+        if not _images_rung(profile.images_url, supports):
+            continue
+        prices = route.deployments[index].gateway.prices
+        if _per_image(prices) and per_image_rate(prices, request) is None:
+            # A per-image card with no rate for this quality/size could only
+            # settle unpriced, so the rung is excluded (fail-closed).
+            unpriced = True
+            continue
+        serving.append(index)
     if not serving:
         _finish_unsupported(plane, authorization)
+        if unpriced:
+            raise NativeBridgeError(unpriced_variant_error(image_variant(request)))
         raise NativeBridgeError(not_an_image_model_error(authorization.alias))
     served_wires = [
         wire
@@ -197,7 +231,9 @@ def _admit_accepted(
                     route,
                     deployment,
                     replace(profile, url=images_url),
-                    openai_images_request(profile.model_id, request),
+                    openai_images_request(
+                        profile.model_id, request, inline_images=is_xai_images_url(images_url)
+                    ),
                 )
             )
     except Exception as exc:  # noqa: BLE001 - boundary sanitizes every failure.
@@ -231,6 +267,11 @@ def _admit_accepted(
         "route_reason": route.route_reason,
         "route": wire_route,
         "image_count": request.n,
+        # Aligned with ``route``: a per-image rung settles image units at this variant.
+        "unit_billing": [
+            {"variant": image_variant(request)} if _per_image(deployment.gateway.prices) else None
+            for deployment in route.deployments
+        ],
         "maximum_total_attempts": MAXIMUM_TOTAL_ATTEMPTS,
         "maximum_same_deployment_attempts": MAXIMUM_SAME_DEPLOYMENT_ATTEMPTS,
     }

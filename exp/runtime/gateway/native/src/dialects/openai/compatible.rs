@@ -269,7 +269,7 @@ impl Normalizer {
         };
         match delta.get("content") {
             Some(Value::String(content)) if !content.is_empty() => {
-                events.push(Event::TextDelta(content.clone()));
+                self.push_content(content, &mut events)?;
             }
             Some(Value::Array(parts)) => self.content_part_events(parts, &mut events)?,
             _ => {}
@@ -351,6 +351,7 @@ impl Normalizer {
                                     name: tool.name.clone(),
                                     namespace: None,
                                     caller: None,
+                                    thought_signature: None,
                                 });
                                 if !tool.raw_arguments.is_empty() {
                                     events.push(Event::ToolArgumentsDelta {
@@ -390,6 +391,7 @@ impl Normalizer {
                                 name,
                                 namespace: None,
                                 caller: None,
+                                thought_signature: None,
                             });
                         }
                         self.tools.insert(index, tool);
@@ -428,6 +430,64 @@ impl Normalizer {
                 self.refusal_seen = true;
                 events.push(Event::RefusalDelta(String::new()));
             }
+        }
+        Ok(events)
+    }
+
+    /// Route one answer-text fragment through the DSML guard (`super::dsml`):
+    /// text that cannot be tool-call markup becomes `TextDelta`, a complete
+    /// DSML block becomes ordinary tool calls, and markup that does not parse
+    /// fails the stream as malformed without ever reaching the caller.
+    fn push_content(&mut self, text: &str, events: &mut Vec<Event>) -> Result<(), Failure> {
+        let released = self.dsml.push(text).map_err(malformed)?;
+        self.release_dsml(released, events)
+    }
+
+    /// Emit what the DSML guard released, in order.
+    fn release_dsml(
+        &mut self,
+        released: super::dsml::Released,
+        events: &mut Vec<Event>,
+    ) -> Result<(), Failure> {
+        if !released.text.is_empty() {
+            events.push(Event::TextDelta(released.text));
+        }
+        for call in released.calls {
+            let index = self.tools.keys().next_back().map_or(0, |last| last + 1);
+            self.reserve_tool_entry(index)?;
+            let arguments = Value::Object(call.arguments).to_string();
+            self.reserve_tool_bytes(arguments.len())?;
+            let call_id = synthesized_call_id(index);
+            let mut tool = ToolAccumulator::new(call_id.clone(), call.name.clone());
+            tool.id_synthesized = true;
+            let delta = tool.push_arguments(&arguments);
+            events.push(Event::ToolCallStarted {
+                custom: false,
+                index,
+                call_id,
+                name: call.name,
+                namespace: None,
+                caller: None,
+                thought_signature: None,
+            });
+            if let Some(delta) = delta {
+                events.push(Event::ToolArgumentsDelta { index, delta });
+            }
+            self.tools.insert(index, tool);
+        }
+        if !released.trailing_text.is_empty() {
+            events.push(Event::TextDelta(released.trailing_text));
+        }
+        Ok(())
+    }
+
+    /// End the DSML guard with the content: a held `<` that never became
+    /// markup is released as text; an open span must parse or fail.
+    pub(in crate::dialects) fn finish_dsml(&mut self) -> Result<Vec<Event>, Failure> {
+        let mut events = Vec::new();
+        if self.dsml.holding() {
+            let released = self.dsml.finish().map_err(malformed)?;
+            self.release_dsml(released, &mut events)?;
         }
         Ok(events)
     }
@@ -472,7 +532,7 @@ impl Normalizer {
                 Some("text") => {
                     let text = wire_text(part.get("text"), "OpenAI-compatible text part")?;
                     if let Some(text) = text.filter(|text| !text.is_empty()) {
-                        events.push(Event::TextDelta(text));
+                        self.push_content(&text, events)?;
                     }
                 }
                 Some("thinking") => match part.get("thinking") {
@@ -512,7 +572,6 @@ impl Normalizer {
     /// finish reason is the provider's declared end of the choice, and both
     /// paths settle it identically.
     fn finish_openai_compatible_stream(&mut self) -> Result<Vec<Event>, Failure> {
-        let finish = self.finish_reason.as_deref();
         // A tool call cut off by the output budget (finish_reason=length,
         // arguments still an open JSON fragment) is the provider's honest
         // truncation, not a malformed stream: it surfaces as Incomplete
@@ -524,11 +583,15 @@ impl Normalizer {
         // (finish_open_tools_relay): that cut call is dropped and the turn
         // settles Incomplete too; a syntax error inside the arguments
         // keeps the strict contract and stays malformed.
-        let (mut events, cut_mid_fragment) = if finish == Some("length") {
+        let unreported = self.usage.is_none();
+        let mut events = self.finish_dsml()?;
+        let finish = self.finish_reason.as_deref();
+        let (tool_events, cut_mid_fragment) = if finish == Some("length") {
             (finish_open_tools_truncated(&mut self.tools)?, false)
         } else {
             finish_open_tools_relay(&mut self.tools, finish.unwrap_or("none"))?
         };
+        events.extend(tool_events);
         if let Some(usage) = self.usage.take() {
             events.push(Event::Usage(usage));
         }
@@ -543,6 +606,20 @@ impl Normalizer {
             };
             events.push(Event::Failed(Failure::refusal(reason)));
         } else if finish == Some("length") || cut_mid_fragment {
+            events.push(Event::Incomplete);
+        } else if finish == Some("stop") && unreported && self.output_token_cap.is_some() {
+            // A capped `stop` with no usage report is the provider's budget
+            // truncation mislabelled: Meta's muse lanes end a stream that hit
+            // `max_tokens` with `finish_reason: stop` and no usage frame
+            // (2026-10-17), while every natural stop reports usage. Settle it
+            // as `length` so the caller sees the cut and the control plane
+            // meters the budget instead of an unknown $0.
+            self.unreported_stop_read_as_length = true;
+            let line = serde_json::json!({
+                "event": "unreported_stop_read_as_length",
+                "output_token_cap": self.output_token_cap,
+            });
+            eprintln!("exp-gateway-native: {line}");
             events.push(Event::Incomplete);
         } else {
             events.push(Event::Completed);

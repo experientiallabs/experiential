@@ -5,7 +5,20 @@ from __future__ import annotations
 from collections.abc import Sequence
 from typing import Protocol, runtime_checkable
 
+from exp.common.core.artifacts import JsonObject
 from exp.common.models.model import Embedding, ModelRequest, ModelResponse
+
+
+class RequestCapacityExceeded(ValueError):
+    """A request was refused locally before provider admission or billing."""
+
+
+@runtime_checkable
+class StructuredRequestPreflight(Protocol):
+    """Optional local admission before a session records possible provider dispatch."""
+
+    def preflight(self, body: JsonObject) -> None:
+        """Validate the exact request without purchasing inference or claiming a budget."""
 
 
 @runtime_checkable

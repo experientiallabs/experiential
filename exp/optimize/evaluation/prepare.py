@@ -31,6 +31,7 @@ from exp.common.tasks import load_task_set
 from exp.common.traces import load_trace_dataset
 from exp.optimize.evaluation.contracts import EvaluationSetup
 from exp.optimize.evaluation.judge_selection import select_judge_model
+from exp.optimize.evaluation.learned_memory import EvaluationMemory, learned_evaluation_memory
 from exp.optimize.evaluation.planning import EvaluationCostPlan, estimate_model_evaluation
 from exp.optimize.router.automatic.provisional import (
     _judge_request_reservation,
@@ -101,6 +102,9 @@ class PreparedModelEvaluation(ContractModel):
         agent_factory_sha256: Digest of the exact worker runtime configuration.
         redacted_field_names: Project privacy fields pinned before execution.
         cost: Engine-owned immutable stage estimates and maximum provider spend.
+        memory: The build's learned simulator memory, frozen at the version every simulated
+            turn reads; explicit None when the build learned nothing. Records missing this
+            field require a new preparation.
     """
 
     setup: EvaluationSetup
@@ -110,6 +114,7 @@ class PreparedModelEvaluation(ContractModel):
     agent_factory_sha256: Sha256
     redacted_field_names: tuple[str, ...]
     cost: EvaluationCostPlan
+    memory: EvaluationMemory | None
 
 
 def read_evaluation_judge(project: ProjectStore, pointer: ArtifactInput) -> JudgeSetupArtifact:
@@ -449,4 +454,5 @@ def prepare_model_evaluation(
         agent_factory_sha256=agent_digest,
         redacted_field_names=config.redacted_field_names,
         cost=cost,
+        memory=learned_evaluation_memory(project, catalog),
     )

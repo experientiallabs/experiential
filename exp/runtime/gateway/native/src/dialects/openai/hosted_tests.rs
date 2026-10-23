@@ -82,8 +82,9 @@ fn message_item_done_preserves_each_content_part_probability_record() {
 fn malformed_responses_probability_records_fail_closed() {
     for records in [
         serde_json::json!([{"token": 7, "logprob": -0.1}]),
-        serde_json::json!([{"token": "x", "logprob": "bad"}]),
-        serde_json::json!([{"token": "x", "logprob": -0.1, "top_logprobs": [{"token": "y", "logprob": "bad"}]}]),
+        serde_json::json!(["x"]),
+        serde_json::json!([{"token": "x", "logprob": -0.1, "top_logprobs": "y"}]),
+        serde_json::json!([{"token": "x", "logprob": -0.1, "top_logprobs": [{"token": 7, "logprob": -0.1}]}]),
     ] {
         let mut normalizer = Normalizer::new(Dialect::OpenAiResponses);
         normalizer.enable_responses_logprobs(true);
@@ -97,6 +98,65 @@ fn malformed_responses_probability_records_fail_closed() {
         }));
         assert!(normalizer.feed(&frame).is_err());
     }
+}
+
+/// A provider's unrepresentable logprob value (null, "-inf", NaN text, absent)
+/// is the contract's negligible -9999.0 on every Responses phase, never a
+/// failed answer; a null alternative stays null where the phase admits one.
+#[test]
+fn unrepresentable_responses_logprob_values_map_to_the_negligible_value() {
+    let mut normalizer = Normalizer::new(Dialect::OpenAiResponses);
+    normalizer.enable_responses_logprobs(true);
+    let delta = hosted_frame(serde_json::json!({
+        "type": "response.output_text.delta",
+        "output_index": 0,
+        "item_id": "msg_n",
+        "content_index": 0,
+        "delta": "x",
+        "logprobs": [{"token": "x", "logprob": null, "top_logprobs": [
+            {"token": "x", "logprob": "-inf"},
+            {"token": "y", "logprob": null},
+        ]}],
+    }));
+    let events = normalizer.feed(&delta).unwrap();
+    let records = events
+        .iter()
+        .find_map(|event| match event {
+            Event::ProviderResponsesLogprobs { records, .. } => Some(records.clone()),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(records[0]["logprob"], -9999.0);
+    assert_eq!(records[0]["top_logprobs"][0]["logprob"], -9999.0);
+    assert!(records[0]["top_logprobs"][1]["logprob"].is_null());
+
+    let done = hosted_frame(serde_json::json!({
+        "type": "response.output_item.done",
+        "output_index": 0,
+        "item": {
+            "id": "msg_n",
+            "type": "message",
+            "role": "assistant",
+            "status": "completed",
+            "content": [{"type": "output_text", "text": "x", "annotations": [], "logprobs": [
+                {"token": "x", "logprob": "-Infinity", "top_logprobs": [{"token": "x", "logprob": "NaN"}]},
+                {"token": "z"},
+            ]}],
+        },
+    }));
+    let events = normalizer.feed(&done).unwrap();
+    let records = events
+        .iter()
+        .find_map(|event| match event {
+            Event::ProviderResponsesLogprobs { records, phase, .. } if phase == "item_done" => {
+                Some(records.clone())
+            }
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(records[0]["logprob"], -9999.0);
+    assert_eq!(records[0]["top_logprobs"][0]["logprob"], -9999.0);
+    assert_eq!(records[1]["logprob"], -9999.0);
 }
 
 /// Frame shapes mirror the documented Responses web_search lifecycle
@@ -602,7 +662,7 @@ fn malformed_terminal_probabilities_preserve_reported_billing_usage() {
         "type": "response.completed", "response": {
             "status": "completed", "usage": {"input_tokens": 17, "output_tokens": 4},
             "output": [{"type": "message", "id": "msg-bad", "content": [
-                {"type": "output_text", "text": "A", "logprobs": [{"token": "A"}]}
+                {"type": "output_text", "text": "A", "logprobs": [{"logprob": -0.1}]}
             ]}]
         }
     }));
