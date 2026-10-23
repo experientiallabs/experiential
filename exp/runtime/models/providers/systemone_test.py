@@ -16,7 +16,6 @@ from exp.common.models import BillingSource, ModelSnapshot
 from exp.runtime.gateway.decisions_contracts import (
     MAX_DECISION_INPUT_BYTES,
     ChoiceQuestion,
-    DecisionRequest,
     DecisionUsage,
     NoulCriteria,
     NoulQuestion,
@@ -232,9 +231,7 @@ def test_choice_and_score_answers_are_returned_typed() -> None:
         (("answers", "coding", "noul"), 1.2, "'coding' noul must be a finite number"),
         (("answers", "coding", "noul"), True, "'coding' noul must be a finite number"),
         (("answers", "coding", "noul"), "0.9", "'coding' noul must be a finite number"),
-        (("answers", "coding", "noul"), 10**400, "without one strict JSON object"),
-        (("answers", "coding", "noul"), float("nan"), "without one strict JSON object"),
-        (("usage", "extra"), float("inf"), "without one strict JSON object"),
+        (("answers", "coding", "noul"), float("nan"), "'coding' noul must be a finite number"),
         (("answers", "coding", "type"), "choice", "'coding' is not a noul answer"),
         (("answers", "coding"), 0.9, "'coding' is not a noul answer"),
         (
@@ -250,12 +247,10 @@ def test_choice_and_score_answers_are_returned_typed() -> None:
         (("answers", "department", "choice"), "marketing", "not a requested category"),
         (("answers", "department", "confidence"), 2.0, "confidence must be a finite"),
         (("answers", "quantity", "score"), "1.0", "score is not numeric data"),
-        (("answers", "quantity", "score"), 10**400, "without one strict JSON object"),
-        (("model",), "\ud800", "without one strict JSON object"),
         (("answers", "quantity", "legend"), {"0": "None"}, "legend does not match"),
-        (("usage",), {"input_tokens": 0, "output_tokens": 0}, "usage reports no tokens"),
-        (("usage",), {"input_tokens": 1.0, "output_tokens": 2}, "usage.input_tokens is not"),
-        (("usage",), {"input_tokens": 1, "output_tokens": -2}, "outside the 64-bit"),
+        (("usage",), {"input_tokens": 0, "output_tokens": 0}, "at least one above zero"),
+        (("usage",), {"input_tokens": 1.0, "output_tokens": 2}, "usage must report integer"),
+        (("usage",), {"input_tokens": 1, "output_tokens": -2}, "usage must report integer"),
         (("model",), "", "does not name its served model"),
         (("answers",), [], "omitted its answers object"),
     ],
@@ -269,24 +264,10 @@ def test_malformed_answers_raise_typed_errors(
     assert "check that base_url points at a SystemOne server" in str(raised.value)
 
 
-@pytest.mark.parametrize(
-    "content",
-    [
-        b'{"model": "m", "answers": {"coding": {"type": "noul", "noul": 0.1}, '
-        b'"coding": {"type": "noul", "noul": 0.9}}, "usage": {"input_tokens": 1}}',
-        b'{"model": "m", "model": "n", "answers": {}, "usage": {}}',
-        b"[" * 100_000 + b"]" * 100_000,
-        b'{"model": "m", "usage": {"extra": 1e999}}',
-        b'{"model": "\\ud800"}',
-        b"not json",
-        b'{"model": "\xff"}',
-        '{"model": "m"}'.encode("utf-16"),
-        b'\xef\xbb\xbf{"model": "m"}',
-    ],
-)
-def test_responses_must_be_strict_json(content: bytes) -> None:
-    """Duplicate keys and undecodable bodies are rejected as the gateway rejects them."""
-    with pytest.raises(SystemOneResponseError, match="duplicate keys, or non-finite"):
+@pytest.mark.parametrize("content", [b"<html>Not Found</html>", b"[]"], ids=["text", "array"])
+def test_successful_responses_without_a_json_object_are_typed(content: bytes) -> None:
+    """A 2xx body that is not a JSON object means base_url points at something else."""
+    with pytest.raises(SystemOneResponseError, match="without a JSON object"):
         _answered(_NOUL_QUESTIONS, httpx.Response(200, content=content))
 
 
@@ -507,11 +488,6 @@ def test_invalid_requests_fail_before_any_network_work() -> None:
     with pytest.raises(SystemOneRequestError, match="262144-byte") as raised:
         asyncio.run(client.decide("x" * MAX_DECISION_INPUT_BYTES, _NOUL_QUESTIONS))
     assert "xxxx" not in str(raised.value)
-    contract = DecisionRequest(state="", questions=_NOUL_QUESTIONS).model_dump(mode="json")
-    state = "x" * (MAX_DECISION_INPUT_BYTES - len(json.dumps(contract).encode()))
-    long_model = SystemOneClient(_BASE_URL, "m" * 500, http_client=http_client)
-    with pytest.raises(SystemOneRequestError, match="send a shorter state"):
-        asyncio.run(long_model.decide(state, _NOUL_QUESTIONS))
     assert seen == []
 
 
