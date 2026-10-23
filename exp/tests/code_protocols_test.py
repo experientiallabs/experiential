@@ -119,7 +119,7 @@ PROTOCOLS = (
         "exp.optimize.evaluation.executable.workbook:PRIVATE_VIEWS_PROTOCOL",
         "private-workbook-views-v2",
         ("exp.optimize.evaluation.executable.workbook",),
-        "19b915db0979a376e0071f9a64cd26f4554f116044b83de063c85b9f3a0fb428",
+        "e14d471c25cadda4e5cc1750bf8784a8f3576d87b37589c8d70a4561a0ed8881",
     ),
     Protocol(
         "exp.runtime.environments.record_world:RECORD_WORLD_PROTOCOL",
