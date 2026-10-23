@@ -50,7 +50,7 @@ PROTOCOLS = (
             "exp.simulation.evaluation.tasks",
             "exp.simulation.evaluation.admission",
         ),
-        "b050c28a545628c3baf96e1768cfa24d98cab0852a7d538ce350ef05004c1630",
+        "04713c2d37d0f5512507a26caa1ba2ea63cd18ec26eeb806f9df923773317328",
     ),
     Protocol(
         "exp.optimize.evaluation.tasks.challenges:CHALLENGE_PROTOCOL",
@@ -60,7 +60,7 @@ PROTOCOLS = (
             "exp.simulation.evaluation.calibration:task_decision",
             "exp.simulation.evaluation.calibration:blinded_case",
         ),
-        "4a503a8fc8bf754d115bb4a2a7eccd9b709378fbf6ad0bb02842a11eba368e18",
+        "cfb50e4ac7dea292a349fd1b25dd4800be6206be76e07a6672d08ef071a041bf",
     ),
     Protocol(
         "exp.optimize.evaluation.council.runner:COUNCIL_HARNESS_PROTOCOL",
@@ -107,7 +107,7 @@ PROTOCOLS = (
         "exp.runtime.environments.workbook_edits:XLSX_ROW_EDITS_PROTOCOL",
         "xlsx-row-edits-v3",
         ("exp.runtime.environments.workbook_edits",),
-        "b1423d44f246df1382ea532deaadd773c31f8891eb65cf55d71b691017032d64",
+        "977a23f451e187c67db9052c5eaa226a49b433727821a904d3708ea648ff6242",
     ),
     Protocol(
         "exp.runtime.environments.artifact_world:ARTIFACT_WORLD_PROTOCOL",
@@ -119,7 +119,7 @@ PROTOCOLS = (
         "exp.optimize.evaluation.executable.workbook:PRIVATE_VIEWS_PROTOCOL",
         "private-workbook-views-v2",
         ("exp.optimize.evaluation.executable.workbook",),
-        "32ed1106318b367d2486290d4dbd9df0510aeeb6ba8f3103d16764bf070888e5",
+        "19b915db0979a376e0071f9a64cd26f4554f116044b83de063c85b9f3a0fb428",
     ),
     Protocol(
         "exp.runtime.environments.record_world:RECORD_WORLD_PROTOCOL",
