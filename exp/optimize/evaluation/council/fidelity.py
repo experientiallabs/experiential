@@ -8,6 +8,8 @@ from pydantic import Field
 from exp.common.core.artifacts import ArtifactInput, ContractModel, JsonObject, sha256_json
 from exp.common.evaluations.reconstruction import DualReport, WorkflowEvidence, mechanical_checks
 from exp.common.project import ProjectStore, artifact_input
+from exp.optimize.evaluation.analysis.source_access import refuse_known_ineligible_sources
+from exp.optimize.evaluation.fidelity.memory import refuse_ineligible_memory
 from exp.optimize.evaluation.fidelity.runner import PreparedFidelity
 
 
@@ -45,6 +47,7 @@ def load_tool_fidelity(
     """
     if len({plan.artifact_id for plan in plans}) != len(plans):
         raise ValueError("duplicate fidelity plans would count the same measurement twice")
+    refuse_known_ineligible_sources(project.artifacts, tuple(plans), maximum_artifacts=100_000)
     profiles: list[JsonObject] = []
     excluded = set(excluded_task_lineages)
     for reference in plans:
@@ -58,6 +61,10 @@ def load_tool_fidelity(
             project.artifacts.read_bytes(reference.artifact_id, "plan.json")
         )
         spec = prepared.spec
+        if spec.memory is not None:
+            refuse_ineligible_memory(
+                project, spec.memory.lineage, checkpoint=spec.memory.checkpoint
+            )
         if prepared.id != reference.artifact_id or spec.world_model != world_model:
             raise ValueError("fidelity plan does not bind the selected simulator")
         if spec.task.partition != "held_out":
@@ -74,6 +81,9 @@ def load_tool_fidelity(
         report_stored = project.artifacts.read(report_id)
         if report_stored.manifest.artifact_type != "workflow-dual-evaluation":
             raise ValueError("saved fidelity report has a different artifact type")
+        refuse_known_ineligible_sources(
+            project.artifacts, (artifact_input(report_stored.manifest),), maximum_artifacts=100_000
+        )
         result = DualReport.model_validate_json(
             project.artifacts.read_bytes(report_id, "report.json")
         )

@@ -16,6 +16,7 @@ from exp.common.core.artifacts import (
 )
 from exp.common.evaluations.reconstruction import DualReport, WorkflowEvidence
 from exp.common.project import ProjectStore, artifact_input
+from exp.optimize.evaluation.analysis.source_access import refuse_known_ineligible_sources
 from exp.optimize.evaluation.harbor.export import export_harbor_task, verify_harbor_export
 from exp.optimize.evaluation.tasks.admission import admit_calibration_evidence
 from exp.simulation.evaluation.calibration import CalibrationJudgment, CalibrationPack, calibrate
@@ -24,7 +25,7 @@ from exp.simulation.evaluation.tasks import load_evaluation_task, normalized_out
 # Identity of the code that decides this artifact's behavior, in place of its source text.
 # Bump it when behavior changes. exp/tests/code_protocols_test.py fails when the covered
 # source changes until it is bumped or, for a pure refactor, its digest is updated.
-CALIBRATION_PROTOCOL = "task-calibration-v7"
+CALIBRATION_PROTOCOL = "task-calibration-v8"
 
 
 class SavedCalibrationJudge(ContractModel):
@@ -90,6 +91,14 @@ def execute_calibration(
     Returns:
         Immutable result reference, or none for a successful dry run.
     """
+    qualification_sources = {spec.pack.task, *(row.report for row in spec.judgments)}
+    for case in spec.pack.cases:
+        qualification_sources.update(case.challenge.source_refs)
+        if case.challenge.witness is not None:
+            qualification_sources.add(case.challenge.witness)
+    refuse_known_ineligible_sources(
+        project.artifacts, tuple(qualification_sources), maximum_artifacts=100_000
+    )
     task = load_evaluation_task(project.artifacts, spec.pack.task)
     if task.verifier != spec.pack.candidate:
         raise ValueError("candidate verifier differs from the exact task being calibrated")

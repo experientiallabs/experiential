@@ -31,6 +31,7 @@ from exp.common.core.locks import CoordinationLock
 from exp.common.models import ModelCatalog, ModelSnapshot
 from exp.common.project import ArtifactAlreadyExistsError, ProjectStore, artifact_input
 from exp.common.tasks import TaskCase
+from exp.optimize.evaluation.fidelity.memory import refuse_ineligible_memory
 from exp.optimize.evaluation.fidelity.runner import FidelityRetrieval
 from exp.optimize.evaluation.learning.traces import Scope, learning_plan, recorded_plan
 from exp.optimize.router.evaluation.build import completed_project_build
@@ -115,6 +116,7 @@ def learned_evaluation_memory(
     if not recorded_plan(project, scope):
         return None
     plan = learning_plan(project, None, scope)
+    refuse_ineligible_memory(project, plan.lineage)
     head = memory_head(project.artifacts, plan.lineage)
     if head is None:
         return None
@@ -164,6 +166,7 @@ def bind_evaluation_memory(
     """
     if memory.world_model != world_model:
         raise ValueError("evaluation memory belongs to a different simulator; prepare again")
+    refuse_ineligible_memory(project, memory.lineage, checkpoint=memory.version)
     version = read_memory_version(project.artifacts, memory.lineage, memory.version)
     selector = JEVCueSelector(
         policy=memory.recall.jev,

@@ -1,4 +1,4 @@
-"""Explicit, immutable source classifications before diagnostic evidence leaves its store."""
+"""Disclosure classifications and qualification exclusions for exact immutable evidence."""
 
 from datetime import UTC, datetime
 from typing import Literal
@@ -20,6 +20,119 @@ class SourceAccess(ContractModel):
     source: ArtifactInput
     scope: Literal["development", "protected"]
     rationale: str
+
+
+class QualificationExclusion(ContractModel):
+    """Exclude exact evidence from qualification while retaining diagnostic access.
+
+    Attributes:
+        source: Immutable evidence whose qualification is excluded.
+        audit: Immutable audit supporting the operator's exclusion.
+        rationale: Reason for exclusion, without copying source contents.
+    """
+
+    source: ArtifactInput
+    audit: ArtifactInput
+    rationale: str
+
+
+def exclude_source_from_qualification(
+    store: ArtifactStore,
+    source: ArtifactInput,
+    *,
+    audit: ArtifactInput,
+    rationale: str,
+    code_revision: str,
+) -> ArtifactInput:
+    """Record a permanent qualification exclusion, separately from disclosure policy.
+
+    This does not protect source contents from diagnostic access or approve any other source.
+    Requalification requires different immutable evidence, not changing this declaration.
+    """
+    if not rationale.strip():
+        raise ValueError("qualification exclusion requires an operator rationale")
+    for reference in (source, audit):
+        if artifact_input(store.read(reference.artifact_id).manifest) != reference:
+            raise ValueError("qualification exclusion reference identity differs")
+    identity = _exclusion_identity(source)
+    with CoordinationLock(store.project_directory / "source-access.lock", timeout=0):
+        if not store.exists(identity):
+            store.write_json(
+                artifact_id=identity,
+                artifact_type="evidence-qualification-exclusion",
+                envelope=ArtifactEnvelope(
+                    schema_version=1,
+                    created_at=datetime.now(UTC),
+                    code_revision=code_revision,
+                    inputs=tuple(sorted((source, audit), key=lambda ref: ref.artifact_id)),
+                ),
+                files={
+                    "exclusion.json": QualificationExclusion(
+                        source=source, audit=audit, rationale=rationale
+                    ).model_dump(mode="json")
+                },
+            )
+        existing = _read_exclusion(store, source)
+        if existing.audit != audit or existing.rationale != rationale:
+            raise ValueError("qualification exclusion already records a different immutable audit")
+        return artifact_input(store.read(identity).manifest)
+
+
+def refuse_known_ineligible_sources(
+    store: ArtifactStore, sources: tuple[ArtifactInput, ...], *, maximum_artifacts: int
+) -> None:
+    """Refuse known exclusions on verified roots and ancestors before qualification.
+
+    Unknown classification is not approval. Disclosure, development admission and memory
+    knowledge-scope validation remain separate checks owned by their existing callers.
+    Verified artifact snapshots may load payload bytes; source content is not semantically
+    decoded or admitted for qualification by this ancestry check.
+    """
+    if maximum_artifacts < 1:
+        raise ValueError("qualification ancestry bound must be positive")
+    pending = list(sources)
+    seen: set[ArtifactInput] = set()
+    while pending:
+        source = pending.pop()
+        if source in seen:
+            continue
+        seen.add(source)
+        if len(seen) > maximum_artifacts:
+            raise ValueError("qualification sources exceed the complete dependency bound")
+        manifest = store.read(source.artifact_id).manifest
+        if artifact_input(manifest) != source:
+            raise ValueError("qualification source dependency identity differs")
+        if store.exists(_exclusion_identity(source)):
+            _read_exclusion(store, source)
+            raise ValueError(
+                f"source excluded from qualification: {source.artifact_id}; "
+                "retain it for diagnostics and prepare independently qualified evidence"
+            )
+        pending.extend(manifest.inputs)
+
+
+def _read_exclusion(store: ArtifactStore, source: ArtifactInput) -> QualificationExclusion:
+    """Verify the exact immutable exclusion and its audit reference."""
+    identity = _exclusion_identity(source)
+    declaration = store.read(identity).manifest
+    exclusion = QualificationExclusion.model_validate_json(
+        store.read_bytes(identity, "exclusion.json")
+    )
+    if (
+        declaration.artifact_type != "evidence-qualification-exclusion"
+        or exclusion.source != source
+        or not exclusion.rationale.strip()
+        or declaration.inputs
+        != tuple(sorted((source, exclusion.audit), key=lambda ref: ref.artifact_id))
+        or artifact_input(store.read(exclusion.audit.artifact_id).manifest) != exclusion.audit
+    ):
+        raise ValueError("qualification exclusion declaration differs")
+    return exclusion
+
+
+def _exclusion_identity(source: ArtifactInput) -> str:
+    """Bind exclusion lookup to exact evidence, independently of diagnostic classification."""
+    return stable_id("source-qualification-exclusion", {"source": source.model_dump(mode="json")})
 
 
 def declare_source_access(

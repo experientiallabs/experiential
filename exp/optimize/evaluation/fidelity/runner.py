@@ -36,6 +36,7 @@ from exp.optimize.evaluation.fidelity.memory import (
     consume_trajectory,
     establish_reservation,
     maintain_memory,
+    refuse_ineligible_memory,
     trajectory_record,
     validate_memory,
 )
@@ -333,6 +334,10 @@ def prepare_fidelity_evaluation(
         artifact = load_grounded_world_model_artifact(project.artifacts, spec.world_model)
         # A registration may predate a guard: recheck what the predictor could see.
         _require_unexposed(project, artifact, spec)
+        if spec.memory is not None:
+            refuse_ineligible_memory(
+                project, spec.memory.lineage, checkpoint=spec.memory.checkpoint
+            )
         if spec.memory is not None and spec.memory.reserved:
             validate_memory(project, spec, artifact)
             establish_reservation(project, spec, code_revision)
@@ -465,6 +470,10 @@ def execute_fidelity_evaluation(
         raise ValueError("execution differs from the saved fidelity registration")
     # Execute from the saved bytes, so a resumed run rebuilds byte-identical requests.
     prepared = saved
+    if prepared.spec.memory is not None:
+        refuse_ineligible_memory(
+            project, prepared.spec.memory.lineage, checkpoint=prepared.spec.memory.checkpoint
+        )
     directory = project.artifacts.project_directory
     with CoordinationLock(directory / (prepared.id + ".lock"), timeout=0):
         previous = saved_fidelity_report(project, prepared)

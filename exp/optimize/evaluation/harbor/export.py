@@ -9,6 +9,7 @@ from pathlib import Path
 
 from exp.common.core.artifacts import ArtifactInput, JsonObject
 from exp.common.project import ProjectStore, artifact_input
+from exp.optimize.evaluation.analysis.source_access import refuse_known_ineligible_sources
 from exp.runtime.environments.artifact_edits import NativeArtifactBinding
 from exp.simulation.capability_briefs import load_capability_brief
 from exp.simulation.evaluation.tasks import load_evaluation_task
@@ -43,6 +44,10 @@ def export_harbor_task(
         Task directory. A trusted runner must separately launch its frozen backend.
     """
     preflight_harbor_destination(destination, name=name)
+    if calibration is not None:
+        refuse_known_ineligible_sources(
+            project.artifacts, (calibration,), maximum_artifacts=100_000
+        )
     task = load_evaluation_task(project.artifacts, task_ref)
     checkpoint = load_world_checkpoint(project.artifacts, task.checkpoint)
     declared_native = task.task.initial_context.get("native_artifact_binding")

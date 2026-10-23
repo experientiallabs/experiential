@@ -11,8 +11,9 @@ from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
-from exp.common.core.artifacts import ArtifactEnvelope, JsonObject
+from exp.common.core.artifacts import ArtifactEnvelope, ArtifactInput, JsonObject
 from exp.common.project import ProjectStore, artifact_input
+from exp.optimize.evaluation.analysis.source_access import refuse_known_ineligible_sources
 from exp.runtime.sessions.store import SessionStore
 from exp.simulation.world_model.dreaming import DreamResult
 from exp.simulation.world_model.experience_memory import (
@@ -21,6 +22,7 @@ from exp.simulation.world_model.experience_memory import (
     is_reserved,
     materialize_log,
     memory_head,
+    memory_version_id,
     publish_trajectory,
     read_memory_version,
     require_memory_scope,
@@ -44,6 +46,28 @@ if TYPE_CHECKING:
 
 INCOMPLETE = "incomplete trajectory is not consumed"
 DUPLICATE = "duplicate trajectory already consumed"
+
+
+def refuse_ineligible_memory(
+    project: ProjectStore, lineage: str, *, checkpoint: int | None = None
+) -> None:
+    """Check known exclusions before loading a pinned checkpoint or a contiguous head.
+
+    Verified snapshots may read payload bytes before semantic memory decoding.
+    A head read also checks every version it would parse;
+    a pinned checkpoint checks its declared ancestry without following newer versions.
+    This is not source admission or a replacement for knowledge and partition validation.
+    """
+    sources: list[ArtifactInput] = []
+    version = checkpoint if checkpoint is not None else 1
+    while project.artifacts.exists(identity := memory_version_id(lineage, version)):
+        if len(sources) >= 100_000:
+            raise ValueError("memory qualification exceeds the contiguous version bound")
+        sources.append(artifact_input(project.artifacts.read(identity).manifest))
+        if checkpoint is not None:
+            break
+        version += 1
+    refuse_known_ineligible_sources(project.artifacts, tuple(sources), maximum_artifacts=100_000)
 
 
 def saved_memory_receipt(project: ProjectStore, prepared: PreparedFidelity) -> JsonObject | None:
@@ -256,6 +280,7 @@ def validate_memory(
     """Check partition, checkpoint and knowledge before anything is written."""
     if spec.memory is None:
         return
+    refuse_ineligible_memory(project, spec.memory.lineage, checkpoint=spec.memory.checkpoint)
     check_partition(project, spec)
     pinned = (
         memory_head(project.artifacts, spec.memory.lineage)
