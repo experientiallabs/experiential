@@ -81,6 +81,7 @@ from exp.optimize.evaluation.fidelity.runner import (
     execute_fidelity_evaluation,
     saved_fidelity_report,
 )
+from exp.optimize.evaluation.learning.repeats import require_unlearned
 from exp.runtime.models.providers.transport import RetryPolicy
 from exp.simulation.engines.text.prompt import INSTANCE_FACTS_GUIDANCE
 from exp.simulation.retrieval.build_inputs import load_completed_build_rag_lineage_bindings
@@ -776,7 +777,7 @@ def learn_from_traces(
             saved = saved_fidelity_report(project, prepared)
             if saved is None or dream_pending(project, prepared):
                 if saved is None:
-                    _require_unlearned(project, plan, spec, earlier)
+                    require_unlearned(project, plan.lineage, spec, earlier)
                 if used + spec.maximum_physical_attempts > maximum_attempts:
                     stopped = (
                         f"attempt budget reached after {learned} of {len(cases)} traces; "
@@ -980,32 +981,3 @@ def _inside(
         return None
     detail = f"trace {index + 1}/{len(cases)}"
     return lambda event: progress(replace(event, detail=event.detail or detail))
-
-
-def _require_unlearned(
-    project: ProjectStore, plan: LearningPlan, spec: FidelitySpec, earlier: set[str]
-) -> None:
-    """Refuse to predict a trace this memory already learned, on memory that has seen later traces.
-
-    A trajectory that an earlier trace of the pass consumed belongs to an identical repeat, which
-    is predicted like any trace and then publishes nothing.
-
-    Args:
-        project: Project holding the memory lineage.
-        plan: The learning plan being run.
-        spec: This trace's learning run.
-        earlier: Trajectory digests of the traces before this one in the pass.
-
-    Raises:
-        ValueError: The trace is already in the lineage under different run inputs.
-    """
-    head = memory_head(project.artifacts, plan.lineage)
-    digest = consumed_trajectory_digest(trajectory_record(spec))
-    if head is not None and digest in head.consumed and digest not in earlier:
-        raise ValueError(
-            f"trace {spec.task.task_id} is already learned into memory {plan.lineage} "
-            f"v{head.version}, but its learning run inputs changed; predicting it again would "
-            "read memory that has seen every later trace. The memory is already learned: use "
-            "it as is, or change the simulator's knowledge or a learning input to start a fresh "
-            "memory"
-        )
