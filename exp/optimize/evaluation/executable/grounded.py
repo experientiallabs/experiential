@@ -24,7 +24,7 @@ from exp.common.core.artifacts import (
     Sha256,
     sha256_json,
 )
-from exp.common.models import ModelCatalog, ModelRequest, load_model_catalog
+from exp.common.models import ModelCatalog, ModelRequest, ReasoningEffort, load_model_catalog
 from exp.common.project import ProjectStore
 from exp.common.release_revision import installed_execution_revision
 from exp.common.tasks import TaskCase
@@ -43,7 +43,7 @@ from exp.runtime.models.providers.admitted_transport import (
     require_admitted_transport,
 )
 from exp.runtime.models.providers.transport import HttpxJsonTransport
-from exp.runtime.models.registry import RuntimeModelCatalog
+from exp.runtime.models.registry import RuntimeModelCatalog, reasoning_catalog
 from exp.runtime.models.structured_completion import CompletionPlan, StructuredCompletion
 from exp.runtime.sessions.dispatch_ledger import DispatchLedger
 from exp.simulation.continuations import WorldCheckpoint
@@ -81,6 +81,7 @@ class GroundedRuntimeDefinition(ContractModel):
             Initial pointers must resolve. Missing later values are omitted as unavailable evidence.
         seed: World scheduler seed; does not make future model responses deterministic.
         maximum_output_tokens: Per-prediction output ceiling.
+        reasoning_effort: Optional explicit predictor-only profile; None retains catalog behavior.
         maximum_reasks: Explicit extra proposals after known contract refusals, within the
             same physical budget. Never retries unknown outcomes or a valid scored result.
         maximum_physical_attempts: Cumulative durable ceiling, including query/recall retries.
@@ -101,6 +102,9 @@ class GroundedRuntimeDefinition(ContractModel):
     probe_paths: dict[str, str] = Field(min_length=1, max_length=128)
     seed: int = 0
     maximum_output_tokens: int = Field(default=4096, ge=1, le=65536)
+    reasoning_effort: ReasoningEffort | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
     maximum_reasks: int = Field(default=0, ge=0, le=3, strict=True)
     maximum_physical_attempts: int = Field(ge=1, le=100_000)
     deadline: AwareDatetime
@@ -206,6 +210,7 @@ def _checked(
     if sha256_json(catalog.model_dump(mode="json")) != spec.catalog_sha256:
         raise ValueError("executable simulator catalog differs from its frozen definition")
     artifact = load_grounded_world_model_artifact(project.artifacts, spec.world_model)
+    reasoning_catalog(catalog, artifact.model_alias, spec.reasoning_effort)
     embedder_alias = index_embedder_alias(project, catalog, artifact)
     aliases = [artifact.model_alias]
     if embedder_alias is not None:
@@ -256,7 +261,13 @@ def _runtime(
         ),
     )
     registry = RuntimeModelCatalog(catalog, transport_factory=lambda: transport)
-    predictor = registry.resolve(artifact.model_alias)
+    predictor_catalog = reasoning_catalog(catalog, artifact.model_alias, spec.reasoning_effort)
+    predictor_registry = (
+        registry
+        if predictor_catalog is catalog
+        else RuntimeModelCatalog(predictor_catalog, transport_factory=lambda: transport)
+    )
+    predictor = predictor_registry.resolve(artifact.model_alias)
     if predictor.snapshot != artifact.model:
         raise ValueError("executable predictor differs from the built simulator")
     embedding = None
@@ -310,10 +321,13 @@ def _runtime(
 
     def complete(body: JsonObject, operation: str) -> JsonObject:
         """Use the actual provider client through the shared admitted physical transport."""
+        request = ModelRequest.model_validate(body)
+        if spec.reasoning_effort is not None:
+            if request.reasoning_effort not in (None, spec.reasoning_effort):
+                raise ValueError("simulator request differs from its frozen reasoning profile")
+            request = request.model_copy(update={"reasoning_effort": spec.reasoning_effort})
         with call_consumer("simulator"):
-            return completion.complete_request(
-                ModelRequest.model_validate(body), operation
-            ).model_dump(mode="json")
+            return completion.complete_request(request, operation).model_dump(mode="json")
 
     reader = None
     if spec.prediction_reading is not None:

@@ -52,22 +52,29 @@ class ProviderTruncatedResponseError(ProviderResponseError):
 
 
 class ProviderRetryableResponseError(ProviderResponseError):
-    """A completed response decoded to no usable output and merits one bounded re-dispatch.
+    """A completed response decoded to no usable output, with its termination signal.
 
-    Reasoning models can consume an entire output budget on hidden reasoning and return
-    neither visible text nor a tool call. The response is well formed on the wire, so the
-    request is safe to dispatch again under the client's bounded retry policy.
+    An empty response without a known length stop may receive a bounded retry. A response
+    that spent its output allowance is terminal and must not buy another model draw.
 
     Attributes:
-        hit_length_limit: Whether the provider reported that the response stopped at the
-            output-token allowance, so the empty output means the allowance was spent (for
-            example on reasoning) rather than that the model chose to say nothing.
+        hit_length_limit: Whether the provider reported output-allowance exhaustion rather
+            than choosing to say nothing.
+        response_body: Successful decoded HTTP body retained for a known length stop, or
+            None when none was attached. It never appears in the error message or repr.
     """
 
-    def __init__(self, message: str, *, hit_length_limit: bool = False) -> None:
-        """Retain the sanitized failure and the provider's length-termination signal."""
+    def __init__(
+        self,
+        message: str,
+        *,
+        hit_length_limit: bool = False,
+        response_body: JsonObject | None = None,
+    ) -> None:
+        """Keep the sanitized failure, length signal and optional returned wire evidence."""
         super().__init__(message)
         self.hit_length_limit = hit_length_limit
+        self.response_body = response_body
 
 
 class ProviderRefusalSignal(StrEnum):

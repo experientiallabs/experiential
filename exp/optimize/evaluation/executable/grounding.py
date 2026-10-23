@@ -17,7 +17,7 @@ from typing import Literal, Self
 from pydantic import AwareDatetime, Field, model_validator
 
 from exp.common.core.artifacts import ContractModel, JsonObject, sha256_bytes, sha256_json
-from exp.common.models import load_model_catalog
+from exp.common.models import ReasoningEffort, load_model_catalog
 from exp.common.project import ProjectBuildArtifacts, ProjectStore
 from exp.common.tasks import TaskCase, ToolSchema
 from exp.common.traces.facts import TracePackageFacts
@@ -51,6 +51,7 @@ class GroundedRuntimeRequest(ContractModel):
         memory: ``learned`` pins the build's latest fit-only learned memory; ``none`` reads no
             memory.
         maximum_model_calls: Actor allowance of the emitted capture definition.
+        reasoning_effort: Frozen predictor-only override; None keeps the catalog default.
         maximum_physical_attempts: The simulator's cumulative provider-attempt ceiling.
         deadline: Shared deadline for every simulator provider call.
     """
@@ -64,6 +65,9 @@ class GroundedRuntimeRequest(ContractModel):
     trace_facts: bool = Field(default=False, strict=True)
     memory: Literal["learned", "none"] = "learned"
     maximum_model_calls: int = Field(default=20, ge=1, le=1000)
+    reasoning_effort: ReasoningEffort | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
     maximum_physical_attempts: int = Field(ge=1, le=100_000)
     deadline: AwareDatetime
 
@@ -122,6 +126,7 @@ def grounded_capture(project: ProjectStore, request: GroundedRuntimeRequest) -> 
         initial_state=request.initial_state,
         facts=facts,
         memory=memory,
+        reasoning_effort=request.reasoning_effort,
         probe_paths=request.probe_paths,
         maximum_physical_attempts=request.maximum_physical_attempts,
         deadline=request.deadline,

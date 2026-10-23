@@ -714,8 +714,12 @@ class ProviderHttpClient(abc.ABC):
                 raise ProviderTruncatedResponseError(
                     str(error), response_body=deepcopy(response.body)
                 ) from error
-            except ProviderRetryableResponseError:
-                if idempotency_key is None:
+            except ProviderRetryableResponseError as error:
+                if error.hit_length_limit:
+                    # A definite allowance stop is one returned model outcome, not QoS.
+                    # Keep its body for durable rejection without inventing an assistant action.
+                    error.response_body = deepcopy(response.body)
+                elif idempotency_key is None:
                     # Replaying a cached, completed empty response cannot produce usable output.
                     request_headers["Idempotency-Key"] = f"exp-{uuid4().hex}"
                 raise
@@ -834,6 +838,8 @@ def _classify_complete_retry(exception: Exception) -> RetryClassification:
         A stable retry decision and concise reason.
     """
     if isinstance(exception, ProviderRetryableResponseError):
+        if exception.hit_length_limit:
+            return RetryClassification(retryable=False, reason="output_budget_exhausted")
         return RetryClassification(retryable=True, reason="empty_completed_output")
     return classify_retry(exception)
 
@@ -841,8 +847,9 @@ def _classify_complete_retry(exception: Exception) -> RetryClassification:
 def _classify_unrepeatable_complete_retry(exception: Exception) -> RetryClassification:
     """Classify failures on a wire without an idempotency contract.
 
-    An empty completed output is a known outcome and is retried; an attempt without an HTTP
-    status may have executed, so it is never resent (see `classify_unrepeatable_retry`).
+    An empty output without a length stop may be retried. A known output-allowance stop is
+    terminal; an attempt without an HTTP status may have executed and is never resent (see
+    `classify_unrepeatable_retry`).
 
     Args:
         exception: Error raised by one post-and-parse attempt.
@@ -851,6 +858,8 @@ def _classify_unrepeatable_complete_retry(exception: Exception) -> RetryClassifi
         A stable retry decision and concise reason.
     """
     if isinstance(exception, ProviderRetryableResponseError):
+        if exception.hit_length_limit:
+            return RetryClassification(retryable=False, reason="output_budget_exhausted")
         return RetryClassification(retryable=True, reason="empty_completed_output")
     return classify_unrepeatable_retry(exception)
 

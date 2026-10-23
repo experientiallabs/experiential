@@ -11,7 +11,15 @@ from exp.common.core.artifacts import ArtifactInput
 from exp.optimize.evaluation.factory.candidates import run_candidate_batch
 from exp.optimize.evaluation.factory.candidates_test import _reply, batch_fixture
 from exp.optimize.evaluation.factory.quality import QUALITY_AXES
-from exp.optimize.evaluation.factory.quality_proxy import QualityProxyAnswer, review_task_quality
+from exp.optimize.evaluation.factory.quality_evidence import (
+    QualityEvidence,
+    expand_quality_evidence,
+)
+from exp.optimize.evaluation.factory.quality_proxy import (
+    QualityProxyAnswer,
+    QualityProxyReport,
+    review_task_quality,
+)
 from exp.runtime.models.providers.transport import ScriptedJsonTransport
 
 
@@ -81,16 +89,27 @@ def test_model_proxy_packages_without_human_and_replays_without_catalog_or_runti
             project.artifacts.read_bytes(cell.proxy_review.artifact_id, "report.json")
         )
         assert "not independently calibrated" in report["scope"]
+        assert report["evidence_protocol"] == "task-quality-evidence-v1"
+        assert QualityProxyReport.model_validate(report).settings.reasoning_effort == "none"
+        legacy = json.loads(json.dumps(report))
+        legacy.pop("evidence_protocol")
+        legacy["settings"].pop("reasoning_effort", None)
+        legacy["settings"].pop("evidence_protocol", None)
+        with pytest.raises(ValidationError, match="evidence_protocol"):
+            QualityProxyReport.model_validate(legacy)
         intent = project.artifacts.read(cell.proxy_review.artifact_id + "-intent")
         request = json.loads(
             project.artifacts.read_bytes(intent.manifest.artifact_id, "request.json")
         )
         payload = json.loads(request["messages"][1]["content"])
         assert len(payload["rubrics"]) == 6
-        assert len(payload["evidence"]["panel_outcomes"]) == 2
-        assert all(
-            row["partition"] == "development" for row in payload["evidence"]["development_controls"]
-        )
+        assert request["reasoning_effort"] == "none"
+        evidence = expand_quality_evidence(QualityEvidence.model_validate(payload["evidence"]))
+        outcomes = evidence["panel_outcomes"]
+        controls = evidence["development_controls"]
+        assert isinstance(outcomes, list) and len(outcomes) == 2
+        assert isinstance(controls, list)
+        assert all(isinstance(row, dict) and row["partition"] == "development" for row in controls)
     from exp.optimize.evaluation.executable.task import load_executable_task
 
     settings = spec.proxy_for(load_executable_task(project, tasks[0]))

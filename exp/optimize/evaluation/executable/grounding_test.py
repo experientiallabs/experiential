@@ -142,3 +142,22 @@ def test_grounding_refuses_held_out_tasks_and_inconsistent_requests(
     facts = {"facts": status_fact(0)}
     with pytest.raises(ValueError, match="declare facts or set trace_facts, not both"):
         request(fit, facts=facts, trace_facts=True)
+
+
+def test_grounding_preserves_default_identity_and_pins_explicit_predictor_reasoning(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The provider-free capture carries a requested profile without changing the saved catalog."""
+    project = built(tmp_path, monkeypatch, learn=False)
+    task = development_tasks(project)[0]
+    baseline = request(task, memory="none")
+    assert "reasoning_effort" not in baseline.model_dump(mode="json")
+    unchanged_catalog = project.model_catalog_path.read_bytes()
+    ordinary = grounded_capture(project, baseline)
+    assert "reasoning_effort" not in ordinary.configuration
+    explicit = grounded_capture(project, request(task, memory="none", reasoning_effort="none"))
+    assert explicit.configuration["reasoning_effort"] == "none"
+    assert explicit.configuration["world_model"] == ordinary.configuration["world_model"]
+    assert project.model_catalog_path.read_bytes() == unchanged_catalog
+    with pytest.raises(ValueError, match="reasoning effort"):
+        grounded_capture(project, request(task, memory="none", reasoning_effort="high"))

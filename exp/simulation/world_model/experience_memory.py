@@ -63,6 +63,9 @@ class MemoryVersion(ArtifactEnvelope):
         lineage: Caller-named memory sequence within one project.
         version: Number of consumed distinct trajectories; 0 is never persisted.
         world_model: Serving simulator whose predictions produced this version's research.
+        knowledge_scope: Null-only annotation emitted by existing same-scheme writers. It
+            grants no scope: the bound source/world graph remains the authority. Accepting
+            explicit null preserves immutable paid checkpoints; new records omit the field.
         knowledge_identity: What the simulator knows (knowledge and serving corpus). This is
             the only compatibility gate: any model, top-k, reranker, prompt, prediction
             guidance or memory selector may read or extend the lineage, so serving
@@ -92,6 +95,7 @@ class MemoryVersion(ArtifactEnvelope):
     library: ArtifactInput
     consumed: tuple[Sha256, ...]
     publisher: str
+    knowledge_scope: None = Field(default=None, exclude_if=lambda value: value is None)
     knowledge_identity: Sha256
     knowledge_identity_scheme: Literal[2]
     serving_policy: JsonObject

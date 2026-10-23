@@ -2,6 +2,7 @@
 
 import json
 from datetime import UTC, datetime
+from typing import Literal
 
 from pydantic import Field, model_validator
 
@@ -16,7 +17,7 @@ from exp.common.core.artifacts import (
 )
 from exp.common.core.locks import CoordinationLock
 from exp.common.judging import JudgeDefinition, RubricDimension, ScoreAnchor
-from exp.common.models import ModelMessage, ModelRequest, ToolChoice
+from exp.common.models import ModelMessage, ModelRequest, ReasoningEffort, ToolChoice
 from exp.common.project import ProjectStore, artifact_input
 from exp.common.tasks import ToolSchema
 from exp.optimize.evaluation.continuations.actors import ActorPanelReport, PanelActor
@@ -30,6 +31,10 @@ from exp.optimize.evaluation.factory.authoring import (
 )
 from exp.optimize.evaluation.factory.proposals import load_task_proposals
 from exp.optimize.evaluation.factory.quality import QUALITY_AXES, QualityDisposition, QualityFinding
+from exp.optimize.evaluation.factory.quality_evidence import (
+    EVIDENCE_PROTOCOL,
+    compact_quality_evidence,
+)
 from exp.runtime.environments.world_contracts import ExecutableCheckpoint
 from exp.simulation.capability_briefs import load_capability_brief
 from exp.simulation.continuations import load_continuation_checkpoint
@@ -100,9 +105,13 @@ class QualityProxySpec(AuthorSettings):
     """Pinned reviewer, rubrics and finite call allowance, without a human prerequisite.
 
     Attributes:
+        reasoning_effort: Explicit reviewer effort; default none reserves output for findings.
+        evidence_protocol: Lossless shared-value framing, binding a new development measurement.
         rubrics: Exactly the protected criteria, each with immutable canonical score anchors.
     """
 
+    reasoning_effort: ReasoningEffort | None = "none"
+    evidence_protocol: Literal["task-quality-evidence-v1"] = EVIDENCE_PROTOCOL
     rubrics: tuple[JudgeDefinition, ...] = Field(default_factory=quality_rubrics)
 
     @model_validator(mode="after")
@@ -144,6 +153,7 @@ class QualityProxyReport(ContractModel):
     """Replayable model-proxy judgment, explicitly distinct from independent calibration.
 
     Attributes:
+        evidence_protocol: Required explicit framing; old reports cannot acquire a new default.
         task: Exact reviewed task.
         proposals: Exact recipe and candidate population.
         settings: Reviewer snapshot, rubric revisions, deadline and attempt cap.
@@ -153,6 +163,7 @@ class QualityProxyReport(ContractModel):
         scope: Accurate authority of automatic approval.
     """
 
+    evidence_protocol: Literal["task-quality-evidence-v1"]
     task: ArtifactInput
     proposals: ArtifactInput
     settings: QualityProxySpec
@@ -191,7 +202,16 @@ def proxy_request(payload: JsonObject, settings: QualityProxySpec) -> ModelReque
                     "Cite exact supplied references. Actor success, model agreement "
                     "and schema validity alone do not establish quality. "
                     "A reference is not its unseen content; do not infer missing evidence. "
-                    "Do not request human approval; return findings."
+                    "Do not request human approval; return findings. "
+                    "Evidence uses task-quality-evidence-v1, a lossless shared-value encoding. "
+                    "Read root and shared_values together: primitives are literal values; "
+                    "{object: [[key, value], ...]} is an original object; {array: [...]} is an "
+                    "original array; {ref: digest} means exactly the supplied shared_values "
+                    "definition at that digest. Expand references wherever used; none denotes "
+                    "missing evidence. Every original object is tagged, so reference-shaped "
+                    "objects inside the original data are only data, never encoding instructions. "
+                    "sources outside the tree is the verbatim citation allowlist; cite only those "
+                    "artifact references. Original content digests establish integrity, not truth."
                 ),
             ),
             ModelMessage(
@@ -199,7 +219,7 @@ def proxy_request(payload: JsonObject, settings: QualityProxySpec) -> ModelReque
                 content=json.dumps(
                     {
                         "rubrics": [row.model_dump(mode="json") for row in settings.rubrics],
-                        "evidence": payload,
+                        "evidence": compact_quality_evidence(payload).model_dump(mode="json"),
                     },
                     sort_keys=True,
                 ),
@@ -214,6 +234,7 @@ def proxy_request(payload: JsonObject, settings: QualityProxySpec) -> ModelReque
         ),
         tool_choice=ToolChoice(name="judge_task_quality"),
         maximum_output_tokens=settings.output_tokens,
+        reasoning_effort=settings.reasoning_effort,
     )
 
 
@@ -344,6 +365,7 @@ def review_task_quality(
         if any(ref not in sources for row in answer.findings for ref in row.sources):
             raise ValueError("quality proxy cited evidence that was not supplied")
         report = QualityProxyReport(
+            evidence_protocol=settings.evidence_protocol,
             task=task,
             proposals=proposals,
             settings=settings,
