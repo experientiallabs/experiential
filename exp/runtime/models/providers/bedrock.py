@@ -63,6 +63,10 @@ NO_REGION_ERROR = (
     + ", ".join(_REGION_SOURCES)
     + ". Set one of them."
 )
+_NO_CREDENTIALS_ERROR = (
+    "Bedrock has no AWS credentials. Configure the standard chain "
+    "(environment keys, a profile, or an instance role)."
+)
 _CLIENT_CONSTRUCTION_LOCK = threading.Lock()
 _RETRYABLE_BOTO_CODES = frozenset(
     {
@@ -557,10 +561,7 @@ class BedrockClient:
                     self._signing_credentials = _import_boto3().Session().get_credentials()
             credentials = self._signing_credentials
         if credentials is None:
-            raise ProviderTransportError(
-                "Bedrock has no AWS credentials. Configure the standard chain "
-                "(environment keys, a profile, or an instance role)."
-            )
+            raise ProviderTransportError(_NO_CREDENTIALS_ERROR)
         return credentials
 
     @property
@@ -674,7 +675,7 @@ class BedrockClient:
             except BedrockRegionError:
                 raise
             except Exception as exc:
-                raise _as_transport_error(exc) from exc
+                raise _as_transport_error(exc, region=self._region) from exc
 
         return run_with_retry(send, policy=retry_policy or self._retry_policy)
 
@@ -808,15 +809,17 @@ def _import_botocore_signing() -> tuple[_SigV4SignerFactory, _AwsRequestFactory]
     return cast("_SigV4SignerFactory", SigV4Auth), cast("_AwsRequestFactory", AWSRequest)
 
 
-def _as_transport_error(exc: Exception) -> ProviderTransportError:
+def _as_transport_error(exc: Exception, *, region: str | None) -> ProviderTransportError:
     """Convert a boto failure into a secret-free retry classification boundary."""
     name = type(exc).__name__
-    if name in {
-        "ReadTimeoutError",
-        "ConnectTimeoutError",
-        "EndpointConnectionError",
-        "TimeoutError",
-    }:
+    if name in {"NoCredentialsError", "PartialCredentialsError", "CredentialRetrievalError"}:
+        return ProviderTransportError(_NO_CREDENTIALS_ERROR, status_code=401)
+    if name == "ParamValidationError":
+        return ProviderTransportError("Bedrock local validation failed", status_code=400)
+    if name == "EndpointConnectionError":
+        region_suffix = f" for region {region}" if region is not None else ""
+        return ProviderTransportError(f"Bedrock could not connect to its endpoint{region_suffix}")
+    if name in {"ReadTimeoutError", "ConnectTimeoutError", "TimeoutError"}:
         return ProviderTransportError("Bedrock request timed out")
     response = getattr(exc, "response", None)
     if isinstance(response, dict):
