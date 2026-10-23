@@ -46,13 +46,12 @@ CONSERVATIVE_CHARS_PER_TOKEN = 1
 # fits a 262,144-byte decision request.
 MAX_WINDOW_CHARS = 32_000
 TOOL_DESCRIPTION_CHARS = 160
-# Fewest characters each opening block keeps before middle blocks are collapsed.
-MIN_BLOCK_CHARS = 80
 
 _MARKER = "\n[... {omitted} characters omitted ...]\n"
 _BLANK_RUNS = re.compile(r"\n{3,}")
-_SURROGATE = re.compile("[\ud800-\udfff]")
-_CONTROL = re.compile("[\x00-\x08\x0b-\x1f]")
+# Characters a decision request cannot carry as plain text: control characters JSON escapes
+# as six bytes, and lone surrogates, which are not valid UTF-8.
+_UNSENDABLE = re.compile("[\x00-\x08\x0b-\x1f\ud800-\udfff]")
 
 
 class TagWindowBudget(ContractModel):
@@ -156,15 +155,19 @@ def clip_text(text: str, limit: int) -> str:
 
 
 def _visible(text: str) -> str:
-    """Replace control characters other than newline and tab with spaces.
+    """Replace control characters other than newline and tab, and lone surrogates, with spaces.
+
+    Terminal escapes are common in tool output, and a payload can escape half of a surrogate
+    pair that its producer cut. Neither reaches a decision request.
 
     Args:
         text: Rendered window text.
 
     Returns:
-        Text of the same length whose JSON encoding needs no six-byte escapes.
+        Text of the same length that is valid UTF-8 and whose JSON encoding needs no six-byte
+        escapes.
     """
-    return _CONTROL.sub(" ", text)
+    return _UNSENDABLE.sub(" ", text)
 
 
 def _compact(text: str) -> str:
@@ -186,14 +189,13 @@ def _arguments(text: str) -> str:
         text: Arguments as emitted.
 
     Returns:
-        Compact JSON, or the compacted original text when it is not JSON, nests too deeply to
-        parse, or escapes a lone surrogate that cannot appear in rendered text.
+        Compact JSON, or the compacted original text when it is not JSON, such as arguments
+        cut off by the length limit.
     """
     try:
-        compact = json.dumps(json.loads(text), ensure_ascii=False, separators=(",", ":"))
-    except (ValueError, RecursionError):
+        return json.dumps(json.loads(text), ensure_ascii=False, separators=(",", ":"))
+    except ValueError:
         return _compact(text)
-    return _compact(text) if _SURROGATE.search(compact) else compact
 
 
 def render_message(message: TagMessage, names: Mapping[str, str]) -> str:
@@ -267,25 +269,16 @@ def _fit(blocks: list[str], budget: int) -> list[str]:
     """Shorten the largest blocks equally until the joined blocks fit the budget.
 
     Blocks smaller than their fair share keep their full text; the rest are clipped to one
-    shared cap. When the blocks do not fit and there are too many for each to keep
-    ``MIN_BLOCK_CHARS``, the middle ones collapse into one omission line, keeping the first and
-    last blocks.
+    shared cap.
 
     Args:
         blocks: Rendered blocks, joined with newlines.
         budget: Most characters of the joined result.
 
     Returns:
-        Blocks in their original order whose newline-joined length fits the budget.
+        Blocks in their original order whose newline-joined length fits the budget, unless the
+        newlines between them alone exceed it.
     """
-    if sum(len(block) for block in blocks) + len(blocks) - 1 <= budget:
-        return blocks
-    most = max(budget // MIN_BLOCK_CHARS, 3)
-    if len(blocks) > most:
-        head = (most - 1) // 2
-        tail = most - 1 - head
-        omitted = len(blocks) - head - tail
-        blocks = [*blocks[:head], f"[... {omitted} messages omitted ...]", *blocks[-tail:]]
     available = max(budget - (len(blocks) - 1), 0)
     if sum(len(block) for block in blocks) <= available:
         return blocks

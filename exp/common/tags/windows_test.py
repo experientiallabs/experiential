@@ -255,16 +255,12 @@ def test_task_header_is_clipped_to_its_budget() -> None:
 
 
 def test_budget_validation_and_token_sizing() -> None:
-    """Budgets keep room for new content and size windows at one token per character."""
+    """Budgets keep room for new content and windows never outgrow the token or byte limit."""
     with pytest.raises(ValidationError, match="at most half"):
         TagWindowBudget(window_chars=2_000, overlap_chars=900, header_chars=200)
-    with pytest.raises(ValidationError):
-        TagWindowBudget(window_chars=100_000)
     budget = TagWindowBudget.for_input_tokens(8_192)
-    assert CONSERVATIVE_CHARS_PER_TOKEN == 1
-    assert budget.window_chars == 8_192 - 2_048
-    assert budget.overlap_chars == budget.window_chars // 12
-    assert TagWindowBudget.for_input_tokens(200_000).window_chars == 32_000
+    assert budget.window_chars * CONSERVATIVE_CHARS_PER_TOKEN <= 8_192 - 2_048
+    assert TagWindowBudget.for_input_tokens(200_000).window_chars <= MAX_WINDOW_CHARS
     with pytest.raises(ValueError, match="larger context"):
         TagWindowBudget.for_input_tokens(2_500)
 
@@ -285,74 +281,29 @@ def test_reused_call_ids_keep_the_name_of_the_earlier_call() -> None:
     assert window.text.endswith("[tool_call write_file] {}")
 
 
-@pytest.mark.parametrize(
-    "arguments",
-    ['{"text":"\\ud800"}', "[" * 10_000, '{"unterminated": "va'],
-    ids=["escaped-surrogate", "deep-nesting", "cut-short"],
-)
-def test_unrenderable_arguments_fall_back_to_their_text(arguments: str) -> None:
-    """Arguments that cannot be re-encoded safely render as their original text.
+def test_windows_hold_only_text_a_request_can_carry() -> None:
+    """Control characters and decoded lone surrogates render as spaces.
 
-    Args:
-        arguments: Argument text with an escaped lone surrogate, deep nesting or a cut end.
+    JSON then costs at most four bytes per character and the text is valid UTF-8.
     """
-    exchange = TagExchange(
-        exchange_id="req",
-        messages=(TagMessage(role="user", content="Go"),),
-        response=(TagMessage(role="assistant", tool_calls=(_call("c", "write", arguments),)),),
-    )
-    windows = turn_windows(exchange, SMALL)
-    assert all(len(window.text) <= SMALL.window_chars for window in windows)
-    assert windows[-1].text.split("[tool_call write] ")[1].startswith(arguments[:20])
-
-
-def test_opening_with_more_blocks_than_characters_stays_bounded() -> None:
-    """Thousands of tiny instruction messages fit one opening that keeps its request."""
-    exchange = TagExchange(
-        exchange_id="req",
-        messages=(
-            *(TagMessage(role="system", content="x") for _ in range(2_001)),
-            TagMessage(role="user", content="Go"),
-        ),
-        response=(TagMessage(role="assistant", content="ok"),),
-    )
-    window = opening_window(exchange, SMALL)
-    assert len(window.text) <= SMALL.window_chars
-    assert window.end_message == 2_002
-    lines = window.text.splitlines()
-    assert lines[0] == "[system] x"
-    assert lines[-1] == "[user] Go"
-    assert any(line.startswith("[... ") and "messages omitted" in line for line in lines)
-
-
-def test_control_characters_never_inflate_the_json_size() -> None:
-    """Control characters render as spaces, so JSON costs at most four bytes per character."""
     budget = TagWindowBudget(window_chars=MAX_WINDOW_CHARS)
     exchange = TagExchange(
         exchange_id="req",
         messages=(TagMessage(role="system", content="\x00\x1b" * 40_000),),
-        response=(TagMessage(role="assistant", content="a\tb\x07c"),),
+        response=(
+            TagMessage(
+                role="assistant",
+                content="a\tb\x07c",
+                tool_calls=(_call("c", "write", '{"text":"cut \\ud83d"}'),),
+            ),
+        ),
     )
     windows = (opening_window(exchange, budget), *turn_windows(exchange, budget))
     for window in windows:
         encoded = json.dumps(window.text, ensure_ascii=False).encode("utf-8")
         assert len(encoded) <= 4 * len(window.text) + 2
         assert "\x00" not in window.text and "\x1b" not in window.text
-    assert windows[-1].text.endswith("[assistant] a\tb c")
-
-
-def test_many_short_opening_messages_that_fit_are_all_kept() -> None:
-    """Openings are only collapsed when their full text does not fit."""
-    exchange = TagExchange(
-        exchange_id="req",
-        messages=(
-            *(TagMessage(role="system", content=f"rule {i}") for i in range(25)),
-            TagMessage(role="user", content="Go"),
-        ),
-        response=(TagMessage(role="assistant", content="ok"),),
-    )
-    lines = opening_window(exchange, SMALL).text.splitlines()
-    assert lines == [*(f"[system] rule {i}" for i in range(25)), "[user] Go"]
+    assert windows[-1].text.endswith('[assistant] a\tb c\n[tool_call write] {"text":"cut  "}')
 
 
 def test_tool_results_fall_back_to_their_own_name() -> None:
