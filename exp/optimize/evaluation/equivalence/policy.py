@@ -8,10 +8,11 @@ refused or unassessable on its own evidence, and an inapplicable dimension stays
 with its reason instead of passing.
 
 Registration. A policy is saved as an immutable ``admission-policy`` artifact whose identity is
-its content and ``ADMISSION_POLICY_PROTOCOL``. Consumers refuse a policy registered after the
-results they judge (``require_policy_precedes``), so margins and gates are fixed before any
-outcome they admit is seen. Re-registering identical content replays the original registration
-and keeps its original time.
+its content and ``ADMISSION_POLICY_PROTOCOL``. Consumers refuse a policy that the registration of
+the results they judge does not cite (``require_policy_precedes``): the results' registration
+names the saved policy by identity and manifest digest, which it can only know once the policy
+exists, so margins and gates are fixed before any outcome they admit is seen, whatever either
+writer's clock said. Re-registering identical content replays the original registration.
 """
 
 from datetime import datetime
@@ -28,6 +29,7 @@ from exp.common.core.artifacts import (
     stable_id,
 )
 from exp.common.project import ArtifactStore, artifact_input
+from exp.common.project.causality import require_cites
 
 ADMISSION_POLICY_PROTOCOL = "admission-policy-v1"
 POLICY_TYPE = "admission-policy"
@@ -172,7 +174,7 @@ def register_admission_policy(
     Args:
         store: Project artifact store.
         policy: Complete policy.
-        created_at: Registration time; consumers refuse results registered before it.
+        created_at: Registration time, informational; order is proven by citation.
         code_revision: Producing implementation identity.
 
     Returns:
@@ -229,7 +231,11 @@ def load_admission_policy(store: ArtifactStore, reference: ArtifactInput) -> Adm
 def require_policy_precedes(
     store: ArtifactStore, policy: ArtifactInput, registration: str, *, subject: str
 ) -> None:
-    """Refuse a policy registered after the results it would judge.
+    """Refuse a policy that the registration of the results it would judge does not cite.
+
+    The registration is written before any execution and cites the exact saved policy in its
+    manifest inputs, so the citation proves the policy was fixed first; timestamps are not
+    compared, so clock skew between the writers can neither admit nor refuse results.
 
     Args:
         store: Project artifact store.
@@ -239,12 +245,16 @@ def require_policy_precedes(
         subject: Human-readable name of the judged results for the error message.
 
     Raises:
-        ValueError: The policy was registered after the results.
+        ValueError: The registration does not cite this exact saved policy.
     """
-    registered = store.read(policy.artifact_id).manifest.created_at
-    if registered > store.read(registration).manifest.created_at:
-        raise ValueError(
-            f"admission policy {policy.artifact_id} was registered after {subject} "
-            f"{registration}; a policy must be fixed before the results it judges, so register "
-            "it first and generate fresh results under it"
-        )
+    require_cites(
+        store,
+        registration,
+        policy,
+        refusal=(
+            f"admission policy {policy.artifact_id} is not cited by {subject} {registration}, "
+            "so nothing shows it was fixed before those results; a policy must be fixed before "
+            "the results it judges, so register it first, pin it in the registration of fresh "
+            "results and generate them under it"
+        ),
+    )

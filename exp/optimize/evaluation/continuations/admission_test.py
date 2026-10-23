@@ -3,7 +3,7 @@
 Every admission applies a registered policy; per-dimension verdicts stay with each branch.
 """
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -44,7 +44,7 @@ def admitted_workbook_study(
 ) -> ArtifactInput:
     """Execute two native branches against independently specified workbook acceptance.
 
-    The admission policy is registered first, before the study it judges.
+    The admission policy is registered first and pinned in the study it judges.
     """
     store = project.artifacts
     policy_ref = registered_policy(store, policy)
@@ -103,6 +103,7 @@ def admitted_workbook_study(
         repeats=2,
         selector="all initial checkpoints",
         training_specification=specification if registered else None,
+        admission_policy=policy_ref,
     )
     actions = actor_actions or (
         AssistantAction(
@@ -225,13 +226,17 @@ def test_a_required_dimension_that_does_not_apply_is_never_silently_passed(
 
 
 def test_a_policy_registered_after_the_study_cannot_admit_it(tmp_path: Path) -> None:
-    """Margins and gates chosen after sampling refuse with an actionable message."""
+    """Margins chosen after sampling refuse, even when the late policy's clock claims earlier."""
     project = ProjectStore(tmp_path, "case")
     admission = ContinuationAdmission.model_validate_json(
         project.artifacts.read_bytes(admitted_workbook_study(project).artifact_id, "admission.json")
     )
-    late = registered_policy(project.artifacts, fixture_policy(margin=0.4))
-    with pytest.raises(ValueError, match="register it first and generate fresh results"):
+    late = registered_policy(
+        project.artifacts, fixture_policy(margin=0.4), at=datetime.now(UTC) - timedelta(days=1)
+    )
+    with pytest.raises(
+        ValueError, match="register it first, pin it in the registration of fresh results"
+    ):
         admit_continuations(
             project.artifacts,
             admission.study,

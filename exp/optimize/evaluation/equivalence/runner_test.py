@@ -675,16 +675,17 @@ def test_registered_policy_calibrates_the_report_over_task_families(
         policy_calibrations(project, (report,), other)
 
 
-def test_a_policy_registered_after_the_comparison_is_refused(
+def test_a_pinned_policy_with_a_later_clock_still_precedes_the_comparison(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A comparison cannot cite margins registered after its own registration."""
-    project, spec, actors, _ = equivalence_fixture(tmp_path, monkeypatch)
-    late = registered_policy(
+    """The registration cites the saved policy, so a policy clock an hour ahead is not refused."""
+    project, spec, _, _ = equivalence_fixture(tmp_path, monkeypatch)
+    skewed = registered_policy(
         project.artifacts,
         fixture_policy(margin=0.5),
         at=datetime.now(UTC) + timedelta(hours=1),
     )
-    with pytest.raises(ValueError, match="registered after comparison registration"):
-        run_equivalence(project, spec.model_copy(update={"policy": late}), code_revision="test")
-    assert not actors.requests
+    result = run_equivalence(
+        project, spec.model_copy(update={"policy": skewed}), code_revision="test"
+    )
+    assert result.calibration is not None and result.calibration.policy == skewed

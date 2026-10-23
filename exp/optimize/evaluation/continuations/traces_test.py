@@ -191,8 +191,12 @@ def study(
     verifier: TaskVerifier = ANSWERED,
     study_probe: Callable[[WorldCheckpoint], JsonObject] = empty_probe,
     probe_sha256: str = PROBE,
+    policy: ArtifactInput | None = None,
 ) -> ArtifactInput:
-    """Run one saved study, one branch per scripted fork, and return its result reference."""
+    """Run one saved study, one branch per scripted fork, and return its result reference.
+
+    The study pins ``policy``, by default the fixture admission policy, before any branch runs.
+    """
     spec = ContinuationStudySpec(
         checkpoint=checkpoint,
         actor_model=MODEL,
@@ -200,6 +204,7 @@ def study(
         probe_sha256=probe_sha256,
         repeats=len(forks),
         selector="fixture forks",
+        admission_policy=policy or registered_policy(store),
     )
     run_continuation_study(
         store,

@@ -1,8 +1,9 @@
 """Independent, pre-registered acceptance of saved development continuations for SFT.
 
 Every branch is judged twice: against the independent training specification frozen before
-sampling, and dimension by dimension under a registered admission policy that predates the
-study. A branch is admitted only when both pass; its per-dimension verdicts stay in the report.
+sampling, and dimension by dimension under a registered admission policy the study pinned
+before sampling. A branch is admitted only when both pass; its per-dimension verdicts stay in
+the report.
 """
 
 from datetime import datetime
@@ -93,7 +94,7 @@ def admit_continuations(
     Args:
         store: Trusted artifact owner; no caller-supplied outcomes are accepted.
         study_ref: Complete saved development study.
-        policy: Registered admission policy, registered before the study.
+        policy: Registered admission policy, pinned in the study registration.
         created_at: Decision publication time.
         code_revision: Producing implementation identity.
 
@@ -101,7 +102,7 @@ def admit_continuations(
         Immutable report including rejected and unknown branches. No calls are dispatched.
 
     Raises:
-        ValueError: The policy is not registered or was registered after the study.
+        ValueError: The policy is not registered or the study registration does not cite it.
     """
     study = load_study(store, study_ref)
     rules = load_admission_policy(store, policy)

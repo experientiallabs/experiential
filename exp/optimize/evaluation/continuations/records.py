@@ -54,6 +54,8 @@ def load_study(store: ArtifactStore, reference: ArtifactInput) -> ContinuationSt
         expected_registration.add(study.spec.training_specification)
     if study.spec.training_evidence is not None:
         expected_registration.update(study.spec.training_evidence.sources())
+    if study.spec.admission_policy is not None:
+        expected_registration.add(study.spec.admission_policy)
     if set(registration.inputs) != expected_registration:
         raise ValueError("study registration lost its frozen checkpoint or training specification")
     inputs = [artifact_input(registration)]

@@ -24,10 +24,11 @@ fit or held out together, and the root exposure ledger joins them by declared ta
 a reservation or exposure of one fork covers the rest. Studies only run from fit tasks of the
 source build (the study owner refuses reserved ones), so no export carries held-out evidence.
 
-Admission. Every export applies one registered admission policy, which must predate every
-study it judges. Each branch's per-dimension verdicts and overall verdict are recorded in its
-occurrence under ``exp.trace.metadata.occurrences[].admission`` and counted per branch in the
-summary; ``calibrations`` names saved comparisons under the same policy that may admit simulated
+Admission. Every export applies one registered admission policy, which every study it judges
+must cite by pinning it as ``admission_policy`` before running. Each branch's per-dimension
+verdicts and overall verdict are recorded in its occurrence under
+``exp.trace.metadata.occurrences[].admission`` and counted per branch in the summary;
+``calibrations`` names saved comparisons under the same policy that may admit simulated
 observations. Admission is provenance for later consumers: refused and unassessable branches
 are still exported, so the evidence denominator stays complete, and verdict wording never
 changes a trace's content identity.
