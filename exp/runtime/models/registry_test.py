@@ -1358,3 +1358,27 @@ def test_reasoning_catalog_refuses_unadvertised_effort(
     with pytest.raises(ValueError, match="reasoning effort 'none' is not supported"):
         reasoning_catalog(catalog, "fixture-model", "none")
     assert catalog.model_dump(mode="json") == original
+
+
+def test_transport_wrapper_preserves_original_resolver_and_credentials() -> None:
+    """Admission cloning changes only fresh transport construction, including injected auth."""
+    inner = ScriptedJsonTransport()
+    runtime = RuntimeModelCatalog(
+        _catalog(), environment={"FIXTURE_API_KEY": "fixture-key"}, transport_factory=lambda: inner
+    )
+    seen: list[object] = []
+
+    def wrapper(transport: object) -> ScriptedJsonTransport:
+        seen.append(transport)
+        assert transport is inner
+        return inner
+
+    clone = runtime.with_transport_wrapper(wrapper)
+    before = runtime.resolve("fixture-model")
+    assert not seen
+    after = clone.resolve("fixture-model")
+    assert seen == [inner]
+    assert before.snapshot == after.snapshot
+    assert before.credential_receipt == after.credential_receipt
+    runtime.resolve("fixture-model")
+    assert seen == [inner]
