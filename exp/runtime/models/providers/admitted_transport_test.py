@@ -1,6 +1,7 @@
 """Physical receipts survive unusable output while credentials stay outside artifacts."""
 
 import json
+from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -8,6 +9,7 @@ import pytest
 
 from exp.common.core.artifacts import JsonObject
 from exp.common.models import ConnectionConfig, ModelCatalog, ModelRecord
+from exp.common.models.client import RequestAdmissionRefused
 from exp.common.project import ArtifactStoreError, ProjectConfig, ProjectStore
 from exp.runtime.models.providers.admitted_transport import (
     ADMITTED_TRANSPORT_PROVIDERS,
@@ -15,8 +17,20 @@ from exp.runtime.models.providers.admitted_transport import (
     require_admitted_transport,
 )
 from exp.runtime.models.providers.attempt_timeouts import ATTEMPT_TIMEOUT_PROTOCOL
-from exp.runtime.models.providers.transport import JsonHttpResponse, ScriptedJsonTransport
-from exp.runtime.models.registry import SUPPORTED_PROVIDERS
+from exp.runtime.models.providers.backpressure import (
+    AdmissionLimits,
+    HostProviderAdmission,
+    ProviderAdmissionRefused,
+    ProviderRoute,
+)
+from exp.runtime.models.providers.openai_compatible_test import _request
+from exp.runtime.models.providers.transport import (
+    JsonHttpResponse,
+    ProviderTransportError,
+    ScriptedJsonTransport,
+)
+from exp.runtime.models.registry import SUPPORTED_PROVIDERS, RuntimeModelCatalog
+from exp.runtime.models.registry_test import _catalog as _registry_catalog
 from exp.runtime.sessions.dispatch_ledger import DispatchCapExhaustedError, DispatchLedger
 
 
@@ -325,3 +339,122 @@ def test_unadmitted_providers_refuse_with_the_remedy(provider: str) -> None:
     message = str(refused.value)
     assert f"critic alias 'fixture' uses provider {provider!r}" in message
     assert "anthropic, azure, gemini, openai, openai-compatible, openrouter" in message
+
+
+def _admitted(
+    tmp_path: Path, inner: ScriptedJsonTransport, admission: HostProviderAdmission, cap: int = 10
+) -> tuple[AdmittedJsonTransport, DispatchLedger, ProjectStore]:
+    """Build an admitted transport over a scripted wire and an explicit host admission."""
+    project = ProjectStore(tmp_path, "attempt")
+    project.initialize(ProjectConfig(project_id="attempt"))
+    ledger = DispatchLedger(tmp_path / "physical.sqlite", cap, "a" * 64)
+    transport = AdmittedJsonTransport(
+        inner,
+        ledger=ledger,
+        artifacts=project.artifacts,
+        code_revision="fixture",
+        deadline=datetime.now(UTC) + timedelta(minutes=10),
+        admission=admission,
+    )
+    return transport, ledger, project
+
+
+def test_open_breaker_refuses_before_the_ledger_claim_and_any_io(tmp_path: Path) -> None:
+    """Overload responses open the provider breaker; the next send is refused, not dispatched."""
+    admission = HostProviderAdmission(
+        tmp_path / "admission.sqlite", AdmissionLimits(breaker_threshold=2)
+    )
+    inner = ScriptedJsonTransport(
+        [JsonHttpResponse(status_code=status, body={}) for status in (429, 503)]
+    )
+    transport, ledger, _ = _admitted(tmp_path, inner, admission)
+    route = transport.for_route(ProviderRoute(provider="openrouter", alias="writer"))
+    for _ in range(2):
+        route.post("https://fixture.invalid", headers={}, payload={}, timeout_seconds=5)
+    assert admission.breaker_state("openrouter") == "open"
+    with pytest.raises(ProviderAdmissionRefused) as refused:
+        route.post("https://fixture.invalid", headers={}, payload={}, timeout_seconds=5)
+    assert isinstance(refused.value, RequestAdmissionRefused)
+    assert refused.value.reason == "circuit_open"
+    assert ledger.used() == 2 and len(inner.requests) == 2
+    assert admission.in_flight(ProviderRoute("openrouter", "writer")) == (0, 0)
+    # An unbound transport is scoped by endpoint host, not by the bound provider's breaker.
+    assert admission.breaker_state("endpoint:fixture.invalid") == "closed"
+
+
+def test_a_slot_is_held_only_while_the_request_is_in_flight(tmp_path: Path) -> None:
+    """The scripted wire observes its own slot; none remains after success or failure."""
+    admission = HostProviderAdmission(tmp_path / "admission.sqlite")
+    route = ProviderRoute(provider="openai", alias="writer")
+    seen: list[tuple[int, int]] = []
+
+    class _Observing(ScriptedJsonTransport):
+        """Record the live slot counts at send time."""
+
+        def post(
+            self,
+            url: str,
+            *,
+            headers: Mapping[str, str],
+            payload: JsonObject,
+            timeout_seconds: float,
+        ) -> JsonHttpResponse:
+            """Record in-flight counts, then answer from the script."""
+            seen.append(admission.in_flight(route))
+            return super().post(
+                url, headers=headers, payload=payload, timeout_seconds=timeout_seconds
+            )
+
+    inner = _Observing(
+        [JsonHttpResponse(status_code=200, body={}), ProviderTransportError("connection reset")]
+    )
+    transport, _, _ = _admitted(tmp_path, inner, admission)
+    bound = transport.for_route(route)
+    bound.post("https://fixture.invalid", headers={}, payload={}, timeout_seconds=5)
+    with pytest.raises(ProviderTransportError):
+        bound.post("https://fixture.invalid", headers={}, payload={}, timeout_seconds=5)
+    assert seen == [(1, 1), (1, 1)]
+    assert admission.in_flight(route) == (0, 0)
+
+
+def test_the_intent_receipt_records_the_idempotency_key_without_other_headers(
+    tmp_path: Path,
+) -> None:
+    """The key a resend must reuse is evidence; the credential header is still never kept."""
+    admission = HostProviderAdmission(tmp_path / "admission.sqlite")
+    inner = ScriptedJsonTransport([JsonHttpResponse(status_code=200, body={})])
+    transport, _, project = _admitted(tmp_path, inner, admission)
+    transport.post(
+        "https://fixture.invalid",
+        headers={"Authorization": "Bearer never-retain", "Idempotency-Key": "exp-intent-abc"},
+        payload={},
+        timeout_seconds=5,
+    )
+    intent = next(i for i in project.artifacts.list_ids() if i.endswith("-intent"))
+    raw = project.artifacts.read_bytes(intent, "receipt.json")
+    assert json.loads(raw)["idempotency_key"] == "exp-intent-abc"
+    assert b"never-retain" not in raw
+
+
+def test_registry_scopes_each_client_by_provider_and_alias(tmp_path: Path) -> None:
+    """Through the registry, overload opens the alias's provider breaker mid-retry-loop."""
+    admission = HostProviderAdmission(
+        tmp_path / "admission.sqlite", AdmissionLimits(breaker_threshold=2)
+    )
+    inner = ScriptedJsonTransport(
+        [JsonHttpResponse(status_code=429, body={"error": {"message": "slow down"}})] * 2
+    )
+    transport, ledger, _ = _admitted(tmp_path, inner, admission)
+    registry = RuntimeModelCatalog(
+        _registry_catalog(provider="openrouter"),
+        environment={"FIXTURE_API_KEY": "fixture"},
+        transport_factory=lambda: transport,
+    )
+    client = registry.resolve("fixture-model").client
+    with pytest.raises(ProviderAdmissionRefused, match="openrouter circuit breaker"):
+        client.complete(_request())
+    assert len(inner.requests) == 2 and ledger.used() == 2
+    assert admission.breaker_state("openrouter") == "open"
+    with pytest.raises(ProviderAdmissionRefused):
+        client.complete(_request())
+    assert len(inner.requests) == 2 and ledger.used() == 2

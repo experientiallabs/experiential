@@ -15,7 +15,7 @@ results, and plans do not live here.
 | `reference/decision-cascade.md` | Cheap next-action decisions with the main model as fallback: labels on reached states, threshold fit by a registered objective, held-out closed-loop confirmation and the versioned runtime policy. |
 | `reference/admission-policy.md` | Per-dimension trajectory admission policies: applicability, predeclared margins, family-clustered calibration and the export consumers. |
 | `reference/evidence-reading.md` | Bounded objective-driven evidence reading during learning investigations: budgets, pinned policy, replay and limits. |
-| `reference/providers.md` | Catalog providers, first-build `--provider` flags, environment variables, Azure endpoint and deployment rules, the Bedrock credential chain, and OpenAI-compatible listing metadata plus identity-only operator declaration. |
+| `reference/providers.md` | Catalog providers, first-build `--provider` flags, environment variables, Azure endpoint and deployment rules, the Bedrock credential chain, OpenAI-compatible listing metadata plus identity-only operator declaration, and host-wide provider admission, backoff and idempotency keys. |
 | `reference/gateway-architecture.md` | Operational local gateway contracts, certified exact-model routing, ownership boundaries, and compatibility locks. |
 | `reference/gateway-anthropic-protocol.md` | The Anthropic Messages surface: block decoding, thinking, cache markers, attachments, server tools, and stream usage. |
 | `reference/gateway-media-surfaces.md` | The embeddings, images, speech, and transcription surfaces, how each lane bills, and the per-unit price card. |

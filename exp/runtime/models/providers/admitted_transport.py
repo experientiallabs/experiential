@@ -1,10 +1,13 @@
 """Count and retain physical attempts at the existing provider transport seam."""
 
+from __future__ import annotations
+
 import json
 import math
 from collections.abc import Callable, Mapping
-from copy import deepcopy
+from copy import copy, deepcopy
 from datetime import UTC, datetime
+from urllib.parse import urlsplit
 
 from exp.common.core.artifacts import ArtifactEnvelope, ArtifactInput, JsonObject, sha256_json
 from exp.common.models import ModelCatalog
@@ -12,7 +15,17 @@ from exp.common.project import ArtifactStore, ArtifactStoreError, artifact_input
 from exp.common.project.request_budget import validate_provider_response
 from exp.runtime.models.call_evidence import current_call_intent, current_consumer
 from exp.runtime.models.providers.attempt_timeouts import ATTEMPT_TIMEOUT_PROTOCOL
-from exp.runtime.models.providers.transport import JsonHttpResponse, JsonHttpTransport
+from exp.runtime.models.providers.backpressure import (
+    AdmissionSlot,
+    HostProviderAdmission,
+    ProviderRoute,
+)
+from exp.runtime.models.providers.transport import (
+    JsonHttpResponse,
+    JsonHttpTransport,
+    ProviderTransportError,
+    public_error_code,
+)
 from exp.runtime.sessions.dispatch_ledger import DispatchLedger
 
 ADMITTED_TRANSPORT_PROVIDERS = frozenset(
@@ -49,7 +62,13 @@ def require_admitted_transport(catalog: ModelCatalog, alias: str, *, consumer: s
 
 
 class AdmittedJsonTransport(JsonHttpTransport):
-    """Retain decoded HTTP responses before model parsing, without another retry owner."""
+    """Admit, retain and pace physical HTTP requests, without another retry owner.
+
+    Before every ledger claim the request passes the host-wide provider admission
+    (:mod:`exp.runtime.models.providers.backpressure`): the provider's circuit breaker must
+    admit it and an in-flight slot of its provider and alias must be free. The slot is held
+    only while the request is in flight, and every definite status updates the breaker.
+    """
 
     def __init__(
         self,
@@ -61,18 +80,37 @@ class AdmittedJsonTransport(JsonHttpTransport):
         deadline: datetime,
         clock: Callable[[], datetime] | None = None,
         before_claim: Callable[[], None] | None = None,
+        admission: HostProviderAdmission | None = None,
+        route: ProviderRoute | None = None,
     ) -> None:
         """Bind physical capacity, immutable receipts and an aware global deadline.
 
         ``before_claim`` runs before every slot claim and refuses by raising, so a caller can
         recheck that it is still allowed to dispatch; nothing is claimed or sent after a refusal.
+        ``admission`` defaults to the host-wide database and registered limits. ``route`` names
+        the provider and alias scopes; the registry binds it per client with :meth:`for_route`,
+        and an unbound transport is scoped by its endpoint host.
         """
         if deadline.tzinfo is None:
             raise ValueError("transport deadline must be timezone-aware")
         self._inner, self._ledger, self._deadline = inner, ledger, deadline
+        self._admission = admission or HostProviderAdmission.for_host()
+        self._route = route
         self._before_claim = before_claim
         self._artifacts, self._revision = artifacts, code_revision
         self._clock = clock or _utc_now
+
+    def for_route(self, route: ProviderRoute) -> AdmittedJsonTransport:
+        """Return a view sharing this ledger, deadline and admission, scoped to ``route``."""
+        view = copy(self)
+        view._route = route
+        return view
+
+    def _route_for(self, url: str) -> ProviderRoute:
+        """Return the bound route, or an endpoint-host scope for an unbound transport."""
+        if self._route is not None:
+            return self._route
+        return ProviderRoute(provider="endpoint:" + (urlsplit(url).hostname or "unknown"))
 
     def _record(
         self, identity: str, value: JsonObject, inputs: tuple[ArtifactInput, ...] = ()
@@ -98,8 +136,13 @@ class AdmittedJsonTransport(JsonHttpTransport):
         payload: JsonObject | None,
         timeout_seconds: float,
         send: Callable[[float], JsonHttpResponse],
+        idempotency_key: str | None = None,
     ) -> JsonHttpResponse:
-        """Admit once, record intent, send once, then retain the returned body or failure."""
+        """Admit once, record intent, send once, then retain the returned body or failure.
+
+        Raises:
+            ProviderAdmissionRefused: The host refused before any claim or network I/O.
+        """
         if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
             raise ValueError("physical request timeout must be finite and positive")
         try:
@@ -115,6 +158,28 @@ class AdmittedJsonTransport(JsonHttpTransport):
             raise TimeoutError("transport deadline reached before physical dispatch")
         if self._before_claim is not None:
             self._before_claim()
+        route = self._route_for(url)
+        with self._admission.admit(route, wait_seconds=min(remaining, timeout_seconds)) as slot:
+            return self._dispatch(
+                method, url, payload, timeout_seconds, send, slot, idempotency_key
+            )
+
+    def _dispatch(
+        self,
+        method: str,
+        url: str,
+        payload: JsonObject | None,
+        timeout_seconds: float,
+        send: Callable[[float], JsonHttpResponse],
+        slot: AdmissionSlot,
+        idempotency_key: str | None,
+    ) -> JsonHttpResponse:
+        """Claim a ledger slot, record intent, send once and report the outcome to the slot."""
+        timeout_seconds -= slot.waited_seconds
+        now = self._clock()
+        remaining = (self._deadline - now).total_seconds()
+        if remaining <= 0 or timeout_seconds <= 0:
+            raise TimeoutError("transport deadline reached before physical dispatch")
         sequence, attempt = self._ledger.claim(now.isoformat())
         base = "provider-attempt-" + attempt
         canonical = current_call_intent()
@@ -129,6 +194,7 @@ class AdmittedJsonTransport(JsonHttpTransport):
                 "consumer": current_consumer(),
                 "timeout_seconds": min(remaining, timeout_seconds),
                 "timeout_protocol": ATTEMPT_TIMEOUT_PROTOCOL,
+                **({"idempotency_key": idempotency_key} if idempotency_key else {}),
                 **({"canonical_request": canonical.model_dump(mode="json")} if canonical else {}),
             },
             () if canonical is None else (canonical,),
@@ -148,6 +214,12 @@ class AdmittedJsonTransport(JsonHttpTransport):
         try:
             response = send(min(remaining, timeout_seconds))
         except Exception as error:  # noqa: BLE001 - preserve ambiguity without retrying.
+            failure = error if isinstance(error, ProviderTransportError) else None
+            slot.record(
+                status_code=None if failure is None else failure.status_code,
+                retry_after_seconds=None if failure is None else failure.retry_after_seconds,
+                error_code=None if failure is None else failure.error_code,
+            )
             self._record(
                 base + "-failure",
                 {
@@ -159,6 +231,11 @@ class AdmittedJsonTransport(JsonHttpTransport):
                 (intent,),
             )
             raise
+        slot.record(
+            status_code=response.status_code,
+            retry_after_seconds=response.retry_after_seconds,
+            error_code=public_error_code(response.body),
+        )
         encoded = json.dumps(response.body, ensure_ascii=False, allow_nan=False)
         try:
             validate_provider_response(encoded)
@@ -234,6 +311,10 @@ class AdmittedJsonTransport(JsonHttpTransport):
                 headers=headers,
                 payload=payload,
                 timeout_seconds=timeout,
+            ),
+            next(
+                (value for name, value in headers.items() if name.lower() == "idempotency-key"),
+                None,
             ),
         )
 

@@ -621,6 +621,55 @@ answers. Retry and failover ceilings per request are the `gateway.retry` object
 ([request policy](gateway-request-policy.md)); concurrency is bounded by
 `exp run --max-active-requests` and each deployment's `dispatch_concurrency_bound`.
 
+## Host-wide admission, backoff and idempotency
+
+Every request sent through the admitted transport (the evaluation, analysis and review commands
+that record physical attempts) first passes a host-wide admission shared by all `exp` processes
+on the machine. Its state is `provider-admission.sqlite` in the same user-data directory as
+`auth.json`:
+
+- **Concurrency.** A request holds one in-flight slot of its provider and one of its model alias
+  only while it is on the wire. Defaults are 8 per provider and 4 per alias. A slot whose
+  process has exited, crashed or been killed is reclaimed by the next request. A request that
+  cannot get a slot within its attempt timeout is refused before dispatch.
+- **Circuit breaker.** After 5 consecutive overload responses (HTTP 429, 503 or 529) from one
+  provider, its breaker opens and new requests to that provider are refused before dispatch for
+  30 seconds, or for the server's `Retry-After` when that is longer. Then exactly one probe is
+  sent: a definite non-overload response closes the breaker, anything else reopens it. A 503
+  that refuses one exact request (a gateway `invalid_provider_stream`) is not overload.
+- **Refusals are resumable.** Both refusals happen before a dispatch-ledger slot is claimed and
+  before any network I/O. They are recorded as not dispatched; the run stops incomplete and
+  resumes in place. They are never scored as misses.
+
+Override the limits in `provider-admission.toml` beside the database:
+
+```toml
+provider_max_in_flight = 8      # default for every provider
+alias_max_in_flight = 4         # default for every alias
+breaker_threshold = 5           # consecutive overloads that open a breaker
+breaker_cooldown_seconds = 30
+
+[providers.openrouter]
+max_in_flight = 16
+
+[aliases."judge"]
+max_in_flight = 2
+```
+
+Retries of one request back off exponentially with full jitter: each wait is a uniform sample of
+`[0, min(cap, base * 2^n)]` with the cap set by the retry policy (2 seconds by default). A
+`Retry-After` on any retryable status, including 429 and 503, is a minimum the wait never
+undercuts.
+
+On the OpenAI-family wire (`openai`, `azure`, `openai-compatible`, `openrouter`) a request made
+under a recorded call intent carries an `Idempotency-Key` derived from that intent, the endpoint
+and the exact body. A resend of the same intent after an ambiguous failure, in the same process
+or a resumed one, therefore carries the same key, and an endpoint that honours the header (such
+as an Experiential gateway) replays rather than executes it twice. Whether a given upstream
+deduplicates by this header is that endpoint's contract. The Anthropic Messages and Gemini
+protocols define no idempotency header, so no intent key is derived for them; for those, and for
+any endpoint that ignores the header, an ambiguous outcome is never redrawn.
+
 ## Errors
 
 Missing credentials name the environment variable and the `exp config providers` recovery, never
