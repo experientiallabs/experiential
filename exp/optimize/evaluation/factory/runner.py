@@ -69,6 +69,7 @@ class FactoryFamily(ContractModel):
         horizon: Declared workflow horizon, unrelated to model count or attempts.
         quality_reviews: Human task-quality attestations, separate from mechanical controls.
         quality_proxy: Optional frozen judge override; default is the last panel model.
+        replay_native_records: Explicit permission for the child batch's native witness replay.
     """
 
     proposal: TaskProposalSpec
@@ -78,6 +79,9 @@ class FactoryFamily(ContractModel):
     horizon: Literal["single_decision", "multi_step", "long_horizon"]
     quality_reviews: tuple[TaskQualityReview, ...] = ()
     quality_proxy: QualityProxySpec | None = None
+    replay_native_records: bool = Field(
+        default=False, strict=True, exclude_if=lambda value: not value
+    )
 
 
 class TaskFactorySpec(ContractModel):
@@ -238,6 +242,7 @@ def _batch(
         namespace=spec.namespace,
         quality_reviews=family.quality_reviews,
         quality_proxy=family.quality_proxy,
+        replay_native_records=family.replay_native_records,
     )
 
 

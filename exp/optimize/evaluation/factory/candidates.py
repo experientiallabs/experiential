@@ -77,6 +77,7 @@ class CandidateBatchSpec(ContractModel):
         namespace: Safe Harbor organization label.
         quality_reviews: Independently attested reviews of the exact tasks and recipe.
         quality_proxy: Optional pinned override; otherwise use the last panel model as judge.
+        replay_native_records: Explicitly allow native witness replay during qualification/readback.
     """
 
     proposals: ArtifactInput
@@ -87,6 +88,9 @@ class CandidateBatchSpec(ContractModel):
     namespace: str = Field(default="development", pattern=r"^[a-z0-9][a-z0-9.-]*$")
     quality_reviews: tuple[TaskQualityReview, ...] = ()
     quality_proxy: QualityProxySpec | None = None
+    replay_native_records: bool = Field(
+        default=False, strict=True, exclude_if=lambda value: not value
+    )
 
     def proxy_for(self, task: ExecutableTask) -> QualityProxySpec:
         """Freeze the effective model/rubric policy from the declared panel and task pins."""
@@ -314,13 +318,18 @@ def _measure(
         qualification = qualify_executable_task(
             project,
             ExecutableQualificationSpec(
-                task=cell.task, feasibility=feasibility, cases=spec.controls
+                task=cell.task,
+                feasibility=feasibility,
+                cases=spec.controls,
+                replay_native_records=spec.replay_native_records,
             ),
             created_at=datetime.now(UTC),
             code_revision=code_revision,
         )
         cell = cell.model_copy(update={"qualification": qualification})
-        if not load_executable_qualification(project, qualification).qualified:
+        if not load_executable_qualification(
+            project, qualification, allow_native_replay=spec.replay_native_records
+        ).qualified:
             return cell.model_copy(update={"status": "unqualified"})
         phase = "actor_panel"
         panel_spec = _panel(spec, task)
@@ -479,11 +488,16 @@ def saved_candidate_batch(
             ):
                 raise ValueError("candidate feasibility belongs to another runtime job")
         if cell.qualification is not None:
-            qualification = load_executable_qualification(project, cell.qualification)
+            qualification = load_executable_qualification(
+                project, cell.qualification, allow_native_replay=spec.replay_native_records
+            )
             if cell.feasibility is None:
                 raise ValueError("candidate qualification has no feasible execution")
             if qualification.spec != ExecutableQualificationSpec(
-                task=cell.task, feasibility=cell.feasibility, cases=spec.controls
+                task=cell.task,
+                feasibility=cell.feasibility,
+                cases=spec.controls,
+                replay_native_records=spec.replay_native_records,
             ):
                 raise ValueError(
                     "candidate qualification changed its controls or feasible execution"
@@ -505,7 +519,9 @@ def saved_candidate_batch(
         if cell.status != "unavailable":
             if cell.failure is not None or cell.qualification is None:
                 raise ValueError("completed candidate lacks a qualification or has an error")
-            qualified = load_executable_qualification(project, cell.qualification).qualified
+            qualified = load_executable_qualification(
+                project, cell.qualification, allow_native_replay=spec.replay_native_records
+            ).qualified
             quality = "needs_review"
             if qualified:
                 quality, receipt = _quality_result(

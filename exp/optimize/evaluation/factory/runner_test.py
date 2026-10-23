@@ -540,3 +540,35 @@ def test_busy_child_remains_pending_and_completes_after_release(
     result = run_task_factory(project, spec, code_revision="test")
     assert result.status == "development_qualified"
     assert all(cell.error_type is None for cell in result.cells)
+
+
+def test_native_record_permission_is_strict_opt_in_through_factory_batch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Legacy identities stay unchanged; explicit replay reaches the normal child owner."""
+    from pydantic import ValidationError
+
+    from exp.optimize.evaluation.factory.candidates import CandidateBatchSpec
+    from exp.optimize.evaluation.factory.runner import _batch
+
+    project, spec, _ = factory_fixture(tmp_path, monkeypatch)
+    family = spec.families[0]
+    legacy_family = family.model_dump(mode="json")
+    assert "replay_native_records" not in legacy_family
+    batch = _batch(project, spec, family, "test")
+    assert "replay_native_records" not in batch.model_dump(mode="json")
+    assert (
+        family.model_copy(update={"replay_native_records": False}).model_dump(mode="json")
+        == legacy_family
+    )
+    opted = family.model_copy(update={"replay_native_records": True})
+    forwarded = _batch(project, spec, opted, "test")
+    assert forwarded.replay_native_records is True
+    assert forwarded.identity("test") != batch.identity("test")
+    for invalid in ("yes", 1, None):
+        with pytest.raises(ValidationError):
+            FactoryFamily.model_validate({**legacy_family, "replay_native_records": invalid})
+        with pytest.raises(ValidationError):
+            CandidateBatchSpec.model_validate(
+                {**batch.model_dump(mode="json"), "replay_native_records": invalid}
+            )
