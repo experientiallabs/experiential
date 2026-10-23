@@ -107,6 +107,33 @@ def test_capture_honors_explicit_posthog_host_override(
     assert clients[0].kwargs["host"] == "https://eu.i.posthog.com"
 
 
+@pytest.mark.parametrize(
+    "host",
+    [
+        "http://telemetry.example.com",
+        "https://user:secret@telemetry.example.com",
+        "https://telemetry.example.com/events",
+        "https://telemetry.example.com?region=us",
+        "https://telemetry.example.com#events",
+        "https://telemetry.example.com:invalid",
+        "https://telemetry.example.com\\@redirect.test",
+        "https://telemetry.example.com/\x01event",
+        "file:///tmp/telemetry",
+    ],
+)
+def test_capture_rejects_unsafe_posthog_host_override(
+    host: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Unsafe telemetry hosts fail closed without constructing a PostHog client."""
+    clients = _install_fake_posthog(monkeypatch)
+    monkeypatch.setenv("EXP_TELEMETRY", "1")
+    monkeypatch.setenv("EXP_POSTHOG_PROJECT_API_KEY", "phc_test")
+    monkeypatch.setenv("EXP_POSTHOG_HOST", host)
+
+    assert not capture("exp router completed", {"success": True}, root=tmp_path / ".exp")
+    assert clients == []
+
+
 def test_capture_respects_project_opt_out(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     clients = _install_fake_posthog(monkeypatch)
 
