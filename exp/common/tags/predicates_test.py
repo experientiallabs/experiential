@@ -211,7 +211,7 @@ def test_unknown_tag_suggests_and_lists_valid_ids() -> None:
         parse_rule("coding AND tool_eror")
     message = str(caught.value)
     assert message.startswith("position 11: unknown tag 'tool_eror' (did you mean 'tool_error'?)")
-    assert "valid tags in experiential-default v1: coding, cybersecurity" in message
+    assert "valid tags in experiential-default v2: coding, cybersecurity" in message
     assert "took_external_action" in message
     with pytest.raises(TagRuleError, match="did you mean 'coding'"):
         parse_rule("CODING")
@@ -278,16 +278,16 @@ def test_evaluation_rejects_edited_banks_under_the_same_version() -> None:
     """Scores from reordered or reworded tags under one id and version are rejected."""
     rule = parse_rule("tool_error")
     edited = _summary().model_copy(update={"bank_digest": "0" * 64})
-    with pytest.raises(TagRuleError, match="different experiential-default v1 wording or order"):
+    with pytest.raises(TagRuleError, match="different experiential-default v2 wording or order"):
         evaluate_rule(rule, edited)
 
 
 def test_evaluation_requires_one_score_per_tag() -> None:
     """Short or long score arrays are rejected before any index is read."""
-    with pytest.raises(TagRuleError, match="expected 15 conversation scores.*got 2"):
+    with pytest.raises(TagRuleError, match="expected 14 conversation scores.*got 2"):
         _matches("tool_error", _summary(), (0.0, 0.0))
     short = _summary().model_copy(update={"turn_max": (0.9,), "turn_min": (0.9,)})
-    with pytest.raises(TagRuleError, match="expected 10 turn scores.*got 1"):
+    with pytest.raises(TagRuleError, match="expected 14 turn scores.*got 1"):
         evaluate_rule(parse_rule("tool_error"), short)
 
 
@@ -295,5 +295,5 @@ def test_rule_json_rejects_indexes_outside_the_bank() -> None:
     """A rule tree read from JSON cannot index past its scope's score count."""
     payload = parse_rule("tool_error").model_dump(mode="json")
     payload["root"]["index"] = TURN_COUNT
-    with pytest.raises(ValidationError, match="turn index 10 but the bank has 10 turn tags"):
+    with pytest.raises(ValidationError, match="turn index 14 but the bank has 14 turn tags"):
         TagRule.model_validate(payload)
