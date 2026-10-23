@@ -69,7 +69,8 @@ def continuation_runtime(project, configuration):
     checkpoint = load_continuation_checkpoint(project.artifacts, reference)
     return ContinuationRuntime(workbook_runtime(checkpoint.world), probe, configuration["probe"])
 """)
-    spec = study.spec.model_copy(update={"actor_model": model.snapshot})
+    # Jobs built from this spec run in other projects; they are never admitted, so no pin.
+    spec = study.spec.model_copy(update={"actor_model": model.snapshot, "admission_policy": None})
     job = ContinuationJob(
         study=spec,
         runtime_file=runtime,

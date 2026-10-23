@@ -350,6 +350,10 @@ def test_cli_run_and_export_with_private_native_state(
     assert registered.exit_code == 0, registered.output
     policy_ref = artifact_input(project.artifacts.read(policy_identity(policy)).manifest)
     assert policy_ref.artifact_id in registered.output
+    # The study pins the registered policy before it runs, so export can prove the order.
+    job = job.model_copy(
+        update={"study": job.study.model_copy(update={"admission_policy": policy_ref})}
+    )
     request.write_text(ContinuationCommand(action="run", job=job).model_dump_json())
     dry = runner.invoke(app, [*command, "--dry-run"])
     assert dry.exit_code == 0, dry.output
