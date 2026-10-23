@@ -71,7 +71,11 @@ Two edges are decided explicitly:
   the attempt's route reason as `reasoning_continuation_failover`. Before this, a pinned turn
   skipped the narrowing altogether, so a sampling control only a tool-less rung takes made the
   ranking pick that rung and the turn was refused on `tools` (a pin on the tool rung itself
-  included).
+  included). Without a content feature the issuer is never dropped for a softer preference:
+  when another rung keeps the caller's `temperature` or `top_p` exactly and the issuer cannot,
+  the issuer still leads and the sampling adapts or drops on it, disclosed
+  (`temperature->dropped(unsupported_by_provider)`), because reasoning continuity outranks
+  sampling exactness.
 - A rung authored `failover_only_on` never takes a first dial. When the only rungs that carry the
   feature are failover-only, the request is refused on the feature with the typed 400 (what the
   dialable rungs lack), never sent to the failover rung and never failed as an internal error.

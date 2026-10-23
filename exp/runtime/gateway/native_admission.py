@@ -25,7 +25,7 @@ from exp.runtime.gateway.affinity import (
     house_aggregator_last,
     rendezvous_order,
 )
-from exp.runtime.gateway.capability_rungs import narrow_to_capable_rungs
+from exp.runtime.gateway.capability_rungs import live_issuer_index, narrow_to_capable_rungs
 from exp.runtime.gateway.class_throttles import fast_request, require_fast_path
 from exp.runtime.gateway.contracts import AuthorizationSnapshot, DirectTarget, GatewayRequest
 from exp.runtime.gateway.native_accounting import NativeAttemptAccounting
@@ -312,14 +312,14 @@ def prepare_route_requests(
     coercion_disclosures: tuple[str, ...] = admission_disclosures
     full_route = route
     full_wires = resolved_wires
+    issuer = live_issuer_index(route)  # A live reasoning pin's issuer outranks sampling.
 
     def candidate_serves(candidate: GatewayRequest) -> bool:
         return _candidate_serves(full_route, full_wires, candidate)
 
     try:
         compatible_indexes = compatible_generation_parameter_profile_indexes(
-            tuple(profile for profile, _client in resolved_wires),
-            admitted_request,
+            tuple(profile for profile, _client in resolved_wires), admitted_request, keep=issuer
         )
     except ProviderParameterError:
         # No rung preserves the request verbatim; retry once with the
@@ -349,8 +349,7 @@ def prepare_route_requests(
         if coercion is None:
             raise
         compatible_indexes = compatible_generation_parameter_profile_indexes(
-            tuple(profile for profile, _client in resolved_wires),
-            coercion.request,
+            tuple(profile for profile, _client in resolved_wires), coercion.request, keep=issuer
         )
         admitted_request = coercion.request
         coercion_disclosures = (*coercion_disclosures, *coercion.disclosures)

@@ -15,6 +15,8 @@ from exp.runtime.models.providers.streaming_requests import route_generation_par
 def compatible_generation_parameter_profile_indexes(
     profiles: Sequence[GatewayWireProfile],
     request: GatewayRequest,
+    *,
+    keep: int | None = None,
 ) -> tuple[int, ...]:
     """Return route rungs that can preserve every caller semantic exactly.
 
@@ -25,6 +27,12 @@ def compatible_generation_parameter_profile_indexes(
     Args:
         profiles: Ordered wire profiles for the certified deployment route.
         request: Decoded public request before provider streaming is forced.
+        keep: A rung the selection must keep whenever it can serve the request
+            at all: a reasoning-pinned continuation's issuing rung, whose
+            thinking continuity outranks every soft preference. The result is
+            then the most exact preference tier that still contains it (its
+            sampling adapts or drops, disclosed, as on any rung that cannot
+            honor it); a rung that cannot serve leaves the ranking unchanged.
 
     Returns:
         Ordered indexes of every compatible route profile.
@@ -56,15 +64,17 @@ def compatible_generation_parameter_profile_indexes(
             for index, profile in enumerate(profiles)
             if all(serves(profile) for serves in kept)
         )
-        if carrying:
+        if carrying and (keep is None or keep in carrying):
             try:
                 ranked = _ranked_profile_indexes(
-                    tuple(profiles[index] for index in carrying), request
+                    tuple(profiles[index] for index in carrying),
+                    request,
+                    keep=None if keep is None else carrying.index(keep),
                 )
             except ProviderParameterError:
                 continue
             return tuple(carrying[index] for index in ranked)
-    return _ranked_profile_indexes(profiles, request)
+    return _ranked_profile_indexes(profiles, request, keep=keep)
 
 
 def _enforces_custom_grammar(profile: GatewayWireProfile) -> bool:
@@ -73,7 +83,7 @@ def _enforces_custom_grammar(profile: GatewayWireProfile) -> bool:
 
 
 def _ranked_profile_indexes(
-    profiles: Sequence[GatewayWireProfile], request: GatewayRequest
+    profiles: Sequence[GatewayWireProfile], request: GatewayRequest, *, keep: int | None = None
 ) -> tuple[int, ...]:
     """Rank every rung by how exactly it preserves the request (see the caller)."""
     # Prefer rungs that HONOR the caller's sampling exactly over rungs that can
@@ -100,6 +110,11 @@ def _ranked_profile_indexes(
             faithful.append(index)
             if _carries_exposed_reasoning(profile, request):
                 exact.append(index)
+    if keep is not None and keep in serviceable:
+        # The issuing rung of a live reasoning pin stays: the most exact tier
+        # that holds it, never a tier that drops it for a softer preference.
+        tiers = ((faithful,) if exact else ()) + (thinking_kept, serviceable)
+        return tuple(next(tier for tier in tiers if keep in tier))
     if exact:
         # Plaintext reasoning only RANKS a route: a rung that cannot replay it
         # drops it per rung at encoding, so every faithful rung stays as a
