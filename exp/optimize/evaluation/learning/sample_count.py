@@ -21,6 +21,17 @@ the search. This module makes the question a registered procedure over the exist
 
 A development-selected checkpoint is never reported as confirmation: reusing a development
 receipt or lineage, a re-audit, a changed configuration or an invalidated receipt is refused.
+
+Order is causal, never read from a clock. Audit receipts are numbered by one owner: each
+receipt's ``sequence`` is assigned while the root exposure ledger's transaction is held. The
+registration and the saved selection are each written while that same transaction is held, and
+record the latest receipt sequence at that moment (``receipts_before``), so a receipt counts as
+opened after them only when its sequence is larger. The selection cites its registration and
+every development receipt, and the confirmation cites the selection and its receipt, each by
+identity and manifest digest. Every ``registered_at``, ``opened_at`` and ``created_at`` is
+informational: a receipt whose clock claims a later time than the selection, but whose sequence
+shows it was minted first, is refused, and one minted after the selection is accepted whatever
+its clock claims.
 """
 
 import json
@@ -48,7 +59,9 @@ from exp.optimize.evaluation.audit.receipts import (
     ReceiptView,
     find_receipt,
     receipt_panel,
+    receipt_reference,
     receipt_view,
+    receipts_held,
 )
 from exp.optimize.evaluation.fidelity.replay import ReplayResult
 from exp.optimize.evaluation.learning.traces import fit_cases, learning_plan
@@ -56,7 +69,7 @@ from exp.optimize.evaluation.learning.traces import fit_cases, learning_plan
 # Identity of the code that decides this artifact's behavior, in place of its source text.
 # Bump it when behavior changes. exp/tests/code_protocols_test.py fails when the covered
 # source changes until it is bumped or, for a pure refactor, its digest is updated.
-SAMPLE_COUNT_PROTOCOL = "sample-count-v2"
+SAMPLE_COUNT_PROTOCOL = "sample-count-v3"
 REGISTRATION_TYPE = "sample-count-registration"
 SELECTION_TYPE = "sample-count-selection"
 CONFIRMATION_TYPE = "sample-count-confirmation"
@@ -87,7 +100,9 @@ class SampleCountRegistration(ContractModel):
         criterion: ``point_estimate`` compares the development estimate; ``wilson_lower_bound``
             compares its lower 95 percent Wilson bound at the lineage count.
         development_lineages: Held-out lineages used for selection, sorted.
-        registered_at: When the procedure was registered; earlier audits never count.
+        registered_at: When the procedure was registered; informational only.
+        receipts_before: Latest audit receipt sequence when the procedure was registered; only
+            receipts with a larger sequence were minted after it and may count.
     """
 
     project: str = Field(min_length=1)
@@ -99,6 +114,7 @@ class SampleCountRegistration(ContractModel):
     criterion: Literal["point_estimate", "wilson_lower_bound"]
     development_lineages: tuple[str, ...] = Field(min_length=1)
     registered_at: AwareDatetime
+    receipts_before: int = Field(ge=0)
 
     @model_validator(mode="after")
     def ordered(self) -> Self:
@@ -146,7 +162,8 @@ class CheckpointMeasurement(ContractModel):
 
     Attributes:
         receipt_id: Audit receipt.
-        opened_at: When the receipt and its reservation were committed.
+        sequence: The receipt's position among the project's receipts, from 1; orders it.
+        opened_at: When the receipt and its reservation were committed; informational only.
         basis: ``independent`` or ``development-re-audit``, fixed at minting.
         headline: The receipt's derived headline, qualified by any re-attempt.
         memory_lineage: Memory lineage read.
@@ -161,6 +178,7 @@ class CheckpointMeasurement(ContractModel):
     """
 
     receipt_id: str
+    sequence: int = Field(ge=1)
     opened_at: AwareDatetime
     basis: Basis
     headline: str
@@ -202,7 +220,11 @@ class SampleCountSelection(ContractModel):
         memory_version: Frozen memory version of the selected count.
         configuration_sha256: Frozen configuration every measurement shared.
         development_receipts: Every development receipt consulted.
-        last_development_at: Latest development receipt time; confirmation must follow it.
+        last_development_sequence: Largest development receipt sequence; confirmation must
+            follow it.
+        receipts_before: Latest audit receipt sequence when the selection was saved, or None
+            before it is saved; confirmation must have a larger sequence. Not part of the
+            selection's identity, so selecting again replays the saved selection.
         evaluated: Each examined count with its development estimate and decision.
     """
 
@@ -213,8 +235,17 @@ class SampleCountSelection(ContractModel):
     memory_version: int | None = None
     configuration_sha256: Sha256 | None = None
     development_receipts: tuple[str, ...] = ()
-    last_development_at: AwareDatetime | None = None
+    last_development_sequence: int | None = None
+    receipts_before: int | None = None
     evaluated: tuple[JsonObject, ...] = ()
+
+    @property
+    def identity(self) -> str:
+        """Selection identity over the decision, bound to the procedure protocol."""
+        decision = self.model_dump(mode="json", exclude={"receipts_before"})
+        return stable_id(
+            SELECTION_TYPE, {"selection": sha256_json(decision), "protocol": SAMPLE_COUNT_PROTOCOL}
+        )
 
 
 def register_sample_count_study(
@@ -235,7 +266,7 @@ def register_sample_count_study(
         threshold: Accuracy the selected count must exceed.
         criterion: Whether the development estimate or its Wilson lower bound must exceed it.
         development_lineages: Held-out lineages reserved for selection.
-        registered_at: Registration time.
+        registered_at: Registration time, informational only.
         code_revision: Producing implementation identity.
 
     Returns:
@@ -245,36 +276,39 @@ def register_sample_count_study(
         ValueError: A count exceeds the fit traces, a lineage is not held out, or a different
             registration already exists under the same identity.
     """
-    registration = plan_sample_count_study(
-        project,
-        grid=grid,
-        threshold=threshold,
-        criterion=criterion,
-        development_lineages=development_lineages,
-        registered_at=registered_at,
-    )
-    identity = registration.identity
-    if project.artifacts.exists(identity):
-        saved = SampleCountRegistration.model_validate_json(
-            project.artifacts.read_bytes(identity, "registration.json")
+    with receipts_held(project) as receipts_before:
+        registration = plan_sample_count_study(
+            project,
+            grid=grid,
+            threshold=threshold,
+            criterion=criterion,
+            development_lineages=development_lineages,
+            registered_at=registered_at,
+            receipts_before=receipts_before,
         )
-        if saved != registration:
-            raise ValueError("a different sample-count registration has this identity")
-        return saved, artifact_input(project.artifacts.read(identity).manifest)
-    build = project.load_project().build
-    if build is None:
-        raise ValueError("register after a completed build")
-    manifest = project.artifacts.write_json(
-        artifact_id=identity,
-        artifact_type=REGISTRATION_TYPE,
-        envelope=ArtifactEnvelope(
-            schema_version=1,
-            created_at=registered_at,
-            code_revision=code_revision,
-            inputs=(build.task_set,),
-        ),
-        files={"registration.json": registration.model_dump(mode="json")},
-    )
+        identity = registration.identity
+        if project.artifacts.exists(identity):
+            saved = SampleCountRegistration.model_validate_json(
+                project.artifacts.read_bytes(identity, "registration.json")
+            )
+            if saved != registration:
+                raise ValueError("a different sample-count registration has this identity")
+            return saved, artifact_input(project.artifacts.read(identity).manifest)
+        build = project.load_project().build
+        if build is None:
+            raise ValueError("register after a completed build")
+        # Written while receipt minting is held, so every later receipt has a larger sequence.
+        manifest = project.artifacts.write_json(
+            artifact_id=identity,
+            artifact_type=REGISTRATION_TYPE,
+            envelope=ArtifactEnvelope(
+                schema_version=1,
+                created_at=registered_at,
+                code_revision=code_revision,
+                inputs=(build.task_set,),
+            ),
+            files={"registration.json": registration.model_dump(mode="json")},
+        )
     return registration, artifact_input(manifest)
 
 
@@ -286,6 +320,7 @@ def plan_sample_count_study(
     criterion: Literal["point_estimate", "wilson_lower_bound"],
     development_lineages: Sequence[str],
     registered_at: datetime,
+    receipts_before: int,
 ) -> SampleCountRegistration:
     """Validate a registration against the project's build and fit order, writing nothing.
 
@@ -295,7 +330,8 @@ def plan_sample_count_study(
         threshold: Accuracy the selected count must exceed.
         criterion: Whether the development estimate or its Wilson lower bound must exceed it.
         development_lineages: Held-out lineages reserved for selection.
-        registered_at: Registration time.
+        registered_at: Registration time, informational only.
+        receipts_before: Latest audit receipt sequence, read while receipt minting is held.
 
     Returns:
         The registration :func:`register_sample_count_study` would save.
@@ -314,6 +350,7 @@ def plan_sample_count_study(
         criterion=criterion,
         development_lineages=tuple(sorted(set(development_lineages))),
         registered_at=registered_at,
+        receipts_before=receipts_before,
     )
     if registration.grid[-1] > len(order):
         raise ValueError(
@@ -374,6 +411,7 @@ def audit_measurement(
         lineages.setdefault(case.lineage, []).append(by_trace.get(case.trace_id))
     return CheckpointMeasurement(
         receipt_id=receipt.receipt_id,
+        sequence=receipt.sequence,
         opened_at=receipt.opened_at,
         basis=receipt.basis,
         headline=view.headline,
@@ -411,13 +449,19 @@ def select_sample_count(
         remain development evidence.
 
     Raises:
-        ValueError: A measurement predates registration, reads another memory, misses or adds
-            lineages, repeats or leaves the grid, or changes the frozen configuration.
+        ValueError: A measurement's receipt was minted before registration (its sequence is
+            not larger than the registration's ``receipts_before``), reads another memory,
+            misses or adds lineages, repeats or leaves the grid, or changes the frozen
+            configuration.
     """
     by_count: dict[int, CheckpointMeasurement] = {}
     for row in development:
-        if row.opened_at < registration.registered_at:
-            raise ValueError("a development audit predates registration; register first")
+        if row.sequence <= registration.receipts_before:
+            raise ValueError(
+                f"development audit {row.receipt_id} (receipt {row.sequence}) predates the "
+                f"registration, which followed receipt {registration.receipts_before}; register "
+                "first, then audit the grid counts"
+            )
         if row.memory_lineage != registration.memory_lineage:
             raise ValueError("a development audit read another memory lineage")
         if tuple(item.lineage for item in row.lineages) != registration.development_lineages:
@@ -432,7 +476,7 @@ def select_sample_count(
         status="threshold_not_met",
         configuration_sha256=development[0].configuration_sha256 if development else None,
         development_receipts=tuple(row.receipt_id for row in development),
-        last_development_at=max((row.opened_at for row in development), default=None),
+        last_development_sequence=max((row.sequence for row in development), default=None),
     )
     evaluated: list[JsonObject] = []
     for count in registration.grid:
@@ -484,9 +528,10 @@ def confirm_sample_count(
         the optimistic development estimate.
 
     Raises:
-        ValueError: No count was selected, or the confirmation reuses development evidence,
-            is not an independent audit, predates selection, was invalidated, or changed the
-            frozen checkpoint or configuration.
+        ValueError: No count was selected or the selection was never saved, or the
+            confirmation reuses development evidence, is not an independent audit, was minted
+            before the saved selection or a development receipt (by receipt sequence), was
+            invalidated, or changed the frozen checkpoint or configuration.
     """
     if selection.registration != registration.identity:
         raise ValueError("the selection belongs to another registration")
@@ -504,10 +549,22 @@ def confirm_sample_count(
     if confirmation.notices:
         raise ValueError("the confirmation receipt was invalidated by predating exposure")
     if (
-        selection.last_development_at is not None
-        and confirmation.opened_at <= selection.last_development_at
+        selection.last_development_sequence is not None
+        and confirmation.sequence <= selection.last_development_sequence
     ):
-        raise ValueError("confirmation must be opened after every development measurement")
+        raise ValueError(
+            f"confirmation must be opened after every development measurement: receipt "
+            f"{confirmation.sequence} is not after receipt {selection.last_development_sequence}"
+        )
+    if selection.receipts_before is None:
+        raise ValueError("confirm a saved selection; record the selection first")
+    if confirmation.sequence <= selection.receipts_before:
+        raise ValueError(
+            f"confirmation must be opened after the saved sample-count selection: receipt "
+            f"{confirmation.receipt_id} (receipt {confirmation.sequence}) was minted before the "
+            f"selection, which followed receipt {selection.receipts_before}; open a new "
+            "independent audit after selecting"
+        )
     if (
         confirmation.memory_lineage != registration.memory_lineage
         or confirmation.memory_version != selection.memory_version
@@ -612,33 +669,36 @@ def register_sample_count(
 ) -> tuple[SampleCountRegistration, ArtifactInput | None]:
     """Register the procedure once; the same procedure registered again replays the first.
 
-    A registration's time decides which audits may count, so registering an unchanged
-    procedure again keeps the earlier registration instead of moving its time past results.
+    A registration's receipt sequence decides which audits may count, so registering an
+    unchanged procedure again keeps the earlier registration instead of moving it past results.
 
     Args:
         project: Project with a completed build and a recorded fit-only learning plan.
         request: Grid, threshold, criterion and development lineages.
-        registered_at: Registration time of a new registration.
+        registered_at: Registration time of a new registration, informational only.
         code_revision: Producing implementation identity.
         dry_run: Validate and return the registration without saving it.
 
     Returns:
         The registration and its artifact (None on a dry run of a new registration).
     """
-    planned = plan_sample_count_study(
-        project,
-        grid=request.grid,
-        threshold=request.threshold,
-        criterion=request.criterion,
-        development_lineages=request.development_lineages,
-        registered_at=registered_at,
-    )
-    procedure = planned.model_dump(exclude={"registered_at"})
+    with receipts_held(project) as receipts_before:
+        planned = plan_sample_count_study(
+            project,
+            grid=request.grid,
+            threshold=request.threshold,
+            criterion=request.criterion,
+            development_lineages=request.development_lineages,
+            registered_at=registered_at,
+            receipts_before=receipts_before,
+        )
+    order_fields = {"registered_at", "receipts_before"}
+    procedure = planned.model_dump(exclude=order_fields)
     for identity in project.artifacts.list_ids(artifact_type=REGISTRATION_TYPE):
         saved = SampleCountRegistration.model_validate_json(
             project.artifacts.read_bytes(identity, "registration.json")
         )
-        if saved.model_dump(exclude={"registered_at"}) == procedure:
+        if saved.model_dump(exclude=order_fields) == procedure:
             return saved, artifact_input(project.artifacts.read(identity).manifest)
     if dry_run:
         return planned, None
@@ -680,10 +740,13 @@ def record_sample_count_selection(
 ) -> tuple[SampleCountSelection, ArtifactInput | None]:
     """Select on the named development audits and save the decision with its measurements.
 
+    The selection is saved while receipt minting is held, with the latest receipt sequence at
+    that moment, and cites its registration and every development receipt.
+
     Args:
         project: Project holding the registration and the audit receipts.
         request: Registration reference and development receipt IDs.
-        created_at: Record time.
+        created_at: Record time, informational only.
         code_revision: Producing implementation identity.
         dry_run: Select without saving.
 
@@ -697,42 +760,49 @@ def record_sample_count_selection(
     registration = _load(project, request.registration, REGISTRATION_TYPE, "registration.json")
     registered = SampleCountRegistration.model_validate_json(registration)
     measurements = tuple(receipt_measurement(project, row) for row in request.development)
-    selection = select_sample_count(registered, measurements)
-    identity = stable_id(
-        SELECTION_TYPE,
-        {"selection": sha256_json(selection), "protocol": SAMPLE_COUNT_PROTOCOL},
-    )
-    for saved_id in project.artifacts.list_ids(artifact_type=SELECTION_TYPE):
-        saved = SampleCountSelection.model_validate_json(
-            project.artifacts.read_bytes(saved_id, "selection.json")
-        )
-        if (
-            saved_id != identity
-            and saved.registration == registered.identity
-            and saved.status == "selected"
-        ):
-            raise ValueError(
-                f"registration {registered.identity} already selected {saved.selected_count} "
-                f"trajectories ({saved_id}); confirm that selection, or register a new procedure"
+    receipts = tuple(receipt_reference(project, row) for row in request.development)
+    selected = select_sample_count(registered, measurements)
+    identity = selected.identity
+    with receipts_held(project) as receipts_before:
+        for saved_id in project.artifacts.list_ids(artifact_type=SELECTION_TYPE):
+            saved = SampleCountSelection.model_validate_json(
+                project.artifacts.read_bytes(saved_id, "selection.json")
             )
-    if project.artifacts.exists(identity):
-        return selection, artifact_input(project.artifacts.read(identity).manifest)
-    if dry_run:
-        return selection, None
-    manifest = project.artifacts.write_json(
-        artifact_id=identity,
-        artifact_type=SELECTION_TYPE,
-        envelope=ArtifactEnvelope(
-            schema_version=1,
-            created_at=created_at,
-            code_revision=code_revision,
-            inputs=(request.registration,),
-        ),
-        files={
-            "selection.json": selection.model_dump(mode="json"),
-            "measurements.json": [row.model_dump(mode="json") for row in measurements],
-        },
-    )
+            if (
+                saved_id != identity
+                and saved.registration == registered.identity
+                and saved.status == "selected"
+            ):
+                raise ValueError(
+                    f"registration {registered.identity} already selected "
+                    f"{saved.selected_count} trajectories ({saved_id}); confirm that selection, "
+                    "or register a new procedure"
+                )
+        if project.artifacts.exists(identity):
+            saved = SampleCountSelection.model_validate_json(
+                project.artifacts.read_bytes(identity, "selection.json")
+            )
+            return saved, artifact_input(project.artifacts.read(identity).manifest)
+        selection = selected.model_copy(update={"receipts_before": receipts_before})
+        if dry_run:
+            return selection, None
+        # Written while receipt minting is held, so every later receipt has a larger sequence.
+        manifest = project.artifacts.write_json(
+            artifact_id=identity,
+            artifact_type=SELECTION_TYPE,
+            envelope=ArtifactEnvelope(
+                schema_version=1,
+                created_at=created_at,
+                code_revision=code_revision,
+                inputs=tuple(
+                    sorted({request.registration, *receipts}, key=lambda item: item.artifact_id)
+                ),
+            ),
+            files={
+                "selection.json": selection.model_dump(mode="json"),
+                "measurements.json": [row.model_dump(mode="json") for row in measurements],
+            },
+        )
     return selection, artifact_input(manifest)
 
 
@@ -752,7 +822,7 @@ def record_sample_count_confirmation(
     Args:
         project: Project holding the selection and the confirmation receipt.
         request: Selection reference and confirmation receipt ID.
-        created_at: Record time.
+        created_at: Record time, informational only.
         code_revision: Producing implementation identity.
         dry_run: Report without saving.
 
@@ -760,14 +830,20 @@ def record_sample_count_confirmation(
         The confirmation report and its artifact (None on a dry run of a new confirmation).
 
     Raises:
-        ValueError: The selection is not saved, the audit opened before or at the saved selection,
-            or the selection was already confirmed on another receipt.
+        ValueError: The selection is not saved, the audit receipt was minted before the saved
+            selection (by receipt sequence, whatever its clock claims), or the selection was
+            already confirmed on another receipt.
     """
     selection = SampleCountSelection.model_validate_json(
         _load(project, request.selection, SELECTION_TYPE, "selection.json")
     )
     selection_manifest = project.artifacts.read(request.selection.artifact_id).manifest
-    registration_ref = selection_manifest.inputs[0]
+    registration_ref = next(
+        (item for item in selection_manifest.inputs if item.artifact_id == selection.registration),
+        None,
+    )
+    if registration_ref is None:
+        raise ValueError(f"{request.selection.artifact_id} does not cite its registration")
     registration = SampleCountRegistration.model_validate_json(
         _load(project, registration_ref, REGISTRATION_TYPE, "registration.json")
     )
@@ -782,8 +858,7 @@ def record_sample_count_confirmation(
                 f"({saved_id}); a selection is confirmed once"
             )
     measurement = receipt_measurement(project, request.confirmation)
-    if measurement.opened_at <= selection_manifest.created_at:
-        raise ValueError("confirmation must be opened after the saved sample-count selection")
+    receipt = receipt_reference(project, request.confirmation)
     report = confirm_sample_count(registration, selection, measurement)
     identity = stable_id(
         CONFIRMATION_TYPE, {"report": sha256_json(report), "protocol": SAMPLE_COUNT_PROTOCOL}
@@ -799,7 +874,7 @@ def record_sample_count_confirmation(
             schema_version=1,
             created_at=created_at,
             code_revision=code_revision,
-            inputs=(request.selection,),
+            inputs=tuple(sorted((request.selection, receipt), key=lambda item: item.artifact_id)),
         ),
         files={"confirmation.json": report},
     )

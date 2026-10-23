@@ -110,7 +110,7 @@ def test_register_select_confirm_on_saved_audits(
         {"resolution": "confirm", "selection": selection, "confirmation": dev_receipt},
         exit_code=2,
     )
-    assert "confirmation must be opened after the saved sample-count selection" in flat(reused)
+    assert "cannot be reported as confirmation" in flat(reused)
     assert not store.artifacts.list_ids(artifact_type=CONFIRMATION_TYPE)
     with open_held_out_audit(
         store, 1, profile="memory", code_revision=REVISION, clock=clock

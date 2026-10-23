@@ -24,14 +24,15 @@ invalidation notice adds "invalidated: predating exposure" after "independent". 
 fully saved receipt keeps the receipt's headline.
 """
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from datetime import datetime
 from typing import Literal
 
 from pydantic import AwareDatetime, Field
 
 from exp.common.core.artifacts import ArtifactEnvelope, ArtifactInput, ContractModel, stable_id
-from exp.common.project import ProjectStore
+from exp.common.project import ProjectStore, artifact_input
 from exp.common.traces.store import load_trace_dataset
 from exp.optimize.evaluation.audit.exposure import LineageExposure, held_out_members
 from exp.optimize.evaluation.audit.panel import (
@@ -258,9 +259,9 @@ class ReceiptView(ContractModel):
 
     Attributes:
         receipt: The immutable root record.
-        attempts: Replaced registrations, in time order.
-        reports: Invocations, in time order.
-        notices: Invalidation notices, in time order.
+        attempts: Replaced registrations, in recorded-time order (display only).
+        reports: Invocations, in recorded-time order (display only).
+        notices: Invalidation notices, in recorded-time order (display only).
     """
 
     receipt: AuditReceipt
@@ -283,11 +284,14 @@ class ReceiptView(ContractModel):
         """Steps re-dispatched after an unknown outcome, by stage, over the current runs.
 
         A run resumed more than once has one in-place child per resumption that grew its
-        retries; only its latest child counts.
+        retries; only its latest child counts. The run's durable recovery log only grows, so
+        the latest child is the one recording the most dispatches, never the latest clock.
         """
         latest: dict[str, AuditAttempt] = {}
         for attempt in self.reattempts:
-            if attempt.redispatched:
+            if attempt.redispatched and _dispatches(attempt) > _dispatches(
+                latest.get(attempt.replacement_run)
+            ):
                 latest[attempt.replacement_run] = attempt
         return stage_counts(row for attempt in latest.values() for row in attempt.redispatched)
 
@@ -313,6 +317,13 @@ class ReceiptView(ContractModel):
         return any(report.kind in ("evaluation", "replay") for report in self.reports)
 
 
+def _dispatches(attempt: AuditAttempt | None) -> tuple[int, int]:
+    """Dispatches an in-place child recorded, then its steps; grows with every resumption."""
+    if attempt is None:
+        return (0, 0)
+    return (sum(row.attempts for row in attempt.redispatched), len(attempt.redispatched))
+
+
 def audit_receipts(project: ProjectStore) -> tuple[AuditReceipt, ...]:
     """Every receipt of the project, in sequence order.
 
@@ -320,13 +331,49 @@ def audit_receipts(project: ProjectStore) -> tuple[AuditReceipt, ...]:
         project: Project holding the receipts.
 
     Returns:
-        Root receipts ordered by sequence, then time.
+        Root receipts ordered by sequence; ``opened_at`` never orders them.
     """
     receipts = (
         AuditReceipt.model_validate_json(project.artifacts.read_bytes(identity, "receipt.json"))
         for identity in project.artifacts.list_ids(artifact_type=RECEIPT_TYPE)
     )
-    return tuple(sorted(receipts, key=lambda receipt: (receipt.sequence, receipt.opened_at)))
+    return tuple(sorted(receipts, key=lambda receipt: (receipt.sequence, receipt.receipt_id)))
+
+
+@contextmanager
+def receipts_held(project: ProjectStore) -> Iterator[int]:
+    """Hold receipt minting and yield the latest receipt sequence of the project.
+
+    Receipts are minted, and their sequence assigned, only inside the root exposure ledger's
+    transaction, so while it is held here no receipt can be minted. A record written inside
+    this context that stores the yielded sequence proves causally that every receipt with a
+    larger sequence was minted after it was written, whatever any clock says.
+
+    Args:
+        project: Project whose receipts are held.
+
+    Yields:
+        The largest receipt sequence so far, or 0 before the first receipt.
+    """
+    with ExposureLedger(project.paths.root).transaction():
+        yield max((receipt.sequence for receipt in audit_receipts(project)), default=0)
+
+
+def receipt_reference(project: ProjectStore, receipt_id: str) -> ArtifactInput:
+    """The exact artifact reference of one saved receipt, for a record that cites it.
+
+    Args:
+        project: Project holding the receipt.
+        receipt_id: Receipt identity.
+
+    Returns:
+        The receipt's identity and manifest digest.
+
+    Raises:
+        ValueError: The project has no such audit receipt.
+    """
+    find_receipt(project, receipt_id)
+    return artifact_input(project.artifacts.read(receipt_id).manifest)
 
 
 def receipt_view(project: ProjectStore, receipt: AuditReceipt) -> ReceiptView:
