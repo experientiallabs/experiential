@@ -8,6 +8,7 @@ import pytest
 from typer.testing import CliRunner
 
 from exp.cli.app import app
+from exp.cli.evaluation.continuation_context_test import UNPRICED_SPEND
 from exp.cli.evaluation.continuations import ContinuationCommand
 from exp.common.core.artifacts import JsonObject, JsonValue
 from exp.common.evaluations.uncertainty import wilson_interval
@@ -198,7 +199,9 @@ def test_campaign_cli_reports_inference_beside_saved_metrics(
     )
     path = tmp_path / "campaign.json"
     path.write_text(
-        ContinuationCommand(action="run-continuation-campaign", campaign=spec).model_dump_json()
+        ContinuationCommand(
+            spend=UNPRICED_SPEND, action="run-continuation-campaign", campaign=spec
+        ).model_dump_json()
     )
     args = ["eval", "case", "--root", str(tmp_path), "--continuations", str(path)]
     result = CliRunner().invoke(app, [*args, "--yes", "--non-interactive"])

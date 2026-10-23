@@ -91,6 +91,7 @@ from exp.simulation.retrieval.transitions import extract_real_transitions
 from exp.simulation.world_model.memory_tree import COMPRESSION_PROMPT
 from exp.simulation.world_model.observed_tools import public_task_tools
 from exp.simulation.world_model.runtime import load_grounded_world_model_artifact
+from exp.simulation.world_model.session_guidance import SessionGuidancePolicy
 from exp.simulation.world_model.session_research import INVESTIGATION_PROMPT, OnlineResearchPolicy
 
 REPLAY_FROM_KEY = "replay_from"
@@ -405,6 +406,7 @@ def replay_spec(
     per_turn: bool = True,
     judged: bool = True,
     judge_effort: ReasoningEffort | None = None,
+    guidance: SessionGuidancePolicy | None = None,
 ) -> FidelitySpec:
     """Derive one fidelity spec for a replay case, with a content-addressed run ID.
 
@@ -426,6 +428,7 @@ def replay_spec(
         per_turn: Ask the judge for per-turn scores too.
         judged: False skips the judge (learning is scored by exact replies).
         judge_effort: Judge reasoning effort, applied when the judge model pins one.
+        guidance: Session-scoped guidance from retrieved originals: one more call per turn.
 
     Returns:
         Complete spec. Its run ID is the placeholder ``pending``: :func:`register_replay`
@@ -463,6 +466,7 @@ def replay_spec(
         + (retrieves and retrieval is not None)
         + (memory is not None)
         + learning
+        + (guidance is not None)
         + PROPOSAL_REASKS
     )
     if online_research is not None and online_research.reading is not None:
@@ -508,6 +512,7 @@ def replay_spec(
         online_research=online_research,
         retrieval=retrieval,
         memory=memory,
+        guidance=guidance,
         roles=RoleBudgets(
             prediction=RoleBudget(output_tokens=prediction),
             investigation=RoleBudget(output_tokens=_allowance(INVESTIGATION_TOKENS, predictor)),

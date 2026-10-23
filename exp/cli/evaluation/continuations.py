@@ -9,8 +9,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
+import typer
 from pydantic import model_validator
 from rich.console import Console
+from rich.markup import escape
+from rich.text import Text
 
 from exp.cli.evaluation.analysis import (
     handle_analyse_failures,
@@ -76,13 +79,23 @@ from exp.cli.evaluation.instance_facts import handle_derive_facts
 from exp.cli.evaluation.judge_challenges import handle_challenge_judges
 from exp.cli.evaluation.learning_repair import handle_repair_learning
 from exp.cli.evaluation.memory_forget import handle_forget_summary
+from exp.cli.evaluation.operator_inputs import (
+    ArtifactReferenceQuery,
+    ModelSnapshotQuery,
+    NativeWorkbookOperation,
+    RubricTrajectoryRegistration,
+    handle_artifact_reference,
+    handle_model_snapshots,
+    handle_native_workbook,
+    handle_register_rubric_trajectory,
+)
 from exp.cli.evaluation.sample_count import handle_sample_count
 from exp.cli.evaluation.state_retention import handle_collect_garbage, handle_retire_checkpoint
 from exp.cli.evaluation.task_hardening import handle_check_task_validity, handle_harden_tasks
 from exp.cli.evaluation.trajectory_traces import handle_export_traces
 from exp.cli.shared.options import usage_error
 from exp.cli.shared.theme import EXP_THEME
-from exp.common.core.artifacts import ArtifactInput, ContractModel
+from exp.common.core.artifacts import ArtifactInput, ContractModel, stable_id
 from exp.common.project import ArtifactStoreError, ProjectStore
 from exp.common.release_revision import installed_execution_revision
 from exp.optimize.evaluation.analysis.actor_decisions import ActorDecisionSpec
@@ -125,8 +138,18 @@ from exp.optimize.evaluation.induction.service import InductionSpec, TransitionV
 from exp.optimize.evaluation.learning.forgetting import SummaryForget
 from exp.optimize.evaluation.learning.lessons import LearningRepair
 from exp.optimize.evaluation.learning.sample_count import SampleCountRequest
+from exp.optimize.evaluation.spending import (
+    SpendPolicy,
+    save_spend_receipt,
+)
 from exp.optimize.evaluation.state_retention import CheckpointRetirement, StateCollection
 from exp.optimize.evaluation.tasks.challenge_runs import ChallengeRunSpec
+from exp.runtime.models.spend_ceiling import (
+    SpendCeilingReached,
+    UnpricedDispatchRefused,
+    current_spend_ceiling,
+    operation_spend_scope,
+)
 from exp.simulation.capability_briefs import CapabilityBrief
 
 
@@ -155,6 +178,12 @@ CONTINUATION_ACTIONS = (
     ContinuationAction("compare-environments", "equivalence", handle_compare_environments),
     ContinuationAction(
         "register-admission-policy", "admission_policy", handle_register_admission_policy
+    ),
+    ContinuationAction("model-snapshots", "snapshots", handle_model_snapshots),
+    ContinuationAction("artifact-reference", "references", handle_artifact_reference),
+    ContinuationAction("native-workbook", "native_workbook", handle_native_workbook),
+    ContinuationAction(
+        "register-rubric-trajectory", "rubric_trajectory", handle_register_rubric_trajectory
     ),
     ContinuationAction("repair-learning", "learning_repair", handle_repair_learning),
     ContinuationAction("sample-count", "sample_count", handle_sample_count),
@@ -277,6 +306,13 @@ class ContinuationCommand(ContractModel):
         induction: Fit-evidence induction of exact per-tool transition programs.
         transition_validation: Provider-free re-validation of saved programs on fit evidence.
         admission_policy: Per-dimension trajectory admission policy to register before results.
+        spend: Explicit spend-ceiling choices: a dollar ceiling replacing the displayed
+            known-rate estimate and an unpriced-attempt ceiling. Not part of the operation's
+            identity, so raising them and resuming continues the same spend ledger.
+        snapshots: Catalog aliases whose digest and exact model snapshots to print.
+        references: Saved artifact IDs or types whose exact references to print.
+        native_workbook: Starting workbooks, task and answer ranges for a native capture.
+        rubric_trajectory: Development chronology to register as a rubric source.
     """
 
     action: ContinuationActionName
@@ -332,6 +368,11 @@ class ContinuationCommand(ContractModel):
     induction: InductionSpec | None = None
     transition_validation: TransitionValidationSpec | None = None
     admission_policy: AdmissionPolicy | None = None
+    spend: SpendPolicy = SpendPolicy()
+    snapshots: ModelSnapshotQuery | None = None
+    references: ArtifactReferenceQuery | None = None
+    native_workbook: NativeWorkbookOperation | None = None
+    rubric_trajectory: RubricTrajectoryRegistration | None = None
 
     @model_validator(mode="after")
     def exact_payload(self) -> "ContinuationCommand":
@@ -381,6 +422,55 @@ def run_continuations(
             yes=yes,
             non_interactive=non_interactive,
             dry_run=dry_run,
+            operation=operation_identity(command),
+            spend=command.spend,
         )
         action = _ACTIONS_BY_NAME[command.action]
-        action.handler(context, getattr(command, action.payload))
+        with operation_spend_scope():
+            try:
+                action.handler(context, getattr(command, action.payload))
+            except (SpendCeilingReached, UnpricedDispatchRefused) as stop:
+                console.print(f"[red]error[/red] {escape(str(stop))}")
+                _spend_receipt(context, announce=True)
+                console.print(
+                    "Completed calls are saved. Raise spend.ceiling_usd or "
+                    "spend.unpriced_attempts in the operation file, then run it again to resume."
+                )
+                raise typer.Exit(code=1) from None
+            _spend_receipt(context)
+
+
+def operation_identity(command: ContinuationCommand) -> str:
+    """Identify one operation and its resumes by its exact payload, excluding spend choices.
+
+    Args:
+        command: Validated continuation command.
+
+    Returns:
+        A content-addressed ID naming the operation's spend ledger directory.
+    """
+    return stable_id("operation", command.model_dump(mode="json", exclude={"spend"}))
+
+
+def _spend_receipt(context: ContinuationContext, *, announce: bool = False) -> None:
+    """Save the operation's final spend receipt when a ceiling was consented.
+
+    Args:
+        context: The invocation whose operation owns the receipt.
+        announce: Also print the accounting and the receipt path, as after a spend stop.
+    """
+    ceiling = current_spend_ceiling()
+    if ceiling is None:
+        return
+    path = save_spend_receipt(context.store, context.operation, ceiling, context.command)
+    if not announce:
+        return
+    summary = ceiling.summary()
+    context.console.print(
+        Text(
+            f"Spend: ${summary.settled_usd:.6f} settled and ${summary.unknown_usd:.6f} kept for "
+            f"unknown outcomes, of a ${summary.ceiling_usd:.6f} ceiling; "
+            f"{summary.unpriced_attempts}/{summary.unpriced_attempt_ceiling} unpriced attempts."
+        )
+    )
+    context.console.print(Text(f"Spend receipt: {path}"))

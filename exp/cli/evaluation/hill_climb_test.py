@@ -8,6 +8,7 @@ import pytest
 from typer.testing import CliRunner, Result
 
 from exp.cli.app import app
+from exp.cli.evaluation.continuation_context_test import UNPRICED_SPEND
 from exp.cli.evaluation.continuations import ContinuationCommand
 from exp.common.core.artifacts import sha256_json
 from exp.common.models import load_model_catalog
@@ -59,6 +60,7 @@ def test_cli_climbs_one_round_proposes_dry_and_reports_the_final_line(
     deadline = datetime.now(UTC) + timedelta(hours=1)
     edit = PromptEdit(kind="append", text=HELPFUL, change_note="Re-read before editing.")
     climb_round = ContinuationCommand(
+        spend=UNPRICED_SPEND,
         action="climb-round",
         climb_round=ClimbRound(climb=spec, round=1, edit=edit, deadline=deadline),
     )
@@ -74,6 +76,7 @@ def test_cli_climbs_one_round_proposes_dry_and_reports_the_final_line(
     assert len(actor.requests) == calls
     catalog = load_model_catalog(project.model_catalog_path)
     proposals = ContinuationCommand(
+        spend=UNPRICED_SPEND,
         action="propose-edits",
         edit_proposals=EditProposalSpec(
             climb=spec,
@@ -87,6 +90,7 @@ def test_cli_climbs_one_round_proposes_dry_and_reports_the_final_line(
     refused = _run(tmp_path, "proposals", proposals, "--dry-run")
     assert refused.exit_code == 2 and "no failed train branch" in refused.output
     report = ContinuationCommand(
+        spend=UNPRICED_SPEND,
         action="climb-report",
         climb_report=ClimbReportSpec(climb=spec, rounds=1, deadline=deadline),
     )

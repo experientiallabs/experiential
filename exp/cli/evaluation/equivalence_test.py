@@ -8,6 +8,7 @@ import pytest
 from typer.testing import CliRunner
 
 from exp.cli.app import app
+from exp.cli.evaluation.continuation_context_test import UNPRICED_SPEND
 from exp.cli.evaluation.continuations import ContinuationCommand
 from exp.common.core.artifacts import ArtifactInput
 from exp.common.project import artifact_input
@@ -28,7 +29,9 @@ def test_public_cli_compares_environments_and_runs_its_council(
     project, spec, actors, reviews = equivalence_fixture(tmp_path, monkeypatch)
     request = tmp_path / "equivalence.json"
     request.write_text(
-        ContinuationCommand(action="compare-environments", equivalence=spec).model_dump_json()
+        ContinuationCommand(
+            spend=UNPRICED_SPEND, action="compare-environments", equivalence=spec
+        ).model_dump_json()
     )
     command = [
         "eval",

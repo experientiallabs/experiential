@@ -13,12 +13,10 @@ consent before any credential or provider client is built. Completed work replay
 """
 
 from datetime import UTC, datetime
-from pathlib import Path
-
-from rich.console import Console
 
 from exp.cli.evaluation.continuation_context import ContinuationContext
-from exp.cli.shared.consent import can_prompt, require_spend_consent
+from exp.common.core.artifacts import sha256_json
+from exp.optimize.evaluation.executable.model_costs import CostComponent
 from exp.optimize.evaluation.learning.lesson_evolution import (
     evolve_lessons,
     preflight_evolution,
@@ -53,12 +51,6 @@ def handle_repair_learning(context: ContinuationContext, spec: LearningRepair) -
         context.revision,
         context.dry_run,
     )
-    root, command, yes, non_interactive = (
-        context.root,
-        context.command,
-        context.yes,
-        context.non_interactive,
-    )
     clock = lambda: datetime.now(UTC)  # noqa: E731 - one shared aware clock
     if isinstance(spec, LearningRepairSpec):
         console.print_json(
@@ -78,7 +70,9 @@ def handle_repair_learning(context: ContinuationContext, spec: LearningRepair) -
         if dry_run:
             console.print_json(data=plan.model_dump(mode="json"))
             return
-        if not plan.saved and not _consented(console, root, command, yes, non_interactive, None):
+        if not plan.saved and not context.consent_ceiling(
+            stage=sha256_json(spec.model_dump(mode="json")), known_usd=None
+        ):
             return
         console.print_json(
             data=evolve_lessons(store, spec, code_revision=revision, clock=clock).model_dump(
@@ -96,29 +90,16 @@ def handle_repair_learning(context: ContinuationContext, spec: LearningRepair) -
     if dry_run:
         console.print_json(data=preflight.model_dump(mode="json"))
         return
-    if preflight.to_dispatch and not _consented(
-        console, root, command, yes, non_interactive, preflight.estimated_cost_usd
+    if preflight.to_dispatch and not context.consent_ceiling(
+        stage=sha256_json(spec.model_dump(mode="json")),
+        known_usd=preflight.estimated_cost_usd or 0.0,
+        unpriced=(
+            (CostComponent(preflight.alias, preflight.to_dispatch, None),)
+            if preflight.estimated_cost_usd is None
+            else ()
+        ),
+        remaining=True,
     ):
         return
     reference, lessons = screen_lessons(store, spec, code_revision=revision, clock=clock)
     console.print_json(data={"lesson_set": reference.model_dump(mode="json"), **lessons.summary()})
-
-
-def _consented(
-    console: Console,
-    root: Path,
-    command: str,
-    yes: bool,
-    non_interactive: bool,
-    estimate: float | None,
-) -> bool:
-    """The shared spend question; an unpriced estimate needs explicit authorization."""
-    return require_spend_consent(
-        console,
-        root=root,
-        yes=yes,
-        estimated_cost_usd=estimate,
-        cost_is_upper_bound=estimate is not None,
-        command=command,
-        non_interactive=non_interactive or not can_prompt(console),
-    )

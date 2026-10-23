@@ -55,6 +55,7 @@ from exp.runtime.models.providers.transport import (
     RetryClassification,
     RetryPolicy,
     classify_retry,
+    classify_unrepeatable_retry,
     is_unbilled_attempt,
     propagate_request_attempt_evidence,
     public_error_code,
@@ -724,7 +725,9 @@ class ProviderHttpClient(abc.ABC):
             policy=self._retry_policy,
             deadline=request_deadline,
             attempt_timeout_seconds=completion_timeout,
-            classify=_classify_complete_retry,
+            classify=_classify_complete_retry
+            if self.supports_idempotency_key
+            else _classify_unrepeatable_complete_retry,
         )
         return result.model_copy(
             update={
@@ -833,6 +836,23 @@ def _classify_complete_retry(exception: Exception) -> RetryClassification:
     if isinstance(exception, ProviderRetryableResponseError):
         return RetryClassification(retryable=True, reason="empty_completed_output")
     return classify_retry(exception)
+
+
+def _classify_unrepeatable_complete_retry(exception: Exception) -> RetryClassification:
+    """Classify failures on a wire without an idempotency contract.
+
+    An empty completed output is a known outcome and is retried; an attempt without an HTTP
+    status may have executed, so it is never resent (see `classify_unrepeatable_retry`).
+
+    Args:
+        exception: Error raised by one post-and-parse attempt.
+
+    Returns:
+        A stable retry decision and concise reason.
+    """
+    if isinstance(exception, ProviderRetryableResponseError):
+        return RetryClassification(retryable=True, reason="empty_completed_output")
+    return classify_unrepeatable_retry(exception)
 
 
 def _run_sync[ResultT](

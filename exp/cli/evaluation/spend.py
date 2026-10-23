@@ -6,12 +6,8 @@ from rich.console import Console
 from rich.text import Text
 
 from exp.common.project import ProjectStore
-from exp.optimize.evaluation.executable.costs import (
-    CostComponent,
-    CostedSpec,
-    evaluation_costs,
-    total_cost,
-)
+from exp.optimize.evaluation.executable.costs import CostedSpec, evaluation_costs
+from exp.optimize.evaluation.executable.model_costs import CostComponent, total_cost
 
 
 def review_cost(console: Console, project: ProjectStore, spec: CostedSpec) -> float | None:
@@ -34,3 +30,23 @@ def review_components(console: Console, components: tuple[CostComponent, ...]) -
         known = math.fsum(row.usd for row in components if row.usd is not None)
         console.print(Text(f"Known components: ${known:.6f}; total remains unknown."))
     return total
+
+
+def review_ceiling(
+    console: Console, project: ProjectStore, spec: CostedSpec
+) -> tuple[float, tuple[CostComponent, ...]]:
+    """Show the spec's inventory and return its known subtotal and unpriced components.
+
+    Args:
+        console: Command-owned output console.
+        project: Project whose catalog prices the inventory.
+        spec: Paid action payload.
+
+    Returns:
+        The known-rate subtotal, which becomes the enforced ceiling by default, and every
+        unpriced component.
+    """
+    components = evaluation_costs(project, spec)
+    review_components(console, components)
+    known = math.fsum(row.usd for row in components if row.usd is not None)
+    return known, tuple(row for row in components if row.usd is None)

@@ -744,6 +744,10 @@ def exp(*arguments: str) -> str:
     return flat(result.output)
 
 
+UNPRICED_SPEND: JsonObject = {"unpriced_attempts": 10_000}
+"""Explicit unpriced-attempt ceiling for the fixture's unpriced simulator and decision wire."""
+
+
 def refused(*arguments: str) -> str:
     """Run one ``exp`` command that must fail and return its flattened output."""
     result = CliRunner().invoke(app, list(arguments))
@@ -774,15 +778,24 @@ class Pipeline:
         return exp("eval", self.project.paths.project_id, "--root", str(self.root), *flags)
 
     def operation(self, name: str, operation: JsonObject, *flags: str) -> str:
-        """Run one ``exp eval --continuations`` operation saved as ``name``.json."""
+        """Run one ``exp eval --continuations`` operation saved as ``name``.json.
+
+        The fixture catalog prices the embedder but not the simulator or decision wire, so
+        every operation explicitly authorizes unpriced attempts beside its dollar ceiling.
+        """
         path = self.tmp / f"{name}.json"
-        path.write_text(json.dumps(operation))
+        path.write_text(json.dumps({"spend": UNPRICED_SPEND, **operation}))
+        return self.eval("--continuations", str(path), "--non-interactive", *flags)
+
+    def emitted(self, path: Path, *flags: str) -> str:
+        """Run an operation file another stage emitted, after authorizing its unpriced roles."""
+        path.write_text(json.dumps({"spend": UNPRICED_SPEND, **json.loads(path.read_text())}))
         return self.eval("--continuations", str(path), "--non-interactive", *flags)
 
     def refused(self, name: str, operation: JsonObject) -> str:
         """Run one ``exp eval --continuations`` operation that must fail; return its output."""
         path = self.tmp / f"{name}.json"
-        path.write_text(json.dumps(operation))
+        path.write_text(json.dumps({"spend": UNPRICED_SPEND, **operation}))
         project, root = self.project.paths.project_id, str(self.root)
         return refused(
             "eval", project, "--root", root, "--continuations", str(path), "--non-interactive"
@@ -1546,14 +1559,7 @@ def compare_environments(
     expected_fact = starting_fact(world, index)
     assert _at(configuration, "facts", "facts", "facts", 0, "key") == expected_fact.key
     candidate_checkpoint = ArtifactInput.model_validate(
-        json_tail(
-            pipeline.eval(
-                "--continuations",
-                str(pipeline.tmp / "capture-simulated.json"),
-                "--non-interactive",
-                "--yes",
-            )
-        )
+        json_tail(pipeline.emitted(pipeline.tmp / "capture-simulated.json", "--yes"))
     )
     assert len(pipeline.provider.requests) == calls, "capture makes no model call"
     if world.kind == "records":
@@ -1638,6 +1644,19 @@ def compare_environments(
     operation = {"action": "compare-environments", "equivalence": spec.model_dump(mode="json")}
     output = pipeline.operation("equivalence", operation, "--yes")
     report = json_tail(output)
+    # Every paid role reserved against the one operation ceiling: priced embeddings settled
+    # in dollars, the unpriced simulator and decision wire against the explicit attempt cap.
+    receipts = [
+        json.loads(path.read_text())
+        for path in (project.paths.runtime_directory / "spend").glob("*/receipt.json")
+    ]
+    spend = next(row for row in receipts if str(row["command"]).endswith("equivalence.json"))
+    assert spend["accounted_usd"] <= spend["ceiling_usd"] and spend["in_flight_usd"] == 0
+    assert spend["unpriced_attempts"] > 0 and spend["unknown_usd"] == 0, spend
+    roles = {row["role"]: row for row in spend["roles"]}
+    assert set(roles) == {"embed", "jev", "judge", "world"}, spend
+    assert 0 < roles["embed"]["settled_usd"] <= spend["ceiling_usd"], spend
+    assert all(roles[role]["unpriced_attempts"] for role in ("jev", "judge", "world")), spend
     metrics = _obj(report["metrics"])
     # Paired evidence: the simulator, conditioned on the instance facts and frozen memory,
     # commits the same material consequence as the native world.
@@ -1960,11 +1979,7 @@ def package_and_trial(
     assert "the witness establishes fail, but the label declares pass" in wrong, wrong
     witnessed = json_tail(pipeline.operation("controls", witness))
     assert json.loads((pipeline.tmp / "qualify.json").read_text()) == witnessed
-    qualified = json_tail(
-        pipeline.eval(
-            "--continuations", str(pipeline.tmp / "qualify.json"), "--non-interactive", "--yes"
-        )
-    )
+    qualified = json_tail(pipeline.emitted(pipeline.tmp / "qualify.json", "--yes"))
     assert qualified["qualified"] is True, qualified["refusals"]
     package = pipeline.tmp / "packages" / pipeline.world.kind
     exported = harbor(

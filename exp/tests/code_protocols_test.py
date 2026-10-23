@@ -80,7 +80,7 @@ PROTOCOLS = (
     ),
     Protocol(
         "exp.optimize.evaluation.council.runner:COUNCIL_HARNESS_PROTOCOL",
-        "council-harness-v4",
+        "council-harness-v5",
         (
             "exp.runtime.agents.chat:ChatAgentRuntime",
             "exp.runtime.agents.pi:PiAgentRuntime",

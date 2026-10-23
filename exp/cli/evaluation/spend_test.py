@@ -5,7 +5,7 @@ from io import StringIO
 from rich.console import Console
 
 from exp.cli.evaluation.spend import review_components
-from exp.optimize.evaluation.executable.costs import CostComponent
+from exp.optimize.evaluation.executable.model_costs import CostComponent
 
 
 def test_review_names_unknown_runtime_beside_priced_actor() -> None:

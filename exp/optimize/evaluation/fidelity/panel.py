@@ -8,6 +8,7 @@ refuses interrupted runs unless resumption was asked for, then runs every trace 
 
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextvars import copy_context
 from datetime import UTC, datetime
 from functools import partial
 from threading import Event
@@ -90,7 +91,7 @@ def execute_panel(
     with ThreadPoolExecutor(PANEL_CONCURRENCY) as pool:
         report(progress, PANEL_STAGE, completed=0, total=total)
         futures = [
-            pool.submit(replay, index, prepared)
+            pool.submit(copy_context().run, replay, index, prepared)
             for index, prepared in enumerate(registrations, start=1)
         ]
         try:

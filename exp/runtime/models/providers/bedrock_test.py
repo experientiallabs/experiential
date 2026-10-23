@@ -314,6 +314,35 @@ def test_retries_stay_on_the_same_region_and_model() -> None:
     assert runtime.converse_calls[0]["modelId"] == "exact-model"
 
 
+def test_a_timed_out_converse_call_is_never_redrawn() -> None:
+    """Converse has no idempotency key, so a call whose outcome is unknown is not resent."""
+
+    class _LostRuntime(_FakeBedrockRuntime):
+        """Time out once after the request may have executed, then answer."""
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.attempts = 0
+
+        def converse(self, **request: object) -> Mapping[str, object]:
+            """Raise one read timeout, then delegate to the recording fake."""
+            self.attempts += 1
+            if self.attempts == 1:
+                raise ProviderTransportError("Bedrock request timed out")
+            return super().converse(**request)
+
+    runtime = _LostRuntime()
+    client = BedrockClient(
+        model=_snapshot("exact-model"),
+        region="us-east-1",
+        environment={},
+        runtime_factory=lambda *, region_name: runtime,
+    )
+    with pytest.raises(ProviderTransportError, match="timed out"):
+        client.complete(_request())
+    assert runtime.attempts == 1
+
+
 def test_catalog_requires_a_complete_bedrock_access_key_pair_and_resolves_ambient() -> None:
     """Bedrock rejects half-configured credentials and preserves ambient-chain resolution."""
     with pytest.raises(ValueError, match="api_key_env"):

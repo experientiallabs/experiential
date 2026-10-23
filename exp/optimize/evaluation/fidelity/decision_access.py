@@ -24,6 +24,7 @@ def decision_caller(
     profile = profile_of()
     if profile.dialect != "typesafe_systemone" or not profile.decisions_url:
         raise ValueError("JEV alias does not expose the native decision wire")
+    transport = transport.priced_as(resolved.alias)
 
     def decide(request: DecisionRequest) -> JsonObject:
         """Dispatch one decision; physical attempts share the run's ledger and deadline."""

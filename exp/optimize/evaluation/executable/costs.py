@@ -1,18 +1,16 @@
 """Credential-free planning costs for the complete declared evaluation schedule.
 
 These estimates price full context capacity and every physical allowance, including simulator
-calls. They are deliberately not dollar authorizations: unknown tariffs and arbitrary trusted
-runtime code require explicit consent, and existing dispatch ledgers enforce the attempt limits.
+calls. Their known-rate subtotal becomes the operation's consented spend ceiling, which every
+paid request reserves against at dispatch (``exp.runtime.models.spend_ceiling``). Unknown
+tariffs and arbitrary trusted runtime code stay unpriced and need explicit consent, and existing
+dispatch ledgers enforce the attempt limits.
 """
 
-import math
-from dataclasses import dataclass
 from pathlib import Path
 
 from exp.common.core.artifacts import JsonObject, Sha256, sha256_bytes
 from exp.common.models import load_model_catalog
-from exp.common.models.pricing import completion_cost_reservation
-from exp.common.models.token_cost import schedule_maximum_cost_nano_usd
 from exp.common.project import ProjectStore
 from exp.optimize.evaluation.analysis.actor_decisions import ActorDecisionSpec
 from exp.optimize.evaluation.analysis.cascade_confirmation import (
@@ -42,6 +40,11 @@ from exp.optimize.evaluation.executable import grounded as grounded_runtime
 from exp.optimize.evaluation.executable import induced as induced_runtime
 from exp.optimize.evaluation.executable import mixed as mixed_runtime
 from exp.optimize.evaluation.executable import workbook as workbook_runtime
+from exp.optimize.evaluation.executable.model_costs import (
+    CostComponent,
+    decision_cost,
+    model_cost,
+)
 from exp.optimize.evaluation.executable.task import load_executable_task
 from exp.optimize.evaluation.factory.authoring import AuthorSettings
 from exp.optimize.evaluation.factory.candidates import CandidateBatchSpec
@@ -62,35 +65,7 @@ from exp.optimize.evaluation.hillclimb.rounds import ClimbRound, round_jobs
 from exp.optimize.evaluation.induction.service import InductionSpec
 from exp.optimize.evaluation.tasks.challenge_runs import ChallengeRunSpec, challenge_attempts
 from exp.runtime.agents.cascade import DeciderDefinition
-from exp.runtime.gateway.decisions_contracts import (
-    MAX_DECISION_CRITERIA,
-    MAX_DECISION_INPUT_BYTES,
-    MAX_DECISION_QUESTIONS,
-)
-from exp.runtime.models.registry import RuntimeModelCatalog
 from exp.simulation.world_model.runtime import load_grounded_world_model_artifact
-
-
-@dataclass(frozen=True)
-class CostComponent:
-    """One finite schedule component, or an explicitly unpriced dependency.
-
-    Attributes:
-        name: Role or dependency displayed before consent.
-        attempts: Maximum physical requests included in this component.
-        usd: Known-rate planning estimate; None when necessary prices or bounds are unavailable.
-    """
-
-    name: str
-    attempts: int
-    usd: float | None
-
-    def scaled(self, count: int) -> "CostComponent":
-        """Repeat an unchanged bounded schedule without assuming saved work is free."""
-        return CostComponent(
-            self.name, self.attempts * count, None if self.usd is None else self.usd * count
-        )
-
 
 # Every paid payload with a declared cost inventory; evaluation_costs refuses anything else.
 CostedSpec = (
@@ -122,66 +97,6 @@ CostedSpec = (
     | CascadeFitSpec
     | CascadeConfirmationSpec
 )
-
-
-def model_cost(
-    project: ProjectStore,
-    alias: str,
-    attempts: int,
-    output: int,
-    *,
-    input_tokens: int | None = None,
-) -> CostComponent:
-    """Price known tariff dimensions at full input capacity without resolving credentials."""
-    catalog = load_model_catalog(project.model_catalog_path)
-    model, caps = RuntimeModelCatalog(catalog, environment={}).snapshot(alias)
-    context, input_rate, output_rate = (
-        caps.context_window_tokens if input_tokens is None else input_tokens,
-        caps.input_cost_per_million_tokens_usd,
-        caps.output_cost_per_million_tokens_usd,
-    )
-    if context is None or input_rate is None or (output and output_rate is None):
-        return CostComponent(alias, attempts, None)
-    if output == 0:
-        return CostComponent(alias, attempts, attempts * context * input_rate / 1_000_000)
-    tariff = catalog.models[alias].token_prices
-    if tariff is not None:
-        return CostComponent(
-            alias,
-            attempts,
-            attempts
-            * schedule_maximum_cost_nano_usd(tariff, input_tokens=context, output_tokens=output)
-            / 1_000_000_000,
-        )
-    reservation = completion_cost_reservation(
-        model=model,
-        input_usd_per_million_tokens=input_rate,
-        output_usd_per_million_tokens=output_rate or 0,
-        cached_input_usd_per_million_tokens=caps.cached_input_cost_per_million_tokens_usd
-        or input_rate,
-        cache_write_usd_per_million_tokens=caps.cache_write_cost_per_million_tokens_usd
-        or input_rate,
-        maximum_attempts=attempts,
-        maximum_input_tokens=context,
-        maximum_output_tokens=output,
-    )
-    return CostComponent(alias, attempts, reservation.estimated_maximum_call_cost_usd)
-
-
-def decision_cost(project: ProjectStore, alias: str, attempts: int) -> CostComponent:
-    """Price the decision wire's repeated context and answer allowance, not an embedding.
-
-    Every question can repeat the whole bounded input. These are accounting allowances;
-    the decision provider has no client-set output-token ceiling. Unknown output prices
-    remain unknown even when a deployment usually returns only a short answer.
-    """
-    return model_cost(
-        project,
-        alias,
-        attempts,
-        MAX_DECISION_QUESTIONS * (1024 + 512 * MAX_DECISION_CRITERIA),
-        input_tokens=MAX_DECISION_QUESTIONS * (MAX_DECISION_INPUT_BYTES + 1024),
-    )
 
 
 def runtime_costs(
@@ -495,10 +410,3 @@ def _validity_costs(project: ProjectStore, spec: ValiditySettings) -> tuple[Cost
             for row in evaluation_costs(project, spec.closed_book)
         ),
     )
-
-
-def total_cost(components: tuple[CostComponent, ...]) -> float | None:
-    """Keep an incomplete inventory explicitly unknown instead of reporting a partial total."""
-    if any(row.usd is None for row in components):
-        return None
-    return math.fsum(row.usd for row in components if row.usd is not None)

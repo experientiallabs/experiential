@@ -183,7 +183,9 @@ a consistent synthetic history does not independently establish realistic produc
 to authorize the displayed finite author/actor allowance when prices are unknown. The manifest
 binds seed tasks, capability briefs, independent control witnesses, the shared actor panel,
 coverage strata, deadline and export destination. Runtime inference keeps its separately declared
-allowance; this command does not claim an aggregate dollar ceiling.
+allowance. Consent sets one spend ceiling over every author and actor request, the known-rate
+subtotal. Unpriced roles may use only their displayed physical attempts, and only after an
+explicit confirmation.
 
 Each seed uses the existing two-to-four-candidate author, native feasibility, observable-contract
 qualification, actor panel and Harbor exporter. Related source lineages, traces or equal workflow

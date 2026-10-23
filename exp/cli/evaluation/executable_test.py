@@ -9,6 +9,7 @@ import pytest
 from typer.testing import CliRunner
 
 from exp.cli.app import app
+from exp.cli.evaluation.continuation_context_test import UNPRICED_SPEND
 from exp.cli.evaluation.continuation_studies import ContinuationExport
 from exp.cli.evaluation.continuations import ContinuationCommand
 from exp.cli.evaluation.executable import ExecutableCommand
@@ -38,7 +39,9 @@ def test_cli_constructs_replayable_assets_and_rejects_bad_dry_run(tmp_path: Path
     path = tmp_path / "construct.json"
     spec = linked_spec()
     command = ContinuationCommand(
-        action="harbor", harbor=ExecutableCommand(action="construct-assets", construction=spec)
+        spend=UNPRICED_SPEND,
+        action="harbor",
+        harbor=ExecutableCommand(action="construct-assets", construction=spec),
     )
     path.write_text(command.model_dump_json())
     args = [
@@ -69,7 +72,9 @@ def test_cli_constructs_replayable_assets_and_rejects_bad_dry_run(tmp_path: Path
     bad = ConstructionSpec.model_validate(raw)
     path.write_text(
         ContinuationCommand(
-            action="harbor", harbor=ExecutableCommand(action="construct-assets", construction=bad)
+            spend=UNPRICED_SPEND,
+            action="harbor",
+            harbor=ExecutableCommand(action="construct-assets", construction=bad),
         ).model_dump_json()
     )
     before = project.artifacts.list_ids()
@@ -107,7 +112,9 @@ def test_cli_serves_expired_frozen_simulator_under_one_explicit_trial_allowance(
         provider_limits=limits,
     )
     path = tmp_path / "serve.json"
-    path.write_text(ContinuationCommand(action="harbor", harbor=command).model_dump_json())
+    path.write_text(
+        ContinuationCommand(spend=UNPRICED_SPEND, action="harbor", harbor=command).model_dump_json()
+    )
     args = [
         "eval",
         project.paths.project_id,
@@ -149,7 +156,9 @@ def test_cli_serves_expired_frozen_simulator_under_one_explicit_trial_allowance(
             )
         }
     )
-    path.write_text(ContinuationCommand(action="harbor", harbor=changed).model_dump_json())
+    path.write_text(
+        ContinuationCommand(spend=UNPRICED_SPEND, action="harbor", harbor=changed).model_dump_json()
+    )
     result = runner.invoke(app, args)
     assert result.exit_code != 0 and "authority changed" in result.output
     assert len(transport.requests) == 1
@@ -177,7 +186,9 @@ def test_cli_exports_and_serves_qualified_workbook_without_leaking_credentials(
         directory=package,
         name="test/workbook",
     )
-    path.write_text(ContinuationCommand(action="harbor", harbor=command).model_dump_json())
+    path.write_text(
+        ContinuationCommand(spend=UNPRICED_SPEND, action="harbor", harbor=command).model_dump_json()
+    )
     args = [
         "eval",
         project.paths.project_id,
@@ -193,7 +204,9 @@ def test_cli_exports_and_serves_qualified_workbook_without_leaking_credentials(
     assert exported.exit_code == 0, exported.output
     path.write_text(
         ContinuationCommand(
-            action="harbor", harbor=ExecutableCommand(action="verify", directory=package)
+            spend=UNPRICED_SPEND,
+            action="harbor",
+            harbor=ExecutableCommand(action="verify", directory=package),
         ).model_dump_json()
     )
     preview = runner.invoke(app, [*args, "--dry-run"])
@@ -212,7 +225,9 @@ def test_cli_exports_and_serves_qualified_workbook_without_leaking_credentials(
         verifier_connection_file=verifier_file,
         duration_seconds=1,
     )
-    path.write_text(ContinuationCommand(action="harbor", harbor=command).model_dump_json())
+    path.write_text(
+        ContinuationCommand(spend=UNPRICED_SPEND, action="harbor", harbor=command).model_dump_json()
+    )
     responses = []
 
     class ExternalHarborClient:
@@ -244,7 +259,9 @@ def test_cli_exports_and_serves_qualified_workbook_without_leaking_credentials(
     (package / "task.toml").write_text((package / "task.toml").read_text() + "\n")
     path.write_text(
         ContinuationCommand(
-            action="harbor", harbor=ExecutableCommand(action="verify", directory=package)
+            spend=UNPRICED_SPEND,
+            action="harbor",
+            harbor=ExecutableCommand(action="verify", directory=package),
         ).model_dump_json()
     )
     tampered = runner.invoke(app, args)
@@ -316,7 +333,7 @@ def test_cli_registers_a_specification_and_witnesses_controls_for_qualification(
     )
     path.write_text(
         ContinuationCommand(
-            action="register-specification", specification=registration
+            spend=UNPRICED_SPEND, action="register-specification", specification=registration
         ).model_dump_json()
     )
     before = project.artifacts.list_ids(artifact_type="evaluation-specification")
@@ -332,7 +349,9 @@ def test_cli_registers_a_specification_and_witnesses_controls_for_qualification(
     command = ExecutableCommand(
         action="witness-controls", controls=controls, operation_file=qualify
     )
-    path.write_text(ContinuationCommand(action="harbor", harbor=command).model_dump_json())
+    path.write_text(
+        ContinuationCommand(spend=UNPRICED_SPEND, action="harbor", harbor=command).model_dump_json()
+    )
     planned = runner.invoke(app, [*args, "--dry-run"])
     assert planned.exit_code == 0 and "10 control outcomes resolved" in planned.output
     assert not qualify.exists()
@@ -420,7 +439,9 @@ def test_dry_run_checks_references_and_runtime_without_publishing(
             action="qualify", qualification_spec=spec.model_copy(update={"task": bad})
         )
     path = tmp_path / "readiness.json"
-    path.write_text(ContinuationCommand(action="harbor", harbor=command).model_dump_json())
+    path.write_text(
+        ContinuationCommand(spend=UNPRICED_SPEND, action="harbor", harbor=command).model_dump_json()
+    )
     before = set(project.artifacts.list_ids())
     result = CliRunner().invoke(
         app,
@@ -458,6 +479,7 @@ def test_cli_prepares_and_executes_qualified_training_job(
     operation_file = tmp_path / "generation.json"
     path.write_text(
         ContinuationCommand(
+            spend=UNPRICED_SPEND,
             action="harbor",
             harbor=ExecutableCommand(
                 action="prepare-training",
@@ -489,6 +511,11 @@ def test_cli_prepares_and_executes_qualified_training_job(
     assert ContinuationCommand.model_validate_json(operation_file.read_text()) == operation
     args[args.index(str(path))] = str(operation_file)
     policy = registered_policy(project.artifacts)
+    # The emitted operation carries no spend choices; the operator authorizes the unpriced
+    # fixture actor explicitly before running it.
+    operation_file.write_text(
+        operation.model_copy(update={"spend": UNPRICED_SPEND}).model_dump_json()
+    )
     execution = runner.invoke(app, args)
     assert execution.exit_code == 0, execution.output
     assert len(transport.requests) == 3
@@ -507,6 +534,7 @@ def test_cli_prepares_and_executes_qualified_training_job(
     operation.job.runtime_file.unlink()
     operation_file.write_text(
         ContinuationCommand(
+            spend=UNPRICED_SPEND,
             action="export",
             export=ContinuationExport(
                 studies=(reference,), policy=policy, dataset=SFTBuildSpec(held_out_fraction=0)
@@ -539,6 +567,7 @@ def test_cli_authors_worlds_with_consent_then_replays_without_provider_or_runtim
     operation = tmp_path / "propose-worlds.json"
     operation.write_text(
         ContinuationCommand(
+            spend=UNPRICED_SPEND,
             action="harbor",
             harbor=ExecutableCommand(
                 action="propose-worlds",
@@ -606,10 +635,11 @@ def test_serve_spend_prompt_names_the_spec_file_the_user_passed(
         commands.append(command)
         return False
 
-    monkeypatch.setattr("exp.cli.evaluation.executable.require_spend_consent", decline)
+    monkeypatch.setattr("exp.cli.evaluation.continuation_context.require_spend_consent", decline)
     path = tmp_path / "my-serve-request.json"
     path.write_text(
         ContinuationCommand(
+            spend=UNPRICED_SPEND,
             action="harbor",
             harbor=ExecutableCommand(
                 action="serve",

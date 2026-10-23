@@ -144,9 +144,12 @@ def _miss_tool(state: JsonValue) -> str:
 
 
 def continuation(root: Path, tmp_path: Path, operation: JsonObject, *flags: str) -> str:
-    """Run ``exp eval PROJECT --continuations`` and return its flattened output."""
+    """Run ``exp eval PROJECT --continuations`` and return its flattened output.
+
+    The fixture's decision wire is unpriced, so the operation authorizes unpriced attempts.
+    """
     path = tmp_path / "operation.json"
-    path.write_text(json.dumps(operation))
+    path.write_text(json.dumps({"spend": {"unpriced_attempts": 1000}, **operation}))
     result = CliRunner().invoke(
         app,
         ["eval", PROJECT, "--root", str(root), "--continuations", str(path), *flags],

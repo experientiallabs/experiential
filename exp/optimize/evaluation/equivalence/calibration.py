@@ -16,9 +16,15 @@ Verdicts are conservative in both directions:
 - unassessable: any planned pair is unknown, fewer units than ``minimum_units`` were measured,
   the reference never admitted the dimension in enough units (both-fail or one-sided panels),
   or the interval crosses the margin. A nonsignificant difference is not equivalence.
+
+State fidelity is admitted only from a panel whose rubric declares ``full`` state coverage.
+Under ``partial`` or ``unknown`` coverage the declared probes compare part of the state, which
+measures actor-level agreement, not state fidelity: agreement there stays unassessable, while a
+demonstrated disagreement on the observed part still refuses.
 """
 
 from collections.abc import Sequence
+from typing import Literal
 
 from exp.common.core.artifacts import ArtifactInput, ContractModel, JsonObject, Sha256
 from exp.common.evaluations.uncertainty import unit_difference_summary, unit_mean_summary
@@ -145,6 +151,8 @@ def calibrate(
     policy: AdmissionPolicy,
     measurements: Sequence[PairMeasurement],
     cases: Sequence[CaseScope],
+    *,
+    state_coverage: Literal["full", "partial", "unknown"],
 ) -> PolicyCalibration:
     """Evaluate every dimension of a paired panel against the policy's margins.
 
@@ -153,6 +161,8 @@ def calibrate(
         policy: The registered policy.
         measurements: Every planned pair under both comparison conditions.
         cases: Coordinates of every registered case, by index.
+        state_coverage: The rubric's declared coverage of environment state; only ``full``
+            coverage can admit state fidelity.
 
     Returns:
         The per-dimension calibration with family-clustered intervals.
@@ -162,7 +172,7 @@ def calibrate(
         policy=policy_ref,
         cases=tuple(cases),
         dimensions=tuple(
-            _dimension(policy.rule(dimension), policy, measurements, scopes)
+            _dimension(policy.rule(dimension), policy, measurements, scopes, state_coverage)
             for dimension in DIMENSIONS
         ),
     )
@@ -173,6 +183,7 @@ def _dimension(
     policy: AdmissionPolicy,
     measurements: Sequence[PairMeasurement],
     cases: dict[int, CaseScope],
+    state_coverage: Literal["full", "partial", "unknown"],
 ) -> DimensionCalibration:
     """Group one dimension's pairs by unit and decide it against the rule's margin."""
     index = DIMENSIONS.index(rule.dimension)
@@ -214,6 +225,14 @@ def _dimension(
     excess = unit_difference_summary(disagreement["candidate"], disagreement["reference_control"])
     fake = unit_mean_summary(false_pass["candidate"])
     status, reason = _verdict(rule, candidate, excess, fake, unknown, len(support))
+    if rule.dimension == "state_fidelity" and state_coverage != "full" and status == "admitted":
+        status, reason = (
+            "unassessable",
+            (
+                f"state coverage is {state_coverage}: the declared probes measure actor-level "
+                "agreement on part of the state, not state fidelity"
+            ),
+        )
     return DimensionCalibration(
         dimension=rule.dimension,
         status=status,

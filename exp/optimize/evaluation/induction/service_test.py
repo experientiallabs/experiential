@@ -10,6 +10,7 @@ from exp.common.core.artifacts import sha256_json
 from exp.common.core.verified_cache import VerifiedCache
 from exp.common.models import load_model_catalog
 from exp.common.project import ProjectStore
+from exp.common.project.causality import cites
 from exp.common.tasks import ToolSchema
 from exp.common.traces import Trace
 from exp.common.traces import store as trace_store
@@ -105,6 +106,12 @@ def test_induction_saves_every_draw_and_replays_without_calls(
         if row.artifact_id.endswith("-proposal")
     ]
     assert len(proposals) == len(PROGRAMS)
+    build = project.load_project().build
+    assert build is not None
+    for evidence in (build.trace_dataset, build.task_set):
+        assert cites(project.artifacts, reference.artifact_id, evidence), (
+            "the induction cites the fit evidence its programs were validated on"
+        )
     request = json.loads(
         project.artifacts.read_bytes(
             f"{reference.artifact_id}-tool-1-attempt-0-intent", "request.json"

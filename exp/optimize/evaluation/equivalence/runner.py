@@ -605,6 +605,7 @@ def _assemble(
             load_admission_policy(project.artifacts, spec.policy),
             measurements,
             scopes,
+            state_coverage=rubric.state_coverage,
         )
     )
     return EquivalenceReport(

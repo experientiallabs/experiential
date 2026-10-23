@@ -1,10 +1,14 @@
 """Ground a simulated executable world in a project's build, ready for ``capture``.
 
-A grounded runtime definition pins the build's world model, the latest learned memory and the
-frozen model catalog. This module reads those references from the project store, so an
-operator declares only the simulated domains, their projection and an allowance, and receives
-a capture definition the ``capture`` action runs unchanged. The task must be development data
-of the same build; held-out tasks are refused.
+A grounded runtime definition pins the build's fit-only world model, the latest fit-only
+learned memory and the frozen model catalog. A development world never reads held-out evidence:
+the fit-only index retrieves no held-out trace, and the fit-only memory (learned by
+``exp eval PROJECT --audit N``) reserved every held-out lineage before it learned anything. The
+memory ``exp build`` learns from every trace is for serving and is never grounded here. This
+module reads those references from the project store, so an operator declares only the
+simulated domains, their projection and an allowance, and receives a capture definition the
+``capture`` action runs unchanged. The task must be development data of the same build;
+held-out tasks are refused.
 """
 
 from pathlib import Path
@@ -25,6 +29,7 @@ from exp.optimize.evaluation.executable.grounded import (
     preflight_grounded_runtime,
 )
 from exp.optimize.evaluation.fidelity.instance_facts import ReplayFacts
+from exp.optimize.evaluation.learning.lineage import plan_world_model
 from exp.optimize.evaluation.learning.profile import learned_evaluation_memory
 from exp.runtime.environments.world_contracts import WorldManifest
 from exp.simulation.development_scope import development_task
@@ -43,7 +48,8 @@ class GroundedRuntimeRequest(ContractModel):
         facts: Explicit validated instance facts about the starting world.
         trace_facts: Read the instance facts the task's source trace package supplied instead;
             the build's trace dataset then joins the capture's sources.
-        memory: ``learned`` pins the build's latest learned memory; ``none`` reads no memory.
+        memory: ``learned`` pins the build's latest fit-only learned memory; ``none`` reads no
+            memory.
         maximum_model_calls: Actor allowance of the emitted capture definition.
         maximum_physical_attempts: The simulator's cumulative provider-attempt ceiling.
         deadline: Shared deadline for every simulator provider call.
@@ -83,9 +89,9 @@ def grounded_capture(project: ProjectStore, request: GroundedRuntimeRequest) -> 
         A capture definition for the built-in grounded runtime factory.
 
     Raises:
-        ValueError: The task is not development data, the build learned no memory while
-            ``learned`` is requested, the trace supplies no usable facts, or the definition
-            fails a runtime or capture check.
+        ValueError: The task is not development data, the build has no fit-only learned
+            memory while ``learned`` is requested, the trace supplies no usable facts, or the
+            definition fails a runtime or capture check.
     """
     task = development_task(project, request.task_id)
     if request.tools:
@@ -95,13 +101,14 @@ def grounded_capture(project: ProjectStore, request: GroundedRuntimeRequest) -> 
         raise ValueError("grounding needs a completed build; run exp build first")
     catalog = load_model_catalog(project.model_catalog_path)
     memory = None
-    world_model = build.world_model
+    world_model = plan_world_model(project.artifacts, build, "fit")
     if request.memory == "learned":
-        memory = learned_evaluation_memory(project, catalog)
+        memory = learned_evaluation_memory(project, catalog, "fit")
         if memory is None:
             raise ValueError(
-                "the build learned no simulator memory; set memory to none, or add a native "
-                "decision model to the catalog and run exp build again"
+                "the build has no fit-only simulator memory, and a development world never "
+                "reads the memory learned from held-out traces; run exp eval PROJECT --audit N "
+                "to learn the fit traces, or set memory to none"
             )
         world_model = memory.world_model
     facts, sources = request.facts, (world_model,)

@@ -43,7 +43,12 @@ def evolve(
     }
     if library is not None:
         request["library"] = library.model_dump(mode="json")
-    return {"action": "repair-learning", "learning_repair": request}
+    return {
+        "action": "repair-learning",
+        "learning_repair": request,
+        # Lesson evolution has no cost inventory, so the operation names its ceiling.
+        "spend": {"ceiling_usd": 1.0, "unpriced_attempts": 1000},
+    }
 
 
 def result(output: str) -> EvolutionResult:

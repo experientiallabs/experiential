@@ -121,3 +121,50 @@ def test_anthropic_messages_defines_no_idempotency_header_so_no_intent_key_is_de
     keys = [transport.requests[0].headers["Idempotency-Key"] for transport in transports]
     assert not any(key.startswith("exp-intent-") for key in keys)
     assert keys[0] != keys[1]
+
+
+def test_a_wire_without_idempotency_never_redraws_an_ambiguous_outcome() -> None:
+    """A lost Messages call is not resent in process; a definite overload answer is retried."""
+    retrying = RetryPolicy(maximum_attempts=3, initial_delay_seconds=0, maximum_delay_seconds=0)
+    ok = JsonHttpResponse(status_code=200, body=_MESSAGES_OK)
+
+    def anthropic(transport: ScriptedJsonTransport) -> AnthropicClient:
+        """A Messages client allowed three attempts."""
+        return AnthropicClient(
+            model=_snapshot("anthropic", "claude-fixture"),
+            api_key="fixture-key",
+            base_url="https://anthropic.fixture/v1",
+            transport=transport,
+            retry_policy=retrying,
+        )
+
+    lost = ScriptedJsonTransport([ProviderTransportError("connection reset after send"), ok])
+    with pytest.raises(ProviderTransportError, match="connection reset"):
+        anthropic(lost).complete(_request())
+    assert len(lost.requests) == 1, "an unknown outcome is never redrawn"
+    overloaded = ScriptedJsonTransport(
+        [JsonHttpResponse(status_code=503, body={"error": {"type": "overloaded"}}), ok]
+    )
+    assert anthropic(overloaded).complete(_request()).output.content == "ok"
+    assert len(overloaded.requests) == 2
+
+
+def test_an_idempotent_wire_resends_an_ambiguous_outcome_under_one_key() -> None:
+    """The OpenAI-family wire deduplicates by key, so a resend after a lost call is safe."""
+    retrying = RetryPolicy(maximum_attempts=3, initial_delay_seconds=0, maximum_delay_seconds=0)
+    transport = ScriptedJsonTransport(
+        [
+            ProviderTransportError("connection reset after send"),
+            JsonHttpResponse(status_code=200, body=_CHAT_OK),
+        ]
+    )
+    client = OpenAICompatibleClient(
+        model=_snapshot(),
+        base_url="https://compatible.fixture/v1",
+        api_key="fixture-key",
+        transport=transport,
+        retry_policy=retrying,
+    )
+    assert client.complete(_request()).output.content == "ok"
+    keys = {row.headers["Idempotency-Key"] for row in transport.requests}
+    assert len(transport.requests) == 2 and len(keys) == 1

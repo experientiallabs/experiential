@@ -592,6 +592,30 @@ def classify_retry(exception: Exception) -> RetryClassification:
     return RetryClassification(retryable=False, reason="non_transport_error")
 
 
+def classify_unrepeatable_retry(exception: Exception) -> RetryClassification:
+    """Classify one error for a wire that cannot deduplicate a resend of the same request.
+
+    A failure that carries no HTTP status (a lost connection, a timeout, a socket error) may
+    follow dispatch, so its outcome is unknown. Without an idempotency contract a resend could
+    execute the request twice and keep the second draw, so it is never retried in process; the
+    error reaches the durable owner, which keeps the outcome unknown. A definite HTTP answer is
+    classified as :func:`classify_retry` classifies it.
+
+    Args:
+        exception: Error raised by one request attempt.
+
+    Returns:
+        A stable retry decision and concise reason.
+    """
+    if isinstance(exception, ProviderTransportError):
+        if exception.status_code is None:
+            return RetryClassification(retryable=False, reason="outcome_unknown")
+        return classify_retry(exception)
+    if isinstance(exception, OSError):
+        return RetryClassification(retryable=False, reason="outcome_unknown")
+    return classify_retry(exception)
+
+
 def run_with_retry[ResultT](
     operation: Callable[[], ResultT],
     *,

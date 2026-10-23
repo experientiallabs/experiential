@@ -41,7 +41,7 @@ from exp.optimize.evaluation.audit.panel_test import (
     episode,
 )
 from exp.optimize.evaluation.contracts import EvaluationBudget
-from exp.optimize.evaluation.fidelity.runner import FidelityRetrieval
+from exp.optimize.evaluation.fidelity.runner import FidelityRetrieval, FidelitySpec
 from exp.optimize.evaluation.fidelity.runner_test import source_project
 from exp.optimize.evaluation.learning import profile as learned_memory
 from exp.optimize.evaluation.learning.profile import (
@@ -67,7 +67,11 @@ from exp.optimize.evaluation.tests.fidelity_memory_test import memory_project
 from exp.optimize.router.automatic.provisional import prepare_hosted_provisional_judge
 from exp.runtime.gateway.decisions_contracts import DecisionRequest, NoulQuestion
 from exp.runtime.models import RuntimeModelCatalog
-from exp.runtime.models.providers.transport import JsonHttpResponse, ScriptedJsonTransport
+from exp.runtime.models.providers.transport import (
+    JsonHttpResponse,
+    ProviderTransportError,
+    ScriptedJsonTransport,
+)
 from exp.simulation.retrieval.jev import JEVPolicy
 from exp.simulation.world_model.experience_memory import memory_head
 
@@ -606,11 +610,10 @@ def test_concurrent_recall_waits_for_one_saved_answer(
     assert len(wire.requests) == 1
 
 
-@pytest.mark.parametrize("replacement_unknown", [False, True])
-def test_explicit_recall_recovery_preserves_original_and_never_redraws_twice(
-    tmp_path: Path, replacement_unknown: bool
-) -> None:
-    """A single exact permit recovers a read-only decision or retains its second ambiguity."""
+def recall_fixture(
+    tmp_path: Path,
+) -> tuple[ProjectStore, FidelitySpec, EvaluationMemory, RuntimeModelCatalog, DecisionRequest]:
+    """A project, pinned memory and catalog whose recall alias speaks the native decision wire."""
     project, spec = source_project(tmp_path)
     config = load_model_catalog(project.model_catalog_path)
     config = config.model_copy(
@@ -638,6 +641,56 @@ def test_explicit_recall_recovery_preserves_original_and_never_redraws_twice(
         state={"record": "permitted"},
         questions={"relevant": NoulQuestion(instructions="Is this record relevant?")},
     )
+
+    return project, spec, memory, catalog, request
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        ProviderTransportError("connection lost after dispatch"),
+        TimeoutError("read timed out"),
+        ConnectionResetError("socket reset"),
+    ],
+)
+def test_an_ambiguous_recall_failure_is_never_redrawn_in_process(
+    tmp_path: Path, failure: Exception
+) -> None:
+    """A dispatched recall whose outcome is unknown is sent once and stays unknown on resume."""
+    project, _, memory, catalog, request = recall_fixture(tmp_path)
+    success = JsonHttpResponse(status_code=200, body={"answers": {"relevant": 0.9}})
+    lost = ScriptedJsonTransport([failure, success, success])
+    with pytest.raises(type(failure)):
+        _recorded_decisions(project, memory, catalog, "fixture", lost)(request)
+    assert len(lost.requests) == 1, "an unknown outcome is never redrawn"
+    assert not project.artifacts.list_ids(artifact_type="evaluation-recall-decision")
+    with pytest.raises(ValueError, match="unknown outcome"):
+        _recorded_decisions(project, memory, catalog, "fixture", lost)(request)
+    assert len(lost.requests) == 1, "a resume refuses instead of redrawing"
+
+
+@pytest.mark.parametrize("status", [429, 503])
+def test_a_definite_recall_answer_is_retried(tmp_path: Path, status: int) -> None:
+    """A definite HTTP refusal is a known outcome without a decision, so the request is resent."""
+    project, _, memory, catalog, request = recall_fixture(tmp_path)
+    limited = ScriptedJsonTransport(
+        [
+            JsonHttpResponse(status_code=status, body={"error": "refused"}),
+            JsonHttpResponse(status_code=200, body={"answers": {"relevant": 0.9}}),
+        ]
+    )
+    decision = _recorded_decisions(project, memory, catalog, "fixture", limited)(request)
+    assert decision == {"answers": {"relevant": 0.9}}
+    assert len(limited.requests) == 2
+    assert limited.requests[0].payload == limited.requests[1].payload
+
+
+@pytest.mark.parametrize("replacement_unknown", [False, True])
+def test_explicit_recall_recovery_preserves_original_and_never_redraws_twice(
+    tmp_path: Path, replacement_unknown: bool
+) -> None:
+    """A single exact permit recovers a read-only decision or retains its second ambiguity."""
+    project, spec, memory, catalog, request = recall_fixture(tmp_path)
 
     class InterruptedTransport(ScriptedJsonTransport):
         """Record a physical dispatch, then simulate process loss before response retention."""

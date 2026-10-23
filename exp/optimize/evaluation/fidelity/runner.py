@@ -100,6 +100,7 @@ from exp.simulation.world_model.runtime import (
     load_grounded_world_model,
     load_grounded_world_model_artifact,
 )
+from exp.simulation.world_model.session_guidance import SessionGuidance, SessionGuidancePolicy
 from exp.simulation.world_model.session_research import OnlineResearchPolicy
 
 
@@ -175,6 +176,7 @@ class FidelitySpec(ContractModel):
             reason, within the same turn; refused output is never repaired.
         judged: False skips the judge; the report records it as not run. Learning uses it:
             its score is exact replies, so a judge call per trace would buy nothing.
+        guidance: Optional temporary session guidance from retrieved originals, never persisted.
         facts: Validated instance facts of the replayed instance, delivered to predictions in
             their own channel by state version; part of the run identity.
     """
@@ -206,6 +208,7 @@ class FidelitySpec(ContractModel):
     proposal_reasks: int = Field(default=0, ge=0, le=3, strict=True, exclude_if=lambda v: not v)
     judged: bool = Field(default=True, strict=True, exclude_if=lambda value: value)
     facts: ReplayFacts | None = Field(default=None, exclude_if=lambda value: value is None)
+    guidance: SessionGuidancePolicy | None = Field(default=None, exclude_if=lambda v: v is None)
 
     @model_validator(mode="after")
     def separate_references(self) -> "FidelitySpec":
@@ -237,6 +240,8 @@ class FidelitySpec(ContractModel):
             raise ValueError("evidence reading requires a registered decision-model alias")
         if self.memory is not None and self.retrieval is None:
             raise ValueError("memory delivery requires a registered JEV retrieval policy")
+        if self.guidance is not None and (self.online_research or self.memory_learns):
+            raise ValueError("session guidance is temporary: frozen or memory-free replays only")
         if self.memory is not None and (self.memory.mode == "learn") != (
             self.online_research is not None
         ):
@@ -248,6 +253,11 @@ class FidelitySpec(ContractModel):
         ):
             raise ValueError("online research must register the spec's JEV memory selector")
         return self
+
+    @property
+    def memory_learns(self) -> bool:
+        """Whether this run publishes memory."""
+        return self.memory is not None and self.memory.mode == "learn"
 
     def budget(self, role: Literal["prediction", "investigation", "judging"]) -> RoleBudget:
         """The registered budget for one role, or the shared legacy allowance."""
@@ -777,6 +787,13 @@ def execute_fidelity_evaluation(
             )
         else:
             _record_resumption(project, prepared, intent, window, now())
+        guide = completion(investigating, structured=True, role="investigation")  # guidance only
+        guidance = None if spec.guidance is None else SessionGuidance(
+            spec.guidance, guide, project.artifacts, session_id=prepared.id,
+            operations=tuple(action.call_id for action in spec.workload.actions),
+            code_revision=prepared.code_revision, clock=now,
+            profile_sha256=guide.completion_profile_sha256, resumption=resumption,
+        )  # fmt: skip
         report(progress, "Loading simulator and memory")
         session = open_grounded_session(
             runtime=runtime,
@@ -816,6 +833,7 @@ def execute_fidelity_evaluation(
             or spec.retrieval is not None,
             facts=None if spec.facts is None else spec.facts.facts,
             facts_version=0 if spec.facts is None else spec.facts.first_version,
+            prediction_reader=guidance,
         )
 
         def skipped_judge(body: JsonObject, logical_id: str) -> JsonObject:

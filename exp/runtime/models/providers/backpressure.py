@@ -229,7 +229,7 @@ def default_admission_path() -> Path:
     return provider_data_dir() / ADMISSION_DATABASE_NAME
 
 
-def _process_start(pid: int) -> str | None:
+def process_start(pid: int) -> str | None:
     """Return a Linux process start-time token, or None where ``/proc`` is unavailable."""
     if not sys.platform.startswith("linux"):
         return None
@@ -272,7 +272,7 @@ def holder_alive(pid: int, start: str | None) -> bool:
         return True
     if _process_state(pid) in {"Z", "X"}:
         return False
-    return start is None or _process_start(pid) in {None, start}
+    return start is None or process_start(pid) in {None, start}
 
 
 class HostProviderAdmission:
@@ -301,7 +301,7 @@ class HostProviderAdmission:
         self._path, self._limits = path, limits
         self._clock, self._sleep = clock, sleep
         self._pid = os.getpid()
-        self._start = _process_start(self._pid)
+        self._start = process_start(self._pid)
         path.parent.mkdir(parents=True, exist_ok=True)
         connection = connect_database(path)
         try:

@@ -8,6 +8,8 @@ case, condition and dimension comparisons, so the paired workflow evidence is om
 from collections.abc import Sequence
 from typing import Literal
 
+import pytest
+
 from exp.common.core.artifacts import ArtifactInput, sha256_json
 from exp.optimize.evaluation.continuations.study import ContinuationBranch
 from exp.optimize.evaluation.equivalence.calibration import CaseScope, PolicyCalibration, calibrate
@@ -78,10 +80,12 @@ def panel(
 
 
 def calibrated(
-    policy: AdmissionPolicy, data: tuple[Sequence[PairMeasurement], Sequence[CaseScope]]
+    policy: AdmissionPolicy,
+    data: tuple[Sequence[PairMeasurement], Sequence[CaseScope]],
+    state_coverage: Literal["full", "partial", "unknown"] = "full",
 ) -> PolicyCalibration:
-    """Calibrate one synthetic panel under a policy."""
-    return calibrate(POLICY, policy, *data)
+    """Calibrate one synthetic panel under a policy, with full state coverage by default."""
+    return calibrate(POLICY, policy, *data, state_coverage=state_coverage)
 
 
 def test_agreement_over_enough_families_admits_and_counts_families_not_cases() -> None:
@@ -125,6 +129,21 @@ def test_coverage_needs_the_unit_world_and_actor_measured_together() -> None:
     assert result.covers("goal_success", "family:lineage-2", other, ACTOR)
     assert not result.covers("goal_success", "family:lineage-0", other, ACTOR)
     assert not result.covers("goal_success", "family:lineage-2", WORLD, ACTOR)
+
+
+@pytest.mark.parametrize("coverage", ["partial", "unknown"])
+def test_partial_state_coverage_never_admits_state_fidelity(
+    coverage: Literal["partial", "unknown"],
+) -> None:
+    """Probe agreement over part of the state is actor equivalence, not state fidelity."""
+    result = calibrated(fixture_policy(), panel(3, 2, SIMULATED_PASS), coverage)
+    assert result.dimension("goal_success").status == "admitted"
+    fidelity = result.dimension("state_fidelity")
+    assert fidelity.status == "unassessable"
+    assert f"state coverage is {coverage}" in fidelity.reason
+    assert "not state fidelity" in fidelity.reason
+    wrong = calibrated(fixture_policy(margin=0.2), panel(6, 1, SIMULATED_FAIL), coverage)
+    assert wrong.dimension("state_fidelity").status == "refused", "disagreement still refuses"
 
 
 def test_declared_families_merge_lineages_into_fewer_units() -> None:

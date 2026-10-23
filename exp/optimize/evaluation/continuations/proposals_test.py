@@ -8,6 +8,7 @@ from pydantic import JsonValue
 from typer.testing import CliRunner
 
 from exp.cli.app import app
+from exp.cli.evaluation.continuation_context_test import UNPRICED_SPEND
 from exp.cli.evaluation.continuations import ContinuationCommand
 from exp.common.core.artifacts import JsonObject
 from exp.common.models import ModelMessage, ModelRequest, load_model_catalog
@@ -227,7 +228,7 @@ def test_cli_selection_and_replay(tmp_path: Path, monkeypatch: pytest.MonkeyPatc
     path = tmp_path / "select.json"
     path.write_text(
         ContinuationCommand(
-            action="propose-checkpoints", checkpoint_proposals=spec
+            spend=UNPRICED_SPEND, action="propose-checkpoints", checkpoint_proposals=spec
         ).model_dump_json()
     )
     args = ["eval", "case", "--root", str(tmp_path), "--continuations", str(path)]

@@ -7,6 +7,7 @@ import pytest
 from typer.testing import CliRunner
 
 from exp.cli.app import app
+from exp.cli.evaluation.continuation_context_test import UNPRICED_SPEND
 from exp.cli.evaluation.continuations import ContinuationCommand
 from exp.optimize.evaluation.induction.service import TransitionValidationSpec
 from exp.optimize.evaluation.induction.service_test import PROGRAMS, induction_fixture
@@ -19,7 +20,9 @@ def test_induction_previews_on_dry_run_asks_consent_then_replays_free(
     project, spec, transport = induction_fixture(tmp_path, monkeypatch)
     operation = tmp_path / "induce.json"
     operation.write_text(
-        ContinuationCommand(action="induce-transitions", induction=spec).model_dump_json()
+        ContinuationCommand(
+            spend=UNPRICED_SPEND, action="induce-transitions", induction=spec
+        ).model_dump_json()
     )
     command = [
         "eval",
@@ -49,6 +52,7 @@ def test_induction_previews_on_dry_run_asks_consent_then_replays_free(
     reference = summary["reference"]
     validation.write_text(
         ContinuationCommand(
+            spend=UNPRICED_SPEND,
             action="validate-transitions",
             transition_validation=TransitionValidationSpec.model_validate({"induction": reference}),
         ).model_dump_json()

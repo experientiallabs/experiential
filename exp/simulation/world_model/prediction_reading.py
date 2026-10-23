@@ -8,6 +8,7 @@ import copy
 import json
 from collections.abc import Mapping
 from dataclasses import replace
+from typing import Protocol
 
 from pydantic import Field
 
@@ -30,6 +31,24 @@ PREDICTION_USE = """The prediction_evidence packet contains exact prior observat
 fallible readers. Support and contradiction are local judgments, not verified rules or current
 state. Preserve original authority and scope. Missing or unread evidence remains unknown.
 """
+
+
+class PredictionPreparation(Protocol):
+    """One extra, durable step that rewrites a framed prediction request before dispatch.
+
+    Prediction reading and session guidance implement it; the engine binds its identity.
+    """
+
+    @property
+    def identity(self) -> Sha256:
+        """Everything about the step that changes the request it produces."""
+        ...
+
+    def resolve(
+        self, prepared: PreparedGroundedWorldModelCall, operation: str
+    ) -> PreparedGroundedWorldModelCall:
+        """Return the prepared call with this step's content delivered."""
+        ...
 
 
 class PredictionReading(ContractModel):

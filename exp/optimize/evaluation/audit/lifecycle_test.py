@@ -212,6 +212,7 @@ def test_a_reservation_committed_between_selection_and_commit_is_respected(
         clock: Callable[[], datetime],
         excluded: Collection[str] = frozenset(),
         memory_profile: MemoryProfile = "learned",
+        checkpoint: int | None = None,
     ) -> PlannedPanel:
         """Plan, then let another receipt reserve the planned lineage before the commit."""
         planned = plan(
@@ -222,6 +223,7 @@ def test_a_reservation_committed_between_selection_and_commit_is_respected(
             clock=clock,
             excluded=excluded,
             memory_profile=memory_profile,
+            checkpoint=checkpoint,
         )
         if not stolen:
             lineage = planned.lineages[0]

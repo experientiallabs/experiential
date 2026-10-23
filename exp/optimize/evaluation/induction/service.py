@@ -194,9 +194,14 @@ def induce_transitions(
             load_induction(store, reference)
             return reference
         episodes = preflight_induction(project, spec)
+        build = project.load_project().build
+        if build is None:
+            raise ValueError("induction needs a completed build; run exp build first")
         draw = _durable_draw(project, spec, identity, code_revision)
         programs: dict[str, TransitionProgram] = {}
-        inputs: list[ArtifactInput] = []
+        # The fit episodes come from the build's trace dataset, split by its task set, so the
+        # result cites both: its programs are traceable to the exact evidence they were fit to.
+        inputs: list[ArtifactInput] = [build.task_set, build.trace_dataset]
         rounds = [0]
 
         def record(row: ProgramProposal | ValidationReport) -> None:

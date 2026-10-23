@@ -73,12 +73,15 @@ class AuditRequest(ContractModel):
         count: Maximum held-out traces.
         include_inspected: Whether exposed or reserved lineages may be selected.
         memory: Memory profile of a ``memory`` audit; ``learned`` reads all learned memory.
+        checkpoint: Earlier frozen memory version read, by consumed fit trajectories; absent
+            reads the final checkpoint.
     """
 
     profile: Profile
     count: int = Field(ge=1)
     include_inspected: bool = False
     memory: MemoryProfile = Field(default="learned", exclude_if=lambda value: value == "learned")
+    checkpoint: int | None = Field(default=None, ge=1, exclude_if=lambda value: value is None)
 
 
 class AuditCase(ContractModel):
