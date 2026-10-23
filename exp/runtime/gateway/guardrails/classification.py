@@ -240,7 +240,12 @@ class ClassificationResult:
 
 
 ClassificationObserver = Callable[[ClassificationResult], None]
-"""Host callback for each definitive answer; it runs on the request path and must not block."""
+"""Host callback for each definitive answer.
+
+It runs synchronously inside ``inspect_input``, in the caller's context and
+before the verdict returns, so a host correlates a result with its request
+through a context variable it sets around the call. It must not block.
+"""
 
 
 class DecisionModelClassifier:
@@ -367,12 +372,13 @@ class DecisionModelClassifier:
             )
             try:
                 self._on_result(result)
-            except Exception:  # noqa: BLE001 - a host observer never changes the verdict.
+            except Exception as exc:  # noqa: BLE001 - a host observer never changes the verdict.
+                # The type only: an exception message could quote host data.
                 _logger.warning(
-                    "guardrail classification observer failed adapter_id=%s check_id=%s",
+                    "guardrail classification observer failed adapter_id=%s check_id=%s error=%s",
                     self._document.adapter_id,
                     check.check_id,
-                    exc_info=True,
+                    type(exc).__name__,
                 )
         return ClassifierVerdict(flagged=bool(flagged))
 

@@ -203,9 +203,11 @@ A host that needs each request's answer passes `on_result` when it constructs th
 The observer receives a `ClassificationResult` for every definitive answer, whether from the
 model or the cache: adapter and check ids, the configuration digest, every question's
 probability, every category's score, the flagged categories, `cached`, and latency. It
-carries no window or question text. The observer runs on the request path, so it must not
-block. An observer that raises is logged and never changes the verdict. Errors and requests
-without text produce no result.
+carries no window or question text. The observer runs synchronously inside `inspect_input`,
+in the caller's context and before the verdict returns, so a host correlates each result with
+its request through a context variable it sets around the call. It must not block. An
+observer that raises is logged by exception type only and never changes the verdict. Errors
+and requests without text produce no result.
 
 ## Observe, then enforce
 
