@@ -322,6 +322,7 @@ def alias_tariffs(catalog: ModelCatalog) -> dict[str, AliasTariff]:
                 if decision
                 else caps.maximum_output_tokens
             ),
+            output_uses_context_bound=not decision,
             repeated_input=MAX_DECISION_QUESTIONS if decision else 1,
             input_framing_tokens=1024 if decision else 0,
         )

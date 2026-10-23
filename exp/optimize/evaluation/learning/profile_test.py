@@ -71,6 +71,7 @@ from exp.runtime.models.providers.transport import (
     JsonHttpResponse,
     ProviderTransportError,
     ScriptedJsonTransport,
+    is_known_unbilled_failure,
 )
 from exp.simulation.retrieval.jev import JEVPolicy
 from exp.simulation.world_model.experience_memory import memory_head
@@ -670,8 +671,10 @@ def test_an_ambiguous_recall_failure_is_never_redrawn_in_process(
 
 
 @pytest.mark.parametrize("status", [429, 503])
-def test_a_definite_recall_answer_is_retried(tmp_path: Path, status: int) -> None:
-    """A definite HTTP refusal is a known outcome without a decision, so the request is resent."""
+def test_uncertified_recall_status_remains_unknown_without_resend(
+    tmp_path: Path, status: int
+) -> None:
+    """An HTTP answer does not prove a non-idempotent decision never executed."""
     project, _, memory, catalog, request = recall_fixture(tmp_path)
     limited = ScriptedJsonTransport(
         [
@@ -679,8 +682,40 @@ def test_a_definite_recall_answer_is_retried(tmp_path: Path, status: int) -> Non
             JsonHttpResponse(status_code=200, body={"answers": {"relevant": 0.9}}),
         ]
     )
-    decision = _recorded_decisions(project, memory, catalog, "fixture", limited)(request)
-    assert decision == {"answers": {"relevant": 0.9}}
+    with pytest.raises(ProviderTransportError) as failure:
+        _recorded_decisions(project, memory, catalog, "fixture", limited)(request)
+    assert failure.value.status_code == status
+    assert not is_known_unbilled_failure(failure.value)
+    assert len(limited.requests) == 1
+    with pytest.raises(ValueError, match="unknown outcome"):
+        _recorded_decisions(project, memory, catalog, "fixture", limited)(request)
+    assert len(limited.requests) == 1
+
+
+@pytest.mark.parametrize("following_status", [200, 503])
+def test_certified_recall_refusal_retries_without_laundering_later_unknown(
+    tmp_path: Path, following_status: int
+) -> None:
+    """Trusted non-dispatch retries, but mixed proof never releases an unknown charge."""
+    project, _, memory, catalog, request = recall_fixture(tmp_path)
+    limited = ScriptedJsonTransport(
+        [
+            JsonHttpResponse(status_code=429, body={"error": "refused"}, known_unbilled=True),
+            JsonHttpResponse(status_code=following_status, body={"answers": {"relevant": 0.9}}),
+            JsonHttpResponse(status_code=200, body={"answers": {"relevant": 0.1}}),
+        ]
+    )
+    decide = _recorded_decisions(project, memory, catalog, "fixture", limited)
+    if following_status == 200:
+        assert decide(request) == {"answers": {"relevant": 0.9}}
+        assert decide(request) == {"answers": {"relevant": 0.9}}
+    else:
+        with pytest.raises(ProviderTransportError) as failure:
+            decide(request)
+        assert failure.value.status_code == 503
+        assert not is_known_unbilled_failure(failure.value)
+        with pytest.raises(ValueError, match="unknown outcome"):
+            decide(request)
     assert len(limited.requests) == 2
     assert limited.requests[0].payload == limited.requests[1].payload
 

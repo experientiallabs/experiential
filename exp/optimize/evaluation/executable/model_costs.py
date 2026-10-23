@@ -13,6 +13,7 @@ from exp.common.models.token_cost import schedule_maximum_cost_nano_usd
 from exp.common.project import ProjectStore
 from exp.optimize.evaluation.fidelity.retrieval_binding import index_embedder_alias
 from exp.optimize.evaluation.fidelity.runner import FidelitySpec
+from exp.optimize.evaluation.spending import DECISION_PROVIDER
 from exp.runtime.gateway.decisions_contracts import (
     MAX_DECISION_CRITERIA,
     MAX_DECISION_INPUT_BYTES,
@@ -54,6 +55,15 @@ def model_cost(
     """Price known tariff dimensions at full input capacity without resolving credentials."""
     catalog = load_model_catalog(project.model_catalog_path)
     model, caps = RuntimeModelCatalog(catalog, environment={}).snapshot(alias)
+    if (
+        output
+        and catalog.connections[catalog.models[alias].connection].provider != DECISION_PROVIDER
+    ):
+        # Use the same trusted whole-generation bound as physical admission. Requested
+        # visible output limits need not include provider-side reasoning, even at effort none.
+        if caps.context_window_tokens is None:
+            return CostComponent(alias, attempts, None)
+        output = max(output, caps.context_window_tokens)
     context, input_rate, output_rate = (
         caps.context_window_tokens if input_tokens is None else input_tokens,
         caps.input_cost_per_million_tokens_usd,

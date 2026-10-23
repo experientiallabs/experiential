@@ -132,6 +132,8 @@ class AliasTariff:
         context_window_tokens: Provider context capacity, bounding billed input per request.
         default_output_tokens: Output allowance of a request whose body sets none (the
             decision wire, or a model's published maximum), or None when unbounded.
+        output_uses_context_bound: Reserve the trusted total model window for generation,
+            including reasoning; a missing window leaves the request unpriced.
         repeated_input: Times the provider may bill the whole input in one request, such as
             every question of a native decision.
         input_framing_tokens: Extra input tokens per repetition added by the provider.
@@ -141,7 +143,10 @@ class AliasTariff:
     input_usd_per_million: float | None = None
     output_usd_per_million: float | None = None
     context_window_tokens: int | None = None
+    # Hand-authored tariffs retain the caller's explicit output-bound contract. Catalog
+    # consumers opt into the conservative joint-window contract below.
     default_output_tokens: int | None = None
+    output_uses_context_bound: bool = False
     repeated_input: int = 1
     input_framing_tokens: int = 0
 
@@ -776,10 +781,18 @@ def request_token_bounds(
     )
     output = explicit if explicit is not None else tariff.default_output_tokens
     if output is None:
+        output = context if tariff.output_uses_context_bound else None
+    if output is None:
         return None
     thinking = settings.get("thinkingConfig")
     if isinstance(thinking, dict):
         output += _positive_int(thinking.get("thinkingBudget")) or 0
+    if tariff.output_uses_context_bound:
+        # The authored model window bounds the entire generation, including hidden reasoning.
+        # A requested visible-output limit is not evidence of a billed-total limit.
+        if context is None:
+            return None
+        output = max(output, context)
     choices = _positive_int(payload.get("n")) or _positive_int(settings.get("candidateCount")) or 1
     return input_tokens, output * choices
 

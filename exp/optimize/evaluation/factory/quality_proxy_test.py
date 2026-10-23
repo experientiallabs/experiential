@@ -8,6 +8,7 @@ import pytest
 from pydantic import ValidationError
 
 from exp.common.core.artifacts import ArtifactInput
+from exp.common.models import ReasoningEffort
 from exp.optimize.evaluation.factory.candidates import run_candidate_batch
 from exp.optimize.evaluation.factory.candidates_test import _reply, batch_fixture
 from exp.optimize.evaluation.factory.quality import QUALITY_AXES
@@ -28,11 +29,12 @@ def proxy_transport(
     tasks: tuple[ArtifactInput, ...],
     *,
     verdict: Literal["pass", "revise", "drop", "unassessable"] = "pass",
+    model: str = "judge-v1",
 ) -> ScriptedJsonTransport:
     """Script only provider replies; preserve actual admitted transport and response parsing."""
     responses = tuple(
         _reply(
-            "judge-v1",
+            model,
             {
                 "role": "assistant",
                 "content": None,
@@ -90,7 +92,8 @@ def test_model_proxy_packages_without_human_and_replays_without_catalog_or_runti
         )
         assert "not independently calibrated" in report["scope"]
         assert report["evidence_protocol"] == "task-quality-evidence-v1"
-        assert QualityProxyReport.model_validate(report).settings.reasoning_effort == "none"
+        assert QualityProxyReport.model_validate(report).settings.reasoning_effort is None
+        assert "reasoning_effort" not in report["settings"]
         legacy = json.loads(json.dumps(report))
         legacy.pop("evidence_protocol")
         legacy["settings"].pop("reasoning_effort", None)
@@ -103,7 +106,7 @@ def test_model_proxy_packages_without_human_and_replays_without_catalog_or_runti
         )
         payload = json.loads(request["messages"][1]["content"])
         assert len(payload["rubrics"]) == 6
-        assert request["reasoning_effort"] == "none"
+        assert request.get("reasoning_effort") is None
         evidence = expand_quality_evidence(QualityEvidence.model_validate(payload["evidence"]))
         outcomes = evidence["panel_outcomes"]
         controls = evidence["development_controls"]
@@ -229,3 +232,72 @@ def test_public_factory_uses_proxy_without_any_human_reviews(
     replay = runner.invoke(app, args)
     assert replay.exit_code == 0, replay.output
     assert len(judges.requests) == 2 and len(actors.requests) == 12
+
+
+@pytest.mark.parametrize("effort,wire", [(None, "high"), ("low", "low"), ("none", "none")])
+def test_proxy_inherits_catalog_mode_unless_an_explicit_supported_override_is_given(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, effort: ReasoningEffort | None, wire: str
+) -> None:
+    """The proxy's real request/receipt preserves a high default and scoped validated overrides."""
+    from exp.optimize.evaluation.factory.authoring import author_response
+    from exp.optimize.evaluation.factory.authoring_test import _reasoning_fixture
+    from exp.optimize.evaluation.factory.quality_proxy import (
+        QualityProxySpec,
+        preflight_quality_proxy,
+        proxy_request,
+    )
+
+    project, source, _ = _reasoning_fixture(tmp_path, monkeypatch)
+    settings = QualityProxySpec(
+        model_alias=source.model_alias,
+        model=source.model,
+        catalog_sha256=source.catalog_sha256,
+        deadline=source.deadline,
+        reasoning_effort=effort,
+    )
+    catalog_before = project.model_catalog_path.read_bytes()
+    transport = proxy_transport(monkeypatch, (source.base,), model=source.model.model_id)
+    request = proxy_request({}, settings)
+    preflight_quality_proxy(project, settings)
+    _, response = author_response(
+        project,
+        settings,
+        request,
+        identity="proxy-reasoning-fixture",
+        sources=(source.base, source.brief),
+        code_revision="test",
+    )
+    assert len(transport.requests) == 1
+    payload = transport.requests[0].payload
+    assert payload is not None and payload["reasoning_effort"] == wire
+    assert project.model_catalog_path.read_bytes() == catalog_before
+    answer = QualityProxyAnswer.model_validate(response.output.tool_calls[0].arguments)
+    assert len(answer.findings) == len(QUALITY_AXES) == 6
+    assert ("reasoning_effort" in settings.model_dump(mode="json")) is (effort is not None)
+    assert settings.reasoning_effort == effort
+
+
+def test_proxy_unsupported_override_refuses_before_a_draw(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An inherited default does not imply that a deployment accepts an explicit off mode."""
+    from exp.optimize.evaluation.factory.authoring_test import _reasoning_fixture
+    from exp.optimize.evaluation.factory.quality_proxy import (
+        QualityProxySpec,
+        preflight_quality_proxy,
+    )
+
+    project, source, transport = _reasoning_fixture(
+        tmp_path, monkeypatch, supported=("low", "high", "max")
+    )
+    inherited = QualityProxySpec(
+        model_alias=source.model_alias,
+        model=source.model,
+        catalog_sha256=source.catalog_sha256,
+        deadline=source.deadline,
+    )
+    preflight_quality_proxy(project, inherited)
+    with pytest.raises(ValueError, match="not supported"):
+        preflight_quality_proxy(project, inherited.model_copy(update={"reasoning_effort": "none"}))
+    assert not transport.requests
+    assert not project.artifacts.list_ids(artifact_type="author-intent")

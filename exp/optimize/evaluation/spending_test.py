@@ -755,6 +755,7 @@ def test_alias_tariffs_price_exactly_the_aliases_the_estimate_prices(tmp_path: P
     assert tariffs["world"].output_usd_per_million == 2.0
     assert tariffs["world"].context_window_tokens == 200_000
     assert tariffs["world"].default_output_tokens == 8_192
+    assert tariffs["world"].output_uses_context_bound
     assert tariffs["embed"].output_usd_per_million is None
     decision = tariffs["jev"]
     assert decision.repeated_input == MAX_DECISION_QUESTIONS
@@ -762,6 +763,7 @@ def test_alias_tariffs_price_exactly_the_aliases_the_estimate_prices(tmp_path: P
         1024 + 512 * MAX_DECISION_CRITERIA
     )
     assert decision.context_window_tokens is None
+    assert not decision.output_uses_context_bound
 
 
 def test_operation_ceiling_of_a_project_without_a_catalog_prices_nothing(

@@ -276,8 +276,8 @@ def _recorded_decisions(
     def post(request: DecisionRequest, active_transport: JsonHttpTransport) -> JsonObject:
         """One decision attempt over a wire that defines no idempotency key.
 
-        Only a definite HTTP answer is retried (`classify_unrepeatable_retry`); an attempt
-        whose outcome is unknown is never resent.
+        Only a trusted certified non-dispatch refusal may retry; an HTTP status alone
+        does not prove non-execution. Unknown outcomes are never resent.
         """
         response = active_transport.post(
             url,
@@ -289,6 +289,7 @@ def _recorded_decisions(
             raise ProviderTransportError(
                 f"recall decision returned HTTP {response.status_code}",
                 status_code=response.status_code,
+                known_unbilled=response.known_unbilled,
             )
         return response.body
 

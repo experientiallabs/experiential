@@ -562,3 +562,52 @@ def test_operation_policy_rolls_back_both_limits_on_second_row_failure(tmp_path:
     after = ceiling.summary()
     assert after.ceiling_usd == 10.0 and after.unpriced_attempt_ceiling == 5
     assert after.authorizations == before.authorizations
+
+
+def test_context_generation_bound_covers_reasoning_beyond_request_and_blocks_next_send(
+    tmp_path: Path,
+) -> None:
+    """Actual reasoning usage exceeding the requested limit settles honestly inside the bound."""
+    tariff = AliasTariff(
+        input_usd_per_million=1,
+        output_usd_per_million=1,
+        context_window_tokens=1000000,
+        default_output_tokens=131072,
+        output_uses_context_bound=True,
+    )
+    payload = _payload(16384)
+    bounds = request_token_bounds(URL, payload, tariff)
+    assert bounds is not None and bounds[1] == 1000000
+    cost = tariff.cost_usd(*bounds)
+    assert cost is not None
+    ceiling = OperationSpendCeiling(tmp_path / "spend.sqlite", tariffs={"actor": tariff})
+    ceiling.authorize("stage", ceiling_usd=cost, unpriced_attempts=0)
+    response = _ok(12511, 17636)
+    inner = ScriptedJsonTransport([response, _ok()])
+    transport, _, _ = _transport(tmp_path, inner, ceiling)
+    transport.post(URL, headers={}, payload=payload, timeout_seconds=30)
+    assert ceiling.summary().settled_usd == pytest.approx((12511 + 17636) / 1000000)
+    with pytest.raises(SpendCeilingReached):
+        transport.post(URL, headers={}, payload=payload, timeout_seconds=30)
+    assert len(inner.requests) == 1
+    multiple = request_token_bounds(URL, {**payload, "n": 3}, tariff)
+    assert multiple is not None and multiple[1] == 3000000
+    assert multiple[0] > bounds[0]
+
+
+def test_context_generation_bound_missing_window_is_unpriced_before_send(tmp_path: Path) -> None:
+    """Neither a visible token limit nor a published output max substitutes for total capacity."""
+    tariff = AliasTariff(
+        input_usd_per_million=1,
+        output_usd_per_million=1,
+        default_output_tokens=131072,
+        output_uses_context_bound=True,
+    )
+    assert request_token_bounds(URL, _payload(16384), tariff) is None
+    ceiling = OperationSpendCeiling(tmp_path / "spend.sqlite", tariffs={"actor": tariff})
+    ceiling.authorize("stage", ceiling_usd=100, unpriced_attempts=0)
+    inner = ScriptedJsonTransport([_ok()])
+    transport, _, _ = _transport(tmp_path, inner, ceiling)
+    with pytest.raises(UnpricedDispatchRefused):
+        transport.post(URL, headers={}, payload=_payload(16384), timeout_seconds=30)
+    assert not inner.requests

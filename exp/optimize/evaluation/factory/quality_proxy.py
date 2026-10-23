@@ -17,7 +17,7 @@ from exp.common.core.artifacts import (
 )
 from exp.common.core.locks import CoordinationLock
 from exp.common.judging import JudgeDefinition, RubricDimension, ScoreAnchor
-from exp.common.models import ModelMessage, ModelRequest, ReasoningEffort, ToolChoice
+from exp.common.models import ModelMessage, ModelRequest, ToolChoice
 from exp.common.project import ProjectStore, artifact_input
 from exp.common.tasks import ToolSchema
 from exp.optimize.evaluation.continuations.actors import ActorPanelReport, PanelActor
@@ -105,12 +105,11 @@ class QualityProxySpec(AuthorSettings):
     """Pinned reviewer, rubrics and finite call allowance, without a human prerequisite.
 
     Attributes:
-        reasoning_effort: Explicit reviewer effort; default none reserves output for findings.
+        reasoning_effort: Optional validated reviewer override; absent inherits the catalog mode.
         evidence_protocol: Lossless shared-value framing, binding a new development measurement.
         rubrics: Exactly the protected criteria, each with immutable canonical score anchors.
     """
 
-    reasoning_effort: ReasoningEffort | None = "none"
     evidence_protocol: Literal["task-quality-evidence-v1"] = EVIDENCE_PROTOCOL
     rubrics: tuple[JudgeDefinition, ...] = Field(default_factory=quality_rubrics)
 
