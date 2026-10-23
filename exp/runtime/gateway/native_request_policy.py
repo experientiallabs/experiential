@@ -32,6 +32,42 @@ def require_route_authority(
         raise route_policy_error()
 
 
+def caller_route_selection(request: object, route: GatewayRoute) -> str | None:
+    """Name the caller's own routing control that confines a request to one rung.
+
+    A request that selects a route (``gateway.routing.route_id``) or forbids
+    fallbacks (``gateway.routing.allow_fallbacks`` or OpenRouter's
+    ``provider.allow_fallbacks`` set to false) cannot be moved to another rung
+    by the gateway. When that rung is throttled the refusal must say so: the
+    generic "all exact-model deployments" wording sent an incident hunt after
+    a routing bug while every request pinned one lane itself (glm-5,
+    2026-10-23: one organization sent ``route_id`` for the Z.ai lane with
+    ``allow_fallbacks: false`` on every call, and the OpenRouter rung was
+    never eligible).
+
+    Args:
+        request: The admitted serving request (only generation requests carry
+            these controls; any other request names none).
+        route: The admitted route; a resolved route id is the host's
+            acknowledgement of the caller's selector.
+
+    Returns:
+        The public spelling of the confining controls, or ``None`` when the
+        caller left the gateway free to choose.
+    """
+    if not isinstance(request, GatewayRequest):
+        return None
+    routing = None if request.gateway is None else request.gateway.routing
+    controls: list[str] = []
+    if route.resolved_route_id is not None:
+        controls.append("gateway.routing.route_id")
+    if routing is not None and not routing.allow_fallbacks:
+        controls.append("gateway.routing.allow_fallbacks: false")
+    if (request.provider_preferences or {}).get("allow_fallbacks") is False:
+        controls.append("provider.allow_fallbacks: false")
+    return " with ".join(controls) if controls else None
+
+
 def restrict_fallbacks(request: GatewayRequest, route: GatewayRoute) -> GatewayRoute:
     """Keep only the first eligible rung when the caller prohibits later routes."""
     routing = None if request.gateway is None else request.gateway.routing

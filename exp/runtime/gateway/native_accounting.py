@@ -64,6 +64,7 @@ from exp.runtime.gateway.native_recovery import (
     recovery_failure,
     retain_recovery_observation_time,
 )
+from exp.runtime.gateway.native_request_policy import caller_route_selection
 from exp.runtime.gateway.native_request_settlement import RequestSettlements
 from exp.runtime.gateway.native_rung_policy import (
     bind_sticky_dispatch,
@@ -83,6 +84,7 @@ from exp.runtime.gateway.native_settlement import (
     exhausted_attempt_payload,
     failure_from_boundary_payload,
     ledger_failure,
+    selected_route_throttled_failure,
     settlement_metadata,
     terminal_from_settlement,
     tool_search_requests_from_terminal,
@@ -674,12 +676,19 @@ class NativeAttemptAccounting:
         if exhaustion is None:
             # An empty forced claim means every deployment is provider-throttled.
             # Otherwise report unavailable without a free-capacity certificate.
-            throttled_remaining = self._health.throttled_remaining_seconds(keys)
-            exhaustion = (
-                all_routes_throttled_failure(throttled_remaining)
-                if throttled_remaining is not None
-                else all_routes_unavailable_failure()
+            # A caller-selected first dial may claim only its own rung, so only
+            # that rung's window decides (a healthy sibling it may not use does
+            # not make the refusal an outage).
+            throttled_remaining = self._health.throttled_remaining_seconds(
+                keys[:1] if selected_first else keys
             )
+            selection = caller_route_selection(entry.request, route)
+            if throttled_remaining is None:
+                exhaustion = all_routes_unavailable_failure()
+            elif selection is not None:
+                exhaustion = selected_route_throttled_failure(throttled_remaining, selection)
+            else:
+                exhaustion = all_routes_throttled_failure(throttled_remaining)
         certified = active and self.finish_request_quietly(
             entry.authorization,
             ledger_failure(exhaustion),
