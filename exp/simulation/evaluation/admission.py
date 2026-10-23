@@ -457,6 +457,11 @@ def _predicate_fingerprint(verifier: TaskVerifier) -> Sha256:
     value["argument_rules"] = {
         name: conjunction(rules) for name, rules in verifier.argument_rules.items()
     }
+    if verifier.argument_schemas:
+        value["argument_schemas"] = {
+            name: _schema_assertions(expand_local_references(schema))
+            for name, schema in verifier.argument_schemas.items()
+        }
     return sha256_json(value)
 
 

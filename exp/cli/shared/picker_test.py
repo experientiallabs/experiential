@@ -335,6 +335,8 @@ def _picker_script(body: str) -> str:
         Source for a child interpreter attached to a pseudo-terminal.
     """
     return (
+        "import os\n"
+        'os.environ["TERM"] = "xterm-256color"\n'
         "from rich.console import Console\n"
         "from exp.cli.shared.picker import PickerOption, choose_many, choose_one\n"
         "console = Console()\n"
@@ -715,7 +717,8 @@ def test_an_exception_during_a_screen_restores_the_terminal(
         python_terminal_child: Runner for one inline script under a pseudo-terminal.
     """
     script = (
-        "import signal, sys, termios\n"
+        "import os, signal, sys, termios\n"
+        'os.environ["TERM"] = "xterm-256color"\n'
         "from rich.console import Console\n"
         "from exp.cli.shared.picker import PickerOption, choose_many\n"
         "def fail(signum, frame):\n"

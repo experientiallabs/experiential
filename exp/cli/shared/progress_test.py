@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import os
 
 import pytest
 from rich.console import Console
@@ -35,6 +36,7 @@ def _plain_console(*, interactive: bool) -> tuple[Console, io.StringIO]:
         width=100,
         color_system=None,
         legacy_windows=False,
+        _environ={**os.environ, "TERM": "xterm-256color"} if interactive else None,
     )
     return console, buffer
 

@@ -717,3 +717,145 @@ def test_matching_endpoints_do_not_prove_unobserved_intermediate_preservation() 
     result = grade(relation_verifier(), value)
     assert result.goal.status == "pass" and result.policy.status == "unassessable"
     assert result.status == "unassessable"
+
+
+@pytest.mark.parametrize("arguments", [{}, {"updates": []}])
+def test_optional_argument_schema_accepts_absent_or_empty_field(arguments: JsonObject) -> None:
+    """A properties constraint allows omission without weakening a present value."""
+    check = TaskVerifier(
+        description="No cell writes; optional updates must be empty.",
+        outcome_schema={},
+        argument_schemas={
+            "edit": {"type": "object", "properties": {"updates": {"type": "array", "maxItems": 0}}}
+        },
+    )
+    result = grade(
+        check,
+        {
+            "steps": [{"action": {"name": "edit", "arguments": arguments}, "status": "valid"}],
+            "stop_reason": "completed",
+            "final_answer": "done",
+        },
+    )
+    assert result.policy.status == "pass"
+
+
+def test_argument_schema_preserves_header_policy_despite_restored_goal() -> None:
+    """A generic observed delete then recovery cannot conceal a forbidden first start."""
+    check = TaskVerifier(
+        description="Preserve header throughout; delete data rows only.",
+        outcome_schema={},
+        rules=(OutcomeRule(path="/final_state/rows", operator="equals", value=45),),
+        argument_schemas={
+            "edit_workbook": {
+                "type": "object",
+                "properties": {
+                    "deletions": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {"start": {"type": "integer", "minimum": 2}},
+                        },
+                    }
+                },
+            }
+        },
+    )
+    steps: list[JsonValue] = [
+        {
+            "action": {
+                "name": "edit_workbook",
+                "arguments": {"deletions": [{"start": 1, "count": 1}]},
+            },
+            "status": "valid",
+        },
+        {
+            "action": {
+                "name": "edit_workbook",
+                "arguments": {"deletions": [{"start": 53, "count": 1}]},
+            },
+            "status": "valid",
+        },
+    ]
+    outcome: JsonObject = {"steps": steps, "final_state": {"rows": 45}, "stop_reason": "completed"}
+    graded = grade(check, outcome)
+    assert graded.goal.status == "pass" and graded.policy.status == "fail"
+    assert grade(check, {**outcome, "steps": steps[1:]}).status == "pass"
+
+
+@pytest.mark.parametrize(
+    "action",
+    [
+        {"name": "edit"},
+        {"name": "edit", "arguments": None},
+        {"name": "edit", "arguments": "unknown"},
+    ],
+)
+def test_argument_schema_missing_observation_is_unassessable(action: JsonObject) -> None:
+    """Unavailable arguments never count as compliant with even an empty schema."""
+    check = TaskVerifier(
+        description="Observe arguments.", outcome_schema={}, argument_schemas={"edit": {}}
+    )
+    result = grade(
+        check, {"steps": [{"action": action, "status": "valid"}], "stop_reason": "completed"}
+    )
+    assert result.policy.status == "unassessable"
+
+
+def test_incomplete_argument_schema_inventory_cannot_pass() -> None:
+    """One compliant prefix does not establish the policy for unobserved future calls."""
+    check = TaskVerifier(
+        description="Observe all arguments.", outcome_schema={}, argument_schemas={"edit": {}}
+    )
+    result = grade(
+        check,
+        {
+            "steps": [{"action": {"name": "edit", "arguments": {}}, "status": "valid"}],
+            "stop_reason": "failure",
+        },
+    )
+    assert result.policy.status == "unassessable"
+
+
+@pytest.mark.parametrize(
+    "schema",
+    [
+        {"pattern": ".*"},
+        {"properties": {"x": {"pattern": "x"}}},
+        {"$ref": "https://example.invalid/schema"},
+        {"$ref": "#"},
+        {"type": "made-up"},
+    ],
+)
+def test_argument_schemas_refuse_unsupported_predicates(schema: JsonObject) -> None:
+    """Argument predicates reuse the bounded schema profile, not a new validator dialect."""
+    from exp.simulation.evaluation.tasks import RuleVerifierDraft
+
+    with pytest.raises(ValueError):
+        TaskVerifier(
+            description="Invalid policy.", outcome_schema={}, argument_schemas={"edit": schema}
+        )
+    with pytest.raises(ValueError):
+        RuleVerifierDraft(
+            description="Invalid draft.",
+            rules=(OutcomeRule(path="", operator="exists"),),
+            argument_schemas={"edit": schema},
+        )
+
+
+def test_argument_schema_draft_compiles_and_legacy_serialization_stays_identical() -> None:
+    """The new predicate is opt-in, compiled and present in exact exported verifier bytes."""
+    from exp.common.core.artifacts import sha256_json
+    from exp.simulation.evaluation.tasks import RuleVerifierDraft
+
+    legacy = TaskVerifier(description="Legacy predicate.", outcome_schema={"type": "object"})
+    assert "argument_schemas" not in legacy.model_dump(mode="json")
+    assert sha256_json(legacy) == "cdd0a7c546aaa0df817664c7b4452d7566d3b3cdd09b1c234432cc76df36c8a9"
+    draft = RuleVerifierDraft(
+        description="Constrain optional updates.",
+        rules=(OutcomeRule(path="", operator="exists"),),
+        argument_schemas={"edit": {"properties": {"updates": {"maxItems": 0}}}},
+    )
+    compiled = draft.compile()
+    assert compiled.argument_schemas == draft.argument_schemas
+    assert TaskVerifier.model_validate_json(compiled.model_dump_json()) == compiled

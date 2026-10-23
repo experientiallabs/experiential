@@ -50,7 +50,8 @@ def test_known_rates_price_every_attempt_without_credentials(
     )
     actor = model_cost(project, "world", 2, 4096)
     assert actor.usd is not None
-    assert actor.attempts == 2 and actor.usd == pytest.approx(0.416384)
+    # Two attempts reserve the complete 200K input and generation windows, including thought.
+    assert actor.attempts == 2 and actor.usd == pytest.approx(1.2)
     reader = decision_cost(project, "world", 2)
     assert reader.usd is not None and reader.usd > actor.usd
     assert decision_cost(project, "judge", 1).usd is None

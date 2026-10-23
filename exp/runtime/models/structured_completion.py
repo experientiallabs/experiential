@@ -33,7 +33,12 @@ from exp.common.project import ArtifactStore, artifact_input
 from exp.common.tasks import ToolSchema
 from exp.common.traces.ingest.json_strict import reject_duplicate_json_keys
 from exp.runtime.models.budget import RequestBudget
-from exp.runtime.models.call_evidence import call_consumer, canonical_call, current_consumer
+from exp.runtime.models.call_evidence import (
+    call_consumer,
+    canonical_call,
+    current_call_intent,
+    current_consumer,
+)
 
 _JSON_OBJECT = TypeAdapter(JsonObject)
 
@@ -277,9 +282,16 @@ class StructuredCompletion:
         requested_output = request.maximum_output_tokens or self.plan.output_tokens
         request = request.model_copy(update={"maximum_output_tokens": requested_output})
         self._check_capacity(request)
-        fingerprint = sha256_json(
-            {"request": request.model_dump(mode="json"), "plan": self.plan.model_dump(mode="json")}
-        )
+        caller = current_call_intent()
+        identity_body: JsonObject = {
+            "request": request.model_dump(mode="json"),
+            "plan": self.plan.model_dump(mode="json"),
+        }
+        if caller is not None:
+            if artifact_input(self._artifacts.read(caller.artifact_id).manifest) != caller:
+                raise ValueError("structured caller intent differs from its exact artifact")
+            identity_body["caller_intent"] = caller.model_dump(mode="json")
+        fingerprint = sha256_json(identity_body)
 
         def operation() -> ModelResponse:
             """Claim physical capacity and retain intent before using the injected client."""
@@ -294,7 +306,7 @@ class StructuredCompletion:
                 envelope=ArtifactEnvelope(
                     schema_version=1,
                     created_at=self._clock(),
-                    inputs=(),
+                    inputs=() if caller is None else (caller,),
                     code_revision=self.plan.code_revision,
                 ),
                 files={
