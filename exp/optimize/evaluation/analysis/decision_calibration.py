@@ -13,6 +13,7 @@ from pydantic import Field, model_validator
 from exp.common.core.artifacts import ArtifactInput, ContractModel, JsonObject, Sha256, sha256_json
 from exp.common.evaluations.uncertainty import Z95_ONE_SIDED, wilson_interval
 from exp.common.project import ArtifactStore, artifact_input
+from exp.common.project.causality import cites
 from exp.optimize.evaluation.analysis.memory_evidence import EvidenceLocator, located_value
 from exp.runtime.agents.cascade import delegates
 
@@ -130,7 +131,8 @@ class DecisionCalibration(ContractModel):
         minimum_support: Minimum distinct declared lineage components supporting confirmation.
         maximum_error: Maximum one-sided 95 percent Wilson upper error bound.
         cases: Complete planned inventory, including missing outcomes.
-        registration: Prospective immutable definition and threshold, predating confirmation.
+        registration: Prospective immutable definition and threshold; every confirmation
+            question cites it in its manifest inputs, which proves the question came after.
     """
 
     definition: DecisionDefinition
@@ -323,10 +325,17 @@ def calibrate_decisions(
                 raise ValueError("decision partitions share source or dependency lineage")
             groups[group] = case.partition
         _verify_case(store, case, spec.definition)
-        if case.partition == "confirmation":
-            question_time = store.read(case.question.source.artifact_id).manifest.created_at
-            if question_time <= registered.manifest.created_at:
-                raise ValueError("confirmation question predates frozen registration")
+        if case.partition == "confirmation" and not cites(
+            store, case.question.source.artifact_id, spec.registration
+        ):
+            # Citing the registration's manifest digest is only possible after it was saved,
+            # so it proves order where comparing the two clocks could not.
+            raise ValueError(
+                f"confirmation question {case.question.source.artifact_id} does not cite the "
+                "frozen registration, so nothing shows it was made after it (it may predate "
+                "frozen registration); save confirmation questions with the registration among "
+                "their inputs"
+            )
     partitions = tuple(
         _measure(spec.cases, name, spec.threshold)
         for name in ("train", "calibration", "confirmation")
