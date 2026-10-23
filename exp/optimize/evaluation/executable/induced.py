@@ -25,7 +25,6 @@ from exp.runtime.environments.worlds import ExecutableWorldRuntime
 from exp.simulation.continuations import WorldCheckpoint
 from exp.simulation.induction.backend import InducedWorldFactory
 from exp.simulation.induction.sandbox import ProgramSandbox
-from exp.simulation.reconstruction.models import resolve
 
 
 class InducedRuntimeDefinition(ContractModel):
@@ -80,15 +79,13 @@ def continuation_runtime(project: ProjectStore, configuration: JsonObject) -> Co
         release = owned.pop_all().close
 
     def probe(checkpoint: WorldCheckpoint) -> JsonObject:
-        """Read only registered simulated state; unresolved fields refuse assessment."""
+        """Omit missing private probe fields without discarding valid actor observations."""
         if not isinstance(checkpoint, ExecutableCheckpoint):
             raise ValueError("simulated projection requires its executable checkpoint")
         if checkpoint.backend_sha256 != sha256_json(factory.definition):
             raise ValueError("probe checkpoint differs from the frozen induced simulator")
         wire = json.loads(checkpoint.image.parts["predictor.json"])
-        return {
-            name: resolve(wire["state"], path) for name, path in spec.grounded.probe_paths.items()
-        }
+        return grounded.simulated_probe(wire["state"], spec.grounded.probe_paths)
 
     return ContinuationRuntime(
         ExecutableWorldRuntime(

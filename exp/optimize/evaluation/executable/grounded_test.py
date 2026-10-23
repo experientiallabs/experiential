@@ -27,8 +27,9 @@ from exp.simulation.engines.text.prompt import INSTANCE_FACTS_GUIDANCE
 from exp.simulation.world_model.prediction_reading import PredictionReading
 
 
+@pytest.mark.parametrize("projection", ["present", "missing", "null"])
 def test_built_world_runs_restores_and_exhausts_one_shared_attempt_budget(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, projection: str
 ) -> None:
     """A frozen trace-built model makes a real provider-protocol call, not a second simulator."""
     project, fidelity = source_project(tmp_path)
@@ -44,7 +45,7 @@ def test_built_world_runs_restores_and_exhausts_one_shared_attempt_budget(
         ),
         manifest=WorldManifest(
             domains=(StateDomain(name="records", owner="simulated"),),
-            tools=(ToolEffectPolicy(name="inspect", reads=("records",), writes=()),),
+            tools=(ToolEffectPolicy(name="inspect", reads=("records",), writes=("records",)),),
         ),
         initial_state={"records": {"status": "pending"}},
         probe_paths={"status": "/records/status"},
@@ -55,6 +56,14 @@ def test_built_world_runs_restores_and_exhausts_one_shared_attempt_budget(
         "observations": [{"call_id": "read", "reply": "pending", "encoding": "text"}],
         "effect": {"kind": "edits", "edits": []},
     }
+    if projection != "present":
+        proposal["effect"]["edits"] = [
+            {
+                "op": "set",
+                "path": ["domains", "records"],
+                "value": {} if projection == "missing" else {"status": None},
+            }
+        ]
     transport = ScriptedJsonTransport(
         (
             JsonHttpResponse(
@@ -91,11 +100,19 @@ def test_built_world_runs_restores_and_exhausts_one_shared_attempt_budget(
     with runtime.world.open(task) as world:
         saved = world.checkpoint()
         assert runtime.probe(saved) == {"status": "pending"}
+        with pytest.raises(ValueError, match="frozen simulator"):
+            runtime.probe(saved.model_copy(update={"backend_sha256": "0" * 64}))
         result = world.execute(
             ToolCall(name="inspect", call_id="read", arguments={"key": "current"})
         )
         assert result.content == "pending"
         assert result.metadata["authority"] == "simulated"
+        expected = (
+            {}
+            if projection == "missing"
+            else {"status": None if projection == "null" else "pending"}
+        )
+        assert runtime.probe(world.checkpoint()) == expected
     # A restored fork shares the same dispatch ledger. It cannot obtain a fresh budget.
     restarted = continuation_runtime(project, spec.model_dump(mode="json"))
     from exp.optimize.evaluation.continuations.study import restore_continuation_world

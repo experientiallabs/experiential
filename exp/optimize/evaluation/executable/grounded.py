@@ -10,6 +10,7 @@ prediction exactly as in fidelity replay and are never derived from native state
 """
 
 import json
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from typing import Self
 
@@ -77,6 +78,7 @@ class GroundedRuntimeDefinition(ContractModel):
         prediction_reading: Optional bounded reading of eligible originals before prediction.
         memory: Explicit version pinned before capture; None means no learned memory is used.
         probe_paths: Evaluator field names mapped to JSON pointers into simulated domain state.
+            Initial pointers must resolve. Missing later values are omitted as unavailable evidence.
         seed: World scheduler seed; does not make future model responses deterministic.
         maximum_output_tokens: Per-prediction output ceiling.
         maximum_reasks: Explicit extra proposals after known contract refusals, within the
@@ -127,6 +129,28 @@ class GroundedRuntimeDefinition(ContractModel):
     def probe_sha256(self) -> Sha256:
         """Bind a pure projection whose authority is explicitly simulated."""
         return sha256_json({"kind": "simulated-domain-projection", "paths": self.probe_paths})
+
+
+def simulated_probe(state: JsonObject, paths: Mapping[str, str]) -> JsonObject:
+    """Project registered simulated state, omitting fields the state no longer has.
+
+    Initial pointers are validated before execution. A later absence is unknown evidence, not
+    a null value, a successful effect, or grounds to discard a valid actor observation.
+
+    Args:
+        state: Simulated domain state of one checkpoint.
+        paths: Evaluator field names mapped to JSON pointers into that state.
+
+    Returns:
+        Every resolvable field by name; unresolvable fields are omitted.
+    """
+    values: JsonObject = {}
+    for name, path in paths.items():
+        try:
+            values[name] = resolve(state, path)
+        except ValueError:
+            continue
+    return values
 
 
 def continuation_runtime(project: ProjectStore, configuration: JsonObject) -> ContinuationRuntime:
@@ -362,13 +386,13 @@ def _runtime(
     )
 
     def probe(checkpoint: WorldCheckpoint) -> JsonObject:
-        """Read only registered simulated state; unresolved fields refuse assessment."""
+        """Omit missing private probe fields without discarding valid actor observations."""
         if not isinstance(checkpoint, ExecutableCheckpoint):
             raise ValueError("simulated projection requires its executable checkpoint")
         if checkpoint.backend_sha256 != sha256_json(factory.definition):
             raise ValueError("probe checkpoint differs from the frozen simulator")
         wire = json.loads(checkpoint.image.parts["predictor.json"])
-        return {name: resolve(wire["state"], path) for name, path in spec.probe_paths.items()}
+        return simulated_probe(wire["state"], spec.probe_paths)
 
     return ContinuationRuntime(
         ExecutableWorldRuntime(spec.manifest, factory, owner="simulated", seed=spec.seed),
