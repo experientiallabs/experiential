@@ -3,6 +3,7 @@
 Every provider here is a scripted transport, so no credential or network call is made.
 """
 
+import json
 import multiprocessing
 import os
 import queue
@@ -14,13 +15,18 @@ from pathlib import Path
 import pytest
 
 from exp.common.core.artifacts import JsonObject
+from exp.common.judging.lm import judge_response_schema
+from exp.common.models import ModelCapabilities
 from exp.common.project import ProjectConfig, ProjectStore
+from exp.runtime.models.budget import RequestBudget
 from exp.runtime.models.providers.admitted_transport import AdmittedJsonTransport
 from exp.runtime.models.providers.backpressure import (
     AdmissionLimits,
     HostProviderAdmission,
     ProviderRoute,
 )
+from exp.runtime.models.providers.openai_compatible import OpenAICompatibleClient
+from exp.runtime.models.providers.openai_compatible_test import _snapshot
 from exp.runtime.models.providers.transport import (
     JsonHttpResponse,
     ProviderTransportError,
@@ -39,6 +45,7 @@ from exp.runtime.models.spend_ceiling import (
     operation_spend_scope,
     request_token_bounds,
 )
+from exp.runtime.models.structured_completion import CompletionPlan, StructuredCompletion
 from exp.runtime.sessions.dispatch_ledger import DispatchCapExhaustedError, DispatchLedger
 
 URL = "https://fixture.invalid/v1/chat/completions"
@@ -611,3 +618,69 @@ def test_context_generation_bound_missing_window_is_unpriced_before_send(tmp_pat
     with pytest.raises(UnpricedDispatchRefused):
         transport.post(URL, headers={}, payload=_payload(16384), timeout_seconds=30)
     assert not inner.requests
+
+
+def test_nullable_judge_schema_crosses_real_admission_and_settles_once(tmp_path: Path) -> None:
+    """A standard judge's nullable schema is text, while real media remains separately bounded."""
+    schema = judge_response_schema()
+    verdict = {"dimensions": [{"dimension_id": "goal", "raw_score": 1, "rationale": None}]}
+    inner = ScriptedJsonTransport(
+        [
+            JsonHttpResponse(
+                200,
+                {
+                    "choices": [
+                        {
+                            "finish_reason": "tool_calls",
+                            "message": {
+                                "tool_calls": [
+                                    {
+                                        "id": "judge-result",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "submit_proposal",
+                                            "arguments": json.dumps(verdict),
+                                        },
+                                    }
+                                ]
+                            },
+                        }
+                    ],
+                    "usage": {"prompt_tokens": 3, "completion_tokens": 4},
+                },
+            )
+        ]
+    )
+    ceiling = _ceiling(tmp_path, 1)
+    admitted, project, physical = _transport(tmp_path, inner, ceiling)
+    caps = ModelCapabilities(
+        supports_tools=True, context_window_tokens=100000, maximum_output_tokens=1024
+    )
+    model = _snapshot().model_copy(update={"capabilities_sha256": caps.identity_sha256()})
+    client = OpenAICompatibleClient(
+        model=model, base_url="https://fixture.invalid/v1", api_key="fixture", transport=admitted
+    )
+    complete = StructuredCompletion(
+        client=client,
+        plan=CompletionPlan(
+            model=model,
+            capabilities=caps,
+            deadline=datetime.now(UTC) + timedelta(minutes=1),
+            output_tokens=1024,
+            maximum_cost_per_call=1,
+            code_revision="fixture",
+            output_protocol="tool",
+        ),
+        budget=RequestBudget(project, identity="nullable-judge"),
+        artifacts=project.artifacts,
+    )
+    body: JsonObject = {
+        "messages": [{"role": "user", "content": "Assess the goal."}],
+        "response_schema": schema,
+    }
+    assert complete(body, "one-judge-cell") == verdict
+    assert complete(body, "one-judge-cell") == verdict
+    assert len(inner.requests) == physical.used() == 1
+    assert '["string", "null"]' in json.dumps(inner.requests[0].payload)
+    assert ceiling.summary().settled_usd == pytest.approx(7 / 1000000)
+    assert ceiling.summary().unknown_usd == 0

@@ -718,7 +718,10 @@ def _carries_media(value: JsonValue) -> bool:
     while pending:
         current = pending.pop()
         if isinstance(current, dict):
-            if current.get("type") in _MEDIA_PART_TYPES or _MEDIA_KEYS & current.keys():
+            kind = current.get("type")
+            if (
+                isinstance(kind, str) and kind in _MEDIA_PART_TYPES
+            ) or _MEDIA_KEYS & current.keys():
                 return True
             pending.extend(current.values())
         elif isinstance(current, list):
