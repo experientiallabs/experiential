@@ -370,7 +370,7 @@ def test_posthog_rejects_model_only_model_identity() -> None:
     assert "model but no provider" in result.issues[0].message
 
 
-def test_posthog_same_tool_multicall_without_result_ids_pairs_fifo() -> None:
+def test_posthog_same_tool_multicall_without_result_ids_is_ambiguous() -> None:
     events = _posthog_events()
     generation_properties = _event_properties(events[0])
     generation_properties["$ai_output_choices"] = [
@@ -414,14 +414,9 @@ def test_posthog_same_tool_multicall_without_result_ids_pairs_fifo() -> None:
 
     result = normalize_posthog_payload(events, source=_source())
 
-    assert result.issues == ()
-    model_spans = [span for span in result.traces[0].spans if span.name == "agent.model_call"]
-    tool_spans = [span for span in result.traces[0].spans if span.name == "agent.tool_call"]
-    assert [span.attributes["gen_ai.tool.call.id"] for span in tool_spans] == [
-        "call-first",
-        "call-second",
-    ]
-    assert [span.parent_span_id for span in tool_spans] == [span.span_id for span in model_spans]
+    assert result.traces == ()
+    assert len(result.issues) == 1
+    assert "ambiguous tool result" in result.issues[0].message
 
 
 def test_posthog_generation_failures_become_trace_failure_evidence() -> None:
@@ -618,7 +613,7 @@ def test_authorized_hogql_pull_uses_injected_client_and_source_converter() -> No
     assert "order by timestamp asc, uuid asc" in query_text
 
 
-def test_authorized_hogql_pull_keeps_uuid_timestamp_ties_fifo_deterministic() -> None:
+def test_authorized_hogql_pull_keeps_uuid_timestamp_ties_and_exact_pairs_deterministic() -> None:
     events = _posthog_events()
     generation_properties = _event_properties(events[0])
     generation_properties["$ai_output_choices"] = [
@@ -626,22 +621,24 @@ def test_authorized_hogql_pull_keeps_uuid_timestamp_ties_fifo_deterministic() ->
             "role": "assistant",
             "tool_calls": [
                 {
+                    "id": "call-first",
                     "function": {
                         "name": "cancel_reservation",
                         "arguments": {"reservation_id": "R-17"},
-                    }
+                    },
                 },
                 {
+                    "id": "call-second",
                     "function": {
                         "name": "cancel_reservation",
                         "arguments": {"reservation_id": "R-18"},
-                    }
+                    },
                 },
             ],
         }
     ]
     first_result_properties = _event_properties(events[1])
-    first_result_properties.pop("$ai_tool_call_id")
+    first_result_properties["$ai_tool_call_id"] = "call-second"
     events.insert(
         2,
         {
@@ -650,6 +647,7 @@ def test_authorized_hogql_pull_keeps_uuid_timestamp_ties_fifo_deterministic() ->
             "properties": {
                 "$ai_trace_id": _TRACE_ID,
                 "$ai_span_id": "tool-2",
+                "$ai_tool_call_id": "call-first",
                 "$ai_parent_id": "generation-1",
                 "$ai_span_name": "cancel_reservation",
                 "$ai_input_state": {"reservation_id": "R-18"},
@@ -681,6 +679,6 @@ def test_authorized_hogql_pull_keeps_uuid_timestamp_ties_fifo_deterministic() ->
     ]
     tool_spans = [span for span in trace.spans if span.name == "agent.tool_call"]
     assert [span.attributes["gen_ai.tool.call.id"] for span in tool_spans] == [
-        "posthog-call-generation-1-0",
-        "posthog-call-generation-1-1",
+        "call-second",
+        "call-first",
     ]

@@ -25,7 +25,7 @@ from exp.common.progress import ProgressEvent, ProgressHook
 from exp.common.project import ProjectStore
 from exp.common.project.config_sqlite import list_projects
 from exp.common.release_revision import installed_release_revision
-from exp.optimize.evaluation.export import export_report
+from exp.optimize.evaluation.export import export_report, simulator_memory_line
 from exp.optimize.evaluation.judging_resume import prepare_judging_revision
 from exp.optimize.evaluation.runs import (
     EvaluationRun,
@@ -124,7 +124,7 @@ def run_evaluation(
                     return
         catalog = load_model_catalog(store.model_catalog_path)
         if resume is not None:
-            with progress_display(_console, single_line=True) as progress:
+            with progress_display(_console) as progress:
                 progress(ProgressEvent(stage="Loading saved evaluation"))
                 run = load_run(store, resume)
                 if run.status == "failed" and run.stage in {"judging", "judgments"}:
@@ -162,7 +162,7 @@ def run_evaluation(
                 )
                 if selected_defaults is None:
                     return
-            with progress_display(_console, single_line=True) as progress:
+            with progress_display(_console) as progress:
                 run = prepare_run(
                     store,
                     catalog,
@@ -202,7 +202,7 @@ def run_evaluation(
             save_run(store, run)
             heading(_console, project, "Running evaluation · Ctrl-C to pause")
             try:
-                with progress_display(_console, single_line=True) as progress:
+                with progress_display(_console) as progress:
                     progress(ProgressEvent(stage="Preparing evaluation"))
                     execute_run(
                         store,
@@ -320,6 +320,7 @@ def _preflight(project: ProjectStore, run: EvaluationRun, *, reviewing: bool = F
     )
     _console.print(Text("Models: " + ", ".join(candidate.alias for candidate in setup.candidates)))
     _console.print(Text(f"World model: {setup.world_model_settings.world_model_alias}"))
+    _console.print(Text(simulator_memory_line(run)))
     _console.print(
         Text(f"Judge: {run.prepared.judge_request.model.model_id} ({setup.judgment_status})")
     )
@@ -333,6 +334,11 @@ def _preflight(project: ProjectStore, run: EvaluationRun, *, reviewing: bool = F
     _console.print(f"\nEstimated ${cost.estimated_cost_usd:,.2f} · {limit}")
     if not cost.maximum_is_upper_bound:
         _console.print("Some tariff dimensions are unknown; estimates are not spending bounds.")
+    if run.prepared.memory is not None:
+        _console.print(
+            "Memory recall decisions are not in the estimate; each is saved and replayed, never "
+            "bought twice."
+        )
     if reviewing:
         for warning in _uncapped_spend_warnings(project, run):
             _console.print(warning)

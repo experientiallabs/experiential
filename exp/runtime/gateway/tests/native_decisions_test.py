@@ -45,6 +45,7 @@ from exp.runtime.gateway.catalog_authority import (
 )
 from exp.runtime.gateway.lifecycle_test import _configured_gateway
 from exp.runtime.gateway.management import GatewayManagement
+from exp.runtime.gateway.organization_tag import ORGANIZATION_TAG_HEADER
 from exp.runtime.gateway.tests.certified_pool_fixture_test import upsert_certified_pool
 from exp.runtime.gateway.tests.native_messages_test import _DRIVER_SOURCE, _HOST, _ServingEngine
 
@@ -614,6 +615,8 @@ def test_typed_answers_preserve_alias_and_settle_exact_owned_usage(engine: _Serv
         headers = {key.lower(): value for key, value in _DecisionsUpstream.headers_seen[-1].items()}
     assert headers["authorization"] == f"Bearer {_PROVIDER_KEY}"
     assert engine.raw_key not in headers.values()
+    # A customer-managed rung never carries the per-organization scheduling tag.
+    assert ORGANIZATION_TAG_HEADER.lower() not in headers
     [(request, attempts)] = _settled(engine, before)
     assert request["request_id"] == response.headers["x-request-id"]
     assert request["key_id"] == "key-one"

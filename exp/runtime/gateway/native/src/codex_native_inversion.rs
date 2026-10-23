@@ -170,6 +170,7 @@ mod tests {
                 provider_status: None,
                 raw_arguments: raw_arguments.to_string(),
                 custom: false,
+                thought_signature: None,
             },
         }
     }
@@ -184,6 +185,7 @@ mod tests {
             name: "multi_agent_v1__close_agent".to_string(),
             namespace: None,
             caller: None,
+            thought_signature: None,
         };
         invert_tool_event(&mut event, &map).unwrap();
         match event {
@@ -245,6 +247,7 @@ mod tests {
                 namespace: None,
                 caller: None,
                 custom: false,
+                thought_signature: None,
             };
             assert!(matches!(
                 &inverter.filter(start).unwrap()[0],

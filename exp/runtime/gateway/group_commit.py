@@ -34,12 +34,12 @@ from exp.common.sqlite.connection import connect_database
 from exp.runtime.gateway.contracts import (
     AttemptId,
     AuthorizationSnapshot,
-    ExecutionSnapshot,
     GatewayEvent,
     GatewayFailure,
     GatewayServiceTierAdmission,
     GatewayServiceTierSettlement,
 )
+from exp.runtime.gateway.execution_snapshot import ExecutionSnapshot
 from exp.runtime.gateway.ledger import SQLiteAttemptLedger
 from exp.runtime.gateway.model_chain_authority import ChainOperation, SQLiteChainPreflight
 from exp.runtime.gateway.native_settlement import (

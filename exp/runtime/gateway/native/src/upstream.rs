@@ -26,20 +26,29 @@ pub(crate) use network::UpstreamClient;
 /// `connect_timeout` bounds only the TCP+TLS connect phase; a dead lane whose
 /// host never accepts the connection fails over after this window instead of
 /// hanging on the per-deployment request timeout.
+///
+/// A public-only (hosted) client also carries a tenant-origin sibling whose
+/// sockets additionally refuse the platform's own infrastructure and any port
+/// outside the tenant set ([`UpstreamClient::for_origin`]).
 pub fn build_client(
     connect_timeout: Duration,
     public_only: bool,
 ) -> Result<UpstreamClient, String> {
-    let builder = client_builder(connect_timeout);
-    let builder = if public_only {
-        network::restrict(builder)
-    } else {
-        builder
-    };
-    builder
+    let failed = |error: reqwest::Error| format!("upstream client construction failed: {error}");
+    if !public_only {
+        return client_builder(connect_timeout)
+            .build()
+            .map(|inner| UpstreamClient::new(inner, false))
+            .map_err(failed);
+    }
+    let policy = std::sync::Arc::new(network::TenantPolicy::from_env());
+    let public = network::restrict(client_builder(connect_timeout))
         .build()
-        .map(|inner| UpstreamClient::new(inner, public_only))
-        .map_err(|error| format!("upstream client construction failed: {error}"))
+        .map_err(failed)?;
+    let tenant = network::restrict_tenant(client_builder(connect_timeout), policy.clone())
+        .build()
+        .map_err(failed)?;
+    Ok(UpstreamClient::new(public, true).with_tenant(tenant, policy))
 }
 
 /// One transport configuration shared by production and protocol-level tests.
@@ -154,11 +163,15 @@ pub(crate) fn decision_http_failure(mut failure: Failure, status: u16) -> Failur
 /// keeps a stalled lead's cost near one fail-fast window. It stays a
 /// `FailureClass::Timeout`, so it feeds the health circuit like other timeouts.
 fn open_timeout_failure() -> Failure {
-    Failure::new(
+    let mut failure = Failure::new(
         FailureClass::Timeout,
         "provider did not send response headers in time",
     )
-    .with_retry(false, true)
+    .with_retry(false, true);
+    // The rung's own allowance until the waterfall learns the shared budget
+    // cut the wait (`waterfall::attribute_header_timeout`).
+    failure.header_timeout = Some(crate::errors::HeaderTimeout::Allowance);
+    failure
 }
 
 /// Open one streaming POST and return the response on HTTP success. The
@@ -404,6 +417,21 @@ async fn non_success_failure(
         Ok(Some(body)) => Some(body),
         _ => None,
     };
+    if body
+        .as_deref()
+        .is_some_and(crate::rejection_shapes::names_account_policy_block)
+    {
+        // An account-level policy block is the provider's verdict on the
+        // ACCOUNT, under whatever status the relay chose (OpenRouter answers
+        // 403 or a 400 `invalid_prompt`): the credential class, so the ladder
+        // fails over and the lane can be demoted. Ledger detail only.
+        return transport_failure(Some(403))
+            .with_provider_detail(Some(format!(
+                "{}: account_policy_block",
+                status_detail(status)
+            )))
+            .with_rate_limit_facts(rate_limit.clone(), retry_after);
+    }
     if status == 429 {
         // OpenAI answers an out-of-quota account with 429
         // `insufficient_quota`, the same status as a throttle. A status-

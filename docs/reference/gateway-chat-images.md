@@ -9,7 +9,9 @@ history with its documented signature-validation bypass, as it does for replayed
 This does not preserve provider-private reasoning signatures. Assistant image history is refused
 on fallback wires that cannot preserve it.
 Image lanes request text and images explicitly on Gemini and OpenRouter, allow bounded SSE
-frames up to 64 MiB, and share the 64 MiB aggregate output bound. Output guardrails that inspect
+frames up to 64 MiB, and share the 64 MiB aggregate output bound. A Gemini image part signed
+with a `thoughtSignature` keeps its signature and media type as capture evidence, with the
+inline bytes replaced by their length; the image itself is charged once, to that image bound. Output guardrails that inspect
 text cannot inspect image pixels, so guarded image lanes buffer and fail closed before delivery.
 Each image is limited to 16 MiB of base64 text and 12 MiB of compressed image bytes before
 base64 decoding. Parsed dimensions must stay within 16,384 pixels per dimension, and the

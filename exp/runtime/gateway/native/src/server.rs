@@ -39,6 +39,9 @@ use crate::route_images::images;
 use crate::route_messages::{messages, messages_count_tokens};
 use crate::route_responses::responses;
 use crate::route_responses_ws::responses_ws;
+use crate::route_videos::{
+    videos_body_limit, videos_content, videos_create, videos_delete, videos_list, videos_retrieve,
+};
 
 /// Serve-time configuration passed from `exp --engine rust`.
 #[derive(Debug, Clone, Deserialize)]
@@ -76,12 +79,29 @@ pub struct ServeConfig {
     /// the edge proxy's 100 s origin timeout; zero or negative disables it.
     #[serde(default = "default_pre_first_byte_budget_seconds")]
     pub pre_first_byte_budget_seconds: f64,
+    /// What a request's budget keeps beyond its route's longest AUTHORED
+    /// first-byte allowance when that allowance raises the budget
+    /// (`waterfall::pre_first_byte_budget`).
+    #[serde(default = "default_pre_first_byte_reserve_seconds")]
+    pub pre_first_byte_reserve_seconds: f64,
+    /// The most an authored allowance may raise a request's budget to; zero
+    /// or negative removes the ceiling.
+    #[serde(default = "default_pre_first_byte_max_seconds")]
+    pub pre_first_byte_max_seconds: f64,
     #[serde(default = "default_callback_permits")]
     pub callback_permits: usize,
+    /// Worker-wide bound on provider output retained across streams.
+    #[serde(default = "default_maximum_retained_output_bytes")]
+    pub maximum_retained_output_bytes: usize,
     #[serde(default = "default_native_usage_enabled")]
     pub native_usage_enabled: bool,
     #[serde(default = "default_graceful_timeout_seconds")]
     pub graceful_timeout_seconds: f64,
+    /// Release waiting requests by class (`Admission::priority_class`) with
+    /// one class of aging per this many seconds (`permit_queue`). Absent
+    /// keeps the FIFO semaphore.
+    #[serde(default)]
+    pub permit_priority_aging_seconds: Option<f64>,
 }
 
 fn default_graceful_timeout_seconds() -> f64 {
@@ -114,6 +134,14 @@ fn default_pre_first_byte_budget_seconds() -> f64 {
     90.0
 }
 
+fn default_pre_first_byte_max_seconds() -> f64 {
+    crate::waterfall::PRE_FIRST_BYTE_MAX.as_secs_f64()
+}
+
+fn default_pre_first_byte_reserve_seconds() -> f64 {
+    crate::waterfall::PRE_FIRST_BYTE_RESERVE.as_secs_f64()
+}
+
 fn default_max_active_requests() -> usize {
     64
 }
@@ -126,6 +154,16 @@ fn default_callback_permits() -> usize {
     4
 }
 
+fn default_maximum_retained_output_bytes() -> usize {
+    crate::retained::DEFAULT_WORKER_RETAINED_OUTPUT_BYTES
+}
+
+/// The serde default the server config uses, for the retained-output tests.
+#[cfg(test)]
+pub(crate) fn default_retained_for_tests() -> usize {
+    default_maximum_retained_output_bytes()
+}
+
 fn default_native_usage_enabled() -> bool {
     true
 }
@@ -136,6 +174,8 @@ pub(crate) struct AppState {
     pub(crate) bridge: Arc<Bridge>,
     pub(crate) http: crate::upstream::UpstreamClient,
     pub(crate) permits: Arc<Semaphore>,
+    /// The order waiting requests take `permits` in (FIFO unless configured).
+    pub(crate) permit_queue: Arc<crate::permit_queue::PermitQueue>,
     pub(crate) request_timeout: Duration,
     /// Fail-fast flat bound on the wait for the provider's response headers
     /// per attempt.
@@ -149,6 +189,10 @@ pub(crate) struct AppState {
     pub(crate) time_to_first_token: Duration,
     /// The pre-first-byte budget (`None`: disabled).
     pub(crate) pre_first_byte_budget: Option<Duration>,
+    /// The reserve kept past the longest authored first-byte allowance.
+    pub(crate) pre_first_byte_reserve: Duration,
+    /// The ceiling on a raised budget (`None`: no ceiling).
+    pub(crate) pre_first_byte_max: Option<Duration>,
     /// Settlement writes still in flight, held open through graceful shutdown.
     pub(crate) pending_settlements: Arc<AtomicUsize>,
     /// Requests handled since start; the idle reclaim loop trims the
@@ -185,6 +229,9 @@ pub async fn run(
         bridge,
         http,
         permits: Arc::new(Semaphore::new(max_active_requests)),
+        permit_queue: Arc::new(crate::permit_queue::PermitQueue::new(
+            config.permit_priority_aging_seconds,
+        )),
         request_timeout: Duration::from_secs_f64(config.request_timeout_seconds),
         time_to_first_byte: Duration::from_secs_f64(config.time_to_first_byte_seconds.max(0.001)),
         time_to_first_byte_slope_seconds_per_million_input_tokens: config
@@ -199,6 +246,11 @@ pub async fn run(
         ),
         pre_first_byte_budget: (config.pre_first_byte_budget_seconds > 0.0)
             .then(|| Duration::from_secs_f64(config.pre_first_byte_budget_seconds)),
+        pre_first_byte_reserve: Duration::from_secs_f64(
+            config.pre_first_byte_reserve_seconds.max(0.0),
+        ),
+        pre_first_byte_max: (config.pre_first_byte_max_seconds > 0.0)
+            .then(|| Duration::from_secs_f64(config.pre_first_byte_max_seconds)),
         pending_settlements: pending_settlements.clone(),
         handled_requests: handled_requests.clone(),
         replays: Arc::new(ReplayStore::new()),
@@ -233,6 +285,17 @@ pub async fn run(
         .route("/v1/files", post(files_create).layer(files_body_limit()))
         .route("/v1/files/{file_id}", get(files_retrieve))
         .route("/v1/files/{file_id}/content", get(files_content))
+        .route(
+            "/v1/videos",
+            post(videos_create)
+                .layer(videos_body_limit())
+                .get(videos_list),
+        )
+        .route(
+            "/v1/videos/{video_id}",
+            get(videos_retrieve).delete(videos_delete),
+        )
+        .route("/v1/videos/{video_id}/content", get(videos_content))
         .route("/health/live", get(health_live))
         .route("/health/ready", get(health_ready))
         .route("/metrics.json", get(metrics_json))
@@ -467,14 +530,30 @@ async fn model_detail(
     }
 }
 
-/// The request's absolute pre-first-byte deadline: its start (the request
-/// deadline minus the request budget) plus the configured budget, never past
-/// the request deadline itself.
-pub(crate) fn pre_first_byte_deadline(
-    state: &AppState,
-    deadline: std::time::Instant,
-) -> Option<std::time::Instant> {
-    let budget = state.pre_first_byte_budget?;
-    let start = deadline.checked_sub(state.request_timeout)?;
-    Some((start + budget).min(deadline))
+impl AppState {
+    /// The request's absolute pre-first-byte deadline: its start (the
+    /// request deadline minus the request budget) plus its budget
+    /// (`waterfall::pre_first_byte_budget`: the configured budget raised to
+    /// the route's longest authored header allowance plus a reserve), never
+    /// past the request deadline itself, and never raised past the ceiling.
+    /// `body` is the raw request body, approximated without its base64 media
+    /// (`waterfall::approximate_input_tokens`, the same estimate the dials use).
+    pub(crate) fn first_byte_budget(
+        &self,
+        deadline: Instant,
+        route: &[crate::waterfall::DeploymentWire],
+        body: &str,
+    ) -> Option<Instant> {
+        let budget = crate::waterfall::pre_first_byte_budget(
+            self.pre_first_byte_budget,
+            self.pre_first_byte_reserve,
+            self.pre_first_byte_max,
+            route,
+            self.time_to_first_byte,
+            self.time_to_first_byte_slope_seconds_per_million_input_tokens,
+            crate::waterfall::approximate_input_tokens(body),
+        )?;
+        let start = deadline.checked_sub(self.request_timeout)?;
+        Some((start + budget).min(deadline))
+    }
 }

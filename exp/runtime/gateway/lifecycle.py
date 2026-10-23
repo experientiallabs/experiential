@@ -29,12 +29,12 @@ from exp.common.models import (
 from exp.runtime.gateway.contracts import (
     AuthorizationSnapshot,
     DirectTarget,
-    ExecutionSnapshot,
     GatewayApiSurface,
     GatewayTarget,
     ProjectTarget,
 )
 from exp.runtime.gateway.embeddings_contracts import ServingRequest
+from exp.runtime.gateway.execution_snapshot import ExecutionSnapshot
 from exp.runtime.gateway.group_commit import GroupCommitAttemptLedger
 from exp.runtime.gateway.interfaces import GatewayControlStore, ProjectTargetResolver
 from exp.runtime.gateway.ledger import SQLiteAttemptLedger
@@ -64,6 +64,7 @@ from exp.runtime.gateway.routing import (
     SelectionWorkerPool,
 )
 from exp.runtime.gateway.sqlite.store import SQLiteGatewayStore
+from exp.runtime.gateway.video.store import SQLiteVideoJobStore, VideoJobStore
 from exp.runtime.models import ModelConnectionError, RuntimeModelCatalog
 from exp.runtime.models.credentials import MissingModelCredentialError, ModelCredentialError
 from exp.runtime.router.runtime import DecisionSink, RouterRuntime, RouterRuntimeIntegrityError
@@ -99,10 +100,9 @@ class _AliasAuthorityState:
     listing_pools: Mapping[tuple[str, str, str], str]
     proof: ExecutionSnapshot
     unavailable_aliases: tuple[tuple[str, str], ...] = ()
-    # (alias, dead active revision_id) -> the last-good prior revision serving
-    # it. Keyed by alias too (not the revision id alone) so a shared revision id
-    # can never route one alias's request to another alias's fallback target.
-    # Empty unless an alias's active pinned snapshot was unservable at load.
+    # (alias, dead active revision_id) -> the last-good prior revision serving it. Keyed by
+    # alias too, so a shared revision id never routes one alias's request to another alias's
+    # fallback target. Empty unless an alias's active pinned snapshot was unservable at load.
     fallback_revisions: Mapping[tuple[str, str], _ServedFallback] = field(default_factory=dict)
 
 
@@ -382,9 +382,8 @@ class _ReadyControlStore:
         served = _serve_or_fallback(self.reloader.state, authorization)
         if served is not None:
             return served
-        # The SQLite authority names a revision this generation has not loaded
-        # (a concurrent activation, or an active revision whose snapshot was
-        # unservable at load); reload once and re-resolve, including last-good.
+        # The SQLite authority names a revision this generation has not loaded (a concurrent
+        # activation or an unservable active snapshot); reload once, re-resolve with last-good.
         authority = (
             authorization.alias,
             authorization.alias_revision_id,
@@ -444,9 +443,9 @@ class LocalGatewayComponents:
     selection_workers: SelectionWorkerPool
     reconciled_expired_requests: int
     reconciled_unknown_attempts: int
-    # The local launch serves no asynchronous batch lane; hosted compositions
-    # supply a BatchControlPlane here to enable /v1/batches.
+    # Hosted compositions supply a BatchControlPlane (/v1/batches); the local launch has none.
     batches: object | None = None
+    video_jobs: VideoJobStore | None = None  # /v1/videos jobs, in the gateway database
 
     @property
     def runtime_catalogs(self) -> Mapping[tuple[str, str], RuntimeModelCatalog]:
@@ -547,6 +546,7 @@ def load_gateway_components(
         selection_workers=selection_workers,
         reconciled_expired_requests=expired,
         reconciled_unknown_attempts=unknown,
+        video_jobs=SQLiteVideoJobStore(manager.database_path),
     )
 
 

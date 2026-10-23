@@ -178,6 +178,12 @@ def drop_gateway_web_search_items(payload: JsonObject) -> JsonObject:
 def official_responses_probe(payload: JsonObject) -> JsonObject:
     """Return the copy of one Responses body the official SDK schema validates."""
     probe = dict(payload)
+    options = payload.get("prompt_cache_options")
+    if isinstance(options, dict) and options.get("ttl") == "12h":
+        # The installed SDK types ``ttl`` as "30m" only, while OpenAI serves
+        # "12h" on Responses (live 2026-10-20). The closed wire model owns the
+        # value, so the probe sees the SDK-known lifetime.
+        probe["prompt_cache_options"] = {**options, "ttl": "30m"}
     if isinstance(raw := payload.get("input"), list):
         # The installed SDK lags the live surface on echoed output items:
         # it has no message `phase` and requires `status` alongside `id`,

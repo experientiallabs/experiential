@@ -26,6 +26,12 @@ pub(crate) trait Sink: Send + 'static {
     /// retains the payload for retry; error details must never include content.
     fn write(&mut self, prepared: &Self::Prepared) -> Result<(), ()>;
 
+    /// A destination that accepts split records keeps caller bodies above this
+    /// many bytes raw for the split builder; `None` decodes them in memory.
+    fn split_raw_above(&self) -> Option<usize> {
+        None
+    }
+
     /// Destinations opt into batching without changing single-record writers.
     fn batch_records(&self) -> usize {
         1
@@ -189,7 +195,16 @@ fn run_worker<S: Sink>(
                         .as_mut()
                         .expect("unprepared record retained");
                     if let Some(mut wire) = entry.item.wire.take() {
-                        record.transport = wire.relay.take().map(super::relay::Relay::decode);
+                        match (wire.relay.take(), sink.split_raw_above()) {
+                            (Some(relay), Some(above)) => {
+                                let (transport, body) = relay.decode_split(above);
+                                record.transport = Some(transport);
+                                record.transport_body = body;
+                            }
+                            (relay, _) => {
+                                record.transport = relay.map(super::relay::Relay::decode);
+                            }
+                        }
                         record.response = wire.decode();
                         if record.response.is_none() {
                             record.provider_reasoning = None;

@@ -7,9 +7,11 @@
 //! payload, buffers the JSON answer under the retained-output cap, validates
 //! it against the request (one image per requested `n`, a reported token
 //! usage), and settles the winning attempt with the provider's prompt and
-//! image token counts. A provider that answers without usage (the per-image
-//! priced dall-e models) is refused as an unbillable answer until the typed
-//! billed-units ledger lands, so no image is ever handed out unaccounted.
+//! image token counts. A rung whose lane prices images per image (dall-e,
+//! xAI Grok Imagine) settles billed `image` units instead: one per image
+//! returned, at the variant admission named, and never its token counts. A
+//! token-billed answer without usage is refused as unbillable, so no image is
+//! ever handed out unaccounted.
 
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
@@ -24,7 +26,7 @@ use crate::admission::{acquire_permit, new_guard, wire_drift_response};
 use crate::dialects::{Dialect, MAXIMUM_RETAINED_OUTPUT_BYTES, OUTPUT_OVERFLOW_MESSAGE};
 use crate::encode::compact_json;
 use crate::errors::{Failure, FailureClass, PublicError};
-use crate::events::Usage;
+use crate::events::{BilledUnits, Usage};
 use crate::metrics::{classify_escalation, METRICS};
 use crate::relay::{collection_public_error, remaining};
 use crate::respond::{
@@ -47,6 +49,10 @@ struct ImagesAdmission {
     route: Vec<DeploymentWire>,
     /// The requested `n`; the provider must answer with exactly this many images.
     image_count: usize,
+    /// Per-rung unit billing aligned with `route`: `Some` bills `image` units at
+    /// that variant, `None` (or an absent list) bills the provider's tokens.
+    #[serde(default)]
+    unit_billing: Vec<Option<ImageUnitBilling>>,
     maximum_total_attempts: u32,
     maximum_same_deployment_attempts: u32,
 }
@@ -62,6 +68,13 @@ impl ImagesAdmission {
             backoff: None,
         }
     }
+}
+
+/// One per-image priced rung's billing: the variant its unit card prices.
+#[derive(Debug, Clone, Deserialize)]
+struct ImageUnitBilling {
+    #[serde(default)]
+    variant: String,
 }
 
 struct Served {
@@ -110,14 +123,14 @@ pub(crate) async fn images(
     };
     if let Some(reason) = admission_value.get("escalate") {
         METRICS.record_escalation(classify_escalation(reason.as_str().unwrap_or_default()));
-        return error_response(&escalation_error());
+        return error_response(&escalation_error(reason.as_str().unwrap_or_default()));
     }
     let admission: ImagesAdmission = match serde_json::from_value(admission_value.clone()) {
         Ok(admission) => admission,
         Err(_) => return wire_drift_response(&state, &admission_value, started).await,
     };
     let mut guard = new_guard(&state, admission.request_id.clone(), started);
-    let permit = match acquire_permit(&state, &mut guard, deadline).await {
+    let permit = match acquire_permit(&state, &mut guard, deadline, None).await {
         Ok(permit) => permit,
         Err(response) => return *response,
     };
@@ -225,9 +238,12 @@ async fn run_ladder(
         guard.rebind(attempt_id);
         total_attempts += 1;
         counts[depth] += 1;
-        match dispatch(&state.http, wire, deadline, admission).await {
+        let units = admission.unit_billing.get(depth).cloned().flatten();
+        let http = state.http.for_origin(wire.tenant_origin);
+        match dispatch(http, wire, deadline, admission, units.as_ref()).await {
             Ok((body, usage)) => return Ok(Served { depth, body, usage }),
             Err((failure, opened)) => {
+                let failure = failure.with_tenant_origin(wire.tenant_origin);
                 if opened {
                     guard.mark_opened();
                 }
@@ -239,6 +255,7 @@ async fn run_ladder(
                     total_attempts,
                     counts[depth],
                     depth,
+                    &counts,
                     &failure,
                     false,
                 );
@@ -266,6 +283,7 @@ async fn dispatch(
     wire: &DeploymentWire,
     deadline: Instant,
     admission: &ImagesAdmission,
+    units: Option<&ImageUnitBilling>,
 ) -> Result<(Value, Usage), (Failure, bool)> {
     let phase_timeout = Duration::from_secs_f64(wire.timeout_seconds.max(0.001));
     let bound = remaining(deadline).min(phase_timeout);
@@ -297,7 +315,7 @@ async fn dispatch(
         Ok(payload) => payload,
         Err(_) => return Err((malformed("images response is not JSON"), true)),
     };
-    public_images(payload, admission).map_err(|failure| (failure, true))
+    public_images(payload, admission, units).map_err(|failure| (failure, true))
 }
 
 /// Read one provider body chunk by chunk under the retained-output cap (a
@@ -345,9 +363,15 @@ fn malformed(reason: &str) -> Failure {
 /// Validate one provider `/images/generations` body against the admitted
 /// request and rebuild it as the public answer: exactly `n` images, each a
 /// `b64_json` or `url` string (passed through untouched, with any
-/// `revised_prompt`), and a billable token usage. The public body keeps the
-/// provider's `created`, `usage`, and the echoed rendering facts.
-fn public_images(payload: Value, admission: &ImagesAdmission) -> Result<(Value, Usage), Failure> {
+/// `revised_prompt`), and a billable meter: `units` bills one `image` unit per
+/// image returned, otherwise the provider's token usage must be present. The
+/// public body keeps the provider's `created`, any `usage`, and the echoed
+/// rendering facts.
+fn public_images(
+    payload: Value,
+    admission: &ImagesAdmission,
+    units: Option<&ImageUnitBilling>,
+) -> Result<(Value, Usage), Failure> {
     let object = payload
         .as_object()
         .ok_or_else(|| malformed("images response is not an object"))?;
@@ -380,8 +404,36 @@ fn public_images(payload: Value, admission: &ImagesAdmission) -> Result<(Value, 
         }
         images.push(Value::Object(public_item));
     }
-    // The surface bills on these counts: an answer without token usage (the
-    // per-image priced models) is unbillable here and is refused, never a zero.
+    let mut public = Map::new();
+    public.insert(
+        "created".to_string(),
+        object.get("created").cloned().unwrap_or(Value::from(0)),
+    );
+    let count = images.len() as u64;
+    public.insert("data".to_string(), Value::Array(images));
+    for key in ["background", "output_format", "quality", "size"] {
+        if let Some(value) = object.get(key) {
+            public.insert(key.to_string(), value.clone());
+        }
+    }
+    if let Some(units) = units {
+        // A per-image lane bills the images returned; any token counts the
+        // provider reports are passed through for the caller, never billed.
+        if let Some(usage) = object.get("usage").filter(|usage| usage.is_object()) {
+            public.insert("usage".to_string(), usage.clone());
+        }
+        let usage = Usage {
+            billed_units: Some(BilledUnits {
+                kind: "image".to_string(),
+                variant: units.variant.clone(),
+                quantity_milli: count.saturating_mul(1000),
+            }),
+            ..Usage::default()
+        };
+        return Ok((Value::Object(public), usage));
+    }
+    // A token-priced lane bills on these counts: an answer without token
+    // usage is unbillable here and is refused, never a zero.
     let usage = object
         .get("usage")
         .and_then(Value::as_object)
@@ -394,17 +446,6 @@ fn public_images(payload: Value, admission: &ImagesAdmission) -> Result<(Value, 
         .get("output_tokens")
         .and_then(Value::as_u64)
         .ok_or_else(|| malformed("images response omitted usage.output_tokens"))?;
-    let mut public = Map::new();
-    public.insert(
-        "created".to_string(),
-        object.get("created").cloned().unwrap_or(Value::from(0)),
-    );
-    public.insert("data".to_string(), Value::Array(images));
-    for key in ["background", "output_format", "quality", "size"] {
-        if let Some(value) = object.get(key) {
-            public.insert(key.to_string(), value.clone());
-        }
-    }
     public.insert("usage".to_string(), Value::Object(usage.clone()));
     let usage = Usage {
         input_tokens: Some(input_tokens),
@@ -412,9 +453,11 @@ fn public_images(payload: Value, admission: &ImagesAdmission) -> Result<(Value, 
         cached_input_tokens: None,
         cache_creation_input_tokens: None,
         cache_creation_1h_input_tokens: None,
+        cache_creation_12h_input_tokens: None,
         reasoning_tokens: None,
         billed_units: None,
         cache_writes_read_back: false,
+        image_output_tokens: None,
     };
     Ok((Value::Object(public), usage))
 }
@@ -467,6 +510,7 @@ mod tests {
             route_reason: "direct".to_string(),
             route: Vec::new(),
             image_count,
+            unit_billing: Vec::new(),
             maximum_total_attempts: 8,
             maximum_same_deployment_attempts: 2,
         }
@@ -491,7 +535,8 @@ mod tests {
                 "input_tokens_details": {"text_tokens": 11, "image_tokens": 0},
             },
         });
-        let (body, usage) = public_images(payload.clone(), &admission(2)).expect("valid answer");
+        let (body, usage) =
+            public_images(payload.clone(), &admission(2), None).expect("valid answer");
         assert_eq!(body["data"], payload["data"]);
         assert_eq!(body["usage"], payload["usage"]);
         assert_eq!(body["created"], json!(1_700_000_000));
@@ -510,9 +555,35 @@ mod tests {
             "usage": {"input_tokens": 1, "output_tokens": 1},
         });
         for payload in [unbilled, short, imageless] {
-            let failure = public_images(payload, &admission(2)).expect_err("malformed");
+            let failure = public_images(payload, &admission(2), None).expect_err("malformed");
             assert_eq!(failure.failure_class, FailureClass::MalformedResponse);
             assert!(failure.failover_eligible);
         }
+    }
+
+    #[test]
+    fn a_per_image_rung_bills_the_images_returned_not_tokens() {
+        let payload = json!({
+            "created": 1,
+            "data": [{"url": "https://example.invalid/a.png"}, {"b64_json": "x"}],
+            "usage": {"input_tokens": 9, "output_tokens": 0},
+        });
+        let units = ImageUnitBilling {
+            variant: "hd/1024x1024".to_string(),
+        };
+        let (body, usage) =
+            public_images(payload.clone(), &admission(2), Some(&units)).expect("valid answer");
+        assert_eq!(body["usage"], payload["usage"]);
+        assert_eq!(usage.input_tokens, None);
+        assert_eq!(usage.output_tokens, None);
+        let billed = usage.billed_units.expect("image units");
+        assert_eq!(billed.kind, "image");
+        assert_eq!(billed.variant, "hd/1024x1024");
+        assert_eq!(billed.quantity_milli, 2_000);
+        let usageless = json!({"data": [{"url": "https://example.invalid/a.png"}]});
+        let (body, usage) =
+            public_images(usageless, &admission(1), Some(&units)).expect("usageless answer");
+        assert!(body.get("usage").is_none());
+        assert_eq!(usage.billed_units.expect("units").quantity_milli, 1_000);
     }
 }

@@ -10,7 +10,7 @@ Chat Completions, Responses and Messages traffic all become the same ``TagExchan
 Only complete, successful responses are tagged, matching what the local store retains. The
 request side is read from the capture context's queryable projection rather than its exact
 ``source_json`` sidecar: tagging needs readable text, and the projection has already replaced
-the code points (NUL, lone surrogates) that cannot be stored or sent as JSON text.
+the NUL code points that cannot be stored as JSON text.
 """
 
 from __future__ import annotations
@@ -65,7 +65,6 @@ _IMAGE_TYPES: Final = frozenset({"image", "input_image", "computer_screenshot"})
 _BLOCK_OUTPUT_FIELDS: Final = frozenset({"caller", "capture_partial_input"})
 # Fields that carry an image itself; an image-typed object without one is ordinary data.
 _MEDIA_FIELDS: Final = frozenset({"data", "image_url", "url", "source", "file_id"})
-_SURROGATE: Final = re.compile("[\ud800-\udfff]")
 _DATA_URL: Final = re.compile(r"data:[\w.+-]+/[\w.+-]+(?:;[\w.+-]+=[\w.+-]+)*;base64,")
 _TEXT_PARTS: Final = frozenset({"text", "input_text", "output_text"})
 _IMAGE_PARTS: Final = frozenset({"image", "image_url", "input_image"})
@@ -87,8 +86,7 @@ def exchange_from_captured(experience: CapturedExchange) -> TagExchange:
         The exchange.
 
     Raises:
-        TagExchangeError: The capture lacks its effective request or a complete response, or
-            a payload nests too deeply to read.
+        TagExchangeError: The capture lacks its effective request or a complete response.
     """
     try:
         context = experience.request.get("exp_context")
@@ -112,10 +110,6 @@ def exchange_from_captured(experience: CapturedExchange) -> TagExchange:
         raise TagExchangeError(
             f"capture {experience.experience_id} cannot be tagged: {exc}. Collect fresh traffic "
             "with capture enabled."
-        ) from exc
-    except RecursionError as exc:
-        raise TagExchangeError(
-            f"capture {experience.experience_id} cannot be tagged: a payload nests too deeply"
         ) from exc
 
 
@@ -151,8 +145,7 @@ def exchange_from_capture_parts(
         The exchange.
 
     Raises:
-        TagExchangeError: The response failed or is incomplete, no message can be read, or a
-            payload nests too deeply to read.
+        TagExchangeError: The response failed or is incomplete, or no message can be read.
     """
     try:
         return _from_parts(
@@ -167,10 +160,6 @@ def exchange_from_capture_parts(
         )
     except ValueError as exc:
         raise TagExchangeError(f"capture {exchange_id} cannot be tagged: {exc}") from exc
-    except RecursionError as exc:
-        raise TagExchangeError(
-            f"capture {exchange_id} cannot be tagged: a payload nests too deeply"
-        ) from exc
 
 
 def exchange_from_capture_record(
@@ -688,7 +677,7 @@ def _readable_serialized(text: str) -> tuple[JsonValue, int]:
         return text, 0
     try:
         parsed = json.loads(text)
-    except (ValueError, RecursionError):
+    except ValueError:
         return text, 0
     projected, images = _readable(parsed)
     if images or projected != parsed:
@@ -697,8 +686,8 @@ def _readable_serialized(text: str) -> tuple[JsonValue, int]:
 
 
 def _compact_json(value: JsonValue) -> str:
-    """Render a JSON value compactly for a window, replacing lone surrogates with U+FFFD."""
-    return _SURROGATE.sub("\ufffd", json.dumps(value, ensure_ascii=False, separators=(",", ":")))
+    """Render a JSON value compactly for a window."""
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
 
 
 def _content(value: JsonObject) -> str | tuple[TagContentPart, ...] | None:

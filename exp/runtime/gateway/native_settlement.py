@@ -26,6 +26,7 @@ from exp.runtime.gateway.contracts import (
     GatewayEventKind,
     GatewayFailure,
     GatewayFailureClass,
+    GatewayHeaderTimeout,
     GatewayRefusalReason,
     GatewayServiceTierAdmission,
     GatewayServiceTierSettlement,
@@ -163,7 +164,22 @@ def failure_from_boundary_payload(payload: object) -> GatewayFailure | None:
             else None
         ),
         refusal_reason=refusal_reason_from_payload(data.get("refusal_reason")),
+        header_timeout=header_timeout_from_payload(data.get("header_timeout")),
     )
+
+
+def header_timeout_from_payload(value: object) -> GatewayHeaderTimeout | None:
+    """Parse the optional typed header-timeout phase from a boundary payload.
+
+    An unknown token fails closed to ``None`` (no hung-lane strike) rather
+    than raising, like ``refusal_reason_from_payload``.
+    """
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        return GatewayHeaderTimeout(value)
+    except ValueError:
+        return None
 
 
 def refusal_reason_from_payload(value: object) -> GatewayRefusalReason | None:
@@ -208,6 +224,27 @@ class NativeSettlementPayload(BaseModel):
     dispatched: bool = Field(default=False, strict=True)
     finalize: bool = Field(default=True, strict=True)
     usage_incomplete_due_to_disconnect: bool = Field(default=False, strict=True)
+    usage_unreported_truncation: bool = Field(default=False, strict=True)
+
+    def validate_truncation(self, failure: GatewayFailure | None, kind: GatewayEventKind) -> bool:
+        """Reject inconsistent unreported-truncation evidence and return the trusted marker.
+
+        Args:
+            failure: Normalized failure attached to this settlement.
+            kind: Normalized terminal event kind.
+
+        Returns:
+            Whether a dispatched budget truncation arrived without a usage meter.
+
+        Raises:
+            ValueError: The marker accompanies undispatched or failed work, or
+                any terminal but an incomplete one.
+        """
+        if self.usage_unreported_truncation and (
+            not self.dispatched or failure is not None or kind is not GatewayEventKind.INCOMPLETE
+        ):
+            raise ValueError("an unreported truncation requires a dispatched incomplete terminal")
+        return self.usage_unreported_truncation
 
     def validate_disconnect(self, failure: GatewayFailure | None, kind: GatewayEventKind) -> bool:
         """Reject inconsistent hold evidence and return the trusted marker.
@@ -260,8 +297,9 @@ class StreamedOutput(BaseModel):
 def streamed_output_from_settlement(data: JsonObject | None) -> StreamedOutput | None:
     """Parse the settlement's optional generated-output evidence.
 
-    Only a dispatched cancellation without a provider terminal carries it,
-    and the data plane always sends it then (an empty object when nothing was
+    A dispatched cancellation without a provider terminal carries it, and so
+    does a budget truncation the provider reported without a usage meter;
+    the data plane always sends it then (an empty object when nothing was
     generated). A malformed object is dropped rather than estimated from, and
     an absent one means a data plane predating the field: either way the
     settlement keeps its unknown meter.
@@ -304,6 +342,8 @@ def terminal_from_settlement(
         raw_usage if isinstance(raw_usage, dict) else None,
         [str(name) for name in raw_tool_names] if isinstance(raw_tool_names, list) else [],
         web_search_requests=web_search_requests_from_settlement(data),
+        web_search_results=web_search_results_from_settlement(data),
+        web_search_cost_nano_usd=web_search_cost_from_settlement(data),
         tool_search_requests=tool_search_requests_from_settlement(data),
     )
     failure_payload = data.get("failure")
@@ -321,6 +361,7 @@ def terminal_from_settlement(
             # The bounded refusal category rides the settlement argument so the
             # control plane counts refusals by reason without parsing detail.
             refusal_reason=refusal_reason_from_payload(failure_payload.get("refusal_reason")),
+            header_timeout=header_timeout_from_payload(failure_payload.get("header_timeout")),
         )
         if (
             failure.failure_class == GatewayFailureClass.THROTTLED
@@ -351,6 +392,7 @@ def terminal_from_settlement(
         usage=_credible_usage(kind, usage),
         failure=failure if kind == GatewayEventKind.FAILED else None,
         usage_incomplete_due_to_disconnect=provenance.validate_disconnect(failure, kind),
+        usage_unreported_truncation=provenance.validate_truncation(failure, kind),
         decision_provider_rejected=(
             surface is GatewayApiSurface.DECISIONS
             and kind is GatewayEventKind.FAILED
@@ -436,6 +478,33 @@ def web_search_requests_from_settlement(data: JsonObject | None) -> int:
     return count if count is not None and count > 0 else 0
 
 
+def web_search_results_from_settlement(data: JsonObject | None) -> int | None:
+    """Return the results the settlement's web searches returned, ``None`` when unnamed.
+
+    The data plane writes ``web_search_results`` only beside a positive
+    ``web_search_requests``; a missing, non-integer, boolean, or negative value
+    (and every settlement without a search) reads as ``None`` so the host
+    prices the search exactly as before the field existed.
+    """
+    if not web_search_requests_from_settlement(data) or data is None:
+        return None
+    count = _optional_count(data.get("web_search_results"))
+    return count if count is not None and count >= 0 else None
+
+
+def web_search_cost_from_settlement(data: JsonObject | None) -> int | None:
+    """Return the search vendor's reported cost in nano-USD, ``None`` when unreported.
+
+    Same rules as :func:`web_search_results_from_settlement`: present only
+    beside a positive search count, and anything but a nonnegative integer
+    reads as unreported.
+    """
+    if not web_search_requests_from_settlement(data) or data is None:
+        return None
+    cost = _optional_count(data.get("web_search_cost_nano_usd"))
+    return cost if cost is not None and cost >= 0 else None
+
+
 def web_search_requests_from_terminal(terminal: GatewayEvent | None) -> int:
     """Return the web-search count the settled usage carries, zero without usage."""
     if terminal is None or terminal.usage is None:
@@ -503,6 +572,7 @@ def settlement_metadata(
     settle: Callable[..., object],
     *,
     service_tier: GatewayServiceTierAdmission | None = None,
+    self_served: bool = False,
 ) -> SettlementMetadata:
     """Project original observations while withholding unsupported host keywords."""
     observed = settlement_rate_limit(data)
@@ -516,7 +586,9 @@ def settlement_metadata(
     }
     if accepts_keyword(settle, "upstream_provider"):
         fields["upstream_provider"] = upstream_provider_from_settlement(data)
-    fields.update(settlement_kwarg(service_tier, {} if data is None else data))
+    fields.update(
+        settlement_kwarg(service_tier, {} if data is None else data, self_served=self_served)
+    )
     return fields
 
 
@@ -611,6 +683,8 @@ def _usage_from_payload(
     tool_names: list[str],
     *,
     web_search_requests: int = 0,
+    web_search_results: int | None = None,
+    web_search_cost_nano_usd: int | None = None,
     tool_search_requests: int = 0,
 ) -> GatewayUsage | None:
     """Build normalized usage without inventing absent token or TTL evidence.
@@ -620,6 +694,8 @@ def _usage_from_payload(
         tool_names: Observed tool names in invocation order.
         web_search_requests: Gateway-executed searches billed to this attempt; rides on
             whichever usage shape the payload yields (a bare count is not usage and is dropped).
+        web_search_results: Results those searches returned; rides beside the count.
+        web_search_cost_nano_usd: The vendor's reported cost; rides beside the count.
         tool_search_requests: Gateway-executed tool-search rounds billed to this attempt;
             rides on the usage exactly as ``web_search_requests`` does.
 
@@ -640,6 +716,8 @@ def _usage_from_payload(
         return GatewayUsage(
             tool_names=names,
             web_search_requests=web_search_requests,
+            web_search_results=web_search_results,
+            web_search_cost_nano_usd=web_search_cost_nano_usd,
             tool_search_requests=tool_search_requests,
             billed_units=billed,
         )
@@ -651,9 +729,15 @@ def _usage_from_payload(
         cache_creation_1h_input_tokens=_optional_count(
             payload.get("cache_creation_1h_input_tokens")
         ),
+        cache_creation_12h_input_tokens=_optional_count(
+            payload.get("cache_creation_12h_input_tokens")
+        ),
         reasoning_tokens=_optional_count(payload.get("reasoning_tokens")),
+        image_output_tokens=_optional_count(payload.get("image_output_tokens")),
         tool_names=names,
         web_search_requests=web_search_requests,
+        web_search_results=web_search_results,
+        web_search_cost_nano_usd=web_search_cost_nano_usd,
         tool_search_requests=tool_search_requests,
         billed_units=billed,
     )

@@ -7,7 +7,7 @@ from typing import ClassVar
 from urllib.parse import urlsplit, urlunsplit
 
 from exp.common.models import ChatMaxTokensField, ModelSnapshot
-from exp.common.models.catalog import (
+from exp.common.models.azure_endpoints import (
     AzureApiSurface,
     infer_azure_api_surface,
     strip_model_inference_root,
@@ -289,6 +289,14 @@ class AzureClient(OpenAICompatibleClient):
         )
         self._api_version = api_version
         self._api_surface = api_surface
+
+    def _carries_prompt_cache_options(self) -> bool:
+        """Only the Azure OpenAI surface takes OpenAI's prompt-cache fields.
+
+        The Foundry model-inference surface serves third-party models on its own
+        schema, so the fields stay off it whatever the resource host.
+        """
+        return self._api_surface == "openai_deployments" and super()._carries_prompt_cache_options()
 
     def _headers(self) -> dict[str, str]:
         """Return Azure ``api-key`` authentication headers without a Bearer token."""

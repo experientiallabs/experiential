@@ -41,6 +41,7 @@ from exp.runtime.gateway.images_contracts import ImagesRequest
 from exp.runtime.gateway.json_object import JSON_OBJECT_SYSTEM_INSTRUCTION
 from exp.runtime.gateway.replay_identity import provider_replay_authority
 from exp.runtime.gateway.reservation_tokenizer import reservation_encoder
+from exp.runtime.gateway.video.contracts import VideoRequest
 from exp.runtime.models.providers.generation_parameter_validation import require_output_bound
 
 INPUT_TOKEN_HEADROOM_PERCENT = 15
@@ -168,7 +169,7 @@ def _prompt_counter(request: ServingRequest) -> _PromptCounter:
                     counter.text(item)
                 else:
                     counter.fixed(len(item))
-        case ImagesRequest():
+        case ImagesRequest() | VideoRequest():
             counter.text(request.prompt)
         case SpeechRequest():
             # Audio rungs enforce this count as a settle ceiling, so text is
@@ -352,7 +353,7 @@ def worst_case_output_tokens(
 ) -> int:
     """Worst-case output tokens one deployment could emit for this request."""
     match request:
-        case EmbeddingsRequest() | ImagesRequest():
+        case EmbeddingsRequest() | ImagesRequest() | VideoRequest():
             return 0
         case SpeechRequest() | TranscriptionRequest():
             capabilities = deployment.capabilities

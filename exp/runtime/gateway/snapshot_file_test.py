@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -156,8 +157,15 @@ def test_prepared_snapshot_rejects_path_and_content_races(tmp_path: Path, mutati
             path.write_bytes(b"{}")
         elif mutation == "rewrite":
             stamp = path.stat()
-            path.write_bytes(b"[]")
-            os.utime(path, ns=(stamp.st_atime_ns, stamp.st_mtime_ns))
+            # Same size and restored mtime leave only the change time to differ.
+            # Kernels advance it on a coarse clock tick, so rewrite until it moves.
+            give_up = time.monotonic() + 5
+            while True:
+                path.write_bytes(b"[]")
+                os.utime(path, ns=(stamp.st_atime_ns, stamp.st_mtime_ns))
+                if path.stat().st_ctime_ns != stamp.st_ctime_ns or time.monotonic() > give_up:
+                    break
+                time.sleep(0.005)
         elif mutation == "directory":
             directory.rename(tmp_path / "old")
             directory.mkdir()

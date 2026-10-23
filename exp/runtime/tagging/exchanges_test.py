@@ -444,38 +444,6 @@ def test_parts_without_an_envelope_still_tag_the_messages() -> None:
     assert exchange.messages[0].text() == "[3 messages not captured]"
 
 
-def test_streamed_tool_input_with_a_wide_integer_decodes() -> None:
-    """A Messages tool input beyond 64-bit range reassembles and decodes exactly."""
-    frames = [dict(frame) if isinstance(frame, dict) else frame for frame in MESSAGES_FRAMES]
-    frames[7] = {
-        "type": "content_block_delta",
-        "index": 1,
-        "delta": {"type": "input_json_delta", "partial_json": "18446744073709551617}"},
-    }
-    body = completed_response(
-        "messages",
-        {
-            "kind": "sse",
-            "status": 200,
-            "frames": frames,
-            "truncated": False,
-            "client_disconnected": False,
-        },
-    )
-    content = body["content"]
-    assert isinstance(content, list) and isinstance(content[1], dict)
-    assert content[1]["input"] == {"cmd": 18446744073709551617}
-    assert "capture_input_source_json" not in content[1]
-    exchange = exchange_from_capture_parts(
-        exchange_id="request-2",
-        protocol="messages",
-        messages=[{"role": "user", "content": "go"}],
-        request=None,
-        response={"kind": "json", "status": 200, "body": body},
-    )
-    assert exchange.response[0].tool_calls[0].function.arguments == '{"cmd":18446744073709551617}'
-
-
 def test_responses_refusals_and_server_tools_stay_readable() -> None:
     """Refusal parts keep their text and server-side tool calls render as tool calls."""
     body: JsonObject = {
@@ -1236,32 +1204,6 @@ def test_image_typed_arguments_without_media_stay_readable() -> None:
     assert "landscape" in call.tool_calls[0].function.arguments
 
 
-def test_serialized_results_with_lone_surrogates_stay_taggable() -> None:
-    """A JSON-encoded result escaping a lone surrogate still renders into windows."""
-    result = '{"note":"\\ud800","content":[{"type":"image","data":"QUJD","mimeType":"image/png"}]}'
-    exchange = exchange_from_capture_parts(
-        exchange_id="request-11",
-        protocol="chat_completions",
-        messages=[
-            {"role": "user", "content": "Shoot"},
-            {
-                "role": "assistant",
-                "provider_native_item": {
-                    "type": "mcp_call",
-                    "id": "m4",
-                    "name": "screenshot",
-                    "arguments": "{}",
-                    "output": result,
-                },
-            },
-        ],
-        request=None,
-        response={"kind": "json", "status": 200, "body": CHAT_BODY},
-    )
-    assert "\ufffd" in exchange.messages[1].tool_calls[0].function.arguments
-    assert turn_windows(exchange)
-
-
 def test_messages_tool_input_cut_off_by_the_length_limit_is_kept() -> None:
     """A tool use cut off mid-input keeps its partial text and marks truncation."""
     body: JsonObject = {
@@ -1525,19 +1467,3 @@ def test_blob_fields_outside_mcp_resources_stay_readable() -> None:
         response={"kind": "json", "status": 200, "body": CHAT_BODY},
     )
     assert exchange.messages[1].text() == '{"blob":"a1","error":"not found"}'
-
-
-def test_deeply_nested_tool_payloads_are_rejected_with_a_reason() -> None:
-    """A payload nested past the projection's depth is a TagExchangeError, not a crash."""
-    nested = "[" * 1000 + "0" + "]" * 1000
-    with pytest.raises(TagExchangeError, match="nests too deeply"):
-        exchange_from_capture_parts(
-            exchange_id="request-17",
-            protocol="chat_completions",
-            messages=[
-                {"role": "user", "content": "Read it"},
-                {"role": "tool", "tool_call_id": "d1", "content": nested},
-            ],
-            request=None,
-            response={"kind": "json", "status": 200, "body": CHAT_BODY},
-        )

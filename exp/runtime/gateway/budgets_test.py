@@ -44,7 +44,6 @@ from exp.runtime.gateway.budgets import (
 )
 from exp.runtime.gateway.contracts import (
     DirectTarget,
-    ExecutionSnapshot,
     GatewayApiSurface,
     GatewayEvent,
     GatewayEventKind,
@@ -61,6 +60,7 @@ from exp.runtime.gateway.decisions_contracts import (
     ScoreQuestion,
 )
 from exp.runtime.gateway.embeddings_contracts import EmbeddingsRequest
+from exp.runtime.gateway.execution_snapshot import ExecutionSnapshot
 from exp.runtime.gateway.images_contracts import ImagesRequest
 from exp.runtime.gateway.ledger import SQLiteAttemptLedger
 from exp.runtime.gateway.model_plan import model_execution_snapshot

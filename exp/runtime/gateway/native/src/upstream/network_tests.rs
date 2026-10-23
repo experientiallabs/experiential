@@ -215,3 +215,123 @@ fn serve_configuration_requires_an_explicit_hosted_opt_in() {
             .unwrap();
     assert!(hosted.public_upstreams_only);
 }
+
+#[test]
+fn tenant_lists_default_to_platform_domains_and_operators_supply_addresses() {
+    // No address ships in the published engine; the platform supplies them.
+    let defaults = TenantPolicy::from_lists(None, None);
+    assert!(!defaults.denies_address("1.1.1.1".parse().unwrap()));
+    assert!(!defaults.denies_address("8.8.8.8".parse().unwrap()));
+    for host in [
+        "xplabs.ai",
+        "clef.xplabs.ai",
+        "GATEWAY.XPLABS.AI.",
+        "api.experientiallabs.ai",
+        "a.private.preview.experientiallabs.ai",
+    ] {
+        assert!(defaults.denies_host(host), "{host}");
+    }
+    for host in ["notxplabs.ai", "xplabs.ai.example", "provider.example"] {
+        assert!(!defaults.denies_host(host), "{host}");
+    }
+    let replaced = TenantPolicy::from_lists(Some(" 9.9.9.9, not-an-ip ,"), Some("Example.TEST."));
+    assert!(replaced.denies_address("9.9.9.9".parse().unwrap()));
+    assert!(!replaced.denies_address("1.1.1.1".parse().unwrap()));
+    assert!(replaced.denies_host("api.example.test"));
+    assert!(!replaced.denies_host("clef.xplabs.ai"));
+    // An empty value disables the list rather than restoring the default.
+    assert_eq!(
+        TenantPolicy::from_lists(Some(""), Some("")),
+        TenantPolicy {
+            addresses: Vec::new(),
+            domains: Vec::new(),
+        }
+    );
+}
+
+#[test]
+fn only_a_hosted_client_holds_tenant_origins_to_ports_and_platform_infrastructure() {
+    let hosted = crate::upstream::build_client(Duration::from_secs(1), true).unwrap();
+    let tenant = hosted.for_origin(true);
+    for url in [
+        "https://clef.xplabs.ai/v1",
+        "https://api.experientiallabs.ai/v1",
+        "https://provider.example:22/v1",
+        "https://provider.example:5432/v1",
+        "https://provider.example:6543/v1",
+        "https://8.8.8.8:27017/v1",
+        "https://127.0.0.1/v1",
+    ] {
+        let failure = tenant.post(url).expect_err(url);
+        assert!(!failure.retryable_same_deployment, "{url}");
+        assert!(failure.failover_eligible, "{url}");
+    }
+    for url in [
+        "https://provider.example/v1",
+        "https://provider.example:443/v1",
+        "https://provider.example:8000/v1",
+        "https://provider.example:8080/v1",
+        "https://provider.example:8443/v1",
+        "https://8.8.8.8/v1",
+    ] {
+        assert!(tenant.post(url).is_ok(), "{url}");
+        assert!(tenant.get(url).is_ok(), "{url}");
+        assert!(tenant.patch(url).is_ok(), "{url}");
+    }
+    // House lanes keep the public-only rule alone: they serve from these hosts.
+    let house = hosted.for_origin(false);
+    assert!(house.post("https://8.8.8.8:8080/v1").is_ok());
+    assert!(house.post("https://clef.xplabs.ai/v1").is_ok());
+    // A standalone plane has no tenant sibling and keeps its local reach.
+    let local = crate::upstream::build_client(Duration::from_secs(1), false).unwrap();
+    assert!(local
+        .for_origin(true)
+        .post("http://127.0.0.1:8080/v1")
+        .is_ok());
+}
+
+#[tokio::test]
+async fn a_tenant_dns_answer_naming_platform_infrastructure_is_refused_at_connect() {
+    let policy = Arc::new(TenantPolicy::from_lists(Some("1.1.1.1, 9.9.9.9"), None));
+    for values in [
+        vec!["1.1.1.1:443"],
+        vec!["8.8.8.8:443", "9.9.9.9:443"],
+        vec!["10.0.0.1:443"],
+    ] {
+        let resolver = TenantResolver {
+            inner: PublicResolver(Answers::new(&values)),
+            policy: policy.clone(),
+        };
+        let error = match resolver.resolve("tenant.example".parse().unwrap()).await {
+            Ok(_) => panic!("{values:?} must be refused"),
+            Err(error) => error.to_string(),
+        };
+        // The hosted endpoint-policy hold matches this sentence.
+        assert!(
+            error.contains("provider DNS must resolve only to public addresses"),
+            "{error}"
+        );
+    }
+    let answers = Answers::new(&["8.8.8.8:443"]);
+    let resolver = TenantResolver {
+        inner: PublicResolver(answers.clone()),
+        policy,
+    };
+    let sockets: Vec<_> = resolver
+        .resolve("tenant.example".parse().unwrap())
+        .await
+        .unwrap()
+        .collect();
+    assert_eq!(sockets, answers.addresses);
+}
+
+#[test]
+fn a_tenant_address_the_platform_lists_is_refused_as_a_literal() {
+    let policy = TenantPolicy::from_lists(Some("1.1.1.1"), Some(""));
+    for raw in ["https://1.1.1.1/v1", "https://1.1.1.1:8080/v1"] {
+        let url = reqwest::Url::parse(raw).unwrap();
+        assert!(validate_url(&url, Some(&policy)).is_err(), "{raw}");
+    }
+    let url = reqwest::Url::parse("https://8.8.8.8/v1").unwrap();
+    assert!(validate_url(&url, Some(&policy)).is_ok());
+}

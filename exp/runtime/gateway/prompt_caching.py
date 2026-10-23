@@ -11,9 +11,11 @@ three promises on every route:
   so the route keeps its certified order.
 * Every caller cache marker is removed before any payload is built: Anthropic
   ``cache_control`` on the top level, content blocks, tool results, tool calls
-  and tool definitions (Bedrock would translate these to ``cachePoint``). The
-  caller's ``prompt_cache_key`` stays in request identity but reaches no
-  provider. Each removed path is disclosed in ``ignored_parameters``.
+  and tool definitions (Bedrock would translate these to ``cachePoint``; OpenAI
+  ``prompt_cache_breakpoint`` markers ride the same carriers), and
+  OpenAI's 12-hour ``prompt_cache_options.ttl``. The caller's
+  ``prompt_cache_key`` stays in request identity but reaches no provider.
+  Each removed path is disclosed in ``ignored_parameters``.
 * A provider that caches prompt prefixes on its own, with no request field
   that turns it off, may still do so. Such rungs stay routable and the
   response discloses ``prompt_caching`` as best effort instead.
@@ -27,7 +29,10 @@ from exp.common.core.artifacts import JsonObject
 from exp.common.models.content import MessageContentPart
 from exp.common.models.gateway_catalog import ExactModelDeployment
 from exp.runtime.gateway.contracts import AuthorizationSnapshot, GatewayMessage, GatewayRequest
-from exp.runtime.gateway.prompt_cache_affinity import provider_prompt_cache_key
+from exp.runtime.gateway.prompt_cache_affinity import (
+    provider_prompt_cache_key,
+    provider_session_id,
+)
 from exp.runtime.models.providers.base import GatewayWireProfile
 
 PROMPT_CACHING_OFF_SUFFIX = "->not_forwarded(organization_prompt_caching_off)"
@@ -42,14 +47,14 @@ _MARKER = "cache_control"
 def with_cache_affinity(
     provider_request: GatewayRequest, authorization: AuthorizationSnapshot
 ) -> GatewayRequest:
-    """Attach the tenant's cache-affinity key to the final dispatch request.
+    """Attach the tenant's cache-affinity key and session id to the final dispatch request.
 
     Cache affinity is per tenant and per session, so it is derived once, from
     the request admission settled on and the frozen authority, and read by
     every rung's payload builder that forwards it. It is applied last so no
     admission-time rebuild (route narrowing, capability or schema coercion)
     can drop it; the public request keeps the caller's own ``prompt_cache_key``
-    untouched. An organization with prompt caching off gets no key at all.
+    untouched. An organization with prompt caching off gets neither.
 
     Args:
         provider_request: The request admission settled on.
@@ -60,12 +65,15 @@ def with_cache_affinity(
     """
     if authorization.prompt_caching_disabled:
         return provider_request
+    organization_id = str(authorization.organization_id)
+    identity_id = str(authorization.identity_id)
     return provider_request.model_copy(
         update={
             "provider_prompt_cache_key": provider_prompt_cache_key(
-                provider_request,
-                organization_id=str(authorization.organization_id),
-                identity_id=str(authorization.identity_id),
+                provider_request, organization_id=organization_id, identity_id=identity_id
+            ),
+            "provider_session_id": provider_session_id(
+                provider_request, organization_id=organization_id, identity_id=identity_id
             ),
         }
     )
@@ -98,6 +106,7 @@ def without_prompt_caching(
     return request.model_copy(
         update={
             "provider_cache_control": None,
+            "prompt_cache_ttl": None,
             "tools": tuple(
                 tool.model_copy(update={_MARKER: None}) if tool.cache_control else tool
                 for tool in request.tools
@@ -176,9 +185,13 @@ def _marker_paths(request: GatewayRequest) -> tuple[str, ...]:
     if any(call.cache_control is not None for m in request.messages for call in m.tool_calls):
         paths.append(f"messages.tool_calls.{_MARKER}")
     if any(_content_marked(message) for message in request.messages):
-        paths.append(f"messages.content.{_MARKER}")
+        # OpenAI breakpoints ride the same carriers; name them as the caller did.
+        spelling = "prompt_cache_breakpoint" if request.prompt_cache_breakpoints else _MARKER
+        paths.append(f"messages.content.{spelling}")
     if request.prompt_cache_key is not None:
         paths.append("prompt_cache_key")
+    if request.prompt_cache_ttl is not None:
+        paths.append("prompt_cache_options.ttl")
     return tuple(paths)
 
 

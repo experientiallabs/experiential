@@ -34,6 +34,7 @@ if os.environ.get("EXP_INSTALLED_RELEASE_EVIDENCE") != "1":
     import pytest
     from packaging.requirements import Requirement
     from packaging.specifiers import SpecifierSet
+    from packaging.version import Version
 
 BUILT_DIST_ENV = "EXP_BUILT_DIST_DIR"
 FORBIDDEN_REQUIREMENTS = frozenset(
@@ -60,6 +61,7 @@ REQUIRED_CORE_REQUIREMENTS = frozenset(
         "httpx",
         "httpx2",
         "ijson",
+        "jsonschema",
         "numpy",
         "openai",
         "posthog",
@@ -92,6 +94,12 @@ REQUIRED_WHEEL_MODULES = frozenset(
         "exp/runtime/models/registry.py",
         "exp/runtime/router/application.py",
         "exp/simulation/comparison.py",
+        "exp/common/evaluations/reconstruction.py",
+        "exp/runtime/models/providers/admitted_transport.py",
+        "exp/runtime/sessions/store.py",
+        "exp/simulation/reconstruction/workflow.py",
+        "exp/simulation/reconstruction/prompts/reconstruct.txt",
+        "exp/simulation/world_model/durable.py",
         "exp/simulation/engines/sandbox.py",
         "exp/optimize/router/automatic/service.py",
         "exp/optimize/router/composition.py",
@@ -260,7 +268,7 @@ def _core_requirement_names(metadata: str) -> frozenset[str]:
 
 
 def _assert_core_requirements(metadata: str) -> None:
-    """Check SDK requirements, the HTTPX2 security floor and Python-gated Capture."""
+    """Check SDK requirements, exact pins (extras too), HTTPX2 floor and Python-gated Capture."""
     _assert_allowed_requirements(metadata)
     requirements: dict[str, str] = {}
     for name, marker in _metadata_requirements(metadata):
@@ -275,9 +283,26 @@ def _assert_core_requirements(metadata: str) -> None:
     headers = Parser().parsestr(metadata, headersonly=True)
     for value in headers.get_all("Requires-Dist", []):
         requirement = Requirement(re.sub(r"\s+", " ", value))
-        if requirement.name.casefold() == "httpx2" and requirement.marker is None:
-            assert requirement.specifier == SpecifierSet(">=2.12,<3"), (
-                f"unexpected HTTPX2 security constraint: {requirement.specifier}"
+        name = requirement.name.casefold()
+        if name == "experiential":
+            # The dev extra's experiential[sft] names this same release.
+            assert not requirement.specifier, f"self-reference carries a version: {value}"
+            continue
+        if name == "openai":
+            # Callers' own code imports the SDK, so it alone stays a certified range.
+            assert requirement.specifier == SpecifierSet(">=3.0,<4"), (
+                f"unexpected OpenAI SDK range: {requirement.specifier}"
+            )
+            continue
+        specifiers = list(requirement.specifier)
+        assert (
+            len(specifiers) == 1
+            and specifiers[0].operator == "=="
+            and "*" not in specifiers[0].version
+        ), f"release requirement is not an exact pin: {value}"
+        if name == "httpx2":
+            assert Version(specifiers[0].version) >= Version("2.12"), (
+                f"HTTPX2 pin is below its security floor: {requirement.specifier}"
             )
 
 
@@ -289,10 +314,45 @@ def test_core_dependency_markers_preserve_sdk_python_312() -> None:
     metadata = "\n".join(f"Requires-Dist: {requirement}" for requirement in project["dependencies"])
     _assert_core_requirements(metadata)
     _assert_core_requirements(metadata + "\n\nRequires-Dist: anthropic>=1.2")
-    _assert_core_requirements(metadata + '\nRequires-Dist: anthropic>=1.2; extra == "dev"')
+    _assert_core_requirements(metadata + '\nRequires-Dist: anthropic==1.2.0; extra == "dev"')
     for marker in ("", '; python_version >= "3.13"'):
         with pytest.raises(AssertionError, match="forbidden release requirement"):
             _assert_core_requirements(metadata + f"\nRequires-Dist: anthropic>=1.2{marker}")
+
+
+def _published_requires_dist() -> list[str]:
+    """Return the Requires-Dist values the built metadata lists, extras included.
+
+    Returns:
+        Core requirements, then each extra's requirements with its marker.
+    """
+    path = Path(__file__).resolve().parents[2] / "pyproject.toml"
+    project = tomllib.loads(path.read_text(encoding="utf-8"))["project"]
+    values = list(project["dependencies"])
+    for extra, requirements in project["optional-dependencies"].items():
+        values += [f'{requirement}; extra == "{extra}"' for requirement in requirements]
+    return values
+
+
+def test_release_requirements_reject_ranges_wildcards_and_versioned_self_reference() -> None:
+    """The published set passes; one wildcard, extra range or pinned self-reference fails.
+
+    The cases loop inside one test: the installed-release driver imports this module
+    without pytest, so module-level pytest decorators cannot appear here.
+    """
+    published = _published_requires_dist()
+    _assert_core_requirements("\n".join(f"Requires-Dist: {value}" for value in published))
+    cases = (
+        ("filelock==", "filelock==3.*", "not an exact pin"),
+        ("tinker==", 'tinker>=0.23; extra == "sft"', "not an exact pin"),
+        ("experiential[sft]", 'experiential[sft]==0.7.216; extra == "dev"', "self-reference"),
+    )
+    for original, replacement, message in cases:
+        values = list(published)
+        index = next(i for i, value in enumerate(values) if value.startswith(original))
+        values[index] = replacement
+        with pytest.raises(AssertionError, match=message):
+            _assert_core_requirements("\n".join(f"Requires-Dist: {value}" for value in values))
 
 
 def _assert_current_archive_members(

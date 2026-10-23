@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from exp.runtime.gateway.budgets import BudgetReservationRejected, BudgetScopeKind
-from exp.runtime.gateway.contracts import ExecutionSnapshot
+from exp.runtime.gateway.execution_snapshot import ExecutionSnapshot
 
 
 def denied_destination_pool(

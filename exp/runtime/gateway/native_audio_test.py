@@ -87,7 +87,7 @@ def _admit(
         resolved_wires=cast(Any, ((SimpleNamespace(speech_url="u"), None),)),
         dead=(),
     )
-    monkeypatch.setattr(native_audio, "dispatchable_route_profiles", lambda *_: dispatchable)
+    monkeypatch.setattr(native_audio, "dispatchable_route_profiles", lambda *_, **__: dispatchable)
     monkeypatch.setattr(native_audio, "record_dead_admission_rungs", lambda *_, **__: None)
     authorization = SimpleNamespace(target=DirectTarget(pool_id="pool"), alias="voice")
     native_audio._route(  # noqa: SLF001
@@ -98,6 +98,7 @@ def _admit(
         surface="speech",
         rung_url=native_audio._speech_rung,  # noqa: SLF001
         payload=lambda *_: {},
+        refusal=lambda *_: None,
         extra={},
     )
     return plane

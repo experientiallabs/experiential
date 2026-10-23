@@ -50,32 +50,25 @@ impl ProviderTools {
 }
 
 /// How many generation-idle windows an open client tool call's arguments may
-/// stay silent on a dialect that buffers them. Anthropic emits a long string
-/// argument (a whole file for Claude Code's Write tool) only once it is
-/// generated and sends nothing meanwhile, not even pings: at the default 60 s
-/// window a large write on a long context died at the same byte on every
-/// retry (2026-10-05). Ten windows is 600 s, Claude Code's own client timeout.
+/// stay silent. Providers buffer long string arguments on every wire:
+/// Anthropic emits a whole file for Claude Code's Write tool only once it is
+/// generated, with no pings meanwhile (a large write died at the same byte on
+/// every retry, 2026-10-05), and vLLM's DeepSeek tool parser on the OpenAI
+/// chat wire holds 800 to 2,800 characters of arguments at a time around
+/// escaped quotes (7 to 14 s silences on an idle server; 400 streams across
+/// 70 orgs killed in 12 hours, 2026-10-20). The attempt is committed once a
+/// call starts, so an earlier verdict could not fail over anyway. Ten windows
+/// is 600 s, Claude Code's own client timeout.
 const BUFFERED_TOOL_ARGUMENT_IDLE_WINDOWS: u32 = 10;
 
-/// Track the client tool calls whose arguments are still being generated, on
-/// a dialect whose provider buffers them.
+/// Track the client tool calls whose arguments are still being generated.
+#[derive(Default)]
 pub(super) struct BufferedToolArguments {
-    buffered: bool,
     open: HashSet<u32>,
 }
 
 impl BufferedToolArguments {
-    pub(super) fn new(buffered: bool) -> Self {
-        Self {
-            buffered,
-            open: HashSet::new(),
-        }
-    }
-
     pub(super) fn observe(&mut self, event: &Event) {
-        if !self.buffered {
-            return;
-        }
         match event {
             Event::ToolCallStarted { index, .. } => {
                 self.open.insert(*index);
@@ -87,7 +80,7 @@ impl BufferedToolArguments {
         }
     }
 
-    /// The generation-idle bound: widened only while a buffered argument is open.
+    /// The generation-idle bound: widened only while a tool call's arguments are open.
     pub(super) fn idle_bound(&self, phase_timeout: Duration) -> Duration {
         if self.open.is_empty() {
             phase_timeout
