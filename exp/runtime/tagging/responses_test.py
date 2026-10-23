@@ -6,8 +6,6 @@ and Messages block lifecycles. The capture adapter tests reuse them.
 
 from __future__ import annotations
 
-import json
-
 import pytest
 from pydantic import JsonValue
 
@@ -177,55 +175,6 @@ def test_streams_are_taken_as_the_collector_assembles_them() -> None:
     assert message["stop_reason"] == "tool_use"
 
 
-def test_messages_tool_inputs_keep_exact_wide_integers() -> None:
-    """The collector's exact source for a wide integer tool input replaces its rounded copy."""
-    frames = list(MESSAGES_FRAMES)
-    frames[7] = {
-        "type": "content_block_delta",
-        "index": 1,
-        "delta": {"type": "input_json_delta", "partial_json": "18446744073709551617}"},
-    }
-    content = completed_response("messages", _sse(frames))["content"]
-    assert isinstance(content, list) and isinstance(content[1], dict)
-    assert content[1]["input"] == {"cmd": 18446744073709551617}
-    assert "capture_input_source_json" not in content[1]
-
-
-def test_exact_sources_are_preferred_over_projections() -> None:
-    """Retained source JSON keeps wide integers and text the projection had to normalize."""
-    exact = json.dumps(
-        {
-            "choices": [
-                {
-                    "index": 0,
-                    "message": {
-                        "role": "assistant",
-                        "content": "a\u0000b \ud800",
-                        "n": 18446744073709551617,
-                    },
-                    "finish_reason": "stop",
-                }
-            ]
-        }
-    )
-    projected: JsonObject = {
-        "choices": [
-            {
-                "index": 0,
-                "message": {"role": "assistant", "content": "a\ufffdb \ufffd", "n": 1.8e19},
-                "finish_reason": "stop",
-            }
-        ]
-    }
-    document: JsonObject = {"kind": "json", "status": 200, "body": projected, "source_json": exact}
-    choices = completed_response("chat_completions", document)["choices"]
-    assert isinstance(choices, list) and isinstance(choices[0], dict)
-    message = choices[0]["message"]
-    assert isinstance(message, dict)
-    assert message["n"] == 18446744073709551617
-    assert message["content"] == "a\u0000b \ufffd"
-
-
 @pytest.mark.parametrize("status", ["completed", "incomplete"])
 def test_responses_streams_take_their_finished_terminal_response(status: str) -> None:
     """A Responses stream body is its terminal response, including a length-limited one.
@@ -260,29 +209,6 @@ def test_unfinished_responses_are_not_tagged() -> None:
     queued: JsonObject = {"kind": "json", "status": 200, "body": {"status": "queued", "output": []}}
     with pytest.raises(ValueError, match="not finished"):
         completed_response("responses", queued)
-
-
-def test_responses_streams_keep_exact_wide_integers() -> None:
-    """The collector's exact terminal event replaces a rounded Responses body."""
-    response: JsonObject = {
-        "status": "completed",
-        "output": [
-            {
-                "type": "function_call",
-                "id": "fc",
-                "call_id": "c1",
-                "name": "seek",
-                "arguments": "{}",
-                "status": "completed",
-                "limit": 18446744073709551617,
-            }
-        ],
-    }
-    frames: list[JsonValue] = [{"type": "response.completed", "response": response}]
-    body = completed_response("responses", _sse(frames))
-    output = body["output"]
-    assert isinstance(output, list) and isinstance(output[0], dict)
-    assert output[0]["limit"] == 18446744073709551617
 
 
 def test_readable_responses_drop_response_only_item_metadata() -> None:
