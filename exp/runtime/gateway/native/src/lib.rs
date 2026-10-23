@@ -109,6 +109,52 @@ impl ShutdownHandle {
     }
 }
 
+/// One composed decision-model classifier, owned by the control plane.
+///
+/// The control plane validates each `decision_model` adapter document,
+/// composes this handle with the endpoint's bearer, and reuses it for every
+/// request. `classify` releases the GIL while the decision call runs, and
+/// every call shares one verdict cache and its counters.
+#[pyclass(frozen)]
+pub struct DecisionClassifier {
+    inner: Arc<guardrails::classify::Classifier>,
+}
+
+#[pymethods]
+impl DecisionClassifier {
+    /// Compose one classifier from its JSON specification and optional bearer.
+    #[new]
+    #[pyo3(signature = (spec_json, bearer=None))]
+    fn new(spec_json: &str, bearer: Option<String>) -> PyResult<Self> {
+        let spec = serde_json::from_str(spec_json)
+            .map_err(|error| PyValueError::new_err(format!("invalid classifier spec: {error}")))?;
+        let inner = Arc::new(
+            guardrails::classify::Classifier::new(spec, bearer).map_err(PyValueError::new_err)?,
+        );
+        Ok(Self { inner })
+    }
+
+    /// Classify one window within `timeout_ms`, blocking without the GIL.
+    ///
+    /// Returns `{"answer": {probabilities, scores, flagged, cached, latency_ms}}`
+    /// or `{"error": "<fixed reason>"}`.
+    fn classify(&self, py: Python<'_>, window: &str, timeout_ms: u64) -> String {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+        let outcome =
+            py.detach(|| guardrails::classify::classify_blocking(&self.inner, window, deadline));
+        let reply = match outcome {
+            Ok(answer) => serde_json::json!({"answer": self.inner.answer_json(&answer)}),
+            Err(error) => serde_json::json!({"error": error.reason()}),
+        };
+        reply.to_string()
+    }
+
+    /// Content-free counters: score buckets, cache hits and misses, errors, latency.
+    fn telemetry_json(&self) -> String {
+        self.inner.telemetry_json().to_string()
+    }
+}
+
 /// One compiled deterministic guardrail rule, owned by the control plane.
 ///
 /// The control plane compiles each authored `regex` adapter once at policy
@@ -686,6 +732,7 @@ const MODEL_STAGE_CONTRACT_VERSION: u32 = 1;
 fn exp_gateway_native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<ShutdownHandle>()?;
     module.add_class::<RegexDetector>()?;
+    module.add_class::<DecisionClassifier>()?;
     module.add_class::<capture::python::CaptureCollector>()?;
     module.add_class::<capture::python::CaptureResponse>()?;
     module.add_function(wrap_pyfunction!(shutdown_handle, module)?)?;

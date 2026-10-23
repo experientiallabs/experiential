@@ -2,12 +2,13 @@
 //!
 //! Rust owns buffering and delivery. A chain whose checks all bind
 //! deterministic detectors runs natively through `plan`, with the compiled
-//! rules in `detector`. Every other chain crosses the JSON-typed python
-//! boundary below, which keeps policy lookup and non-deterministic adapters
-//! (`http_json` and future model-based classifiers) in python.
+//! rules in `detector`. Decision-model classification runs natively through
+//! `classify`. Every other chain crosses the JSON-typed python boundary below,
+//! which keeps policy lookup and the remaining adapters (`http_json`) in python.
 //!
 //! This module never logs request text, completions, or replacements.
 
+pub(crate) mod classify;
 pub mod detector;
 pub(crate) mod input;
 pub mod plan;

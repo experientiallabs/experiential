@@ -511,7 +511,7 @@ fn malformed(reason: &str) -> Failure {
 }
 
 /// Strict JSON parsing rejects duplicate keys at every depth, including answers.
-fn strict_json(bytes: &[u8]) -> Result<Value, Failure> {
+pub(crate) fn strict_json(bytes: &[u8]) -> Result<Value, Failure> {
     struct Unique(Value);
     impl<'de> Deserialize<'de> for Unique {
         fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
