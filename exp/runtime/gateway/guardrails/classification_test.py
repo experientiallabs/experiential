@@ -13,6 +13,8 @@ from pydantic import ValidationError
 from exp.common.core.artifacts import JsonObject, JsonValue
 from exp.runtime.gateway.contracts import GatewayApiSurface, GatewayMessage, GatewayRequest
 from exp.runtime.gateway.guardrails.classification import (
+    ClassificationObserver,
+    ClassificationResult,
     DecisionModelAdapterDocument,
     DecisionModelClassifier,
 )
@@ -93,6 +95,7 @@ def _classify(
     handler: Callable[[httpx.Request], httpx.Response],
     requests: list[GatewayRequest],
     document: JsonObject | None = None,
+    on_result: ClassificationObserver | None = None,
 ) -> tuple[DecisionModelClassifier, list[bool | Exception]]:
     """Run inspections in order through one adapter and capture verdicts or errors."""
     results: list[bool | Exception] = []
@@ -103,6 +106,7 @@ def _classify(
             adapter = DecisionModelClassifier(
                 DecisionModelAdapterDocument.model_validate(document or _document()),
                 client=client,
+                on_result=on_result,
             )
             for request in requests:
                 try:
@@ -181,6 +185,67 @@ def test_definitive_answers_are_cached_and_errors_are_not(
     assert isinstance(buckets, dict)
     assert buckets["prompt_injection"] == [0] * 19 + [2]
     assert buckets["off_topic"] == [0, 2] + [0] * 18
+
+
+def test_observer_receives_every_definitive_answer_with_its_probabilities(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Fresh and cached answers both report per-question output; errors and empty windows don't."""
+    monkeypatch.setenv("DECISION_MODEL_BEARER", "fixture-credential")
+    statuses = iter((503, 200))
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        """Fail once, then answer."""
+        status = next(statuses)
+        answers = _answers(overrides_instructions=0.25, unrelated_task=0.875, unrelated_domain=0.75)
+        return httpx.Response(status, json=answers if status == 200 else {})
+
+    image_only = GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=(GatewayMessage(role="user", provider_native_item={"type": "item"}),),
+    )
+    observed: list[ClassificationResult] = []
+    adapter, results = _classify(
+        handler, [_request(), image_only, _request(), _request()], on_result=observed.append
+    )
+
+    assert isinstance(results[0], ClassifierProtocolError)
+    assert results[1:] == [False, True, True]
+    assert [result.cached for result in observed] == [False, True]
+    fresh, cached = observed
+    assert (
+        fresh.probabilities
+        == cached.probabilities
+        == (
+            ("overrides_instructions", 0.25),
+            ("unrelated_task", 0.875),
+            ("unrelated_domain", 0.75),
+        )
+    )
+    assert fresh.scores == cached.scores == (("prompt_injection", 0.25), ("off_topic", 0.8125))
+    assert fresh.flagged == cached.flagged == ("off_topic",)
+    assert (fresh.adapter_id, fresh.check_id) == ("request-classifier", "classify-input")
+    assert fresh.configuration_digest == adapter.configuration_digest
+
+
+def test_an_observer_that_raises_never_changes_the_verdict() -> None:
+    """Host recording failures are logged, and the classification still decides the request."""
+
+    def broken(result: ClassificationResult) -> None:
+        """Fail like a host recorder bug."""
+        raise RuntimeError("recorder unavailable")
+
+    _, results = _classify(
+        lambda request: httpx.Response(
+            200,
+            json=_answers(overrides_instructions=0.95, unrelated_task=0.0, unrelated_domain=0.0),
+        ),
+        [_request()],
+        _document(bearer_env=None),
+        on_result=broken,
+    )
+
+    assert results == [True]
 
 
 def _answer_body(injection: str, kind: str = "noul") -> bytes:

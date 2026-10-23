@@ -152,8 +152,8 @@ refused. A request with no text at all is allowed without a classifier call.
 ## Verdict cache
 
 Each adapter keeps a bounded, thread-safe least-recently-used cache. The key is the SHA-256
-of the adapter's configuration digest and the window text, and the value is the category
-scores, so the cache never holds request text. Entries expire after `ttl_seconds`. Only
+of the adapter's configuration digest and the window text, and the value is the question
+probabilities, so the cache never holds request text. Entries expire after `ttl_seconds`. Only
 definitive answers are cached: an error is never stored, and the next request asks the
 model again. Reloading the guardrail file builds new adapters with empty caches.
 
@@ -198,6 +198,14 @@ observation records add policy, check, outcome, and latency as for every guardra
 `DecisionModelClassifier.telemetry()` returns the same data as counters: per-category
 bucket counts, cache hits and misses, errors, and the summed latency of model calls. Window
 text, question text, and classifier payloads are never logged or retained.
+
+A host that needs each request's answer passes `on_result` when it constructs the adapter.
+The observer receives a `ClassificationResult` for every definitive answer, whether from the
+model or the cache: adapter and check ids, the configuration digest, every question's
+probability, every category's score, the flagged categories, `cached`, and latency. It
+carries no window or question text. The observer runs on the request path, so it must not
+block. An observer that raises is logged and never changes the verdict. Errors and requests
+without text produce no result.
 
 ## Observe, then enforce
 

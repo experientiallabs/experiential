@@ -5,7 +5,8 @@ One SystemOne call asks every configured question in a single forward pass:
 ``{"answers": {"<id>": {"type": "noul", "noul": <probability>}}}``. Question
 probabilities combine into operator categories, and a request is flagged when
 any category score reaches its threshold. A self-hosted SGLang server running a
-Clef model serves this wire, as do hosted SystemOne endpoints.
+Clef model serves this wire, as do hosted SystemOne endpoints. A host that needs
+each request's answer, not only the verdict, passes an ``on_result`` observer.
 """
 
 from __future__ import annotations
@@ -17,6 +18,7 @@ import math
 import threading
 import time
 from collections.abc import Callable
+from dataclasses import dataclass
 from hashlib import sha256
 from typing import Final, Literal
 
@@ -34,6 +36,7 @@ from exp.runtime.gateway.decisions_contracts import (
 )
 from exp.runtime.gateway.guardrails.classification_cache import (
     CategoryScores,
+    QuestionProbabilities,
     VerdictCache,
     VerdictCacheSettings,
 )
@@ -211,6 +214,35 @@ def score_bucket(score: float) -> int:
     return min(math.floor(score * SCORE_BUCKETS), SCORE_BUCKETS - 1)
 
 
+@dataclass(frozen=True)
+class ClassificationResult:
+    """One definitive answer for one request window, without request or question text.
+
+    Attributes:
+        adapter_id: Adapter that classified the window.
+        check_id: Check that asked.
+        configuration_digest: Digest of the endpoint, model, categories, and window.
+        probabilities: Every question's probability, in authored order.
+        scores: Every category's combined score, in authored order.
+        flagged: Categories whose score reached their threshold, in authored order.
+        cached: Whether the answer came from the verdict cache.
+        latency_seconds: Time to the answer, including the cache lookup.
+    """
+
+    adapter_id: str
+    check_id: str
+    configuration_digest: str
+    probabilities: QuestionProbabilities
+    scores: CategoryScores
+    flagged: tuple[str, ...]
+    cached: bool
+    latency_seconds: float
+
+
+ClassificationObserver = Callable[[ClassificationResult], None]
+"""Host callback for each definitive answer; it runs on the request path and must not block."""
+
+
 class DecisionModelClassifier:
     """Classify a bounded request window with one SystemOne decision call.
 
@@ -220,6 +252,8 @@ class DecisionModelClassifier:
     timeouts, malformed bodies, missing answers, and probabilities that are not
     finite numbers in ``[0, 1]`` are classifier protocol errors. The adapter
     logs only content-free metadata and never logs window or question text.
+    Every definitive answer, cached or not, reaches the optional observer; an
+    observer that raises is logged and never changes the verdict.
     """
 
     def __init__(
@@ -228,6 +262,7 @@ class DecisionModelClassifier:
         *,
         client: httpx.AsyncClient | None = None,
         monotonic: Callable[[], float] = time.monotonic,
+        on_result: ClassificationObserver | None = None,
     ) -> None:
         """Bind one validated adapter document.
 
@@ -235,11 +270,13 @@ class DecisionModelClassifier:
             document: Endpoint, model, categories, window, and cache settings.
             client: Optional injected client. ``None`` uses the shared pool.
             monotonic: Clock for cache expiry and latency, in seconds.
+            on_result: Optional observer of every definitive answer.
         """
         self._document = document
         self._questions = document.questions
         self._client = client
         self._monotonic = monotonic
+        self._on_result = on_result
         self._cache = VerdictCache(document.cache, monotonic=monotonic)
         self._telemetry = ClassificationTelemetry(tuple(document.categories))
         self._digest = sha256(
@@ -284,11 +321,11 @@ class DecisionModelClassifier:
             return ClassifierVerdict(flagged=False)
         key = sha256(self._digest.encode() + b"\n" + state.encode("utf-8")).digest()
         started = self._monotonic()
-        scores = self._cache.get(key)
-        cached = scores is not None
-        if scores is None:
+        probabilities = self._cache.get(key)
+        cached = probabilities is not None
+        if probabilities is None:
             try:
-                probabilities = await self._decide(state)
+                probabilities = tuple((await self._decide(state)).items())
             except ClassifierProtocolError as exc:
                 latency = self._monotonic() - started
                 self._telemetry.record_error(latency)
@@ -301,11 +338,10 @@ class DecisionModelClassifier:
                     exc,
                 )
                 raise
-            scores = tuple(
-                (name, category.score(probabilities))
-                for name, category in self._document.categories.items()
-            )
-            self._cache.put(key, scores)
+            self._cache.put(key, probabilities)
+        by_question = dict(probabilities)
+        categories = self._document.categories
+        scores = tuple((name, category.score(by_question)) for name, category in categories.items())
         latency = self._monotonic() - started
         self._telemetry.record(scores, cached=cached, latency_seconds=latency)
         _logger.info(
@@ -317,10 +353,28 @@ class DecisionModelClassifier:
             latency * 1000.0,
             ",".join(f"{name}:{score_bucket(value) / SCORE_BUCKETS:.2f}" for name, value in scores),
         )
-        categories = self._document.categories
-        return ClassifierVerdict(
-            flagged=any(value >= categories[name].threshold for name, value in scores)
-        )
+        flagged = tuple(name for name, value in scores if value >= categories[name].threshold)
+        if self._on_result is not None:
+            result = ClassificationResult(
+                adapter_id=self._document.adapter_id,
+                check_id=check.check_id,
+                configuration_digest=self._digest,
+                probabilities=probabilities,
+                scores=scores,
+                flagged=flagged,
+                cached=cached,
+                latency_seconds=latency,
+            )
+            try:
+                self._on_result(result)
+            except Exception:  # noqa: BLE001 - a host observer never changes the verdict.
+                _logger.warning(
+                    "guardrail classification observer failed adapter_id=%s check_id=%s",
+                    self._document.adapter_id,
+                    check.check_id,
+                    exc_info=True,
+                )
+        return ClassifierVerdict(flagged=bool(flagged))
 
     async def inspect_output(
         self,

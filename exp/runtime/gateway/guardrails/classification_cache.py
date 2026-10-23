@@ -13,6 +13,9 @@ from exp.common.core.artifacts import ContractModel
 CategoryScores = tuple[tuple[str, float], ...]
 """Ordered ``(category, score)`` pairs, each score in ``[0, 1]``."""
 
+QuestionProbabilities = tuple[tuple[str, float], ...]
+"""Ordered ``(question, probability)`` pairs, each probability in ``[0, 1]``."""
+
 
 class VerdictCacheSettings(ContractModel):
     """Bounds for one adapter's verdict cache.
@@ -27,9 +30,9 @@ class VerdictCacheSettings(ContractModel):
 
 
 class VerdictCache:
-    """Least-recently-used map from a window digest to its category scores.
+    """Least-recently-used map from a window digest to its question probabilities.
 
-    Keys are SHA-256 digests and values are scores, so the cache never holds
+    Keys are SHA-256 digests and values are probabilities, so the cache never holds
     request text. Callers store only definitive answers; a classifier error is
     never cached and the next request asks the model again. Isolation workers
     share one cache, so every operation holds one lock.
@@ -45,40 +48,40 @@ class VerdictCache:
         self._max_entries = settings.max_entries
         self._ttl_seconds = settings.ttl_seconds
         self._monotonic = monotonic
-        self._entries: OrderedDict[bytes, tuple[float, CategoryScores]] = OrderedDict()
+        self._entries: OrderedDict[bytes, tuple[float, QuestionProbabilities]] = OrderedDict()
         self._lock = threading.Lock()
 
-    def get(self, key: bytes) -> CategoryScores | None:
-        """Return fresh scores for ``key`` and mark them recently used.
+    def get(self, key: bytes) -> QuestionProbabilities | None:
+        """Return fresh probabilities for ``key`` and mark them recently used.
 
         Args:
             key: SHA-256 digest of the configuration and window.
 
         Returns:
-            The cached scores, or ``None`` when absent or expired.
+            The cached probabilities, or ``None`` when absent or expired.
         """
         with self._lock:
             entry = self._entries.get(key)
             if entry is None:
                 return None
-            expires_at, scores = entry
+            expires_at, probabilities = entry
             if expires_at <= self._monotonic():
                 del self._entries[key]
                 return None
             self._entries.move_to_end(key)
-            return scores
+            return probabilities
 
-    def put(self, key: bytes, scores: CategoryScores) -> None:
+    def put(self, key: bytes, probabilities: QuestionProbabilities) -> None:
         """Store one definitive answer and evict the least recently used overflow.
 
         Args:
             key: SHA-256 digest of the configuration and window.
-            scores: Category scores the decision model produced for that window.
+            probabilities: Question probabilities the decision model produced for that window.
         """
         if self._max_entries == 0:
             return
         with self._lock:
-            self._entries[key] = (self._monotonic() + self._ttl_seconds, scores)
+            self._entries[key] = (self._monotonic() + self._ttl_seconds, probabilities)
             self._entries.move_to_end(key)
             while len(self._entries) > self._max_entries:
                 self._entries.popitem(last=False)
