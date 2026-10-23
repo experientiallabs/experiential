@@ -538,7 +538,7 @@ fn a_cyber_policy_response_failed_carries_the_reason_on_both_surfaces() {
     assert_eq!(public.code, "refusal");
     assert_eq!(
         public.message,
-        "provider refused the request: cybersecurity policy"
+        "The model's provider declined this request (cybersecurity policy). Rephrase the request or choose another model."
     );
     // Chat / Responses surface (OpenAI envelope).
     let chat_body = public.json_body();

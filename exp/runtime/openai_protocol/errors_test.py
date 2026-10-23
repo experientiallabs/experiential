@@ -122,7 +122,10 @@ def test_refusal_failure_is_a_request_error_not_a_routing_failure() -> None:
     assert error.status_code == 400
     assert error.detail.code == "refusal"
     assert error.detail.type == "invalid_request_error"
-    assert error.detail.message == "provider refused the request"
+    assert error.detail.message == (
+        "The model's provider declined to answer this request. Rephrase the request or "
+        "choose another model."
+    )
     assert error.retry_after_seconds is None
     # A refusal with no named reason is explicitly unspecified so a client can
     # always read the field.
@@ -263,7 +266,12 @@ def test_provider_explanation_is_ignored_outside_the_client_error_class() -> Non
 
     error = public_failure_error(failure)
 
-    assert error.detail.message == "provider service failed; retry after a short delay"
+    assert error.detail.message == (
+        "The model's provider had a server error and no other provider for this model "
+        "could take the request. Retry after a short delay; if it keeps failing, choose "
+        "another model."
+    )
+    assert "gpt-internal-7" not in error.detail.message
 
 
 @pytest.mark.parametrize("param", (None, "tools"))
@@ -298,3 +306,18 @@ def test_retry_after_must_be_positive() -> None:
             message="quota exhausted",
             retry_after_seconds=0,
         )
+
+
+def test_a_rate_limit_error_type_renders_for_a_wait_for_reset_refusal() -> None:
+    """A wait-for-reset 429 can wear ``rate_limit_error`` instead of a quota type."""
+    error = OpenAIProtocolError(
+        status_code=429,
+        code="rate_limit_exceeded",
+        message="this organization exceeded 240 dispatches per minute; retry in 60 seconds",
+        error_type="rate_limit_error",
+        retry_after_seconds=60,
+    )
+    body = _error_body(error)
+    assert body["type"] == "rate_limit_error"
+    assert body["code"] == "rate_limit_exceeded"
+    assert error.headers() == {"Retry-After": "60"}

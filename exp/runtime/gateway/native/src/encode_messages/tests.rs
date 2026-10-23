@@ -43,7 +43,7 @@ fn a_text_less_refusal_is_an_invalid_request_error_on_the_messages_surface() {
             "type": "error",
             "error": {
                 "type": "invalid_request_error",
-                "message": "provider refused the request",
+                "message": "The model's provider declined to answer this request. Rephrase the request or choose another model.",
                 // A refusal with no named reason still carries the category,
                 // as `unspecified`, on the Anthropic envelope.
                 "refusal_reason": "unspecified",

@@ -14,22 +14,32 @@ from exp.runtime.gateway.contracts import (
     GatewayFailureClass,
     GatewayRefusalReason,
 )
+from exp.runtime.openai_protocol.caller_copy import caller_copy
 
 THROTTLED_RETRY_AFTER_SECONDS = 5
 UNAVAILABLE_RETRY_AFTER_SECONDS = 2
+
+
+# The OpenAI error ``type`` vocabulary. ``rate_limit_error`` names a 429 the
+# caller clears by waiting (OpenAI's own rate-limit code is
+# ``rate_limit_exceeded``); clients such as Codex and DeepSeek Harness read
+# ``insufficient_quota`` as an exhausted balance and replace the message with
+# their own fixed billing text, so a wait-for-reset refusal must not wear it.
+type OpenAIErrorType = Literal[
+    "invalid_request_error",
+    "authentication_error",
+    "permission_error",
+    "insufficient_quota",
+    "rate_limit_error",
+    "api_error",
+]
 
 
 class OpenAIErrorDetail(ContractModel):
     """One public OpenAI error without provider or credential details."""
 
     message: str = Field(min_length=1, max_length=2_048)
-    type: Literal[
-        "invalid_request_error",
-        "authentication_error",
-        "permission_error",
-        "insufficient_quota",
-        "api_error",
-    ]
+    type: OpenAIErrorType
     param: str | None = Field(default=None, max_length=512)
     code: str = Field(min_length=1, max_length=128)
     refusal_reason: GatewayRefusalReason | None = None
@@ -52,13 +62,7 @@ class OpenAIProtocolError(ValueError):
         status_code: int,
         code: str,
         message: str,
-        error_type: Literal[
-            "invalid_request_error",
-            "authentication_error",
-            "permission_error",
-            "insufficient_quota",
-            "api_error",
-        ] = "invalid_request_error",
+        error_type: OpenAIErrorType = "invalid_request_error",
         param: str | None = None,
         retry_after_seconds: int | None = None,
         refusal_reason: GatewayRefusalReason | None = None,
@@ -178,17 +182,7 @@ def public_failure_error(
     """
     mappings: dict[
         GatewayFailureClass,
-        tuple[
-            int,
-            str,
-            Literal[
-                "invalid_request_error",
-                "authentication_error",
-                "permission_error",
-                "insufficient_quota",
-                "api_error",
-            ],
-        ],
+        tuple[int, str, OpenAIErrorType],
     ] = {
         GatewayFailureClass.INVALID_REQUEST: (400, "invalid_request", "invalid_request_error"),
         GatewayFailureClass.UNSUPPORTED_CAPABILITY: (
@@ -231,11 +225,14 @@ def public_failure_error(
         detail_param = failure.safe_details.get("param")
         if param is None and isinstance(detail_param, str):
             param = detail_param
-    message = failure.safe_message
+    # The caller wording of the durable sentence; a relayed provider detail
+    # rebuilds the message from the durable head below instead.
+    message = caller_copy(failure.failure_class, failure.safe_message)
     if (
         failure.failure_class is GatewayFailureClass.INVALID_REQUEST
         and failure.provider_detail is not None
     ):
+        message = failure.safe_message
         # The provider's own sentence names the field and the reason, so it
         # replaces the generic "verify the request fields" advice.
         message = f"{message.split(';')[0].strip()}: {failure.provider_detail}"

@@ -1,7 +1,11 @@
 //! OpenAI-shaped public errors mirroring `exp.runtime.openai_protocol.errors`.
 
+use std::borrow::Cow;
+
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+
+use crate::caller_copy::caller_copy;
 
 /// One sanitized public protocol error carrying its HTTP representation.
 ///
@@ -489,12 +493,13 @@ impl Failure {
             )
     }
 
-    /// The message a caller may read for this failure.
-    pub fn caller_message(&self) -> &str {
+    /// The message a caller may read for this failure: the caller wording of
+    /// the durable `safe_message` (`caller_copy`), which itself never changes.
+    pub fn caller_message(&self) -> Cow<'_, str> {
         if self.tenant_opaque() {
-            TENANT_ORIGIN_MESSAGE
+            Cow::Borrowed(TENANT_ORIGIN_MESSAGE)
         } else {
-            &self.safe_message
+            caller_copy(self.failure_class, &self.safe_message)
         }
     }
 
@@ -596,7 +601,16 @@ impl Failure {
             FailureClass::Unavailable => (503, "gateway_unavailable", "api_error"),
             _ => (502, "all_routes_failed", "api_error"),
         };
-        let mut error = PublicError::new(status, code, &self.safe_message, error_type);
+        // A relayed provider detail rebuilds the message from the durable
+        // head below, so only a detail-free failure takes the caller wording.
+        let message = if self.failure_class == FailureClass::InvalidRequest
+            && self.provider_detail.is_some()
+        {
+            Cow::Borrowed(self.safe_message.as_str())
+        } else {
+            caller_copy(self.failure_class, &self.safe_message)
+        };
+        let mut error = PublicError::new(status, code, &message, error_type);
         if self.failure_class == FailureClass::Refusal {
             // Every refusal answer names its category; a refusal built
             // without one (a visible-refusal stream, a bare stop reason) is
@@ -683,11 +697,12 @@ mod tests {
             assert_ne!(failure.public_error().code, "custom_endpoint_failed");
             assert_eq!(failure.caller_message(), "gateway's own answer");
         }
-        // An ordinary rung keeps its distinct answer.
+        // An ordinary rung keeps its distinct answer, in caller wording.
         let house = Failure::new(FailureClass::Transport, "provider transport failed");
         assert_eq!(
             house.with_tenant_origin(false).caller_message(),
-            "provider transport failed"
+            "The gateway could not reach the model's provider. Retry after a short delay; \
+             if it keeps failing, choose another model."
         );
     }
 
@@ -714,7 +729,7 @@ mod tests {
         assert_eq!(error.status_code, 400);
         assert_eq!(error.code, "refusal");
         assert_eq!(error.error_type, "invalid_request_error");
-        assert_eq!(error.message, "provider refused the request");
+        assert_eq!(error.message, "The model's provider declined to answer this request. Rephrase the request or choose another model.");
         assert_eq!(error.retry_after_seconds, None);
         // A refusal built without a reason still names its category.
         assert_eq!(error.refusal_reason, Some(RefusalReason::Unspecified));
@@ -727,38 +742,43 @@ mod tests {
 
     #[test]
     fn every_refusal_reason_renders_its_fixed_phrase_and_wire_name() {
-        // (reason, wire name, public message): the message is the generic
+        // (reason, wire name, public message): the message is the caller
         // sentence plus the reason's fixed phrase, never provider prose.
         let table = [
             (
                 RefusalReason::CyberPolicy,
                 "cyber_policy",
-                "provider refused the request: cybersecurity policy",
+                "The model's provider declined this request (cybersecurity policy). Rephrase the request or \
+                 choose another model.",
             ),
             (
                 RefusalReason::Cbrn,
                 "cbrn",
-                "provider refused the request: biological/chemical safety policy",
+                "The model's provider declined this request (biological/chemical safety policy). Rephrase the request or \
+                 choose another model.",
             ),
             (
                 RefusalReason::ContentPolicy,
                 "content_policy",
-                "provider refused the request: content policy",
+                "The model's provider declined this request (content policy). Rephrase the request or \
+                 choose another model.",
             ),
             (
                 RefusalReason::Recitation,
                 "recitation",
-                "provider refused the request: recitation of copyrighted material",
+                "The model's provider declined this request (recitation of copyrighted material). Rephrase the request or \
+                 choose another model.",
             ),
             (
                 RefusalReason::DataInspection,
                 "data_inspection",
-                "provider refused the request: data inspection",
+                "The model's provider declined this request (data inspection). Rephrase the request or \
+                 choose another model.",
             ),
             (
                 RefusalReason::Unspecified,
                 "unspecified",
-                "provider refused the request",
+                "The model's provider declined to answer this request. Rephrase the request or choose another model.",
             ),
         ];
         for (reason, wire, message) in table {
@@ -867,7 +887,8 @@ mod tests {
         assert_eq!(coerced.provider_detail.as_deref(), Some("specific detail"));
         assert_eq!(
             coerced.public_error().message,
-            "provider returned a malformed response; retry the request"
+            "The model's provider sent an incomplete or invalid response, so the gateway \
+             discarded it. Retry the request; if it keeps happening, choose another model."
         );
         let transport = Failure::new(FailureClass::Transport, "kept").boundary();
         assert_eq!(transport.safe_message, "kept");
