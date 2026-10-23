@@ -13,9 +13,11 @@ import subprocess
 import sys
 import termios
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
+from functools import wraps
 from pathlib import Path
+from typing import Concatenate
 
 import pytest
 
@@ -322,3 +324,74 @@ def python_terminal_child(
         return terminal_child([sys.executable, "-c", script], **keywords)
 
     return run
+
+
+def _owned_constructor[Resource, **Arguments](
+    constructor: Callable[Concatenate[Resource, Arguments], None], owners: list[Resource]
+) -> Callable[Concatenate[Resource, Arguments], None]:
+    """Track only successfully initialized test-owned resources without changing arguments."""
+
+    @wraps(constructor)
+    def initialize(
+        resource: Resource, /, *args: Arguments.args, **kwargs: Arguments.kwargs
+    ) -> None:
+        """Construct normally, then retain the successful owner until function teardown."""
+        constructor(resource, *args, **kwargs)
+        owners.append(resource)
+
+    return initialize
+
+
+@pytest.fixture(autouse=True)
+def own_native_gateway_resources(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """Own legacy test-created native resources until this function's bounded teardown.
+
+    Successful real constructors transfer ownership to this test fixture. Cleanup uses the
+    production public close contracts, in control-plane, accounting, guardrail, then component
+    order.
+    Failed constructors remain the production startup rollback's responsibility. Tests that
+    verify explicit shutdown must assert resource release before this fixture tears down, so
+    this lifetime owner cannot conceal a broken close implementation. Module-scoped fixtures
+    retain their own explicit shutdown helpers. No garbage collection or FD limits are changed.
+    """
+    from exp.runtime.gateway.guardrails.enforcement import GuardrailEngine
+    from exp.runtime.gateway.lifecycle import LocalGatewayComponents
+    from exp.runtime.gateway.native_accounting import NativeAttemptAccounting
+    from exp.runtime.gateway.native_bridge import NativeControlPlane
+
+    components: list[LocalGatewayComponents] = []
+    planes: list[NativeControlPlane] = []
+    engines: list[GuardrailEngine] = []
+    accountings: list[NativeAttemptAccounting] = []
+    monkeypatch.setattr(
+        LocalGatewayComponents,
+        "__init__",
+        _owned_constructor(LocalGatewayComponents.__init__, components),
+    )
+    monkeypatch.setattr(
+        NativeControlPlane,
+        "__init__",
+        _owned_constructor(NativeControlPlane.__init__, planes),
+    )
+    monkeypatch.setattr(
+        GuardrailEngine,
+        "__init__",
+        _owned_constructor(GuardrailEngine.__init__, engines),
+    )
+    monkeypatch.setattr(
+        NativeAttemptAccounting,
+        "__init__",
+        _owned_constructor(NativeAttemptAccounting.__init__, accountings),
+    )
+    try:
+        yield
+    finally:
+        failures: list[Exception] = []
+        for owners in (planes, accountings, engines, components):
+            for resource in reversed(owners):
+                try:
+                    resource.close(timeout_seconds=5.0)
+                except Exception as error:  # noqa: BLE001 - close every owner, then report every failure.
+                    failures.append(error)
+        if failures:
+            raise ExceptionGroup("test-owned native gateway resources failed to close", failures)

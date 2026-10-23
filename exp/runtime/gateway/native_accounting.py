@@ -12,6 +12,7 @@ from typing import Final
 
 from exp.common.core.artifacts import JsonObject
 from exp.common.models.gateway_catalog import ExactModelDeployment
+from exp.common.sqlite.connection import close_idle_connections
 from exp.runtime.gateway.attempt_tokens import worst_case_output_tokens
 from exp.runtime.gateway.budget_continuation import denied_destination_pool
 from exp.runtime.gateway.budgets import BudgetReservationRejected, BudgetScopeKind
@@ -57,6 +58,7 @@ from exp.runtime.gateway.native_execution import (
     dispatch_disclosure,
 )
 from exp.runtime.gateway.native_fallback_rules import eligible_ladder, rule_fallback_reason
+from exp.runtime.gateway.native_lifecycle import NativeAccountingLifecycle
 from exp.runtime.gateway.native_recovery import (
     observe_reserved_attempt,
     record_departure,
@@ -113,7 +115,7 @@ TOOL_SEARCH_ROUND: Final = "tool_search_round"
 """Dispatch reason of a same-rung re-dial after a gateway tool-search round."""
 
 
-class NativeAttemptAccounting:
+class NativeAttemptAccounting(NativeAccountingLifecycle):
     """Registry of admitted requests and their durable attempt settlements.
 
     A lock protects Rust callbacks; timed and opportunistic sweeps bound abandoned
@@ -182,7 +184,7 @@ class NativeAttemptAccounting:
         self._throttles_failed_over = 0
         self._throttle_backoff_redials = 0
         self._throttle_backoff_forced = 0
-        # Reconcile retained writes and abandoned requests even without new traffic.
+        self._sweep_stop = threading.Event()
         self._sweeper = threading.Thread(
             target=self._sweep_loop,
             name="exp-native-settlement-sweep",
@@ -193,7 +195,11 @@ class NativeAttemptAccounting:
     @property
     def accounting_healthy(self) -> bool:
         """Return whether every durable terminal write has landed."""
-        return self._accounting_healthy and not self.request_settlements.pending
+        return (
+            not self._sweep_stop.is_set()
+            and self._accounting_healthy
+            and not self.request_settlements.pending
+        )
 
     @property
     def health(self) -> DeploymentHealthRegistry:
@@ -876,10 +882,12 @@ class NativeAttemptAccounting:
         )
 
     def _sweep_loop(self) -> None:
-        """Periodically reconcile retained or expired attempts for the process lifetime."""
-        while True:
-            time.sleep(_SWEEP_INTERVAL_SECONDS)
-            self.sweep_expired()
+        """Periodically reconcile retained or expired attempts until the owner stops."""
+        try:
+            while not self._sweep_stop.wait(_SWEEP_INTERVAL_SECONDS):
+                self.sweep_expired()
+        finally:
+            close_idle_connections()
 
     def sweep_expired(self) -> None:
         """Recover retained settlements and close abandoned requests.

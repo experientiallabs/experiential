@@ -142,6 +142,7 @@ def test_project_option_launches_the_native_gateway_on_loopback(
     served: list[tuple[object, str, int]] = []
     control_planes: list[object] = []
     closed: list[float] = []
+    resource_closes: list[tuple[str, float]] = []
     guardrails = SimpleNamespace(close=lambda *, timeout_seconds: closed.append(timeout_seconds))
 
     def prepare(project: str, root: Path, *, policy_id: str | None) -> ProjectGatewayCompatibility:
@@ -169,6 +170,7 @@ def test_project_option_launches_the_native_gateway_on_loopback(
         reconciled_expired_requests=0,
         reconciled_unknown_attempts=0,
         unavailable_aliases=(),
+        close=lambda *, timeout_seconds: resource_closes.append(("components", timeout_seconds)),
     )
 
     def load_components(
@@ -196,6 +198,7 @@ def test_project_option_launches_the_native_gateway_on_loopback(
         assert value is components
         plane = SimpleNamespace(
             components=value,
+            close=lambda *, timeout_seconds: resource_closes.append(("control", timeout_seconds)),
             reconciled_expired_requests=0,
             reconciled_unknown_attempts=0,
         )
@@ -271,6 +274,7 @@ def test_project_option_launches_the_native_gateway_on_loopback(
     assert loaded == [(Path("/tmp/local-exp"), frozenset({"project-a"}))]
     assert served == ([] if check else [(control_planes[0], "127.0.0.1", 8123)])
     assert closed == [0.25]
+    assert resource_closes == [("control", 0.25), ("components", 0.25)]
     receipt = json.loads(result.stdout)
     assert receipt["launch_mode"] == "project_alias"
     assert receipt["base_url"] == "http://127.0.0.1:8123/v1"
@@ -318,8 +322,10 @@ def test_unbindable_port_fails_before_any_ready_receipt(
         reconciled_expired_requests=0,
         reconciled_unknown_attempts=0,
         unavailable_aliases=(),
+        close=lambda *, timeout_seconds: resource_closes.append(("components", timeout_seconds)),
     )
     closed: list[float] = []
+    resource_closes: list[tuple[str, float]] = []
     guardrails = SimpleNamespace(close=lambda *, timeout_seconds: closed.append(timeout_seconds))
     monkeypatch.setattr("exp.cli.gateway.compatibility.prepare_project_gateway", prepare)
     monkeypatch.setattr(
@@ -337,6 +343,7 @@ def test_unbindable_port_fails_before_any_ready_receipt(
             reconciled_unknown_attempts=0,
             request_timeout_seconds=120.0,
             guardrail_detectors={},
+            close=lambda *, timeout_seconds: resource_closes.append(("control", timeout_seconds)),
         ),
     )
 
@@ -361,6 +368,10 @@ def test_unbindable_port_fails_before_any_ready_receipt(
     assert "bind" in result.output
     assert '"status":"ready"' not in result.output
     assert closed == [run_app.DEFAULT_GRACEFUL_TIMEOUT_SECONDS]
+    assert resource_closes == [
+        ("control", run_app.DEFAULT_GRACEFUL_TIMEOUT_SECONDS),
+        ("components", run_app.DEFAULT_GRACEFUL_TIMEOUT_SECONDS),
+    ]
 
 
 def test_noninteractive_default_gateway_returns_stable_empty_state_json(tmp_path: Path) -> None:

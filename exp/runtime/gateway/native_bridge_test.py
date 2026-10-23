@@ -2492,11 +2492,13 @@ def test_abandoned_inflight_attempts_are_swept_after_the_deadline(
     control = NativeControlPlane(components, request_timeout_seconds=0.01)
     native_time = mock.Mock(wraps=time)
     native_time.monotonic.side_effect = clock.monotonic
-    # Only these module references are replaced. SQLite auth and settlement use
-    # their constructor clock; shared timer, health and group-commit time stays real.
+    # Admission and snapshot preflight share the deterministic monotonic clock; SQLite auth
+    # and settlement use their constructor clock. Shared timer, health and group-commit time
+    # stays real, while local I/O does not consume the test's logical request allowance.
     with (
         mock.patch("exp.runtime.gateway.native_bridge.time", native_time),
         mock.patch("exp.runtime.gateway.native_accounting.time", native_time),
+        mock.patch("exp.runtime.gateway.model_chain_authority.time", native_time),
         mock.patch("exp.runtime.gateway.native_accounting._SWEEP_GRACE_SECONDS", 0.0),
     ):
         clock.elapsed += setup_elapsed
