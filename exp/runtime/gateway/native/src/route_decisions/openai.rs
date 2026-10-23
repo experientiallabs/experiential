@@ -11,7 +11,7 @@ use serde_json::{json, Value};
 
 use super::{
     choice_can_be_highest, decision_usage, malformed, probability, score_matches_distribution,
-    token_count, unit_total, wire_failure, DecisionsAdmission,
+    score_mismatch, token_count, unit_total, wire_failure, DecisionsAdmission,
 };
 use crate::errors::Failure;
 use crate::events::Usage;
@@ -197,7 +197,11 @@ fn validate_score(question: &Value, answer: &Value) -> Result<(), Failure> {
     // position-weighted average SystemOne scores already satisfy.
     let base = first.ok_or_else(wire_failure)?;
     if !score_matches_distribution(score - base as f64, &probabilities) {
-        return Err(malformed("decision score does not match its probabilities"));
+        return Err(score_mismatch(
+            "decision score does not match its probabilities",
+            score - base as f64,
+            &probabilities,
+        ));
     }
     Ok(())
 }

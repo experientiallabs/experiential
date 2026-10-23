@@ -146,13 +146,13 @@ def test_remember_turn_retains_openai_encrypted_reasoning_for_tool_continuation(
             "text": "",
             "refusal": False,
             "encrypted_reasoning": [
-                {"output_index": 2, "item_id": "rs-2", "encrypted_content": "second-opaque"},
-                {"output_index": 0, "item_id": "rs-0", "encrypted_content": "first-opaque"},
+                {"output_index": 2, "item_id": "rs_2", "encrypted_content": "second-opaque"},
+                {"output_index": 0, "item_id": "rs_0", "encrypted_content": "first-opaque"},
             ],
             "tool_calls": [
                 {
                     "output_index": 1,
-                    "item_id": "fc-1",
+                    "item_id": "fc_1",
                     "call_id": "call-one",
                     "name": "lookup",
                     "arguments": '{ "query" : "λ" }',
@@ -169,10 +169,10 @@ def test_remember_turn_retains_openai_encrypted_reasoning_for_tool_continuation(
     encrypted_blocks = tuple(
         cast(EncryptedReasoningBlock, block) for block in message.provider_reasoning
     )
-    assert tuple(block.id for block in encrypted_blocks) == ("rs-0", "rs-2")
+    assert tuple(block.id for block in encrypted_blocks) == ("rs_0", "rs_2")
     assert tuple(block.output_index for block in encrypted_blocks) == (0, 2)
     call = message.tool_calls[0]
-    assert call.provider_item_id == "fc-1"
+    assert call.provider_item_id == "fc_1"
     assert call.provider_output_index == 1
     assert call.raw_arguments == '{ "query" : "λ" }'
 
@@ -197,7 +197,7 @@ def test_remember_turn_retains_openai_encrypted_reasoning_for_tool_continuation(
         },
         {
             "type": "function_call",
-            "id": "fc-1",
+            "id": "fc_1",
             "call_id": "call-one",
             "name": "lookup",
             "arguments": '{ "query" : "λ" }',
@@ -223,15 +223,15 @@ def test_remember_turn_replays_assistant_preamble_at_its_provider_output_index()
         data={
             "text": "I will look that up.",
             "message_output_index": 1,
-            "message_item_id": "msg-1",
+            "message_item_id": "msg_1",
             "refusal": False,
             "encrypted_reasoning": [
-                {"output_index": 0, "item_id": "rs-0", "encrypted_content": "opaque"}
+                {"output_index": 0, "item_id": "rs_0", "encrypted_content": "opaque"}
             ],
             "tool_calls": [
                 {
                     "output_index": 2,
-                    "item_id": "fc-2",
+                    "item_id": "fc_2",
                     "call_id": "call-2",
                     "name": "lookup",
                     "arguments": '{ "query" : "λ" }',
@@ -259,8 +259,8 @@ def test_remember_turn_replays_assistant_preamble_at_its_provider_output_index()
     payload_input = cast(list[JsonObject], payload["input"])
     assert [(item["type"], item.get("id")) for item in payload_input[:-1]] == [
         ("reasoning", None),
-        ("message", "msg-1"),
-        ("function_call", "fc-2"),
+        ("message", "msg_1"),
+        ("function_call", "fc_2"),
     ]
     message_content = cast(list[JsonObject], payload_input[1]["content"])
     assert message_content[0]["text"] == "I will look that up."
@@ -284,14 +284,14 @@ def test_remember_turn_preserves_multiple_messages_status_phase_and_idless_call(
             "message_outputs": [
                 {
                     "output_index": 1,
-                    "item_id": "msg-commentary",
+                    "item_id": "msg_commentary",
                     "text": "Checking first.",
                     "status": "incomplete",
                     "phase": "commentary",
                 },
                 {
                     "output_index": 3,
-                    "item_id": "msg-final",
+                    "item_id": "msg_final",
                     "text": "Final answer.",
                     "status": "completed",
                     "phase": "final_answer",
@@ -300,7 +300,7 @@ def test_remember_turn_preserves_multiple_messages_status_phase_and_idless_call(
             "encrypted_reasoning": [
                 {
                     "output_index": 0,
-                    "item_id": "rs-incomplete",
+                    "item_id": "rs_incomplete",
                     "encrypted_content": "opaque-incomplete",
                     "status": "incomplete",
                 }
@@ -323,14 +323,14 @@ def test_remember_turn_preserves_multiple_messages_status_phase_and_idless_call(
         previous_response_id=context.response_id,
     )
     first, second = state.messages[-2:]
-    assert first.provider_item_id == "msg-commentary"
+    assert first.provider_item_id == "msg_commentary"
     assert first.provider_status == "incomplete"
     assert first.provider_phase == "commentary"
     assert cast(EncryptedReasoningBlock, first.provider_reasoning[0]).status == "incomplete"
     assert first.tool_calls[0].provider_item_id is None
     assert first.tool_calls[0].provider_output_index == 2
     assert first.tool_calls[0].provider_status == "incomplete"
-    assert second.provider_item_id == "msg-final"
+    assert second.provider_item_id == "msg_final"
     assert second.provider_phase == "final_answer"
 
     request = GatewayRequest(
@@ -409,10 +409,10 @@ def test_remember_turn_rejects_coerced_function_call_fields(field: str, value: o
     "encrypted",
     (
         "not-an-array",
-        [{"output_index": 0, "item_id": "rs-0", "encrypted_content": ""}],
+        [{"output_index": 0, "item_id": "rs_0", "encrypted_content": ""}],
         [
-            {"output_index": 0, "item_id": "rs-0", "encrypted_content": "one"},
-            {"output_index": 0, "item_id": "rs-1", "encrypted_content": "duplicate"},
+            {"output_index": 0, "item_id": "rs_0", "encrypted_content": "one"},
+            {"output_index": 0, "item_id": "rs_1", "encrypted_content": "duplicate"},
         ],
     ),
 )
@@ -480,7 +480,7 @@ def test_remember_turn_retains_and_replays_a_tool_call_namespace() -> None:
             "tool_calls": [
                 {
                     "output_index": 0,
-                    "item_id": "fc-ns",
+                    "item_id": "fc_ns",
                     "call_id": "call-ns",
                     "name": "spawn_agent",
                     "namespace": "collaboration",
@@ -521,7 +521,7 @@ def test_remember_turn_retains_and_replays_a_tool_call_namespace() -> None:
     )
     payload_input = cast(list[JsonObject], payload["input"])
     assert payload_input[0] == {
-        "id": "fc-ns",
+        "id": "fc_ns",
         "type": "function_call",
         "call_id": "call-ns",
         "name": "spawn_agent",
@@ -546,7 +546,7 @@ def test_remember_turn_rejects_a_coerced_tool_call_namespace() -> None:
                     "tool_calls": [
                         {
                             "output_index": 0,
-                            "item_id": "fc-ns",
+                            "item_id": "fc_ns",
                             "call_id": "call-ns",
                             "name": "spawn_agent",
                             "namespace": cast(JsonValue, value),
@@ -652,7 +652,7 @@ def test_remember_turn_retains_and_replays_a_tool_call_caller() -> None:
             "tool_calls": [
                 {
                     "output_index": 0,
-                    "item_id": "fc-caller",
+                    "item_id": "fc_caller",
                     "call_id": "call-caller",
                     "name": "lookup",
                     "caller": caller,

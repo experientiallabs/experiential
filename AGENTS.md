@@ -356,6 +356,31 @@ uv run pytest -q
     The palette above is the contract. Rendering scripts for one-off visuals do not belong in the
     repository (rule 5).
 
+16. **Follow prior art; one mechanism per concern.** Before building anything, find how the
+    codebase already does it and do it that way, even when the existing mechanism is less
+    convenient than a fresh one. An existing mechanism carries cases a new one will miss. A second
+    mechanism for a concern listed below is not added beside the first: either extend the owner,
+    or migrate every existing call site to the new one in the same change series. Parallel work
+    sessions are the usual source of drift, so check this map before writing code:
+
+    | Concern | Owner | Use |
+    | --- | --- | --- |
+    | Progress of a long-running command | `exp/cli/shared/progress.py` | `progress_display` for one phase, `progress_phases` for several; services report through `exp/common/progress.py` `report` |
+    | Spend consent and cost warnings | `exp/cli/shared/consent.py` | `require_spend_consent` |
+    | Command results and saved detail | `exp/optimize/evaluation/export.py`, `exp/cli/build/summary.py` | A short summary on the terminal; the full output saved atomically beside the saved run under the project's runtime directory (`export_report`, `save_details`), then a `Report: <path>` line |
+    | Usage errors | `exp/cli/shared/options.py` | `usage_error` |
+    | Interactive choices | `exp/cli/shared/picker.py` | `choose_one` |
+    | Terminal styling | `exp/cli/shared/theme.py` | `EXP_THEME` |
+    | Saved-result identity | `exp/common/core/artifacts.py` | `stable_id` over content; never over paths or source files |
+    | Local identifiers in paths | `exp/common/project/paths.py` | `validate_local_id` |
+    | Atomic file writes | `exp/common/core/files.py` | `write_text_atomic` |
+    | Model choice | `exp/common/models/catalog_roles.py` | Catalog roles, not new flags |
+    | Provider calls and retries | `exp/runtime/models/registry.py`, `exp/runtime/models/providers/transport.py` | `RuntimeModelCatalog`, `RetryPolicy` |
+    | Producer revision | `exp/common/release_revision.py` | `installed_release_revision` |
+
+    Keep this table current. A change that introduces an owner for a new concern adds its row in
+    the same commit.
+
 ## One package
 
 This repo publishes **one flagship distribution**: `experiential`, whose importable python code
@@ -372,6 +397,10 @@ Rules of the road:
   workflow publishes prebuilt abi3 wheels). The crate ships no importable python beyond the
   compiled `exp_gateway_native` module; python code still belongs under `exp/`. No further path
   sources or distributions may be added.
+- **Exact pins only**: every requirement in `[project.dependencies]` and the extras is an `==`
+  pin, except `openai`, which callers' own code imports and which stays the certified
+  `>=3.0,<4` range. A version moves only by a reviewed edit, and `[tool.uv] exclude-newer`
+  keeps every resolved release at least 7 days old.
 - **Keep dependency ownership explicit**: published shared building blocks are normal PyPI
   requirements. Provider-neutral catalog metadata and immutable snapshots live under
   `exp/common/models/`; explicit runtime clients use the shared HTTP transport. A release resolves

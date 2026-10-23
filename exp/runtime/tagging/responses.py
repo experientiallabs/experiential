@@ -5,6 +5,10 @@ A capture record stores its response as ``{"kind": "json", "body": ...}`` or as 
 assembly and validity: streams are reassembled by its frame assembly and taken as it assembles
 them once their end marker arrived. Tagging adds only what it needs to build an exchange: a
 successful status, no reported error, no lost frames, and a finished Responses body.
+
+Tagging reads the record's queryable projection (``body`` or ``frames``), never its exact
+``source_json`` sidecar: the two differ only in NUL text and integers beyond 64 bits, which no
+tag question depends on.
 """
 
 from __future__ import annotations
@@ -25,12 +29,8 @@ _NATIVE_PROTOCOL: Final[dict[CaptureProtocol, str]] = {
     "responses": "responses",
     "messages": "messages",
 }
-_RESPONSES_TERMINAL_EVENTS: Final = frozenset(
-    {"response.completed", "response.incomplete", "response.failed"}
-)
 # Statuses of a finished Responses body; incomplete means it stopped at its length limit.
 _FINISHED_RESPONSES: Final = frozenset({"completed", "incomplete"})
-_SURROGATE: Final = re.compile("[\ud800-\udfff]")
 # Item metadata that responses carry but the request schema rejects.
 _OUTPUT_ONLY_FIELDS: Final = frozenset({"caller", "created_by"})
 # Item ids of web searches the gateway runs itself.
@@ -61,19 +61,18 @@ def completed_response(protocol: CaptureProtocol, document: JsonObject) -> JsonO
         raise ValueError(f"the response status is {status}; only successful responses are tagged")
     kind = document.get("kind")
     if kind == "json":
-        body = _authoritative(document, "body")
+        body = document.get("body")
     elif kind == "sse":
         if document.get("truncated") is not False or document.get("client_disconnected"):
             raise ValueError("the stream was cut short before it completed")
-        frames = _authoritative(document, "frames")
+        frames = document.get("frames")
         if not isinstance(frames, list):
             raise ValueError("the stream has no frames")
         captured = CaptureResponse(_NATIVE_PROTOCOL[protocol], _sse_bytes(frames), True)
-        body = _exact_terminal(json.loads(captured.body_json), captured.events_json)
+        body = json.loads(captured.body_json)
         incomplete = protocol == "responses" and isinstance(body, dict)
         if not (captured.completed or (incomplete and body.get("status") == "incomplete")):
             raise ValueError("the stream ended before its end marker")
-        _restore_exact_inputs(body)
     else:
         raise ValueError(f"unknown response kind {kind!r}")
     if not isinstance(body, dict):
@@ -83,84 +82,6 @@ def completed_response(protocol: CaptureProtocol, document: JsonObject) -> JsonO
     if _has_error(body):
         raise ValueError("the response reports an error")
     return body
-
-
-def _exact_terminal(body: JsonValue, events_json: str | None) -> JsonValue:
-    """Use the collector's exact Responses terminal event when it kept one.
-
-    The collector keeps a Responses stream's exact events beside the assembled body when
-    values needed it (integers beyond 64 bits). The terminal event's response replaces the
-    rounded body, keeping the error the collector recorded.
-
-    Args:
-        body: The assembled body.
-        events_json: The collector's exact events, or None.
-
-    Returns:
-        The exact terminal response, or the assembled body.
-    """
-    if not isinstance(events_json, str) or not isinstance(body, dict):
-        return body
-    if body.get("capture_incomplete"):
-        return body
-    for event in reversed(json.loads(events_json)):
-        if (
-            isinstance(event, dict)
-            and event.get("type") in _RESPONSES_TERMINAL_EVENTS
-            and isinstance(source := event.get("response"), dict)
-        ):
-            return {**source, "error": body.get("error")}
-    return body
-
-
-def _restore_exact_inputs(body: JsonValue) -> None:
-    """Restore Messages tool inputs the collector kept as exact source beside a rounded copy.
-
-    Args:
-        body: An assembled body, updated in place.
-    """
-    content = body.get("content") if isinstance(body, dict) else None
-    for block in content if isinstance(content, list) else ():
-        if isinstance(block, dict) and isinstance(
-            source := block.pop("capture_input_source_json", None), str
-        ):
-            block["input"] = json.loads(source)
-
-
-def _authoritative(document: JsonObject, key: str) -> JsonValue:
-    """Return a stored response field from its exact source when one was retained.
-
-    A capture keeps exact ``source_json`` beside a queryable projection when values needed
-    normalizing (NUL text, integers beyond 64 bits). The source is authoritative; lone
-    surrogates it may escape become U+FFFD so the text stays valid.
-
-    Args:
-        document: The response document.
-        key: The projected field, ``body`` or ``frames``.
-
-    Returns:
-        The exact value, or the projection when no source was kept.
-    """
-    source = document.get("source_json")
-    return _valid_text(json.loads(source)) if isinstance(source, str) else document.get(key)
-
-
-def _valid_text(value: JsonValue) -> JsonValue:
-    """Replace lone surrogates in every string of a JSON value.
-
-    Args:
-        value: A decoded JSON value.
-
-    Returns:
-        The same value with U+FFFD in place of each lone surrogate.
-    """
-    if isinstance(value, str):
-        return _SURROGATE.sub("\ufffd", value)
-    if isinstance(value, list):
-        return [_valid_text(item) for item in value]
-    if isinstance(value, dict):
-        return {_SURROGATE.sub("\ufffd", key): _valid_text(item) for key, item in value.items()}
-    return value
 
 
 def readable_responses(body: JsonObject) -> tuple[JsonObject, dict[str, str]]:
@@ -220,7 +141,7 @@ def _json_object(text: str) -> bool:
     """Report whether text parses as a JSON object."""
     try:
         return isinstance(json.loads(text), dict)
-    except (ValueError, RecursionError):
+    except ValueError:
         return False
 
 

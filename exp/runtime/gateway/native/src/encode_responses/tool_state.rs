@@ -17,6 +17,10 @@ pub(super) struct ToolState {
     /// Opaque SDK 3.0 `caller` attribution re-emitted verbatim like
     /// `namespace` so the item round-trips exactly as emitted.
     pub(super) caller: Option<Value>,
+    /// Gemini's opaque thought signature, rendered as
+    /// `extra_content.google.thought_signature` (the Chat shape) so a caller
+    /// echoing the item returns it on the replayed `function_call`.
+    pub(super) thought_signature: Option<String>,
     pub(super) arguments: String,
     pub(super) status: Option<ProviderOutputItemStatus>,
     pub(super) done: bool,
@@ -53,6 +57,9 @@ impl ToolState {
             "status".to_string(),
             json!(self.status.unwrap_or(fallback_status).as_str()),
         );
-        Value::Object(item)
+        crate::encode::with_thought_signature(
+            Value::Object(item),
+            self.thought_signature.as_deref(),
+        )
     }
 }

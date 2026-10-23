@@ -19,6 +19,7 @@ use crate::events::{Event, Usage};
 use crate::metrics::METRICS;
 use crate::replay::OwnerLease;
 use crate::waterfall::CommittedAttempt;
+use crate::web_search::WebSearchMeter;
 
 #[path = "settlement_observation.rs"]
 mod observation;
@@ -97,42 +98,61 @@ fn settle_argument(
     first_token_at: Option<SystemTime>,
     rate_limit_headers: Option<&serde_json::Map<String, Value>>,
     upstream_provider: Option<&str>,
-    web_search_requests: u32,
+    web_search: WebSearchMeter,
     tool_search_requests: u32,
 ) -> String {
     let mut argument = json!({
         "request_id": request_id,
         "attempt_id": attempt_id,
         "outcome": outcome,
-        "usage": usage.map(|usage| json!({
-            "input_tokens": usage.input_tokens,
-            "output_tokens": usage.output_tokens,
-            "cached_input_tokens": usage.cached_input_tokens,
-            "cache_creation_input_tokens": usage.cache_creation_input_tokens,
-            "cache_creation_1h_input_tokens": usage.cache_creation_1h_input_tokens,
-            "reasoning_tokens": usage.reasoning_tokens,
-        })),
+        "usage": usage.map(|usage| {
+            let mut wire = json!({
+                "input_tokens": usage.input_tokens,
+                "output_tokens": usage.output_tokens,
+                "cached_input_tokens": usage.cached_input_tokens,
+                "cache_creation_input_tokens": usage.cache_creation_input_tokens,
+                "cache_creation_1h_input_tokens": usage.cache_creation_1h_input_tokens,
+                "reasoning_tokens": usage.reasoning_tokens,
+            });
+            // The generated-image subset joins only when the provider reported one.
+            if let Some(image) = usage.image_output_tokens {
+                wire["image_output_tokens"] = json!(image);
+            }
+            if let Some(half_day) = usage.cache_creation_12h_input_tokens {
+                wire["cache_creation_12h_input_tokens"] = json!(half_day);
+            }
+            wire
+        }),
         "tool_names": tool_names,
-        "failure": failure.map(|failure| json!({
-            "failure_class": failure.failure_class.as_str(),
-            "safe_message": failure.safe_message,
-            // The provider's own sanitized rejection sentence (client-error
-            // class only); accounting persists it on the failed-attempt row so
-            // an operator sees WHY the provider refused the call.
-            "provider_detail": failure.provider_detail,
-            // The bounded refusal category (refusal class only), so the
-            // control plane can count refusals by reason without parsing the
-            // free-form provider_detail.
-            "refusal_reason": failure.refusal_reason.map(|reason| reason.as_str()),
-            // The customer's own BYOK credential/account failure: the ledger
-            // files it as the caller's invalid request (see
-            // native_accounting.ledger_failure).
-            "customer_owned": failure.customer_owned,
-            // The provider's own stated wait (a throttled open's integer
-            // Retry-After), so the control plane sizes the deployment's
-            // throttle window from it instead of the fixed default.
-            "retry_after_seconds": failure.retry_after_seconds,
-        })),
+        "failure": failure.map(|failure| {
+            let mut wire = json!({
+                "failure_class": failure.failure_class.as_str(),
+                "safe_message": failure.safe_message,
+                // The provider's own sanitized rejection sentence (client-error
+                // class only); accounting persists it on the failed-attempt row so
+                // an operator sees WHY the provider refused the call.
+                "provider_detail": failure.provider_detail,
+                // The bounded refusal category (refusal class only), so the
+                // control plane can count refusals by reason without parsing the
+                // free-form provider_detail.
+                "refusal_reason": failure.refusal_reason.map(|reason| reason.as_str()),
+                // The customer's own BYOK credential/account failure: the ledger
+                // files it as the caller's invalid request (see
+                // native_accounting.ledger_failure).
+                "customer_owned": failure.customer_owned,
+                // The provider's own stated wait (a throttled open's integer
+                // Retry-After), so the control plane sizes the deployment's
+                // throttle window from it instead of the fixed default.
+                "retry_after_seconds": failure.retry_after_seconds,
+            });
+            // Which bound ended a header-phase timeout, so lane ejection
+            // strikes only a lane that spent its own allowance; only a
+            // header timeout carries the key.
+            if let Some(phase) = failure.header_timeout {
+                wire["header_timeout"] = json!(phase.as_str());
+            }
+            wire
+        }),
         "finalize": finalize,
         "opened": opened,
         // Explicit HTTP-rejection provenance for decisions only. Unknown
@@ -155,8 +175,15 @@ fn settle_argument(
     // carries the count, so a failed rung's non-finalizing settlement can
     // never bill it a second time. Absent at zero, so unsearched requests
     // settle with exactly the bytes they always did.
-    if finalize && web_search_requests > 0 {
-        argument["web_search_requests"] = json!(web_search_requests);
+    if finalize && web_search.requests > 0 {
+        argument["web_search_requests"] = json!(web_search.requests);
+        // What the searches returned and, when the vendor reported it, what
+        // they cost, so the host can bill the true pass-through instead of a
+        // flat per-search rate. Both ride only beside a positive count.
+        argument["web_search_results"] = json!(web_search.results);
+        if let Some(cost) = web_search.cost_nano_usd {
+            argument["web_search_cost_nano_usd"] = json!(cost);
+        }
     }
     // The gateway's own tool-search rounds bill the same way: once, on the
     // settlement that closes the request, absent at zero.
@@ -244,10 +271,11 @@ pub struct AttemptGuard {
     /// The upstream an aggregator named as serving the active attempt's
     /// committed stream, recorded at commit and settled alongside the outcome.
     upstream_provider: Option<String>,
-    /// How many web searches the control plane executed for this request
-    /// before dispatch (from the admission); a request-level fact that
-    /// survives `rebind` and rides only the finalizing settlement.
-    web_search_requests: u32,
+    /// The web searches the control plane executed for this request before
+    /// dispatch (count, results, vendor cost; from the admission); a
+    /// request-level fact that survives `rebind` and rides only the
+    /// finalizing settlement.
+    web_search: WebSearchMeter,
     /// How many gateway-run tool-search rounds this request completed so
     /// far (recorded by the waterfall as each round lands); request-level
     /// like the web-search count, so it survives `rebind` and rides only the
@@ -303,7 +331,7 @@ impl AttemptGuard {
             first_token_at: None,
             rate_limit_headers: None,
             upstream_provider: None,
-            web_search_requests: 0,
+            web_search: WebSearchMeter::default(),
             tool_search_requests: 0,
             observation: Observation::default(),
         }
@@ -337,10 +365,10 @@ impl AttemptGuard {
         eprintln!("exp-gateway-native: {line}");
     }
 
-    /// Record the admission's count of gateway-executed web searches, so the
-    /// finalizing settlement bills them.
-    pub fn record_web_search_requests(&mut self, requests: u32) {
-        self.web_search_requests = requests;
+    /// Record the admission's gateway-executed web-search meter, so the
+    /// finalizing settlement bills it.
+    pub fn record_web_search(&mut self, meter: WebSearchMeter) {
+        self.web_search = meter;
     }
 
     /// Record how many gateway-run tool-search rounds the request has
@@ -499,7 +527,7 @@ impl AttemptGuard {
             self.first_token_at,
             rate_limit_headers,
             self.upstream_provider.as_deref(),
-            self.web_search_requests,
+            self.web_search,
             self.tool_search_requests,
         );
         let argument = tier_provenance(argument, &observed.service_tier);
@@ -511,6 +539,15 @@ impl AttemptGuard {
                 && meter_failure
                     .is_some_and(|failure| failure.failure_class == FailureClass::Cancelled),
             &observed.streamed_output,
+        );
+        let argument = unreported_truncation_provenance(
+            argument,
+            self.dispatched
+                && meter_failure.is_none()
+                && outcome == "incomplete"
+                && observed.unreported_truncation
+                && !usage.is_some_and(Usage::has_token_counts),
+            &observed,
         );
         if finalize {
             let cancelled = failure.map(|failure| failure.failure_class == FailureClass::Cancelled)
@@ -641,6 +678,34 @@ fn disconnect_provenance(
     compact_json(&payload)
 }
 
+/// Stamp a capped request's budget truncation the provider reported without
+/// a usage meter (a usage-less `stop` read as `length`, or an output-less one).
+///
+/// The generated output observed rides along so the control plane meters the
+/// whole output budget the provider billed, with its own tokenizer for the
+/// prompt, instead of settling provider work as an unknown $0.
+fn unreported_truncation_provenance(
+    argument: String,
+    unreported: bool,
+    observed: &observation::Observed,
+) -> String {
+    if !unreported {
+        return argument;
+    }
+    let mut payload: Value =
+        serde_json::from_str(&argument).expect("settlement JSON was encoded locally");
+    let streamed = &observed.streamed_output;
+    payload["usage_unreported_truncation"] = json!(true);
+    payload["streamed_output"] = json!({
+        "text": streamed.text,
+        "reasoning": streamed.reasoning,
+        "text_overflow_chars": streamed.text_overflow_chars,
+        "reasoning_overflow_chars": streamed.reasoning_overflow_chars,
+        "images": streamed.images,
+    });
+    compact_json(&payload)
+}
+
 /// An already observed provider terminal wins over subscriber cancellation.
 fn cancellation_outcome(terminal: Option<&Event>) -> (&'static str, Option<Failure>) {
     match terminal {
@@ -695,7 +760,7 @@ impl Drop for AttemptGuard {
                                     .and_then(|failure| failure.rate_limit_headers.as_deref())
                             }),
                             self.upstream_provider.as_deref(),
-                            self.web_search_requests,
+                            self.web_search,
                             self.tool_search_requests,
                         ),
                     )

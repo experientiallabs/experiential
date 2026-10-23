@@ -21,6 +21,15 @@ if TYPE_CHECKING:
         WorldModelSessionLimits as WorldModelSessionLimits,
     )
     from exp.simulation.world_model.application import load_world_model as load_world_model
+    from exp.simulation.world_model.durable import (
+        DurableWorldModelSession as DurableWorldModelSession,
+    )
+    from exp.simulation.world_model.durable import (
+        SessionPolicy as SessionPolicy,
+    )
+    from exp.simulation.world_model.durable import (
+        open_reconstructed_session as open_reconstructed_session,
+    )
 from exp.simulation.world_model.artifact import (
     GROUNDED_WORLD_MODEL_ARTIFACT_TYPE,
     GroundedWorldModelArtifact,
@@ -33,6 +42,10 @@ from exp.simulation.world_model.runtime import (
     load_grounded_world_model,
     load_grounded_world_model_artifact,
     verify_grounded_world_model_artifact,
+)
+
+_DURABLE_EXPORTS = frozenset(
+    {"DurableWorldModelSession", "SessionPolicy", "open_reconstructed_session"}
 )
 
 _APPLICATION_EXPORTS = frozenset(
@@ -48,6 +61,9 @@ _APPLICATION_EXPORTS = frozenset(
 )
 
 __all__ = [
+    "DurableWorldModelSession",
+    "SessionPolicy",
+    "open_reconstructed_session",
     "GROUNDED_WORLD_MODEL_ARTIFACT_TYPE",
     "GroundedWorldModel",
     "GroundedWorldModelArtifact",
@@ -79,6 +95,10 @@ def __getattr__(name: str) -> object:
     Raises:
         AttributeError: The name is not a lazy public application export.
     """
+    if name in _DURABLE_EXPORTS:
+        value = getattr(import_module("exp.simulation.world_model.durable"), name)
+        globals()[name] = value
+        return value
     if name not in _APPLICATION_EXPORTS:
         raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
     value = getattr(import_module("exp.simulation.world_model.application"), name)
@@ -88,4 +108,4 @@ def __getattr__(name: str) -> object:
 
 def __dir__() -> list[str]:
     """Return module globals plus supported lazy application exports."""
-    return sorted(set(globals()) | _APPLICATION_EXPORTS)
+    return sorted(set(globals()) | _APPLICATION_EXPORTS | _DURABLE_EXPORTS)

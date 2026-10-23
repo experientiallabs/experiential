@@ -11,9 +11,14 @@ from exp.runtime.models.providers.anthropic_tool_compat import (
     anthropic_rejects_assistant_prefill,
 )
 from exp.runtime.models.providers.base import GatewayWireProfile
-from exp.runtime.models.providers.errors import ProviderParameterError
+from exp.runtime.models.providers.errors import (
+    ProviderParameterError,
+    UnsupportedReasoningEffortError,
+)
 from exp.runtime.models.providers.reasoning_compat import (
+    GEMINI_NONE_SUBSTITUTE_EFFORT,
     REASONING_EFFORTS,
+    gemini_none_rides_minimal,
     supported_reasoning_efforts,
 )
 from exp.runtime.models.providers.thinking_budget import thinking_budget_value
@@ -132,6 +137,72 @@ def profile_reasoning_efforts(profile: GatewayWireProfile) -> tuple[str, ...]:
         configured_effort=profile.reasoning_effort,
         explicit_efforts=profile.supported_reasoning_efforts or None,
     )
+
+
+def require_route_reasoning_effort(
+    profiles: Sequence[GatewayWireProfile],
+    request: GatewayRequest,
+    provider_updates: dict[str, object],
+    ignored: list[str],
+) -> None:
+    """Require the caller's effort on every rung, after the one disclosed substitute.
+
+    Gemini 3 Flash has no thinking-off level; its "closest to off" is
+    MINIMAL. A caller's ``none`` on a route whose only rungs lacking ``none``
+    are such deployments dispatches as ``minimal``: the public request keeps
+    ``none`` and the rewrite is disclosed (``<effort field>->minimal``),
+    because minimal is not zero thinking. Every other effort must be on every
+    rung's exact ladder.
+
+    Args:
+        profiles: The route's wire profiles.
+        request: The caller's canonical request; ``reasoning_effort`` is set.
+        provider_updates: The dispatched-request overrides, written in place.
+        ignored: The route's disclosure list, appended in place.
+
+    Raises:
+        UnsupportedReasoningEffortError: Some rung cannot carry the effort.
+    """
+    effort = request.reasoning_effort
+    if effort == "none" and _none_rides_minimal(profiles):
+        effort = GEMINI_NONE_SUBSTITUTE_EFFORT
+        provider_updates["reasoning_effort"] = effort
+        disclosure = f"{request.caller_effort_parameter}->{effort}"
+        if disclosure not in ignored:
+            ignored.append(disclosure)
+    portable = set(REASONING_EFFORTS)
+    for profile in profiles:
+        portable.intersection_update(profile_reasoning_efforts(profile))
+    if effort not in portable:
+        raise UnsupportedReasoningEffortError(
+            effort=str(request.reasoning_effort),
+            supported_efforts=tuple(level for level in REASONING_EFFORTS if level in portable),
+            param=request.caller_effort_parameter,
+        )
+
+
+def _none_rides_minimal(profiles: Sequence[GatewayWireProfile]) -> bool:
+    """Whether a caller's ``none`` dispatches as ``minimal`` across this route.
+
+    True when at least one rung is a Gemini 3 Flash deployment whose ladder
+    has no ``none`` (see ``gemini_none_rides_minimal``), every rung lacking
+    ``none`` is such a deployment, and every rung can carry ``minimal``. A rung
+    of any other family that cannot honor ``none`` keeps the typed refusal.
+    """
+    riders = 0
+    for profile in profiles:
+        efforts = profile_reasoning_efforts(profile)
+        if GEMINI_NONE_SUBSTITUTE_EFFORT not in efforts:
+            return False
+        if "none" in efforts:
+            continue
+        if profile.reasoning_wire_format not in {
+            "gemini_thinking",
+            "reasoning",
+        } or not gemini_none_rides_minimal(profile.model_id):
+            return False
+        riders += 1
+    return riders > 0
 
 
 def resolve_level_less_enable(

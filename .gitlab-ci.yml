@@ -24,7 +24,7 @@ variables:
     value: ""
     description: >-
       Manual pipelines only: the pipeline area to run, named after its file in
-      .gitlab/ci without the .yml suffix (for example python-package).
+      .gitlab/ci without the .yml suffix (python-package or gate).
 
 include:
   - local: .gitlab/ci/*.yml

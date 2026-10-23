@@ -1,4 +1,4 @@
-"""Tests for the disconnect usage estimate."""
+"""Tests for the disconnect and unreported-truncation usage estimates."""
 
 from __future__ import annotations
 
@@ -15,7 +15,9 @@ from exp.runtime.gateway.contracts import (
 )
 from exp.runtime.gateway.disconnect_estimate import (
     FALLBACK_CHARACTERS_PER_TOKEN,
+    bill_within_output_ceiling,
     estimate_disconnect_usage,
+    estimate_unreported_truncation_usage,
 )
 from exp.runtime.gateway.embeddings_contracts import EmbeddingsRequest
 from exp.runtime.gateway.ledger_valuation import estimated_cost_nano_usd
@@ -424,3 +426,130 @@ def test_estimated_marker_requires_a_disconnect_with_both_totals() -> None:
             usage_incomplete_due_to_disconnect=True,
             usage_estimated=True,
         )
+
+
+def _truncated() -> GatewayEvent:
+    """Build a trusted budget truncation the provider sent without a usage meter."""
+    return GatewayEvent(
+        kind=GatewayEventKind.INCOMPLETE, sequence_number=0, usage_unreported_truncation=True
+    )
+
+
+def test_unreported_truncation_meters_at_least_the_dispatched_output_budget() -> None:
+    """Meta's usage-less capped stop bills the whole budget, unstreamed reasoning included."""
+    request = _request()
+    streamed = StreamedOutput(text="Sunlight scatters off air molecules.")
+    estimated = estimate_unreported_truncation_usage(
+        _truncated(),
+        request=request,
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        opened=True,
+        streamed=streamed,
+        output_budget=300,
+    )
+    assert estimated.usage_estimated is True
+    usage = estimated.usage
+    assert usage is not None
+    assert usage.input_tokens == counted_input_tokens(request) > 0
+    assert usage.output_tokens == 300
+    # Streamed text already past the budget is the meter, never cut back.
+    tokens = _tokens(streamed.text)
+    over = estimate_unreported_truncation_usage(
+        _truncated(),
+        request=request,
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        opened=True,
+        streamed=streamed,
+        output_budget=1,
+    )
+    assert over.usage is not None and over.usage.output_tokens == tokens
+
+
+def test_unreported_truncation_estimate_needs_its_marker_and_opened_evidence() -> None:
+    """An ordinary terminal, an unopened dial, or missing evidence keeps its meter as sent."""
+    plain = GatewayEvent(kind=GatewayEventKind.INCOMPLETE, sequence_number=0)
+    for terminal, opened, streamed in (
+        (plain, True, StreamedOutput(text="ok")),
+        (_truncated(), False, StreamedOutput(text="ok")),
+        (_truncated(), True, None),
+    ):
+        unchanged = estimate_unreported_truncation_usage(
+            terminal,
+            request=_request(),
+            surface=GatewayApiSurface.CHAT_COMPLETIONS,
+            opened=opened,
+            streamed=streamed,
+            output_budget=300,
+        )
+        assert unchanged.usage is None
+        assert unchanged.usage_estimated is False
+
+
+def test_unreported_truncation_marker_rides_only_incomplete_terminals() -> None:
+    """Only an incomplete terminal claims the marker, and a marked one may carry an estimate."""
+    for kind in (GatewayEventKind.COMPLETED, GatewayEventKind.FAILED):
+        with pytest.raises(ValueError, match="unreported truncation requires"):
+            GatewayEvent(
+                kind=kind,
+                sequence_number=0,
+                failure=GatewayFailure(
+                    failure_class=GatewayFailureClass.PROVIDER_INTERNAL, safe_message="failed"
+                )
+                if kind is GatewayEventKind.FAILED
+                else None,
+                usage_unreported_truncation=True,
+            )
+    marked = GatewayEvent(
+        kind=GatewayEventKind.INCOMPLETE,
+        sequence_number=0,
+        usage=GatewayUsage(input_tokens=1, output_tokens=1),
+        usage_unreported_truncation=True,
+        usage_estimated=True,
+    )
+    assert "usage_unreported_truncation" not in marked.model_dump()
+
+
+def _completed(usage: GatewayUsage) -> GatewayEvent:
+    """Build one completed terminal carrying a provider-reported meter."""
+    return GatewayEvent(kind=GatewayEventKind.COMPLETED, sequence_number=0, usage=usage)
+
+
+def test_output_past_the_callers_ceiling_bills_at_the_ceiling() -> None:
+    """Novita r1-turbo answered max_tokens=16 with 206 tokens (203 reasoning); 16 is billed."""
+    reported = GatewayUsage(
+        input_tokens=12, output_tokens=206, reasoning_tokens=203, cached_input_tokens=4
+    )
+    clamped = bill_within_output_ceiling(
+        _completed(reported), output_ceiling=16, deployment_id="deployment-a"
+    ).usage
+    assert clamped is not None
+    assert (clamped.output_tokens, clamped.reasoning_tokens) == (16, 16)
+    # Input legs are the caller's prompt, never the overshoot.
+    assert (clamped.input_tokens, clamped.cached_input_tokens) == (12, 4)
+    partial = bill_within_output_ceiling(
+        _completed(GatewayUsage(input_tokens=12, output_tokens=40, reasoning_tokens=10)),
+        output_ceiling=32,
+    ).usage
+    assert partial is not None
+    assert (partial.output_tokens, partial.reasoning_tokens) == (32, 10)
+
+
+@pytest.mark.parametrize(
+    ("usage", "ceiling"),
+    [
+        (GatewayUsage(input_tokens=12, output_tokens=16, reasoning_tokens=12), 16),
+        (GatewayUsage(input_tokens=12, output_tokens=206, reasoning_tokens=203), None),
+        (GatewayUsage(input_tokens=12), 16),
+        (None, 16),
+    ],
+)
+def test_meters_within_or_without_a_ceiling_are_billed_as_reported(
+    usage: GatewayUsage | None, ceiling: int | None
+) -> None:
+    """Only a known output total past an explicit ceiling is clamped."""
+    terminal = (
+        _completed(usage)
+        if usage is not None
+        else GatewayEvent(kind=GatewayEventKind.INCOMPLETE, sequence_number=0)
+    )
+    assert bill_within_output_ceiling(terminal, output_ceiling=ceiling) is terminal

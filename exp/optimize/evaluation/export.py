@@ -15,6 +15,7 @@ from exp.common.evaluations.model_report import ModelEvaluationReport
 from exp.common.project import ProjectStore
 from exp.common.rollouts import RolloutArtifact
 from exp.common.tasks import TaskCase, load_task_set
+from exp.optimize.evaluation.learned_memory import NO_MEMORY_NOTE, EvaluationMemory
 from exp.optimize.evaluation.runs import EvaluationRun, run_directory
 from exp.simulation.engines.text.resume import load_rollout
 
@@ -29,6 +30,8 @@ class ReportEvidence(ContractModel):
         report: Verified aggregate model comparison.
         judgment_status: Provisional or human-calibrated project judge status.
         world_model: Configured simulator alias.
+        memory: Learned simulator memory the evaluation read, or None without memory.
+        simulator_memory: One line naming that memory, or saying there was none.
         judge_model: Exact judging model identity.
         tasks: Scenarios pinned by the evaluation dataset.
         rows: Model/scenario/repeat outcomes, including invalid evidence.
@@ -43,6 +46,8 @@ class ReportEvidence(ContractModel):
     report: ModelEvaluationReport
     judgment_status: Literal["provisional", "human_calibrated"]
     world_model: str
+    memory: EvaluationMemory | None = None
+    simulator_memory: str = NO_MEMORY_NOTE
     judge_model: str
     tasks: tuple[TaskCase, ...]
     rows: tuple[EvaluationRow, ...]
@@ -74,6 +79,8 @@ def load_report_evidence(project: ProjectStore, run: EvaluationRun) -> ReportEvi
         report=report,
         judgment_status=run.prepared.setup.judgment_status,
         world_model=run.prepared.setup.world_model_settings.world_model_alias,
+        memory=run.prepared.memory,
+        simulator_memory=simulator_memory_line(run),
         judge_model=run.prepared.judge_request.model.model_id,
         tasks=tuple(
             task
@@ -85,6 +92,12 @@ def load_report_evidence(project: ProjectStore, run: EvaluationRun) -> ReportEvi
         simulation_cost_usd=run.simulation_cost_usd,
         judge_cost_usd=run.judge_cost_usd,
     )
+
+
+def simulator_memory_line(run: EvaluationRun) -> str:
+    """The learned memory a run's simulator read, or the note that it had none."""
+    memory = run.prepared.memory
+    return NO_MEMORY_NOTE if memory is None else memory.line()
 
 
 def export_report(project: ProjectStore, run: EvaluationRun) -> tuple[Path, Path]:

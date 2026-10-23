@@ -10,12 +10,12 @@ from exp.common.models.gateway_catalog import ExactModelDeployment
 from exp.runtime.gateway.contracts import (
     AuthorizationSnapshot,
     DirectTarget,
-    ExecutionSnapshot,
     GatewayApiSurface,
     GatewayFailure,
     GatewayFailureClass,
     GatewayRefusalReason,
 )
+from exp.runtime.gateway.execution_snapshot import ExecutionSnapshot
 from exp.runtime.gateway.health import DeploymentHealthRegistry
 from exp.runtime.gateway.native_execution import (
     claim_route_from,
@@ -32,6 +32,7 @@ from exp.runtime.gateway.native_fallback_rules import (
     require_unrestricted_rung,
     route_fallback_rules,
     rule_fallback_reason,
+    untried_depths,
 )
 from exp.runtime.gateway.routing import GatewayRoute
 
@@ -217,3 +218,20 @@ def test_every_rung_restricted_fails_closed_at_admission() -> None:
         require_unrestricted_rung(
             _route(_deployment("a", ("refusal",)), _deployment("b", ("throttled",)))
         )
+
+
+def test_untried_depths_include_skipped_earlier_rungs_and_honor_the_rules() -> None:
+    """A failover may land on any undispatched depth, earlier ones first, inside its rules."""
+    throttled = GatewayFailure(
+        failure_class=GatewayFailureClass.THROTTLED,
+        safe_message="throttled",
+        failover_eligible=True,
+    )
+    assert untried_depths((None, None, None), throttled, [0, 1, 0], 1) == (0, 2)
+    assert untried_depths((None, None, None), throttled, [1, 1, 0], 0) == (2,)
+    assert untried_depths((None, None), throttled, [1, 1], 1) == ()
+    # A rule rung that does not name the failure stays out even when untried.
+    rules = (frozenset({"refusal:cyber_policy"}), None, None)
+    assert untried_depths(rules, throttled, [0, 1, 0], 1) == (2,)
+    # A policy that does not advance the class leaves only matching rule rungs.
+    assert untried_depths((None, None), throttled, [0, 1], 1, unrestricted=False) == ()

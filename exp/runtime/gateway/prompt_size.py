@@ -41,6 +41,18 @@ MAXIMUM_BYTES_PER_TOKEN = 8
 
 CONTEXT_LENGTH_EXCEEDED_CODE = "context_length_exceeded"
 
+# Bytes per token assumed when sizing a clamped output budget beside a prompt
+# too large for the strict one-token-per-byte bound to leave room. Typical
+# prose and code run 3.5 to 4, so this over-counts the prompt for most text.
+TYPICAL_BYTES_PER_TOKEN = 3
+
+# Tokens held back for chat-template framing (role markers, tool wrappers)
+# that the text bytes do not count.
+TEMPLATE_RESERVE_TOKENS = 256
+
+CONTEXT_WINDOW_CLAMP_REASON = "context_window"
+"""Reason named in the ``ignored_parameters`` entry of an oversized output ceiling."""
+
 
 def prompt_text_bytes(request: GatewayRequest) -> int:
     """Count the UTF-8 bytes of every text the model will read.
@@ -95,6 +107,69 @@ def minimum_prompt_tokens(request: GatewayRequest) -> int:
     return prompt_text_bytes(request) // MAXIMUM_BYTES_PER_TOKEN
 
 
+def clamp_output_to_context_window(
+    route: GatewayRoute,
+    request: GatewayRequest,
+) -> tuple[GatewayRequest, tuple[str, ...]]:
+    """Lower an output ceiling that no rung's context window can reserve.
+
+    Clients send ``max_tokens`` far above any window (10,000,000 to a
+    131,072-token route, production 2026-10-17) on routes that declare no
+    output maximum, so the output-range repair never sees them and the window
+    check refused a prompt of two tokens. When the prompt itself fits the
+    largest declared window but prompt plus ceiling fits no rung, the ceiling
+    is lowered to what that window leaves and disclosed as
+    ``<param>-><n>(context_window)``, the same shape as the output-range clamp.
+    The prompt is sized from ABOVE here, unlike the narrowing below: at most
+    one token per byte (byte-level tokenizers never emit more) plus a template
+    reserve, so the lowered ceiling fits whatever the real count. A prompt too
+    large for that bound to leave room is sized at
+    :data:`TYPICAL_BYTES_PER_TOKEN` instead. A rung that declares no window,
+    or that already holds the request, keeps it verbatim; a prompt the bound
+    cannot fit at all is left to the refusal below. Only the output ceiling
+    (``max_tokens`` / ``max_completion_tokens`` / ``max_output_tokens``) is
+    ever changed, never the prompt.
+
+    Args:
+        route: Resolved ordered route.
+        request: Canonical decoded request.
+
+    Returns:
+        The request (lowered or unchanged) and its disclosures.
+    """
+    requested = request.maximum_output_tokens
+    if requested is None:
+        return request, ()
+    windows: list[int] = []
+    for deployment in route.deployments:
+        window = (
+            None
+            if deployment.capabilities is None
+            else deployment.capabilities.context_window_tokens
+        )
+        if window is None:
+            return request, ()
+        windows.append(window)
+    if not windows:
+        return request, ()
+    text_bytes = prompt_text_bytes(request)
+    minimum = text_bytes // MAXIMUM_BYTES_PER_TOKEN
+    if any(minimum + requested <= window for window in windows):
+        return request, ()
+    largest = max(windows)
+    target = largest - text_bytes - TEMPLATE_RESERVE_TOKENS
+    if target < 1:
+        typical = -(-text_bytes // TYPICAL_BYTES_PER_TOKEN)
+        target = largest - typical - TEMPLATE_RESERVE_TOKENS
+    if target < 1:
+        return request, ()
+    parameter = request.maximum_output_tokens_parameter or "max_tokens"
+    return (
+        request.model_copy(update={"maximum_output_tokens": target}),
+        (f"{parameter}->{target}({CONTEXT_WINDOW_CLAMP_REASON})",),
+    )
+
+
 def context_window_compatible_indexes(
     route: GatewayRoute,
     request: GatewayRequest,
@@ -116,11 +191,13 @@ def context_window_compatible_indexes(
     terminal refusals in the week to 2026-09-15; 116 of them fit the box's
     window on prompt alone and died on prompt + max_tokens).
 
-    ``max_tokens`` is never clamped to a smaller rung's window: the prompt
-    estimate is a loose lower bound, so a clamp computed from it could still
-    overflow at the provider, and it would silently change the caller's
-    request on one rung of the route. The rung is skipped; the refusal (when
-    no rung fits) names the largest budget that would.
+    ``max_tokens`` is never clamped to a smaller rung's window here: the
+    prompt estimate is a loose lower bound, so a clamp computed from it could
+    still overflow at the provider, and it would silently change the caller's
+    request on one rung of the route. The rung is skipped; a ceiling no rung
+    can hold is lowered beforehand, disclosed, by
+    :func:`clamp_output_to_context_window`, and the refusal (when no rung
+    fits even so) names the largest budget that would.
 
     Args:
         route: Resolved ordered route.
@@ -169,3 +246,38 @@ def context_window_compatible_indexes(
             "larger context window."
         )
     raise ProviderParameterError(message=message, param=param, code=CONTEXT_LENGTH_EXCEEDED_CODE)
+
+
+def prompt_cap_indexes(route: GatewayRoute, request: GatewayRequest) -> tuple[int, ...] | None:
+    """The rungs to keep once ``max_prompt_tokens`` caps are applied, or ``None`` to keep all.
+
+    A rung whose authored prompt cap (``GatewayRungDispatchPolicy.max_prompt_tokens``)
+    the prompt's lower-bound estimate reaches is dropped, counting the prompt
+    only (a large ``max_tokens`` never drops it), but only when an uncapped
+    rung of the same exact model stays on the route: the cap is a preference
+    (a dedicated low-batch replica keeping long cold prefills off), never a
+    reason to refuse or to move the request to another model. It runs after
+    the window, capability and tier narrowing; the generation-profile and
+    protocol narrowing follow it, which a dedicated replica of the same model
+    on the same wire passes exactly as its main lane does.
+    """
+    minimum = prompt_text_bytes(request) // MAXIMUM_BYTES_PER_TOKEN
+    capped: set[int] = set()
+    for index, deployment in enumerate(route.deployments):
+        dispatch = deployment.gateway.dispatch
+        cap = None if dispatch is None else dispatch.max_prompt_tokens
+        if cap is not None and minimum >= cap:
+            capped.add(index)
+    if not capped:
+        return None
+    served_models = {
+        deployment.exact_model_id
+        for index, deployment in enumerate(route.deployments)
+        if index not in capped
+    }
+    keep = tuple(
+        index
+        for index, deployment in enumerate(route.deployments)
+        if index not in capped or deployment.exact_model_id not in served_models
+    )
+    return None if len(keep) == len(route.deployments) else keep

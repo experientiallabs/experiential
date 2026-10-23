@@ -56,7 +56,7 @@ variables:
     - /opt/python/cp312-cp312/bin/python -m pip install --quiet --no-cache-dir --disable-pip-version-check --root-user-action=ignore "uv==${UV_VERSION}" "maturin==${MATURIN_VERSION}"
     - export PATH="/opt/python/cp312-cp312/bin:$PATH"
     - !reference [.snippets, rust]
-    - maturin build --release --compatibility manylinux2014 --manifest-path exp/runtime/gateway/native/Cargo.toml --out native-dist
+    - maturin build --release --locked --compatibility manylinux2014 --manifest-path exp/runtime/gateway/native/Cargo.toml --out native-dist
   # Smoke tests the wheel on its own platform.
   smoke-native:
     - uv venv --python 3.12 native-smoke
@@ -65,7 +65,7 @@ variables:
 
 python-package-source:
   stage: preflight
-  image: python:3.12-slim-trixie
+  image: python:3.12.15-slim-trixie@sha256:cb33f7f771ecec2ef1225cf39b159591a040391bd73e4c01f00fdfc4c47611d2
   needs: []
   rules:
     - if: $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $RUN_WORKFLOW == "python-package" && $PYTHON_PACKAGE_SOURCE == "latest-release"
@@ -107,7 +107,7 @@ python-package-source:
 
 python-package-wheel-linux-x86_64:
   extends: [.python-package-wheel-linux]
-  image: quay.io/pypa/manylinux2014_x86_64:2026.09.23-1
+  image: quay.io/pypa/manylinux2014_x86_64:2026.09.23-1@sha256:2fa5f99f660f115f547d96b4edcadfc19f77a6de8807734bf0fc4924f81be01a
   rules: !reference [.python-package-rules, rules]
   script:
     - !reference [.python-package-snippets, release-source]
@@ -118,7 +118,7 @@ python-package-wheel-linux-x86_64:
 
 python-package-wheel-linux-aarch64:
   extends: [.python-package-wheel-linux]
-  image: quay.io/pypa/manylinux2014_aarch64:2026.09.23-1
+  image: quay.io/pypa/manylinux2014_aarch64:2026.09.23-1@sha256:47940daeb8e0fdcc7deefad334bfda3d8d12b447ba1ebd5411f9f106318eafdb
   tags: [saas-linux-small-arm64]
   rules: !reference [.python-package-rules, rules]
   script:
@@ -147,7 +147,7 @@ python-package-wheel-macos-arm64:
   rules: !reference [.python-package-rules, rules]
   script:
     - !reference [.python-package-snippets, release-source]
-    - uvx --from "maturin==${MATURIN_VERSION}" maturin build --release --manifest-path exp/runtime/gateway/native/Cargo.toml --out native-dist
+    - uvx --from "maturin==${MATURIN_VERSION}" maturin build --release --locked --manifest-path exp/runtime/gateway/native/Cargo.toml --out native-dist
     - !reference [.python-package-snippets, smoke-native]
 
 # The Intel wheel is cross-compiled on the Apple silicon runner, so it cannot
@@ -158,7 +158,7 @@ python-package-wheel-macos-x86_64:
   script:
     - !reference [.python-package-snippets, release-source]
     - rustup target add x86_64-apple-darwin
-    - uvx --from "maturin==${MATURIN_VERSION}" maturin build --release --target x86_64-apple-darwin --manifest-path exp/runtime/gateway/native/Cargo.toml --out native-dist
+    - uvx --from "maturin==${MATURIN_VERSION}" maturin build --release --locked --target x86_64-apple-darwin --manifest-path exp/runtime/gateway/native/Cargo.toml --out native-dist
 
 # The hosted Windows runner runs a fixed Windows Server 2022 VM with
 # PowerShell and takes no image. It has two cores, so compiling the crate's
@@ -189,7 +189,7 @@ python-package-wheel-windows-x86_64:
     # The abi3 build links python3.lib from an explicit Python 3.12.
     - uv python install 3.12
     - $python = uv python find 3.12
-    - uvx --from "maturin==$env:MATURIN_VERSION" maturin build --release --interpreter $python --manifest-path exp/runtime/gateway/native/Cargo.toml --out native-dist
+    - uvx --from "maturin==$env:MATURIN_VERSION" maturin build --release --locked --interpreter $python --manifest-path exp/runtime/gateway/native/Cargo.toml --out native-dist
     - uv venv --python 3.12 native-smoke
     - uv pip install --python native-smoke\Scripts\python.exe (Get-ChildItem native-dist\*.whl).FullName
     - .\native-smoke\Scripts\python.exe -c "import exp_gateway_native as n; assert n.__version__; assert callable(n.serve)"
@@ -200,7 +200,7 @@ python-package-wheel-windows-x86_64:
 python-package-build:
   extends: [.tools]
   stage: build
-  image: python:3.12-trixie
+  image: python:3.12.15-trixie@sha256:22b3d25281ff46186331c6c95fbb52aa7e65261013a9c7612002656e4290410f
   rules: !reference [.python-package-rules, rules]
   # Waits for every wheel the pipeline builds; only the linux-x86_64 wheel's
   # files are needed here.
@@ -287,7 +287,7 @@ python-package-build:
 python-package-capture-smoke:
   extends: [.tools]
   stage: test
-  image: python:3.13-trixie
+  image: python:3.13.17-trixie@sha256:2d90366719bf27f9a26d3496b34bfe44fc383b10e7360ca316152f7b348f4f92
   rules:
     - if: $CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+(rc\d+)?$/ && $CI_COMMIT_REF_PROTECTED == "true" && $CI_PIPELINE_SOURCE == "push"
     - if: $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $RUN_WORKFLOW == "python-package" && $PYTHON_PACKAGE_PUBLISH == "true"
@@ -308,7 +308,7 @@ python-package-capture-smoke:
 python-package-publish:
   extends: [.tools]
   stage: publish
-  image: python:3.12-trixie
+  image: python:3.12.15-trixie@sha256:22b3d25281ff46186331c6c95fbb52aa7e65261013a9c7612002656e4290410f
   rules:
     - if: $CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+(rc\d+)?$/ && $CI_COMMIT_REF_PROTECTED == "true" && $CI_PIPELINE_SOURCE == "push"
     - if: $CI_PIPELINE_SOURCE =~ /^(web|api)$/ && $RUN_WORKFLOW == "python-package" && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $PYTHON_PACKAGE_SOURCE == "latest-release" && $PYTHON_PACKAGE_PUBLISH == "true"

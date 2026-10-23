@@ -26,6 +26,7 @@ fn wire(base: Option<f64>, slope: Option<f64>) -> DeploymentWire {
         image_output: false,
         model_id: String::new(),
         billing_customer_managed: false,
+        tenant_origin: false,
         explicit_cache: false,
         automatic_cache: false,
         automatic_cache_written_tokens: None,
@@ -120,6 +121,7 @@ fn successor_requires_capacity_and_an_eligible_class() {
         1,
         1,
         0,
+        &[1],
         &retryable,
         false,
     ));
@@ -131,6 +133,7 @@ fn successor_requires_capacity_and_an_eligible_class() {
         2,
         2,
         0,
+        &[1],
         &retryable,
         false,
     ));
@@ -142,6 +145,7 @@ fn successor_requires_capacity_and_an_eligible_class() {
         2,
         2,
         0,
+        &[1],
         &retryable,
         false,
     ));
@@ -153,6 +157,7 @@ fn successor_requires_capacity_and_an_eligible_class() {
         8,
         1,
         0,
+        &[1],
         &retryable,
         false,
     ));
@@ -164,6 +169,7 @@ fn successor_requires_capacity_and_an_eligible_class() {
         1,
         1,
         0,
+        &[1],
         &retryable,
         false,
     ));
@@ -179,6 +185,7 @@ fn ineligible_classes_never_advance_without_refusal_opt_in() {
         1,
         1,
         0,
+        &[1],
         &invalid,
         false,
     ));
@@ -190,6 +197,7 @@ fn ineligible_classes_never_advance_without_refusal_opt_in() {
         1,
         1,
         0,
+        &[1],
         &refusal,
         false,
     ));
@@ -201,6 +209,7 @@ fn ineligible_classes_never_advance_without_refusal_opt_in() {
         1,
         1,
         0,
+        &[1],
         &refusal,
         true,
     ));
@@ -212,6 +221,7 @@ fn ineligible_classes_never_advance_without_refusal_opt_in() {
         1,
         1,
         0,
+        &[1],
         &refusal,
         true,
     ));
@@ -227,6 +237,7 @@ fn failover_only_classes_skip_the_redial_and_advance() {
         1,
         1,
         0,
+        &[1],
         &throttled,
         false,
     ));
@@ -237,6 +248,7 @@ fn failover_only_classes_skip_the_redial_and_advance() {
         1,
         1,
         0,
+        &[1],
         &throttled,
         false,
     ));
@@ -249,9 +261,11 @@ fn usage(output_tokens: Option<u64>, reasoning_tokens: Option<u64>) -> Usage {
         cached_input_tokens: None,
         cache_creation_input_tokens: None,
         cache_creation_1h_input_tokens: None,
+        cache_creation_12h_input_tokens: None,
         reasoning_tokens,
         billed_units: None,
         cache_writes_read_back: false,
+        image_output_tokens: None,
     }
 }
 
@@ -361,4 +375,191 @@ fn first_token_allowance_has_its_own_base_and_shares_the_input_slope() {
     // The header allowance is untouched by the token base.
     let header = first_byte_allowance(&overridden, Duration::from_secs(15), 240.0, 0.0);
     assert_eq!(header, Duration::from_secs_f64(15.0));
+}
+
+#[test]
+fn failover_eligibility_matrix_by_upstream_status() {
+    // Dead-lane answers fail over to an untried rung (a skipped earlier one
+    // included); the caller's own 4xx never does. 401/403, 402 and a
+    // provider 404 keep their classifier's rule: operator deadness advances.
+    let route = plain(2);
+    let advances = |failure: &Failure| {
+        successor_possible(
+            policy(false),
+            &route,
+            far_deadline(),
+            1,
+            2,
+            1,
+            &[0, 1],
+            failure,
+            false,
+        )
+    };
+    for status in [500, 502, 503, 504, 401, 402, 403, 404, 408, 429] {
+        let failure = crate::upstream::transport_failure(Some(status));
+        assert!(failure.failover_eligible, "{status}");
+        assert!(advances(&failure), "{status}");
+    }
+    let refused = crate::upstream::transport_failure(None);
+    assert!(refused.failover_eligible && advances(&refused));
+    for status in [400, 413, 422] {
+        let failure = crate::upstream::transport_failure(Some(status));
+        assert!(!failure.failover_eligible, "{status}");
+        assert!(!advances(&failure), "{status}");
+    }
+}
+
+#[test]
+fn an_authored_header_allowance_raises_the_pre_first_byte_budget() {
+    let configured = Some(Duration::from_secs(90));
+    let default_base = Duration::from_secs(15);
+    // A ~200k-token prompt on a self-hosted lead authoring 300 s: the budget
+    // covers the lead's whole allowance (300 + 240 x 0.2 = 348 s) plus the
+    // reserve, so the header wait is never cut at the 90 s default.
+    let mut lead = wire(Some(300.0), None);
+    lead.deployment_id = "lead".to_string();
+    let route = [lead, wire(None, None)];
+    let budget = pre_first_byte_budget(
+        configured,
+        wire::PRE_FIRST_BYTE_RESERVE,
+        None,
+        &route,
+        default_base,
+        240.0,
+        200_000.0,
+    )
+    .expect("budget stays enabled");
+    assert_eq!(
+        budget,
+        Duration::from_secs(348) + wire::PRE_FIRST_BYTE_RESERVE
+    );
+    // A slow backup reached by failover counts as much as the lead.
+    let backup_slow = [wire(None, None), wire(Some(300.0), Some(0.0))];
+    assert_eq!(
+        pre_first_byte_budget(
+            configured,
+            wire::PRE_FIRST_BYTE_RESERVE,
+            None,
+            &backup_slow,
+            default_base,
+            240.0,
+            1.0
+        ),
+        Some(Duration::from_secs(300) + wire::PRE_FIRST_BYTE_RESERVE)
+    );
+    // Lanes that author nothing keep the configured budget, however large the prompt.
+    assert_eq!(
+        pre_first_byte_budget(
+            configured,
+            wire::PRE_FIRST_BYTE_RESERVE,
+            None,
+            &plain(2),
+            default_base,
+            240.0,
+            900_000.0
+        ),
+        configured
+    );
+    // An authored allowance below the budget never shrinks it.
+    let short = [wire(Some(20.0), Some(0.0))];
+    assert_eq!(
+        pre_first_byte_budget(
+            configured,
+            wire::PRE_FIRST_BYTE_RESERVE,
+            None,
+            &short,
+            default_base,
+            240.0,
+            1.0
+        ),
+        configured
+    );
+    // A disabled budget stays disabled.
+    assert_eq!(
+        pre_first_byte_budget(
+            None,
+            wire::PRE_FIRST_BYTE_RESERVE,
+            None,
+            &route,
+            default_base,
+            240.0,
+            200_000.0
+        ),
+        None
+    );
+}
+
+#[test]
+fn the_raised_budget_stops_at_its_ceiling_and_never_lowers_the_configured_one() {
+    let configured = Some(Duration::from_secs(90));
+    let slow = [wire(Some(3_600.0), Some(0.0))];
+    // An hour authored on one rung is cut at the ceiling.
+    assert_eq!(
+        pre_first_byte_budget(
+            configured,
+            wire::PRE_FIRST_BYTE_RESERVE,
+            Some(wire::PRE_FIRST_BYTE_MAX),
+            &slow,
+            Duration::from_secs(15),
+            240.0,
+            1.0,
+        ),
+        Some(wire::PRE_FIRST_BYTE_MAX)
+    );
+    // A ceiling below the configured budget leaves the configured budget.
+    assert_eq!(
+        pre_first_byte_budget(
+            Some(Duration::from_secs(900)),
+            wire::PRE_FIRST_BYTE_RESERVE,
+            Some(wire::PRE_FIRST_BYTE_MAX),
+            &slow,
+            Duration::from_secs(15),
+            240.0,
+            1.0,
+        ),
+        Some(Duration::from_secs(900))
+    );
+}
+
+#[test]
+fn a_large_body_raises_the_budget_by_its_text_not_its_base64_media() {
+    // A 400k-character prompt plus a 4 MB inline image.
+    let prompt = "x".repeat(400_000);
+    let image = "A".repeat(4_000_000);
+    let body = format!(
+        r#"{{"messages":[{{"role":"user","content":[{{"type":"text","text":"{prompt}"}},{{"type":"image_url","image_url":{{"url":"data:image/png;base64,{image}"}}}}]}}]}}"#
+    );
+    let tokens = approximate_input_tokens(&body);
+    let text_only = (body.len() - image.len()) as f64 / 4.0;
+    assert!((tokens - text_only).abs() < 1.0, "{tokens} vs {text_only}");
+    // The lead authors a 240 s/M slope: ~100k tokens add ~24 s, not ~264 s.
+    let lead = [wire(Some(60.0), Some(240.0))];
+    let budget = pre_first_byte_budget(
+        Some(Duration::from_secs(90)),
+        wire::PRE_FIRST_BYTE_RESERVE,
+        Some(wire::PRE_FIRST_BYTE_MAX),
+        &lead,
+        Duration::from_secs(15),
+        240.0,
+        tokens,
+    )
+    .expect("budget enabled");
+    assert!(budget < Duration::from_secs(120), "{budget:?}");
+    // Even counted whole, the ceiling would hold it.
+    let whole = pre_first_byte_budget(
+        Some(Duration::from_secs(90)),
+        wire::PRE_FIRST_BYTE_RESERVE,
+        Some(wire::PRE_FIRST_BYTE_MAX),
+        &[wire(Some(400.0), Some(240.0))],
+        Duration::from_secs(15),
+        240.0,
+        body.len() as f64 / 4.0,
+    );
+    assert_eq!(whole, Some(wire::PRE_FIRST_BYTE_MAX));
+    // Text that merely mentions base64 is counted.
+    assert_eq!(
+        approximate_input_tokens(r#"{"a":";base64,abcd"}"#),
+        20.0 / 4.0
+    );
 }

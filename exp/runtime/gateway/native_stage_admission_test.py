@@ -10,10 +10,11 @@ from uuid import NAMESPACE_URL, uuid5
 import pytest
 
 from exp.common.models.catalog import GatewayRungDispatchPolicy
-from exp.common.models.gateway_catalog import ExactModelDeployment, FailoverMode
+from exp.common.models.gateway_catalog import BillingSource, ExactModelDeployment, FailoverMode
 from exp.runtime.gateway import native_stage_admission
 from exp.runtime.gateway.contracts import (
     AuthorizationSnapshot,
+    GatewayApiSurface,
     GatewayMessage,
     GatewayRequest,
     GatewayUsage,
@@ -245,7 +246,9 @@ def test_no_fallback_stage_preselection_never_enters_child(
     )
     accounting = NativeAttemptAccounting(_RecordingLedger(), recovery_host=Host())
 
-    def prepare(candidate: GatewayRoute, resolved: tuple, incoming: GatewayRequest) -> tuple:
+    def prepare(
+        candidate: GatewayRoute, resolved: tuple, incoming: GatewayRequest, _fast: bool = False
+    ) -> tuple:
         """Observe the stage boundary before capability filtering or effectful search."""
         assert all(item.exact_model_id == snapshot.exact_model_id for item in candidate.deployments)
         if not root_available:
@@ -1488,3 +1491,159 @@ def test_no_recovery_host_skips_prefix_digest(monkeypatch: pytest.MonkeyPatch) -
     assert set(admitted.snapshot.deployment_ids) == set(route.snapshot.deployment_ids)
     assert placement.fingerprint is not None
     assert placement.verified_warm_deployment_id is None
+
+
+def _staged_route(
+    deployments: tuple[ExactModelDeployment, ...], mode: FailoverMode = "maximize_cache"
+) -> GatewayRoute:
+    """One single-stage model-chain route over ``deployments`` (a chain-semantics route)."""
+    route, _ = _affinity_fixture()
+    stage = route.snapshot.stage_for_depth(0).model_copy(
+        update={
+            "stage_index": 0,
+            "exact_model_id": "root",
+            "pool_id": "pool-root",
+            "deployment_ids": tuple(d.deployment_id for d in deployments),
+            "rung_positions": tuple(range(len(deployments))),
+            "ancestry": ("root",),
+            "failover_mode": mode,
+        }
+    )
+    return route.model_copy(
+        update={
+            "snapshot": route.snapshot.model_copy(
+                update={
+                    "exact_model_id": "root",
+                    "pool_id": "pool-root",
+                    "deployment_ids": tuple(d.deployment_id for d in deployments),
+                    "model_stages": (stage,),
+                }
+            ),
+            "deployment": deployments[0],
+            "fallback_deployments": deployments[1:],
+        }
+    )
+
+
+def _rung(
+    template: ExactModelDeployment, deployment_id: str, provider: str, *, house: bool
+) -> ExactModelDeployment:
+    return template.model_copy(
+        update={
+            "deployment_id": deployment_id,
+            "exact_model_id": "root",
+            "provider": provider,
+            "billing_source": BillingSource.HOST_MANAGED
+            if house
+            else BillingSource.CUSTOMER_MANAGED,
+        }
+    )
+
+
+@pytest.mark.parametrize("mode", ["maximize_cache", "maximize_cache_affinity"])
+def test_stage_marker_grouping_never_leads_with_the_house_openrouter_rung(
+    mode: FailoverMode,
+) -> None:
+    """GLM-5.3-Flash-uncensored 2026-10-22, the exact prod shape (chain route, model stages).
+
+    Stage [Experiential Cloud box (drops markers), house OpenRouter (forwards
+    them)]: before, a cache-marked request dispatched OpenRouter first (451
+    /v1/messages leads in half an hour) although the platform ordered it
+    last. The box leads; OpenRouter stays the stage's last rung.
+    """
+    route, original = _affinity_fixture()
+    template = route.deployment
+    box = _rung(template, "ec-box", "experiential_cloud", house=True)
+    openrouter = _rung(template, "house-openrouter", "openrouter", house=True)
+    client = original[0][1]
+    wires = (
+        (GatewayWireProfile(dialect="openai_compatible", url="https://ec.test"), client),
+        (
+            GatewayWireProfile(
+                dialect="openai_compatible",
+                url="https://openrouter.ai/api/v1",
+                forwards_cache_control=True,
+            ),
+            client,
+        ),
+    )
+    staged = _staged_route((box, openrouter), mode)
+    ordered, resolved, _ = stage_affinity_ordered_rungs(
+        staged,
+        wires,
+        _marked_request(),
+        accounting=NativeAttemptAccounting(_RecordingLedger()),
+        authorization=staged.snapshot.authorization,
+        continuation=None,
+    )
+    assert ordered.snapshot.deployment_ids == ("ec-box", "house-openrouter")
+    assert [profile.url for profile, _ in resolved] == [
+        "https://ec.test",
+        "https://openrouter.ai/api/v1",
+    ]
+
+
+def test_stage_marker_grouping_still_leads_with_a_marker_honoring_direct_lane() -> None:
+    """The open question for the owner, pinned as today's behavior (not a decision).
+
+    Stage [Experiential Cloud box (drops markers), novita (forwards them)]: the
+    grouping leads with novita while the box is healthy. On GLM-5.3-Flash-
+    uncensored novita was an emergency fallback clone, so the grouping put a
+    fallback ahead of our own capacity. Only the house OpenRouter rung is
+    held back here; whether own-capacity rungs should outrank a
+    marker-honoring fallback is the owner's call (MR body).
+    """
+    route, original = _affinity_fixture()
+    template = route.deployment
+    box = _rung(template, "ec-box", "experiential_cloud", house=True)
+    novita = _rung(template, "novita", "novita", house=True)
+    client = original[0][1]
+    wires = (
+        (GatewayWireProfile(dialect="openai_compatible", url="https://ec.test"), client),
+        (
+            GatewayWireProfile(
+                dialect="openai_compatible",
+                url="https://api.novita.ai/openai",
+                forwards_cache_control=True,
+            ),
+            client,
+        ),
+    )
+    staged = _staged_route((box, novita))
+    ordered, _, _ = stage_affinity_ordered_rungs(
+        staged,
+        wires,
+        _marked_request(),
+        accounting=NativeAttemptAccounting(_RecordingLedger()),
+        authorization=staged.snapshot.authorization,
+        continuation=None,
+    )
+    assert ordered.snapshot.deployment_ids == ("novita", "ec-box")
+
+
+def test_an_unreordered_stage_keeps_its_authored_order() -> None:
+    """A markerless request on a maximize_cache stage is not reordered at all.
+
+    The aggregator rule rides the scheduler's own reorders only, so an
+    authored stage order (an org's own chain) is never rewritten here.
+    """
+    route, original = _affinity_fixture()
+    template = route.deployment
+    openrouter = _rung(template, "house-openrouter", "openrouter", house=True)
+    box = _rung(template, "ec-box", "experiential_cloud", house=True)
+    client = original[0][1]
+    profile = GatewayWireProfile(dialect="openai_compatible", url="https://any.test")
+    staged = _staged_route((openrouter, box))
+    plain = GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=(GatewayMessage(role="user", content="hi"),),
+    )
+    ordered, _, _ = stage_affinity_ordered_rungs(
+        staged,
+        ((profile, client), (profile, client)),
+        plain,
+        accounting=NativeAttemptAccounting(_RecordingLedger()),
+        authorization=staged.snapshot.authorization,
+        continuation=None,
+    )
+    assert ordered.snapshot.deployment_ids == ("house-openrouter", "ec-box")

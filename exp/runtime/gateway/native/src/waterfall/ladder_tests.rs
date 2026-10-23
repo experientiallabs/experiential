@@ -295,6 +295,7 @@ pub(super) fn wire(deployment_id: &str, url: &str, throttle_redial_budget: u32) 
         headers: HashMap::new(),
         model_id: "gpt-test".to_string(),
         billing_customer_managed: false,
+        tenant_origin: false,
         explicit_cache: false,
         automatic_cache: false,
         automatic_cache_written_tokens: None,
@@ -814,8 +815,6 @@ fn rule_wire(deployment_id: &str, url: &str, tokens: &[&str]) -> DeploymentWire 
         native_tool_translation: Default::default(),
         billing_customer_managed: true,
         failover_only_on: Some(tokens.iter().map(|token| token.to_string()).collect()),
-        zdr_constrained: false,
-        capture_logprobs: false,
         ..wire(deployment_id, url, 0)
     }
 }
@@ -994,6 +993,7 @@ fn a_first_dial_reserved_on_a_failover_only_rung_fails_closed() {
 }
 
 mod capture_logprobs_tests;
+mod gemini_image_tests;
 mod logprobs_tests;
 mod pre_first_byte_tests;
 mod responses_logprobs_tests;

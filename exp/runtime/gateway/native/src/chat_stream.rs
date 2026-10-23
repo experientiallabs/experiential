@@ -55,7 +55,7 @@ pub(super) async fn stream_response(
         let mut guard = guard;
         let mut lease = lease;
         let mut committed = committed;
-        let mut delivery = Delivery::new(sender.clone(), lease.is_some());
+        let mut delivery = Delivery::new(sender.clone(), lease.is_some()).paced(committed.pace);
         let mut encoder = ChatSseEncoder::new_with_ignored(
             &request_id,
             &alias,
@@ -221,7 +221,7 @@ pub(super) async fn stream_response(
                     return;
                 }
             }
-            for outward in outward_events {
+            for outward in delivery.pace(outward_events, deadline).await {
                 let encoded = match encoder.feed(&outward) {
                     Ok(encoded) => encoded,
                     Err(_) => {

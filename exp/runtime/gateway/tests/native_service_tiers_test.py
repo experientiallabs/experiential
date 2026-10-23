@@ -238,30 +238,63 @@ def test_real_native_tier_settlement(
 
 
 @pytest.mark.parametrize("surface", ["chat/completions", "responses"])
-def test_unconfigured_fast_lane_is_refused_before_provider(
+def test_unconfigured_fast_lane_dispatches_at_standard_with_disclosure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, surface: str
 ) -> None:
-    """A synthetic endpoint on a closed port must never be contacted without a tier card."""
+    """Fast on a lane without a priority card runs at standard, never billed as priority.
+
+    Codex Fast mode sends ``service_tier: priority`` to every model; refusing
+    it failed 213 requests a day. Standard processing never costs the caller
+    more, so the request dispatches without the tier and discloses the change.
+    """
+    received: list[JsonObject] = []
+    body = _body(True, None)  # the openai house lane dispatches on the Responses wire
+
+    class Provider(BaseHTTPRequestHandler):
+        """Capture the dispatched wire payload."""
+
+        def do_POST(self) -> None:  # noqa: N802
+            """Record one request and answer a finite stream."""
+            received.append(json.loads(self.rfile.read(int(self.headers["content-length"]))))
+            self.send_response(200)
+            self.send_header("content-type", "text/event-stream")
+            self.send_header("content-length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, format: str, *args: object) -> None:
+            """Keep synthetic requests quiet."""
+            del format, args
+
+    upstream = ThreadingHTTPServer(("127.0.0.1", 0), Provider)
+    thread = threading.Thread(target=upstream.serve_forever, daemon=True)
+    thread.start()
     monkeypatch.setenv("TEST_PROVIDER_KEY", "synthetic-key")
-    monkeypatch.setattr(registry, "OPENAI_BASE_URL", "http://127.0.0.1:1/v1")
-    manager, key = _configure(tmp_path, "openai", configured=False)
+    monkeypatch.setattr(registry, "OPENAI_BASE_URL", f"http://127.0.0.1:{upstream.server_port}/v1")
+    _manager, key = _configure(tmp_path, "openai", configured=False)
     gateway = _ServedGateway(tmp_path, _unused_port())
     try:
         gateway.start()
         payload: JsonObject = {"model": "coding", "service_tier": "fast"}
         if surface == "responses":
-            payload["input"] = "Hello"
+            payload.update({"input": "Hello", "max_output_tokens": 16})
         else:
-            payload["messages"] = [{"role": "user", "content": "Hello"}]
+            payload.update({"messages": [{"role": "user", "content": "Hello"}], "max_tokens": 16})
         response = httpx.post(
             f"http://127.0.0.1:{gateway.port}/v1/{surface}",
             headers={"Authorization": f"Bearer {key}"},
             json=payload,
             timeout=10,
         )
-        assert response.status_code == 400, response.text
-        assert response.json()["error"]["param"] == "service_tier"
+        assert response.status_code == 200, response.text
+        assert (
+            "service_tier->default(priority_unavailable)"
+            in response.json()["x-experiential-ignored-parameters"]
+        )
+        assert len(received) == 1
+        assert "service_tier" not in received[0]
     finally:
         gateway.stop()
-    with sqlite3.connect(manager.database_path) as connection:
-        assert connection.execute("SELECT count(*) FROM gateway_attempts").fetchone() == (0,)
+        upstream.shutdown()
+        upstream.server_close()
+        thread.join(timeout=5)
