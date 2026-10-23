@@ -34,6 +34,7 @@ from exp.common.core.artifacts import (
     stable_id,
 )
 from exp.common.project import ProjectStore, artifact_input
+from exp.common.project.causality import cites
 from exp.optimize.evaluation.fidelity.memory_policy import (
     LESSON_SET_TYPE,
     LessonSelection,
@@ -377,6 +378,8 @@ def _publish(
     envelope = ArtifactEnvelope(
         schema_version=1, created_at=created_at, code_revision=code_revision
     )
+    # Cited so the new set supersedes them by causal order rather than by creation time.
+    superseded = _current_lesson_sets(project, fit.lineage, fit.version)
     known = set() if parent is None else {entry.entry_id for entry in parent.entries}
     additions: list[LibraryEntry] = []
     rows: dict[str, list[ScreenedLesson]] = {"in": [], "out": [], "unknown": [], "none": []}
@@ -428,7 +431,11 @@ def _publish(
             update={
                 "inputs": tuple(
                     sorted(
-                        {fit_ref, *(() if library_ref is None else (library_ref,))},
+                        {
+                            fit_ref,
+                            *(() if library_ref is None else (library_ref,)),
+                            *superseded,
+                        },
                         key=lambda ref: ref.artifact_id,
                     )
                 )
@@ -515,7 +522,11 @@ def load_lesson_set(project: ProjectStore, reference: ArtifactInput) -> LessonSe
 
 
 def latest_lesson_set(project: ProjectStore, lineage: str, version: int) -> ArtifactInput:
-    """The most recently published lesson set of one memory checkpoint.
+    """The current lesson set of one memory checkpoint: the one no later set supersedes.
+
+    A lesson set saved for a checkpoint that already has one cites the current set in its
+    inputs, so the newest is the one no other set of that checkpoint cites. Creation times are
+    never compared: clock skew between the processes that screened cannot pick an older set.
 
     Args:
         project: Project holding the lesson sets.
@@ -526,19 +537,37 @@ def latest_lesson_set(project: ProjectStore, lineage: str, version: int) -> Arti
         The lesson set reference.
 
     Raises:
-        ValueError: The checkpoint has no lesson set.
+        ValueError: The checkpoint has no lesson set, or several with no recorded order.
     """
-    store = project.artifacts
-    found: list[tuple[datetime, str, ArtifactInput]] = []
-    for identity in store.list_ids(artifact_type=LESSON_SET_TYPE):
-        manifest = store.read(identity).manifest
-        reference = artifact_input(manifest)
-        selection = load_lesson_selection(store, reference)
-        if (selection.lineage, selection.version) == (lineage, version):
-            found.append((manifest.created_at, identity, reference))
-    if not found:
+    current = _current_lesson_sets(project, lineage, version)
+    if not current:
         raise ValueError(
             f"memory {lineage} v{version} has no screened lesson set; run the repair-learning "
             "continuation with resolution screen-lessons first"
         )
-    return max(found)[2]
+    if len(current) > 1:
+        raise ValueError(
+            f"memory {lineage} v{version} has {len(current)} screened lesson sets that do not "
+            f"supersede one another ({', '.join(item.artifact_id for item in current)}), so "
+            "none is the latest; run screen-lessons again to save one that supersedes them"
+        )
+    return current[0]
+
+
+def _current_lesson_sets(project: ProjectStore, lineage: str, version: int) -> list[ArtifactInput]:
+    """Lesson sets of one checkpoint that no other set of the checkpoint cites, by ID."""
+    store = project.artifacts
+    found: list[ArtifactInput] = []
+    for identity in store.list_ids(artifact_type=LESSON_SET_TYPE):
+        reference = artifact_input(store.read(identity).manifest)
+        selection = load_lesson_selection(store, reference)
+        if (selection.lineage, selection.version) == (lineage, version):
+            found.append(reference)
+    return sorted(
+        (
+            item
+            for item in found
+            if not any(cites(store, other.artifact_id, item) for other in found if other != item)
+        ),
+        key=lambda item: item.artifact_id,
+    )

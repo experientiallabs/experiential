@@ -147,7 +147,8 @@ def test_the_build_retest_reads_the_build_memory_after_an_audit_learned(
         code_revision=REVISION,
         clock=lambda: datetime.now(UTC),
     )
-    assert learning_plan(store).scope == "fit", "the audit's memory published most recently"
+    with pytest.raises(ValueError, match="nothing orders them"):
+        learning_plan(store)  # two unrelated lineages; publication clocks never decide
     panel = register_miss_retest(store, 99, code_revision=REVISION, clock=lambda: datetime.now(UTC))
     assert panel.world_model == build_plan.world_model
     assert panel.learned == USERS, "every trace, not only the fit traces"

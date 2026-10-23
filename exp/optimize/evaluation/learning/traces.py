@@ -291,8 +291,8 @@ def learning_plan(
         project: Project with a completed build.
         recall_alias: Native decision alias for memory recall; required the first time, and
             must match the recorded one afterwards. None reads the recorded plan.
-        scope: Traces to learn. None reads the recorded plan whose memory learned most
-            recently (``all`` when neither has learned anything yet).
+        scope: Traces to learn. None reads the recorded plan whose memory has published, and
+            refuses when both have (``all`` when neither has learned anything yet).
         record: Record a new plan; set only when learning starts.
         evidence_reading: Enable bounded investigation readers; None follows a saved plan.
         dream_every: Consolidate every N traces and at completion; None follows the saved plan.
@@ -431,19 +431,32 @@ def _bind_learning_plan(
 
 
 def _active_scope(project: ProjectStore) -> Scope:
-    """The scope whose memory published most recently; ``all`` before anything is learned."""
-    published: list[tuple[datetime, int, Scope]] = []
+    """The one scope whose memory has published; ``all`` before anything is learned.
+
+    The two scopes' memories are separate lineages that never cite each other, so nothing but
+    their clocks could say which published last; when both have published, the choice is
+    refused instead of guessed from creation times.
+
+    Raises:
+        ValueError: Both the all-traces and the fit-only memory have published versions.
+    """
+    published: list[tuple[Scope, str]] = []
     recorded: list[Scope] = []
-    for rank, scope in enumerate(SCOPES):
+    for scope in SCOPES:
         lineage = _plan_identity(project, scope)[2]
         if not _recorded(project, lineage):
             continue
         recorded.append(scope)
-        head = memory_head(project.artifacts, lineage)
-        if head is not None:
-            published.append((head.created_at, -rank, scope))
+        if memory_head(project.artifacts, lineage) is not None:
+            published.append((scope, lineage))
+    if len(published) > 1:
+        raise ValueError(
+            "this build has learned memory in more than one scope ("
+            + ", ".join(f"{scope}: {lineage}" for scope, lineage in published)
+            + "), and nothing orders them; name the memory lineage or scope explicitly"
+        )
     if published:
-        return max(published)[2]
+        return published[0][0]
     return recorded[0] if recorded else "all"
 
 

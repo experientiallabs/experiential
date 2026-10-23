@@ -687,7 +687,7 @@ prediction. A trace's first saved measurement fixes its score, including unanswe
 misses. Later learning retries cannot replace that measurement, and the curve reports traces not
 learned separately. The retest covers learned traces only and preserves their first measurement
 as its baseline. A cancelled learning preflight records nothing; later commands read the memory
-that learned most recently. When every trace is already learned, learning replays its saved
+of the scope they name. When every trace is already learned, learning replays its saved
 results without asking for spend consent.
 
 Knowledge pinned in a simulator (built outside `exp build`, for example for `exp eval --fidelity`)

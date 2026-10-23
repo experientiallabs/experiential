@@ -46,8 +46,9 @@ registered procedure in three resolutions, run in order:
  "forget": {"lineage": "LINEAGE", "block": "#0-3", "reason": "why the summary is stale"}}
 ```
 
-`block` is the summary ID memory views print. `lineage` may be omitted for the memory the
-recorded learning plan learned most recently. The forget is eligible only when:
+`block` is the summary ID memory views print. `lineage` may be omitted while only one recorded
+learning plan's memory has published; once both the all-traces and the fit-only memory have,
+name it, since nothing orders the two lineages. The forget is eligible only when:
 
 - the block is a complete aligned block of the head version's log and its current summary
   generation is built (an unbuilt or already forgotten block has nothing to forget);
