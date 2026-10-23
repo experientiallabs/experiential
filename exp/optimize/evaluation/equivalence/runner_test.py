@@ -17,6 +17,7 @@ from exp.optimize.evaluation.equivalence import runner as owner
 from exp.optimize.evaluation.equivalence.evidence import PairMeasurement
 from exp.optimize.evaluation.equivalence.policy_test import fixture_policy, registered_policy
 from exp.optimize.evaluation.equivalence.review import ReviewModel
+from exp.optimize.evaluation.equivalence.rubric_test import frozen_rubric
 from exp.optimize.evaluation.equivalence.runner import (
     EquivalenceCase,
     EquivalenceSpec,
@@ -259,6 +260,7 @@ def equivalence_fixture(
     ).snapshot("judge")[0]
     reviewer = ReviewModel(alias="judge", model=model, output_tokens=1024)
     spec = EquivalenceSpec(
+        rubric=frozen_rubric(project, reviewer),
         cases=(
             EquivalenceCase(
                 reference=base,

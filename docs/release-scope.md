@@ -199,9 +199,13 @@ without judge dispatch. Equivalent observed actor mistakes may support fidelity,
 actor competence. Rubric normalization remains distinct from mechanical accuracy.
 
 `exp eval PROJECT --root ROOT --continuations SPEC.json` accepts
-`{"action":"compare-environments","equivalence":...}`. Each `EquivalenceSpec` case binds a
-reference and candidate `ContinuationJob`, identical public actor checkpoints and policies,
-and explicit initial-state and material final-state probe paths. The candidate may use the
+`{"action":"compare-environments","equivalence":...}`. Each `EquivalenceSpec` names a frozen
+trajectory-derived judge rubric (`rubric`), and each case binds a reference and candidate
+`ContinuationJob`, identical public actor checkpoints and policies, and the declared
+initial-state and material final-state probe paths (both required under a full-state rubric).
+The rubric comes from admitted development trajectories of other families through
+`derive-equivalence-rubric` and an explicit `freeze-equivalence-rubric` author review; it is
+provisional, not an independently calibrated judge. The candidate may use the
 frozen grounded simulator or mixed runtime. Separate reference, candidate and repeated-reference
 executions retain every planned branch, including unavailable ones. The reference repeat exposes
 actor variability; it does not establish a confidence interval or population equivalence.
@@ -210,7 +214,8 @@ runtime code or credentials. New dispatch needs the normal spend consent.
 
 The report separates mechanical outcome/effect agreement, task competence, unavailable-pair
 bounds and semantic rubric ratings. Missing initial evidence, changed initial actor requests or
-incomplete execution make the comparison unassessable. Matching failures do not become successful
+incomplete execution make the comparison unassessable. Missing final-state evidence leaves the
+material outcome unknown while the paired behavior is still judged. Matching failures do not become successful
 training examples. No judge score overrides mechanical disagreement. Private evaluator probes
 and council findings never enter the actor requests.
 Blinded A/B judge packets exclude backend observation metadata and execution-owner receipts;

@@ -5,6 +5,8 @@ from pathlib import Path
 import pytest
 
 from exp.common.core.artifacts import sha256_json
+from exp.common.evaluations.actor_equivalence import RUBRIC_DIMENSIONS, ActorEquivalenceReport
+from exp.common.evaluations.reconstruction import AxisOutcome
 from exp.common.project import ProjectStore
 from exp.optimize.evaluation.continuations.admission import ContinuationAdmission
 from exp.optimize.evaluation.continuations.admission_test import admitted_workbook_study
@@ -98,6 +100,7 @@ def test_material_evidence_cannot_be_inferred_from_matching_final_prose(
     else:
         assert measured.material_agreement == "unassessable"
         assert measured.differences
+    assert measured.behavior_assessable == (fault in {"missing_state", "matching_failure"})
     if fault == "interrupted":
         assert measured.comparison.candidate_assessment.task_result == "unassessable"
         assert measured.comparison.candidate.stop_reason == "outcome_unknown"
@@ -111,6 +114,7 @@ def _pair(case: int, repeat: int, condition: str, agreement: str) -> PairMeasure
         condition=condition,
         material_agreement=agreement,
         comparison=_COMPARISON,
+        behavior_assessable=False,
         differences=(),
     )
 
@@ -156,3 +160,37 @@ def test_cases_weigh_equally_and_control_agreement_is_subtracted() -> None:
     assert -1 <= low < -0.25 < high <= 1
     cases = metrics["by_case"]
     assert isinstance(cases, dict) and cases["1"]["candidate_minus_control"] == -0.5
+
+
+def test_rubric_ratings_average_repeats_within_a_case_first() -> None:
+    """A case with more repeats cannot dominate a criterion's mean rating."""
+
+    def judged(case: int, repeat: int, score: int | None) -> PairMeasurement:
+        """One pair whose judge rated every criterion, or left it unassessable."""
+        axes = tuple(
+            AxisOutcome(
+                dimension_id=name,
+                status="assessed" if score is not None else "unassessable",
+                score=score,
+                rationale="fixture",
+                evidence_refs=("A:final",) if score is not None else (),
+            )
+            for name in RUBRIC_DIMENSIONS
+        )
+        report = ActorEquivalenceReport(
+            comparison_sha256="a" * 64,
+            judge_sha256="b" * 64,
+            status="completed",
+            axes=axes,
+            score_100=None,
+        )
+        pair = _pair(case, repeat, "candidate", "match")
+        return pair.model_copy(update={"judgment": report, "behavior_assessable": True})
+
+    rows = (judged(0, 0, 5), judged(0, 1, 5), judged(0, 2, 5), judged(1, 0, 1), judged(2, 0, None))
+    metrics = equivalence_metrics(rows)["candidate"]
+    assert isinstance(metrics, dict)
+    goal = metrics["rubric_dimensions"]["goal"]
+    assert goal["case_mean_score_1_to_5_not_accuracy"] == 3
+    assert (goal["assessed"], goal["unassessable"], goal["cases_assessed"]) == (4, 1, 2)
+    assert metrics["behavior_assessable_pairs"] == 5

@@ -17,7 +17,10 @@ from exp.common.core.artifacts import (
     stable_id,
 )
 from exp.common.core.locks import CoordinationLock
-from exp.common.evaluations.actor_equivalence import evaluate_actor_equivalence
+from exp.common.evaluations.actor_equivalence import (
+    EquivalenceRubric,
+    evaluate_actor_equivalence,
+)
 from exp.common.progress import ProgressHook, report
 from exp.common.project import ProjectStore, artifact_input
 from exp.optimize.evaluation.analysis.failures import analyse_failures
@@ -51,6 +54,7 @@ from exp.optimize.evaluation.equivalence.review import (
     review_call,
     review_inputs,
 )
+from exp.optimize.evaluation.equivalence.rubric import load_equivalence_rubric
 from exp.optimize.evaluation.executable.deferral import (
     deferred_execution,
     record_execution_deferral,
@@ -67,14 +71,17 @@ class EquivalenceCase(ContractModel):
         reference: Restorable executable reference and actor policy.
         candidate: Restorable simulator or mixed environment with the same public interface.
         initial_state_paths: Required equal private probe fields, relative to initial_state.
+            A rubric with full state coverage requires at least one.
         final_state_paths: Material consequence fields to compare, relative to final_state.
             Select semantic properties, not incidental serialization or valid-method differences.
+            A rubric with full state coverage requires at least one; with partial or unknown
+            coverage an empty set leaves outcomes to the verifier while behavior stays judged.
     """
 
     reference: ContinuationJob
     candidate: ContinuationJob
-    initial_state_paths: tuple[str, ...] = Field(min_length=1)
-    final_state_paths: tuple[str, ...] = Field(min_length=1)
+    initial_state_paths: tuple[str, ...] = ()
+    final_state_paths: tuple[str, ...] = ()
 
     @model_validator(mode="after")
     def same_policy(self) -> "EquivalenceCase":
@@ -123,6 +130,10 @@ class EquivalenceSpec(ContractModel):
     """Predeclared actor/environment pairs and bounded semantic reviewers.
 
     Attributes:
+        rubric: Reviewed trajectory-derived judge rubric (``freeze-equivalence-rubric``),
+            cited by the registration before any execution. Its development families must be
+            disjoint from the evaluated ones. It shapes semantic ratings only; admission stays
+            with ``policy``.
         cases: One case per actor/task binding; source families remain explicit in metrics.
         judge: Frozen semantic reviewer, separate from deterministic goal/effect checks.
         analysts: Read-only council reviewers; agreement does not establish correctness.
@@ -135,6 +146,7 @@ class EquivalenceSpec(ContractModel):
             report to measurements; it then calibrates no simulated trajectory.
     """
 
+    rubric: ArtifactInput
     cases: tuple[EquivalenceCase, ...] = Field(min_length=1, max_length=100)
     judge: ReviewModel
     analysts: tuple[ReviewModel, ...] = Field(min_length=1, max_length=10)
@@ -258,6 +270,32 @@ def equivalence_cells(spec: EquivalenceSpec, revision: str) -> tuple[Equivalence
     return tuple(cells)
 
 
+def _lineages(project: ProjectStore, spec: EquivalenceSpec) -> tuple[str, ...]:
+    """Return the source lineage of every registered case, in case order."""
+    return tuple(
+        load_continuation_checkpoint(
+            project.artifacts, case.reference.study.checkpoint
+        ).task.lineage_group_id
+        for case in spec.cases
+    )
+
+
+def _rubric(project: ProjectStore, spec: EquivalenceSpec) -> EquivalenceRubric:
+    """Load the frozen rubric, refusing development families the comparison also evaluates.
+
+    Lineages are grouped by the pinned admission policy's declared families, so a family is
+    excluded as a whole; without a policy each lineage is its own family.
+    """
+    families = (
+        {}
+        if spec.policy is None
+        else load_admission_policy(project.artifacts, spec.policy).families
+    )
+    return load_equivalence_rubric(
+        project, spec.rubric, evaluation_lineages=_lineages(project, spec), families=families
+    )
+
+
 def _validate_cases(project: ProjectStore, spec: EquivalenceSpec) -> None:
     """Require identical public actor state while retaining distinct private worlds."""
     spec = EquivalenceSpec.model_validate(spec.model_dump(mode="json"))
@@ -275,6 +313,12 @@ def _validate_cases(project: ProjectStore, spec: EquivalenceSpec) -> None:
                 "duplicate actor/source lineage; use repeats within its registered case"
             )
         seen.add(key)
+    if _rubric(project, spec).state_coverage == "full" and any(
+        not case.initial_state_paths or not case.final_state_paths for case in spec.cases
+    ):
+        raise ValueError(
+            "a full-state rubric requires declared initial and final material probes in every case"
+        )
 
 
 def preflight_equivalence(project: ProjectStore, spec: EquivalenceSpec) -> None:
@@ -345,6 +389,7 @@ def _assemble(
 ) -> EquivalenceReport:
     """Review the complete measured inventory after actors finish, without feedback to actors."""
     identity = spec.identity(revision)
+    rubric = _rubric(project, spec)
     base_sources = tuple(sorted(sources, key=lambda ref: ref.artifact_id))
     measurements, paired = [], {}
     families = set()
@@ -353,23 +398,31 @@ def _assemble(
     def review(
         reviewer: ReviewModel, body: JsonObject, key: str, consumer: Literal["analyst", "unknown"]
     ) -> JsonObject:
-        """Use one durable shared review budget, retaining dependencies even on failure."""
+        """Use one durable shared review budget, retaining dependencies even on failure.
+
+        The rubric's development sources are re-admitted under the source-access lock before
+        each disclosure, so a source protected after the rubric was frozen stops later reviews.
+        """
         try:
-            return review_call(
-                project,
-                reviewer,
-                body,
-                identity=key,
-                panel_id=identity,
-                catalog_sha256=spec.cases[0].reference.catalog_sha256,
-                maximum_attempts=spec.maximum_review_attempts,
-                maximum_call_attempts=spec.review_attempt_allowance(),
-                deadline=spec.deadline,
-                sources=base_sources,
-                code_revision=revision,
-                allow_dispatch=allow_dispatch,
-                consumer=consumer,
-            )
+            with CoordinationLock(
+                project.artifacts.project_directory / "source-access.lock", timeout=0
+            ):
+                _rubric(project, spec)
+                return review_call(
+                    project,
+                    reviewer,
+                    body,
+                    identity=key,
+                    panel_id=identity,
+                    catalog_sha256=spec.cases[0].reference.catalog_sha256,
+                    maximum_attempts=spec.maximum_review_attempts,
+                    maximum_call_attempts=spec.review_attempt_allowance(),
+                    deadline=spec.deadline,
+                    sources=base_sources,
+                    code_revision=revision,
+                    allow_dispatch=allow_dispatch,
+                    consumer=consumer,
+                )
         finally:
             sources.update(review_inputs(project, key))
 
@@ -427,15 +480,10 @@ def _assemble(
                     condition=condition,
                     identity=key,
                 )
-                # A known candidate failure is already a material difference with no trace
-                # for a semantic judge to rate, so only two completed executions are judged.
-                if measured.material_agreement != "unassessable" and all(
-                    side.execution == "completed"
-                    for side in (
-                        measured.comparison.reference_assessment,
-                        measured.comparison.candidate_assessment,
-                    )
-                ):
+                # Only behavior from two completed, valid executions of the same first request
+                # is judged. A known candidate failure is already a material difference with no
+                # trace to rate; missing final probes leave outcomes unknown, not behavior.
+                if measured.behavior_assessable:
                     if not allow_dispatch and not project.artifacts.exists(key + "-intent"):
                         raise ValueError("equivalence report lost a planned judge request")
                     report(
@@ -445,6 +493,7 @@ def _assemble(
                     )
                     judgment = evaluate_actor_equivalence(
                         measured.comparison,
+                        rubric=rubric,
                         model_identity=sha256_json(spec.judge),
                         complete=lambda body, logical: review(spec.judge, body, logical, "unknown"),
                     )
@@ -454,6 +503,7 @@ def _assemble(
                 paired[prefix] = {
                     "reference_execution": f"pair:{index}:execution:reference:{repeat}",
                     "other_execution": f"pair:{index}:execution:{condition}:{repeat}",
+                    "behavior_assessable": measured.behavior_assessable,
                     "material_agreement": measured.material_agreement,
                     "differences": list(measured.differences),
                     "reference_checks": measured.comparison.reference_assessment.model_dump(
@@ -566,6 +616,10 @@ def _assemble(
         calibration=calibration,
         metrics={
             **equivalence_metrics(tuple(measurements)),
+            "rubric": spec.rubric.model_dump(mode="json"),
+            "rubric_revision": rubric.definition.revision,
+            "state_coverage": rubric.state_coverage,
+            "rubric_calibration": rubric.calibration,
             "source_families": len(families),
             "actor_task_cases": len(spec.cases),
             "actor_models": len(
@@ -590,7 +644,7 @@ def _registration(
         raise ValueError("equivalence registration differs")
     expected_roots = _registration_inputs(spec)
     if set(registration.inputs) != expected_roots:
-        raise ValueError("equivalence registration lost its paired checkpoints")
+        raise ValueError("equivalence registration lost its paired checkpoints, rubric or policy")
     if spec.policy is not None:
         load_admission_policy(store, spec.policy)
         require_policy_precedes(store, spec.policy, identity, subject="comparison registration")
@@ -598,9 +652,10 @@ def _registration(
 
 
 def _registration_inputs(spec: EquivalenceSpec) -> set[ArtifactInput]:
-    """Return the paired checkpoints and any pinned admission policy a registration binds."""
+    """Return the paired checkpoints, the frozen rubric and any pinned admission policy."""
     roots = {
-        job.study.checkpoint for case in spec.cases for job in (case.reference, case.candidate)
+        spec.rubric,
+        *(job.study.checkpoint for case in spec.cases for job in (case.reference, case.candidate)),
     }
     if spec.policy is not None:
         roots.add(spec.policy)

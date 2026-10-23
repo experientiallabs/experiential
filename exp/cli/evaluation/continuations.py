@@ -48,6 +48,8 @@ from exp.cli.evaluation.development import (
 from exp.cli.evaluation.equivalence import (
     handle_admit_actor_prefix,
     handle_compare_environments,
+    handle_derive_equivalence_rubric,
+    handle_freeze_equivalence_rubric,
     handle_register_admission_policy,
 )
 from exp.cli.evaluation.executable import (
@@ -105,6 +107,7 @@ from exp.optimize.evaluation.continuations.selection import CheckpointSelectionS
 from exp.optimize.evaluation.continuations.traces import TrajectoryTraceExport
 from exp.optimize.evaluation.equivalence.policy import AdmissionPolicy
 from exp.optimize.evaluation.equivalence.prefixes import ActorPrefixSpec
+from exp.optimize.evaluation.equivalence.rubric import RubricDerivationSpec, RubricReview
 from exp.optimize.evaluation.equivalence.runner import EquivalenceSpec
 from exp.optimize.evaluation.executable.controls import SpecificationRegistration
 from exp.optimize.evaluation.executable.scenarios import RecordScenarioSpec, RecordWitnessSpec
@@ -143,6 +146,12 @@ class ContinuationAction[Payload]:
 
 
 CONTINUATION_ACTIONS = (
+    ContinuationAction(
+        "derive-equivalence-rubric", "rubric_derivation", handle_derive_equivalence_rubric
+    ),
+    ContinuationAction(
+        "freeze-equivalence-rubric", "rubric_review", handle_freeze_equivalence_rubric
+    ),
     ContinuationAction("compare-environments", "equivalence", handle_compare_environments),
     ContinuationAction(
         "register-admission-policy", "admission_policy", handle_register_admission_policy
@@ -253,6 +262,8 @@ class ContinuationCommand(ContractModel):
         campaign: Registered source attempts, selectors, prospective critics and continuations.
         learning_repair: Failed-learning settlement, lesson screening or library evolution.
         sample_count: Trajectory-count registration, development selection or confirmation.
+        rubric_derivation: Admitted development trajectories and the bounded rubric proposer.
+        rubric_review: Explicit acceptance of one saved provisional rubric draft.
         equivalence: Paired executable reference/candidate studies and diagnostic trace council.
         specification: Independent acceptance specification and its source evidence to save.
         development_tasks: Build fit tasks to print, optionally one with its public tools.
@@ -306,6 +317,8 @@ class ContinuationCommand(ContractModel):
     campaign: ContinuationCampaignSpec | None = None
     learning_repair: LearningRepair | None = None
     sample_count: SampleCountRequest | None = None
+    rubric_derivation: RubricDerivationSpec | None = None
+    rubric_review: RubricReview | None = None
     equivalence: EquivalenceSpec | None = None
     specification: SpecificationRegistration | None = None
     development_tasks: DevelopmentTaskQuery | None = None

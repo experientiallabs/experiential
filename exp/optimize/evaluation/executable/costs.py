@@ -36,6 +36,7 @@ from exp.optimize.evaluation.continuations.job import ContinuationJob
 from exp.optimize.evaluation.continuations.observation_contrast import ObservationContrastSpec
 from exp.optimize.evaluation.continuations.proposals import CheckpointProposalSpec
 from exp.optimize.evaluation.continuations.selection import load_selection_plan, selection_jobs
+from exp.optimize.evaluation.equivalence.rubric import RubricDerivationSpec
 from exp.optimize.evaluation.equivalence.runner import EquivalenceSpec
 from exp.optimize.evaluation.executable import grounded as grounded_runtime
 from exp.optimize.evaluation.executable import induced as induced_runtime
@@ -106,6 +107,7 @@ CostedSpec = (
     | ActorPanelSpec
     | CheckpointExperimentSpec
     | ContinuationCampaignSpec
+    | RubricDerivationSpec
     | EquivalenceSpec
     | CandidateBatchSpec
     | TaskFactorySpec
@@ -360,6 +362,12 @@ def evaluation_costs(project: ProjectStore, spec: CostedSpec) -> tuple[CostCompo
                 row.scaled(count)
                 for critic in spec.critics
                 for row in (*job_costs(project, suffix), *evaluation_costs(project, critic))
+            ),
+        )
+    if isinstance(spec, RubricDerivationSpec):
+        return (
+            model_cost(
+                project, spec.proposer.alias, spec.maximum_attempts, spec.proposer.output_tokens
             ),
         )
     if isinstance(spec, EquivalenceSpec):

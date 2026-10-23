@@ -4,6 +4,7 @@ from typing import Literal
 
 from exp.common.core.artifacts import ContractModel, JsonObject, JsonValue, Sha256, sha256_json
 from exp.common.evaluations.actor_equivalence import (
+    RUBRIC_DIMENSIONS,
     ActorComparison,
     ActorEquivalenceReport,
     ActorExecutionAssessment,
@@ -31,6 +32,9 @@ class PairMeasurement(ContractModel):
         repeat: Registered branch index.
         condition: Simulator comparison or repeated-reference variability control.
         comparison: Exact observed pair and per-side task checks.
+        behavior_assessable: Both executions completed with only valid steps from the same
+            first actor request and equal declared initial probes, so their behavior can be
+            judged even when declared outcomes or final state are unavailable.
         material_agreement: Equality on declared outcomes and consequences, or unavailable.
         differences: Failed or missing prerequisites and differing material properties.
         judgment: Optional semantic ratings, never an independent truth certificate.
@@ -42,6 +46,7 @@ class PairMeasurement(ContractModel):
     repeat: int
     condition: Literal["candidate", "reference_control"]
     comparison: ActorComparison
+    behavior_assessable: bool
     material_agreement: Literal["match", "different", "unassessable"]
     differences: tuple[str, ...] = ()
     judgment: ActorEquivalenceReport | None = None
@@ -155,10 +160,15 @@ def measure_pair(
     leaves the pair unassessable. A known candidate execution failure against a completed
     reference is a material difference: the candidate evidence it could not produce is
     explained by that failure, so it cannot hide the pair among unknowns.
+
+    Behavior stays assessable without final-state probes or outcome predicates: only an
+    unavailable or different initial probe, a different first actor request, an incomplete
+    execution or a non-valid step makes the paired behavior unassessable.
     """
     left, right = assessment(reference, verifier), assessment(candidate, verifier)
     differences: list[str] = []
     incomparable = candidate_missing = False
+    behavior_assessable = left.execution == "completed" and right.execution == "completed"
     for field, paths in (("initial_state", initial_paths), ("final_state", final_paths)):
         a, b = _object(reference.outcome, field), _object(candidate.outcome, field)
         for path in paths:
@@ -167,11 +177,14 @@ def measure_pair(
                 differences.append(f"unavailable:{field}{path}")
                 incomparable = incomparable or x is None
                 candidate_missing = candidate_missing or y is None
+                behavior_assessable = behavior_assessable and field != "initial_state"
             elif sha256_json(x[0]) != sha256_json(y[0]):
                 differences.append(f"different:{field}{path}")
                 incomparable = incomparable or field == "initial_state"
+                behavior_assessable = behavior_assessable and field != "initial_state"
     requests = [_initial_request(branch) for branch in (reference, candidate)]
     if requests[0] is None or requests[0] != requests[1]:
+        behavior_assessable = False
         differences.append("unavailable:matching_initial_actor_requests")
         incomparable = incomparable or requests[0] is None or requests[1] is not None
         candidate_missing = candidate_missing or requests[1] is None
@@ -199,6 +212,11 @@ def measure_pair(
         reference_assessment=left,
         candidate_assessment=right,
     )
+    behavior_assessable = behavior_assessable and all(
+        step.status == "valid"
+        for trace in (comparison.reference, comparison.candidate)
+        for step in trace.steps
+    )
     agreement: Literal["match", "different", "unassessable"] = (
         "unassessable"
         if incomparable or (candidate_missing and not failed)
@@ -211,6 +229,7 @@ def measure_pair(
         repeat=repeat,
         condition=condition,
         comparison=comparison,
+        behavior_assessable=behavior_assessable,
         material_agreement=agreement,
         differences=tuple(differences),
         dimensions=pair_dimensions(
@@ -324,6 +343,11 @@ def _counts(rows: tuple[PairMeasurement, ...]) -> JsonObject:
         matrix[key] = matrix.get(key, 0) + 1
     return {
         "planned_pairs": len(rows),
+        "behavior_assessable_pairs": sum(row.behavior_assessable for row in rows),
+        "behavior_unassessable_pairs": sum(not row.behavior_assessable for row in rows),
+        "rubric_dimensions": {
+            dimension: _dimension_metrics(rows, dimension) for dimension in RUBRIC_DIMENSIONS
+        },
         "material_matches": matches,
         "material_differences": len(rows) - matches - unknown,
         "unassessable": unknown,
@@ -334,4 +358,41 @@ def _counts(rows: tuple[PairMeasurement, ...]) -> JsonObject:
             and row.comparison.candidate_assessment.task_result == "pass"
             for row in rows
         ),
+    }
+
+
+def _dimension_metrics(rows: tuple[PairMeasurement, ...], dimension: str) -> JsonObject:
+    """Report one judged criterion, keeping unavailable and failed judgments in its counts.
+
+    The mean is a 1 to 5 rating, not an accuracy: repeats are averaged within each case first
+    and every case with an assessed rating weighs equally. No interval is reported because a
+    bounded rating mean is not a proportion.
+
+    Args:
+        rows: Planned pairs of one condition, or of one case.
+        dimension: Frozen rubric reporting dimension.
+
+    Returns:
+        Assessed, unassessable, judge-failure and unjudged counts and the case-weighted mean.
+    """
+    axes = [
+        (row.case, axis)
+        for row in rows
+        if row.judgment is not None
+        for axis in row.judgment.axes
+        if axis.dimension_id == dimension
+    ]
+    scores: dict[int, list[int]] = {}
+    for case, axis in axes:
+        if axis.status == "assessed" and axis.score is not None:
+            scores.setdefault(case, []).append(axis.score)
+    means = [sum(values) / len(values) for values in scores.values()]
+    return {
+        "planned_pairs": len(rows),
+        "assessed": sum(len(values) for values in scores.values()),
+        "unassessable": sum(axis.status == "unassessable" for _, axis in axes),
+        "judge_failure": sum(axis.status == "judge_failure" for _, axis in axes),
+        "not_judged": len(rows) - len(axes),
+        "cases_assessed": len(means),
+        "case_mean_score_1_to_5_not_accuracy": sum(means) / len(means) if means else None,
     }

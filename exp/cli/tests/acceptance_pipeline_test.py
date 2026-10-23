@@ -9,9 +9,11 @@ only, so a break between two stages fails here even when every stage's own tests
    then replays the saved audit without a provider call.
 3. ``register-admission-policy`` fixes the per-dimension admission policy before any result;
    ``development-tasks`` chooses a fit task of the build, ``ground-runtime`` grounds the built
-   simulator with its learned memory and the trace's instance facts, and
-   ``compare-environments`` runs the native world and that simulator on the captured task under
-   one actor policy and that policy's margins.
+   simulator with its learned memory and the trace's instance facts,
+   ``derive-equivalence-rubric`` and ``freeze-equivalence-rubric`` fix the judge's rubric from an
+   admitted development trajectory of another family, and ``compare-environments`` runs the
+   native world and that simulator on the captured task under one actor policy, that policy's
+   margins and the frozen rubric.
 4. ``register-specification`` saves an independent acceptance specification, and ``capture``
    and ``run`` fork native branches from the captured checkpoint.
 5. ``export-traces`` turns those trajectories into imports under the policy: native ones are
@@ -53,12 +55,15 @@ from exp.common.core.artifacts import (
     sha256_bytes,
     sha256_json,
 )
+from exp.common.evaluations.actor_equivalence import RUBRIC_DIMENSIONS
+from exp.common.evaluations.reconstruction import WorkflowEvidence, WorkflowStep
 from exp.common.models import ToolCall, load_model_catalog
 from exp.common.project import ProjectStore, artifact_input
 from exp.common.tasks import TaskCase, ToolSchema
 from exp.common.tasks.facts import FactProvenance, FactValidation, InstanceFact, InstanceFacts
 from exp.common.tasks.store import load_task_set
 from exp.common.traces.ingest.persistence import read_ingested_traces
+from exp.optimize.evaluation.analysis.source_access import declare_source_access
 from exp.optimize.evaluation.audit.panel import MemoryProfile, plan_held_out_panel
 from exp.optimize.evaluation.audit.panel_test import (
     SimulatedProvider,
@@ -74,6 +79,11 @@ from exp.optimize.evaluation.continuations.study import ContinuationStudySpec
 from exp.optimize.evaluation.equivalence.policy import policy_identity
 from exp.optimize.evaluation.equivalence.policy_test import fixture_policy
 from exp.optimize.evaluation.equivalence.review import ReviewModel
+from exp.optimize.evaluation.equivalence.rubric import (
+    RubricDerivationSpec,
+    RubricTrajectory,
+    register_rubric_trajectory,
+)
 from exp.optimize.evaluation.equivalence.runner import EquivalenceCase, EquivalenceSpec
 from exp.optimize.evaluation.executable import workbook as workbook_runtime
 from exp.optimize.evaluation.executable.loader import ContinuationRuntime
@@ -1245,7 +1255,9 @@ class ScriptedReviewer(ScriptedJsonTransport):
             "findings": [],
             "limitations": ["Scripted reviewer; no live-model equivalence measured."],
         }
-        if "summary" not in properties:
+        if "grounding" in properties:
+            proposal = _rubric_proposal(_user_content(payload))
+        elif "summary" not in properties:
             proposal = {}
             for name in properties:
                 proposal[name] = {
@@ -1259,6 +1271,48 @@ class ScriptedReviewer(ScriptedJsonTransport):
         return _tool_reply(
             "judge-v1", str(_at(payload, "tool_choice", "function", "name")), proposal
         )
+
+
+def _rubric_proposal(request: JsonObject) -> JsonObject:
+    """Propose a rubric that cites an exact excerpt of the first supplied public field."""
+    allowed = _obj(request["allowed_evidence_refs"])
+    reference, text = next((key, str(value)) for key, value in allowed.items() if value)
+    dimensions = RUBRIC_DIMENSIONS
+    return {
+        "rubric": {
+            "definition": {
+                "name": "Order handling",
+                "syllabus": "Compare how both executions read state and commit the request.",
+                "dimensions": [
+                    {
+                        "dimension_id": name,
+                        "name": name,
+                        "description": f"Paired {name} relationships observed in development.",
+                        "min_score": 1,
+                        "max_score": 5,
+                        "anchors": [
+                            {"score": score, "description": f"Paired {name} level {score}"}
+                            for score in range(1, 6)
+                        ],
+                    }
+                    for name in dimensions
+                ],
+            },
+            "state_coverage": request["state_coverage"],
+            "criteria": [
+                {
+                    "dimension_id": name,
+                    "valid_variations": ["Instance identifiers may differ."],
+                    "unassessable_when": "The relevant effect is not observed.",
+                }
+                for name in dimensions
+            ],
+        },
+        "grounding": [
+            {"dimension_id": name, "citations": [{"reference": reference, "quote": text[:40]}]}
+            for name in dimensions
+        ],
+    }
 
 
 def json_tail(output: str) -> JsonObject:
@@ -1354,6 +1408,83 @@ def register_policy(pipeline: Pipeline) -> ArtifactInput:
     reference = artifact_input(pipeline.project.artifacts.read(policy_identity(policy)).manifest)
     assert reference.artifact_id in output, output
     return reference
+
+
+def freeze_rubric(pipeline: Pipeline, reviewer: ReviewModel, catalog_sha256: str) -> ArtifactInput:
+    """Stage 3b: derive the judge's rubric from a development trajectory, review and freeze it.
+
+    Registering the trajectory and classifying it are operator Python calls; derivation and the
+    explicit review run through the CLI, and the frozen draft replays without a model call.
+    """
+    project = pipeline.project
+    task = TaskCase(
+        task_id="rubric-development",
+        lineage_group_id="rubric-development-family",
+        partition="fit",
+        workload_weight=1.0,
+        origin="authored",
+        instruction="Look up the order and report its status",
+    )
+    source = register_rubric_trajectory(
+        project,
+        RubricTrajectory(
+            task=task,
+            trajectory=WorkflowEvidence(
+                workflow_id="rubric-development",
+                task=task.instruction,
+                initial_state={},
+                steps=(
+                    WorkflowStep(
+                        step=0,
+                        action={"name": "get_order_details", "arguments": {"order_id": "#W1"}},
+                        status="valid",
+                        reply="order #W1 is pending",
+                    ),
+                ),
+                final_answer="Order #W1 is pending",
+                stop_reason="completed",
+            ),
+        ),
+        inputs=(),
+        code_revision=REVISION,
+    )
+    declare_source_access(
+        project.artifacts,
+        source,
+        scope="development",
+        rationale="Authored development trajectory outside the evaluated family",
+        code_revision=REVISION,
+    )
+    derivation = RubricDerivationSpec(
+        sources=(source,),
+        proposer=reviewer,
+        catalog_sha256=catalog_sha256,
+        state_coverage="partial",
+        deadline=DEADLINE,
+    )
+    operation: JsonObject = {
+        "action": "derive-equivalence-rubric",
+        "rubric_derivation": derivation.model_dump(mode="json"),
+    }
+    assert "no calls or publication" in pipeline.operation("rubric", operation, "--dry-run")
+    draft = ArtifactInput.model_validate(
+        json_tail(pipeline.operation("rubric", operation, "--yes"))["draft"]
+    )
+    assert json_tail(pipeline.operation("rubric", operation))["draft"] == draft.model_dump(
+        mode="json"
+    ), "a saved draft replays without consent or a model call"
+    review: JsonObject = {
+        "action": "freeze-equivalence-rubric",
+        "rubric_review": {
+            "draft": draft.model_dump(mode="json"),
+            "reviewer": "acceptance author",
+            "rationale": "Citations and paired anchors reviewed; calibration remains pending.",
+        },
+    }
+    assert "no publication" in pipeline.operation("rubric-review", review, "--dry-run")
+    return ArtifactInput.model_validate(
+        json_tail(pipeline.operation("rubric-review", review))["rubric"]
+    )
 
 
 def compare_environments(
@@ -1476,7 +1607,14 @@ def compare_environments(
     )
     model = RuntimeModelCatalog(catalog, environment={}).snapshot("judge")[0]
     reviewer = ReviewModel(alias="judge", model=model, output_tokens=1024)
+    reviews = ScriptedReviewer()
+    monkeypatch.setattr(
+        "exp.optimize.evaluation.equivalence.review.HttpxJsonTransport", lambda: reviews
+    )
+    rubric = freeze_rubric(pipeline, reviewer, development.catalog_sha256)
+    assert len(reviews.requests) == 1, "one proposal; the replay and the freeze make no call"
     spec = EquivalenceSpec(
+        rubric=rubric,
         cases=(
             EquivalenceCase(
                 reference=reference,
@@ -1492,12 +1630,8 @@ def compare_environments(
         policy=policy,
     )
     actor = ScriptedActor(terms.plans[:1])
-    reviews = ScriptedReviewer()
     monkeypatch.setattr(
         "exp.optimize.evaluation.continuations.job.HttpxJsonTransport", lambda: actor
-    )
-    monkeypatch.setattr(
-        "exp.optimize.evaluation.equivalence.review.HttpxJsonTransport", lambda: reviews
     )
     # The operator's runtime file executes as a fresh module, so it imports this transport anew.
     monkeypatch.setattr(transport, "HttpxJsonTransport", lambda: pipeline.provider)
@@ -1515,6 +1649,11 @@ def compare_environments(
     assert _obj(control["agreement"])["wilson_95"]
     assert _obj(metrics["candidate_minus_control"])["estimate"] == 0.0
     assert set(_obj(report["analyses"])) == {"case-0:judge"}
+    # The judge rated under the frozen rubric; its ratings stay separate from admission.
+    assert metrics["rubric"] == rubric.model_dump(mode="json")
+    assert metrics["rubric_calibration"] == "provisional"
+    goal_ratings = _obj(_obj(candidate["rubric_dimensions"])["goal"])
+    assert (goal_ratings["assessed"], goal_ratings["not_judged"]) == (1, 0), goal_ratings
     # One task family is too few independent units for any equivalence verdict.
     calibration = _obj(report["calibration"])
     assert calibration["policy"] == policy.artifact_id

@@ -677,7 +677,7 @@ def test_registry_is_the_one_list_of_actions_and_payloads() -> None:
 
     names = [action.name for action in CONTINUATION_ACTIONS]
     payloads = [action.payload for action in CONTINUATION_ACTIONS]
-    assert len(set(names)) == len(names) == 50
+    assert len(set(names)) == len(names) == 52
     assert len(set(payloads)) == len(payloads)
     assert set(payloads) == set(ContinuationCommand.model_fields) - {"action"}
     assert get_args(ContinuationCommand.model_fields["action"].annotation) == tuple(names)
