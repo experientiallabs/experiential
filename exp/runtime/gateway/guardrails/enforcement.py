@@ -17,6 +17,8 @@ from exp.runtime.gateway.contracts import (
 from exp.runtime.gateway.guardrails.bounded import BoundedInspect, ClassifierTimeoutError
 from exp.runtime.gateway.guardrails.client import InternalClassifierClient
 from exp.runtime.gateway.guardrails.contracts import (
+    ClassificationResult,
+    ClassificationVerdict,
     ClassifierCoverageError,
     ClassifierUncertainError,
     ClassifierVerdict,
@@ -661,6 +663,8 @@ class GuardrailEngine:
                 policy, check, GuardrailOutcome.UNAVAILABLE, self._monotonic() - started
             )
         elapsed = self._monotonic() - started
+        if isinstance(verdict, ClassificationVerdict):
+            self._classified(policy, check, verdict.classification)
         if not verdict.flagged:
             self._decision(policy, check, GuardrailAction.ALLOW, GuardrailOutcome.ALLOW, elapsed)
             return None
@@ -737,6 +741,30 @@ class GuardrailEngine:
             outcome.value,
             latency_seconds * 1000,
         )
+
+    def _classified(
+        self, policy: GuardrailPolicy, check: GuardrailCheck, result: ClassificationResult
+    ) -> None:
+        """Hand one answer to the host; a failing host never changes the verdict."""
+        try:
+            self._record_classification(policy, check, result)
+        except Exception as exc:  # noqa: BLE001 - host recording never changes a verdict.
+            # The type only: an exception message could quote host data.
+            _logger.warning(
+                "guardrail classification record failed policy_id=%s check_id=%s error=%s",
+                policy.policy_id,
+                check.check_id,
+                type(exc).__name__,
+            )
+
+    def _record_classification(
+        self, policy: GuardrailPolicy, check: GuardrailCheck, result: ClassificationResult
+    ) -> None:
+        """Host seam for one decision-model answer, with the policy and check it answered.
+
+        The engine keeps no answer. A host that persists them overrides this; it
+        runs on the inspection path, in observe and enforce mode, and must not block.
+        """
 
     def _apply_input(
         self,

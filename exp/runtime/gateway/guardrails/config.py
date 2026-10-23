@@ -226,7 +226,7 @@ def _adapter(
     if kind == "regex":
         return RegexClassifier(RegexAdapterDocument.model_validate(item))
     if kind == "decision_model":
-        return _decision_model_adapter(item, http_client=http_client)
+        return _decision_model_adapter(item)
     raise ValueError("adapter kind must be keyword, regex, http_json, or decision_model")
 
 
@@ -261,17 +261,13 @@ def _http_json_adapter(
     )
 
 
-def _decision_model_adapter(
-    item: dict[str, object],
-    *,
-    http_client: httpx.AsyncClient | None,
-) -> DecisionModelClassifier:
+def _decision_model_adapter(item: dict[str, object]) -> DecisionModelClassifier:
     """Parse one decision-model classification adapter."""
     try:
         authored = DecisionModelAdapterDocument.model_validate(item)
     except ValidationError as exc:
         raise ValueError(f"decision_model adapter is malformed: {_first_error(exc)}") from exc
-    return DecisionModelClassifier(authored, client=http_client)
+    return DecisionModelClassifier(authored)
 
 
 def _first_error(exc: ValidationError) -> str:

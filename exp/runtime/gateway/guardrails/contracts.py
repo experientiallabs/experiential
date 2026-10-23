@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from enum import StrEnum
 from typing import Literal
 
@@ -239,6 +240,41 @@ class ClassifierVerdict(ContractModel):
     flagged: bool
     replacement_text: str | None = None
     replacement_messages: tuple[GatewayMessage, ...] | None = None
+
+
+@dataclass(frozen=True)
+class ClassificationResult:
+    """One definitive decision-model answer for one request window, without its text.
+
+    Attributes:
+        adapter_id: Adapter that classified the window.
+        check_id: Check that asked.
+        configuration_digest: Digest of the endpoint, model, categories, and window.
+        probabilities: Every question's probability, in authored order.
+        scores: Every category's combined score, in authored order.
+        flagged: Categories whose score reached their threshold, in authored order.
+        cached: Whether the answer came from the verdict cache.
+        latency_seconds: Time to the answer, including the cache lookup.
+    """
+
+    adapter_id: str
+    check_id: str
+    configuration_digest: str
+    probabilities: tuple[tuple[str, float], ...]
+    scores: tuple[tuple[str, float], ...]
+    flagged: tuple[str, ...]
+    cached: bool
+    latency_seconds: float
+
+
+class ClassificationVerdict(ClassifierVerdict):
+    """A decision-model verdict with its answer; only that in-process adapter builds one.
+
+    The answer never serializes, and a remote classifier's reply validates as a
+    plain ``ClassifierVerdict``, so no remote party can author a classification.
+    """
+
+    classification: ClassificationResult = Field(exclude=True, repr=False)
 
 
 class GuardrailOutcome(StrEnum):

@@ -71,7 +71,7 @@ Adapter fields:
 | Field | Meaning |
 | --- | --- |
 | `url` | Full SystemOne endpoint. Public gateway routes are rejected. |
-| `bearer_env` | Optional environment variable that holds a bearer credential. The document never stores the value. |
+| `bearer_env` | Optional environment variable that holds a bearer credential, read once when the adapter is built. The document never stores the value. A named variable that is unset fails every inspection. |
 | `model` | Decision model identifier sent with every request. |
 | `timeout_ms` | Deadline for one classifier HTTP call, default 2,000 ms. Keep it at or below the check's `timeout_ms`. |
 | `max_response_bytes` | Largest accepted answer body, default 64 KiB. |
@@ -151,9 +151,11 @@ refused. A request with no text at all is allowed without a classifier call.
 
 ## Verdict cache
 
-Each adapter keeps a bounded, thread-safe least-recently-used cache. The key is the SHA-256
-of the adapter's configuration digest and the window text, and the value is the category
-scores, so the cache never holds request text. Entries expire after `ttl_seconds`. Only
+The decision call, its answer validation, scoring, and the cache run in the native gateway
+module, so no inspection holds the Python interpreter while the model answers. Each adapter
+keeps a bounded least-recently-used cache. The key is the SHA-256 of the adapter's
+configuration digest and the window text, and the value is the question probabilities, so
+the cache never holds request text. Entries expire after `ttl_seconds`. Only
 definitive answers are cached: an error is never stored, and the next request asks the
 model again. Reloading the guardrail file builds new adapters with empty caches.
 
@@ -198,6 +200,16 @@ observation records add policy, check, outcome, and latency as for every guardra
 `DecisionModelClassifier.telemetry()` returns the same data as counters: per-category
 bucket counts, cache hits and misses, errors, and the summed latency of model calls. Window
 text, question text, and classifier payloads are never logged or retained.
+
+Every definitive answer, from the model or the cache, reaches the engine's
+`_record_classification(policy, check, result)` seam with the policy and check it answered
+for, in observe and enforce mode. The `ClassificationResult` holds the adapter and check ids,
+the configuration digest, every question's probability, every category's score, the flagged
+categories, `cached`, and latency. It carries no window or question text. The engine keeps
+none of them; a host that persists answers overrides the seam, which must not block. A host
+that raises is logged by exception type only and never changes the verdict. Errors and
+requests without text produce no result. The answer rides on a `ClassificationVerdict` only
+this in-process adapter builds, so a remote classifier's reply can never author one.
 
 ## Observe, then enforce
 
