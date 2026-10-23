@@ -41,7 +41,8 @@ class HumanScore(ContractModel):
         lineage_id: Source lineage used to separate fit and held-out evidence.
         dimension_id: Scored rubric axis.
         score: Signed integer checked against the axis before persistence.
-        created_at: Timezone-aware time the reviewer authored this score.
+        created_at: Timezone-aware time the reviewer authored this score; informational, never
+            used to order labels and reviews.
         supersedes_label_id: Earlier active label being corrected, or None for a new label.
         adjudicates_review_ids: Independent reviews this score resolves; empty for a score
             recorded directly. Omitted from persistence when empty, so direct labels keep their
@@ -74,7 +75,8 @@ class ReviewerJudgment(ContractModel):
         lineage_id: Source lineage used to separate fit and held-out evidence.
         dimension_id: Scored rubric axis.
         score: Signed integer checked against the axis before persistence.
-        created_at: Timezone-aware time the reviewer authored this judgment.
+        created_at: Timezone-aware time the reviewer authored this judgment; informational,
+            never used to order labels and reviews.
         critique: Optional evidence-grounded justification citing observable fields or events.
     """
 
@@ -153,20 +155,36 @@ class HumanScoreHistory(ContractModel):
                 raise ValueError("adjudications must name distinct recorded human reviews")
             if any(_target_key(reviews[item]) != _target_key(score) for item in cited):
                 raise ValueError("adjudications must resolve reviews of the same rollout and scale")
-            if any(reviews[item].created_at > score.created_at for item in cited):
-                raise ValueError("adjudications must be recorded after the reviews they resolve")
-            earlier = {
+            # Recorded order, never reviewer clocks: an adjudication names every review of its
+            # target in the history when it is appended, so it names a prefix of them here.
+            recorded = [
                 review.review_id
                 for review in self.reviews
                 if _target_key(review) == _target_key(score)
-                and review.created_at <= score.created_at
-            }
-            if set(cited) != earlier:
+            ]
+            if set(cited) != set(recorded[: len(cited)]):
                 raise ValueError(
                     "adjudications must name every independent review recorded before them, "
                     "including disagreeing ones"
                 )
         return self
+
+    def _require_every_recorded_review(self, score: HumanScore) -> None:
+        """Refuse an adjudication that omits a review of its target already in this history.
+
+        The history is the single ordered owner of reviews, so the reviews already in it are
+        exactly those recorded before the adjudication, whatever any reviewer's clock claims.
+        """
+        recorded = {
+            review.review_id for review in self.reviews if _target_key(review) == _target_key(score)
+        }
+        cited = set(score.adjudicates_review_ids)
+        # Unknown or cross-target citations are refused by the history validator's own message.
+        if cited and cited <= recorded and cited != recorded:
+            raise ValueError(
+                "adjudications must name every independent review recorded before them, "
+                "including disagreeing ones"
+            )
 
     @model_validator(mode="after")
     def _require_linear_correction_history(self) -> HumanScoreHistory:
@@ -219,10 +237,12 @@ class HumanScoreHistory(ContractModel):
             A validated append-only history with the supplied score at its end.
 
         Raises:
-            ValueError: The supplied score is expressed as a correction.
+            ValueError: The supplied score is expressed as a correction, or adjudicates
+                without naming every review of its target already recorded.
         """
         if score.supersedes_label_id is not None:
             raise ValueError("append accepts original labels; use correct for a correction")
+        self._require_every_recorded_review(score)
         return HumanScoreHistory(scores=(*self.scores, score), reviews=self.reviews)
 
     def correct(self, score: HumanScore) -> HumanScoreHistory:
@@ -235,10 +255,12 @@ class HumanScoreHistory(ContractModel):
             A validated append-only history retaining both the old and new labels.
 
         Raises:
-            ValueError: The supplied score does not declare a predecessor.
+            ValueError: The supplied score does not declare a predecessor, or adjudicates
+                without naming every review of its target already recorded.
         """
         if score.supersedes_label_id is None:
             raise ValueError("correct requires supersedes_label_id")
+        self._require_every_recorded_review(score)
         return HumanScoreHistory(scores=(*self.scores, score), reviews=self.reviews)
 
     def review(self, review: ReviewerJudgment) -> HumanScoreHistory:
