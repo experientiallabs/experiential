@@ -21,7 +21,6 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Literal
 
-from filelock import FileLock
 from pydantic import Field
 
 from exp.common.core.artifacts import (
@@ -33,6 +32,7 @@ from exp.common.core.artifacts import (
     sha256_json,
     stable_id,
 )
+from exp.common.core.locks import CoordinationLock
 from exp.common.models import ModelMessage, ModelRequest, ModelResponse, ToolChoice
 from exp.common.project import ProjectStore, artifact_input
 from exp.common.tasks import ToolSchema
@@ -574,7 +574,7 @@ def run_task_validity(
     """Register, run the ordered checks with durable draws, and save the complete report."""
     spec = TaskValiditySpec.model_validate_json(spec.model_dump_json())
     store, identity = project.artifacts, spec.identity(code_revision)
-    with FileLock(store.project_directory / (identity + ".lock"), timeout=0):
+    with CoordinationLock(store.project_directory / (identity + ".lock"), timeout=0):
         saved = saved_task_validity(project, spec, code_revision=code_revision)
         if saved is not None:
             return saved

@@ -8,8 +8,6 @@ from copy import deepcopy
 from datetime import UTC, datetime
 from threading import RLock
 
-from filelock import FileLock
-
 from exp.common.core.artifacts import (
     ArtifactEnvelope,
     ArtifactInput,
@@ -18,6 +16,7 @@ from exp.common.core.artifacts import (
     sha256_json,
     stable_id,
 )
+from exp.common.core.locks import CoordinationLock
 from exp.common.models import ToolCall
 from exp.common.project import ProjectStore, artifact_input
 from exp.optimize.evaluation.continuations.study import (
@@ -346,7 +345,7 @@ def open_executable_harbor_trial(
         },
     )
     store = project.artifacts
-    with FileLock(store.project_directory / (identity + ".lock"), timeout=0):
+    with CoordinationLock(store.project_directory / (identity + ".lock"), timeout=0):
         start: JsonObject = {
             "task": task_ref.model_dump(mode="json"),
             "provider_limits": None

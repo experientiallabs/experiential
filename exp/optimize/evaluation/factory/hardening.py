@@ -17,7 +17,7 @@ never adds a task family. Pass-rate bands are reported, never used to change a v
 from datetime import UTC, datetime
 from typing import Literal
 
-from filelock import FileLock, Timeout
+from filelock import Timeout
 from pydantic import Field
 
 from exp.common.core.artifacts import (
@@ -28,6 +28,7 @@ from exp.common.core.artifacts import (
     sha256_json,
     stable_id,
 )
+from exp.common.core.locks import CoordinationLock
 from exp.common.project import ProjectStore, artifact_input
 from exp.optimize.evaluation.continuations.actors import (
     ActorPanelSpec,
@@ -547,7 +548,7 @@ def run_task_hardening(
     """Run levels in order; saved levels and children replay, unknown outcomes never redraw."""
     spec = TaskHardeningSpec.model_validate_json(spec.model_dump_json())
     store, identity = project.artifacts, spec.identity(code_revision)
-    with FileLock(store.project_directory / (identity + ".lock"), timeout=0):
+    with CoordinationLock(store.project_directory / (identity + ".lock"), timeout=0):
         saved = saved_task_hardening(project, spec, code_revision=code_revision)
         if saved is not None:
             return saved

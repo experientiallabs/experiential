@@ -12,7 +12,7 @@ import json
 from datetime import UTC, datetime
 from typing import Literal
 
-from filelock import FileLock, Timeout
+from filelock import Timeout
 from pydantic import Field
 
 from exp.common.core.artifacts import (
@@ -23,6 +23,7 @@ from exp.common.core.artifacts import (
     stable_id,
     strict_equal,
 )
+from exp.common.core.locks import CoordinationLock
 from exp.common.evaluations.reconstruction import WorkflowEvidence
 from exp.common.project import ProjectStore, artifact_input
 from exp.optimize.evaluation.fidelity.memory import (
@@ -150,7 +151,7 @@ def retire_trace(
             "learned or not learned already and cannot be retired"
         )
     for prepared in attempts:
-        lock = FileLock(project.artifacts.project_directory / (prepared.id + ".lock"))
+        lock = CoordinationLock(project.artifacts.project_directory / (prepared.id + ".lock"))
         try:
             lock.acquire(timeout=0)
         except Timeout as error:
@@ -216,7 +217,7 @@ def repair_learning(
         Explicit publication outcome, or a validated dry-run description.
     """
     store = project.artifacts
-    with FileLock(store.project_directory / (spec.run.artifact_id + ".lock"), timeout=0):
+    with CoordinationLock(store.project_directory / (spec.run.artifact_id + ".lock"), timeout=0):
         for ref in (spec.run, spec.report, *((spec.parent,) if spec.parent else ())):
             if artifact_input(store.read(ref.artifact_id).manifest) != ref:
                 raise ValueError("learning repair source changed; supply its exact saved reference")

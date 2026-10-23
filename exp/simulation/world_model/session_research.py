@@ -8,7 +8,6 @@ from datetime import datetime
 from pathlib import Path
 from typing import Protocol, Self
 
-from filelock import FileLock
 from pydantic import Field, model_validator
 
 from exp.common.core.artifacts import (
@@ -22,6 +21,7 @@ from exp.common.core.artifacts import (
     stable_id,
     strict_equal,
 )
+from exp.common.core.locks import CoordinationLock
 from exp.common.models import ToolCall
 from exp.common.models.unknown_outcome import resume_unknown
 from exp.common.project import ArtifactStore
@@ -227,7 +227,7 @@ class SessionResearch:
         self._overview_sources_of = overview_sources_of
         self._retrieved_sources_of = retrieved_sources_of
         self._store, self._artifacts, self._complete = store, artifacts, complete
-        self._lock = FileLock(lock_path, timeout=0)
+        self._lock = CoordinationLock(lock_path, timeout=0)
         self._clock, self._code_revision = clock, code_revision
         self._resumption = resumption
 

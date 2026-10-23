@@ -11,7 +11,6 @@ from datetime import UTC, datetime
 from functools import cache
 from typing import Literal, Self
 
-from filelock import FileLock
 from pydantic import AwareDatetime, Field, JsonValue, model_validator
 
 from exp.common.core.artifacts import (
@@ -23,6 +22,7 @@ from exp.common.core.artifacts import (
     sha256_json,
     stable_id,
 )
+from exp.common.core.locks import CoordinationLock
 from exp.common.models import (
     ModelMessage,
     ModelRequest,
@@ -505,7 +505,7 @@ def propose_checkpoints(
     """Draw once, retain the exact response, then publish the existing matched-control plan."""
     spec = CheckpointProposalSpec.model_validate_json(spec.model_dump_json())
     store, identity = project.artifacts, spec.identity(code_revision)
-    with FileLock(store.project_directory / (identity + ".lock"), timeout=0):
+    with CoordinationLock(store.project_directory / (identity + ".lock"), timeout=0):
         pool, excluded, request = _packet(project, spec)
         response_id, intent_id = identity + "-response", identity + "-intent"
         inputs = tuple(

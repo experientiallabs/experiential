@@ -3,7 +3,6 @@
 from datetime import datetime
 from typing import Literal
 
-from filelock import FileLock
 from pydantic import Field, model_validator
 
 from exp.common.core.artifacts import (
@@ -13,6 +12,7 @@ from exp.common.core.artifacts import (
     sha256_json,
     stable_id,
 )
+from exp.common.core.locks import CoordinationLock
 from exp.common.project import ProjectStore, artifact_input
 from exp.optimize.evaluation.continuations.intervention import (
     ActionIntervention,
@@ -356,7 +356,7 @@ def publish_task_variant(
 ) -> ArtifactInput:
     """Serialize candidate publication; identical re-entry never creates another task version."""
     spec = TaskVariantSpec.model_validate_json(spec.model_dump_json())
-    with FileLock(
+    with CoordinationLock(
         project.artifacts.project_directory / (spec.identity(code_revision) + ".lock"), timeout=0
     ):
         preflight_task_variant(project, spec)

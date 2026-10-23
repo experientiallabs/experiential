@@ -5,7 +5,6 @@ from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
 from typing import Literal
 
-from filelock import FileLock
 from pydantic import AwareDatetime, Field, model_validator
 
 from exp.common.core.artifacts import (
@@ -16,6 +15,7 @@ from exp.common.core.artifacts import (
     sha256_json,
     stable_id,
 )
+from exp.common.core.locks import CoordinationLock
 from exp.common.evaluations.reconstruction import (
     DualReport,
     EvaluationReferences,
@@ -487,7 +487,7 @@ def execute_fidelity_evaluation(
     # Execute from the saved bytes, so a resumed run rebuilds byte-identical requests.
     prepared = saved
     directory = project.artifacts.project_directory
-    with FileLock(directory / (prepared.id + ".lock"), timeout=0):
+    with CoordinationLock(directory / (prepared.id + ".lock"), timeout=0):
         previous = saved_fidelity_report(project, prepared)
         intent = prepared.id + "-execution"
         if previous is not None and not dream_pending(project, prepared):

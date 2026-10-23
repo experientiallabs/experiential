@@ -21,7 +21,6 @@ means lineages disjoint from every fit source; the project's reserved held-out t
 from collections.abc import Callable
 from datetime import UTC, datetime
 
-from filelock import FileLock
 from pydantic import Field
 
 from exp.common.core.artifacts import (
@@ -32,6 +31,7 @@ from exp.common.core.artifacts import (
     sha256_json,
     stable_id,
 )
+from exp.common.core.locks import CoordinationLock
 from exp.common.evaluations.uncertainty import unit_difference_summary, unit_mean_summary
 from exp.common.project import ProjectStore, artifact_input
 from exp.optimize.evaluation.analysis.decision_cascade import (
@@ -319,7 +319,7 @@ def run_cascade_confirmation(
         The saved confirmation; a completed one replays without runtime code or provider calls.
     """
     store, identity = project.artifacts, spec.identity(code_revision)
-    with FileLock(store.project_directory / (identity + ".lock"), timeout=0):
+    with CoordinationLock(store.project_directory / (identity + ".lock"), timeout=0):
         saved = saved_cascade_confirmation(project, spec, code_revision=code_revision)
         if saved is not None:
             return saved

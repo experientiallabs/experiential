@@ -11,6 +11,8 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 
+from exp.common.core.host_scope import require_host_scope
+
 
 def connect_database(
     path: Path,
@@ -31,7 +33,13 @@ def connect_database(
 
     Returns:
         Configured connection with row-name access.
+
+    Raises:
+        HostScopeError: The database directory belongs to another machine or sits on an
+            undeclared network filesystem, where SQLite's locks and WAL index do not work.
     """
+    if path.parent.is_dir():  # otherwise SQLite itself refuses to open the database
+        require_host_scope(path.parent)
     connection = sqlite3.connect(
         path if create else f"{path.absolute().as_uri()}?mode=rw",
         timeout=busy_timeout_ms / 1_000,

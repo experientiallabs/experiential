@@ -3,7 +3,6 @@
 from datetime import UTC, datetime
 from pathlib import Path
 
-from filelock import FileLock
 from pydantic import Field
 
 from exp.common.core.artifacts import (
@@ -16,6 +15,7 @@ from exp.common.core.artifacts import (
     sha256_json,
     stable_id,
 )
+from exp.common.core.locks import CoordinationLock
 from exp.common.project import ProjectStore, artifact_input
 from exp.common.tasks import TaskCase
 from exp.optimize.evaluation.executable.loader import load_runtime_definition
@@ -107,7 +107,7 @@ def capture_initial_world(
     """
     store = project.artifacts
     identity = definition.identity(code_revision)
-    with FileLock(store.project_directory / (identity + ".lock"), timeout=0):
+    with CoordinationLock(store.project_directory / (identity + ".lock"), timeout=0):
         saved = saved_capture(project, definition, code_revision=code_revision)
         if saved is not None:
             return saved

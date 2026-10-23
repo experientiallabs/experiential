@@ -13,6 +13,7 @@ from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 
+from exp.common.core.host_scope import require_host_scope
 from exp.common.project.sqlite_schema import initialize_project_schema
 from exp.common.sqlite.connection import (
     enable_wal_mode,
@@ -57,6 +58,7 @@ def _create_database(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     if path.parent.is_symlink():
         raise ValueError("Content database directory must not be a symlink.")
+    require_host_scope(path.parent)
     try:
         descriptor = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
     except FileExistsError:

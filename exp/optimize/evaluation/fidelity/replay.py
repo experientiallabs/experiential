@@ -35,7 +35,7 @@ from collections.abc import Sequence
 from datetime import datetime, timedelta
 from typing import Literal
 
-from filelock import FileLock, Timeout
+from filelock import Timeout
 from pydantic import Field, JsonValue
 
 from exp.common.core.artifacts import (
@@ -45,6 +45,7 @@ from exp.common.core.artifacts import (
     sha256_json,
     stable_id,
 )
+from exp.common.core.locks import CoordinationLock
 from exp.common.evaluations.reconstruction import (
     DualReport,
     EvaluationReferences,
@@ -870,7 +871,7 @@ def _retired(
         catalog = load_model_catalog(project.model_catalog_path)
         return sha256_json(catalog.model_dump(mode="json")) != saved.catalog_sha256
     if now < saved.spec.deadline:
-        lock = FileLock(project.artifacts.project_directory / (saved.id + ".lock"))
+        lock = CoordinationLock(project.artifacts.project_directory / (saved.id + ".lock"))
         try:
             lock.acquire(timeout=0)
         except Timeout:

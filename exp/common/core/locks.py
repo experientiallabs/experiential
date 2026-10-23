@@ -12,17 +12,23 @@ paths.
 `filelock` rather than a direct `fcntl.flock`: it is the same advisory-lock semantics, but it
 selects `fcntl` on POSIX and `msvcrt` on Windows, so nothing here prevents EXP from importing on a
 non-POSIX platform. It is declared directly in `pyproject.toml` because this module imports it.
+
+Every cross-process lock in EXP is a `CoordinationLock`, never a bare `filelock.FileLock`: OS file
+locks only exclude processes of one machine, so each acquisition first checks the directory's
+host binding (`exp.common.core.host_scope.require_host_scope`) and refuses another machine or an
+undeclared network filesystem instead of silently losing mutual exclusion.
 """
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
 
-from filelock import FileLock, Timeout
+from filelock import AcquireReturnProxy, FileLock, Timeout
 
 from exp.common.core.files import resolve_write_target
+from exp.common.core.host_scope import require_host_scope
 
 # How long a writer waits for another process to finish. These writes are a few file operations,
 # so real contention never comes close; the bound exists so a hung holder is REPORTED instead of
@@ -32,6 +38,52 @@ DEFAULT_LOCK_TIMEOUT_S = 10.0
 
 class FileLockTimeout(RuntimeError):
     """Another process held a file's write lock for longer than the bounded wait."""
+
+
+class CoordinationLock(FileLock):
+    """A cross-process `FileLock` that is only acquired on the machine owning its directory.
+
+    Construct it exactly like `FileLock`. Each acquisition first runs `require_host_scope` on the
+    lock file's directory, so a second machine sharing the directory, or a network filesystem
+    nobody declared single-writer, raises `HostScopeError` instead of "acquiring" a lock that
+    excludes nothing.
+    """
+
+    def acquire(
+        self,
+        timeout: float | None = None,
+        poll_interval: float | None = None,
+        *,
+        poll_intervall: float | None = None,
+        blocking: bool | None = None,
+        cancel_check: Callable[[], bool] | None = None,
+    ) -> AcquireReturnProxy:
+        """Check the directory's host binding, then acquire as `FileLock.acquire` does.
+
+        Args:
+            timeout: Seconds to wait, as for `FileLock.acquire`.
+            poll_interval: Seconds between attempts, as for `FileLock.acquire`.
+            poll_intervall: Deprecated `filelock` spelling of ``poll_interval``.
+            blocking: Whether to wait at all, as for `FileLock.acquire`.
+            cancel_check: Optional cooperative cancellation probe, as for `FileLock.acquire`.
+
+        Returns:
+            The `filelock` proxy usable as a context manager.
+
+        Raises:
+            HostScopeError: Another machine owns the lock's directory, or it is on an undeclared
+                network filesystem.
+        """
+        directory = Path(self.lock_file).parent
+        directory.mkdir(parents=True, exist_ok=True)
+        require_host_scope(directory)
+        return super().acquire(
+            timeout,
+            poll_interval,
+            poll_intervall=poll_intervall,
+            blocking=blocking,
+            cancel_check=cancel_check,
+        )
 
 
 @contextmanager
@@ -76,11 +128,13 @@ def file_write_lock(
 
     Raises:
         FileLockTimeout: The lock was still held after `timeout_s`.
+        HostScopeError: Another machine owns the lock's directory, or it is on an undeclared
+            network filesystem.
     """
     target = resolve_write_target(path)
     lock_path = target.with_name(f"{target.name}.lock")
     lock_path.parent.mkdir(parents=True, exist_ok=True)
-    lock = FileLock(lock_path, timeout=timeout_s, mode=0o600)
+    lock = CoordinationLock(lock_path, timeout=timeout_s, mode=0o600)
     try:
         lock.acquire()
     except Timeout:

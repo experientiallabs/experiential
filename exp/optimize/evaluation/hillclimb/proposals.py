@@ -12,7 +12,6 @@ import json
 from datetime import UTC, datetime
 from typing import Literal
 
-from filelock import FileLock
 from pydantic import AwareDatetime, Field
 
 from exp.common.core.artifacts import (
@@ -24,6 +23,7 @@ from exp.common.core.artifacts import (
     sha256_json,
     stable_id,
 )
+from exp.common.core.locks import CoordinationLock
 from exp.common.models import ModelResponse, ModelSnapshot, load_model_catalog
 from exp.common.project import ArtifactStore, ProjectStore, artifact_input
 from exp.optimize.evaluation.analysis.failures import analyse_failures
@@ -480,7 +480,7 @@ def run_edit_proposals(
         return saved
     identity = spec.identity(code_revision)
     directory = project.artifacts.project_directory
-    with FileLock(directory / (identity + ".lock"), timeout=0):
+    with CoordinationLock(directory / (identity + ".lock"), timeout=0):
         saved = saved_edit_proposals(project, spec, code_revision=code_revision)
         if saved is not None:
             return saved

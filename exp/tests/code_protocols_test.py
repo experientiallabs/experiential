@@ -76,7 +76,7 @@ PROTOCOLS = (
             "exp.simulation.evaluation.calibration:task_decision",
             "exp.simulation.evaluation.calibration:blinded_case",
         ),
-        "7d95dd1c8cdfd8977a79cdafd5e9774912ce47df0b2fee245af3ea6dc64ad133",
+        "00191aa5ee5110a96da03c9fad4e0e789044b5468931b9dec62bb5d577241b62",
     ),
     Protocol(
         "exp.optimize.evaluation.council.runner:COUNCIL_HARNESS_PROTOCOL",
@@ -141,7 +141,7 @@ PROTOCOLS = (
             "exp.optimize.evaluation.hillclimb.stages",
             "exp.optimize.evaluation.hillclimb.rounds:run_climb_round",
         ),
-        "0a8bed3a95de3534e0a74c48a9caba76df3be5c9b9dee9094886041389c421a6",
+        "b65f8761630693a3491f1dc1863cb697205f5b8d57050be862e2dcb7bb9dd0cd",
     ),
     Protocol(
         "exp.optimize.evaluation.hillclimb.proposals:EDIT_PROPOSAL_PROTOCOL",

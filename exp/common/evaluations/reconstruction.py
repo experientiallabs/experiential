@@ -8,7 +8,6 @@ from operator import not_
 from pathlib import Path
 from typing import Annotated, Literal, Protocol, Self, runtime_checkable
 
-from filelock import FileLock
 from pydantic import Field, model_validator
 
 from exp.common.core.artifacts import (
@@ -21,6 +20,7 @@ from exp.common.core.artifacts import (
     strict_equal,
     validate_artifact_id,
 )
+from exp.common.core.locks import CoordinationLock
 from exp.common.judging.definition import JudgeDefinition
 from exp.common.models.client import RequestAdmissionRefused, RequestCapacityExceeded
 from exp.common.project import ArtifactStore, artifact_input
@@ -972,7 +972,7 @@ def evaluate(
     validate_artifact_id(artifact_id)
     lock = artifacts.project_directory.resolve() / ("evaluation-" + artifact_id + ".lock")
     lock.parent.mkdir(parents=True, exist_ok=True)
-    with FileLock(lock, timeout=0):
+    with CoordinationLock(lock, timeout=0):
         return _evaluate_locked(
             evidence,
             references,

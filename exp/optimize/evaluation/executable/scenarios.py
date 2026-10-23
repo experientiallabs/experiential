@@ -8,7 +8,6 @@ This publishes a development seed, not a qualified evaluation or a fidelity clai
 from datetime import UTC, datetime
 from typing import Literal
 
-from filelock import FileLock
 from pydantic import Field, model_validator
 
 from exp.common.core.artifacts import (
@@ -19,6 +18,7 @@ from exp.common.core.artifacts import (
     sha256_json,
     stable_id,
 )
+from exp.common.core.locks import CoordinationLock
 from exp.common.models import ToolCall
 from exp.common.project import ProjectStore, artifact_input
 from exp.common.tasks import TaskCase, ToolSchema
@@ -255,7 +255,7 @@ def prepare_record_scenario(
     """
     store = project.artifacts
     identity = spec.identity(code_revision)
-    with FileLock(store.project_directory / (identity + ".lock"), timeout=0):
+    with CoordinationLock(store.project_directory / (identity + ".lock"), timeout=0):
         saved = saved_record_scenario(project, spec, code_revision=code_revision)
         if saved is not None:
             return saved

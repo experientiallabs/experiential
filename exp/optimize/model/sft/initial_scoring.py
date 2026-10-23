@@ -2,9 +2,8 @@
 
 from datetime import datetime
 
-from filelock import FileLock
-
 from exp.common.core.artifacts import ArtifactEnvelope, ArtifactInput, sha256_json, stable_id
+from exp.common.core.locks import CoordinationLock
 from exp.common.project import ProjectStore, artifact_input
 from exp.optimize.model.sft.builder import load_verified_sft_dataset
 from exp.optimize.model.sft.tail_sft import LossScorer, load_initial_losses, record_initial_losses
@@ -70,7 +69,7 @@ def score_initial_training_losses(
         raise TinkerSFTError("initial scoring dataset digest differs")
     examples = tuple(row.example for row in artifact.rows if row.partition == "train")
     identity = scoring_identity(dataset, spec, code_revision)
-    with FileLock(store.artifacts.project_directory / (identity + ".lock"), timeout=0):
+    with CoordinationLock(store.artifacts.project_directory / (identity + ".lock"), timeout=0):
         saved = saved_initial_scoring(store, dataset, spec, code_revision=code_revision)
         if saved is not None:
             return saved

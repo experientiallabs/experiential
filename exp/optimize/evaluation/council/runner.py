@@ -8,7 +8,6 @@ from datetime import UTC, datetime
 from threading import Lock
 from typing import Literal
 
-from filelock import FileLock
 from pydantic import AwareDatetime, Field, model_validator
 
 from exp.common.core.artifacts import (
@@ -19,6 +18,7 @@ from exp.common.core.artifacts import (
     sha256_json,
     stable_id,
 )
+from exp.common.core.locks import CoordinationLock
 from exp.common.evaluations.reconstruction import (
     EvaluationReferences,
     JudgeConfig,
@@ -454,7 +454,7 @@ def execute_trace_council(
     )
     if saved != prepared:
         raise ValueError("execution differs from the saved council registration")
-    with FileLock(project.artifacts.project_directory / (prepared.id + ".lock"), timeout=0):
+    with CoordinationLock(project.artifacts.project_directory / (prepared.id + ".lock"), timeout=0):
         previous = saved_trace_council(project, prepared)
         if previous is not None:
             return previous

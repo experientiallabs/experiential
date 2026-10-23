@@ -2,7 +2,6 @@
 
 from datetime import UTC, datetime
 
-from filelock import FileLock
 from jsonschema import Draft202012Validator
 from pydantic import Field
 
@@ -15,6 +14,7 @@ from exp.common.core.artifacts import (
     stable_id,
 )
 from exp.common.core.json_schema import expand_local_references
+from exp.common.core.locks import CoordinationLock
 from exp.common.models import AssistantAction, ModelMessage, ToolCall
 from exp.common.project import ProjectStore, artifact_input
 from exp.optimize.evaluation.continuations.job import (
@@ -158,7 +158,7 @@ def capture_action_intervention(
     """
     store = project.artifacts
     identity = spec.identity(code_revision)
-    with FileLock(store.project_directory / (identity + ".lock"), timeout=0):
+    with CoordinationLock(store.project_directory / (identity + ".lock"), timeout=0):
         saved = saved_intervention(project, spec, code_revision=code_revision)
         if saved is not None:
             return saved

@@ -16,7 +16,6 @@ report; new or changed fit traces can only keep or shrink what induced code owns
 from collections.abc import Callable
 from datetime import UTC, datetime
 
-from filelock import FileLock
 from pydantic import AwareDatetime, Field
 
 from exp.common.core.artifacts import (
@@ -28,6 +27,7 @@ from exp.common.core.artifacts import (
     sha256_json,
     stable_id,
 )
+from exp.common.core.locks import CoordinationLock
 from exp.common.models import ModelRequest, ModelResponse, ModelSnapshot, load_model_catalog
 from exp.common.project import ArtifactStore, ProjectStore, artifact_input
 from exp.common.tasks import ToolSchema
@@ -188,7 +188,7 @@ def induce_transitions(
     """
     store = project.artifacts
     identity = spec.identity(code_revision)
-    with FileLock(store.project_directory / (identity + ".lock"), timeout=0):
+    with CoordinationLock(store.project_directory / (identity + ".lock"), timeout=0):
         if store.exists(identity):
             reference = artifact_input(store.read(identity).manifest)
             load_induction(store, reference)

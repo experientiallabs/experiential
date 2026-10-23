@@ -6,7 +6,7 @@ awareness, certify containment, establish cue equivalence, or admit their own tr
 
 from datetime import UTC, datetime
 
-from filelock import FileLock, Timeout
+from filelock import Timeout
 from pydantic import Field, model_validator
 
 from exp.common.core.artifacts import (
@@ -17,6 +17,7 @@ from exp.common.core.artifacts import (
     sha256_json,
     stable_id,
 )
+from exp.common.core.locks import CoordinationLock
 from exp.common.models import ModelMessage
 from exp.common.project import ProjectStore, artifact_input
 from exp.optimize.evaluation.continuations.job import (
@@ -226,7 +227,7 @@ def run_framing_study(
     """Register both cues before any call and run alternating conditions under one panel lease."""
     identity = framing_identity(spec, code_revision)
     store = project.artifacts
-    with FileLock(store.project_directory / (identity + ".lock"), timeout=0):
+    with CoordinationLock(store.project_directory / (identity + ".lock"), timeout=0):
         saved = saved_framing_study(project, spec, code_revision=code_revision)
         if saved is not None:
             return saved

@@ -8,7 +8,7 @@ never release qualification, a new independent lineage or training admission.
 from datetime import UTC, datetime
 from typing import Literal, Self
 
-from filelock import FileLock, Timeout
+from filelock import Timeout
 from pydantic import Field, model_validator
 
 from exp.common.core.artifacts import (
@@ -19,6 +19,7 @@ from exp.common.core.artifacts import (
     sha256_json,
     stable_id,
 )
+from exp.common.core.locks import CoordinationLock
 from exp.common.models import ToolCall
 from exp.common.project import ProjectStore, artifact_input
 from exp.optimize.evaluation.analysis.research import ResearchFailure
@@ -396,7 +397,7 @@ def run_scenario_search(
     spec = ScenarioSearchSpec.model_validate_json(spec.model_dump_json())
     store = project.artifacts
     identity = spec.identity(code_revision)
-    with FileLock(store.project_directory / (identity + ".lock"), timeout=0):
+    with CoordinationLock(store.project_directory / (identity + ".lock"), timeout=0):
         if store.exists(identity + "-result"):
             saved = ScenarioSearchResult.model_validate_json(
                 store.read_bytes(identity + "-result", "result.json")

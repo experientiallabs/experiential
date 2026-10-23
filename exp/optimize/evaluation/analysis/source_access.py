@@ -3,9 +3,8 @@
 from datetime import UTC, datetime
 from typing import Literal
 
-from filelock import FileLock
-
 from exp.common.core.artifacts import ArtifactEnvelope, ArtifactInput, ContractModel, stable_id
+from exp.common.core.locks import CoordinationLock
 from exp.common.project import ArtifactStore, artifact_input
 
 
@@ -36,7 +35,7 @@ def declare_source_access(
     Classifications are trusted operator declarations, not automatic content inspection.
     They confer no authority on a source's dependencies, which need their own declarations.
     """
-    with FileLock(store.project_directory / "source-access.lock", timeout=0):
+    with CoordinationLock(store.project_directory / "source-access.lock", timeout=0):
         return _declare_source_access(
             store, source, scope=scope, rationale=rationale, code_revision=code_revision
         )
