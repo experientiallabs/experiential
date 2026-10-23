@@ -180,11 +180,57 @@ def test_retry_runs_a_bounded_same_operation() -> None:
             operation,
             policy=RetryPolicy(maximum_attempts=2, initial_delay_seconds=0.5),
             sleep=delays.append,
+            random_sample=lambda: 1.0,
         )
         == "ok"
     )
     assert attempts == 2
     assert delays == [0.5]
+
+
+def test_ordinary_backoff_waits_a_full_jitter_share_of_a_capped_exponential_window() -> None:
+    """Without a server minimum each wait is a uniform share of ``min(cap, base * 2**n)``."""
+    delays: list[float] = []
+    samples = iter([0.5, 0.25, 1.0, 0.0])
+
+    def operation() -> str:
+        """Fail with ordinary overload every time."""
+        raise ProviderTransportError("busy", status_code=503)
+
+    with pytest.raises(ProviderTransportError):
+        run_with_retry(
+            operation,
+            policy=RetryPolicy(
+                maximum_attempts=5, initial_delay_seconds=0.5, maximum_delay_seconds=1.5
+            ),
+            sleep=delays.append,
+            random_sample=lambda: next(samples),
+        )
+    # Windows 0.5, 1.0, 1.5 (capped), 1.5 (capped); a zero-length wait is not slept.
+    assert delays == [0.25, 0.25, 1.5]
+
+
+@pytest.mark.parametrize("status", [429, 503])
+def test_retry_after_on_overload_is_a_minimum_even_with_a_zero_jitter_sample(status: int) -> None:
+    """A Retry-After on 429 or 503 is never undercut by full jitter."""
+    delays: list[float] = []
+    attempts = 0
+
+    def operation() -> str:
+        """Overload once with a server minimum, then succeed."""
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise ProviderTransportError("busy", status_code=status, retry_after_seconds=1.25)
+        return "ok"
+
+    assert (
+        run_with_retry(
+            operation, policy=RetryPolicy(), sleep=delays.append, random_sample=lambda: 0.0
+        )
+        == "ok"
+    )
+    assert delays == [1.25]
 
 
 @pytest.mark.parametrize(
