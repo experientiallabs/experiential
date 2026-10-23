@@ -20,6 +20,7 @@ from exp.common.models import (
     ModelSnapshot,
     ReasoningEffort,
 )
+from exp.runtime.models.call_evidence import intent_idempotency_key
 from exp.runtime.models.credentials import DispatchCredentialReceipt
 from exp.runtime.models.providers.async_transport import (
     AsyncJsonHttpTransport,
@@ -540,6 +541,14 @@ class ProviderHttpClient(abc.ABC):
     """
 
     default_headers: ClassVar[Mapping[str, str]] = {}
+    # Whether this wire defines ``Idempotency-Key``. True only on the OpenAI-family wire
+    # (OpenAI, Azure, OpenAI-compatible, OpenRouter), where the header is the protocol's
+    # convention and Experiential's own gateway replays by it: a request made under a recorded
+    # canonical intent there carries a key derived from that intent, so a resend after an
+    # ambiguous failure reuses it. The Anthropic Messages and Gemini protocols define no
+    # idempotency header; their per-call key is a fresh identity no endpoint deduplicates, and
+    # an ambiguous outcome there is resolved only by never redrawing it.
+    supports_idempotency_key: ClassVar[bool] = False
 
     def __init__(
         self,
@@ -651,7 +660,9 @@ class ProviderHttpClient(abc.ABC):
             for name, value in self._headers().items()
             if name.lower() != "idempotency-key"
         }
-        request_headers["Idempotency-Key"] = idempotency_key or f"exp-{uuid4().hex}"
+        request_headers["Idempotency-Key"] = (
+            idempotency_key or self._intent_idempotency_key(url, payload) or f"exp-{uuid4().hex}"
+        )
 
         attempts = 0
         unbilled_attempts = 0
@@ -735,6 +746,10 @@ class ProviderHttpClient(abc.ABC):
         """
         raise ProviderCapabilityError(capability="native_data_plane")
 
+    def _intent_idempotency_key(self, url: str, payload: JsonObject) -> str | None:
+        """Return the current intent's stable key on a wire that defines the header, else None."""
+        return intent_idempotency_key(url, payload) if self.supports_idempotency_key else None
+
     def _headers(self) -> dict[str, str]:
         """Build the authenticated JSON headers sent with every request."""
         return {
@@ -770,14 +785,15 @@ class ProviderHttpClient(abc.ABC):
             The first successful decoded provider body.
         """
         request_deadline = deadline or RequestDeadline.after(self._timeout_seconds)
+        url = f"{self._base_url}/{self._request_path(path)}"
         return await post_json_async(
             self._transport,
-            f"{self._base_url}/{self._request_path(path)}",
+            url,
             headers=self._headers(),
             payload=payload,
             deadline=request_deadline,
             retry_policy=self._retry_policy,
-            idempotency_key=idempotency_key,
+            idempotency_key=idempotency_key or self._intent_idempotency_key(url, payload),
             attempt_timeout_seconds=self._timeout_seconds,
         )
 
