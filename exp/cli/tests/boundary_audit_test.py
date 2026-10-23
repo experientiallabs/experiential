@@ -46,6 +46,7 @@ from exp.optimize.evaluation.induction import service as induction_service
 from exp.optimize.evaluation.induction.service import InductionSpec
 from exp.optimize.evaluation.learning.lessons import load_lesson_set
 from exp.optimize.evaluation.learning.traces import learning_plan
+from exp.optimize.evaluation.spending import SpendPolicy
 from exp.runtime.models import RuntimeModelCatalog
 from exp.runtime.models.providers.transport import (
     JsonHttpResponse,
@@ -472,7 +473,9 @@ def test_an_unknown_critic_call_is_never_redrawn_through_the_cli(
     lost = ScriptedJsonTransport([ProviderTransportError("connection reset after send")] * 8)
     monkeypatch.setattr(actor_critic, "HttpxJsonTransport", lambda: lost)
     request = tmp_path / "critic.json"
-    command = ContinuationCommand(action="predict-success", critic=critic_spec(job))
+    command = ContinuationCommand(
+        action="predict-success", critic=critic_spec(job), spend=SpendPolicy(unpriced_attempts=8)
+    )
     request.write_text(command.model_dump_json())
     arguments = [
         "eval", project.paths.project_id, "--root", str(project.paths.root),
@@ -510,7 +513,9 @@ def test_an_unknown_quality_proxy_call_blocks_packaging_and_stays_counted(
         """Evaluate the batch under one registration namespace through the CLI."""
         request = tmp_path / f"{namespace}.json"
         batch = spec.model_copy(update={"namespace": namespace})
-        command = ContinuationCommand(action="evaluate-candidates", batch=batch)
+        command = ContinuationCommand(
+            action="evaluate-candidates", batch=batch, spend=SpendPolicy(unpriced_attempts=32)
+        )
         request.write_text(command.model_dump_json())
         result = CliRunner().invoke(
             app,
