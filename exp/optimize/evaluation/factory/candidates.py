@@ -47,6 +47,11 @@ from exp.optimize.evaluation.executable.qualification import (
 )
 from exp.optimize.evaluation.executable.task import ExecutableTask, load_executable_task
 from exp.optimize.evaluation.factory.proposals import load_task_proposals
+from exp.optimize.evaluation.factory.quality import (
+    TaskQualityReview,
+    quality_disposition,
+    validate_quality_reviews,
+)
 from exp.optimize.evaluation.factory.variants import load_task_variant
 from exp.optimize.evaluation.harbor.export import verify_harbor_export
 from exp.simulation.evaluation.calibration import CalibrationCase
@@ -60,9 +65,10 @@ class CandidateBatchSpec(ContractModel):
         controls: Independent source-backed verifier controls for this unchanged intent/verifier.
         actors: Frozen declared weak-to-strong comparison models.
         minimum_difference: Descriptive separation threshold, never correctness approval.
-        destination: Optional parent for Harbor exports after observable-contract qualification.
+        destination: Optional exports after observable-contract and task-quality approval.
             Tier separation is reported independently and does not gate correctness or packaging.
         namespace: Safe Harbor organization label.
+        quality_reviews: Independently attested reviews of the exact tasks and recipe.
     """
 
     proposals: ArtifactInput
@@ -71,6 +77,7 @@ class CandidateBatchSpec(ContractModel):
     minimum_difference: float = Field(default=0.05, gt=0, le=1, allow_inf_nan=False)
     destination: Path | None = None
     namespace: str = Field(default="development", pattern=r"^[a-z0-9][a-z0-9.-]*$")
+    quality_reviews: tuple[TaskQualityReview, ...] = ()
 
     def identity(self, code_revision: str) -> str:
         """Bind all prototypes, controls, models and shipping rules before execution."""
@@ -99,7 +106,14 @@ class CandidateMeasurement(ContractModel):
     feasibility: ArtifactInput | None = None
     qualification: ArtifactInput | None = None
     panel: ArtifactInput | None = None
-    status: Literal["unavailable", "unqualified", "qualified_candidate", "packaged"]
+    status: Literal[
+        "unavailable",
+        "unqualified",
+        "needs_review",
+        "rejected_quality",
+        "qualified_candidate",
+        "packaged",
+    ]
     failure: str | None = None
     package: Path | None = None
     failure_detail: StructuredFailure | None = None
@@ -121,7 +135,8 @@ class CandidateBatch(ContractModel):
     scope: str = (
         "development candidates from one related task family; observable-contract qualification "
         "only; fixed-panel tier separation is a separate selection signal, not a shipping gate; "
-        "no semantic-equivalence, independent fidelity, "
+        "task quality additionally requires an operator-attested human review; "
+        "no semantic-equivalence proof, independent fidelity, "
         "generalization, container-containment or full task certification; no training promotion"
     )
 
@@ -150,7 +165,14 @@ def preflight_candidate_batch(
 ) -> None:
     """Check all planned runtimes/models and the complete finite allowance before any calls."""
     attempts = 0
-    for _, reference, task in _population(project, spec):
+    population = _population(project, spec)
+    validate_quality_reviews(
+        project,
+        spec.quality_reviews,
+        proposals=spec.proposals,
+        tasks=frozenset(reference for _, reference, _ in population),
+    )
+    for _, reference, task in population:
         if project.artifacts.read(reference.artifact_id).manifest.code_revision != code_revision:
             raise ValueError("candidate task code revision differs; republish before measuring")
         preflight_actor_panel(project, _panel(spec, task))
@@ -194,6 +216,8 @@ def _package(
     """Publish or verify the same exact qualified package, never overwrite changed output."""
     if spec.destination is None or cell.qualification is None:
         raise ValueError("candidate packaging needs a destination and a qualified candidate")
+    if quality_disposition(spec.quality_reviews, cell.task) != "accepted":
+        raise ValueError("factory packaging requires independent task-quality review")
     path = spec.destination / cell.task.artifact_id
     name = f"{spec.namespace}/candidate-{index}"
     if path.exists():
@@ -262,6 +286,11 @@ def _measure(
                 "status": "qualified_candidate",
             }
         )
+        quality = quality_disposition(spec.quality_reviews, cell.task)
+        if quality != "accepted":
+            return cell.model_copy(
+                update={"status": "rejected_quality" if quality == "rejected" else "needs_review"}
+            )
         if spec.destination is not None:
             phase = "package_export"
             cell = cell.model_copy(
@@ -323,6 +352,8 @@ def _counts(cells: tuple[CandidateMeasurement, ...]) -> JsonObject:
             for status in (
                 "unavailable",
                 "unqualified",
+                "needs_review",
+                "rejected_quality",
                 "qualified_candidate",
                 "packaged",
             )
@@ -348,6 +379,7 @@ def saved_candidate_batch(
     registration = artifact_input(store.read(identity).manifest)
     sources = {
         spec.proposals,
+        *(ref for review in spec.quality_reviews for ref in review.sources()),
         *(case.challenge.witness for case in spec.controls if case.challenge.witness),
     }
     if (
@@ -357,6 +389,12 @@ def saved_candidate_batch(
     ):
         raise ValueError("candidate batch lost its original registration")
     population = _population(project, spec)
+    validate_quality_reviews(
+        project,
+        spec.quality_reviews,
+        proposals=spec.proposals,
+        tasks=frozenset(reference for _, reference, _ in population),
+    )
     if len(report.candidates) != len(population):
         raise ValueError("candidate batch lost a proposed candidate")
     dependencies = {registration}
@@ -407,9 +445,14 @@ def saved_candidate_batch(
             if cell.failure is not None or cell.qualification is None:
                 raise ValueError("completed candidate lacks a qualification or has an error")
             qualified = load_executable_qualification(project, cell.qualification).qualified
+            quality = quality_disposition(spec.quality_reviews, cell.task)
             expected = (
                 "unqualified"
                 if not qualified
+                else "needs_review"
+                if quality == "needs_review"
+                else "rejected_quality"
+                if quality == "rejected"
                 else "qualified_candidate"
                 if spec.destination is None
                 else "packaged"
@@ -454,6 +497,7 @@ def run_candidate_batch(
                 sorted(
                     {
                         spec.proposals,
+                        *(ref for review in spec.quality_reviews for ref in review.sources()),
                         *(
                             case.challenge.witness
                             for case in spec.controls

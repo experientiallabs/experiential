@@ -145,6 +145,23 @@ denominator-preserving evidence.
 
 ## Development task factory
 
+Factory packaging requires a separate task-quality review in addition to observable-contract
+qualification. Each candidate must have an operator-attested human review bound to its exact
+task and proposal registration. `CandidateBatchSpec.quality_reviews` and
+`FactoryFamily.quality_reviews` carry evidence over prompt/verifier alignment, verifier/intent
+alignment, production prompt distribution, world sufficiency and causality, failure attribution,
+and meaningful difficulty. Missing, unapproved or revision-requested reviews remain
+`needs_review`; a human drop is `rejected_quality`. Model proposals and actor success cannot
+approve task quality. Adding review evidence starts a new registration and reuses unchanged
+saved child executions. These attestations do not establish expert-proxy calibration or general
+production fidelity. Direct mechanical qualification remains explicitly narrower.
+
+World history can be materialized through `RecordScenarioSpec.setup_actions` and `finish_tick`:
+the existing kernel executes setup actions and scheduled events, replays native setup, and saves
+the reached checkpoint and execution receipts. Causal consistency follows only from the declared
+transition rules and checked invariants. Randomness must be seeded and its distributions justified;
+a consistent synthetic history does not independently establish realistic production behavior.
+
 `exp eval PROJECT --root ROOT --pipeline pipeline.json --dry-run` validates a
 `exp.optimize.evaluation.factory.runner.TaskFactorySpec`. Repeat with `--yes --non-interactive`
 to authorize the displayed finite author/actor allowance when prices are unknown. The manifest

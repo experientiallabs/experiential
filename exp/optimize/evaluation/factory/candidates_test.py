@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 from filelock import Timeout
 
-from exp.common.core.artifacts import JsonObject
+from exp.common.core.artifacts import ArtifactInput, JsonObject
 from exp.common.models import load_model_catalog
 from exp.common.project import ProjectStore, artifact_input
 from exp.optimize.evaluation.continuations.actors import PanelActor
@@ -17,7 +17,13 @@ from exp.optimize.evaluation.executable.package import verify_executable_package
 from exp.optimize.evaluation.executable.qualification_test import qualified_fixture
 from exp.optimize.evaluation.executable.task import load_executable_task, persist_executable_task
 from exp.optimize.evaluation.factory.candidates import CandidateBatchSpec, run_candidate_batch
-from exp.optimize.evaluation.factory.proposals import TaskProposalSpec, propose_tasks
+from exp.optimize.evaluation.factory.proposals import (
+    TaskProposalSpec,
+    load_task_proposals,
+    propose_tasks,
+)
+from exp.optimize.evaluation.factory.quality import QUALITY_AXES, QualityFinding, TaskQualityReview
+from exp.optimize.evaluation.factory.variants import load_task_variant
 from exp.runtime.environments.tests.world_conformance_test import workbook_case
 from exp.runtime.models.providers.transport import JsonHttpResponse, ScriptedJsonTransport
 from exp.runtime.models.registry import RuntimeModelCatalog
@@ -38,6 +44,31 @@ def _reply(model: str, message: JsonObject, finish: str = "stop") -> JsonHttpRes
             "model": model,
             "choices": [{"index": 0, "finish_reason": finish, "message": message}],
         },
+    )
+
+
+def fixture_quality_reviews(
+    project: ProjectStore, proposals: ArtifactInput, sources: tuple[ArtifactInput, ...]
+) -> tuple[TaskQualityReview, ...]:
+    """Supply software stand-ins for review plumbing, never real expert labels."""
+    return tuple(
+        TaskQualityReview(
+            task=load_task_variant(project, variant).task,
+            proposals=proposals,
+            reviewer="software-fixture-human-stand-in",
+            authority="human",
+            approved=True,
+            findings=tuple(
+                QualityFinding(
+                    axis=axis,
+                    verdict="pass",
+                    rationale="Software fixture only; not actual independent expert calibration.",
+                    sources=sources,
+                )
+                for axis in QUALITY_AXES
+            ),
+        )
+        for variant in load_task_proposals(project, proposals).variants
     )
 
 
@@ -146,6 +177,9 @@ def batch_fixture(
             PanelActor(alias="judge", model=catalog.snapshot("judge")[0], label="declared strong"),
         ),
         destination=tmp_path / "packages",
+        quality_reviews=fixture_quality_reviews(
+            project, proposals, (brief_ref, original_acceptance)
+        ),
     )
     replies = []
     for _ in range(2):

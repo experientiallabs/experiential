@@ -41,6 +41,7 @@ from exp.optimize.evaluation.factory.proposals import (
     propose_tasks,
     saved_task_proposals,
 )
+from exp.optimize.evaluation.factory.quality import TaskQualityReview
 from exp.simulation.capability_briefs import load_capability_brief
 from exp.simulation.continuations import load_continuation_checkpoint
 from exp.simulation.evaluation.calibration import CalibrationCase, CalibrationPack
@@ -61,6 +62,7 @@ class FactoryFamily(ContractModel):
         strata: Intended coverage cells; semantic applicability remains a declared contract.
         information: Declared information condition of this seed world.
         horizon: Declared workflow horizon, unrelated to model count or attempts.
+        quality_reviews: Human task-quality attestations, separate from mechanical controls.
     """
 
     proposal: TaskProposalSpec
@@ -68,10 +70,11 @@ class FactoryFamily(ContractModel):
     strata: tuple[str, ...] = Field(min_length=1)
     information: Literal["available", "discoverable", "conflicting", "unavailable"]
     horizon: Literal["single_decision", "multi_step", "long_horizon"]
+    quality_reviews: tuple[TaskQualityReview, ...] = ()
 
 
 class TaskFactorySpec(ContractModel):
-    """An unattended development factory with a frozen population, mixture and allowance.
+    """A bounded development factory with a frozen population, mixture and allowance.
 
     Attributes:
         families: Seed tasks from distinct needs or workflows; related seeds remain grouped.
@@ -115,7 +118,7 @@ class FactoryCell(ContractModel):
         seed: Exact original task; its variants never add source-family breadth.
         proposals: Saved original candidate inventory, when available.
         batch: Complete feasibility, qualification, panel and package measurements.
-        status: Scoped qualification, rejection, operational failure or no dispatch.
+        status: Scoped qualification, pending review, rejection, failure or no dispatch.
         phase: Last application phase, useful without leaking raw exception text.
         error_type: Sanitized error class, never an implicit retry instruction.
     """
@@ -123,7 +126,9 @@ class FactoryCell(ContractModel):
     seed: ArtifactInput
     proposals: ArtifactInput | None = None
     batch: ArtifactInput | None = None
-    status: Literal["qualified", "rejected", "operationally_incomplete", "not_started"]
+    status: Literal[
+        "qualified", "rejected", "needs_review", "operationally_incomplete", "not_started"
+    ]
     phase: Literal["coverage", "author", "measurement", "complete"]
     error_type: str | None = None
 
@@ -143,10 +148,13 @@ class TaskFactoryResult(ContractModel):
     spec: TaskFactorySpec
     cells: tuple[FactoryCell, ...]
     coverage: DistributionSelection
-    status: Literal["development_qualified", "insufficient_evidence", "operationally_incomplete"]
+    status: Literal[
+        "development_qualified", "needs_review", "insufficient_evidence", "operationally_incomplete"
+    ]
     counts: JsonObject
     scope: str = (
-        "machine-qualified development observable contracts and declared coverage only; "
+        "development observable contracts with operator-attested task quality "
+        "and declared coverage; "
         "no protected release confirmation, subjective judgment calibration, native fidelity, "
         "semantic novelty, deployed containment or training-benefit claim; author/actor budgets "
         "exclude separately bounded runtime inference; no weights are trained"
@@ -215,6 +223,7 @@ def _batch(
         actors=spec.actors,
         destination=spec.destination / family.proposal.base.artifact_id,
         namespace=spec.namespace,
+        quality_reviews=family.quality_reviews,
     )
 
 
@@ -250,6 +259,8 @@ def preflight_task_factory(
             ):
                 raise ValueError("factory requires exact independent control witness references")
         if saved_task_proposals(project, family.proposal, code_revision=code_revision) is None:
+            if family.quality_reviews:
+                raise ValueError("quality reviews require an existing exact proposal population")
             preflight_task_proposals(project, family.proposal)
             preflight_actor_panel(project, ActorPanelSpec(cases=(task.job,), actors=spec.actors))
         else:
@@ -268,6 +279,7 @@ def _sources(spec: TaskFactorySpec) -> tuple[ArtifactInput, ...]:
                 for ref in (
                     family.proposal.base,
                     family.proposal.brief,
+                    *(ref for review in family.quality_reviews for ref in review.sources()),
                     *(case.challenge.witness for case in family.controls if case.challenge.witness),
                 )
             },
@@ -321,6 +333,8 @@ def _result(
         if not any(coverage.deficits.values())
         else "operationally_incomplete"
         if failures
+        else "needs_review"
+        if any(cell.status == "needs_review" for cell in cells)
         else "insufficient_evidence"
     )
     return TaskFactoryResult(
@@ -342,13 +356,15 @@ def _result(
 
 def _batch_status(
     batch: CandidateBatch,
-) -> Literal["qualified", "rejected", "operationally_incomplete"]:
+) -> Literal["qualified", "rejected", "needs_review", "operationally_incomplete"]:
     """Qualification depends on verified packages; actor difficulty is only descriptive."""
     if any(row.status == "packaged" for row in batch.candidates):
         return "qualified"
     return (
         "operationally_incomplete"
         if any(row.status == "unavailable" for row in batch.candidates)
+        else "needs_review"
+        if any(row.status == "needs_review" for row in batch.candidates)
         else "rejected"
     )
 
