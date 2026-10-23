@@ -25,6 +25,7 @@ from exp.runtime.gateway.native_execution import (
 from exp.runtime.gateway.native_fallback_rules import (
     FALLBACK_REASON_PREFIX,
     FailoverRulesError,
+    dialable_rejections,
     eligible_depths,
     eligible_ladder,
     failure_token,
@@ -218,6 +219,22 @@ def test_every_rung_restricted_fails_closed_at_admission() -> None:
         require_unrestricted_rung(
             _route(_deployment("a", ("refusal",)), _deployment("b", ("throttled",)))
         )
+
+
+def test_dialable_rejections_name_what_the_first_dial_rungs_lack() -> None:
+    """Only a failover-only rung serves: the unrestricted rungs' rejections, in order."""
+    route = _route(_deployment("a"), _deployment("byok", ("refusal",)), _deployment("c"))
+    assert dialable_rejections(route, (1,), ("a-lacks", "c-lacks")) == ("a-lacks", "c-lacks")
+    # An unrestricted rung serves: nothing to refuse.
+    assert dialable_rejections(route, (1, 2), ("a-lacks",)) == ()
+    # Nothing serves: only the dialable rungs' reasons, never the failover rung's.
+    assert dialable_rejections(route, (), ("a-lacks", "byok-lacks", "c-lacks")) == (
+        "a-lacks",
+        "c-lacks",
+    )
+    # No unrestricted rung at all is the guard's misconfiguration, not a refusal.
+    restricted = _route(_deployment("x", ("refusal",)), _deployment("y", ("throttled",)))
+    assert dialable_rejections(restricted, (0,), ("y-lacks",)) == ()
 
 
 def test_untried_depths_include_skipped_earlier_rungs_and_honor_the_rules() -> None:

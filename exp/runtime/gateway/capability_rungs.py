@@ -45,8 +45,20 @@ The hard features handled here are all decided by the decoded request alone:
   pre-GPT-5.6 model) is never asked. With no such rung the request is refused.
 
 When no rung carries a feature the route is left whole and the existing
-checks and disclosed coercions decide. A reasoning-pinned continuation whose
-issuing rung is still on the route, and a caller-pinned route, never move.
+checks and disclosed coercions decide. A narrowing that would keep only
+``failover_only_on`` rungs counts as no rung carrying the feature: such a rung
+never takes a first dial, so the route stays whole and the request is refused
+on the feature, never handed to a rung reserved for failover.
+
+A caller-pinned route (``gateway.routing.route_id``) never moves: the caller
+named the rung. A reasoning-pinned continuation keeps its issuing rung first
+through every preference here, but not past a content feature the issuing rung
+cannot carry (tools, media, structured output, the 12-hour cache lifetime):
+refusing would fail a request another rung serves, so the route narrows past
+the issuer, the pin goes stale and every surviving rung dispatches without the
+issuer's sealed reasoning, exactly as on a failover past it (the ledger records
+``reasoning_continuation_failover``). Thinking preferences never move a live
+pin: the issuer already reasoned.
 """
 
 from __future__ import annotations
@@ -56,6 +68,7 @@ from collections.abc import Callable
 from exp.common.models.gateway_catalog import ExactModelDeployment
 from exp.runtime.gateway.contracts import GatewayApiSurface, GatewayRequest
 from exp.runtime.gateway.native_execution import select_route_deployments
+from exp.runtime.gateway.native_fallback_rules import rung_rules
 from exp.runtime.gateway.routing import GatewayRoute
 from exp.runtime.models.providers.base import GatewayWireProfile
 from exp.runtime.models.providers.errors import ProviderParameterError
@@ -221,12 +234,11 @@ def narrow_to_capable_rungs(
         The narrowed route and wires plus the reorder disclosures, each
         recorded only when its feature passed over the lead rung. The inputs
         come back unchanged when the request asks for no hard feature, every
-        rung or no rung carries it, or the route is pinned to a live rung.
+        rung or no rung that may take a first dial carries it, or the caller
+        pinned the route. A live reasoning pin is kept unless its issuing rung
+        cannot carry a content feature the caller sent.
     """
-    pinned = route.reasoning_pinned_deployment_id
-    if route.resolved_route_id is not None or any(
-        deployment.deployment_id == pinned for deployment in route.deployments
-    ):
+    if route.resolved_route_id is not None:
         return route, resolved_wires, ()
     disclosures: list[str] = []
     if request.prompt_cache_ttl == "12h":
@@ -278,6 +290,10 @@ def narrow_to_capable_rungs(
             + STRUCTURED_OUTPUT_RUNG_SUFFIX,
             disclosures,
         )
+    pinned = route.reasoning_pinned_deployment_id
+    if any(deployment.deployment_id == pinned for deployment in route.deployments):
+        # The issuing rung carries every content feature above; it leads.
+        return route, resolved_wires, tuple(disclosures)
     if requests_thinking(request):
         route, resolved_wires = _narrow(
             route,
@@ -306,8 +322,16 @@ def _narrow(
     disclosure: str,
     disclosures: list[str],
 ) -> tuple[GatewayRoute, _ResolvedWires]:
-    """Select ``indexes`` unless they keep every rung or none, disclosing a moved lead."""
-    if not indexes or len(indexes) == len(route.deployments):
+    """Select ``indexes`` unless they keep every rung or none, disclosing a moved lead.
+
+    A selection of ``failover_only_on`` rungs alone keeps none: no rung of it
+    may take the first dial.
+    """
+    if (
+        not indexes
+        or len(indexes) == len(route.deployments)
+        or all(rung_rules(route.deployments[index]) is not None for index in indexes)
+    ):
         return route, resolved_wires
     if indexes[0] != 0:
         disclosures.append(disclosure)

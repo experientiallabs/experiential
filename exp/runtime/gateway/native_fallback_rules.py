@@ -166,6 +166,37 @@ def require_unrestricted_rung(route: GatewayRoute) -> None:
         )
 
 
+def dialable_rejections[Rejection](
+    route: GatewayRoute, served: Sequence[int], rejections: Sequence[Rejection]
+) -> tuple[Rejection, ...]:
+    """Return the dialable rungs' rejections when only failover-only rungs serve a request.
+
+    Admission keeps the rungs that can serve a request; when every one of them
+    is failover-only, nothing may take the first dial. The request is then
+    refused on what the unrestricted rungs lacked, never handed to a rung
+    reserved for failover.
+
+    Args:
+        route: The route the per-rung check ran over.
+        served: Route positions that passed it, in route order.
+        rejections: One rejection per position that did not, in route order.
+
+    Returns:
+        The unrestricted rungs' rejections, in route order, when no serving
+        rung is unrestricted; empty when one is, or when the route has no
+        unrestricted rung at all (``require_unrestricted_rung`` names that).
+    """
+    rules = route_fallback_rules(route)
+    if has_unrestricted_rung(tuple(rules[index] for index in served)):
+        return ()
+    refused = tuple(index for index in range(len(rules)) if index not in served)
+    return tuple(
+        rejection
+        for index, rejection in zip(refused, rejections, strict=True)
+        if rules[index] is None
+    )
+
+
 def rule_fallback_reason(
     route: GatewayRoute, candidate: int, current_depth: object, failure: GatewayFailure | None
 ) -> str | None:

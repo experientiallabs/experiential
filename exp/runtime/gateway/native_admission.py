@@ -37,7 +37,7 @@ from exp.runtime.gateway.native_execution import (
     request_carries_cache_markers,
     select_route_deployments,
 )
-from exp.runtime.gateway.native_fallback_rules import require_unrestricted_rung
+from exp.runtime.gateway.native_fallback_rules import dialable_rejections, require_unrestricted_rung
 from exp.runtime.gateway.native_image_output import image_aware_stream_payload
 from exp.runtime.gateway.native_reasoning import rung_provider_request
 from exp.runtime.gateway.native_request_policy import restrict_fallbacks
@@ -440,6 +440,8 @@ def prepare_route_requests(
         # Nothing coercible remains; the shared admit handler scopes
         # capability rejections to their exact public request field.
         raise route_rejection(protocol_errors)
+    if dialable := dialable_rejections(route, protocol_indexes, protocol_errors):
+        raise route_rejection(dialable)  # Only failover-only rungs serve it: refuse, typed.
     if len(protocol_indexes) != len(route.deployments):
         selected_indexes = tuple(protocol_indexes)
         route = select_route_deployments(route, selected_indexes)
