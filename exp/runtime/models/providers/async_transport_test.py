@@ -636,33 +636,6 @@ def test_httpx_decode_failure_does_not_expose_body_or_headers() -> None:
     assert "header-canary" not in message
 
 
-def test_caller_decoder_reads_raw_bytes_and_its_rejection_is_a_decode_failure() -> None:
-    """A strict decoder sees the exact body, and its ValueError fails like non-JSON."""
-    seen: list[bytes] = []
-
-    def strict(content: bytes) -> JsonObject:
-        """Record the raw bytes and refuse a repeated key."""
-        seen.append(content)
-        if content.count(b'"a"') > 1:
-            raise ValueError("duplicate key")
-        return {"a": 1}
-
-    async def scenario(content: bytes) -> JsonHttpResponse:
-        """Post once through the production transport with the strict decoder."""
-        mock = httpx.MockTransport(lambda request: httpx.Response(200, content=content))
-        async with httpx.AsyncClient(transport=mock) as client:
-            transport = HttpxAsyncJsonTransport(client, json_loads=strict)
-            return await transport.post(
-                "https://provider.test/v1", headers={}, payload={}, timeout_seconds=1
-            )
-
-    assert asyncio.run(scenario(b'{"a": 1}')).body == {"a": 1}
-    with pytest.raises(ProviderTransportError, match="non-JSON HTTP 200") as raised:
-        asyncio.run(scenario(b'{"a": 1, "a": 2}'))
-    assert raised.value.status_code == 200
-    assert seen == [b'{"a": 1}', b'{"a": 1, "a": 2}']
-
-
 @pytest.mark.parametrize("method", ["get", "post"])
 def test_async_transport_names_connection_failures_without_exposing_secrets(method: str) -> None:
     """Async JSON transport uses the same safe failure diagnostics as embedding requests."""

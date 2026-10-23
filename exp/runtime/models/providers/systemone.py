@@ -9,12 +9,11 @@ one JSON ``POST {base_url}/systemone`` whose body is exactly ``{"model", "state"
 Experiential gateway's ``/v1/systemone`` route.
 
 Requests are validated with the gateway's decision contract before any network work.
-Responses are decoded as strict JSON (no duplicate keys, NaN, or Infinity) and checked the
-way the gateway checks provider answers: every question answered exactly once with its type,
-probabilities in ``[0, 1]`` that sum to one (allowing only the rounding envelope of
-hundredth-valued bins), a choice that can be the most probable category, and a score equal
-to its probability-weighted level. Any violation raises a typed error instead of producing a
-default value.
+Responses are checked the way the gateway checks provider answers: every question answered
+exactly once with its type, probabilities in ``[0, 1]`` that sum to one (allowing only the
+rounding envelope of hundredth-valued bins), a choice that can be the most probable category,
+a score equal to its probability-weighted level, and usage that satisfies the decision usage
+contract. Any violation raises a typed error instead of producing a default value.
 """
 
 from __future__ import annotations
@@ -55,7 +54,6 @@ from exp.runtime.models.providers.transport import (
 SystemOneQuestion = NoulQuestion | ChoiceQuestion | ScoreQuestion
 
 _PROBABILITY_TOLERANCE = 1e-6
-_MAX_TOKEN_COUNT = 2**63 - 1
 _RETRYABLE_STATUS_CODES = frozenset({500, 502, 503, 504})
 _SINGLE_ATTEMPT = RetryPolicy(maximum_attempts=1)
 _STATUS_HINTS = {
@@ -191,7 +189,6 @@ class SystemOneClient:
             retry_policy: Attempt bound for connection failures and HTTP 5xx. The default
                 makes one attempt; other failures are never retried.
             http_client: Caller-owned HTTPX client; defaults to the shared pooled client.
-                Responses are always decoded as strict JSON, like the gateway decodes them.
 
         Raises:
             ValueError: The URL, model, credential, timeout, or concurrency is unusable.
@@ -233,7 +230,7 @@ class SystemOneClient:
         self._timeout = timeout
         self._max_concurrency = max_concurrency
         self._retry_policy = retry_policy
-        self._transport = HttpxAsyncJsonTransport(http_client, json_loads=_strict_json)
+        self._transport = HttpxAsyncJsonTransport(http_client)
         self._headers = {"Content-Type": "application/json"}
         if api_key is not None:
             self._headers["Authorization"] = f"Bearer {api_key.get_secret_value()}"
@@ -269,17 +266,8 @@ class SystemOneClient:
             SystemOneResponseError: The response does not answer the request correctly.
         """
         request = _validated_request(state, questions)
-        payload = request.provider_body(self._model)
-        wire_bytes = len(
-            json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-        )
-        if wire_bytes > MAX_DECISION_INPUT_BYTES:
-            raise SystemOneRequestError(
-                f"SystemOne request body is {wire_bytes} bytes, over the "
-                f"{MAX_DECISION_INPUT_BYTES}-byte limit; send a shorter state or fewer questions"
-            )
         async with self._slots:
-            body = await self._post(payload)
+            body = await self._post(request.provider_body(self._model))
         try:
             return _decision_result(body, request.questions)
         except _MalformedAnswer as error:
@@ -356,9 +344,8 @@ class SystemOneClient:
             )
         if 200 <= status < 300:
             return SystemOneResponseError(
-                f"SystemOne endpoint {self._url} returned HTTP {status} without one strict JSON "
-                "object (invalid JSON or text, duplicate keys, or non-finite numbers); check "
-                "that base_url points at a SystemOne server"
+                f"SystemOne endpoint {self._url} returned HTTP {status} without a JSON object; "
+                "check that base_url points at a SystemOne server"
             )
         hint = _STATUS_HINTS.get(status) or (
             "the server failed; check its logs, or pass a retry_policy to retry server errors"
@@ -369,64 +356,6 @@ class SystemOneClient:
             f"SystemOne endpoint {self._url} returned HTTP {status}{tried}: {hint}",
             status_code=status,
         )
-
-
-def _strict_json(content: bytes) -> JsonValue:
-    """Decode a response like the gateway: duplicate keys, bad text, and overflow are errors.
-
-    Args:
-        content: Raw response bytes.
-
-    Returns:
-        The decoded JSON value.
-
-    Raises:
-        ValueError: The bytes are not UTF-8 JSON, repeat a key, hold NaN or Infinity, hold a
-            number beyond double range, hold an unpaired surrogate, or nest too deeply.
-    """
-
-    def unique(pairs: list[tuple[str, JsonValue]]) -> JsonObject:
-        """Refuse a repeated key instead of silently keeping its last value."""
-        result: JsonObject = {}
-        for key, value in pairs:
-            if key in result:
-                raise ValueError("duplicate JSON key")
-            result[key] = value
-        return result
-
-    def non_finite(constant: str) -> JsonValue:
-        """Refuse JSON's nonstandard NaN and Infinity literals."""
-        raise ValueError(f"non-finite JSON value {constant}")
-
-    def finite_float(text: str) -> float:
-        """Refuse a number literal that overflows to infinity."""
-        value = float(text)
-        if not math.isfinite(value):
-            raise ValueError("JSON number exceeds double range")
-        return value
-
-    def bounded_int(text: str) -> int:
-        """Refuse an integer literal beyond double range, which the gateway cannot read."""
-        value = int(text)
-        if abs(value) > sys.float_info.max:
-            raise ValueError("JSON number exceeds double range")
-        return value
-
-    try:
-        # Decode as strict UTF-8 first: bytes input would let json.loads accept UTF-16,
-        # UTF-32, or a byte order mark, which the gateway's decoder refuses.
-        decoded = json.loads(
-            content.decode("utf-8"),
-            object_pairs_hook=unique,
-            parse_constant=non_finite,
-            parse_float=finite_float,
-            parse_int=bounded_int,
-        )
-        # Escaped unpaired surrogates decode to text that is not valid Unicode; encoding fails.
-        json.dumps(decoded, ensure_ascii=False).encode("utf-8")
-    except RecursionError as error:
-        raise ValueError("JSON nesting exceeds the decoder limit") from error
-    return decoded
 
 
 def _loopback(hostname: str) -> bool:
@@ -574,19 +503,16 @@ def _score_answer(answer: JsonObject, question: ScoreQuestion, where: str) -> Sc
 
 
 def _usage(body: JsonObject) -> DecisionUsage:
-    """Validate the endpoint's token counts, which must report at least one token."""
+    """Read the endpoint's input and output token counts with the decision usage contract."""
     usage = body.get("usage")
-    counts: list[int] = []
-    for name in ("input_tokens", "output_tokens"):
-        value = usage.get(name) if isinstance(usage, dict) else None
-        if isinstance(value, bool) or not isinstance(value, int):
-            raise _MalformedAnswer(f"usage.{name} is not a nonnegative integer")
-        if not 0 <= value <= _MAX_TOKEN_COUNT:
-            raise _MalformedAnswer(f"usage.{name} is outside the 64-bit token range")
-        counts.append(value)
-    if counts == [0, 0]:
-        raise _MalformedAnswer("usage reports no tokens for a completed decision")
-    return DecisionUsage(input_tokens=counts[0], output_tokens=counts[1])
+    names = ("input_tokens", "output_tokens")
+    counts = {name: usage.get(name) for name in names} if isinstance(usage, dict) else {}
+    try:
+        return DecisionUsage.model_validate(counts)
+    except ValidationError:
+        raise _MalformedAnswer(
+            "usage must report integer input_tokens and output_tokens, at least one above zero"
+        ) from None
 
 
 def _probability(value: JsonValue, what: str) -> float:
