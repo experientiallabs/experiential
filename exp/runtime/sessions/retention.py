@@ -11,6 +11,9 @@ durable cursor, so an interrupted collection resumes where it stopped. A commit 
 two batches may reuse a candidate node by digest; every batch therefore re-checks the current
 roots and the children of nodes created since the mark, and keeps any candidate they reach.
 Readers see a complete revision because each read runs in one SQLite snapshot.
+
+A preview reads one snapshot and writes nothing: it reports what a collection would reclaim now
+and, for each pin, the nodes that only that pin keeps, which its release would make collectable.
 """
 
 from __future__ import annotations
@@ -66,6 +69,36 @@ class CollectionReport(ContractModel):
     reclaimed_bytes: int = Field(ge=0)
     retained_nodes: int = Field(ge=0)
     complete: bool
+
+
+class PinHolding(ContractModel):
+    """One pin and what it alone keeps alive.
+
+    Attributes:
+        pin: The registered owner and revision range.
+        exclusive_nodes: Nodes no head and no other pin reaches; releasing the pin frees them.
+        exclusive_bytes: Template, children and digest bytes of those nodes.
+    """
+
+    pin: RetentionPin
+    exclusive_nodes: int = Field(ge=0)
+    exclusive_bytes: int = Field(ge=0)
+
+
+class CollectionPreview(ContractModel):
+    """What a collection would reclaim now, and what each pin holds, from one snapshot.
+
+    Attributes:
+        reclaimable_nodes: Stored nodes no head and no pin reaches.
+        reclaimable_bytes: Template, children and digest bytes of those nodes.
+        retained_nodes: Nodes reachable from heads and pins.
+        pins: Every registered pin, ordered by owner and session.
+    """
+
+    reclaimable_nodes: int = Field(ge=0)
+    reclaimable_bytes: int = Field(ge=0)
+    retained_nodes: int = Field(ge=0)
+    pins: tuple[PinHolding, ...]
 
 
 def pin_revisions(connection: sqlite3.Connection, pin: RetentionPin) -> RetentionPin:
@@ -170,6 +203,79 @@ def live_roots(connection: sqlite3.Connection) -> set[bytes]:
         )
     )
     return roots
+
+
+def registered_pins(connection: sqlite3.Connection) -> tuple[RetentionPin, ...]:
+    """Return every registered pin, ordered by owner and session.
+
+    Args:
+        connection: Open connection.
+
+    Returns:
+        The pins.
+    """
+    return tuple(
+        RetentionPin(
+            owner_id=row["owner_id"],
+            session_id=row["session_id"],
+            start_revision=row["start_revision"],
+            end_revision=row["end_revision"],
+        )
+        for row in connection.execute(
+            "SELECT owner_id, session_id, start_revision, end_revision FROM state_pins"
+            " ORDER BY owner_id, session_id"
+        )
+    )
+
+
+def preview_collection(connection: sqlite3.Connection) -> CollectionPreview:
+    """Report reclaimable nodes and each pin's exclusive holding without writing anything.
+
+    Args:
+        connection: Connection inside a read transaction, so every query sees one snapshot.
+
+    Returns:
+        The preview.
+    """
+    sizes = {
+        bytes(row[0]): row[1] + DIGEST_BYTES
+        for row in connection.execute(
+            "SELECT digest, length(template) + length(children) FROM state_nodes"
+        )
+    }
+    heads = {bytes(row[0]) for row in connection.execute("SELECT root FROM sessions")}
+    pins = registered_pins(connection)
+    pin_roots = {
+        (pin.owner_id, pin.session_id): {
+            bytes(row[0])
+            for row in connection.execute(
+                "SELECT root FROM state_events WHERE session_id = ? AND revision >= ?"
+                " AND revision < ?",
+                (pin.session_id, pin.start_revision, pin.end_revision),
+            )
+        }
+        for pin in pins
+    }
+    reachable = _reachable(connection, heads.union(*pin_roots.values()))
+    holdings = []
+    for pin in pins:
+        key = (pin.owner_id, pin.session_id)
+        others = heads.union(*(roots for owner, roots in pin_roots.items() if owner != key))
+        exclusive = reachable - _reachable(connection, others)
+        holdings.append(
+            PinHolding(
+                pin=pin,
+                exclusive_nodes=len(exclusive),
+                exclusive_bytes=sum(sizes[digest] for digest in exclusive),
+            )
+        )
+    unreachable = sizes.keys() - reachable
+    return CollectionPreview(
+        reclaimable_nodes=len(unreachable),
+        reclaimable_bytes=sum(sizes[digest] for digest in unreachable),
+        retained_nodes=len(reachable),
+        pins=tuple(holdings),
+    )
 
 
 def collect(

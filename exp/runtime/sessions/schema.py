@@ -117,6 +117,36 @@ def refuse_stale_schema(path: Path) -> None:
         raise SessionStoreError(_stale_message(path, version))
 
 
+def is_session_database(path: Path) -> bool:
+    """Whether ``path`` is a session database of this schema, checked read-only.
+
+    Other SQLite files (dispatch ledgers, project metadata) share directories with session
+    stores; this lets a caller find the stores without opening, and so initializing, anything.
+
+    Args:
+        path: Existing file.
+
+    Returns:
+        True for a schema-4 store with its identity table.
+    """
+    try:
+        connection = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)
+    except sqlite3.Error:
+        return False
+    try:
+        if connection.execute("PRAGMA user_version").fetchone()[0] != SCHEMA_VERSION:
+            return False
+        tables = {
+            row[0]
+            for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+        }
+    except sqlite3.DatabaseError:
+        return False
+    finally:
+        connection.close()
+    return {"store_identity", "state_pins", "state_nodes"} <= tables
+
+
 def _stale_message(path: Path, version: int) -> str:
     """Explain a schema refusal and what to do about it."""
     return (

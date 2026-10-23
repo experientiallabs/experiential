@@ -78,10 +78,13 @@ from exp.runtime.sessions.records import (
     StepStatus,
 )
 from exp.runtime.sessions.retention import (
+    CollectionPreview,
     CollectionReport,
     RetentionPin,
     collect,
     pin_revisions,
+    preview_collection,
+    registered_pins,
     release_pin,
 )
 from exp.runtime.sessions.schema import open_schema, refuse_stale_schema
@@ -853,6 +856,35 @@ class SessionStore:
         )
         return report
 
+    def pins(self) -> tuple[RetentionPin, ...]:
+        """Return every registered retention pin, ordered by owner and session."""
+        with self._snapshot() as connection:
+            return registered_pins(connection)
+
+    def preview_collection(self) -> CollectionPreview:
+        """Report what ``collect_garbage`` would reclaim and what each pin holds; write nothing.
+
+        Returns:
+            Reclaimable and retained counts and every pin's exclusive holding, from one snapshot.
+        """
+        with self._snapshot() as connection:
+            return preview_collection(connection)
+
+    def vacuum(self) -> int:
+        """Rewrite the database file so pages freed by collection return to the file system.
+
+        SQLite runs the rewrite as one transaction, so an interrupted vacuum leaves the store
+        unchanged; it waits for, and then excludes, concurrent writers.
+
+        Returns:
+            Bytes by which the database and its write-ahead log shrank.
+        """
+        before = _file_bytes(self._path)
+        with self._connect() as connection:
+            connection.execute("VACUUM")
+            connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        return max(0, before - _file_bytes(self._path))
+
     def verify_history(self, session_id: str) -> tuple[StateRef, ...]:
         """Rebuild every revision from the recorded genesis and edits alone, and check it.
 
@@ -894,6 +926,12 @@ class SessionStore:
             )
             for revision, root in enumerate(recorded)
         )
+
+
+def _file_bytes(path: Path) -> int:
+    """Return the size of a database file and its write-ahead log."""
+    wal = path.with_name(path.name + "-wal")
+    return path.stat().st_size + (wal.stat().st_size if wal.exists() else 0)
 
 
 def _head_row(connection: sqlite3.Connection, session_id: str) -> sqlite3.Row:

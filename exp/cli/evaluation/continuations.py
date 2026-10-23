@@ -75,6 +75,7 @@ from exp.cli.evaluation.judge_challenges import handle_challenge_judges
 from exp.cli.evaluation.learning_repair import handle_repair_learning
 from exp.cli.evaluation.memory_forget import handle_forget_summary
 from exp.cli.evaluation.sample_count import handle_sample_count
+from exp.cli.evaluation.state_retention import handle_collect_garbage, handle_retire_checkpoint
 from exp.cli.evaluation.task_hardening import handle_check_task_validity, handle_harden_tasks
 from exp.cli.evaluation.trajectory_traces import handle_export_traces
 from exp.cli.shared.options import usage_error
@@ -121,6 +122,7 @@ from exp.optimize.evaluation.induction.service import InductionSpec, TransitionV
 from exp.optimize.evaluation.learning.forgetting import SummaryForget
 from exp.optimize.evaluation.learning.lessons import LearningRepair
 from exp.optimize.evaluation.learning.sample_count import SampleCountRequest
+from exp.optimize.evaluation.state_retention import CheckpointRetirement, StateCollection
 from exp.optimize.evaluation.tasks.challenge_runs import ChallengeRunSpec
 from exp.simulation.capability_briefs import CapabilityBrief
 
@@ -154,6 +156,8 @@ CONTINUATION_ACTIONS = (
     ContinuationAction("probe-actor-decisions", "actor_decisions", handle_probe_actor_decisions),
     ContinuationAction("inspect-memory", "memory", handle_inspect_memory),
     ContinuationAction("forget-summary", "forget", handle_forget_summary),
+    ContinuationAction("retire-checkpoint", "retirement", handle_retire_checkpoint),
+    ContinuationAction("collect-garbage", "collection", handle_collect_garbage),
     ContinuationAction("measure-decisions", "decisions", handle_measure_decisions),
     ContinuationAction("challenge-judges", "challenge", handle_challenge_judges),
     ContinuationAction("fit-decision-cascade", "cascade_fit", handle_fit_decision_cascade),
@@ -235,6 +239,8 @@ class ContinuationCommand(ContractModel):
         record_witness: Explicit native script and independent predicate for witness-record.
         memory: Saved canonical calls to inspect without model calls or memory mutation.
         forget: One stale memory summary to forget from the next version, with its reason.
+        retirement: One unreferenced world checkpoint whose session-history pins to release.
+        collection: Session-state collection; with ``--dry-run`` a report of pins and reclaim.
         decisions: Frozen fixed-question calibration inventory, never a serving approval.
         challenge: Registered fixed-output judge challenge study with one model per arm.
         cascade_fit: Development trajectories, decider, grid and objective for a cascade fit.
@@ -286,6 +292,8 @@ class ContinuationCommand(ContractModel):
     record_witness: RecordWitnessSpec | None = None
     memory: MemoryInspection | None = None
     forget: SummaryForget | None = None
+    retirement: CheckpointRetirement | None = None
+    collection: StateCollection | None = None
     decisions: DecisionCalibration | None = None
     challenge: ChallengeRunSpec | None = None
     cascade_fit: CascadeFitSpec | None = None
