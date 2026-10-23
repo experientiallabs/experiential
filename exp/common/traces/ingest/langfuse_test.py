@@ -99,6 +99,51 @@ def test_load_langfuse_file_keeps_completion_and_customer_identity(tmp_path: Pat
     assert answer.attributes["exp.customer.id"] == "customer-3"
 
 
+def test_load_langfuse_file_treats_null_usage_counts_as_undeclared(tmp_path: Path) -> None:
+    """Null token counts retain an unmetered generation without usage evidence."""
+    observations = _observations()
+    observations[0]["usage"] = {"input": None, "output": None, "total": None, "unit": "TOKENS"}
+    path = tmp_path / "langfuse.json"
+    path.write_text(json.dumps([_trace(observations)]), encoding="utf-8")
+
+    result = LANGFUSE_SOURCE.load(path)
+
+    assert result.issues == ()
+    assert result.traces[0].spans[0].usage is None
+
+
+def test_load_langfuse_file_uses_details_when_usage_is_null(tmp_path: Path) -> None:
+    """Detailed token counts remain available when the older usage field is null."""
+    observations = _observations()
+    observations[0]["usage"] = None
+    observations[0]["usageDetails"] = {"input": 12, "output": 5, "total": 17}
+    path = tmp_path / "langfuse.json"
+    path.write_text(json.dumps([_trace(observations)]), encoding="utf-8")
+
+    result = LANGFUSE_SOURCE.load(path)
+
+    assert result.issues == ()
+    assert result.traces[0].spans[0].usage is not None
+    assert result.traces[0].spans[0].usage.input_tokens == 12
+    assert result.traces[0].spans[0].usage.output_tokens == 5
+
+
+def test_load_langfuse_file_uses_details_when_usage_counts_are_null(tmp_path: Path) -> None:
+    """Detailed token counts supersede an older usage object with only null counts."""
+    observations = _observations()
+    observations[0]["usage"] = {"input": None, "output": None, "total": None, "unit": "TOKENS"}
+    observations[0]["usageDetails"] = {"input": 12, "output": 5, "total": 17}
+    path = tmp_path / "langfuse.json"
+    path.write_text(json.dumps([_trace(observations)]), encoding="utf-8")
+
+    result = LANGFUSE_SOURCE.load(path)
+
+    assert result.issues == ()
+    assert result.traces[0].spans[0].usage is not None
+    assert result.traces[0].spans[0].usage.input_tokens == 12
+    assert result.traces[0].spans[0].usage.output_tokens == 5
+
+
 def test_load_langfuse_file_accepts_bare_observations(tmp_path: Path) -> None:
     """Observation exports without a trace wrapper group by their declared traceId."""
     path = tmp_path / "langfuse.jsonl"
