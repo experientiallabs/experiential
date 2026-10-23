@@ -135,38 +135,38 @@ def prepare_record_witness(
         checkpoint.world, ExecutableCheckpoint
     ):
         raise ValueError("record witness needs the exact public task and native seed checkpoint")
-    runtime = load_runtime_definition(
+    with load_runtime_definition(
         project,
         runtime_file=spec.capture.runtime_file,
         runtime_sha256=spec.capture.runtime_sha256,
         configuration=spec.capture.configuration,
         probe_sha256=spec.capture.probe_sha256,
-    )
-    if not isinstance(runtime.world, ExecutableWorldRuntime):
-        raise ValueError("record witnesses require a wholly native executable world")
-    replay = RecordReplayRuntime(runtime.world, runtime.probe, runtime.probe_sha256)
-    now = datetime.now(UTC)
-    reference = execute_record_script(
-        project.artifacts,
-        replay,
-        task=checkpoint.task,
-        baseline=checkpoint.world,
-        actions=spec.actions,
-        finish_tick=spec.finish_tick,
-        sources=(*spec.capture.sources, spec.checkpoint),
-        created_at=now,
-        code_revision=code_revision,
-    )
-    execution = load_record_execution(project.artifacts, reference)
-    witness = record_label_witness(
-        project.artifacts,
-        specification=spec.specification,
-        outcome=execution.outcome,
-        receipt=reference,
-        record_runtime=replay,
-        created_at=now,
-        code_revision=code_revision,
-    )
+    ) as runtime:
+        if not isinstance(runtime.world, ExecutableWorldRuntime):
+            raise ValueError("record witnesses require a wholly native executable world")
+        replay = RecordReplayRuntime(runtime.world, runtime.probe, runtime.probe_sha256)
+        now = datetime.now(UTC)
+        reference = execute_record_script(
+            project.artifacts,
+            replay,
+            task=checkpoint.task,
+            baseline=checkpoint.world,
+            actions=spec.actions,
+            finish_tick=spec.finish_tick,
+            sources=(*spec.capture.sources, spec.checkpoint),
+            created_at=now,
+            code_revision=code_revision,
+        )
+        execution = load_record_execution(project.artifacts, reference)
+        witness = record_label_witness(
+            project.artifacts,
+            specification=spec.specification,
+            outcome=execution.outcome,
+            receipt=reference,
+            record_runtime=replay,
+            created_at=now,
+            code_revision=code_revision,
+        )
     return {
         "receipt": reference.model_dump(mode="json"),
         "witness": witness.model_dump(mode="json"),
@@ -280,32 +280,32 @@ def prepare_record_scenario(
                 files={"specification.json": spec},
             )
         )
-        runtime = load_runtime_definition(
+        with load_runtime_definition(
             project,
             runtime_file=spec.capture.runtime_file,
             runtime_sha256=spec.capture.runtime_sha256,
             configuration=spec.capture.configuration,
             probe_sha256=spec.capture.probe_sha256,
-        )
-        if not isinstance(runtime.world, ExecutableWorldRuntime):
-            raise ValueError("record scenarios require a wholly native executable world")
-        require_record_runtime(runtime.world)
-        setup_task = spec.capture.task.model_copy(
-            update={"tools": (*spec.capture.task.tools, *spec.setup_tools)}
-        )
-        with runtime.world.open(setup_task) as world:
-            baseline = world.checkpoint()
-        execution_ref = execute_record_script(
-            store,
-            RecordReplayRuntime(runtime.world, runtime.probe, runtime.probe_sha256),
-            task=setup_task,
-            baseline=baseline,
-            actions=spec.setup_actions,
-            finish_tick=spec.finish_tick,
-            sources=(*spec.capture.sources, registration),
-            created_at=now,
-            code_revision=code_revision,
-        )
+        ) as runtime:
+            if not isinstance(runtime.world, ExecutableWorldRuntime):
+                raise ValueError("record scenarios require a wholly native executable world")
+            require_record_runtime(runtime.world)
+            setup_task = spec.capture.task.model_copy(
+                update={"tools": (*spec.capture.task.tools, *spec.setup_tools)}
+            )
+            with runtime.world.open(setup_task) as world:
+                baseline = world.checkpoint()
+            execution_ref = execute_record_script(
+                store,
+                RecordReplayRuntime(runtime.world, runtime.probe, runtime.probe_sha256),
+                task=setup_task,
+                baseline=baseline,
+                actions=spec.setup_actions,
+                finish_tick=spec.finish_tick,
+                sources=(*spec.capture.sources, registration),
+                created_at=now,
+                code_revision=code_revision,
+            )
         execution = load_record_execution(store, execution_ref)
         if any(step.reply.is_error for step in execution.steps):
             raise ValueError("scenario setup returned a tool error; inspect the execution receipt")

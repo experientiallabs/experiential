@@ -184,10 +184,10 @@ def capture_action_intervention(
             )
         )
         original = load_continuation_checkpoint(store, spec.base.study.checkpoint)
-        runtime = load_continuation_runtime(project, spec.base)
-        with restore_continuation_world(
-            runtime.world, original.world_task, original.world
-        ) as world:
+        with (
+            load_continuation_runtime(project, spec.base) as runtime,
+            restore_continuation_world(runtime.world, original.world_task, original.world) as world,
+        ):
             before = runtime.probe(world.checkpoint())
             observation = world.execute(spec.action)
             image = world.checkpoint()

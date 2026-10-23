@@ -317,3 +317,61 @@ def test_declared_workbook_facts_reach_the_simulated_side_beside_native_receipts
     rows = channel["instance_facts"]["facts"]
     assert len(rows) == len(facts.facts) + 1 and rows[-1]["key"].startswith("native-read/")
     assert set(channel["environment_state"]["domains"]) == {"records"}
+
+
+def _released_native(spec: MixedRuntimeDefinition, marker: Path) -> MixedRuntimeDefinition:
+    """Rewrite the reviewed native factory so closing it leaves a marker file."""
+    source = spec.native.runtime_file.read_text().replace(
+        'return ContinuationRuntime(world, probe, configuration["probe"])',
+        'return ContinuationRuntime(world, probe, configuration["probe"], '
+        'lambda: Path(configuration["marker"]).touch())',
+    )
+    spec.native.runtime_file.write_text("from pathlib import Path\n" + source)
+    native = spec.native.model_copy(
+        update={
+            "runtime_sha256": sha256_bytes(spec.native.runtime_file.read_bytes()),
+            "configuration": {**spec.native.configuration, "marker": str(marker)},
+        }
+    )
+    return spec.model_copy(update={"native": native})
+
+
+def test_closing_the_composition_closes_its_native_runtime(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The mixed runtime owns both parts; leaving its block releases the native one."""
+    project, spec, _, _ = mixed_fixture(tmp_path, monkeypatch)
+    marker = tmp_path / "native-closed"
+    spec = _released_native(spec, marker)
+    with continuation_runtime(project, spec.model_dump(mode="json")) as runtime:
+        assert not marker.exists()
+        assert isinstance(runtime.world, mixed_runtime.MixedRealityEnvironmentRuntime)
+    assert marker.exists()
+
+
+def test_a_refused_composition_closes_the_native_runtime_it_loaded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A manifest refusal after the native factory ran still releases what it opened."""
+    project, spec, _, transport = mixed_fixture(tmp_path, monkeypatch)
+    marker = tmp_path / "native-closed"
+    spec = _released_native(spec, marker)
+    other = spec.simulated.manifest.model_copy(
+        update={
+            "domains": (*spec.simulated.manifest.domains, StateDomain(name="extra", owner="native"))
+        }
+    )
+    native = spec.native.model_copy(
+        update={
+            "configuration": {
+                **spec.native.configuration,
+                "manifest": other.model_dump(mode="json"),
+            }
+        }
+    )
+    with pytest.raises(ValueError, match="manifest differs"):
+        continuation_runtime(
+            project, spec.model_copy(update={"native": native}).model_dump(mode="json")
+        )
+    assert marker.exists()
+    assert not transport.requests

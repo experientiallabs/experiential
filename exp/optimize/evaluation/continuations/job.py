@@ -189,20 +189,20 @@ def execute_continuation_job(
         if job.study.cascade is None
         else admitted_decider(catalog, job.study.cascade.decider, transport, job.deadline)
     )
-    runtime = load_continuation_runtime(project, job)
-    return run_continuation_study(
-        project.artifacts,
-        job.study,
-        actor=ChatAgentRuntime(
-            maximum_model_calls=job.maximum_model_calls, system_prompt=job.system_prompt
-        ),
-        model=model.client,
-        world=runtime.world,
-        probe=runtime.probe,
-        probe_sha256=runtime.probe_sha256,
-        code_revision=revision,
-        decider=decider,
-    )
+    with load_continuation_runtime(project, job) as runtime:
+        return run_continuation_study(
+            project.artifacts,
+            job.study,
+            actor=ChatAgentRuntime(
+                maximum_model_calls=job.maximum_model_calls, system_prompt=job.system_prompt
+            ),
+            model=model.client,
+            world=runtime.world,
+            probe=runtime.probe,
+            probe_sha256=runtime.probe_sha256,
+            code_revision=revision,
+            decider=decider,
+        )
 
 
 def load_continuation_runtime(project: ProjectStore, job: ContinuationJob) -> ContinuationRuntime:
@@ -210,6 +210,7 @@ def load_continuation_runtime(project: ProjectStore, job: ContinuationJob) -> Co
 
     Only the checked source bytes execute. Private probes remain evaluator capabilities.
     Dependencies imported by the trusted factory are the operator's environment responsibility.
+    The caller closes the returned runtime, normally with ``with``.
     """
     return load_runtime_definition(
         project,

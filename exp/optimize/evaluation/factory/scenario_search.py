@@ -265,93 +265,98 @@ def _cell(
         point = load_continuation_checkpoint(project.artifacts, reached.checkpoint)
         capture = candidate.scenario.capture.model_copy(update={"task": point.task})
         phase = "runtime_binding"
-        runtime = load_runtime_definition(
+        with load_runtime_definition(
             project,
             runtime_file=capture.runtime_file,
             runtime_sha256=capture.runtime_sha256,
             configuration=capture.configuration,
             probe_sha256=capture.probe_sha256,
-        )
-        if not isinstance(runtime.world, ExecutableWorldRuntime):
-            raise ValueError("scenario controls require the declared native world")
-        replay = RecordReplayRuntime(runtime.world, runtime.probe, runtime.probe_sha256)
-        for control in candidate.controls:
-            phase = "control:" + control.role
-            output = prepare_record_witness(
-                project,
-                RecordWitnessSpec(
-                    capture=capture,
-                    checkpoint=reached.checkpoint,
-                    actions=control.actions,
-                    finish_tick=control.finish_tick,
-                    specification=candidate.acceptance,
-                ),
-                code_revision=revision,
-            )
-            reference = ArtifactInput.model_validate(output["witness"])
-            witnesses.append(reference)
-            witness = LabelWitness.model_validate_json(
-                project.artifacts.read_bytes(reference.artifact_id, "witness.json")
-            )
-            expected = "fail" if control.role in {"targeted_error", "unwanted_effect"} else "pass"
-            challenge = VerifierChallenge(
-                id=reference.artifact_id,
-                outcome=witness.observation,
-                expected=expected,
-                authority="native_execution",
-                witness=reference,
-                rationale=control.role,
-                source_refs=(candidate.acceptance,),
-            )
-            refusal = verify_label_witness(
-                project.artifacts,
-                challenge,
-                label=expected,
-                compared=(candidate.verifier,),
-                record_runtime=replay,
-            )
-            assessed = grade(candidate.verifier, witness.observation)
-            if refusal is None and expected == "pass" and assessed.status == "pass":
-                specification = EvaluationSpecification.model_validate_json(
-                    project.artifacts.read_bytes(
-                        candidate.acceptance.artifact_id, "specification.json"
+        ) as runtime:
+            if not isinstance(runtime.world, ExecutableWorldRuntime):
+                raise ValueError("scenario controls require the declared native world")
+            replay = RecordReplayRuntime(runtime.world, runtime.probe, runtime.probe_sha256)
+            for control in candidate.controls:
+                phase = "control:" + control.role
+                output = prepare_record_witness(
+                    project,
+                    RecordWitnessSpec(
+                        capture=capture,
+                        checkpoint=reached.checkpoint,
+                        actions=control.actions,
+                        finish_tick=control.finish_tick,
+                        specification=candidate.acceptance,
+                    ),
+                    code_revision=revision,
+                )
+                reference = ArtifactInput.model_validate(output["witness"])
+                witnesses.append(reference)
+                witness = LabelWitness.model_validate_json(
+                    project.artifacts.read_bytes(reference.artifact_id, "witness.json")
+                )
+                expected = (
+                    "fail" if control.role in {"targeted_error", "unwanted_effect"} else "pass"
+                )
+                challenge = VerifierChallenge(
+                    id=reference.artifact_id,
+                    outcome=witness.observation,
+                    expected=expected,
+                    authority="native_execution",
+                    witness=reference,
+                    rationale=control.role,
+                    source_refs=(candidate.acceptance,),
+                )
+                refusal = verify_label_witness(
+                    project.artifacts,
+                    challenge,
+                    label=expected,
+                    compared=(candidate.verifier,),
+                    record_runtime=replay,
+                )
+                assessed = grade(candidate.verifier, witness.observation)
+                if refusal is None and expected == "pass" and assessed.status == "pass":
+                    specification = EvaluationSpecification.model_validate_json(
+                        project.artifacts.read_bytes(
+                            candidate.acceptance.artifact_id, "specification.json"
+                        )
                     )
-                )
-                tested = probe_verifier(
-                    candidate.verifier, specification.predicate, witness.observation
-                )
-                probes[reference.artifact_id] = tested
-                if tested.false_passes:
+                    tested = probe_verifier(
+                        candidate.verifier, specification.predicate, witness.observation
+                    )
+                    probes[reference.artifact_id] = tested
+                    if tested.false_passes:
+                        refusals.append(
+                            control.role
+                            + ": verifier accepted "
+                            + str(len(tested.false_passes))
+                            + " synthetic counterexamples rejected by the independent"
+                            + " specification; "
+                            + "inspect verifier_probes before publishing"
+                        )
+                if control.role == "recovery":
+                    steps = witness.observation.get("steps")
+                    if not isinstance(steps, list) or not any(
+                        isinstance(step, dict)
+                        and isinstance(step.get("reply"), dict)
+                        and step["reply"].get("is_error") is True
+                        for step in steps[:-1]
+                    ):
+                        refusals.append(
+                            "recovery requires an observed tool error before a valid completion"
+                        )
+                if refusal is not None:
+                    refusals.append(control.role + ": " + refusal.reason + ": " + refusal.detail)
+                if assessed.status != expected:
                     refusals.append(
-                        control.role
-                        + ": verifier accepted "
-                        + str(len(tested.false_passes))
-                        + " synthetic counterexamples rejected by the independent specification; "
-                        + "inspect verifier_probes before publishing"
+                        control.role + ": verifier does not distinguish the native outcome"
                     )
-            if control.role == "recovery":
-                steps = witness.observation.get("steps")
-                if not isinstance(steps, list) or not any(
-                    isinstance(step, dict)
-                    and isinstance(step.get("reply"), dict)
-                    and step["reply"].get("is_error") is True
-                    for step in steps[:-1]
+                if control.role == "targeted_error" and not (
+                    assessed.goal.status == "fail" and assessed.policy.status == "pass"
                 ):
-                    refusals.append(
-                        "recovery requires an observed tool error before a valid completion"
-                    )
-            if refusal is not None:
-                refusals.append(control.role + ": " + refusal.reason + ": " + refusal.detail)
-            if assessed.status != expected:
-                refusals.append(control.role + ": verifier does not distinguish the native outcome")
-            if control.role == "targeted_error" and not (
-                assessed.goal.status == "fail" and assessed.policy.status == "pass"
-            ):
-                refusals.append("targeted_error must fail the goal using permitted effects")
-            if control.role == "unwanted_effect" and not (
-                assessed.goal.status == "pass" and assessed.policy.status == "fail"
-            ):
-                refusals.append("unwanted_effect must achieve the goal with prohibited effects")
+                    refusals.append("targeted_error must fail the goal using permitted effects")
+                if control.role == "unwanted_effect" and not (
+                    assessed.goal.status == "pass" and assessed.policy.status == "fail"
+                ):
+                    refusals.append("unwanted_effect must achieve the goal with prohibited effects")
         if not refusals:
             phase = "task_publication"
             variant = publish_task_variant(

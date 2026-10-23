@@ -384,20 +384,22 @@ def open_executable_harbor_trial(
             record = json.loads(store.read_bytes(key, "record.json"))
             reference = ArtifactInput.model_validate(record["world"])
             restored = load_world_image(store, reference)
-        runtime = load_runtime_definition(
-            project,
-            runtime_file=task.job.runtime_file,
-            runtime_sha256=task.job.runtime_sha256,
-            configuration=task.job.configuration,
-            probe_sha256=task.job.study.probe_sha256,
-            provider_grant=None
-            if provider_limits is None
-            else ProviderGrant(
-                registration=registration,
-                limits=provider_limits,
-            ),
-        )
-        with restore_continuation_world(runtime.world, checkpoint.world_task, restored) as session:
+        with (
+            load_runtime_definition(
+                project,
+                runtime_file=task.job.runtime_file,
+                runtime_sha256=task.job.runtime_sha256,
+                configuration=task.job.configuration,
+                probe_sha256=task.job.study.probe_sha256,
+                provider_grant=None
+                if provider_limits is None
+                else ProviderGrant(
+                    registration=registration,
+                    limits=provider_limits,
+                ),
+            ) as runtime,
+            restore_continuation_world(runtime.world, checkpoint.world_task, restored) as session,
+        ):
             yield ExecutableHarborTrial(
                 project,
                 task_ref,

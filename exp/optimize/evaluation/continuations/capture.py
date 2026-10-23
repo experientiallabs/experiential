@@ -130,18 +130,20 @@ def capture_initial_world(
                 files={"definition.json": definition},
             )
         )
-        runtime = load_runtime_definition(
-            project,
-            runtime_file=definition.runtime_file,
-            runtime_sha256=definition.runtime_sha256,
-            configuration=definition.configuration,
-            probe_sha256=definition.probe_sha256,
-        )
         actor = ChatAgentRuntime(
             maximum_model_calls=definition.maximum_model_calls,
             system_prompt=definition.system_prompt,
         )
-        with runtime.world.open(definition.task) as world:
+        with (
+            load_runtime_definition(
+                project,
+                runtime_file=definition.runtime_file,
+                runtime_sha256=definition.runtime_sha256,
+                configuration=definition.configuration,
+                probe_sha256=definition.probe_sha256,
+            ) as runtime,
+            runtime.world.open(definition.task) as world,
+        ):
             checkpoint = ContinuationCheckpoint(
                 task=definition.task,
                 actor=actor.initial_checkpoint(definition.task),

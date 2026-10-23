@@ -4,19 +4,28 @@ Only the explicitly selected source bytes execute, after their digest is checked
 calls the file's ``continuation_runtime`` factory; a load under a ``ProviderGrant`` calls its
 ``trial_runtime`` factory with that per-trial provider authority. Private probes remain evaluator
 capabilities. Dependencies imported by the trusted factory are the operator's responsibility.
+
+A runtime may own processes or files (an induced-program worker, the parts of a composition).
+Whoever loads one closes it: use it as a context manager, or call ``close``. A runtime that the
+loader refuses after its factory ran is closed before the refusal propagates.
 """
 
 import importlib.util
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from types import ModuleType
+from types import ModuleType, TracebackType
+from typing import Self
 
 from exp.common.core.artifacts import JsonObject, Sha256, sha256_bytes
 from exp.common.project import ProjectStore
 from exp.optimize.evaluation.continuations.study import WorldRuntime
 from exp.optimize.evaluation.executable.provider_grant import ProviderGrant
 from exp.simulation.continuations import WorldCheckpoint
+
+
+def _owns_nothing() -> None:
+    """Release nothing: the factory started no process and holds no file."""
 
 
 @dataclass(frozen=True)
@@ -27,11 +36,32 @@ class ContinuationRuntime:
         world: Existing executable or mixed runtime with exact restore semantics.
         probe: Evaluator-only state projection, never passed to the actor.
         probe_sha256: Digest of the projection definition checked against registration.
+        release: Stops what the factory started; idempotent. Factories that own nothing
+            leave the default.
     """
 
     world: WorldRuntime
     probe: Callable[[WorldCheckpoint], JsonObject]
     probe_sha256: Sha256
+    release: Callable[[], None] = _owns_nothing
+
+    def close(self) -> None:
+        """Release every process and file the factory opened; later calls do nothing."""
+        self.release()
+
+    def __enter__(self) -> Self:
+        """Return this runtime; resources are released when the block exits."""
+        return self
+
+    def __exit__(
+        self,
+        exception_type: type[BaseException] | None,
+        exception: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        """Close on every exit path, including exceptions and interrupts."""
+        del exception_type, exception, traceback
+        self.close()
 
 
 def load_runtime_definition(
@@ -54,7 +84,8 @@ def load_runtime_definition(
         provider_grant: Per-trial provider authority; selects ``trial_runtime`` when given.
 
     Returns:
-        The factory's runtime, after its type and probe identity are checked.
+        The factory's runtime, after its type and probe identity are checked. The caller
+        closes it.
     """
     if provider_grant is not None:
         provider_grant.require_configuration(project, configuration, runtime_sha256=runtime_sha256)
@@ -71,6 +102,7 @@ def load_runtime_definition(
     if not isinstance(runtime, ContinuationRuntime):
         raise ValueError("runtime factory must return ContinuationRuntime")
     if runtime.probe_sha256 != probe_sha256:
+        runtime.close()
         raise ValueError("runtime probe differs from the frozen definition")
     return runtime
 
