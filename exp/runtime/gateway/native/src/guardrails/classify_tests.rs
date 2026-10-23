@@ -165,6 +165,31 @@ async fn one_call_scores_every_category_and_flags_at_its_inclusive_threshold() {
     );
 }
 
+#[test]
+fn a_mean_reaches_its_inclusive_threshold_exactly() {
+    let ids: Vec<String> = (0..10).map(|index| format!("q{index}")).collect();
+    let questions: Map<String, Value> = ids
+        .iter()
+        .map(|id| (id.clone(), json!({"type": "noul", "instructions": "?"})))
+        .collect();
+    let mean = Classifier::new(
+        spec(
+            "https://decisions.example.invalid/systemone",
+            json!({
+                "questions": questions,
+                "categories": [{"id": "mean", "aggregate": "mean", "threshold": 0.8, "questions": ids}]
+            }),
+        ),
+        None,
+    )
+    .unwrap();
+
+    assert_eq!(mean.scores(&[0.8; 10]), vec![0.8]);
+    assert_eq!(fsum([0.1; 10].into_iter()), 1.0);
+    assert_eq!(fsum([1e100, 1.0, -1e100, 1e-100].into_iter()), 1.0);
+    assert_eq!(fsum(std::iter::empty()), 0.0);
+}
+
 #[tokio::test]
 async fn definitive_answers_are_cached_and_errors_are_not() {
     let probabilities = [

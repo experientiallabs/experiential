@@ -154,6 +154,8 @@ impl Classifier {
             category_questions.push(indexes);
         }
         let client = reqwest::Client::builder()
+            // The configured endpoint only: never an ambient HTTP(S)_PROXY.
+            .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
             .retry(reqwest::retry::never())
             .use_rustls_tls()
@@ -302,7 +304,7 @@ impl Classifier {
                 let values = indexes.iter().map(|index| probabilities[*index]);
                 match category.aggregate {
                     Aggregate::Max => values.fold(0.0, f64::max),
-                    Aggregate::Mean => values.sum::<f64>() / indexes.len() as f64,
+                    Aggregate::Mean => fsum(values) / indexes.len() as f64,
                 }
             })
             .collect()
@@ -343,6 +345,55 @@ impl Classifier {
             .map_err(|_| ClassifyError::Timeout)??;
         answer_probabilities(&raw, &self.question_ids)
     }
+}
+
+/// The correctly rounded sum of `values`, as python's `math.fsum` computes it.
+///
+/// A mean category compares its score to an inclusive threshold, so ten
+/// answers of 0.8 must average to exactly 0.8, never 0.7999999999999999.
+fn fsum(values: impl Iterator<Item = f64>) -> f64 {
+    // Shewchuk's exact partials, then a round-half-even correction.
+    let mut partials: Vec<f64> = Vec::new();
+    for mut x in values {
+        let mut kept = 0;
+        for index in 0..partials.len() {
+            let mut y = partials[index];
+            if x.abs() < y.abs() {
+                std::mem::swap(&mut x, &mut y);
+            }
+            let high = x + y;
+            let low = y - (high - x);
+            if low != 0.0 {
+                partials[kept] = low;
+                kept += 1;
+            }
+            x = high;
+        }
+        partials.truncate(kept);
+        partials.push(x);
+    }
+    let Some(mut high) = partials.pop() else {
+        return 0.0;
+    };
+    let mut low = 0.0;
+    while let Some(y) = partials.pop() {
+        let x = high;
+        high = x + y;
+        low = y - (high - x);
+        if low != 0.0 {
+            break;
+        }
+    }
+    if let Some(&next) = partials.last() {
+        if (low < 0.0 && next < 0.0) || (low > 0.0 && next > 0.0) {
+            let y = low * 2.0;
+            let x = high + y;
+            if y == x - high {
+                high = x;
+            }
+        }
+    }
+    high
 }
 
 fn transport(error: reqwest::Error) -> ClassifyError {
