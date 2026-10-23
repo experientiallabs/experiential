@@ -135,11 +135,12 @@ def load_otlp_file(
     )
     try:
         document: JsonValue = json.loads(text)
-    except json.JSONDecodeError:
+    except json.JSONDecodeError as exc:
         return _normalize_jsonl(
             text,
             source=source,
             semantic_convention_version=semantic_convention_version,
+            document_error=exc,
         )
     return normalize_otlp_payload(
         document,
@@ -249,6 +250,7 @@ def _normalize_jsonl(
     *,
     source: SourceIdentity,
     semantic_convention_version: str,
+    document_error: json.JSONDecodeError,
 ) -> TraceNormalizationResult:
     """Decode JSONL and admit only an unambiguous complete capture profile.
 
@@ -256,6 +258,7 @@ def _normalize_jsonl(
         text: UTF-8 JSONL source text.
         source: Immutable identity of the original source bytes.
         semantic_convention_version: Pinned GenAI convention used for normalization.
+        document_error: Original whole-document failure retained if no JSONL record decodes.
 
     Returns:
         Canonical traces plus every retained parse or validation exclusion.
@@ -283,8 +286,16 @@ def _normalize_jsonl(
             profile_payloads.append(json.loads(line, object_pairs_hook=reject_duplicate_json_keys))
         except DuplicateJsonKeyError:
             profile_eligible = False
-    if not payloads and not issues:
-        raise OtlpTraceFormatError("OTLP JSONL file contains no records")
+    if not payloads:
+        if not issues:
+            raise OtlpTraceFormatError("OTLP JSONL file contains no records")
+        issues = [
+            TraceNormalizationIssue(
+                "document",
+                f"invalid JSON document: {document_error.msg} at "
+                f"line {document_error.lineno} column {document_error.colno}",
+            )
+        ]
     if profile_eligible and not issues:
         canonical_payloads = canonicalize_environment_capture_payloads(profile_payloads)
         if canonical_payloads is not None:

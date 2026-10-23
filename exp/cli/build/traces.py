@@ -54,11 +54,20 @@ def load_build_traces(
             )
         staged = normalized_source(source, path.expanduser())
     with staged as normalized:
-        if normalized.summary().trace_count == 0:
-            raise ValueError(
+        summary = normalized.summary()
+        if summary.trace_count == 0:
+            message = (
                 "no valid canonical traces were produced; inspect the input and provide "
                 f"at least one valid {source} trace"
             )
+            if summary.issues:
+                label = "issue" if len(summary.issues) == 1 else "issues"
+                details = " | ".join(
+                    f"{issue.source_record[:240]}: {' '.join(issue.message.split())[:240]}"
+                    for issue in summary.issues[:3]
+                )
+                message += f"; {len(summary.issues)} normalization {label}: {details}"
+            raise ValueError(message)
         storage = (
             TemporaryDirectory(prefix="exp-build-preview-") if dry_run else nullcontext(str(root))
         )

@@ -1741,6 +1741,39 @@ def test_build_rejects_an_undeclared_trace_source(tmp_path: Path) -> None:
     assert "posthog" in unstyle(result.output)
 
 
+def test_build_reports_the_retained_malformed_document_issue(tmp_path: Path) -> None:
+    """A zero-trace build shows the bounded parser diagnostic needed to fix its input.
+
+    Args:
+        tmp_path: Temporary project root and malformed trace source.
+    """
+    export = tmp_path / "traces.json"
+    export.write_text('{\n  "resourceSpans": [\n', encoding="utf-8")
+    root = tmp_path / ".exp"
+    root.mkdir()
+    _catalog(root)
+
+    result = _RUNNER.invoke(
+        app,
+        [
+            "build",
+            "support",
+            "--traces",
+            str(export),
+            "--source",
+            "otlp",
+            "--root",
+            str(root),
+            "--dry-run",
+        ],
+    )
+
+    assert result.exit_code == 2
+    output = " ".join(unstyle(result.output).replace("│", " ").split())
+    assert "1 normalization issue" in output
+    assert "document: invalid JSON document: parse error: premature EOF" in output
+
+
 def test_build_pins_stored_import_after_original_source_is_removed(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

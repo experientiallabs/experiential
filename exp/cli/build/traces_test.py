@@ -1,5 +1,6 @@
 """Builds mine the exact saved import while source acquisition stays resumable and scoped."""
 
+import json
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -123,3 +124,50 @@ def test_empty_build_source_is_not_published(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="no valid canonical traces"):
         load_build_traces("powerset", root=root, path=source, source="chat-json")
     assert not root.exists()
+
+
+def test_empty_build_source_reports_only_three_issue_details(tmp_path: Path) -> None:
+    """The zero-trace error counts all exclusions but keeps its sample bounded.
+
+    Args:
+        tmp_path: Temporary source and build root.
+    """
+    source = tmp_path / "invalid.jsonl"
+    source.write_text("{}\n" * 4, encoding="utf-8")
+
+    with pytest.raises(ValueError) as raised:
+        load_build_traces(
+            "powerset",
+            root=tmp_path / "state",
+            path=source,
+            source="chat-json",
+        )
+
+    assert "4 normalization issues" in str(raised.value)
+    assert "record-1:" in str(raised.value)
+    assert "record-2:" in str(raised.value)
+    assert "record-3:" in str(raised.value)
+    assert "record-4:" not in str(raised.value)
+
+
+def test_empty_build_source_bounds_issue_record_labels(tmp_path: Path) -> None:
+    """An invalid source identity cannot create an unbounded terminal diagnostic.
+
+    Args:
+        tmp_path: Temporary source and build root.
+    """
+    trace_id = "x" * 1_000
+    source = tmp_path / "invalid.json"
+    source.write_text(json.dumps({"traceId": trace_id}), encoding="utf-8")
+
+    with pytest.raises(ValueError) as raised:
+        load_build_traces(
+            "powerset",
+            root=tmp_path / "state",
+            path=source,
+            source="otlp",
+        )
+
+    message = str(raised.value)
+    assert trace_id not in message
+    assert f"trace-{'x' * 234}:" in message
