@@ -267,9 +267,10 @@ class DecisionModelClassifier:
             return ClassifierVerdict(flagged=False)
         if self._unset_bearer:
             raise ClassifierProtocolError(_UNSET_BEARER)
-        reply = json.loads(
-            await asyncio.to_thread(self._native.classify, state, self._document.timeout_ms)
-        )
+        # The engine stops waiting at the check's timeout; bounding the native
+        # call by it too keeps no call running past the engine's inflight lease.
+        timeout_ms = min(self._document.timeout_ms, check.timeout_ms)
+        reply = json.loads(await asyncio.to_thread(self._native.classify, state, timeout_ms))
         if "error" in reply:
             _logger.info(
                 "guardrail classification adapter_id=%s check_id=%s cache=miss error=%s",

@@ -284,24 +284,43 @@ def test_contract_drift_is_a_classifier_protocol_error(
 def test_timeouts_and_missing_credentials_are_classifier_protocol_errors(
     systemone: _SystemOne, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A slow answer times out at the document's bound; an unset bearer never calls the model."""
-    systemone.answer(
-        delay=2.0, overrides_instructions=0.1, unrelated_task=0.1, unrelated_domain=0.1
-    )
+    """A slow answer times out at the nearer of the document's and the check's bound.
+
+    The engine stops waiting at the check's timeout, so the native call ends
+    there too rather than run on past the engine's inflight lease. An unset
+    bearer never calls the model.
+    """
+    for _ in range(2):
+        systemone.answer(
+            delay=2.0, overrides_instructions=0.1, unrelated_task=0.1, unrelated_domain=0.1
+        )
     monkeypatch.delenv("DECISION_MODEL_BEARER", raising=False)
     unset = _adapter(_document(url=systemone.url, bearer_env="DECISION_MODEL_BEARER"))
-    slow = _adapter(_document(url=systemone.url, timeout_ms=100))
+    by_document = _adapter(_document(url=systemone.url, timeout_ms=100))
+    by_check = _adapter(_document(url=systemone.url))
+    quick_check = _CHECK.model_copy(update={"timeout_ms": 100})
 
     started = time.monotonic()
     (missing,) = _inspect(unset, [_request()])
-    (timed_out,) = _inspect(slow, [_request()])
+    (document_timeout,) = _inspect(by_document, [_request()])
+    check_timeout = asyncio.run(_raises(by_check, quick_check))
 
     assert isinstance(missing, ClassifierProtocolError)
     assert "unset" in str(missing)
-    assert isinstance(timed_out, ClassifierProtocolError)
-    assert "timed out" in str(timed_out)
+    for result in (document_timeout, check_timeout):
+        assert isinstance(result, ClassifierProtocolError)
+        assert "timed out" in str(result)
     assert time.monotonic() - started < 1.5
-    assert [authorization for authorization, _ in systemone.seen] == [None]
+    assert [authorization for authorization, _ in systemone.seen] == [None, None]
+
+
+async def _raises(adapter: DecisionModelClassifier, check: GuardrailCheck) -> Exception:
+    """Return the error one inspection under ``check`` raises."""
+    try:
+        await adapter.inspect_input(request=_request(), check=check)
+    except ClassifierProtocolError as exc:
+        return exc
+    raise AssertionError("the inspection did not fail")
 
 
 def test_requests_without_text_are_allowed_without_a_model_call(systemone: _SystemOne) -> None:
