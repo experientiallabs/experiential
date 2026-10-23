@@ -6,6 +6,7 @@ import asyncio
 import time
 
 import pytest
+from google.auth.exceptions import RefreshError, TransportError
 
 from exp.common.core.artifacts import JsonObject
 from exp.common.models import (
@@ -19,14 +20,25 @@ from exp.common.models import (
     ModelRecord,
 )
 from exp.common.models.setup import ProviderConnection
-from exp.runtime.gateway.contracts import GatewayApiSurface, GatewayMessage, GatewayRequest
+from exp.runtime.gateway.contracts import (
+    GatewayApiSurface,
+    GatewayFailureClass,
+    GatewayMessage,
+    GatewayRequest,
+)
+from exp.runtime.models.credentials import ModelCredentialError
 from exp.runtime.models.providers.async_transport import (
     ProviderDeadlineExceeded,
     RequestDeadline,
 )
+from exp.runtime.models.providers.errors import normalized_provider_failure
 from exp.runtime.models.providers.openai_compatible_test import _request, _snapshot
 from exp.runtime.models.providers.streaming_requests import dialect_stream_payload
-from exp.runtime.models.providers.transport import JsonHttpResponse, ScriptedJsonTransport
+from exp.runtime.models.providers.transport import (
+    JsonHttpResponse,
+    ProviderTransportError,
+    ScriptedJsonTransport,
+)
 from exp.runtime.models.providers.vertex import (
     ServiceAccountTokenProvider,
     VertexClient,
@@ -82,6 +94,22 @@ class _FakeCredentials:
         self.refresh_calls += 1
         self.token = self._tokens.pop(0)
         self.valid = True
+
+
+class _FailingCredentials:
+    """Deterministic credential that raises one fixed token-refresh failure."""
+
+    valid = False
+    token = None
+
+    def __init__(self, failure: Exception) -> None:
+        """Store the failure raised by refresh."""
+        self.failure = failure
+
+    def refresh(self, request: object) -> None:
+        """Raise the configured failure without contacting Google."""
+        del request
+        raise self.failure
 
 
 def test_vertex_routes_publisher_models_with_a_bearer_token() -> None:
@@ -331,6 +359,49 @@ def test_service_account_provider_rejects_an_empty_minted_token() -> None:
 
     with pytest.raises(VertexCredentialError, match="no access token"):
         provider()
+
+
+def test_service_account_provider_maps_a_refused_refresh_to_authentication() -> None:
+    """A refused OAuth mint becomes a sanitized provider-authentication failure."""
+    provider = ServiceAccountTokenProvider(
+        "{}",
+        credentials=_FailingCredentials(RefreshError("invalid_grant sensitive detail")),
+    )
+
+    with pytest.raises(VertexCredentialError, match="service-account credential") as captured:
+        provider()
+
+    assert isinstance(captured.value, ModelCredentialError)
+    assert "sensitive detail" not in str(captured.value)
+    failure = normalized_provider_failure(captured.value)
+    assert failure.failure_class is GatewayFailureClass.PROVIDER_AUTHENTICATION
+    assert failure.failover_eligible
+
+
+@pytest.mark.parametrize(
+    "refresh_failure",
+    [
+        TransportError("transport sensitive detail"),
+        RefreshError("temporary sensitive detail", retryable=True),
+    ],
+)
+def test_service_account_provider_maps_temporary_refresh_failures_to_transport(
+    refresh_failure: Exception,
+) -> None:
+    """Network and retryable OAuth failures become sanitized transport failures."""
+    provider = ServiceAccountTokenProvider(
+        "{}",
+        credentials=_FailingCredentials(refresh_failure),
+    )
+
+    with pytest.raises(ProviderTransportError, match="token endpoint request failed") as captured:
+        provider()
+
+    assert "sensitive detail" not in str(captured.value)
+    failure = normalized_provider_failure(captured.value)
+    assert failure.failure_class is GatewayFailureClass.TRANSPORT
+    assert failure.retryable_same_deployment
+    assert failure.failover_eligible
 
 
 def test_service_account_provider_rejects_non_json_credentials() -> None:

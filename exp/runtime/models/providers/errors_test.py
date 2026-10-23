@@ -7,6 +7,7 @@ import asyncio
 import pytest
 
 from exp.runtime.gateway.contracts import GatewayFailureClass
+from exp.runtime.models.credentials import ModelCredentialError
 from exp.runtime.models.providers.async_transport import ProviderDeadlineExceeded
 from exp.runtime.models.providers.errors import (
     ProviderCapabilityError,
@@ -152,6 +153,16 @@ def test_parameter_failure_preserves_only_public_code_and_path() -> None:
 
     assert failure.failure_class is GatewayFailureClass.INVALID_REQUEST
     assert failure.safe_details == {"code": "invalid_parameter", "param": "temperature"}
+
+
+def test_model_credential_failure_is_provider_authentication() -> None:
+    """Credential resolution failures use the provider-authentication recovery policy."""
+    failure = normalized_provider_failure(ModelCredentialError("raw credential canary"))
+
+    assert failure.failure_class is GatewayFailureClass.PROVIDER_AUTHENTICATION
+    assert failure.retryable_same_deployment is False
+    assert failure.failover_eligible is True
+    assert "canary" not in failure.model_dump_json()
 
 
 @pytest.mark.parametrize(

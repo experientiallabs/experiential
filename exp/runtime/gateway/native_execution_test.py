@@ -149,6 +149,7 @@ def test_admission_dead_failure_mirrors_runtime_circuit_classes() -> None:
     from exp.runtime.models import ModelConnectionError
     from exp.runtime.models.credentials import MissingModelCredentialError, ModelCredentialError
     from exp.runtime.models.providers.errors import ProviderCapabilityError
+    from exp.runtime.models.providers.transport import ProviderTransportError
 
     # A missing credential opens the circuit at once, like a runtime 401.
     for credential_error in (
@@ -167,6 +168,12 @@ def test_admission_dead_failure_mirrors_runtime_circuit_classes() -> None:
         _admission_dead_failure(ProviderCapabilityError(capability="reasoning")).failure_class
         == GatewayFailureClass.TRANSPORT
     )
+    transport_failure = _admission_dead_failure(
+        ProviderTransportError("Vertex token endpoint request failed")
+    )
+    assert transport_failure.failure_class == GatewayFailureClass.TRANSPORT
+    assert transport_failure.retryable_same_deployment is True
+    assert transport_failure.failover_eligible is True
 
 
 def test_claim_ladder_prefers_healthy_then_probe_then_forced() -> None:

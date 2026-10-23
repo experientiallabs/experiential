@@ -12,6 +12,7 @@ from exp.common.models.pricing import (
     ProviderPricingUnavailableError as ProviderPricingUnavailableError,
 )
 from exp.runtime.gateway.contracts import GatewayFailure, GatewayFailureClass
+from exp.runtime.models.credentials import ModelCredentialError
 from exp.runtime.models.providers.async_transport import ProviderDeadlineExceeded
 from exp.runtime.models.providers.transport import ProviderTransportError
 
@@ -171,6 +172,15 @@ def normalized_provider_failure(exception: BaseException) -> GatewayFailure:
             safe_message=(
                 "provider request deadline exceeded; retry with a shorter prompt "
                 "or a smaller max_tokens value"
+            ),
+            failover_eligible=True,
+        )
+    if isinstance(exception, ModelCredentialError):
+        return GatewayFailure(
+            failure_class=GatewayFailureClass.PROVIDER_AUTHENTICATION,
+            safe_message=(
+                "provider authentication failed; ask the gateway operator to verify "
+                "the provider connection credential"
             ),
             failover_eligible=True,
         )
