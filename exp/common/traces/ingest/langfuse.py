@@ -77,6 +77,7 @@ def _record_observations(record: JsonObject, ordinal: int) -> tuple[VendorObserv
         source_trace_id=source_trace_id,
         ordinal=ordinal,
         request_text=first_user_text(json_value(record.get("input"))),
+        use_input_request=False,
         extensions={},
         trace_provider=None,
     )
@@ -112,6 +113,7 @@ def _trace_observations(trace: JsonObject, ordinal: int) -> tuple[VendorObservat
             source_trace_id=source_trace_id,
             ordinal=ordinal + len(emitted),
             request_text=request_text if not emitted else None,
+            use_input_request=request_text is None,
             extensions=extensions,
             trace_provider=trace_provider,
         )
@@ -179,6 +181,7 @@ def _observation(
     source_trace_id: str,
     ordinal: int,
     request_text: str | None,
+    use_input_request: bool,
     extensions: JsonObject,
     trace_provider: str | None,
 ) -> VendorObservation | None:
@@ -189,6 +192,7 @@ def _observation(
         source_trace_id: Langfuse trace identity.
         ordinal: Source order position for the emitted observation.
         request_text: Trace request text, supplied only for the first emitted observation.
+        use_input_request: Whether a model observation may supply request text from its input.
         extensions: Approved EXP extension attributes for the trace.
         trace_provider: Provider declared at trace level, when any.
 
@@ -226,9 +230,11 @@ def _observation(
             failure_message=failure,
             extensions=extensions,
         )
+    input_messages = json_value(raw.get("input"))
     output = json_value(raw.get("output"))
     tool_calls = declared_tool_calls(output)
     model, declared_model = _model_identity(raw, trace_provider)
+    input_request = first_user_text(input_messages) if use_input_request else None
     return VendorObservation(
         source_trace_id=source_trace_id,
         source_span_id=source_span_id,
@@ -237,8 +243,8 @@ def _observation(
         ended_at=ended_at,
         kind="model",
         source_parent_span_id=parent,
-        request_text=request_text,
-        input_messages=json_value(raw.get("input")),
+        request_text=request_text or input_request,
+        input_messages=input_messages,
         completion_text=declared_completion_text(output) or None,
         tool_calls=tool_calls,
         model=model,
