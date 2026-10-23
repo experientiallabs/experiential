@@ -394,6 +394,7 @@ uv run pytest -q
     | Saved-result identity | `exp/common/core/artifacts.py` | `stable_id` over content; never over paths or source files |
     | Local identifiers in paths | `exp/common/project/paths.py` | `validate_local_id` |
     | Atomic file writes | `exp/common/core/files.py` | `write_text_atomic` |
+    | Reusable SQLite connections and lock contention | `exp/common/sqlite/connection.py`, `exp/common/project/database.py` | `persistent_connection` keeps one connection per thread, path and configuration, forgets inherited handles after fork and reopens a replaced file; project state goes through `project_connection`, which validates once per connection and schema change and retries only uncommitted lock refusals with bounded jittered backoff before `ProjectDatabaseBusyError` |
 | Local process containment | `exp/runtime/environments/containment/host.py` | `host_containment` selects the host backend; its `ContainmentReport` (`exp/common/rollouts/containment.py`) is enforced per session or refused, and sandbox bindings record its `ContainmentLevel` |
     | Model choice | `exp/common/models/catalog_roles.py` | Catalog roles, not new flags |
     | Providers admitted for physical-attempt evidence | `exp/runtime/models/providers/admitted_transport.py` | `require_admitted_transport` before credentials; `ADMITTED_TRANSPORT_PROVIDERS`, never a hand-typed provider set |
