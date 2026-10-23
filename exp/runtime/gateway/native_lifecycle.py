@@ -23,6 +23,11 @@ class NativeAccountingLifecycle:
     _sweep_stop: threading.Event
     _sweeper: threading.Thread
 
+    @property
+    def running(self) -> bool:
+        """Report worker liveness separately from the durable write-health contract."""
+        return not self._sweep_stop.is_set() and self._sweeper.is_alive()
+
     def close(self, *, timeout_seconds: float = 30.0) -> None:
         """Interrupt idle sweeping and wait only for the bounded caller-owned drain budget."""
         if timeout_seconds < 0:

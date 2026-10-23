@@ -195,11 +195,7 @@ class NativeAttemptAccounting(NativeAccountingLifecycle):
     @property
     def accounting_healthy(self) -> bool:
         """Return whether every durable terminal write has landed."""
-        return (
-            not self._sweep_stop.is_set()
-            and self._accounting_healthy
-            and not self.request_settlements.pending
-        )
+        return self._accounting_healthy and not self.request_settlements.pending
 
     @property
     def health(self) -> DeploymentHealthRegistry:

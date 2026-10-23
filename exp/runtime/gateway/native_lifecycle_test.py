@@ -167,10 +167,15 @@ def test_closing_one_control_preserves_borrowed_components_and_guardrails(
         first.close(timeout_seconds=2)
         assert components.accounting_healthy
         assert first.readiness("{}") == "false"
+        assert not first._accounting.running
+        assert first._accounting.accounting_healthy
+        assert second._accounting.running
         assert second.readiness("{}") == "true"
         assert "coding" in second.models(json.dumps({"raw_key": key}))
         second.close(timeout_seconds=2)
         assert second.readiness("{}") == "false"
+        assert not second._accounting.running
+        assert second._accounting.accounting_healthy
         assert components.accounting_healthy
     finally:
         monkeypatch.setattr(guardrails, "close", owner_close)
