@@ -4,7 +4,8 @@ A ``Tagger`` renders an exchange into its conversation opening window and its tu
 sends one decision request per window with that scope's tags as ``noul`` questions, and returns
 every probability in bank scope order as ``ExchangeTags``. A window whose decision fails fails
 the whole exchange with a ``TaggingError``; no score is ever filled in. ``tag_many`` streams a
-batch with a bounded number of decisions in flight and asks each conversation opening once.
+batch with a bounded number of decisions in flight, asks each conversation opening once, and
+turns any failure confined to one exchange into that exchange's ``TaggingError``.
 """
 
 from __future__ import annotations
@@ -30,30 +31,34 @@ _MAX_MODEL_CHARS = 256
 
 
 class TaggingError(Exception):
-    """One exchange was not tagged because the decision for one of its windows failed.
+    """One exchange was not tagged: a window decision failed, or preparing or tagging it raised.
 
     Attributes:
         exchange_id: The exchange that was not tagged.
-        scope: Scope of the failed window.
-        window_index: Index of the failed window within its scope.
-        cause: The typed decision failure, also chained as ``__cause__``.
+        scope: Scope of the failed window, or None when no window decision failed.
+        window_index: Index of the failed window within its scope, or None likewise.
+        cause: The failure, also chained as ``__cause__``.
     """
 
-    def __init__(self, exchange_id: str, window: TagWindow, cause: SystemOneError) -> None:
-        """Describe the failed window and keep its cause.
+    def __init__(self, exchange_id: str, window: TagWindow | None, cause: Exception) -> None:
+        """Describe the failure and keep its cause.
 
         Args:
             exchange_id: The exchange that was not tagged.
-            window: The window whose decision failed.
-            cause: The decision failure.
+            window: The window whose decision failed, or None for a failure outside one
+                window's decision, such as a window that could not be built.
+            cause: The failure.
         """
-        super().__init__(
-            f"exchange {exchange_id} was not tagged: the decision for its {window.scope.value} "
-            f"window {window.index} failed ({cause})"
+        where = (
+            f"the decision for its {window.scope.value} window {window.index} failed"
+            if window is not None
+            else f"{type(cause).__name__} while preparing or tagging it"
         )
+        super().__init__(f"exchange {exchange_id} was not tagged: {where} ({cause})")
+        self.__cause__ = cause
         self.exchange_id = exchange_id
-        self.scope = window.scope
-        self.window_index = window.index
+        self.scope = None if window is None else window.scope
+        self.window_index = None if window is None else window.index
         self.cause = cause
 
 
@@ -294,16 +299,19 @@ class Tagger:
                 from an earlier run.
 
         Yields:
-            ``ExchangeTags`` for each tagged exchange and ``TaggingError`` for each exchange a
-            failed decision stopped, in completion order.
+            ``ExchangeTags`` for each tagged exchange and ``TaggingError`` for each exchange that
+            was not tagged, in completion order. Any ``Exception`` raised while preparing or
+            tagging one exchange (its opening key, its windows, a decision) fails only that
+            exchange, so one unexpected input never stops the batch.
 
         Raises:
-            Exception: Any failure other than a decision error, such as reading the exchanges.
+            Exception: A failure outside any one exchange, such as reading the exchanges.
+                ``KeyboardInterrupt``, ``SystemExit`` and cancellation always propagate.
         """
         tagged = set(opening_tagged_keys)
         # Keys whose opening is being asked, with the exchanges held until it finishes.
         held: dict[str, list[TagExchange]] = {}
-        pending: dict[asyncio.Task[ExchangeTags], str | None] = {}
+        pending: dict[asyncio.Task[ExchangeTags], tuple[str, str | None]] = {}
         source = iter(exchanges)
 
         def start(exchange: TagExchange, key: str) -> None:
@@ -316,7 +324,7 @@ class Tagger:
                 tagged.add(key)
                 held[key] = []
             task = asyncio.create_task(self.tag(exchange, opening_already_tagged=not claimed))
-            pending[task] = key if claimed else None
+            pending[task] = (exchange.exchange_id, key if claimed else None)
 
         try:
             while True:
@@ -324,15 +332,22 @@ class Tagger:
                     exchange = next(source, None)
                     if exchange is None:
                         break
-                    start(exchange, conversation_key(exchange))
+                    try:
+                        key = conversation_key(exchange)
+                    except Exception as error:  # noqa: BLE001 - fails only this exchange
+                        yield TaggingError(exchange.exchange_id, None, error)
+                        continue
+                    start(exchange, key)
                 if not pending:
                     return
                 done, _ = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
                 for task in [task for task in pending if task in done]:
-                    claimed_key = pending.pop(task)
+                    exchange_id, claimed_key = pending.pop(task)
                     error = task.exception()
                     if error is not None and not isinstance(error, TaggingError):
-                        raise error
+                        if not isinstance(error, Exception):
+                            raise error
+                        error = TaggingError(exchange_id, None, error)
                     if claimed_key is not None:
                         if error is not None:
                             tagged.discard(claimed_key)

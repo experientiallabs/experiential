@@ -10,7 +10,7 @@ import httpx
 import pytest
 
 from exp.common.tags.bank import DEFAULT_TAG_BANK, TagBank
-from exp.common.tags.exchange import TagExchange, TagMessage
+from exp.common.tags.exchange import TagExchange, TagFunction, TagMessage, TagToolCall
 from exp.common.tags.records import ExchangeTags
 from exp.runtime.models.providers.systemone import SystemOneClient
 from exp.runtime.tagging.jsonl import TagFailure, TagJsonlReport, tag_jsonl
@@ -84,6 +84,25 @@ def test_tag_jsonl_writes_results_and_failures_then_resumes(tmp_path: Path) -> N
     assert records[1].conversation is None
     assert len(requests) == 1
     assert len((tmp_path / "failures.jsonl").read_text().splitlines()) == 1
+
+
+def test_an_exchange_that_cannot_be_tagged_fails_alone(tmp_path: Path) -> None:
+    """An exchange whose windows cannot be built is one recorded failure; the rest are tagged."""
+    call = TagToolCall(id="c", function=TagFunction(name="write", arguments="[" * 50_000))
+    poisoned = TagExchange(
+        exchange_id="deep",
+        conversation_key="k2",
+        messages=(TagMessage(role="user", content="Go"),),
+        response=(TagMessage(role="assistant", tool_calls=(call,)),),
+    )
+    lines = [_exchange("e1", "a"), poisoned.model_dump_json() + "\n", _exchange("e2", "b")]
+    (tmp_path / "exchanges.jsonl").write_text("".join(lines))
+    assert _run(_tagger(set(), []), tmp_path) == TagJsonlReport(tagged=2, failed=1, skipped=0)
+    assert [record.exchange_id for record in _records(tmp_path / "tags.jsonl")] == ["e1", "e2"]
+    (line,) = (tmp_path / "failures.jsonl").read_text().splitlines()
+    failure = TagFailure.model_validate_json(line)
+    assert (failure.exchange_id, failure.scope, failure.window_index) == ("deep", None, None)
+    assert failure.error == "RecursionError"
 
 
 def test_an_interrupted_last_line_is_dropped_and_tagged_again(tmp_path: Path) -> None:

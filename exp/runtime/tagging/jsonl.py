@@ -30,19 +30,19 @@ logger = logging.getLogger(__name__)
 
 
 class TagFailure(ContractModel):
-    """One exchange a failed decision stopped, as written to the failures file.
+    """One exchange that was not tagged, as written to the failures file.
 
     Attributes:
         exchange_id: The exchange that was not tagged.
-        scope: Scope of the failed window.
-        window_index: Index of the failed window within its scope.
-        error: Class name of the decision error.
+        scope: Scope of the failed window, or None when no window decision failed.
+        window_index: Index of the failed window within its scope, or None likewise.
+        error: Class name of the failure.
         message: What went wrong and what to do about it.
     """
 
     exchange_id: str = Field(min_length=1, max_length=512)
-    scope: TagScope
-    window_index: int = Field(ge=0)
+    scope: TagScope | None
+    window_index: int | None = Field(ge=0)
     error: str
     message: str
 
