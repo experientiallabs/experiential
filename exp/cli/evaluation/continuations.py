@@ -15,6 +15,7 @@ from rich.console import Console
 from rich.markup import escape
 from rich.text import Text
 
+from exp.cli.evaluation.agent_memory import handle_learn_agent_memory
 from exp.cli.evaluation.analysis import (
     handle_analyse_failures,
     handle_analyse_memory,
@@ -135,6 +136,7 @@ from exp.optimize.evaluation.hillclimb.proposals import EditProposalSpec
 from exp.optimize.evaluation.hillclimb.report import ClimbReportSpec
 from exp.optimize.evaluation.hillclimb.rounds import ClimbRound
 from exp.optimize.evaluation.induction.service import InductionSpec, TransitionValidationSpec
+from exp.optimize.evaluation.learning.agent_memory_contracts import AgentMemorySpec
 from exp.optimize.evaluation.learning.forgetting import SummaryForget
 from exp.optimize.evaluation.learning.lessons import LearningRepair
 from exp.optimize.evaluation.learning.sample_count import SampleCountRequest
@@ -186,6 +188,7 @@ CONTINUATION_ACTIONS = (
         "register-rubric-trajectory", "rubric_trajectory", handle_register_rubric_trajectory
     ),
     ContinuationAction("repair-learning", "learning_repair", handle_repair_learning),
+    ContinuationAction("learn-agent-memory", "agent_memory", handle_learn_agent_memory),
     ContinuationAction("sample-count", "sample_count", handle_sample_count),
     ContinuationAction("admit-actor-prefix", "prefix", handle_admit_actor_prefix),
     ContinuationAction("check-failure-research", "research", handle_check_failure_research),
@@ -290,6 +293,7 @@ class ContinuationCommand(ContractModel):
         checkpoint_proposals: Retrospective point selector producing an existing matched plan.
         campaign: Registered source attempts, selectors, prospective critics and continuations.
         learning_repair: Failed-learning settlement, lesson screening or library evolution.
+        agent_memory: Outcome-labelled trace export to learn agent memory from, and its folder.
         sample_count: Trajectory-count registration, development selection or confirmation.
         rubric_derivation: Admitted development trajectories and the bounded rubric proposer.
         rubric_review: Explicit acceptance of one saved provisional rubric draft.
@@ -352,6 +356,7 @@ class ContinuationCommand(ContractModel):
     checkpoint_proposals: CheckpointProposalSpec | None = None
     campaign: ContinuationCampaignSpec | None = None
     learning_repair: LearningRepair | None = None
+    agent_memory: AgentMemorySpec | None = None
     sample_count: SampleCountRequest | None = None
     rubric_derivation: RubricDerivationSpec | None = None
     rubric_review: RubricReview | None = None
