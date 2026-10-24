@@ -518,8 +518,17 @@ def test_idle_worker_cannot_retain_a_released_observation_subject(failed: bool) 
         )
         del subject
         assert owner._idle.wait(2)
+        # Admission can be released before the worker's completion callback unwinds.
+        # Let that callback drop its traceback references while keeping the worker alive.
+        for worker in inspects._pool._workers:
+            settled = threading.Event()
+            loop = worker._loop
+            assert loop is not None
+            loop.call_soon_threadsafe(settled.set)
+            assert settled.wait(2)
         gc.collect()
         assert retained() is None
         assert owner._bytes == 0
     finally:
         owner.close(timeout_seconds=2)
+        inspects.close(timeout_seconds=2)

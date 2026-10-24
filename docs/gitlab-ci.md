@@ -1,12 +1,20 @@
 # GitLab CI
 
-The repository lives at `gitlab.com/experiential-labs-group/experiential`.
-`.gitlab-ci.yml` holds only the pipeline-wide settings and includes every file
+The primary development repository is `github.com/experientiallabs/experiential`.
+GitHub Actions runs the gate and gateway-latency workflows on pull requests and
+pushes to `main`. The gate uses Ubuntu runners for lint, types, Rust checks and
+five non-live Python test shards, plus Windows snapshot-authority tests and a
+path-scoped macOS Capture and W16 evidence job. Gateway latency uses an Ubuntu
+runner against a local mock; the larger benchmark runner requires a manual run.
+The macOS Capture job excludes the native `/usr/bin/security` verifier and the
+test that probes default Keychain paths, while retaining other certificate tests.
+
+`gitlab.com/experiential-labs-group/experiential` remains available for publishing
+and manual validation. `.gitlab-ci.yml` holds only the pipeline-wide settings and includes every file
 in `.gitlab/ci/`. Each file there owns one pipeline area and is named after it;
 the areas are `python-package` and `gate`. `.gitlab/ci/_templates.yml` holds the
-shared hidden keys: pinned tool versions and install snippets. The gate and
-gateway-latency workflows under `.github/workflows/` have no runner; the `gate`
-area runs the former's Linux jobs on demand.
+shared hidden keys: pinned tool versions and install snippets. The GitLab `gate`
+area runs the Linux gate jobs on demand. Package publishing remains on GitLab.
 
 ## Pipelines and triggers
 
@@ -38,7 +46,7 @@ known-red tests are deselected by node id in the `rest` shard, each with a
 comment naming why; every other test is strict. Run it on a branch before
 handing off a change that has no other test pipeline.
 
-Merge requests and pushes to `main` run nothing. Every job uses a GitLab-hosted
+GitLab merge requests and pushes to `main` run no jobs. Every GitLab job uses a hosted
 runner, which bills the group's compute minutes, and macOS minutes cost six
 times the small Linux rate.
 

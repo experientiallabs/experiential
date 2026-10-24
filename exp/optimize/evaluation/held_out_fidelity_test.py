@@ -14,6 +14,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
+from click import unstyle
 from typer.testing import CliRunner
 
 from exp.cli.app import app
@@ -754,24 +755,28 @@ class Outage(SimulatedProvider):
         return super().post(url, headers=headers, payload=payload, timeout_seconds=timeout_seconds)
 
 
+@pytest.mark.parametrize("color", [False, True])
 def test_a_provider_outage_stops_visibly_and_never_becomes_a_score(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, color: bool
 ) -> None:
     """A rejected key stops the command non-zero; no score is saved; a retry measures for real."""
+    monkeypatch.setenv("TERM", "xterm-256color")
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    monkeypatch.setattr("typer.rich_utils.FORCE_TERMINAL", color)
     provider = Outage([episode(i) for i in range(USERS)], learnable=True)
     root, store, _ = build_project(tmp_path, monkeypatch, provider)
     provider.down = True
     command = ["eval", PROJECT, "--root", str(root), "--audit", "3", "--yes", "--non-interactive"]
-    failed = CliRunner().invoke(app, command)
-    output = " ".join(failed.output.split())
+    failed = CliRunner().invoke(app, command, color=color)
+    output = " ".join(unstyle(failed.output).split())
     assert failed.exit_code == 1, failed.output
     assert "a provider request failed" in output and "--retry-incomplete" in output
     assert "Held-out fidelity" not in output and "learned" not in output
     assert learning_curve(store, "fit") is None, "a failed prediction is never a measurement"
 
     provider.down = False
-    stopped = CliRunner().invoke(app, command)
+    stopped = CliRunner().invoke(app, command, color=color)
     assert stopped.exit_code != 0, "an interrupted trace is never bought again silently"
-    assert "--retry-incomplete" in " ".join(stopped.output.split())
+    assert "--retry-incomplete" in " ".join(unstyle(stopped.output).split())
     output = held_out_command(root, 3, "--retry-incomplete")
     assert "9/9 replies exact (100%)" in output

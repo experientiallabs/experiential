@@ -596,7 +596,7 @@ class VertexAnthropicClient(ProviderHttpClient):
 
     Claude on Vertex AI speaks the SAME Anthropic Messages payloads as direct Anthropic, so
     the shared :func:`anthropic_messages_request` builder and :func:`anthropic_messages_response`
-    parser carry the wire — translated once, never forked. Vertex differs only at the envelope:
+    parser carry the wire, translated once and never forked. Vertex differs only at the envelope:
     the endpoint is ``publishers/anthropic/models/<model>:streamRawPredict`` on the
     project-and-location root, auth is the connection's OAuth bearer (not ``x-api-key``), the
     ``anthropic_version`` rides in the BODY as ``vertex-2023-10-16`` rather than a header, and

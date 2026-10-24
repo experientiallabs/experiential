@@ -245,7 +245,12 @@ _VERTEX_URL = (
 
 @pytest.mark.parametrize(
     "url",
-    [_VERTEX_URL, _VERTEX_URL.replace("aiplatform.", "us-central1-aiplatform.")],
+    [
+        _VERTEX_URL,
+        _VERTEX_URL.replace("aiplatform.", "us-central1-aiplatform."),
+        _VERTEX_URL.replace("aiplatform.", "aiplatform.us.rep."),
+        _VERTEX_URL.replace("aiplatform.", "aiplatform.eu.rep."),
+    ],
 )
 def test_vertex_glm_turns_thinking_off_through_the_chat_template(url: str) -> None:
     """Vertex MaaS GLM serves effort none as enable_thinking false, never reasoning_effort.
@@ -274,6 +279,9 @@ def test_vertex_glm_turns_thinking_off_through_the_chat_template(url: str) -> No
         ("https://aiplatform.googleapis.com@evil.example/v1", "zai-org/glm-5-maas"),
         ("https://evil.example/aiplatform.googleapis.com", "zai-org/glm-5-maas"),
         ("https://evil.example/?host=aiplatform.googleapis.com", "zai-org/glm-5-maas"),
+        ("https://aiplatform.us.rep.googleapis.com.evil.example/v1", "zai-org/glm-5-maas"),
+        ("https://evilaiplatform.us.rep.googleapis.com/v1", "zai-org/glm-5-maas"),
+        ("https://us-central1-aiplatform.us.rep.googleapis.com/v1", "zai-org/glm-5-maas"),
     ],
 )
 def test_reasoning_off_template_rule_is_scoped_to_vertex_glm(url: str, model_id: str) -> None:

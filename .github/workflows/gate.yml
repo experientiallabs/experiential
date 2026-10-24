@@ -352,11 +352,12 @@ jobs:
       - name: Install the project and its dev extras
         run: uv sync --extra dev
       - name: Capture selective TLS streaming and local redirector lifecycle
-        # Certificate tests run in the Linux shard. Their native macOS verifier
-        # invokes /usr/bin/security, which agent-run checks must not execute.
+        # Keep certificate coverage except native security execution and real
+        # Keychain path probes, which agent-run checks must not perform.
         run: >-
           uv run pytest -q exp/runtime/capture exp/cli/capture
-          --ignore=exp/runtime/capture/certificates_test.py
+          --deselect=exp/runtime/capture/certificates_test.py::test_unsafe_default_keychain_never_installs_trust
+          -k 'not (test_real_tls_chains_enforce_exact_dns_and_deny_ip_scope and macos)'
       - name: W16 router and bounded local-process evidence
         env:
           EXP_RELEASE_REVISION: ${{ github.sha }}

@@ -315,15 +315,20 @@ def reasoning_off_via_chat_template(profile: GatewayWireProfile) -> bool:
     'reasoning_effort' to be one of: 'high', 'low', 'max', 'medium',
     'minimal'") and ignores ``thinking: {type: disabled}``, but
     ``chat_template_kwargs: {enable_thinking: false}`` answers with no
-    reasoning at all (zai-org/glm-5-maas, probed 2026-10-18). Scoped to that
+    reasoning at all. Scoped to that
     host and publisher so no other Vertex model changes its wire.
     """
     host = (urlsplit(profile.url).hostname or "").lower()
     service, _, domain = host.partition(".")
     return (
         profile.dialect == "openai_compatible"
-        and domain == "googleapis.com"
-        and (service == "aiplatform" or service.endswith("-aiplatform"))
+        and (
+            (
+                domain == "googleapis.com"
+                and (service == "aiplatform" or service.endswith("-aiplatform"))
+            )
+            or host in {"aiplatform.us.rep.googleapis.com", "aiplatform.eu.rep.googleapis.com"}
+        )
         and profile.model_id.lower().startswith("zai-org/glm")
     )
 
@@ -353,8 +358,7 @@ def reasoning_via_zai_thinking(profile: GatewayWireProfile) -> bool:
     default. Huawei Cloud MaaS serves GLM-5.1 with the same contract: its chat
     completions reference (support.huaweicloud.com model-call-019 / -022, read
     2026-10-19) lists ``thinking.type`` enabled | disabled for GLM-5.1, default
-    enabled, and names GLM-5.1 in no ``reasoning_effort`` row. Before this the
-    Huawei rung declared no effort ladder, so reasoning off was refused there.
+    enabled, and names GLM-5.1 in no ``reasoning_effort`` row.
     Scoped to the Z.ai and Huawei MaaS hosts and those two models so no other
     origin or model changes its wire.
     """
@@ -438,7 +442,7 @@ def _is_anthropic_files_block(block: object) -> bool:
 
     A Files reference is a ``file`` block or an image/document block whose own
     ``source`` is ``{"type": "file", ...}`` (a ``file_id`` handle). This inspects
-    ONLY the block's own type and source — NEVER a ``tool_use`` block's ``input``,
+    ONLY the block's own type and source, NEVER a ``tool_use`` block's ``input``,
     a ``tool_result`` block's ``content``, or a tool schema, which carry ARBITRARY
     caller JSON that may legitimately contain keys like ``file_id`` or
     ``{"type": "file"}`` and must not be mistaken for a Files handle.

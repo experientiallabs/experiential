@@ -3,13 +3,9 @@
 A numeric budget (``thinking.budget_tokens`` on Messages, ``thinking_budget``
 on Chat) is preserved verbatim only on qualified Anthropic, Gemini 2.5 and
 Qwen Cloud wires (:mod:`exp.runtime.models.providers.thinking_budget`). A route
-that reasons through an effort ladder instead used to refuse the budget by
-name, which ended every session of a client that pins one
-(qwen3.8-flash-next-uncensored on Experiential Cloud, 27 refusals across two
-organizations in two hours, production 2026-10-19). The budget now names the
-depth it asks for, that depth snaps to the nearest tier the route serves, and
-the substitution is disclosed. A route with no reasoning tier at all keeps the
-refusal.
+that reasons through an effort ladder maps the budget's requested depth to
+the nearest tier the route serves and discloses the substitution. A route
+with no reasoning tier refuses the budget.
 """
 
 from __future__ import annotations

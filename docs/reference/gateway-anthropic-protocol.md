@@ -75,8 +75,8 @@ folded total the ledger bills: an Anthropic rung's own `cache_read_input_tokens`
 (Chat) or `input_tokens_details.cached_tokens` (Responses), Gemini's `cachedContentTokenCount`,
 Bedrock's `cacheReadInputTokens`; Anthropic and Bedrock report cache writes. Other rungs
 carry `cache_creation_input_tokens: 0`. The start frame carries what the upstream already
-reported before content — an Anthropic upstream's own start-frame input and cache meters,
-mirrored — and otherwise the control plane's pre-dispatch count of the prompt (the reservation
+reported before content, mirroring an Anthropic upstream's own start-frame input and cache meters,
+and otherwise the control plane's pre-dispatch count of the prompt (the reservation
 estimator without its headroom, carried on the admission as `input_token_estimate`, the same
 count `count_tokens` answers) in Anthropic's documented start shape,
 `{"input_tokens": N, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0, "output_tokens": 1}`
