@@ -21,7 +21,7 @@ from exp.common.models.catalog import (
     write_model_catalog,
 )
 from exp.common.models.discovery import DiscoveredModel, resolve_discovered_model
-from exp.common.models.model import BillingSource
+from exp.common.models.model import BillingSource, ModelCapabilities
 from exp.common.models.unknown_outcome import DispatchOutcomeUnknown
 from exp.common.project import ProjectStore
 from exp.optimize.evaluation.learning import agent_memory
@@ -45,16 +45,42 @@ from exp.runtime.models.structured_completion import ReturnedOutputRejected
 NOW = datetime(2026, 10, 24, 12, tzinfo=UTC)
 
 
+# The OSS route the project runs: an OpenAI-compatible gateway with the catalog's own prices.
+GATEWAY = ConnectionConfig(
+    provider="openai-compatible",
+    base_url="https://api.experientiallabs.ai/v1",
+    api_key_env="EXPERIENTIAL_API_KEY",
+)
+GATEWAY_MODEL = ModelCapabilities(
+    supports_tools=True,
+    supports_structured_output=True,
+    supports_completions=True,
+    context_window_tokens=1_048_576,
+    maximum_output_tokens=131_072,
+    input_cost_per_million_tokens_usd=1.4,
+    output_cost_per_million_tokens_usd=4.4,
+)
+
+
 def project_root(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     *,
     priced: bool = True,
-    model: str = "claude-sonnet-5",
+    model: str = "glm-5.3",
 ) -> Path:
-    """An EXP root whose catalog holds one Anthropic alias resolved by model discovery."""
-    discovered = DiscoveredModel(provider="anthropic", model=model)
-    capabilities = resolve_discovered_model(discovered).capabilities
+    """An EXP root whose catalog holds one learning alias, ``learner``.
+
+    ``glm-5.3`` is served by the OpenAI-compatible gateway with declared prices; an Anthropic
+    model is resolved by model discovery from EXP's maintained metadata.
+    """
+    if model.startswith("claude-"):
+        connection = ConnectionConfig(provider="anthropic", api_key_env="ANTHROPIC_API_KEY")
+        capabilities = resolve_discovered_model(
+            DiscoveredModel(provider="anthropic", model=model)
+        ).capabilities
+    else:
+        connection, capabilities = GATEWAY, GATEWAY_MODEL
     if not priced:
         capabilities = capabilities.model_copy(update={"input_cost_per_million_tokens_usd": None})
     root = tmp_path / ".exp"
@@ -62,12 +88,10 @@ def project_root(
     write_model_catalog(
         root / "models.toml",
         ModelCatalog(
-            connections={
-                "anthropic": ConnectionConfig(provider="anthropic", api_key_env="ANTHROPIC_API_KEY")
-            },
+            connections={"provider": connection},
             models={
                 "learner": ModelRecord(
-                    connection="anthropic",
+                    connection="provider",
                     model=model,
                     billing_source=BillingSource.CUSTOMER_MANAGED,
                     capabilities=capabilities,
@@ -75,7 +99,8 @@ def project_root(
             },
         ),
     )
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "fixture-key")
+    assert connection.api_key_env is not None
+    monkeypatch.setenv(connection.api_key_env, "fixture-key")
     return root
 
 
@@ -330,7 +355,13 @@ def test_costs_price_every_request_at_the_spend_ceilings_whole_generation_bound(
     )
     extraction = extraction_cost(store, prepared)
     assert extraction.attempts == len(prepared.batches)
-    assert extraction.usd is not None and extraction.usd > 10 * extraction.attempts
+    window, price = (
+        GATEWAY_MODEL.context_window_tokens,
+        GATEWAY_MODEL.output_cost_per_million_tokens_usd,
+    )
+    assert window is not None and price is not None
+    assert extraction.usd is not None
+    assert extraction.usd > extraction.attempts * window * price / 1_000_000
     rows = tuple(
         Lesson(kind=kind, statement=f"s{index}", applies_when="w", evidence=("e",), traces=("t",))
         for index in range(25)

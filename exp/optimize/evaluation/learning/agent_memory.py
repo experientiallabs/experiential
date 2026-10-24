@@ -180,7 +180,7 @@ def prepare_agent_memory(
     if model.provider == "anthropic" and anthropic_rejects_forced_tool_choice(model.model_id):
         raise ValueError(
             f"model {model.model_id!r} rejects a named tool choice, which every structured "
-            "proposal sends; choose a learning model that accepts it, such as claude-sonnet-5"
+            "proposal sends; choose a catalog alias whose model accepts a named tool"
         )
     if model_cost(project, spec.alias, 1, OUTPUT_TOKENS["extract"]).usd is None:
         raise ValueError(

@@ -24,12 +24,13 @@ PROJECT = "memory"
 CONTRACT = "Write the report to /out/report.md as markdown."
 
 
-class MessagesWire:
-    """Scripted Anthropic Messages wire answering each stage's named structured proposal.
+class ScriptedWire:
+    """Scripted provider wire answering each stage's named structured proposal.
 
-    Extraction proposes one shared contract per shown trace, merging puts every candidate in one
-    group and screening accepts every lesson. ``refuse`` makes one stage answer outside its
-    schema.
+    Speaks the Anthropic Messages or the OpenAI-compatible Chat Completions dialect, whichever
+    the request uses. Extraction proposes one shared contract per shown trace, merging puts every
+    candidate in one group and screening accepts every lesson. ``refuse`` makes one stage answer
+    outside its schema.
     """
 
     def __init__(self, refuse: str | None = None) -> None:
@@ -49,14 +50,32 @@ class MessagesWire:
         self.requests.append(RecordedRequest(url, headers, payload))
         tools = payload["tools"]
         assert isinstance(tools, list)
-        properties = at(tools[0], "input_schema", "properties")
+        chat = url.endswith("/chat/completions")
+        schema = at(tools[0], "function", "parameters") if chat else at(tools[0], "input_schema")
+        properties = at(schema, "properties")
         assert isinstance(properties, dict)
         stage, answer = self._answer(properties)
         if stage == self.refuse:
             answer = {"unexpected": True}
-        return JsonHttpResponse(
-            status_code=200,
-            body={
+        if chat:
+            call = {"name": "submit_proposal", "arguments": json.dumps(answer)}
+            body: JsonObject = {
+                "id": f"chat-{len(self.requests)}",
+                "model": payload["model"],
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": None,
+                            "tool_calls": [{"id": "call", "type": "function", "function": call}],
+                        },
+                        "finish_reason": "tool_calls",
+                    }
+                ],
+                "usage": {"prompt_tokens": 100, "completion_tokens": 50},
+            }
+        else:
+            body = {
                 "id": f"msg-{len(self.requests)}",
                 "type": "message",
                 "role": "assistant",
@@ -66,8 +85,8 @@ class MessagesWire:
                 ],
                 "stop_reason": "tool_use",
                 "usage": {"input_tokens": 100, "output_tokens": 50},
-            },
-        )
+            }
+        return JsonHttpResponse(status_code=200, body=body)
 
     @staticmethod
     def _answer(properties: JsonObject) -> tuple[str, JsonObject]:
@@ -144,7 +163,7 @@ def operation(tmp_path: Path) -> JsonObject:
 
 
 def learn(
-    root: Path, tmp_path: Path, wire: MessagesWire, monkeypatch: pytest.MonkeyPatch, *flags: str
+    root: Path, tmp_path: Path, wire: ScriptedWire, monkeypatch: pytest.MonkeyPatch, *flags: str
 ) -> str:
     """Run the action over the fixture export and return its flattened output."""
     monkeypatch.setattr(agent_memory, "HttpxJsonTransport", lambda: wire)
@@ -163,18 +182,15 @@ def test_learning_writes_screened_memory_and_replays_without_calls(
 ) -> None:
     """Three stages run once; the rerun replays every saved answer and rewrites nothing."""
     root = project_root(tmp_path, monkeypatch)
-    wire = MessagesWire()
+    wire = ScriptedWire()
     output = learn(root, tmp_path, wire, monkeypatch, "--yes", "--non-interactive")
     assert "3 traces (2 passed, 1 failed, 0 unknown; 0 shown cut), 1 extraction requests" in output
     assert "Extracted 3 candidate lessons (0 requests unusable)" in output
     assert "1 of 1 merged lessons accepted, 0 unscreened, 0 requests unusable" in output
     assert [request.url for request in wire.requests] == [
-        "https://api.anthropic.com/v1/messages"
+        "https://api.experientiallabs.ai/v1/chat/completions"
     ] * 3
-    payload = wire.requests[0].payload
-    assert payload["tool_choice"] == {"type": "tool", "name": "submit_proposal"}
-    assert payload["thinking"] == {"type": "adaptive"}
-    assert not {"temperature", "top_p", "top_k"} & set(payload)
+    assert wire.requests[0].payload["model"] == "glm-5.3"
     memory = (tmp_path / "memory" / "MEMORY.md").read_text()
     assert "3 earlier attempts at similar tasks (2 passed, 1 failed" in memory
     assert "[Task contracts](task-contracts.md): 1 lessons" in memory
@@ -185,10 +201,24 @@ def test_learning_writes_screened_memory_and_replays_without_calls(
         "task-contracts.md",
     ]
 
-    replay = MessagesWire()
+    replay = ScriptedWire()
     again = learn(root, tmp_path, replay, monkeypatch, "--non-interactive")
     assert replay.requests == []
     assert "1 of 1 merged lessons accepted" in again
+
+
+def test_an_anthropic_learning_model_names_its_proposal_tool_without_sampling_fields(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The Messages route sends the named tool beside adaptive thinking and no sampling field."""
+    root = project_root(tmp_path, monkeypatch, model="claude-sonnet-5")
+    wire = ScriptedWire()
+    learn(root, tmp_path, wire, monkeypatch, "--yes", "--non-interactive")
+    payload = wire.requests[0].payload
+    assert wire.requests[0].url == "https://api.anthropic.com/v1/messages"
+    assert payload["tool_choice"] == {"type": "tool", "name": "submit_proposal"}
+    assert payload["thinking"] == {"type": "adaptive"}
+    assert not {"temperature", "top_p", "top_k"} & set(payload)
 
 
 def test_a_refused_answer_is_recorded_never_redrawn_and_leaves_its_lessons_unexported(
@@ -196,7 +226,7 @@ def test_a_refused_answer_is_recorded_never_redrawn_and_leaves_its_lessons_unexp
 ) -> None:
     """A malformed screening answer leaves the lesson unscreened, and a rerun asks nothing."""
     root = project_root(tmp_path, monkeypatch)
-    wire = MessagesWire(refuse="screen")
+    wire = ScriptedWire(refuse="screen")
     output = learn(root, tmp_path, wire, monkeypatch, "--yes", "--non-interactive")
     assert "0 of 1 merged lessons accepted, 1 unscreened, 1 requests unusable" in output
     assert "unusable screen" in output
@@ -217,7 +247,7 @@ def test_dry_run_prints_the_preflight_and_makes_no_call(
 ) -> None:
     """The plan is registered and priced, but no credential is used and nothing is written."""
     root = project_root(tmp_path, monkeypatch)
-    wire = MessagesWire()
+    wire = ScriptedWire()
     output = learn(root, tmp_path, wire, monkeypatch, "--dry-run")
     assert "1 extraction requests with learner, at most $" in output
     assert "Dry run: no provider calls." in output
@@ -230,7 +260,7 @@ def test_a_model_that_refuses_named_tool_choice_is_refused_before_any_call(
 ) -> None:
     """Structured proposals name their tool; a model that answers that with a 400 is refused."""
     root = project_root(tmp_path, monkeypatch, model="claude-sonnet-5-5")
-    wire = MessagesWire()
+    wire = ScriptedWire()
     monkeypatch.setattr(agent_memory, "HttpxJsonTransport", lambda: wire)
     path = tmp_path / "operation.json"
     path.write_text(json.dumps(operation(tmp_path)))
@@ -247,7 +277,7 @@ def test_an_unpriced_learning_model_is_refused_before_any_call(
 ) -> None:
     """Every request needs a known reservation, so a missing price stops the preflight."""
     root = project_root(tmp_path, monkeypatch, priced=False)
-    wire = MessagesWire()
+    wire = ScriptedWire()
     monkeypatch.setattr(agent_memory, "HttpxJsonTransport", lambda: wire)
     path = tmp_path / "operation.json"
     path.write_text(json.dumps(operation(tmp_path)))
