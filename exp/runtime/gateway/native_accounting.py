@@ -12,7 +12,6 @@ from typing import Final
 
 from exp.common.core.artifacts import JsonObject
 from exp.common.models.gateway_catalog import ExactModelDeployment
-from exp.common.sqlite.connection import close_idle_connections
 from exp.runtime.gateway.attempt_tokens import worst_case_output_tokens
 from exp.runtime.gateway.budget_continuation import denied_destination_pool
 from exp.runtime.gateway.budgets import BudgetReservationRejected, BudgetScopeKind
@@ -98,7 +97,6 @@ from exp.runtime.gateway.sticky_affinity import StickySpillRegistry
 from exp.runtime.openai_protocol.errors import public_failure_error
 
 _SWEEP_GRACE_SECONDS = 5.0
-_SWEEP_INTERVAL_SECONDS = 5.0
 _SWEEP_BATCH = 16
 
 # The request deadline ran out between attempts, before any provider answered.
@@ -876,14 +874,6 @@ class NativeAttemptAccounting(NativeAccountingLifecycle):
             lock=self._lock,
             sample_gate=self._cache_sample_gate,
         )
-
-    def _sweep_loop(self) -> None:
-        """Periodically reconcile retained or expired attempts until the owner stops."""
-        try:
-            while not self._sweep_stop.wait(_SWEEP_INTERVAL_SECONDS):
-                self.sweep_expired()
-        finally:
-            close_idle_connections()
 
     def sweep_expired(self) -> None:
         """Recover retained settlements and close abandoned requests.

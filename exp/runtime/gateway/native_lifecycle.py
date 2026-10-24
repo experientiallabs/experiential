@@ -16,12 +16,26 @@ from exp.runtime.gateway.video.engine import VideoEngine
 if TYPE_CHECKING:
     from exp.runtime.gateway.native_accounting import NativeAttemptAccounting
 
+_SWEEP_INTERVAL_SECONDS = 5.0
+
 
 class NativeAccountingLifecycle:
     """Stop one settlement sweeper without erasing retained settlement or request evidence."""
 
     _sweep_stop: threading.Event
     _sweeper: threading.Thread
+
+    def sweep_expired(self) -> None:
+        """Recover retained settlements and close abandoned requests; owners implement it."""
+        raise NotImplementedError
+
+    def _sweep_loop(self) -> None:
+        """Periodically reconcile retained or expired attempts until the owner stops."""
+        try:
+            while not self._sweep_stop.wait(_SWEEP_INTERVAL_SECONDS):
+                self.sweep_expired()
+        finally:
+            close_idle_connections()
 
     @property
     def running(self) -> bool:
