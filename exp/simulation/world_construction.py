@@ -13,8 +13,6 @@ from importlib.metadata import version
 from pathlib import Path
 from typing import Annotated, Literal, Self
 
-from openpyxl import Workbook, load_workbook
-from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE
 from pydantic import Field, StrictBool, StrictFloat, StrictInt, StrictStr, model_validator
 
 from exp.common.core.artifacts import (
@@ -28,7 +26,6 @@ from exp.common.core.artifacts import (
     stable_id,
 )
 from exp.common.project import ArtifactAlreadyExistsError, ArtifactStore, artifact_input
-from exp.runtime.environments import workbook_edits
 
 Cell = (
     None
@@ -255,6 +252,12 @@ def materialize_tables(spec: ConstructionSpec) -> dict[str, MaterializedTable]:
 
 def _xlsx(tables: dict[str, MaterializedTable], sheets: tuple[str, ...]) -> bytes:
     """Render literal cells and refuse any XLSX representation that loses information."""
+    # Importers that only declare construction schemas must not need the artifact-edits extra.
+    from openpyxl import Workbook, load_workbook
+    from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE
+
+    from exp.runtime.environments import workbook_edits
+
     book = Workbook()
     book.remove(book.worksheets[0])
     book.properties.created = datetime(2000, 1, 1)
@@ -315,6 +318,8 @@ def compile_construction(spec: ConstructionSpec) -> dict[str, bytes]:
 
 def _identity(spec: ConstructionSpec, code_revision: str) -> str:
     """Bind source bytes as well as the caller's revision, including dirty local edits."""
+    from exp.runtime.environments import workbook_edits
+
     return stable_id(
         "world-construction",
         {

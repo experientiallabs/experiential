@@ -39,7 +39,6 @@ from exp.optimize.evaluation.equivalence.runner import EquivalenceSpec
 from exp.optimize.evaluation.executable import grounded as grounded_runtime
 from exp.optimize.evaluation.executable import induced as induced_runtime
 from exp.optimize.evaluation.executable import mixed as mixed_runtime
-from exp.optimize.evaluation.executable import workbook as workbook_runtime
 from exp.optimize.evaluation.executable.model_costs import (
     CostComponent,
     decision_cost,
@@ -103,8 +102,12 @@ def runtime_costs(
     project: ProjectStore, digest: Sha256, configuration: JsonObject
 ) -> tuple[CostComponent, ...]:
     """Recognize maintained factory bytes without executing a caller's runtime module."""
-    if digest == sha256_bytes(Path(workbook_runtime.__file__).read_bytes()):
-        workbook_runtime.WorkbookRuntimeDefinition.model_validate(configuration)
+    if digest == sha256_bytes(Path(__file__).with_name("workbook.py").read_bytes()):
+        # Generic cost review must not import optional workbook dependencies; only the
+        # selected maintained owner needs its typed model.
+        from exp.optimize.evaluation.executable.workbook import WorkbookRuntimeDefinition
+
+        WorkbookRuntimeDefinition.model_validate(configuration)
         return ()
     if digest == sha256_bytes(Path(mixed_runtime.__file__).read_bytes()):
         mixed = mixed_runtime.MixedRuntimeDefinition.model_validate(configuration)

@@ -36,7 +36,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
 from hashlib import sha256
 from importlib.metadata import version
-from typing import Literal, cast
+from typing import cast
 from xml.etree import ElementTree
 from zipfile import BadZipFile, ZipFile
 
@@ -53,9 +53,8 @@ from openpyxl.workbook.workbook import Workbook
 from openpyxl.worksheet.datavalidation import DataValidation
 from openpyxl.worksheet.formula import ArrayFormula, DataTableFormula
 from openpyxl.worksheet.worksheet import Worksheet
-from pydantic import Field
 
-from exp.common.core.artifacts import ContractModel, JsonObject, JsonValue, canonical_json_bytes
+from exp.common.core.artifacts import JsonObject, JsonValue, canonical_json_bytes
 from exp.common.tasks.facts import (
     FactProvenance,
     FactValidation,
@@ -64,14 +63,13 @@ from exp.common.tasks.facts import (
     InstanceFactsError,
 )
 from exp.runtime.environments.artifact_edits import MAX_ARTIFACT_BYTES
+from exp.runtime.environments.facts_derivers import DEFAULT_MAX_FACT_BYTES
 
 # Identity of the code that decides these facts, in place of its source text. Bump it when the
 # encoding or validation changes. exp/tests/code_protocols_test.py fails when this module
 # changes until it is bumped or, for a pure refactor, its digest is updated.
 WORKBOOK_FACTS_PROTOCOL = "xlsx-instance-facts-v1"
 
-DEFAULT_MAX_FACT_BYTES = 1024 * 1024
-MAX_FACT_BYTES = 8 * 1024 * 1024
 MAX_WORKBOOK_CELLS = 500_000
 _MAX_EXPANDED_BYTES = 256 * 1024 * 1024
 _MAX_PARTS = 10_000
@@ -214,59 +212,46 @@ class DecodedWorkbook:
         raise KeyError(name)
 
 
-class WorkbookFactsDeriver(ContractModel):
-    """The native workbook backend's instance-facts deriver.
+def derive_workbook_facts(
+    path: str, payload: bytes, *, max_bytes: int, allow_unrepresented: bool
+) -> InstanceFacts:
+    """Validated facts about one starting workbook, keyed ``<path>/workbook``.
 
-    Attributes:
-        kind: Deriver name in derivation specs.
-        max_bytes: Bound on the encoded value's canonical JSON size; larger workbooks are
-            refused. Default 1 MiB, at most 8 MiB.
-        allow_unrepresented: Accept archive parts whose content lies outside the encoding,
-            listing each in the facts, instead of refusing the workbook.
+    Args:
+        path: The workbook's canonical path in the task's world, such as ``input.xlsx``.
+        payload: Exact workbook bytes.
+        max_bytes: Bound on the encoded value's canonical JSON size.
+        allow_unrepresented: List unrepresented archive parts instead of refusing them.
+
+    Returns:
+        One conditioning fact at state version 0 whose value is the encoded workbook.
+
+    Raises:
+        WorkbookFactsRefused: The workbook has unrepresented content, exceeds a bound,
+            cannot be read, or fails round-trip validation.
     """
-
-    kind: Literal["xlsx-workbook"] = "xlsx-workbook"
-    max_bytes: int = Field(default=DEFAULT_MAX_FACT_BYTES, ge=1024, le=MAX_FACT_BYTES, strict=True)
-    allow_unrepresented: bool = Field(default=False, strict=True)
-
-    def derive(self, path: str, payload: bytes) -> InstanceFacts:
-        """Validated facts about one starting workbook, keyed ``<path>/workbook``.
-
-        Args:
-            path: The workbook's canonical path in the task's world, such as ``input.xlsx``.
-            payload: Exact workbook bytes.
-
-        Returns:
-            One conditioning fact at state version 0 whose value is the encoded workbook.
-
-        Raises:
-            WorkbookFactsRefused: The workbook has unrepresented content, exceeds a bound,
-                cannot be read, or fails round-trip validation.
-        """
-        value = encode_workbook(
-            payload, max_bytes=self.max_bytes, allow_unrepresented=self.allow_unrepresented
-        )
-        reader = f"openpyxl {version('openpyxl')}"
-        fact = InstanceFact(
-            key=f"{path}/workbook",
-            value=value,
-            visibility="conditioning",
-            provenance=FactProvenance(
-                adapter=f"{WORKBOOK_FACTS_PROTOCOL} ({reader})",
-                source=path,
-                source_sha256=sha256(payload, usedforsecurity=False).hexdigest(),
-                validation=FactValidation(
-                    status="validated",
-                    method=(
-                        f"every stored cell decoded from the encoding equals {reader} (formula "
-                        "and data_only loads) by type and exact repr; sheet order, dimensions "
-                        "and features round-trip exactly"
-                    ),
+    value = encode_workbook(payload, max_bytes=max_bytes, allow_unrepresented=allow_unrepresented)
+    reader = f"openpyxl {version('openpyxl')}"
+    fact = InstanceFact(
+        key=f"{path}/workbook",
+        value=value,
+        visibility="conditioning",
+        provenance=FactProvenance(
+            adapter=f"{WORKBOOK_FACTS_PROTOCOL} ({reader})",
+            source=path,
+            source_sha256=sha256(payload, usedforsecurity=False).hexdigest(),
+            validation=FactValidation(
+                status="validated",
+                method=(
+                    f"every stored cell decoded from the encoding equals {reader} (formula "
+                    "and data_only loads) by type and exact repr; sheet order, dimensions "
+                    "and features round-trip exactly"
                 ),
-                state_version=0,
             ),
-        )
-        return InstanceFacts(facts=(fact,))
+            state_version=0,
+        ),
+    )
+    return InstanceFacts(facts=(fact,))
 
 
 def encode_workbook(

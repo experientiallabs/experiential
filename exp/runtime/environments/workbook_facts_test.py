@@ -25,9 +25,9 @@ from openpyxl.worksheet.table import Table
 from exp.common.core.artifacts import canonical_json_bytes
 from exp.common.tasks.facts import InstanceFacts, InstanceFactsError
 from exp.runtime.environments import workbook_facts
+from exp.runtime.environments.facts_derivers import WorkbookFactsDeriver
 from exp.runtime.environments.workbook_facts import (
     WORKBOOK_FACTS_PROTOCOL,
-    WorkbookFactsDeriver,
     WorkbookFactsRefused,
     decode_workbook_facts,
     encode_workbook,
