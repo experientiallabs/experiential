@@ -31,6 +31,7 @@ from exp.runtime.gateway.request_policy import GatewayRequestPolicy
 from exp.runtime.gateway.sampling_extras import SamplingExtraFields
 from exp.runtime.gateway.service_tiers import ServiceTier
 from exp.runtime.models.providers.openrouter_routing import ProviderRoutingPreferences
+from exp.runtime.openai_protocol import responses_input_items as _extra_items
 from exp.runtime.openai_protocol.cache_control import EphemeralCacheControl
 from exp.runtime.openai_protocol.custom_tool_wire import ChatCustomTool, ChatCustomToolCall
 from exp.runtime.openai_protocol.custom_tool_wire import CustomToolCallItem as _CustomToolCall
@@ -934,7 +935,12 @@ _ResponsesOutputItem = Annotated[
     | _AdditionalToolsItem
     | _CustomToolCall
     | _CustomToolCallOutput
-    | _HostedToolItemEcho,
+    | _HostedToolItemEcho
+    | _extra_items.AgentMessageItem
+    | _extra_items.CompactionTriggerItem
+    | _extra_items.ContextCompactionItem
+    | _extra_items.ConfigurationUpdateItem
+    | _extra_items.ItemReferenceItem,
     Field(discriminator="type"),
 ]
 _ResponsesInputItem = _ResponseMessage | _ResponsesOutputItem

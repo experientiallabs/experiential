@@ -416,7 +416,11 @@ def convert_native_history(
     ``GatewayMessage.provider_native_item``. On a foreign wire these become
     ordinary assistant tool calls (with the same mangled names the declarations
     used) and tool results. ``additional_tools`` items are dropped: their tools
-    are declared on this turn's ``tools`` array.
+    are declared on this turn's ``tools`` array. An ``agent_message`` becomes a
+    user turn carrying its plaintext. Provider-owned items no foreign wire can
+    read (hosted-tool echoes, ``compaction`` and ``context_compaction``,
+    ``configuration_update``, ``item_reference``) are dropped with disclosure,
+    and a ``compaction_trigger`` refuses (``COMPACTION_TRIGGER_UNSERVABLE``).
 
     Args:
         messages: The decoded messages that may carry native items.
@@ -425,6 +429,9 @@ def convert_native_history(
 
     Returns:
         The converted message tuple and any drop disclosures.
+
+    Raises:
+        ProviderParameterError: The history carries a ``compaction_trigger``.
     """
     _reserve_plain_history(messages, mapping)
     calls_by_id: dict[str, ToolCall | None] = {}
@@ -470,7 +477,7 @@ def convert_native_history(
                 else message
             )
             continue
-        replacement, disclosure = _convert_history_item(item, mapping, tool_search_name)
+        replacement, item_disclosures = _convert_history_item(item, mapping, tool_search_name)
         previous = converted[-1] if converted else None
         if (
             replacement is not None
@@ -487,29 +494,93 @@ def convert_native_history(
             )
         elif replacement is not None:
             converted.append(replacement)
-        if disclosure is not None and disclosure not in disclosures:
-            disclosures.append(disclosure)
+        for disclosure in item_disclosures:
+            if disclosure not in disclosures:
+                disclosures.append(disclosure)
     return tuple(converted), disclosures
+
+
+COMPACTION_TRIGGER_UNSERVABLE = (
+    "A 'compaction_trigger' input item asks the provider for an encrypted context "
+    "compaction, which only an OpenAI Responses route can produce, and this model "
+    "route has no such rung. Compact the conversation client-side instead (Codex "
+    "compacts locally when the gateway is configured as a custom model provider, "
+    '[model_providers.<name>] with wire_api = "responses"), or use a model served '
+    "on an OpenAI route."
+)
+"""The refusal a foreign-wire rung states for a compaction request.
+
+Dropping the trigger would serve an ordinary, fully billed answer to a
+request whose client accepts only a ``compaction`` output item (Codex treats
+anything else as a fatal compaction failure and tries again on the next
+turn), so a foreign rung narrows out of a mixed route and a route without an
+OpenAI Responses rung refuses before dispatch."""
+
+
+def _agent_message_text(item: JsonObject) -> tuple[str, tuple[str, ...]]:
+    """Render one raw ``agent_message`` as the text of a foreign-wire user message.
+
+    The heading follows Codex's own rendering of an agent message for a
+    consumer without the native item ("Agent message from <author>:"). The
+    message becomes a user turn, not assistant history: it is input this
+    agent answers (Codex counts it as a turn boundary), and a trailing
+    assistant turn would read as prefill. Plaintext parts are kept in order;
+    image and encrypted parts have no carrier on a foreign wire and are named
+    as dropped.
+
+    Args:
+        item: The validated raw caller item.
+
+    Returns:
+        The message text and the disclosures for parts that were dropped.
+    """
+    texts: list[str] = []
+    disclosures: list[str] = []
+    content = item.get("content")
+    for part in content if isinstance(content, list) else ():
+        if not isinstance(part, dict):
+            continue
+        kind = part.get("type")
+        text = part.get("text")
+        if kind == "input_text" and isinstance(text, str):
+            texts.append(text)
+        elif kind in ("encrypted_content", "input_image"):
+            disclosure = f"input.agent_message.content.{kind}->dropped(unsupported_by_provider)"
+            if disclosure not in disclosures:
+                disclosures.append(disclosure)
+    author = item.get("author")
+    heading = f"Agent message from {author}:" if isinstance(author, str) else "Agent message:"
+    return "\n".join((heading, *texts)), tuple(disclosures)
 
 
 def _convert_history_item(
     item: JsonObject, mapping: NativeToolMapping, tool_search_name: str
-) -> tuple[GatewayMessage | None, str | None]:
+) -> tuple[GatewayMessage | None, tuple[str, ...]]:
     """Translate one history item with the declaration's full-origin name allocation.
 
-    Return the provider message and optional omission disclosure, using the same custom
+    Return the provider message and its omission disclosures, using the same custom
     and namespace origin mapping as the declared tools.
+
+    Raises:
+        ProviderParameterError: The item is a ``compaction_trigger``.
     """
     item_type = item.get("type")
+    if item_type == "agent_message":
+        text, dropped = _agent_message_text(item)
+        return GatewayMessage(role="user", content=text), dropped
+    if item_type == "compaction_trigger":
+        raise ProviderParameterError(
+            message=COMPACTION_TRIGGER_UNSERVABLE, param="input", code="unsupported_parameter"
+        )
     if item_type == "additional_tools":
-        return None, "input.additional_tools->dropped(declared_inline)"
+        return None, ("input.additional_tools->dropped(declared_inline)",)
     if item_type == "custom_tool_call":
         call_id = _string(item.get("call_id"))
         name = _string(item.get("name"))
         namespace = _string(item.get("namespace"))
         text = item.get("input")
         if call_id is None or name is None:
-            return None, "input.custom_tool_call->dropped(malformed)"
+            return None, ("input.custom_tool_call->dropped(malformed)",)
         mangled = mapping.allocate(name, namespace, True)
         arguments: JsonObject = {_CUSTOM_INPUT_PROPERTY: text if isinstance(text, str) else ""}
         call = ToolCall(
@@ -518,19 +589,19 @@ def _convert_history_item(
             arguments=arguments,
             raw_arguments=json.dumps(arguments),
         )
-        return GatewayMessage(role="assistant", tool_calls=(call,)), None
+        return GatewayMessage(role="assistant", tool_calls=(call,)), ()
     if item_type == "custom_tool_call_output":
         call_id = _string(item.get("call_id"))
         output = item.get("output")
         if call_id is None:
-            return None, "input.custom_tool_call_output->dropped(malformed)"
+            return None, ("input.custom_tool_call_output->dropped(malformed)",)
         return (
             GatewayMessage(
                 role="tool",
                 tool_call_id=call_id,
                 content=output if isinstance(output, str) else "",
             ),
-            None,
+            (),
         )
     if item_type == "function_call":
         call_id = _string(item.get("call_id"))
@@ -538,37 +609,37 @@ def _convert_history_item(
         namespace = _string(item.get("namespace"))
         raw_arguments = item.get("arguments")
         if call_id is None or name is None or not isinstance(raw_arguments, str):
-            return None, "input.function_call->dropped(malformed)"
+            return None, ("input.function_call->dropped(malformed)",)
         mangled = mapping.allocate(name, namespace, False) if namespace is not None else name
         try:
             arguments = json.loads(raw_arguments)
         except json.JSONDecodeError:
-            return None, "input.function_call->dropped(malformed)"
+            return None, ("input.function_call->dropped(malformed)",)
         if not isinstance(arguments, dict):
-            return None, "input.function_call->dropped(malformed)"
+            return None, ("input.function_call->dropped(malformed)",)
         call = ToolCall(
             call_id=call_id, name=mangled, arguments=arguments, raw_arguments=raw_arguments
         )
-        return GatewayMessage(role="assistant", tool_calls=(call,)), None
+        return GatewayMessage(role="assistant", tool_calls=(call,)), ()
     if item_type == "function_call_output":
         call_id = _string(item.get("call_id"))
         output = item.get("output")
         if call_id is None:
-            return None, "input.function_call_output->dropped(malformed)"
+            return None, ("input.function_call_output->dropped(malformed)",)
         return (
             GatewayMessage(
                 role="tool",
                 tool_call_id=call_id,
                 content=output if isinstance(output, str) else "",
             ),
-            None,
+            (),
         )
     if item_type == "tool_search_call":
         # The gateway's own tool-search round echoed back: replay it as the
         # function call the model actually made, so the conversation stays whole.
         call_id = _string(item.get("call_id"))
         if call_id is None:
-            return None, "input.tool_search_call->dropped(malformed)"
+            return None, ("input.tool_search_call->dropped(malformed)",)
         raw = item.get("arguments")
         arguments = raw if isinstance(raw, dict) else {}
         if "goal" in arguments and "query" not in arguments:
@@ -579,11 +650,11 @@ def _convert_history_item(
             arguments=arguments,
             raw_arguments=json.dumps(arguments, separators=(",", ":")),
         )
-        return GatewayMessage(role="assistant", tool_calls=(call,)), None
+        return GatewayMessage(role="assistant", tool_calls=(call,)), ()
     if item_type == "tool_search_output":
         call_id = _string(item.get("call_id"))
         if call_id is None:
-            return None, "input.tool_search_output->dropped(malformed)"
+            return None, ("input.tool_search_output->dropped(malformed)",)
         tools = item.get("tools")
         names = [
             entry.get("name")
@@ -594,6 +665,7 @@ def _convert_history_item(
             {"matched": [{"name": name} for name in names], "loaded": bool(names)},
             separators=(",", ":"),
         )
-        return GatewayMessage(role="tool", tool_call_id=call_id, content=content), None
-    # Hosted-tool echoes (web_search_call, mcp_call, ...) have no foreign shape.
-    return None, f"input.{item_type}->dropped(unsupported_by_provider)"
+        return GatewayMessage(role="tool", tool_call_id=call_id, content=content), ()
+    # Hosted-tool echoes (web_search_call, mcp_call, ...), compacted history,
+    # positional configuration and stored references have no foreign shape.
+    return None, (f"input.{item_type}->dropped(unsupported_by_provider)",)

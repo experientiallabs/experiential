@@ -18,6 +18,7 @@ from pydantic import JsonValue
 
 from exp.common.core.artifacts import JsonObject
 from exp.runtime.openai_protocol.errors import invalid_field, unsupported_field
+from exp.runtime.openai_protocol.responses_input_items import SDK_UNKNOWN_INPUT_ITEM_TYPES
 from exp.runtime.openai_protocol.wire_models import (
     _ResponseMessage,
     _ResponsesRequest,
@@ -194,6 +195,10 @@ def official_responses_probe(payload: JsonObject) -> JsonObject:
         # official probe sees a normalized item.
         adapted: list[JsonValue] = []
         for index, entry in enumerate(cast("list[JsonValue]", raw)):
+            if isinstance(entry, dict) and entry.get("type") in SDK_UNKNOWN_INPUT_ITEM_TYPES:
+                # The installed SDK does not enumerate these items (see
+                # ``responses_input_items``); the strict wire model owns them.
+                continue
             if isinstance(entry, dict):
                 entry = official_message_content(official_image_details(entry, f"input.{index}"))
             if (

@@ -7802,3 +7802,136 @@ def test_responses_instructions_reach_a_chat_wire_lane_as_system(tmp_path: Path)
     assert isinstance(messages, list)
     assert messages[0] == {"role": "system", "content": "Answer in French."}
     assert admission["ignored_parameters"] == [DEVELOPER_ROLE_REWRITE_DISCLOSURE]
+
+
+_CODEX_AGENT_TASK: JsonObject = {
+    "type": "agent_message",
+    "author": "/root",
+    "recipient": "/root/worker",
+    "content": [
+        {"type": "input_text", "text": "Message Type: NEW_TASK\nPayload:\nCount the tests."}
+    ],
+}
+"""A sub-agent's task as Codex 0.162/0.163 records it (``ResponseItem::AgentMessage``)."""
+
+
+def _codex_items_body(*items: JsonObject) -> str:
+    """Return a Codex-shaped Responses body: a user turn followed by ``items``."""
+    return json.dumps(
+        {
+            "model": "coding",
+            "store": False,
+            "input": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "go"}],
+                },
+                *items,
+            ],
+        }
+    )
+
+
+def _admitted_payload(admission: JsonObject) -> JsonObject:
+    """Narrow one admission to its lead rung's upstream payload."""
+    route = cast("list[JsonObject]", admission["route"])
+    return cast("JsonObject", route[0]["upstream_payload"])
+
+
+def test_codex_agent_and_compaction_items_forward_verbatim_on_an_openai_rung(
+    tmp_path: Path,
+) -> None:
+    """The real admission bridge hands a native OpenAI Responses rung every
+    Codex item byte-for-byte, in place: the sub-agent task, a positional
+    configuration update, and the trailing compaction trigger (which used to
+    refuse the turn as "Invalid value for 'input.N.role': expected a value.")."""
+    control, raw_key = _openai_responses_pool_control_plane(
+        tmp_path, {"TEST_ALPHA_KEY": "alpha-secret", "TEST_BETA_KEY": "beta-secret"}
+    )
+    configuration: JsonObject = {"type": "configuration_update", "reasoning": {"effort": "high"}}
+    trigger: JsonObject = {"type": "compaction_trigger"}
+
+    admission = _admit(
+        control,
+        raw_key,
+        _codex_items_body(_CODEX_AGENT_TASK, configuration, trigger),
+        surface="responses",
+    )
+
+    items = cast("list[JsonObject]", _admitted_payload(admission)["input"])
+    assert items[-3:] == [_CODEX_AGENT_TASK, configuration, trigger]
+    assert admission["ignored_parameters"] == []
+    assert "attempt_id" in _start_first(control, admission)
+
+
+def test_codex_agent_items_translate_or_drop_with_disclosure_on_a_chat_rung(
+    tmp_path: Path,
+) -> None:
+    """A Chat rung receives the sub-agent task as a user turn in Codex's own
+    rendering, and the items no Chat wire can read are dropped and named."""
+    control, raw_key = _control_plane(tmp_path)
+
+    admission = _admit(
+        control,
+        raw_key,
+        _codex_items_body(
+            {"type": "configuration_update", "reasoning": {"effort": "high"}},
+            {"type": "item_reference", "id": "rs_1"},
+            _CODEX_AGENT_TASK,
+        ),
+        surface="responses",
+    )
+
+    messages = cast("list[JsonObject]", _admitted_payload(admission)["messages"])
+    assert [message["role"] for message in messages] == ["user", "user"]
+    assert messages[-1]["content"] == (
+        "Agent message from /root:\nMessage Type: NEW_TASK\nPayload:\nCount the tests."
+    )
+    ignored = cast("list[str]", admission["ignored_parameters"])
+    assert "input.configuration_update->dropped(unsupported_by_provider)" in ignored
+    assert "input.item_reference->dropped(unsupported_by_provider)" in ignored
+    assert "attempt_id" in _start_first(control, admission)
+
+
+def test_a_compaction_trigger_on_a_chat_route_is_a_named_400_before_dispatch(
+    tmp_path: Path,
+) -> None:
+    """No Chat rung can answer with a compaction item, so the request is refused
+    by name, with the client-side remedy, instead of serving a billed ordinary
+    answer the client discards."""
+    control, raw_key = _control_plane(tmp_path)
+
+    with pytest.raises(NativeBridgeError) as refused:
+        _admit(
+            control,
+            raw_key,
+            _codex_items_body(_CODEX_AGENT_TASK, {"type": "compaction_trigger"}),
+            surface="responses",
+        )
+
+    error = json.loads(refused.value.public_error_json)
+    assert error["status_code"] == 400
+    assert error["code"] == "unsupported_parameter"
+    assert error["param"] == "input"
+    assert "'compaction_trigger'" in error["message"]
+    assert "custom model provider" in error["message"]
+
+
+def test_an_unknown_responses_item_type_is_named_at_its_type(tmp_path: Path) -> None:
+    """A genuinely unknown item is refused at ``input.N.type`` with the accepted
+    vocabulary, never at the message branch's ``role``."""
+    control, raw_key = _control_plane(tmp_path)
+
+    with pytest.raises(NativeBridgeError) as refused:
+        _admit(
+            control,
+            raw_key,
+            _codex_items_body({"type": "future_item"}),
+            surface="responses",
+        )
+
+    error = json.loads(refused.value.public_error_json)
+    assert error["status_code"] == 400
+    assert error["param"] == "input.1.type"
+    assert "but got 'future_item' instead." in error["message"]

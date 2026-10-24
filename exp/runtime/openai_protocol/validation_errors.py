@@ -16,6 +16,7 @@ from pydantic import ValidationError
 from pydantic_core import ErrorDetails
 
 from exp.runtime.openai_protocol.errors import OpenAIProtocolError, invalid_field
+from exp.runtime.openai_protocol.responses_input_items import EXTRA_INPUT_ITEM_TYPES
 from exp.runtime.openai_protocol.wire_models import (
     HOSTED_TOOL_ITEM_TYPES_ASSISTANT,
     HOSTED_TOOL_ITEM_TYPES_TOOL,
@@ -31,6 +32,7 @@ _OUTPUT_ITEM_VARIANTS = {
     "additional_tools",
     "custom_tool_call",
     "custom_tool_call_output",
+    *EXTRA_INPUT_ITEM_TYPES,
     # Hosted-tool echo variants share the same union-branch label shape.
     *HOSTED_TOOL_ITEM_TYPES_TOOL,
     *HOSTED_TOOL_ITEM_TYPES_ASSISTANT,
@@ -65,6 +67,10 @@ def cleaned_location(location: tuple[str | int, ...]) -> tuple[str, ...]:
     """
     cleaned: list[str] = []
     last_index = len(location) - 1
+    # The cleaned depth at which an item's variant label was dropped: the
+    # segment after it is that item's own field even when it spells like a
+    # variant (a ``configuration_update`` item's ``reasoning`` object).
+    variant_dropped_at: int | None = None
     for index, part in enumerate(location):
         text = str(part)
         if text in _LOCATION_NOISE:
@@ -86,7 +92,9 @@ def cleaned_location(location: tuple[str | int, ...]) -> tuple[str, ...]:
             and cleaned
             and cleaned[-1].isdigit()
             and index != last_index
+            and variant_dropped_at != len(cleaned)
         ):
+            variant_dropped_at = len(cleaned)
             continue
         # A discriminated part whose tag is also its payload field name
         # (``file.file``, ``image_url.image_url``) reports the tag once.
@@ -172,6 +180,50 @@ def _discriminator_message(param: str, detail: ErrorDetails) -> tuple[str, str] 
     return tag_param, f"Invalid value for '{tag_param}': got {got}."
 
 
+def _declared_unknown_tag(details: list[ErrorDetails]) -> tuple[str, str] | None:
+    """Name the ``type`` of an item that declared a tag no union branch accepts.
+
+    An item union pairs a model with a defaulted tag (the Responses message,
+    whose ``type`` defaults to ``message``) with a discriminated union of
+    every other item. An item that states a tag neither side knows makes the
+    defaulted branch report each field it lacks, and its "role: expected a
+    value" used to win as the most specific complaint (Codex's agent and
+    compaction items, 2026-10-24), naming a field the caller never meant to
+    send. The defaulted branch's literal fault on the discriminator itself
+    proves the item declared a tag, so the tag is the field to name, against
+    the whole accepted vocabulary of both sides.
+    """
+    for detail in details:
+        if detail["type"] != "union_tag_invalid":
+            continue
+        context = detail.get("ctx") or {}
+        discriminator = _quoted_values(context.get("discriminator"))
+        field = discriminator[0] if discriminator else "type"
+        location = tuple(detail["loc"])
+        parent = location[:-1]
+        sibling_tags = [
+            value
+            for sibling in details
+            if sibling["type"] == "literal_error"
+            and len(sibling["loc"]) == len(location) + 1
+            and tuple(sibling["loc"][: len(parent)]) == parent
+            and sibling["loc"][-1] == field
+            for value in _quoted_values((sibling.get("ctx") or {}).get("expected"))
+        ]
+        if not sibling_tags:
+            continue
+        tags = [*sibling_tags, *_quoted_values(context.get("expected_tags"))]
+        merged: ErrorDetails = {
+            **detail,
+            "ctx": {
+                **context,
+                "expected_tags": ", ".join(f"'{tag}'" for tag in dict.fromkeys(tags)),
+            },
+        }
+        return _discriminator_message(".".join(cleaned_location(location)) or "body", merged)
+    return None
+
+
 def shape_message(param: str, details: list[ErrorDetails]) -> str | None:
     """Describe what shape a field expected versus what arrived.
 
@@ -236,6 +288,9 @@ def validation_protocol_error(error: ValidationError) -> OpenAIProtocolError:
     same path, so the message lists the whole accepted set rather than the
     one branch that happened to complain least.
     """
+    declared = _declared_unknown_tag(error.errors(include_url=False))
+    if declared is not None:
+        return invalid_field(*declared)
     groups: dict[tuple[str | int, ...], list[tuple[tuple[str, ...], ErrorDetails]]] = {}
     for detail in error.errors(include_url=False):
         groups.setdefault(tuple(detail["loc"][:-1]), []).append(

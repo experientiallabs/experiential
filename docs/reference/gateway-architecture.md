@@ -414,7 +414,8 @@ as an object; its internal shape is the provider's). `function_call_output.outpu
 SDK list form: text and image parts map onto the canonical tool message and re-emit typed, an
 all-text list keeps the plain-string wire shape, and any other part kind is a named 400. A
 reasoning input item without `encrypted_content` (a `store: true` replay by item id) carries
-verbatim to homogeneous native Responses routes and the provider judges resolvability. Off the
+verbatim to homogeneous native Responses routes and the provider judges resolvability. Agent,
+compaction, configuration, and reference items: [Responses input items](gateway-responses-input-items.md). Off the
 native Responses wire, tool-call and tool-result attribution (`namespace`/`caller`/output
 `name`) drops with per-field disclosure — the call itself always survives — and a
 Messages-surface effort the route cannot serve rejects as `output_config.effort` with

@@ -45,8 +45,6 @@ from exp.runtime.openai_protocol.client_field_repairs import (
 )
 from exp.runtime.openai_protocol.custom_tool_wire import (
     ChatCustomToolCall,
-    CustomToolCallItem,
-    CustomToolCallOutputItem,
 )
 from exp.runtime.openai_protocol.custom_tools import (
     chat_custom_call_messages,
@@ -83,12 +81,14 @@ from exp.runtime.openai_protocol.reasoning_replay import (
     fold_replayed_reasoning,
 )
 from exp.runtime.openai_protocol.responses_input import (
+    NATIVE_INPUT_ITEMS,
     ReplayedFunctionCall,
     ReplayedFunctionOutput,
     ReplayedInput,
     ReplayedMessage,
     ReplayedNativeItem,
     ReplayedReasoning,
+    native_input_role,
     responses_input_messages,
 )
 from exp.runtime.openai_protocol.responses_probe import (
@@ -112,13 +112,10 @@ from exp.runtime.openai_protocol.web_search import (
     split_online_suffix,
 )
 from exp.runtime.openai_protocol.wire_models import (
-    HOSTED_TOOL_ITEM_TYPES_TOOL,
-    _AdditionalToolsItem,
     _AssistantToolCall,
     _ChatRequest,
     _ChatTool,
     _FunctionCall,
-    _HostedToolItemEcho,
     _Message,
     _ResponseFunctionCall,
     _ResponseMessage,
@@ -848,27 +845,11 @@ def _response_input_messages(
         return responses_input_messages(value)
     replayed: list[ReplayedInput] = []
     for index, item in enumerate(value):
-        if isinstance(
-            item,
-            (
-                _AdditionalToolsItem,
-                CustomToolCallItem,
-                CustomToolCallOutputItem,
-                _HostedToolItemEcho,
-            ),
-        ):
+        if isinstance(item, NATIVE_INPUT_ITEMS):
             # The raw caller item, not the re-serialized wire model, so the
             # native rung receives the item byte-for-byte.
-            if isinstance(item, _HostedToolItemEcho):
-                native_role = "tool" if item.type in HOSTED_TOOL_ITEM_TYPES_TOOL else "assistant"
-            elif isinstance(item, CustomToolCallItem):
-                native_role = "assistant"
-            elif isinstance(item, CustomToolCallOutputItem):
-                native_role = "tool"
-            else:
-                native_role = "developer"
             replayed.append(
-                ReplayedNativeItem(index=index, role=native_role, item=raw_items[index])
+                ReplayedNativeItem(index=index, role=native_input_role(item), item=raw_items[index])
             )
         elif isinstance(item, _ResponseReasoningItem):
             if item.encrypted_content is None:
