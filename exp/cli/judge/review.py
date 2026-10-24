@@ -15,7 +15,7 @@ from rich.prompt import Confirm, IntPrompt, Prompt
 from exp.cli.judge.trace_viewer import view_trace_proposal
 from exp.cli.judge.transcript import render_field, render_trace, span_evidence_text
 from exp.common.judging import Rubric, RubricDimension
-from exp.common.traces import TraceSpan
+from exp.common.traces import Trace, TraceSpan
 from exp.optimize.router.judging.contracts import (
     HumanJudgeCorrection,
     JudgeTracePreview,
@@ -277,23 +277,23 @@ def _render_axis_proposals(
         if target_citations:
             console.print("Cited trace evidence:", style="bold")
         for span_id in target_citations:
-            source, span = _find_evidence_span(proposal, span_id, reference=False)
+            source, trace, span = _find_evidence_span(proposal, span_id, reference=False)
             console.print(f"  {span_id} ({source}; {span.name})", markup=False)
             render_field(
                 console,
                 "  Evidence content",
-                span_evidence_text(span),
+                span_evidence_text(trace, span),
                 character_limit=character_limit,
             )
         if cited_reference:
             console.print("Cited reference trace evidence:", style="bold")
             for span_id in cited_reference:
-                source, span = _find_evidence_span(proposal, span_id, reference=True)
+                source, trace, span = _find_evidence_span(proposal, span_id, reference=True)
                 console.print(f"  {span_id} ({source}; {span.name})", markup=False)
                 render_field(
                     console,
                     "  Evidence content",
-                    span_evidence_text(span),
+                    span_evidence_text(trace, span),
                     character_limit=character_limit,
                 )
 
@@ -494,7 +494,7 @@ def _find_evidence_span(
     span_id: str,
     *,
     reference: bool,
-) -> tuple[str, TraceSpan]:
+) -> tuple[str, Trace, TraceSpan]:
     """Resolve one cited span to its displayed candidate without guessing.
 
     Args:
@@ -503,7 +503,7 @@ def _find_evidence_span(
         reference: Whether the citation belongs to the pairwise reference trace.
 
     Returns:
-        Human-readable candidate label and exact cited span.
+        Human-readable candidate label, the trace holding the span, and the exact cited span.
 
     Raises:
         ValueError: The cited span is absent from its displayed trace.
@@ -517,7 +517,7 @@ def _find_evidence_span(
     if trace is not None:
         for span in trace.spans:
             if span.span_id == span_id:
-                return source, span
+                return source, trace, span
     raise ValueError(f"judge cited {source} evidence that is not displayed: {span_id}")
 
 

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Literal, cast
 
-from pydantic import AwareDatetime, Field, field_validator, model_validator
+from pydantic import AwareDatetime, Field, JsonValue, field_validator, model_validator
 
 from exp.common.core.artifacts import (
     ArtifactEnvelope,
@@ -19,6 +19,12 @@ from exp.common.core.artifacts import (
 from exp.common.models import ModelSnapshot, Usage
 from exp.common.tasks import ToolSchema
 from exp.common.tasks.facts import INSTANCE_FACTS_CONTEXT_KEY
+
+INPUT_MESSAGES_KEY = "gen_ai.input.messages"
+"""Span attribute holding one model call's input messages inline."""
+
+INPUT_HISTORY_PREFIX_KEY = "exp.input.history_prefix"
+"""Span attribute naming how many leading ``Trace.message_history`` entries form its input."""
 
 
 class TraceSource(ContractModel):
@@ -79,6 +85,12 @@ class Trace(ContractModel):
         source: Source provenance.
         instance_facts: Raw instance facts the trace package supplied for this trace's
             instance; validated by the consumer before use. Omitted when absent.
+        message_history: One conversation's messages, stored once. A model span whose input
+            is a prefix of this conversation names the prefix length in
+            ``exp.input.history_prefix`` instead of copying the messages into
+            ``gen_ai.input.messages``, so stored size grows linearly with transcript length.
+            The longest referenced prefix is the whole history. Omitted when empty; read a
+            span's input through :meth:`input_messages`.
     """
 
     trace_id: str = Field(min_length=1, max_length=512)
@@ -90,6 +102,7 @@ class Trace(ContractModel):
     outcome: TraceOutcome | None = None
     source: TraceSource
     instance_facts: JsonObject | None = Field(default=None, exclude_if=lambda value: value is None)
+    message_history: tuple[JsonObject, ...] = Field(default=(), exclude_if=lambda value: not value)
 
     @model_validator(mode="before")
     @classmethod
@@ -128,6 +141,49 @@ class Trace(ContractModel):
         if len(set(span_ids)) != len(span_ids):
             raise ValueError("trace span IDs must be unique")
         return value
+
+    @model_validator(mode="after")
+    def _require_resolvable_history_prefixes(self) -> Trace:
+        """Every history reference resolves, and the history holds nothing unreferenced."""
+        longest = 0
+        for span in self.spans:
+            if INPUT_HISTORY_PREFIX_KEY not in span.attributes:
+                continue
+            prefix = span.attributes[INPUT_HISTORY_PREFIX_KEY]
+            if not isinstance(prefix, int) or isinstance(prefix, bool) or prefix < 0:
+                raise ValueError(f"span {span.span_id!r} history prefix must be a count")
+            if prefix > len(self.message_history):
+                raise ValueError(
+                    f"span {span.span_id!r} references {prefix} history messages but the "
+                    f"trace stores {len(self.message_history)}"
+                )
+            if INPUT_MESSAGES_KEY in span.attributes:
+                raise ValueError(
+                    f"span {span.span_id!r} declares its input both inline and as a history prefix"
+                )
+            longest = max(longest, prefix)
+        if longest != len(self.message_history):
+            raise ValueError(
+                f"trace stores {len(self.message_history)} history messages but its spans "
+                f"reference only {longest}"
+            )
+        return self
+
+    def input_messages(self, span: TraceSpan) -> JsonValue | None:
+        """Return one span's input messages, resolving a shared-history reference.
+
+        Args:
+            span: A span of this trace.
+
+        Returns:
+            The referenced history prefix as a list, the span's inline
+            ``gen_ai.input.messages`` value as declared (possibly JSON-encoded text), or
+            ``None`` when the span declares neither.
+        """
+        prefix = span.attributes.get(INPUT_HISTORY_PREFIX_KEY)
+        if isinstance(prefix, int) and not isinstance(prefix, bool):
+            return list(self.message_history[:prefix])
+        return span.attributes.get(INPUT_MESSAGES_KEY)
 
 
 class TraceDataset(ArtifactEnvelope):
