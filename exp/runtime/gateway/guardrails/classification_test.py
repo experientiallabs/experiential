@@ -12,6 +12,7 @@ from pydantic import ValidationError
 
 from exp.common.core.artifacts import JsonObject, JsonValue
 from exp.runtime.gateway.contracts import GatewayApiSurface, GatewayMessage, GatewayRequest
+from exp.runtime.gateway.decisions_contracts import MAX_DECISION_INPUT_BYTES
 from exp.runtime.gateway.guardrails.classification import (
     DecisionModelAdapterDocument,
     DecisionModelClassifier,
@@ -302,14 +303,14 @@ def test_document_rejects_repeated_question_ids_and_oversized_questions() -> Non
         categories={
             "off_topic": {
                 "threshold": 0.5,
-                "questions": {"long": {"instructions": "x" * 200_000}},
+                "questions": {"long": {"instructions": "x" * (MAX_DECISION_INPUT_BYTES - 32_768)}},
             }
         }
     )
 
     with pytest.raises(ValidationError, match="unique across categories"):
         DecisionModelAdapterDocument.model_validate(repeated)
-    with pytest.raises(ValidationError, match="262144-byte decision input limit"):
+    with pytest.raises(ValidationError, match="byte decision input limit"):
         DecisionModelAdapterDocument.model_validate(oversized)
     with pytest.raises(ValidationError, match="greater than 0"):
         DecisionModelAdapterDocument.model_validate(

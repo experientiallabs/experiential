@@ -276,6 +276,22 @@ def test_question_and_total_input_bounds_are_independent() -> None:
         decode_decision_request(json.dumps({**_body(), "state": "x" * MAX_DECISION_INPUT_BYTES}))
 
 
+def test_long_context_state_roundtrips_without_truncation() -> None:
+    """A synthetic 200k-token state reaches the provider with its final evidence intact."""
+    state = "The deployment is healthy. " * 40_000 + "Final evidence: deployment failed."
+    body = {**_body(), "state": state}
+    request = decode_decision_request(json.dumps(body)).request
+    assert request.state == state
+    assert request.provider_body("clef")["state"] == state
+
+
+def test_text_budget_counts_utf8_bytes() -> None:
+    """Non-ASCII state consumes its encoded byte count, not its character count."""
+    state = "\U0001f642" * (MAX_DECISION_INPUT_BYTES // 4)
+    with pytest.raises(ValueError, match="byte input limit"):
+        decode_decision_request(json.dumps({**_body(), "state": state}, ensure_ascii=False))
+
+
 @pytest.mark.parametrize(
     "usage",
     [
@@ -364,7 +380,7 @@ def test_text_only_requests_carry_no_assets_key() -> None:
 
 
 def test_image_data_does_not_count_toward_the_text_budget() -> None:
-    """A large image is bounded by the image budget, not the 262144-byte text budget."""
+    """A large image is bounded independently of the text budget."""
     data = base64.b64encode(b"x" * MAX_DECISION_INPUT_BYTES).decode()
     big: JsonObject = {"format": "jpg", "data_base64": data}
     assets = {**_assets(), "c83a0e15-big": big}

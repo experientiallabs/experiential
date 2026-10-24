@@ -16,7 +16,7 @@ from exp.runtime.gateway.contracts import GatewayApiSurface
 MAX_DECISION_QUESTIONS = 32
 MAX_DECISION_CRITERIA = 64
 MAX_SCORE_CRITERIA = 10
-MAX_DECISION_INPUT_BYTES = 262_144
+MAX_DECISION_INPUT_BYTES = 4_194_304
 """Serialized request bytes excluding image data (asset entries)."""
 MAX_DECISION_JSON_DEPTH = 64
 MAX_DECISION_IMAGE_BYTES = 33_554_432
@@ -271,7 +271,8 @@ class DecisionRequest(ContractModel):
         if _json_bytes(self.model_dump(mode="json", exclude={"assets"})) > MAX_DECISION_INPUT_BYTES:
             raise DecisionRequestError(
                 "body",
-                "decision request exceeds the 262144-byte input limit (image data not counted)",
+                f"decision request exceeds the {MAX_DECISION_INPUT_BYTES}-byte input limit "
+                "(image data not counted); shorten state or questions",
             )
         if self.assets is not None:
             self._bounded_assets(self.assets)
