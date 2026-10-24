@@ -1356,9 +1356,12 @@ def test_build_preflight_auto_runs_without_proceed(tmp_path: Path) -> None:
     assert "embedding    at most $" in output
     assert "budget       $5.000000" in output
     assert "Proceed?" not in output
-    assert "serving index" in output
-    assert "fit-only index" in output
-    assert "grounded model" in output
+    # One progress line covers indexing. A log names the phase once, then each index stage
+    # when it starts and once more when its counts complete; nothing repeats beyond that.
+    assert output.count("Building indexes") == 1
+    stages = [line for line in output.splitlines() if line.startswith("  . ")]
+    assert len(stages) == len(set(stages))
+    assert "  . RAG (fit-only index)" in stages and "  . grounded model" in stages
     assert "next: exp optimize router support" in output
     assert _RESOLVE_CALLS == ["embed"]
 

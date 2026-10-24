@@ -63,6 +63,7 @@ fn completed_body_orders_text_before_tool_use_blocks() {
             index: 0,
             call_id: "call-1".to_string(),
             name: "search".to_string(),
+            thought_signature: None,
         },
         Event::ToolArgumentsDelta {
             index: 0,
@@ -79,6 +80,7 @@ fn completed_body_orders_text_before_tool_use_blocks() {
                 provider_status: None,
                 raw_arguments: "{\"b\":1,\"a\":2}".to_string(),
                 custom: false,
+                thought_signature: None,
             },
         },
         Event::Completed,
@@ -105,6 +107,7 @@ fn completed_body_preserves_interleaved_block_order() {
             index: 0,
             call_id: "call-1".to_string(),
             name: "search".to_string(),
+            thought_signature: None,
         },
         Event::ToolCallCompleted {
             index: 0,
@@ -117,6 +120,7 @@ fn completed_body_preserves_interleaved_block_order() {
                 provider_status: None,
                 raw_arguments: "{}".to_string(),
                 custom: false,
+                thought_signature: None,
             },
         },
         Event::TextDelta("after ".to_string()),
@@ -143,6 +147,7 @@ fn deferred_tool_completion_keeps_the_started_block_position() {
             index: 0,
             call_id: "call-1".to_string(),
             name: "search".to_string(),
+            thought_signature: None,
         },
         Event::ToolArgumentsDelta {
             index: 0,
@@ -160,6 +165,7 @@ fn deferred_tool_completion_keeps_the_started_block_position() {
                 provider_status: None,
                 raw_arguments: "{}".to_string(),
                 custom: false,
+                thought_signature: None,
             },
         },
         Event::Completed,
@@ -194,6 +200,7 @@ fn interleaved_parallel_tools_stream_strictly_sequential_blocks() {
             index: 0,
             call_id: "call-a".to_string(),
             name: "alpha".to_string(),
+            thought_signature: None,
         },
         Event::ToolArgumentsDelta {
             index: 0,
@@ -206,6 +213,7 @@ fn interleaved_parallel_tools_stream_strictly_sequential_blocks() {
             index: 1,
             call_id: "call-b".to_string(),
             name: "beta".to_string(),
+            thought_signature: None,
         },
         Event::ToolArgumentsDelta {
             index: 1,
@@ -226,6 +234,7 @@ fn interleaved_parallel_tools_stream_strictly_sequential_blocks() {
                 provider_status: None,
                 raw_arguments: "{\"a\": 1}".to_string(),
                 custom: false,
+                thought_signature: None,
             },
         },
         Event::ToolCallCompleted {
@@ -239,6 +248,7 @@ fn interleaved_parallel_tools_stream_strictly_sequential_blocks() {
                 provider_status: None,
                 raw_arguments: "{\"b\": 2}".to_string(),
                 custom: false,
+                thought_signature: None,
             },
         },
         Event::Completed,
@@ -407,6 +417,7 @@ fn interleaved_thinking_between_tool_blocks_keeps_sequential_indices() {
             index: 0,
             call_id: "call-1".to_string(),
             name: "search".to_string(),
+            thought_signature: None,
         },
         Event::ToolArgumentsDelta {
             index: 0,
@@ -423,6 +434,7 @@ fn interleaved_thinking_between_tool_blocks_keeps_sequential_indices() {
                 provider_status: None,
                 raw_arguments: "{}".to_string(),
                 custom: false,
+                thought_signature: None,
             },
         },
         Event::Completed,
@@ -482,6 +494,7 @@ fn web_search_events() -> Vec<Event> {
                 provider_status: None,
                 raw_arguments: "{\"query\": \"current stable Python\"}".to_string(),
                 custom: false,
+                thought_signature: None,
             },
         },
         Event::ServerToolResult {
@@ -608,6 +621,7 @@ fn paused_turn_keeps_its_stop_reason_on_both_paths() {
                 provider_status: None,
                 raw_arguments: "{}".to_string(),
                 custom: false,
+                thought_signature: None,
             },
         },
         Event::PausedTurn,
@@ -705,6 +719,7 @@ pub(super) fn tool_turn_reasoning_events() -> Vec<Event> {
             index: 0,
             call_id: "call-1".to_string(),
             name: "lookup".to_string(),
+            thought_signature: None,
         },
         Event::ToolArgumentsDelta {
             index: 0,
@@ -721,6 +736,7 @@ pub(super) fn tool_turn_reasoning_events() -> Vec<Event> {
                 provider_status: None,
                 raw_arguments: "{}".to_string(),
                 custom: false,
+                thought_signature: None,
             },
         },
         Event::Completed,

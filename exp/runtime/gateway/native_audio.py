@@ -15,8 +15,10 @@ and how each rung bills:
   provider's metered seconds; a token-priced lane bills its token usage.
 
 A rung serves an audio surface only on a positive capability claim and an
-OpenAI-wire endpoint for it (fail-closed). Keyed replay, streaming, voice
-cloning, and non-OpenAI wires are not admitted.
+endpoint for it (fail-closed): the OpenAI audio wire, or ElevenLabs' own wire
+for an ElevenLabs rung (:mod:`exp.runtime.models.providers.elevenlabs_audio`
+translates the request). Keyed replay, streaming, and voice cloning are not
+admitted.
 """
 
 from __future__ import annotations
@@ -48,8 +50,11 @@ from exp.runtime.gateway.native_accounting import (
     NativeBridgeError,
     authority_error,
 )
-from exp.runtime.gateway.native_admission import record_dead_admission_rungs
+from exp.runtime.gateway.native_admission import (
+    record_dead_admission_rungs,
+)
 from exp.runtime.gateway.native_components import NativeGatewayComponents, SyncWriteLedger
+from exp.runtime.gateway.native_dead_rungs import UNAVAILABLE_AT_ADMISSION
 from exp.runtime.gateway.native_decode import (
     NativeDecodeError,
     decode_native_speech_body,
@@ -68,6 +73,11 @@ from exp.runtime.gateway.native_settlement import gateway_updating_failure
 from exp.runtime.gateway.routing import GatewayRoutingError
 from exp.runtime.models.providers import require_gateway_provider
 from exp.runtime.models.providers.base import GatewayWireProfile
+from exp.runtime.models.providers.elevenlabs_audio import (
+    ELEVENLABS_AUDIO_DIALECT,
+    elevenlabs_speech_target,
+    elevenlabs_transcription_fields,
+)
 from exp.runtime.models.providers.openai_audio_payloads import (
     openai_speech_request,
     openai_transcription_fields,
@@ -173,6 +183,28 @@ class NativeAudioMixin:
         request = decoded.request
         authorization, deadline = _accept(self, data, decoded.alias, request, "speech")
 
+        def elevenlabs(profile: GatewayWireProfile) -> tuple[str, JsonObject] | OpenAIProtocolError:
+            """Render an ElevenLabs rung's endpoint and body, or its refusal."""
+            return elevenlabs_speech_target(profile.speech_url or "", profile.model_id, request)
+
+        def rung_url(profile: GatewayWireProfile, deployment: ExactModelDeployment) -> str | None:
+            """The rung's speech endpoint; an ElevenLabs rung's carries voice and format."""
+            url = _speech_rung(profile, deployment)
+            if url is None or profile.dialect != ELEVENLABS_AUDIO_DIALECT:
+                return url
+            target = elevenlabs(profile)
+            return url if isinstance(target, OpenAIProtocolError) else target[0]
+
+        def refusal(
+            profile: GatewayWireProfile, deployment: ExactModelDeployment
+        ) -> OpenAIProtocolError | None:
+            """The field this rung cannot honor for this request, if any."""
+            del deployment
+            if profile.dialect != ELEVENLABS_AUDIO_DIALECT:
+                return None
+            target = elevenlabs(profile)
+            return target if isinstance(target, OpenAIProtocolError) else None
+
         def payload(profile: GatewayWireProfile, deployment: ExactModelDeployment) -> JsonObject:
             """Build one rung's speech body, asking for SSE on a token-priced rung.
 
@@ -181,8 +213,14 @@ class NativeAudioMixin:
                 deployment: The rung's deployment, whose price card picks the mode.
 
             Returns:
-                The OpenAI ``/audio/speech`` JSON body for this rung.
+                The OpenAI ``/audio/speech`` JSON body for this rung, or the
+                ElevenLabs body for an ElevenLabs rung.
             """
+            if profile.dialect == ELEVENLABS_AUDIO_DIALECT:
+                target = elevenlabs(profile)
+                if isinstance(target, OpenAIProtocolError):  # pragma: no cover - refused above.
+                    raise GatewayRoutingError("refused ElevenLabs rung reached its payload")
+                return target[1]
             metered = billing_mode(deployment, "speech") == "tokens"
             return openai_speech_request(profile.model_id, request, metered_stream=metered)
 
@@ -192,8 +230,9 @@ class NativeAudioMixin:
             request,
             deadline,
             surface="speech",
-            rung_url=_speech_rung,
+            rung_url=rung_url,
             payload=payload,
+            refusal=refusal,
             extra={"input_characters": request.input_characters},
         )
 
@@ -222,6 +261,16 @@ class NativeAudioMixin:
         request = decoded.request
         authorization, deadline = _accept(self, data, decoded.alias, request, "transcription")
 
+        def refusal(
+            profile: GatewayWireProfile, deployment: ExactModelDeployment
+        ) -> OpenAIProtocolError | None:
+            """The field this rung cannot honor for this request, if any."""
+            del deployment
+            if profile.dialect != ELEVENLABS_AUDIO_DIALECT:
+                return None
+            fields = elevenlabs_transcription_fields(profile.model_id, request)
+            return fields if isinstance(fields, OpenAIProtocolError) else None
+
         def payload(profile: GatewayWireProfile, deployment: ExactModelDeployment) -> JsonObject:
             """Build one rung's transcription text fields (the audio is attached natively).
 
@@ -230,9 +279,15 @@ class NativeAudioMixin:
                 deployment: Unused: the fields do not depend on the billing mode.
 
             Returns:
-                The ordered multipart text fields for this rung.
+                The ordered multipart text fields for this rung (ElevenLabs'
+                ``model_id`` fields on an ElevenLabs rung).
             """
             del deployment
+            if profile.dialect == ELEVENLABS_AUDIO_DIALECT:
+                fields = elevenlabs_transcription_fields(profile.model_id, request)
+                if isinstance(fields, OpenAIProtocolError):  # pragma: no cover - refused above.
+                    raise GatewayRoutingError("refused ElevenLabs rung reached its payload")
+                return fields
             return openai_transcription_fields(profile.model_id, request)
 
         return _route(
@@ -243,6 +298,7 @@ class NativeAudioMixin:
             surface="transcription",
             rung_url=_transcription_rung,
             payload=payload,
+            refusal=refusal,
             extra={
                 "response_format": request.response_format or "json",
                 "maximum_audio_milli": request.maximum_audio_seconds * 1_000,
@@ -309,9 +365,16 @@ def _route(  # noqa: PLR0913 - one admission seam shared by both audio surfaces.
     surface: AudioSurface,
     rung_url: Callable[[GatewayWireProfile, ExactModelDeployment], str | None],
     payload: Callable[[GatewayWireProfile, ExactModelDeployment], JsonObject],
+    refusal: Callable[[GatewayWireProfile, ExactModelDeployment], OpenAIProtocolError | None],
     extra: JsonObject,
 ) -> str:
-    """Route and package one durably accepted audio request."""
+    """Route and package one durably accepted audio request.
+
+    A rung whose wire cannot honor one of the request's options (an
+    ElevenLabs rung asked for an unsupported format or voice) is skipped for
+    this request; when no rung can serve it, the first refusal reaches the
+    caller as a field-specific 400 rather than an escalation.
+    """
     if not isinstance(authorization.target, DirectTarget):
         _finish_unsupported(plane, authorization, surface)
         raise NativeBridgeError(not_an_audio_model_error(authorization.alias, surface))
@@ -320,6 +383,7 @@ def _route(  # noqa: PLR0913 - one admission seam shared by both audio surfaces.
         dispatchable = dispatchable_route_profiles(
             plane._components.runtime_catalogs,  # noqa: SLF001
             route,
+            reread=lambda: plane._components.runtime_catalogs,  # noqa: SLF001
         )
     except NativeDialectUnavailableError as exc:
         return plane._escalate_accepted(authorization, str(exc))  # noqa: SLF001
@@ -345,16 +409,31 @@ def _route(  # noqa: PLR0913 - one admission seam shared by both audio surfaces.
         raise NativeBridgeError(not_an_audio_model_error(authorization.alias, surface))
     if not dispatchable.indexes:
         return plane._escalate_accepted(  # noqa: SLF001
-            authorization, "every certified deployment was unavailable at admission"
+            authorization, UNAVAILABLE_AT_ADMISSION
         )
     serving: list[tuple[int, GatewayWireProfile, str]] = []
+    refusals: list[OpenAIProtocolError] = []
     for index, (profile, _client) in zip(
         dispatchable.indexes, dispatchable.resolved_wires, strict=True
     ):
         deployment = route.deployments[index]
         url = rung_url(profile, deployment)
-        if url is not None and billing_mode(deployment, surface) is not None:
-            serving.append((index, profile, url))
+        if url is None or billing_mode(deployment, surface) is None:
+            continue
+        refused = refusal(profile, deployment)
+        if refused is not None:
+            refusals.append(refused)
+            continue
+        serving.append((index, profile, url))
+    if not serving and refusals:
+        plane._accounting.finish_request_quietly(  # noqa: SLF001
+            authorization,
+            GatewayFailure(
+                failure_class=GatewayFailureClass.INVALID_REQUEST,
+                safe_message="no deployment of the model alias honors the request's audio options",
+            ),
+        )
+        raise NativeBridgeError(refusals[0])
     if not serving:
         return plane._escalate_accepted(  # noqa: SLF001
             authorization, "every audio-capable deployment was unavailable at admission"

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import math
-import re
 from collections.abc import Mapping, Sequence
 from dataclasses import replace
 from typing import ClassVar, Literal, cast
@@ -29,6 +28,7 @@ from exp.common.models.usage_observability import (
     fold_openai_shaped_reasoning,
     unreported_token_details,
 )
+from exp.common.traces.ingest.json_strict import reject_duplicate_json_keys
 from exp.runtime.gateway.images_contracts import ImagesRequest
 from exp.runtime.models.providers.async_transport import (
     AsyncJsonHttpTransport,
@@ -64,15 +64,18 @@ from exp.runtime.models.providers.instruction_turns import (
     fold_instruction_turns_after_the_first,
     fold_trailing_instruction_turns,
 )
+from exp.runtime.models.providers.json_prefix import incomplete_json_object_prefix
 from exp.runtime.models.providers.openrouter_routing import (
     OPENROUTER_PROVIDER_ID,
     openrouter_cache_writes_within_reads,
 )
+from exp.runtime.models.providers.prompt_cache_options import openai_prompt_cache_origin
 from exp.runtime.models.providers.reasoning_compat import (
     openai_reasoning_effort,
     require_sampling_reasoning_compatibility,
 )
 from exp.runtime.models.providers.transport import JsonHttpTransport, RetryPolicy
+from exp.runtime.models.providers.xai import xai_videos_url
 
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 OPENROUTER_REFERER = "https://github.com/experientiallabs/experiential"
@@ -104,28 +107,20 @@ def openai_compatible_request(
     Args:
         model_id: Provider model identifier to place on the wire.
         request: Typed EXP request.
-        token_limit_key: Wire field carrying the output-token ceiling. Azure OpenAI
-            reasoning deployments reject ``max_tokens`` and require
-            ``max_completion_tokens``.
+        token_limit_key: Output-token ceiling field; Azure reasoning deployments require
+            ``max_completion_tokens`` instead of ``max_tokens``.
         supports_temperature: Whether this exact model accepts explicit sampling controls.
         supports_top_p: Whether this exact model accepts nucleus sampling. ``None`` follows
             ``supports_temperature`` for older catalog records.
         supports_top_k: Whether this exact route accepts top-k sampling.
-        supports_logprobs: Reserved route capability retained for contract parity. Chat
-            logprob controls are currently ignored because the normalized gateway response
-            cannot return provider logprob details.
+        supports_logprobs: Reserved capability; ignored until normalized responses carry logprobs.
         supports_reasoning: Whether this exact model accepts a reasoning control.
         reasoning_effort: Optional catalog-pinned reasoning effort.
         reasoning_wire_format: Provider field used for normalized reasoning effort.
-        deepseek_reasoning_history: Whether this is DeepSeek's own origin, whose
-            thinking mode requires ``reasoning_content`` on every assistant message
-            of the current turn; every assistant message is backfilled with an
-            empty one (the typed request carries no reasoning to forward), the
-            same rule the streaming builder applies in ``openai_chat_message``.
-        system_messages_leading_only: Whether this rung's chat template accepts a
-            system message only as the very first message; every other
-            instruction turn is folded into user text, the same rule as the
-            streaming builder (``fold_instruction_turns_after_the_first``).
+        deepseek_reasoning_history: Backfill assistant messages with empty reasoning content
+            for DeepSeek thinking, matching ``openai_chat_message`` in the streaming builder.
+        system_messages_leading_only: Fold non-leading instruction turns into user text,
+            matching ``fold_instruction_turns_after_the_first`` in the streaming builder.
 
     Returns:
         A JSON object for ``/chat/completions``.
@@ -232,7 +227,9 @@ def openai_embedding_request(
     return request
 
 
-def openai_images_request(model_id: str, request: ImagesRequest) -> JsonObject:
+def openai_images_request(
+    model_id: str, request: ImagesRequest, *, inline_images: bool = False
+) -> JsonObject:
     """Convert one canonical image-generation request into the OpenAI wire body.
 
     Every optional control is omitted when absent so the provider default
@@ -241,6 +238,10 @@ def openai_images_request(model_id: str, request: ImagesRequest) -> JsonObject:
     Args:
         model_id: Served image model id.
         request: Canonical image-generation request.
+        inline_images: Force ``response_format: "b64_json"`` whatever the caller
+            asked, for a provider that keeps hosted images (xAI refuses ``url``
+            output for Zero Data Retention teams). The caller then receives
+            ``b64_json`` items; the gateway hosts no images to link to.
 
     Returns:
         The OpenAI-compatible ``/images/generations`` request body.
@@ -259,6 +260,8 @@ def openai_images_request(model_id: str, request: ImagesRequest) -> JsonObject:
         value = getattr(request, field)
         if value is not None:
             body[field] = value
+    if inline_images:
+        body["response_format"] = "b64_json"
     return body
 
 
@@ -613,6 +616,7 @@ class OpenAICompatibleClient(OpenAIEmbeddingMixin):
             images_url=f"{self._base_url}/{self._request_path('images/generations')}",
             speech_url=f"{self._base_url}/{self._request_path('audio/speech')}",
             transcriptions_url=f"{self._base_url}/{self._request_path('audio/transcriptions')}",
+            videos_url=xai_videos_url(self._base_url),
             headers=self._headers(),
             model_id=self._model.model_id,
             timeout_seconds=self._timeout_seconds,
@@ -650,7 +654,12 @@ class OpenAICompatibleClient(OpenAIEmbeddingMixin):
             # does may still reject an unknown top-level field, so the
             # declaration never widens what is sent, BYOK or not.
             forwards_prompt_cache_key=is_hunyuan_base_url(self._base_url),
+            forwards_prompt_cache_options=self._carries_prompt_cache_options(),
         )
+
+    def _carries_prompt_cache_options(self) -> bool:
+        """Whether this origin carries OpenAI's ``prompt_cache_options`` and breakpoints."""
+        return openai_prompt_cache_origin(self._base_url)
 
     def _completion_path(self) -> str:
         """Return the shared Chat Completions route."""
@@ -774,15 +783,19 @@ def parse_openai_wire_tool_call(
         function.get("arguments"), f"tool_calls[{index}].function.arguments"
     )
     try:
-        arguments = json.loads(raw_arguments)
+        arguments = json.loads(raw_arguments, object_pairs_hook=reject_duplicate_json_keys)
     except json.JSONDecodeError as exc:
-        if hit_length_limit and _incomplete_json_object_prefix(raw_arguments):
+        if hit_length_limit and incomplete_json_object_prefix(raw_arguments):
             raise ProviderTruncatedResponseError(
                 f"tool_calls[{index}].function.arguments ended inside JSON "
                 "at the response length boundary"
             ) from exc
         raise OpenAICompatibleResponseError(
             f"tool_calls[{index}].function.arguments is not JSON"
+        ) from exc
+    except ValueError as exc:
+        raise OpenAICompatibleResponseError(
+            f"tool_calls[{index}].function.arguments contains duplicate JSON keys"
         ) from exc
     if not isinstance(arguments, dict):
         raise OpenAICompatibleResponseError(
@@ -794,87 +807,6 @@ def parse_openai_wire_tool_call(
         arguments=arguments,
         raw_arguments=raw_arguments,
     )
-
-
-_JSON_STRING_CHAR = r'(?:[^"\\\x00-\x1f]|\\(?:["\\/bfnrt]|u[0-9a-fA-F]{4}))'
-_JSON_NUMBER = r"-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?"
-_JSON_SCALAR = re.compile(rf'"{_JSON_STRING_CHAR}*"|true|false|null|{_JSON_NUMBER}')
-_JSON_INCOMPLETE_SCALAR = re.compile(
-    rf'"{_JSON_STRING_CHAR}*(?:\\(?:u[0-9a-fA-F]{{0,3}})?)?'
-    r"|t|tr|tru|f|fa|fal|fals|n|nu|nul|-"
-    r"|-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?[eE][+-]?"
-    r"|-?(?:0|[1-9][0-9]*)\."
-)
-
-
-def _incomplete_json_object_prefix(value: str) -> bool:
-    """Whether appending bytes could complete an unfinished JSON object.
-
-    Track container grammar as well as tokens: EOF inside a literal, exponent
-    or escape is recoverable only when all preceding structure is valid. This
-    neither repairs arguments nor accepts a complete non-object value.
-
-    Args:
-        value: Exact decoded tool-argument string rejected by the JSON parser.
-
-    Returns:
-        True only when appending characters could complete the started JSON object
-        without changing its existing tokens or container grammar.
-    """
-    if not value.lstrip(" \t\r\n").startswith("{"):
-        return False
-    position = 0
-    states = ["end", "value"]
-    while states:
-        state = states.pop()
-        while position < len(value) and value[position] in " \t\r\n":
-            position += 1
-        if position == len(value):
-            return state != "end"
-        char = value[position]
-        if state == "end":
-            return False
-        if state == "object_first":
-            if char == "}":
-                position += 1
-                continue
-            state = "key"
-        if state == "array_first":
-            if char == "]":
-                position += 1
-            else:
-                states.extend(("array_next", "value"))
-            continue
-        if state in ("object_next", "array_next"):
-            if char == ("}" if state == "object_next" else "]"):
-                position += 1
-                continue
-            if char != ",":
-                return False
-            states.extend(("key",) if state == "object_next" else ("array_next", "value"))
-            position += 1
-            continue
-        if state == "colon":
-            if char != ":":
-                return False
-            states.extend(("object_next", "value"))
-            position += 1
-            continue
-        if state == "key":
-            if char != '"':
-                return False
-            states.append("colon")
-        elif char in "{[":
-            states.append("object_first" if char == "{" else "array_first")
-            position += 1
-            continue
-        if _JSON_INCOMPLETE_SCALAR.fullmatch(value, position):
-            return True
-        scalar = _JSON_SCALAR.match(value, position)
-        if scalar is None:
-            return False
-        position = scalar.end()
-    return False
 
 
 def _array_or_empty(message: JsonObject) -> list[JsonValue]:
@@ -909,6 +841,13 @@ def _usage(payload: JsonObject, *, cache_writes_within_reads: bool) -> Usage | N
         return None if value is None else require_integer(value, f"usage.{group}.{field}")
 
     reasoning = detail("completion_tokens_details", "reasoning_tokens")
+    raw_top_level = usage.get("reasoning_tokens")
+    if raw_top_level is not None:
+        # Azure AI Foundry's DeepSeek models report the same subset as a top-level
+        # count, validated like the native mapper; the nested placement wins.
+        top_level = require_integer(raw_top_level, "usage.reasoning_tokens")
+        if reasoning is None and "reasoning_tokens" not in unknown:
+            reasoning = top_level
     raw_total = usage.get("total_tokens")
     total = None if raw_total is None else require_integer(raw_total, "usage.total_tokens")
     try:

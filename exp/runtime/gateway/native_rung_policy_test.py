@@ -16,7 +16,7 @@ from exp.common.models.catalog import (
     ModelCatalog,
     ModelRecord,
 )
-from exp.common.models.dispatch_policy import GatewayThrottleRedialPolicy
+from exp.common.models.dispatch_policy import GatewayThrottleRedialPolicy, SaturationPolicy
 from exp.common.models.failover_tokens import FailoverToken
 from exp.common.models.gateway_catalog import (
     ExactModelDeployment,
@@ -28,7 +28,6 @@ from exp.runtime.gateway import native_rung_policy
 from exp.runtime.gateway.contracts import (
     AuthorizationSnapshot,
     DirectTarget,
-    ExecutionSnapshot,
     GatewayApiSurface,
     GatewayFailure,
     GatewayFailureClass,
@@ -36,6 +35,7 @@ from exp.runtime.gateway.contracts import (
     GatewayRefusalReason,
     GatewayRequest,
 )
+from exp.runtime.gateway.execution_snapshot import ExecutionSnapshot
 from exp.runtime.gateway.health import DeploymentHealthRegistry
 from exp.runtime.gateway.native_execution import InflightRequest, deployment_health_key
 from exp.runtime.gateway.native_rung_policy import (
@@ -250,6 +250,38 @@ def test_reserve_rung_slot_sheds_fresh_sessions_early_only_with_warm_standing_ab
     assert isinstance(shed, RungShed) and shed.reason == "fresh_session_spill"
     assert isinstance(
         reserve_rung_slot(loads, sticky, warm, deployment, reserved_tokens=0, force=False), str
+    )
+
+
+def test_reserve_rung_slot_classes_a_caching_off_request_as_a_fresh_session() -> None:
+    """With prompt caching off a request has no fingerprint yet still sheds early.
+
+    Without the rule, a request carrying no fingerprint would skip the early
+    threshold entirely and compete for the slice kept for warm sessions.
+    """
+    loads = RungLoadRegistry()
+    sticky = StickySpillRegistry()
+    deployment = _deployment(
+        "deployment-a",
+        connection_sha256="b" * 64,
+        dispatch=GatewayRungDispatchPolicy(
+            concurrency_bound=4, fresh_session_spill_fraction=0.5, sticky_spill_seconds=60
+        ),
+    )
+    plain = _entry((deployment,), failover_mode="maximize_cache_affinity")
+    caching_off = dataclasses.replace(
+        plain,
+        authorization=plain.authorization.model_copy(update={"prompt_caching_disabled": True}),
+    )
+    for _ in range(2):
+        assert isinstance(
+            reserve_rung_slot(loads, sticky, plain, deployment, reserved_tokens=0, force=False),
+            str,
+        )
+    shed = reserve_rung_slot(loads, sticky, caching_off, deployment, reserved_tokens=0, force=False)
+    assert isinstance(shed, RungShed) and shed.reason == "fresh_session_spill"
+    assert isinstance(
+        reserve_rung_slot(loads, sticky, plain, deployment, reserved_tokens=0, force=False), str
     )
 
 
@@ -722,3 +754,76 @@ def test_shed_keeps_the_cache_placed_rung_on_the_first_dispatch_only() -> None:
             )
         ).route.model_copy(update={"cache_placed_deployment_id": "deployment-a"})
         assert shed_keeps_pin(soft, 0) is False
+
+
+def _carded_reserve_rung(*, saturation: SaturationPolicy) -> ExactModelDeployment:
+    """A carded self-hosted rung, bound 4 per worker, reserving 25% for :fast."""
+    from exp.common.models.catalog_prices import GatewayServiceTierPrices, GatewayTokenPrices
+
+    base = _deployment(
+        "deployment-a",
+        connection_sha256="b" * 64,
+        dispatch=GatewayRungDispatchPolicy(
+            concurrency_bound=4,
+            upstream_priority=True,
+            fast_reserve_fraction=0.25,
+            saturation=saturation,
+        ),
+    )
+    carded = GatewayTokenPrices(
+        input_nano_usd_per_million_tokens=1_000,
+        output_nano_usd_per_million_tokens=2_000,
+        priority=GatewayServiceTierPrices(
+            input_nano_usd_per_million_tokens=2_000, output_nano_usd_per_million_tokens=4_000
+        ),
+    )
+    return base.model_copy(
+        update={
+            "billing_source": BillingSource.HOST_MANAGED,
+            "gateway": base.gateway.model_copy(update={"prices": carded}),
+        }
+    )
+
+
+def test_a_refuse_lane_holds_regular_to_three_of_four_and_keeps_one_for_fast() -> None:
+    """GLM /glm3 shape: regular sheds hard at 3, even forced; :fast takes the fourth slot."""
+    loads = RungLoadRegistry()
+    deployment = _carded_reserve_rung(saturation="refuse")
+    entry = _entry((deployment,))
+    fast_entry = dataclasses.replace(
+        entry, authorization=entry.authorization.model_copy(update={"fast": True})
+    )
+    sticky = StickySpillRegistry()
+
+    def reserve(item: InflightRequest, *, force: bool = False) -> str | RungShed | None:
+        return reserve_rung_slot(loads, sticky, item, deployment, reserved_tokens=10, force=force)
+
+    for _ in range(3):
+        assert isinstance(reserve(entry), str)
+    assert reserve(entry) == RungShed("queue_bound", overflow_ceiling=True)
+    assert reserve(entry, force=True) == RungShed("queue_bound", overflow_ceiling=True)
+    assert isinstance(reserve(fast_entry), str)
+    assert reserve(fast_entry) == RungShed("queue_bound", overflow_ceiling=True)
+
+
+def test_an_overflow_lane_never_turns_the_reserve_into_a_refusal() -> None:
+    """DeepSeek shape: regular past its share sheds softly and overflows on the forced pass."""
+    loads = RungLoadRegistry()
+    deployment = _carded_reserve_rung(saturation="overflow")
+    entry = _entry((deployment,))
+    fast_entry = dataclasses.replace(
+        entry, authorization=entry.authorization.model_copy(update={"fast": True})
+    )
+    sticky = StickySpillRegistry()
+
+    def reserve(item: InflightRequest, *, force: bool = False) -> str | RungShed | None:
+        return reserve_rung_slot(loads, sticky, item, deployment, reserved_tokens=10, force=force)
+
+    for _ in range(3):
+        assert isinstance(reserve(entry), str)
+    shed = reserve(entry)
+    assert isinstance(shed, RungShed)
+    assert shed.reason == "queue_bound"
+    assert not shed.overflow_ceiling
+    assert isinstance(reserve(fast_entry), str)  # first claim on the kept slot
+    assert isinstance(reserve(entry, force=True), str)  # overflow as today

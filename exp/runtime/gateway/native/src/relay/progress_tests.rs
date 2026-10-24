@@ -193,17 +193,45 @@ async fn anthropic_buffered_tool_argument_is_still_bounded() {
     assert!(waited < Duration::from_secs(1), "waited {waited:?}");
 }
 
-#[tokio::test]
-async fn other_dialects_keep_the_generation_idle_window_for_tool_arguments() {
-    let frames = stream::iter([Ok::<_, reqwest::Error>(Bytes::from_static(
-        b"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"Write\",\"arguments\":\"{\\\"a\\\"\"}}]}}]}\n\n",
+/// A vLLM DeepSeek Write call on the chat wire: the parser holds the `content`
+/// argument for `silence`, then the call completes when the stream ends.
+fn chat_buffered_write_call(silence: Duration) -> BoxStream<'static, reqwest::Result<Bytes>> {
+    stream::iter([Ok::<_, reqwest::Error>(Bytes::from_static(
+        b"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"Write\",\"arguments\":\"{\\\"path\\\": \\\"\"}}]}}]}\n\n",
     ))])
+    .chain(stream::once(async move {
+        tokio::time::sleep(silence).await;
+        Ok(Bytes::from_static(
+            b"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"a.py\\\"}\"}}]}}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\ndata: [DONE]\n\n",
+        ))
+    }))
     .chain(stream::pending())
-    .boxed();
+    .boxed()
+}
+
+#[tokio::test]
+async fn chat_buffered_tool_argument_outlasts_the_generation_idle_window() {
+    let start = Instant::now();
+    let idle = Duration::from_millis(20);
+    let mut relay = UpstreamRelay::from_stream(
+        chat_buffered_write_call(idle * 4),
+        Dialect::OpenAiCompatible,
+        start + Duration::from_secs(1),
+    );
+    let deadline = start + Duration::from_secs(5);
+    drain_until(&mut relay, deadline, idle, start, |event| {
+        matches!(event, Event::ToolCallCompleted { .. })
+    })
+    .await
+    .expect("a silent buffered argument is not a stall");
+}
+
+#[tokio::test]
+async fn chat_buffered_tool_argument_is_still_bounded() {
     let start = Instant::now();
     let idle = Duration::from_millis(10);
     let mut relay = UpstreamRelay::from_stream(
-        frames,
+        chat_buffered_write_call(Duration::from_secs(5)),
         Dialect::OpenAiCompatible,
         start + Duration::from_secs(1),
     );
@@ -212,5 +240,7 @@ async fn other_dialects_keep_the_generation_idle_window_for_tool_arguments() {
         .await
         .unwrap_err();
     assert!(failure.safe_message.contains("stopped making progress"));
-    assert!(start.elapsed() < idle * 10);
+    let waited = start.elapsed();
+    assert!(waited >= idle * 10, "waited {waited:?}");
+    assert!(waited < Duration::from_secs(1), "waited {waited:?}");
 }

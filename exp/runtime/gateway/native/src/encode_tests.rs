@@ -42,9 +42,11 @@ fn chat_cache_ttl_survives_two_gateway_hops_without_inventing_zero() {
             cached_input_tokens: Some(10),
             cache_creation_input_tokens: Some(100),
             cache_creation_1h_input_tokens: hour,
+            cache_creation_12h_input_tokens: None,
             reasoning_tokens: Some(5),
             billed_units: None,
             cache_writes_read_back: false,
+            image_output_tokens: None,
         };
         for streaming in [false, true] {
             let mut current = usage.clone();
@@ -81,6 +83,7 @@ fn fireworks_tool_events() -> Vec<Event> {
             index: 0,
             call_id: "call-one".to_string(),
             name: "lookup".to_string(),
+            thought_signature: None,
         },
         Event::ToolArgumentsDelta {
             index: 0,
@@ -97,6 +100,7 @@ fn fireworks_tool_events() -> Vec<Event> {
                 provider_item_id: None,
                 provider_status: None,
                 custom: false,
+                thought_signature: None,
             },
         },
         Event::Completed,
@@ -209,6 +213,7 @@ fn reasoning_carrier_preserves_provider_tool_start_order() {
             index: 1,
             call_id: "call-one".to_string(),
             name: "first".to_string(),
+            thought_signature: None,
         },
         Event::ToolCallStarted {
             custom: false,
@@ -217,6 +222,7 @@ fn reasoning_carrier_preserves_provider_tool_start_order() {
             index: 0,
             call_id: "call-zero".to_string(),
             name: "second".to_string(),
+            thought_signature: None,
         },
         Event::ToolCallCompleted {
             index: 0,
@@ -229,6 +235,7 @@ fn reasoning_carrier_preserves_provider_tool_start_order() {
                 provider_item_id: None,
                 provider_status: None,
                 custom: false,
+                thought_signature: None,
             },
         },
         Event::ToolCallCompleted {
@@ -242,6 +249,7 @@ fn reasoning_carrier_preserves_provider_tool_start_order() {
                 provider_item_id: None,
                 provider_status: None,
                 custom: false,
+                thought_signature: None,
             },
         },
     ];
@@ -417,6 +425,7 @@ fn web_search_admission() -> crate::web_search::WebSearchAdmission {
             title: "Python".to_string(),
         }],
         include_sources: false,
+        cost_nano_usd: None,
     }
 }
 
@@ -538,6 +547,7 @@ fn custom_tool_events(custom: bool, name: &str, deltas: &[&str], raw: &str) -> V
         index: 0,
         call_id: "call-custom".to_string(),
         name: name.to_string(),
+        thought_signature: None,
     }];
     events.extend(deltas.iter().map(|delta| Event::ToolArgumentsDelta {
         index: 0,
@@ -554,6 +564,7 @@ fn custom_tool_events(custom: bool, name: &str, deltas: &[&str], raw: &str) -> V
             provider_item_id: None,
             provider_status: None,
             custom,
+            thought_signature: None,
         },
     });
     events.push(Event::Completed);
@@ -723,4 +734,131 @@ fn disjoint_writes_and_the_anthropic_shape_keep_reads_and_writes_apart() {
     assert_eq!(messages["input_tokens"], 1_270);
     // Settlement's disjoint read leg is untouched by the reporting convention.
     assert_eq!(written_and_read_back().cached_input_tokens, Some(0));
+}
+
+/// An Anthropic-style turn (thinking billed inside output, no count) reports
+/// an estimated reasoning count on both Chat encoders, marked as estimated,
+/// while the settled `Usage` keeps reasoning unknown.
+#[test]
+fn chat_reports_an_estimated_reasoning_count_when_the_provider_publishes_none() {
+    let usage = Usage {
+        input_tokens: Some(48),
+        output_tokens: Some(40),
+        ..Usage::default()
+    };
+    let events = vec![
+        Event::ThinkingDelta {
+            index: 0,
+            delta: "1001 is 7 x 11 x 13.".into(),
+        },
+        Event::TextDelta("No.".into()),
+        Event::Usage(usage.clone()),
+        Event::Completed,
+    ];
+    let mut stream = ChatSseEncoder::new_with_ignored("request-1", "claude", 1, true, vec![]);
+    let mut frames = stream.start().expect("stream start must encode");
+    for event in &events {
+        frames.extend(stream.feed(event).expect("event must encode"));
+    }
+    let usage_frame = frames
+        .iter()
+        .filter_map(|frame| frame.strip_prefix("data: "))
+        .filter_map(|data| serde_json::from_str::<Value>(data.trim()).ok())
+        .find(|payload| payload.get("usage").is_some_and(|usage| !usage.is_null()))
+        .expect("include_usage emits a usage chunk");
+    assert_eq!(
+        usage_frame["usage"]["completion_tokens_details"]["reasoning_tokens"],
+        39
+    );
+    assert_eq!(
+        usage_frame["usage"]["estimated_token_details"],
+        json!(["reasoning_tokens"])
+    );
+    assert!(usage_frame["usage"]["unreported_token_details"]
+        .as_array()
+        .is_none_or(|fields| !fields.contains(&json!("reasoning_tokens"))));
+
+    let completed = completed_chat_body_with_ignored("request-1", "claude", 1, &events, &[], false)
+        .expect("completed body must encode");
+    assert_eq!(
+        completed.body["usage"]["completion_tokens_details"]["reasoning_tokens"],
+        39
+    );
+    assert_eq!(
+        completed.body["usage"]["estimated_token_details"],
+        json!(["reasoning_tokens"])
+    );
+    // Settlement reads the aggregated Usage, which stays unreported.
+    assert_eq!(
+        completed.usage.expect("usage aggregates").reasoning_tokens,
+        None
+    );
+}
+
+#[test]
+fn gemini_thought_signatures_ride_chat_tool_calls_as_extra_content() {
+    // Google's OpenAI-compatible shape, on the first streamed chunk of the
+    // signed call and on the completed message; the unsigned call has none.
+    let mut events = Vec::new();
+    for (index, signature) in [(0u32, Some("c2lnbmF0dXJlLWE=")), (1, None)] {
+        let call_id = format!("call-{index}");
+        events.push(Event::ToolCallStarted {
+            custom: false,
+            index,
+            call_id: call_id.clone(),
+            name: "get_weather".to_string(),
+            namespace: None,
+            caller: None,
+            thought_signature: signature.map(str::to_string),
+        });
+        events.push(Event::ToolArgumentsDelta {
+            index,
+            delta: "{}".to_string(),
+        });
+        events.push(Event::ToolCallCompleted {
+            index,
+            call: crate::events::CompletedToolCall {
+                call_id,
+                name: "get_weather".to_string(),
+                namespace: None,
+                caller: None,
+                thought_signature: signature.map(str::to_string),
+                provider_item_id: None,
+                provider_status: None,
+                raw_arguments: "{}".to_string(),
+                custom: false,
+            },
+        });
+    }
+    events.push(Event::Completed);
+    let signed = json!({"google": {"thought_signature": "c2lnbmF0dXJlLWE="}});
+
+    let mut stream =
+        ChatSseEncoder::new_with_ignored("request-1", "gemini", 1_700_000_000, false, Vec::new());
+    let mut frames = stream.start().expect("stream start must encode");
+    for event in &events {
+        frames.extend(stream.feed(event).expect("event must encode"));
+    }
+    let starts: Vec<Value> = frames
+        .iter()
+        .filter_map(|frame| frame.strip_prefix("data: "))
+        .filter_map(|data| serde_json::from_str::<Value>(data.trim()).ok())
+        .filter_map(|chunk| {
+            chunk["choices"][0]["delta"]["tool_calls"][0]
+                .as_object()
+                .cloned()
+        })
+        .filter(|call| call.contains_key("id"))
+        .map(Value::Object)
+        .collect();
+    assert_eq!(starts.len(), 2);
+    assert_eq!(starts[0]["extra_content"], signed);
+    assert!(starts[1].get("extra_content").is_none());
+
+    let completed =
+        completed_chat_body_with_ignored("request-1", "gemini", 1_700_000_000, &events, &[], false)
+            .expect("completed body must encode");
+    let calls = &completed.body["choices"][0]["message"]["tool_calls"];
+    assert_eq!(calls[0]["extra_content"], signed);
+    assert!(calls[1].get("extra_content").is_none());
 }

@@ -122,6 +122,11 @@ class GatewayWireProfile:
             None when the connection speaks no speech wire.
         transcriptions_url: Full OpenAI-wire ``/audio/transcriptions`` endpoint
             sharing ``headers``; None when the connection speaks no transcription wire.
+        organization_tag_key: Private HMAC key for the opaque per-organization
+            scheduling tag a self-hosted SystemOne origin receives
+            (``exp.runtime.gateway.organization_tag``); None sends no tag. Excluded
+            from diagnostics. The tag is only ever attached on a host-funded,
+            non-tenant rung, whatever this field holds.
     """
 
     dialect: str
@@ -151,6 +156,9 @@ class GatewayWireProfile:
     """Whether the exact model accepts explicit sampling temperature."""
 
     billing_customer_managed: bool = False
+    tenant_origin: bool = False
+    """A customer-addressed origin: the data plane answers its failures opaquely and holds its
+    socket to the tenant destination policy (ports and platform infrastructure)."""
     service_tier_pricing_enabled: bool = False
     """Whether this HOST-funded rung may still forward ``service_tier``.
 
@@ -179,6 +187,14 @@ class GatewayWireProfile:
     strict OpenAI-compatible server, and the wire profile is the only place
     that knows.
     """
+    forwards_prompt_cache_ttl: bool = False
+    """Whether this rung's wire carries OpenAI's ``prompt_cache_options.ttl``.
+
+    True only on OpenAI's own Responses API. The catalog's
+    ``supports_prompt_cache_ttl_12h`` says the lane's model honours the 12-hour
+    lifetime; this says the wire can send it, so a ChatGPT plan rung or a relay
+    inheriting the lane's capabilities declines instead of guessing.
+    """
     """Whether this rung dispatches on tenant-owned (BYOK) credentials.
 
     Tier selectors (``service_tier``) forward only where the caller pays the
@@ -195,6 +211,32 @@ class GatewayWireProfile:
         """Whether this adapter can carry or translate explicit cache checkpoints."""
         return self.dialect in {"anthropic_messages", "bedrock_converse_stream"} or (
             self.dialect == "openai_compatible" and self.forwards_cache_control
+        )
+
+    forwards_prompt_cache_options: bool = False
+    """Whether this rung's wire carries OpenAI's explicit prompt-caching controls.
+
+    ``prompt_cache_options.mode`` and the content-block ``prompt_cache_breakpoint``
+    markers (https://developers.openai.com/api/docs/guides/prompt-caching). True only
+    on origins that document or relay them: OpenAI's own API, Azure OpenAI and
+    OpenRouter (``prompt_cache_options.openai_prompt_cache_origin``). Every other
+    OpenAI-shaped server keeps the fields off its wire: a strict one answers an
+    unknown field with a 400.
+    """
+
+    def honors_cache_markers(self, *, openai_breakpoints: bool) -> bool:
+        """Whether this rung caches at the caller's explicit cache markers.
+
+        Args:
+            openai_breakpoints: Whether the caller marked blocks with OpenAI's
+                ``prompt_cache_breakpoint`` (``GatewayRequest.prompt_cache_breakpoints``),
+                which OpenAI-wire rungs carrying the field re-emit as such.
+
+        Returns:
+            True when the markers reach the provider in a form it caches at.
+        """
+        return self.preserves_cache_control or (
+            openai_breakpoints and self.forwards_prompt_cache_options
         )
 
     minimum_temperature: float = 0.0
@@ -340,6 +382,8 @@ class GatewayWireProfile:
     decisions_url: str | None = None
     """Full TypeSafe SystemOne endpoint, absent on non-decision connections."""
 
+    organization_tag_key: bytes | None = field(default=None, repr=False)
+
     openai_decisions_url: str | None = None
     """Full OpenAI Decisions API ``/decisions`` endpoint, present only on direct
     OpenAI connections and sharing ``headers``; ``None`` keeps the OpenAI-shaped
@@ -351,6 +395,21 @@ class GatewayWireProfile:
 
     speech_url: str | None = None
     transcriptions_url: str | None = None
+
+    videos_url: str | None = None
+    """Full video-job creation endpoint for this connection, sharing ``headers``:
+    Veo's ``models/{model}:predictLongRunning`` on a Gemini connection, xAI's
+    ``/videos/generations`` on an xAI-origin OpenAI-compatible connection, and
+    ``None`` on every other connection, so the video surface excludes the rung."""
+
+    anthropic_vertex_version: str | None = None
+    """Set ONLY on an ``anthropic_messages`` rung served through Vertex AI
+    (Claude on Vertex). When present, the dispatch body builder drops the
+    top-level ``model`` field (the model is in the ``:rawPredict`` URL) and sets
+    ``anthropic_version`` to this value, which is how Vertex carries the version
+    that direct Anthropic sends in the ``anthropic-version`` HEADER. ``None`` on
+    direct Anthropic / Bedrock / Azure-Foundry Claude, whose bodies name the
+    model and omit ``anthropic_version``."""
 
     @property
     def replays_plaintext_reasoning(self) -> bool:
@@ -372,6 +431,8 @@ class GatewayWireProfile:
             "gemini_generate_content",
             "bedrock_converse_stream",
             "typesafe_systemone",
+            # ElevenLabs' audio wire: admitted only on the audio surfaces.
+            "elevenlabs_audio",
         }:
             raise ValueError("gateway wire dialect is not implemented")
         if self.reasoning_wire_format not in {

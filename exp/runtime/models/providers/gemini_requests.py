@@ -9,20 +9,24 @@ builders import it without creating a cycle through the streaming stack.
 
 from __future__ import annotations
 
-from typing import Literal
+from collections.abc import Iterable
+from typing import Literal, cast
 
 from exp.common.core.artifacts import JsonObject
 from exp.common.models import ModelMessage, ModelRequest, ToolChoice
+from exp.runtime.gateway.contracts import GatewayApiSurface, GatewayRequest
 from exp.runtime.gateway.json_object import JSON_OBJECT_SYSTEM_INSTRUCTION
 from exp.runtime.models.providers.audios import gemini_audio_part
-from exp.runtime.models.providers.base import DEFAULT_MAXIMUM_OUTPUT_TOKENS
+from exp.runtime.models.providers.base import DEFAULT_MAXIMUM_OUTPUT_TOKENS, GatewayWireProfile
 from exp.runtime.models.providers.documents import gemini_document_part
 from exp.runtime.models.providers.images import gemini_image_part
 from exp.runtime.models.providers.instruction_turns import (
     fold_instruction_turns_after_the_leading_run,
 )
 from exp.runtime.models.providers.reasoning_compat import (
+    gemini_thinking_budget,
     gemini_thinking_level,
+    gemini_thinks_by_default,
     reasoning_display_enabled,
 )
 from exp.runtime.models.providers.videos import gemini_video_part
@@ -32,10 +36,45 @@ GEMINI_THOUGHT_SIGNATURE_BYPASS = "skip_thought_signature_validator"
 
 Gemini 3 answers a function call with an opaque ``thoughtSignature`` and
 rejects the next turn with HTTP 400 unless that part comes back carrying it.
-The gateway's public OpenAI and Anthropic surfaces have no field for it, so
-no client can round-trip the real value; Google documents this literal as the
-way to replay a function call whose signature was not retained.
+A replayed call carries its real signature when the caller echoed one
+(``ToolCall.provider_thought_signature``); a turn whose calls carry none
+(history from another provider, or a client that dropped the field) uses this
+literal, which Google documents for replaying a call whose signature was not
+retained.
 """
+
+
+THOUGHT_SIGNATURE_DROPPED = "messages.tool_calls.thought_signature->dropped(no_gemini_rung)"
+"""Disclosure recorded when echoed Chat thought signatures reach no rung that reads them.
+
+Only the Gemini generateContent wire (Gemini and Vertex) replays a signature;
+every other wire omits it, so a Chat caller that echoed one, in either
+spelling, learns at admission that no rung on the route will receive it.
+"""
+
+
+def disclose_dropped_thought_signatures(
+    profiles: Iterable[GatewayWireProfile],
+    request: GatewayRequest,
+    ignored: list[str],
+) -> None:
+    """Record :data:`THOUGHT_SIGNATURE_DROPPED` when no rung can replay a signature.
+
+    Like block-level cache markers, the signature is kept while ANY rung reads
+    it (the Gemini rung replays it, the others omit it) and disclosed only
+    when none does. Nothing is recorded for a Chat request without one.
+    """
+    if (
+        request.surface == GatewayApiSurface.CHAT_COMPLETIONS
+        and any(
+            call.provider_thought_signature is not None
+            for message in request.messages
+            for call in message.tool_calls
+        )
+        and not any(profile.dialect == "gemini_generate_content" for profile in profiles)
+        and THOUGHT_SIGNATURE_DROPPED not in ignored
+    ):
+        ignored.append(THOUGHT_SIGNATURE_DROPPED)
 
 
 def gemini_model_path(model_id: str) -> str:
@@ -100,13 +139,23 @@ def gemini_generate_request(
     # after conversation start rides as user text where the caller put it
     # (consecutive user contents are accepted on this wire); only the leading
     # run is hoisted.
+    turn = _CallTurn()
     for message in fold_instruction_turns_after_the_leading_run(request.messages):
         if message.role in {"system", "developer"}:
             if message.content is None:
                 raise ValueError("system messages need text content")
             system_parts.append({"text": message.content})
             continue
-        contents.append(_gemini_content(message, tool_names))
+        if message.role == "assistant":
+            turn.close(contents)
+        content = _gemini_content(message, tool_names)
+        if message.role == "assistant":
+            turn.open(message, contents, content)
+        elif turn.collects(message):
+            turn.add(message, content)
+        else:
+            contents.append(content)
+    turn.close(contents)
     if json_object_output:
         system_parts.append({"text": JSON_OBJECT_SYSTEM_INSTRUCTION})
     payload: JsonObject = {"contents": contents}
@@ -143,15 +192,22 @@ def gemini_generate_request(
         generation["responseMimeType"] = "application/json"
     effective_reasoning_effort = request.reasoning_effort or reasoning_effort
     if supports_reasoning:
+        thinking_config: JsonObject = {}
+        budget: int | None = None
+        if effective_reasoning_effort is not None:
+            level = gemini_thinking_level(model_id, effective_reasoning_effort)
+            budget = gemini_thinking_budget(model_id, level)
+            # Google rejects a request that sets both fields.
+            if budget is not None:
+                thinking_config["thinkingBudget"] = budget
+            else:
+                thinking_config["thinkingLevel"] = level.upper()
+        thinking = budget != 0 and (budget is not None or gemini_thinks_by_default(model_id))
         # Thought summaries are the readable reasoning Google returns; without
         # includeThoughts a thinking model streams only opaque signatures.
-        thinking_config: JsonObject = (
-            {"includeThoughts": True} if reasoning_display_enabled() else {}
-        )
-        if effective_reasoning_effort is not None:
-            thinking_config["thinkingLevel"] = gemini_thinking_level(
-                model_id, effective_reasoning_effort
-            ).upper()
+        # Vertex refuses includeThoughts on a request whose thinking is off.
+        if thinking and reasoning_display_enabled():
+            thinking_config["includeThoughts"] = True
         if thinking_config:
             generation["thinkingConfig"] = thinking_config
     # The normalized gateway response has no logprob representation. Keep the
@@ -164,6 +220,88 @@ def gemini_generate_request(
         generation["maxOutputTokens"] = default_maximum_output_tokens
     payload["generationConfig"] = generation
     return payload
+
+
+GEMINI_MISSING_TOOL_RESULT = (
+    "[no result: the caller's history carries no tool result for this call]"
+)
+"""Function response sent for a parallel call the caller's history never answered.
+
+Gemini refuses a turn unless the content after a model turn answers every one
+of its function calls ("the number of function response parts is equal to
+the number of function call parts"). A history whose call went unanswered (an
+interrupted client) is served with this placeholder in the call's slot; the
+gateway discloses it as ``GEMINI_MISSING_TOOL_RESULT_DISCLOSURE``.
+"""
+
+
+class _CallTurn:
+    """Regroup the answers to one model turn's function calls into one user content.
+
+    Gemini checks that the content right after a model turn carries exactly
+    one ``functionResponse`` part per ``functionCall`` part. Chat and
+    Responses histories carry one tool message per call, sometimes split by
+    user text (folded tool-result images, client reminders), so every result
+    answering the open turn is collected and emitted as ONE user content in
+    call order, ahead of the user contents that arrived with them. A call with
+    no result gets ``GEMINI_MISSING_TOOL_RESULT`` once a later turn exists; a
+    trailing model turn awaiting results is left as it is.
+    """
+
+    def __init__(self) -> None:
+        self._calls: tuple[tuple[str, str], ...] = ()
+        self._responses: dict[str, JsonObject] = {}
+        self._others: list[JsonObject] = []
+
+    def open(self, message: ModelMessage, contents: list[JsonObject], content: JsonObject) -> None:
+        """Append a model turn and start collecting answers to its calls."""
+        contents.append(content)
+        action = message.assistant_action
+        calls = () if action is None else action.tool_calls
+        self._calls = tuple((call.call_id, call.name) for call in calls)
+
+    def collects(self, message: ModelMessage) -> bool:
+        """Whether a user or tool message belongs to the open call turn."""
+        return bool(self._calls) and message.role in {"user", "tool"}
+
+    def add(self, message: ModelMessage, content: JsonObject) -> None:
+        """Hold one message of the open call turn until the turn closes."""
+        call_id = message.tool_call_id or ""
+        if (
+            message.role == "tool"
+            and call_id not in self._responses
+            and any(call_id == known for known, _name in self._calls)
+        ):
+            self._responses[call_id] = content
+            return
+        self._others.append(content)
+
+    def close(self, contents: list[JsonObject]) -> None:
+        """Emit the open turn's answers as one user content, then the rest in order."""
+        if not self._calls:
+            return
+        if self._responses or self._others:
+            parts: list[JsonObject] = []
+            for call_id, name in self._calls:
+                response = self._responses.get(call_id)
+                if response is None:
+                    parts.append(
+                        {
+                            "functionResponse": {
+                                "name": name,
+                                "response": {"content": GEMINI_MISSING_TOOL_RESULT},
+                            }
+                        }
+                    )
+                    continue
+                response_parts = response["parts"]
+                assert isinstance(response_parts, list)
+                parts.extend(cast("list[JsonObject]", response_parts))
+            contents.append({"role": "user", "parts": parts})
+            contents.extend(self._others)
+        self._calls = ()
+        self._responses = {}
+        self._others = []
 
 
 def _gemini_content(message: ModelMessage, tool_names: dict[str, str]) -> JsonObject:
@@ -234,14 +372,18 @@ def _gemini_content(message: ModelMessage, tool_names: dict[str, str]) -> JsonOb
     elif text is not None:
         parts.append({"text": text})
     if action is not None:
+        # Gemini signs only the first call of a parallel batch, so a turn that
+        # carries any real signature replays exactly as issued (unsigned calls
+        # stay unsigned); a turn with none falls back to the placeholder.
+        signed_turn = any(call.provider_thought_signature for call in action.tool_calls)
         for call in action.tool_calls:
             tool_names[call.call_id] = call.name
-            parts.append(
-                {
-                    "functionCall": {"name": call.name, "args": call.arguments},
-                    "thoughtSignature": GEMINI_THOUGHT_SIGNATURE_BYPASS,
-                }
-            )
+            part: JsonObject = {"functionCall": {"name": call.name, "args": call.arguments}}
+            if call.provider_thought_signature is not None:
+                part["thoughtSignature"] = call.provider_thought_signature
+            elif not signed_turn:
+                part["thoughtSignature"] = GEMINI_THOUGHT_SIGNATURE_BYPASS
+            parts.append(part)
     if not parts:
         raise ValueError("assistant messages need text or tool calls")
     return {"role": "model", "parts": parts}

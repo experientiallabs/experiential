@@ -182,7 +182,7 @@ frozen model-capability identity. Admission requires a known nonnegative
 `gateway.prices.output_nano_usd_per_million_tokens = 0`. Unknown prices are not free prices.
 Only direct exact-model pools serve decisions; project-backed aliases are refused.
 
-Send exactly three top-level fields: `model` (the granted public alias), `state`, and `questions`.
+Send `model` (the granted public alias), `state`, and `questions`, plus optional image `assets`.
 State and each question's instructions may be a string, JSON object, or array. This example uses
 all three question types; replace `systemone` with the decision alias your gateway grants:
 
@@ -208,7 +208,7 @@ all three question types; replace `systemone` with the decision alias your gatew
 
 | Type | Question criteria | Answer fields |
 |---|---|---|
-| `noul` | Optional object with `true` and `false` descriptions | `type`, `noul` (probability from 0 to 1) |
+| `noul` | Optional object with `true` and `false` text, object, or array descriptions | `type`, `noul` (probability from 0 to 1) |
 | `choice` | Object mapping 2 through 64 category names to text, object, or array descriptions, or `null` | `type`, `choice`, `confidence`, `probabilities` keyed by the requested names |
 | `score` | Ordered array of 2 through 10 text, object, or array descriptions | `type`, `score`, `confidence`, `legend`, `probabilities` keyed by zero-based index strings |
 
@@ -224,14 +224,52 @@ their independently rounded half-hundredth intervals, clipped to `[0, 1]`: the p
 may then read 0.99 or 1.01, a choice may sit one hundredth below another category only if that
 distribution can make it highest, and a hundredth-valued score must match that distribution's
 weighted index. These bounded checks respect the shared probability mass and admit closed
-interval endpoints because rounding ties are unspecified. Finer-precision totals, winners and
-scores keep the exact checks.
+interval endpoints because rounding ties are unspecified. Beside hundredth-valued
+probabilities, a score is judged at the precision the provider reported it to: a tenth-valued
+score (`3.9` beside an expectation of 3.87) must lie within half a tenth, a hundredth-valued
+one within half a hundredth, and a thousandth-valued one within half a thousandth of that
+distribution's achievable weighted index. TypeSafe may also publish bins that were each
+rounded to hundredths with the normalization residual folded into one bin that rounded
+highest, beside a score computed from the unrounded distribution; when the published total is
+exactly 1, a score is also admitted against that convention's exact achievable weighted index:
+every other bin stays within half a hundredth, and the bin that absorbed the residual must itself
+have rounded at least as high as every other published bin, which also bounds how far it can
+drift on a near tie (four levels allow up to 0.01 more than independent rounding, five levels up
+to 0.02). A whole-number score is read at tenths. Precision is
+read from the number itself, so a hundredth-rounded score ending in zero (`1.10`) is read at
+tenths. Finer-precision totals, winners and scores keep the exact checks. A rejected score
+records its numbers (score, recomputed expectation, bins, achievable rounding envelope, folded
+residual envelope and tolerance) in the operator log and the ledger detail; the public error stays generic.
 Missing answers, mismatched types or criteria, and missing or invalid usage fail closed. Only validated answer fields are returned; extra provider metadata is omitted.
 
+### Image assets
+
+TypeSafe accepts images through a top-level `assets` map keyed by caller-chosen reference strings.
+Each asset is `{"type": "image", "format": "png" | "jpg" | "jpeg", "data_base64": "..."}`
+(`type` is optional). The reference is written wherever the image belongs, as a whole string or
+inside a longer one, in `state`, a question's `instructions`, or its `criteria`; object keys are
+never references. Every asset must be referenced. Base64 uses the standard alphabet with `=`
+padding, no whitespace, and no `data:` prefix. Multipart file parts (`part`) are refused. The
+gateway adds `TypeSafe-Danger-Zone-Images: true` to the upstream request only when `assets` is
+present, so callers do not send it. A request with assets is served only by deployments whose
+`gateway.capabilities.supports_image_input` is true; otherwise it is refused with
+`unsupported_capability` on `assets` before dispatch. `box` questions are not served.
+
+The gateway bounds at most 256 assets, 1,024 UTF-8 bytes per reference, 65,536 reference bytes in
+total, 16,777,216 decoded bytes per image (TypeSafe's per-file limit), and 33,554,432 decoded image
+bytes per request; sizes are computed from the base64 text without decoding it. TypeSafe enforces
+its own format and pixel limits. Each image reserves a fixed 4,096-token planning allowance once per
+question that references it (a state image counts for every question), however often its reference
+repeats; settlement still bills only TypeSafe's reported input tokens. The TypeSafe opt-in header
+is sent only to `typesafe` deployments. Decision bodies over 1 MiB first take one unit per started
+MiB from a 128 MiB per-worker budget, held for the whole request, so concurrent large bodies wait
+rather than multiplying memory; the native front passes the body's byte length to admission.
+
 Limits are 1 through 32 questions, 1 through 256 UTF-8 bytes per question ID or choice category
-name, and at most 262,144 bytes for both the raw body and the normalized request. Duplicate JSON
-keys, non-finite numbers, unknown fields, chat messages, tools, generation controls, and `stream`
-are rejected before acceptance. Nested data must use valid UTF-8, integers in the inclusive range
+name, and at most 262,144 bytes for the normalized request excluding image assets. The raw body
+may additionally carry the base64 image data. Duplicate JSON keys, non-finite numbers, unknown
+fields, chat messages, tools, generation controls, and `stream` are rejected before acceptance
+with a field-specific `invalid_parameter` error that never quotes request content. Nested data must use valid UTF-8, integers in the inclusive range
 `-2^63` through `2^64 - 1`, and at most 64 JSON levels. These are gateway serialization bounds,
 not TypeSafe token limits. Objects and arrays retain their structure instead of becoming strings. Responses are buffered, never streamed. `Idempotency-Key` is
 ignored: resubmitting the same request is a new operation, not a replay. There is no continuation,
@@ -377,6 +415,12 @@ The model record `model` field is the exact Azure deployment identifier sent on 
 derives a deployment from an alias or a base-model name. Use a separate alias for an embedding
 deployment.
 
+Foundry serves Claude only on the native Anthropic Messages API at `{resource}/anthropic/v1`, with
+the key as a Bearer token. A deployment routes there when its `model` (the deployment name) or its
+`served_model_id` is a Claude model id Experiential knows; set `served_model_id` to that id when the
+deployment carries a name of your own (`model = "my-opus"`, `served_model_id = "claude-opus-4-6"`).
+The request still names the deployment. Every other deployment uses the Azure OpenAI wire.
+
 `AZURE_OPENAI_API_KEY` is paired with `AZURE_OPENAI_ENDPOINT` when that endpoint variable is set.
 A catalog endpoint that is not the same resource cannot use that key. Comparison lowercases the
 scheme and host, treats default HTTPS and HTTP ports as equivalent to an omitted port, keeps path
@@ -452,6 +496,19 @@ model = "amazon.titan-embed-text-v2:0"
 supports_embeddings = true
 input_cost_per_million_tokens_usd = 0
 ```
+
+Claude of the adaptive-thinking generation (Fable 5, Mythos 5, Opus 4.7, Opus 4.8, Opus 5
+and Sonnet 5 inference profiles) takes a reasoning effort on the gateway's ConverseStream wire
+when its capabilities declare `supports_reasoning = true`. A caller effort is sent as
+`additionalModelRequestFields.thinking = {"type": "adaptive", "display": "summarized"}` with
+`output_config.effort`, which Converse forwards into the Anthropic request body. A model that
+thinks without a config (Opus 5, Sonnet 5, Fable 5) is asked only for the readable display.
+The summarized thinking streams back as display reasoning, and the reply carries the
+estimated reasoning count described in the gateway generation reference, because Converse
+reports thinking only inside `outputTokens`. The thinking signature is not returned: Converse
+has no replay path for it here, and adaptive thinking does not require replayed thinking on a
+tool turn. Older Claude releases and non-Claude Bedrock models keep no reasoning control on this
+wire, whatever their capabilities declare.
 
 ## Anthropic inference geography
 

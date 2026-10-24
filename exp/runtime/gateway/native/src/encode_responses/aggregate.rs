@@ -22,6 +22,9 @@ pub(super) fn responses_usage(usage: Option<&Usage>) -> Value {
     if let Some(hour) = usage.cache_creation_1h_input_tokens {
         input_details["cache_write_1h_tokens"] = json!(hour);
     }
+    if let Some(split) = crate::encode::cache_write_lifetimes(usage) {
+        input_details["cache_write_tokens_details"] = split;
+    }
     let mut wire = json!({
         "input_tokens": input,
         // `cache_write_tokens` joined the official shape (openai-python 3.x
@@ -31,6 +34,7 @@ pub(super) fn responses_usage(usage: Option<&Usage>) -> Value {
         "output_tokens_details": {"reasoning_tokens": usage.reasoning_tokens.unwrap_or(0)},
         "total_tokens": input + output,
     });
+    crate::encode::annotate_image_tokens(&mut wire["output_tokens_details"], usage);
     let unreported = usage.unreported_token_details();
     if !unreported.is_empty() {
         wire["unreported_token_details"] = json!(unreported);

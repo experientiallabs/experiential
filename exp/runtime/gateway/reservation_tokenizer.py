@@ -108,3 +108,79 @@ def reservation_encoder() -> tiktoken.Encoding:
         mergeable_ranks=packaged_ranks(),
         special_tokens=_O200K_SPECIAL_TOKENS,
     )
+
+
+EXACT_COUNT_MAX_CHARACTERS = 1 << 20
+"""Prompt characters the reservation counts with the BPE on a bridge thread.
+
+About a quarter million tokens of prose or code, which covers every ordinary
+coding-agent turn; the remainder of a longer prompt is bounded by its UTF-8
+length (see :func:`reservation_token_bound`), so one oversized request holds a
+bridge thread for a fixed tokenizer slice, never for its whole prompt."""
+
+
+def count_reservation_tokens(text: str) -> int:
+    """Count ``text`` with the reservation BPE exactly as ``encode_ordinary`` does.
+
+    Encodes into tiktoken's native token buffer instead of a Python list, so the
+    whole encode runs with the GIL released and no per-token Python integer is
+    ever allocated. Special-token strings count as ordinary text, and lone
+    surrogates (legal in a decoded JSON string) are replaced the way
+    ``encode_ordinary`` replaces them.
+    """
+    if not text:
+        return 0
+    encoder = reservation_encoder()
+    try:
+        return len(encoder.encode_to_numpy(text, disallowed_special=()))
+    except UnicodeEncodeError:
+        repaired = text.encode("utf-16", "surrogatepass").decode("utf-16", "replace")
+        return len(encoder.encode_to_numpy(repaired, disallowed_special=()))
+
+
+def reservation_token_bound(
+    text: str, *, exact_characters: int = EXACT_COUNT_MAX_CHARACTERS
+) -> int:
+    """Return a bound at or above the reservation BPE count of ``text``.
+
+    Text within ``exact_characters`` is counted exactly. Longer text is split at
+    a pre-tokenization reset (a newline directly followed by a letter, where no
+    o200k pre-token can span the boundary, so the BPE count of the whole is the
+    sum of the counts of the halves); the prefix is counted exactly and the
+    suffix is bounded by its UTF-8 length, since every byte-level BPE token
+    covers at least one byte. Without a reset inside the window the whole text
+    is bounded by its UTF-8 length.
+    """
+    if len(text) <= exact_characters:
+        return count_reservation_tokens(text)
+    split = _pretokenizer_reset(text, exact_characters)
+    return count_reservation_tokens(text[:split]) + _utf8_length(text[split:])
+
+
+_RESET_SEARCH_NEWLINES = 4_096
+"""Newlines inspected backwards from the window edge for a reset point."""
+
+
+def _pretokenizer_reset(text: str, limit: int) -> int:
+    """Return the largest reset index at or below ``limit``, or 0 when none is near.
+
+    A reset is an index ``i`` with ``text[i - 1] == "\\n"`` and ``text[i]`` a
+    letter: no o200k pattern alternative matches a newline followed by a letter
+    (letter runs exclude ``\\r\\n`` from their optional prefix, punctuation runs
+    stop after trailing newlines, whitespace runs stop before non-space), and
+    the pattern has no look-behind, so matching restarts identically there.
+    """
+    end = limit
+    for _ in range(_RESET_SEARCH_NEWLINES):
+        newline = text.rfind("\n", 0, end)
+        if newline < 0:
+            return 0
+        if text[newline + 1].isalpha():
+            return newline + 1
+        end = newline
+    return 0
+
+
+def _utf8_length(text: str) -> int:
+    """UTF-8 length of ``text``, counting a lone surrogate as its three encoded bytes."""
+    return len(text.encode("utf-8", "surrogatepass"))

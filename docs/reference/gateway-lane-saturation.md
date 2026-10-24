@@ -99,6 +99,83 @@ rung: that provider would receive an unknown field. Unset (the default) sends no
 no identity bytes. Like every new dispatch field, author it only after every serving worker
 runs a build that parses it.
 
+## Request-class throttles (inert by default)
+
+A host may vouch `AuthorizationSnapshot.priority_class`, a request class from `0` (free
+account) to `8` (the top plan's paid request), plus optional class throttles. Every throttle
+acts ONLY on a self-hosted rung: one whose dispatch policy authors `upstream_priority`
+(`class_throttles.is_self_hosted_rung`, the same predicate that gates vLLM's `priority` field).
+Third-party, BYOK and tenant rungs never author it, so on them every lever below is a no-op.
+
+- **vLLM priority by class** (frees capacity). With a class, an opted-in rung gets vLLM
+  priority `8 - priority_class` (`class_throttles.TOP_PRIORITY_CLASS`) instead of the
+  Pro/paying/free map, so the server schedules and preempts by class.
+- **Per-class in-flight cap** (frees capacity). `self_hosted_class_concurrency` caps how many
+  dispatches of the request's class one worker holds on a self-hosted rung; past it the rung
+  sheds as a hit overflow ceiling (never force-admitted), leaving GPU slots for other classes.
+- **Output pace** (delivery only; the GPU still generates at full speed).
+  `output_tokens_per_second` is evaluated at reservation (`class_throttles.output_pace`): with
+  `output_pace_saturation` set, only while the rung's in-flight count is at or above that
+  fraction of its bound (the authored `concurrency_bound`, else the worker's default lane
+  share; an unbounded rung has no signal and is never threshold-paced). A paced attempt's
+  `start_attempt` reply carries the rate and the data plane's Chat, Messages and Responses
+  stream loops hold released events in a one-second token bucket over estimated tokens
+  (`output_pacing.rs`), keeping heartbeats and never outliving the request deadline. An
+  unpaced reply is byte-identical to before.
+- **Class-ordered permits.** With `permit_priority_aging_seconds` in the serve config, requests
+  waiting for one of the worker's `max_active_requests` permits are released by
+  `priority_class` (carried on the admission), gaining one class per aging period so no class
+  starves (`permit_queue.rs`). Absent, the permits stay the FIFO semaphore.
+
+The class changes no admission bound, overflow factor or fair-share weight.
+
+### The `:fast` request (`AuthorizationSnapshot.fast`)
+
+A host sets `fast` for a request a caller asked to run faster at the priority card. Admission
+asks for the priority processing tier (`class_throttles.fast_request`) and narrows to rungs that
+carry a priority card; when none does it refuses (`require_fast_path`), never serving it at the
+standard tier. On a third-party rung that is the provider's own priority tier, settled only on
+witnessed evidence (a downgrade settles at standard). On a self-hosted rung (`upstream_priority`)
+the tier is ours, so the request gets more of the GPU:
+
+- vLLM priority `-1` (`FAST_UPSTREAM_PRIORITY`), ahead of every class, and no `service_tier`
+  field on the vLLM wire;
+- permit class `9` (`FAST_PRIORITY_CLASS`) in a configured permit queue;
+- no class cap and no pace;
+- a split bound: fast reservations may hold the upper half of the rung's bound (at least one),
+  outside fair share; while any is held, every other reservation may hold only the lower half
+  (at least one), hard, even for a priority overflow. Fast ignores the rung's total, so a full
+  rung can briefly hold its bound plus the upper half until earlier requests finish. Like
+  every registry bound this is per gateway worker, and rate windows still apply;
+- or, on a rung that authors `fast_reserve_fraction` (0 < f < 1, needs `concurrency_bound`), an
+  always-on reserve in place of the split: every other reservation holds at most the regular
+  share, `(1 - f) * bound` rounded half up (at least one), whether or not a fast request is in
+  flight, and never the full bound; a fast reservation admits below the bound. `0.25` holds others
+  to 36 of 48 and 3 of 4; a bound too small to split (1, or 2 at 0.25) keeps no reserve. On a
+  `refuse` lane both limits are hard, even for a priority overflow (a single-rung lane refuses Pro
+  past the regular share). On an `overflow` lane they stay soft: a request past them spills to the
+  next rung first, so fast has first claim on the kept slots, and admits on the forced pass exactly
+  as an overflow bound does today, never a refusal (a forced pass, a forced rate redial included,
+  is judged against the full bound). A forced fast request on an overflow lane is uncapped, like a
+  free overflow, and counts toward a priority caller's first-dial overflow ceiling. Fair share (each organization's regular
+  reservations only), the fresh-session threshold, trial headroom and pacing saturation of other
+  traffic read the regular share. Under heavy regular load on a refuse lane fast has the reserve
+  alone. Per worker, like the bound;
+- settlement confirmed at the requested card (`tier_settlement`): our server reports no tier.
+
+Every self-hosted lever needs the rung's priority card (`fast_on_rung`), so a fast request
+never gets more of the GPU at the standard price. A caller's plain `service_tier=priority` that
+admission keeps is treated as fast on the rung (`tier_authorization`): held and settled at the
+card with these levers, except the permit class, which reads the host's authorization.
+
+A fast request is placed by conversation like any other (`maximize_cache_affinity` keeps its
+replica's prefix cache warm). A dedicated low-batch replica can author
+`GatewayRungDispatchPolicy.max_prompt_tokens`: a prompt at least that long (lower-bound
+estimate, prompt only) skips the rung at admission, after the window, capability and tier
+narrowing, when an uncapped
+rung of the same model stays on the route (`prompt_size.prompt_cap_indexes`), so long cold
+prefills stay off it. The cap never refuses a request and never moves it to another model.
+
 The default bound is already half the worker's permits, so its Pro factor stays below
 `1 / DEFAULT_LANE_SHARE` and one lane's priority traffic never holds every permit. A rung whose
 forced admission hit its ceiling (`RungShed.overflow_ceiling`) is skipped, and the request is

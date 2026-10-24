@@ -300,7 +300,7 @@ fn score_requires_exact_legend_index_set_and_expected_value() {
     assert_malformed(provider);
 }
 
-fn score_payload(probabilities: &[f64], score: f64) -> (DecisionsAdmission, Value) {
+pub(super) fn score_payload(probabilities: &[f64], score: f64) -> (DecisionsAdmission, Value) {
     let mut admitted = admission();
     let criteria: Vec<Value> = (0..probabilities.len())
         .map(|i| json!(format!("Level {i}")))
@@ -350,8 +350,10 @@ fn independently_rounded_live_scores_preserve_provider_answers_and_usage() {
 #[test]
 fn rounding_never_excuses_infeasible_scores_or_high_precision_disagreement() {
     for (probabilities, score) in [
-        (vec![1.0, 0.0, 0.0, 0.0, 0.0], 0.03),
-        (vec![0.0, 0.0, 0.0, 0.0, 1.0], 3.97),
+        // A unit bin may have absorbed the folded residual of four bins just
+        // under half a hundredth each (latent expectation up to 0.05), never more.
+        (vec![1.0, 0.0, 0.0, 0.0, 0.0], 0.06),
+        (vec![0.0, 0.0, 0.0, 0.0, 1.0], 3.94),
         (vec![0.0, 0.87, 0.13, 0.0, 0.0], 1.5),
         (vec![0.0, 0.87, 0.13, 0.0, 0.0], 1.12001),
         (vec![0.0, 0.87, 0.13, 0.0, 0.0], 1.120000000005),
@@ -409,11 +411,12 @@ fn rounding_extrema_match_an_independent_three_bin_enumeration() {
         }
         let minimum = *possible.iter().min().unwrap();
         let maximum = *possible.iter().max().unwrap();
+        let (low, high) = score_envelope(&probabilities).expect("hundredth bins");
         for score_hundredths in 0..=200 {
             let feasible =
                 score_hundredths * 4 + 2 >= minimum && score_hundredths * 4 - 2 <= maximum;
             assert_eq!(
-                score_matches_distribution(score_hundredths as f64 / 100.0, &probabilities),
+                score_meets_envelope(score_hundredths as f64 / 100.0, low, high),
                 feasible,
                 "{probabilities:?}, score={score_hundredths}"
             );
@@ -563,6 +566,21 @@ fn normalization_tolerance_is_small_and_does_not_change_provider_numbers() {
     assert_malformed(provider);
 }
 
+/// Whether a first-dial failure at depth 0 leaves a successor dispatch.
+fn advances(policy: RoutePolicy, route: &[DeploymentWire], failure: &Failure) -> bool {
+    successor_possible(
+        policy,
+        route,
+        Instant::now() + Duration::from_secs(1),
+        1,
+        1,
+        0,
+        &[1],
+        failure,
+        false,
+    )
+}
+
 #[test]
 fn default_single_attempt_policy_never_redials_unknown_idempotency() {
     let failure = rejected_http(401);
@@ -570,25 +588,11 @@ fn default_single_attempt_policy_never_redials_unknown_idempotency() {
     assert!(!failure.retryable_same_deployment);
     let mut admitted = admission();
     admitted.maximum_total_attempts = 2;
-    assert!(!successor_possible(
-        admitted.policy(),
-        &[wire(false)],
-        Instant::now() + Duration::from_secs(1),
-        1,
-        1,
-        0,
-        &failure,
-        false
-    ));
-    assert!(successor_possible(
+    assert!(!advances(admitted.policy(), &[wire(false)], &failure));
+    assert!(advances(
         admitted.policy(),
         &[wire(false), wire(false)],
-        Instant::now() + Duration::from_secs(1),
-        1,
-        1,
-        0,
-        &failure,
-        false
+        &failure
     ));
 }
 
@@ -659,32 +663,14 @@ fn uncertain_outcomes_never_advance_even_with_an_unused_second_rung() {
         let failure = route_failure(failure, &wire(false), policy, 1);
         assert!(!failure.retryable_same_deployment);
         assert!(!failure.failover_eligible);
-        assert!(!successor_possible(
-            policy,
-            &[wire(false), wire(false)],
-            Instant::now() + Duration::from_secs(1),
-            1,
-            1,
-            0,
-            &failure,
-            false
-        ));
+        assert!(!advances(policy, &[wire(false), wire(false)], &failure));
     }
     for status in [401, 403, 404] {
         let failure = route_failure(rejected_http(status), &wire(false), admission().policy(), 1);
         assert!(failure.decision_provider_rejected);
         assert_eq!(failure.failover_eligible, status == 401);
         assert_eq!(
-            successor_possible(
-                policy,
-                &[wire(false), wire(false)],
-                Instant::now() + Duration::from_secs(1),
-                1,
-                1,
-                0,
-                &failure,
-                false
-            ),
+            advances(policy, &[wire(false), wire(false)], &failure),
             status == 401
         );
     }

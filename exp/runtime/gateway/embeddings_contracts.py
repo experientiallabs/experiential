@@ -12,6 +12,7 @@ from exp.runtime.gateway.contracts import GatewayApiSurface, GatewayRequest
 from exp.runtime.gateway.decisions_contracts import DecisionRequest
 from exp.runtime.gateway.images_contracts import ImagesRequest
 from exp.runtime.gateway.ledger_valuation import require_representable_nano_usd
+from exp.runtime.gateway.video.contracts import VideoRequest
 
 type EmbeddingTokenIds = Annotated[
     tuple[Annotated[int, Field(strict=True, ge=0)], ...], Field(min_length=1)
@@ -82,13 +83,14 @@ ServingRequest = (
     | DecisionRequest
     | SpeechRequest
     | TranscriptionRequest
+    | VideoRequest
 )
 """One admitted serving request across every public surface.
 
 The money, auth, and accounting seams widen from ``GatewayRequest`` to this
 union so a chat-assuming reader cannot duck-type onto an embeddings request and
 touch an absent leg (messages, output tokens): ``ty`` enumerates every reader
-that must now handle the embeddings and images arms, and each branches
+that must now handle the embeddings, images, and video arms, and each branches
 exhaustively.
 """
 

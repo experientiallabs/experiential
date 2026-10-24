@@ -32,10 +32,16 @@ from exp.runtime.gateway.reasoning_carrier import (
     parse_reasoning_content_carrier,
     scheme_for_carrier,
 )
+from exp.runtime.gateway.sampling_extras import SAMPLING_EXTRA_FIELDS, sampling_extras_of
 from exp.runtime.models.providers.openrouter_routing import ProviderRoutingPreferences
 from exp.runtime.openai_protocol.cache_control import (
     drop_opencode_cache_control,
     restore_chat_cache_control,
+)
+from exp.runtime.openai_protocol.client_field_repairs import (
+    chat_output_cap,
+    repair_chat,
+    repair_responses,
 )
 from exp.runtime.openai_protocol.custom_tool_wire import (
     ChatCustomToolCall,
@@ -49,16 +55,28 @@ from exp.runtime.openai_protocol.custom_tools import (
     custom_turn_cache_disclosures,
     expand_chat_custom_calls,
 )
-from exp.runtime.openai_protocol.enable_thinking import translate_enable_thinking
-from exp.runtime.openai_protocol.errors import invalid_field, unsupported_field
+from exp.runtime.openai_protocol.enable_thinking import (
+    CHAT_TEMPLATE_PRESERVE_THINKING_IGNORED,
+    translate_enable_thinking,
+)
+from exp.runtime.openai_protocol.errors import (
+    invalid_field,
+    unsupported_field,
+    validated_operation_headers,
+)
 from exp.runtime.openai_protocol.manifest import (
     CHAT_MANIFEST,
     EMBEDDINGS_MANIFEST,
-    RESPONSES_INCLUDE_PATHS_ACCEPTED,
     RESPONSES_MANIFEST,
+    responses_include_options,
     validate_manifest,
 )
 from exp.runtime.openai_protocol.media_parts import message_content
+from exp.runtime.openai_protocol.prompt_cache_controls import (
+    extract_prompt_cache_breakpoints,
+    prompt_cache_fields,
+    restore_responses_breakpoints,
+)
 from exp.runtime.openai_protocol.prompt_cache_key_alias import fold_prompt_cache_key_alias
 from exp.runtime.openai_protocol.reasoning_replay import (
     ReplayedReasoningTooLong,
@@ -74,7 +92,6 @@ from exp.runtime.openai_protocol.responses_input import (
     responses_input_messages,
 )
 from exp.runtime.openai_protocol.responses_probe import (
-    drop_gateway_web_search_items,
     official_responses_probe,
     require_responses_input,
     require_responses_text_spelling,
@@ -82,8 +99,10 @@ from exp.runtime.openai_protocol.responses_probe import (
 from exp.runtime.openai_protocol.structured_text import (
     chat_json_object_output,
     chat_structured_text,
+    responses_json_object_output,
     responses_structured_text,
 )
+from exp.runtime.openai_protocol.tool_call_extra_content import thought_signature
 from exp.runtime.openai_protocol.tool_choice import chat_tool_choice, responses_tool_choice
 from exp.runtime.openai_protocol.tool_search import chat_tool_search, responses_tool_search
 from exp.runtime.openai_protocol.validation_errors import validation_protocol_error
@@ -244,9 +263,11 @@ def decode_chat(
     OpenCode may attach an Anthropic-style ``cache_control`` annotation on
     Chat messages and on text content parts. Supported ephemeral forms are
     validated outside official OpenAI validation and retained on canonical
-    cache carriers for adapters that support them. Other unknown nested fields stay rejected. The
-    Vercel AI SDK's camelCase ``promptCacheKey`` is folded onto
-    ``prompt_cache_key`` first, so it decodes as the documented wire field.
+    cache carriers for adapters that support them. Unknown keys on messages, their
+    tool calls and content parts are dropped with disclosure
+    (:mod:`exp.runtime.openai_protocol.unknown_message_fields`); every other unknown
+    nested field stays rejected. The Vercel AI SDK's camelCase ``promptCacheKey`` is
+    folded onto ``prompt_cache_key`` first, so it decodes as the documented wire field.
 
     Args:
         payload: Parsed JSON request body.
@@ -259,8 +280,9 @@ def decode_chat(
     Raises:
         OpenAIProtocolError: The body is invalid, unknown, or unsupported.
     """
-    payload, alias_disclosures = fold_prompt_cache_key_alias(payload)
-    cache_payload = payload
+    payload, alias_disclosures = repair_chat(*fold_prompt_cache_key_alias(payload))
+    breakpoints = extract_prompt_cache_breakpoints(payload, container="messages")
+    payload = cache_payload = breakpoints.marked  # Breakpoints ride the cache_control path.
     payload = drop_opencode_cache_control(payload)
     validate_manifest(payload, CHAT_MANIFEST)
     # The installed SDK's effort literal lags the newest provider tier
@@ -270,6 +292,7 @@ def decode_chat(
         _without_chat_message_extensions(payload),
         extension_fields={
             "top_k",
+            *SAMPLING_EXTRA_FIELDS,
             "reasoning_effort",
             "enable_thinking",
             "thinking_budget",
@@ -280,11 +303,14 @@ def decode_chat(
         },
     )
     request = _validate_wire(_ChatRequest, payload)
+    cache = prompt_cache_fields(breakpoints, request.prompt_cache_options)
     alias, online_suffix = split_online_suffix(request.model)
-    idempotency_key, client_request_id = _validated_operation_headers(
+    idempotency_key, client_request_id = validated_operation_headers(
         idempotency_key, client_request_id
     )
-    maximum = request.max_completion_tokens or request.max_tokens or request.max_output_tokens
+    maximum, maximum_parameter, cap_disclosures = chat_output_cap(
+        request.max_completion_tokens, request.max_tokens, request.max_output_tokens
+    )
     stop = (
         ()
         if request.stop is None
@@ -321,9 +347,17 @@ def decode_chat(
             json_object_output=chat_json_object_output(request.response_format),
             ignored_parameters=(
                 *alias_disclosures,
+                *cap_disclosures,
+                *breakpoints.disclosures,
                 *cache_disclosures,
                 *custom_turn_cache_disclosures(cache_payload.get("messages")),
                 *thinking.disclosures,
+                *(
+                    (CHAT_TEMPLATE_PRESERVE_THINKING_IGNORED,)
+                    if request.chat_template_kwargs is not None
+                    and request.chat_template_kwargs.preserve_thinking is not None
+                    else ()
+                ),
                 *_replayed_reasoning_disclosures(request.messages),
             ),
             zdr_requested=request.provider is not None and request.provider.demands_zdr,
@@ -335,15 +369,7 @@ def decode_chat(
                 online_suffix=online_suffix,
             ),
             maximum_output_tokens=maximum,
-            maximum_output_tokens_parameter=(
-                "max_completion_tokens"
-                if request.max_completion_tokens is not None
-                else "max_tokens"
-                if request.max_tokens is not None
-                else "max_output_tokens"
-                if request.max_output_tokens is not None
-                else None
-            ),
+            maximum_output_tokens_parameter=maximum_parameter,
             thinking_budget=request.thinking_budget,
             provider_thinking_config=thinking.thinking_config,
             stop=stop,
@@ -352,6 +378,7 @@ def decode_chat(
             top_k=request.top_k,
             frequency_penalty=request.frequency_penalty,
             presence_penalty=request.presence_penalty,
+            sampling_extras=sampling_extras_of(request),
             logprobs=request.logprobs,
             top_logprobs=request.top_logprobs,
             reasoning_effort=thinking.reasoning_effort,
@@ -364,6 +391,8 @@ def decode_chat(
             safety_identifier=request.safety_identifier,
             user=request.user,
             prompt_cache_key=request.prompt_cache_key,
+            prompt_cache_mode=cache.mode,
+            prompt_cache_breakpoints=cache.breakpoints,
             service_tier=request.service_tier,
             text_verbosity=request.verbosity,
             idempotency_key=idempotency_key,
@@ -426,11 +455,14 @@ def decode_responses(
     Raises:
         OpenAIProtocolError: The body is invalid, unknown, or unsupported.
     """
-    payload, alias_disclosures = fold_prompt_cache_key_alias(drop_gateway_web_search_items(payload))
+    payload, alias_disclosures = repair_responses(*fold_prompt_cache_key_alias(payload))
+    breakpoints = extract_prompt_cache_breakpoints(payload, container="input")
+    payload = breakpoints.payload
     validate_manifest(payload, RESPONSES_MANIFEST)
     # The installed SDK's effort literal lags the newest provider tier
     # ("ultra"), so the strict wire model owns reasoning validation.
     request = _validate_wire(_ResponsesRequest, payload)
+    cache = prompt_cache_fields(breakpoints, request.prompt_cache_options)
     alias, online_suffix = split_online_suffix(request.model)
     require_responses_input(request)
     if not isinstance(request.input, str):
@@ -447,8 +479,8 @@ def decode_responses(
         include_encrypted_reasoning,
         include_output_text_logprobs,
         include_web_search_sources,
-    ) = _responses_include_options(request.include)
-    idempotency_key, client_request_id = _validated_operation_headers(
+    ) = responses_include_options(request.include)
+    idempotency_key, client_request_id = validated_operation_headers(
         idempotency_key, client_request_id
     )
     raw_input = payload.get("input")
@@ -469,8 +501,17 @@ def decode_responses(
                 )
             )
     replayed_items = cast("list[JsonObject]", raw_input) if isinstance(raw_input, list) else ()
+    marked = breakpoints.marked.get("input") if breakpoints.present else None
+    cache_disclosures: list[str] = []
     try:
-        messages = list(_response_input_messages(request.input, raw_items=replayed_items))
+        messages = list(
+            _response_input_messages(
+                request.input,
+                raw_items=replayed_items,
+                marked_items=cast("list[JsonObject]", marked) if isinstance(marked, list) else (),
+                cache_disclosures=cache_disclosures,
+            )
+        )
     except ValidationError as exc:
         # History reconstruction folds echoed items into canonical messages,
         # so a canonical-contract violation (such as duplicate call_ids in one
@@ -495,8 +536,11 @@ def decode_responses(
             tool_choice=responses_tool_choice(request.tool_choice, native_tools=native_tools),
             parallel_tool_calls=request.parallel_tool_calls,
             structured_text=responses_structured_text(request.text),
+            json_object_output=responses_json_object_output(request.text),
             ignored_parameters=(
                 *alias_disclosures,
+                *breakpoints.disclosures,
+                *cache_disclosures,
                 *_replayed_reasoning_disclosures(
                     ()
                     if isinstance(request.input, str)
@@ -548,6 +592,10 @@ def decode_responses(
             safety_identifier=request.safety_identifier,
             user=request.user,
             prompt_cache_key=request.prompt_cache_key,
+            # The provider defaults ("implicit", "30m") are already satisfied.
+            prompt_cache_ttl=cache.ttl,
+            prompt_cache_mode=cache.mode,
+            prompt_cache_breakpoints=cache.breakpoints,
             service_tier=request.service_tier,
             idempotency_key=idempotency_key,
             client_request_id=client_request_id,
@@ -617,31 +665,6 @@ def _validate_wire[ModelT: BaseModel](model: type[ModelT], payload: JsonObject) 
         return model.model_validate(payload)
     except ValidationError as exc:
         raise validation_protocol_error(exc) from exc
-
-
-def _validated_operation_headers(
-    idempotency_key: str | None, client_request_id: str | None
-) -> tuple[str | None, str | None]:
-    """Validate the two caller identity headers as independent concepts.
-
-    ``Idempotency-Key`` names one retriable operation and is the only header
-    that keys replay and duplicate detection. ``X-Client-Request-Id`` is a
-    caller correlation identity: Codex sends its session id there on every
-    request of a session (captured live 2026-08-29), and the provider serves
-    those requests without deduplication, so treating it as an operation key
-    would reject the second request of every real session as a conflict. It
-    is echoed on responses and scopes route affinity only, and the two
-    headers may therefore carry different values.
-    """
-    for name, value in (
-        ("Idempotency-Key", idempotency_key),
-        ("X-Client-Request-Id", client_request_id),
-    ):
-        if value is not None and (
-            not value or len(value) > 512 or any(ord(char) < 32 for char in value)
-        ):
-            raise invalid_field(name, f"{name} must be a non-empty display-safe value.")
-    return idempotency_key, client_request_id
 
 
 def _messages(messages: tuple[_Message, ...], prefix: str) -> tuple[GatewayMessage, ...]:
@@ -782,6 +805,7 @@ def _tool_call(call: _AssistantToolCall, param: str) -> ToolCall:
             if call.cache_control is not None
             else None
         ),
+        provider_thought_signature=thought_signature(call.extra_content, call.thought_signature),
     )
 
 
@@ -808,42 +832,18 @@ def _response_tool(tool: _ResponseTool) -> GatewayToolDefinition:
     )
 
 
-def _responses_include_options(include: tuple[str, ...] | None) -> tuple[bool, bool, bool]:
-    """Validate the closed ``include`` selector list.
-
-    Args:
-        include: Raw caller include paths.
-
-    Returns:
-        The encrypted-reasoning, output-text-logprobs and web-search-sources
-        selectors.
-
-    Raises:
-        OpenAIProtocolError: An include path is not supported by this gateway.
-    """
-    if include is None:
-        return False, False, False
-    for path in include:
-        if path not in RESPONSES_INCLUDE_PATHS_ACCEPTED:
-            raise invalid_field(
-                "include",
-                f"The include path {path!r} is not supported by this gateway. "
-                "Only 'reasoning.encrypted_content', 'message.output_text.logprobs' "
-                "and 'web_search_call.action.sources' are available.",
-            )
-    return (
-        "reasoning.encrypted_content" in include,
-        "message.output_text.logprobs" in include,
-        "web_search_call.action.sources" in include,
-    )
-
-
 def _response_input_messages(
     value: str | tuple[_ResponsesInputItem, ...],
     *,
     raw_items: Sequence[JsonObject] = (),
+    marked_items: Sequence[JsonObject] = (),
+    cache_disclosures: list[str],
 ) -> tuple[GatewayMessage, ...]:
-    """Validate replay details and reconstruct OpenAI or Fireworks history."""
+    """Validate replay details and reconstruct OpenAI or Fireworks history.
+
+    ``marked_items`` carry text-block breakpoints as ``cache_control`` (see
+    ``prompt_cache_controls``); restore disclosures land in ``cache_disclosures``.
+    """
     if isinstance(value, str):
         return responses_input_messages(value)
     replayed: list[ReplayedInput] = []
@@ -926,7 +926,9 @@ def _response_input_messages(
                 ) from exc
             replayed.append(ReplayedReasoning(index=index, block=block, visible=visible))
         elif isinstance(item, _ResponseMessage):
-            converted = _messages((item,), f"input.{index}")
+            converted = restore_responses_breakpoints(
+                _messages((item,), f"input.{index}"), marked_items, index, cache_disclosures
+            )
             if converted and item.role == "assistant":
                 converted = (
                     converted[0].model_copy(
@@ -944,6 +946,7 @@ def _response_input_messages(
             wire_call = _AssistantToolCall(
                 id=item.call_id,
                 function=_FunctionCall(name=item.name, arguments=item.arguments),
+                extra_content=item.extra_content,
             )
             replayed.append(
                 ReplayedFunctionCall(

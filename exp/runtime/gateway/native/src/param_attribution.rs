@@ -158,7 +158,9 @@ pub fn rejected_model_not_found(dialect: Dialect, body: &str) -> bool {
 /// 2.1.251 or later"), and dropping that sentence left callers with a
 /// generic 400 for a client-side fix (2026-09-04 ledger).
 pub fn rejected_detail(dialect: Dialect, body: &str, request_words: &[&str]) -> Option<String> {
-    let value = parse_error_document(body)?;
+    let Some(value) = parse_error_document(body) else {
+        return plain_text_detail(dialect, body, request_words);
+    };
     let message = error_message_field(dialect, &value)?;
     if dialect == Dialect::OpenAiCompatible {
         if let Some(relayed) = family_envelope(dialect, &value)
@@ -169,6 +171,34 @@ pub fn rejected_detail(dialect: Dialect, body: &str, request_words: &[&str]) -> 
         }
     }
     sanitized_detail(message, request_words)
+}
+
+/// Longest non-JSON client-error body relayed as the provider's sentence.
+const MAXIMUM_PLAIN_TEXT_BODY: usize = 512;
+
+/// The provider's sentence when a client-error body is plain text, not JSON.
+///
+/// Some origins and reseller relays answer a 4xx with a bare sentence
+/// (`text/plain`), which no envelope reader could parse, so the caller got
+/// only "verify the request fields". A short single-line body is the
+/// provider's own explanation and takes the same identifier screen as an
+/// envelope sentence; an HTML error page, a multi-line dump, or anything
+/// longer than one sentence stays generic. TypeSafe defines no error prose
+/// contract and is never read.
+fn plain_text_detail(dialect: Dialect, body: &str, request_words: &[&str]) -> Option<String> {
+    if dialect == Dialect::TypesafeSystemone {
+        return None;
+    }
+    let text = body.trim();
+    if text.is_empty()
+        || text.len() > MAXIMUM_PLAIN_TEXT_BODY
+        || text.starts_with('<')
+        || text.starts_with('{')
+        || text.starts_with('[')
+    {
+        return None;
+    }
+    sanitized_detail(text, request_words)
 }
 
 /// The provider's own error code or type from one client-error body, as a

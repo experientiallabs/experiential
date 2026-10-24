@@ -546,7 +546,7 @@ async fn active_output_still_obeys_the_hard_total_deadline() {
             }
             Err(failure) => {
                 assert_eq!(failure.failure_class, FailureClass::Timeout);
-                assert_eq!(failure.safe_message, "gateway execution deadline exceeded");
+                assert_eq!(failure.safe_message, DEADLINE_WHILE_GENERATING_MESSAGE);
                 break;
             }
             other => panic!("unexpected outcome: {other:?}"),
@@ -557,6 +557,27 @@ async fn active_output_still_obeys_the_hard_total_deadline() {
         "active output survives the first-token allowance"
     );
     assert!(started.elapsed() < Duration::from_millis(500));
+}
+
+#[tokio::test]
+async fn a_deadline_before_any_output_names_the_silent_provider() {
+    let silent = stream::pending::<Result<Bytes, reqwest::Error>>().boxed();
+    let started = Instant::now();
+    let mut relay = UpstreamRelay::from_stream(
+        silent,
+        Dialect::OpenAiCompatible,
+        started + Duration::from_secs(60),
+    );
+    let failure = relay
+        .next_event(
+            started + Duration::from_millis(50),
+            Duration::from_secs(60),
+            started,
+        )
+        .await
+        .expect_err("the request deadline ends a silent attempt");
+    assert_eq!(failure.failure_class, FailureClass::Timeout);
+    assert_eq!(failure.safe_message, DEADLINE_BEFORE_OUTPUT_MESSAGE);
 }
 
 #[tokio::test]

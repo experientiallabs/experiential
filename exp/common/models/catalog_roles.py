@@ -13,7 +13,9 @@ class ModelRoles(ContractModel):
 
     Each completion role may carry its own reasoning-effort choice, so one alias can use
     different efforts as world model, judge, or router candidate. An absent role effort means
-    the alias's catalog capability pin applies unchanged.
+    the alias's catalog capability pin applies unchanged. ``memory_recall`` names the native
+    decision model that recalls simulator memory while learning; when absent, the build picks
+    one from the catalog.
     """
 
     candidates: tuple[str, ...] = ()
@@ -23,6 +25,7 @@ class ModelRoles(ContractModel):
     rubric_proposer: str | None = None
     embedder: str | None = None
     teacher: str | None = None
+    memory_recall: str | None = Field(default=None, exclude_if=lambda value: value is None)
     world_model_reasoning_effort: ReasoningEffort | None = None
     judge_reasoning_effort: ReasoningEffort | None = None
     candidate_reasoning_efforts: dict[str, ReasoningEffort] = Field(default_factory=dict)

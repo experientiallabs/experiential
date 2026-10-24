@@ -231,6 +231,26 @@ def anthropic_adaptive_only_thinking(model_id: str) -> bool:
     return any(family in normalized for family in _ANTHROPIC_ADAPTIVE_ONLY_FAMILIES)
 
 
+def bedrock_adaptive_thinking_model(model_id: str) -> bool:
+    """Return whether a Bedrock model id is Claude of the adaptive-thinking generation.
+
+    Converse forwards ``additionalModelRequestFields`` into the Anthropic
+    request body, so these families take ``thinking: {type: adaptive,
+    display}`` and ``output_config.effort`` exactly as the Messages wire does
+    (verified live 2026-10-19 on us.anthropic opus-4-7, opus-4-8, opus-5,
+    sonnet-5, fable-5 and fable-5-1 at high and max). Older Claude releases
+    on Bedrock (budgeted thinking, no effort ladder) and every non-Claude
+    Bedrock model keep no reasoning control on this wire.
+
+    Args:
+        model_id: Exact Bedrock model or inference-profile identifier.
+
+    Returns:
+        ``True`` for a Claude inference profile of an adaptive-only family.
+    """
+    return "anthropic.claude" in model_id.lower() and anthropic_adaptive_only_thinking(model_id)
+
+
 def anthropic_thinks_without_config(model_id: str) -> bool:
     """Return whether a request with no thinking config still runs adaptive thinking.
 
@@ -316,15 +336,114 @@ def gemini_thinking_level(model_id: str, effort: str) -> str:
     return _require_exact_effort(model_id, effort, _gemini_supported_efforts(model_id))
 
 
-def _gemini_supported_efforts(model_id: str) -> Collection[str]:
-    """Return documented native thinking levels for one Gemini family."""
-    normalized = (
+_GEMINI_2_5_THINKING_BUDGETS = {"none": 0, "low": 1_024, "medium": 8_192, "high": 24_576}
+"""Gemini 2.5 effort budgets, the values Google's OpenAI-compatible endpoint maps.
+
+Every value sits inside each 2.5 family's documented budget range (Pro
+128-32,768, Flash 0-24,576, Flash-Lite 0 or 512-24,576); probed live on AI
+Studio and Vertex 2026-10-19.
+"""
+
+
+def gemini_thinking_budget(model_id: str, level: str) -> int | None:
+    """Return the ``thinkingBudget`` carrying one validated effort, or None.
+
+    Gemini 2.5 has no ``thinkingLevel`` (both AI Studio and Vertex answer 400
+    "thinking_level is not supported"), so every 2.5 effort rides a budget.
+    Later families take ``thinkingLevel`` and use a budget only to switch
+    thinking off (``none`` is a zero budget; the field has no off value).
+
+    Args:
+        model_id: Exact Gemini model identifier.
+        level: An effort already validated by :func:`gemini_thinking_level`.
+
+    Returns:
+        The budget to send, or None when the effort rides ``thinkingLevel``.
+    """
+    if _gemini_family(model_id).startswith("gemini-2-5-"):
+        return _GEMINI_2_5_THINKING_BUDGETS[level]
+    return 0 if level == "none" else None
+
+
+def gemini_thinks_by_default(model_id: str) -> bool:
+    """Whether a Gemini model thinks when the request sets no thinking control.
+
+    Gemini 2.5 Flash-Lite thinks only when given a budget; Vertex refuses
+    ``includeThoughts`` on a request that leaves thinking off ("include_thoughts
+    is only enabled when thinking is enabled"). Every other family thinks by
+    default.
+
+    Args:
+        model_id: Exact Gemini model identifier.
+
+    Returns:
+        False only for a family whose thinking is off unless budgeted.
+    """
+    return not _gemini_family(model_id).startswith("gemini-2-5-flash-lite")
+
+
+GEMINI_NONE_SUBSTITUTE_EFFORT: Final = "minimal"
+"""The level a Gemini 3 Flash rung dispatches for a caller's ``none``."""
+
+
+def gemini_none_rides_minimal(model_id: str) -> bool:
+    """Whether a caller's ``none`` dispatches as ``minimal`` on this Gemini model.
+
+    The Gemini 3 Flash families have no thinking-off level: ``thinkingLevel``
+    stops at MINIMAL, the provider's own "closest to off" (it may still think a
+    little). OpenRouter serves ``none`` to these models as minimal, and
+    pinned clients send ``none`` to every model, so a house Gemini rung that
+    refused it handed every such request to OpenRouter. The substitute is a
+    disclosed rewrite (``reasoning_effort->minimal``), never a ``none`` tier on
+    the ladder: the rung still does not honor a real off switch, and every
+    consumer that asks "can this rung stop reasoning" keeps the true answer.
+    Only flash families whose exact ladder carries ``minimal`` and lacks
+    ``none`` qualify (gemini-3.7-flash and 3.8-flash refuse MINIMAL by name).
+
+    Args:
+        model_id: Exact provider model id, bare (``gemini-3.1-flash-lite``) or
+            prefixed (``models/``, ``publishers/google/models/``, ``google/``).
+
+    Returns:
+        ``True`` when ``none`` should dispatch as ``minimal`` with disclosure.
+    """
+    bare = model_id.rsplit("/", 1)[-1]
+    family = _gemini_family(bare)
+    if not family.startswith("gemini-3") or "flash" not in family:
+        return False
+    supported = _gemini_supported_efforts(bare)
+    return GEMINI_NONE_SUBSTITUTE_EFFORT in supported and "none" not in supported
+
+
+def _gemini_family(model_id: str) -> str:
+    """Normalize a Gemini model id to the bare family form the tables match."""
+    return (
         _normalized_model(model_id)
         .removeprefix("publishers/google/models/")
         .removeprefix("models/")
     )
-    if "gemini-3-7-flash" in normalized or "gemini-3-1-pro" in normalized:
-        supported: Collection[str] = ("low", "medium", "high")
+
+
+def _gemini_supported_efforts(model_id: str) -> Collection[str]:
+    """Return documented native thinking levels for one Gemini family."""
+    normalized = _gemini_family(model_id)
+    if "gemini-4-argon" in normalized:
+        # Live on AI Studio 2026-10-13: LOW, MEDIUM and HIGH are accepted and
+        # think measurably differently (0 / ~150-400 / ~1000-1350 thought
+        # tokens on one prompt); MINIMAL and XHIGH answer 400. "none" rides
+        # thinkingBudget 0, which this model accepts with zero thoughts.
+        supported: Collection[str] = ("none", "low", "medium", "high")
+    elif "gemini-3-8-flash" in normalized:
+        # Probed live 2026-10-20 on Vertex (global generateContent) and AI
+        # Studio: LOW, MEDIUM and HIGH are accepted and think measurably more
+        # at each step (Vertex 573 / 777 / 811, AI Studio 400 / 916 / 1707
+        # thought tokens on one prompt). MINIMAL answers 400 on both ("not
+        # supported for this model") and XHIGH is not a field value. "none" is
+        # absent: thinkingBudget 0 is accepted but the model still thinks
+        # (290 and 604 thought tokens), so it would not be an off switch.
+        supported = ("low", "medium", "high")
+    elif "gemini-3-7-flash" in normalized or "gemini-3-1-pro" in normalized:
+        supported = ("low", "medium", "high")
     elif "gemini-3-pro" in normalized:
         supported = ("low", "high")
     elif "gemini-3-1-flash-lite-image" in normalized:
@@ -340,8 +459,11 @@ def _gemini_supported_efforts(model_id: str) -> Collection[str]:
         )
     ):
         supported = ("minimal", "low", "medium", "high")
-    elif normalized.startswith("gemini-2-5-"):
+    elif normalized.startswith("gemini-2-5-pro"):
+        # 2.5 Pro only works in thinking mode: a zero budget answers 400.
         supported = ("low", "medium", "high")
+    elif normalized.startswith("gemini-2-5-"):
+        supported = ("none", "low", "medium", "high")
     else:
         # New Gemini 3 variants remain callable while discovery catches up.
         # HIGH is the only level documented across every current family.

@@ -28,6 +28,7 @@ from exp.common.models import (
 from exp.common.models.catalog_prices import GatewayTokenPrices
 from exp.common.models.token_cost import schedule_usage_cost_nano_usd
 from exp.common.tasks import ToolSchema
+from exp.runtime.gateway.images_contracts import ImagesRequest
 from exp.runtime.models.providers.errors import (
     ProviderRefusalError,
     ProviderRefusalSignal,
@@ -43,6 +44,7 @@ from exp.runtime.models.providers.openai_compatible import (
     openai_compatible_response,
     openai_embedding_request,
     openai_embedding_response_raw,
+    openai_images_request,
     parse_openai_wire_tool_call,
 )
 from exp.runtime.models.providers.transport import (
@@ -1200,3 +1202,37 @@ def test_typed_content_parts_concatenate_text_and_reject_non_object_parts() -> N
                 configured_model=_snapshot("mistral", "mistral-small-2603"),
                 latency_seconds=1,
             )
+
+
+def test_tool_argument_duplicate_keys_are_rejected_before_typed_replay() -> None:
+    """Raw arguments cannot collapse duplicates into an apparently valid cached proposal."""
+    with pytest.raises(OpenAICompatibleResponseError, match="duplicate JSON keys"):
+        parse_openai_wire_tool_call(
+            {
+                "id": "answer",
+                "function": {"name": "submit_proposal", "arguments": '{"value":1,"value":2}'},
+            },
+            0,
+        )
+
+
+@pytest.mark.parametrize("asked", [None, "url", "b64_json"])
+def test_inline_images_forces_base64_whatever_the_caller_asked(
+    asked: Literal["url", "b64_json"] | None,
+) -> None:
+    """An inline-images rung (xAI, Zero Data Retention) always asks for ``b64_json``."""
+    request = ImagesRequest(prompt="a cat", n=2, response_format=asked)
+    body = openai_images_request("grok-imagine-image", request, inline_images=True)
+    assert body == {
+        "model": "grok-imagine-image",
+        "prompt": "a cat",
+        "n": 2,
+        "response_format": "b64_json",
+    }
+
+
+def test_other_rungs_forward_the_callers_response_format() -> None:
+    """Without inline images the caller's choice, or its absence, is forwarded as given."""
+    asked = ImagesRequest(prompt="a cat", response_format="url")
+    assert openai_images_request("dall-e-3", asked)["response_format"] == "url"
+    assert "response_format" not in openai_images_request("dall-e-3", ImagesRequest(prompt="a"))

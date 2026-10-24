@@ -19,6 +19,8 @@ dialed (``fallback_reason = failover_only_on:<token>``).
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+
 from exp.common.models.failover_tokens import REFUSAL_TOKEN, REFUSAL_TOKEN_PREFIX
 from exp.common.models.gateway_catalog import ExactModelDeployment
 from exp.runtime.gateway.contracts import GatewayFailure, GatewayFailureClass, GatewayRefusalReason
@@ -103,6 +105,35 @@ def eligible_depths(
         for depth in range(start, len(rules))
         if (rules[depth] is None and unrestricted)
         or matched_token(rules[depth], failure) is not None
+    )
+
+
+def untried_depths(
+    rules: FallbackRules,
+    failure: GatewayFailure | None,
+    dispatched: Sequence[int],
+    current_depth: int,
+    *,
+    unrestricted: bool = True,
+) -> tuple[int, ...]:
+    """Return the depths a failover from ``current_depth`` may claim, in route order.
+
+    Every depth not dispatched yet in this request (``dispatched`` counts
+    physical dispatches per depth) and not the failing depth itself, EARLIER
+    depths included: a rung the request skipped (shed at its bound on the
+    first dial, or ordered behind an affinity choice) is still a live
+    successor when the rung it was skipped for fails (production,
+    2026-10-21: a full lane at depth 0 was skipped, the dead lane at depth 1
+    502'd, and the request ended with nothing revisited). Route order is kept
+    among the untried depths, so a skipped earlier rung is preferred over a
+    later one. The ``failover_only_on`` rules apply exactly as in
+    ``eligible_depths``; the data plane mirrors this set
+    (``waterfall/fallback_rules.rs``, ``successor_available``).
+    """
+    return tuple(
+        depth
+        for depth in eligible_depths(rules, 0, failure, unrestricted=unrestricted)
+        if depth != current_depth and (depth >= len(dispatched) or dispatched[depth] == 0)
     )
 
 

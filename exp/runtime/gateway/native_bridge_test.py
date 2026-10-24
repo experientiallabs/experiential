@@ -8,6 +8,7 @@ import logging
 import sqlite3
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -72,6 +73,7 @@ from exp.runtime.gateway.native_bridge import (
 )
 from exp.runtime.gateway.native_bridge_errors import capability_param as _public_capability_param
 from exp.runtime.gateway.native_components import NativeGatewayComponents
+from exp.runtime.gateway.native_dead_rungs import UNAVAILABLE_AT_ADMISSION
 from exp.runtime.gateway.native_reasoning import (
     CHANGED_TURN_CARRIER_DROPPED,
     UNAVAILABLE_ISSUER_CARRIER_DROPPED,
@@ -94,6 +96,7 @@ from exp.runtime.models.providers.instruction_turns import (
     SYSTEM_FOLD_DISCLOSURE,
 )
 from exp.runtime.models.providers.openai_compatible import OpenAICompatibleClient
+from exp.runtime.models.providers.protocol import DEVELOPER_ROLE_REWRITE_DISCLOSURE
 from exp.runtime.models.providers.streaming_requests import openai_compatible_stream_payload
 from exp.runtime.openai_protocol.errors import OpenAIProtocolError, public_failure_error
 from exp.runtime.openai_protocol.requests import decode_chat, decode_responses
@@ -382,6 +385,110 @@ def _admit(
         scope = json.loads(control.claim_scope(json.dumps(payload)))
         payload["claimed_guardrail_revision"] = scope.get("guardrail_revision")
     return json.loads(control.admit(json.dumps(payload)))
+
+
+def test_request_class_reaches_the_admission_only_when_the_host_sets_one(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No class leaves the admission byte-identical; a set class orders the permit queue."""
+    control, raw_key = _control_plane(tmp_path)
+    unclassed = _admit(control, raw_key, _chat_body(stream=True))
+    assert "priority_class" not in unclassed
+    original = SQLiteGatewayStore.authorize_request
+
+    def authorize_classed(
+        self: SQLiteGatewayStore,
+        *,
+        raw_key: str,
+        alias: str,
+        request: ServingRequest,
+        deadline_monotonic: float,
+        app_referer: str | None = None,
+        app_title: str | None = None,
+        client_ip: str | None = None,
+    ) -> AuthorizationSnapshot:
+        """Ordinary authorization plus a host-vouched class 6."""
+        authority = original(
+            self,
+            raw_key=raw_key,
+            alias=alias,
+            request=request,
+            deadline_monotonic=deadline_monotonic,
+            app_referer=app_referer,
+            app_title=app_title,
+            client_ip=client_ip,
+        )
+        return authority.model_copy(update={"priority_class": 6})
+
+    monkeypatch.setattr(SQLiteGatewayStore, "authorize_request", authorize_classed)
+    classed = _admit(control, raw_key, _chat_body(stream=True))
+    assert classed["priority_class"] == 6
+
+
+@pytest.mark.parametrize("provider", ("anthropic", "openai-compatible"))
+def test_openrouter_sampling_extras_forward_or_drop_per_rung_never_refuse(
+    tmp_path: Path, provider: str
+) -> None:
+    """``repetition_penalty`` / ``min_p`` / ``top_a`` are admitted on every rung.
+
+    Neither an Anthropic rung nor a generic OpenAI-compatible rung that is not
+    marked self-hosted (a reseller that may refuse unknown fields) carries
+    them: the real admission bridge dispatches without any of them and names
+    each drop in ``ignored_parameters``. A self-hosted vLLM rung's forwarding
+    is covered in native_rungs_test.
+    """
+    _manager, key = _configured_gateway(
+        tmp_path,
+        provider=provider,
+        capabilities=ModelCapabilities(maximum_output_tokens=2_048),
+    )
+    control = NativeControlPlane(
+        load_gateway_components(tmp_path, environment={"TEST_PROVIDER_KEY": "local-test-key"})
+    )
+    body = {**json.loads(_chat_body()), "repetition_penalty": 1.1, "min_p": 0.05, "top_a": 0.2}
+    admission = _admit(control, key, json.dumps(body))
+    route = admission["route"]
+    assert isinstance(route, list) and isinstance(route[0], dict)
+    payload = route[0]["upstream_payload"]
+    assert isinstance(payload, dict)
+    ignored = admission["ignored_parameters"]
+    assert isinstance(ignored, list)
+    assert not {"repetition_penalty", "min_p", "top_a"} & set(payload)
+    for name in ("repetition_penalty", "min_p", "top_a"):
+        assert f"{name}->dropped(unsupported_by_provider)" in ignored
+    assert "attempt_id" in _start_first(control, admission)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (("repetition_penalty", 0), ("repetition_penalty", 3.0), ("min_p", "0.1"), ("top_a", -1)),
+)
+def test_an_invalid_sampling_extra_is_a_named_400(
+    tmp_path: Path, field: str, value: object
+) -> None:
+    """Admission validates the extras' type and range before any rung is chosen."""
+    control, raw_key = _control_plane(tmp_path)
+    body = {**json.loads(_chat_body()), field: value}
+    with pytest.raises(NativeBridgeError) as refused:
+        _admit(control, raw_key, json.dumps(body))
+    public_error = json.loads(refused.value.public_error_json)
+    assert public_error["status_code"] == 400
+    assert public_error["code"] == "invalid_parameter"
+    assert public_error["param"] == field
+
+
+def test_a_plain_priority_tier_never_jumps_the_permit_queue(tmp_path: Path) -> None:
+    """``service_tier`` priority without ``:fast`` keeps the caller's own permit class.
+
+    Only the per-rung entry treats an admitted priority tier as fast
+    (class_throttles.tier_authorization); the worker-wide permit queue reads
+    the authorization the host vouched for.
+    """
+    control, raw_key = _control_plane(tmp_path)
+    body = json.loads(_chat_body(stream=True))
+    for tier in ("priority", "fast"):
+        admitted = _admit(control, raw_key, json.dumps({**body, "service_tier": tier}))
+        assert "priority_class" not in admitted, admitted
 
 
 @pytest.mark.parametrize("provider", ("anthropic", "openai-compatible"))
@@ -2239,6 +2346,101 @@ def test_abandoned_inflight_attempts_are_swept_after_the_deadline(
             )
 
 
+def test_admit_sends_adaptive_thinking_to_a_reasoning_bedrock_claude_rung(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A Chat effort on a reasoning-declared Bedrock Claude rung reaches Converse.
+
+    The deployment declares the same reasoning contract the direct Anthropic
+    lane carries (effort ladder, no required default). Before Bedrock carried
+    adaptive thinking such a declaration contradicted the client profile and
+    the rung could not serve; now the frozen Converse body asks for summarized
+    adaptive thinking at the caller's effort, which is what returns readable
+    reasoning and an estimated reasoning count on the Chat reply.
+    """
+    from exp.common.models import (
+        GatewayDeploymentCapabilities,
+        GatewayTokenPrices,
+        ModelCapabilities,
+    )
+    from exp.runtime.gateway.catalog_authority import (
+        ConnectionConfig,
+        upsert_connection,
+        upsert_singleton_deployment,
+    )
+
+    for name in ("AWS_SESSION_TOKEN", "AWS_BEARER_TOKEN_BEDROCK", "AWS_PROFILE"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "AKIDEXAMPLE")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "sigv4-secret-canary")
+    manager, raw_key = _configured_gateway(tmp_path)
+    upsert_connection(
+        tmp_path,
+        name="bedrock-main",
+        connection=ConnectionConfig(provider="bedrock", region="us-east-1"),
+        replace=False,
+    )
+    normalized, snapshot, _changed = upsert_singleton_deployment(
+        tmp_path,
+        deployment_alias="opus",
+        connection_name="bedrock-main",
+        provider_model="us.anthropic.claude-opus-4-8",
+        exact_model_id="bedrock-opus-exact",
+        revision=None,
+        capabilities=ModelCapabilities(
+            supports_reasoning=True,
+            supports_temperature=True,
+            minimum_temperature=1.0,
+            maximum_temperature=1.0,
+            maximum_output_tokens=128_000,
+        ),
+        gateway_capabilities=GatewayDeploymentCapabilities(
+            supports_streaming=True,
+            supports_streaming_tool_arguments=True,
+            supported_reasoning_efforts=("low", "medium", "high", "xhigh", "max"),
+        ),
+        prices=GatewayTokenPrices(),
+        pricing_source=None,
+        replace=False,
+    )
+    manager.activate_direct_alias(
+        alias_id="opus",
+        alias_name="opus",
+        revision_id="revision-opus",
+        pool_id="opus",
+        snapshot_ref=f"catalog-snapshots/{snapshot.name}",
+        catalog_sha256=normalized.identity_sha256(),
+    )
+    manager.add_grant(identity_id="default", alias_id="opus")
+    control = NativeControlPlane(
+        load_gateway_components(tmp_path, environment={"TEST_PROVIDER_KEY": "provider-secret"})
+    )
+    admission = _admit(
+        control,
+        raw_key,
+        json.dumps(
+            {
+                "model": "opus",
+                "messages": [{"role": "user", "content": "hi"}],
+                "max_tokens": 6000,
+                "reasoning_effort": "high",
+            }
+        ),
+    )
+    assert "escalate" not in admission
+    started = _flatten_started(control, admission)
+    assert started["dialect"] == "bedrock_converse_stream"
+    body = started["upstream_body"]
+    assert isinstance(body, str)
+    payload = json.loads(body)
+    assert payload["additionalModelRequestFields"] == {
+        "thinking": {"type": "adaptive", "display": "summarized"},
+        "output_config": {"effort": "high"},
+    }
+    assert payload["inferenceConfig"]["maxTokens"] == 6000
+
+
 @pytest.mark.parametrize(
     "auth_mode",
     ("ambient_pair", "ambient_bearer", "explicit_bearer", "explicit_pair"),
@@ -3439,20 +3641,94 @@ def test_admit_recovers_a_dead_lead_when_its_credential_heals(tmp_path: Path) ->
     assert [item["model_id"] for item in recovered] == ["alpha-model-exact", "beta-model-exact"]
 
 
-def test_admit_escalates_when_every_rung_is_dead(tmp_path: Path) -> None:
-    """A route with no resolvable rung is finished closed, not served."""
+def test_admit_escalates_when_every_rung_is_dead(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A route with no resolvable rung is finished closed, not served.
+
+    The ledger row says ``unavailable`` (the caller gets the retryable 503), not
+    the internal servability fault it read as before (production 2026-10-19).
+    """
     environment = {"TEST_ALPHA_KEY": "alpha-secret", "TEST_PROVIDER_KEY": "beta-secret"}
     control, raw_key = _partial_pool_control_plane(tmp_path, environment)
+    recorded: list[GatewayFailure] = []
+    original_finish = control._accounting.finish_request_quietly  # noqa: SLF001
+
+    def _capture(
+        authorization: AuthorizationSnapshot,
+        failure: GatewayFailure,
+        *,
+        web_search_requests: int = 0,
+    ) -> bool:
+        """Record the verdict while preserving the complete current meter contract."""
+        recorded.append(failure)
+        return original_finish(authorization, failure, web_search_requests=web_search_requests)
+
+    monkeypatch.setattr(control._accounting, "finish_request_quietly", _capture)  # noqa: SLF001
 
     environment.clear()
     admission = _admit(control, raw_key, _chat_body())
 
-    assert "escalate" in admission
+    assert admission["escalate"] == UNAVAILABLE_AT_ADMISSION
+    assert [failure.failure_class for failure in recorded] == [GatewayFailureClass.UNAVAILABLE]
     control_plane = cast("JsonObject", control.metrics_snapshot()["control_plane"])
     assert control_plane["admission_dead_rungs_skipped"] == 2
     # A total outage escalates on its own path; the lead-skip counter means
     # "a fallback served while the lead was dead" and must stay silent here.
     assert control_plane["admission_lead_rungs_skipped"] == 0
+
+
+class _SwappingComponents:
+    """Delegate to real components; run ``on_swap`` at one chosen catalog read.
+
+    Stands in for a catalog refresh that swaps the runtime catalogs (and their
+    credential environment) while an admission is between two reads.
+    """
+
+    def __init__(self, components: object) -> None:
+        self._components = components
+        self.catalog_reads = 0
+        self.swap_at: int | None = None
+        self.on_swap: Callable[[], None] = lambda: None
+
+    def __getattr__(self, name: str) -> object:
+        if name == "runtime_catalogs":
+            self.catalog_reads += 1
+            if self.catalog_reads == self.swap_at:
+                self.on_swap()
+        return getattr(self._components, name)
+
+
+def test_admit_re_resolves_once_when_every_rung_is_dead(tmp_path: Path) -> None:
+    """A route dead only across a catalog swap serves on the re-read catalogs.
+
+    gemini-3.1-flash-lite's single Vertex rung answered 7 retryable 503s an hour
+    to one tenant, each landing on the worker's "gateway catalog refreshed"
+    line (production 2026-10-19); the generation that just swapped in serves it.
+    """
+    environment = {"TEST_ALPHA_KEY": "alpha-secret", "TEST_PROVIDER_KEY": "beta-secret"}
+    control, raw_key = _partial_pool_control_plane(tmp_path, environment)
+    swapping = _SwappingComponents(control._components)  # noqa: SLF001
+    control._components = swapping  # type: ignore[assignment]  # noqa: SLF001
+    _admit(control, raw_key, _chat_body())
+    reads_per_admission = swapping.catalog_reads
+
+    # The swap lands only after every read a healthy admission makes, so it
+    # is visible to the re-read alone.
+    saved = dict(environment)
+    environment.clear()
+    swapping.catalog_reads = 0
+    swapping.swap_at = reads_per_admission + 1
+    swapping.on_swap = lambda: environment.update(saved)
+    admission = _admit(control, raw_key, _chat_body())
+
+    assert "escalate" not in admission
+    route = cast("list[JsonObject]", admission["route"])
+    assert [item["model_id"] for item in route] == ["alpha-model-exact", "beta-model-exact"]
+    assert swapping.catalog_reads == reads_per_admission + 1
+    control_plane = cast("JsonObject", control.metrics_snapshot()["control_plane"])
+    # Nothing was dead once the swap landed, so no circuit opened.
+    assert control_plane["admission_dead_rungs_skipped"] == 0
 
 
 def test_admit_keeps_a_fully_resolvable_route_and_never_skips(tmp_path: Path) -> None:
@@ -3890,9 +4166,11 @@ def test_metrics_snapshot_counts_a_replayed_retained_settlement(tmp_path: Path) 
 
 def test_metrics_snapshot_counts_a_swept_abandoned_attempt(tmp_path: Path) -> None:
     """An abandoned admission closed by the sweep moves the cancellation counter."""
-    control, raw_key = _control_plane(tmp_path, request_timeout_seconds=0.01)
+    # The deadline must outlast admission itself (a 10 ms budget raced local
+    # snapshot preparation on a loaded CI runner) and then lapse before the sweep.
+    control, raw_key = _control_plane(tmp_path, request_timeout_seconds=0.5)
     _admit(control, raw_key, _chat_body())
-    time.sleep(0.05)
+    time.sleep(0.6)
     with mock.patch("exp.runtime.gateway.native_accounting._SWEEP_GRACE_SECONDS", 0.0):
         control._accounting.sweep_expired()  # noqa: SLF001 - the timer normally drives this.
 
@@ -5636,12 +5914,11 @@ def test_keyed_reasoning_content_joins_replay_identity(tmp_path: Path) -> None:
             )
         )
 
-    # The seeded route is OpenAI-compatible, so the carrier is rejected at
-    # parameter admission; the accepted request still lands a durable keyed
-    # terminal, which is exactly what replay identity is checked against.
-    with pytest.raises(NativeBridgeError) as first:
-        admit_keyed(reasoning_body("blob-one=="))
-    assert json.loads(first.value.public_error_json)["code"] == "unsupported_parameter"
+    # The seeded route is OpenAI-compatible, so it cannot read the carrier and
+    # admission drops it with disclosure; the accepted keyed request is still
+    # what replay identity is checked against.
+    first = admit_keyed(reasoning_body("blob-one=="))
+    assert "input.reasoning.encrypted_content->dropped(foreign_route)" in json.dumps(first)
 
     with pytest.raises(NativeBridgeError) as changed:
         admit_keyed(reasoning_body("blob-two=="))
@@ -5659,9 +5936,12 @@ def test_capability_rejection_names_the_public_request_field(
 
     Both the caller's 400 and the ledger row name it: an alert that only
     read "cannot preserve a requested capability" could not be triaged
-    without opening the request.
+    without opening the request. The lane is native Responses, the one wire
+    that defines ``developer`` and so still requires the declaration.
     """
-    control, raw_key = _control_plane(tmp_path)
+    control, raw_key = _openai_responses_pool_control_plane(
+        tmp_path, {"TEST_ALPHA_KEY": "alpha-secret", "TEST_BETA_KEY": "beta-secret"}
+    )
     recorded: list[GatewayFailure] = []
     original_finish = control._accounting.finish_request_quietly  # noqa: SLF001
 
@@ -7285,3 +7565,240 @@ def test_gemini_rung_folds_a_mid_conversation_system_turn_instead_of_refusing(
         {"role": "user", "parts": [{"text": "Go ahead."}]},
     ]
     assert HOISTING_WIRE_SYSTEM_FOLD_DISCLOSURE in cast(list[str], admission["ignored_parameters"])
+
+
+def test_provider_routing_preferences_are_resolved_at_admission(tmp_path: Path) -> None:
+    """OpenRouter-style ``provider`` pins resolve against our rungs, never silently.
+
+    A pin no rung matches is a 400 naming the providers the model offers
+    (request-5ff5f798: ``order: [no_such_host]`` returned 200); a matching
+    pin admits; unsupported keys are disclosed.
+    """
+    control, raw_key = _control_plane(tmp_path)
+
+    def body(preferences: JsonObject) -> str:
+        """One chat body carrying ``preferences``."""
+        return json.dumps(
+            {
+                "model": "coding",
+                "messages": [{"role": "user", "content": "hi"}],
+                "provider": preferences,
+            }
+        )
+
+    with pytest.raises(NativeBridgeError) as raised:
+        _admit(control, raw_key, body({"order": ["no_such_host"], "allow_fallbacks": False}))
+    error = json.loads(raised.value.public_error_json)
+    assert error["param"] == "provider.order"
+    assert "Providers serving this model:" in error["message"]
+    admitted_provider = cast("list[JsonObject]", _admit(control, raw_key, _chat_body())["route"])
+    served = _admit(
+        control,
+        raw_key,
+        body({"only": [str(admitted_provider[0]["provider"])], "sort": "price"}),
+    )
+    assert "provider.sort->ignored(unsupported)" in cast("list[str]", served["ignored_parameters"])
+
+
+def test_the_unavailable_at_admission_reason_matches_the_native_503_mapping() -> None:
+    """Every escalation site's literal is the exact constant the Rust plane turns into a 503.
+
+    A drifted sentence would silently put the escalation back on the anonymous 500.
+    """
+    gateway = Path(native_bridge_module.__file__).parent
+    respond = (gateway / "native" / "src" / "respond.rs").read_text()
+    reason = "every certified deployment was unavailable at admission"
+    assert f'pub(crate) const UNAVAILABLE_AT_ADMISSION: &str =\n    "{reason}";' in respond
+    assert UNAVAILABLE_AT_ADMISSION == reason
+    sites = [
+        path.name
+        for path in gateway.glob("native_*.py")
+        if not path.name.endswith("_test.py")
+        and (reason in path.read_text() or "UNAVAILABLE_AT_ADMISSION" in path.read_text())
+    ]
+    assert sorted(sites) == [
+        "native_audio.py",
+        "native_bridge.py",
+        "native_dead_rungs.py",
+        "native_decisions.py",
+        "native_embeddings.py",
+        "native_images.py",
+        "native_openai_decisions.py",
+    ]
+
+
+def test_chat_client_hints_serve_disclosed_instead_of_refusing(tmp_path: Path) -> None:
+    """``seed``, retention, stray ``stream_options`` and ``agent`` admit, disclosed.
+
+    Production 2026-10-18: each was a named 400 (seed and prompt_cache_retention
+    "not supported by this gateway profile", stream_options "requires
+    stream=true", WorkBuddy's messages.N.agent "Invalid value"), although none
+    of them can change a correct answer.
+    """
+    root = tmp_path / "gateway"
+    root.mkdir()
+    control, raw_key = _control_plane(root)
+    body = json.dumps(
+        {
+            "model": "coding",
+            "messages": [{"role": "user", "content": "hi", "agent": "build"}],
+            "seed": 7,
+            "prompt_cache_retention": "24h",
+            "stream_options": {"include_usage": True},
+        }
+    )
+    admission = _flatten_started(control, _admit(control, raw_key, body))
+    assert admission["ignored_parameters"] == [
+        "messages.agent->dropped(client_annotation)",
+        "seed->ignored(determinism_hint_not_forwarded)",
+        "prompt_cache_retention->ignored(not_forwarded)",
+        "stream_options->ignored(stream_false)",
+    ]
+    upstream = admission["upstream_payload"]
+    assert isinstance(upstream, dict)
+    assert "seed" not in upstream
+    assert "prompt_cache_retention" not in upstream
+    messages = cast("list[JsonObject]", upstream["messages"])
+    assert all("agent" not in message for message in messages)
+
+
+def test_workbuddy_message_bookkeeping_is_dropped_before_dispatch(tmp_path: Path) -> None:
+    """WorkBuddy's ``conversationRequestId`` history admits, disclosed, never forwarded.
+
+    Production 2026-10-23: WorkBuddy (and ReactorNetty, node, curl and urllib
+    clients) stamp ``conversationRequestId`` on every message they keep, so the
+    second turn of every chat was a named 400 that a retry repeats. The key is
+    dropped before dispatch, named once however many messages carried it, and
+    leaves the replay identity exactly where the plain history puts it.
+    """
+    root = tmp_path / "gateway"
+    root.mkdir()
+    control, raw_key = _control_plane(root)
+    history = [
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": "hello"},
+        {"role": "user", "content": "and now?"},
+    ]
+    tagged_history = [
+        {**message, "conversationRequestId": f"conv-{index}"}
+        for index, message in enumerate(history)
+    ]
+    tagged = json.dumps({"model": "coding", "messages": tagged_history})
+    plain = json.dumps({"model": "coding", "messages": history})
+    admission = _flatten_started(control, _admit(control, raw_key, tagged))
+    assert admission["ignored_parameters"] == [
+        "messages.conversationRequestId->dropped(unknown_message_field)",
+    ]
+    upstream = admission["upstream_payload"]
+    assert isinstance(upstream, dict)
+    assert "conversationRequestId" not in json.dumps(upstream)
+    tagged_scope = _claim_scope(control, raw_key, tagged, idempotency_key="workbuddy-op")
+    plain_scope = _claim_scope(control, raw_key, plain, idempotency_key="workbuddy-op")
+    assert tagged_scope == plain_scope
+
+
+def test_claude_code_turn_output_config_serves_on_the_messages_lane(tmp_path: Path) -> None:
+    """Claude Code's ``messages[1].output_config`` admits, disclosed, never forwarded.
+
+    Production 2026-10-18 onward: claude-cli 2.1.282 through 2.1.310 sent
+    ``output_config`` inside ``messages[1]`` and every such ``/v1/messages``
+    call was a 400 ``Unknown parameter 'messages.1.output_config'``, though
+    Anthropic serves the same body. The turn key is dropped before dispatch
+    and named once; the native Anthropic wire carries no turn-level key.
+    """
+    root = tmp_path / "anthropic-root"
+    root.mkdir()
+    _manager, raw_key = _configured_gateway(root, provider="anthropic")
+    components = load_gateway_components(
+        root,
+        environment={"TEST_PROVIDER_KEY": "provider-secret-canary"},
+    )
+    control = NativeControlPlane(components, request_timeout_seconds=120.0)
+    body = json.dumps(
+        {
+            "model": "coding",
+            "max_tokens": 32,
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "hello", "output_config": {"effort": "high"}},
+                {"role": "user", "content": "and now?"},
+            ],
+        }
+    )
+    admission = _flatten_started(control, _admit(control, raw_key, body, surface="messages"))
+    assert admission["ignored_parameters"] == [
+        "messages.output_config->dropped(unknown_message_field)",
+    ]
+    upstream = admission["upstream_payload"]
+    assert isinstance(upstream, dict)
+    upstream_messages = cast("list[JsonObject]", upstream["messages"])
+    assert [message["role"] for message in upstream_messages] == ["user", "assistant", "user"]
+    assert all(set(message) <= {"role", "content"} for message in upstream_messages)
+    assert "output_config" not in upstream
+
+
+@pytest.mark.parametrize("declared", (False, True))
+def test_developer_messages_reach_a_chat_wire_lane_as_system(
+    tmp_path: Path, declared: bool
+) -> None:
+    """A Chat-wire lane serves ``developer`` as ``system`` instead of narrowing out.
+
+    The OpenAI-compatible wire enumerates system/user/assistant only, so the
+    payload always carries the instruction as ``system`` (in place, after any
+    existing system turn). A lane whose catalog does not declare the role
+    used to be removed from the route, handing the request to a fallback
+    provider; it is now admitted and the rewrite is disclosed. A lane that
+    declares the role keeps serving exactly as before, with no disclosure.
+    """
+    _manager, raw_key = _configured_gateway(
+        tmp_path,
+        gateway_capabilities=GatewayDeploymentCapabilities(
+            supports_streaming=True,
+            supports_streaming_tool_arguments=True,
+            supports_developer_messages=declared,
+        ),
+    )
+    control = NativeControlPlane(
+        load_gateway_components(tmp_path, environment={"TEST_PROVIDER_KEY": "local-test-key"})
+    )
+    body = json.dumps(
+        {
+            "model": "coding",
+            "messages": [
+                {"role": "system", "content": "You are terse."},
+                {"role": "developer", "content": "Answer in French."},
+                {"role": "user", "content": "hello"},
+            ],
+        }
+    )
+
+    admission = _admit(control, raw_key, body)
+
+    route = admission["route"]
+    assert isinstance(route, list) and isinstance(route[0], dict)
+    payload = route[0]["upstream_payload"]
+    assert isinstance(payload, dict)
+    assert payload["messages"] == [
+        {"role": "system", "content": "You are terse."},
+        {"role": "system", "content": "Answer in French."},
+        {"role": "user", "content": "hello"},
+    ]
+    expected = [] if declared else [DEVELOPER_ROLE_REWRITE_DISCLOSURE]
+    assert admission.get("ignored_parameters", []) == expected
+
+
+def test_responses_instructions_reach_a_chat_wire_lane_as_system(tmp_path: Path) -> None:
+    """Responses ``instructions`` (a developer turn) no longer narrow a Chat lane out."""
+    control, raw_key = _control_plane(tmp_path)
+    body = json.dumps({"model": "coding", "instructions": "Answer in French.", "input": "hello"})
+
+    admission = _admit_responses(control, raw_key, body)
+
+    route = admission["route"]
+    assert isinstance(route, list) and isinstance(route[0], dict)
+    payload = route[0]["upstream_payload"]
+    assert isinstance(payload, dict)
+    messages = payload["messages"]
+    assert isinstance(messages, list)
+    assert messages[0] == {"role": "system", "content": "Answer in French."}
+    assert admission["ignored_parameters"] == [DEVELOPER_ROLE_REWRITE_DISCLOSURE]

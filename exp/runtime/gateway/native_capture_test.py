@@ -24,8 +24,10 @@ from exp.runtime.gateway.native_capture import (
     CaptureConfiguration,
     CaptureController,
     CaptureDeliveryLimits,
+    CaptureMetrics,
     CaptureRecord,
     CaptureRequest,
+    CaptureSpillConfiguration,
     CaptureSseResponse,
 )
 from exp.runtime.gateway.native_server import serve_native_gateway
@@ -1200,3 +1202,97 @@ def test_capture_records_accept_marked_provider_logprobs() -> None:
         evidence = {**marked.provider_logprobs.model_dump(mode="json"), **malformed}
         with pytest.raises(ValidationError):
             CaptureRecord.model_validate({**base, "provider_logprobs": evidence})
+
+
+def test_spill_is_opt_in_and_only_spilling_collectors_take_large_requests(tmp_path: Path) -> None:
+    """Without spill the 8 MiB request bound stays; with it a request may reach 128 MiB."""
+    assert CaptureConfiguration().spill is None
+    with pytest.raises(ValueError, match="spilling collector"):
+        CaptureConfiguration(maximum_request_bytes=9 * 1024 * 1024)
+    spilled = CaptureConfiguration(
+        maximum_request_bytes=128 * 1024 * 1024,
+        maximum_pending_bytes=256 * 1024 * 1024,
+        spill=CaptureSpillConfiguration(directory=str(tmp_path)),
+    )
+    assert json.loads(spilled.model_dump_json())["spill"]["directory"] == str(tmp_path)
+    with pytest.raises(ValueError):
+        CaptureSpillConfiguration(directory="")
+    with pytest.raises(ValueError):
+        CaptureSpillConfiguration(directory=str(tmp_path), part_threshold_bytes=1)
+    # A destination that cannot take split records must not be given a spill store.
+    with pytest.raises(ValueError, match="split"):
+        native.CaptureCollector(spilled.model_dump_json(), lambda _: None)
+
+
+def test_spilling_collector_hands_an_oversized_request_over_whole_as_a_split_record(
+    tmp_path: Path,
+) -> None:
+    """A request past the record bound arrives as a skeleton plus parts, untrimmed."""
+    received: list[object] = []
+    paths: list[str] = []
+
+    def write(
+        records: tuple[bytes | tuple[str, bytes, str, list[tuple[str, str, int]]], ...],
+    ) -> list[bool]:
+        """Read every part while the files exist, then acknowledge."""
+        for record in records:
+            if isinstance(record, tuple):
+                kind, skeleton, marker, parts = record
+                assert kind == "split"
+                document = json.loads(skeleton)
+                for part_kind, path, size in parts:
+                    assert part_kind == "json"
+                    assert Path(path).stat().st_size == size
+                    paths.append(path)
+                messages = document["request"]["context"]["request"]["messages"]
+                assert messages == {marker: 0}
+                received.append(json.loads(Path(parts[0][1]).read_bytes()))
+            else:
+                received.append(record)
+        return [True] * len(records)
+
+    configuration = CaptureConfiguration(
+        settlement_required=False,
+        maximum_request_bytes=64 * 1024 * 1024,
+        maximum_pending_bytes=128 * 1024 * 1024,
+        delivery=CaptureDeliveryLimits(
+            maximum_record_bytes=1024 * 1024, maximum_bytes=64 * 1024 * 1024
+        ),
+        spill=CaptureSpillConfiguration(directory=str(tmp_path / "spill")),
+    )
+    collector = native.CaptureCollector.batched(
+        configuration.model_dump_json(), write, bytes_output=True
+    )
+    content = "x" * (20 * 1024 * 1024)
+    request = json.loads(_request_json())
+    request["context"]["request"]["messages"] = [{"role": "user", "content": content}]
+    assert collector.begin(json.dumps(request))
+    collector.settle("request", True, False)
+    assert collector.close(30)
+    assert received == [[{"role": "user", "content": content}]]
+    # The parts are removed once the destination acknowledged them.
+    assert paths
+    assert not any(Path(path).exists() for path in paths)
+
+
+def test_capture_metrics_admit_the_twelve_hour_write_subset() -> None:
+    """The native usage meter serializes OpenAI's 12-hour subset into capture metrics."""
+    metrics = CaptureMetrics.model_validate(
+        {
+            "started_at": 1.0,
+            "first_token_at": None,
+            "terminal_at": 2.0,
+            "duration_ms": 1000.0,
+            "usage_complete": True,
+            "usage": {
+                "input_tokens": 3250,
+                "output_tokens": 5,
+                "cached_input_tokens": 0,
+                "reasoning_tokens": 0,
+                "cache_creation_input_tokens": 3247,
+                "cache_creation_12h_input_tokens": 3247,
+            },
+        }
+    )
+    assert metrics.usage is not None
+    assert metrics.usage.cache_creation_12h_input_tokens == 3247

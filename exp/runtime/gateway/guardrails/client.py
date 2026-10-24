@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-from collections.abc import Awaitable, Iterator
+from collections.abc import Awaitable, Callable, Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
-from typing import Protocol
+from typing import Protocol, runtime_checkable
 
 from exp.runtime.gateway.contracts import GatewayRequest
 from exp.runtime.gateway.guardrails.contracts import (
@@ -81,6 +81,51 @@ class InternalClassifierClient(Protocol):
         """
         ...
 
+    def input_window_digest(self, *, check: GuardrailCheck) -> str | None:
+        """Return the configuration digest of a windowed adapter, or ``None``.
+
+        A digest marks an adapter that sends only its own bounded window of the
+        request. A transport that cannot prove that returns ``None``, which keeps
+        the complete-request bound in force.
+        """
+        ...
+
+    def input_projection(
+        self, *, check: GuardrailCheck
+    ) -> Callable[[GatewayRequest], GatewayRequest] | None:
+        """Return the adapter's bounded-subject projection, or ``None``.
+
+        A projection maps a request to a small one the adapter inspects
+        identically. A transport that cannot prove that returns ``None``, which
+        keeps the complete request as the subject.
+        """
+        ...
+
+
+@runtime_checkable
+class ProjectingClassifier(Protocol):
+    """An input adapter that reads only a bounded projection of the request."""
+
+    def project_input(self, request: GatewayRequest) -> GatewayRequest:
+        """Return a bounded request this adapter inspects exactly like ``request``."""
+        ...
+
+
+@runtime_checkable
+class WindowedClassifier(Protocol):
+    """An input adapter that sends a bounded window of the request, never all of it.
+
+    The engine binds the digest into replay revisions, and a policy whose input
+    checks are all windowed is not refused for its complete request size. The
+    digest covers every setting that can change a verdict, such as the model,
+    questions, thresholds, and window bounds.
+    """
+
+    @property
+    def configuration_digest(self) -> str:
+        """Return a content-free SHA-256 hex digest of the verdict settings."""
+        ...
+
 
 class DirectClassifierClient:
     """Call registered adapters in-process under the recursion guard.
@@ -143,6 +188,26 @@ class DirectClassifierClient:
         if not isinstance(adapter, StreamableClassifier):
             return None
         return adapter.stream_redactor()
+
+    def input_window_digest(self, *, check: GuardrailCheck) -> str | None:
+        """Return the bound adapter's configuration digest when it is windowed.
+
+        Only an adapter that builds its own bounded window has one. Every
+        adapter that receives the complete request returns ``None``.
+        """
+        adapter = self._registry.require(check.adapter_id)
+        if not isinstance(adapter, WindowedClassifier):
+            return None
+        return adapter.configuration_digest
+
+    def input_projection(
+        self, *, check: GuardrailCheck
+    ) -> Callable[[GatewayRequest], GatewayRequest] | None:
+        """Return the bound adapter's bounded-subject projection when it has one."""
+        adapter = self._registry.require(check.adapter_id)
+        if not isinstance(adapter, ProjectingClassifier):
+            return None
+        return adapter.project_input
 
 
 class ClassifierLookup(Protocol):

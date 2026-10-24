@@ -52,9 +52,11 @@ fn start_frame_carries_the_upstream_start_usage_when_known() {
         cached_input_tokens: Some(2000),
         cache_creation_input_tokens: None,
         cache_creation_1h_input_tokens: None,
+        cache_creation_12h_input_tokens: None,
         reasoning_tokens: None,
         billed_units: None,
         cache_writes_read_back: false,
+        image_output_tokens: None,
     }));
     let frames = encoder.start().expect("starts");
     let start: Value = serde_json::from_str(
@@ -187,9 +189,11 @@ fn upstream_start_usage_outranks_the_pre_dispatch_estimate() {
         cached_input_tokens: Some(10),
         cache_creation_input_tokens: None,
         cache_creation_1h_input_tokens: None,
+        cache_creation_12h_input_tokens: None,
         reasoning_tokens: None,
         billed_units: None,
         cache_writes_read_back: false,
+        image_output_tokens: None,
     }));
     let frames = encoder.start().expect("starts");
     let start: Value = serde_json::from_str(

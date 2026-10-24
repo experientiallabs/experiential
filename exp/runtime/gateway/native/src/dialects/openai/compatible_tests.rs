@@ -127,39 +127,42 @@ fn malformed_frame_preserves_previous_meter_after_sparse_usage() {
 }
 
 #[test]
-fn sparse_usage_rejects_cache_subsets_above_the_coalesced_input() {
-    for reports in [
-        vec![
-            json!({"prompt_tokens":100,"completion_tokens":1}),
-            json!({"prompt_tokens_details":{"cached_tokens":200}}),
-        ],
-        vec![
-            json!({"prompt_tokens":100,"completion_tokens":1,"prompt_tokens_details":{"cached_tokens":100}}),
-            json!({"prompt_tokens":100,"prompt_tokens_details":{"cache_write_tokens":100}}),
-        ],
+fn sparse_cache_subsets_above_the_coalesced_input_raise_the_input_total() {
+    for (reports, settled) in [
+        (
+            vec![
+                json!({"prompt_tokens":100,"completion_tokens":1}),
+                json!({"prompt_tokens_details":{"cached_tokens":200}}),
+            ],
+            (Some(200), Some(200), None),
+        ),
+        (
+            vec![
+                json!({"prompt_tokens":100,"completion_tokens":1,"prompt_tokens_details":{"cached_tokens":100}}),
+                json!({"prompt_tokens":100,"prompt_tokens_details":{"cache_write_tokens":100}}),
+            ],
+            (Some(200), Some(100), Some(100)),
+        ),
     ] {
         let mut normalizer = Normalizer::new(Dialect::OpenAiCompatible);
-        normalizer
-            .feed(&SseEvent {
-                event: None,
-                data: json!({"choices":[],"usage":reports[0]}).to_string(),
-            })
-            .unwrap();
-        let failure = normalizer
-            .feed(&SseEvent {
-                event: None,
-                data: json!({"choices":[],"usage":reports[1]}).to_string(),
-            })
-            .expect_err("coalesced cache subsets exceed input");
-        assert_eq!(failure.failure_class, FailureClass::MalformedResponse);
-        assert!(
+        for report in reports {
             normalizer
-                .observed_usage()
-                .unwrap()
-                .cached_input_tokens
-                .unwrap_or(0)
-                <= 100
+                .feed(&SseEvent {
+                    event: None,
+                    data: json!({"choices":[],"usage":report}).to_string(),
+                })
+                .expect("coalesced cache subsets settle");
+        }
+        let usage = normalizer.observed_usage().unwrap();
+        assert_eq!(
+            (
+                usage.input_tokens,
+                usage.cached_input_tokens,
+                usage.cache_creation_input_tokens
+            ),
+            settled
         );
+        assert_eq!(usage.output_tokens, Some(1));
     }
 }
 
@@ -857,31 +860,56 @@ fn writes_within_reads_coalesces_sparse_reports_before_separating() {
 }
 
 #[test]
-fn writes_within_reads_still_rejects_impossible_reports() {
-    for usage in [
+fn writes_within_reads_settles_reports_that_overflow_input_after_separation() {
+    for (usage, settled) in [
         // Reads above the input total.
-        json!({"prompt_tokens": 100, "completion_tokens": 1,
-               "prompt_tokens_details": {"cached_tokens": 101, "cache_write_tokens": 0}}),
+        (
+            json!({"prompt_tokens": 100, "completion_tokens": 1,
+                   "prompt_tokens_details": {"cached_tokens": 101, "cache_write_tokens": 0}}),
+            (101, 101, Some(0)),
+        ),
         // Writes that were not read back and do not fit input disjointly either.
-        json!({"prompt_tokens": 100, "completion_tokens": 1,
-               "prompt_tokens_details": {"cached_tokens": 60, "cache_write_tokens": 61}}),
+        (
+            json!({"prompt_tokens": 100, "completion_tokens": 1,
+                   "prompt_tokens_details": {"cached_tokens": 60, "cache_write_tokens": 61}}),
+            (121, 60, Some(61)),
+        ),
         // Writes alone above the input total.
-        json!({"prompt_tokens": 100, "completion_tokens": 1,
-               "prompt_tokens_details": {"cached_tokens": 100, "cache_write_tokens": 101}}),
+        (
+            json!({"prompt_tokens": 100, "completion_tokens": 1,
+                   "prompt_tokens_details": {"cached_tokens": 100, "cache_write_tokens": 101}}),
+            (201, 100, Some(101)),
+        ),
     ] {
         let mut normalizer = Normalizer::new(Dialect::OpenAiCompatible);
         normalizer.set_cache_writes_within_reads(true);
-        let failure = feed_usage(&mut normalizer, usage).expect_err("impossible usage fails");
-        assert_eq!(failure.failure_class, FailureClass::MalformedResponse);
+        feed_usage(&mut normalizer, usage).expect("a finished generation settles");
+        let usage = normalizer.observed_usage().unwrap();
+        assert_eq!(
+            (
+                usage.input_tokens.unwrap(),
+                usage.cached_input_tokens.unwrap(),
+                usage.cache_creation_input_tokens
+            ),
+            settled
+        );
     }
 }
 
 #[test]
-fn disjoint_rungs_keep_rejecting_overlapping_cache_legs() {
+fn disjoint_rungs_price_overlapping_cache_legs_in_full() {
+    // A read-back report on a rung not configured `writes_within_reads`: both
+    // legs are kept as reported and the input total covers them, so the
+    // written tokens price at the write rate and their read-back at the read
+    // rate, never fewer tokens than the provider reported in either leg.
     let mut normalizer = Normalizer::new(Dialect::OpenAiCompatible);
-    let failure = feed_usage(&mut normalizer, openrouter_gemini_cache_write())
-        .expect_err("reads plus writes above input are impossible on a disjoint rung");
-    assert_eq!(failure.failure_class, FailureClass::MalformedResponse);
+    feed_usage(&mut normalizer, openrouter_gemini_cache_write())
+        .expect("an overlapping report settles");
+    let usage = normalizer.observed_usage().unwrap();
+    assert_eq!(usage.input_tokens, Some(21326));
+    assert_eq!(usage.cached_input_tokens, Some(10663));
+    assert_eq!(usage.cache_creation_input_tokens, Some(10663));
+    assert_eq!(usage.output_tokens, Some(9));
 }
 
 #[test]
@@ -950,3 +978,8 @@ fn writes_within_reads_accepts_a_cache_covering_the_whole_prompt() {
         (Some(13304), Some(0), Some(13304))
     );
 }
+
+// Meta usage-less max_tokens stop tests, kept beside this module so neither
+// file crosses the repository line limit.
+#[path = "compatible_length_tests.rs"]
+mod length;

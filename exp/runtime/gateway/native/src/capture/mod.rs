@@ -16,6 +16,8 @@ pub(crate) mod reasoning;
 pub(crate) mod record;
 mod relay;
 pub(crate) mod response;
+pub(crate) mod spill;
+pub(crate) mod split;
 
 /// Optional caller correlation, never authentication, routing or idempotency authority.
 /// Ignore malformed or repeated headers rather than reject otherwise valid inference.

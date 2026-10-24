@@ -3,8 +3,8 @@
 The strict wire models live beside the decoder in ``requests.py``; this module
 turns their Pydantic rejections into the stable, field-specific public errors
 the HTTP layer renders in the Anthropic envelope, and recognizes the
-known-but-unsupported content blocks (video, audio, documents inside a
-``tool_result``) whose union miss would otherwise misdirect the caller.
+known-but-unsupported content blocks (video and audio, at the top level or
+inside a ``tool_result``) whose union miss would otherwise misdirect the caller.
 """
 
 from __future__ import annotations
@@ -25,10 +25,26 @@ _REJECTED_BLOCK_HINTS = {
     )
     for kind in ("video", "audio")
 }
-_REJECTED_TOOL_RESULT_BLOCK_HINTS = {
-    "document": "document blocks are not supported inside tool_result content",
-    **_REJECTED_BLOCK_HINTS,
-}
+_MESSAGE_BLOCK_TYPES = frozenset(
+    {
+        "text",
+        "image",
+        "document",
+        "thinking",
+        "redacted_thinking",
+        "tool_use",
+        "tool_result",
+        "server_tool_use",
+        "web_search_tool_result",
+        "tool_search_tool_result",
+        "tool_reference",
+    }
+)
+"""Every message content block type the decoder's block union admits.
+
+A block outside it misses every union arm at the same depth, and the deepest
+error would name the first arm (``Input should be 'text'``) instead of the
+block the caller actually sent."""
 
 
 def validate_wire[WireModelT: BaseModel](payload: JsonObject, wire: type[WireModelT]) -> WireModelT:
@@ -120,9 +136,16 @@ def rejected_block_hint(payload: JsonObject) -> tuple[str, str] | None:
                 continue
             block_object = cast(JsonObject, block)
             param = f"messages.{message_index}.content.{block_index}"
-            hint = _REJECTED_BLOCK_HINTS.get(str(block_object.get("type")))
+            block_type = str(block_object.get("type"))
+            hint = _REJECTED_BLOCK_HINTS.get(block_type)
             if hint is not None:
                 return param, hint
+            if block_type not in _MESSAGE_BLOCK_TYPES:
+                return f"{param}.type", (
+                    f"unsupported content block type '{block_type[:64]}'; message content "
+                    "supports text, image, document, thinking, redacted_thinking, "
+                    "tool_use, tool_result, and echoed server tool blocks."
+                )
             if block_object.get("type") == "tool_result" and isinstance(
                 block_object.get("content"), list
             ):
@@ -131,12 +154,13 @@ def rejected_block_hint(payload: JsonObject) -> tuple[str, str] | None:
                         continue
                     inner_type = str(cast(JsonObject, inner).get("type"))
                     inner_param = f"{param}.content.{inner_index}"
-                    hint = _REJECTED_TOOL_RESULT_BLOCK_HINTS.get(inner_type)
+                    hint = _REJECTED_BLOCK_HINTS.get(inner_type)
                     if hint is not None:
                         return inner_param, hint
-                    if inner_type not in ("text", "image"):
+                    if inner_type not in ("text", "image", "document", "tool_reference"):
                         return inner_param, (
-                            f"unsupported block type '{inner_type}' inside tool_result "
-                            "content; only text and image sub-blocks are supported."
+                            f"unsupported block type '{inner_type[:64]}' inside tool_result "
+                            "content; only text, image, document, and tool_reference "
+                            "sub-blocks are supported."
                         )
     return None

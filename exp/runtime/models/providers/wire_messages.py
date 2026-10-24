@@ -8,8 +8,10 @@ engines cannot drift at the message boundary.
 
 from __future__ import annotations
 
+from typing import Literal
+
 from exp.common.core.artifacts import JsonObject
-from exp.common.models.content import ImageContentPart, TextContentPart
+from exp.common.models.content import MessageContentPart, TextContentPart
 from exp.runtime.gateway.contracts import (
     TOOL_ERROR_TEXT_PREFIX,
     GatewayMessage,
@@ -30,6 +32,7 @@ from exp.runtime.models.providers.images import (
     openai_chat_image_part,
     responses_image_part,
 )
+from exp.runtime.models.providers.openai_item_ids import openai_issued_item_id
 from exp.runtime.models.providers.videos import openai_chat_video_part, reject_video_part
 
 TOOL_RESULT_IMAGE_FOLD_HEADER = (
@@ -38,49 +41,92 @@ TOOL_RESULT_IMAGE_FOLD_HEADER = (
 )
 """Leading text of the user message that carries folded tool-result images."""
 
+TOOL_RESULT_DOCUMENT_FOLD_HEADER = (
+    "Documents returned by the tool results above. This model's wire cannot carry "
+    "a document inside a tool result, so each document is attached here, numbered "
+    "where it appeared:"
+)
+"""Leading text of the user message that carries folded tool-result documents."""
+
+TOOL_RESULT_ATTACHMENT_FOLD_HEADER = (
+    "Images and documents returned by the tool results above. This model's wire "
+    "carries only text inside tool messages, so each one is attached here, "
+    "numbered where it appeared:"
+)
+"""Leading text of the user message that carries both folded attachment kinds."""
+
+FoldedAttachmentKind = Literal["image", "document"]
+"""Attachment kinds a fold can move out of tool results into a following user turn."""
+
 
 def tool_result_image_marker(ordinal: int) -> str:
     """Return the in-place marker left where a folded tool-result image stood."""
     return f"[image {ordinal}: attached in the next user message]"
 
 
-def fold_tool_result_images(
-    messages: tuple[GatewayMessage, ...],
-) -> tuple[GatewayMessage, ...]:
-    """Move tool-result images into one user message after each run of tool results.
+def tool_result_document_marker(ordinal: int) -> str:
+    """Return the in-place marker left where a folded tool-result document stood."""
+    return f"[document {ordinal}: attached in the next user message]"
 
-    Chat Completions and Gemini ``functionResponse`` define no image carrier
-    inside a tool result, while a user turn carries images on both wires. The
-    fold keeps every image the caller sent: each tool message keeps its text
-    with a numbered marker where the image stood, and one user message
-    following the LAST tool message of the contiguous run (a user message
-    between two results of one parallel batch breaks the tool-call linkage
-    both providers check) carries the images in order, each introduced by its
-    number and the tool call that returned it. The disclosure travels in
-    ``x-experiential-ignored-parameters`` as ``TOOL_RESULT_IMAGE_FOLD_DISCLOSURE``.
+
+def fold_tool_result_attachments(
+    messages: tuple[GatewayMessage, ...],
+    *,
+    kinds: tuple[FoldedAttachmentKind, ...],
+) -> tuple[GatewayMessage, ...]:
+    """Move tool-result attachments into one user message after each run of results.
+
+    A fold dialect's tool results carry no such attachment on its wire (Chat
+    Completions and Gemini ``functionResponse`` define no image or document
+    carrier inside a tool result; Responses and Bedrock carry images but not
+    documents), while a user turn carries both on every one of those wires.
+    The fold keeps every attachment the caller sent: each tool message keeps
+    its text with a numbered per-kind marker where the attachment stood, and
+    one user message following the LAST tool message of the contiguous run (a
+    user message between two results of one parallel batch breaks the
+    tool-call linkage providers check) carries the attachments in order,
+    each introduced by its number and the tool call that returned it. The
+    disclosure travels in ``x-experiential-ignored-parameters`` as the fold
+    constant naming the kind (``TOOL_RESULT_IMAGE_FOLD_DISCLOSURE``,
+    ``TOOL_RESULT_DOCUMENT_FOLD_DISCLOSURE``).
 
     Args:
         messages: The request's canonical messages.
+        kinds: Attachment kinds this wire cannot carry inside a tool result.
 
     Returns:
-        The folded messages; the same tuple when no tool message carries an image.
+        The folded messages; the same tuple when no tool message carries a
+        folded kind.
     """
-    if not any(message.role == "tool" and message.images for message in messages):
+    folded_kinds = frozenset(kinds)
+    if not folded_kinds or not folded_kinds <= {"image", "document"}:
+        raise ValueError("fold kinds must be image and/or document")
+    if not any(
+        message.role == "tool" and any(part.kind in folded_kinds for part in message.content_parts)
+        for message in messages
+    ):
         return messages
     out: list[GatewayMessage] = []
-    pending: list[tuple[int, str, ImageContentPart]] = []
-    ordinal = 0
+    pending: list[tuple[int, str, str, MessageContentPart]] = []
+    ordinals: dict[str, int] = {"image": 0, "document": 0}
 
     def flush() -> None:
-        """Emit the pending images as one user message after the tool run."""
+        """Emit the pending attachments as one user message after the tool run."""
         if not pending:
             return
-        parts: list[TextContentPart | ImageContentPart] = [
-            TextContentPart(text=TOOL_RESULT_IMAGE_FOLD_HEADER)
-        ]
-        for number, call_id, image in pending:
-            parts.append(TextContentPart(text=f"\nImage {number} (tool_call_id {call_id}):"))
-            parts.append(image)
+        pending_kinds = {kind for _number, _call_id, kind, _part in pending}
+        header = (
+            TOOL_RESULT_IMAGE_FOLD_HEADER
+            if pending_kinds == {"image"}
+            else TOOL_RESULT_DOCUMENT_FOLD_HEADER
+            if pending_kinds == {"document"}
+            else TOOL_RESULT_ATTACHMENT_FOLD_HEADER
+        )
+        parts: list[MessageContentPart] = [TextContentPart(text=header)]
+        for number, call_id, kind, part in pending:
+            label = "Image" if kind == "image" else "Document"
+            parts.append(TextContentPart(text=f"\n{label} {number} (tool_call_id {call_id}):"))
+            parts.append(part)
         out.append(
             GatewayMessage(
                 role="user",
@@ -95,18 +141,42 @@ def fold_tool_result_images(
             flush()
             out.append(message)
             continue
-        if not message.images:
+        if not any(part.kind in folded_kinds for part in message.content_parts):
             out.append(message)
             continue
         texts: list[str] = []
+        kept: list[MessageContentPart] = []
         for part in message.content_parts:
-            if part.kind == "image":
-                ordinal += 1
-                pending.append((ordinal, message.tool_call_id or "", part))
-                texts.append(tool_result_image_marker(ordinal))
+            if part.kind in folded_kinds:
+                ordinals[part.kind] += 1
+                number = ordinals[part.kind]
+                pending.append((number, message.tool_call_id or "", part.kind, part))
+                marker = (
+                    tool_result_image_marker(number)
+                    if part.kind == "image"
+                    else tool_result_document_marker(number)
+                )
+                texts.append(marker)
+                # The marker rides as a text part where the attachment stood,
+                # so a message that keeps a non-folded attachment stays
+                # internally consistent (its parts flatten to its content).
+                kept.append(TextContentPart(text=marker))
             elif part.kind == "text":
                 texts.append(part.text)
-        out.append(message.model_copy(update={"content": "".join(texts), "content_parts": ()}))
+                if part.text:
+                    kept.append(part)
+            else:
+                # An attachment kind this fold leaves alone (an image on a
+                # documents-only fold) stays on the tool message; its wire
+                # carries it inside the tool result natively.
+                kept.append(part)
+        if not any(part.kind != "text" for part in kept):
+            # Every attachment folded: the message is text-only again, and a
+            # text-only message carries no parts.
+            kept = []
+        out.append(
+            message.model_copy(update={"content": "".join(texts), "content_parts": tuple(kept)})
+        )
     flush()
     return tuple(out)
 
@@ -128,8 +198,11 @@ def responses_items(message: GatewayMessage) -> list[JsonObject]:
                 elif part.kind == "image":
                     output_value.append(responses_image_part(part))
                 else:
-                    # The canonical contract restricts tool messages to text
-                    # and image parts; anything else here is a gateway bug.
+                    # The canonical contract carries text, image, and
+                    # document parts on tool messages, but the builder folds
+                    # documents into a following user turn before this point
+                    # (this wire has no document carrier inside a tool
+                    # output); anything else here is a gateway bug.
                     raise ProviderResponseError("tool results carry only text and image parts")
             if message.tool_is_error:
                 output_value.insert(0, {"type": "input_text", "text": TOOL_ERROR_TEXT_PREFIX})
@@ -212,24 +285,31 @@ def responses_items(message: GatewayMessage) -> list[JsonObject]:
             if message.provider_item_id is None:
                 raise ProviderResponseError("Responses assistant output omitted its provider ID")
             output_message: JsonObject = {
-                "type": "message",
-                "id": message.provider_item_id,
+                # A client- or gateway-minted id OpenAI would refuse: the turn
+                # replays at its position as plain assistant history.
                 "role": "assistant",
-                "status": message.provider_status or "completed",
-                "content": (
-                    [
-                        {
-                            "type": "output_text",
-                            "text": message.content,
-                            "annotations": [],
-                        }
-                    ]
-                    if message.content is not None
-                    else []
-                ),
+                "content": message.content or "",
             }
-            if message.provider_phase is not None:
-                output_message["phase"] = message.provider_phase
+            if openai_issued_item_id(message.provider_item_id, "message"):
+                output_message = {
+                    "type": "message",
+                    "id": message.provider_item_id,
+                    "role": "assistant",
+                    "status": message.provider_status or "completed",
+                    "content": (
+                        [
+                            {
+                                "type": "output_text",
+                                "text": message.content,
+                                "annotations": [],
+                            }
+                        ]
+                        if message.content is not None
+                        else []
+                    ),
+                }
+                if message.provider_phase is not None:
+                    output_message["phase"] = message.provider_phase
             indexed_items.append((message.provider_output_index, output_message))
     for call in message.tool_calls:
         item: JsonObject = {
@@ -247,7 +327,9 @@ def responses_items(message: GatewayMessage) -> list[JsonObject]:
         # like the namespace; absent stays absent.
         if call.provider_caller is not None:
             item["caller"] = call.provider_caller
-        if call.provider_item_id is not None:
+        if call.provider_item_id is not None and openai_issued_item_id(
+            call.provider_item_id, "function_call"
+        ):
             item["id"] = call.provider_item_id
         if call.provider_status is not None:
             item["status"] = call.provider_status
@@ -409,15 +491,18 @@ def anthropic_blocks(message: GatewayMessage) -> tuple[str, list[JsonObject]]:
             "content": message.content or "",
         }
         if message.content_parts:
-            # A tool screenshot re-emits as the caller's exact block run:
-            # image parts become image blocks in their original positions.
-            # The canonical model restricts tool messages to these two kinds.
-            # Empty text parts drop loss-free (the wire rejects empty text
-            # blocks); an all-empty run keeps the flattened string content.
+            # A tool screenshot or tool-returned document re-emits as the
+            # caller's exact block run: image and document parts become image
+            # and document blocks in their original positions. The canonical
+            # model restricts tool messages to these three kinds. Empty text
+            # parts drop loss-free (the wire rejects empty text blocks); an
+            # all-empty run keeps the flattened string content.
             run: list[JsonObject] = []
             for part in message.content_parts:
                 if part.kind == "image":
                     run.append(anthropic_image_block(part))
+                elif part.kind == "document":
+                    run.append(anthropic_document_block(part))
                 elif part.kind == "text" and part.text:
                     block: JsonObject = {"type": "text", "text": part.text}
                     if part.cache_control is not None:
@@ -425,6 +510,22 @@ def anthropic_blocks(message: GatewayMessage) -> tuple[str, list[JsonObject]]:
                     run.append(block)
             if run:
                 result["content"] = run
+        if message.tool_references:
+            # A client-side tool search's loaded tools re-emit as the
+            # caller's reference blocks after the result's own content (a
+            # references-only result, the shape Claude Code's ToolSearch
+            # sends, is byte-identical); the provider expands each one into
+            # the named deferred tool's definition.
+            content = result["content"]
+            run = (
+                list(content)
+                if isinstance(content, list)
+                else ([{"type": "text", "text": content}] if content else [])
+            )
+            run.extend(
+                {"type": "tool_reference", "tool_name": name} for name in message.tool_references
+            )
+            result["content"] = run
         # Only the Anthropic wire can express a failed tool invocation; the
         # marker is emitted solely when set so existing payloads are unchanged.
         if message.tool_is_error:
@@ -610,7 +711,11 @@ def openai_chat_message(
     Responses dialect) and the third-party OpenAI-compatible servers behind
     it (Azure AI Foundry, DeepSeek, vLLM, and the like) enumerate the classic
     roles only and 400 on ``developer`` by name. The Responses builder keeps
-    ``developer`` verbatim, since that wire defines the role.
+    ``developer`` verbatim, since that wire defines the role. A rung whose
+    catalog does not declare ``developer`` support is admitted because of
+    this fold and the caller reads it as
+    ``messages.developer->system(rewritten_by_gateway)``
+    (``developer_role_rewrite_disclosure``).
 
     ``reasoning_route_sha256`` is the active preserved-thinking route identity
     for this rung (Fireworks or Hunyuan); an unsealed ``reasoning_content``

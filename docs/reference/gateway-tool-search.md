@@ -51,3 +51,32 @@ Callers replay the gateway's own output. Messages accepts `tool_search_tool_resu
 `tool_reference` blocks in assistant history (carried verbatim to Anthropic rungs); Responses
 accepts `tool_search_call` / `tool_search_output` items, which a foreign wire receives as the
 function call and tool result they were (`codex_tools.convert_native_history`).
+
+## Client-side tool search (`tool_reference` in a tool result)
+
+A Messages caller can run its own search instead of declaring a server tool (Claude Code's
+ToolSearch does this): it marks most tools `defer_loading: true`, declares an ordinary custom
+search tool, and answers that tool's call with a `tool_result` whose content holds one
+`{"type": "tool_reference", "tool_name": "<name>"}` block per deferred tool it loads. On
+Anthropic's API a deferred tool stays out of the model's context until a reference loads it,
+and the API expands each reference into the named tool's full definition.
+
+The decoder admits `tool_reference` sub-blocks beside text, image and document sub-blocks (an
+optional `cache_control` on one re-emits on the enclosing result, the same prompt boundary) and
+carries them on the canonical tool message's `tool_references`. Any other sub-block type is still
+a named 400. Each wire then maps them as follows (`exp/runtime/models/providers/tool_references.py`):
+
+| Dialect | `tool_reference` | Deferred tools |
+|---|---|---|
+| `anthropic_messages` (Anthropic, and every rung that speaks its wire) | re-emitted as reference blocks after the result's own content (a references-only result is byte-identical) | every tool forwards with `defer_loading` intact; the provider expands references |
+| Chat, Responses, Bedrock Converse, Gemini | one text line per reference in the tool result (`Tool loaded: <name>. ...`), disclosed as `messages.content.tool_result.tool_reference->text` | every tool dispatches immediately loaded, with its full definition and no marker, disclosed as `tools.defer_loading` |
+
+The same rule holds for any request with deferred tools and no tool-search declaration, on every
+surface: a non-Anthropic rung never receives `defer_loading`. OpenAI's own marker needs its hosted
+`tool_search` in the same request (it refuses `Invalid Value: 'tools.defer_loading'. Deferred
+tools require tools.tool_search.`), and a caller searching client-side declares none. Loading every
+tool never fails the request, leaves every declared tool callable, and keeps the tool prefix stable
+across turns so provider prompt caching holds; the cost is the deferred definitions' input tokens.
+A request that does declare a tool-search tool takes the planner above instead: an all-native
+route keeps the provider's search and its markers, and any other route runs the gateway search,
+which partitions the tools and clears the markers itself. Only the reference text applies to it.

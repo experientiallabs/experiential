@@ -57,6 +57,10 @@ class CaptureResponse:
     @property
     def events_json(self) -> str | None: ...
 
+# A record too large for memory: ("split", skeleton JSON, reference marker,
+# [(part kind, file path, byte length), ...]). See native_capture.CaptureSpillConfiguration.
+SplitRecord = tuple[Literal["split"], bytes, str, list[tuple[Literal["json", "frames"], str, int]]]
+
 class CaptureCollector:
     """Bounded native content capture with an off-path persistence destination."""
 
@@ -74,7 +78,7 @@ class CaptureCollector:
     @overload
     def batched(
         config_json: str,
-        sink: Callable[[tuple[bytes, ...]], list[bool]],
+        sink: Callable[[tuple[bytes | SplitRecord, ...]], list[bool]],
         *,
         completion_references: bool = False,
         bytes_output: Literal[True],

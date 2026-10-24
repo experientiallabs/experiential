@@ -7,7 +7,11 @@ from rich.text import Text
 
 from exp.cli.shared.picker import PickerOption, choose_one
 from exp.common.project import ProjectStore
-from exp.optimize.evaluation.export import export_report, load_report_evidence
+from exp.optimize.evaluation.export import (
+    export_report,
+    load_report_evidence,
+    simulator_memory_line,
+)
 from exp.optimize.evaluation.runs import EvaluationRun
 
 
@@ -42,8 +46,9 @@ def render_report(console: Console, project: ProjectStore, run: EvaluationRun) -
     repeats = run.prepared.setup.repeats
     console.print(
         f"{len(evidence.tasks)} scenarios · {len(report.models)} models · "
-        f"{repeats} {'run' if repeats == 1 else 'runs'} per scenario\n"
+        f"{repeats} {'run' if repeats == 1 else 'runs'} per scenario"
     )
+    console.print(Text(simulator_memory_line(run) + "\n"))
     table = Table(box=None, padding=(0, 2), expand=False)
     table.add_column("Model", overflow="fold")
     table.add_column("Score /100", justify="right", no_wrap=True)

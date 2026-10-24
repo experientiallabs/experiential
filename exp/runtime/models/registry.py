@@ -62,6 +62,8 @@ from exp.runtime.models.providers.chatgpt_subscription import (
     chatgpt_re_sign_in_hint,
     chatgpt_refresher,
 )
+from exp.runtime.models.providers.elevenlabs import ElevenLabsClient
+from exp.runtime.models.providers.elevenlabs_audio import ELEVENLABS_BASE_URL
 from exp.runtime.models.providers.gemini import GEMINI_BASE_URL, GeminiClient
 from exp.runtime.models.providers.openai import OPENAI_BASE_URL, OpenAIClient
 from exp.runtime.models.providers.openai_compatible import (
@@ -83,6 +85,7 @@ from exp.runtime.models.providers.tinker_sampling import (
 from exp.runtime.models.providers.transport import JsonHttpTransport
 from exp.runtime.models.providers.typesafe import TYPESAFE_BASE_URL, TypeSafeClient
 from exp.runtime.models.providers.vertex import (
+    VertexAnthropicClient,
     VertexClient,
     VertexOpenAIClient,
     VertexTokenProviderFactory,
@@ -155,6 +158,8 @@ class ResolvedModel:
             and the capability identity. It never changes a provider's wire dialect.
         credential_receipt: Private receipt resolved atomically with authentication, or None
             when the credential source cannot establish recovery or cache evidence scope.
+        tenant_origin: The alias's connection is a customer-addressed origin
+            (``ConnectionConfig.tenant_origin``), held to the tenant dispatch policy.
     """
 
     alias: str
@@ -165,6 +170,7 @@ class ResolvedModel:
     served_model_id: str | None = None
     token_prices: GatewayTokenPrices | None = None
     credential_receipt: DispatchCredentialReceipt | None = field(default=None, repr=False)
+    tenant_origin: bool = False
 
 
 class RuntimeModelCatalog:
@@ -275,9 +281,14 @@ class RuntimeModelCatalog:
         )
 
     def resolve(self, alias: str, *, role: CatalogRoleName | None = None) -> ResolvedModel:
-        """Resolve the client and bind the same catalog's complete pricing schedule."""
+        """Resolve the client and bind the catalog's pricing schedule and origin policy."""
         resolved = self._resolve(alias, role=role)
-        return replace(resolved, token_prices=self._catalog.models[alias].token_prices)
+        record = self._catalog.models[alias]
+        return replace(
+            resolved,
+            token_prices=record.token_prices,
+            tenant_origin=self._catalog.connections[record.connection].tenant_origin,
+        )
 
     def _resolve(self, alias: str, *, role: CatalogRoleName | None = None) -> ResolvedModel:
         """Build the one approved client shape named by an alias.
@@ -370,6 +381,8 @@ class RuntimeModelCatalog:
                 supports_top_p=_supports_top_p(capabilities),
                 supports_top_k=_supports_flag(capabilities, "supports_top_k"),
                 supports_logprobs=_supports_flag(capabilities, "supports_logprobs"),
+                supports_reasoning=capabilities.supports_reasoning is True,
+                reasoning_effort=capabilities.reasoning_effort,
             )
             client = BoundedBedrockClient(bedrock_client)
             return ResolvedModel(
@@ -396,6 +409,30 @@ class RuntimeModelCatalog:
                 if self._vertex_token_provider_factory is None
                 else self._vertex_token_provider_factory(credentials_json=api_key)
             )
+            if vertex_wire_for_model(snapshot.model_id) == "anthropic_messages":
+                # A Claude model published on Vertex ("Claude on Vertex AI"): served over the
+                # native Anthropic Messages wire at publishers/anthropic/models/<model>, under
+                # the same OAuth bearer. Anthropic models expose no embedding surface.
+                anthropic_client = VertexAnthropicClient(
+                    model=snapshot,
+                    api_key=api_key,
+                    base_url=connection.base_url,
+                    transport=self._transport_factory(),
+                    token_provider=token_provider,
+                    supports_temperature=capabilities.supports_temperature,
+                    supports_top_p=_supports_top_p(capabilities),
+                    supports_top_k=_supports_flag(capabilities, "supports_top_k"),
+                    supports_reasoning=capabilities.supports_reasoning,
+                    reasoning_effort=capabilities.reasoning_effort,
+                )
+                return ResolvedModel(
+                    alias,
+                    snapshot,
+                    capabilities,
+                    anthropic_client,
+                    None,
+                    served_model_id=record.served_model_id,
+                )
             if vertex_wire_for_model(snapshot.model_id) == "openai_compatible":
                 # A Model Garden MaaS id: Vertex serves it only over its
                 # OpenAI-compatible route, so the compatible client's wire and
@@ -509,7 +546,11 @@ class RuntimeModelCatalog:
             # the OpenAI-deployments wire (which 404s `api_not_supported` for
             # them). A known Anthropic model on an Azure connection routes there;
             # every other azure model keeps the OpenAI-compatible AzureClient.
-            if known_model_metadata("anthropic", snapshot.model_id) is not None:
+            # ``model`` is the operator-chosen DEPLOYMENT name, so a Claude
+            # deployment named anything but its model id is recognized through
+            # ``served_model_id``, the model the deployment answers as. The
+            # request still names the deployment.
+            if _azure_anthropic_model(snapshot.model_id, record.served_model_id):
                 anthropic_client = AnthropicClient(
                     model=snapshot,
                     api_key=api_key,
@@ -634,6 +675,10 @@ class RuntimeModelCatalog:
             )
         if provider in {"openrouter", "openai-compatible"}:
             http_kwargs["chat_max_tokens_field"] = capabilities.chat_max_tokens_field
+        if provider == "elevenlabs":
+            # Audio only: no sampling or reasoning facts apply, but the
+            # configured dispatch timeout does.
+            http_kwargs["timeout_seconds"] = self._http_timeout_seconds
         if provider in {"anthropic", "gemini", "openrouter", "openai-compatible"}:
             http_kwargs.update(
                 {
@@ -826,6 +871,7 @@ class RuntimeModelCatalog:
 
 _HTTP_PROVIDERS: Mapping[str, tuple[_HttpClientFactory, str | None]] = {
     "anthropic": (AnthropicClient, ANTHROPIC_BASE_URL),
+    "elevenlabs": (ElevenLabsClient, ELEVENLABS_BASE_URL),
     "gemini": (GeminiClient, GEMINI_BASE_URL),
     "openai-compatible": (OpenAICompatibleClient, None),
     "openrouter": (OpenRouterClient, OPENROUTER_BASE_URL),
@@ -840,6 +886,24 @@ SUPPORTED_PROVIDERS = frozenset(_HTTP_PROVIDERS) | {
     "vertex",
 }
 """Every provider identifier the runtime registry can construct a client for."""
+
+
+def _azure_anthropic_model(deployment: str, served_model_id: str | None) -> bool:
+    """Whether an Azure deployment serves a known Anthropic model.
+
+    Args:
+        deployment: The Azure deployment name the request addresses.
+        served_model_id: The model the deployment answers as, when the catalog
+            pins one; it names the model behind an operator-chosen deployment.
+
+    Returns:
+        True when either names a model the Anthropic metadata table knows.
+    """
+    return any(
+        known_model_metadata("anthropic", model_id) is not None
+        for model_id in (deployment, served_model_id)
+        if model_id is not None
+    )
 
 
 def _supports_flag(capabilities: ModelCapabilities, name: str) -> bool:

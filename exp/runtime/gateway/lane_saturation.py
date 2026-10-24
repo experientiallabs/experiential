@@ -101,6 +101,32 @@ def priority_overflow_ceiling(
     return bound * (pro if priority_admission == 2 else min(paying, pro))
 
 
+FAILOVER_OVERFLOW_FRACTION = 0.5
+"""How far past its bound a rung admits FORCED failover passes, as a fraction of the bound.
+
+A request whose rung already failed is forced past a full sibling's bound
+(``failover_pass``) rather than ended, but only this many such passes may be
+in flight on one rung per worker (half the bound, at least one): a dead lane
+cannot shift its whole load onto the backup at once. Past it the failover is
+refused with the fast retryable ``lane_saturated_failure``.
+"""
+
+
+def failover_overflow_cap(bound: int | None) -> int | None:
+    """The in-flight forced failover passes one bounded rung may hold, or ``None``.
+
+    Args:
+        bound: The rung's effective bound (authored or the worker default).
+
+    Returns:
+        ``ceil(bound * FAILOVER_OVERFLOW_FRACTION)``, at least one; ``None``
+        for a rung with no in-flight bound (rate windows only).
+    """
+    if bound is None:
+        return None
+    return max(1, math.ceil(bound * FAILOVER_OVERFLOW_FRACTION))
+
+
 def default_lane_bound(max_active_requests: int, share: float = DEFAULT_LANE_SHARE) -> int:
     """The per-worker in-flight cap for rungs that author no ``concurrency_bound``.
 
@@ -178,8 +204,10 @@ def overflow_target(
     away. The reservation caps that overflow (``priority_overflow_ceiling``);
     a rung whose forced admission hit its cap (``RungShed.overflow_ceiling``)
     is skipped for the next bypassed rung, and the request is refused once
-    every bypassed rung is capped. A bypass that was not a registry shed
-    (a cold throttle failover) keeps the historical overflow.
+    every bypassed rung is capped. A free caller is refused on a hard shed
+    (a class cap or the :fast split, ``overflow_ceiling``). A bypass that was
+    not a registry shed (a cold throttle failover) keeps the historical
+    overflow.
 
     Args:
         route: The admitted route.
@@ -223,9 +251,12 @@ def _historical_target(route: GatewayRoute, depth: int, shed: RungShed | None) -
         shed: The registry's shed on that rung, when the bypass was a reservation.
 
     Returns:
-        ``depth`` to force-admit, or ``None`` when the rung's bound refuses.
+        ``depth`` to force-admit, or ``None`` when the rung's bound refuses or
+        the shed was hard (a class cap or the :fast split).
     """
-    if shed is not None and shed.default_bound:
+    # A hard shed (a class cap, the :fast split) sheds a forced retry the
+    # same way, so overflowing it would walk the ladder until the deadline.
+    if shed is not None and (shed.default_bound or shed.overflow_ceiling):
         return None
     policy = route.deployments[depth].gateway.dispatch
     if policy is not None and policy.saturation == "refuse":

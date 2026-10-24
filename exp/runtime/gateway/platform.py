@@ -20,7 +20,6 @@ from exp.common.models.gateway_catalog import (
 from exp.common.models.gateway_pools import GatewayEquivalenceCertification
 from exp.runtime.gateway.contracts import (
     AttemptId,
-    ExecutionSnapshot,
     GatewayEvent,
     GatewayEventKind,
     GatewayFailure,
@@ -31,6 +30,7 @@ from exp.runtime.gateway.contracts import (
     OrganizationId,
     VirtualKeyId,
 )
+from exp.runtime.gateway.execution_snapshot import ExecutionSnapshot
 
 ConnectionId = ArtifactId
 ProviderConnectionRevisionId = ArtifactId

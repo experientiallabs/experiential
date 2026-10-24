@@ -2,11 +2,18 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import cast
 
 import pytest
 
-from exp.common.models import BillingSource, ModelCapabilities, ModelSnapshot
+from exp.common.models import (
+    BilledUnitKind,
+    BillingSource,
+    GatewayUnitPrices,
+    ModelCapabilities,
+    ModelSnapshot,
+)
 from exp.common.models.catalog import (
     GatewayDeploymentCapabilities,
     GatewayDeploymentMetadata,
@@ -245,6 +252,16 @@ def test_profile_resolution_binds_the_deployment_billing_source() -> None:
     assert house.forwards_service_tier is False
 
 
+def test_profile_resolution_binds_the_runtime_tenant_origin() -> None:
+    """The wire profile carries the resolved connection's tenant-origin policy."""
+    base = GatewayWireProfile(dialect="openai_compatible", url="https://tenant.example.test")
+    resolved = _resolved(_NativeClient(base), ModelCapabilities())
+    plain = _resolved_wire_profile(_deployment(None), resolved)
+    assert plain.tenant_origin is False
+    tenant = _resolved_wire_profile(_deployment(None), replace(resolved, tenant_origin=True))
+    assert tenant.tenant_origin is True
+
+
 def test_profile_resolution_forwards_service_tier_on_a_tier_priced_house_lane() -> None:
     """A host-funded rung whose model carries a per-tier pass-through CARD
     forwards that tier even though the caller does not pay the provider
@@ -318,3 +335,43 @@ def test_audio_claims_without_an_endpoint_or_a_billable_meter_block_the_alias() 
     assert execution_resolution._audio_claim_blockers(priced, served) == ()  # noqa: SLF001
     unclaimed = _deployment(None)
     assert execution_resolution._audio_claim_blockers(unclaimed, bare) == ()  # noqa: SLF001
+
+
+def test_an_elevenlabs_audio_claim_must_bill_a_unit_card() -> None:
+    """ElevenLabs reports no token usage, so a token-priced ElevenLabs rung is blocked."""
+    claims = GatewayDeploymentCapabilities(supports_speech=True)
+    elevenlabs = GatewayWireProfile(
+        dialect="elevenlabs_audio",
+        url="https://example.test/v1/text-to-speech",
+        speech_url="https://example.test/v1/text-to-speech",
+    )
+    tokens = _deployment(None, claims).model_copy(
+        update={"capabilities": ModelCapabilities(maximum_output_tokens=2_000)}
+    )
+    tokens = tokens.model_copy(
+        update={
+            "gateway": tokens.gateway.model_copy(
+                update={
+                    "prices": GatewayTokenPrices(
+                        input_nano_usd_per_million_tokens=1,
+                        output_nano_usd_per_million_tokens=1,
+                    )
+                }
+            )
+        }
+    )
+    assert execution_resolution._audio_claim_blockers(tokens, elevenlabs) == (  # noqa: SLF001
+        "deployment 'primary' claims speech on ElevenLabs without a unit card",
+    )
+    units = tokens.model_copy(
+        update={
+            "gateway": tokens.gateway.model_copy(
+                update={
+                    "prices": GatewayTokenPrices(
+                        units=GatewayUnitPrices(kind=BilledUnitKind.CHARACTER, rates={"": 40_000})
+                    )
+                }
+            )
+        }
+    )
+    assert execution_resolution._audio_claim_blockers(units, elevenlabs) == ()  # noqa: SLF001

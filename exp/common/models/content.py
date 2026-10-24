@@ -32,8 +32,18 @@ IMAGE_MEDIA_TYPES: dict[str, ImageMediaType] = {
 }
 """Media types every image-capable provider wire in this gateway accepts."""
 
-MAXIMUM_IMAGE_BASE64_BYTES = 5 * 1024 * 1024
-"""Largest encoded image this gateway forwards (the narrowest provider cap)."""
+MAXIMUM_IMAGE_BYTES = 20 * 1024 * 1024
+"""Largest decoded image this gateway admits: OpenAI's documented per-image cap."""
+
+MAXIMUM_IMAGE_BASE64_BYTES = 4 * -(-MAXIMUM_IMAGE_BYTES // 3)
+"""Largest encoded image this gateway forwards: the base64 length of a 20 MiB image.
+
+The cap is the widest provider's, not the narrowest: screenshots are baked
+into an agent's transcript, so a gateway ceiling below what OpenAI accepts
+wedges sessions that the OpenAI rungs would serve (RooCode and Codex Desktop
+sent 5 to 12 MiB images, 2026-10-17). Narrower per-image limits (Anthropic's
+5 MB, Bedrock's 3.75 MB) surface as provider errors on those rungs, like the
+narrower Bedrock image count. The 64 MiB request-body bound caps the aggregate."""
 
 MAXIMUM_IMAGES_PER_REQUEST = 100
 """Largest number of images one request may carry across all its messages.

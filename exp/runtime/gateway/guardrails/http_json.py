@@ -270,7 +270,7 @@ class HttpJsonClassifier:
     ) -> ClassifierVerdict:
         """POST the inspect envelope and validate the classifier contract."""
         headers = {"accept": "application/json", "content-type": "application/json"}
-        authorization = _authorization_header(self._bearer_env)
+        authorization = bearer_authorization_header(self._bearer_env)
         if authorization is not None:
             headers["authorization"] = authorization
         client = self._client or shared_http_json_client()
@@ -291,7 +291,7 @@ class HttpJsonClassifier:
                 )
                 if status < 200 or status >= 300:
                     raise ClassifierProtocolError(f"classifier returned HTTP {status}")
-                body = await _read_bounded(response, self._max_response_bytes)
+                body = await read_bounded_body(response, self._max_response_bytes)
         except ClassifierProtocolError:
             raise
         except asyncio.CancelledError:
@@ -365,7 +365,7 @@ def _classifier_visible_message(message: GatewayMessage) -> JsonObject:
     return message.model_dump(mode="json", by_alias=True, exclude_none=False)
 
 
-def _authorization_header(bearer_env: str | None) -> str | None:
+def bearer_authorization_header(bearer_env: str | None) -> str | None:
     """Resolve optional bearer auth from the process environment.
 
     Args:
@@ -409,7 +409,7 @@ def _inspect_payload(
     return payload
 
 
-async def _read_bounded(response: httpx.Response, limit: int) -> bytes:
+async def read_bounded_body(response: httpx.Response, limit: int) -> bytes:
     """Read a response body and reject oversized payloads.
 
     Args:

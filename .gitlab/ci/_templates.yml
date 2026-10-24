@@ -1,0 +1,45 @@
+# Shared hidden keys for the jobs in .gitlab/ci. Jobs use them with
+# `extends:` or `!reference`; see docs/gitlab-ci.md.
+
+# Pinned tool versions, including the Rust toolchain that compiles the
+# published native wheels.
+.tools:
+  variables:
+    UV_VERSION: "0.12.18"
+    MATURIN_VERSION: "1.14.1"
+    RUST_TOOLCHAIN: "1.99.1"
+    # The gate's dependency audit; the digest is the release's published SHA-256.
+    OSV_SCANNER_VERSION: "2.7.0"
+    OSV_SCANNER_SHA256: "160c6253e2922e9e0a6a9771c5c4c40a4b3c6090b34a3cdd5e80c96cc2e4218b"
+
+.snippets:
+  # Installs the pinned uv into an official python image's interpreter.
+  uv:
+    - python3 -m pip install --quiet --no-cache-dir --disable-pip-version-check --root-user-action=ignore "uv==${UV_VERSION}"
+  # Installs the pinned uv on a hosted macOS runner.
+  uv-macos:
+    - curl -LsSf "https://astral.sh/uv/${UV_VERSION}/install.sh" | env UV_INSTALL_DIR="$HOME/.local/bin" UV_NO_MODIFY_PATH=1 sh
+    - export PATH="$HOME/.local/bin:$PATH"
+  # Installs the pinned uv on the hosted Windows runner, whose shell is PowerShell.
+  uv-windows:
+    - $env:UV_INSTALL_DIR = "$env:USERPROFILE\.local\bin"
+    - $env:UV_NO_MODIFY_PATH = "1"
+    - Invoke-RestMethod "https://astral.sh/uv/$env:UV_VERSION/install.ps1" | Invoke-Expression
+    - $env:Path = "$env:USERPROFILE\.local\bin;$env:Path"
+  # Installs the pinned Rust toolchain with rustup into $CARGO_HOME, or
+  # ~/.cargo when the job sets no CARGO_HOME.
+  rust:
+    - curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path --profile minimal --default-toolchain "${RUST_TOOLCHAIN}"
+    - export PATH="${CARGO_HOME:-$HOME/.cargo}/bin:$PATH"
+  # Installs the pinned MSVC Rust toolchain on the hosted Windows runner into
+  # $env:CARGO_HOME and $env:RUSTUP_HOME, reusing a cached rustup.
+  rust-windows:
+    - |
+      if (-not (Test-Path "$env:CARGO_HOME\bin\rustup.exe")) {
+        Invoke-WebRequest -UseBasicParsing -Uri "https://static.rust-lang.org/rustup/dist/x86_64-pc-windows-msvc/rustup-init.exe" -OutFile "$env:TEMP\rustup-init.exe"
+        & "$env:TEMP\rustup-init.exe" -y --no-modify-path --profile minimal --default-toolchain $env:RUST_TOOLCHAIN
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      }
+    - $env:Path = "$env:CARGO_HOME\bin;$env:Path"
+    - rustup toolchain install $env:RUST_TOOLCHAIN --profile minimal --no-self-update
+    - rustup default $env:RUST_TOOLCHAIN

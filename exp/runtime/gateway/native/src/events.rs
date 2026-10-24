@@ -13,7 +13,8 @@
 //! - OpenAI-shaped wires (Responses via `openai_usage`, Chat Completions via
 //!   `openai_compatible_usage`): OpenAI, OpenRouter, DeepSeek, and Fireworks
 //!   report reasoning inside the output total; xAI (native and relayed by
-//!   Azure Foundry) reports it outside on both wires. The provider's own
+//!   Azure Foundry) reports it outside on both wires; Azure Foundry DeepSeek
+//!   puts the Chat count in top-level `reasoning_tokens`. The provider's own
 //!   `total_tokens` decides: `input + output` is the subset shape and is
 //!   forwarded as reported, `input + output + reasoning` is the additive shape
 //!   and folds (`fold_openai_shaped_reasoning`). Without a decisive total, a
@@ -60,7 +61,17 @@ pub struct Usage {
     /// Observed one-hour subset; absent when no complete TTL breakdown exists.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_creation_1h_input_tokens: Option<u64>,
+    /// OpenAI's 12-hour subset of the writes (`ttl_12h_tokens`), disjoint from
+    /// the one-hour subset. Settlement prices it at the lane's 12-hour write
+    /// rate, 2.5 times input when the card authors none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_creation_12h_input_tokens: Option<u64>,
     pub reasoning_tokens: Option<u64>,
+    /// Image-modality subset of `output_tokens` (generated images, never
+    /// thinking), present only when the provider reported a nonzero count.
+    /// Settlement prices it at the lane's image-output rate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_output_tokens: Option<u64>,
     /// Media units priced by the deployment's unit card; absent on token-priced attempts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub billed_units: Option<BilledUnits>,
@@ -86,6 +97,11 @@ pub struct CompletedToolCall {
     /// this call; carried verbatim like `namespace` so the item
     /// round-trips exactly as the provider emitted it.
     pub caller: Option<Value>,
+    /// Gemini's opaque `thoughtSignature` on this `functionCall` part. The
+    /// next request must echo it with the call, so it reaches the caller
+    /// (Chat and Responses `extra_content.google.thought_signature`) and
+    /// returns on the replayed call.
+    pub thought_signature: Option<String>,
     pub provider_item_id: Option<String>,
     pub provider_status: Option<ProviderOutputItemStatus>,
     /// Raw provider-order argument text: a validated JSON object for
@@ -257,6 +273,9 @@ pub enum Event {
         /// Opaque SDK 3.0 `caller` attribution carried verbatim like
         /// `namespace`.
         caller: Option<Value>,
+        /// Gemini's opaque `thoughtSignature` for this call, known when the
+        /// call opens (Gemini delivers each call whole with its signature).
+        thought_signature: Option<String>,
     },
     ToolArgumentsDelta {
         index: u32,
@@ -580,6 +599,7 @@ pub fn simplified_event(event: &Event) -> Value {
             name,
             namespace,
             caller,
+            thought_signature,
         } => {
             let mut payload = serde_json::json!({
                 "kind": "tool_call_started",
@@ -595,6 +615,9 @@ pub fn simplified_event(event: &Event) -> Value {
             }
             if let Some(caller) = caller {
                 payload["caller"] = caller.clone();
+            }
+            if let Some(signature) = thought_signature {
+                payload["thought_signature"] = Value::String(signature.clone());
             }
             payload
         }
@@ -616,6 +639,9 @@ pub fn simplified_event(event: &Event) -> Value {
             }
             if let Some(caller) = &call.caller {
                 payload["caller"] = caller.clone();
+            }
+            if let Some(signature) = &call.thought_signature {
+                payload["thought_signature"] = Value::String(signature.clone());
             }
             if let Some(item_id) = &call.provider_item_id {
                 payload["item_id"] = Value::String(item_id.clone());
@@ -724,6 +750,12 @@ pub fn simplified_event(event: &Event) -> Value {
             if let Some(hour) = usage.cache_creation_1h_input_tokens {
                 payload["cache_creation_1h_input_tokens"] = serde_json::json!(hour);
             }
+            if let Some(half_day) = usage.cache_creation_12h_input_tokens {
+                payload["cache_creation_12h_input_tokens"] = serde_json::json!(half_day);
+            }
+            if let Some(image) = usage.image_output_tokens {
+                payload["image_output_tokens"] = serde_json::json!(image);
+            }
             payload
         }
         // A stop-sequence cut is a completed turn to every python consumer
@@ -806,73 +838,6 @@ impl JsonValueScan {
     }
 }
 
-/// Why a tail streamed after a complete argument object was dropped rather
-/// than failing the call. Each shape reproduces exactly one parse, so no
-/// argument content is ever invented or chosen between alternatives.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RedundantTail {
-    /// Only whitespace (a pretty-printed buffer's trailing newline).
-    Whitespace,
-    /// One or more exact repetitions of the complete value (`{}{}`, a
-    /// duplicated whole-object delta).
-    DuplicateValue,
-    /// Empty JSON literals after a zero-argument call (`{}""`: Azure
-    /// Foundry's DeepSeek shim, live 2026-09-10, 222 attempts in one day).
-    EmptyLiterals,
-}
-
-impl RedundantTail {
-    fn as_str(self) -> &'static str {
-        match self {
-            RedundantTail::Whitespace => "whitespace",
-            RedundantTail::DuplicateValue => "duplicate_value",
-            RedundantTail::EmptyLiterals => "empty_literals",
-        }
-    }
-}
-
-/// Classify the bytes a provider streamed AFTER its argument object closed.
-///
-/// Accepts only tails whose removal is unambiguous: whitespace; exact
-/// repetitions of the whole value; and, after a zero-argument `{}` only,
-/// empty literals (`""`, `{}`, `[]`) that carry no argument content. A tail
-/// that is merely a suffix of the value (`{"a":1}}`) is NOT accepted: the same
-/// bytes arise from a dropped inner delta (`{"a":1,"b":{` lost from
-/// `{"a":1,"b":{"c":2}}`), so the parse would be a guess.
-pub fn redundant_tail(value: &str, tail: &str) -> Option<RedundantTail> {
-    let value = value.trim();
-    let tail = tail.trim();
-    if tail.is_empty() {
-        return Some(RedundantTail::Whitespace);
-    }
-    let mut rest = tail;
-    let mut duplicates = true;
-    while !rest.is_empty() {
-        match rest.strip_prefix(value) {
-            Some(after) if !value.is_empty() => rest = after.trim_start(),
-            _ => {
-                duplicates = false;
-                break;
-            }
-        }
-    }
-    if duplicates {
-        return Some(RedundantTail::DuplicateValue);
-    }
-    if value != "{}" {
-        return None;
-    }
-    let mut rest = tail;
-    while !rest.is_empty() {
-        rest = rest
-            .strip_prefix("\"\"")
-            .or_else(|| rest.strip_prefix("{}"))
-            .or_else(|| rest.strip_prefix("[]"))?
-            .trim_start();
-    }
-    Some(RedundantTail::EmptyLiterals)
-}
-
 /// Accumulated per-stream state for one incrementally emitted function call.
 #[derive(Debug, Clone)]
 pub struct ToolAccumulator {
@@ -882,6 +847,8 @@ pub struct ToolAccumulator {
     pub namespace: Option<String>,
     /// Opaque SDK 3.0 `caller` attribution carried verbatim.
     pub caller: Option<Value>,
+    /// Gemini's opaque `thoughtSignature` for this call.
+    pub thought_signature: Option<String>,
     pub provider_item_id: Option<String>,
     pub provider_status: Option<ProviderOutputItemStatus>,
     pub raw_arguments: String,
@@ -918,6 +885,7 @@ impl ToolAccumulator {
             name,
             namespace: None,
             caller: None,
+            thought_signature: None,
             provider_item_id: None,
             provider_status: None,
             raw_arguments: String::new(),
@@ -981,6 +949,7 @@ impl ToolAccumulator {
             name: self.name.clone(),
             namespace: self.namespace.clone(),
             caller: self.caller.clone(),
+            thought_signature: self.thought_signature.clone(),
             provider_item_id: self.provider_item_id.clone(),
             provider_status: self.provider_status,
             raw_arguments: self.raw_arguments.clone(),
@@ -990,7 +959,7 @@ impl ToolAccumulator {
 }
 
 mod tool_arguments;
-pub use tool_arguments::require_json_object_text;
+pub use tool_arguments::{redundant_tail, require_json_object_text, RedundantTail};
 mod usage;
 pub use usage::*;
 

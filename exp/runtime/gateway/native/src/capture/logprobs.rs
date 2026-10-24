@@ -56,6 +56,12 @@ pub(crate) fn align_with_response(record: &mut super::record::Record, wire_pendi
                 && !client_disconnected
                 && !frames.iter().any(reports_failure)
         }
+        // Frames are on disk; the stream facts decide, as the relay saw them.
+        Some(super::record::Response::Spilled(spilled)) => {
+            (200..300).contains(&spilled.status)
+                && !spilled.truncated
+                && !spilled.client_disconnected
+        }
         None => false,
     };
     if complete {

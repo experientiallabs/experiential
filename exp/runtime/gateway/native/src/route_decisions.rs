@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::Response;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 
 use crate::admission::{acquire_permit, new_guard, wire_drift_response};
@@ -36,7 +36,9 @@ use crate::server::AppState;
 use crate::settlement::AttemptGuard;
 use crate::upstream::open_decision_stream;
 use crate::waterfall::{successor_possible, DeploymentWire, RoutePolicy, StartResponse};
+use body_budget::reserve_body;
 use openai::{openai_decision_usage, public_openai_decisions};
+use residual::residual_envelope;
 
 const PROBABILITY_TOLERANCE: f64 = 1e-6;
 
@@ -129,6 +131,12 @@ async fn serve(
         Ok(Err(error)) => return error_response(&error),
         Err(_) => return error_response(&timeout_failure().public_error()),
     };
+    // Held for the whole request: the body and its admitted payloads stay
+    // resident until the provider answer is relayed.
+    let _body_budget = match reserve_body(body.len(), deadline).await {
+        Ok(permit) => permit,
+        Err(error) => return error_response(&error),
+    };
     let raw_key = match bearer_key(&headers) {
         Ok(key) => key,
         Err(error) => return error_response(&error),
@@ -137,30 +145,28 @@ async fn serve(
     if let Err(error) = state.bridge.call("authenticate", authenticate).await {
         return error_response(&error);
     }
-    let body_text = match String::from_utf8(body.to_vec()) {
-        Ok(text) => text,
-        Err(_) => return error_response(&PublicError::invalid_json()),
+    let Ok(body_text) = std::str::from_utf8(&body) else {
+        return error_response(&PublicError::invalid_json());
     };
     let client_request_id = latin1_header(&headers, "x-client-request-id");
-    let argument = admission_argument(&raw_key, &body_text, &headers);
+    let argument = admission_argument(&raw_key, body_text, &headers);
+    drop(body);
     let admission_text = match state.bridge.call(admission_method, argument).await {
         Ok(text) => text,
         Err(error) => return error_response(&error),
     };
-    let admission_value: Value = match serde_json::from_str(&admission_text) {
-        Ok(value) => value,
-        Err(_) => return error_response(&PublicError::internal()),
+    let admission = match parse_admission(&admission_text, expected_wire) {
+        Ok(admission) => admission,
+        Err(Parsed::Escalate(reason)) => {
+            METRICS.record_escalation(classify_escalation(&reason));
+            return error_response(&escalation_error(&reason));
+        }
+        Err(Parsed::Drift(value)) => return wire_drift_response(&state, &value, started).await,
+        Err(Parsed::Malformed) => return error_response(&PublicError::internal()),
     };
-    if let Some(reason) = admission_value.get("escalate") {
-        METRICS.record_escalation(classify_escalation(reason.as_str().unwrap_or_default()));
-        return error_response(&escalation_error());
-    }
-    let admission = match serde_json::from_value::<DecisionsAdmission>(admission_value.clone()) {
-        Ok(admission) if admission.wire == expected_wire => admission,
-        _ => return wire_drift_response(&state, &admission_value, started).await,
-    };
+    drop(admission_text);
     let mut guard = new_guard(&state, admission.request_id.clone(), started);
-    let _permit = match acquire_permit(&state, &mut guard, deadline).await {
+    let _permit = match acquire_permit(&state, &mut guard, deadline, None).await {
         Ok(permit) => permit,
         Err(response) => return *response,
     };
@@ -182,15 +188,63 @@ async fn serve(
     }
 }
 
+/// An admission bridge answer that is not a dispatchable decision route.
+enum Parsed {
+    Escalate(String),
+    Drift(Value),
+    Malformed,
+}
+
+#[derive(Deserialize)]
+struct EscalationProbe {
+    #[serde(default)]
+    escalate: Option<Value>,
+}
+
+/// Decode the admission straight from its text: the route carries every
+/// rung's provider payload, so no intermediate `Value` copy is kept.
+fn parse_admission(text: &str, expected_wire: DecisionWire) -> Result<DecisionsAdmission, Parsed> {
+    let Ok(probe) = serde_json::from_str::<EscalationProbe>(text) else {
+        return Err(Parsed::Malformed);
+    };
+    if let Some(reason) = probe.escalate {
+        return Err(Parsed::Escalate(
+            reason.as_str().unwrap_or_default().to_string(),
+        ));
+    }
+    match serde_json::from_str::<DecisionsAdmission>(text) {
+        Ok(admission) if admission.wire == expected_wire => Ok(admission),
+        _ => Err(Parsed::Drift(
+            serde_json::from_str(text).unwrap_or(Value::Null),
+        )),
+    }
+}
+
+#[derive(Serialize)]
+struct AdmissionArgument<'a> {
+    body: &'a str,
+    /// UTF-8 length of `body`, so admission bounds it without re-encoding.
+    body_bytes: usize,
+    #[serde(flatten)]
+    fields: Map<String, Value>,
+}
+
 /// Forward authority, app identity, and trusted proxy IP without caller idempotency.
 fn admission_argument(raw_key: &str, body: &str, headers: &HeaderMap) -> String {
-    let mut argument = json!({
+    let mut fields = json!({
         "raw_key": raw_key,
-        "body": body,
         "client_ip": client_ip(headers),
     });
-    with_app_identity(&mut argument, headers);
-    compact_json(&argument)
+    with_app_identity(&mut fields, headers);
+    let Value::Object(fields) = fields else {
+        unreachable!("the admission fields are built as an object")
+    };
+    serde_json::to_string(&AdmissionArgument {
+        body,
+        body_bytes: body.len(),
+        fields,
+    })
+    .unwrap_or_else(|_| "null".to_string())
 }
 
 /// Reserve every physical dispatch through the same authority as other routes.
@@ -276,10 +330,12 @@ async fn run_ladder(
         }
         total_attempts += 1;
         counts[depth] += 1;
-        match dispatch(&state.http, wire, deadline, admission, guard).await {
+        let http = state.http.for_origin(wire.tenant_origin);
+        match dispatch(http, wire, deadline, admission, guard).await {
             Ok((body, usage)) => return Ok(Served { depth, body, usage }),
             Err(failure) => {
-                let failure = route_failure(failure, wire, policy, counts[depth]);
+                let failure = route_failure(failure, wire, policy, counts[depth])
+                    .with_tenant_origin(wire.tenant_origin);
                 let boundary = failure.clone().boundary();
                 let possible = successor_possible(
                     policy,
@@ -288,6 +344,7 @@ async fn run_ladder(
                     total_attempts,
                     counts[depth],
                     depth,
+                    &counts,
                     &failure,
                     false,
                 );
@@ -607,8 +664,10 @@ fn public_decisions(
                     || score > criteria.len().saturating_sub(1) as f64
                     || !score_matches_distribution(score, &probabilities)
                 {
-                    return Err(malformed(
+                    return Err(score_mismatch(
                         "decision score does not match its probability distribution",
+                        score,
+                        &probabilities,
                     ));
                 }
                 json!({"type": kind, "score": answer["score"], "confidence": answer["confidence"],
@@ -653,34 +712,82 @@ fn decision_usage(payload: &Value) -> Result<Usage, Failure> {
         cached_input_tokens: None,
         cache_creation_input_tokens: None,
         cache_creation_1h_input_tokens: None,
+        cache_creation_12h_input_tokens: None,
         reasoning_tokens: None,
         billed_units: None,
         cache_writes_read_back: false,
+        image_output_tokens: None,
     })
+}
+
+/// The probability-weighted level average recomputed from the wire bins.
+fn expected_score(probabilities: &[f64]) -> f64 {
+    probabilities
+        .iter()
+        .enumerate()
+        .map(|(index, value)| index as f64 * value)
+        .sum()
 }
 
 /// Check a score without treating rounded wire probabilities as exact model values.
 fn score_matches_distribution(score: f64, probabilities: &[f64]) -> bool {
-    let expected: f64 = probabilities
-        .iter()
-        .enumerate()
-        .map(|(index, value)| index as f64 * value)
-        .sum();
-    if (score - expected).abs() <= PROBABILITY_TOLERANCE {
+    if (score - expected_score(probabilities)).abs() <= PROBABILITY_TOLERANCE {
         return true;
     }
-    // Hundredth-valued wire scores need not equal an expectation recomputed from
-    // rounded bins. Only that precision gets an envelope; finer data stays strict.
-    let Some(score_hundredths) = hundredths(score) else {
-        return false;
-    };
     // A single unit distribution must explain all bins together, not a separate
-    // error allowance for each weighted term.
-    let Some(bounds) = rounding_bounds(probabilities) else {
+    // error allowance for each weighted term. Only hundredth-valued bins get an
+    // envelope; finer bins stay strict.
+    let Some((minimum, maximum)) = score_envelope(probabilities) else {
         return false;
     };
-    if !admits_unit_total(&bounds) {
+    if score_meets_envelope(score, minimum, maximum) {
+        return true;
+    }
+    // TypeSafe also publishes bins rounded to hundredths whose residual was
+    // folded into one highest bin so the total reads exactly one, while its
+    // score keeps the unrounded expectation (production 2026-10-23: 0.71 beside
+    // [0.49, 0.37, 0.11, 0.03], whose independent envelope tops out at 0.70).
+    // That folded bin can sit up to half a hundredth per other bin away from
+    // its latent value, so it gets its own exact envelope of that convention.
+    residual_envelope(probabilities)
+        .is_some_and(|(minimum, maximum)| score_meets_envelope(score, minimum, maximum))
+}
+
+/// Whether a score, read at the precision it was reported to, meets an
+/// envelope in half-hundredths.
+fn score_meets_envelope(score: f64, minimum: i64, maximum: i64) -> bool {
+    // The score is rounded at the precision the provider REPORTED it to
+    // (TypeSafe answers `score=3.9` beside bins whose latent expectation is
+    // 3.87, production 2026-10-17), so it stands for the closed interval of
+    // half a unit in its last decimal place, and passes only when that
+    // interval meets the envelope. A whole-number score is read at tenths,
+    // the coarsest precision the provider reports, so `4` cannot claim a
+    // half-unit allowance; scores finer than thousandths stay strict. No
+    // output is repaired or normalized, and structurally invalid
+    // distributions never reach this check.
+    let Some((units, scale)) = reported_precision(score) else {
         return false;
+    };
+    // The envelope is in half-hundredths (1/200); the score interval is
+    // [(2u-1)/(2s), (2u+1)/(2s)]. Cross-multiplied to stay in integers.
+    (2 * units + 1) * 100 >= minimum * scale && (2 * units - 1) * 100 <= maximum * scale
+}
+
+/// The score in units of its reported decimal place, and that place's scale:
+/// tenths at the coarsest, thousandths at the finest, `None` finer still.
+fn reported_precision(score: f64) -> Option<(i64, i64)> {
+    [(10.0, 10), (100.0, 100), (1000.0, 1000)]
+        .into_iter()
+        .find_map(|(factor, scale)| decimal_units(score, factor).map(|units| (units, scale)))
+}
+
+/// Extreme expectations, in half-hundredths, of every unit distribution whose
+/// bins round to the published hundredth bins; `None` when the bins are finer
+/// than hundredths or no unit distribution explains them.
+fn score_envelope(probabilities: &[f64]) -> Option<(i64, i64)> {
+    let bounds = rounding_bounds(probabilities)?;
+    if !admits_unit_total(&bounds) {
+        return None;
     }
     let lower_sum: i64 = bounds.iter().map(|(low, _)| low).sum();
     let base: i64 = bounds
@@ -690,9 +797,35 @@ fn score_matches_distribution(score: f64, probabilities: &[f64]) -> bool {
         .sum();
     let minimum = rounded_expectation(base, 200 - lower_sum, bounds.iter().enumerate());
     let maximum = rounded_expectation(base, 200 - lower_sum, bounds.iter().enumerate().rev());
-    // Closed envelopes admit unspecified half-way rounding. No output is repaired
-    // or normalized, and structurally invalid distributions never reach this check.
-    2 * score_hundredths + 1 >= minimum && 2 * score_hundredths - 1 <= maximum
+    Some((minimum, maximum))
+}
+
+/// A score rejection that names the numbers it was judged on.
+///
+/// The reason is replaced by the generic malformed-response message on the
+/// public error, but rides into the operator log and the ledger detail
+/// (`Failure::boundary`), so a rejected score can be told apart as provider
+/// inconsistency or an overly strict check. Every value is a numeric model
+/// output or a gateway constant, never prompt content.
+fn score_mismatch(reason: &str, score: f64, probabilities: &[f64]) -> Failure {
+    let bins = probabilities
+        .iter()
+        .map(f64::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    let render = |envelope: Option<(i64, i64)>| {
+        envelope.map_or_else(
+            || "none".to_string(),
+            |(minimum, maximum)| format!("[{},{}]", minimum as f64 / 200.0, maximum as f64 / 200.0),
+        )
+    };
+    malformed(&format!(
+        "{reason} (score={score}, expected={}, probabilities=[{bins}], \
+         rounding_envelope={}, residual_envelope={}, tolerance={PROBABILITY_TOLERANCE})",
+        expected_score(probabilities),
+        render(score_envelope(probabilities)),
+        render(residual_envelope(probabilities)),
+    ))
 }
 
 /// Check a selected category without treating rounded wire probabilities as exact.
@@ -746,7 +879,12 @@ fn admits_unit_total(bounds: &[(i64, i64)]) -> bool {
 
 /// Recognize decimal hundredths, including their binary floating-point residue.
 fn hundredths(value: f64) -> Option<i64> {
-    let scaled = value * 100.0;
+    decimal_units(value, 100.0)
+}
+
+/// Recognize a value with at most the decimal precision `scale` names.
+fn decimal_units(value: f64, scale: f64) -> Option<i64> {
+    let scaled = value * scale;
     let rounded = scaled.round();
     // Allow binary representation and multiplication roundoff, not extra decimal
     // precision. A relative bound also keeps tiny nonzero bins distinct from zero.
@@ -842,10 +980,20 @@ fn served_headers(
     headers
 }
 
+#[cfg(test)]
+#[path = "route_decisions/admission_tests.rs"]
+mod admission_tests;
+#[path = "route_decisions/body_budget.rs"]
+mod body_budget;
 #[path = "route_decisions/openai.rs"]
 mod openai;
 #[cfg(test)]
 #[path = "route_decisions/openai_tests.rs"]
 mod openai_tests;
+#[path = "route_decisions/residual.rs"]
+mod residual;
+#[cfg(test)]
+#[path = "route_decisions/score_tests.rs"]
+mod score_tests;
 #[cfg(test)]
 mod tests;

@@ -15,7 +15,9 @@ from exp.runtime.gateway.contracts import (
     GatewayRequest,
     GatewayUsage,
 )
+from exp.runtime.openai_protocol.cache_write_lifetimes import cache_write_lifetimes
 from exp.runtime.openai_protocol.errors import OpenAIProtocolError
+from exp.runtime.openai_protocol.reasoning_estimate import ReasoningEstimate
 from exp.runtime.openai_protocol.streaming import (
     ResponsesSseEncoder,
     stable_public_id,
@@ -123,7 +125,9 @@ def completed_body(
                 "logprobs": probability_value,
             }
         ],
-        "usage": chat_usage(usage),
+        "usage": ReasoningEstimate.from_events(events).annotate(
+            chat_usage(usage), usage, "completion_tokens_details"
+        ),
         **_ignored_parameters_extension(request),
     }
 
@@ -141,6 +145,8 @@ def chat_usage(usage: GatewayUsage | None) -> JsonObject | None:
         details["cache_write_tokens"] = usage.cache_creation_input_tokens
     if usage.cache_creation_1h_input_tokens is not None:
         details["cache_write_1h_tokens"] = usage.cache_creation_1h_input_tokens
+    if (split := cache_write_lifetimes(usage)) is not None:
+        details["cache_write_tokens_details"] = split
     output_details: JsonObject = {}
     if usage.reasoning_tokens is not None:
         output_details["reasoning_tokens"] = usage.reasoning_tokens

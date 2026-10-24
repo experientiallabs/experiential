@@ -43,3 +43,27 @@ pub fn anthropic_error_body(error: &PublicError) -> Value {
     }
     body
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_bridge_authority_refusal_renders_as_a_retryable_overloaded_error() {
+        // The exact JSON the Python boundary attaches for a bare store refusal.
+        let error: PublicError = serde_json::from_str(
+            r#"{"status_code":503,"code":"gateway_authority_unavailable",
+                "message":"The gateway could not confirm serving authority for this request.",
+                "error_type":"api_error","param":null,"retry_after_seconds":5}"#,
+        )
+        .unwrap();
+        assert_eq!(error.retry_after_seconds, Some(5));
+        let body = anthropic_error_body(&error);
+        assert_eq!(body["type"], "error");
+        assert_eq!(body["error"]["type"], "overloaded_error");
+        assert_eq!(
+            body["error"]["message"],
+            "The gateway could not confirm serving authority for this request."
+        );
+    }
+}

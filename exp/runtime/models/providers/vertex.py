@@ -23,6 +23,10 @@ from urllib.parse import urlsplit
 
 from exp.common.core.artifacts import JsonObject
 from exp.common.models import ChatMaxTokensField, ModelRequest, ModelResponse, ModelSnapshot
+from exp.runtime.models.providers.anthropic import (
+    anthropic_messages_request,
+    anthropic_messages_response,
+)
 from exp.runtime.models.providers.async_transport import (
     AsyncJsonHttpTransport,
     ProviderDeadlineExceeded,
@@ -51,10 +55,21 @@ VERTEX_TOKEN_SCOPE = "https://www.googleapis.com/auth/cloud-platform"
 VERTEX_OPENAPI_PATH_PREFIX = "endpoints/openapi/"
 """Route prefix, below the project-and-location root, of Vertex's OpenAI-compatible surface."""
 
-VertexWire = Literal["gemini_generate_content", "openai_compatible"]
-"""The two wire dialects one Vertex connection serves, chosen per model id."""
+VertexWire = Literal["gemini_generate_content", "openai_compatible", "anthropic_messages"]
+"""The three wire dialects one Vertex connection serves, chosen per model id."""
 
 _MODEL_PATH_PREFIX = "publishers/google/models/"
+_ANTHROPIC_PATH_PREFIX = "publishers/anthropic/models/"
+# An Anthropic Claude model published on Vertex ("Claude on Vertex AI"): served over the
+# native Anthropic Messages wire at ``publishers/anthropic/models/<model>:rawPredict`` (and
+# ``:streamRawPredict`` for SSE) under the same OAuth bearer as every other Vertex route. A
+# catalog lane names it with this exact prefix so the dialect is unambiguous against a bare
+# Gemini id; the bare ``<model>`` after the prefix (e.g. ``claude-opus-4-5@20250514``) is the
+# publisher model id that fills the URL ``<model>`` segment.
+VERTEX_ANTHROPIC_VERSION = "vertex-2023-10-16"
+"""The ``anthropic_version`` Vertex requires in the Messages BODY (direct Anthropic carries
+its version in the ``anthropic-version`` HEADER instead); the top-level ``model`` field is
+omitted because the model travels in the URL."""
 # A bare id (``gemini-2.5-pro``) or a Google resource path names a Google-published model
 # on the Gemini wire; any OTHER ``<publisher>/<model>`` spelling is a Model Garden MaaS id
 # for the OpenAI-compatible route (see ``vertex_wire_for_model``).
@@ -88,6 +103,8 @@ def vertex_wire_for_model(model_id: str) -> VertexWire:
     Returns:
         The dialect the resolved client speaks for this model.
     """
+    if model_id.startswith(_ANTHROPIC_PATH_PREFIX):
+        return "anthropic_messages"
     if model_id.startswith(_MODEL_PATH_PREFIX):
         return "openai_compatible" if model_id.endswith(_MAAS_SUFFIX) else "gemini_generate_content"
     if model_id.startswith("models/") or "/" not in model_id:
@@ -557,6 +574,176 @@ class VertexOpenAIClient(OpenAICompatibleClient):
             reasoning_effort=self._reasoning_effort,
             reasoning_wire_format=self.reasoning_wire_format,
             sampling_requires_reasoning_none=self._sampling_requires_reasoning_none,
+        )
+
+
+def _vertex_anthropic_model_id(model_id: str) -> str:
+    """Return the bare publisher model id that fills a Vertex Anthropic route segment.
+
+    Args:
+        model_id: Catalog identifier, with or without the ``publishers/anthropic/models/``
+            resource-path prefix (e.g. ``publishers/anthropic/models/claude-opus-4-5@20250514``
+            or ``claude-opus-4-5@20250514``).
+
+    Returns:
+        The bare ``<model>@<version>`` the ``:rawPredict`` URL names.
+    """
+    return model_id.removeprefix(_ANTHROPIC_PATH_PREFIX).removeprefix("models/")
+
+
+class VertexAnthropicClient(ProviderHttpClient):
+    """Calls one Anthropic Claude model published on Vertex over the native Messages wire.
+
+    Claude on Vertex AI speaks the SAME Anthropic Messages payloads as direct Anthropic, so
+    the shared :func:`anthropic_messages_request` builder and :func:`anthropic_messages_response`
+    parser carry the wire — translated once, never forked. Vertex differs only at the envelope:
+    the endpoint is ``publishers/anthropic/models/<model>:streamRawPredict`` on the
+    project-and-location root, auth is the connection's OAuth bearer (not ``x-api-key``), the
+    ``anthropic_version`` rides in the BODY as ``vertex-2023-10-16`` rather than a header, and
+    the top-level ``model`` field is dropped because the model is in the URL.
+    """
+
+    def __init__(
+        self,
+        *,
+        model: ModelSnapshot,
+        api_key: str,
+        base_url: str,
+        transport: AsyncJsonHttpTransport | JsonHttpTransport | None = None,
+        retry_policy: RetryPolicy = DEFAULT_RETRY_POLICY,
+        timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
+        token_provider: VertexTokenProvider | None = None,
+        supports_temperature: bool = True,
+        supports_top_p: bool = True,
+        supports_top_k: bool = False,
+        supports_reasoning: bool = False,
+        reasoning_effort: str | None = None,
+    ) -> None:
+        """Create a Vertex Anthropic client for one project-and-location endpoint root.
+
+        Args:
+            model: Resolved configured model identity.
+            api_key: Service-account JSON credential; it mints each request's bearer token and
+                never travels on the wire.
+            base_url: Project-and-location endpoint root, such as
+                ``https://us-east5-aiplatform.googleapis.com/v1/projects/PROJECT/locations/us-east5``.
+            transport: Optional deterministic transport used by tests.
+            retry_policy: Bounded same-endpoint retry policy.
+            timeout_seconds: Per-attempt timeout floor.
+            token_provider: Optional deterministic bearer-token seam for tests.
+            supports_temperature: Whether the exact model accepts temperature.
+            supports_top_p: Whether the exact model accepts top-p sampling.
+            supports_top_k: Whether the exact model accepts top-k sampling.
+            supports_reasoning: Whether the exact model accepts extended-thinking configuration.
+            reasoning_effort: Optional catalog-pinned reasoning effort.
+        """
+        _require_vertex_host(base_url)
+        super().__init__(
+            model=model,
+            api_key=api_key,
+            base_url=base_url,
+            transport=transport,
+            retry_policy=retry_policy,
+            timeout_seconds=timeout_seconds,
+        )
+        self._token_provider = token_provider or ServiceAccountTokenProvider(api_key)
+        self._supports_temperature = supports_temperature
+        self._supports_top_p = supports_top_p
+        self._supports_top_k = supports_top_k
+        self._supports_reasoning = supports_reasoning
+        self._reasoning_effort = reasoning_effort
+
+    async def complete_async(
+        self,
+        request: ModelRequest,
+        *,
+        deadline: RequestDeadline | None = None,
+        idempotency_key: str | None = None,
+    ) -> ModelResponse:
+        """Warm the bearer token off the event loop, then run the shared completion flow."""
+        request_deadline = deadline or RequestDeadline.after(
+            completion_timeout_seconds(self._timeout_seconds, request.maximum_output_tokens)
+        )
+        await _warm_vertex_bearer_token(
+            self._token_provider, request_deadline, self._timeout_seconds
+        )
+        return await super().complete_async(
+            request, deadline=request_deadline, idempotency_key=idempotency_key
+        )
+
+    def _headers(self) -> dict[str, str]:
+        """Build native Vertex headers carrying the provider's current bearer token."""
+        return _vertex_bearer_headers(self._token_provider)
+
+    def gateway_wire_profile(self) -> GatewayWireProfile:
+        """Return the native Anthropic Messages profile pinned to the Vertex SSE route.
+
+        The URL is the ``:streamRawPredict`` endpoint the native data plane POSTs for SSE, the
+        same way :class:`VertexClient` pins the Gemini ``:streamGenerateContent`` route; the
+        bearer token is minted on the blocking callback thread so the hourly refresh never
+        blocks Rust's async dispatcher.
+        """
+        return GatewayWireProfile(
+            dialect="anthropic_messages",
+            url=f"{self._base_url}/{self._stream_path()}",
+            headers=self._headers(),
+            model_id=self._model.model_id,
+            timeout_seconds=self._timeout_seconds,
+            supports_temperature=self._supports_temperature,
+            maximum_temperature=1.0,
+            supports_top_p=self._supports_top_p,
+            supports_top_k=self._supports_top_k,
+            supports_reasoning=self._supports_reasoning,
+            reasoning_wire_format="anthropic_adaptive",
+            reasoning_effort=self._reasoning_effort,
+            # The marker the shared dispatch body builder keys on to emit the
+            # Vertex-correct envelope (drop top-level "model", add
+            # "anthropic_version"); this is the path EVERY real gateway request
+            # takes, not the blocking _build_request below.
+            # NOT LIVE-VERIFIED and left for the connection/catalog step to
+            # validate against live Vertex: prompt-caching cache_control (incl.
+            # the 1h TTL) availability and billing parity, extended-thinking
+            # budgets, and max_tokens ceilings on Vertex-Anthropic vs direct
+            # Anthropic. Batch is out of scope.
+            anthropic_vertex_version=VERTEX_ANTHROPIC_VERSION,
+        )
+
+    def _completion_path(self) -> str:
+        """Return the publisher-scoped native blocking rawPredict route."""
+        return (
+            f"{_ANTHROPIC_PATH_PREFIX}{_vertex_anthropic_model_id(self._model.model_id)}:rawPredict"
+        )
+
+    def _stream_path(self) -> str:
+        """Return the publisher-scoped native SSE streaming route."""
+        return (
+            f"{_ANTHROPIC_PATH_PREFIX}"
+            f"{_vertex_anthropic_model_id(self._model.model_id)}:streamRawPredict"
+        )
+
+    def _build_request(self, request: ModelRequest) -> JsonObject:
+        """Build the Anthropic Messages body with Vertex's envelope quirks.
+
+        Reuses the shared Anthropic builder, then drops the top-level ``model`` (it is in the
+        URL) and adds ``anthropic_version`` (which Vertex reads from the body).
+        """
+        payload = anthropic_messages_request(
+            _vertex_anthropic_model_id(self._model.model_id),
+            request,
+            supports_temperature=self._supports_temperature,
+            supports_top_p=self._supports_top_p,
+            supports_top_k=self._supports_top_k,
+            supports_reasoning=self._supports_reasoning,
+            reasoning_effort=self._reasoning_effort,
+        )
+        payload.pop("model", None)
+        payload["anthropic_version"] = VERTEX_ANTHROPIC_VERSION
+        return payload
+
+    def _parse_response(self, payload: JsonObject, *, latency_seconds: float) -> ModelResponse:
+        """Convert one completed Messages payload into the shared response contract."""
+        return anthropic_messages_response(
+            payload, configured_model=self._model, latency_seconds=latency_seconds
         )
 
 

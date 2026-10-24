@@ -1,5 +1,9 @@
 //! Bounded provider events, committed to one deployment and drained by HTTP surfaces.
 
+mod deadline;
+pub use deadline::{
+    stream_timeout_failure, DEADLINE_BEFORE_OUTPUT_MESSAGE, DEADLINE_WHILE_GENERATING_MESSAGE,
+};
 mod progress;
 
 use std::collections::VecDeque;
@@ -33,8 +37,7 @@ pub fn collection_public_error(failure: &Failure) -> PublicError {
 /// again after streamed deltas, matching the Python bounded aggregator.
 pub fn event_retained_bytes(event: &Event) -> usize {
     match event {
-        Event::GeminiThoughtPart(part) => crate::dialects::records_retained_bytes(part)
-            .unwrap_or(MAXIMUM_RETAINED_OUTPUT_BYTES.saturating_add(1)),
+        Event::GeminiThoughtPart(part) => crate::dialects::json_retained_bytes(part),
         Event::TextDelta(text) | Event::RefusalDelta(text) | Event::Image(text) => text.len(),
         Event::ProviderTextDelta { delta, .. } | Event::ProviderRefusalDelta { delta, .. } => {
             delta.len()
@@ -52,9 +55,11 @@ pub fn event_retained_bytes(event: &Event) -> usize {
         Event::ToolArgumentsDelta { delta, .. } | Event::ServerToolArgumentsDelta { delta, .. } => {
             delta.len()
         }
-        Event::ToolCallCompleted { call, .. } | Event::ServerToolUseCompleted { call, .. } => {
-            call.raw_arguments.len().max(64)
-        }
+        Event::ToolCallCompleted { call, .. } | Event::ServerToolUseCompleted { call, .. } => call
+            .raw_arguments
+            .len()
+            .max(64)
+            .saturating_add(call.thought_signature.as_deref().map_or(0, str::len)),
         Event::ServerToolResult { block, .. } => block.len(),
         Event::CitationDelta { citation, .. } => citation.len(),
         Event::HostedToolItemStarted { item, .. } | Event::HostedToolItemCompleted { item, .. } => {
@@ -80,21 +85,6 @@ pub fn event_retained_bytes(event: &Event) -> usize {
         Event::SafeguardResults(results) => crate::dialects::records_retained_bytes(results)
             .unwrap_or(MAXIMUM_RETAINED_OUTPUT_BYTES.saturating_add(1)),
         _ => 64,
-    }
-}
-
-/// Classify one mid-stream chunk timeout the way the python transport does:
-/// a stalled provider read is a retryable transport failure unless the
-/// request's own deadline is exhausted.
-pub fn stream_timeout_failure(deadline: Instant) -> Failure {
-    if remaining(deadline).is_zero() {
-        Failure::new(FailureClass::Timeout, "gateway execution deadline exceeded")
-    } else {
-        Failure::new(
-            FailureClass::Transport,
-            "provider transport failed; retry the request",
-        )
-        .with_retry(true, true)
     }
 }
 
@@ -178,6 +168,8 @@ pub struct UpstreamRelay {
     /// failure the provider declares on this stream, before or after commit,
     /// is re-owned as the customer's. `None` on house rungs.
     customer_managed_provider: Option<String>,
+    /// A tenant origin: every failure this stream yields answers opaquely.
+    tenant_origin: bool,
     eof: bool,
     /// Whether any body byte has arrived: stamps the time-to-first-byte
     /// histogram once. It does NOT satisfy the stall bound below: a provider
@@ -278,14 +270,13 @@ impl UpstreamRelay {
             stop_guard: None,
             tool_serializer: None,
             customer_managed_provider: None,
+            tenant_origin: false,
             eof: false,
             first_byte_recorded: false,
             stall_bound_armed: true,
             committed: false,
             provider_tools: progress::ProviderTools::default(),
-            tool_arguments: progress::BufferedToolArguments::new(
-                dialect == Dialect::AnthropicMessages,
-            ),
+            tool_arguments: progress::BufferedToolArguments::default(),
             last_progress_at: None,
             yielded_at: None,
             first_token_deadline,
@@ -368,18 +359,14 @@ impl UpstreamRelay {
                 match event {
                     Event::Usage(_) => observation.record(event),
                     Event::Failed(failure) => {
-                        let failure = match self.customer_managed_provider.as_deref() {
-                            Some(provider) => crate::stream_errors::customer_credential_failure(
-                                failure.clone(),
-                                provider,
-                            ),
-                            None => failure.clone(),
-                        };
-                        observation.record(&Event::Failed(failure));
+                        observation.record(&Event::Failed(self.owned_failure(failure.clone())));
                     }
                     _ if event.is_terminal() => observation.record(event),
                     _ => {}
                 }
+            }
+            if self.normalizer.unreported_stop_read_as_length() {
+                observation.mark_unreported_truncation();
             }
         }
         self.pending.extend(events);
@@ -404,6 +391,12 @@ impl UpstreamRelay {
     /// ready: Tokio's timeout polls a ready future before its timer.
     fn read_failure(&self, deadline: Instant, phase_timeout: Duration) -> Option<Failure> {
         if remaining(deadline).is_zero() {
+            if self.last_progress_at.is_some() {
+                return Some(Failure::new(
+                    FailureClass::Timeout,
+                    DEADLINE_WHILE_GENERATING_MESSAGE,
+                ));
+            }
             return Some(stream_timeout_failure(deadline));
         }
         if self.provider_tools.active() {
@@ -439,14 +432,12 @@ impl UpstreamRelay {
         self.first_token_at
     }
 
-    /// The upstream an aggregator named as serving this stream (OpenRouter's
-    /// per-chunk `provider`), read at commit to settle with the attempt.
+    /// The upstream an aggregator named for this stream (OpenRouter's `provider`), settled at commit.
     pub fn upstream_provider(&self) -> Option<String> {
         self.normalizer.upstream_provider().map(str::to_string)
     }
 
-    /// Caller-known label words (the dispatched model id) exempt from the
-    /// provider-identifier screen on stream-error detail.
+    /// Caller-known words (the dispatched model id) exempt from the stream-error identifier screen.
     pub fn set_request_words<I, S>(&mut self, words: I)
     where
         I: IntoIterator<Item = S>,
@@ -455,10 +446,20 @@ impl UpstreamRelay {
         self.normalizer.set_request_words(words);
     }
 
+    /// Carry the caller's output cap into terminal classification.
+    pub fn set_output_token_cap(&mut self, cap: Option<u64>) {
+        self.normalizer.set_output_token_cap(cap);
+    }
+
     /// Carry the rung's cache-write accounting into usage normalization.
     pub fn set_cache_writes_within_reads(&mut self, writes_within_reads: bool) {
         self.normalizer
             .set_cache_writes_within_reads(writes_within_reads);
+    }
+
+    /// Carry whether this rung asked for 12-hour cache writes into usage normalization.
+    pub fn set_twelve_hour_cache_writes(&mut self, requested: bool) {
+        self.normalizer.set_twelve_hour_cache_writes(requested);
     }
 
     /// Carry the tokens this attempt's own automatic cache create wrote.
@@ -509,6 +510,21 @@ impl UpstreamRelay {
         self.customer_managed_provider = provider;
     }
 
+    /// Mark this relay's origin as a tenant's, so every failure it yields is opaque.
+    pub fn set_tenant_origin(&mut self, tenant: bool) {
+        self.tenant_origin = tenant;
+    }
+
+    /// Attribute one yielded failure: a customer-managed provider owns its
+    /// credential failures, and a tenant origin's answer is opaque.
+    fn owned_failure(&self, failure: Failure) -> Failure {
+        let failure = match self.customer_managed_provider.as_deref() {
+            Some(provider) => crate::stream_errors::customer_credential_failure(failure, provider),
+            None => failure,
+        };
+        failure.with_tenant_origin(self.tenant_origin)
+    }
+
     /// Serialize this relay's tool calls to one per turn (the caller sent
     /// `parallel_tool_calls: false` to a wire without that control).
     pub fn set_serialize_tool_calls(&mut self, serialize: bool) {
@@ -544,13 +560,8 @@ impl UpstreamRelay {
         let Some(mut event) = self.pending.pop_front() else {
             return Ok(false);
         };
-        if let (Some(provider), Event::Failed(failure)) =
-            (self.customer_managed_provider.as_deref(), &event)
-        {
-            event = Event::Failed(crate::stream_errors::customer_credential_failure(
-                failure.clone(),
-                provider,
-            ));
+        if let Event::Failed(failure) = &event {
+            event = Event::Failed(self.owned_failure(failure.clone()));
         }
         // Progress belongs to the provider, not the outward projection. A
         // stop-sequence match suppresses later text while still draining the
@@ -804,12 +815,20 @@ pub async fn collect_committed(
 ) -> Result<Vec<Event>, Failure> {
     let mut events: Vec<Event> = Vec::new();
     let mut retained_bytes = 0usize;
+    let mut lease = crate::retained::RetainedLease::default();
     let mut retain = |events: &mut Vec<Event>, event: Event| -> Result<(), Failure> {
-        retained_bytes = retained_bytes.saturating_add(event_retained_bytes(&event));
+        let bytes = event_retained_bytes(&event);
+        retained_bytes = retained_bytes.saturating_add(bytes);
         if retained_bytes > MAXIMUM_RETAINED_OUTPUT_BYTES {
             return Err(Failure::new(
                 FailureClass::ProviderInternal,
                 OUTPUT_OVERFLOW_MESSAGE,
+            ));
+        }
+        if !lease.reserve(bytes) {
+            return Err(Failure::new(
+                FailureClass::Unavailable,
+                crate::retained::WORKER_RETENTION_EXHAUSTED_MESSAGE,
             ));
         }
         events.push(event);

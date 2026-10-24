@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import gzip
 import hashlib
+import random
 from pathlib import Path
 
 import pytest
@@ -17,8 +18,10 @@ from exp.runtime.gateway.reservation_tokenizer import (
     PACKAGED_RANKS_SHA256,
     RESERVATION_ENCODING,
     ReservationTokenizerError,
+    count_reservation_tokens,
     packaged_ranks,
     reservation_encoder,
+    reservation_token_bound,
 )
 
 
@@ -102,3 +105,72 @@ def test_corrupt_or_missing_table_fails_loud(monkeypatch: pytest.MonkeyPatch) ->
     )
     with pytest.raises(ReservationTokenizerError, match="missing or unreadable"):
         packaged_ranks()
+
+
+_ALPHABET = (
+    "abcXYZ",
+    "éßЖ漢字",
+    "0123456789",
+    " ",
+    "  \t",
+    "\n",
+    "\r\n",
+    "\n\n",
+    "{}[]();:,.!?'\"/\\-_=+*&^%$#@",
+    "'s 're 'll",
+    "\u0301",  # a combining mark
+    "😀",
+    "<|endoftext|>",
+)
+
+
+def _random_text(rng: random.Random, pieces: int) -> str:
+    """Adversarial mixtures of every o200k pre-tokenizer character class."""
+    return "".join(rng.choice(_ALPHABET) for _ in range(pieces))
+
+
+def test_buffer_count_equals_encode_ordinary_including_specials_and_surrogates() -> None:
+    encoder = reservation_encoder()
+    rng = random.Random(11)
+    texts = [_random_text(rng, rng.randint(0, 400)) for _ in range(200)]
+    texts += ["", "<|endoftext|><|endofprompt|>", "lone \ud800 surrogate", "x" * 10_000]
+    for text in texts:
+        assert count_reservation_tokens(text) == len(encoder.encode_ordinary(text))
+
+
+def test_newline_letter_boundaries_split_the_count_exactly() -> None:
+    """The reset the bounded count relies on: no pre-token spans "\n" + letter."""
+    encoder = reservation_encoder()
+    rng = random.Random(23)
+    for _ in range(300):
+        text = _random_text(rng, rng.randint(2, 300)) + "\n" + rng.choice("aZéЖ漢")
+        text += _random_text(rng, rng.randint(0, 300))
+        for index in range(1, len(text)):
+            if text[index - 1] == "\n" and text[index].isalpha():
+                whole = len(encoder.encode_ordinary(text))
+                halves = len(encoder.encode_ordinary(text[:index])) + len(
+                    encoder.encode_ordinary(text[index:])
+                )
+                assert whole == halves, repr(text[max(0, index - 8) : index + 8])
+
+
+def test_bound_is_exact_within_the_window_and_never_below_the_count() -> None:
+    encoder = reservation_encoder()
+    rng = random.Random(5)
+    for _ in range(200):
+        text = _random_text(rng, rng.randint(0, 600))
+        exact = len(encoder.encode_ordinary(text))
+        assert reservation_token_bound(text) == exact
+        for window in (0, 1, 16, 64, 256):
+            assert reservation_token_bound(text, exact_characters=window) >= exact
+
+
+def test_bound_counts_the_prefix_and_bounds_the_rest_by_utf8_length() -> None:
+    prefix = "def handler(event):\n    return event\n"
+    suffix = "Reply in prose. " * 50
+    text = prefix + suffix
+    counted = reservation_token_bound(text, exact_characters=len(prefix) + 3)
+    assert counted == count_reservation_tokens(prefix) + len(suffix.encode())
+    # No reset inside the window: the whole text is bounded by its bytes.
+    flat = "word " * 200
+    assert reservation_token_bound(flat, exact_characters=100) == len(flat.encode())

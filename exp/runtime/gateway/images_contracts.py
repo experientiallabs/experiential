@@ -7,6 +7,7 @@ from typing import Literal
 from pydantic import Field
 
 from exp.common.core.artifacts import ContractModel
+from exp.common.models.catalog_prices import BilledUnitKind, GatewayTokenPrices
 from exp.runtime.gateway.contracts import GatewayApiSurface
 from exp.runtime.gateway.ledger_valuation import require_representable_nano_usd
 
@@ -56,22 +57,61 @@ class ImagesRequest(ContractModel):
         return self.user
 
 
+def image_variant(request: ImagesRequest) -> str:
+    """The priced variant of one request on a per-image unit card.
+
+    ``quality/size`` with omitted parts dropped (``"hd/1024x1792"``,
+    ``"1024x1024"``, or ``""``). A card without that exact key prices the
+    request at its flat ``""`` rate when it has one.
+
+    Args:
+        request: The canonical request.
+
+    Returns:
+        The variant key.
+    """
+    return "/".join(part for part in (request.quality, request.size) if part)
+
+
+def per_image_rate(prices: GatewayTokenPrices, request: ImagesRequest) -> int | None:
+    """The lane's nano-USD per image for this request, or None when not per-image priced.
+
+    Args:
+        prices: The deployment's price card.
+        request: The canonical request.
+
+    Returns:
+        The rate, or None when the card is absent, of another kind, or has no
+        rate for the request's variant.
+    """
+    units = prices.units
+    if units is None or units.kind != BilledUnitKind.IMAGE:
+        return None
+    return units.rate_for(image_variant(request))
+
+
 def images_ceiling_nano_usd(
     request: ImagesRequest,
     *,
     input_tokens: int,
     input_rate: int | None,
     output_rate: int | None,
+    image_rate: int | None = None,
 ) -> int | None:
-    """Return the conservative reservation ceiling for one token-priced image call.
+    """Return the conservative reservation ceiling for one image call.
 
-    GPT image models bill prompt tokens at the input rate and generated image
-    tokens at the output rate; ``input_tokens`` is the prompt's estimated input
-    reservation and ``n`` times the largest per-image token count bounds the
-    output. A lane without both rates is unpriced for images (``None``): the
-    per-image priced models (dall-e) wait for the typed billed-units ledger. A
-    ceiling past the int8 ledger column raises ``NanoUsdOverflowError``.
+    A per-image priced lane (``image_rate``) reserves ``n`` images at its rate,
+    which is also the most it can settle. GPT image models bill prompt tokens
+    at the input rate and generated image tokens at the output rate;
+    ``input_tokens`` is the prompt's estimated input reservation and ``n``
+    times the largest per-image token count bounds the output. A token lane
+    without both rates is unpriced (``None``). A ceiling past the int8 ledger
+    column raises ``NanoUsdOverflowError``.
     """
+    if image_rate is not None:
+        return require_representable_nano_usd(
+            request.n * image_rate, what="images reservation ceiling"
+        )
     if input_rate is None or output_rate is None:
         return None
     input_ceiling = input_tokens * input_rate

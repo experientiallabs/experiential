@@ -115,9 +115,17 @@ class GatewayUsage(ContractModel):
         cached_input_tokens: Cache-read subset of the input.
         cache_creation_input_tokens: Cache-write subset of the input.
         cache_creation_1h_input_tokens: One-hour subset of the cache writes.
+        cache_creation_12h_input_tokens: OpenAI 12-hour subset of the cache writes,
+            disjoint from the one-hour subset, or None when no split was reported.
         reasoning_tokens: Reasoning subset of the output.
+        image_output_tokens: Generated-image subset of the output (Gemini's IMAGE
+            modality count, OpenRouter's ``image_tokens``), or None when unreported.
         tool_names: Invoked tool names in first-use order.
         web_search_requests: Gateway-executed web searches billed to the attempt.
+        web_search_results: Results those searches returned (each billed by the
+            vendor as one contents page), or None when the settlement named none.
+        web_search_cost_nano_usd: The search vendor's own reported cost for those
+            searches in whole nano-USD, or None when it reported none.
         tool_search_requests: Gateway-executed tool-search rounds billed to the attempt.
         billed_units: Media units priced by the deployment's unit card (characters,
             audio or video seconds, images), beside or instead of tokens; None on
@@ -134,13 +142,23 @@ class GatewayUsage(ContractModel):
     cache_creation_1h_input_tokens: int | None = Field(default=None, ge=0)
     """Observed 1-hour subset of cache writes; zero proves all writes use 5m.
     None means no complete TTL breakdown was reported, so write cost is unknown."""
+    cache_creation_12h_input_tokens: int | None = Field(default=None, ge=0)
     reasoning_tokens: int | None = Field(default=None, ge=0)
+    image_output_tokens: int | None = Field(default=None, ge=0)
     tool_names: tuple[str, ...] = ()
     """Invoked tool names in first-use order, names only and never arguments."""
     web_search_requests: int = Field(default=0, ge=0)
     """Gateway-executed web searches billed to this attempt; never a provider
     meter and not a subset of any token total. Zero on every attempt that ran
     no search, including every attempt settled by an engine predating it."""
+    web_search_results: int | None = Field(default=None, ge=0)
+    """Results the gateway's web searches returned (each one a vendor contents
+    page); None whenever ``web_search_requests`` is zero or the engine that
+    settled predates the field, so a host prices the search as before."""
+    web_search_cost_nano_usd: int | None = Field(default=None, ge=0)
+    """The search vendor's own reported cost for this attempt's web searches
+    (Exa ``costDollars.total``) in whole nano-USD; None when the vendor
+    reported none. A host billing the true pass-through prefers it."""
     tool_search_requests: int = Field(default=0, ge=0)
     """Gateway-executed tool-search rounds billed to this attempt; never a
     provider meter and not a subset of any token total. Zero on every attempt
@@ -167,6 +185,16 @@ class GatewayUsage(ContractModel):
             or self.cache_creation_1h_input_tokens > self.cache_creation_input_tokens
         ):
             raise ValueError("1-hour cache writes require a covering cache-creation total")
+        if self.cache_creation_12h_input_tokens is not None and (
+            self.cache_creation_input_tokens is None
+            or self.cache_creation_12h_input_tokens + (self.cache_creation_1h_input_tokens or 0)
+            > self.cache_creation_input_tokens
+        ):
+            raise ValueError("12-hour cache writes require a covering cache-creation total")
+        if self.image_output_tokens is not None and (
+            self.output_tokens is None or self.image_output_tokens > self.output_tokens
+        ):
+            raise ValueError("image output tokens require a covering output total")
         return self
 
     @property
@@ -238,14 +266,23 @@ class GatewayEvent(ContractModel):
     estimate. Neither policy treats the partial meter as a final provider bill.
     This marker never joins public serialized events or replay identity.
     """
-    usage_estimated: bool = Field(default=False, exclude=True, strict=True)
-    """The usage on a cancelled disconnect is the gateway's own tokenizer estimate.
+    usage_unreported_truncation: bool = Field(default=False, exclude=True, strict=True)
+    """Trusted evidence that a capped request's budget truncation arrived without a usage meter.
 
-    Set only by the accounting registry after a dispatched, opened attempt lost
-    its caller before the provider's final meter: the prompt count and the
-    generated text observed so far replace the legs the provider never
-    reported, so the work the provider billed settles at its estimated cost
-    instead of an unknown one. Observed legs are kept; never a public field.
+    The provider generated the whole output budget yet sent no usage report
+    (a usage-less ``stop`` the data plane read as ``length``), so the meter is
+    estimated at no less than that budget rather than settled as unknown.
+    This marker never joins public serialized events or replay identity.
+    """
+    usage_estimated: bool = Field(default=False, exclude=True, strict=True)
+    """The usage is the gateway's own tokenizer estimate of an unreported meter.
+
+    Set only by the accounting registry, after a dispatched, opened attempt
+    lost its caller before the provider's final meter, or truncated at its
+    output budget without one: the prompt count and the generated text observed replace the legs
+    the provider never reported, so the work the provider billed settles at
+    its estimated cost instead of an unknown one. Observed legs are kept;
+    never a public field.
     """
     decision_provider_rejected: bool = Field(default=False, exclude=True, strict=True)
     """Internal decision settlement evidence that an HTTP rejection preceded execution.
@@ -280,12 +317,14 @@ class GatewayEvent(ContractModel):
             or self.failure.failure_class is not GatewayFailureClass.CANCELLED
         ):
             raise ValueError("incomplete disconnect usage requires a cancelled terminal")
+        if self.usage_unreported_truncation and self.kind is not GatewayEventKind.INCOMPLETE:
+            raise ValueError("an unreported truncation requires an incomplete terminal")
         if self.usage_estimated and (
-            not self.usage_incomplete_due_to_disconnect
+            not (self.usage_incomplete_due_to_disconnect or self.usage_unreported_truncation)
             or self.usage is None
             or not self.usage.has_token_counts
         ):
-            raise ValueError("estimated usage requires a disconnect with both token totals")
+            raise ValueError("estimated usage requires an unreported meter with both token totals")
         if self.kind in {GatewayEventKind.TEXT_DELTA, GatewayEventKind.REFUSAL_DELTA}:
             if self.text_delta is None:
                 raise ValueError("text and refusal deltas require text_delta")
@@ -405,6 +444,19 @@ class GatewayRefusalReason(StrEnum):
     UNSPECIFIED = "unspecified"
 
 
+class GatewayHeaderTimeout(StrEnum):
+    """Which bound ended a dial waiting for response headers, mirroring the
+    native ``HeaderTimeout``.
+
+    ``allowance``: the rung's own first-byte allowance expired, a hung-lane
+    strike. ``budget``: the request's shared pre-first-byte budget (or its
+    deadline) expired first, so a fallback dialed late is not blamed.
+    """
+
+    ALLOWANCE = "allowance"
+    BUDGET = "budget"
+
+
 class GatewayFailure(ContractModel):
     """Sanitized failure with retry and failover eligibility already classified."""
 
@@ -435,6 +487,9 @@ class GatewayFailure(ContractModel):
     Set from the provider's own code and sentence and carried on the public
     error and the settlement argument, so the caller reads the category and
     the control plane counts refusals by reason without parsing detail."""
+    header_timeout: GatewayHeaderTimeout | None = None
+    """Set only on a header-phase timeout: which bound expired (lane ejection
+    counts only ``allowance``)."""
 
 
 def _validate_responses_probability_records(

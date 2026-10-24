@@ -52,6 +52,7 @@ class WorldModelSessionLimits:
     maximum_observation_bytes: int = 65_536
     maximum_task_bytes: int = 65_536
     maximum_initial_context_bytes: int = 262_144
+    maximum_output_tokens: int = 1_024
 
     def __post_init__(self) -> None:
         """Validate every count, time, and byte ceiling.
@@ -60,6 +61,7 @@ class WorldModelSessionLimits:
             ValueError: A limit is nonpositive or the TTL is not finite.
         """
         integer_limits = (
+            self.maximum_output_tokens,
             self.maximum_sessions,
             self.maximum_messages_per_session,
             self.maximum_transcript_bytes,
@@ -272,7 +274,7 @@ class WorldModel:
                     candidate_response=candidate_action,
                     state=state.environment_state,
                     excluded_lineage_ids=(),
-                    maximum_output_tokens=1_024,
+                    maximum_output_tokens=self.limits.maximum_output_tokens,
                 )
                 dispatched = self._runtime.complete_turn(prepared)
             except WorldModelCapacityError as exc:

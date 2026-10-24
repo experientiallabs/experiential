@@ -5,10 +5,69 @@ not permission to select a smaller output budget or a more expensive reasoning m
 
 ## Output limits
 
-Chat Completions accepts `max_completion_tokens`, `max_tokens`, or `max_output_tokens`
-(one non-null spelling per request) through its protocol decoder. Messages requires `max_tokens`. An explicit limit remains a ceiling:
-a route that requires a larger minimum is excluded or refused before dispatch, not served
-with a silently increased limit.
+Chat Completions accepts `max_completion_tokens`, `max_tokens`, or `max_output_tokens` through
+its protocol decoder. Neither OpenAI nor OpenRouter defines them as exclusive, and many clients
+send `max_tokens` beside `max_completion_tokens`, so when several arrive together the smallest
+value is the cap (ties keep `max_completion_tokens`, then `max_tokens`) and each other spelling is
+disclosed as `max_tokens->ignored(superseded_by_max_completion_tokens)`. Each value must still be
+a positive integer. Messages requires `max_tokens`. An explicit limit remains a ceiling.
+Admission prefers any rung that accepts the exact value. When no rung on the route does, the
+limit is clamped onto the leading rung's accepted range and the change is disclosed: a limit
+above the route maximum dispatches at that maximum (`max_tokens->32768(route_maximum)`; Claude
+Code sends 64000 or 128000 to every model), and a limit below the route floor (16 on the OpenAI
+Responses wire, or a catalog-declared minimum) dispatches at the floor
+(`max_output_tokens->16(route_minimum)`). Lowering never bills more than the caller allowed;
+raising adds at most the floor's few tokens. A plan account that refuses any ceiling still
+narrows out instead.
+
+## Sampling ranges
+
+`temperature` and `top_p` outside the public bounds (`temperature` 0 to 2, `top_p` 0 to 1, never
+NaN) are refused by the protocol decoder. Inside them, admission prefers any rung that accepts the
+exact value. When every rung that declares the control refuses the value on range, it is clamped
+onto the leading rung's range like an output limit and disclosed: Claude's thinking lanes accept
+only `temperature` 1.0, so a caller's 0.1 serves as `temperature->1.0(route_minimum)` instead of
+a 400. A rung that does not declare the control serves by dropping it
+(`temperature->dropped(unsupported_by_provider)`), so its presence leaves the value unclamped.
+
+## Structured output routing
+
+A `response_format` (Chat) or `text.format` (Responses) json_schema request is a hard capability:
+admission first narrows the route to the rungs whose catalog declares structured output, in route
+order, and only then ranks them by how exactly they keep sampling and thinking preferences.
+Otherwise a lead rung that keeps the caller's `temperature` exactly but cannot enforce a schema
+would win the ranking and be refused, although a later rung serves the schema (qwen3.8-27b,
+2026-10-17). When the lead is passed over the move is disclosed as
+`response_format->routed(structured_output_rung)` (`text.format->...` on Responses). A route
+with no structured-output rung keeps failing closed on the field. A continuation pinned to the
+rung that sealed its reasoning, and a caller-pinned `gateway.routing.route_id`, never move.
+
+## Tool and media routing
+
+Function `tools` and media inputs (images, video, audio, PDFs) are hard capabilities too, and they
+narrow before structured output: admission keeps only the rungs whose catalog declares them, then
+ranks those by sampling. A rung that does not declare the feature would be refused by the
+per-rung capability check anyway, so narrowing never drops a rung that could serve; it stops a
+tool-less rung that keeps `temperature` and `top_p` exactly from winning the ranking. GitHub
+Copilot sends tools with `temperature` 0.1 and `top_p` 1; on gpt-6-astra only the tool-less Novita
+rung takes those controls, so the request was refused as unsupported `tools` although the OpenAI
+rung serves tools (2026-10-20). That rung now serves and drops the sampling it does not take,
+disclosed. A passed-over lead is disclosed as `tools->routed(tools_rung)`, or
+`messages->routed(image_input_rung)` (`input->...` on Responses) for media. Because structured
+output narrows among the rungs tools kept, a request no rung can serve whole is refused on the
+feature the tool rungs lack (`response_format`), not on `tools`. A route with no rung for the
+feature keeps failing closed on it.
+
+## Output limits and context windows
+
+A limit that no rung's declared context window can reserve beside the prompt (`max_tokens`
+10,000,000 on a 131,072-token route that declares no output maximum) is lowered before the
+window check to what the largest window leaves, disclosed as
+`max_tokens-><n>(context_window)`. The prompt is sized from above for this: one token per text
+byte plus a 256-token template reserve, or three bytes per token when that leaves no room. A
+rung that declares no window, or that already holds the request, keeps the value. Only the
+output limit changes: a prompt that alone exceeds every window is still refused with
+`context_length_exceeded`.
 
 When the caller omits a limit:
 
@@ -38,10 +97,91 @@ It does not promise that every billed output token appears as visible text or to
 Responses input messages with role `user`, `system`, or `developer` may include
 `status` without an output item ID, as in the official input-message contract.
 Their status does not create assistant replay identity. An assistant output
-message carrying `status` still requires its item ID; replay phase markers keep
-their existing identity requirement.
+message replayed with `status` or `phase` but without its item ID (LiteLLM's
+Responses bridge echoes history this way) decodes as plain assistant history:
+the markers cannot anchor a replay without the ID, so they are dropped and
+disclosed as `input.status->dropped(no_item_id)` / `input.phase->dropped(no_item_id)`.
+Messages that carry their ID keep status and phase for exact replay.
+
+Item IDs the OpenAI Responses API could not have issued (a client's `msg_<uuid>`,
+another gateway's `item_` prefix, a non-`fc_` function-call ID) are never sent to
+an OpenAI Responses rung, which refuses them. The item replays without its ID at
+its original position; `store=false` means the provider resolves nothing by ID.
+
+## Tolerated client fields
+
+- Responses `stream_options` is accepted. The gateway never emits obfuscation
+  padding, so `include_obfuscation: false` is honored exactly; `true` is disclosed
+  as `stream_options.include_obfuscation->ignored(not_emitted)`, and the object on
+  a non-streaming call as `stream_options->ignored(stream_false)`.
+- Responses `text.format.type: "json_object"` selects the same schema-free JSON mode
+  as Chat `response_format: {"type": "json_object"}`.
+- A key the gateway does not define on a conversation object is dropped before dispatch
+  instead of refused: on Chat messages, their assistant `tool_calls` entries, their
+  content parts and each part's media object (`image_url`, `video_url`, `input_audio`,
+  `file`; the Vercel AI SDK sends `image_url.providerOptions`), on Responses `message`
+  input items and their content parts, and on Messages turns (Claude Code 2.1.282 and
+  later sends `output_config` inside a turn, disclosed as
+  `messages.output_config->dropped(unknown_message_field)`; the top-level `output_config`
+  is unaffected). Chat apps stamp their own bookkeeping on the history they replay
+  (WorkBuddy's `conversationRequestId`, `isInternalToolCall`, `model_id`), so a refusal
+  failed every later turn. Each dropped key is named once per request, as
+  `messages.<field>`, `messages.tool_calls.<field>`, `messages.content.<field>` or
+  `messages.content.image_url.<field>` (`input.` on Responses)
+  `->dropped(unknown_message_field)`. Keys traced to one client keep
+  `client_annotation` as the reason: Copilot Chat's `cot_id` and `cot_summary`, the
+  `timestamp` and `startsNewUserRequest` other agents stamp, WorkBuddy CLI's `agent`, and
+  an image's `image_url.dimensions` size hint. Field names are reduced to `[A-Za-z0-9_]`, at most 64
+  characters, and at most 16 keys are named; the rest are counted in one
+  `messages.*->dropped(<n>_more_unknown_message_fields)` entry. Defined fields keep
+  their typed refusal for a bad value, unknown keys inside a tool call's `function`
+  object, inside a Messages content block, or on other Responses item types stay
+  refused, and an unknown top-level parameter is still `unsupported_parameter`.
+- OpenAI's optional participant `name` on a system, developer, user or assistant message is
+  dropped, disclosed as `messages.name->dropped(participant_name)`. On tool messages `name`
+  still attributes the result.
+- `chat_template_kwargs.preserve_thinking` is accepted and disclosed as
+  `chat_template_kwargs.preserve_thinking->ignored(not_forwarded)`: no wire receives
+  `chat_template_kwargs` verbatim.
+- A Responses reasoning input item with neither `id` nor `encrypted_content` cannot be resolved
+  by any provider, and its summary never reaches provider history, so it is removed,
+  `input.reasoning->dropped(no_id_or_encrypted_content)`.
+- Codex Desktop's `internal_chat_message_metadata_passthrough` on Responses input items is
+  removed, `input.internal_chat_message_metadata_passthrough->dropped(client_annotation)`, and
+  its `stream_options.reasoning_summary_delivery` is disclosed as
+  `stream_options.reasoning_summary_delivery->ignored(not_supported)`.
+- Inline input images are accepted up to 20 MiB decoded (OpenAI's per-image limit; the base64
+  text may be up to 27,962,028 characters). Narrower provider limits (Anthropic, Bedrock)
+  surface as provider errors on those rungs.
+- On the Messages surface a `document` block with Anthropic's `text` source
+  (`media_type: "text/plain"`) joins the turn as the caller's text, title first. A content
+  block of a type the surface does not define is refused naming that type.
+- A control-store refusal that names no caller field (for example a model-chain release
+  crossing) answers a retryable 503 `gateway_authority_unavailable` with `Retry-After: 5`
+  (`overloaded_error` on the Messages surface), with the store's reason in the worker log,
+  instead of an unnamed 400.
+- `service_tier: "priority"` (Codex Fast mode) on a route with no priority-capable
+  rung dispatches at the standard tier, disclosed as
+  `service_tier->default(priority_unavailable)`. Standard never costs more. `flex`
+  asks for a cheaper tier, so it stays a typed refusal on such a route.
 
 ## Reasoning controls
+
+When no rung on a route can honor a reasoning control verbatim, admission applies the
+nearest servable reading and discloses it:
+
+- `none` or `minimal` below a route's whole effort ladder (for example `low, high, max`)
+  takes the shallowest tier the route serves, `reasoning_effort->low(lowest_supported)`.
+  Such a route cannot turn reasoning off; other efforts still only snap down.
+- A level-less enable-thinking toggle (`enable_thinking`, `chat_template_kwargs`) on a
+  route whose rungs cannot reason at any depth is dropped,
+  `enable_thinking->dropped(no_reasoning_rung)`. Numerical thinking budgets are never
+  dropped this way.
+- `include: ["reasoning.encrypted_content"]` on a route with no native Responses rung and no
+  gateway reasoning carrier is dropped, `include.reasoning.encrypted_content->dropped(no_reasoning_carrier)`:
+  the answer is what an omitted selector produces. Replayed native encrypted reasoning that no
+  rung can read is removed from history, `input.reasoning.encrypted_content->dropped(foreign_route)`.
+  A route with a native Responses rung keeps the payload and the provider judges it.
 
 Valid explicit thinking-off settings remain off. Model families distinguish support for
 budgeted thinking from support for disabling thinking. Claude Opus 5.5, Fable and Mythos
@@ -57,6 +197,14 @@ Opus 5.5 also cannot force a tool selection: the existing capability policy uses
 only after all eligible routes decline the forced choice and discloses `tool_choice->auto`.
 This does not guarantee a tool call. See the provider's
 [Opus 5.5 contract](https://platform.claude.com/docs/en/models/opus-5-5/migration-guide).
+
+Some origins turn thinking off with their own switch rather than `reasoning_effort: none`.
+GLM-5 and GLM-5.1 on Z.ai and on Huawei Cloud MaaS take `thinking: {type: disabled}` for
+`none` and `{type: enabled}` for any other level. Huawei MaaS DeepSeek-V4 models take
+`thinking: {type: disabled}` for `none` and keep `reasoning_effort` for `high` and `max`.
+Vertex MaaS GLM takes `chat_template_kwargs: {enable_thinking: false}`. On OpenRouter, a
+request with reasoning off also lists the upstreams seen to keep thinking anyway in
+`provider.ignore` (AtlasCloud today), so OpenRouter serves it elsewhere or refuses.
 
 A Responses `reasoning.summary` (or its deprecated alias `reasoning.generate_summary`) is
 best effort, as on OpenAI's own API. Admission prefers a rung whose wire carries summary parts over every other preference
@@ -101,14 +249,22 @@ an authored setting. A model name appearing inside a system message is not an AP
 A caller that explicitly requests budgeted thinking without a budget receives a derived
 budget that must fit the effective per-provider output ceiling. An explicit budget is not
 rewritten to fit. An impossible combination is refused before provider dispatch. Numeric
-Messages budgets are forwarded only to budget-capable wires, never converted into advisory
-effort or adaptive thinking.
+Messages budgets are forwarded verbatim to budget-capable wires. On a route with no
+budget-capable rung, the budget snaps to the nearest tier the route's effort ladder serves
+(under 2k tokens `low`, under 8k `medium`, under 24k `high`, above that `xhigh`; `0` asks for
+off and `-1` for the lane's default depth), disclosed as
+`thinking.budget_tokens->reasoning_effort:<tier>(route_effort_ladder)`. Only a route with no
+reasoning tier refuses it, and a budget beside an explicit effort stays refused. Haiku 4.5
+rejects adaptive thinking and `output_config.effort` by name, so `thinking: {type: "adaptive"}`
+there becomes a budget derived from `max_tokens` (`thinking.type->enabled`), and a recognized
+effort beside it drops as `output_config.effort->dropped(superseded_by_thinking_budget)`.
 
 The Chat field `thinking_budget` preserves the caller's numeric control on qualified
 Anthropic, Gemini 2.5, and native Qwen Cloud routes. Use it as an OpenAI SDK `extra_body`
 field (or a top-level field in HTTP JSON). It is not combined with `reasoning_effort`.
 The gateway translates the field name for the selected provider and discloses that
-translation; it does not replace the number with an effort tier.
+translation. On a route with no qualified rung it snaps onto the effort ladder like a
+Messages budget, disclosed as `thinking_budget->reasoning_effort:<tier>(route_effort_ladder)`.
 
 | Native provider route | Models | Provider control and constraints |
 | --- | --- | --- |
@@ -202,9 +358,16 @@ releasing the rest of the reserved bound; the local gateway's monthly allocation
 figure. A disconnect the provider never answered (not opened), or one on a DECISIONS request,
 keeps the conservative policy: the full reserved bound consumes local budget, the provider cost
 stays unknown, observed partial counts remain available, and hosted accounting retains unresolved
-authorization separately from settled spend. An observed terminal with missing usage retains the
-host's unknown-terminal policy; neither marker broadens it. Stopping generation is not evidence
-that its unreported usage was free, and an estimate is never reported as observed.
+authorization separately from settled spend. On a capped request, an OpenAI-compatible `stop`
+with no usage report is read as a budget truncation: the caller sees `length`, and the dispatched
+incomplete terminal carries the internal `usage_unreported_truncation` signal with the same
+`streamed_output`. An opened one is completed by the same estimate, with output metered at no less
+than the output budget the attempt dispatched with, because the provider generated and billed the
+whole budget, unstreamed reasoning included. Meta's muse lanes end a stream that hit `max_tokens`
+with `finish_reason: stop` and no usage frame (2026-10-17), and those turns had settled at $0. Any
+other observed terminal with missing usage retains the host's unknown-terminal policy.
+Stopping generation is not evidence that its unreported usage was free, and an estimate is never
+reported as observed.
 
 Meter parsing follows the provider's wire contract. Missing primary counts on partial
 OpenAI, Anthropic, or Bedrock reports remain unknown. Gemini's present `usageMetadata` uses
@@ -222,6 +385,59 @@ null, or the integer zero; contradictory positive or malformed values are reject
 gateway hops and SDK provider adapters restore those details to unknown before valuation.
 Every relay hop must preserve this evidence. A downstream parser cannot recover observability
 that an older relay already discarded.
+
+OpenAI's 12-hour prompt cache lifetime rides Responses `prompt_cache_options.ttl: "12h"`
+([OpenAI prompt caching](https://developers.openai.com/api/docs/guides/prompt-caching): "In the
+Responses API, set `prompt_cache_options.ttl` to choose the minimum cache lifetime"). `"30m"` is
+the provider default and is accepted as already satisfied; any other value, and `"12h"` on Chat
+(OpenAI's Chat answers 400 for it; `"30m"` is Chat's only documented lifetime), is refused. Admission
+narrows the route to rungs declaring `supports_prompt_cache_ttl_12h` whose wire carries the field
+(OpenAI's own Responses API) and refuses the request with `unsupported_capability` on
+`prompt_cache_options.ttl` when none does, so no rung that would write at the default lifetime or
+refuse the field (Azure, OpenRouter, a ChatGPT plan rung, a pre-GPT-5.6 model) is ever asked. An organization
+with prompt caching off has the lifetime removed and disclosed. The provider's
+`input_tokens_details.cache_write_tokens_details.ttl_12h_tokens` becomes the 12-hour write
+subset, disjoint from any one-hour subset, and is relayed as `cache_write_tokens_details` with
+`ttl_30m_tokens` and `ttl_12h_tokens`. Those writes price at the card's
+`cache_creation_12h_input_nano_usd_per_million_tokens`, or at 2.5 times its input rate (OpenAI's
+published total write rate) when the card authors none, never at the 30-minute write rate. A
+12-hour request whose provider reports writes without the split bills every write at 12 hours.
+
+`prompt_cache_options.mode: "explicit"` and the content-block `prompt_cache_breakpoint`
+(`{"mode": "explicit", "ttl"?: ...}`) are accepted on both OpenAI surfaces
+(`exp/runtime/openai_protocol/prompt_cache_controls.py`). `mode: "implicit"` is the provider
+default and is never forwarded; any other mode, a breakpoint that is not that exact shape, and a
+breakpoint `ttl` other than the request's own lifetime (re-emitted breakpoints inherit it) are
+named 400s, as is `prewarm`. A text-block breakpoint rides the canonical ephemeral
+`cache_control` carrier at the same block, so per dialect:
+
+- OpenAI, Azure OpenAI (its `openai_deployments` surface) and OpenRouter, on Chat and Responses,
+  receive `prompt_cache_options` and every breakpoint in their own spelling
+  (`GatewayWireProfile.forwards_prompt_cache_options`; a marked instruction rides an input item,
+  since Responses `instructions` cannot hold one). Explicit-mode cache writes are reported and
+  billed through the same `cache_write_tokens` legs as implicit ones.
+- Anthropic and Bedrock cache at the same blocks as ephemeral `cache_control` / `cachePoint` at
+  their 5-minute default, never the dearer 1-hour lifetime, disclosed as
+  `prompt_cache_breakpoint->translated(cache_control_5m)`; they cache only at markers, so
+  explicit mode already holds there.
+- Every other wire (Gemini, Novita, vLLM and other OpenAI-compatible servers, Azure's Foundry
+  model-inference surface) never receives the fields. Like any cache marker they are kept while
+  some rung honors them, and only a route where none does discloses
+  `prompt_cache_options.mode->not_forwarded(provider_decides_caching)` and
+  `messages.content.prompt_cache_breakpoint->not_forwarded(...)`. A breakpoint on an image,
+  audio or file part, or inside a Responses tool output, is dropped with a
+  `->dropped(unsupported_media)` / `->dropped(unsupported_tool_output)` disclosure.
+
+Anthropic Messages and Bedrock Converse bill thinking inside `output_tokens` and publish no
+separate count, so their reasoning meter stays unknown for settlement. Chat and Responses
+callers still receive an estimate, the way OpenRouter reports one: when the provider published
+no count and the turn carried thinking in any form, `completion_tokens_details.reasoning_tokens`
+(Chat) or `output_tokens_details.reasoning_tokens` (Responses) is `output_tokens` less
+`ceil(visible_bytes / 4)` for the answer text, refusal text and client tool arguments, floored
+at zero. The usage object then names it in `usage.estimated_token_details`
+(`["reasoning_tokens"]`, its only allowed entry) instead of `unreported_token_details`. The
+estimate is display only: it never changes the settled usage, and native hops and SDK provider
+adapters read a marked count as unknown.
 
 ## Gemini usage trailers
 
@@ -345,3 +561,40 @@ requires exact-version provider and ledger verification in its authorized enviro
 OpenRouter documents omission of optional upstream token caps, not a universal numeric default.
 Its public streaming schema carries argument strings and termination reasons; it does not
 specify an internal repair algorithm for every malformed tool response.
+
+## Provider routing preferences
+
+Every surface accepts OpenRouter's documented `provider` object
+([provider routing](https://openrouter.ai/docs/features/provider-routing)). The gateway resolves
+its routing keys against the model's own rungs at admission and never forwards them to an
+aggregator upstream:
+
+- `only` keeps rungs of the listed providers; `ignore` drops them.
+- `order` tries the listed providers first, in that order; the rest remain fallbacks.
+- `allow_fallbacks: false` with `order` serves only the listed providers; without `order` it
+  serves only the first eligible rung. A pinned rung that fails, or is unavailable, is the
+  request's error, never a failover.
+
+A rung is named by its catalog provider id (`bedrock`, `azure_openai`, `openai`, `anthropic`,
+`openrouter`, ...), or by the label a host assigns through its components' optional
+`provider_label` callable (a hosted platform maps a masked house lane to the name it shows, such
+as `experiential_cloud`, so callers pin the name they see in `x-gateway-provider`). OpenRouter
+slugs are aliases: `amazon-bedrock`, `azure`, `google-vertex`, `google-ai-studio`. A preference
+no rung satisfies (an unknown name, or `only`/`ignore` excluding every rung) is a 400 on
+`provider.<key>` naming the providers serving the model. `zdr` keeps its zero-data-retention
+handling; `zdr` and `data_collection` are the only caller keys an OpenRouter rung receives. Any
+other key (`sort`, `quantizations`, `max_price`, `require_parameters`, ...) is disclosed as
+`provider.<key>->ignored(unsupported)`. `gateway.routing` (`route_id`, `allow_fallbacks`)
+applies on top of the narrowed route.
+
+## Retained provider output
+
+Provider output the gateway holds while relaying (tool arguments and reasoning summaries in the
+normalizer, Messages blocks held for ordering, a non-streaming aggregation, a Responses
+continuation) is bounded per stream at 64 MiB. An embedder may also bound it across all streams
+of one worker with `maximum_retained_output_bytes` (`serve_native_gateway`). The worker-wide
+budget is off by default, which is the behavior before it existed; 1 GiB, a quarter of a 4 GiB
+worker, is the suggested value once enabled. With it on, a stream whose next retained bytes would
+cross the budget fails with a retryable 503 `gateway_unavailable`, and a Responses continuation
+that would cross it is not retained while the stream serves on. Bytes relayed straight through to
+the caller never count, and every reservation returns when its stream ends.

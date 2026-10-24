@@ -65,6 +65,13 @@ _DRIVER_SOURCE = textwrap.dedent(
             Path(config["root"]),
             environment={"TEST_PROVIDER_KEY": os.environ["TEST_PROVIDER_KEY"]},
         )
+        pace = config.get("output_tokens_per_second")
+        if pace is not None:
+            # Every reserved attempt is paced, as class_throttles would pace a
+            # self-hosted rung (output pacing scenarios).
+            import exp.runtime.gateway.native_accounting as accounting
+
+            accounting.attempt_output_pace = lambda *_args: pace
         control_plane = NativeControlPlane(
             components,
             request_timeout_seconds=config["request_timeout_seconds"],
@@ -305,6 +312,12 @@ class _PrimaryUpstream(BaseHTTPRequestHandler):
                 )
                 self.wfile.write(_terminal_frames())
                 return
+            if prompt == "long-answer":
+                # 4,000 visible bytes (about 1,000 estimated tokens) sent at once.
+                for _ in range(40):
+                    self.wfile.write(_content_chunk("y" * 100))
+                self.wfile.write(_terminal_frames(completion_tokens=1_000))
+                return
             self.wfile.write(_content_chunk("from-primary"))
             self.wfile.write(_terminal_frames())
         except OSError:
@@ -395,6 +408,7 @@ def serve_waterfall_engine(
     tmp_path_factory: pytest.TempPathFactory,
     *,
     time_to_first_token_seconds: float | None = None,
+    output_tokens_per_second: float | None = None,
 ) -> Iterator[_ServingEngine]:
     """Serve the primary/secondary harness engine; other modules build their own.
 
@@ -403,6 +417,8 @@ def serve_waterfall_engine(
         time_to_first_token_seconds: The engine's first-token allowance for
             this engine (input scaling disabled alongside it), or ``None``
             for the engine's defaults.
+        output_tokens_per_second: The pace every reserved attempt carries in
+            its ``start_attempt`` reply, or ``None`` for none.
 
     Yields:
         The live serving facts as a :class:`_ServingEngine`.
@@ -433,6 +449,8 @@ def serve_waterfall_engine(
     if time_to_first_token_seconds is not None:
         config_values["time_to_first_token_seconds"] = time_to_first_token_seconds
         config_values["time_to_first_byte_seconds_per_million_input_tokens"] = 0.0
+    if output_tokens_per_second is not None:
+        config_values["output_tokens_per_second"] = output_tokens_per_second
     config = json.dumps(config_values)
     stderr_log = root / "driver-stderr.log"
     environment = dict(os.environ)

@@ -9,7 +9,7 @@ and deployment budgets. The bridge module owns boundary encoding.
 from __future__ import annotations
 
 import threading
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Final, Literal
 
@@ -19,6 +19,7 @@ from exp.common.models.gateway_catalog import (
     ExactModelDeployment,
     FailoverMode,
 )
+from exp.runtime.gateway.attempt_tokens import worst_case_input_tokens
 from exp.runtime.gateway.contracts import (
     AuthorizationSnapshot,
     GatewayFailure,
@@ -36,7 +37,8 @@ from exp.runtime.gateway.guardrails.session import GuardrailSession
 from exp.runtime.gateway.health import DeploymentHealthKey, DeploymentHealthRegistry
 from exp.runtime.gateway.model_plan import project_stage_selection
 from exp.runtime.gateway.native_capture import PendingCapture
-from exp.runtime.gateway.native_fallback_rules import FallbackRules, eligible_depths
+from exp.runtime.gateway.native_dead_rungs import ADMISSION_DEAD_ERRORS, DeadRung, dead_rung
+from exp.runtime.gateway.native_fallback_rules import FallbackRules, untried_depths
 from exp.runtime.gateway.native_responses import ContinuationContext
 from exp.runtime.gateway.native_settlement import deployment_operation_key
 from exp.runtime.gateway.reasoning_carrier import ReasoningCarrierAuthority
@@ -46,8 +48,7 @@ from exp.runtime.gateway.request_policy import RequestAttemptPolicy, attempt_pol
 from exp.runtime.gateway.routing import GatewayRoute, GatewayRoutingError
 from exp.runtime.gateway.rung_admission import RungLoadKey
 from exp.runtime.gateway.tool_search.plan import ToolSearchState
-from exp.runtime.models import ModelConnectionError, RuntimeModelCatalog
-from exp.runtime.models.credentials import ModelCredentialError
+from exp.runtime.models import RuntimeModelCatalog
 from exp.runtime.models.providers.base import GatewayWireProfile
 from exp.runtime.models.providers.cache_policy import cache_markers
 from exp.runtime.models.providers.errors import ProviderCapabilityError, ProviderParameterError
@@ -246,6 +247,17 @@ class InflightRequest:
     public_request: GatewayRequest | None = None
     tool_search: ToolSearchState | None = None
     explicit_cache_state: NativeCacheState | None = field(default=None, repr=False)
+    # ``request``'s input-token reservation keyed by the object it counted;
+    # a tool-search round that replaces the request recounts once.
+    input_reservation: tuple[ServingRequest, int] | None = field(default=None, repr=False)
+
+    def reserved_input_tokens(self) -> int:
+        """Return the input-token reservation, tokenizing the request at most once."""
+        memo = self.input_reservation
+        if memo is None or memo[0] is not self.request:
+            memo = (self.request, worst_case_input_tokens(self.request))
+            self.input_reservation = memo
+        return memo[1]
 
     def __post_init__(self) -> None:
         """Size the per-deployment attempt counters to the frozen route."""
@@ -389,6 +401,8 @@ def claim_route_from(
     every healthy claim and bounded probe is unavailable, the first
     non-throttled route is dispatched anyway, subject only to the request
     deadline and to throttle windows the provider explicitly requested.
+    A lane this worker ejected as a dead box (``lane_ejection``) is walked
+    last in every pass, never dropped: a route with nothing else still dials it.
 
     Args:
         health: Revision-isolated circuit and throttle registry.
@@ -401,9 +415,10 @@ def claim_route_from(
     Returns:
         The claimed route index, or ``None`` when nothing is claimable.
     """
-    candidates = [
-        index for index in (range(len(keys)) if depths is None else depths) if index >= start
-    ]
+    candidates = health.order(
+        keys,
+        [index for index in (range(len(keys)) if depths is None else depths) if index >= start],
+    )
     for claim in (health.claim, health.claim_last_resort, health.claim_forced):
         for route_index in candidates:
             if claim(keys[route_index]):
@@ -437,7 +452,10 @@ def next_route_candidate(
     The hard total cap ends the ladder, a retryable failure redials the same
     deployment while its bounded count and a health claim allow, and otherwise
     a failover-eligible failure (or an opted-in typed refusal) advances to the
-    next claimable deployment.
+    first claimable deployment this request has not dispatched yet, in route
+    order: a rung skipped earlier (shed at its bound, passed over by affinity
+    order) is revisited before later ones, and a rung already dispatched is
+    never dialed again except by the same-deployment redial above.
 
     A pool authoring ``throttle_redial`` turns a throttle into a bounded
     backoff-and-redial on the warm rung first: when the data plane reports it
@@ -548,33 +566,14 @@ def next_route_candidate(
             return None
     refusal_eligible = failure.failure_class == GatewayFailureClass.REFUSAL and refusal_failover
     rules = fallback_rules or (None,) * len(keys)
-    depths = eligible_depths(
+    depths = untried_depths(
         rules,
-        current_depth + 1,
         failure,
+        physical_counts,
+        current_depth,
         unrestricted=failure.failover_eligible or refusal_eligible,
     )
-    return claim_route_from(health, keys, current_depth + 1, depths) if depths else None
-
-
-# Resolve-time deadness that a frozen route narrows past at admission instead
-# of failing the whole request. A missing credential, connection drift, or
-# capability drift means the deployment cannot be dispatched right now; it is an
-# operational outage, not a request fault, so the route narrows past the rung
-# and the rung's health circuit is fed like any runtime failure so it recovers
-# automatically when it heals. Operator-*disabled* deployments never reach here:
-# the catalog drops a disabled deployment from the live route on its ~15s
-# refresh, so this path only ever sees operational deadness that should recover.
-_ADMISSION_DEAD_ERRORS = (ModelConnectionError, ModelCredentialError, ProviderCapabilityError)
-
-
-@dataclass(frozen=True)
-class DeadRung:
-    """One route deployment that could not be resolved for dispatch at admission."""
-
-    index: int
-    deployment: ExactModelDeployment
-    failure: GatewayFailure
+    return claim_route_from(health, keys, 0, depths) if depths else None
 
 
 @dataclass(frozen=True)
@@ -681,6 +680,8 @@ def resolve_route_profiles(
 def dispatchable_route_profiles(
     runtime_catalogs: Mapping[tuple[str, str], RuntimeModelCatalog],
     route: GatewayRoute,
+    *,
+    reread: Callable[[], Mapping[tuple[str, str], RuntimeModelCatalog]] | None = None,
 ) -> DispatchableRoute:
     """Resolve a frozen route, narrowing past any rung dead at admission.
 
@@ -700,6 +701,14 @@ def dispatchable_route_profiles(
         runtime_catalogs: Revision and catalog digests mapped to frozen
             runtime catalogs.
         route: Resolved ordered route.
+        reread: Optional accessor for the catalogs as they stand now. When
+            every rung is dead, the route resolves once more against it before
+            the caller declares the route unavailable: a catalog refresh swaps
+            the runtime catalogs (and their credential environment) with one
+            assignment, and an admission caught across that swap must not fail
+            a route the new generation serves (gemini-3.1-flash-lite's one
+            Vertex rung, 7 such 503s an hour for one tenant, each landing on
+            the "gateway catalog refreshed" line, production 2026-10-19).
 
     Returns:
         The dispatchable rung indexes with their resolved wires, plus every
@@ -710,6 +719,17 @@ def dispatchable_route_profiles(
             native-dialect implementation.
         GatewayRoutingError: The authorized catalog is not loaded.
     """
+    dispatchable = _dispatchable_once(runtime_catalogs, route)
+    if reread is None or dispatchable.indexes or not dispatchable.dead:
+        return dispatchable
+    return _dispatchable_once(reread(), route)
+
+
+def _dispatchable_once(
+    runtime_catalogs: Mapping[tuple[str, str], RuntimeModelCatalog],
+    route: GatewayRoute,
+) -> DispatchableRoute:
+    """Resolve every rung of ``route`` once; see :func:`dispatchable_route_profiles`."""
     catalog = _authorized_runtime_catalog(runtime_catalogs, route)
     indexes: list[int] = []
     resolved_wires: list[tuple[GatewayWireProfile, NativeWireClient]] = []
@@ -717,41 +737,12 @@ def dispatchable_route_profiles(
     for index, deployment in enumerate(route.deployments):
         try:
             resolved = _resolve_deployment_profile(catalog, deployment)
-        except _ADMISSION_DEAD_ERRORS as exc:
-            dead.append(DeadRung(index, deployment, _admission_dead_failure(exc)))
+        except ADMISSION_DEAD_ERRORS as exc:
+            dead.append(dead_rung(index, deployment, exc))
             continue
         indexes.append(index)
         resolved_wires.append(resolved)
     return DispatchableRoute(tuple(indexes), tuple(resolved_wires), tuple(dead))
-
-
-def _admission_dead_failure(exc: Exception) -> GatewayFailure:
-    """Classify one admission-time deadness into a health-circuit failure.
-
-    A missing credential mirrors a runtime auth rejection (a hard failure that
-    opens the circuit at once); a connection or capability drift mirrors a
-    runtime transport failure (an operational failure that opens after the
-    circuit threshold). Both stay honest by feeding the same circuit that
-    runtime failures do, so recovery is the existing cooldown plus half-open
-    probe and never a permanent blacklist.
-    """
-    match exc:
-        case ModelCredentialError():
-            return GatewayFailure(
-                failure_class=GatewayFailureClass.PROVIDER_AUTHENTICATION,
-                safe_message=(
-                    "the resolved deployment had no usable credential at admission; "
-                    "failing over to the next deployment"
-                ),
-            )
-        case _:
-            return GatewayFailure(
-                failure_class=GatewayFailureClass.TRANSPORT,
-                safe_message=(
-                    "the resolved deployment was unavailable at admission; "
-                    "failing over to the next deployment"
-                ),
-            )
 
 
 def select_route_deployments(
@@ -914,6 +905,7 @@ def deployment_wire_entry(
         # provider account there is the customer's own configuration, so the
         # data plane surfaces it as their 400 instead of operator deadness.
         "billing_customer_managed": profile.billing_customer_managed,
+        "tenant_origin": profile.tenant_origin,  # opaque failures, tenant socket policy
         "timeout_seconds": profile.timeout_seconds,
         "upstream_payload": None if upstream_body is not None else upstream_payload,
         "upstream_body": upstream_body,

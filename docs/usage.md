@@ -11,7 +11,7 @@ The root surface is deliberately small:
 | `exp login [--root ROOT]` | Sign in to Experiential Cloud, save the returned organization key, and synchronize account-visible models with the catalog's default-route capabilities and undiscounted prices. Known metadata is reused without capability or price questions. | User-local credential plus secret-free hosted provider/model records in `.exp/models.toml`. |
 | `exp capture [--verbose] [--domain HOST ...]` | Capture supported OpenAI and Anthropic traffic across macOS apps until Ctrl+C, reusing `exp login`. | Cloud traces and bounded private retry batches. |
 | `exp run [PROJECT] [--root ROOT] [--check]` | Start the local gateway directly, optionally with one project-backed alias. | OpenAI-compatible endpoint, readiness routes, and content-free usage view. |
-| `exp eval [PROJECT] --models ALIAS,ALIAS` | Compare models on the project scenarios, or open the terminal project picker. | Saved resumable run, JSON evidence, and offline Pareto report. |
+| `exp eval [PROJECT] --models ALIAS,ALIAS` | Compare models on the project scenarios, simulated with the build's learned memory, or open the terminal project picker. | Saved resumable run, JSON evidence, and offline Pareto report. |
 | `exp build PROJECT [-t PATH] --source SOURCE --root ROOT [--provider NAME ...]` | Import file or gateway traces, mine scenarios, and prepare world-model grounding; omitting traces opens the guided build. | Canonical imports in `gateway/traffic.db`, versioned scenarios, serving RAG, fit RAG and a grounded world model. |
 | `exp optimize router PROJECT --root ROOT [--yes]` | Complete bounded simulation and judgment, fit a frozen router, then verify held-out evidence. | Fit evaluation, policy, held-out evaluation, and router report. |
 | `exp optimize model PROJECT --root ROOT [--yes]` | Verify one project-bound W12 dataset and conservatively preflight bounded managed Tinker SFT. | Completed W13 result and registered frozen alias, or a fail-closed preflight with no paid dispatch. |
@@ -419,6 +419,120 @@ quality measurement can call the separate `build_fidelity_evaluation_plan` and
 reports contain measurements only, never an approval or denial. See the
 [router contracts](reference/router_optimization_config.md).
 
+### Learning from traces
+
+`exp build PROJECT -t PATH` learns the simulator from the traces as part of every build. After
+the index and simulator are built, it replays every trace once, in export order, on a hybrid
+simulator: learned memory supplies behavioral rules, and the build's index supplies recorded facts
+(a trace never retrieves its own lineage). Every step in a trace is predicted before its recorded
+replies are disclosed and mismatches are investigated. Only investigations the investigator marks
+transferable, phrased by the observable cue that triggers them, become memory rules; every
+investigation stays recallable as a record. Each trace is published as one memory version and
+the memory log is compressed. Memory records are recalled by a native decision model on the
+SystemOne decisions wire: the catalog's `memory_recall` role when set, otherwise the catalog's
+decision model, preferring Clef Flash (`cloudflare/clef-flash`), then Clef, then Jev. A catalog
+without a decision model builds the simulator without learning and says how to add one. The pass is
+resumable: completed traces replay without provider calls. Learning has no defined cost, so a
+build that learns asks for consent at a terminal and needs `--yes` in automation; without it,
+automation stops before any index is bought and prints the exact command to run again. The
+learning memory belongs to the exact protocol (prompts, re-asks, token limits, attempts): changing
+it learns a fresh memory trace by trace, while changing only the judge replays without calls.
+
+Learning is measured test-then-train: each trace is predicted whole on the memory pinned before
+it. None of the trace's own feedback or investigations reaches its predictions; they are
+published with the trace. Memory from earlier traces of the same task lineage is hidden too,
+just as retrieval hides the trace's own lineage. Memory written after a prediction saw retrieved
+evidence depends on the retrieved traces, so a retrieved fact never reaches its own task through
+memory either. The recorded actions are replayed in order, but after the trace's public prefix
+the simulator sees its own earlier replies and state, never the recorded replies, so an early
+error carries forward into later turns. Every learning report is therefore a measurement of
+recorded actions over the simulator's own history, on a task memory has not learned, even though
+every trace is consumed. The pass prints this as learning progress (replies exact and reply
+fields matching), a learning curve of exact replies by trace order, and the latest unseen-task
+estimate: the last quarter of traces, predicted on nearly final memory, with its trace count.
+Traces whose learning fails remain in the score; their separate count shows when prediction
+progress exceeds memory growth.
+
+Learning progress averages simulators from empty memory to nearly final memory, so it shows
+whether memory helps as it grows. It does not measure the final simulator on unseen traces:
+after the pass, no trace is left unseen. Claims about the final simulator on unseen traces
+come from `exp eval PROJECT --audit N` (below). The audit measures a separate simulator that
+learned only the fit traces, a conservative proxy for the one learned from every trace; the
+build's own all-traces simulator is not independently evaluated.
+
+A simulator proposal that fails validation is never repaired: it is asked again, at most twice,
+with the refusal reason, and each re-ask is saved and counted. After that the turn fails. A trace
+buys at most 24 investigations across all feedback batches; failed investigation intents count
+toward that limit too. Later misses are recorded as raw feedback without one, and the trace is
+still learned. Concurrent investigations share one session lease, preventing another feedback
+batch or prediction from changing the session while their receipts settle.
+
+A memory version always shows the predictor the same overview: the first read of a version
+records which compressed summaries existed, and every later read of that version uses exactly
+those, even after more compression completes.
+
+The build ends by retesting every learned trace that had at least one inexact reply, against
+the final memory checkpoint, and compares each turn before and after learning: fixed, still
+wrong, or regressed. The retest reads what memory learned from those
+traces, so it checks that the lessons of a miss stuck; it does not measure unlearned tasks.
+
+`exp eval PROJECT --models A,B` evaluates workers on the learned simulator, with no flag.
+Preparation pins the build's memory at its latest version, and every simulated turn reads it:
+records are recalled per tool call through the learning plan's recall alias and policy, and the
+version's pinned overview comes with every turn. Evaluation only reads memory; it never publishes
+or researches. Evaluation tasks are mined from the traces memory learned, so each task reads
+memory with its own task lineage (and the lineages of its source traces) hidden, exactly as
+learning hides it. Lineages reserved for evaluation stay withheld, and a held-out task reads only
+memory of known provenance. The memory version is part of the evaluation plan: saved results
+replay only for identical memory, and a run saved without memory resumes without it. The review
+header and the saved report name the version (`Simulator memory: vN (...)`). A build that learned
+nothing evaluates on the bare simulator and says so in one line. Recall decisions are saved and
+replay on resume; they are not part of the spend estimate.
+
+`exp eval PROJECT --audit N [--verbose]` is the independent audit. It first learns a separate
+memory from fit traces only: held-out lineages are reserved before the first trace, so they are
+never learned, and the fit-only index is used for recorded facts. Saved results replay without
+calls. It then replays N held-out traces, selected deterministically, against that memory's
+final checkpoint. It prints one aggregate line (replies exact, reply fields matching, judge
+mean), how often the judge's per-turn verdict agrees with exact reproduction (a check on the
+judge, not a score), and the learning curve.
+
+The audit stays independent only while nobody tunes the simulator on its cases. Held-out traces
+are selected deterministically, so a second audit replays the same ones. Once anyone inspects a
+held-out trace's per-trace results (`--verbose`, the per-trace table or its transcript) and
+changes prompts, rules or code in response, that trace is development data: a later score on it
+is a re-audit of fitted cases, not an independent measurement. The provenance checks cannot see
+this channel. An independent audit after such tuning needs held-out lineages nobody has
+inspected, which in practice means new traces from a new import.
+
+In every replay, turns the simulator never answered count as not reproduced, and `--verbose`
+adds every trace and turn. Run IDs are derived from the run's inputs, including the prompts the
+simulator sends, so a changed input starts a new run and an unchanged one replays without provider
+calls. A run that stopped after buying calls is never bought again silently: rerun with
+`--retry-incomplete` (on `exp build` or `exp eval --audit`) to replace it. A learning trace that stops before completing is
+retried up to three times in the same pass; any trace still not learned is reported separately.
+Every trace is predicted whole before any of its replies is disclosed;
+investigations of its misses then run together, so a failed investigation never prevents a
+prediction. A trace's first saved measurement fixes its score, including unanswered turns as
+misses. Later learning retries cannot replace that measurement, and the curve reports traces not
+learned separately. The retest covers learned traces only and preserves their first measurement
+as its baseline. A cancelled learning preflight records nothing; later commands read the memory
+that learned most recently. When every trace is already learned, learning replays its saved
+results without asking for spend consent.
+
+Knowledge pinned in a simulator (built outside `exp build`, for example for `exp eval --fidelity`)
+is checked before any provider call. Its constructor sources, research notes and prior-library
+entries are resolved to recorded traces and task lineages, and a task whose own evidence they
+contain is refused. A held-out task is also refused when any knowledge channel has no recorded
+provenance, unless the hand-written rules are declared `authored`.
+
+A trace may mark its public prefix in its request context (`exp.request.context`, for example
+`{"task_lineage": "user_17", "replay_from": 2}`): the first `replay_from` recorded tool calls and
+their replies are given to the simulator as initial observations, and measurement starts at the
+next call. Without it, every recorded call is measured. Traces that declare no tool list
+(`exp.request.tools`) get tool signatures observed in learned traces: names and argument names
+only.
+
 ### Simulated tool observations
 
 Text world models generate environment observations for declared tools. Candidate tool calls are
@@ -426,10 +540,18 @@ passed to the world model together with schemas, the visible transcript, retriev
 and private environment state. Parallel calls receive one ordered tool message per call ID; no
 external tool implementation runs. Malformed observation batches are invalid rollouts.
 
+Durable learning and fidelity sessions validate state-edit structure and commit a transition
+atomically. They do not mechanically enforce domain rules such as which ticket statuses may
+follow one another, or whether a literal reply agrees with the proposed state. A structurally
+valid wrong transition remains in the candidate world and can affect later predictions. Learned
+rules are provisional model hypotheses; compression is lossy and cannot certify their truth.
+Their full source records and provenance remain available. Structural correctness and measured
+reply fidelity therefore do not establish equivalence to an executable application's behavior.
+
 The public session API accepts `world.new_session(task="Research", tools=(tool_schema,))` followed
 by `world.step(session.id, assistant_message)`. Each result exposes `messages`, an ordered tuple
 of OpenAI user or tool messages, and `terminal`. Tool observations are nonterminal so the agent can
-consume them before producing its final answer. World-model artifacts pin the v2 prompt; rebuild
+consume them before producing its final answer. World-model artifacts pin the current prompt; rebuild
 projects created with a different prompt before running them.
 
 ### Build scenarios from traces

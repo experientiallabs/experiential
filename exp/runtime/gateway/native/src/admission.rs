@@ -25,7 +25,7 @@ use crate::settlement::AttemptGuard;
 use crate::throttle_backoff::ThrottleRedial;
 use crate::tool_search::{ToolSearchAdmission, ToolSearchRound};
 use crate::waterfall::{DeploymentWire, RoutePolicy, Served};
-use crate::web_search::WebSearchAdmission;
+use crate::web_search::{WebSearchAdmission, WebSearchMeter};
 
 /// The wire configuration returned by one successful admission: the full
 /// ordered certified route (one wire configuration per deployment, each with
@@ -89,6 +89,11 @@ pub(crate) struct Admission {
     /// `length`), never a completed empty answer.
     #[serde(default)]
     pub maximum_output_tokens: Option<u64>,
+    /// The host-vouched request class (0..8, higher first) a configured
+    /// permit queue orders waiting requests by (`permit_queue`). Absent on
+    /// every request whose host sends no class.
+    #[serde(default, rename = "priority_class")]
+    pub class: Option<u8>,
     /// The caller's stable identity (organization and identity ids), the
     /// scope of the data plane's per-caller replay-repair memory. The
     /// request's own bearer cannot serve: in a hosted worker it is the
@@ -162,12 +167,16 @@ impl Admission {
         }
     }
 
-    /// How many gateway-executed web searches this request bills; `0` when
-    /// the control plane ran none.
-    pub(crate) fn web_search_requests(&self) -> u32 {
+    /// The full web-search meter (count, results returned, vendor cost) the
+    /// finalizing settlement bills; all zero when the control plane ran none.
+    pub(crate) fn web_search_meter(&self) -> WebSearchMeter {
         self.web_search
             .as_ref()
-            .map_or(0, |web_search| web_search.requests)
+            .map_or_else(WebSearchMeter::default, |web_search| WebSearchMeter {
+                requests: web_search.requests,
+                results: u32::try_from(web_search.results.len()).unwrap_or(u32::MAX),
+                cost_nano_usd: web_search.cost_nano_usd,
+            })
     }
 
     /// Whether the winning completion must be buffered for an output chain,
@@ -351,9 +360,11 @@ pub(crate) async fn acquire_permit(
     state: &AppState,
     guard: &mut AttemptGuard,
     deadline: Instant,
+    priority_class: Option<u8>,
 ) -> Result<tokio::sync::OwnedSemaphorePermit, Box<Response>> {
     let permit_wait_started = Instant::now();
-    match tokio::time::timeout_at(deadline.into(), state.permits.clone().acquire_owned()).await {
+    let acquire = state.permit_queue.acquire(&state.permits, priority_class);
+    match tokio::time::timeout_at(deadline.into(), acquire).await {
         Ok(Ok(permit)) => {
             METRICS.permit_wait_ms.record(permit_wait_started.elapsed());
             Ok(permit)

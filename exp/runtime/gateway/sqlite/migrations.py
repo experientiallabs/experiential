@@ -16,7 +16,7 @@ from exp.runtime.gateway.sqlite.nano_usd_migration import (
     migrate_money_to_nano_usd,
 )
 
-SCHEMA_VERSION = 29
+SCHEMA_VERSION = 30
 
 
 class GatewaySchemaError(RuntimeError):
@@ -774,6 +774,22 @@ _MIGRATIONS: dict[int, tuple[MigrationStep, ...]] = {
         "ALTER TABLE gateway_attempts ADD COLUMN billed_unit_rate INTEGER CHECK ("
         "billed_unit_rate IS NULL OR billed_unit_rate >= 0)",
     ),
+    30: (  # asynchronous video jobs (exp.runtime.gateway.video.store)
+        "PRAGMA writable_schema = ON",
+        "UPDATE sqlite_master SET sql = replace(sql, "
+        "'''speech'', ''transcription'')', '''speech'', ''transcription'', ''video'')') "
+        "WHERE type = 'table' AND name = 'gateway_requests'",
+        "PRAGMA writable_schema = RESET",
+        "CREATE TABLE gateway_schema_refresh_v30 (noop INTEGER) STRICT",
+        "DROP TABLE gateway_schema_refresh_v30",
+        "CREATE TABLE gateway_video_jobs (video_id TEXT PRIMARY KEY, "
+        "organization_id TEXT NOT NULL, identity_id TEXT NOT NULL, created_at TEXT NOT NULL, "
+        "settled INTEGER NOT NULL CHECK (settled IN (0, 1)), "
+        "deleted INTEGER NOT NULL CHECK (deleted IN (0, 1)), job TEXT NOT NULL) STRICT",
+        "CREATE INDEX gateway_video_jobs_owner "
+        "ON gateway_video_jobs (organization_id, identity_id, created_at)",
+        "CREATE INDEX gateway_video_jobs_open ON gateway_video_jobs (created_at) WHERE settled = 0",
+    ),
     24: (  # plan sign-in kind: part of the connection identity digest, so it rides the revision
         "ALTER TABLE provider_connection_revisions ADD COLUMN subscription TEXT "
         "CHECK (subscription IN ('chatgpt', 'anthropic'))",
@@ -920,6 +936,7 @@ def _require_schema_objects(connection: sqlite3.Connection) -> None:
         "gateway_attempts",
         "gateway_monthly_budgets",
         "gateway_requests",
+        "gateway_video_jobs",
         "identities",
         "identity_alias_grants",
         "operation_receipts",

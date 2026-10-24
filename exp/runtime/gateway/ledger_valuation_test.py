@@ -512,3 +512,17 @@ def test_units_beside_a_partial_token_report_leave_the_cost_unknown() -> None:
     assert frozen_usage_cost(row, GatewayUsage(billed_units=units)) == 2_000
     partial = GatewayUsage(input_tokens=5, billed_units=units)
     assert frozen_usage_cost(row, partial) is None
+
+
+def test_settled_image_tokens_price_at_the_image_rate_when_one_is_given() -> None:
+    """The settled image subset meets its own rate; no rate keeps output pricing."""
+    usage = GatewayUsage(input_tokens=0, output_tokens=1_126, image_output_tokens=1_120)
+    rates = {"input_rate": 0, "cached_input_rate": 0, "output_rate": 12, "reasoning_rate": 12}
+    assert (
+        estimated_cost_nano_usd(usage, **rates, image_output_rate=None)
+        == (1_126 * 12 + 500_000) // 1_000_000
+    )
+    assert (
+        estimated_cost_nano_usd(usage, **rates, image_output_rate=120_000_000_000)
+        == (1_120 * 120_000_000_000 + 6 * 12 + 500_000) // 1_000_000
+    )

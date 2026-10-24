@@ -352,7 +352,11 @@ jobs:
       - name: Install the project and its dev extras
         run: uv sync --extra dev
       - name: Capture selective TLS streaming and local redirector lifecycle
-        run: uv run pytest -q exp/runtime/capture exp/cli/capture
+        # Certificate tests run in the Linux shard. Their native macOS verifier
+        # invokes /usr/bin/security, which agent-run checks must not execute.
+        run: >-
+          uv run pytest -q exp/runtime/capture exp/cli/capture
+          --ignore=exp/runtime/capture/certificates_test.py
       - name: W16 router and bounded local-process evidence
         env:
           EXP_RELEASE_REVISION: ${{ github.sha }}

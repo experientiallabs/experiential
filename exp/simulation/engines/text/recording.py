@@ -11,10 +11,8 @@ from threading import Lock
 from typing import TYPE_CHECKING, cast
 
 from exp.common.core.artifacts import (
-    FailureAttribution,
     FailureCode,
     JsonObject,
-    StructuredFailure,
     redact_secret_json,
 )
 from exp.common.models import (
@@ -46,9 +44,15 @@ from exp.runtime.environments import Observation
 from exp.runtime.models import ResolvedModel
 from exp.simulation.engines.clock import timestamp
 from exp.simulation.engines.text.environment import SimulatedToolUseError
-from exp.simulation.engines.text.errors import provider_call_failure
+from exp.simulation.engines.text.errors import (
+    TextSimulationError,
+    provider_call_failure,
+    text_failure,
+)
 from exp.simulation.engines.text.grounding import estimate_retrieval_economics
+from exp.simulation.engines.text.memory import TurnMemory
 from exp.simulation.engines.text.prompt import (
+    MemoryContext,
     SimulatedToolResult,
     TextWorldModelProtocolError,
     TextWorldModelTransition,
@@ -80,15 +84,6 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-class TextSimulationError(RuntimeError):
-    """A text simulator boundary failed with an artifact-safe terminal classification."""
-
-    def __init__(self, stop_reason: StopReason, failure: StructuredFailure) -> None:
-        super().__init__(failure.message)
-        self.stop_reason = stop_reason
-        self.failure = failure
-
-
 class RecordingCandidateClient:
     """Injects text-world turns after candidate calls while retaining only visible evidence."""
 
@@ -114,6 +109,7 @@ class RecordingCandidateClient:
         redacted_field_names: frozenset[str],
         clock: Callable[[], datetime],
         token_counter: TokenCounter,
+        memory: TurnMemory | None = None,
     ) -> None:
         """Bind one task, two independent model clients, and strict simulation boundaries.
 
@@ -137,6 +133,8 @@ class RecordingCandidateClient:
             redacted_field_names: Project fields redacted before events persist.
             clock: Time source used to order emitted spans deterministically in tests.
             token_counter: Full-request counter used before every provider call.
+            memory: Frozen learned memory this task may read, recalled once per world turn
+                and delivered with the turn's request; None for a simulator without memory.
         """
         if maximum_transition_attempts < 1:
             raise ValueError("maximum_transition_attempts must be positive")
@@ -159,6 +157,7 @@ class RecordingCandidateClient:
         self._redacted_field_names = redacted_field_names
         self._clock = clock
         self._token_counter = token_counter
+        self._memory = memory
         self._candidate_spans: list[RolloutSpan] = []
         self._world_model_spans: list[RolloutSpan] = []
         self._candidate_responses: list[ModelResponse] = []
@@ -317,7 +316,7 @@ class RecordingCandidateClient:
             Exception: The active candidate, embedder, or world-model provider fails.
         """
         if self._terminal:
-            raise _text_failure(
+            raise text_failure(
                 StopReason.COMPLETED,
                 FailureCode.UNSUPPORTED,
                 "candidate requested another turn after the text world model reached a terminal "
@@ -325,21 +324,21 @@ class RecordingCandidateClient:
                 phase="candidate_after_terminal",
             )
         if len(self._candidate_responses) >= self._maximum_steps:
-            raise _text_failure(
+            raise text_failure(
                 StopReason.MAXIMUM_STEPS,
                 FailureCode.BUDGET,
                 f"text simulation reached its maximum of {self._maximum_steps} candidate turns",
                 phase="candidate_turn_limit",
             )
         if self._pending_tools:
-            raise _text_failure(
+            raise text_failure(
                 StopReason.FAILURE,
                 FailureCode.VALIDATION,
                 "consume every simulated tool result before requesting another candidate turn",
                 phase="pending_tool_results",
             )
         if request.tools != self._task.tools:
-            raise _text_failure(
+            raise text_failure(
                 StopReason.FAILURE,
                 FailureCode.VALIDATION,
                 "candidate request must preserve the task's declared tool schemas",
@@ -421,7 +420,7 @@ class RecordingCandidateClient:
         if any(call.name not in names for call in calls) or len({c.call_id for c in calls}) != len(
             calls
         ):
-            raise _text_failure(
+            raise text_failure(
                 StopReason.FAILURE,
                 FailureCode.VALIDATION,
                 "candidate tool calls require declared tool names and unique call IDs",
@@ -431,6 +430,7 @@ class RecordingCandidateClient:
             self._maximum_output_tokens,
             self._world_model.capabilities.maximum_output_tokens or self._maximum_output_tokens,
         )
+        memory = self._recall(candidate_request.messages, candidate_response.output)
         try:
             self._grounded_world_model.preflight_turn(
                 task=self._task,
@@ -444,9 +444,10 @@ class RecordingCandidateClient:
                     if self._world_model_request
                     else None
                 ),
+                memory=memory,
             )
         except WorldModelCapacityError as exc:
-            raise _text_failure(
+            raise text_failure(
                 StopReason.CONTEXT_OVERFLOW,
                 FailureCode.CONTEXT_OVERFLOW,
                 str(exc),
@@ -467,7 +468,7 @@ class RecordingCandidateClient:
                 queries, self._grounded_world_model.retriever, self._query_embedding
             )
         except RAGQueryInputLimitError as exc:
-            raise _text_failure(
+            raise text_failure(
                 StopReason.MAXIMUM_COST,
                 FailureCode.BUDGET,
                 "grounding query exceeds its reserved input-token ceiling",
@@ -484,6 +485,7 @@ class RecordingCandidateClient:
                 state=self._environment_state,
                 maximum_output_tokens=world_output,
                 json_object_output=self._world_model_json_object_output,
+                memory=memory,
             ),
             # The retained retrieval estimate above already covers this dispatch's worst case
             # in every reconciliation path, so the window's incremental reservation is zero.
@@ -506,6 +508,28 @@ class RecordingCandidateClient:
         self._terminal = transition.terminal
         return candidate_response
 
+    def _recall(
+        self, visible_messages: tuple[ModelMessage, ...], action: AssistantAction
+    ) -> MemoryContext | None:
+        """Recall learned memory for one world turn, or None without memory.
+
+        A recall failure ends the episode as a retryable simulator failure, so resume can
+        run the cell again; decisions already saved replay without another call.
+        """
+        if self._memory is None:
+            return None
+        try:
+            return self._memory.context(visible_messages, action, self._environment_state)
+        except Exception as exc:
+            raise text_failure(
+                StopReason.FAILURE,
+                FailureCode.PROVIDER,
+                f"memory recall failed: {exc}",
+                phase="memory_recall",
+                exception_type=type(exc).__name__,
+                retryable=True,
+            ) from exc
+
     def _complete_world_turn(
         self, prepared: PreparedGroundedWorldModelCall, candidate_ended_at: datetime
     ) -> TextWorldModelTransition:
@@ -520,7 +544,7 @@ class RecordingCandidateClient:
                 return self._dispatch_world_turn(attempt, candidate_ended_at)
             except TextWorldModelProtocolError as exc:
                 if number + 1 == self._maximum_transition_attempts:
-                    raise _text_failure(
+                    raise text_failure(
                         StopReason.FAILURE,
                         FailureCode.PROVIDER,
                         str(exc),
@@ -617,7 +641,7 @@ class RecordingCandidateClient:
             transition = self._grounded_world_model.parse_turn(dispatched).transition
         except TextWorldModelProtocolError as exc:
             self._invalid_world_model_responses.append(self._world_model_responses.pop())
-            failure = _text_failure(
+            failure = text_failure(
                 StopReason.FAILURE,
                 FailureCode.PROVIDER,
                 str(exc),
@@ -638,7 +662,7 @@ class RecordingCandidateClient:
         """Admit generated tokens, including reasoning, without treating missing usage as zero."""
         usages = [response.economics.usage for response in self._candidate_responses]
         if any(usage is None for usage in usages):
-            raise _text_failure(
+            raise text_failure(
                 StopReason.MAXIMUM_OUTPUT_TOKENS,
                 FailureCode.BUDGET,
                 "candidate usage is missing; cannot safely admit more output tokens",
@@ -647,7 +671,7 @@ class RecordingCandidateClient:
         used = sum(usage.output_tokens for usage in usages if usage is not None)
         remaining = self._maximum_rollout_output_tokens - used
         if remaining <= 0:
-            raise _text_failure(
+            raise text_failure(
                 StopReason.MAXIMUM_OUTPUT_TOKENS,
                 FailureCode.BUDGET,
                 "rollout output-token budget exhausted; increase it to continue",
@@ -712,7 +736,7 @@ class RecordingCandidateClient:
         ]
         if any(cost is None for cost in costs):
             if self._stop_on_overspend:
-                raise _text_failure(
+                raise text_failure(
                     StopReason.MAXIMUM_COST,
                     FailureCode.BUDGET,
                     f"{role} call is blocked because prior provider spend is unknown",
@@ -730,7 +754,7 @@ class RecordingCandidateClient:
         if total < self._maximum_cost_usd:
             return
         if self._stop_on_overspend:
-            raise _text_failure(
+            raise text_failure(
                 StopReason.MAXIMUM_COST,
                 FailureCode.BUDGET,
                 f"reconciled provider spend reached the simulation ceiling before the {role} call",
@@ -801,7 +825,7 @@ def _require_completion_request_bounds(
     """
     output_tokens = request.maximum_output_tokens
     if output_tokens is None:
-        raise _text_failure(
+        raise text_failure(
             StopReason.MAXIMUM_COST,
             FailureCode.BUDGET,
             f"{role} request lacks a reserved output ceiling",
@@ -814,7 +838,7 @@ def _require_completion_request_bounds(
             output_tokens=output_tokens,
         )
     except ValueError as exc:
-        raise _text_failure(
+        raise text_failure(
             StopReason.MAXIMUM_COST,
             FailureCode.BUDGET,
             str(exc),
@@ -853,7 +877,7 @@ def _verify_completion_budget_binding(
             maximum_attempts=maximum_attempts,
         )
     except ValueError as exc:
-        raise _text_failure(
+        raise text_failure(
             StopReason.MAXIMUM_COST,
             FailureCode.BUDGET,
             str(exc),
@@ -891,7 +915,7 @@ def _require_response_identity(
         and response.model.connection_sha256 == expected.connection_sha256
     ):
         return
-    raise _text_failure(
+    raise text_failure(
         StopReason.FAILURE,
         FailureCode.VALIDATION,
         f"{role} response identity does not match its pinned resolved model",
@@ -902,7 +926,7 @@ def _require_response_identity(
 def _require_complete_response(response: ModelResponse, *, role: str) -> None:
     """Turn an explicit provider length stop into a durable failed simulation cell."""
     if response.finish_reason == ModelFinishReason.LENGTH:
-        raise _text_failure(
+        raise text_failure(
             StopReason.LENGTH,
             FailureCode.PROVIDER,
             f"{role} response reached its maximum output budget; EXP did not truncate it",
@@ -919,7 +943,7 @@ def _preflight_context(
     """Fail closed when full request plus output budget cannot fit a known context window."""
     budget = request.maximum_output_tokens
     if budget is None:  # pragma: no cover - bounded callers always provide an explicit budget
-        raise _text_failure(
+        raise text_failure(
             StopReason.FAILURE,
             FailureCode.VALIDATION,
             f"model alias {alias!r} has no explicit output budget",
@@ -929,14 +953,14 @@ def _preflight_context(
         capabilities.maximum_output_tokens is not None
         and capabilities.maximum_output_tokens < budget
     ):
-        raise _text_failure(
+        raise text_failure(
             StopReason.FAILURE,
             FailureCode.UNSUPPORTED,
             f"model alias {alias!r} cannot supply the requested {budget} output tokens",
             phase="model_capabilities",
         )
     if capabilities.context_window_tokens is None:
-        raise _text_failure(
+        raise text_failure(
             StopReason.CONTEXT_OVERFLOW,
             FailureCode.CONTEXT_OVERFLOW,
             f"model alias {alias!r} does not report a context window for safe text simulation",
@@ -944,7 +968,7 @@ def _preflight_context(
         )
     input_tokens = token_counter.count(request)
     if input_tokens < 0:
-        raise _text_failure(
+        raise text_failure(
             StopReason.FAILURE,
             FailureCode.VALIDATION,
             "text simulation token counter returned a negative request size",
@@ -952,45 +976,10 @@ def _preflight_context(
         )
     required = input_tokens + budget
     if required > capabilities.context_window_tokens:
-        raise _text_failure(
+        raise text_failure(
             StopReason.CONTEXT_OVERFLOW,
             FailureCode.CONTEXT_OVERFLOW,
             f"model alias {alias!r} context window {capabilities.context_window_tokens} cannot "
             f"fit {input_tokens} input plus {budget} output tokens",
             phase="context_preflight",
         )
-
-
-def _text_failure(
-    stop_reason: StopReason,
-    code: FailureCode,
-    message: str,
-    *,
-    phase: str,
-    exception_type: str | None = None,
-    retryable: bool = False,
-) -> TextSimulationError:
-    """Build one non-secret structured simulator failure with a stable phase label.
-
-    Args:
-        stop_reason: Terminal classification recorded with the failed episode.
-        code: Structured failure code persisted with the evidence.
-        message: Non-secret operator-facing failure description.
-        phase: Stable simulator phase label persisted in the failure details.
-        exception_type: Optional exception class name retained for diagnostics.
-        retryable: Whether resume may supersede this failure with a fresh attempt.
-
-    Returns:
-        One artifact-safe terminal simulator error.
-    """
-    return TextSimulationError(
-        stop_reason,
-        StructuredFailure(
-            code=code,
-            message=message,
-            retryable=retryable,
-            exception_type=exception_type,
-            attribution=FailureAttribution.MODEL,
-            details={"phase": phase},
-        ),
-    )

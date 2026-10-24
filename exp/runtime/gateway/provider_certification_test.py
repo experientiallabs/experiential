@@ -20,11 +20,12 @@ def test_provider_matrix_is_complete_deterministic_and_secret_free() -> None:
     """Every launch-provider cell is labeled and the artifact round-trips exactly."""
     matrix = PROVIDER_CERTIFICATION_MATRIX
 
-    assert len(matrix.cells) == 9 * len(ProviderCapability)
+    assert len(matrix.cells) == 10 * len(ProviderCapability)
     assert {cell.provider for cell in matrix.cells} == {
         "anthropic",
         "azure",
         "bedrock",
+        "elevenlabs",
         "gemini",
         "openai",
         "openai-compatible",
@@ -32,7 +33,9 @@ def test_provider_matrix_is_complete_deterministic_and_secret_free() -> None:
         "typesafe",
         "vertex",
     }
-    chat_cells = tuple(cell for cell in matrix.cells if cell.provider != "typesafe")
+    chat_cells = tuple(
+        cell for cell in matrix.cells if cell.provider not in {"typesafe", "elevenlabs"}
+    )
     assert {cell.client_sdk for cell in chat_cells} == {"openai==3.0.0"}
     assert {cell.evaluated_at for cell in chat_cells} == {datetime(2026, 8, 25, tzinfo=UTC)}
     assert {cell.gateway_api_surfaces for cell in chat_cells} == {("chat.completions", "responses")}
@@ -61,6 +64,7 @@ def test_provider_matrix_does_not_claim_unperformed_live_credentials() -> None:
         "anthropic",
         "azure",
         "bedrock",
+        "elevenlabs",
         "gemini",
         "openai",
         "openai-compatible",
@@ -148,3 +152,18 @@ def test_vertex_cells_name_native_profile_and_shared_stream_fixtures() -> None:
     assert cell.result is ProviderCertificationResult.PROVIDER_FIXTURE_PASS
     assert "exp/runtime/models/providers/vertex_test.py" in cell.evidence
     assert "exp/runtime/gateway/tests/native_dialect_parity_test.py" in cell.evidence
+
+
+def test_elevenlabs_certification_names_the_audio_surfaces_without_claiming_chat() -> None:
+    """Audio evidence certifies usage and cancellation, never chat streams or live service."""
+    cells = {
+        cell.capability: cell
+        for cell in PROVIDER_CERTIFICATION_MATRIX.cells
+        if cell.provider == "elevenlabs"
+    }
+    assert set(cells) == set(ProviderCapability)
+    assert all(cell.gateway_api_surfaces == ("speech", "transcription") for cell in cells.values())
+    assert cells[ProviderCapability.USAGE].result is (
+        ProviderCertificationResult.PROVIDER_FIXTURE_PASS
+    )
+    assert cells[ProviderCapability.TEXT_STREAM].result is ProviderCertificationResult.UNSUPPORTED

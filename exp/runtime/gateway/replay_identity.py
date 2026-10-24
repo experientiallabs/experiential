@@ -11,6 +11,7 @@ from exp.runtime.gateway.contracts import EncryptedReasoningBlock, GatewayReques
 from exp.runtime.gateway.decisions_contracts import DecisionRequest
 from exp.runtime.gateway.embeddings_contracts import EmbeddingsRequest, ServingRequest
 from exp.runtime.gateway.images_contracts import ImagesRequest
+from exp.runtime.gateway.video.contracts import VideoRequest
 
 
 def caller_operation_sha256(request: GatewayRequest) -> Sha256 | None:
@@ -84,6 +85,7 @@ def provider_replay_authority(request: GatewayRequest) -> JsonObject | None:
                 and call.provider_status is None
                 and call.provider_namespace is None
                 and call.provider_caller is None
+                and call.provider_thought_signature is None
             ):
                 continue
             retained_call: JsonObject = {
@@ -101,11 +103,16 @@ def provider_replay_authority(request: GatewayRequest) -> JsonObject | None:
                 retained_call["provider_namespace"] = call.provider_namespace
             if call.provider_caller is not None:
                 retained_call["provider_caller"] = call.provider_caller
+            if call.provider_thought_signature is not None:
+                retained_call["provider_thought_signature"] = call.provider_thought_signature
             retained_calls.append(retained_call)
         if retained_calls:
             authority["tool_calls"] = retained_calls
         if message.tool_is_error:
             authority["tool_is_error"] = True
+        if message.tool_references:
+            # A loaded deferred tool changes what the model can call.
+            authority["tool_references"] = list(message.tool_references)
         if message.provider_tool_name is not None:
             authority["provider_tool_name"] = message.provider_tool_name
         if message.provider_tool_namespace is not None:
@@ -141,6 +148,7 @@ def provider_replay_authority(request: GatewayRequest) -> JsonObject | None:
         and request.speed is None
         and request.inference_geo is None
         and request.service_tier is None
+        and request.sampling_extras is None
         and not request.include_output_text_logprobs
         and not request.include_web_search_sources
         and not request.json_object_output
@@ -174,6 +182,11 @@ def provider_replay_authority(request: GatewayRequest) -> JsonObject | None:
     if request.service_tier is not None:
         # A provider tier changes pricing and scheduling for the same body.
         envelope["service_tier"] = request.service_tier
+    if request.sampling_extras is not None:
+        # Sampling extras change the answer distribution for the same body.
+        envelope["sampling_extras"] = request.sampling_extras.model_dump(
+            mode="json", exclude_none=True
+        )
     if request.provider_preferences is not None:
         # The caller's OpenRouter routing preferences change which upstream
         # serves the same body, so a reused operation key with a different
@@ -214,7 +227,7 @@ def canonical_request_sha256(request: ServingRequest) -> Sha256:
     request with no carrier digests exactly as its plain serialization, so
     every request decoded before the carriers existed keeps its identity.
 
-    The embeddings, images, decisions, speech, and transcription surfaces have no
+    The embeddings, images, decisions, speech, transcription, and video surfaces have no
     messages, tools, or excluded provider carriers, so they digest exactly as
     their plain serialization.
 
@@ -231,6 +244,7 @@ def canonical_request_sha256(request: ServingRequest) -> Sha256:
             | DecisionRequest()
             | SpeechRequest()
             | TranscriptionRequest()
+            | VideoRequest()
         ):
             return sha256_json(request)
         case GatewayRequest():

@@ -18,7 +18,6 @@ from exp.common.models.gateway_chains_test import chain
 from exp.common.models.gateway_pools import GatewayEquivalenceCertification
 from exp.runtime.gateway.contracts import (
     DirectTarget,
-    ExecutionSnapshot,
     GatewayApiSurface,
     GatewayFailure,
     GatewayFailureClass,
@@ -26,6 +25,7 @@ from exp.runtime.gateway.contracts import (
     GatewayRequest,
     ProjectTarget,
 )
+from exp.runtime.gateway.execution_snapshot import ExecutionSnapshot
 from exp.runtime.gateway.health import DeploymentHealthRegistry
 from exp.runtime.gateway.model_plan import model_execution_snapshot, project_stage_selection
 from exp.runtime.gateway.native_execution import (

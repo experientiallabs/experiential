@@ -9,6 +9,7 @@ use sha2::{Digest, Sha256};
 use crate::errors::{Failure, PublicError};
 use crate::events::{ChoiceLogprobs, Event, Usage};
 use crate::reasoning_display::{self, DisplayJoiner, ReasoningOutput};
+use crate::reasoning_estimate::ReasoningEstimate;
 use crate::tool_search::annotate_tool_search_usage_details;
 use crate::web_search::{annotate_usage_details, ChatWebSearch, WebSearchAdmission};
 
@@ -132,6 +133,16 @@ impl ReasoningCarrierState {
                 "Chat reasoning content requires complete unique tool calls.",
             ));
         }
+        // A custom (freeform) call returns to the gateway as an opaque
+        // `custom_tool_call` history item, never as a tool-call turn, so a
+        // carrier sealed over it could not be bound on the next request and its
+        // freeform input is no JSON object to digest. The turn serves without
+        // preserved reasoning, as a failover would (Codex `apply_patch` on
+        // Experiential Cloud failed every such completed turn at the terminal,
+        // production 2026-10-19).
+        if self.completed.values().any(|call| call.custom) {
+            return Ok(None);
+        }
         let route_sha256 = self.route_sha256.clone().ok_or_else(|| {
             invalid_provider_stream("Chat reasoning content omitted provider route identity.")
         })?;
@@ -189,6 +200,8 @@ pub struct ChatSseEncoder {
     reasoning_output_exposed: bool,
     reasoning_displayed: bool,
     reasoning_display: DisplayJoiner,
+    /// Visible output and thinking for the estimated reasoning count.
+    reasoning_estimate: ReasoningEstimate,
     web_search: Option<ChatWebSearch>,
     /// Gateway-run tool-search rounds metered on the usage chunk; zero
     /// leaves every frame byte-identical.
@@ -221,6 +234,7 @@ impl ChatSseEncoder {
             reasoning_output_exposed: false,
             reasoning_displayed: false,
             reasoning_display: DisplayJoiner::default(),
+            reasoning_estimate: ReasoningEstimate::default(),
             web_search: None,
             tool_search_requests: 0,
         }
@@ -302,6 +316,7 @@ impl ChatSseEncoder {
             ));
         }
         self.reasoning.observe(event)?;
+        self.reasoning_estimate.observe(event);
         if let Some(web_search) = self.web_search.as_mut() {
             web_search.observe(event);
         }
@@ -380,6 +395,7 @@ impl ChatSseEncoder {
                 call_id,
                 name,
                 custom,
+                thought_signature,
                 ..
             } => {
                 if self.tool_indices.contains_key(index) {
@@ -406,6 +422,7 @@ impl ChatSseEncoder {
                         "function": {"name": name, "arguments": ""},
                     })
                 };
+                let call = with_thought_signature(call, thought_signature.as_deref());
                 Ok(vec![self.chunk(json!({ "tool_calls": [call] }), None)])
             }
             Event::ToolArgumentsDelta { index, delta } => {
@@ -535,7 +552,10 @@ impl ChatSseEncoder {
     }
 
     fn usage_chunk(&self, usage: &Usage) -> String {
-        let mut usage = streaming_chat_usage(usage);
+        let reported = usage;
+        let mut usage = streaming_chat_usage(reported);
+        self.reasoning_estimate
+            .annotate(&mut usage, Some(reported), "completion_tokens_details");
         annotate_usage_details(
             &mut usage,
             self.web_search.as_ref().map(ChatWebSearch::admission),
@@ -551,6 +571,20 @@ impl ChatSseEncoder {
         });
         chat_data(&payload)
     }
+}
+
+/// Attach Gemini's thought signature to one public tool call in the shape
+/// Google's own OpenAI-compatible endpoint uses,
+/// `extra_content.google.thought_signature`, so clients built for that
+/// endpoint echo it back unchanged. A call without one is left as it was.
+pub fn with_thought_signature(mut call: Value, thought_signature: Option<&str>) -> Value {
+    if let (Some(signature), Some(object)) = (thought_signature, call.as_object_mut()) {
+        object.insert(
+            "extra_content".to_string(),
+            json!({"google": {"thought_signature": signature}}),
+        );
+    }
+    call
 }
 
 /// Frame one compact UTF-8-preserving Chat SSE data event.
@@ -575,11 +609,32 @@ fn streaming_chat_usage(usage: &Usage) -> Value {
         "prompt_tokens_details": chat_input_details(usage, true),
         "completion_tokens_details": {"reasoning_tokens": usage.reasoning_tokens.unwrap_or(0)},
     });
+    annotate_image_tokens(&mut wire["completion_tokens_details"], usage);
     let unreported = usage.unreported_token_details();
     if !unreported.is_empty() {
         wire["unreported_token_details"] = json!(unreported);
     }
     wire
+}
+
+/// Name the generated-image subset of the output as `image_tokens`
+/// (OpenRouter's field) inside an output-details object, when one was reported.
+pub(crate) fn annotate_image_tokens(details: &mut Value, usage: &Usage) {
+    if let (Some(image), Some(details)) = (usage.image_output_tokens, details.as_object_mut()) {
+        details.insert("image_tokens".to_string(), json!(image));
+    }
+}
+
+/// OpenAI's write-lifetime split (`ttl_30m_tokens`, `ttl_12h_tokens`), named
+/// only when a 12-hour count was observed: the two never overlap and sum to
+/// `cache_write_tokens` less any one-hour subset.
+pub(crate) fn cache_write_lifetimes(usage: &Usage) -> Option<Value> {
+    let half_day = usage.cache_creation_12h_input_tokens?;
+    let written = usage.cache_creation_input_tokens.unwrap_or(0);
+    let short = written
+        .saturating_sub(half_day)
+        .saturating_sub(usage.cache_creation_1h_input_tokens.unwrap_or(0));
+    Some(json!({"ttl_30m_tokens": short, "ttl_12h_tokens": half_day}))
 }
 
 /// Input subsets remain unknown when absent; cache writes are never invented.
@@ -597,6 +652,9 @@ fn chat_input_details(usage: &Usage, streaming: bool) -> Value {
     if let Some(hour) = usage.cache_creation_1h_input_tokens {
         details.insert("cache_write_1h_tokens".into(), json!(hour));
     }
+    if let Some(split) = cache_write_lifetimes(usage) {
+        details.insert("cache_write_tokens_details".into(), split);
+    }
     if details.is_empty() {
         Value::Null
     } else {
@@ -613,10 +671,12 @@ fn completed_chat_usage(usage: Option<&Usage>) -> Value {
     let input = usage.input_tokens.unwrap_or(0);
     let output = usage.output_tokens.unwrap_or(0);
     let details = chat_input_details(usage, false);
-    let output_details = match usage.reasoning_tokens {
+    let mut output_details = match usage.reasoning_tokens {
         Some(reasoning) => json!({"reasoning_tokens": reasoning}),
+        None if usage.image_output_tokens.is_some() => json!({}),
         None => Value::Null,
     };
+    annotate_image_tokens(&mut output_details, usage);
     json!({
         "prompt_tokens": input,
         "completion_tokens": output,
@@ -731,11 +791,14 @@ pub fn completed_chat_body_with_carrier(
                 "type": "custom",
                 "custom": {"name": call.name, "input": call.raw_arguments},
             })),
-            Event::ToolCallCompleted { call, .. } => Some(json!({
-                "id": call.call_id,
-                "type": "function",
-                "function": {"name": call.name, "arguments": call.raw_arguments},
-            })),
+            Event::ToolCallCompleted { call, .. } => Some(with_thought_signature(
+                json!({
+                    "id": call.call_id,
+                    "type": "function",
+                    "function": {"name": call.name, "arguments": call.raw_arguments},
+                }),
+                call.thought_signature.as_deref(),
+            )),
             _ => None,
         })
         .collect();
@@ -828,6 +891,12 @@ pub fn completed_chat_body_with_carrier(
                 .insert("reasoning".to_string(), Value::String(text));
         }
     }
+    let mut usage_wire = completed_chat_usage(usage.as_ref());
+    ReasoningEstimate::from_events(events).annotate(
+        &mut usage_wire,
+        usage.as_ref(),
+        "completion_tokens_details",
+    );
     let mut body = json!({
         "id": stable_public_id("chatcmpl", request_id),
         "object": "chat.completion",
@@ -841,7 +910,7 @@ pub fn completed_chat_body_with_carrier(
                 "logprobs": logprobs.as_ref().map_or(Value::Null, |value| serde_json::to_value(value).unwrap_or(Value::Null)),
             }
         ],
-        "usage": completed_chat_usage(usage.as_ref()),
+        "usage": usage_wire,
     });
     if !ignored_parameters.is_empty() {
         body.as_object_mut()

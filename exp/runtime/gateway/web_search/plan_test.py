@@ -3,6 +3,7 @@
 import asyncio
 import time
 
+from exp.common.models.model import ToolCall
 from exp.runtime.gateway.contracts import (
     GatewayApiSurface,
     GatewayMessage,
@@ -16,13 +17,16 @@ from exp.runtime.gateway.tests.web_search_backend_fixture_test import (
     StaticWebSearchBackend,
 )
 from exp.runtime.gateway.tool_contracts import GatewayAllowedToolsChoice
+from exp.runtime.gateway.web_search.backend import WebSearchHits
 from exp.runtime.gateway.web_search.contracts import GatewayWebSearch, GatewayWebSearchResult
 from exp.runtime.gateway.web_search.plan import (
     DROPPED_FAILED,
     DROPPED_NO_QUERY,
     DROPPED_NOT_ALLOWED,
+    DROPPED_TOOL_LOOP,
     DROPPED_UNAVAILABLE,
     TOOL_CHOICE_CLEARED,
+    answers_tool_call,
     derive_query,
     inject_results,
     instruction_text,
@@ -298,3 +302,107 @@ def test_a_declared_search_outside_the_allowed_set_never_searches() -> None:
     )
     plan_web_search(allowed, ["openai_compatible"], backend, deadline_monotonic=_deadline())
     assert backend.queries == ["What is the latest Rust release?"]
+
+
+class _CostReportingBackend:
+    """A backend that attaches a vendor cost to its hits, like Exa's ``costDollars``."""
+
+    name = "costed"
+
+    def __init__(self, cost: int | None) -> None:
+        self._cost = cost
+
+    async def search(
+        self,
+        query: str,
+        *,
+        max_results: int,
+        allowed_domains: object,
+        blocked_domains: object,
+        timeout_seconds: float,
+    ) -> WebSearchHits:
+        del query, allowed_domains, blocked_domains, timeout_seconds
+        return WebSearchHits(_HITS[:max_results], vendor_cost_nano_usd=self._cost)
+
+
+def test_admission_carries_the_vendor_reported_cost_only_when_reported() -> None:
+    request = _request(search=GatewayWebSearch(declared_as="plugin", max_results=2))
+    costed = plan_web_search(
+        request,
+        ["openai_compatible"],
+        _CostReportingBackend(9_000_000),
+        deadline_monotonic=_deadline(),
+    )
+    assert costed.admission is not None
+    assert costed.admission["cost_nano_usd"] == 9_000_000
+    assert costed.admission["requests"] == 1
+    assert costed.admission["results"] == [{"url": hit.url, "title": hit.title} for hit in _HITS]
+    unreported = plan_web_search(
+        request, ["openai_compatible"], _CostReportingBackend(None), deadline_monotonic=_deadline()
+    )
+    assert unreported.admission is not None
+    assert "cost_nano_usd" not in unreported.admission
+
+
+def _loop_messages(*, trailing_user: str | None = None) -> tuple[GatewayMessage, ...]:
+    """One agent loop: question, a tool call, its result, and optionally split user text."""
+    messages = [
+        GatewayMessage(role="user", content="What is the latest Rust release?"),
+        GatewayMessage(
+            role="assistant",
+            tool_calls=(ToolCall(call_id="call-1", name="read_file", arguments={"path": "a"}),),
+        ),
+        GatewayMessage(role="tool", tool_call_id="call-1", content="file body"),
+    ]
+    if trailing_user is not None:
+        messages.append(GatewayMessage(role="user", content=trailing_user))
+    return tuple(messages)
+
+
+def test_answers_tool_call_reads_the_latest_input() -> None:
+    assert answers_tool_call(_request().model_copy(update={"messages": _loop_messages()}))
+    # One Anthropic user turn mixing tool_result and text splits into the
+    # tool message followed by the text: still a tool-result turn.
+    split = _request().model_copy(
+        update={"messages": _loop_messages(trailing_user="<system-reminder>")}
+    )
+    assert answers_tool_call(split)
+    assert not answers_tool_call(_request())
+
+
+def test_a_search_tool_is_not_pre_searched_on_a_tool_result_turn() -> None:
+    """Codex and Claude Code re-declare the search tool on every loop step: search once."""
+    for declared_as, surface in (
+        ("responses_tool", GatewayApiSurface.RESPONSES),
+        ("messages_server_tool", GatewayApiSurface.MESSAGES),
+    ):
+        backend = StaticWebSearchBackend(_HITS)
+        request = _request(surface, search=GatewayWebSearch(declared_as=declared_as)).model_copy(
+            update={"messages": _loop_messages()}
+        )
+        plan = plan_web_search(
+            request, ["openai_compatible"], backend, deadline_monotonic=_deadline()
+        )
+        assert backend.queries == []
+        assert plan.admission is None
+        assert DROPPED_TOOL_LOOP in plan.request.ignored_parameters
+        # The turn that opens with the user's question still searches.
+        opening = _request(surface, search=GatewayWebSearch(declared_as=declared_as))
+        searched = plan_web_search(
+            opening, ["openai_compatible"], backend, deadline_monotonic=_deadline()
+        )
+        assert searched.admission is not None and searched.admission["requests"] == 1
+
+
+def test_per_request_spellings_still_search_once_on_a_tool_result_turn() -> None:
+    """The plugin, :online and web_search_options promise one search per request."""
+    for declared_as in ("plugin", "model_suffix", "web_search_options"):
+        backend = StaticWebSearchBackend(_HITS)
+        request = _request(search=GatewayWebSearch(declared_as=declared_as)).model_copy(
+            update={"messages": _loop_messages()}
+        )
+        plan = plan_web_search(
+            request, ["openai_compatible"], backend, deadline_monotonic=_deadline()
+        )
+        assert backend.queries == ["What is the latest Rust release?"]
+        assert plan.admission is not None and plan.admission["requests"] == 1

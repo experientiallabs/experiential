@@ -45,6 +45,7 @@ from exp.runtime.gateway.catalog_authority import (
 )
 from exp.runtime.gateway.lifecycle_test import _configured_gateway
 from exp.runtime.gateway.management import GatewayManagement
+from exp.runtime.gateway.organization_tag import ORGANIZATION_TAG_HEADER
 from exp.runtime.gateway.tests.certified_pool_fixture_test import upsert_certified_pool
 from exp.runtime.gateway.tests.native_messages_test import _DRIVER_SOURCE, _HOST, _ServingEngine
 
@@ -416,7 +417,7 @@ def _engine(
         organization_id=manager.organization_id,
         period=datetime.now(UTC).strftime("%Y-%m"),
         scope=BudgetScope(kind=BudgetScopeKind.TEAM),
-        limit_nano_usd=100_000_000,
+        limit_nano_usd=1_000_000_000,
     )
     driver = root / "native_decisions_driver.py"
     driver.write_text(_PROFILE_OVERRIDE_SOURCE + "\n\n" + _DRIVER_SOURCE + "\n")
@@ -594,10 +595,18 @@ def _provider_calls() -> int:
         return len(_DecisionsUpstream.payloads)
 
 
-def test_typed_answers_preserve_alias_and_settle_exact_owned_usage(engine: _ServingEngine) -> None:
+@pytest.mark.parametrize("state_repeats", [0, 40_000])
+def test_typed_answers_preserve_alias_and_settle_exact_owned_usage(
+    engine: _ServingEngine, state_repeats: int
+) -> None:
     """Native answers preserve every question type and bill 451 input tokens exactly."""
     before = _request_ids(engine)
-    response = _post(engine, _body(), **{"x-client-request-id": "decision-correlation"})
+    body = _body()
+    if state_repeats:
+        cast(JsonObject, body["state"])["message"] = (
+            "The deployment is healthy. " * state_repeats + "Final evidence: failed."
+        )
+    response = _post(engine, body, **{"x-client-request-id": "decision-correlation"})
     assert response.status_code == 200, response.text
     public = response.json()
     assert re.fullmatch(r"decision_[0-9a-f]{32}", public["id"])
@@ -610,10 +619,12 @@ def test_typed_answers_preserve_alias_and_settle_exact_owned_usage(engine: _Serv
     assert response.headers["x-gateway-route-depth"] == "0"
     assert response.headers["x-client-request-id"] == "decision-correlation"
     with _DecisionsUpstream.payloads_lock:
-        assert _DecisionsUpstream.payloads[-1] == {**_body(), "model": "jev-latest"}
+        assert _DecisionsUpstream.payloads[-1] == {**body, "model": "jev-latest"}
         headers = {key.lower(): value for key, value in _DecisionsUpstream.headers_seen[-1].items()}
     assert headers["authorization"] == f"Bearer {_PROVIDER_KEY}"
     assert engine.raw_key not in headers.values()
+    # A customer-managed rung never carries the per-organization scheduling tag.
+    assert ORGANIZATION_TAG_HEADER.lower() not in headers
     [(request, attempts)] = _settled(engine, before)
     assert request["request_id"] == response.headers["x-request-id"]
     assert request["key_id"] == "key-one"

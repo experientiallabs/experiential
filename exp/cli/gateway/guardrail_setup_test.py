@@ -29,6 +29,7 @@ from exp.common.core.artifacts import stable_id, validate_artifact_id
 from exp.common.core.locks import FileLockTimeout, file_write_lock
 from exp.runtime.gateway.guardrails.config import engine_from_document, load_guardrail_engine
 from exp.runtime.gateway.guardrails.preset import STANDARD_DEFAULT_TIMEOUT_MS, STANDARD_PRESET_STEPS
+from exp.runtime.gateway.guardrails.store_test import _authorization
 from exp.runtime.gateway.sqlite.alias_activation import AliasActivationOutcomeUnknownError
 
 _ORG = "local"
@@ -149,7 +150,7 @@ def test_explicit_standard_opt_in_authors_one_shared_adapter(tmp_path: Path) -> 
     assert set(policy["capability_adapters"].values()) == {adapter_id}
     engine = load_guardrail_engine(tmp_path)
     assert engine is not None
-    loaded = engine.policies_for(_ORG, _IDENTITY)[0]
+    loaded = engine.policies_for(_authorization(_ORG, _IDENTITY))[0]
     assert loaded is not None
     assert loaded.protected is True
     assert len(loaded.checks) == len(STANDARD_PRESET_STEPS)
@@ -399,7 +400,7 @@ def test_non_owned_standard_looking_policy_is_custom(tmp_path: Path) -> None:
     engine = engine_from_document(
         json.loads(guardrail_config_path(tmp_path).read_text(encoding="utf-8"))
     )
-    policy = engine.policies_for(_ORG, _IDENTITY)[0]
+    policy = engine.policies_for(_authorization(_ORG, _IDENTITY))[0]
     assert policy is not None
     assert policy.policy_id == "hand-authored-standard"
 
@@ -424,7 +425,7 @@ def test_authored_revision_preserves_custom_standard_policy(tmp_path: Path) -> N
     assert path.read_bytes() == before
     engine = load_guardrail_engine(tmp_path)
     assert engine is not None
-    assert engine.policies_for(_ORG, _IDENTITY)[0].revision == "detector-v2"
+    assert engine.policies_for(_authorization(_ORG, _IDENTITY))[0].revision == "detector-v2"
 
 
 def test_collect_rejects_ambiguous_custom_answers(tmp_path: Path) -> None:

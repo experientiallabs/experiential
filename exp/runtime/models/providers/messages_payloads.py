@@ -33,11 +33,12 @@ from exp.runtime.models.providers.reasoning_compat import (
     anthropic_reasoning_effort,
     anthropic_thinking_budget_tokens,
     anthropic_thinks_without_config,
+    bedrock_adaptive_thinking_model,
     reasoning_display_enabled,
 )
 from exp.runtime.models.providers.wire_messages import (
     anthropic_blocks,
-    fold_tool_result_images,
+    fold_tool_result_attachments,
     retained_cache_marked_blocks,
 )
 from exp.runtime.openai_protocol.model_adapter import model_request as gateway_model_request
@@ -527,11 +528,16 @@ def gemini_generate_content_stream_payload(
         ProviderResponseError: A message cannot preserve its tool linkage on
             Gemini's wire.
     """
-    # Gemini's functionResponse carries JSON text; a tool screenshot rides a
-    # following user content (one content per message, no role alternation
-    # rule on this wire). The native ``functionResponse.parts`` carrier is
-    # documented for the Gemini 3 series only and is not adopted unprobed.
-    folded = request.model_copy(update={"messages": fold_tool_result_images(request.messages)})
+    # Gemini's functionResponse carries JSON text; a tool screenshot or a
+    # tool-returned document rides a following user content (one content per
+    # message, no role alternation rule on this wire). The native
+    # ``functionResponse.parts`` carrier is documented for the Gemini 3
+    # series only and is not adopted unprobed.
+    folded = request.model_copy(
+        update={
+            "messages": fold_tool_result_attachments(request.messages, kinds=("image", "document"))
+        }
+    )
     try:
         return gemini_generate_request(
             model_id,
@@ -563,6 +569,8 @@ def bedrock_converse_stream_payload(
     supports_top_p: bool = True,
     supports_top_k: bool = False,
     supports_logprobs: bool = False,
+    supports_reasoning: bool = False,
+    reasoning_effort: str | None = None,
 ) -> JsonObject:
     """Translate one canonical request to the native ConverseStream REST body.
 
@@ -573,8 +581,11 @@ def bedrock_converse_stream_payload(
 
     Args:
         model_id: Exact Bedrock model or inference-profile identifier; it
-            travels in the wire profile URL and keeps the dispatch signature.
+            travels in the wire profile URL and selects the thinking contract.
         request: Canonical gateway request.
+        supports_reasoning: Whether this rung declares a reasoning control.
+        reasoning_effort: The rung's required default effort, used only when
+            the caller sent none.
 
     Returns:
         Native Converse request body for the streaming REST route.
@@ -587,9 +598,15 @@ def bedrock_converse_stream_payload(
         ProviderResponseError: A message cannot be represented without
             dropping tool context.
     """
-    del model_id
+    # A tool-returned document rides a following user turn: this wire's
+    # toolResult carries text, image, and JSON blocks, and a user turn carries
+    # the document natively (see the fold's docstring). A native toolResult
+    # document block is the unprobed follow-up this fold stands in for.
+    request = request.model_copy(
+        update={"messages": fold_tool_result_attachments(request.messages, kinds=("document",))}
+    )
     try:
-        return converse_body(
+        payload = converse_body(
             request,
             supports_temperature=supports_temperature,
             supports_top_p=supports_top_p,
@@ -614,3 +631,50 @@ def bedrock_converse_stream_payload(
         raise
     except ValueError as exc:
         raise ProviderResponseError(str(exc)) from exc
+    if supports_reasoning and bedrock_adaptive_thinking_model(model_id):
+        thinking = _bedrock_claude_thinking_fields(
+            model_id, request.reasoning_effort or reasoning_effort, payload
+        )
+        if thinking:
+            fields = payload.get("additionalModelRequestFields")
+            merged: JsonObject = dict(fields) if isinstance(fields, dict) else {}
+            merged.update(thinking)
+            payload["additionalModelRequestFields"] = merged
+    return payload
+
+
+def _bedrock_claude_thinking_fields(
+    model_id: str, effort: str | None, payload: JsonObject
+) -> JsonObject:
+    """Return the Anthropic thinking fields one Converse request carries.
+
+    Converse merges ``additionalModelRequestFields`` into the Anthropic body,
+    so the adaptive generation takes the same ``thinking`` object and
+    ``output_config.effort`` the Messages builder sends. A caller effort turns
+    adaptive thinking on at that effort; with no effort, a generation that
+    thinks without a config is still asked for a readable display (and
+    nothing else) unless the request carries sampling controls. Display
+    follows the reasoning display kill switch, exactly like the Messages wire:
+    without it the provider streams signature-only thinking.
+
+    Args:
+        model_id: Exact Bedrock Claude inference-profile identifier.
+        effort: The caller's effort, else the rung's required default.
+        payload: The built Converse body, read for sampling controls.
+
+    Returns:
+        The fields to merge, or an empty object when none apply.
+    """
+    display = {"display": "summarized"} if reasoning_display_enabled() else {}
+    if effort is not None and effort != "none":
+        return {
+            "thinking": {"type": "adaptive", **display},
+            "output_config": {"effort": anthropic_reasoning_effort(model_id, effort)},
+        }
+    inference = payload.get("inferenceConfig")
+    sampled = isinstance(inference, dict) and any(
+        key in inference for key in ("temperature", "topP")
+    )
+    if effort is None and display and anthropic_thinks_without_config(model_id) and not sampled:
+        return {"thinking": {"type": "adaptive", **display}}
+    return {}

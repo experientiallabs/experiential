@@ -81,6 +81,12 @@ def text_input_context(request: GatewayRequest) -> str:
                 "call_id": message.tool_call_id,
                 "name": message.provider_tool_name,
                 "namespace": message.provider_tool_namespace,
+                # Loaded deferred-tool names are caller text the model reads.
+                **(
+                    {"tool_references": list(message.tool_references)}
+                    if message.tool_references
+                    else {}
+                ),
             }
             for message in results
         ]

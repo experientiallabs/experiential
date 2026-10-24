@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
+from typing import Literal
 
 from pydantic import Field, model_validator
 
@@ -21,7 +22,11 @@ from exp.common.project import (
     ArtifactStore,
     artifact_input,
 )
+from exp.simulation.engines.text.knowledge import SimulationKnowledge
 from exp.simulation.engines.text.prompt import (
+    RECONSTRUCTED_TEXT_PROMPT_ID,
+    RECONSTRUCTED_TEXT_PROMPT_VERSION,
+    RECONSTRUCTED_TEXT_SYSTEM_PROMPT,
     WORLD_MODEL_TEXT_GROUNDING_SCHEMA_VERSION,
     WORLD_MODEL_TEXT_PROMPT_ID,
     WORLD_MODEL_TEXT_PROMPT_VERSION,
@@ -38,17 +43,26 @@ GROUNDED_WORLD_MODEL_GROUNDING_SCHEMA_VERSION = WORLD_MODEL_TEXT_GROUNDING_SCHEM
 GROUNDED_WORLD_MODEL_SYSTEM_PROMPT = WORLD_MODEL_TEXT_SYSTEM_PROMPT
 
 
-def grounded_world_model_prompt_sha256() -> str:
+def grounded_world_model_prompt_sha256(*, reconstructed: bool = False) -> str:
     """Return the digest of the complete grounded world-model system prompt.
+
+    Args:
+        reconstructed: Select the separate reconstruction prompt rather than the baseline.
 
     Returns:
         Stable SHA-256 prompt identity.
     """
     return sha256_json(
         {
-            "prompt_id": GROUNDED_WORLD_MODEL_PROMPT_ID,
-            "prompt_version": GROUNDED_WORLD_MODEL_PROMPT_VERSION,
-            "system_prompt": GROUNDED_WORLD_MODEL_SYSTEM_PROMPT,
+            "prompt_id": RECONSTRUCTED_TEXT_PROMPT_ID
+            if reconstructed
+            else GROUNDED_WORLD_MODEL_PROMPT_ID,
+            "prompt_version": RECONSTRUCTED_TEXT_PROMPT_VERSION
+            if reconstructed
+            else GROUNDED_WORLD_MODEL_PROMPT_VERSION,
+            "system_prompt": RECONSTRUCTED_TEXT_SYSTEM_PROMPT
+            if reconstructed
+            else GROUNDED_WORLD_MODEL_SYSTEM_PROMPT,
             "grounding_schema_version": GROUNDED_WORLD_MODEL_GROUNDING_SCHEMA_VERSION,
             "rag_key_schema_version": RAG_KEY_SCHEMA_VERSION,
         }
@@ -64,6 +78,9 @@ def grounded_world_model_content(
     prompt_sha256: str,
     top_k: int,
     code_revision: str,
+    knowledge: SimulationKnowledge | None = None,
+    selection_policy_sha256: str | None = None,
+    original_evidence: OriginalEvidence = "retrieved",
 ) -> dict[str, object]:
     """Return the complete content-addressed identity of a grounded world model.
 
@@ -75,11 +92,27 @@ def grounded_world_model_content(
         prompt_sha256: Exact prompt-content digest.
         top_k: Number of real transitions retrieved per prediction.
         code_revision: Exact code revision that creates the artifact.
+        knowledge: Frozen reconstruction and investigation context.
+        selection_policy_sha256: Optional explicit reranker identity.
+        original_evidence: ``retrieved`` grounds each prediction in nearest recorded
+            transitions; ``none`` predicts from task, history and learned memory only.
 
     Returns:
         Canonical content mapping used to derive the artifact identity.
     """
+    # Optional inputs at their defaults add nothing, so a world model persisted before they
+    # existed keeps the identity it was saved under.
+    extra: dict[str, object] = {
+        **({} if original_evidence == "retrieved" else {"original_evidence": original_evidence}),
+        **(
+            {}
+            if selection_policy_sha256 is None
+            else {"selection_policy_sha256": selection_policy_sha256}
+        ),
+        **({} if knowledge is None else {"knowledge": knowledge.model_dump(mode="json")}),
+    }
     return {
+        **extra,
         "serving_rag": serving_rag.model_dump(mode="json"),
         "model_alias": model_alias,
         "model": model.model_dump(mode="json"),
@@ -90,8 +123,18 @@ def grounded_world_model_content(
     }
 
 
+OriginalEvidence = Literal["retrieved", "none"]
+
+
 class GroundedWorldModelArtifact(ArtifactEnvelope):
-    """Executable text world model bound to one immutable serving RAG snapshot."""
+    """Executable text world model bound to one immutable serving RAG snapshot.
+
+    Attributes:
+        original_evidence: ``retrieved`` (source-RAG profile) retrieves nearest recorded
+            transitions for every prediction. ``none`` (memory-first profile) never retrieves
+            them; the serving index is kept only as the identity of the stored evidence corpus,
+            and predictions read the task, visible history and learned memory.
+    """
 
     world_model_id: ArtifactId
     serving_rag: ArtifactInput
@@ -100,6 +143,11 @@ class GroundedWorldModelArtifact(ArtifactEnvelope):
     prompt_version: str = Field(min_length=1, max_length=256)
     prompt_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     top_k: int = Field(gt=0)
+    knowledge: SimulationKnowledge | None = None
+    selection_policy_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    original_evidence: OriginalEvidence = Field(
+        default="retrieved", exclude_if=lambda value: value == "retrieved"
+    )
 
     @model_validator(mode="after")
     def _require_single_rag_input(self) -> GroundedWorldModelArtifact:
@@ -133,6 +181,9 @@ def persist_grounded_world_model(
     created_at: datetime,
     code_revision: str,
     top_k: int,
+    knowledge: SimulationKnowledge | None = None,
+    selection_policy_sha256: str | None = None,
+    original_evidence: OriginalEvidence = "retrieved",
 ) -> PersistedGroundedWorldModel:
     """Persist a reusable world model over one verified immutable serving index.
 
@@ -144,6 +195,9 @@ def persist_grounded_world_model(
         created_at: Artifact materialization time.
         code_revision: Exact EXP revision producing the artifact.
         top_k: Number of grounded demonstrations supplied per step.
+        knowledge: Optional frozen reconstructed knowledge and research history.
+        selection_policy_sha256: Frozen reranker identity, required when using JEV.
+        original_evidence: Retrieve recorded transitions, or predict from memory only.
 
     Returns:
         Completed artifact and exact verified manifest.
@@ -158,11 +212,20 @@ def persist_grounded_world_model(
         serving_rag=serving_rag,
         model_alias=model_alias,
         model=model,
-        prompt_version=GROUNDED_WORLD_MODEL_PROMPT_VERSION,
-        prompt_sha256=grounded_world_model_prompt_sha256(),
+        prompt_version=(
+            RECONSTRUCTED_TEXT_PROMPT_VERSION
+            if knowledge is not None
+            else GROUNDED_WORLD_MODEL_PROMPT_VERSION
+        ),
+        prompt_sha256=grounded_world_model_prompt_sha256(reconstructed=knowledge is not None),
         top_k=top_k,
         code_revision=code_revision,
+        knowledge=knowledge,
+        selection_policy_sha256=selection_policy_sha256,
+        original_evidence=original_evidence,
     )
+    if original_evidence == "none" and selection_policy_sha256 is not None:
+        raise ValueError("a memory-first simulator retrieves no originals to rerank")
     artifact = GroundedWorldModelArtifact(
         schema_version=1,
         created_at=created_at,
@@ -173,9 +236,16 @@ def persist_grounded_world_model(
         serving_rag=serving_rag,
         model_alias=model_alias,
         model=model,
-        prompt_version=GROUNDED_WORLD_MODEL_PROMPT_VERSION,
-        prompt_sha256=grounded_world_model_prompt_sha256(),
+        prompt_version=(
+            RECONSTRUCTED_TEXT_PROMPT_VERSION
+            if knowledge is not None
+            else GROUNDED_WORLD_MODEL_PROMPT_VERSION
+        ),
+        prompt_sha256=grounded_world_model_prompt_sha256(reconstructed=knowledge is not None),
         top_k=top_k,
+        knowledge=knowledge,
+        selection_policy_sha256=selection_policy_sha256,
+        original_evidence=original_evidence,
     )
     try:
         stored, manifest = store.write_or_replay(

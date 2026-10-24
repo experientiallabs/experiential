@@ -13,6 +13,9 @@ dist/
 .ty_cache/
 .DS_Store
 
+# CI caches GitLab saves from inside the project directory (docs/gitlab-ci.md).
+.ci-cache/
+
 # Rust extension build artifacts (PoC gateway data plane).
 exp/runtime/gateway/native/target/
 

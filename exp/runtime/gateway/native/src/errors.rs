@@ -273,6 +273,13 @@ pub fn empty_completion_headers(flagged: bool) -> Vec<(String, String)> {
     }
 }
 
+/// The one answer a tenant origin's upstream failure gets. Distinct transport,
+/// TLS, timeout and status messages would let a caller map ports and services
+/// behind a customer-addressed endpoint, so none of them crosses; the precise
+/// cause stays on the failure for settlement.
+pub const TENANT_ORIGIN_MESSAGE: &str =
+    "your custom endpoint could not be reached or returned an invalid response";
+
 pub const EMPTY_COMPLETION_MESSAGE: &str = "the model ended its turn without producing any output; \
      adjust the request (for example, end the conversation on a user turn or ask for a text answer) and resend";
 
@@ -332,6 +339,39 @@ pub struct Failure {
     /// flag never crosses the bridge and never reaches settlement.
     #[serde(skip)]
     pub encrypted_reasoning_rejected: bool,
+    /// The failure came from a customer-addressed origin. Its class, message
+    /// and detail still settle as they are; only the caller-facing answer
+    /// collapses to [`TENANT_ORIGIN_MESSAGE`] (see [`Self::public_error`]).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub tenant_origin: bool,
+    /// Set only on a header-phase timeout: which bound expired. A lane that
+    /// spent its OWN first-byte allowance is a hung-lane strike; one cut by
+    /// the request's pre-first-byte budget (or deadline) is not, because
+    /// the budget is shared and a healthy fallback dialed late gets only its
+    /// remainder. Crosses the bridge as `header_timeout` (python
+    /// `GatewayHeaderTimeout`), read by the control plane's lane ejection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub header_timeout: Option<HeaderTimeout>,
+}
+
+/// Which bound ended a dial waiting for its provider's response headers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HeaderTimeout {
+    /// The rung's own first-byte allowance expired: the lane did not answer.
+    Allowance,
+    /// The request's shared budget (or deadline) expired first.
+    Budget,
+}
+
+impl HeaderTimeout {
+    /// The boundary token, shared with python `GatewayHeaderTimeout`.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Allowance => "allowance",
+            Self::Budget => "budget",
+        }
+    }
 }
 
 impl Failure {
@@ -349,6 +389,8 @@ impl Failure {
             refusal_reason: None,
             rate_limit_headers: None,
             encrypted_reasoning_rejected: false,
+            tenant_origin: false,
+            header_timeout: None,
         }
     }
 
@@ -421,6 +463,41 @@ impl Failure {
         self
     }
 
+    /// Mark this failure as a tenant origin's when `tenant` is set; never clears.
+    pub fn with_tenant_origin(mut self, tenant: bool) -> Self {
+        self.tenant_origin |= tenant;
+        self
+    }
+
+    /// Whether the caller sees only [`TENANT_ORIGIN_MESSAGE`]: every class an
+    /// upstream answer or connection produces. The caller's own classes, the
+    /// gateway's, and an empty completion (a delivered turn) keep their shape.
+    fn tenant_opaque(&self) -> bool {
+        self.tenant_origin
+            && matches!(
+                self.failure_class,
+                FailureClass::InvalidRequest
+                    | FailureClass::Throttled
+                    | FailureClass::Transport
+                    | FailureClass::Timeout
+                    | FailureClass::ProviderAuthentication
+                    | FailureClass::ProviderNotFound
+                    | FailureClass::ProviderQuota
+                    | FailureClass::Refusal
+                    | FailureClass::MalformedResponse
+                    | FailureClass::ProviderInternal
+            )
+    }
+
+    /// The message a caller may read for this failure.
+    pub fn caller_message(&self) -> &str {
+        if self.tenant_opaque() {
+            TENANT_ORIGIN_MESSAGE
+        } else {
+            &self.safe_message
+        }
+    }
+
     /// Mark whether the provider refused replayed encrypted reasoning.
     pub fn with_encrypted_reasoning_rejected(mut self, rejected: bool) -> Self {
         self.encrypted_reasoning_rejected = rejected;
@@ -457,6 +534,7 @@ impl Failure {
                     "provider returned a malformed response; retry the request",
                 )
                 .with_retry(self.retryable_same_deployment, self.failover_eligible)
+                .with_tenant_origin(self.tenant_origin)
                 .with_provider_detail(Some(self.safe_message))
             }
             _ => self,
@@ -469,6 +547,16 @@ impl Failure {
     /// the reset boundary is computed control-plane side; the PoC returns the
     /// plain safe message with a one-hour retry hint instead.
     pub fn public_error(&self) -> PublicError {
+        // A tenant origin's upstream failure: one status, code and message
+        // whatever broke, so the answer cannot fingerprint what sits behind it.
+        if self.tenant_opaque() {
+            return PublicError::new(
+                502,
+                "custom_endpoint_failed",
+                TENANT_ORIGIN_MESSAGE,
+                "api_error",
+            );
+        }
         // The customer's own BYOK credential or account: their 400, with the
         // message that names their provider and the fix.
         if self.customer_owned {
@@ -546,6 +634,75 @@ impl Failure {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_tenant_origin_collapses_every_upstream_class_and_keeps_the_rest() {
+        let upstream = [
+            FailureClass::InvalidRequest,
+            FailureClass::Throttled,
+            FailureClass::Transport,
+            FailureClass::Timeout,
+            FailureClass::ProviderAuthentication,
+            FailureClass::ProviderNotFound,
+            FailureClass::ProviderQuota,
+            FailureClass::Refusal,
+            FailureClass::MalformedResponse,
+            FailureClass::ProviderInternal,
+        ];
+        for class in upstream {
+            let mut failure = Failure::new(class, "connect failed: Connection refused")
+                .with_provider_detail(Some("http 404".to_string()))
+                .with_rejected_parameter(Some("model".to_string()))
+                .with_tenant_origin(true);
+            failure.customer_owned = true;
+            failure.retry_after_seconds = Some(9);
+            let error = failure.public_error();
+            assert_eq!(error.status_code, 502, "{class:?}");
+            assert_eq!(error.code, "custom_endpoint_failed");
+            assert_eq!(error.message, TENANT_ORIGIN_MESSAGE);
+            assert_eq!(error.param, None);
+            assert_eq!(error.retry_after_seconds, None);
+            assert_eq!(error.refusal_reason, None);
+            assert_eq!(failure.caller_message(), TENANT_ORIGIN_MESSAGE);
+            // Settlement still reads the precise cause.
+            assert_eq!(failure.safe_message, "connect failed: Connection refused");
+            assert_eq!(failure.failure_class, class);
+        }
+        for class in [
+            FailureClass::Authentication,
+            FailureClass::Authorization,
+            FailureClass::QuotaExceeded,
+            FailureClass::UnsupportedCapability,
+            FailureClass::Cancelled,
+            FailureClass::Guardrail,
+            FailureClass::EmptyCompletion,
+            FailureClass::Internal,
+            FailureClass::Unavailable,
+        ] {
+            let failure = Failure::new(class, "gateway's own answer").with_tenant_origin(true);
+            assert_ne!(failure.public_error().code, "custom_endpoint_failed");
+            assert_eq!(failure.caller_message(), "gateway's own answer");
+        }
+        // An ordinary rung keeps its distinct answer.
+        let house = Failure::new(FailureClass::Transport, "provider transport failed");
+        assert_eq!(
+            house.with_tenant_origin(false).caller_message(),
+            "provider transport failed"
+        );
+    }
+
+    #[test]
+    fn the_malformed_boundary_keeps_a_tenant_origin_opaque() {
+        let failure = Failure::new(FailureClass::MalformedResponse, "unexpected item type")
+            .with_tenant_origin(true)
+            .boundary();
+        assert!(failure.tenant_origin);
+        assert_eq!(failure.public_error().message, TENANT_ORIGIN_MESSAGE);
+        assert_eq!(
+            failure.provider_detail.as_deref(),
+            Some("unexpected item type")
+        );
+    }
 
     #[test]
     fn a_refusal_is_a_request_error_with_its_own_code_never_a_routing_failure() {

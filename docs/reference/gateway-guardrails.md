@@ -32,7 +32,11 @@ engine = GuardrailEngine(
 control = NativeControlPlane(components, guardrails=engine)
 ```
 
-The gateway resolves `policies_for(organization_id, identity_id)` once for admission.
+The gateway resolves `policies_for(authorization)` once for admission. The
+`AuthorizationSnapshot` carries the organization, identity, alias, and frozen alias
+target, so a host store can scope a policy to exact-model pools as well as identities.
+`MappingGuardrailStore` scopes by organization and identity, and by exact-model pool when
+a policy sets `target_pool_ids`.
 The session captures every applicable policy, the original deadline, approval state,
 and output requirements. Continuation expansion, rewrites, gateway search rounds,
 response delivery, cancellation, and settlement all use that session. No later
@@ -258,7 +262,10 @@ returns `409`; retrying takes a new snapshot. Change `revision` whenever the det
 or external rollout configuration changes.
 Policies are immutable; compose a new engine snapshot when changing adapters.
 Default inspection bounds are 1 MiB, and the same absolute request deadline applies
-throughout inspection and provider execution.
+throughout inspection and provider execution. An adapter that sends only its own bounded
+window of the request (a `WindowedClassifier`) declares a configuration digest. That digest
+joins the replay revision, and a policy whose input checks are all windowed is not refused
+for its total request size.
 
 Startup requires `GUARDRAIL_CONTRACT_VERSION=3`. Publish coordinated engine and
 native packages before a downstream host updates its exact release pins. There
@@ -324,6 +331,11 @@ Built-in adapter kinds:
   a dedicated classifier endpoint. It never calls `POST /v1/chat/completions`
   or `POST /v1/responses`. Operators bind replaceable hosted adapters,
   including a hosted PII redactor, by `adapter_id`.
+- `decision_model`: input classification with a decision model on the SystemOne
+  wire. It sends a bounded window of the conversation, scores operator categories
+  against thresholds, and caches verdicts. A policy whose input checks are all
+  windowed is not refused for its total request size. See
+  [Classification guardrails](gateway-classification-guardrails.md).
 
 Other adapters may still be injected in code when composing a `GuardrailEngine`.
 

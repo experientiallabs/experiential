@@ -88,6 +88,7 @@ class _Record:
     speech: JsonObject = field(default_factory=dict)
     fields: dict[str, list[str]] = field(default_factory=dict)
     audio_bytes: int = 0
+    audio_header: bytes = b""
 
 
 class _AudioUpstream(BaseHTTPRequestHandler):
@@ -165,7 +166,12 @@ class _AudioUpstream(BaseHTTPRequestHandler):
                 fields.setdefault(name, []).append(payload.decode())
         with self.lock:
             self.records.append(
-                _Record(route="transcription", fields=fields, audio_bytes=len(audio))
+                _Record(
+                    route="transcription",
+                    fields=fields,
+                    audio_bytes=len(audio),
+                    audio_header=audio[:_WAV_HEADER_BYTES],
+                )
             )
         model = fields["model"][0]
         if model.endswith("tokens-model"):
@@ -412,6 +418,34 @@ def test_transcription_bills_metered_seconds_and_keeps_the_audio_in_the_data_pla
     }
     # 2.4 metered seconds at 100,000 nano-USD per second.
     assert _cost(engine) == before + 240_000
+
+
+@pytest.mark.parametrize("placeholder", [0xFFFFFFFF, 0])
+def test_a_streamed_wav_is_measured_to_its_end_and_forwarded_with_settled_sizes(
+    engine: _ServingEngine, placeholder: int
+) -> None:
+    """A WAV written as a stream (what ``/v1/audio/speech`` emits) is transcribed.
+
+    Its RIFF and ``data`` sizes are placeholders; both are read as running to
+    the end of the upload, so it bills the seconds actually sent and reaches
+    the provider as a self-consistent file of the same length.
+    """
+    before = _cost(engine)
+    audio = bytearray(_wav(1.5))
+    struct.pack_into("<I", audio, 4, placeholder)
+    struct.pack_into("<I", audio, 40, placeholder)
+    transcript = _client(engine).audio.transcriptions.create(
+        model="scribe", file=("speech.wav", bytes(audio), "audio/wav")
+    )
+    assert transcript.text == "hello world"
+    upstream = _last("transcription")
+    assert upstream.audio_bytes == len(audio)
+    riff_size, data_size = (
+        struct.unpack_from("<I", upstream.audio_header, offset)[0] for offset in (4, 40)
+    )
+    assert (riff_size, data_size) == (len(audio) - 8, len(audio) - _WAV_HEADER_BYTES)
+    # 1.5 metered seconds at 100,000 nano-USD per second.
+    assert _cost(engine) == before + 150_000
 
 
 def test_text_and_verbose_formats_render_from_the_metered_answer(engine: _ServingEngine) -> None:

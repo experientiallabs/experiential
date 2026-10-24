@@ -111,6 +111,8 @@ pub struct MessagesSseEncoder {
     open_position: Option<usize>,
     next_unopened: usize,
     buffered_bytes: usize,
+    /// `buffered_bytes`' share of the worker-wide retention budget.
+    retained: crate::retained::RetainedLease,
     tool_identities: HashMap<u32, (String, String)>,
     tool_arguments: HashMap<u32, String>,
     tool_completed: HashSet<u32>,
@@ -169,6 +171,7 @@ impl MessagesSseEncoder {
             open_position: None,
             next_unopened: 0,
             buffered_bytes: 0,
+            retained: crate::retained::RetainedLease::default(),
             tool_identities: HashMap::new(),
             tool_arguments: HashMap::new(),
             tool_completed: HashSet::new(),
@@ -554,6 +557,7 @@ impl MessagesSseEncoder {
                 "Messages stream buffered blocks exceeded the gateway response limit.",
             ));
         }
+        self.retain_buffered()?;
         self.blocks[position].pending_signature.push_str(signature);
         Ok(self.advance())
     }
@@ -566,6 +570,7 @@ impl MessagesSseEncoder {
                 "Messages stream buffered blocks exceeded the gateway response limit.",
             ));
         }
+        self.retain_buffered()?;
         let mut block = PendingBlock::new(BlockKind::Redacted);
         block.redacted_data = Some(data.to_string());
         self.blocks.push(block);
@@ -602,6 +607,7 @@ impl MessagesSseEncoder {
                 "Messages stream buffered blocks exceeded the gateway response limit.",
             ));
         }
+        self.retain_buffered()?;
         if serde_json::from_str::<Value>(citation).is_err() {
             return Err(invalid_provider_stream(
                 "Messages citation was not valid JSON.",
@@ -685,6 +691,7 @@ impl MessagesSseEncoder {
                 "Messages stream buffered blocks exceeded the gateway response limit.",
             ));
         }
+        self.retain_buffered()?;
         if serde_json::from_str::<Value>(block).is_err() {
             return Err(invalid_provider_stream(
                 "Messages server tool result was not valid JSON.",
@@ -756,6 +763,7 @@ impl MessagesSseEncoder {
                 "Messages stream buffered blocks exceeded the gateway response limit.",
             ));
         }
+        self.retain_buffered()?;
         self.blocks[position].pending.push_str(delta);
         Ok(())
     }
@@ -816,6 +824,7 @@ impl MessagesSseEncoder {
                 BlockKind::Redacted => {
                     let data = block.redacted_data.take().unwrap_or_default();
                     self.buffered_bytes = self.buffered_bytes.saturating_sub(data.len());
+                    retention::release_buffered(&mut self.retained, self.buffered_bytes);
                     json!({"type": "redacted_thinking", "data": data})
                 }
                 BlockKind::Tool(tool_index) => {
@@ -845,6 +854,7 @@ impl MessagesSseEncoder {
                 BlockKind::ServerResult => {
                     let raw = block.server_result_block.take().unwrap_or_default();
                     self.buffered_bytes = self.buffered_bytes.saturating_sub(raw.len());
+                    retention::release_buffered(&mut self.retained, self.buffered_bytes);
                     serde_json::from_str(&raw)
                         .expect("scheduled server result was validated as JSON")
                 }
@@ -870,6 +880,7 @@ impl MessagesSseEncoder {
         let anthropic_index = block.anthropic_index;
         for citation in block.pending_citations.drain(..) {
             self.buffered_bytes = self.buffered_bytes.saturating_sub(citation.len());
+            retention::release_buffered(&mut self.retained, self.buffered_bytes);
             let parsed: Value =
                 serde_json::from_str(&citation).expect("retained citation was validated as JSON");
             frames.push(event_frame(
@@ -900,6 +911,7 @@ impl MessagesSseEncoder {
         self.buffered_bytes = self
             .buffered_bytes
             .saturating_sub(block.pending_signature.len());
+        retention::release_buffered(&mut self.retained, self.buffered_bytes);
         block.pending_signature.clear();
     }
 
@@ -935,6 +947,7 @@ impl MessagesSseEncoder {
             }),
         ));
         self.buffered_bytes = self.buffered_bytes.saturating_sub(block.pending.len());
+        retention::release_buffered(&mut self.retained, self.buffered_bytes);
         block.pending.clear();
     }
 }
@@ -942,6 +955,7 @@ impl MessagesSseEncoder {
 mod aggregate;
 mod display;
 mod errors;
+mod retention;
 mod terminal;
 mod usage;
 

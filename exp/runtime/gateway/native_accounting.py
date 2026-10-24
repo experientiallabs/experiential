@@ -7,13 +7,19 @@ import logging
 import threading
 import time
 from collections.abc import Callable
+from datetime import UTC, datetime
 from typing import Final
 
 from exp.common.core.artifacts import JsonObject
 from exp.common.models.gateway_catalog import ExactModelDeployment
-from exp.runtime.gateway.attempt_tokens import worst_case_input_tokens, worst_case_output_tokens
+from exp.runtime.gateway.attempt_tokens import worst_case_output_tokens
 from exp.runtime.gateway.budget_continuation import denied_destination_pool
 from exp.runtime.gateway.budgets import BudgetReservationRejected, BudgetScopeKind
+from exp.runtime.gateway.class_throttles import (
+    attempt_output_pace,
+    started_attempt_payload,
+    tier_settlement,
+)
 from exp.runtime.gateway.contracts import (
     AuthorizationSnapshot,
     GatewayEvent,
@@ -22,6 +28,12 @@ from exp.runtime.gateway.contracts import (
     GatewayFailureClass,
 )
 from exp.runtime.gateway.disconnect_estimate import settled_terminal
+from exp.runtime.gateway.failover_pass import (
+    FailoverPass,
+    failover_refusal,
+    forced_failover_target,
+    sideways_claim,
+)
 from exp.runtime.gateway.guardrails.session import discard_guardrails
 from exp.runtime.gateway.health import DeploymentHealthRegistry
 from exp.runtime.gateway.lane_saturation import lane_saturated_failure, overflow_target
@@ -32,6 +44,7 @@ from exp.runtime.gateway.native_accounting_errors import (
     authority_error,
     internal_protocol_error,
 )
+from exp.runtime.gateway.native_attempt_pricing import deployment_priced_at, priced_attempt
 from exp.runtime.gateway.native_components import SyncWriteLedger
 from exp.runtime.gateway.native_execution import (
     THROTTLE_BACKOFF,
@@ -41,9 +54,7 @@ from exp.runtime.gateway.native_execution import (
     ThrottleDisposition,
     claim_route_from,
     deployment_health_key,
-    deployment_priced_for_service_tier,
     dispatch_disclosure,
-    rung_load_key,
 )
 from exp.runtime.gateway.native_fallback_rules import eligible_ladder, rule_fallback_reason
 from exp.runtime.gateway.native_recovery import (
@@ -56,7 +67,9 @@ from exp.runtime.gateway.native_recovery import (
 from exp.runtime.gateway.native_request_settlement import RequestSettlements
 from exp.runtime.gateway.native_rung_policy import (
     bind_sticky_dispatch,
+    ejection_disclosure,
     failed_dispatch_candidate,
+    record_attempt_health,
     record_cache_fraction,
     reserve_rung_slot,
     shed_keeps_rung,
@@ -71,7 +84,6 @@ from exp.runtime.gateway.native_settlement import (
     failure_from_boundary_payload,
     ledger_failure,
     settlement_metadata,
-    settlement_rate_limit,
     terminal_from_settlement,
     tool_search_requests_from_terminal,
     tool_search_requests_kwarg,
@@ -80,13 +92,20 @@ from exp.runtime.gateway.native_settlement import (
 )
 from exp.runtime.gateway.recovery import RecoveryHost, SessionRecoveryRegistry
 from exp.runtime.gateway.rung_admission import RungLoadRegistry, RungShed
-from exp.runtime.gateway.service_tiers import tier_admission
 from exp.runtime.gateway.sticky_affinity import StickySpillRegistry
 from exp.runtime.openai_protocol.errors import public_failure_error
 
 _SWEEP_GRACE_SECONDS = 5.0
 _SWEEP_INTERVAL_SECONDS = 5.0
 _SWEEP_BATCH = 16
+
+# The request deadline ran out between attempts, before any provider answered.
+# The streaming relay names the other case (output already flowing) itself.
+DEADLINE_BEFORE_ANSWER_MESSAGE: Final = (
+    "the request reached the gateway's time limit before any provider finished "
+    "answering; retry the request"
+)
+
 _logger = logging.getLogger(__name__)
 
 
@@ -109,6 +128,7 @@ class NativeAttemptAccounting:
         cache_sample_gate: Callable[[str], bool] | None = None,
         recovery_host: RecoveryHost | None = None,
         default_lane_bound: int | None = None,
+        clock: Callable[[], datetime] = lambda: datetime.now(UTC),
     ) -> None:
         """Bind the durable ledger and start the settlement sweep.
 
@@ -116,11 +136,13 @@ class NativeAttemptAccounting:
             write_ledger: Blocking durable request and attempt ledger.
             budget_error_factory: Optional mapping for a rejected reservation.
             default_lane_bound: Per-worker cap for rungs authoring no bound (lane_saturation).
+            clock: Aware wall clock that dates each attempt's start for off-peak pricing.
             cache_sample_gate: Predicate admitting a settled attempt to the cache-priority
                 EWMA. Hosts exclude promo-funded samples so subsidized replay cannot buy
                 fair-share weight. ``None`` admits every sample; exceptions skip it.
         """
         self._write_ledger = write_ledger
+        self._clock = clock
         self.request_settlements = RequestSettlements(write_ledger)
         self._finish_attempt: Callable[..., None] = write_ledger.finish_attempt
         self._budget_error_factory = budget_error_factory
@@ -196,20 +218,20 @@ class NativeAttemptAccounting:
         reserved_tokens: int,
         force: bool,
         rate_retry: bool = False,
+        failover: bool = False,
     ) -> str | RungShed | None:
-        """Reserve one policy-bounded slot on a rung, or report the shed.
+        """Reserve one slot through ``reserve_rung_slot``, counting every shed.
 
         Args:
             entry: The owning in-flight request (organization and weight).
             deployment: The claimed rung about to dispatch.
-            reserved_tokens: Worst-case tokens this dispatch reserves, counted
-                against the rung's token window when one is authored.
+            reserved_tokens: Worst-case tokens this dispatch reserves.
             force: Admit past soft policy limits when overflow is explicitly allowed.
             rate_retry: Skip only rate-window checks after scheduled backoff.
+            failover: The reservation is a failover's forced pass.
 
         Returns:
-            An opaque reservation ticket, the shed disclosure, or ``None``
-            when the rung authors no admission policy (the untouched default).
+            A ticket, the shed disclosure, or ``None`` without an admission policy.
         """
         result = reserve_rung_slot(
             self._loads,
@@ -219,6 +241,7 @@ class NativeAttemptAccounting:
             reserved_tokens=reserved_tokens,
             force=force,
             rate_retry=rate_retry,
+            failover_pass=failover,
         )
         if isinstance(result, RungShed):
             with self._lock:
@@ -356,7 +379,7 @@ class NativeAttemptAccounting:
         if time.monotonic() >= entry.deadline_monotonic:
             failure = GatewayFailure(
                 failure_class=GatewayFailureClass.TIMEOUT,
-                safe_message="gateway execution deadline exceeded",
+                safe_message=DEADLINE_BEFORE_ANSWER_MESSAGE,
             )
             self.finish_request_quietly(entry.authorization, failure)
             with self._lock:
@@ -373,6 +396,7 @@ class NativeAttemptAccounting:
         redial_depth: int | None = None  # The rung a post-backoff redial re-dials.
         tool_search_round = False
         reasoning_repair = data.get("reasoning_repair") is True and isinstance(current_depth, int)
+        failover = FailoverPass.begin(entry, failure, current_depth)
         if failure is not None and isinstance(current_depth, int):
             candidate, disposition = failed_dispatch_candidate(
                 health=self._health,
@@ -415,8 +439,8 @@ class NativeAttemptAccounting:
         forced_overflow = False
         capacity_refused = False
         shed_records: dict[int, RungShed] = {}
-        # Tokenize the input reservation once per ladder walk for all candidates.
-        reserved_input_tokens = worst_case_input_tokens(entry.request)
+        # Tokenize the input reservation once per request for every attempt.
+        reserved_input_tokens = entry.reserved_input_tokens()
         while True:
             with self._lock:
                 active = self._inflight.get(request_id) is entry and entry.pending_abandon is None
@@ -427,7 +451,7 @@ class NativeAttemptAccounting:
                     failure_class=GatewayFailureClass.TIMEOUT
                     if active
                     else GatewayFailureClass.CANCELLED,
-                    safe_message="gateway execution deadline exceeded"
+                    safe_message=DEADLINE_BEFORE_ANSWER_MESSAGE
                     if active
                     else "gateway request was cancelled",
                 )
@@ -447,10 +471,21 @@ class NativeAttemptAccounting:
                             self._rung_saturation_refusals += 1
                         break
                 else:
-                    break
+                    # A failover is never ended by a sibling's bound (failover_pass).
+                    candidate = forced_failover_target(
+                        failover, policy_sheds, shed_records, self._health, keys
+                    )
+                    if candidate is None:
+                        refusal = failover_refusal(failover, entry.authorization, shed_records)
+                        if refusal is not None:
+                            last_failure = refusal
+                            with self._lock:
+                                self._rung_saturation_refusals += 1
+                        break
+                    forced_overflow = True
             if route.snapshot.stage_for_depth(candidate).pool_id in entry.denied_destination_pools:
                 self._health.release_probe(keys[candidate])
-                candidate = claim_route_from(self._health, keys, candidate + 1, ladder)
+                candidate = sideways_claim(failover, self._health, keys, ladder, candidate)
                 continue
             if not entry.attempt_policy.permits(
                 entry.total_attempts, entry.attempt_counts[candidate]
@@ -465,20 +500,13 @@ class NativeAttemptAccounting:
                 )
                 self._health.release_probe(keys[candidate])
                 break
-            tier = tier_admission(
-                route.deployments[candidate].gateway.prices,
+            priced_at = self._clock()
+            deployment, tier = priced_attempt(
+                route.deployments[candidate],
                 getattr(entry.request, "service_tier", None),
                 forwards_tier=candidate < len(entry.tier_forwarded_by_depth)
                 and entry.tier_forwarded_by_depth[candidate],
-                customer_managed=route.deployments[candidate].billing_source == "customer_managed",
-            )
-            deployment = deployment_priced_for_service_tier(
-                route.deployments[candidate],
-                getattr(entry.request, "service_tier", None),
-                forwards_tier=(
-                    candidate < len(entry.tier_forwarded_by_depth)
-                    and entry.tier_forwarded_by_depth[candidate]
-                ),
+                instant=priced_at,
             )
             reservation_request = entry.request
             if entry.reserved_output_tokens_by_depth:
@@ -493,6 +521,7 @@ class NativeAttemptAccounting:
                 reserved_tokens=reserved_input_tokens + reserved_output_tokens,
                 force=forced_overflow,
                 rate_retry=forced_overflow and candidate == redial_depth,
+                failover=failover is not None and failover.forcing,
             )
             if isinstance(ticket, RungShed):
                 record_departure(
@@ -516,7 +545,7 @@ class NativeAttemptAccounting:
                         self._rung_saturation_refusals += 1
                     break
                 if not forced_overflow:
-                    candidate = claim_route_from(self._health, keys, candidate + 1, ladder)
+                    candidate = sideways_claim(failover, self._health, keys, ladder, candidate)
                 continue
             throttle_backoff = candidate == redial_depth
             dispatch_reason, preferred_deployment = dispatch_disclosure(
@@ -529,6 +558,15 @@ class NativeAttemptAccounting:
             )
             if tool_search_round:
                 dispatch_reason = TOOL_SEARCH_ROUND
+            elif candidate != current_depth:
+                dispatch_reason, preferred_deployment = ejection_disclosure(
+                    self._health,
+                    keys,
+                    route,
+                    failover.untried if failover is not None else ladder,
+                    candidate,
+                    (dispatch_reason, preferred_deployment),
+                )
             try:
                 attempt_id = self._write_ledger.start_attempt(
                     snapshot=route.snapshot,
@@ -549,7 +587,7 @@ class NativeAttemptAccounting:
                     and entry.recovery_reason is not None
                     and dispatch_reason in (None, "affinity", "affinity_sticky")
                     else dispatch_reason,
-                    preferred_deployment=preferred_deployment,
+                    preferred_deployment=deployment_priced_at(preferred_deployment, priced_at),
                 )
             except BudgetReservationRejected as exc:
                 if ticket is not None:
@@ -560,7 +598,7 @@ class NativeAttemptAccounting:
                     entry.denied_destination_pools.add(denied_pool)
                     last_failure = budget_quota_failure()
                     forced_overflow = False
-                    candidate = claim_route_from(self._health, keys, candidate + 1, ladder)
+                    candidate = sideways_claim(failover, self._health, keys, ladder, candidate)
                     continue
                 if exc.scope_kind is not BudgetScopeKind.DEPLOYMENT:
                     error = (
@@ -582,7 +620,7 @@ class NativeAttemptAccounting:
                 # A forced reservation belongs only to the selected rung, never
                 # a later destination reached after this one's budget rejection.
                 forced_overflow = False
-                candidate = claim_route_from(self._health, keys, candidate + 1, ladder)
+                candidate = sideways_claim(failover, self._health, keys, ladder, candidate)
                 continue
             except Exception as exc:  # noqa: BLE001 - boundary sanitizes every failure.
                 # A reservation that raised before returning an attempt id
@@ -629,9 +667,8 @@ class NativeAttemptAccounting:
                 entry.attempt_depths[attempt_id] = candidate
                 if tier is not None:
                     entry.attempt_service_tiers[attempt_id] = tier
-            return json.dumps(
-                {"attempt_id": attempt_id, "route_depth": candidate},
-                separators=(",", ":"),
+            return started_attempt_payload(
+                attempt_id, candidate, attempt_output_pace(entry, deployment, self._loads)
             )
         exhaustion = last_failure
         if exhaustion is None:
@@ -690,7 +727,7 @@ class NativeAttemptAccounting:
                 **settlement_metadata(
                     data,
                     self._finish_attempt,
-                    service_tier=entry.attempt_service_tiers.get(attempt_id),
+                    **tier_settlement(entry, attempt_id),
                 ),
                 **web_search_requests_kwarg(
                     self._finish_attempt, web_search_requests_from_terminal(terminal)
@@ -705,7 +742,15 @@ class NativeAttemptAccounting:
                 entry.pending_settlement = data
             raise authority_error(exc) from exc
         failure = terminal.failure
-        self._record_health(entry, attempt_id, opened=opened, failure=failure, settlement=data)
+        record_attempt_health(
+            self._health,
+            self._loads,
+            entry,
+            attempt_id,
+            opened=opened,
+            failure=failure,
+            settlement=data,
+        )
         self._record_cache_fraction(entry, attempt_id, terminal)
         record_session_outcome(
             self.recovery,
@@ -763,8 +808,8 @@ class NativeAttemptAccounting:
                 return "{}"
             try:
                 if entry.active_attempt_id is not None:
-                    self._record_health(
-                        entry, entry.active_attempt_id, opened=False, failure=failure
+                    record_attempt_health(
+                        self._health, self._loads, entry, entry.active_attempt_id, failure=failure
                     )
                     self._finish_attempt(
                         attempt_id=entry.active_attempt_id,
@@ -816,56 +861,6 @@ class NativeAttemptAccounting:
             )
         except Exception:  # noqa: BLE001 - the original sanitized admission error wins.
             return False
-
-    def _record_health(
-        self,
-        entry: InflightRequest,
-        attempt_id: str,
-        *,
-        opened: bool,
-        failure: GatewayFailure | None,
-        settlement: JsonObject | None = None,
-    ) -> None:
-        """Apply one settled attempt's outcome to the deployment circuits.
-
-        Restore successful opens; exhausted provider windows throttle until reset.
-
-        Args:
-            entry: The owning in-flight request.
-            attempt_id: The settled attempt.
-            opened: Whether the provider dispatch opened successfully.
-            failure: The terminal failure, or ``None`` for a success.
-            settlement: The settlement payload carrying the harvested rate-limit headers.
-        """
-        # Slot and health releases are idempotent across settlement, abandon, and sweep.
-        self._loads.release_attempt(attempt_id)
-        depth = entry.attempt_depths.get(attempt_id)
-        if depth is None:
-            return
-        deployment = entry.route.deployments[depth]
-        key = deployment_health_key(entry.authorization, deployment)
-        if opened:
-            self._health.dispatch_opened(key)
-        if failure is not None:
-            policy = deployment.gateway.dispatch
-            if failure.failure_class == GatewayFailureClass.THROTTLED and (
-                policy is not None
-                and (
-                    policy.concurrency_bound is not None
-                    or policy.requests_per_minute is not None
-                    or policy.tokens_per_minute is not None
-                )
-            ):
-                # Clamp the learned ceiling to the observed rate; recovery creep
-                # rediscovers headroom. Only admission-participating rungs reserve
-                # through the registry, providing a real window and enforcing the ceiling.
-                self._loads.record_throttle(rung_load_key(deployment))
-            self._health.failed(key, failure)
-        else:
-            self._health.succeeded(key)
-        exhausted = settlement_rate_limit(settlement).exhausted_reset_after_seconds
-        if exhausted is not None:
-            self._health.exhausted(key, exhausted)
 
     def _record_cache_fraction(
         self, entry: InflightRequest, attempt_id: str, terminal: GatewayEvent
@@ -963,7 +958,7 @@ class NativeAttemptAccounting:
                 **settlement_metadata(
                     settlement,
                     self._finish_attempt,
-                    service_tier=entry.attempt_service_tiers.get(attempt_id),
+                    **tier_settlement(entry, attempt_id),
                 ),
                 **web_search_requests_kwarg(
                     self._finish_attempt, web_search_requests_from_terminal(terminal)
@@ -977,8 +972,14 @@ class NativeAttemptAccounting:
             return False
         failure = terminal.failure
         opened = settlement is not None and settlement.get("opened") is True
-        self._record_health(
-            entry, attempt_id, opened=opened, failure=failure, settlement=settlement
+        record_attempt_health(
+            self._health,
+            self._loads,
+            entry,
+            attempt_id,
+            opened=opened,
+            failure=failure,
+            settlement=settlement,
         )
         # Cache-priority observations must not depend on which settlement path succeeds.
         self._record_cache_fraction(entry, attempt_id, terminal)

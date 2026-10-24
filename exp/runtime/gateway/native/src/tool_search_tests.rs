@@ -33,6 +33,7 @@ fn started(index: u32, call_id: &str, name: &str) -> Event {
         name: name.to_string(),
         namespace: None,
         caller: None,
+        thought_signature: None,
     }
 }
 
@@ -55,6 +56,7 @@ fn completed(index: u32, call_id: &str, name: &str, raw_arguments: &str) -> Even
             provider_status: None,
             raw_arguments: raw_arguments.to_string(),
             custom: false,
+            thought_signature: None,
         },
     }
 }
@@ -88,6 +90,7 @@ fn web_search() -> WebSearchAdmission {
             title: "Python".to_string(),
         }],
         include_sources: false,
+        cost_nano_usd: None,
     }
 }
 
@@ -849,6 +852,7 @@ fn withholder_bounds_the_calls_it_will_carry_into_a_round() {
             provider_status: None,
             raw_arguments: arguments.to_string(),
             custom: false,
+            thought_signature: None,
         },
     };
     for index in 0..(MAXIMUM_WITHHELD_SEARCH_CALLS as u32) {

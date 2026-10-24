@@ -339,6 +339,7 @@ impl Normalizer {
                         name,
                         namespace,
                         caller,
+                        thought_signature: None,
                     });
                     if let Some(Value::String(initial)) = item.get("arguments") {
                         if !initial.is_empty() {
@@ -405,6 +406,7 @@ impl Normalizer {
                         name,
                         namespace,
                         caller,
+                        thought_signature: None,
                     });
                     if let Some(Value::String(initial)) = item.get("input") {
                         if !initial.is_empty() {
@@ -912,6 +914,7 @@ fn error_code_text(value: &Value) -> Option<String> {
 }
 
 mod compatible;
+pub(super) mod dsml;
 
 #[cfg(test)]
 #[path = "openai/normalizer_tests.rs"]

@@ -60,11 +60,63 @@ struct PythonBatchSink {
     callback: Py<PyAny>,
     completion_references: bool,
     bytes_output: bool,
+    spill: Option<Arc<super::spill::SpillStore>>,
 }
 
 struct EncodedRecord {
     value: Py<PyAny>,
     bytes: usize,
+    /// Split-record parts stay on disk until the destination acknowledges.
+    _parts: Vec<super::spill::SpillFile>,
+}
+
+impl PythonBatchSink {
+    /// Hand the destination `("split", skeleton, marker, [(kind, path, bytes), ...])`.
+    fn prepare_split(
+        &self,
+        record: &Record,
+        store: &super::spill::SpillStore,
+        maximum_bytes: usize,
+    ) -> Result<EncodedRecord, ()> {
+        let split = super::split::split(record, store, maximum_bytes).ok_or(())?;
+        let bytes = split.skeleton.len();
+        Python::try_attach(|py| {
+            let parts = split
+                .parts
+                .iter()
+                .map(|part| {
+                    let path =
+                        part.file.path().to_str().ok_or_else(|| {
+                            PyValueError::new_err("capture spill path is not UTF-8")
+                        })?;
+                    PyTuple::new(
+                        py,
+                        [
+                            part.kind.as_str().into_pyobject(py)?.into_any(),
+                            path.into_pyobject(py)?.into_any(),
+                            part.bytes.into_pyobject(py)?.into_any(),
+                        ],
+                    )
+                })
+                .collect::<PyResult<Vec<_>>>()?;
+            let value = PyTuple::new(
+                py,
+                [
+                    "split".into_pyobject(py)?.into_any(),
+                    PyBytes::new(py, split.skeleton.as_bytes()).into_any(),
+                    split.marker.as_str().into_pyobject(py)?.into_any(),
+                    pyo3::types::PyList::new(py, parts)?.into_any(),
+                ],
+            )?;
+            Ok::<_, PyErr>(EncodedRecord {
+                value: value.into_any().unbind(),
+                bytes,
+                _parts: split.parts.into_iter().map(|part| part.file).collect(),
+            })
+        })
+        .ok_or(())?
+        .map_err(|_| ())
+    }
 }
 
 impl Sink for PythonBatchSink {
@@ -77,12 +129,22 @@ impl Sink for PythonBatchSink {
     }
 
     fn prepare(&self, record: &Record, maximum_bytes: usize) -> Result<Self::Prepared, ()> {
+        if let Some(store) = &self.spill {
+            if record.requires_split() {
+                return self.prepare_split(record, store, maximum_bytes);
+            }
+        }
         let encoded = if self.completion_references {
             record.encode_update(maximum_bytes)
         } else {
             record.encode(maximum_bytes)
-        }
-        .ok_or(())?;
+        };
+        let encoded = match (encoded, &self.spill) {
+            (Some(encoded), _) => encoded,
+            // Too large for one in-memory record: keep it whole as a split record.
+            (None, Some(store)) => return self.prepare_split(record, store, maximum_bytes),
+            (None, None) => return Err(()),
+        };
         let bytes = encoded.len();
         Python::try_attach(|py| {
             let value = if self.bytes_output {
@@ -90,7 +152,11 @@ impl Sink for PythonBatchSink {
             } else {
                 encoded.into_pyobject(py)?.into_any().unbind()
             };
-            Ok::<_, PyErr>(EncodedRecord { value, bytes })
+            Ok::<_, PyErr>(EncodedRecord {
+                value,
+                bytes,
+                _parts: Vec::new(),
+            })
         })
         .ok_or(())?
         .map_err(|_| ())
@@ -102,6 +168,10 @@ impl Sink for PythonBatchSink {
         } else {
             Err(())
         }
+    }
+
+    fn split_raw_above(&self) -> Option<usize> {
+        self.spill.as_ref().map(|store| store.part_threshold_bytes)
     }
 
     fn batch_records(&self) -> usize {
@@ -198,13 +268,20 @@ impl CaptureCollector {
         let config: Configuration = serde_json::from_str(config_json)
             .map_err(|_| PyValueError::new_err("invalid capture configuration"))?;
         py.detach(|| {
-            Collector::new(
+            let spill = config
+                .spill
+                .as_ref()
+                .map(super::spill::SpillStore::new)
+                .transpose()?;
+            Collector::with_spill(
                 config,
                 PythonBatchSink {
                     callback: sink,
                     completion_references,
                     bytes_output,
+                    spill: spill.clone(),
                 },
+                spill,
             )
         })
         .map(|collector| Self {

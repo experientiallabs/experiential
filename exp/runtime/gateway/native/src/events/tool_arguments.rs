@@ -51,3 +51,70 @@ impl ToolAccumulator {
         }
     }
 }
+
+/// Why a tail streamed after a complete argument object was dropped rather
+/// than failing the call. Each shape reproduces exactly one parse, so no
+/// argument content is ever invented or chosen between alternatives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RedundantTail {
+    /// Only whitespace (a pretty-printed buffer's trailing newline).
+    Whitespace,
+    /// One or more exact repetitions of the complete value (`{}{}`, a
+    /// duplicated whole-object delta).
+    DuplicateValue,
+    /// Empty JSON literals after a zero-argument call (`{}""`: Azure
+    /// Foundry's DeepSeek shim, live 2026-09-10, 222 attempts in one day).
+    EmptyLiterals,
+}
+
+impl RedundantTail {
+    pub(super) fn as_str(self) -> &'static str {
+        match self {
+            RedundantTail::Whitespace => "whitespace",
+            RedundantTail::DuplicateValue => "duplicate_value",
+            RedundantTail::EmptyLiterals => "empty_literals",
+        }
+    }
+}
+
+/// Classify the bytes a provider streamed AFTER its argument object closed.
+///
+/// Accepts only tails whose removal is unambiguous: whitespace; exact
+/// repetitions of the whole value; and, after a zero-argument `{}` only,
+/// empty literals (`""`, `{}`, `[]`) that carry no argument content. A tail
+/// that is merely a suffix of the value (`{"a":1}}`) is NOT accepted: the same
+/// bytes arise from a dropped inner delta (`{"a":1,"b":{` lost from
+/// `{"a":1,"b":{"c":2}}`), so the parse would be a guess.
+pub fn redundant_tail(value: &str, tail: &str) -> Option<RedundantTail> {
+    let value = value.trim();
+    let tail = tail.trim();
+    if tail.is_empty() {
+        return Some(RedundantTail::Whitespace);
+    }
+    let mut rest = tail;
+    let mut duplicates = true;
+    while !rest.is_empty() {
+        match rest.strip_prefix(value) {
+            Some(after) if !value.is_empty() => rest = after.trim_start(),
+            _ => {
+                duplicates = false;
+                break;
+            }
+        }
+    }
+    if duplicates {
+        return Some(RedundantTail::DuplicateValue);
+    }
+    if value != "{}" {
+        return None;
+    }
+    let mut rest = tail;
+    while !rest.is_empty() {
+        rest = rest
+            .strip_prefix("\"\"")
+            .or_else(|| rest.strip_prefix("{}"))
+            .or_else(|| rest.strip_prefix("[]"))?
+            .trim_start();
+    }
+    Some(RedundantTail::EmptyLiterals)
+}

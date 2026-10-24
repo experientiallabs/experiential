@@ -29,7 +29,6 @@ from exp.runtime.gateway.client_apps import ClientApp, with_client_identity
 from exp.runtime.gateway.contracts import (
     AuthorizationSnapshot,
     DirectTarget,
-    ExecutionSnapshot,
     GatewayApiSurface,
     GatewayEvent,
     GatewayEventKind,
@@ -40,6 +39,7 @@ from exp.runtime.gateway.contracts import (
     GatewayUsage,
 )
 from exp.runtime.gateway.decisions_contracts import DecisionRequest, NoulQuestion
+from exp.runtime.gateway.execution_snapshot import ExecutionSnapshot
 from exp.runtime.gateway.group_commit import GroupCommitAttemptLedger, SyncGroupCommitLedger
 from exp.runtime.gateway.ledger import (
     GatewayLedgerError,

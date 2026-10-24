@@ -22,13 +22,13 @@ from exp.common.models.gateway_catalog import (
 from exp.runtime.gateway.budgets import current_budget_period
 from exp.runtime.gateway.contracts import (
     DirectTarget,
-    ExecutionSnapshot,
     GatewayApiSurface,
     GatewayFailure,
     GatewayFailureClass,
     GatewayMessage,
     GatewayRequest,
 )
+from exp.runtime.gateway.execution_snapshot import ExecutionSnapshot
 from exp.runtime.gateway.ledger import SQLiteAttemptLedger
 from exp.runtime.gateway.management import GatewayManagement
 

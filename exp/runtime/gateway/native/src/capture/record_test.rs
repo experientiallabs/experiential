@@ -28,6 +28,8 @@ fn record<R>(response: R) -> Record<R> {
         gemini_thought_parts_source_json: None,
         provider_logprobs: None,
         captured_at: 1.0,
+        transport_body: None,
+        messages_part: None,
     }
 }
 
