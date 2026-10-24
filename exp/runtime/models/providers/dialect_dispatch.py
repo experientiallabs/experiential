@@ -319,9 +319,11 @@ def reasoning_off_via_chat_template(profile: GatewayWireProfile) -> bool:
     host and publisher so no other Vertex model changes its wire.
     """
     host = (urlsplit(profile.url).hostname or "").lower()
+    service, _, domain = host.partition(".")
     return (
         profile.dialect == "openai_compatible"
-        and host.endswith("aiplatform.googleapis.com")
+        and domain == "googleapis.com"
+        and (service == "aiplatform" or service.endswith("-aiplatform"))
         and profile.model_id.lower().startswith("zai-org/glm")
     )
 

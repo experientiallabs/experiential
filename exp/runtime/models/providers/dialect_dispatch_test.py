@@ -268,6 +268,12 @@ def test_vertex_glm_turns_thinking_off_through_the_chat_template(url: str) -> No
     [
         (_VERTEX_URL, "moonshotai/kimi-k2-thinking-maas"),
         ("https://api.novita.ai/openai/v1/chat/completions", "zai-org/glm-5.1"),
+        ("https://evilaiplatform.googleapis.com/v1/chat/completions", "zai-org/glm-5-maas"),
+        ("https://sub.aiplatform.googleapis.com/v1/chat/completions", "zai-org/glm-5-maas"),
+        ("https://aiplatform.googleapis.com.evil.example/v1", "zai-org/glm-5-maas"),
+        ("https://aiplatform.googleapis.com@evil.example/v1", "zai-org/glm-5-maas"),
+        ("https://evil.example/aiplatform.googleapis.com", "zai-org/glm-5-maas"),
+        ("https://evil.example/?host=aiplatform.googleapis.com", "zai-org/glm-5-maas"),
     ],
 )
 def test_reasoning_off_template_rule_is_scoped_to_vertex_glm(url: str, model_id: str) -> None:

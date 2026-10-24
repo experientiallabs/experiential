@@ -944,7 +944,7 @@ dependencies = [
 
 [[package]]
 name = "experiential"
-version = "0.7.220"
+version = "0.7.221"
 source = { editable = "." }
 dependencies = [
     { name = "anyio" },
