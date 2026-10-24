@@ -623,6 +623,7 @@ class VertexAnthropicClient(ProviderHttpClient):
         supports_top_k: bool = False,
         supports_reasoning: bool = False,
         reasoning_effort: ReasoningEffort | None = None,
+        supports_forced_tool_choice: bool | None = None,
     ) -> None:
         """Create a Vertex Anthropic client for one project-and-location endpoint root.
 
@@ -641,6 +642,8 @@ class VertexAnthropicClient(ProviderHttpClient):
             supports_top_k: Whether the exact model accepts top-k sampling.
             supports_reasoning: Whether the exact model accepts extended-thinking configuration.
             reasoning_effort: Optional catalog-pinned reasoning effort.
+            supports_forced_tool_choice: The catalog's declaration that the exact model accepts
+                a forced ``tool_choice``; see :func:`anthropic_messages_request`.
         """
         _require_vertex_host(base_url)
         super().__init__(
@@ -657,6 +660,7 @@ class VertexAnthropicClient(ProviderHttpClient):
         self._supports_top_p = supports_top_p
         self._supports_top_k = supports_top_k
         self._supports_reasoning = supports_reasoning
+        self._supports_forced_tool_choice = supports_forced_tool_choice
 
     async def complete_async(
         self,
@@ -740,6 +744,7 @@ class VertexAnthropicClient(ProviderHttpClient):
             supports_top_k=self._supports_top_k,
             supports_reasoning=self._supports_reasoning,
             reasoning_effort=self._reasoning_effort,
+            supports_forced_tool_choice=self._supports_forced_tool_choice,
         )
         payload.pop("model", None)
         payload["anthropic_version"] = VERTEX_ANTHROPIC_VERSION
