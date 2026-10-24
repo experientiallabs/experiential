@@ -451,11 +451,13 @@ class OperationSpendCeiling:
                     )
                     if used >= allowance:
                         raise UnpricedDispatchRefused(alias, reason)
-                    return self._insert(connection, alias, None, 0.0, embedding=_is_embedding(url))
+                    return self._insert(
+                        connection, alias, None, 0.0, embedding=is_embedding_endpoint(url)
+                    )
                 accounted = _accounted(connection)
                 if accounted + cost <= ceiling + _TOLERANCE_USD:
                     return self._insert(
-                        connection, alias, tariff, cost, embedding=_is_embedding(url)
+                        connection, alias, tariff, cost, embedding=is_embedding_endpoint(url)
                     )
                 pending = int(
                     connection.execute(
@@ -734,7 +736,7 @@ def _positive_int(value: JsonValue) -> int | None:
     return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else None
 
 
-def _is_embedding(url: str) -> bool:
+def is_embedding_endpoint(url: str) -> bool:
     """Return whether the endpoint is an embedding route, whose requests bill no output."""
     path = urlsplit(url).path
     return path.endswith("/embeddings") or path.endswith((":embedContent", ":batchEmbedContents"))
@@ -767,7 +769,7 @@ def request_token_bounds(
     elif context is not None:
         size = min(size, context)
     input_tokens = tariff.repeated_input * (size + tariff.input_framing_tokens)
-    if _is_embedding(url):
+    if is_embedding_endpoint(url):
         return input_tokens, 0
     generation = payload.get("generationConfig")
     settings = generation if isinstance(generation, dict) else {}

@@ -6,6 +6,7 @@ import sqlite3
 from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import cast
 
 import httpx
 import pytest
@@ -15,7 +16,7 @@ from exp.cli.build.app import (
     _complete_grounded_build,
     _embedding_cost_ceiling,
 )
-from exp.common.core.artifacts import JsonObject
+from exp.common.core.artifacts import JsonObject, sha256_bytes, sha256_json
 from exp.common.models import ModelCapabilities, write_model_catalog
 from exp.common.project import ProjectConfig, ProjectModelConfiguration, ProjectStore
 from exp.common.traces.ingest.sources import load_trace_source
@@ -156,7 +157,12 @@ def test_index_wire_receipt_spending_and_both_indexes_replay(tmp_path: Path) -> 
     ]
     assert len(intents) == 1
     physical = json.loads(store.artifacts.read_bytes(intents[0], "receipt.json"))
-    assert physical["request_body"] == inner.requests[0]
+    assert physical["request_sha256"] == sha256_json(inner.requests[0])
+    sent = cast(list[str], inner.requests[0]["input"])
+    assert physical["request_body"]["input"] == [
+        {"text_sha256": sha256_bytes(text.encode("utf-8")), "characters": len(text)}
+        for text in sent
+    ]
     assert physical["canonical_request"] is not None
     assert "secret" not in json.dumps(physical)
     replay = run(store, completed, runtime)

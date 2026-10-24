@@ -9,7 +9,14 @@ from copy import copy, deepcopy
 from datetime import UTC, datetime
 from urllib.parse import urlsplit
 
-from exp.common.core.artifacts import ArtifactEnvelope, ArtifactInput, JsonObject, sha256_json
+from exp.common.core.artifacts import (
+    ArtifactEnvelope,
+    ArtifactInput,
+    JsonObject,
+    JsonValue,
+    sha256_bytes,
+    sha256_json,
+)
 from exp.common.models import ModelCatalog
 from exp.common.project import ArtifactStore, ArtifactStoreError, artifact_input
 from exp.common.project.request_budget import validate_provider_response
@@ -30,6 +37,7 @@ from exp.runtime.models.spend_ceiling import (
     OperationSpendCeiling,
     Reservation,
     current_spend_ceiling,
+    is_embedding_endpoint,
 )
 from exp.runtime.sessions.dispatch_ledger import DispatchLedger
 
@@ -44,6 +52,41 @@ registry providers fall outside it: ``bedrock`` and ``tinker`` dispatch through 
 runtimes, ``typesafe`` and ``elevenlabs`` serve no completion (the native gateway owns their
 wire), and ``vertex`` mints its OAuth bearer token over Google's own HTTP client.
 """
+
+_EMBEDDED_TEXT_KEYS = frozenset({"input", "text"})
+"""Embedding request fields that carry text: OpenAI-wire ``input`` and Gemini part ``text``."""
+
+
+def _retained_request(url: str, payload: JsonObject | None) -> JsonObject | None:
+    """Return the request body an intent receipt keeps for one physical request.
+
+    Embedding inputs are chunks of the caller's own stored evidence, so the receipt cites each
+    text by its digest and length instead of copying it. Agent traces routinely quote placeholder
+    credentials such as ``Authorization: token ${GITHUB_TOKEN}``, which the credential boundary
+    would otherwise refuse to retain. Every other field, and every non-embedding body, is kept
+    whole and still passes the boundary unchanged.
+
+    Args:
+        url: Absolute provider endpoint, which distinguishes embedding requests.
+        payload: Exact JSON request body, or None for a bodiless request.
+
+    Returns:
+        The body to retain; ``request_sha256`` still digests the exact sent body.
+    """
+    if payload is None or not is_embedding_endpoint(url):
+        return payload
+    return {name: _cite_texts(value, name) for name, value in payload.items()}
+
+
+def _cite_texts(value: JsonValue, key: str | None) -> JsonValue:
+    """Replace embedded text under :data:`_EMBEDDED_TEXT_KEYS` with its digest and length."""
+    if isinstance(value, str) and key in _EMBEDDED_TEXT_KEYS:
+        return {"text_sha256": sha256_bytes(value.encode("utf-8")), "characters": len(value)}
+    if isinstance(value, list):
+        return [_cite_texts(item, key) for item in value]
+    if isinstance(value, dict):
+        return {name: _cite_texts(item, name) for name, item in value.items()}
+    return value
 
 
 def require_admitted_transport(catalog: ModelCatalog, alias: str, *, consumer: str) -> None:
@@ -174,8 +217,9 @@ class AdmittedJsonTransport(JsonHttpTransport):
         """
         if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
             raise ValueError("physical request timeout must be finite and positive")
+        retained = _retained_request(url, payload)
         try:
-            validate_provider_response(json.dumps(payload, ensure_ascii=False, allow_nan=False))
+            validate_provider_response(json.dumps(retained, ensure_ascii=False, allow_nan=False))
         except ArtifactStoreError as error:
             raise ArtifactStoreError(
                 "provider request cannot be retained at the credential boundary; "
@@ -190,7 +234,7 @@ class AdmittedJsonTransport(JsonHttpTransport):
         route = self._route_for(url)
         with self._admission.admit(route, wait_seconds=min(remaining, timeout_seconds)) as slot:
             return self._dispatch(
-                method, url, payload, timeout_seconds, send, slot, idempotency_key
+                method, url, payload, retained, timeout_seconds, send, slot, idempotency_key
             )
 
     def _dispatch(
@@ -198,6 +242,7 @@ class AdmittedJsonTransport(JsonHttpTransport):
         method: str,
         url: str,
         payload: JsonObject | None,
+        retained: JsonObject | None,
         timeout_seconds: float,
         send: Callable[[float], JsonHttpResponse],
         slot: AdmissionSlot,
@@ -206,7 +251,8 @@ class AdmittedJsonTransport(JsonHttpTransport):
         """Reserve spend, claim a ledger slot, record intent, send once and settle the outcome.
 
         A reservation is released only while the request provably has not left: before the
-        dispatch mark commits, nothing has been sent.
+        dispatch mark commits, nothing has been sent. The intent keeps ``retained``, the
+        receipt form of the body, beside the digest of the exact ``payload`` that is sent.
         """
         timeout_seconds -= slot.waited_seconds
         now = self._clock()
@@ -229,7 +275,7 @@ class AdmittedJsonTransport(JsonHttpTransport):
                     "method": method,
                     "endpoint_sha256": sha256_json({"url": url}),
                     "request_sha256": sha256_json(payload),
-                    "request_body": payload,
+                    "request_body": retained,
                     "consumer": current_consumer(),
                     "timeout_seconds": min(remaining, timeout_seconds),
                     "timeout_protocol": ATTEMPT_TIMEOUT_PROTOCOL,
