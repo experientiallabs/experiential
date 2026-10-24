@@ -114,7 +114,8 @@ class ProviderCapabilityError(ValueError):
             detail: Optional caller-safe sentence completing the public
                 message, such as which provider a media handle names.
         """
-        super().__init__(f"provider deployment does not support {capability}")
+        message = f"provider deployment does not support {capability}"
+        super().__init__(message if detail is None else f"{message}: {detail}")
         self.capability = capability
         self.detail = detail
 

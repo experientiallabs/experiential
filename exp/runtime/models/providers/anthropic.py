@@ -17,6 +17,7 @@ from exp.common.models import (
     ToolChoice,
     Usage,
 )
+from exp.common.models.known_models import known_model_metadata
 from exp.runtime.gateway.contracts import GatewayRequest
 from exp.runtime.gateway.json_object import JSON_OBJECT_SYSTEM_INSTRUCTION
 from exp.runtime.models.providers.async_transport import AsyncJsonHttpTransport
@@ -118,10 +119,11 @@ def anthropic_messages_request(
 
     Raises:
         ProviderCapabilityError: ``forced_tool_choice`` when the model cannot force a tool and
-            more than one tool is offered, so ``auto`` would let it pick another one.
+            more than one tool is offered, so ``auto`` would let it pick another one, or when
+            the declaration is unset on a model the maintained records say rejects forcing.
         ValueError: A visible request message cannot be represented by the native protocol.
     """
-    steered_tool = _unforceable_tool(request, supports_forced_tool_choice)
+    steered_tool = _unforceable_tool(model_id, request, supports_forced_tool_choice)
     system_parts: list[str] = []
     messages: list[JsonObject] = []
     for message in request.messages:
@@ -425,17 +427,32 @@ def _anthropic_tool_choice(
 
 
 def _unforceable_tool(
-    request: ModelRequest, supports_forced_tool_choice: bool | None
+    model_id: str, request: ModelRequest, supports_forced_tool_choice: bool | None
 ) -> str | None:
     """Return the tool a forced choice must be steered to on a model that cannot force one.
 
-    ``ModelRequest`` already guarantees a forced choice names one of the offered tools.
+    ``ModelRequest`` already guarantees a forced choice names one of the offered tools. The
+    catalog decides; the maintained record is consulted only to refuse an undeclared model
+    that is known to answer a forced choice with a 400, never to change the request.
 
     Raises:
-        ProviderCapabilityError: ``auto`` would leave the model another tool to pick.
+        ProviderCapabilityError: ``auto`` would leave the model another tool to pick, or the
+            catalog leaves the declaration unset on a model known to reject a forced choice.
     """
-    if supports_forced_tool_choice is not False or request.tool_choice in (None, "auto", "none"):
+    if request.tool_choice in (None, "auto", "none") or supports_forced_tool_choice:
         return None
+    if supports_forced_tool_choice is None:
+        known = known_model_metadata("anthropic", model_id)
+        if known is None or known.supports_forced_tool_choice is not False:
+            return None
+        raise ProviderCapabilityError(
+            capability="forced_tool_choice",
+            detail=(
+                f"{model_id} rejects a forced tool_choice; declare "
+                "supports_forced_tool_choice = false in this alias's catalog capabilities, "
+                "or re-sync the catalog, so requests use auto with the single tool"
+            ),
+        )
     if len(request.tools) != 1:
         raise ProviderCapabilityError(capability="forced_tool_choice")
     return request.tools[0].name

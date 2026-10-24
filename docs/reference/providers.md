@@ -126,6 +126,36 @@ The gateway does not claim support for new provider beta features merely because
 supports them. See the official [model specifications](https://platform.claude.com/docs/en/models/sonnet-5-5/overview)
 and [migration contract](https://platform.claude.com/docs/en/models/sonnet-5-5/whats-new-sonnet-5-5).
 
+## Forced tool choice on Claude
+
+Claude Fable 5.1, Mythos 5.1, Opus 5.5 and Sonnet 5.5 answer a forced `tool_choice` (`any`, or
+one named tool) with a 400, with or without thinking. Structured calls in Experiential force
+their single answer tool, so the catalog declares whether each alias accepts that:
+
+```toml
+[models.sonnet.capabilities]
+supports_tools = true
+supports_forced_tool_choice = false
+```
+
+With `false`, the Anthropic, Foundry, Claude plan and Vertex Claude clients send a forced choice
+of the only offered tool as `tool_choice = {"type": "auto", "disable_parallel_tool_use": true}`
+and add a system instruction naming that tool. Callers still accept only exactly one call of the
+named tool, so a text-only or two-call answer is retained and refused as with any other invalid
+output. A forced choice among several tools is refused before dispatch, because `auto` would let
+the model pick another one. `true` sends the forced choice unchanged.
+
+When the field is absent, the forced choice is sent unchanged, unless EXP's maintained records
+say the model rejects it. Then the call is refused before dispatch with an error naming
+`supports_forced_tool_choice`. Discovery writes `false` for these four releases on a direct
+Anthropic connection, so a catalog re-synced after this change needs no edit. Azure Foundry
+and Vertex Claude aliases are not filled in by discovery: declare the field by hand, as their
+prices and limits already are. The field does not change the model's identity digest. It
+enters the replay identity of a structured completion plan only once it is declared.
+
+The gateway decides forced tool choice on its own wire path, by its capability-preservation
+policy described under Claude Sonnet 5.5.
+
 ## Plan connections (ChatGPT and Claude)
 
 A connection may dispatch on a consumer plan instead of an API key: `subscription = "chatgpt"`

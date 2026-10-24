@@ -123,14 +123,14 @@ def test_a_forced_choice_among_several_tools_is_refused_before_dispatch() -> Non
 
 
 @pytest.mark.parametrize(
-    ("declared", "wire"),
+    ("model_id", "declared", "wire"),
     [
-        (None, {"type": "tool", "name": "create_ticket"}),
-        (False, {"type": "auto", "disable_parallel_tool_use": True}),
+        ("claude-sonnet-5", None, {"type": "tool", "name": "create_ticket"}),
+        ("claude-sonnet-5-5", False, {"type": "auto", "disable_parallel_tool_use": True}),
     ],
 )
 def test_the_client_sends_the_declared_choice_and_returns_the_one_tool_call(
-    declared: bool | None, wire: dict[str, object]
+    model_id: str, declared: bool | None, wire: dict[str, object]
 ) -> None:
     """The catalog's declaration reaches the wire; the returned call is parsed either way."""
     transport = ScriptedJsonTransport(
@@ -159,7 +159,7 @@ def test_the_client_sends_the_declared_choice_and_returns_the_one_tool_call(
         ]
     )
     client = AnthropicClient(
-        model=_snapshot("anthropic", "claude-sonnet-5-5"),
+        model=_snapshot("anthropic", model_id),
         api_key="fixture",
         transport=transport,
         supports_forced_tool_choice=declared,
@@ -170,3 +170,19 @@ def test_the_client_sends_the_declared_choice_and_returns_the_one_tool_call(
     assert transport.requests[0][2]["tool_choice"] == wire
     (call,) = response.output.tool_calls
     assert (call.name, call.arguments) == ("create_ticket", {"priority": "high"})
+
+
+@pytest.mark.parametrize(
+    "model_id", ["claude-sonnet-5-5", "claude-opus-5-5-20261001", "claude-fable-5-1@20260901"]
+)
+def test_an_undeclared_model_known_to_reject_forcing_names_the_catalog_field(
+    model_id: str,
+) -> None:
+    """The catalog stays the only gate: nothing is rewritten, the operator is told what to set."""
+    with pytest.raises(
+        ProviderCapabilityError, match="declare supports_forced_tool_choice = false"
+    ):
+        anthropic_messages_request(model_id, _request(tool_choice="required"))
+
+    unforced = anthropic_messages_request(model_id, _request(tool_choice="auto"))
+    assert unforced["tool_choice"] == {"type": "auto"}

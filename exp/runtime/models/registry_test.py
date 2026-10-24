@@ -1305,7 +1305,7 @@ def test_transport_wrapper_preserves_original_resolver_and_credentials() -> None
 @pytest.mark.parametrize(
     ("declared", "wire"),
     [
-        (None, {"type": "tool", "name": "submit_proposal"}),
+        (True, {"type": "tool", "name": "submit_proposal"}),
         (False, {"type": "auto", "disable_parallel_tool_use": True}),
     ],
 )
