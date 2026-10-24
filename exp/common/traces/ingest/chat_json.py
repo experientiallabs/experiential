@@ -15,8 +15,7 @@ Message mapping follows the roles the conversation already declares:
 
 A model call's input is every message before it. The conversation's messages are declared once,
 on the first observation, and stored once on the trace; each model span names how many of them
-form its input. Import size and time therefore grow linearly with transcript length instead of
-copying the history into every step.
+form its input. Import size and time therefore grow linearly with transcript length.
 
 Chat JSON carries no source timing. When a message declares no timestamp, EXP assigns ordinal
 timestamps that preserve message order only, and every resulting span records
