@@ -1,0 +1,342 @@
+"""Agent memory stages with injected completions: merging, failures, plans and windows.
+
+The provider path (admitted transport, consent and replay) runs end to end in
+``exp/cli/evaluation/agent_memory_test.py``.
+"""
+
+import json
+import operator
+from collections.abc import Callable
+from datetime import UTC, datetime, timedelta
+from functools import partial
+from pathlib import Path
+
+import pytest
+
+from exp.common.core.artifacts import ArtifactInput, JsonObject, JsonValue
+from exp.common.models.catalog import (
+    ConnectionConfig,
+    ModelCatalog,
+    ModelRecord,
+    write_model_catalog,
+)
+from exp.common.models.discovery import DiscoveredModel, resolve_discovered_model
+from exp.common.models.model import BillingSource
+from exp.common.models.unknown_outcome import DispatchOutcomeUnknown
+from exp.common.project import ProjectStore
+from exp.optimize.evaluation.learning import agent_memory
+from exp.optimize.evaluation.learning.agent_memory import (
+    Completions,
+    PreparedMemory,
+    consolidate,
+    consolidation_cost,
+    extract_candidates,
+    extraction_cost,
+    prepare_agent_memory,
+    stage_completions,
+)
+from exp.optimize.evaluation.learning.agent_memory_contracts import (
+    AgentMemorySpec,
+    CandidateSet,
+    Lesson,
+)
+from exp.runtime.models.structured_completion import ReturnedOutputRejected
+
+NOW = datetime(2026, 10, 24, 12, tzinfo=UTC)
+
+
+def project_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    priced: bool = True,
+    model: str = "claude-sonnet-5",
+) -> Path:
+    """An EXP root whose catalog holds one Anthropic alias resolved by model discovery."""
+    discovered = DiscoveredModel(provider="anthropic", model=model)
+    capabilities = resolve_discovered_model(discovered).capabilities
+    if not priced:
+        capabilities = capabilities.model_copy(update={"input_cost_per_million_tokens_usd": None})
+    root = tmp_path / ".exp"
+    root.mkdir()
+    write_model_catalog(
+        root / "models.toml",
+        ModelCatalog(
+            connections={
+                "anthropic": ConnectionConfig(provider="anthropic", api_key_env="ANTHROPIC_API_KEY")
+            },
+            models={
+                "learner": ModelRecord(
+                    connection="anthropic",
+                    model=model,
+                    billing_source=BillingSource.CUSTOMER_MANAGED,
+                    capabilities=capabilities,
+                )
+            },
+        ),
+    )
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "fixture-key")
+    return root
+
+
+def at(value: JsonValue, *keys: str) -> JsonValue:
+    """The value at a path of object keys, asserting every step is an object."""
+    for key in keys:
+        assert isinstance(value, dict), key
+        value = value[key]
+    return value
+
+
+def clock() -> datetime:
+    """A fixed aware clock."""
+    return NOW
+
+
+def export(tmp_path: Path, rows: list[JsonObject]) -> Path:
+    """A chat JSON export of the given conversations."""
+    path = tmp_path / "traces.jsonl"
+    path.write_text("\n".join(json.dumps(row) for row in rows) + "\n")
+    return path
+
+
+def passed(trace_id: str, text: str = "report") -> JsonObject:
+    """One passing conversation."""
+    return {
+        "trace_id": trace_id,
+        "exp.outcome.status": "success",
+        "messages": [
+            {"role": "user", "content": f"Write the {text}."},
+            {"role": "assistant", "content": "Done."},
+        ],
+    }
+
+
+def prepared_memory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    count: int = 3,
+    *,
+    batch_bytes: int = 150_000,
+    maximum_trace_bytes: int = 40_000,
+) -> tuple[ProjectStore, PreparedMemory]:
+    """A registered plan over ``count`` passing traces."""
+    root = project_root(tmp_path, monkeypatch)
+    store = ProjectStore(root, "memory")
+    spec = AgentMemorySpec(
+        traces=export(tmp_path, [passed(f"t{index}") for index in range(count)]),
+        output=tmp_path / "out",
+        alias="learner",
+        batch_bytes=batch_bytes,
+        maximum_trace_bytes=maximum_trace_bytes,
+    )
+    return store, prepare_agent_memory(store, spec, code_revision="test", clock=clock)
+
+
+def scripted(answers: dict[str, Callable[[JsonObject], JsonObject]]) -> Completions:
+    """Stage completions that answer from the request body, recording nothing."""
+
+    def stage(name: str) -> Callable[[JsonObject, str], JsonObject]:
+        """One stage's completion."""
+        return lambda body, _logical_id: answers[name](body)
+
+    return Completions(
+        extract=stage("extract"), merge=stage("merge"), screen=stage("screen"), concurrency=2
+    )
+
+
+def shown_labels(body: JsonObject) -> list[str]:
+    """The trace labels an extraction request may cite."""
+    enum = at(body, "response_schema", "properties", "lessons", "items", "properties", "traces")
+    enum = at(enum, "items", "enum")
+    assert isinstance(enum, list)
+    return [str(label) for label in enum]
+
+
+def lesson(statement: str, traces: list[str], kind: str = "procedure") -> JsonObject:
+    """One extracted lesson."""
+    return {
+        "kind": kind,
+        "statement": statement,
+        "applies_when": "always",
+        "evidence": f"seen in {traces}",
+        "traces": traces,
+    }
+
+
+def candidates(*rows: Lesson) -> CandidateSet:
+    """An unsaved candidate set holding the given lessons."""
+    return CandidateSet(
+        schema_version=1,
+        created_at=NOW,
+        code_revision="test",
+        candidates_id="candidates",
+        plan=ArtifactInput(artifact_id="plan", sha256="0" * 64),
+        candidates=rows,
+        failed=(),
+    )
+
+
+def test_merging_unites_citations_and_evidence_and_never_adds_a_trace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two batches cite different traces; their merged lesson cites both, once."""
+    store, prepared = prepared_memory(
+        tmp_path, monkeypatch, batch_bytes=10_000, maximum_trace_bytes=5_000
+    )
+    prepared = PreparedMemory(
+        plan=prepared.plan,
+        reference=prepared.reference,
+        traces=prepared.traces,
+        batches=((0,), (1, 2)),
+    )
+    completions = scripted(
+        {
+            "extract": lambda body: {"lessons": [lesson("Use make test.", shown_labels(body))]},
+            "merge": lambda _body: {
+                "lessons": [{"statement": "Run make test.", "applies_when": "a", "sources": [0, 1]}]
+            },
+            "screen": lambda _body: {
+                "screenings": [{"lesson": 0, "general": 1, "covered": 0, "supported": 0.6}]
+            },
+        }
+    )
+    found = extract_candidates(store, prepared, completions, code_revision="t", clock=clock)
+    assert [len(row.traces) for row in found[1].candidates] == [1, 2]
+    _, memory = consolidate(store, prepared, found, completions, code_revision="t", clock=clock)
+    (merged,) = memory.lessons
+    assert merged.statement == "Run make test."
+    assert merged.traces == tuple(sorted(trace.trace_id for trace in prepared.traces))
+    assert merged.evidence == ("seen in ['T1']", "seen in ['T2', 'T3']")
+    assert merged.score == pytest.approx(0.6) and merged.accepted
+    assert memory.outcomes == {"PASS": 3, "FAIL": 0, "unknown": 0}
+
+
+def test_unusable_answers_are_recorded_by_kind_and_leave_their_inputs_untouched(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Unknown, refused and malformed answers are kept apart; none is retried or invented."""
+    store, prepared = prepared_memory(tmp_path, monkeypatch)
+
+    def unknown(_body: JsonObject) -> JsonObject:
+        """A dispatch whose answer was never saved."""
+        raise DispatchOutcomeUnknown("lost")
+
+    def refused(_body: JsonObject) -> JsonObject:
+        """A returned answer the completion owner refused."""
+        raise ReturnedOutputRejected("not a proposal")
+
+    lost = scripted({"extract": unknown})
+    _, nothing = extract_candidates(store, prepared, lost, code_revision="t", clock=clock)
+    assert nothing.candidates == ()
+    assert [(row.stage, row.status) for row in nothing.failed] == [("extract", "unknown")]
+
+    other = ProjectStore(store.paths.root, "second")
+    prepared = prepare_agent_memory(
+        other,
+        AgentMemorySpec(traces=tmp_path / "traces.jsonl", output=tmp_path / "o", alias="learner"),
+        code_revision="t",
+        clock=clock,
+    )
+    completions = scripted(
+        {
+            "extract": lambda body: {
+                "lessons": [lesson(f"s{label}", [label], "pitfall") for label in shown_labels(body)]
+            },
+            "merge": refused,
+            "screen": lambda _body: {"screenings": []},
+        }
+    )
+    found = extract_candidates(other, prepared, completions, code_revision="t", clock=clock)
+    _, memory = consolidate(other, prepared, found, completions, code_revision="t", clock=clock)
+    assert [lesson.statement for lesson in memory.lessons] == ["sT1", "sT2", "sT3"]
+    assert all(lesson.screening is None and not lesson.accepted for lesson in memory.lessons)
+    assert [(row.stage, row.status) for row in memory.failed] == [
+        ("merge", "rejected"),
+        ("screen", "rejected"),
+    ]
+    assert "answer refused" in memory.failed[1].reason
+
+
+def test_any_other_failure_stops_the_stage_without_saving_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A spend stop or transport error propagates, so a rerun resumes the same requests."""
+    store, prepared = prepared_memory(tmp_path, monkeypatch)
+
+    def stopped(_body: JsonObject) -> JsonObject:
+        """An infrastructure stop."""
+        raise TimeoutError("completion deadline reached before dispatch")
+
+    with pytest.raises(TimeoutError):
+        extract_candidates(
+            store,
+            prepared,
+            scripted({"extract": stopped}),
+            code_revision="t",
+            clock=clock,
+        )
+    assert store.artifacts.list_ids(artifact_type="agent-memory-candidates") == ()
+
+
+def test_the_plan_replays_and_the_window_is_fixed_by_the_first_paid_stage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Preparing twice registers one plan; a later window never moves the deadline."""
+    store, first = prepared_memory(tmp_path, monkeypatch)
+    spec = AgentMemorySpec(
+        traces=tmp_path / "traces.jsonl", output=tmp_path / "out", alias="learner"
+    )
+    again = prepare_agent_memory(
+        store, spec, code_revision="test", clock=lambda: NOW + timedelta(days=3)
+    )
+    assert again.reference == first.reference
+    assert store.artifacts.list_ids(artifact_type="agent-memory-window") == ()
+    for hours_later in (0, 9):
+        stage_completions(
+            store,
+            first,
+            hours=2,
+            concurrency=1,
+            code_revision="t",
+            clock=partial(operator.add, NOW, timedelta(hours=hours_later)),
+        )
+    (window_id,) = store.artifacts.list_ids(artifact_type="agent-memory-window")
+    saved = json.loads(store.artifacts.read_bytes(window_id, "window.json"))
+    assert datetime.fromisoformat(saved["deadline"]) == NOW + timedelta(hours=2)
+
+
+def test_exclusions_are_refused_unless_allowed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A record the source cannot normalize stops learning until the operator allows it."""
+    root = project_root(tmp_path, monkeypatch)
+    store = ProjectStore(root, "memory")
+    broken = {**passed("bad"), "exp.outcome.status": "failure"}
+    traces = export(tmp_path, [passed("good"), broken])
+    spec = AgentMemorySpec(traces=traces, output=tmp_path / "out", alias="learner")
+    with pytest.raises(ValueError, match="1 records .* cannot be normalized"):
+        prepare_agent_memory(store, spec, code_revision="t", clock=clock)
+    allowed = spec.model_copy(update={"allow_exclusions": True})
+    prepared = prepare_agent_memory(store, allowed, code_revision="t", clock=clock)
+    assert len(prepared.traces) == 1
+
+
+def test_costs_price_every_request_at_the_spend_ceilings_whole_generation_bound(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Consent shows what admission will reserve, so it can never stop a consented run."""
+    store, prepared = prepared_memory(
+        tmp_path, monkeypatch, count=4, batch_bytes=10_000, maximum_trace_bytes=5_000
+    )
+    extraction = extraction_cost(store, prepared)
+    assert extraction.attempts == len(prepared.batches)
+    assert extraction.usd is not None and extraction.usd > 10 * extraction.attempts
+    rows = tuple(
+        Lesson(kind=kind, statement=f"s{index}", applies_when="w", evidence=("e",), traces=("t",))
+        for index in range(25)
+        for kind in ("procedure", "pitfall")
+    )
+    merge, screen = consolidation_cost(store, prepared, candidates(*rows))
+    assert merge.attempts == 2 * agent_memory.MERGE_ROUNDS
+    assert screen.attempts == 4
+    assert consolidation_cost(store, prepared, candidates())[0].attempts == 0
