@@ -48,6 +48,13 @@ fn streamed_chunks_land_in_order_and_the_last_handle_removes_the_file() {
         .all(|(index, chunk)| chunk.iter().all(|byte| *byte == index as u8)));
     assert_eq!(store.shared.used.load(Ordering::Acquire), 100_000);
     let path = file.path().to_owned();
+    // Completion wakes waiters before the writer drops its handle. Wait until
+    // this is the last handle so its synchronous deletion is what we test.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while Arc::strong_count(&file.0) > 1 && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(Arc::strong_count(&file.0), 1);
     drop(file);
     assert!(!path.exists());
     assert_eq!(store.shared.used.load(Ordering::Acquire), 0);
