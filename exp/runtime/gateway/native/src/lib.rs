@@ -113,11 +113,13 @@ impl ShutdownHandle {
 ///
 /// The control plane validates each `decision_model` adapter document,
 /// composes this handle with the endpoint's bearer, and reuses it for every
-/// request. `classify` releases the GIL while the decision call runs, and
+/// request. `classify` releases the GIL while the decision call runs; the data
+/// plane resolves the same classifier by `handle` for observing checks, so
 /// every call shares one verdict cache and its counters.
 #[pyclass(frozen)]
 pub struct DecisionClassifier {
     inner: Arc<guardrails::classify::Classifier>,
+    handle: u64,
 }
 
 #[pymethods]
@@ -131,7 +133,14 @@ impl DecisionClassifier {
         let inner = Arc::new(
             guardrails::classify::Classifier::new(spec, bearer).map_err(PyValueError::new_err)?,
         );
-        Ok(Self { inner })
+        let handle = guardrails::classify::register(&inner);
+        Ok(Self { inner, handle })
+    }
+
+    /// The identity the data plane resolves this classifier by.
+    #[getter]
+    fn handle(&self) -> u64 {
+        self.handle
     }
 
     /// Classify one window within `timeout_ms`, blocking without the GIL.
@@ -745,7 +754,7 @@ fn exp_gateway_native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(failure_public_error_fixture, module)?)?;
     module.add("__version__", env!("CARGO_PKG_VERSION"))?;
     module.add("AUTOMATIC_VERTEX_CACHE_CONTRACT_VERSION", 1)?;
-    module.add("GUARDRAIL_CONTRACT_VERSION", 3)?;
+    module.add("GUARDRAIL_CONTRACT_VERSION", 4)?;
     module.add("MODEL_STAGE_CONTRACT_VERSION", MODEL_STAGE_CONTRACT_VERSION)?;
     Ok(())
 }

@@ -13,14 +13,24 @@
 //! whether the caller is the data plane or a python thread. The window text
 //! leaves this module only as the decision request's state, and nothing here
 //! logs it.
+//!
+//! An observing policy's checks run here end to end: admission names each
+//! classifier by handle with the window to classify, [`spawn_observations`]
+//! classifies them beside generation, and one control-plane callback records
+//! every answer. Nothing waits for them, and no response byte depends on them.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
+use tokio::sync::Semaphore;
+
+use crate::bridge::Bridge;
+use crate::encode::compact_json;
 
 /// Histogram buckets per category, each 0.05 wide.
 pub(crate) const SCORE_BUCKETS: usize = 20;
@@ -556,6 +566,98 @@ fn runtime() -> &'static tokio::runtime::Runtime {
             .build()
             .expect("the decision classifier runtime starts")
     })
+}
+
+type Registry = Mutex<HashMap<u64, Weak<Classifier>>>;
+
+fn registry() -> &'static Registry {
+    static REGISTRY: OnceLock<Registry> = OnceLock::new();
+    REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Make one classifier reachable by handle until its last owner drops it.
+pub(crate) fn register(classifier: &Arc<Classifier>) -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    let handle = NEXT.fetch_add(1, Ordering::Relaxed);
+    if let Ok(mut entries) = registry().lock() {
+        entries.retain(|_, entry| entry.strong_count() > 0);
+        entries.insert(handle, Arc::downgrade(classifier));
+    }
+    handle
+}
+
+/// The live classifier behind a handle, or `None` once it was replaced or dropped.
+pub(crate) fn lookup(handle: u64) -> Option<Arc<Classifier>> {
+    registry().lock().ok()?.get(&handle)?.upgrade()
+}
+
+/// One observing check admission handed to the data plane.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct Observation {
+    /// The control plane's index of the check, echoed in its result.
+    pub(crate) index: u32,
+    /// The classifier's handle.
+    pub(crate) handle: u64,
+    /// The bounded window to classify.
+    pub(crate) window: String,
+}
+
+/// Requests whose observations may be in flight at once in this process.
+const MAXIMUM_OBSERVING_REQUESTS: usize = 256;
+
+fn observing() -> &'static Arc<Semaphore> {
+    static OBSERVING: OnceLock<Arc<Semaphore>> = OnceLock::new();
+    OBSERVING.get_or_init(|| Arc::new(Semaphore::new(MAXIMUM_OBSERVING_REQUESTS)))
+}
+
+/// Classify a request's observations beside generation and report them once.
+///
+/// Nothing awaits the task. Each observation answers, errs with a fixed
+/// reason, or is skipped when the process already observes its maximum of
+/// requests or the classifier is gone; `guardrail_observation_results`
+/// receives `{request_id, results: [{index, answer | error | skipped}]}`.
+pub(crate) fn spawn_observations(
+    bridge: Arc<Bridge>,
+    request_id: &str,
+    observations: &[Observation],
+    deadline: Instant,
+) {
+    if observations.is_empty() {
+        return;
+    }
+    let request_id = request_id.to_owned();
+    let observations = observations.to_vec();
+    let permit = observing().clone().try_acquire_owned().ok();
+    tokio::spawn(async move {
+        let results = match permit {
+            Some(_permit) => {
+                futures_util::future::join_all(
+                    observations.iter().map(|observation| observe(observation, deadline)),
+                )
+                .await
+            }
+            None => observations
+                .iter()
+                .map(|observation| json!({"index": observation.index, "skipped": "observation capacity is full"}))
+                .collect(),
+        };
+        let argument = compact_json(&json!({"request_id": request_id, "results": results}));
+        // A failed callback loses only content-free observation records.
+        let _ = bridge.call("guardrail_observation_results", argument).await;
+    });
+}
+
+async fn observe(observation: &Observation, deadline: Instant) -> Value {
+    let Some(classifier) = lookup(observation.handle) else {
+        return json!({"index": observation.index, "skipped": "classifier was replaced"});
+    };
+    match classifier.classify(&observation.window, deadline).await {
+        Ok(answer) => {
+            json!({"index": observation.index, "answer": classifier.answer_json(&answer)})
+        }
+        Err(error) => json!({"index": observation.index, "error": error.reason()}),
+    }
 }
 
 /// Block the calling thread on one classification; for callers outside the data plane.

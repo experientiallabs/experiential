@@ -235,9 +235,23 @@ class DecisionModelClassifier:
         self._native = native.DecisionClassifier(json.dumps(specification), credential)
 
     @property
+    def adapter_id(self) -> str:
+        """Return the adapter identity."""
+        return self._document.adapter_id
+
+    @property
     def configuration_digest(self) -> str:
         """Return the digest of the endpoint, model, categories, and window."""
         return self._digest
+
+    @property
+    def native_handle(self) -> int:
+        """Return the handle the data plane resolves this classifier by."""
+        return self._native.handle
+
+    def classification_window(self, request: GatewayRequest) -> str:
+        """Return the window this adapter classifies, empty when the request has no text."""
+        return classification_window(request, self._document.window)
 
     def telemetry(self) -> dict[str, JsonValue]:
         """Return this adapter's content-free score, cache, and latency counters.
@@ -262,7 +276,7 @@ class DecisionModelClassifier:
         Raises:
             ClassifierProtocolError: The decision call did not return a valid answer.
         """
-        state = classification_window(request, self._document.window)
+        state = self.classification_window(request)
         if not state:
             return ClassifierVerdict(flagged=False)
         if self._unset_bearer:

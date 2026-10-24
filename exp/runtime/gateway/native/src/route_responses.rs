@@ -252,6 +252,12 @@ pub(crate) async fn responses(
             },
         ),
     };
+    crate::guardrails::classify::spawn_observations(
+        state.bridge.clone(),
+        &admission.request_id,
+        &admission.guardrail_observations,
+        deadline,
+    );
     let mut won =
         acquire_guarded_attempt(&context, &mut guard, admission.guardrail_input_pending).await;
     adopt_outcome(&mut admission, &mut won);

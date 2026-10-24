@@ -814,6 +814,10 @@ class NativeControlPlane(
             response["throttle_redial"] = route.snapshot.throttle_redial.model_dump(mode="json")
         if plan is not None:
             response["guardrail_output_plan"] = plan
+        if guardrails is not None and (
+            observations := guardrails.native_observation_plan(authorization.request_id)
+        ):
+            response["guardrail_observations"] = observations
         if web_search_admission is not None:
             response["web_search"] = web_search_admission
         if tool_search_admission is not None:

@@ -25,6 +25,7 @@ from exp.runtime.gateway.guardrails.deterministic import (
     native_input_request,
     native_output_plan,
 )
+from exp.runtime.gateway.guardrails.native_classification import NativeObservation
 from exp.runtime.gateway.guardrails.streaming import StreamSegment
 from exp.runtime.gateway.guardrails.subjects import ObservedSubjects
 
@@ -61,18 +62,22 @@ class GuardrailSession:
         policies: All applicable policies, captured once under authenticated authority.
         deadline_monotonic: Original absolute deadline, never renewed by polls or retries.
         detectors: Pure native detector implementations, empty until configured.
+        native_data_plane: Whether the data plane classifies the observing checks
+            it can run itself, from the admission plan, default False.
         _input: Pending parallel input inspection, or None before it starts.
         _input_failure: Retained input or required capture rejection, or None before failure.
         _input_approved_at: Approval time, or None before the current subject is approved.
         _closed: Whether cancellation closed this session, false initially.
         _inspected: Exact input and approved-result pairs, empty before inspection.
         _observed: Content-free subject identities and optional observation admission state.
+        _native: Distinct observing windows awaiting the admission plan, keyed by check.
     """
 
     engine: GuardrailEngine
     policies: tuple[GuardrailPolicy, ...]
     deadline_monotonic: float
     detectors: Mapping[str, NativeDetector] = field(default_factory=dict, repr=False)
+    native_data_plane: bool = False
     _input: Future[None] | None = field(default=None, init=False, repr=False)
     _input_failure: GatewayFailure | None = field(default=None, init=False, repr=False)
     _input_approved_at: float | None = field(default=None, init=False, repr=False)
@@ -81,6 +86,9 @@ class GuardrailSession:
         default_factory=list, init=False, repr=False
     )
     _observed: ObservedSubjects = field(default_factory=ObservedSubjects, init=False, repr=False)
+    _native: dict[tuple[int, str, str], tuple[NativeObservation, str]] = field(
+        default_factory=dict, init=False, repr=False
+    )
 
     @property
     def enforcing_policies(self) -> tuple[GuardrailPolicy, ...]:
@@ -88,16 +96,69 @@ class GuardrailSession:
         return tuple(policy for policy in self.policies if policy.mode == "enforce")
 
     def _observe_input(self, request: GatewayRequest) -> None:
-        """Submit each complete context once without retaining its text in the session."""
+        """Submit each complete context once without retaining its text in the session.
+
+        On a native data plane, a policy whose input checks all bind a native
+        classifier contributes only its distinct windows to the admission plan;
+        the complete request is never copied for it.
+        """
         observers = tuple(p for p in self.policies if p.mode == "observe" and p.input_checks)
-        if not observers:
+        inspected: list[GuardrailPolicy] = []
+        for policy in observers:
+            bound = [
+                (check, classifier)
+                for check in policy.input_checks
+                if self.native_data_plane
+                and (classifier := self.engine.native_classifier(check)) is not None
+            ]
+            if not bound or len(bound) != len(policy.input_checks):
+                inspected.append(policy)
+                continue
+            for check, classifier in bound:
+                window = classifier.classification_window(request)
+                self._native.setdefault(
+                    (id(policy), check.check_id, window),
+                    (
+                        NativeObservation(
+                            policy=policy,
+                            check=check,
+                            adapter_id=classifier.adapter_id,
+                            configuration_digest=classifier.configuration_digest,
+                            handle=classifier.native_handle,
+                        ),
+                        window,
+                    ),
+                )
+        if not inspected:
             return
         self.engine.observe_inputs(
-            policies=observers,
+            policies=tuple(inspected),
             request=request,
             deadline_monotonic=self.deadline_monotonic,
             observed=self._observed,
         )
+
+    def native_observation_plan(self, request_id: str) -> list[JsonObject]:
+        """Hand the data plane each distinct observing window once.
+
+        A check whose request has no classifiable text is allowed here without
+        a call, as the adapter would. The engine keeps what the report needs.
+
+        Returns:
+            ``[{index, handle, window}]`` entries, empty when nothing is observed natively.
+        """
+        entries, self._native = tuple(self._native.values()), {}
+        expected: list[NativeObservation] = []
+        plan: list[JsonObject] = []
+        for observation, window in entries:
+            if not window:
+                self.engine.record_text_free_observation(observation.policy, observation.check)
+                continue
+            plan.append({"index": len(expected), "handle": observation.handle, "window": window})
+            expected.append(observation)
+        if expected:
+            self.engine.expect_native_observations(request_id, tuple(expected))
+        return plan
 
     def can_overlap_input(self, request: GatewayRequest) -> bool:
         """Overlap read-only input decisions only when generation cannot cause side effects."""

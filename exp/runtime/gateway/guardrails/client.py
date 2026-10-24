@@ -90,6 +90,38 @@ class InternalClassifierClient(Protocol):
         """
         ...
 
+    def native_classifier(self, *, check: GuardrailCheck) -> NativeClassifier | None:
+        """Return the check's adapter when the data plane can run it itself, or ``None``."""
+        ...
+
+
+@runtime_checkable
+class NativeClassifier(Protocol):
+    """An input adapter the data plane runs itself: a native handle and its window.
+
+    The control plane builds the window; the data plane classifies it with the
+    classifier behind ``native_handle`` and reports the answer back.
+    """
+
+    @property
+    def adapter_id(self) -> str:
+        """Return the adapter identity the answer names."""
+        ...
+
+    @property
+    def configuration_digest(self) -> str:
+        """Return a content-free SHA-256 hex digest of the verdict settings."""
+        ...
+
+    @property
+    def native_handle(self) -> int:
+        """Return the handle the data plane resolves this classifier by."""
+        ...
+
+    def classification_window(self, request: GatewayRequest) -> str:
+        """Return the window text this adapter classifies, empty when there is none."""
+        ...
+
 
 @runtime_checkable
 class WindowedClassifier(Protocol):
@@ -179,6 +211,11 @@ class DirectClassifierClient:
         if not isinstance(adapter, WindowedClassifier):
             return None
         return adapter.configuration_digest
+
+    def native_classifier(self, *, check: GuardrailCheck) -> NativeClassifier | None:
+        """Return the bound adapter when the data plane can run it, or ``None``."""
+        adapter = self._registry.require(check.adapter_id)
+        return adapter if isinstance(adapter, NativeClassifier) else None
 
 
 class ClassifierLookup(Protocol):

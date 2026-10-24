@@ -108,6 +108,11 @@ pub(crate) struct Admission {
     /// every response byte exactly as before.
     #[serde(default)]
     pub web_search: Option<WebSearchAdmission>,
+    /// Observing decision-model checks the data plane classifies itself,
+    /// beside generation, reporting every answer once to the control plane.
+    /// Absent when no observing policy binds a native classifier.
+    #[serde(default)]
+    pub guardrail_observations: Vec<crate::guardrails::classify::Observation>,
     /// The gateway-run tool search for this request: the function tool the
     /// model was given in place of the deferred catalog, and the round
     /// budget. Absent when the gateway runs no search (no deferred tools, or

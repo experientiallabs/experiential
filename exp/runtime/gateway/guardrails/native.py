@@ -71,9 +71,9 @@ def validate_guardrail_engine(engine: GuardrailEngine | None) -> None:
     if engine is None:
         return
     native = importlib.import_module("exp_gateway_native")
-    if getattr(native, "GUARDRAIL_CONTRACT_VERSION", None) != 3:
+    if getattr(native, "GUARDRAIL_CONTRACT_VERSION", None) != 4:
         raise ValueError(
-            "guardrails require native GUARDRAIL_CONTRACT_VERSION=3; "
+            "guardrails require native GUARDRAIL_CONTRACT_VERSION=4; "
             "install the coordinated native package"
         )
 
@@ -90,7 +90,9 @@ def open_admission_guardrails(
     session = (
         None
         if engine is None
-        else engine.open_request(authorization, deadline_monotonic=deadline_monotonic)
+        else engine.open_request(
+            authorization, deadline_monotonic=deadline_monotonic, native_data_plane=True
+        )
     )
     if request.idempotency_key is not None:
         revision = None if session is None else session.engine.policy_revision(session.policies)
@@ -273,10 +275,12 @@ class _GuardrailPlane(Protocol):
     Attributes:
         _accounting: Owner of live requests and their terminal settlement.
         _capture: Optional collector bound to the host's authenticated capture policy.
+        _guardrails: The shared engine, or ``None`` when no policy is configured.
     """
 
     _accounting: NativeAttemptAccounting
     _capture: CaptureController | None
+    _guardrails: GuardrailEngine | None
 
 
 class NativeGuardrailsMixin:
@@ -350,6 +354,22 @@ class NativeGuardrailsMixin:
             if self._accounting.entry(request_id) is entry and entry.pending_abandon is None
             else '{"action":"closed"}'
         )
+
+    def guardrail_observation_results(self: _GuardrailPlane, argument: str) -> str:
+        """Record the data plane's one report of a request's native observations.
+
+        Args:
+            argument: JSON ``{request_id, results: [{index, answer | error | skipped}]}``.
+
+        Returns:
+            An empty JSON object; the report never affects the request.
+        """
+        engine = self._guardrails
+        payload = json.loads(argument)
+        results = payload.get("results") if isinstance(payload, dict) else None
+        if engine is not None and isinstance(results, list):
+            engine.record_native_observations(str(payload.get("request_id") or ""), results)
+        return "{}"
 
     def enforce_output_segment(self: _GuardrailPlane, argument: str) -> str:
         """Release one deterministic segment through the admitted session."""

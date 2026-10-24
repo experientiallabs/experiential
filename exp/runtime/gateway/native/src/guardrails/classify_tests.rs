@@ -350,3 +350,106 @@ fn a_spec_the_control_plane_could_not_have_validated_is_refused() {
         assert!(Classifier::new(spec(url, overrides), None).is_err());
     }
 }
+
+#[test]
+fn a_handle_resolves_until_its_classifier_is_dropped() {
+    let classifier = classifier("https://decisions.example.invalid/systemone", json!({}));
+    let handle = register(&classifier);
+
+    assert!(lookup(handle).is_some());
+    drop(classifier);
+    assert!(lookup(handle).is_none());
+}
+
+#[tokio::test]
+async fn observations_report_every_answer_once_without_holding_the_request() {
+    use pyo3::prelude::*;
+
+    Python::initialize();
+    let (url, seen) = serve(vec![Reply::answers(&[
+        ("overrides_instructions", 0.95),
+        ("unrelated_task", 0.1),
+        ("unrelated_domain", 0.1),
+    ])])
+    .await;
+    let (failing_url, failing_seen) = serve(vec![Reply::raw(503, "{}")]).await;
+    let current = classifier(&url, json!({}));
+    let failing = classifier(&failing_url, json!({}));
+    let replaced = classifier(&url, json!({}));
+    let (live, broken, gone) = (register(&current), register(&failing), register(&replaced));
+    drop(replaced);
+    let plane = Python::attach(|py| {
+        pyo3::types::PyModule::from_code(
+            py,
+            c"class Plane:\n def __init__(self): self.results = []\n def guardrail_observation_results(self, argument):\n  self.results.append(argument)\n  return '{}'\n def close_thread_resources(self, argument): return '{}'\n",
+            c"observation_plane.py",
+            c"observation_plane",
+        )
+        .unwrap()
+        .getattr("Plane")
+        .unwrap()
+        .call0()
+        .unwrap()
+        .unbind()
+    });
+    let bridge =
+        Arc::new(crate::bridge::Bridge::new(Python::attach(|py| plane.clone_ref(py)), 1).unwrap());
+    let observations = [
+        Observation {
+            index: 0,
+            handle: live,
+            window: "flagged".into(),
+        },
+        Observation {
+            index: 1,
+            handle: broken,
+            window: "failing".into(),
+        },
+        Observation {
+            index: 2,
+            handle: gone,
+            window: "replaced".into(),
+        },
+    ];
+
+    let started = Instant::now();
+    spawn_observations(bridge.clone(), "request-1", &observations, soon());
+    assert!(
+        started.elapsed() < Duration::from_millis(50),
+        "nothing awaits the observations"
+    );
+    let reported = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let results: Vec<String> = Python::attach(|py| {
+                plane
+                    .bind(py)
+                    .getattr("results")
+                    .unwrap()
+                    .extract()
+                    .unwrap()
+            });
+            if !results.is_empty() {
+                return results;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("one report");
+
+    assert_eq!(reported.len(), 1);
+    let report: Value = serde_json::from_str(&reported[0]).unwrap();
+    assert_eq!(report["request_id"], "request-1");
+    let results = report["results"].as_array().unwrap();
+    assert_eq!(results[0]["answer"]["flagged"], json!(["prompt_injection"]));
+    assert_eq!(results[1]["error"], "decision model returned HTTP 503");
+    assert_eq!(results[2]["skipped"], "classifier was replaced");
+    assert_eq!(
+        (
+            seen.lock().unwrap().len(),
+            failing_seen.lock().unwrap().len()
+        ),
+        (1, 1),
+        "a replaced classifier is never called"
+    );
+}

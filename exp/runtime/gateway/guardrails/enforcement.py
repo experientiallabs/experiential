@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 import time
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from hashlib import sha256
 
 from exp.common.core.artifacts import canonical_json_bytes
@@ -15,7 +15,7 @@ from exp.runtime.gateway.contracts import (
     GatewayRequest,
 )
 from exp.runtime.gateway.guardrails.bounded import BoundedInspect, ClassifierTimeoutError
-from exp.runtime.gateway.guardrails.client import InternalClassifierClient
+from exp.runtime.gateway.guardrails.client import InternalClassifierClient, NativeClassifier
 from exp.runtime.gateway.guardrails.contracts import (
     ClassificationResult,
     ClassificationVerdict,
@@ -32,6 +32,11 @@ from exp.runtime.gateway.guardrails.contracts import (
     coverage_failure,
     guardrail_failure,
     request_exceeds_inspection_limit,
+)
+from exp.runtime.gateway.guardrails.native_classification import (
+    NativeObservation,
+    PendingObservations,
+    classification_result,
 )
 from exp.runtime.gateway.guardrails.observation import (
     ObservationAdmission,
@@ -108,6 +113,7 @@ class GuardrailEngine:
         self._observation_records = ObservationRecorder(
             self._deliver_observation, max_records=max_observation_records
         )
+        self._native_observations = PendingObservations()
         self.input_invocations = 0
         self.output_invocations = 0
         self.classifier_calls = 0
@@ -117,14 +123,25 @@ class GuardrailEngine:
         return self._store.policies_for(authorization)
 
     def open_request(
-        self, authorization: AuthorizationSnapshot, *, deadline_monotonic: float
+        self,
+        authorization: AuthorizationSnapshot,
+        *,
+        deadline_monotonic: float,
+        native_data_plane: bool = False,
     ) -> GuardrailSession | None:
-        """Freeze all applicable policies into one request-owned execution session."""
+        """Freeze all applicable policies into one request-owned execution session.
+
+        ``native_data_plane`` marks an admission whose data plane classifies the
+        observing checks it can run itself (see ``native_classification``).
+        """
         policies = self.policies_for(authorization)
         if not policies:
             return None
         return GuardrailSession(
-            engine=self, policies=policies, deadline_monotonic=deadline_monotonic
+            engine=self,
+            policies=policies,
+            deadline_monotonic=deadline_monotonic,
+            native_data_plane=native_data_plane,
         )
 
     def revision_for(self, authorization: AuthorizationSnapshot) -> str | None:
@@ -411,6 +428,63 @@ class GuardrailEngine:
                 else GuardrailOutcome.SKIPPED
             )
             self._emit_observation(policy, None, outcome, 0.0)
+
+    def native_classifier(self, check: GuardrailCheck) -> NativeClassifier | None:
+        """Return the check's adapter when the data plane can classify for it, or ``None``."""
+        try:
+            return self._client.native_classifier(check=check)
+        except Exception:  # noqa: BLE001 - an unresolvable adapter stays on this engine.
+            return None
+
+    def expect_native_observations(
+        self, request_id: str, observations: tuple[NativeObservation, ...]
+    ) -> None:
+        """Hold what one request's data-plane report needs, never its window text."""
+        self._native_observations.expect(request_id, observations)
+
+    def record_native_observations(self, request_id: str, results: Sequence[object]) -> None:
+        """Record one data-plane report: an answer, an error, or a skip per observing check.
+
+        A report for an unknown or evicted request, or an entry that does not
+        name one of its observations, records nothing.
+        """
+        observations = self._native_observations.take(request_id)
+        for item in results:
+            if not isinstance(item, dict):
+                continue
+            index = item.get("index")
+            if not isinstance(index, int) or not 0 <= index < len(observations):
+                continue
+            observation = observations[index]
+            policy, check = observation.policy, observation.check
+            answer, error = item.get("answer"), item.get("error")
+            if isinstance(answer, dict):
+                try:
+                    result = classification_result(observation, answer)
+                except TypeError:
+                    self._decision(
+                        policy, check, GuardrailAction.ERROR, GuardrailOutcome.UNAVAILABLE, 0.0
+                    )
+                    continue
+                self._classified(policy, check, result)
+                if result.flagged:
+                    action, outcome = check.action, GuardrailOutcome.FLAGGED
+                else:
+                    action, outcome = GuardrailAction.ALLOW, GuardrailOutcome.ALLOW
+                self._decision(policy, check, action, outcome, result.latency_seconds)
+            elif isinstance(error, str):
+                outcome = (
+                    GuardrailOutcome.TIMEOUT
+                    if "timed out" in error
+                    else GuardrailOutcome.UNAVAILABLE
+                )
+                self._decision(policy, check, GuardrailAction.ERROR, outcome, 0.0)
+            else:
+                self._decision(policy, check, GuardrailAction.ERROR, GuardrailOutcome.SKIPPED, 0.0)
+
+    def record_text_free_observation(self, policy: GuardrailPolicy, check: GuardrailCheck) -> None:
+        """Record an observing check whose request has no classifiable text as allowed."""
+        self._decision(policy, check, GuardrailAction.ALLOW, GuardrailOutcome.ALLOW, 0.0)
 
     def record_unsupported_observations(self, policies: tuple[GuardrailPolicy, ...]) -> None:
         """Record incomplete observation coverage on a surface with no inspection boundary."""
