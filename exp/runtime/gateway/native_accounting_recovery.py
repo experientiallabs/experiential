@@ -99,7 +99,8 @@ def recover_expired(accounting: NativeAttemptAccounting) -> None:
             settlement=settlement,
         ):
             with accounting._lock:
-                entry.pending_settlement = None
+                if entry.pending_settlement == settlement:
+                    entry.pending_settlement = None
                 accounting._sweep_retained_replayed += 1
     for request_id, entry in abandoned:
         try:
