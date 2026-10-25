@@ -2312,7 +2312,8 @@ def test_abandoned_inflight_attempts_are_swept_after_the_deadline(
     with (
         mock.patch("exp.runtime.gateway.native_bridge.time", native_time),
         mock.patch("exp.runtime.gateway.native_accounting.time", native_time),
-        mock.patch("exp.runtime.gateway.native_accounting._SWEEP_GRACE_SECONDS", 0.0),
+        mock.patch("exp.runtime.gateway.native_accounting_recovery.time", native_time),
+        mock.patch("exp.runtime.gateway.native_accounting_recovery._SWEEP_GRACE_SECONDS", 0.0),
     ):
         clock.elapsed += setup_elapsed
         abandoned = _admit_started(control, raw_key, _chat_body())
@@ -2326,6 +2327,9 @@ def test_abandoned_inflight_attempts_are_swept_after_the_deadline(
         clock.elapsed += 0.002 + setup_elapsed
         assert clock.monotonic() > entry.deadline_monotonic
         second = _admit(control, raw_key, _chat_body())
+        # Admission does not sweep another request on its critical path.
+        assert control._accounting.entry(request_id) is entry  # noqa: SLF001
+        control._accounting.sweep_expired()  # noqa: SLF001 - the timer drives recovery.
         assert control._accounting.entry(request_id) is None  # noqa: SLF001
         assert control._accounting.entry(str(second["request_id"])) is not None  # noqa: SLF001
         control._accounting.sweep_expired()  # noqa: SLF001
@@ -4171,7 +4175,7 @@ def test_metrics_snapshot_counts_a_swept_abandoned_attempt(tmp_path: Path) -> No
     control, raw_key = _control_plane(tmp_path, request_timeout_seconds=0.5)
     _admit(control, raw_key, _chat_body())
     time.sleep(0.6)
-    with mock.patch("exp.runtime.gateway.native_accounting._SWEEP_GRACE_SECONDS", 0.0):
+    with mock.patch("exp.runtime.gateway.native_accounting_recovery._SWEEP_GRACE_SECONDS", 0.0):
         control._accounting.sweep_expired()  # noqa: SLF001 - the timer normally drives this.
 
     snapshot = control.metrics_snapshot()
