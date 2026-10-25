@@ -354,6 +354,13 @@ def _control_plane(
     return control, raw_key
 
 
+@pytest.mark.parametrize("timeout", [0.0, -1.0, float("nan"), float("inf"), float("-inf")])
+def test_request_timeout_requires_a_finite_positive_value(tmp_path: Path, timeout: float) -> None:
+    """Invalid budgets fail before native configuration or readiness can accept them."""
+    with pytest.raises(ValueError, match="request_timeout_seconds"):
+        _control_plane(tmp_path, request_timeout_seconds=timeout)
+
+
 def _chat_body(*, model: str = "coding", stream: bool = False) -> str:
     """Return one raw Chat Completions request body."""
     payload: JsonObject = {"model": model, "messages": [{"role": "user", "content": "hi"}]}

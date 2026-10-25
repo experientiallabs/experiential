@@ -7,7 +7,9 @@ import shutil
 import stat
 import subprocess
 import sys
-from pathlib import Path
+from pathlib import Path, PurePath
+from types import SimpleNamespace
+from unittest import mock
 
 import pytest
 from cryptography import x509
@@ -176,6 +178,15 @@ def test_unsafe_default_keychain_never_installs_trust(
     """Do not turn an absent or system keychain preference into a wider trust mutation."""
     certificate = prepare_certificate(tmp_path / "certificates", _DOMAINS)
     calls: list[list[str]] = []
+    # Simulate all path metadata too: this test must never stat, resolve, or
+    # inspect an actual Keychain path, even when the native command is mocked.
+    lexical_path = PurePath(keychain_output.strip('"'))
+    simulated_path = mock.Mock(spec=Path)
+    simulated_path.is_absolute.return_value = lexical_path.is_absolute()
+    simulated_path.is_file.return_value = str(lexical_path) == "/Library/Keychains/System.keychain"
+    simulated_path.stat.return_value = SimpleNamespace(st_uid=os.getuid())
+    simulated_path.resolve.return_value = lexical_path
+    monkeypatch.setattr(certificates, "Path", mock.Mock(return_value=simulated_path))
 
     def run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
         """Return only the unsafe default-keychain preference under test."""

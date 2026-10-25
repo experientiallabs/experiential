@@ -107,6 +107,8 @@ pub(super) async fn stream_response(
 
         // Mirror any prefix-peeked first token before a start-frame send can cancel and drop it.
         guard.record_first_token(committed.relay.first_token_at());
+        let mut prefix: std::collections::VecDeque<Event> = committed.prefix.drain(..).collect();
+        let mut send_deadline = deadline;
         let start_frames = match encoder.start() {
             Ok(frames) => frames,
             Err(_) => {
@@ -117,12 +119,18 @@ pub(super) async fn stream_response(
             }
         };
         for frame in start_frames {
+            if committed
+                .relay
+                .deadline_cut(deadline, &mut send_deadline, &prefix)
+            {
+                fail_stream!(crate::relay::deadline_while_generating())
+            }
             let data = Bytes::from(frame);
             if lease.is_some() {
                 replayable = capture_frame(&mut capture, &data, replayable);
                 delivery.retain_replay(replayable);
             }
-            if !delivery.send(deadline, data).await {
+            if !delivery.send(send_deadline, data).await {
                 committed.relay.close_transport();
                 log_stream_exit(&request_id, "subscriber_closed_or_delivery_deadline");
                 guard.settle_cancelled(usage.as_ref(), &tool_names).await;
@@ -130,10 +138,11 @@ pub(super) async fn stream_response(
             }
         }
 
-        let mut prefix: std::collections::VecDeque<Event> = committed.prefix.drain(..).collect();
-        let mut send_deadline = deadline;
         loop {
-            if committed.relay.deadline_cut(deadline, &mut send_deadline) {
+            if committed
+                .relay
+                .deadline_cut(deadline, &mut send_deadline, &prefix)
+            {
                 fail_stream!(crate::relay::deadline_while_generating())
             }
             let event = if let Some(event) = prefix.pop_front() {

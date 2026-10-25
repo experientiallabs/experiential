@@ -695,6 +695,8 @@ async fn stream_messages(
         // `message_start` instead of the zero placeholder.
         encoder.set_initial_usage(usage.clone());
         encoder.set_pre_dispatch_input_estimate(admission.input_token_estimate);
+        let mut prefix: std::collections::VecDeque<Event> = committed.prefix.drain(..).collect();
+        let mut send_deadline = deadline;
         let start_frames = match encoder.start() {
             Ok(frames) => frames,
             Err(_) => {
@@ -705,7 +707,13 @@ async fn stream_messages(
             }
         };
         for frame in start_frames {
-            if !delivery.send(deadline, Bytes::from(frame)).await {
+            if committed
+                .relay
+                .deadline_cut(deadline, &mut send_deadline, &prefix)
+            {
+                fail_stream!(crate::relay::deadline_while_generating())
+            }
+            if !delivery.send(send_deadline, Bytes::from(frame)).await {
                 committed.relay.close_transport();
                 log_stream_exit(&request_id, "subscriber_closed_or_delivery_deadline");
                 guard.settle_cancelled(usage.as_ref(), &tool_names).await;
@@ -713,10 +721,11 @@ async fn stream_messages(
             }
         }
 
-        let mut prefix: std::collections::VecDeque<Event> = committed.prefix.drain(..).collect();
-        let mut send_deadline = deadline;
         loop {
-            if committed.relay.deadline_cut(deadline, &mut send_deadline) {
+            if committed
+                .relay
+                .deadline_cut(deadline, &mut send_deadline, &prefix)
+            {
                 fail_stream!(crate::relay::deadline_while_generating())
             }
             let event = if let Some(event) = prefix.pop_front() {

@@ -571,7 +571,7 @@ def test_request_timeout_rejects_values_outside_its_bounds(
     monkeypatch.setenv("TERM", "xterm-256color")
     monkeypatch.delenv("NO_COLOR", raising=False)
     monkeypatch.setattr("typer.rich_utils.FORCE_TERMINAL", color)
-    for value in ("0", "7200"):
+    for value in ("0", "7200", "nan", "inf", "-inf"):
         result = CliRunner().invoke(
             app, ["run", "--root", str(tmp_path), "--request-timeout", value], color=color
         )

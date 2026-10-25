@@ -2,6 +2,7 @@
 //! They name what happened (still writing, or nothing yet) and the remedy,
 //! never the internal mechanism.
 
+use std::collections::VecDeque;
 use std::time::Instant;
 
 use super::remaining;
@@ -44,18 +45,26 @@ impl super::UpstreamRelay {
     /// true when the request deadline ran out while the provider is still
     /// writing, so the stream must end with [`deadline_while_generating`]
     /// rather than a close that reads as a clean end. When the provider
-    /// already declared its terminal (a decoded terminal is queued, or a
+    /// already declared its terminal (in the committed prefix or relay queues, or a
     /// declared finish is draining its trailer) the stream runs on to that
     /// terminal, which the relay yields at once past the deadline, and `send`
     /// gains the one terminal grace for the frames still queued ahead of it,
     /// fixed at first expiry so it cannot renew per frame.
-    pub fn deadline_cut(&self, deadline: Instant, send: &mut Instant) -> bool {
+    pub fn deadline_cut(
+        &self,
+        deadline: Instant,
+        send: &mut Instant,
+        committed_prefix: &VecDeque<crate::events::Event>,
+    ) -> bool {
         if !remaining(deadline).is_zero() {
             return false;
         }
-        // Decoded events wait in `pending` until the stream guards move them
-        // to `ready`; a terminal in either queue is already declared.
-        let terminal_pending = self.normalizer.metadata_drain_started().is_some()
+        // Commitment may have moved a private reasoning carrier and its terminal
+        // out of the relay into the caller's prefix. All three queues count.
+        let terminal_pending = committed_prefix
+            .iter()
+            .any(crate::events::Event::is_terminal)
+            || self.normalizer.metadata_drain_started().is_some()
             || self.ready.iter().any(crate::events::Event::is_terminal)
             || self.pending.iter().any(crate::events::Event::is_terminal);
         if !terminal_pending {
@@ -70,6 +79,7 @@ impl super::UpstreamRelay {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
     use std::time::{Duration, Instant};
 
     use bytes::Bytes;
@@ -99,7 +109,7 @@ mod tests {
         let relay = relay(Vec::new());
         let deadline = Instant::now();
         let mut send = deadline;
-        assert!(relay.deadline_cut(deadline, &mut send));
+        assert!(relay.deadline_cut(deadline, &mut send, &VecDeque::new()));
         assert_eq!(send, deadline);
     }
 
@@ -119,16 +129,49 @@ mod tests {
         assert!(matches!(first, Event::TextDelta(_)));
         let deadline = Instant::now();
         let mut send = deadline;
-        assert!(!relay.deadline_cut(deadline, &mut send));
+        assert!(!relay.deadline_cut(deadline, &mut send, &VecDeque::new()));
         let grace = send;
         assert!(grace > deadline);
         // The grace is fixed at first expiry: a later check never renews it.
-        assert!(!relay.deadline_cut(deadline, &mut send));
+        assert!(!relay.deadline_cut(deadline, &mut send, &VecDeque::new()));
         assert_eq!(send, grace);
         let terminal = relay
             .next_event(deadline, Duration::from_secs(5), Instant::now())
             .await
             .unwrap();
         assert!(matches!(terminal, Some(Event::Completed)));
+    }
+
+    #[tokio::test]
+    async fn a_terminal_in_the_committed_prefix_keeps_its_success_and_one_grace() {
+        let relay = relay(Vec::new());
+        let mut prefix = VecDeque::from([
+            Event::ReasoningContentDelta {
+                route_sha256: "a".repeat(64),
+                delta: "private reasoning".to_owned(),
+            },
+            Event::Usage(crate::events::Usage::default()),
+            Event::Completed,
+        ]);
+        let deadline = Instant::now();
+        let mut send = deadline;
+        assert!(!relay.deadline_cut(deadline, &mut send, &prefix));
+        let grace = send;
+        assert!(grace > deadline);
+        while !prefix.is_empty() {
+            assert!(!relay.deadline_cut(deadline, &mut send, &prefix));
+            assert_eq!(send, grace);
+            prefix.pop_front();
+        }
+    }
+
+    #[tokio::test]
+    async fn a_nonterminal_committed_prefix_does_not_extend_the_deadline() {
+        let relay = relay(Vec::new());
+        let prefix = VecDeque::from([Event::TextDelta("still writing".to_owned())]);
+        let deadline = Instant::now();
+        let mut send = deadline;
+        assert!(relay.deadline_cut(deadline, &mut send, &prefix));
+        assert_eq!(send, deadline);
     }
 }

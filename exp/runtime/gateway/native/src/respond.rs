@@ -387,7 +387,7 @@ pub(crate) fn complete_visible_refusal(events: &mut [Event]) -> Option<Failure> 
     None
 }
 
-pub(crate) fn sse_body_response(headers: &[(String, String)], body: Vec<u8>) -> Response {
+pub(crate) fn sse_body_response(headers: &[(String, String)], body: impl Into<Body>) -> Response {
     let mut builder = Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "text/event-stream; charset=utf-8");
@@ -400,7 +400,7 @@ pub(crate) fn sse_body_response(headers: &[(String, String)], body: Vec<u8>) -> 
         }
     }
     builder
-        .body(Body::from(body))
+        .body(body.into())
         .unwrap_or_else(|_| Response::new(Body::empty()))
 }
 

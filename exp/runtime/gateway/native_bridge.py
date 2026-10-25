@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import time
 from collections.abc import Callable
 
@@ -228,8 +229,8 @@ class NativeControlPlane(
             explicit_cache: Durable host policy and resource accounting for marked Google
                 prefixes. None disables explicit cache operations; generation is unchanged.
         """
-        if request_timeout_seconds <= 0:
-            raise ValueError("request_timeout_seconds must be positive")
+        if not math.isfinite(request_timeout_seconds) or request_timeout_seconds <= 0:
+            raise ValueError("request_timeout_seconds must be finite and positive")
         self._components = components
         validate_guardrail_engine(guardrails)
         self._automatic_cache = automatic_cache

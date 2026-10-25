@@ -627,6 +627,9 @@ def test_azure_connection_requires_endpoint_key_and_api_version() -> None:
     assert inference.identity_sha256() != connection.identity_sha256()
     explicit_classic = connection.model_copy(update={"azure_api_surface": "openai_deployments"})
     assert explicit_classic.identity_sha256() == connection.identity_sha256()
+    responses = connection.model_copy(update={"azure_api_surface": "responses"})
+    assert responses.identity_sha256() != connection.identity_sha256()
+    assert responses.identity_sha256() != inference.identity_sha256()
     assert connection.identity_sha256() == sha256_json(
         {
             "provider": "azure",

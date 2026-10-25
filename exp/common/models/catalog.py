@@ -343,11 +343,10 @@ class ConnectionConfig(ContractModel):
         }
         if self.api_version is not None:
             identity["api_version"] = self.api_version
-        if self.provider == "azure" and self.azure_api_surface == "model_inference":
-            # Keep classic Azure revisions byte-compatible with the identity
-            # contract that predates this discriminator. Only the genuinely
-            # different Foundry surface needs a new credential binding.
-            identity["azure_api_surface"] = "model_inference"
+        if self.provider == "azure" and self.azure_api_surface in {"model_inference", "responses"}:
+            # Distinct Azure wire surfaces must not share a credential binding
+            # or silently reuse each other's configured connection.
+            identity["azure_api_surface"] = self.azure_api_surface
         if self.inference_geo is not None:
             identity["inference_geo"] = self.inference_geo
         if self.region is not None:

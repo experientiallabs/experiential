@@ -9,7 +9,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use axum::body::Body;
 use axum::extract::State;
-use axum::http::{header, HeaderValue, StatusCode};
+use axum::http::StatusCode;
 use axum::response::Response;
 use bytes::Bytes;
 use serde_json::{json, Value};
@@ -776,6 +776,8 @@ async fn stream_responses(
 
         // Mirror any prefix-peeked first token before a start-frame send can cancel and drop it.
         guard.record_first_token(committed.relay.first_token_at());
+        let mut prefix: std::collections::VecDeque<Event> = committed.prefix.drain(..).collect();
+        let mut send_deadline = deadline;
         let start_frames = match encoder.start() {
             Ok(frames) => frames,
             Err(_) => {
@@ -786,22 +788,29 @@ async fn stream_responses(
             }
         };
         for frame in start_frames {
+            if committed
+                .relay
+                .deadline_cut(deadline, &mut send_deadline, &prefix)
+            {
+                fail_stream!(crate::relay::deadline_while_generating())
+            }
             let data = Bytes::from(frame);
             if lease.is_some() {
                 replayable = capture_frame(&mut capture, &data, replayable);
                 delivery.retain_replay(replayable);
             }
-            if !delivery.send(deadline, data).await {
+            if !delivery.send(send_deadline, data).await {
                 committed.relay.close_transport();
                 guard.settle_cancelled(usage.as_ref(), &tool_names).await;
                 return;
             }
         }
 
-        let mut prefix: std::collections::VecDeque<Event> = committed.prefix.drain(..).collect();
-        let mut send_deadline = deadline;
         'stream: loop {
-            if committed.relay.deadline_cut(deadline, &mut send_deadline) {
+            if committed
+                .relay
+                .deadline_cut(deadline, &mut send_deadline, &prefix)
+            {
                 fail_stream!(crate::relay::deadline_while_generating())
             }
             let event = if let Some(event) = prefix.pop_front() {
@@ -980,19 +989,8 @@ async fn stream_responses(
         .await;
     });
 
-    let body = Body::from_stream(ReceiverStream::new(receiver));
-    let mut builder = Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, "text/event-stream; charset=utf-8");
-    for (name, value) in &header_pairs {
-        if let (Ok(name), Ok(value)) = (
-            header::HeaderName::try_from(name.as_str()),
-            HeaderValue::try_from(value.as_str()),
-        ) {
-            builder = builder.header(name, value);
-        }
-    }
-    builder
-        .body(body)
-        .unwrap_or_else(|_| Response::new(Body::empty()))
+    sse_body_response(
+        &header_pairs,
+        Body::from_stream(ReceiverStream::new(receiver)),
+    )
 }

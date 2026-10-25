@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import sys
 from pathlib import Path
 
@@ -154,6 +155,8 @@ def start_gateway(
         typer.BadParameter: The selected project form or activation is invalid,
             or the native gateway extension is not installed.
     """
+    if not math.isfinite(request_timeout):
+        raise typer.BadParameter("--request-timeout must be finite")
     if policy is not None and project is None:
         raise typer.BadParameter("--policy requires --project")
     blocker = _native_engine_blocker()
