@@ -47,6 +47,7 @@ from exp.runtime.models.providers.async_transport import (
 )
 from exp.runtime.models.providers.azure import (
     AzureClient,
+    AzureResponsesClient,
     azure_anthropic_base_url,
     bind_azure_api_key,
     resolve_azure_api_surface,
@@ -577,6 +578,34 @@ class RuntimeModelCatalog:
                     capabilities,
                     anthropic_client,
                     None,
+                    served_model_id=record.served_model_id,
+                )
+            if api_surface == "responses":
+                responses_client = AzureResponsesClient(
+                    model=snapshot,
+                    endpoint=connection.base_url,
+                    api_key=api_key,
+                    api_version=api_version,
+                    transport=self._transport_factory(),
+                    timeout_seconds=self._http_timeout_seconds,
+                    supports_temperature=capabilities.supports_temperature,
+                    supports_top_p=_supports_top_p(capabilities),
+                    supports_logprobs=_supports_flag(capabilities, "supports_logprobs"),
+                    supports_frequency_penalty=_supports_flag(
+                        capabilities, "supports_frequency_penalty"
+                    ),
+                    supports_presence_penalty=_supports_flag(
+                        capabilities, "supports_presence_penalty"
+                    ),
+                    supports_reasoning=capabilities.supports_reasoning,
+                    reasoning_effort=capabilities.reasoning_effort,
+                )
+                return ResolvedModel(
+                    alias,
+                    snapshot,
+                    capabilities,
+                    responses_client,
+                    responses_client if capabilities.supports_embeddings is not False else None,
                     served_model_id=record.served_model_id,
                 )
             client = AzureClient(

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from dataclasses import replace
 from typing import ClassVar
 from urllib.parse import urlsplit, urlunsplit
 
@@ -14,7 +15,12 @@ from exp.common.models.azure_endpoints import (
 )
 from exp.runtime.models.credentials import ModelCredentialError
 from exp.runtime.models.providers.async_transport import AsyncJsonHttpTransport
-from exp.runtime.models.providers.base import DEFAULT_RETRY_POLICY, DEFAULT_TIMEOUT_SECONDS
+from exp.runtime.models.providers.base import (
+    DEFAULT_RETRY_POLICY,
+    DEFAULT_TIMEOUT_SECONDS,
+    GatewayWireProfile,
+)
+from exp.runtime.models.providers.openai import OpenAIClient
 from exp.runtime.models.providers.openai_compatible import OpenAICompatibleClient
 from exp.runtime.models.providers.transport import JsonHttpTransport, RetryPolicy
 
@@ -316,6 +322,111 @@ class AzureClient(OpenAICompatibleClient):
         """
         if self._api_surface == "model_inference" or self._api_version != _V1_API_VERSION:
             path = f"{path}?api-version={self._api_version}"
+        return path
+
+
+class AzureResponsesClient(OpenAIClient):
+    """Calls one Azure OpenAI or Foundry deployment over the native Responses API.
+
+    The connection opts in with ``azure_api_surface = "responses"``. Requests go to
+    ``{resource}/openai/v1/responses`` (``api_version = "v1"``) or to the dated preview route
+    ``{resource}/openai/responses?api-version=...``, name the deployment in ``model``, and
+    authenticate with the ``api-key`` header. Every Responses-only request field the gateway
+    forwards to OpenAI (``prompt_cache_key``, reasoning, ``include``) reaches the deployment.
+    """
+
+    def __init__(
+        self,
+        *,
+        model: ModelSnapshot,
+        endpoint: str,
+        api_key: str,
+        api_version: str,
+        transport: AsyncJsonHttpTransport | JsonHttpTransport | None = None,
+        retry_policy: RetryPolicy = DEFAULT_RETRY_POLICY,
+        timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
+        supports_temperature: bool = True,
+        supports_top_p: bool | None = None,
+        supports_logprobs: bool = False,
+        supports_frequency_penalty: bool = False,
+        supports_presence_penalty: bool = False,
+        supports_reasoning: bool = False,
+        reasoning_effort: str | None = None,
+    ) -> None:
+        """Create a Responses client bound to one Azure resource, key, and deployment.
+
+        Args:
+            model: Resolved identity whose ``model_id`` is the exact Azure deployment name.
+            endpoint: Explicit Azure resource endpoint from the catalog.
+            api_key: Credential already paired with ``endpoint``.
+            api_version: ``v1`` or a dated Azure API version that serves Responses.
+            transport: Optional deterministic transport used by tests.
+            retry_policy: Bounded same-endpoint retry policy.
+            timeout_seconds: Per-attempt timeout floor.
+            supports_temperature: Whether the deployment accepts an explicit temperature.
+            supports_top_p: Whether the deployment accepts ``top_p``.
+            supports_logprobs: Whether the deployment returns output-text log probabilities.
+            supports_frequency_penalty: Whether the deployment accepts a frequency penalty.
+            supports_presence_penalty: Whether the deployment accepts a presence penalty.
+            supports_reasoning: Whether the deployment accepts the ``reasoning`` object.
+            reasoning_effort: Optional catalog-pinned reasoning effort.
+
+        Raises:
+            ValueError: The endpoint or API version is missing.
+        """
+        if not endpoint:
+            raise ValueError("Azure clients require an explicit resource endpoint")
+        if not api_version:
+            raise ValueError("Azure clients require an explicit api_version")
+        root = endpoint.rstrip("/")
+        if root.lower().endswith(_V1_ROOT_SUFFIX):
+            root = root[: -len(_V1_ROOT_SUFFIX)]
+        super().__init__(
+            model=model,
+            api_key=api_key,
+            base_url=f"{root}{_V1_ROOT_SUFFIX}"
+            if api_version == _V1_API_VERSION
+            else f"{root}/openai",
+            transport=transport,
+            retry_policy=retry_policy,
+            timeout_seconds=timeout_seconds,
+            supports_temperature=supports_temperature,
+            supports_top_p=supports_top_p,
+            supports_logprobs=supports_logprobs,
+            supports_frequency_penalty=supports_frequency_penalty,
+            supports_presence_penalty=supports_presence_penalty,
+            supports_reasoning=supports_reasoning,
+            reasoning_effort=reasoning_effort,
+        )
+        self._api_version = api_version
+
+    def gateway_wire_profile(self) -> GatewayWireProfile:
+        """Return the Responses wire profile without OpenAI's own cache-lifetime field.
+
+        ``prompt_cache_options.ttl`` is carried only by OpenAI's own Responses API
+        (``GatewayWireProfile.forwards_prompt_cache_ttl``); an Azure deployment declines a
+        12-hour lifetime request so admission prefers a rung that honors it.
+        """
+        return replace(super().gateway_wire_profile(), forwards_prompt_cache_ttl=False)
+
+    def _headers(self) -> dict[str, str]:
+        """Return Azure ``api-key`` authentication headers without a Bearer token."""
+        return {
+            "api-key": self._api_key,
+            "Content-Type": "application/json",
+        }
+
+    def _request_path(self, path: str) -> str:
+        """Append the dated API version to one logical Azure route.
+
+        Args:
+            path: Provider route below the configured base URL.
+
+        Returns:
+            Wire path with the configured API version when one is dated.
+        """
+        if self._api_version != _V1_API_VERSION:
+            return f"{path}?api-version={self._api_version}"
         return path
 
 

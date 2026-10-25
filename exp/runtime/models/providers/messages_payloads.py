@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from exp.common.core.artifacts import JsonObject
 from exp.runtime.gateway.contracts import (
+    GatewayApiSurface,
     GatewayNamedToolChoice,
     GatewayRequest,
 )
@@ -300,6 +301,11 @@ def anthropic_messages_stream_payload(
         payload["cache_control"] = request.provider_cache_control
     if request.inference_geo is not None:
         payload["inference_geo"] = request.inference_geo
+    end_user = _messages_end_user(request)
+    if end_user is not None:
+        # Anthropic's one defined metadata key attributes abuse signals to the
+        # caller's end user rather than the whole account behind the rung.
+        payload["metadata"] = {"user_id": end_user}
     # A budgeted-enabled-only model (haiku-4-5) rejects ``thinking.type:
     # adaptive`` and ``output_config.effort`` by NAME: its reasoning dial is a
     # token budget, not the effort ladder. An effort reaching this seam is the
@@ -417,6 +423,19 @@ def _display_summarized_thinking(model_id: str, payload: JsonObject) -> None:
 
 _UNMARKABLE_BLOCK_TYPES = frozenset({"thinking", "redacted_thinking"})
 """Content block types the wire refuses to carry a ``cache_control`` marker on."""
+
+
+def _messages_end_user(request: GatewayRequest) -> str | None:
+    """Return the caller's Messages ``metadata.user_id``, if one was sent.
+
+    Only the Messages surface defines ``metadata.user_id``; Chat and Responses
+    ``metadata`` is the caller's own key-value store and never reaches a
+    provider.
+    """
+    if request.surface != GatewayApiSurface.MESSAGES:
+        return None
+    user_id = request.metadata.get("user_id")
+    return user_id if isinstance(user_id, str) and user_id else None
 
 
 def _cache_marker(blocks: tuple[JsonObject, ...]) -> JsonObject | None:

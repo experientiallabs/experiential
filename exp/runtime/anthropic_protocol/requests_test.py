@@ -1471,6 +1471,18 @@ def test_caller_beta_tokens_partition_into_allowlist_and_disclosures() -> None:
     assert raised.value.detail.param == "anthropic-beta"
 
 
+def test_the_one_hour_cache_ttl_beta_is_forwarded() -> None:
+    """A one-hour cache marker keeps the beta that admits it.
+
+    The marker itself relays byte-for-byte, so dropping the token would leave
+    the provider to refuse or downgrade a ``ttl: "1h"`` breakpoint the caller
+    priced at the one-hour rate.
+    """
+    decoded = decode_messages(_body(), anthropic_beta="extended-cache-ttl-2025-04-11")
+    assert decoded.request.provider_beta_tokens == ("extended-cache-ttl-2025-04-11",)
+    assert decoded.request.ignored_parameters == ()
+
+
 @pytest.mark.parametrize("length", [65_537, 119_825, 262_145, 1_048_576])
 def test_tool_descriptions_are_preserved_without_a_per_field_limit(length: int) -> None:
     """Messages preserves large descriptions, including their final Unicode character."""

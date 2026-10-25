@@ -16,7 +16,7 @@ from exp.runtime.gateway.sqlite.nano_usd_migration import (
     migrate_money_to_nano_usd,
 )
 
-SCHEMA_VERSION = 30
+SCHEMA_VERSION = 31
 
 
 class GatewaySchemaError(RuntimeError):
@@ -789,6 +789,16 @@ _MIGRATIONS: dict[int, tuple[MigrationStep, ...]] = {
         "CREATE INDEX gateway_video_jobs_owner "
         "ON gateway_video_jobs (organization_id, identity_id, created_at)",
         "CREATE INDEX gateway_video_jobs_open ON gateway_video_jobs (created_at) WHERE settled = 0",
+    ),
+    31: (  # the Azure Responses surface (azure_endpoints.AzureApiSurface), CHECK-only rewrite
+        "PRAGMA writable_schema = ON",
+        "UPDATE sqlite_master SET sql = replace(sql, "
+        "'''openai_deployments'', ''model_inference'')', "
+        "'''openai_deployments'', ''model_inference'', ''responses'')') "
+        "WHERE type = 'table' AND name = 'provider_connection_revisions'",
+        "PRAGMA writable_schema = RESET",
+        "CREATE TABLE gateway_schema_refresh_v31 (noop INTEGER) STRICT",
+        "DROP TABLE gateway_schema_refresh_v31",
     ),
     24: (  # plan sign-in kind: part of the connection identity digest, so it rides the revision
         "ALTER TABLE provider_connection_revisions ADD COLUMN subscription TEXT "

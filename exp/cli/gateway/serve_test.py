@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import io
 import json
 import re
@@ -23,6 +24,7 @@ from exp.cli.app import app
 from exp.cli.gateway.compatibility import ProjectGatewayCompatibility
 from exp.cli.gateway.setup import InteractiveSetupResult
 from exp.runtime.gateway.auth import IssuedVirtualKey
+from exp.runtime.gateway.native_bridge import NativeControlPlane
 from exp.runtime.gateway.sqlite.alias_activation import AliasActivationOutcomeUnknownError
 
 
@@ -43,6 +45,7 @@ def test_run_command_starts_the_gateway_directly(
             bool,
             float,
             int,
+            float,
         ]
     ] = []
 
@@ -58,6 +61,7 @@ def test_run_command_starts_the_gateway_directly(
         check: bool,
         graceful_timeout: float,
         max_active_requests: int,
+        request_timeout: float,
     ) -> None:
         """Capture the shared launcher arguments without starting a server."""
         captured.append(
@@ -72,6 +76,7 @@ def test_run_command_starts_the_gateway_directly(
                 check,
                 graceful_timeout,
                 max_active_requests,
+                request_timeout,
             )
         )
 
@@ -95,6 +100,8 @@ def test_run_command_starts_the_gateway_directly(
             "4.5",
             "--max-active-requests",
             "7",
+            "--request-timeout",
+            "900",
         ],
     )
 
@@ -111,6 +118,7 @@ def test_run_command_starts_the_gateway_directly(
             True,
             4.5,
             7,
+            900.0,
         )
     ]
 
@@ -546,3 +554,19 @@ def test_first_run_unknown_setup_outcome_delivers_the_only_raw_key(
     assert "export EXP_GATEWAY_KEY=exp_vk_unknown_secret" in transcript
     assert "Preserve this one-time gateway key: exp_vk_unknown_secret" in transcript
     assert "exp config gateway key issue default --key-id RECOVERY_KEY --json" in transcript
+
+
+def test_cli_default_deadline_matches_the_control_plane_default() -> None:
+    """``exp run`` without ``--request-timeout`` keeps the control plane's own budget."""
+    default = inspect.signature(NativeControlPlane).parameters["request_timeout_seconds"].default
+    assert run_app.DEFAULT_REQUEST_TIMEOUT_SECONDS == default
+
+
+def test_request_timeout_rejects_values_outside_its_bounds(tmp_path: Path) -> None:
+    """A zero or multi-hour deadline is refused before anything starts."""
+    for value in ("0", "7200"):
+        result = CliRunner().invoke(
+            app, ["run", "--root", str(tmp_path), "--request-timeout", value]
+        )
+        assert result.exit_code != 0
+        assert "--request-timeout" in result.output

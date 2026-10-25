@@ -811,6 +811,7 @@ fn adopt_outcome_moves_a_settled_attempts_rounds_onto_the_admission() {
         encrypted_reasoning_stripped: false,
         empty_completion: false,
         tool_search_rounds: vec![round("call_x", Some("weather"), None, &["get_weather"])],
+        rate_limit_headers: Vec::new(),
     });
     adopt_outcome(&mut admission, &mut won);
     assert_eq!(admission.tool_search_rounds.len(), 1);

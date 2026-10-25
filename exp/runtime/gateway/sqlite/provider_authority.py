@@ -7,6 +7,7 @@ from typing import Literal, cast
 
 from exp.common.core.artifacts import ContractModel, Sha256, stable_id
 from exp.common.models import ConnectionConfig
+from exp.common.models.azure_endpoints import AzureApiSurface
 from exp.common.models.catalog import SubscriptionKind
 
 
@@ -332,7 +333,7 @@ def _authority(row: sqlite3.Row) -> ProviderConnectionAuthority:
         api_key_env=None if row["api_key_env"] is None else str(row["api_key_env"]),
         api_version=None if row["api_version"] is None else str(row["api_version"]),
         azure_api_surface=cast(
-            Literal["openai_deployments", "model_inference"] | None,
+            AzureApiSurface | None,
             None if row["azure_api_surface"] is None else str(row["azure_api_surface"]),
         ),
         region=None if row["region"] is None else str(row["region"]),

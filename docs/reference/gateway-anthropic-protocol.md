@@ -74,9 +74,14 @@ folded total the ledger bills: an Anthropic rung's own `cache_read_input_tokens`
 `cache_creation_input_tokens`, an OpenAI-wire rung's `prompt_tokens_details.cached_tokens`
 (Chat) or `input_tokens_details.cached_tokens` (Responses), Gemini's `cachedContentTokenCount`,
 Bedrock's `cacheReadInputTokens`; Anthropic and Bedrock report cache writes. Other rungs
-carry `cache_creation_input_tokens: 0`. The start frame carries what the upstream already
-reported before content, mirroring an Anthropic upstream's own start-frame input and cache meters,
-and otherwise the control plane's pre-dispatch count of the prompt (the reservation
+carry `cache_creation_input_tokens: 0`. When the provider reported its write lifetimes, the
+usage object also carries Anthropic's own `cache_creation` object,
+`{"ephemeral_5m_input_tokens": N, "ephemeral_1h_input_tokens": M}`, so a caller pricing writes
+from it charges one-hour writes at the one-hour rate. It is omitted when no breakdown was
+observed (the split is never inferred) and when the writes include an OpenAI 12-hour subset.
+The start frame carries what the upstream already reported before content, mirroring an
+Anthropic upstream's own start-frame input and cache meters, and otherwise the control
+plane's pre-dispatch count of the prompt (the reservation
 estimator without its headroom, carried on the admission as `input_token_estimate`, the same
 count `count_tokens` answers) in Anthropic's documented start shape,
 `{"input_tokens": N, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0, "output_tokens": 1}`
@@ -91,3 +96,12 @@ SDK accumulators (Python and TypeScript) copy every usage field present on `mess
 their final message shows the true counts. The estimate is display-only: the encoder keeps it
 apart from the usage it settles from, so it never reaches `message_delta` or the ledger, which
 bill the provider's report.
+
+## Metadata and beta tokens
+
+`metadata.user_id` reaches Anthropic Messages rungs (Anthropic, Foundry Claude, or any
+`anthropic` connection with a custom `base_url`) as the provider's own end-user attribution.
+Other rungs define no equivalent and omit it. The caller's `anthropic-beta` header is forwarded
+through an exact allowlist (`MESSAGES_BETA_TOKENS_FORWARDED`); `extended-cache-ttl-2025-04-11`
+is on it, so a `cache_control: {"type": "ephemeral", "ttl": "1h"}` marker keeps the token that
+admits it. Every other token is dropped with an `anthropic-beta.<token>` disclosure.

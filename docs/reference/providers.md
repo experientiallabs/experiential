@@ -421,6 +421,24 @@ the key as a Bearer token. A deployment routes there when its `model` (the deplo
 deployment carries a name of your own (`model = "my-opus"`, `served_model_id = "claude-opus-4-6"`).
 The request still names the deployment. Every other deployment uses the Azure OpenAI wire.
 
+Set `azure_api_surface = "responses"` to call a connection's OpenAI deployments over the native
+Responses API instead of Chat Completions: `{resource}/openai/v1/responses` with
+`api_version = "v1"`, or `{resource}/openai/responses?api-version=...` with a dated preview
+version. Responses-only fields then reach the deployment (`prompt_cache_key` as its cache-routing
+hint, reasoning, `include`), and Responses callers no longer go through a Chat translation. The
+surface is never inferred from the host. Use a separate connection for deployments that do not
+serve Responses. `store` stays off upstream on every Responses rung: continuation state for
+`previous_response_id` is held by the gateway, not the provider.
+
+```toml
+[connections.foundry-responses]
+provider = "azure"
+base_url = "https://myresource.services.ai.azure.com"
+api_key_env = "AZURE_OPENAI_API_KEY"
+api_version = "v1"
+azure_api_surface = "responses"
+```
+
 `AZURE_OPENAI_API_KEY` is paired with `AZURE_OPENAI_ENDPOINT` when that endpoint variable is set.
 A catalog endpoint that is not the same resource cannot use that key. Comparison lowercases the
 scheme and host, treats default HTTPS and HTTP ports as equivalent to an omitted port, keeps path
@@ -589,6 +607,19 @@ supports_tools = true
 input_cost_per_million_tokens_usd = 0
 output_cost_per_million_tokens_usd = 0
 ```
+
+## Provider rate-limit headers
+
+A response served on the caller's own credential (`billing_source = "customer_managed"`, the
+default for every local connection) carries the provider's numeric rate-limit headers:
+`x-ratelimit-{limit,remaining}-{requests,tokens}`,
+`anthropic-ratelimit-{requests,tokens}-{limit,remaining}`, and the plan windows
+(`x-codex-*`, `anthropic-ratelimit-unified-*`). For Azure AI Foundry these are the only live quota
+signal. A host-funded rung's headers describe a shared account and are never relayed. No other
+provider header is forwarded, and `retry-after` appears only on a refusal the gateway itself
+answers. Retry and failover ceilings per request are the `gateway.retry` object
+([request policy](gateway-request-policy.md)); concurrency is bounded by
+`exp run --max-active-requests` and each deployment's `dispatch_concurrency_bound`.
 
 ## Errors
 

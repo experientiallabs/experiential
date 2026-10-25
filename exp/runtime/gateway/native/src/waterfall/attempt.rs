@@ -10,7 +10,7 @@ use super::{
 use crate::dialects::Dialect;
 use crate::errors::{Failure, FailureClass};
 use crate::events::{Event, Usage};
-use crate::rate_limit_headers::harvest_rate_limit_headers;
+use crate::rate_limit_headers::{caller_rate_limit_headers, harvest_rate_limit_headers};
 use crate::relay::{ended_without_terminal, remaining, track_event, UpstreamRelay};
 use crate::replay_repair::AttemptRepair;
 use crate::settlement::AttemptGuard;
@@ -222,6 +222,8 @@ pub(super) async fn run_attempt(
         // attempt whatever its terminal outcome; a failed OPEN instead carries
         // them on its failure (attached in `open_stream`).
         guard.record_rate_limit_headers(harvest_rate_limit_headers(response.headers()));
+        let caller_rate_limits =
+            caller_rate_limit_headers(response.headers(), wire.billing_customer_managed);
         let mut relay = match wire
             .fireworks_reasoning_route_sha256
             .clone()
@@ -402,6 +404,7 @@ pub(super) async fn run_attempt(
                         tool_search_rounds: Vec::new(),
                         tool_search_dropped_after_output,
                         pace: None,
+                        rate_limit_headers: caller_rate_limits,
                     }));
                 }
                 withheld_bytes += event_bytes;
@@ -432,6 +435,7 @@ pub(super) async fn run_attempt(
                     tool_search_rounds: Vec::new(),
                     tool_search_dropped_after_output,
                     pace: None,
+                    rate_limit_headers: caller_rate_limits,
                 }));
             }
             if !event.is_terminal() {
@@ -572,6 +576,7 @@ pub(super) async fn run_attempt(
                                 depth,
                                 encrypted_reasoning_stripped,
                                 search_rounds,
+                                caller_rate_limits,
                             )
                             .await;
                         }
@@ -604,6 +609,7 @@ pub(super) async fn run_attempt(
                         depth,
                         encrypted_reasoning_stripped,
                         search_rounds,
+                        caller_rate_limits,
                     )
                     .await;
                 }
