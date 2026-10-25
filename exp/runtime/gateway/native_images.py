@@ -130,8 +130,6 @@ class NativeImagesMixin:
                 rung of the alias generates images.
         """
         assert_not_internal_classification()
-        self._accounting.sweep_expired()
-        self._accounting.request_settlements.require_clear()
         data = json.loads(argument)
         try:
             decoded = decode_native_images_body(str(data["body"]))
@@ -148,6 +146,7 @@ class NativeImagesMixin:
             )
             authorization = authorize_serving_model_chains(self._components, authorization)
             authorization = with_client_identity(authorization, data)  # reporting-only app facts
+            self._accounting.require_clear(authorization.organization_id)
         except Exception as exc:  # noqa: BLE001 - boundary sanitizes every failure.
             raise authority_error(exc) from exc
         require_unguarded_surface(self._guardrails, authorization, "images")
@@ -261,6 +260,7 @@ def _admit_accepted(
     )
     response: JsonObject = {
         "request_id": authorization.request_id,
+        "caller_scope": f"{authorization.organization_id}:{authorization.identity_id}",
         "alias": authorization.alias,
         "alias_revision_id": authorization.alias_revision_id,
         "exact_model_id": route.snapshot.exact_model_id,

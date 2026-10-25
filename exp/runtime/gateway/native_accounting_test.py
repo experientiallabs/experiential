@@ -1223,7 +1223,9 @@ def test_ordinal_mismatch_is_a_wire_contract_failure() -> None:
 def test_abandon_without_an_active_attempt_finalizes_the_request_row() -> None:
     """Abandoning an accepted request with no reservation closes the request."""
     registry, ledger, _entry = _registry()
-    assert registry.abandon(json.dumps({"request_id": "request-one"})) == "{}"
+    assert json.loads(registry.abandon(json.dumps({"request_id": "request-one"}))) == {
+        "terminalized": True
+    }
     assert [failure.failure_class.value for failure in ledger.finished_requests] == ["cancelled"]
     assert registry.entry("request-one") is None
 
@@ -2498,7 +2500,9 @@ class TestRungDispatchPolicy:
         _admit(registry, deployments, request_id="request-1")
         _admit(registry, deployments, request_id="request-2")
         assert _start(registry, ordinal=0, request_id="request-1")["route_depth"] == 0
-        assert registry.abandon(json.dumps({"request_id": "request-1"})) == "{}"
+        assert json.loads(registry.abandon(json.dumps({"request_id": "request-1"}))) == {
+            "terminalized": True
+        }
         assert registry.loads.inflight(("deployment-a", "b" * 64)) == 0
         assert _start(registry, ordinal=0, request_id="request-2")["route_depth"] == 0
 

@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING, Protocol, cast
 from exp.runtime.gateway.guardrails.deterministic import NativeDetector
 
 if TYPE_CHECKING:
-    from exp_gateway_native import CaptureCollector, ShutdownHandle
+    from exp_gateway_native import CallbackScopes, CaptureCollector, ShutdownHandle
 
     from exp.runtime.gateway.native_bridge import NativeControlPlane
 
@@ -100,6 +100,7 @@ def serve_native_gateway(
     host: str,
     port: int,
     max_active_requests: int = 64,
+    callback_permits: int = 4,
     graceful_timeout_seconds: float = 10.0,
     connect_timeout_seconds: float = 5.0,
     public_upstreams_only: bool = False,
@@ -110,6 +111,7 @@ def serve_native_gateway(
     native_usage_enabled: bool = True,
     maximum_retained_output_bytes: int | None = None,
     capture: CaptureCollector | None = None,
+    callback_scopes: CallbackScopes | None = None,
     shutdown: ShutdownHandle | None = None,
     on_listening: Callable[[], None] | None = None,
 ) -> None:
@@ -120,6 +122,9 @@ def serve_native_gateway(
         host: Public listener host.
         port: Public listener port.
         max_active_requests: Native concurrent-admission bound.
+        callback_permits: Serving callback workers, 1 through 256. The native
+            bridge reserves a separate settlement pool of max(2, permits/4)
+            workers and bounds each admitted organization to half each pool.
         graceful_timeout_seconds: Bound for graceful shutdown.
         connect_timeout_seconds: Fail-fast bound on the TCP+TLS connect phase
             of every provider call, so a lane whose host never accepts the
@@ -177,6 +182,9 @@ def serve_native_gateway(
             setting existed; 1 GiB (a quarter of a 4 GiB worker) is the
             suggested value when enabling it.
         capture: The collector shared with the admission controller; None retains no content.
+        callback_scopes: In-process registry populated by the trusted host front
+            with each ephemeral relay token and its verified organization before
+            native authentication. Caller headers cannot register a scope.
         shutdown: Optional embedder-owned stop handle from
             ``exp_gateway_native.shutdown_handle()``. A host serving on a
             background thread calls ``request_shutdown()`` to stop the plane
@@ -191,6 +199,8 @@ def serve_native_gateway(
         NativeGatewayServerError: The extension is unavailable or the native
             server fails.
     """
+    if not 1 <= callback_permits <= 256:
+        raise ValueError("callback_permits must be between 1 and 256")
     try:
         native = importlib.import_module("exp_gateway_native")
     except ModuleNotFoundError as exc:
@@ -200,6 +210,7 @@ def serve_native_gateway(
         "host": host,
         "port": port,
         "max_active_requests": max_active_requests,
+        "callback_permits": callback_permits,
         "request_timeout_seconds": control_plane.request_timeout_seconds,
         "graceful_timeout_seconds": graceful_timeout_seconds,
         "connect_timeout_seconds": connect_timeout_seconds,
@@ -228,6 +239,7 @@ def serve_native_gateway(
             on_listening,
             control_plane.guardrail_detectors,
             capture,
+            callback_scopes,
         )
     except KeyboardInterrupt:
         # The native server drains on SIGINT before returning control to Python.

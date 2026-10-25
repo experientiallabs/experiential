@@ -34,6 +34,7 @@ def test_host_passes_the_serve_configuration(
         on_listening: object,
         guardrail_detectors: object,
         capture: object,
+        callback_scopes: object,
     ) -> None:
         """Capture the extension boundary call."""
         captured["control_plane"] = control_plane
@@ -94,6 +95,7 @@ def test_host_forwards_an_embedder_owned_shutdown_handle(
         on_listening: object,
         guardrail_detectors: object,
         capture: object,
+        callback_scopes: object,
     ) -> None:
         """Capture the extension boundary call."""
         del control_plane, config_json, on_listening, guardrail_detectors, capture

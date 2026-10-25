@@ -41,9 +41,11 @@ from exp.runtime.gateway.ledger import AttemptRejectedError
 from exp.runtime.gateway.model_chain_authority import require_bound_model_chain_authority
 from exp.runtime.gateway.native_accounting_errors import (
     NativeBridgeError,
+    accounting_recovering_error,
     authority_error,
     internal_protocol_error,
 )
+from exp.runtime.gateway.native_accounting_recovery import FairRecovery, recover_expired
 from exp.runtime.gateway.native_attempt_pricing import deployment_priced_at, priced_attempt
 from exp.runtime.gateway.native_components import SyncWriteLedger
 from exp.runtime.gateway.native_execution import (
@@ -95,9 +97,7 @@ from exp.runtime.gateway.rung_admission import RungLoadRegistry, RungShed
 from exp.runtime.gateway.sticky_affinity import StickySpillRegistry
 from exp.runtime.openai_protocol.errors import public_failure_error
 
-_SWEEP_GRACE_SECONDS = 5.0
 _SWEEP_INTERVAL_SECONDS = 5.0
-_SWEEP_BATCH = 16
 
 # The request deadline ran out between attempts, before any provider answered.
 # The streaming relay names the other case (output already flowing) itself.
@@ -116,8 +116,8 @@ TOOL_SEARCH_ROUND: Final = "tool_search_round"
 class NativeAttemptAccounting:
     """Registry of admitted requests and their durable attempt settlements.
 
-    A lock protects Rust callbacks; timed and opportunistic sweeps bound abandoned
-    reservations. Failed terminal writes block readiness until startup reconciliation.
+    A lock protects Rust callbacks; a background sweep owns abandoned reservations.
+    Failed terminal writes block only the affected organization until recovery.
     """
 
     def __init__(
@@ -155,7 +155,12 @@ class NativeAttemptAccounting:
         self._sticky = StickySpillRegistry()
         self._inflight: dict[str, InflightRequest] = {}
         self._lock = threading.Lock()
-        self._accounting_healthy = True
+        self._retained_recovery = FairRecovery[tuple[str, InflightRequest]](
+            lambda item: item[1].authorization.organization_id
+        )
+        self._abandoned_recovery = FairRecovery[tuple[str, InflightRequest]](
+            lambda item: item[1].authorization.organization_id
+        )
         self._sweep_retained_replayed = 0
         self._sweep_abandoned_cancelled = 0
         # Admission-time dead-rung skips: a request served off a fallback
@@ -193,7 +198,24 @@ class NativeAttemptAccounting:
     @property
     def accounting_healthy(self) -> bool:
         """Return whether every durable terminal write has landed."""
-        return self._accounting_healthy and not self.request_settlements.pending
+        with self._lock:
+            pending = any(
+                entry.pending_settlement is not None or entry.pending_abandon is not None
+                for entry in self._inflight.values()
+            )
+        return not pending and not self.request_settlements.pending
+
+    def require_clear(self, organization_id: str) -> None:
+        """Refuse only the organization whose prior accounting is recovering."""
+        self.request_settlements.require_clear(organization_id)
+        with self._lock:
+            pending = any(
+                entry.authorization.organization_id == organization_id
+                and (entry.pending_settlement is not None or entry.pending_abandon is not None)
+                for entry in self._inflight.values()
+            )
+        if pending:
+            raise NativeBridgeError(accounting_recovering_error())
 
     @property
     def health(self) -> DeploymentHealthRegistry:
@@ -761,6 +783,8 @@ class NativeAttemptAccounting:
             recovery_failure(data, failure),
         )
         with self._lock:
+            if entry.pending_settlement == data:
+                entry.pending_settlement = None
             if finalize:
                 discard_guardrails(self._inflight.pop(request_id, None))
             elif entry.active_attempt_id == attempt_id:
@@ -778,7 +802,7 @@ class NativeAttemptAccounting:
                 ``failure`` (defaulting to a cancellation).
 
         Returns:
-            An empty JSON object; an unknown request is a no-op.
+            Whether the request is terminalized; an unknown request is already closed.
 
         Raises:
             NativeBridgeError: The terminal write failed; the entry remains for retry.
@@ -788,24 +812,24 @@ class NativeAttemptAccounting:
         with self._lock:
             entry = self._inflight.get(request_id)
         if entry is None:
-            return "{}"
+            return '{"terminalized":true}'
         failure = failure_from_boundary_payload(data.get("failure")) or GatewayFailure(
             failure_class=GatewayFailureClass.CANCELLED,
             safe_message="gateway request was cancelled",
         )
         with self._lock:
             if self._inflight.get(request_id) is not entry:
-                return "{}"
+                return '{"terminalized":true}'
             if entry.pending_abandon is None:
                 entry.pending_abandon = failure
             failure = entry.pending_abandon
         if entry.guardrails is not None:
             failure = entry.guardrails.settlement_failure() or failure
         if not entry.execution_lock.acquire(blocking=False):
-            return "{}"
+            return '{"terminalized":false}'
         try:
             if self.entry(request_id) is not entry:
-                return "{}"
+                return '{"terminalized":true}'
             try:
                 if entry.active_attempt_id is not None:
                     record_attempt_health(
@@ -836,7 +860,7 @@ class NativeAttemptAccounting:
                 raise authority_error(exc) from exc
             with self._lock:
                 discard_guardrails(self._inflight.pop(request_id, None))
-            return "{}"
+            return '{"terminalized":true}'
         finally:
             entry.execution_lock.release()
 
@@ -882,56 +906,8 @@ class NativeAttemptAccounting:
             self.sweep_expired()
 
     def sweep_expired(self) -> None:
-        """Recover retained settlements and close abandoned requests.
-
-        Retained writes replay the original outcome, usage, and finalize flag.
-        Expired requests close as cancelled through their active attempt, or request row
-        if none exists. This covers broken wire contracts and data-plane crashes short
-        of process death. Repeated attempt-write failures latch accounting unhealthy.
-        """
-        self.request_settlements.retry(_SWEEP_BATCH)
-        now = time.monotonic()
-        with self._lock:
-            retained = [
-                (request_id, entry)
-                for request_id, entry in self._inflight.items()
-                if entry.pending_settlement is not None
-            ][:_SWEEP_BATCH]
-            abandoned = [
-                (request_id, entry)
-                for request_id, entry in self._inflight.items()
-                if entry.pending_settlement is None
-                and (
-                    entry.pending_abandon is not None
-                    or entry.deadline_monotonic + _SWEEP_GRACE_SECONDS < now
-                )
-            ][:_SWEEP_BATCH]
-        for request_id, entry in retained:
-            settlement = entry.pending_settlement
-            if settlement is None:
-                continue
-            terminal, failure = settled_terminal(settlement, entry, loads=self._loads)
-            if self._settle_swept(
-                request_id,
-                entry,
-                attempt_id=str(settlement["attempt_id"]),
-                terminal=terminal,
-                failure=failure,
-                finalize=bool(settlement.get("finalize", True)),
-                settlement=settlement,
-            ):
-                with self._lock:
-                    entry.pending_settlement = None
-                    self._sweep_retained_replayed += 1
-        for request_id, entry in abandoned:
-            try:
-                self.abandon(json.dumps({"request_id": request_id}))
-            except NativeBridgeError:
-                self._accounting_healthy = False
-                continue
-            with self._lock:
-                if self._inflight.get(request_id) is not entry:
-                    self._sweep_abandoned_cancelled += 1
+        """Recover a fair bounded selection without running in admission callbacks."""
+        recover_expired(self)
 
     def _settle_swept(
         self,
@@ -968,7 +944,6 @@ class NativeAttemptAccounting:
                 ),
             )
         except Exception:  # noqa: BLE001 - keep the entry; the sweep retries.
-            self._accounting_healthy = False
             return False
         failure = terminal.failure
         opened = settlement is not None and settlement.get("opened") is True
