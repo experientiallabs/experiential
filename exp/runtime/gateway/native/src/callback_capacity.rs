@@ -40,6 +40,24 @@ pub(crate) struct CallbackCapacity {
 }
 
 impl CallbackCapacity {
+    /// Resolve only engine-owned request identities or trusted host relay tokens.
+    pub(crate) fn organization(
+        &self,
+        request_id: Option<&str>,
+        token: Option<&str>,
+    ) -> Option<String> {
+        token
+            .and_then(|token| self.tokens.lock().ok()?.get(token).cloned())
+            .or_else(|| {
+                request_id.and_then(|id| {
+                    self.requests
+                        .lock()
+                        .ok()?
+                        .get(id)
+                        .map(|(scope, _)| scope.clone())
+                })
+            })
+    }
     pub(crate) fn new(serving: usize, settlement: usize) -> Self {
         let serving_share = (serving / 2).max(1);
         let settlement_share = (settlement / 2).max(1);
@@ -298,8 +316,8 @@ mod tests {
             "admit_images",
             "admit_speech",
             "admit_transcription",
-            "admit_decision",
-            "admit_openai_decision",
+            "admit_decisions",
+            "admit_openai_decisions",
         ] {
             capacity.completed(
                 surface,

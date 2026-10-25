@@ -50,6 +50,9 @@ pub struct ServeConfig {
     pub port: u16,
     #[serde(default = "default_max_active_requests")]
     pub max_active_requests: usize,
+    /// Per-organization share, acquired before the global dispatch queue.
+    #[serde(default)]
+    pub max_active_per_organization: Option<usize>,
     #[serde(default = "default_request_timeout_seconds")]
     pub request_timeout_seconds: f64,
     /// Fail-fast bound on the TCP+TLS connect phase of every provider call.
@@ -174,6 +177,7 @@ pub(crate) struct AppState {
     pub(crate) bridge: Arc<Bridge>,
     pub(crate) http: crate::upstream::UpstreamClient,
     pub(crate) permits: Arc<Semaphore>,
+    pub(crate) dispatch_capacity: Arc<crate::dispatch_capacity::DispatchCapacity>,
     /// The order waiting requests take `permits` in (FIFO unless configured).
     pub(crate) permit_queue: Arc<crate::permit_queue::PermitQueue>,
     pub(crate) request_timeout: Duration,
@@ -224,11 +228,22 @@ pub async fn run(
     let http = crate::upstream::build_client(connect_timeout, config.public_upstreams_only)?;
     let pending_settlements = Arc::new(AtomicUsize::new(0));
     let max_active_requests = config.max_active_requests.max(1);
+    if config
+        .max_active_per_organization
+        .is_some_and(|limit| limit == 0 || limit > max_active_requests)
+    {
+        return Err(
+            "max_active_per_organization must be between 1 and max_active_requests".to_owned(),
+        );
+    }
     let handled_requests = Arc::new(AtomicUsize::new(0));
     let state = AppState {
         bridge,
         http,
         permits: Arc::new(Semaphore::new(max_active_requests)),
+        dispatch_capacity: Arc::new(crate::dispatch_capacity::DispatchCapacity::new(
+            config.max_active_per_organization,
+        )),
         permit_queue: Arc::new(crate::permit_queue::PermitQueue::new(
             config.permit_priority_aging_seconds,
         )),

@@ -32,7 +32,7 @@ pub(super) async fn stream_response(
     committed: CommittedAttempt,
     created_at: i64,
     deadline: Instant,
-    permit: tokio::sync::OwnedSemaphorePermit,
+    permit: crate::dispatch_capacity::DispatchPermit,
     lease: Option<OwnerLease>,
     client_request_id: Option<String>,
     incremental_guardrail: bool,

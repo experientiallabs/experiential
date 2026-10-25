@@ -55,6 +55,7 @@ def test_host_passes_the_serve_configuration(
         host="0.0.0.0",
         port=8080,
         max_active_requests=23,
+        max_active_per_organization=7,
         graceful_timeout_seconds=45.0,
         connect_timeout_seconds=4.0,
         public_upstreams_only=public_only,
@@ -69,6 +70,7 @@ def test_host_passes_the_serve_configuration(
     assert config["host"] == "0.0.0.0"
     assert config["port"] == 8080
     assert config["max_active_requests"] == 23
+    assert config["max_active_per_organization"] == 7
     assert config["request_timeout_seconds"] == 37.0
     assert config["graceful_timeout_seconds"] == 45.0
     assert config["connect_timeout_seconds"] == 4.0
