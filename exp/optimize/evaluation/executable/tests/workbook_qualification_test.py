@@ -231,3 +231,75 @@ def test_incomplete_or_unowned_views_do_not_count(
     else:
         task = task.model_copy(update={"job": task.job.model_copy(update={"configuration": {}})})
     assert not _pins_native_workbook_outputs(task)
+
+
+def test_generic_cli_and_foreign_runtime_do_not_import_optional_workbook_dependencies(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A fresh interpreter without openpyxl handles generic CLI and foreign owners."""
+    import json
+    import os
+    import subprocess
+    import sys
+
+    task = bound_task(tmp_path, monkeypatch)
+    foreign = tmp_path / "foreign.py"
+    foreign.write_text('raise AssertionError("foreign runtime must not be imported")\n')
+    cases = {
+        "native": task.model_dump(mode="json"),
+        "foreign": task.model_copy(
+            update={
+                "job": task.job.model_copy(
+                    update={
+                        "runtime_file": foreign,
+                        "runtime_sha256": sha256_bytes(foreign.read_bytes()),
+                    }
+                )
+            }
+        ).model_dump(mode="json"),
+        "spoofed": task.model_copy(
+            update={"job": task.job.model_copy(update={"runtime_file": foreign})}
+        ).model_dump(mode="json"),
+        "missing": task.model_copy(
+            update={"job": task.job.model_copy(update={"runtime_file": tmp_path / "absent.py"})}
+        ).model_dump(mode="json"),
+        "no_outputs": task.model_copy(update={"output_paths": ()}).model_dump(mode="json"),
+    }
+    path = tmp_path / "cases.json"
+    path.write_text(json.dumps(cases))
+    script = """
+import importlib.abc,json,sys
+class NoWorkbook(importlib.abc.MetaPathFinder):
+    def find_spec(self,fullname,path=None,target=None):
+        if fullname.split('.')[0]=='openpyxl':
+            raise ModuleNotFoundError('optional workbook dependency unavailable',name='openpyxl')
+sys.meta_path.insert(0,NoWorkbook())
+from exp.optimize.evaluation.executable.qualification import _pins_native_workbook_outputs
+from exp.optimize.evaluation.executable.task import ExecutableTask
+from exp.cli.app import app
+from typer.testing import CliRunner
+result=CliRunner().invoke(app,['optimize','--help'])
+assert result.exit_code==0,(result.output,result.exception)
+assert 'openpyxl' not in sys.modules
+cases=json.load(open(sys.argv[1]))
+for name in ('foreign','spoofed','missing','no_outputs'):
+    assert not _pins_native_workbook_outputs(ExecutableTask.model_validate(cases[name])),name
+assert 'exp.optimize.evaluation.executable.workbook' not in sys.modules
+try:
+    _pins_native_workbook_outputs(ExecutableTask.model_validate(cases['native']))
+except ModuleNotFoundError as error:
+    assert error.name=='openpyxl'
+else:
+    raise AssertionError('selected workbook must still require its optional dependency')
+"""
+    environment = dict(os.environ)
+    environment["PYTHONPATH"] = str(Path(__file__).resolve().parents[5])
+    result = subprocess.run(
+        [sys.executable, "-B", "-c", script, str(path)],
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr

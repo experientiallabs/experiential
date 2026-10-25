@@ -24,13 +24,11 @@ from exp.common.evaluations.reconstruction import WorkflowEvidence
 from exp.common.project import ProjectStore, artifact_input
 from exp.optimize.evaluation.continuations.job import load_continuation_runtime
 from exp.optimize.evaluation.continuations.records import load_study
-from exp.optimize.evaluation.executable import workbook as workbook_runtime
 from exp.optimize.evaluation.executable.task import (
     ExecutableTask,
     load_executable_task,
     preflight_executable_task,
 )
-from exp.optimize.evaluation.executable.workbook import WorkbookRuntimeDefinition
 from exp.runtime.environments.worlds import ExecutableWorldRuntime
 from exp.simulation.capability_briefs import load_capability_brief
 from exp.simulation.evaluation.admission import verify_label_witness
@@ -226,14 +224,23 @@ def _pins_native_workbook_outputs(task: ExecutableTask) -> bool:
     all-sheet coverage and non-fallback output mapping must reproduce the built-in contract.
     This does not certify binary file equality or effects outside the observed workbook.
     """
-    maintained = sha256_bytes(Path(workbook_runtime.__file__).read_bytes())
-    if not task.output_paths or task.job.runtime_sha256 != maintained:
+    if not task.output_paths:
         return False
     try:
+        maintained = sha256_bytes(Path(__file__).with_name("workbook.py").read_bytes())
+        if task.job.runtime_sha256 != maintained:
+            return False
         if sha256_bytes(task.job.runtime_file.read_bytes()) != maintained:
             return False
+    except OSError:
+        return False
+    # Generic CLI/qualification paths must not import optional workbook dependencies.
+    # Only a selected maintained owner with both source hashes verified needs its typed model.
+    from exp.optimize.evaluation.executable.workbook import WorkbookRuntimeDefinition
+
+    try:
         definition = WorkbookRuntimeDefinition.model_validate(task.job.configuration)
-    except (OSError, ValueError):
+    except ValueError:
         return False
     outputs = set(definition.output_paths)
     writable = {name for tool in definition.manifest.tools for name in tool.writes}
