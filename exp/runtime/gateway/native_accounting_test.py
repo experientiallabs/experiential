@@ -4792,15 +4792,21 @@ def test_recovery_shutdown_retains_transport_ownership_until_blocking_write_ends
     from exp.runtime.gateway import native_accounting
 
     entered, release = threading.Event(), threading.Event()
+    ledger = _RecordingLedger()
+    original_recover = native_accounting.recover_expired
 
     def recover(accounting: NativeAttemptAccounting) -> None:
-        del accounting
+        # Other tests may still own sweepers. Their callback cannot satisfy
+        # this instance's synchronization or inherit its blocking transport.
+        if accounting._write_ledger is not ledger:
+            original_recover(accounting)
+            return
         entered.set()
         assert release.wait(5)
 
     monkeypatch.setattr(native_accounting, "_SWEEP_INTERVAL_SECONDS", 0.01)
     monkeypatch.setattr(native_accounting, "recover_expired", recover)
-    accounting = NativeAttemptAccounting(_RecordingLedger())
+    accounting = NativeAttemptAccounting(ledger)
     try:
         assert entered.wait(5)
         assert not accounting.close(0)
