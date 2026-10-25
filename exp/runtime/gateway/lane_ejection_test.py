@@ -55,6 +55,16 @@ def test_policy_reads_operator_overrides_and_keeps_defaults() -> None:
         LaneEjectionPolicy.from_environ({EJECTION_COOLDOWN_ENV: "0"})
 
 
+@pytest.mark.parametrize(
+    "variable", [EJECTION_WINDOW_ENV, EJECTION_HEADER_WINDOW_ENV, EJECTION_COOLDOWN_ENV]
+)
+@pytest.mark.parametrize("value", ["nan", "inf", "-inf", "0", "-1"])
+def test_policy_rejects_nonfinite_or_nonpositive_durations(variable: str, value: str) -> None:
+    """Every operator duration permits streak expiry and eventual recovery."""
+    with pytest.raises(ValueError):
+        LaneEjectionPolicy.from_environ({variable: value})
+
+
 def test_three_dead_lane_failures_inside_the_window_eject_for_the_cooldown() -> None:
     """Refused or 5xx three times in ten seconds: ordered last for thirty seconds."""
     tracker = LaneEjections(LaneEjectionPolicy())

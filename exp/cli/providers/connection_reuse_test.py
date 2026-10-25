@@ -31,3 +31,31 @@ def test_azure_reuses_only_the_same_wire_surface(
         region=None,
     )
     assert result == (existing if configured == requested else None)
+
+
+@pytest.mark.parametrize("suffix", ["", "/models", "/models/", "/openai/v1/"])
+def test_responses_reuses_equivalent_resource_roots(suffix: str) -> None:
+    """A different spelling of one Responses root preserves its identity and credential."""
+    existing = ProviderConnection(
+        name="azure-responses",
+        provider="azure",
+        api_key_env="AZURE_FIXTURE_KEY",
+        base_url="https://resource.services.ai.azure.com",
+        api_version="v1",
+        azure_api_surface="responses",
+    )
+    candidate_url = f"{existing.base_url}{suffix}"
+    candidate = existing.catalog_config().model_copy(update={"base_url": candidate_url})
+    assert candidate.identity_sha256() == existing.catalog_config().identity_sha256()
+    assert (
+        reused_connection(
+            (existing,),
+            provider="azure",
+            api_key_env=existing.api_key_env,
+            base_url=candidate_url,
+            api_version=existing.api_version,
+            azure_api_surface="responses",
+            region=None,
+        )
+        == existing
+    )

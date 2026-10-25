@@ -48,17 +48,15 @@ impl super::UpstreamRelay {
     /// already declared its terminal (in the committed prefix or relay queues, or a
     /// declared finish is draining its trailer) the stream runs on to that
     /// terminal, which the relay yields at once past the deadline, and `send`
-    /// gains the one terminal grace for the frames still queued ahead of it,
-    /// fixed at first expiry so it cannot renew per frame.
+    /// gains one terminal grace for the frames still queued ahead of it.
+    /// Arm it as soon as the terminal is observed, so an in-flight send may
+    /// cross the request deadline; the bound never renews per frame.
     pub fn deadline_cut(
         &self,
         deadline: Instant,
         send: &mut Instant,
         committed_prefix: &VecDeque<crate::events::Event>,
     ) -> bool {
-        if !remaining(deadline).is_zero() {
-            return false;
-        }
         // Commitment may have moved a private reasoning carrier and its terminal
         // out of the relay into the caller's prefix. All three queues count.
         let terminal_pending = committed_prefix
@@ -68,10 +66,10 @@ impl super::UpstreamRelay {
             || self.ready.iter().any(crate::events::Event::is_terminal)
             || self.pending.iter().any(crate::events::Event::is_terminal);
         if !terminal_pending {
-            return true;
+            return remaining(deadline).is_zero();
         }
         if *send == deadline {
-            *send = crate::respond::terminal_send_deadline(deadline);
+            *send = deadline.max(Instant::now()) + crate::respond::TERMINAL_FRAME_GRACE;
         }
         false
     }
@@ -132,7 +130,7 @@ mod tests {
         assert!(!relay.deadline_cut(deadline, &mut send, &VecDeque::new()));
         let grace = send;
         assert!(grace > deadline);
-        // The grace is fixed at first expiry: a later check never renews it.
+        // A later check never renews the terminal's first send bound.
         assert!(!relay.deadline_cut(deadline, &mut send, &VecDeque::new()));
         assert_eq!(send, grace);
         let terminal = relay
@@ -169,9 +167,45 @@ mod tests {
     async fn a_nonterminal_committed_prefix_does_not_extend_the_deadline() {
         let relay = relay(Vec::new());
         let prefix = VecDeque::from([Event::TextDelta("still writing".to_owned())]);
+        let open = Instant::now() + Duration::from_secs(60);
+        let mut send = open;
+        assert!(!relay.deadline_cut(open, &mut send, &prefix));
+        assert_eq!(send, open);
         let deadline = Instant::now();
         let mut send = deadline;
         assert!(relay.deadline_cut(deadline, &mut send, &prefix));
         assert_eq!(send, deadline);
+    }
+
+    #[tokio::test]
+    async fn queued_terminals_arm_one_grace_before_the_request_deadline() {
+        let relay = relay(Vec::new());
+        let prefix = VecDeque::from([Event::Completed]);
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let mut send = deadline;
+        assert!(!relay.deadline_cut(deadline, &mut send, &prefix));
+        assert_eq!(send, deadline + crate::respond::TERMINAL_FRAME_GRACE);
+        let grace = send;
+        assert!(!relay.deadline_cut(deadline, &mut send, &prefix));
+        assert_eq!(send, grace);
+    }
+
+    #[tokio::test]
+    async fn queued_completions_survive_backpressure_across_the_request_deadline() {
+        let relay = relay(Vec::new());
+        let prefix = VecDeque::from([Event::Completed]);
+        let deadline = Instant::now() + Duration::from_millis(50);
+        let mut send = deadline;
+        assert!(!relay.deadline_cut(deadline, &mut send, &prefix));
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+        sender.send(Ok(Bytes::from_static(b"start"))).await.unwrap();
+        let receive = tokio::spawn(async move {
+            tokio::time::sleep_until((deadline + Duration::from_millis(25)).into()).await;
+            assert_eq!(receiver.recv().await.unwrap().unwrap(), b"start"[..]);
+            receiver.recv().await.unwrap().unwrap()
+        });
+        let mut delivery = crate::respond::stream_delivery::Delivery::new(sender, false);
+        assert!(delivery.send(send, Bytes::from_static(b"done")).await);
+        assert_eq!(receive.await.unwrap(), b"done"[..]);
     }
 }

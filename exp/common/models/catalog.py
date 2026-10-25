@@ -30,7 +30,7 @@ from exp.common.core.artifacts import (
     validate_artifact_id,
 )
 from exp.common.core.files import write_text_atomic
-from exp.common.models.azure_endpoints import AzureApiSurface
+from exp.common.models.azure_endpoints import AzureApiSurface, strip_model_inference_root
 from exp.common.models.bedrock_connection import require_bedrock_connection_shape
 from exp.common.models.catalog_prices import (
     MAXIMUM_RATE_NANO_USD_PER_MILLION_TOKENS as MAXIMUM_RATE_NANO_USD_PER_MILLION_TOKENS,
@@ -109,6 +109,8 @@ def _normalize_connection_base_url(connection: ConnectionConfig) -> str | None:
     if connection.base_url is None:
         return None
     normalized = _normalize_base_url(connection.base_url)
+    if connection.provider == "azure" and connection.azure_api_surface == "responses":
+        return strip_model_inference_root(normalized)
     # Endpoint identity is deliberately narrower than request routing: it folds only the terminal
     # ``/models`` segment, and only for a declared surface, so no stored credential digest moves
     # for a connection the operator never edited.

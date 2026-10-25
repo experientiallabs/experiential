@@ -1,13 +1,8 @@
 """Per-worker, per-lane ejection of a rung whose box answers nothing but dead-lane failures.
 
-On 2026-10-21 a self-hosted rung's box refused every connection (or answered
-an instant 502) for twenty minutes, and every request on the route dialed it
-first: 7,000+ wasted dials. The revision-scoped health circuit
-(``DeploymentHealthRegistry``) keys on the authorization's catalog digest, so
-its memory restarts per revision view, and it counts timeouts and malformed
-streams alike. This tracker keys on the physical lane, the ``rung_load_key``
-convention ``(deployment_id, connection_sha256)``, across every revision view,
-so every request on the worker learns from every other one. The deployment id
+The tracker keys on the physical lane, the ``rung_load_key`` convention
+``(deployment_id, connection_sha256)``, across catalog revisions, so every
+request on the worker learns from every other one. The deployment id
 is the one the plan carries (``mp-<model_provider uuid>`` for a host lane); a
 BYOK variant carries its own id (``mp-<row>-c-<connection>``) and so never
 inherits its host lane's ejection, nor the host lane a variant's. It counts
@@ -38,6 +33,7 @@ account-wide or provider-wide: a dead lane ejects only itself.
 
 from __future__ import annotations
 
+import math
 import os
 from collections import deque
 from collections.abc import Mapping
@@ -106,12 +102,13 @@ class LaneEjectionPolicy:
         """Reject a policy that could never eject or never recover.
 
         Raises:
-            ValueError: A negative count or a non-positive duration.
+            ValueError: A negative count or a nonfinite or non-positive duration.
         """
         if self.failures < 0 or self.header_timeouts < 0:
             raise ValueError("lane ejection counts must not be negative")
-        if min(self.window_seconds, self.header_window_seconds, self.cooldown_seconds) <= 0:
-            raise ValueError("lane ejection windows and cooldown must be positive")
+        durations = (self.window_seconds, self.header_window_seconds, self.cooldown_seconds)
+        if any(not math.isfinite(value) or value <= 0 for value in durations):
+            raise ValueError("lane ejection windows and cooldown must be finite and positive")
 
     @classmethod
     def from_environ(cls, environ: Mapping[str, str] | None = None) -> LaneEjectionPolicy:
