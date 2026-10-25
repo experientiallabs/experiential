@@ -981,3 +981,8 @@ class AuthorizationSnapshot(ClientAttribution):
     descendant_start_authorized: bool = False
     zdr_requested: bool = False
     prompt_caching_disabled: bool = False
+    image_input_notice: str | None = Field(default=None, max_length=1_024, exclude=True)
+    """Host per-model copy the model is asked to tell the user when a latest-turn
+    image is degraded on a text-only route (``dialect_dispatch.image_input_notice``).
+    Request-time operator copy, never a catalog input; excluded from durable
+    serialization like the requested route id."""

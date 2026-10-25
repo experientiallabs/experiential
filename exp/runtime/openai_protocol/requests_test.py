@@ -4905,6 +4905,33 @@ def test_responses_unknown_content_part_type_names_the_accepted_vocabulary() -> 
     )
 
 
+def test_original_image_detail_decodes_on_a_tool_screenshot() -> None:
+    """Codex sends ``detail: "original"`` on a tool screenshot (OpenAI's
+    full-resolution level); a refusal would wedge every later turn of the
+    session, so it decodes and rides to the wire (2026-10-24: one org, four
+    400s in fifteen minutes on ``input.30.output.2.input_image.detail``)."""
+    decoded = decode_responses(
+        {
+            "model": "coding",
+            "input": [
+                {"type": "function_call", "call_id": "c1", "name": "shot", "arguments": "{}"},
+                {
+                    "type": "function_call_output",
+                    "call_id": "c1",
+                    "output": [
+                        {
+                            "type": "input_image",
+                            "image_url": "https://x/y.png",
+                            "detail": "original",
+                        }
+                    ],
+                },
+            ],
+        }
+    )
+    assert [image.detail for image in decoded.request.images] == ["original"]
+
+
 def test_vocabulary_rejections_name_the_members_and_a_bad_tag_names_the_tag() -> None:
     """A literal member fault names the members (never the arriving JSON type);
     a discriminated part's wrong tag additionally names the tag pydantic reports."""
@@ -4919,7 +4946,7 @@ def test_vocabulary_rejections_name_the_members_and_a_bad_tag_names_the_tag() ->
                             {
                                 "type": "input_image",
                                 "image_url": "https://x/y",
-                                "detail": "original",
+                                "detail": "ultra",
                             }
                         ],
                     }
@@ -4929,7 +4956,7 @@ def test_vocabulary_rejections_name_the_members_and_a_bad_tag_names_the_tag() ->
     assert detail.value.detail.param == "input.0.content.0.input_image.detail"
     assert detail.value.detail.message == (
         "Invalid value for 'input.0.content.0.input_image.detail': expected one of 'auto', "
-        "'low' or 'high'."
+        "'low', 'high' or 'original'."
     )
     with pytest.raises(OpenAIProtocolError) as chat_part:
         decode_chat(

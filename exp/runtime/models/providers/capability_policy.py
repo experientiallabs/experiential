@@ -736,7 +736,9 @@ def _without_clear_thinking_edits(context_management: JsonObject) -> JsonObject 
     return {**context_management, "edits": retained}
 
 
-def coerce_capability(capability: str, request: GatewayRequest) -> RequestCoercion | None:
+def coerce_capability(
+    capability: str, request: GatewayRequest, image_input_notice: str | None = None
+) -> RequestCoercion | None:
     """Build the disclosed coercion for one preflight capability rejection.
 
     Four coercions exist, all only here (after every rung declined the
@@ -750,17 +752,15 @@ def coerce_capability(capability: str, request: GatewayRequest) -> RequestCoerci
     changes pricing and latency
     semantics, which the caller can act on only when told, so the drop is
     disclosed rather than silent. Images degrade to placeholder text on an
-    image-incapable route because a screenshot (a tool result or a pasted
-    user image) is baked into the caller's history and a rejection wedges
-    every later turn; only a request with no caller text beside its images
-    keeps the refusal, since the placeholder would be all the model sees.
-    ``pdf_input`` and ``pdf_url_input`` degrade only documents a tool returned
-    (Claude Code's Read on a PDF). Every other capability names a feature with
-    no approximation and stays fail-closed.
+    image-incapable route (a screenshot in history wedges every later turn
+    when refused) unless the request has no caller text at all; ``pdf_input``
+    and ``pdf_url_input`` degrade only documents a tool returned. Every other
+    capability names a feature with no approximation and stays fail-closed.
 
     Args:
         capability: Stable capability literal from the preflight rejection.
         request: Decoded request no rung could preserve.
+        image_input_notice: Host per-model copy for the latest-turn image notice.
 
     Returns:
         The disclosed substitution to retry with, or ``None`` when the
@@ -777,7 +777,7 @@ def coerce_capability(capability: str, request: GatewayRequest) -> RequestCoerci
         if (tool_stripped := strip_tool_result_images(messages)) is not None:
             messages = tool_stripped
             disclosures.append(TOOL_RESULT_IMAGE_DROP_DISCLOSURE)
-        if (stripped := strip_message_images(messages)) is not None:
+        if (stripped := strip_message_images(messages, image_input_notice)) is not None:
             messages = stripped
             disclosures.append(IMAGE_INPUT_DROP_DISCLOSURE)
         if not disclosures:
@@ -836,6 +836,7 @@ def coerce_route_rejections(
     errors: Sequence[ProviderParameterError | ProviderCapabilityError],
     deployment_count: int,
     request: GatewayRequest,
+    image_input_notice: str | None = None,
 ) -> RequestCoercion | None:
     """Pick the one disclosed coercion a set of per-rung rejections allows.
 
@@ -852,6 +853,7 @@ def coerce_route_rejections(
         errors: One rejection per declined deployment, in route order.
         deployment_count: Number of deployments the route offered.
         request: Decoded request no rung could preserve.
+        image_input_notice: Host per-model copy for the latest-turn image notice.
 
     Returns:
         The disclosed substitution to retry with, or ``None`` when nothing
@@ -859,7 +861,7 @@ def coerce_route_rejections(
     """
     capability = route_wide_capability(errors, deployment_count)
     if capability is not None:
-        return coerce_capability(capability, request)
+        return coerce_capability(capability, request, image_input_notice)
     if any(
         isinstance(error, ProviderCapabilityError) and error.capability == "service_tier"
         for error in errors

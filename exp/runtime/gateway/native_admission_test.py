@@ -1076,6 +1076,69 @@ def test_user_image_degrades_with_disclosure_on_a_text_only_route(
     assert accounting.recorded == 1
 
 
+def test_latest_turn_image_carries_the_hosts_per_model_notice() -> None:
+    """The authorization's per-model copy reaches the latest-turn notice.
+
+    The host looks the copy up per alias at authorize time and freezes it on
+    the snapshot; admission quotes it into the placeholder so the model tells
+    the user, while the thread keeps serving.
+    """
+    from exp.runtime.anthropic_protocol.requests import decode_messages
+    from exp.runtime.models.providers.dialect_dispatch import (
+        IMAGE_INPUT_DROP_DISCLOSURE,
+        image_input_notice,
+    )
+
+    text_only = GatewayDeploymentMetadata(
+        capabilities=GatewayDeploymentCapabilities(
+            supports_streaming=True,
+            supports_streaming_tool_arguments=True,
+        )
+    )
+    route = _mixed_route(
+        "maximize_availability",
+        (_deployment("vllm", gateway=text_only),),
+        GatewayApiSurface.MESSAGES,
+    )
+    copy = "We're rejecting images on this model for now."
+    authorization = route.snapshot.authorization.model_copy(update={"image_input_notice": copy})
+    client = cast(NativeWireClient, object())
+    wires = ((GatewayWireProfile(dialect="openai_compatible", url="https://vllm.test"), client),)
+    request = decode_messages(
+        {
+            "model": "coding",
+            "max_tokens": 64,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "look"},
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": "image/png",
+                                "data": _TOOL_IMAGE_PNG,
+                            },
+                        },
+                    ],
+                }
+            ],
+        }
+    ).request.model_copy(update={"include_usage": True})
+
+    _narrowed, _wires_out, public, provider, _placement = admitted_route_requests(
+        route,
+        wires,
+        request,
+        accounting=cast(NativeAttemptAccounting, _AdmissionCoercionCounter()),
+        authorization=authorization,
+    )
+
+    assert provider.messages[0].content == "look" + image_input_notice(copy)
+    assert IMAGE_INPUT_DROP_DISCLOSURE in public.ignored_parameters
+
+
 @pytest.mark.parametrize("stream", [True, False])
 def test_tool_result_pdf_degrades_with_disclosure_on_a_pdf_incapable_route(stream: bool) -> None:
     """Claude Code's Read on a PDF serves on a route with no PDF input.

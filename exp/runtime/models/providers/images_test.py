@@ -60,6 +60,19 @@ def test_responses_uses_input_image() -> None:
     }
 
 
+def test_original_detail_rides_responses_and_becomes_high_on_chat() -> None:
+    """Codex's ``original`` level is OpenAI Responses vocabulary only.
+
+    The Responses wire forwards it verbatim; Chat Completions defines no such
+    level, so it carries ``high``, the closest fidelity that wire accepts.
+    """
+    original = _INLINE.model_copy(update={"detail": "original"})
+    assert responses_image_part(original)["detail"] == "original"
+    chat = openai_chat_image_part(original)["image_url"]
+    assert isinstance(chat, dict)
+    assert chat["detail"] == "high"
+
+
 def test_anthropic_splits_base64_and_url_sources() -> None:
     """Anthropic declares the carrier and the media type on the source."""
     assert anthropic_image_block(_INLINE) == {

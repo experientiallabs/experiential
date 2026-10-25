@@ -234,21 +234,53 @@ IMAGE_INPUT_DROP_DISCLOSURE = "messages.content.image->placeholder"
 """Disclosure recorded when caller-turn images degrade to placeholder text.
 
 Coding agents keep a pasted screenshot in the conversation history and resend
-it on every later turn, so refusing a text-only route wedges the whole thread
+it on every later turn, so refusing a text-only route wedged the whole thread
 for good (customer report, 2026-10-25: about 3,200 refusals across 456 orgs in
-one day, mostly the uncensored Experiential Cloud models). The image becomes
-a placeholder the model can read and answer about; a request with no caller
-text at all keeps the refusal (``capability_policy``)."""
+one day, mostly the uncensored Experiential Cloud models). The owner's rule:
+show the error, keep the history alive. An image in the LATEST user turn
+becomes a notice that asks the model to tell the user; an image in an earlier,
+resent turn becomes a bare marker so the model does not repeat the error every
+turn. A request with no caller text at all keeps the refusal
+(``capability_policy``)."""
 
-IMAGE_INPUT_PLACEHOLDER = "[image not processed: this model does not accept image input]"
-"""Text substituted for each dropped caller-turn image, in part position."""
+IMAGE_INPUT_PLACEHOLDER = "[image not processed]"
+"""Text substituted for each dropped image in an earlier, resent user turn."""
+
+IMAGE_INPUT_NOTICE_PREFIX = "[image not processed: this model does not accept image input. "
+"""Opening of the latest-turn notice; the instruction to the model follows."""
+
+IMAGE_INPUT_DEFAULT_NOTICE = (
+    IMAGE_INPUT_NOTICE_PREFIX + "Tell the user their image could not be processed by this model.]"
+)
+"""Latest-turn notice when the host authored no per-model message."""
+
+MAXIMUM_IMAGE_INPUT_NOTICE_CHARACTERS = 1_024
+"""Longest host-authored per-model message carried into the notice."""
+
+
+def image_input_notice(message: str | None) -> str:
+    """Return the latest-turn image notice, quoting a host-authored message.
+
+    Args:
+        message: The host's per-model copy for this alias, or ``None`` for
+            the default instruction.
+
+    Returns:
+        The bracketed notice substituted for each latest-turn image.
+    """
+    if message is None or not message.strip():
+        return IMAGE_INPUT_DEFAULT_NOTICE
+    return IMAGE_INPUT_NOTICE_PREFIX + f"Tell the user exactly this: {message.strip()}]"
 
 
 def strip_message_images(
     messages: tuple[GatewayMessage, ...],
+    notice: str | None = None,
 ) -> tuple[GatewayMessage, ...] | None:
     """Replace non-tool image parts with positional placeholder text.
 
+    Images in the latest user message become :func:`image_input_notice`;
+    images in every earlier message become :data:`IMAGE_INPUT_PLACEHOLDER`.
     Every other part keeps its place; a message left with only text collapses
     back to plain content. The message's Anthropic cache-marked text run no
     longer matches the new content, so it is dropped (a cache hint, never
@@ -256,6 +288,7 @@ def strip_message_images(
 
     Args:
         messages: The request's canonical messages.
+        notice: The host's per-model copy for the latest-turn notice, if any.
 
     Returns:
         The degraded messages, or ``None`` when no non-tool message carries an
@@ -263,13 +296,18 @@ def strip_message_images(
     """
     if not any(message.role != "tool" and message.images for message in messages):
         return None
+    latest_user = max(
+        (index for index, message in enumerate(messages) if message.role == "user"),
+        default=-1,
+    )
     out: list[GatewayMessage] = []
-    for message in messages:
+    for index, message in enumerate(messages):
         if message.role == "tool" or not message.images:
             out.append(message)
             continue
+        text = image_input_notice(notice) if index == latest_user else IMAGE_INPUT_PLACEHOLDER
         parts = tuple(
-            TextContentPart(text=IMAGE_INPUT_PLACEHOLDER) if part.kind == "image" else part
+            TextContentPart(text=text) if part.kind == "image" else part
             for part in message.content_parts
         )
         content = "".join(part.text for part in parts if part.kind == "text")
