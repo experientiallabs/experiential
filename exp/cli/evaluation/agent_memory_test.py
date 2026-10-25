@@ -255,21 +255,17 @@ def test_dry_run_prints_the_preflight_and_makes_no_call(
     assert not (tmp_path / "memory").exists()
 
 
-def test_a_model_that_refuses_named_tool_choice_is_refused_before_any_call(
+def test_a_model_that_rejects_named_tool_choice_is_steered_by_its_catalog_declaration(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Structured proposals name their tool; a model that answers that with a 400 is refused."""
+    """A model that answers a named tool choice with a 400 is offered the one tool on auto."""
     root = project_root(tmp_path, monkeypatch, model="claude-sonnet-5-5")
     wire = ScriptedWire()
-    monkeypatch.setattr(agent_memory, "HttpxJsonTransport", lambda: wire)
-    path = tmp_path / "operation.json"
-    path.write_text(json.dumps(operation(tmp_path)))
-    result = CliRunner().invoke(
-        app, ["eval", PROJECT, "--root", str(root), "--continuations", str(path), "--yes"]
-    )
-    assert result.exit_code != 0
-    assert "rejects a named tool choice" in " ".join(result.output.split())
-    assert wire.requests == []
+    learn(root, tmp_path, wire, monkeypatch, "--yes", "--non-interactive")
+    payload = wire.requests[0].payload
+    assert payload["tool_choice"] == {"type": "auto", "disable_parallel_tool_use": True}
+    tools = payload["tools"]
+    assert isinstance(tools, list) and [tool["name"] for tool in tools] == ["submit_proposal"]
 
 
 def test_an_unpriced_learning_model_is_refused_before_any_call(

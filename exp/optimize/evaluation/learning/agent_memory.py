@@ -87,9 +87,6 @@ from exp.runtime.models.providers.admitted_transport import (
     AdmittedJsonTransport,
     require_admitted_transport,
 )
-from exp.runtime.models.providers.anthropic_tool_compat import (
-    anthropic_rejects_forced_tool_choice,
-)
 from exp.runtime.models.providers.transport import HttpxJsonTransport, RetryPolicy
 from exp.runtime.models.structured_completion import (
     CompletionPlan,
@@ -171,17 +168,12 @@ def prepare_agent_memory(
 
     Raises:
         ValueError: The export holds records that cannot be normalized and exclusions are not
-            allowed, the alias does not use the admitted transport, the learning model rejects
-            a named tool choice, or it has no input or output price.
+            allowed, the alias does not use the admitted transport, or the learning model has
+            no input or output price.
     """
     catalog = load_model_catalog(project.model_catalog_path)
     require_admitted_transport(catalog, spec.alias, consumer="agent memory")
     model, _ = RuntimeModelCatalog(catalog, environment={}).snapshot(spec.alias)
-    if model.provider == "anthropic" and anthropic_rejects_forced_tool_choice(model.model_id):
-        raise ValueError(
-            f"model {model.model_id!r} rejects a named tool choice, which every structured "
-            "proposal sends; choose a catalog alias whose model accepts a named tool"
-        )
     if model_cost(project, spec.alias, 1, OUTPUT_TOKENS["extract"]).usd is None:
         raise ValueError(
             f"model alias {spec.alias!r} has no input or output price or no context window; add "
