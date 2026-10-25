@@ -31,7 +31,8 @@ from exp.runtime.models.providers.admitted_transport import (
 )
 from exp.runtime.models.providers.errors import ProviderRetryableResponseError
 from exp.runtime.models.providers.transport import HttpxJsonTransport
-from exp.runtime.models.registry import RuntimeModelCatalog, reasoning_catalog
+from exp.runtime.models.reasoning_view import reasoning_catalog
+from exp.runtime.models.registry import RuntimeModelCatalog
 from exp.runtime.sessions.dispatch_ledger import DispatchLedger
 
 
