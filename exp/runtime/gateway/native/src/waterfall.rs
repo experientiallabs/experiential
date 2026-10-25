@@ -180,6 +180,8 @@ enum AttemptEnd {
         /// outward only when the ladder is exhausted with a non-refusal
         /// failure.
         exhaustion_flush: Vec<Event>,
+        /// Only this physical attempt's caller-visible quota headers may be served.
+        rate_limit_headers: Vec<(String, String)>,
         usage: Option<Usage>,
         tool_names: Vec<String>,
         opened: bool,
@@ -518,6 +520,7 @@ pub async fn acquire_attempt(ctx: &WaterfallContext<'_>, guard: &mut AttemptGuar
                 failure,
                 refusal_eligible,
                 exhaustion_flush,
+                rate_limit_headers,
                 usage,
                 tool_names,
                 opened,
@@ -645,7 +648,7 @@ pub async fn acquire_attempt(ctx: &WaterfallContext<'_>, guard: &mut AttemptGuar
                         encrypted_reasoning_stripped,
                         empty_completion: false,
                         tool_search_rounds: Vec::new(),
-                        rate_limit_headers: Vec::new(),
+                        rate_limit_headers,
                     });
                 }
                 if failure.failure_class == FailureClass::EmptyCompletion {
@@ -668,7 +671,7 @@ pub async fn acquire_attempt(ctx: &WaterfallContext<'_>, guard: &mut AttemptGuar
                         encrypted_reasoning_stripped,
                         empty_completion: true,
                         tool_search_rounds: std::mem::take(&mut tool_search_rounds),
-                        rate_limit_headers: Vec::new(),
+                        rate_limit_headers,
                     });
                 }
                 let boundary = with_largest_retry_after(boundary, largest_retry_after);
@@ -711,6 +714,8 @@ mod search_round;
 mod ladder_tests;
 #[cfg(test)]
 mod progress_tests;
+#[cfg(test)]
+mod rate_limit_tests;
 #[cfg(test)]
 mod repair_ladder_tests;
 #[cfg(test)]

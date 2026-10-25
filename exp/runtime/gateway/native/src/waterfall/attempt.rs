@@ -34,6 +34,7 @@ pub(super) async fn run_attempt(
     let Some(dialect) = Dialect::from_str(&wire.dialect) else {
         // Admission validated every dialect; reaching here is wire drift.
         return AttemptEnd::Ladder {
+            rate_limit_headers: Vec::new(),
             failure: Failure::new(
                 FailureClass::Internal,
                 "gateway engine does not support the resolved provider dialect",
@@ -56,6 +57,7 @@ pub(super) async fn run_attempt(
         Ok(headers) => headers,
         Err(_) => {
             return AttemptEnd::Ladder {
+                rate_limit_headers: Vec::new(),
                 failure: Failure::new(
                     FailureClass::ProviderAuthentication,
                     "provider dispatch signing failed",
@@ -74,6 +76,7 @@ pub(super) async fn run_attempt(
             Ok(wire) => wire,
             Err(failure) => {
                 return AttemptEnd::Ladder {
+                    rate_limit_headers: Vec::new(),
                     failure,
                     refusal_eligible: false,
                     exhaustion_flush: Vec::new(),
@@ -205,6 +208,7 @@ pub(super) async fn run_attempt(
                     };
                 }
                 return AttemptEnd::Ladder {
+                    rate_limit_headers: Vec::new(),
                     failure: customer_owned(attribute_header_timeout(ctx, failure), wire),
                     refusal_eligible: false,
                     exhaustion_flush: Vec::new(),
@@ -292,6 +296,7 @@ pub(super) async fn run_attempt(
                 Ok(Some(event)) => event,
                 Ok(None) => {
                     return AttemptEnd::Ladder {
+                        rate_limit_headers: caller_rate_limits,
                         failure: ended_without_terminal(),
                         refusal_eligible: false,
                         exhaustion_flush: Vec::new(),
@@ -318,6 +323,7 @@ pub(super) async fn run_attempt(
                         continue 'dial;
                     }
                     return AttemptEnd::Ladder {
+                        rate_limit_headers: caller_rate_limits,
                         failure,
                         refusal_eligible: false,
                         exhaustion_flush: Vec::new(),
@@ -377,6 +383,7 @@ pub(super) async fn run_attempt(
                         && !crate::logprobs::is_refusal(&event)
                     {
                         return AttemptEnd::Ladder {
+                            rate_limit_headers: caller_rate_limits,
                             failure: Failure::new(
                                 FailureClass::MalformedResponse,
                                 crate::dialects::OUTPUT_OVERFLOW_MESSAGE,
@@ -481,6 +488,7 @@ pub(super) async fn run_attempt(
                         Vec::new()
                     };
                     return AttemptEnd::Ladder {
+                        rate_limit_headers: caller_rate_limits,
                         failure: failure.clone(),
                         refusal_eligible: typed_refusal && ctx.policy.refusal_failover,
                         exhaustion_flush,
@@ -497,6 +505,7 @@ pub(super) async fn run_attempt(
                         // matching the python executor's converted terminal.
                         withheld.clear();
                         return AttemptEnd::Ladder {
+                            rate_limit_headers: caller_rate_limits,
                             failure: Failure::new(
                                 FailureClass::Refusal,
                                 "provider refused the request",
@@ -516,6 +525,7 @@ pub(super) async fn run_attempt(
                         // per-dial bound: the gateway's own limit, so the dial
                         // fails closed instead of running an oversized round.
                         return AttemptEnd::Ladder {
+                            rate_limit_headers: caller_rate_limits,
                             failure: withheld_overflow_failure(),
                             refusal_eligible: false,
                             exhaustion_flush: Vec::new(),
@@ -545,6 +555,7 @@ pub(super) async fn run_attempt(
                         // gateway strips): it takes the ladder like any other
                         // pre-commit failure instead of settling an empty success.
                         return AttemptEnd::Ladder {
+                            rate_limit_headers: caller_rate_limits,
                             failure: empty_completion_failure(wire),
                             refusal_eligible: false,
                             exhaustion_flush: Vec::new(),
@@ -584,6 +595,7 @@ pub(super) async fn run_attempt(
                         // delivered nothing at all. Nothing was committed outward,
                         // so the ladder is safe, exactly like the billed twin.
                         return AttemptEnd::Ladder {
+                            rate_limit_headers: caller_rate_limits,
                             failure: empty_completion_failure(wire),
                             refusal_eligible: false,
                             exhaustion_flush: Vec::new(),

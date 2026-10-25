@@ -51,7 +51,7 @@ pub(crate) fn failure_frames(encoder: &mut ChatSseEncoder, failure: &Failure) ->
 }
 
 /// Emit the Responses encoder's sanitized failure lifecycle when the stream
-/// has not already reached a terminal.
+/// has not already reached a terminal, using its already-armed send bound.
 pub(crate) async fn emit_responses_failure(
     sender: &mpsc::Sender<Result<Bytes, std::io::Error>>,
     deadline: Instant,
@@ -64,7 +64,6 @@ pub(crate) async fn emit_responses_failure(
     let frames = encoder
         .feed(&Event::Failed(failure.clone()))
         .unwrap_or_default();
-    let deadline = terminal_send_deadline(deadline);
     for frame in frames {
         if !send_bounded(sender, deadline, Bytes::from(frame)).await {
             return;
@@ -338,10 +337,12 @@ fn capture_frame_bounded(
 /// answer as a clean end of stream.
 pub(crate) const TERMINAL_FRAME_GRACE: Duration = Duration::from_secs(5);
 
-/// The send bound for a stream's terminal frames: the request deadline, or
-/// a short grace past it when it has already run out.
-pub(crate) fn terminal_send_deadline(deadline: Instant) -> Instant {
-    deadline.max(Instant::now() + TERMINAL_FRAME_GRACE)
+/// Arm one terminal grace for the entire remaining stream, including its tail.
+/// Once armed, even an exhausted bound is never renewed by another frame.
+pub(crate) fn arm_terminal_send_deadline(deadline: Instant, send: &mut Instant) {
+    if *send == deadline {
+        *send = deadline.max(Instant::now()) + TERMINAL_FRAME_GRACE;
+    }
 }
 
 /// Deliver one public frame bounded by the request deadline, so a connected
@@ -442,7 +443,7 @@ pub(crate) async fn settle_stream_end(
 }
 
 /// Close one stream that reached a terminal outcome: publish the keyed
-/// capture (or abandon it), then flush the withheld terminal frames.
+/// capture (or abandon it), then flush within the already-armed send bound.
 ///
 /// A keyed stream that cannot be retained (capture overflow or a rejected publication) ends
 /// without its terminal frames, so the caller observes a truncated stream
@@ -485,7 +486,6 @@ pub(crate) async fn finish_stream_terminal(
             return;
         }
     }
-    let deadline = terminal_send_deadline(deadline);
     for data in frames {
         if !send_bounded(sender, deadline, data).await {
             log_stream_exit(request_id, "terminal_delivery_closed_or_deadline");
@@ -497,6 +497,68 @@ pub(crate) async fn finish_stream_terminal(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn terminal_grace_is_armed_once_even_after_expiry() {
+        let request_deadline = Instant::now() - Duration::from_secs(20);
+        let mut send = request_deadline;
+        arm_terminal_send_deadline(request_deadline, &mut send);
+        assert!(send > Instant::now());
+        let expired = request_deadline + TERMINAL_FRAME_GRACE;
+        send = expired;
+        arm_terminal_send_deadline(request_deadline, &mut send);
+        assert_eq!(send, expired);
+    }
+
+    #[tokio::test]
+    async fn responses_failure_does_not_renew_an_expired_send_bound() {
+        let (sender, mut receiver) = mpsc::channel(1);
+        sender
+            .send(Ok(Bytes::from_static(b"prefix")))
+            .await
+            .unwrap();
+        let mut encoder = ResponsesSseEncoder::new("request", "model", 1, Default::default());
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            emit_responses_failure(
+                &sender,
+                Instant::now() - Duration::from_millis(1),
+                &mut encoder,
+                &Failure::new(FailureClass::Timeout, "timed out"),
+            ),
+        )
+        .await
+        .expect("a failure tail must use its existing send bound");
+        assert_eq!(receiver.recv().await.unwrap().unwrap(), "prefix");
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn terminal_tail_does_not_renew_an_expired_send_bound() {
+        let (sender, mut receiver) = mpsc::channel(1);
+        sender
+            .send(Ok(Bytes::from_static(b"prefix")))
+            .await
+            .unwrap();
+        let mut lease = None;
+        let mut capture = Vec::new();
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            finish_stream_terminal(
+                &sender,
+                Instant::now() - Duration::from_millis(1),
+                &mut lease,
+                false,
+                &mut capture,
+                &[],
+                vec![Bytes::from_static(b"terminal")],
+            ),
+        )
+        .await
+        .expect("an exhausted terminal grace must not restart");
+        assert_eq!(receiver.recv().await.unwrap().unwrap(), "prefix");
+        assert!(receiver.try_recv().is_err());
+    }
 
     #[test]
     fn a_route_unavailable_at_admission_escalates_as_a_retryable_503() {

@@ -60,6 +60,7 @@ def test_responses_routes_use_the_resource_root(api_version: str, suffix: str) -
         responses_root if api_version == "v1" else f"{_ENDPOINT}/openai/deployments/gpt-deployment"
     )
     assert profile.url == f"{responses_root}/responses{query}"
+    assert profile.openai_decisions_url is None
     assert profile.embeddings_url == f"{deployment_root}/embeddings{query}"
     assert profile.images_url == f"{deployment_root}/images/generations{query}"
     assert profile.speech_url == f"{deployment_root}/audio/speech{query}"

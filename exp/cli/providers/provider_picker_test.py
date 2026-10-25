@@ -1071,7 +1071,7 @@ def test_azure_prepares_exact_connection_for_manual_deployment_declaration() -> 
 def test_azure_prepares_explicit_model_inference_surface() -> None:
     """Interactive setup can author Foundry model inference without losing its discriminator."""
     console = ScriptedConsole(
-        "https://resource.services.ai.azure.com/models\n2024-05-01-preview\nmodel_inference\n"
+        "https://resource.services.ai.azure.com/models\nmodel_inference\n2024-05-01-preview\n"
     )
 
     connection = provider_picker.collect_provider_connection("azure", console=console)
@@ -1089,6 +1089,19 @@ def test_azure_defaults_a_foundry_endpoint_to_its_own_surface_and_version() -> N
     assert connection is not None
     assert connection.azure_api_surface == "model_inference"
     assert connection.api_version == "2024-05-01-preview"
+
+
+@pytest.mark.parametrize("surface", ["responses", "openai_deployments"])
+@pytest.mark.parametrize("version", ["", "2025-04-01-preview"])
+def test_azure_version_default_follows_the_selected_surface(surface: str, version: str) -> None:
+    """Selecting an OpenAI surface on Foundry offers v1 and preserves explicit versions."""
+    console = ScriptedConsole(f"https://resource.services.ai.azure.com\n{surface}\n{version}\n")
+
+    connection = provider_picker.collect_provider_connection("azure", console=console)
+
+    assert connection is not None
+    assert connection.azure_api_surface == surface
+    assert connection.api_version == (version or "v1")
 
 
 @pytest.mark.parametrize(

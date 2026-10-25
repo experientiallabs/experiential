@@ -30,10 +30,10 @@ use crate::metrics::{classify_escalation, METRICS};
 use crate::relay::{collect_committed, collection_public_error, track_event};
 use crate::replay::{CachedResponse, Claim, OwnerLease, ReplayKey};
 use crate::respond::{
-    bearer_key, cached_response, capture_frame, client_ip, complete_visible_refusal,
-    emit_responses_failure, error_response, escalation_error, finish_stream_terminal,
-    json_response, latin1_header, outward_event, read_body, settle_stream_end, sse_body_response,
-    stream_delivery::Delivery, with_app_identity,
+    arm_terminal_send_deadline, bearer_key, cached_response, capture_frame, client_ip,
+    complete_visible_refusal, emit_responses_failure, error_response, escalation_error,
+    finish_stream_terminal, json_response, latin1_header, outward_event, read_body,
+    settle_stream_end, sse_body_response, stream_delivery::Delivery, with_app_identity,
 };
 use crate::responses_retention::{remember_argument, remember_continuation, ResponsesRetention};
 use crate::route_chat::{seal_reasoning_candidate, seal_reasoning_events};
@@ -761,12 +761,14 @@ async fn stream_responses(
         // Withhold undecided deterministic redaction segments.
         let mut output_guardrails = StreamGuardrails::new(&request_id, incremental_guardrail);
         let terminal_frames: Vec<String>;
+        let mut send_deadline = deadline;
 
         macro_rules! fail_stream {
             ($failure:expr) => {{
                 committed.relay.close_transport();
                 let failure = $failure.boundary();
-                emit_responses_failure(&sender, deadline, &mut encoder, &failure).await;
+                arm_terminal_send_deadline(deadline, &mut send_deadline);
+                emit_responses_failure(&sender, send_deadline, &mut encoder, &failure).await;
                 guard
                     .settle("failed", usage.as_ref(), &tool_names, Some(&failure), true)
                     .await;
@@ -777,7 +779,6 @@ async fn stream_responses(
         // Mirror any prefix-peeked first token before a start-frame send can cancel and drop it.
         guard.record_first_token(committed.relay.first_token_at());
         let mut prefix: std::collections::VecDeque<Event> = committed.prefix.drain(..).collect();
-        let mut send_deadline = deadline;
         let start_frames = match encoder.start() {
             Ok(frames) => frames,
             Err(_) => {
@@ -844,6 +845,9 @@ async fn stream_responses(
                 }
             };
             track_event(&event, &mut usage, &mut tool_names);
+            if event.is_terminal() {
+                arm_terminal_send_deadline(deadline, &mut send_deadline);
+            }
             if matches!(event, Event::Failed(_)) {
                 usage = committed.relay.usage_before_failure(usage.take());
             }
@@ -866,9 +870,7 @@ async fn stream_responses(
                 Ok(events) => events,
                 Err(failure) => fail_stream!(failure),
             };
-            // The terminal is recorded before its frames flush, so a
-            // disconnect during the final flush still settles by the
-            // provider's outcome instead of as a cancellation.
+            // Record the terminal before flushing, so disconnects still settle its outcome.
             if guarded {
                 for released in &outward_events {
                     retention.track(released);
@@ -979,7 +981,7 @@ async fn stream_responses(
         }
         finish_stream_terminal(
             &sender,
-            deadline,
+            send_deadline,
             &mut lease,
             replayable,
             &mut capture,

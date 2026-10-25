@@ -402,13 +402,18 @@ class AzureResponsesClient(OpenAIClient):
         self._api_version = api_version
 
     def gateway_wire_profile(self) -> GatewayWireProfile:
-        """Return the Responses wire profile without OpenAI's own cache-lifetime field.
+        """Return the Responses wire profile without direct-OpenAI-only capabilities.
 
         ``prompt_cache_options.ttl`` is carried only by OpenAI's own Responses API
         (``GatewayWireProfile.forwards_prompt_cache_ttl``); an Azure deployment declines a
-        12-hour lifetime request so admission prefers a rung that honors it.
+        12-hour lifetime request so admission prefers a rung that honors it. Azure
+        does not expose the direct OpenAI Decisions route.
         """
-        return replace(super().gateway_wire_profile(), forwards_prompt_cache_ttl=False)
+        return replace(
+            super().gateway_wire_profile(),
+            forwards_prompt_cache_ttl=False,
+            openai_decisions_url=None,
+        )
 
     def _headers(self) -> dict[str, str]:
         """Return Azure ``api-key`` authentication headers without a Bearer token."""

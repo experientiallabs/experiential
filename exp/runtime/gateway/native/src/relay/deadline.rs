@@ -68,9 +68,7 @@ impl super::UpstreamRelay {
         if !terminal_pending {
             return remaining(deadline).is_zero();
         }
-        if *send == deadline {
-            *send = deadline.max(Instant::now()) + crate::respond::TERMINAL_FRAME_GRACE;
-        }
+        crate::respond::arm_terminal_send_deadline(deadline, send);
         false
     }
 }

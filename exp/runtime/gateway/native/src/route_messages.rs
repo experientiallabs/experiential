@@ -30,8 +30,8 @@ use crate::metrics::{classify_escalation, METRICS};
 use crate::reasoning_display::ReasoningOutput;
 use crate::relay::{collect_committed, collection_public_error, track_event};
 use crate::respond::{
-    bearer_key, client_ip, complete_visible_refusal, escalation_error, json_response,
-    latin1_header_list, outward_event, read_body, send_bounded, settle_stream_end,
+    arm_terminal_send_deadline, bearer_key, client_ip, complete_visible_refusal, escalation_error,
+    json_response, latin1_header_list, outward_event, read_body, send_bounded, settle_stream_end,
     sse_body_response, with_app_identity,
 };
 use crate::respond::{log_stream_exit, stream_delivery::Delivery};
@@ -674,16 +674,18 @@ async fn stream_messages(
         // window the detector cannot yet decide about is withheld.
         let mut output_guardrails = StreamGuardrails::new(&request_id, incremental_guardrail);
         let mut empty_completion = false;
+        let mut send_deadline = deadline;
 
         macro_rules! fail_stream {
             ($failure:expr) => {{
                 committed.relay.close_transport();
                 log_stream_exit(&request_id, "provider_or_encoding_failure");
                 let failure = $failure.boundary();
+                arm_terminal_send_deadline(deadline, &mut send_deadline);
                 guard
                     .settle("failed", usage.as_ref(), &tool_names, Some(&failure), true)
                     .await;
-                emit_messages_failure(&sender, deadline, &mut encoder, &failure).await;
+                emit_messages_failure(&sender, send_deadline, &mut encoder, &failure).await;
                 return;
             }};
         }
@@ -696,7 +698,6 @@ async fn stream_messages(
         encoder.set_initial_usage(usage.clone());
         encoder.set_pre_dispatch_input_estimate(admission.input_token_estimate);
         let mut prefix: std::collections::VecDeque<Event> = committed.prefix.drain(..).collect();
-        let mut send_deadline = deadline;
         let start_frames = match encoder.start() {
             Ok(frames) => frames,
             Err(_) => {
@@ -760,6 +761,9 @@ async fn stream_messages(
                 }
             };
             track_event(&event, &mut usage, &mut tool_names);
+            if event.is_terminal() {
+                arm_terminal_send_deadline(deadline, &mut send_deadline);
+            }
             if matches!(event, Event::Failed(_)) {
                 usage = committed.relay.usage_before_failure(usage.take());
             }
@@ -894,7 +898,7 @@ async fn stream_messages(
 }
 
 /// Emit the Messages encoder's sanitized failure lifecycle (one Anthropic
-/// `error` event) when the stream has not already reached a terminal.
+/// `error` event) within the already-armed send bound, unless already terminal.
 async fn emit_messages_failure(
     sender: &mpsc::Sender<Result<Bytes, std::io::Error>>,
     deadline: Instant,
@@ -907,10 +911,39 @@ async fn emit_messages_failure(
     let frames = encoder
         .feed(&Event::Failed(failure.clone()))
         .unwrap_or_default();
-    let deadline = crate::respond::terminal_send_deadline(deadline);
     for frame in frames {
         if !send_bounded(sender, deadline, Bytes::from(frame)).await {
             return;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn messages_failure_does_not_renew_an_expired_send_bound() {
+        let (sender, mut receiver) = mpsc::channel(1);
+        sender
+            .send(Ok(Bytes::from_static(b"prefix")))
+            .await
+            .unwrap();
+        let mut encoder = MessagesSseEncoder::new("request", "model");
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            emit_messages_failure(
+                &sender,
+                Instant::now() - Duration::from_millis(1),
+                &mut encoder,
+                &Failure::new(FailureClass::Timeout, "timed out"),
+            ),
+        )
+        .await
+        .expect("a failure tail must use its existing send bound");
+        assert_eq!(receiver.recv().await.unwrap().unwrap(), "prefix");
+        assert!(receiver.try_recv().is_err());
     }
 }

@@ -381,14 +381,6 @@ def collect_provider_connection(
     if provider == "azure":
         assert base_url is not None
         inferred_surface = infer_azure_api_surface(base_url)
-        default_api_version = (
-            MODEL_INFERENCE_FALLBACK_API_VERSION if inferred_surface == "model_inference" else "v1"
-        )
-        api_version = ask_text(
-            "Azure OpenAI API version", console=console, default=default_api_version
-        )
-        if not api_version:
-            return None
         selected_surface = ask_text(
             "Azure API surface",
             console=console,
@@ -399,6 +391,14 @@ def collect_provider_connection(
         if selected_surface not in get_args(AzureApiSurface):
             raise ValueError(f"unsupported Azure API surface {selected_surface!r}")
         azure_api_surface = cast(AzureApiSurface, selected_surface)
+        default_api_version = (
+            MODEL_INFERENCE_FALLBACK_API_VERSION if selected_surface == "model_inference" else "v1"
+        )
+        api_version = ask_text(
+            "Azure OpenAI API version", console=console, default=default_api_version
+        )
+        if not api_version:
+            return None
     if provider == "bedrock":
         region = (
             ask_text(

@@ -18,8 +18,8 @@ use crate::guardrails::StreamGuardrails;
 use crate::relay::track_event;
 use crate::replay::OwnerLease;
 use crate::respond::{
-    capture_frame, failure_frames, finish_stream_terminal, log_stream_exit, outward_event,
-    settle_stream_end, stream_delivery::Delivery,
+    arm_terminal_send_deadline, capture_frame, failure_frames, finish_stream_terminal,
+    log_stream_exit, outward_event, settle_stream_end, stream_delivery::Delivery,
 };
 use crate::settlement::AttemptGuard;
 use crate::tool_search::configure_chat_encoder;
@@ -77,12 +77,14 @@ pub(super) async fn stream_response(
         // Deterministic output redaction as bytes flow: only the trailing
         // window the detector cannot yet decide about is withheld.
         let mut output_guardrails = StreamGuardrails::new(&request_id, incremental_guardrail);
+        let mut send_deadline = deadline;
 
         macro_rules! fail_stream {
             ($failure:expr) => {{
                 committed.relay.close_transport();
                 log_stream_exit(&request_id, "provider_or_encoding_failure");
                 let failure = $failure.boundary();
+                arm_terminal_send_deadline(deadline, &mut send_deadline);
                 let frames = failure_frames(&mut encoder, &failure);
                 if !guard
                     .settle("failed", usage.as_ref(), &tool_names, Some(&failure), true)
@@ -93,7 +95,7 @@ pub(super) async fn stream_response(
                 }
                 finish_stream_terminal(
                     &sender,
-                    deadline,
+                    send_deadline,
                     &mut lease,
                     replayable,
                     &mut capture,
@@ -108,7 +110,6 @@ pub(super) async fn stream_response(
         // Mirror any prefix-peeked first token before a start-frame send can cancel and drop it.
         guard.record_first_token(committed.relay.first_token_at());
         let mut prefix: std::collections::VecDeque<Event> = committed.prefix.drain(..).collect();
-        let mut send_deadline = deadline;
         let start_frames = match encoder.start() {
             Ok(frames) => frames,
             Err(_) => {
@@ -177,6 +178,9 @@ pub(super) async fn stream_response(
                 }
             };
             track_event(&event, &mut usage, &mut tool_names);
+            if event.is_terminal() {
+                arm_terminal_send_deadline(deadline, &mut send_deadline);
+            }
             if matches!(event, Event::Failed(_)) {
                 usage = committed.relay.usage_before_failure(usage.take());
             }
@@ -249,7 +253,7 @@ pub(super) async fn stream_response(
                     // so keyed owners publish the exact byte stream first.
                     finish_stream_terminal(
                         &sender,
-                        deadline,
+                        send_deadline,
                         &mut lease,
                         replayable,
                         &mut capture,
