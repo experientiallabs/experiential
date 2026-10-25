@@ -261,7 +261,7 @@ activation steps first; if manual review is required, wait for approval.
 Payment does not bypass review. After approval, ask me to complete card verification at
 https://platform.experientiallabs.ai/credits to unlock free models (a one-time
 $1 charge credited to my balance), or add credits for paid calls.
-BYOK pass-through on my connected keys is unaffected.
+BYOK does not draw platform credits, but still requires review approval.
 
 ## 3. Start calling models on the gateway
 
@@ -287,8 +287,8 @@ have mine, ask me.
 
 2. Check activation and funding in the platform before making a call. If review
    is required, wait for approval. For a Free account, ask me to complete card verification
-   and select an available core model from step 1 (GPT-6 Luna, DeepSeek V4.1 Flash
-   or Clef, with Jev for existing accounts). Do not charge my card without explicit
+   and select an available core chat model from step 1 (GPT-6 Luna or DeepSeek V4.1 Flash).
+   Clef and Jev use the native decisions API, not chat. Do not charge my card without explicit
    approval. Other models require funded credits; ask before purchasing any.
    First call with the OpenAI SDK (Chat Completions): send ONE minimal completion
    to that verified, available model. Send a MINIMAL request body: model + messages
@@ -459,7 +459,9 @@ step 2) as the bearer token on every call below.
    by batch id and record hash).
    If you can't: skip it and tell me — this step is optional.
 
-8. Offer to repoint ALL my coding agents at the gateway. Ask me first, then for
+8. Before repointing any client, follow the returned overview_url's activation steps.
+   If manual review is required, wait for approval; this also applies to BYOK.
+   Offer to repoint ALL my coding agents at the gateway. Ask me first, then for
    each coding agent I actually use, set its OpenAI-compatible (or Anthropic)
    base URL to https://api.experientiallabs.ai/v1 and its key to my xpl_ key (EXPLABS_API_KEY). Put the
    key in env, never in committed config, and show me each change before you make
@@ -474,8 +476,6 @@ step 2) as the bearer token on every call below.
    - Conductor: if I run my agents through Conductor, set the gateway as the
      upstream OpenAI-compatible provider there (base URL https://api.experientiallabs.ai/v1 + my xpl_ key)
      so every agent it orchestrates routes through Experiential.
-   Before any test call, follow the returned overview_url's activation steps.
-   If manual review is required, wait for approval; this also applies to BYOK.
    After each repoint, make one tiny test call (model + messages only) through
    that agent's client to confirm it routes. Use a model served by one of the
    provider keys I connected in step 6 so it runs as free BYOK pass-through:
@@ -498,4 +498,4 @@ activation steps first; if manual review is required, wait for approval.
 Payment does not bypass review. After approval, ask me to complete card verification at
 https://platform.experientiallabs.ai/credits to unlock free models (a one-time
 $1 charge credited to my balance), or add credits for paid calls.
-BYOK pass-through on my connected keys is unaffected.
+BYOK does not draw platform credits, but still requires review approval.
