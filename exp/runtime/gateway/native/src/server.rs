@@ -243,6 +243,7 @@ pub async fn run(
         permits: Arc::new(Semaphore::new(max_active_requests)),
         dispatch_capacity: Arc::new(crate::dispatch_capacity::DispatchCapacity::new(
             config.max_active_per_organization,
+            config.permit_priority_aging_seconds,
         )),
         permit_queue: Arc::new(crate::permit_queue::PermitQueue::new(
             config.permit_priority_aging_seconds,
