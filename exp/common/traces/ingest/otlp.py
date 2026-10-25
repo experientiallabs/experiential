@@ -414,10 +414,7 @@ def _normalize_trace_group(
 def _normalize_span(raw: JsonObject, attributes: JsonObject) -> TraceSpan:
     """Validate one GenAI span and convert it to the canonical span contract."""
     span_id = _validate_w3c_id(_required_text(raw.get("spanId"), "spanId"), kind="span")
-    parent_raw = raw.get("parentSpanId")
-    parent_span_id = None
-    if parent_raw is not None:
-        parent_span_id = _validate_w3c_id(_required_text(parent_raw, "parentSpanId"), kind="span")
+    parent_span_id = _parent_span_id(raw)
     name = _required_text(raw.get("name"), "span name")
     started_at = _timestamp(raw.get("startTimeUnixNano"), "startTimeUnixNano")
     ended_at = _timestamp(raw.get("endTimeUnixNano"), "endTimeUnixNano")
@@ -704,6 +701,28 @@ def _first_text(attributes: JsonObject, keys: tuple[str, ...]) -> str | None:
         if isinstance(value, str) and value.strip():
             return normalize_durable_text(value.strip())
     return None
+
+
+def _parent_span_id(raw: JsonObject) -> str | None:
+    """Return a span's parent ID, treating OTLP's empty default as a root.
+
+    The trace proto requires ``parent_span_id`` to be empty for a root span. JSON
+    exporters either omit ``parentSpanId`` or emit an empty string for that default.
+    A present, nonempty value must still be a non-zero W3C span ID.
+
+    Args:
+        raw: Source span object.
+
+    Returns:
+        Canonical parent span ID, or ``None`` when this span is a root.
+
+    Raises:
+        OtlpTraceFormatError: A declared parent ID is blank or not a W3C span ID.
+    """
+    parent_raw = raw.get("parentSpanId")
+    if parent_raw is None or parent_raw == "":
+        return None
+    return _validate_w3c_id(_required_text(parent_raw, "parentSpanId"), kind="span")
 
 
 def _required_text(value: JsonValue | None, label: str) -> str:

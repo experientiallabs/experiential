@@ -362,6 +362,48 @@ def test_invalid_w3c_identity_excludes_the_trace_with_a_clear_issue() -> None:
     assert "W3C ID" in result.issues[0].message
 
 
+def test_empty_otlp_parent_span_id_is_a_root_span() -> None:
+    """An empty parentSpanId is the OTLP default for a root span, same as omitting it."""
+    omitted = normalize_otlp_payload(_payload(), source=_source())
+    empty = _payload()
+    _span(empty, 0)["parentSpanId"] = ""
+
+    result = normalize_otlp_payload(empty, source=_source())
+
+    assert omitted.issues == ()
+    assert result.issues == ()
+    assert len(result.traces) == 1
+    assert result.traces[0].spans[0].parent_span_id is None
+    assert omitted.traces[0].spans[0].parent_span_id is None
+    assert result.traces[0].spans[1].parent_span_id == _CALL_SPAN_ID
+    assert result.traces[0].task == omitted.traces[0].task
+
+
+@pytest.mark.parametrize(
+    ("parent", "message"),
+    [
+        (" ", "parentSpanId must be non-empty text"),
+        ("not-a-span", "span ID must be a non-zero lowercase 16-hex W3C ID"),
+        ("0000000000000000", "span ID must be a non-zero lowercase 16-hex W3C ID"),
+    ],
+)
+def test_malformed_otlp_parent_span_id_still_excludes_the_trace(parent: str, message: str) -> None:
+    """A present parent ID that is not empty still has to be a W3C span ID.
+
+    Args:
+        parent: Declared parentSpanId value.
+        message: Exclusion text the normalizer must keep.
+    """
+    payload = _payload()
+    _span(payload, 0)["parentSpanId"] = parent
+
+    result = normalize_otlp_payload(payload, source=_source())
+
+    assert result.traces == ()
+    assert len(result.issues) == 1
+    assert message in result.issues[0].message
+
+
 def test_jsonl_preserves_a_malformed_line_as_an_explicit_exclusion(tmp_path: Path) -> None:
     payload = _payload()
     path = tmp_path / "traces.jsonl"
