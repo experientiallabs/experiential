@@ -4810,3 +4810,19 @@ def test_recovery_shutdown_retains_transport_ownership_until_blocking_write_ends
     finally:
         release.set()
         accounting.close(5)
+
+
+def test_idle_recovery_shutdown_flushes_retained_request_meter() -> None:
+    """Close wakes an idle sweep and cannot discard a known failed-write meter."""
+    ledger = _RecordingLedger()
+    accounting = NativeAttemptAccounting(ledger)
+    failure = GatewayFailure(failure_class=GatewayFailureClass.CANCELLED, safe_message="cancelled")
+    ledger.fail_request_finishes = 1
+    with pytest.raises(RuntimeError):
+        accounting.request_settlements.finish(
+            _authorization(_DIGEST), failure, certify_no_effects=False, web_search_requests=1
+        )
+    assert not accounting.accounting_healthy
+    assert accounting.close(5)
+    assert ledger.request_search_meters == [1]
+    assert accounting.accounting_healthy

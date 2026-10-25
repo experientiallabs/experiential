@@ -904,11 +904,18 @@ class NativeAttemptAccounting:
 
     def _sweep_loop(self) -> None:
         """Periodically reconcile retained or expired attempts for the process lifetime."""
-        while not self._stop_sweeper.wait(_SWEEP_INTERVAL_SECONDS):
+        while True:
+            closing = self._stop_sweeper.wait(_SWEEP_INTERVAL_SECONDS)
+            if closing and self.accounting_healthy:
+                return
             try:
                 self.sweep_expired()
             except Exception as error:  # noqa: BLE001 - retain work and keep recovery alive.
                 _logger.warning("gateway recovery pass failed: %s", type(error).__name__)
+            # Closing recovery retains ownership and its retry cadence until
+            # every known meter has reached the durable ledger.
+            if closing:
+                time.sleep(_SWEEP_INTERVAL_SECONDS)
 
     def close(self, timeout_seconds: float = 10.0) -> bool:
         """Stop owned recovery before a host closes its durable transport.
@@ -921,7 +928,7 @@ class NativeAttemptAccounting:
             raise ValueError("recovery shutdown timeout must be between zero and 300 seconds")
         self._stop_sweeper.set()
         self._sweeper.join(timeout_seconds)
-        return not self._sweeper.is_alive()
+        return not self._sweeper.is_alive() and self.accounting_healthy
 
     def sweep_expired(self) -> None:
         """Recover a fair bounded selection without running in admission callbacks."""
