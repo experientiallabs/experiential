@@ -4783,3 +4783,30 @@ def test_delayed_first_sweep_does_not_renew_expired_cache_evidence(
     )
     assert len(ledger.finished) == 1
     assert decision.deployment_id is None and decision.warm_remaining_seconds == 0
+
+
+def test_recovery_shutdown_retains_transport_ownership_until_blocking_write_ends(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A host cannot close the durable client while recovery still owns a write."""
+    from exp.runtime.gateway import native_accounting
+
+    entered, release = threading.Event(), threading.Event()
+
+    def recover(accounting: NativeAttemptAccounting) -> None:
+        del accounting
+        entered.set()
+        assert release.wait(5)
+
+    monkeypatch.setattr(native_accounting, "_SWEEP_INTERVAL_SECONDS", 0.01)
+    monkeypatch.setattr(native_accounting, "recover_expired", recover)
+    accounting = NativeAttemptAccounting(_RecordingLedger())
+    try:
+        assert entered.wait(5)
+        assert not accounting.close(0)
+        release.set()
+        assert accounting.close(5)
+        assert accounting.close(0)
+    finally:
+        release.set()
+        accounting.close(5)

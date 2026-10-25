@@ -1,5 +1,5 @@
 version = 1
-revision = 5
+revision = 3
 requires-python = ">=3.12"
 resolution-markers = [
     "python_full_version >= '3.14' and sys_platform == 'win32'",
@@ -15,12 +15,12 @@ exclude-newer = "0001-01-01T00:00:00Z" # This has no effect and is included for 
 exclude-newer-span = "P7D"
 
 [options.exclude-newer-package]
-certifi = "2026-10-21T00:00:00Z"
 exp-gateway-native = false
 exp-mitmproxy = false
-exp-mitmproxy-rs = false
+certifi = "2026-10-21T00:00:00Z"
 experiential = false
 filelock = "2026-10-18T00:00:00Z"
+exp-mitmproxy-rs = false
 
 [[package]]
 name = "aiohappyeyeballs"

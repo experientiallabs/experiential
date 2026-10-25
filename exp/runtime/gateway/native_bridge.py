@@ -272,6 +272,10 @@ class NativeControlPlane(
         # request, and a corrupt table fails startup with its own message.
         reservation_encoder()
 
+    def close(self, timeout_seconds: float = 10.0) -> bool:
+        """Stop background recovery after the native data plane has drained."""
+        return self._accounting.close(timeout_seconds)
+
     @property
     def guardrail_detectors(self) -> dict[str, deterministic.NativeDetector]:
         """Return the compiled deterministic rules the data plane enforces."""

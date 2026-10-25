@@ -188,6 +188,7 @@ class NativeAttemptAccounting:
         self._throttle_backoff_redials = 0
         self._throttle_backoff_forced = 0
         # Reconcile retained writes and abandoned requests even without new traffic.
+        self._stop_sweeper = threading.Event()
         self._sweeper = threading.Thread(
             target=self._sweep_loop,
             name="exp-native-settlement-sweep",
@@ -903,12 +904,24 @@ class NativeAttemptAccounting:
 
     def _sweep_loop(self) -> None:
         """Periodically reconcile retained or expired attempts for the process lifetime."""
-        while True:
-            time.sleep(_SWEEP_INTERVAL_SECONDS)
+        while not self._stop_sweeper.wait(_SWEEP_INTERVAL_SECONDS):
             try:
                 self.sweep_expired()
             except Exception as error:  # noqa: BLE001 - retain work and keep recovery alive.
                 _logger.warning("gateway recovery pass failed: %s", type(error).__name__)
+
+    def close(self, timeout_seconds: float = 10.0) -> bool:
+        """Stop owned recovery before a host closes its durable transport.
+
+        Hosts drain data-plane callbacks first. A timeout leaves the transport
+        owned by recovery; the caller must not close it underneath that thread.
+        Durable reservations remain pending when no trustworthy meter exists.
+        """
+        if not 0 <= timeout_seconds <= 300:
+            raise ValueError("recovery shutdown timeout must be between zero and 300 seconds")
+        self._stop_sweeper.set()
+        self._sweeper.join(timeout_seconds)
+        return not self._sweeper.is_alive()
 
     def sweep_expired(self) -> None:
         """Recover a fair bounded selection without running in admission callbacks."""
