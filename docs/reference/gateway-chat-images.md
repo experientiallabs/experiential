@@ -24,3 +24,6 @@ decoding; their dimensions must agree, and their RGBA buffers must also fit with
 Known image-emitting models on unsupported completion surfaces are refused before dispatch; use
 Chat Completions or a separately supported Images API route. The Images API capability remains
 independent.
+
+An `input_image.detail` of `original` (OpenAI's full-resolution level, sent by Codex) is accepted on
+both OpenAI surfaces: the Responses wire forwards it verbatim and Chat Completions carries it as `high`.

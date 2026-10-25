@@ -863,9 +863,138 @@ def test_tool_result_images_degrade_with_placeholder_on_a_non_vision_route() -> 
     assert coercion.disclosures == (TOOL_RESULT_IMAGE_DROP_DISCLOSURE,)
 
 
-def test_top_level_user_images_keep_the_fail_closed_contract() -> None:
-    """A user image the caller can re-send never degrades silently."""
-    assert coerce_capability("image_input", _tool_image_request(user_image=True)) is None
+def test_user_images_degrade_with_placeholder_beside_tool_images() -> None:
+    """A pasted user image degrades like a tool screenshot instead of refusing.
+
+    Both live in the history an agent resends every turn, so refusing either
+    wedges the thread; each image becomes placeholder text in place and each
+    kind is disclosed.
+    """
+    from exp.runtime.models.providers.dialect_dispatch import (
+        IMAGE_INPUT_DEFAULT_NOTICE,
+        IMAGE_INPUT_DROP_DISCLOSURE,
+    )
+    from exp.runtime.models.providers.streaming_requests import (
+        TOOL_RESULT_IMAGE_DROP_DISCLOSURE,
+        TOOL_RESULT_IMAGE_PLACEHOLDER,
+    )
+
+    coercion = coerce_capability("image_input", _tool_image_request(user_image=True))
+    assert coercion is not None
+    user, tool = coercion.request.messages
+    assert user.content_parts == ()
+    # The only user turn is the latest: the model is asked to tell the user.
+    assert user.content == "go" + IMAGE_INPUT_DEFAULT_NOTICE
+    assert tool.content == "tool said:" + TOOL_RESULT_IMAGE_PLACEHOLDER
+    assert coercion.request.images == ()
+    assert coercion.disclosures == (
+        TOOL_RESULT_IMAGE_DROP_DISCLOSURE,
+        IMAGE_INPUT_DROP_DISCLOSURE,
+    )
+
+
+def test_user_image_keeps_other_attachments_in_place() -> None:
+    """Only image parts are replaced; a document beside them keeps its slot."""
+    from exp.common.models.content import (
+        DocumentContentPart,
+        ImageContentPart,
+        TextContentPart,
+    )
+    from exp.runtime.models.providers.dialect_dispatch import IMAGE_INPUT_DEFAULT_NOTICE
+
+    pdf = DocumentContentPart(media_type="application/pdf", data="JVBERi0xLjQK")
+    request = GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=(
+            GatewayMessage(
+                role="user",
+                content="see",
+                content_parts=(
+                    TextContentPart(text="see"),
+                    ImageContentPart(media_type="image/png", data="aGk="),
+                    pdf,
+                ),
+            ),
+        ),
+    )
+    coercion = coerce_capability("image_input", request)
+    assert coercion is not None
+    (message,) = coercion.request.messages
+    assert message.content_parts == (
+        TextContentPart(text="see"),
+        TextContentPart(text=IMAGE_INPUT_DEFAULT_NOTICE),
+        pdf,
+    )
+    assert message.content == "see" + IMAGE_INPUT_DEFAULT_NOTICE
+
+
+def test_only_the_latest_user_turn_asks_the_model_to_surface_the_error() -> None:
+    """Show the error, keep the history alive (owner, 2026-10-25).
+
+    A resent image in an earlier turn becomes a bare marker so the model does
+    not repeat the error every turn; the latest turn's image carries the
+    host's per-model copy when one is authored, else the default notice.
+    """
+    from exp.common.models.content import ImageContentPart, TextContentPart
+    from exp.runtime.models.providers.dialect_dispatch import (
+        IMAGE_INPUT_DEFAULT_NOTICE,
+        IMAGE_INPUT_PLACEHOLDER,
+        image_input_notice,
+    )
+
+    def user_image(text: str) -> GatewayMessage:
+        return GatewayMessage(
+            role="user",
+            content=text,
+            content_parts=(
+                TextContentPart(text=text),
+                ImageContentPart(media_type="image/png", data="aGk="),
+            ),
+        )
+
+    request = GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=(
+            user_image("old"),
+            GatewayMessage(role="assistant", content="ok"),
+            user_image("new"),
+        ),
+    )
+    coercion = coerce_capability("image_input", request)
+    assert coercion is not None
+    old, _assistant, new = coercion.request.messages
+    assert old.content == "old" + IMAGE_INPUT_PLACEHOLDER
+    assert new.content == "new" + IMAGE_INPUT_DEFAULT_NOTICE
+
+    copy = "We're rejecting images on this model for now."
+    custom = coerce_capability("image_input", request, copy)
+    assert custom is not None
+    assert custom.request.messages[0].content == "old" + IMAGE_INPUT_PLACEHOLDER
+    assert custom.request.messages[2].content == "new" + image_input_notice(copy)
+    assert image_input_notice(copy) == (
+        "[image not processed: this model does not accept image input. "
+        "Tell the user exactly this: We're rejecting images on this model for now.]"
+    )
+    # Blank copy is no copy.
+    assert image_input_notice("  ") == IMAGE_INPUT_DEFAULT_NOTICE
+
+
+def test_a_request_of_nothing_but_images_keeps_the_refusal() -> None:
+    """With no caller text the placeholder would be all the model sees."""
+    from exp.common.models.content import ImageContentPart
+
+    image_only = GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=(
+            GatewayMessage(role="system", content="You are helpful."),
+            GatewayMessage(
+                role="user",
+                content="",
+                content_parts=(ImageContentPart(media_type="image/png", data="aGk="),),
+            ),
+        ),
+    )
+    assert coerce_capability("image_input", image_only) is None
     # And a request with no images at all offers nothing to coerce.
     assert (
         coerce_capability(

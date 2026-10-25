@@ -44,7 +44,9 @@ def openai_chat_image_part(image: ImageContentPart) -> JsonObject:
         raise ProviderCapabilityError(capability=MEDIA_HANDLE_CAPABILITY)
     image_url: JsonObject = {"url": image.data_url()}
     if image.detail is not None:
-        image_url["detail"] = image.detail
+        # Chat Completions defines no ``original`` level; ``high`` is the
+        # closest fidelity it accepts.
+        image_url["detail"] = "high" if image.detail == "original" else image.detail
     return {"type": "image_url", "image_url": image_url}
 
 

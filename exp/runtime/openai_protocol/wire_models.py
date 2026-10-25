@@ -23,6 +23,7 @@ from exp.common.models.content import (
     MAXIMUM_DOCUMENT_NAME_CHARACTERS,
     MAXIMUM_IMAGE_BASE64_BYTES,
     MAXIMUM_VIDEO_BASE64_BYTES,
+    ImageDetail,
     ImageMediaType,
 )
 from exp.common.models.model import MAXIMUM_TOOL_CALL_ID_CHARACTERS, ReasoningEffort
@@ -87,7 +88,7 @@ class _TextPart(_WireModel):
         return value
 
 
-_ImageDetail = Literal["auto", "low", "high"]
+_ImageDetail = ImageDetail
 """Caller fidelity hint forwarded verbatim to the wires that accept it."""
 
 _MAXIMUM_IMAGE_URL_CHARACTERS = MAXIMUM_IMAGE_BASE64_BYTES + 128

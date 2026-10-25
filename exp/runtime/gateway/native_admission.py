@@ -125,7 +125,7 @@ def admitted_route_requests(
     """
     request = fast_request(without_prompt_caching(request, authorization), authorization)
     route, resolved_wires, public_request, provider_request, disclosures = prepare_route_requests(
-        route, resolved_wires, request, authorization.fast
+        route, resolved_wires, request, authorization.fast, authorization.image_input_notice
     )
     require_fast_path(provider_request, authorization)
     if disclosures:
@@ -243,6 +243,7 @@ def prepare_route_requests(
     resolved_wires: _ResolvedWires,
     request: GatewayRequest,
     fast: bool = False,
+    image_input_notice: str | None = None,
 ) -> tuple[GatewayRoute, _ResolvedWires, GatewayRequest, GatewayRequest, tuple[str, ...]]:
     """Pure capability filtering and shaping, with disclosures returned but never recorded.
 
@@ -402,7 +403,7 @@ def prepare_route_requests(
         # a unanimous capability rejection coerces any coercible capability,
         # mixed rejections only the service-tier hint.
         coercion = coerce_route_rejections(
-            protocol_errors, len(route.deployments), admitted_request
+            protocol_errors, len(route.deployments), admitted_request, image_input_notice
         )
         if coercion is not None:
             admitted_request = coercion.request

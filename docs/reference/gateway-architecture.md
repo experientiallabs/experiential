@@ -595,8 +595,9 @@ and the route discloses `messages.content.tool_result.image->following_user_mess
 `messages.content.tool_result.document->following_user_message`; the attachment ceilings and
 size bounds apply as for top-level user attachments. A route with no image (or PDF) input at
 all degrades the attachment to placeholder text, disclosed as
-`messages.content.tool_result.image->placeholder` (or `messages.content.tool_result.document->placeholder`);
-a top-level user attachment keeps the fail-closed contract because the caller can re-send it.
+`messages.content.tool_result.image->placeholder` (or `...document->placeholder`); a user-turn image degrades too,
+disclosed `messages.content.image->placeholder`: the latest user turn asks the model to tell the user (quoting
+`AuthorizationSnapshot.image_input_notice` when set), earlier turns get `[image not processed]`; image-only requests stay refused.
 Both OpenAI surfaces accept the Vercel AI SDK's camelCase `promptCacheKey` (sent verbatim by
 opencode and other `ai-sdk` coding clients) as an alias of `prompt_cache_key`: it is renamed
 before manifest validation and decodes exactly as the documented field. When both spellings
@@ -921,7 +922,7 @@ metric; every serving surface carries that list to the caller as a body-level
 Anthropic message on both `message_start` and the aggregated body), so a drop is never silent; nothing coercible keeps the first rung's own field-scoped rejection.
 When a coercion APPLIES but none SERVES (every candidate dies one layer later, on a blocker
 unrelated to the coerced field), admission carries the unprobed coercion forward so the stage
-that actually refuses names the caller's remedy: an image on a text-only reasoning route is
+that actually refuses names the caller's remedy: an image-only turn on a text-only reasoning route is
 refused on `messages`, never as an unsupported `thinking` field that merely rode along.
 Thinking disclosures name an applied translation, not consent to drop a cost constraint.
 An explicit off setting must be enforceable on the selected wire; otherwise admission refuses
