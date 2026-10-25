@@ -956,6 +956,126 @@ def test_tool_result_image_degrades_with_disclosure_on_a_non_vision_route(stream
     assert accounting.recorded == 1
 
 
+def _pasted_screenshot_request(surface: GatewayApiSurface) -> GatewayRequest:
+    """Decode a coding-agent turn whose history carries a pasted user screenshot.
+
+    One body per public surface: the image rides as a Chat ``image_url`` part,
+    a Responses ``input_image`` part, or an Anthropic ``image`` block, in an
+    earlier user turn that the agent resends on every later turn.
+    """
+    from exp.runtime.anthropic_protocol.requests import decode_messages
+    from exp.runtime.openai_protocol.requests import decode_responses
+
+    data_url = f"data:image/png;base64,{_TOOL_IMAGE_PNG}"
+    match surface:
+        case GatewayApiSurface.CHAT_COMPLETIONS:
+            image: JsonObject = {"type": "image_url", "image_url": {"url": data_url}}
+            text: JsonObject = {"type": "text", "text": "what is wrong here?"}
+            decoded = decode_chat(
+                {
+                    "model": "coding",
+                    "messages": [
+                        {"role": "user", "content": [text, image]},
+                        {"role": "assistant", "content": "I cannot tell yet."},
+                        {"role": "user", "content": "try again"},
+                    ],
+                }
+            )
+        case GatewayApiSurface.RESPONSES:
+            decoded = decode_responses(
+                {
+                    "model": "coding",
+                    "input": [
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "input_text", "text": "what is wrong here?"},
+                                {"type": "input_image", "image_url": data_url},
+                            ],
+                        },
+                        {"role": "user", "content": "try again"},
+                    ],
+                }
+            )
+        case _:
+            decoded = decode_messages(
+                {
+                    "model": "coding",
+                    "max_tokens": 128,
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": "what is wrong here?"},
+                                {
+                                    "type": "image",
+                                    "source": {
+                                        "type": "base64",
+                                        "media_type": "image/png",
+                                        "data": _TOOL_IMAGE_PNG,
+                                    },
+                                },
+                            ],
+                        },
+                        {"role": "assistant", "content": "I cannot tell yet."},
+                        {"role": "user", "content": "try again"},
+                    ],
+                }
+            )
+    return decoded.request.model_copy(update={"include_usage": True})
+
+
+@pytest.mark.parametrize(
+    "surface",
+    [
+        GatewayApiSurface.CHAT_COMPLETIONS,
+        GatewayApiSurface.RESPONSES,
+        GatewayApiSurface.MESSAGES,
+    ],
+)
+def test_user_image_degrades_with_disclosure_on_a_text_only_route(
+    surface: GatewayApiSurface,
+) -> None:
+    """A pasted screenshot serves as placeholder text instead of a refusal.
+
+    The customer report (2026-10-25): an agent that once sent an image to a
+    text-only model got every later turn refused, because the image stays in
+    the history it resends. The text-only route now answers with the image
+    replaced in place and ``ignored_parameters`` naming the drop.
+    """
+    from exp.runtime.models.providers.dialect_dispatch import (
+        IMAGE_INPUT_DROP_DISCLOSURE,
+        IMAGE_INPUT_PLACEHOLDER,
+    )
+
+    text_only = GatewayDeploymentMetadata(
+        capabilities=GatewayDeploymentCapabilities(
+            supports_streaming=True,
+            supports_streaming_tool_arguments=True,
+        )
+    )
+    deployments = (_deployment("vllm", gateway=text_only),)
+    route = _mixed_route("maximize_availability", deployments, surface)
+    client = cast(NativeWireClient, object())
+    wires = ((GatewayWireProfile(dialect="openai_compatible", url="https://vllm.test"), client),)
+    accounting = _AdmissionCoercionCounter()
+
+    _narrowed, _wires_out, public, provider, _placement = admitted_route_requests(
+        route,
+        wires,
+        _pasted_screenshot_request(surface),
+        accounting=cast(NativeAttemptAccounting, accounting),
+        authorization=route.snapshot.authorization,
+    )
+
+    first = provider.messages[0]
+    assert first.content_parts == ()
+    assert first.content == "what is wrong here?" + IMAGE_INPUT_PLACEHOLDER
+    assert provider.images == ()
+    assert IMAGE_INPUT_DROP_DISCLOSURE in public.ignored_parameters
+    assert accounting.recorded == 1
+
+
 @pytest.mark.parametrize("stream", [True, False])
 def test_tool_result_pdf_degrades_with_disclosure_on_a_pdf_incapable_route(stream: bool) -> None:
     """Claude Code's Read on a PDF serves on a route with no PDF input.
@@ -2202,7 +2322,9 @@ def test_an_image_refusal_is_never_blamed_on_the_thinking_field() -> None:
     "The parameter 'thinking' is not supported by this model route" for a
     pasted screenshot (25 such 400s on 2026-09-11; removing thinking still
     failed). The rejection the caller sees must be the one the coerced request
-    hits: the image, on ``messages``.
+    hits: the image, on ``messages``. The turn is image-only: an image beside
+    caller text degrades to a placeholder instead (2026-10-25), so only a
+    request with nothing but images still reaches the refusal.
     """
     from exp.runtime.anthropic_protocol.requests import decode_messages
     from exp.runtime.gateway.native_accounting import NativeAttemptAccounting
@@ -2240,7 +2362,6 @@ def test_an_image_refusal_is_never_blamed_on_the_thinking_field() -> None:
                 "type": "image",
                 "source": {"type": "base64", "media_type": "image/png", "data": _TOOL_IMAGE_PNG},
             },
-            {"type": "text", "text": "What is this?"},
         ],
     }
     for thinking in ({"type": "disabled"}, {"type": "enabled"}, {"type": "adaptive"}):

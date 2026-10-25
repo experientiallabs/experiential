@@ -595,8 +595,13 @@ and the route discloses `messages.content.tool_result.image->following_user_mess
 `messages.content.tool_result.document->following_user_message`; the attachment ceilings and
 size bounds apply as for top-level user attachments. A route with no image (or PDF) input at
 all degrades the attachment to placeholder text, disclosed as
-`messages.content.tool_result.image->placeholder` (or `messages.content.tool_result.document->placeholder`);
-a top-level user attachment keeps the fail-closed contract because the caller can re-send it.
+`messages.content.tool_result.image->placeholder` (or `messages.content.tool_result.document->placeholder`).
+A user-turn image on such a route degrades the same way (a coding agent resends a pasted screenshot
+on every later turn, so a refusal would wedge the thread): each image becomes
+`[image not processed: this model does not accept image input]` in place, disclosed as
+`messages.content.image->placeholder`, on every surface (Chat `image_url`, Responses `input_image`,
+Anthropic `image`). Only a request with no caller text beside its images keeps the refusal. A
+top-level user document keeps the fail-closed contract.
 Both OpenAI surfaces accept the Vercel AI SDK's camelCase `promptCacheKey` (sent verbatim by
 opencode and other `ai-sdk` coding clients) as an alias of `prompt_cache_key`: it is renamed
 before manifest validation and decodes exactly as the documented field. When both spellings
@@ -921,8 +926,8 @@ metric; every serving surface carries that list to the caller as a body-level
 Anthropic message on both `message_start` and the aggregated body), so a drop is never silent; nothing coercible keeps the first rung's own field-scoped rejection.
 When a coercion APPLIES but none SERVES (every candidate dies one layer later, on a blocker
 unrelated to the coerced field), admission carries the unprobed coercion forward so the stage
-that actually refuses names the caller's remedy: an image on a text-only reasoning route is
-refused on `messages`, never as an unsupported `thinking` field that merely rode along.
+that actually refuses names the caller's remedy: an image-only request on a text-only reasoning
+route is refused on `messages`, never as an unsupported `thinking` field that merely rode along.
 Thinking disclosures name an applied translation, not consent to drop a cost constraint.
 An explicit off setting must be enforceable on the selected wire; otherwise admission refuses
 the named field before dispatch. A budget-less enable can translate onto an admissible effort

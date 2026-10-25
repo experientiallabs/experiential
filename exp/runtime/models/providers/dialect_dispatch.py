@@ -230,6 +230,59 @@ def strip_tool_result_images(
     return tuple(out)
 
 
+IMAGE_INPUT_DROP_DISCLOSURE = "messages.content.image->placeholder"
+"""Disclosure recorded when caller-turn images degrade to placeholder text.
+
+Coding agents keep a pasted screenshot in the conversation history and resend
+it on every later turn, so refusing a text-only route wedges the whole thread
+for good (customer report, 2026-10-25: about 3,200 refusals across 456 orgs in
+one day, mostly the uncensored Experiential Cloud models). The image becomes
+a placeholder the model can read and answer about; a request with no caller
+text at all keeps the refusal (``capability_policy``)."""
+
+IMAGE_INPUT_PLACEHOLDER = "[image not processed: this model does not accept image input]"
+"""Text substituted for each dropped caller-turn image, in part position."""
+
+
+def strip_message_images(
+    messages: tuple[GatewayMessage, ...],
+) -> tuple[GatewayMessage, ...] | None:
+    """Replace non-tool image parts with positional placeholder text.
+
+    Every other part keeps its place; a message left with only text collapses
+    back to plain content. The message's Anthropic cache-marked text run no
+    longer matches the new content, so it is dropped (a cache hint, never
+    semantics); tool messages are left to :func:`strip_tool_result_images`.
+
+    Args:
+        messages: The request's canonical messages.
+
+    Returns:
+        The degraded messages, or ``None`` when no non-tool message carries an
+        image (nothing to strip).
+    """
+    if not any(message.role != "tool" and message.images for message in messages):
+        return None
+    out: list[GatewayMessage] = []
+    for message in messages:
+        if message.role == "tool" or not message.images:
+            out.append(message)
+            continue
+        parts = tuple(
+            TextContentPart(text=IMAGE_INPUT_PLACEHOLDER) if part.kind == "image" else part
+            for part in message.content_parts
+        )
+        content = "".join(part.text for part in parts if part.kind == "text")
+        if all(part.kind == "text" for part in parts):
+            parts = ()
+        out.append(
+            message.model_copy(
+                update={"content": content, "content_parts": parts, "provider_text_blocks": ()}
+            )
+        )
+    return tuple(out)
+
+
 def strip_tool_result_documents(
     messages: tuple[GatewayMessage, ...],
 ) -> tuple[GatewayMessage, ...] | None:

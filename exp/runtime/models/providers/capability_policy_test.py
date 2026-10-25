@@ -863,9 +863,86 @@ def test_tool_result_images_degrade_with_placeholder_on_a_non_vision_route() -> 
     assert coercion.disclosures == (TOOL_RESULT_IMAGE_DROP_DISCLOSURE,)
 
 
-def test_top_level_user_images_keep_the_fail_closed_contract() -> None:
-    """A user image the caller can re-send never degrades silently."""
-    assert coerce_capability("image_input", _tool_image_request(user_image=True)) is None
+def test_user_images_degrade_with_placeholder_beside_tool_images() -> None:
+    """A pasted user image degrades like a tool screenshot instead of refusing.
+
+    Both live in the history an agent resends every turn, so refusing either
+    wedges the thread; each image becomes placeholder text in place and each
+    kind is disclosed.
+    """
+    from exp.runtime.models.providers.dialect_dispatch import (
+        IMAGE_INPUT_DROP_DISCLOSURE,
+        IMAGE_INPUT_PLACEHOLDER,
+    )
+    from exp.runtime.models.providers.streaming_requests import (
+        TOOL_RESULT_IMAGE_DROP_DISCLOSURE,
+        TOOL_RESULT_IMAGE_PLACEHOLDER,
+    )
+
+    coercion = coerce_capability("image_input", _tool_image_request(user_image=True))
+    assert coercion is not None
+    user, tool = coercion.request.messages
+    assert user.content_parts == ()
+    assert user.content == "go" + IMAGE_INPUT_PLACEHOLDER
+    assert tool.content == "tool said:" + TOOL_RESULT_IMAGE_PLACEHOLDER
+    assert coercion.request.images == ()
+    assert coercion.disclosures == (
+        TOOL_RESULT_IMAGE_DROP_DISCLOSURE,
+        IMAGE_INPUT_DROP_DISCLOSURE,
+    )
+
+
+def test_user_image_keeps_other_attachments_in_place() -> None:
+    """Only image parts are replaced; a document beside them keeps its slot."""
+    from exp.common.models.content import (
+        DocumentContentPart,
+        ImageContentPart,
+        TextContentPart,
+    )
+    from exp.runtime.models.providers.dialect_dispatch import IMAGE_INPUT_PLACEHOLDER
+
+    pdf = DocumentContentPart(media_type="application/pdf", data="JVBERi0xLjQK")
+    request = GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=(
+            GatewayMessage(
+                role="user",
+                content="see",
+                content_parts=(
+                    TextContentPart(text="see"),
+                    ImageContentPart(media_type="image/png", data="aGk="),
+                    pdf,
+                ),
+            ),
+        ),
+    )
+    coercion = coerce_capability("image_input", request)
+    assert coercion is not None
+    (message,) = coercion.request.messages
+    assert message.content_parts == (
+        TextContentPart(text="see"),
+        TextContentPart(text=IMAGE_INPUT_PLACEHOLDER),
+        pdf,
+    )
+    assert message.content == "see" + IMAGE_INPUT_PLACEHOLDER
+
+
+def test_a_request_of_nothing_but_images_keeps_the_refusal() -> None:
+    """With no caller text the placeholder would be all the model sees."""
+    from exp.common.models.content import ImageContentPart
+
+    image_only = GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=(
+            GatewayMessage(role="system", content="You are helpful."),
+            GatewayMessage(
+                role="user",
+                content="",
+                content_parts=(ImageContentPart(media_type="image/png", data="aGk="),),
+            ),
+        ),
+    )
+    assert coerce_capability("image_input", image_only) is None
     # And a request with no images at all offers nothing to coerce.
     assert (
         coerce_capability(
