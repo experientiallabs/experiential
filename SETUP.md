@@ -4,8 +4,10 @@ Copy-paste prompts for getting started with the hosted Experiential Labs gateway
 (dashboard https://platform.experientiallabs.ai, API https://api.experientiallabs.ai/v1, OpenAI and Anthropic compatible). Paste the
 prompt you want into your coding agent (Claude Code, Cursor, Codex, Aider, or
 Conductor) and it runs the setup for you. Your account is created instantly from
-the email you give the agent; verifying that email unlocks platform credits, and everything else
-works right away. This file mirrors the machine-readable contract at
+the email you give the agent. Free has no signup or monthly general credits.
+GPT-6 Luna, DeepSeek V4.1 Flash and Clef share 10 RPM, 250K TPM and 1M input/output
+tokens per UTC day. Unlock free and promotional models with a one-time $1 card
+verification charge, credited to your balance. Paid calls need funded credits. This file mirrors the machine-readable contract at
 https://platform.experientiallabs.ai/llms.txt.
 
 Each block below is one self-contained prompt. The prompt text is the product's
@@ -18,8 +20,8 @@ me and then pull my existing LLM traces onto the platform as telemetry. This is
 my consent to create the account under my identity (using the email I give you
 when you ask), to read my own trace files, and to use the observability
 credential I give you. No browser step is needed to start — my account is
-created instantly from my email; I only verify that email later to unlock my
-credits, and I don't need to for my traces to land.
+created instantly from my email. Signup does not grant general credits;
+my traces can land without purchasing credits.
 
 This uploads my existing traces so I can see them as telemetry on the platform.
 
@@ -55,9 +57,9 @@ path — if you don't have one, ask me.
 
 4. Confirm the key is live — this does NOT spend credits.
    GET https://api.experientiallabs.ai/v1/models with the key -> the models my account can call. Do NOT
-   make a paid chat completion yet: my credits stay locked until I verify my
-   email (I do that at the very end), and a paid call would be refused with
-   "insufficient_quota". Landing my traces as telemetry works regardless.
+   make a paid chat completion until my account is activated and funded.
+   Email verification alone does not grant credits; without a funded balance,
+   a paid call is refused with "insufficient_quota". Landing my traces as telemetry works regardless.
 
 Now bring my traces in as telemetry. Use EXPLABS_API_KEY (the xpl_ key from
 step 2) as the bearer token on every call below. org_id is from step 2.
@@ -142,10 +144,10 @@ and the machine-readable contract is https://platform.experientiallabs.ai/llms.t
 
 One last thing to tell me, then you're done: check my email inbox for a message
 from Experiential Labs and click the verification link (or enter the code at
-https://platform.experientiallabs.ai/signin) to confirm my email. That's the ONLY thing left for me to do, and
-it just unlocks my credits for paid model calls — my traces are already live and
-don't need it. Until I verify, credit-drawing model calls are refused with
-"insufficient_quota"; using my own provider keys (BYOK) is unaffected.
+https://platform.experientiallabs.ai/signin) to confirm my email. My traces are already live.
+To use free models, complete the one-time $1 card verification at
+https://platform.experientiallabs.ai/credits; the charge is credited to my balance.
+Paid calls need funded credits. BYOK calls use my own provider keys.
 
 ## 2. Connect your inference provider keys (BYOK)
 
@@ -155,8 +157,8 @@ the gateway with my own keys (BYOK). This is my consent to create the account
 under my identity (using the email I give you when you ask), to search for MY
 own provider keys locally, and to connect the ones I approve to MY gateway
 account. No browser step is needed to start — my account is created instantly
-from my email; I only verify that email later to unlock platform credits, and I
-don't need to for BYOK pass-through calls (those run on my own keys).
+from my email. Signup does not grant general credits, and BYOK pass-through
+calls run on my own keys.
 
 Do it in this order. Print what you're doing at each step. If you lack a
 capability (no network, no file access) or get stuck, stop and tell me exactly
@@ -190,9 +192,9 @@ path — if you don't have one, ask me.
 
 4. Confirm the key is live — this does NOT spend credits.
    GET https://api.experientiallabs.ai/v1/models with the key -> the models my account can call. Do NOT
-   make a paid chat completion yet: my credits stay locked until I verify my
-   email (I do that at the very end), and a paid call would be refused with
-   "insufficient_quota". Landing my traces as telemetry works regardless.
+   make a paid chat completion until my account is activated and funded.
+   Email verification alone does not grant credits; without a funded balance,
+   a paid call is refused with "insufficient_quota". Landing my traces as telemetry works regardless.
 
 Now connect my own provider keys. Use EXPLABS_API_KEY (the xpl_ key from step 2)
 as the bearer token on every call below.
@@ -251,9 +253,11 @@ connections anytime at https://platform.experientiallabs.ai/settings/integration
 One last thing to tell me, then you're done: to also use Experiential's
 platform-funded credits (calling models WITHOUT your own keys), check my email
 inbox for a message from Experiential Labs and click the verification link (or
-enter the code at https://platform.experientiallabs.ai/signin) to confirm my email. That unlocks my credits;
-until then, credit-drawing model calls are refused with "insufficient_quota",
-but BYOK pass-through on my connected keys is unaffected.
+enter the code at https://platform.experientiallabs.ai/signin) to confirm my email.
+Email verification does not grant credits. Complete card verification at
+https://platform.experientiallabs.ai/credits to unlock free models (a one-time
+$1 charge credited to my balance), or add credits for paid calls.
+BYOK pass-through on my connected keys is unaffected.
 
 ## 3. Start calling models on the gateway
 
@@ -367,9 +371,9 @@ path — if you don't have one, ask me.
 
 4. Confirm the key is live — this does NOT spend credits.
    GET https://api.experientiallabs.ai/v1/models with the key -> the models my account can call. Do NOT
-   make a paid chat completion yet: my credits stay locked until I verify my
-   email (I do that at the very end), and a paid call would be refused with
-   "insufficient_quota". Landing my traces as telemetry works regardless.
+   make a paid chat completion until my account is activated and funded.
+   Email verification alone does not grant credits; without a funded balance,
+   a paid call is refused with "insufficient_quota". Landing my traces as telemetry works regardless.
 
 Now onboard my account with my own tools. Use EXPLABS_API_KEY (the xpl_ key from
 step 2) as the bearer token on every call below.
@@ -465,8 +469,8 @@ step 2) as the bearer token on every call below.
    After each repoint, make one tiny test call (model + messages only) through
    that agent's client to confirm it routes. Use a model served by one of the
    provider keys I connected in step 6 so it runs as free BYOK pass-through:
-   until I verify my email my platform credits stay locked and a credit-drawing
-   call is refused with "insufficient_quota".
+   paid calls require an activated account and funded credits. Signup and
+   email verification do not grant general credits.
 
 When you're done, report back to me: my org_id, my starting credit balance
 (credits_granted), how many models GET /v1/models returned, which providers you
@@ -478,6 +482,8 @@ contract is https://platform.experientiallabs.ai/llms.txt.
 One last thing to tell me, then you're done: to use Experiential's
 platform-funded credits (calling models WITHOUT my own keys), check my email
 inbox for a message from Experiential Labs and click the verification link (or
-enter the code at https://platform.experientiallabs.ai/signin) to confirm my email. That unlocks my credits;
-until then, credit-drawing model calls are refused with "insufficient_quota",
-but BYOK pass-through on my connected keys is unaffected.
+enter the code at https://platform.experientiallabs.ai/signin) to confirm my email.
+Email verification does not grant credits. Complete card verification at
+https://platform.experientiallabs.ai/credits to unlock free models (a one-time
+$1 charge credited to my balance), or add credits for paid calls.
+BYOK pass-through on my connected keys is unaffected.
