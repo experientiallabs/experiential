@@ -1,4 +1,0 @@
-# This stack builds both packages from one selected commit for CI and preview.
-# Remove this marker and bump both distributions before publishing a release.
-experiential = "0.7.220"
-exp-gateway-native = "0.3.170"
