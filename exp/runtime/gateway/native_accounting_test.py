@@ -4556,6 +4556,69 @@ def _retained_settlement(
     return accounting, ledger, clock, entry, payload
 
 
+def test_delayed_sweep_cannot_clear_a_newer_attempts_observed_meter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(NativeAttemptAccounting, "_sweep_loop", lambda self: None)
+    accounting, ledger, entry = _registry()
+    first = _start(accounting, ordinal=0)
+    payload = {
+        "request_id": "request-one",
+        "attempt_id": first["attempt_id"],
+        "outcome": "failed",
+        "usage": {"input_tokens": 101, "output_tokens": 11},
+        "failure": _retryable_failure(),
+        "finalize": False,
+    }
+    ledger.fail_finishes = 1
+    with pytest.raises(NativeBridgeError):
+        accounting.settle(json.dumps(payload))
+    paused, release = threading.Event(), threading.Event()
+    finish = accounting._finish_attempt
+
+    def delayed_finish(**fields: object) -> None:
+        finish(**fields)
+        if threading.current_thread().name == "delayed-sweep":
+            paused.set()
+            assert release.wait(5)
+
+    monkeypatch.setattr(accounting, "_finish_attempt", delayed_finish)
+    errors: list[BaseException] = []
+
+    def sweep() -> None:
+        try:
+            accounting.sweep_expired()
+        except BaseException as error:  # noqa: BLE001 - propagate thread failures.
+            errors.append(error)
+
+    worker = threading.Thread(target=sweep, name="delayed-sweep")
+    worker.start()
+    try:
+        assert paused.wait(5)
+        accounting.settle(json.dumps(payload))
+        second = _start(accounting, ordinal=1, failure=_retryable_failure())
+        newer = {
+            **payload,
+            "attempt_id": second["attempt_id"],
+            "finalize": True,
+            "usage": {"input_tokens": 303, "output_tokens": 33},
+        }
+        ledger.fail_finishes = 1
+        with pytest.raises(NativeBridgeError):
+            accounting.settle(json.dumps(newer))
+    finally:
+        release.set()
+        worker.join(5)
+    assert not worker.is_alive() and not errors
+    assert entry.pending_settlement == newer
+    accounting.sweep_expired()
+    assert entry.pending_settlement is None
+    terminal = ledger.terminal_events[-1]
+    assert terminal is not None and terminal.usage is not None
+    assert terminal.usage.input_tokens == 303
+    assert terminal.usage.output_tokens == 33
+
+
 @pytest.mark.parametrize("failing", [False, True])
 def test_concurrent_settle_and_sweep_observe_recovery_once(
     monkeypatch: pytest.MonkeyPatch, failing: bool
