@@ -145,7 +145,9 @@ and the machine-readable contract is https://platform.experientiallabs.ai/llms.t
 One last thing to tell me, then you're done: check my email inbox for a message
 from Experiential Labs and click the verification link (or enter the code at
 https://platform.experientiallabs.ai/signin) to confirm my email. My traces are already live.
-To use free models, complete the one-time $1 card verification at
+Follow the activation steps at the returned overview_url first. If manual review
+is required, wait for approval; payment does not bypass review.
+To use free models after approval, complete the one-time $1 card verification at
 https://platform.experientiallabs.ai/credits; the charge is credited to my balance.
 Paid calls need funded credits. BYOK calls use my own provider keys.
 
@@ -254,7 +256,9 @@ One last thing to tell me, then you're done: to also use Experiential's
 platform-funded credits (calling models WITHOUT your own keys), check my email
 inbox for a message from Experiential Labs and click the verification link (or
 enter the code at https://platform.experientiallabs.ai/signin) to confirm my email.
-Email verification does not grant credits. Complete card verification at
+Email verification does not grant credits. Follow the returned overview_url's
+activation steps first; if manual review is required, wait for approval.
+Payment does not bypass review. After approval, complete card verification at
 https://platform.experientiallabs.ai/credits to unlock free models (a one-time
 $1 charge credited to my balance), or add credits for paid calls.
 BYOK pass-through on my connected keys is unaffected.
@@ -281,15 +285,18 @@ have mine, ask me.
    GET https://api.experientiallabs.ai/v1/models with the key as a bearer token. Use the model ids
    EXACTLY as returned. This does not spend credits.
 
-2. First call with the OpenAI SDK (Chat Completions). Point the OpenAI client at
-   the gateway and send ONE minimal chat completion to the smallest Qwen in the
-   list (qwen3.5-9b at launch). Send a MINIMAL request body — model + messages
+2. Check activation and funding in the platform before making a call. If review
+   is required, wait for approval. For a Free account, complete card verification
+   and select an available core model from step 1 (GPT-6 Luna, DeepSeek V4.1 Flash
+   or Clef). Other models require funded credits; ask before purchasing any.
+   First call with the OpenAI SDK (Chat Completions): send ONE minimal completion
+   to that verified, available model. Send a MINIMAL request body — model + messages
    ONLY, no temperature, top_p, or other sampling params (some models reject
    those and the call comes back as all_routes_failed, 502).
      from openai import OpenAI
      client = OpenAI(base_url="https://api.experientiallabs.ai/v1", api_key=EXPLABS_API_KEY)
      r = client.chat.completions.create(
-         model="qwen3.5-9b",
+         model="<the available model id selected above>",
          messages=[{"role": "user", "content": "reply with the single word: ok"}])
      print(r.choices[0].message.content)
    The gateway also serves the OpenAI Responses API at https://api.experientiallabs.ai/v1/responses
@@ -298,7 +305,7 @@ have mine, ask me.
 3. First call with the Anthropic SDK (Messages). The gateway serves the Anthropic
    Messages API at https://api.experientiallabs.ai/v1/messages over the same key. Point the Anthropic
    client's base_url at https://api.experientiallabs.ai/v1 (NOT /v1/messages — the SDK appends the path)
-   and send one small message to an available model. Text only: the lane drops
+   and send one small message to the same eligible model. Text only: the lane drops
    extended thinking and rejects image/document blocks.
      from anthropic import Anthropic
      client = Anthropic(base_url="https://api.experientiallabs.ai/v1", api_key=EXPLABS_API_KEY)
@@ -321,8 +328,8 @@ have mine, ask me.
    model + that it succeeded + its cost, the Anthropic test call's model + that it
    succeeded, and any coding agents you repointed.
 
-These test calls run on Experiential's platform-funded lane (a fraction of a cent
-of my credits) and prove serving and billing end to end. Read the contract if you
+These test calls use the Free allowance for eligible core models or funded
+credits for other models. Report the actual outcome and cost. Read the contract if you
 build further: https://platform.experientiallabs.ai/docs (human docs) and https://platform.experientiallabs.ai/llms.txt (machine-readable:
 honored and refused parameters, error codes, streaming caveats). Follow it
 literally.
@@ -336,8 +343,8 @@ my coding agents at the gateway. This is my consent to create the account under
 my identity (using the email I give you when you ask), to search for MY own
 provider keys and coding-agent logs locally, and to connect the ones I approve to
 MY gateway account. No browser step is needed to start — my account is created
-instantly from my email; I only verify that email later to unlock platform
-credits.
+instantly from my email. Email verification confirms my identity; follow the
+returned activation steps before card verification or funding model usage.
 
 Do it in this order. Print what you're doing at each step. If you lack a
 capability (no network, no file access) or get stuck, stop and tell me exactly
@@ -483,7 +490,9 @@ One last thing to tell me, then you're done: to use Experiential's
 platform-funded credits (calling models WITHOUT my own keys), check my email
 inbox for a message from Experiential Labs and click the verification link (or
 enter the code at https://platform.experientiallabs.ai/signin) to confirm my email.
-Email verification does not grant credits. Complete card verification at
+Email verification does not grant credits. Follow the returned overview_url's
+activation steps first; if manual review is required, wait for approval.
+Payment does not bypass review. After approval, complete card verification at
 https://platform.experientiallabs.ai/credits to unlock free models (a one-time
 $1 charge credited to my balance), or add credits for paid calls.
 BYOK pass-through on my connected keys is unaffected.
