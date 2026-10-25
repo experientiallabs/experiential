@@ -23,11 +23,13 @@ from exp.runtime.models.providers.azure import (
     MODEL_INFERENCE_API_VERSIONS,
     MODEL_INFERENCE_FALLBACK_API_VERSION,
     AzureClient,
+    AzureResponsesClient,
     bind_azure_api_key,
     infer_azure_api_surface,
     resolve_azure_api_surface,
     same_azure_endpoint,
 )
+from exp.runtime.models.providers.errors import ProviderParameterError
 from exp.runtime.models.providers.openai_compatible_test import _request, _snapshot
 from exp.runtime.models.providers.transport import JsonHttpResponse, ScriptedJsonTransport
 from exp.runtime.models.registry import RuntimeModelCatalog
@@ -35,6 +37,56 @@ from exp.runtime.models.registry import RuntimeModelCatalog
 _SECRET = "azure-secret-key-value"
 _ENDPOINT = "https://resource.openai.azure.com"
 _OTHER_ENDPOINT = "https://other.openai.azure.com"
+
+
+@pytest.mark.parametrize("api_version", ["v1", "2025-04-01-preview"])
+@pytest.mark.parametrize("suffix", ["", "/", "/models", "/models/", "/openai/v1/"])
+def test_responses_routes_use_the_resource_root(api_version: str, suffix: str) -> None:
+    """Foundry endpoint spellings retain one resource root for Responses and media."""
+    transport = ScriptedJsonTransport(
+        [JsonHttpResponse(status_code=200, body={"data": [{"index": 0, "embedding": [3.0, 4.0]}]})]
+    )
+    client = AzureResponsesClient(
+        model=_snapshot("azure", "gpt-deployment"),
+        endpoint=f"{_ENDPOINT}{suffix}",
+        api_key=_SECRET,
+        api_version=api_version,
+        transport=transport,
+    )
+    profile = client.gateway_wire_profile()
+    query = "" if api_version == "v1" else f"?api-version={api_version}"
+    responses_root = f"{_ENDPOINT}/openai/v1" if api_version == "v1" else f"{_ENDPOINT}/openai"
+    deployment_root = (
+        responses_root if api_version == "v1" else f"{_ENDPOINT}/openai/deployments/gpt-deployment"
+    )
+    assert profile.url == f"{responses_root}/responses{query}"
+    assert profile.embeddings_url == f"{deployment_root}/embeddings{query}"
+    assert profile.images_url == f"{deployment_root}/images/generations{query}"
+    assert profile.speech_url == f"{deployment_root}/audio/speech{query}"
+    assert profile.transcriptions_url == f"{deployment_root}/audio/transcriptions{query}"
+    assert client.embed(["hello"])[0].values == (0.6, 0.8)
+    url, headers, payload = transport.requests[0]
+    assert url == profile.embeddings_url
+    assert headers["api-key"] == _SECRET
+    assert payload["model"] == "gpt-deployment"
+
+
+def test_responses_rejects_sampling_with_active_reasoning() -> None:
+    """The catalog sampling constraint reaches both native profiles and Python requests."""
+    client = AzureResponsesClient(
+        model=_snapshot("azure", "gpt-deployment"),
+        endpoint=_ENDPOINT,
+        api_key=_SECRET,
+        api_version="v1",
+        supports_reasoning=True,
+        sampling_requires_reasoning_none=True,
+    )
+    assert client.gateway_wire_profile().sampling_requires_reasoning_none is True
+    with pytest.raises(ProviderParameterError, match="reasoning_effort"):
+        client._build_request(_request().model_copy(update={"reasoning_effort": "high"}))
+    payload = client._build_request(_request().model_copy(update={"reasoning_effort": "none"}))
+    assert payload["temperature"] == 0.2
+    assert payload["reasoning"] == {"effort": "none"}
 
 
 def _completion_response() -> JsonObject:
@@ -604,8 +656,9 @@ def test_inferred_foundry_endpoint_with_the_v1_root_targets_the_models_route() -
     assert client._base_url == "https://resource.services.ai.azure.com/models"
 
 
-def test_foundry_endpoint_roots_pair_with_one_stored_credential() -> None:
+@pytest.mark.parametrize("api_surface", ["model_inference", "responses"])
+def test_foundry_endpoint_roots_pair_with_one_stored_credential(api_surface: str) -> None:
     """The resource root, its /models form, and its /openai/v1 form name one Azure resource."""
     root = "https://resource.services.ai.azure.com"
     for spelling in (root, f"{root}/models", f"{root}/openai/v1"):
-        assert same_azure_endpoint(spelling, root, api_surface="model_inference")
+        assert same_azure_endpoint(spelling, root, api_surface=api_surface)

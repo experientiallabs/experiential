@@ -599,6 +599,7 @@ class RuntimeModelCatalog:
                     ),
                     supports_reasoning=capabilities.supports_reasoning,
                     reasoning_effort=capabilities.reasoning_effort,
+                    sampling_requires_reasoning_none=capabilities.sampling_requires_reasoning_none,
                 )
                 return ResolvedModel(
                     alias,

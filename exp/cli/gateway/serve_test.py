@@ -16,6 +16,7 @@ from unittest import mock
 
 import pytest
 import typer
+from click import unstyle
 from rich.console import Console
 from typer.testing import CliRunner
 
@@ -562,11 +563,17 @@ def test_cli_default_deadline_matches_the_control_plane_default() -> None:
     assert run_app.DEFAULT_REQUEST_TIMEOUT_SECONDS == default
 
 
-def test_request_timeout_rejects_values_outside_its_bounds(tmp_path: Path) -> None:
+@pytest.mark.parametrize("color", [False, True])
+def test_request_timeout_rejects_values_outside_its_bounds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, color: bool
+) -> None:
     """A zero or multi-hour deadline is refused before anything starts."""
+    monkeypatch.setenv("TERM", "xterm-256color")
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    monkeypatch.setattr("typer.rich_utils.FORCE_TERMINAL", color)
     for value in ("0", "7200"):
         result = CliRunner().invoke(
-            app, ["run", "--root", str(tmp_path), "--request-timeout", value]
+            app, ["run", "--root", str(tmp_path), "--request-timeout", value], color=color
         )
         assert result.exit_code != 0
-        assert "--request-timeout" in result.output
+        assert "--request-timeout" in unstyle(result.output)

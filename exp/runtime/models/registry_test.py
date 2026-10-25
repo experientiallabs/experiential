@@ -1226,7 +1226,11 @@ def test_azure_responses_surface_dispatches_over_the_native_responses_wire(
                 connection="foundry",
                 model="gpt-5-6-deployment",
                 billing_source=BillingSource.CUSTOMER_MANAGED,
-                capabilities=ModelCapabilities(supports_completions=True, supports_reasoning=True),
+                capabilities=ModelCapabilities(
+                    supports_completions=True,
+                    supports_reasoning=True,
+                    sampling_requires_reasoning_none=True,
+                ),
             )
         },
         roles=ModelRoles(candidates=("gpt",), incumbent="gpt"),
@@ -1248,3 +1252,4 @@ def test_azure_responses_surface_dispatches_over_the_native_responses_wire(
     assert "Authorization" not in profile.headers
     assert profile.forwards_prompt_cache_key is True
     assert profile.forwards_prompt_cache_ttl is False
+    assert profile.sampling_requires_reasoning_none is True

@@ -352,6 +352,7 @@ class AzureResponsesClient(OpenAIClient):
         supports_presence_penalty: bool = False,
         supports_reasoning: bool = False,
         reasoning_effort: str | None = None,
+        sampling_requires_reasoning_none: bool = False,
     ) -> None:
         """Create a Responses client bound to one Azure resource, key, and deployment.
 
@@ -370,6 +371,7 @@ class AzureResponsesClient(OpenAIClient):
             supports_presence_penalty: Whether the deployment accepts a presence penalty.
             supports_reasoning: Whether the deployment accepts the ``reasoning`` object.
             reasoning_effort: Optional catalog-pinned reasoning effort.
+            sampling_requires_reasoning_none: Whether sampling requires reasoning effort ``none``.
 
         Raises:
             ValueError: The endpoint or API version is missing.
@@ -378,9 +380,7 @@ class AzureResponsesClient(OpenAIClient):
             raise ValueError("Azure clients require an explicit resource endpoint")
         if not api_version:
             raise ValueError("Azure clients require an explicit api_version")
-        root = endpoint.rstrip("/")
-        if root.lower().endswith(_V1_ROOT_SUFFIX):
-            root = root[: -len(_V1_ROOT_SUFFIX)]
+        root = strip_model_inference_root(endpoint)
         super().__init__(
             model=model,
             api_key=api_key,
@@ -397,6 +397,7 @@ class AzureResponsesClient(OpenAIClient):
             supports_presence_penalty=supports_presence_penalty,
             supports_reasoning=supports_reasoning,
             reasoning_effort=reasoning_effort,
+            sampling_requires_reasoning_none=sampling_requires_reasoning_none,
         )
         self._api_version = api_version
 
@@ -417,7 +418,7 @@ class AzureResponsesClient(OpenAIClient):
         }
 
     def _request_path(self, path: str) -> str:
-        """Append the dated API version to one logical Azure route.
+        """Select the dated deployment route for media and append its API version.
 
         Args:
             path: Provider route below the configured base URL.
@@ -426,6 +427,8 @@ class AzureResponsesClient(OpenAIClient):
             Wire path with the configured API version when one is dated.
         """
         if self._api_version != _V1_API_VERSION:
+            if path in {"embeddings", "images/generations", "audio/speech", "audio/transcriptions"}:
+                path = f"deployments/{self._model.model_id}/{path}"
             return f"{path}?api-version={self._api_version}"
         return path
 
@@ -452,6 +455,6 @@ def _canonical_azure_endpoint(
     default_port = 443 if scheme == "https" else 80
     comparable_port = None if port in {None, default_port} else port
     path = parsed.path.rstrip("/")
-    if api_surface == "model_inference":
+    if api_surface in {"model_inference", "responses"}:
         path = strip_model_inference_root(path)
     return (scheme, hostname, comparable_port, path)
