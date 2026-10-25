@@ -209,6 +209,8 @@ fn shutdown_handle() -> ShutdownHandle {
 /// entirely in the data plane instead of calling `enforce_output`.
 #[pyfunction]
 #[pyo3(signature = (control_plane, config_json, shutdown=None, on_listening=None, guardrail_detectors=None, capture=None, callback_scopes=None))]
+// Keep the public Python positional ABI; Python is an implicit eighth argument.
+#[allow(clippy::too_many_arguments)]
 fn serve(
     py: Python<'_>,
     control_plane: Py<PyAny>,
