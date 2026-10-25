@@ -325,8 +325,6 @@ def _admit_decoded(
     plane: _ImagesPlane, data: JsonObject, alias: str, request: ImagesRequest
 ) -> str:
     """Authorize and durably accept one decoded image request, then route it."""
-    plane._accounting.sweep_expired()  # noqa: SLF001
-    plane._accounting.request_settlements.require_clear()  # noqa: SLF001
     deadline = time.monotonic() + plane._request_timeout_seconds  # noqa: SLF001
     try:
         authorization = plane._components.store.authorize_request(  # noqa: SLF001
@@ -340,6 +338,7 @@ def _admit_decoded(
             authorization,
         )
         authorization = with_client_identity(authorization, data)  # reporting-only app facts
+        plane._accounting.require_clear(authorization.organization_id)  # noqa: SLF001
     except Exception as exc:  # noqa: BLE001 - boundary sanitizes every failure.
         raise authority_error(exc) from exc
     require_unguarded_surface(plane._guardrails, authorization, "images")  # noqa: SLF001
@@ -548,6 +547,7 @@ def _admit_accepted(
     )
     response: JsonObject = {
         "request_id": authorization.request_id,
+        "caller_scope": f"{authorization.organization_id}:{authorization.identity_id}",
         "alias": authorization.alias,
         "alias_revision_id": authorization.alias_revision_id,
         "exact_model_id": route.snapshot.exact_model_id,

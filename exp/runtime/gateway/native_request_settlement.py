@@ -7,9 +7,12 @@ from dataclasses import dataclass, field
 from inspect import signature
 
 from exp.runtime.gateway.contracts import AuthorizationSnapshot, GatewayFailure
-from exp.runtime.gateway.native_accounting_errors import NativeBridgeError
+from exp.runtime.gateway.native_accounting_errors import (
+    NativeBridgeError,
+    accounting_recovering_error,
+)
+from exp.runtime.gateway.native_accounting_recovery import FairRecovery
 from exp.runtime.gateway.native_components import SyncWriteLedger
-from exp.runtime.openai_protocol.errors import OpenAIProtocolError
 
 
 @dataclass
@@ -50,6 +53,7 @@ class RequestSettlements:
         self._ledger = ledger
         self._pending: dict[str, _Settlement] = {}
         self._lock = threading.Lock()
+        self._recovery = FairRecovery[_Settlement](lambda item: item.authorization.organization_id)
 
     @property
     def pending(self) -> bool:
@@ -57,16 +61,15 @@ class RequestSettlements:
         with self._lock:
             return any(settlement.retained for settlement in self._pending.values())
 
-    def require_clear(self) -> None:
-        """Refuse new paid admission work while a previous request's meter is uncommitted."""
-        if self.pending:
-            raise NativeBridgeError(
-                OpenAIProtocolError(
-                    status_code=503,
-                    code="accounting_unavailable",
-                    message="Request accounting is recovering. Retry later.",
-                )
+    def require_clear(self, organization_id: str) -> None:
+        """Refuse the affected organization while its original meter is uncommitted."""
+        with self._lock:
+            pending = any(
+                item.retained and item.authorization.organization_id == organization_id
+                for item in self._pending.values()
             )
+        if pending:
+            raise NativeBridgeError(accounting_recovering_error())
 
     def finish(
         self,
@@ -111,7 +114,9 @@ class RequestSettlements:
     def retry(self, limit: int) -> None:
         """Replay bounded retained writes verbatim; a repeated failure keeps its owner."""
         with self._lock:
-            pending = [item for item in self._pending.values() if item.retained][:limit]
+            pending = self._recovery.select(
+                [item for item in self._pending.values() if item.retained], limit
+            )
         for settlement in pending:
             try:
                 self._commit(settlement)

@@ -310,8 +310,6 @@ class NativeControlPlane(
                 capability admission failed.
         """
         assert_not_internal_classification()
-        self._accounting.sweep_expired()
-        self._accounting.request_settlements.require_clear()
         data = json.loads(argument)
         surface = str(data.get("surface", "chat"))
         decoded = self._decode_body(
@@ -335,6 +333,7 @@ class NativeControlPlane(
             )
             authorization = authorize_serving_model_chains(self._components, authorization)
             authorization = with_client_identity(authorization, data)  # reporting-only app facts
+            self._accounting.require_clear(authorization.organization_id)
         except Exception as exc:  # noqa: BLE001 - boundary sanitizes every failure.
             mapped = _authority_error(exc)
             pointer = self._batch_pointer_error(alias=decoded.alias, mapped=mapped)
