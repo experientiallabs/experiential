@@ -44,6 +44,8 @@ def authority_error(exception: Exception) -> NativeBridgeError:
     Returns:
         A boundary error carrying the matching public OpenAI error.
     """
+    if isinstance(exception, NativeBridgeError):
+        return exception
     return NativeBridgeError(boundary_protocol_error(exception))
 
 
