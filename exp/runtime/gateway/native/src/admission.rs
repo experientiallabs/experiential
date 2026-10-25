@@ -362,9 +362,18 @@ pub(crate) async fn acquire_permit(
     guard: &mut AttemptGuard,
     deadline: Instant,
     priority_class: Option<u8>,
-) -> Result<tokio::sync::OwnedSemaphorePermit, Box<Response>> {
+) -> Result<crate::dispatch_capacity::DispatchPermit, Box<Response>> {
     let permit_wait_started = Instant::now();
-    let acquire = state.permit_queue.acquire(&state.permits, priority_class);
+    let organization = state
+        .bridge
+        .capacity
+        .organization(Some(guard.request_id()), None);
+    let acquire = state.dispatch_capacity.acquire(
+        organization.as_deref(),
+        &state.permits,
+        &state.permit_queue,
+        priority_class,
+    );
     match tokio::time::timeout_at(deadline.into(), acquire).await {
         Ok(Ok(permit)) => {
             METRICS.permit_wait_ms.record(permit_wait_started.elapsed());

@@ -597,7 +597,7 @@ async fn completed_responses(
     mut committed: CommittedAttempt,
     created_at: i64,
     deadline: Instant,
-    permit: tokio::sync::OwnedSemaphorePermit,
+    permit: crate::dispatch_capacity::DispatchPermit,
     mut lease: Option<OwnerLease>,
     client_request_id: Option<String>,
 ) -> Response {
@@ -652,7 +652,7 @@ async fn guarded_responses(
     mut committed: CommittedAttempt,
     created_at: i64,
     deadline: Instant,
-    permit: tokio::sync::OwnedSemaphorePermit,
+    permit: crate::dispatch_capacity::DispatchPermit,
     mut lease: Option<OwnerLease>,
     client_request_id: Option<String>,
 ) -> Response {
@@ -726,7 +726,7 @@ async fn stream_responses(
     committed: CommittedAttempt,
     created_at: i64,
     deadline: Instant,
-    permit: tokio::sync::OwnedSemaphorePermit,
+    permit: crate::dispatch_capacity::DispatchPermit,
     lease: Option<OwnerLease>,
     client_request_id: Option<String>,
     incremental_guardrail: bool,

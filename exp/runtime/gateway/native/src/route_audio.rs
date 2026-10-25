@@ -26,6 +26,7 @@
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
+use crate::dispatch_capacity::DispatchPermit;
 use axum::body::Body;
 use axum::extract::State;
 use axum::http::{header, HeaderMap, StatusCode};
@@ -33,7 +34,6 @@ use axum::response::Response;
 use base64::Engine as _;
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
-use tokio::sync::OwnedSemaphorePermit;
 
 use crate::admission::{new_guard, wire_drift_response};
 use crate::audio_upload::{measure_upload, read_upload, AudioUpload};
@@ -128,7 +128,7 @@ pub(crate) async fn speech(
     // Like transcription, the body is read only under a permit and the
     // request deadline, so the concurrency limit bounds every buffered body.
     let deadline = started + state.request_timeout;
-    let permit = match pre_admission_permit(&state, deadline).await {
+    let permit = match pre_admission_permit(&state, deadline, &raw_key).await {
         Ok(permit) => permit,
         Err(error) => return error_response(&error),
     };
@@ -174,7 +174,7 @@ pub(crate) async fn transcriptions(
     // under a concurrency permit and the request deadline, so the configured
     // request limit bounds this route's buffered memory like every other route.
     let deadline = started + state.request_timeout;
-    let permit = match pre_admission_permit(&state, deadline).await {
+    let permit = match pre_admission_permit(&state, deadline, &raw_key).await {
         Ok(permit) => permit,
         Err(error) => return error_response(&error),
     };
@@ -213,8 +213,16 @@ const MAXIMUM_SPEECH_BODY_BYTES: usize = 128 * 1024;
 async fn pre_admission_permit(
     state: &AppState,
     deadline: Instant,
-) -> Result<OwnedSemaphorePermit, PublicError> {
-    match tokio::time::timeout_at(deadline.into(), state.permits.clone().acquire_owned()).await {
+    raw_key: &str,
+) -> Result<DispatchPermit, PublicError> {
+    let organization = state.bridge.capacity.organization(None, Some(raw_key));
+    let acquire = state.dispatch_capacity.acquire(
+        organization.as_deref(),
+        &state.permits,
+        &state.permit_queue,
+        None,
+    );
+    match tokio::time::timeout_at(deadline.into(), acquire).await {
         Ok(Ok(permit)) => Ok(permit),
         Ok(Err(_)) => Err(PublicError::draining()),
         Err(_) => Err(Failure::new(
@@ -245,7 +253,7 @@ async fn serve(
     body_key: &str,
     body_value: Value,
     job: Job<'_>,
-    permit: OwnedSemaphorePermit,
+    permit: DispatchPermit,
 ) -> Response {
     let deadline = started + state.request_timeout;
     if Instant::now() >= deadline {

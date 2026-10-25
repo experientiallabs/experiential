@@ -100,6 +100,7 @@ def serve_native_gateway(
     host: str,
     port: int,
     max_active_requests: int = 64,
+    max_active_per_organization: int | None = None,
     callback_permits: int = 4,
     graceful_timeout_seconds: float = 10.0,
     connect_timeout_seconds: float = 5.0,
@@ -122,6 +123,8 @@ def serve_native_gateway(
         host: Public listener host.
         port: Public listener port.
         max_active_requests: Native concurrent-admission bound.
+        max_active_per_organization: Maximum active requests for a trusted organization,
+            held through upload or stream completion. None disables the tenant bound.
         callback_permits: Serving callback workers, 1 through 256. The native
             bridge reserves a separate settlement pool of max(2, permits/4)
             workers and bounds each admitted organization to half each pool.
@@ -201,6 +204,11 @@ def serve_native_gateway(
     """
     if not 1 <= callback_permits <= 256:
         raise ValueError("callback_permits must be between 1 and 256")
+    if (
+        max_active_per_organization is not None
+        and not 1 <= max_active_per_organization <= max_active_requests
+    ):
+        raise ValueError("max_active_per_organization must be between 1 and max_active_requests")
     try:
         native = importlib.import_module("exp_gateway_native")
     except ModuleNotFoundError as exc:
@@ -210,6 +218,7 @@ def serve_native_gateway(
         "host": host,
         "port": port,
         "max_active_requests": max_active_requests,
+        "max_active_per_organization": max_active_per_organization,
         "callback_permits": callback_permits,
         "request_timeout_seconds": control_plane.request_timeout_seconds,
         "graceful_timeout_seconds": graceful_timeout_seconds,

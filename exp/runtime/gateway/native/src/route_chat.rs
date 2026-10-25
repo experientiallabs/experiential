@@ -689,7 +689,7 @@ async fn completed_response(
     mut committed: CommittedAttempt,
     created_at: i64,
     deadline: Instant,
-    permit: tokio::sync::OwnedSemaphorePermit,
+    permit: crate::dispatch_capacity::DispatchPermit,
     mut lease: Option<OwnerLease>,
     client_request_id: Option<String>,
 ) -> Response {
@@ -743,7 +743,7 @@ async fn guarded_chat_response(
     mut committed: CommittedAttempt,
     created_at: i64,
     deadline: Instant,
-    permit: tokio::sync::OwnedSemaphorePermit,
+    permit: crate::dispatch_capacity::DispatchPermit,
     mut lease: Option<OwnerLease>,
     client_request_id: Option<String>,
 ) -> Response {
