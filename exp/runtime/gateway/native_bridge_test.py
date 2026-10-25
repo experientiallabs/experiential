@@ -7982,3 +7982,65 @@ def test_an_unpaired_function_output_becomes_a_user_turn_on_a_chat_rung(
         "<codex_delegation>Review the patch.</codex_delegation>"
     )
     assert "attempt_id" in _start_first(control, admission)
+
+
+_CODEX_WEB_SEARCH_ECHO: JsonObject = {
+    "type": "web_search_call",
+    "action": {"type": "find_in_page", "url": "https://example.com/docs"},
+}
+"""A web search echo as codex_exec 0.118 to 0.145 sends it: no id, status, or find pattern."""
+
+
+def test_a_codex_web_search_echo_forwards_verbatim_on_an_openai_rung(tmp_path: Path) -> None:
+    """The echo with Codex's omitted fields reaches the native rung unchanged
+    (it used to refuse at 'input.N.action.type' against the computer-use
+    actions)."""
+    control, raw_key = _openai_responses_pool_control_plane(
+        tmp_path, {"TEST_ALPHA_KEY": "alpha-secret", "TEST_BETA_KEY": "beta-secret"}
+    )
+
+    admission = _admit(
+        control, raw_key, _codex_items_body(_CODEX_WEB_SEARCH_ECHO), surface="responses"
+    )
+
+    items = cast("list[JsonObject]", _admitted_payload(admission)["input"])
+    assert items[-1] == _CODEX_WEB_SEARCH_ECHO
+    assert "attempt_id" in _start_first(control, admission)
+
+
+def test_a_codex_web_search_echo_drops_with_disclosure_on_a_chat_rung(tmp_path: Path) -> None:
+    """A Chat rung cannot read a provider-executed search item: it is removed and named."""
+    control, raw_key = _control_plane(tmp_path)
+
+    admission = _admit(
+        control,
+        raw_key,
+        _codex_items_body(_CODEX_WEB_SEARCH_ECHO, {"role": "user", "content": "continue"}),
+        surface="responses",
+    )
+
+    messages = cast("list[JsonObject]", _admitted_payload(admission)["messages"])
+    assert [message["role"] for message in messages] == ["user", "user"]
+    ignored = cast("list[str]", admission["ignored_parameters"])
+    assert "input.web_search_call->dropped(unsupported_by_provider)" in ignored
+    assert "attempt_id" in _start_first(control, admission)
+
+
+def test_a_malformed_web_search_echo_is_named_at_its_own_field(tmp_path: Path) -> None:
+    """A genuinely invalid echo is refused at its own field, not at another item's actions."""
+    control, raw_key = _control_plane(tmp_path)
+
+    with pytest.raises(NativeBridgeError) as refused:
+        _admit(
+            control,
+            raw_key,
+            _codex_items_body(
+                {"type": "web_search_call", "action": {"type": "search", "query": 5}}
+            ),
+            surface="responses",
+        )
+
+    error = json.loads(refused.value.public_error_json)
+    assert error["status_code"] == 400
+    assert error["param"] == "input.1.action.query"
+    assert "'click'" not in error["message"]

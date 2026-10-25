@@ -30,3 +30,13 @@ The installed `openai` SDK schema does not enumerate `agent_message`, `context_c
 their shape. A malformed item of a known type is refused at its own field (`input.N.recipient`,
 `input.N.reasoning.effort`), and an item whose `type` no model accepts is refused at
 `input.N.type` with the whole accepted vocabulary.
+
+A replayed `web_search_call` (a provider-executed search, forwarded verbatim to a native Responses
+rung and dropped elsewhere as `input.web_search_call->dropped(unsupported_by_provider)`) is
+accepted with the fields Codex serializes as optional left out: `id`, `status`, `action`, and a
+`find_in_page` action's `url` or `pattern`, plus action types and statuses newer than the installed
+SDK schema. Only the official-schema probe sees those fields completed; a field the caller did send
+keeps its shape check. Because the official schema's item and action unions are not
+discriminated, a branch whose own `type` refused the value is set aside while a sibling branch
+still reports, so an invalid echo is named at its own field (`input.N.action.query`) and never at
+another item's vocabulary (the computer-use and local-shell actions).

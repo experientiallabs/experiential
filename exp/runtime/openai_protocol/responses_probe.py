@@ -143,6 +143,41 @@ _SDK_WEB_SEARCH_ACTIONS = frozenset({"search", "open_page", "find_in_page"})
 """Web search action types the installed SDK's input-item schema enumerates."""
 
 
+_SDK_WEB_SEARCH_STATUSES = frozenset({"in_progress", "searching", "completed", "failed"})
+"""Web search item statuses the installed SDK's input-item schema enumerates."""
+
+
+def official_web_search_item(entry: JsonObject) -> JsonObject:
+    """Shape one replayed ``web_search_call`` the way the installed SDK schema requires.
+
+    Codex serializes every field of its web search item as optional
+    (``ResponseItem::WebSearchCall`` and ``WebSearchAction``, codex-rs
+    ``protocol/src/models.rs``): ``id``, ``status`` and ``action`` are left
+    out when unknown, a ``find_in_page`` action may lack its ``url`` or
+    ``pattern``, and newer action types and statuses (openai-python 3.37 adds
+    ``incomplete``) postdate the installed schema, which requires each of
+    them. The item forwards byte-for-byte to the native Responses rung that
+    authored it, so only the probe copy is completed: placeholders fill what
+    is missing or newer, and every field the caller did send keeps its own
+    shape check ("Invalid value for 'input.N.action.type'" on codex_exec
+    0.118 to 0.145, Bun and ReactorNetty clients, Oct 20 to 25).
+    """
+    item = dict(entry)
+    if item.get("id") is None:
+        item["id"] = PROBE_OUTPUT_ITEM_ID
+    status = item.get("status")
+    if status is None or (isinstance(status, str) and status not in _SDK_WEB_SEARCH_STATUSES):
+        item["status"] = "completed"
+    action = item.get("action")
+    if action is None or (
+        isinstance(action, dict) and action.get("type") not in _SDK_WEB_SEARCH_ACTIONS
+    ):
+        item["action"] = {"type": "search", "query": ""}
+    elif isinstance(action, dict) and action.get("type") == "find_in_page":
+        item["action"] = {"url": "", "pattern": "", **action}
+    return item
+
+
 _GATEWAY_WEB_SEARCH_ITEM_ID = re.compile(r"wsgw_[0-9a-f]{32}")
 """The id of a web_search_call item the gateway itself rendered (native
 ``web_search.rs``, ``GATEWAY_WEB_SEARCH_ITEM_PREFIX``)."""
@@ -249,11 +284,7 @@ def official_responses_probe(payload: JsonObject) -> JsonObject:
                 # value for 'input.N.action.type'" on 55 requests, Sep 24 -
                 # Oct 6), so the probe sees an SDK-known action in place of an
                 # unknown one and still checks the item's structure.
-                item = dict(entry)
-                action = item.get("action")
-                if isinstance(action, dict) and action.get("type") not in _SDK_WEB_SEARCH_ACTIONS:
-                    item["action"] = {"type": "search", "query": ""}
-                adapted.append(item)
+                adapted.append(official_web_search_item(entry))
             elif isinstance(entry, dict) and entry.get("type") == "reasoning":
                 item = dict(entry)
                 if item.get("id") is None:

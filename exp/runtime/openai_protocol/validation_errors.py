@@ -224,6 +224,41 @@ def _declared_unknown_tag(details: list[ErrorDetails]) -> tuple[str, str] | None
     return None
 
 
+def _without_rejected_branches(details: list[ErrorDetails]) -> list[ErrorDetails]:
+    """Drop the complaints of union branches whose own ``type`` refused the value.
+
+    The official schema's unions are not discriminated, so every branch
+    reports. A branch whose ``type`` literal failed is not the one the caller
+    meant, yet its deeper complaints can outrank the meant branch's: a replayed
+    ``web_search_call`` lacking one field was reported at ``action.type``
+    against the computer-use and local-shell actions ("expected one of
+    'click', ... or 'exec'"; codex_exec, Bun and ReactorNetty clients, Oct 20
+    to 25). A refused branch is dropped only while a sibling branch of the
+    same union still reports, so a value that no branch accepts keeps every
+    complaint and the pooled vocabulary.
+    """
+    rejected = {
+        tuple(detail["loc"][:-1])
+        for detail in details
+        if detail["type"] == "literal_error" and detail["loc"] and detail["loc"][-1] == "type"
+    }
+    dropped: set[tuple[str | int, ...]] = set()
+    for branch in rejected:
+        parent = branch[:-1]
+        if any(
+            len(detail["loc"]) > len(parent) + 1
+            and tuple(detail["loc"][: len(parent)]) == parent
+            and parent + (detail["loc"][len(parent)],) not in rejected
+            for detail in details
+        ):
+            dropped.add(branch)
+    return [
+        detail
+        for detail in details
+        if not any(tuple(detail["loc"][: len(branch)]) == branch for branch in dropped)
+    ]
+
+
 def shape_message(param: str, details: list[ErrorDetails]) -> str | None:
     """Describe what shape a field expected versus what arrived.
 
@@ -288,11 +323,12 @@ def validation_protocol_error(error: ValidationError) -> OpenAIProtocolError:
     same path, so the message lists the whole accepted set rather than the
     one branch that happened to complain least.
     """
-    declared = _declared_unknown_tag(error.errors(include_url=False))
+    every_detail = error.errors(include_url=False)
+    declared = _declared_unknown_tag(every_detail)
     if declared is not None:
         return invalid_field(*declared)
     groups: dict[tuple[str | int, ...], list[tuple[tuple[str, ...], ErrorDetails]]] = {}
-    for detail in error.errors(include_url=False):
+    for detail in _without_rejected_branches(every_detail):
         groups.setdefault(tuple(detail["loc"][:-1]), []).append(
             (cleaned_location(detail["loc"]), detail)
         )

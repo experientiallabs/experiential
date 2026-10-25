@@ -5572,18 +5572,83 @@ def test_replayed_web_search_items_decode_whatever_their_action(action: JsonObje
     assert decoded.request.surface == GatewayApiSurface.RESPONSES
 
 
-def test_malformed_replayed_web_search_items_are_still_refused() -> None:
-    """Relaxing the action enum keeps the item's structural checks."""
-    with pytest.raises(OpenAIProtocolError):
+@pytest.mark.parametrize(
+    ("item", "param"),
+    [
+        ({"type": "web_search_call", "id": "ws_1", "action": "search"}, "input.1.action"),
+        (
+            {"type": "web_search_call", "action": {"type": "search", "query": 5}},
+            "input.1.action.query",
+        ),
+        (
+            {"type": "web_search_call", "action": {"type": "find_in_page", "url": 5}},
+            "input.1.action.url",
+        ),
+        ({"type": "web_search_call", "status": 5}, "input.1.status"),
+    ],
+)
+def test_malformed_replayed_web_search_items_are_still_refused(
+    item: JsonObject, param: str
+) -> None:
+    """Completing the fields Codex leaves out keeps the checks on every field sent.
+
+    A missing ``status`` used to be the refused case here; Codex serializes it
+    (and ``id``, ``action``, and a find action's ``url``/``pattern``) as
+    optional, so a missing field is now completed for the probe only, and a
+    field of the wrong shape is refused at that field, never at the
+    computer-use or local-shell action vocabulary.
+
+    Args:
+        item: One malformed web search item.
+        param: The field the refusal must name.
+    """
+    with pytest.raises(OpenAIProtocolError) as refused:
         decode_responses(
             {
                 "model": "coding",
-                "input": [
-                    {"type": "message", "role": "user", "content": "look it up"},
-                    {"type": "web_search_call", "id": "ws_1", "action": {"type": "other"}},
-                ],
+                "input": [{"type": "message", "role": "user", "content": "look it up"}, item],
             }
         )
+
+    assert refused.value.detail.param == param
+    assert "'click'" not in refused.value.detail.message
+
+
+@pytest.mark.parametrize(
+    "item",
+    [
+        {"type": "web_search_call", "action": {"type": "search", "query": "weather"}},
+        {"type": "web_search_call", "id": "ws_1", "action": {"type": "open_page"}},
+        {
+            "type": "web_search_call",
+            "id": "ws_1",
+            "status": "completed",
+            "action": {"type": "find_in_page", "url": "https://example.com"},
+        },
+        {"type": "web_search_call", "id": "ws_1", "status": "incomplete"},
+        {"type": "web_search_call", "id": "ws_1", "action": {"type": "other"}},
+    ],
+)
+def test_codex_web_search_echoes_with_omitted_fields_forward_verbatim(item: JsonObject) -> None:
+    """Codex 0.118 to 0.145 echoes ``web_search_call`` items without ``id``,
+    ``status``, ``action``, or a find action's ``pattern`` (all optional in
+    ``ResponseItem::WebSearchCall``), and openai-python 3.37 adds the
+    ``incomplete`` status; each used to refuse as "Invalid value for
+    'input.N.action.type': expected one of 'click', ... or 'exec'." The item
+    decodes and the native OpenAI wire receives it unchanged.
+
+    Args:
+        item: One web search echo as Codex sends it.
+    """
+    decoded = decode_responses(
+        {"model": "gpt-5.6-sol", "input": [{"role": "user", "content": "look it up"}, item]}
+    )
+
+    assert decoded.request.messages[-1].provider_native_item == item
+    payload = openai_responses_stream_payload(
+        "gpt-5.6-sol", decoded.request, supports_temperature=False
+    )
+    assert cast("list[JsonObject]", payload["input"])[-1] == item
 
 
 def test_gateway_issued_web_search_items_are_dropped_on_replay() -> None:
