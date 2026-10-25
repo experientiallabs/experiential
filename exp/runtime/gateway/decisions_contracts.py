@@ -12,6 +12,11 @@ from pydantic import Field, StrictInt, ValidationError, field_validator, model_v
 
 from exp.common.core.artifacts import ContractModel, JsonValue
 from exp.runtime.gateway.contracts import GatewayApiSurface
+from exp.runtime.gateway.lone_surrogates import (
+    SURROGATE_ESCAPE,
+    has_lone_surrogate,
+    repaired_text,
+)
 
 MAX_DECISION_QUESTIONS = 32
 MAX_DECISION_CRITERIA = 64
@@ -34,10 +39,6 @@ MAX_DECISION_BODY_BYTES = (
 """Raw body ceiling: the text budget, base64 image data, and bounded asset framing."""
 DECISION_FIELDS = frozenset({"model", "state", "questions", "assets"})
 _STANDARD_BASE64 = re.compile(r"[A-Za-z0-9+/]*={0,2}")
-_SURROGATE_ESCAPE = re.compile(r"\\u[dD][89a-fA-F][0-9a-fA-F]{2}")
-"""A JSON surrogate escape; without one, ``json.loads`` produces no surrogate code point."""
-_LONE_SURROGATE = re.compile("[\ud800-\udfff]")
-"""A surrogate left in decoded text, which ``json.loads`` leaves only when it was unpaired."""
 STATE_SURROGATES_REPLACED = "state->replaced(lone_surrogate)"
 """Disclosure recorded when lone UTF-16 surrogate escapes in ``state`` become U+FFFD."""
 INSTRUCTIONS_SURROGATES_REPLACED = "questions.instructions->replaced(lone_surrogate)"
@@ -457,7 +458,7 @@ def decode_decision_request(body: str, byte_length: int | None = None) -> Decode
             "body", "decision JSON nesting exceeds the 64-level limit"
         ) from exc
     ignored_parameters: tuple[str, ...] = ()
-    if isinstance(raw, dict) and _SURROGATE_ESCAPE.search(body) is not None:
+    if isinstance(raw, dict) and SURROGATE_ESCAPE.search(body) is not None:
         raw, ignored_parameters = _replace_lone_surrogates(raw)
     _native_json(raw)
     if not isinstance(raw, dict):
@@ -542,7 +543,7 @@ def _repaired_content(value: JsonValue, param: str, depth: int) -> tuple[JsonVal
     if depth > MAX_DECISION_JSON_DEPTH:
         return value, False
     if isinstance(value, str):
-        return _repaired_text(value)
+        return repaired_text(value)
     if isinstance(value, list):
         items = [_repaired_content(item, param, depth + 1) for item in value]
         return [item for item, _changed in items], any(changed for _item, changed in items)
@@ -550,7 +551,7 @@ def _repaired_content(value: JsonValue, param: str, depth: int) -> tuple[JsonVal
         result: dict[str, JsonValue] = {}
         any_changed = False
         for key, item in value.items():
-            new_key, key_changed = _repaired_text(key)
+            new_key, key_changed = repaired_text(key)
             if new_key in result:
                 raise DecisionRequestError(
                     param,
@@ -563,18 +564,11 @@ def _repaired_content(value: JsonValue, param: str, depth: int) -> tuple[JsonVal
     return value, False
 
 
-def _repaired_text(text: str) -> tuple[str, bool]:
-    """Return ``text`` with each lone surrogate replaced by U+FFFD, and whether any was."""
-    if text.isascii() or _LONE_SURROGATE.search(text) is None:
-        return text, False
-    return _LONE_SURROGATE.sub("\N{REPLACEMENT CHARACTER}", text), True
-
-
 def _refuse_surrogate_identifiers(raw: dict[str, JsonValue]) -> None:
     """Name the identifier field holding a lone surrogate, without echoing it."""
 
     def lone(text: object) -> bool:
-        return isinstance(text, str) and _LONE_SURROGATE.search(text) is not None
+        return isinstance(text, str) and has_lone_surrogate(text)
 
     questions = raw.get("questions")
     assets = raw.get("assets")
