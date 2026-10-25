@@ -367,6 +367,7 @@ uv run pytest -q
     | --- | --- | --- |
     | Progress of a long-running command | `exp/cli/shared/progress.py` | `progress_display` for one phase, `progress_phases` for several; services report through `exp/common/progress.py` `report` |
     | Native gateway composition lifetime | `exp/runtime/gateway/native_lifecycle.py`, `exp/runtime/gateway/lifecycle.py` | Close control-plane pollers before caller-owned local components; bounded worker drain and startup rollback release thread-owned SQLite caches; no daemon thread substitutes for explicit ownership |
+    | Latency subprocess output lifetime | `exp/runtime/gateway/latency_measure.py` | `GatewayProcess`: keep one stdout reader; stop and wait for the process, join its reader, then close the pipe; startup failures use the same bounded owner |
     | Spend consent and cost warnings | `exp/cli/shared/consent.py` | `require_spend_consent` |
     | Command results and saved detail | `exp/optimize/evaluation/export.py`, `exp/cli/build/summary.py` | A short summary on the terminal; the full output saved atomically beside the saved run under the project's runtime directory (`export_report`, `save_details`), then a `Report: <path>` line |
     | Usage errors | `exp/cli/shared/options.py` | `usage_error` |
