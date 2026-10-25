@@ -721,7 +721,7 @@ class _ResponseFunctionOutput(_WireModel):
 
     Attributes:
         type: Required function-result discriminator.
-        call_id: Required bounded linkage to the corresponding assistant tool call.
+        call_id: Bounded linkage to the assistant call; absent on an unpaired output.
         name: Optional nonempty tool name, at most 256 characters and preserved verbatim.
         namespace: Optional nonempty tool-tree owner, at most 256 characters and retained on replay.
         caller: Optional opaque programmatic-call attribution, preserved verbatim.
@@ -731,7 +731,9 @@ class _ResponseFunctionOutput(_WireModel):
     """
 
     type: Literal["function_call_output"]
-    call_id: str = Field(min_length=1, max_length=MAXIMUM_TOOL_CALL_ID_CHARACTERS)
+    call_id: str | None = Field(
+        default=None, min_length=1, max_length=MAXIMUM_TOOL_CALL_ID_CHARACTERS
+    )
     name: str | None = Field(default=None, min_length=1, max_length=256)
     namespace: str | None = Field(default=None, min_length=1, max_length=256)
     caller: JsonObject | None = None

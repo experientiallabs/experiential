@@ -6095,3 +6095,51 @@ def test_a_malformed_known_item_names_its_own_field(item: JsonObject, param: str
         decode_responses({"model": "gpt-5.6-sol", "input": _codex_history(item)})
 
     assert refused.value.detail.param == param
+
+
+_CODEX_UNPAIRED_OUTPUT: JsonObject = {
+    "type": "function_call_output",
+    "id": "fco_1",
+    "name": "send_message_to_thread",
+    "namespace": "codex_app",
+    "output": "<codex_delegation>Review the patch.</codex_delegation>",
+}
+"""A named output that answers no call, as Codex 0.162 to 0.164 sends it (thread delivery)."""
+
+
+def test_an_unpaired_function_output_decodes_as_a_verbatim_native_item() -> None:
+    """Codex 0.162+ starts or steers a turn with a ``function_call_output`` that
+    carries ``name``/``namespace`` but no ``call_id`` (openai-python 3.37 makes
+    the field optional). It used to refuse the turn as "Invalid value for
+    'input.3.call_id': expected a value." (codex-tui 0.164, Codex Desktop
+    0.162 to 0.164); it now decodes as a native item on the user role and the
+    native OpenAI wire receives it unchanged."""
+    decoded = decode_responses(
+        {
+            "model": "gpt-5.6-sol",
+            "input": [
+                {"role": "developer", "content": "Be brief."},
+                {"role": "user", "content": "<environment_context />"},
+                {"role": "user", "content": "<permissions />"},
+                _CODEX_UNPAIRED_OUTPUT,
+            ],
+        }
+    )
+
+    last = decoded.request.messages[-1]
+    assert last.role == "user"
+    assert last.provider_native_item == _CODEX_UNPAIRED_OUTPUT
+    payload = openai_responses_stream_payload(
+        "gpt-5.6-sol", decoded.request, supports_temperature=False
+    )
+    assert cast("list[JsonObject]", payload["input"])[-1] == _CODEX_UNPAIRED_OUTPUT
+
+
+def test_a_paired_function_output_still_decodes_as_a_tool_result() -> None:
+    """An output that carries its call_id keeps the canonical tool-message shape."""
+    decoded = decode_responses({"model": "gpt-5.6-sol", "input": _codex_history()})
+
+    last = decoded.request.messages[-1]
+    assert last.role == "tool"
+    assert last.tool_call_id == "call_1"
+    assert last.provider_native_item is None

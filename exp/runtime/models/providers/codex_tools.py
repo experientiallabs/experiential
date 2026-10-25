@@ -416,8 +416,9 @@ def convert_native_history(
     ``GatewayMessage.provider_native_item``. On a foreign wire these become
     ordinary assistant tool calls (with the same mangled names the declarations
     used) and tool results. ``additional_tools`` items are dropped: their tools
-    are declared on this turn's ``tools`` array. An ``agent_message`` becomes a
-    user turn carrying its plaintext. Provider-owned items no foreign wire can
+    are declared on this turn's ``tools`` array. An ``agent_message``, and a
+    ``function_call_output`` that answers no call, become a user turn carrying
+    their plaintext. Provider-owned items no foreign wire can
     read (hosted-tool echoes, ``compaction`` and ``context_compaction``,
     ``configuration_update``, ``item_reference``) are dropped with disclosure,
     and a ``compaction_trigger`` refuses (``COMPACTION_TRIGGER_UNSERVABLE``).
@@ -553,6 +554,47 @@ def _agent_message_text(item: JsonObject) -> tuple[str, tuple[str, ...]]:
     return "\n".join((heading, *texts)), tuple(disclosures)
 
 
+def _unpaired_output_text(item: JsonObject) -> tuple[str, tuple[str, ...]]:
+    """Render one ``function_call_output`` that answers no call as foreign-wire user text.
+
+    A named output without a ``call_id`` (Codex 0.162+ delivers thread
+    messages and notifications this way) has no call for a tool message to
+    answer, and a Chat wire refuses an orphan tool message, so it becomes the
+    input it is: a user turn. The heading follows Codex's own rendering of
+    such an output for a consumer without the native item ("tool
+    <namespace>.<name> result"). Text parts are kept in order; any other part
+    has no carrier in that turn and is named as dropped.
+
+    Args:
+        item: The validated raw caller item.
+
+    Returns:
+        The message text and the disclosures for parts that were dropped.
+    """
+    name = _string(item.get("name"))
+    namespace = _string(item.get("namespace"))
+    tool = ".".join(part for part in (namespace, name) if part is not None)
+    heading = f"Tool {tool} result:" if tool else "Tool result:"
+    output = item.get("output")
+    if isinstance(output, str):
+        return f"{heading}\n{output}", ()
+    texts: list[str] = []
+    disclosures: list[str] = []
+    for part in output if isinstance(output, list) else ():
+        kind = part.get("type") if isinstance(part, dict) else None
+        text = part.get("text") if isinstance(part, dict) else None
+        if kind in ("input_text", "output_text", "text") and isinstance(text, str):
+            texts.append(text)
+        else:
+            disclosure = (
+                f"input.function_call_output.output.{kind or 'part'}"
+                "->dropped(unsupported_by_provider)"
+            )
+            if disclosure not in disclosures:
+                disclosures.append(disclosure)
+    return "\n".join((heading, *texts)), tuple(disclosures)
+
+
 def _convert_history_item(
     item: JsonObject, mapping: NativeToolMapping, tool_search_name: str
 ) -> tuple[GatewayMessage | None, tuple[str, ...]]:
@@ -625,7 +667,8 @@ def _convert_history_item(
         call_id = _string(item.get("call_id"))
         output = item.get("output")
         if call_id is None:
-            return None, ("input.function_call_output->dropped(malformed)",)
+            text, dropped = _unpaired_output_text(item)
+            return GatewayMessage(role="user", content=text), dropped
         return (
             GatewayMessage(
                 role="tool",

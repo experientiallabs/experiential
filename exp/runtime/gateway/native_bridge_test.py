@@ -7935,3 +7935,50 @@ def test_an_unknown_responses_item_type_is_named_at_its_type(tmp_path: Path) -> 
     assert error["status_code"] == 400
     assert error["param"] == "input.1.type"
     assert "but got 'future_item' instead." in error["message"]
+
+
+_CODEX_UNPAIRED_OUTPUT: JsonObject = {
+    "type": "function_call_output",
+    "name": "send_message_to_thread",
+    "namespace": "codex_app",
+    "output": "<codex_delegation>Review the patch.</codex_delegation>",
+}
+"""A named output that answers no call, as Codex 0.162 to 0.164 sends it."""
+
+
+def test_an_unpaired_function_output_forwards_verbatim_on_an_openai_rung(
+    tmp_path: Path,
+) -> None:
+    """The real admission bridge hands a native OpenAI Responses rung the output
+    without a call_id unchanged (it used to refuse as 'input.N.call_id')."""
+    control, raw_key = _openai_responses_pool_control_plane(
+        tmp_path, {"TEST_ALPHA_KEY": "alpha-secret", "TEST_BETA_KEY": "beta-secret"}
+    )
+
+    admission = _admit(
+        control, raw_key, _codex_items_body(_CODEX_UNPAIRED_OUTPUT), surface="responses"
+    )
+
+    items = cast("list[JsonObject]", _admitted_payload(admission)["input"])
+    assert items[-1] == _CODEX_UNPAIRED_OUTPUT
+    assert admission["ignored_parameters"] == []
+    assert "attempt_id" in _start_first(control, admission)
+
+
+def test_an_unpaired_function_output_becomes_a_user_turn_on_a_chat_rung(
+    tmp_path: Path,
+) -> None:
+    """A Chat rung receives the output as a user turn in Codex's own rendering."""
+    control, raw_key = _control_plane(tmp_path)
+
+    admission = _admit(
+        control, raw_key, _codex_items_body(_CODEX_UNPAIRED_OUTPUT), surface="responses"
+    )
+
+    messages = cast("list[JsonObject]", _admitted_payload(admission)["messages"])
+    assert [message["role"] for message in messages] == ["user", "user"]
+    assert messages[-1]["content"] == (
+        "Tool codex_app.send_message_to_thread result:\n"
+        "<codex_delegation>Review the patch.</codex_delegation>"
+    )
+    assert "attempt_id" in _start_first(control, admission)

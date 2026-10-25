@@ -28,6 +28,9 @@ from exp.runtime.openai_protocol.wire_models import (
 PROBE_OUTPUT_ITEM_ID = "msg_gateway_probe"
 """Placeholder item id the official probe sees on an id-less assistant message."""
 
+PROBE_UNPAIRED_CALL_ID = "call_gateway_probe"
+"""Placeholder call id the official probe sees on an unpaired function output."""
+
 
 def official_message_content(entry: JsonObject) -> JsonObject:
     """Respell an assistant message's ``input_text`` parts as ``output_text`` for the probe.
@@ -228,6 +231,15 @@ def official_responses_probe(payload: JsonObject) -> JsonObject:
                 if item.get("id") is not None and "status" not in item:
                     item["status"] = "completed"
                 adapted.append(item)
+            elif (
+                isinstance(entry, dict)
+                and entry.get("type") == "function_call_output"
+                and entry.get("call_id") is None
+            ):
+                # SDK 3.37 makes call_id optional (a named output that answers
+                # no call, which Codex 0.162+ sends); the installed 3.0 schema
+                # still requires it, so the probe sees a placeholder.
+                adapted.append({**entry, "call_id": PROBE_UNPAIRED_CALL_ID})
             elif isinstance(entry, dict) and entry.get("type") == "web_search_call":
                 # A replayed provider-executed web search item forwards
                 # byte-for-byte to the native Responses rung that authored it

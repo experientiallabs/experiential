@@ -943,6 +943,12 @@ def _response_input_messages(
                     ),
                 )
             )
+        elif item.call_id is None:
+            # A named output that answers no call (SDK 3.37 makes call_id
+            # optional; Codex 0.162+ delivers thread messages and
+            # notifications this way) has no canonical tool message, so it
+            # is carried verbatim like the other provider-owned items.
+            replayed.append(ReplayedNativeItem(index=index, role="user", item=raw_items[index]))
         else:
             if isinstance(item.output, str):
                 output_text, output_parts = item.output, ()

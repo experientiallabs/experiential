@@ -1056,3 +1056,50 @@ def test_a_compaction_trigger_narrows_out_a_foreign_rung_and_refuses_without_one
     assert refused.value.code == "unsupported_parameter"
     assert "'compaction_trigger'" in str(refused.value)
     assert "custom model provider" in str(refused.value)
+
+
+@pytest.mark.parametrize(
+    ("output", "expected", "dropped"),
+    [
+        (
+            "<codex_delegation>Review the patch.</codex_delegation>",
+            "Tool codex_app.send_message_to_thread result:\n"
+            "<codex_delegation>Review the patch.</codex_delegation>",
+            (),
+        ),
+        (
+            [
+                {"type": "input_text", "text": "Alice mentioned you."},
+                {"type": "input_image", "image_url": "https://example.com/a.png"},
+            ],
+            "Tool codex_app.send_message_to_thread result:\nAlice mentioned you.",
+            ("input.function_call_output.output.input_image->dropped(unsupported_by_provider)",),
+        ),
+    ],
+)
+def test_an_unpaired_function_output_becomes_a_user_turn_on_a_foreign_wire(
+    output: JsonValue, expected: str, dropped: tuple[str, ...]
+) -> None:
+    """A Chat wire refuses an orphan tool message, so the output becomes the input it is.
+
+    Args:
+        output: The output in string or list form.
+        expected: The rendered user text.
+        dropped: The disclosures for parts with no carrier.
+    """
+    request = _codex_items_request(
+        {
+            "type": "function_call_output",
+            "name": "send_message_to_thread",
+            "namespace": "codex_app",
+            "output": output,
+        }
+    )
+
+    public, provider = route_generation_parameter_requests((_AZURE_CHAT,), request)
+
+    assert provider.messages[-1].role == "user"
+    assert provider.messages[-1].tool_call_id is None
+    assert provider.messages[-1].content == expected
+    for disclosure in dropped:
+        assert disclosure in public.ignored_parameters
