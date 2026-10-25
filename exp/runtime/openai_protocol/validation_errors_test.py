@@ -3,7 +3,62 @@ messages are exercised in requests_test.py."""
 
 from __future__ import annotations
 
-from exp.runtime.openai_protocol.validation_errors import cleaned_location
+import pytest
+from pydantic import BaseModel, ConfigDict, ValidationError
+
+from exp.runtime.openai_protocol.validation_errors import (
+    cleaned_location,
+    unknown_parameter_message,
+    validation_protocol_error,
+)
+
+
+class _Closed(BaseModel):
+    """A strict wire object, the shape every gateway wire model shares."""
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class _Function(_Closed):
+    name: str
+    strict: bool = False
+
+
+class _Tool(_Closed):
+    function: _Function
+
+
+class _Tools(_Closed):
+    tools: list[_Tool]
+
+
+class _Search(_Closed):
+    query: str
+
+
+class _Fetch(_Closed):
+    url: str
+    limit: int
+
+
+class _Action(_Closed):
+    action: _Search | _Fetch
+
+
+class _Gateway(_Closed):
+    retry: bool = False
+
+
+class _Body(_Closed):
+    gateway: _Gateway
+
+
+def _rendered(model: type[BaseModel], payload: object) -> tuple[str | None, str]:
+    """Return the (param, message) one validation failure renders as."""
+    with pytest.raises(ValidationError) as caught:
+        model.model_validate(payload)
+    detail = validation_protocol_error(caught.value).detail
+    return detail.param, detail.message
 
 
 def test_cleaned_location_drops_branch_labels_but_keeps_a_same_named_final_field() -> None:
@@ -23,3 +78,46 @@ def test_cleaned_location_drops_branch_labels_but_keeps_a_same_named_final_field
         "image_url",
         "url",
     )
+
+
+def test_an_undefined_key_is_named_unknown_and_unsupported_not_an_invalid_value() -> None:
+    """Agno's ``requires_confirmation`` on a function tool read "Invalid value" (2026-10-25)."""
+    param, message = _rendered(
+        _Tools, {"tools": [{"function": {"name": "f", "requires_confirmation": True}}]}
+    )
+    assert param == "tools.0.function.requires_confirmation"
+    assert message == (
+        "Unknown parameter 'tools.0.function.requires_confirmation': "
+        "this field is not supported. Remove it and resend."
+    )
+    assert message == unknown_parameter_message(param)
+
+
+def test_a_defined_key_with_a_bad_value_keeps_its_value_message() -> None:
+    """Only an undefined key is "unknown"; a defined one still names its expected shape."""
+    param, message = _rendered(_Tools, {"tools": [{"function": {"name": "f", "strict": "maybe"}}]})
+    assert param == "tools.0.function.strict"
+    assert message.startswith("Invalid value for 'tools.0.function.strict'")
+
+
+def test_a_key_some_union_branch_defines_is_never_called_unknown() -> None:
+    """A sibling branch defining the key with a value fault means the caller may have meant it.
+
+    ``limit`` is extra on the search branch but defined (wrong type) on the
+    fetch branch, so "unknown parameter" would misdescribe the request.
+    """
+    param, message = _rendered(_Action, {"action": {"query": "q", "limit": "ten"}})
+    assert param == "action.limit"
+    assert message.startswith("Invalid value for 'action.limit'")
+    # A key NO branch defines is still named unknown inside the union.
+    assert _rendered(_Action, {"action": {"query": "q", "bogus": 1}}) == (
+        "action.bogus",
+        unknown_parameter_message("action.bogus"),
+    )
+
+
+def test_an_undefined_gateway_key_keeps_the_unknown_parameter_wording() -> None:
+    """The gateway extension object was the one place already naming stray keys."""
+    param, message = _rendered(_Body, {"gateway": {"retries": 3}})
+    assert param == "gateway.retries"
+    assert message == unknown_parameter_message("gateway.retries")

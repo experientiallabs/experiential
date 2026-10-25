@@ -137,6 +137,14 @@ its original position; `store=false` means the provider resolves nothing by ID.
   their typed refusal for a bad value, unknown keys inside a tool call's `function`
   object, inside a Messages content block, or on other Responses item types stay
   refused, and an unknown top-level parameter is still `unsupported_parameter`.
+- An unknown key anywhere else in a Chat or Responses body (a function tool definition
+  included) stays refused as `invalid_parameter`, and the message names the key as unknown
+  and says to remove it: `Unknown parameter 'tools.0.function.requires_confirmation': this
+  field is not supported. Remove it and resend.` A function tool accepts `name`,
+  `description`, `parameters` and `strict` (plus `defer_loading`); Agno's client-side
+  approval flags (`requires_confirmation`, `external_execution`, `approval_type`) are not
+  part of OpenAI's function tool schema. A key that some branch of a union defines keeps
+  its value message, so a value fault is never reported as a stray key.
 - OpenAI's optional participant `name` on a system, developer, user or assistant message is
   dropped, disclosed as `messages.name->dropped(participant_name)`. On tool messages `name`
   still attributes the result.

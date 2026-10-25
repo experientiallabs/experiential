@@ -222,6 +222,40 @@ def shape_message(param: str, details: list[ErrorDetails]) -> str | None:
     return f"Invalid value for '{param}': expected {description}."
 
 
+def unknown_parameter_message(param: str) -> str:
+    """State that a field the gateway does not define is unsupported and must go.
+
+    Pydantic reports an undefined key as ``extra_forbidden``, which carries no
+    expected shape; a bare ``Invalid value for '<param>'.`` would read as a
+    value fault when the key itself is the problem (an agent framework's own
+    flag on a function tool, such as Agno's ``requires_confirmation``). The
+    code stays ``invalid_parameter``; only the message names the fix.
+    """
+    return f"Unknown parameter '{param}': this field is not supported. Remove it and resend."
+
+
+def _names_unknown_field(
+    groups: dict[tuple[str | int, ...], list[tuple[tuple[str, ...], ErrorDetails]]],
+    location: tuple[str, ...],
+    details: list[ErrorDetails],
+) -> bool:
+    """Whether the chosen field is a key no union branch defines.
+
+    Every complaint at the chosen location must be ``extra_forbidden``, across
+    every branch that reported it: when some sibling branch defines the key and
+    objected to its VALUE instead, the caller may have meant that branch, and
+    "unknown parameter" would misdescribe a value fault as a stray key.
+    """
+    if not details or any(detail["type"] != "extra_forbidden" for detail in details):
+        return False
+    return all(
+        detail["type"] == "extra_forbidden"
+        for members in groups.values()
+        for cleaned, detail in members
+        if cleaned == location
+    )
+
+
 def validation_protocol_error(error: ValidationError) -> OpenAIProtocolError:
     """Convert Pydantic locations into stable dotted OpenAI ``param`` paths.
 
@@ -253,10 +287,10 @@ def validation_protocol_error(error: ValidationError) -> OpenAIProtocolError:
     location = max((cleaned for cleaned, _ in best), key=len, default=())
     param = ".".join(location) or "body"
     details = [detail for cleaned, detail in best if cleaned == location]
+    if _names_unknown_field(groups, location, details):
+        return invalid_field(param, unknown_parameter_message(param))
     if param.startswith("gateway."):
         for detail in details:
-            if detail["type"] == "extra_forbidden":
-                return invalid_field(param, f"Unknown parameter '{param}'. Remove it and resend.")
             if detail["type"] in {
                 "greater_than_equal",
                 "less_than_equal",
