@@ -20,6 +20,7 @@ use std::thread::JoinHandle;
 use pyo3::prelude::*;
 use tokio::sync::{oneshot, OwnedSemaphorePermit, Semaphore};
 
+use crate::callback_capacity::CallbackCapacity;
 use crate::errors::PublicError;
 
 /// One queued control-plane call and the responder that hands its outcome
@@ -30,6 +31,8 @@ struct Job {
     responder: oneshot::Sender<Result<String, PublicError>>,
     // Cancellation of the awaiting request cannot release queued/running capacity.
     _permit: OwnedSemaphorePermit,
+    _tenant_permit: OwnedSemaphorePermit,
+    capacity: Arc<CallbackCapacity>,
 }
 
 /// Bounded bridge to one Python `NativeControlPlane` instance.
@@ -41,6 +44,9 @@ pub struct Bridge {
     queue: Mutex<Option<mpsc::Sender<Job>>>,
     workers: Mutex<Vec<JoinHandle<()>>>,
     permits: Arc<Semaphore>,
+    settlement_queue: Mutex<Option<mpsc::Sender<Job>>>,
+    settlement_permits: Arc<Semaphore>,
+    pub(crate) capacity: Arc<CallbackCapacity>,
 }
 
 impl Bridge {
@@ -50,7 +56,8 @@ impl Bridge {
     /// has an idle worker and never queues behind another call after its
     /// permit is granted.
     pub fn new(object: Py<PyAny>, maximum_concurrent_calls: usize) -> Result<Self, String> {
-        let worker_count = maximum_concurrent_calls.max(1);
+        let worker_count = maximum_concurrent_calls.clamp(1, 256);
+        let settlement_count = (worker_count / 4).max(2);
         let (sender, receiver) = mpsc::channel::<Job>();
         let receiver = Arc::new(Mutex::new(receiver));
         let mut workers = Vec::with_capacity(worker_count);
@@ -63,7 +70,21 @@ impl Bridge {
                 .map_err(|error| format!("failed to start bridge worker {index}: {error}"))?;
             workers.push(handle);
         }
+        let (settlement_sender, settlement_receiver) = mpsc::channel::<Job>();
+        let settlement_receiver = Arc::new(Mutex::new(settlement_receiver));
+        for index in 0..settlement_count {
+            let receiver = settlement_receiver.clone();
+            let object = Python::attach(|py| object.clone_ref(py));
+            let handle = std::thread::Builder::new()
+                .name(format!("gateway-settlement-{index}"))
+                .spawn(move || worker_loop(&receiver, &object))
+                .map_err(|error| format!("failed to start settlement worker {index}: {error}"))?;
+            workers.push(handle);
+        }
         Ok(Self {
+            settlement_queue: Mutex::new(Some(settlement_sender)),
+            settlement_permits: Arc::new(Semaphore::new(settlement_count)),
+            capacity: Arc::new(CallbackCapacity::new(worker_count, settlement_count)),
             queue: Mutex::new(Some(sender)),
             workers: Mutex::new(workers),
             permits: Arc::new(Semaphore::new(worker_count)),
@@ -76,8 +97,19 @@ impl Bridge {
         method: &'static str,
         argument: String,
     ) -> Result<String, PublicError> {
-        let permit = self
-            .permits
+        let tenant_permit = self.capacity.acquire(method, &argument).await?;
+        let settlement = CallbackCapacity::is_settlement(method);
+        let pool = if settlement {
+            &self.settlement_permits
+        } else {
+            &self.permits
+        };
+        let queue = if settlement {
+            &self.settlement_queue
+        } else {
+            &self.queue
+        };
+        let permit = pool
             .clone()
             .acquire_owned()
             .await
@@ -86,7 +118,7 @@ impl Bridge {
         // callback itself, not queueing behind other bridge calls.
         let call_started = std::time::Instant::now();
         let (responder, outcome) = oneshot::channel();
-        let submitted = match self.queue.lock() {
+        let submitted = match queue.lock() {
             Ok(guard) => match guard.as_ref() {
                 Some(sender) => sender
                     .send(Job {
@@ -94,6 +126,8 @@ impl Bridge {
                         argument,
                         responder,
                         _permit: permit,
+                        _tenant_permit: tenant_permit,
+                        capacity: self.capacity.clone(),
                     })
                     .is_ok(),
                 None => false,
@@ -123,6 +157,9 @@ impl Drop for Bridge {
     /// and dies inside its detached serving closure.
     fn drop(&mut self) {
         if let Ok(mut guard) = self.queue.lock() {
+            guard.take();
+        }
+        if let Ok(mut guard) = self.settlement_queue.lock() {
             guard.take();
         }
         if let Ok(mut workers) = self.workers.lock() {
@@ -158,9 +195,12 @@ fn worker_loop(receiver: &Mutex<mpsc::Receiver<Job>>, object: &Py<PyAny>) {
             // the receive lock, so one poisoned call cannot take down the
             // pool.
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                control_plane_call(py, object, job.method, job.argument)
+                control_plane_call(py, object, job.method, &job.argument)
             }))
             .unwrap_or_else(|_| Err(PublicError::internal()));
+            if let Ok(reply) = &outcome {
+                job.capacity.completed(job.method, &job.argument, reply);
+            }
             let _ = job.responder.send(outcome);
         }
         // The control plane caches one SQLite connection per worker thread;
@@ -181,7 +221,7 @@ fn control_plane_call(
     py: Python<'_>,
     object: &Py<PyAny>,
     method: &'static str,
-    argument: String,
+    argument: &str,
 ) -> Result<String, PublicError> {
     let bound = object.bind(py);
     match bound.call_method1(method, (argument,)) {
@@ -389,7 +429,7 @@ class Plane:
         drop(bridge);
         // Drop joins the workers, so every one of them has already run its
         // `close_thread_resources` cleanup, including idle workers.
-        assert_eq!(attribute_length(&observer, "closed_threads"), 3);
+        assert_eq!(attribute_length(&observer, "closed_threads"), 5);
     }
 
     #[test]

@@ -309,8 +309,6 @@ class NativeAudioMixin:
 def _begin(plane: _AudioPlane, argument: str) -> JsonObject:
     """Run the shared admission preamble and parse the bridge argument."""
     assert_not_internal_classification()
-    plane._accounting.sweep_expired()  # noqa: SLF001
-    plane._accounting.request_settlements.require_clear()  # noqa: SLF001
     return json.loads(argument)
 
 
@@ -346,6 +344,7 @@ def _accept(
         authorization = with_client_identity(authorization, data)  # reporting-only app facts
     except Exception as exc:  # noqa: BLE001 - boundary sanitizes every failure.
         raise authority_error(exc) from exc
+    plane._accounting.require_clear(authorization.organization_id)  # noqa: SLF001
     require_unguarded_surface(plane._guardrails, authorization, surface)  # noqa: SLF001
     if time.monotonic() >= deadline:
         raise NativeBridgeError(audio_deadline_error())
@@ -490,6 +489,7 @@ def _route(  # noqa: PLR0913 - one admission seam shared by both audio surfaces.
     )
     response: JsonObject = {
         "request_id": authorization.request_id,
+        "caller_scope": f"{authorization.organization_id}:{authorization.identity_id}",
         "alias": authorization.alias,
         "alias_revision_id": authorization.alias_revision_id,
         "exact_model_id": route.snapshot.exact_model_id,

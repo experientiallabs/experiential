@@ -205,14 +205,11 @@ class NativeObservabilityMixin:
     def readiness(self, argument: str) -> str:
         """Return whether bridge settlement and composition accounting stay healthy.
 
-        Readiness fails closed once the bridge's own settlement registry has
-        latched a durable-write loss, once the composition's accounting
-        surface reports unhealthy, or when an injected hosted lifecycle probe
-        answers false or raises.
+        Retained writes block their organization's admission, not other tenants
+        or whole-process readiness. Infrastructure accounting failures and an
+        injected hosted lifecycle probe still fail closed.
         """
         del argument
-        if not self._accounting.accounting_healthy:
-            return "false"
         try:
             if not self._components.accounting_healthy:
                 return "false"

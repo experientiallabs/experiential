@@ -11,6 +11,8 @@ mod audio_duration;
 mod audio_elevenlabs;
 mod audio_upload;
 mod bridge;
+mod callback_capacity;
+mod callback_scope_registry;
 mod capture;
 mod codex_native_inversion;
 mod dialects;
@@ -205,7 +207,7 @@ fn shutdown_handle() -> ShutdownHandle {
 /// `RegexDetector`, so an admission whose output chain is deterministic runs
 /// entirely in the data plane instead of calling `enforce_output`.
 #[pyfunction]
-#[pyo3(signature = (control_plane, config_json, shutdown=None, on_listening=None, guardrail_detectors=None, capture=None))]
+#[pyo3(signature = (control_plane, config_json, shutdown=None, on_listening=None, guardrail_detectors=None, capture=None, callback_scopes=None))]
 fn serve(
     py: Python<'_>,
     control_plane: Py<PyAny>,
@@ -214,14 +216,21 @@ fn serve(
     on_listening: Option<Py<PyAny>>,
     guardrail_detectors: Option<&Bound<'_, PyDict>>,
     capture: Option<&capture::python::CaptureCollector>,
+    callback_scopes: Option<&callback_scope_registry::CallbackScopes>,
 ) -> PyResult<()> {
     let config: ServeConfig = serde_json::from_str(config_json)
         .map_err(|error| PyValueError::new_err(format!("invalid serve config: {error}")))?;
     retained::configure(config.maximum_retained_output_bytes);
     let detectors = Arc::new(collect_detectors(guardrail_detectors)?);
-    let bridge = Arc::new(
-        Bridge::new(control_plane, config.callback_permits).map_err(PyRuntimeError::new_err)?,
-    );
+    let mut bridge =
+        Bridge::new(control_plane, config.callback_permits).map_err(PyRuntimeError::new_err)?;
+    let capacity = Arc::get_mut(&mut bridge.capacity).expect("bridge has not accepted a callback");
+    if let Some(scopes) = callback_scopes {
+        capacity.tokens = scopes.inner.clone();
+    }
+    capacity.request_timeout =
+        std::time::Duration::from_secs_f64(config.request_timeout_seconds.max(1.0) + 60.0);
+    let bridge = Arc::new(bridge);
     let stop = shutdown.and_then(ShutdownHandle::take_receiver);
     let capture = capture.map(|collector| collector.inner.clone());
     let outcome = py.detach(move || {
@@ -685,6 +694,7 @@ const MODEL_STAGE_CONTRACT_VERSION: u32 = 1;
 #[pymodule]
 fn exp_gateway_native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<ShutdownHandle>()?;
+    module.add_class::<callback_scope_registry::CallbackScopes>()?;
     module.add_class::<RegexDetector>()?;
     module.add_class::<capture::python::CaptureCollector>()?;
     module.add_class::<capture::python::CaptureResponse>()?;

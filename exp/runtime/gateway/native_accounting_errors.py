@@ -55,3 +55,12 @@ def internal_protocol_error() -> OpenAIProtocolError:
         message="The gateway request failed.",
         error_type="api_error",
     )
+
+
+def accounting_recovering_error() -> OpenAIProtocolError:
+    """Return an organization-scoped retryable accounting refusal."""
+    return OpenAIProtocolError(
+        status_code=503,
+        code="accounting_unavailable",
+        message="Request accounting is recovering. Retry later.",
+    )
