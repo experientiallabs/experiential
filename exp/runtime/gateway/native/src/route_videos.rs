@@ -184,7 +184,7 @@ pub(crate) async fn videos_create(
     headers: HeaderMap,
     request: axum::extract::Request,
 ) -> Response {
-    let _permit = match acquire_batch_permit(&state).await {
+    let _permit = match acquire_batch_permit(&state, &headers).await {
         Ok(permit) => permit,
         Err(error) => return error_response(&error),
     };

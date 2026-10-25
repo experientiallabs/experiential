@@ -303,6 +303,10 @@ impl Drop for SettlementTask {
 }
 
 impl AttemptGuard {
+    /// The engine-owned request identity used for tenant scheduling.
+    pub(crate) fn request_id(&self) -> &str {
+        &self.request_id
+    }
     /// Count the owning detached task against graceful-shutdown draining.
     pub fn hold_task(&self) -> SettlementTask {
         SettlementTask::hold(self.pending.clone())

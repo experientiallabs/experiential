@@ -16,6 +16,7 @@ mod callback_scope_registry;
 mod capture;
 mod codex_native_inversion;
 mod dialects;
+mod dispatch_capacity;
 mod encode;
 mod encode_messages;
 mod encode_responses;

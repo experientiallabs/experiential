@@ -6,13 +6,13 @@
 //! the duration demuxed from its packets) are what admission validates. A
 //! `source_url` is refused: the gateway never fetches a caller-named URL.
 
+use crate::dispatch_capacity::DispatchPermit;
 use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, FromRequest, Multipart};
 use axum::http::{header, StatusCode};
 use base64::Engine as _;
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
-use tokio::sync::OwnedSemaphorePermit;
 
 use crate::audio_duration;
 use crate::errors::PublicError;
@@ -76,8 +76,8 @@ pub(crate) async fn read_upload(
 pub(crate) async fn measure_upload(
     mut fields: Map<String, Value>,
     mut upload: AudioUpload,
-    permit: OwnedSemaphorePermit,
-) -> Result<(Map<String, Value>, AudioUpload, OwnedSemaphorePermit), PublicError> {
+    permit: DispatchPermit,
+) -> Result<(Map<String, Value>, AudioUpload, DispatchPermit), PublicError> {
     // A streamed WAV's placeholder sizes are settled first, so the measured,
     // digested and forwarded bytes are the same self-consistent file.
     audio_duration::settle_streamed_wav_sizes(&mut upload.bytes);

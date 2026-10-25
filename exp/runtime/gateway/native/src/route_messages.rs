@@ -542,7 +542,7 @@ async fn completed_messages(
     mut guard: AttemptGuard,
     mut committed: CommittedAttempt,
     deadline: Instant,
-    permit: tokio::sync::OwnedSemaphorePermit,
+    permit: crate::dispatch_capacity::DispatchPermit,
 ) -> Response {
     let _permit = permit;
     let phase_timeout = admission.phase_timeout(committed.depth);
@@ -586,7 +586,7 @@ async fn guarded_messages(
     mut guard: AttemptGuard,
     mut committed: CommittedAttempt,
     deadline: Instant,
-    permit: tokio::sync::OwnedSemaphorePermit,
+    permit: crate::dispatch_capacity::DispatchPermit,
 ) -> Response {
     let _permit = permit;
     let phase_timeout = admission.phase_timeout(committed.depth);
@@ -646,7 +646,7 @@ async fn stream_messages(
     guard: AttemptGuard,
     committed: CommittedAttempt,
     deadline: Instant,
-    permit: tokio::sync::OwnedSemaphorePermit,
+    permit: crate::dispatch_capacity::DispatchPermit,
     incremental_guardrail: bool,
 ) -> Response {
     let (sender, receiver) = mpsc::channel::<Result<Bytes, std::io::Error>>(64);
