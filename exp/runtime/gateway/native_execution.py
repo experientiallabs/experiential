@@ -158,6 +158,8 @@ class InflightRequest:
         execution_lock: Serializes reservation, abandonment and estimated-fraction retention
             for this request only; fraction reads and tokenization run outside it.
         pending_abandon: Terminal failure retained while a reservation is in flight.
+        abandon_write_failed: Whether abandonment attempted durable cleanup and failed;
+            waiting for an active execution alone is not an accounting failure.
         ordinary_attempt_counts: Per-route failure-retry counts, initialized from physical
             counts; semantic tool turns and reasoning-repair successors do not increment them.
         attempt_policy: Effective caller bounds, defaulting to the operator's retry mechanics.
@@ -200,6 +202,7 @@ class InflightRequest:
     pending_settlement: JsonObject | None = None
     execution_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
     pending_abandon: GatewayFailure | None = None
+    abandon_write_failed: bool = False
     # Responses-only retention facts consumed by ``remember`` after a
     # successful terminal; chat attempts carry ``None``.
     continuation: ContinuationContext | None = None

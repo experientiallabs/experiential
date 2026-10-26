@@ -5,19 +5,20 @@ from __future__ import annotations
 # This companion owns the accounting registry's recovery loop and locked state.
 # ruff: noqa: SLF001
 import json
+import logging
 import time
 from collections import deque
 from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 from exp.runtime.gateway.disconnect_estimate import settled_terminal
-from exp.runtime.gateway.native_accounting_errors import NativeBridgeError
 
 if TYPE_CHECKING:
     from exp.runtime.gateway.native_accounting import NativeAttemptAccounting
 
 _SWEEP_BATCH = 16
 _SWEEP_GRACE_SECONDS = 5.0
+_logger = logging.getLogger(__name__)
 
 
 class FairRecovery[T]:
@@ -88,16 +89,21 @@ def recover_expired(accounting: NativeAttemptAccounting) -> None:
         settlement = entry.pending_settlement
         if settlement is None:
             continue
-        terminal, failure = settled_terminal(settlement, entry, loads=accounting._loads)
-        if accounting._settle_swept(
-            request_id,
-            entry,
-            attempt_id=str(settlement["attempt_id"]),
-            terminal=terminal,
-            failure=failure,
-            finalize=bool(settlement.get("finalize", True)),
-            settlement=settlement,
-        ):
+        try:
+            terminal, failure = settled_terminal(settlement, entry, loads=accounting._loads)
+            finished = accounting._settle_swept(
+                request_id,
+                entry,
+                attempt_id=str(settlement["attempt_id"]),
+                terminal=terminal,
+                failure=failure,
+                finalize=bool(settlement.get("finalize", True)),
+                settlement=settlement,
+            )
+        except Exception as error:  # noqa: BLE001 - one poison item cannot stop another tenant.
+            _logger.warning("retained gateway recovery failed: %s", type(error).__name__)
+            continue
+        if finished:
             with accounting._lock:
                 if entry.pending_settlement == settlement:
                     entry.pending_settlement = None
@@ -105,7 +111,8 @@ def recover_expired(accounting: NativeAttemptAccounting) -> None:
     for request_id, entry in abandoned:
         try:
             accounting.abandon(json.dumps({"request_id": request_id}))
-        except NativeBridgeError:
+        except Exception as error:  # noqa: BLE001 - retain cancellation and continue fair recovery.
+            _logger.warning("abandoned gateway recovery failed: %s", type(error).__name__)
             continue
         with accounting._lock:
             if accounting._inflight.get(request_id) is not entry:

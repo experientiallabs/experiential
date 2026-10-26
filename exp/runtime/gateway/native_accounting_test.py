@@ -1003,6 +1003,53 @@ def _settle(
     )
 
 
+def test_poison_recovery_item_retains_its_meter_and_does_not_block_another_org(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failing host observation cannot terminate or starve the recovery loop."""
+    from unittest.mock import Mock
+
+    from exp.runtime.gateway import native_accounting_recovery
+
+    monkeypatch.setattr(NativeAttemptAccounting, "_sweep_loop", lambda self: None)
+    ledger = _RecordingLedger()
+    accounting = NativeAttemptAccounting(ledger)
+    deployments = (_deployment("lead", connection_sha256="b" * 64),)
+    first = _admit(accounting, deployments, request_id="poison", organization_id="first")
+    second = _admit(accounting, deployments, request_id="healthy", organization_id="second")
+    for request_id in ("poison", "healthy"):
+        attempt = _start(accounting, ordinal=0, request_id=request_id)
+        ledger.fail_finishes = 1
+        with pytest.raises(NativeBridgeError):
+            _settle(
+                accounting,
+                attempt_id=str(attempt["attempt_id"]),
+                outcome="completed",
+                finalize=True,
+                request_id=request_id,
+            )
+    assert first.pending_settlement is not None
+    assert second.pending_settlement is not None
+    retained = first.pending_settlement
+    original = native_accounting_recovery.settled_terminal
+    good = original(second.pending_settlement, second, loads=accounting.loads)
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            native_accounting_recovery,
+            "settled_terminal",
+            Mock(side_effect=[ValueError("invalid recovery observation"), good]),
+        )
+        accounting.sweep_expired()
+    assert first.pending_settlement == retained
+    assert accounting.entry("healthy") is None
+    accounting.require_clear("second")
+    with pytest.raises(NativeBridgeError):
+        accounting.require_clear("first")
+    accounting.sweep_expired()
+    assert accounting.entry("poison") is None
+    assert len(ledger.finished) == 2
+
+
 def _retryable_failure() -> JsonObject:
     """One wire failure the executor may redial on the same deployment."""
     return {
@@ -4418,6 +4465,10 @@ def test_abandon_during_committed_reservation_retains_and_closes_late_attempt(
     try:
         assert committed.wait(5)
         accounting.abandon(json.dumps({"request_id": "late-reservation"}))
+        # Cancellation intent while reserve still owns the request lock is not
+        # a failed ledger write and must not fence sibling admissions.
+        accounting.require_clear(entry.authorization.organization_id)
+        assert not accounting.accounting_healthy
         assert accounting.entry("late-reservation") is entry
         assert not ledger.finished_requests and not ledger.finished
         if failed_cleanup:
@@ -4430,6 +4481,9 @@ def test_abandon_during_committed_reservation_retains_and_closes_late_attempt(
         assert len(errors) == 1 and isinstance(errors[0], NativeBridgeError)
         assert not results and accounting.entry("late-reservation") is entry
         assert entry.active_attempt_id is not None and not ledger.finished
+        with pytest.raises(NativeBridgeError):
+            accounting.require_clear(entry.authorization.organization_id)
+        accounting.require_clear("another-organization")
         accounting.sweep_expired()
     else:
         assert not errors and results and results[0].get("exhausted") is True
