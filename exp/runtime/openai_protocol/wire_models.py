@@ -311,7 +311,10 @@ class _Message(_WireModel):
     clients) carry `refusal`, `annotations`, `audio`, and `function_call`
     keys even when they are empty. Callers echo those messages back verbatim
     on tool-call continuations, so the empty forms are accepted here; only a
-    populated value is rejected as unsupported.
+    populated value is rejected as unsupported. A populated legacy
+    ``function_call`` (and a ``role: "function"`` result) never reaches this
+    model: :mod:`exp.runtime.openai_protocol.legacy_functions` rewrites both to
+    ``tool_calls`` and a ``tool`` message first.
 
     LiteLLM's ``Message.model_dump()`` adds ``provider_specific_fields``,
     ``thinking_blocks``, ``reasoning_items``, and ``images`` to every

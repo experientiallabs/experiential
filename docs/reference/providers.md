@@ -674,6 +674,9 @@ optional; named questions carry unique names. Bounds: at most 32 questions, 64 c
 and 32 MiB. A rung serves it only when it declares `supports_decisions`, prices output at exactly
 zero, and its connection exposes OpenAI's own `/decisions` endpoint (direct OpenAI connections;
 never Azure, ChatGPT plans, or SystemOne rungs, and a SystemOne body never reaches an OpenAI rung).
+A model with no such rung is refused with 400 `unsupported_capability` on `model`; when one of its
+rungs serves native decisions (the SystemOne lane's own rung rule), the refusal says so and points
+the caller to `POST /v1/systemone` on the same host with the same key and model id.
 Reservations count text and question bytes plus 2,048 tokens per image, 16 per message and 256 per
 question, with no output reservation. Answers are matched to questions by position and validated
 (echoed names, types, typed requested values, level labels and positions, unit probability totals

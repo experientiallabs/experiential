@@ -152,12 +152,15 @@ CHAT_MANIFEST = CompatibilityManifest(
             "prompt_cache_boundaries",
         ),
         _field("seed", CompatibilityDisposition.IGNORED),
+        # OpenAI's deprecated (not removed) spellings of ``tools`` and
+        # ``tool_choice``: rewritten to them with disclosure before manifest
+        # validation (``legacy_functions.translate_legacy_functions``).
+        _field("functions", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "function_tools"),
+        _field("function_call", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "function_tools"),
         *(
             _field(path, CompatibilityDisposition.UNSUPPORTED)
             for path in (
                 "audio",
-                "function_call",
-                "functions",
                 "logit_bias",
                 "modalities",
                 "moderation",

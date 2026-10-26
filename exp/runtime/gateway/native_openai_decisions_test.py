@@ -17,6 +17,11 @@ from exp.common.models import (
     ModelCapabilities,
 )
 from exp.runtime.gateway.catalog_authority import upsert_connection, upsert_singleton_deployment
+from exp.runtime.gateway.contracts import (
+    AuthorizationSnapshot,
+    GatewayFailure,
+    GatewayFailureClass,
+)
 from exp.runtime.gateway.ledger import SQLiteAttemptLedger
 from exp.runtime.gateway.lifecycle import load_gateway_components
 from exp.runtime.gateway.management import GatewayManagement
@@ -193,15 +198,68 @@ def test_settlement_bills_reported_input_tokens(tmp_path: Path) -> None:
     assert report["totals"]["output_tokens"] == 0
 
 
-def test_systemone_lane_does_not_serve_the_openai_wire(tmp_path: Path) -> None:
-    """An OpenAI-shaped request never reaches a TypeSafe SystemOne rung."""
+def _recorded_failures(
+    control: NativeControlPlane, monkeypatch: pytest.MonkeyPatch
+) -> list[GatewayFailure]:
+    """Record the content-free failures admission settles accepted requests with."""
+    recorded: list[GatewayFailure] = []
+    accounting = control._accounting  # noqa: SLF001
+    finish = accounting.finish_request_quietly
+
+    def _spy(authorization: AuthorizationSnapshot, failure: GatewayFailure) -> None:
+        recorded.append(failure)
+        finish(authorization, failure)
+
+    monkeypatch.setattr(accounting, "finish_request_quietly", _spy)
+    return recorded
+
+
+def test_systemone_lane_does_not_serve_the_openai_wire(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An OpenAI-shaped request never reaches a SystemOne rung; the refusal points there."""
     control, raw_key = _systemone_control_plane(tmp_path)
+    recorded = _recorded_failures(control, monkeypatch)
     with pytest.raises(NativeBridgeError) as refused:
         _admit(control, raw_key, _body(model="decisions"))
     error = _public_error(refused.value)
     assert error["status_code"] == 400
     assert error["code"] == "unsupported_capability"
+    assert error["param"] == "model"
+    assert error["message"] == (
+        "The model 'decisions' supports native decisions, not the OpenAI Decisions API. "
+        "POST /v1/systemone on this same API host with your same API key "
+        "(Authorization: Bearer) and the same model id 'decisions', using model, state "
+        "and questions. Key questions by id; each needs type (noul, choice or score) "
+        "and instructions (choice also needs a criteria object; score a criteria "
+        "array). Read answers[id]; do not send input or a questions list."
+    )
+    assert [failure.safe_message for failure in recorded] == [
+        "the model alias serves native decisions on /v1/systemone, not the OpenAI Decisions API"
+    ]
+    assert recorded[0].failure_class is GatewayFailureClass.UNSUPPORTED_CAPABILITY
     assert _rows(control) == [("decisions", "failed")]
+
+
+def test_a_lane_serving_neither_decisions_wire_keeps_the_choose_another_model_refusal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Undeclared SystemOne support is not a SystemOne hint: the generic copy stays."""
+    control, raw_key = _systemone_control_plane(tmp_path, supports_decisions=False)
+    recorded = _recorded_failures(control, monkeypatch)
+    with pytest.raises(NativeBridgeError) as refused:
+        _admit(control, raw_key, _body(model="decisions"))
+    error = _public_error(refused.value)
+    assert error["code"] == "unsupported_capability"
+    assert error["message"] == (
+        "The model 'decisions' does not serve the OpenAI Decisions API. Choose a "
+        "decision model served by OpenAI from GET /v1/models and resend the request "
+        "to /v1/decisions."
+    )
+    assert "/v1/systemone" not in json.dumps(error)
+    assert [failure.safe_message for failure in recorded] == [
+        "the model alias does not serve the OpenAI Decisions API"
+    ]
 
 
 def test_undeclared_or_output_priced_lanes_are_refused(tmp_path: Path) -> None:
