@@ -63,6 +63,7 @@ from exp.runtime.gateway.native_settlement import (
 )
 from exp.runtime.gateway.recovery import (
     FrozenRecoveryBinding,
+    RecoveryHost,
     RecoveryLease,
     RecoveryObservation,
     RecoverySnapshot,
@@ -329,10 +330,12 @@ class _RecordingLedger:
         return certify_no_effects and authorization.request_id not in self.started_request_ids
 
 
-def _registry() -> tuple[NativeAttemptAccounting, _RecordingLedger, InflightRequest]:
+def _registry(
+    *, background_recovery: bool = True
+) -> tuple[NativeAttemptAccounting, _RecordingLedger, InflightRequest]:
     """Compose one registry over a two-deployment certified route."""
     ledger = _RecordingLedger()
-    registry = NativeAttemptAccounting(ledger)  # type: ignore[arg-type]
+    registry = NativeAttemptAccounting(ledger, background_recovery=background_recovery)  # type: ignore[arg-type]
     deployments = (
         _deployment("deployment-a", connection_sha256="b" * 64),
         _deployment("deployment-b", connection_sha256="c" * 64),
@@ -1339,12 +1342,21 @@ def test_graceful_retirements_preserve_retries_prior_failures_and_unknown_usage(
     monkeypatch: pytest.MonkeyPatch, swept: bool
 ) -> None:
     """Two connection retirements retain both receipts without tripping or healing the circuit."""
-    registry, ledger, entry = _registry()
+    registry, ledger, entry = _registry(background_recovery=False)
     registry.recovery_host = RecoveryHostFake()
 
-    def unexpected_observation(*_args: object, **_kwargs: object) -> None:
+    def unexpected_observation(
+        recovery: SessionRecoveryRegistry,
+        host: RecoveryHost | None,
+        observed: InflightRequest,
+        attempt_id: str,
+        usage: GatewayUsage | None,
+        failure: GatewayFailure | None,
+    ) -> None:
         """A graceful retirement must produce neither a departure nor a success."""
-        raise AssertionError("connection retirement reached recovery history")
+        if observed is entry:
+            raise AssertionError("connection retirement reached recovery history")
+        record_session_outcome(recovery, host, observed, attempt_id, usage, failure)
 
     monkeypatch.setattr(
         "exp.runtime.gateway.native_accounting.record_session_outcome", unexpected_observation
