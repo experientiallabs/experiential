@@ -36,8 +36,11 @@ class ContainmentGuarantee(StrEnum):
         NO_NEW_PRIVILEGES: Set-user-ID and file capabilities cannot raise privileges.
         HOST_PROCESS_ISOLATION: Processes outside the session cannot be seen by PID, signaled,
             traced, or have their environment or memory read.
-        FILESYSTEM_WRITE_CONFINEMENT: Writes, creations, renames, and deletions are confined to
-            the private workspace (plus the null, zero, and full devices).
+        FILESYSTEM_WRITE_CONFINEMENT: File content writes, truncations, creations, links,
+            renames, and deletions are confined to the private workspace (plus the null, zero,
+            and full devices). Metadata of existing files (mode, owner, timestamps, extended
+            attributes) is not confined: Landlock has no right for it, so a command can still
+            change it on any host path the invoking user owns.
         NETWORK_DENIED: No IP network, including loopback, and no abstract Unix sockets outside
             the session. Filesystem Unix sockets the user can reach are not covered.
     """

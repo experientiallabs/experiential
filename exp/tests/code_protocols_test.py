@@ -71,7 +71,7 @@ PROTOCOLS = (
             "exp.simulation.evaluation.calibration:task_decision",
             "exp.simulation.evaluation.calibration:blinded_case",
         ),
-        "cfb50e4ac7dea292a349fd1b25dd4800be6206be76e07a6672d08ef071a041bf",
+        "7d95dd1c8cdfd8977a79cdafd5e9774912ce47df0b2fee245af3ea6dc64ad133",
     ),
     Protocol(
         "exp.optimize.evaluation.council.runner:COUNCIL_HARNESS_PROTOCOL",

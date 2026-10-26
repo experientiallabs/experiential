@@ -431,6 +431,31 @@ def test_writes_outside_the_private_workspace_are_denied(tmp_path: Path) -> None
     assert not outside.exists()
 
 
+@_requires(ContainmentGuarantee.FILESYSTEM_WRITE_CONFINEMENT)
+def test_write_confinement_claims_no_metadata_confinement_landlock_cannot_enforce(
+    tmp_path: Path,
+) -> None:
+    """Landlock has no right for chmod, chown, utimes or xattrs, so the claim must exclude them.
+
+    A mode change beside the workspace still succeeds under the guarantee, and the guarantee's
+    documented scope names file metadata as not confined.
+    """
+    runtime = _runtime(tmp_path)
+    outside = tmp_path / "host-file.txt"
+    outside.write_text("host", encoding="utf-8")
+    outside.chmod(0o644)
+
+    with runtime.open(_task()) as session:
+        changed = session.execute(_call("chmod", path=str(outside)))
+
+    assert changed.content == "changed"
+    assert outside.stat().st_mode & 0o777 == 0o600
+    scope = " ".join(str(ContainmentGuarantee.__doc__).split())
+    assert "Metadata of existing files (mode, owner, timestamps, extended attributes) is not" in (
+        scope
+    )
+
+
 @_requires(ContainmentGuarantee.NETWORK_DENIED)
 def test_network_is_denied_including_host_loopback(tmp_path: Path) -> None:
     """Neither a host loopback listener nor an unrouted address is reachable."""
@@ -780,6 +805,13 @@ for line in sys.stdin:
         try:
             (Path(os.environ["EXP_SANDBOX_WORKSPACE"]) / arguments["path"]).write_text("x")
             reply("written")
+        except OSError as error:
+            reply(type(error).__name__)
+        continue
+    if name == "chmod":
+        try:
+            os.chmod(arguments["path"], 0o600)
+            reply("changed")
         except OSError as error:
             reply(type(error).__name__)
         continue

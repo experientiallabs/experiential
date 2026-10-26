@@ -49,7 +49,7 @@ reason.
 | `process_count_limit` | At most `process_count` processes in the whole session, the command included. | yes | no |
 | `no_new_privileges` | Set-user-ID files and file capabilities cannot raise privileges. | yes | no |
 | `host_process_isolation` | Processes outside the session cannot be addressed by PID, signaled, traced, or have their environment or memory read. | Landlock ABI 3+ and verified private procfs | no |
-| `filesystem_write_confinement` | Writes, creations, renames, and deletions only inside the workspace (and `/dev/null`, `/dev/zero`, `/dev/full`). | Landlock ABI 3+ | no |
+| `filesystem_write_confinement` | Content writes, truncations, creations, links, renames, and deletions only inside the workspace (and `/dev/null`, `/dev/zero`, `/dev/full`). Metadata of existing files (mode, owner, timestamps, extended attributes) is not confined. | Landlock ABI 3+ | no |
 | `network_denied` | No IP network, including host loopback, and no abstract Unix sockets outside the session. | network namespace | no |
 
 Explicit non-guarantees on every host: filesystem reads are not confined (files the user can
@@ -66,7 +66,9 @@ them refuses local execution with the kernel error and the settings to change
 (`kernel.unprivileged_userns_clone`, `user.max_user_namespaces`, or an AppArmor policy that
 permits unprivileged user namespaces). Network denial additionally needs network namespaces;
 without them `network_denied` is reported unavailable and a caller that requires it is refused.
-Write confinement needs Landlock ABI 3 or newer. Host-process isolation additionally requires
+Write confinement needs Landlock ABI 3 or newer. Landlock has no access right for `chmod`,
+`chown`, `utimes` or extended attributes, so the guarantee leaves the metadata of host files the
+invoking user owns changeable. Host-process isolation additionally requires
 a private mount namespace and a procfs mount for the session's PID namespace. The probe checks
 that `/proc/self` matches the command's PID and that procfs lists only session processes.
 A denied or ineffective mount leaves `host_process_isolation` unavailable; the other proven
