@@ -394,22 +394,49 @@ class LedgerSnapshot:
             Unresolved node counts per unknown scheme.
         """
         known = set(computable)
-        resolved = {node.vertex for node in self.records.nodes if node.scheme in known}
-        # Only a verified equivalence resolves a node; a shared grouping edge never does.
-        linked = {
-            vertex
-            for equivalence in self.records.equivalences
-            if any(item in resolved for item in equivalence.vertices)
-            for vertex in equivalence.vertices
-        }
+        resolved = self.resolved_vertices(computable)
         counts: dict[SchemeIdentity, int] = defaultdict(int)
         for node in self.records.nodes:
-            if node.scheme not in known and node.vertex not in linked:
+            if node.scheme not in known and node.vertex not in resolved:
                 counts[node.scheme] += 1
         return tuple(
             UnknownScheme(scheme=scheme, nodes=count)
             for scheme, count in sorted(counts.items(), key=lambda item: item[0].key)
         )
+
+    def resolved_vertices(self, computable: Sequence[SchemeIdentity]) -> frozenset[Vertex]:
+        """Vertices tied to a content fingerprint computable here.
+
+        A node under a computable scheme resolves only when it has a fingerprint: an unresolved
+        vertex names its source record, not its content, so it can never match the same task
+        imported again with call IDs. Every other vertex resolves only through verified
+        equivalences, followed transitively; a shared grouping edge never resolves one.
+
+        Args:
+            computable: Identities of the schemes that pass their vectors on this machine.
+
+        Returns:
+            The resolved vertices.
+        """
+        known = set(computable)
+        anchors = {
+            node.vertex
+            for node in self.records.nodes
+            if node.scheme in known and node.fingerprint is not None
+        }
+        union = UnionFind(anchors)
+        for equivalence in self.records.equivalences:
+            first, *rest = equivalence.vertices
+            for vertex in rest:
+                union.union(first, vertex)
+        roots = {union.find(vertex) for vertex in anchors}
+        linked = {
+            vertex
+            for equivalence in self.records.equivalences
+            for vertex in equivalence.vertices
+            if union.find(vertex) in roots
+        }
+        return frozenset(anchors | linked)
 
     def _nearest(
         self, vertices: Iterable[Vertex], marked: Mapping[Vertex, list[str]]
@@ -673,7 +700,7 @@ class ExposureLedger:
         if not snapshot.unknown_schemes(computable):
             return 0
         resolved = 0
-        linked = {vertex for item in snapshot.records.equivalences for vertex in item.vertices}
+        linked = snapshot.resolved_vertices(computable)
         for node in snapshot.records.nodes:
             if node.scheme in computable or node.vertex in linked:
                 continue
@@ -683,7 +710,8 @@ class ExposureLedger:
             fresh = _nodes(self, node.source.project, node.build, node.source.dataset, (trace,))
             with self.transaction() as transaction:
                 _write_nodes(transaction, fresh, extra={node.source.record_sha256: node.vertex})
-            resolved += 1
+            # A link to an unresolved vertex groups the node but leaves its content unknown.
+            resolved += any(item.fingerprint is not None for item in fresh)
         return resolved
 
     def record_exposure(self, exposure: LedgerExposure) -> None:

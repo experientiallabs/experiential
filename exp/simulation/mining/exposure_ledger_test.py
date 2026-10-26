@@ -61,6 +61,11 @@ OLD = Scheme(
     compute=ordered_fingerprint,
     vectors=(GoldenVector(trace=trace(0), fingerprint=ordered_fingerprint(trace(0))),),
 )
+TASK_ONLY = Scheme(
+    specification={"name": "trace-task", "version": 1, "hash": "task text only"},
+    compute=lambda item: sha256_json({"task": item.task}),
+    vectors=(GoldenVector(trace=trace(0), fingerprint=sha256_json({"task": trace(0).task})),),
+)
 EDITED = Scheme(
     specification={**TRACE_CONTENT_SPECIFICATION, "unicode": "NFC before hashing"},
     compute=trace_content_fingerprint,
@@ -163,6 +168,40 @@ def test_matching_runs_under_every_computable_scheme_with_equivalence_links(
     assert new.snapshot().unknown_schemes([TRACE_CONTENT.identity]) == ()
     resolved = new.snapshot().exposure((vertex(new, b),))
     assert resolved is not None, "full equivalence lets the new scheme see the old exposure"
+
+
+def test_a_link_to_an_unfingerprintable_vertex_leaves_the_scheme_unknown(
+    tmp_path: Path,
+) -> None:
+    """An unresolved vertex names a source, not content, so linking to it never resolves."""
+    ambiguous = vector_trace(
+        "Look up order #W5.",
+        ((None, "get_order", {"order_id": "#W5"}, "{}"),),
+        trace_id="ambiguous",
+    )
+    build(ExposureLedger(tmp_path, schemes=(TASK_ONLY,)), "one", ambiguous)
+    new = ExposureLedger(tmp_path, schemes=(TRACE_CONTENT,))
+    assert new.resolve_sources(lambda source: ambiguous) == 0
+    [node] = [
+        node for node in new.snapshot().records.nodes if node.scheme == TRACE_CONTENT.identity
+    ]
+    assert node.fingerprint is None, "the current scheme cannot pair its calls"
+    assert len(new.snapshot().records.equivalences) == 1, "the link still groups the two"
+    [unknown] = new.snapshot().unknown_schemes([TRACE_CONTENT.identity])
+    assert (unknown.scheme, unknown.nodes) == (TASK_ONLY.identity, 1)
+
+
+def test_unknown_schemes_linked_only_to_each_other_still_resolve_from_sources(
+    tmp_path: Path,
+) -> None:
+    """An equivalence between two unknown schemes never blocks recovery from the source."""
+    item = trace(1)
+    build(ExposureLedger(tmp_path, schemes=(OLD, TASK_ONLY)), "one", item)
+    new = ExposureLedger(tmp_path, schemes=(TRACE_CONTENT,))
+    unknown = new.snapshot().unknown_schemes([TRACE_CONTENT.identity])
+    assert {row.scheme for row in unknown} == {OLD.identity, TASK_ONLY.identity}
+    assert new.resolve_sources(lambda source: item) == 2
+    assert new.snapshot().unknown_schemes([TRACE_CONTENT.identity]) == ()
 
 
 def test_scheme_identity_conflicts_are_refused(tmp_path: Path) -> None:
