@@ -86,7 +86,7 @@ dispatch outcome stops the step instead: it is never resolved by a fresh main-mo
   grade is the verified outcome. Mistakes stay in as failed outcomes; unknown outcomes stay
   counted as unknown. Calls made under a forced tool choice are not the main model's free choice
   and are excluded. Branches from one checkpoint reach shared states, so each state and decision
-  is labelled `verified_correct` (some trajectory taking it from there passed),
+  of that checkpoint is labelled `verified_correct` (some trajectory taking it from there passed),
   `verified_error` (every assessed one failed) or `unverified`.
 - **Shadow pass.** The decider is asked once per distinct reached state. Each answer is a durable
   receipt written after its intent; an interrupted dispatch stays unknown and is never redrawn,
@@ -94,7 +94,8 @@ dispatch outcome stops the step instead: it is never resolved by a fresh main-mo
 - **Estimate.** For every grid value a trajectory keeps its verified outcome unless the cascade
   would have accepted a decision different from the main model's (for a draft, a different
   complete action, ignoring call IDs). From that state the trajectories that took the decider's
-  decision from the same state stand in for what would have followed; with none observed, the
+  decision from the same state of the same checkpoint stand in for what would have followed
+  (variants of one task can share a visible state over different hidden worlds); with none observed, the
   trajectory counts as a task failure and a policy violation. Task success and policy
   compliance are compared per lineage as the paired difference cascade minus main.
 - **Selection** follows the registered objective `max_delegation_noninferior`: the largest

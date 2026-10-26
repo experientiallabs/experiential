@@ -13,9 +13,9 @@ The procedure is registered before any decider answer is read:
 4. Estimate each grid threshold offline. A trajectory keeps its verified outcome unless the
    cascade would have accepted a decision differing from the main model's. From that reached
    state the cascade follows the decider, so the trajectories that took the decider's decision
-   from the same state (continuation branches reach shared states) stand in for what would
-   have followed. Without such an observed continuation the trajectory counts as a task failure
-   and a policy violation, because what would have followed is not observed.
+   from the same state of the same checkpoint (continuation branches reach shared states) stand
+   in for what would have followed. Without such an observed continuation the trajectory counts
+   as a task failure and a policy violation, because what would have followed is not observed.
 5. Select by the registered objective: the largest delegated share whose task success and
    policy compliance stay within their margins of the main model alone, compared per lineage.
    Ties go to the higher threshold. The selected threshold becomes a deployable
@@ -75,7 +75,7 @@ from exp.runtime.sessions.dispatch_ledger import DispatchLedger
 
 # Identity of the estimator and selection rule below, in place of their source text. Bump it
 # when either changes; exp/tests/code_protocols_test.py records the covered source.
-CASCADE_FIT_PROTOCOL = "decision-cascade-fit-v1"
+CASCADE_FIT_PROTOCOL = "decision-cascade-fit-v2"
 FIT_SCOPE = (
     "development fit on the main model's own trajectories; offline estimate splicing observed "
     "continuations at accepted disagreements and failing a trajectory without one; states the "
@@ -269,19 +269,21 @@ def estimate_threshold(
     A trajectory with no accepted disagreement keeps its verified outcome. At its first
     accepted disagreement the cascade would have taken the decider's decision from that reached
     state; the trajectories that took the same decision (or, for a draft, the same complete
-    action) from the same state are its observed continuations, and their estimated outcomes
-    are averaged in its place. Without any such continuation it counts as a task failure and a
-    policy violation. Splicing always moves to a later disagreement, so the recursion ends.
+    action) from the same state of the same checkpoint are its observed continuations, and their
+    estimated outcomes are averaged in its place. Without any such continuation it counts as a
+    task failure and a policy violation. Splicing always moves to a later disagreement, so the
+    recursion ends.
     """
     decision_labels = points.labels(by="decision")
     action_labels = points.labels(by="action")
     delegated = avoided = agreed = correct = wrong = 0
-    diverges: dict[Trajectory, tuple[Sha256, str]] = {}
-    takes: dict[tuple[Sha256, str], list[Trajectory]] = defaultdict(list)
+    diverges: dict[Trajectory, tuple[str, Sha256, str]] = {}
+    takes: dict[tuple[str, Sha256, str], list[Trajectory]] = defaultdict(list)
     for point in points.points:
         trajectory = (point.study.artifact_id, point.branch)
-        takes[point.state_sha256, point.main_choice].append(trajectory)
-        takes[point.state_sha256, point.main_action_sha256].append(trajectory)
+        world = point.checkpoint.artifact_id
+        takes[world, point.state_sha256, point.main_choice].append(trajectory)
+        takes[world, point.state_sha256, point.main_action_sha256].append(trajectory)
         decision = predictions.get(point.state_sha256)
         allowed = tuple(name for name in point.candidates if name not in spec.never_delegate)
         if decision is None or not delegates(
@@ -292,16 +294,16 @@ def estimate_threshold(
         avoided += decision.action is not None
         if decision.action is None:
             taken, same = decision.selected, decision.selected == point.main_choice
-            label = decision_labels.get((point.state_sha256, taken), "unverified")
+            label = decision_labels.get((world, point.state_sha256, taken), "unverified")
         else:
             taken = action_projection(decision.action)
             same = taken == point.main_action_sha256
-            label = action_labels.get((point.state_sha256, taken), "unverified")
+            label = action_labels.get((world, point.state_sha256, taken), "unverified")
         agreed += same
         correct += label == "verified_correct"
         wrong += label == "verified_error"
         if not same:
-            diverges.setdefault(trajectory, (point.state_sha256, taken))
+            diverges.setdefault(trajectory, (world, point.state_sha256, taken))
     verdicts = {
         (row.study.artifact_id, row.branch): {"success": row.outcome, "compliance": row.policy}
         for row in points.trajectories

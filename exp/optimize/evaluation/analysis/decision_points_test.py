@@ -422,9 +422,9 @@ def test_reached_states_carry_the_main_choice_and_verified_outcome(
     assert firsts[0].state_sha256 == firsts[1].state_sha256
     assert firsts[0].call != firsts[1].call
     labels = points.labels(by="decision")
-    state = firsts[0].state_sha256
-    assert labels[state, spec.correct_key] == "verified_correct"
-    assert labels[state, spec.mistake_key] == "verified_error"
+    world_id, state = firsts[0].checkpoint.artifact_id, firsts[0].state_sha256
+    assert labels[world_id, state, spec.correct_key] == "verified_correct"
+    assert labels[world_id, state, spec.mistake_key] == "verified_error"
     assert points.lineages == ("d1",)
     assert all(point.candidates[-1] == RESPOND for point in points.points)
     if kind == "tickets":

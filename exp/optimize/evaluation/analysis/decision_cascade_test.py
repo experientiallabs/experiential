@@ -15,9 +15,16 @@ from exp.optimize.evaluation.analysis import decision_cascade as owner
 from exp.optimize.evaluation.analysis.decision_cascade import (
     CascadeFitSpec,
     CascadeObjective,
+    ThresholdRow,
+    estimate_threshold,
     preflight_cascade_fit,
     run_cascade_fit,
     saved_cascade_fit,
+)
+from exp.optimize.evaluation.analysis.decision_points import (
+    DecisionPoint,
+    DecisionPointSet,
+    Trajectory,
 )
 from exp.optimize.evaluation.analysis.decision_points_test import (
     WORLDS,
@@ -27,8 +34,10 @@ from exp.optimize.evaluation.analysis.decision_points_test import (
     project_fixture,
     world,
 )
-from exp.runtime.agents.cascade import DeciderDefinition
+from exp.runtime.agents.cascade import OTHER, RESPOND, DeciderDefinition, NextActionDecision
+from exp.runtime.agents.cascade_test import snapshot
 from exp.runtime.models.providers.transport import JsonHttpResponse
+from exp.simulation.evaluation.tasks import Verdict
 
 DEVELOPMENT = ("d1", "d2", "d3", "d4")
 
@@ -202,3 +211,81 @@ def test_registration_refuses_default_grids_and_undeclared_lineages(
                 update={"decider": spec.decider.model_copy(update={"model": spec.main_model})}
             ),
         )
+
+
+STATE = sha256_json({"state": "first"})
+OPTIONS = ("close", "open", RESPOND)
+
+
+def reference(name: str) -> ArtifactInput:
+    """Return a fixture artifact reference."""
+    return ArtifactInput(artifact_id=name, sha256=sha256_json(name))
+
+
+def branch(
+    checkpoint: str, lineage: str, index: int, choice: str, outcome: Verdict
+) -> tuple[Trajectory, DecisionPoint]:
+    """Return one branch of one study that makes ``choice`` at the shared visible state."""
+    study = reference(f"study-{checkpoint}")
+    point = DecisionPoint(
+        id=f"{checkpoint}-{index}",
+        study=study,
+        branch=index,
+        call=reference(f"call-{checkpoint}-{index}"),
+        checkpoint=reference(checkpoint),
+        lineage=lineage,
+        task_id=f"task-{lineage}",
+        state_sha256=STATE,
+        candidates=OPTIONS,
+        main_choice=choice,
+        main_action_sha256=sha256_json(choice),
+        outcome=outcome,
+        policy=outcome,
+    )
+    row = Trajectory(study=study, branch=index, lineage=lineage, outcome=outcome, policy=outcome)
+    return row, point
+
+
+def offline(
+    branches: list[tuple[Trajectory, DecisionPoint]], lineages: tuple[str, ...]
+) -> ThresholdRow:
+    """Estimate threshold 0.9 when the decider always closes with full confidence."""
+    model = snapshot("main-v1")
+    points = DecisionPointSet(
+        main_model=model,
+        studies=tuple(dict.fromkeys(row.study for row, _ in branches)),
+        trajectories=tuple(row for row, _ in branches),
+        points=tuple(point for _, point in branches),
+    )
+    decider = DeciderDefinition(kind="systemone", alias="jev", model=snapshot("jev-v1"))
+    spec = CascadeFitSpec(
+        sources=points.studies,
+        main_model=model,
+        development_lineages=lineages,
+        decider=decider,
+        grid=(0.9,),
+        objective=CascadeObjective(
+            success_margin=0.1,
+            compliance_margin=0.1,
+            criterion="point_estimate",
+            minimum_lineages=len(lineages),
+        ),
+        catalog_sha256=sha256_json("catalog"),
+        maximum_physical_attempts=10,
+        deadline=datetime.now(UTC) + timedelta(hours=1),
+    )
+    close = NextActionDecision(
+        selected="close", probabilities={"close": 1.0, "open": 0.0, RESPOND: 0.0, OTHER: 0.0}
+    )
+    return estimate_threshold(points, {STATE: close}, 0.9, spec)
+
+
+def test_donors_and_labels_never_cross_worlds_that_share_a_visible_state() -> None:
+    """A passing close in world X neither labels nor stands in for a close in world Y."""
+    row = offline(
+        [branch("world-x", "a", 0, "close", "pass"), branch("world-y", "b", 0, "open", "fail")],
+        ("a", "b"),
+    )
+    assert row.delegated == 2 and row.affected_trajectories == 1
+    assert row.verified_correct == 1
+    assert row.success["unit_differences"] == {"a": 0.0, "b": 0.0}

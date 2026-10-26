@@ -6,12 +6,14 @@ first tool, or ``respond``), and the branch's verifier grade is the verified out
 trajectory that choice belongs to. Failed trajectories are kept, so a mistake is labelled by its
 failed outcome instead of disappearing; unassessable trajectories stay counted as unknown.
 
-Branches from one checkpoint reach some states more than once. Pooling them gives a state-level
-label for each decision: ``verified_correct`` when some trajectory taking it from that state
-passed, ``verified_error`` when every assessed trajectory taking it failed, and ``unverified``
-otherwise. A verified-correct decision shows that a successful continuation exists after it; it
-does not certify the decision in isolation. Only the main model's own free choices count: calls
-it made under a forced tool choice and studies run with a cascade are excluded.
+Branches from one checkpoint reach some states more than once. Pooling them within that
+checkpoint gives a state-level label for each decision: ``verified_correct`` when some trajectory
+taking it from that state passed, ``verified_error`` when every assessed trajectory taking it
+failed, and ``unverified`` otherwise. Variants of one task can share a visible state while their
+hidden worlds differ, so pooling never crosses checkpoints. A verified-correct decision shows that
+a successful continuation exists after it; it does not certify the decision in isolation. Only
+the main model's own free choices count: calls it made under a forced tool choice and studies run
+with a cascade are excluded.
 """
 
 from collections import defaultdict
@@ -48,9 +50,12 @@ class DecisionPoint(ContractModel):
         study: Complete saved continuation study.
         branch: Planned branch index within that study.
         call: Exact saved actor request.
+        checkpoint: Exact paired actor/world checkpoint the branch continued from; labels and
+            observed continuations are pooled only within it.
         lineage: Task lineage, the independent unit.
         task_id: Public task identity.
-        state_sha256: Identity of the reached state; branches reaching it again share it.
+        state_sha256: Identity of the actor-visible reached state; branches reaching it again
+            share it, as does any other world presenting the same visible state.
         candidates: Ordered next-action options at that state.
         main_choice: The main model's decision.
         main_action_sha256: The main model's complete action, ignoring generated call IDs.
@@ -62,6 +67,7 @@ class DecisionPoint(ContractModel):
     study: ArtifactInput
     branch: int = Field(ge=0)
     call: ArtifactInput
+    checkpoint: ArtifactInput
     lineage: str
     task_id: str
     state_sha256: Sha256
@@ -117,12 +123,18 @@ class DecisionPointSet(ContractModel):
             found.setdefault(point.state_sha256, point.call)
         return found
 
-    def labels(self, *, by: Literal["decision", "action"]) -> dict[tuple[Sha256, str], StateLabel]:
-        """Label each observed state and main decision (or complete action) by its outcomes."""
-        outcomes: dict[tuple[Sha256, str], list[Verdict]] = defaultdict(list)
+    def labels(
+        self, *, by: Literal["decision", "action"]
+    ) -> dict[tuple[str, Sha256, str], StateLabel]:
+        """Label each checkpoint's observed state and main decision (or action) by its outcomes.
+
+        Keys are ``(checkpoint artifact, state, decision)``: outcomes from another world never
+        label a decision, even at a byte-identical visible state.
+        """
+        outcomes: dict[tuple[str, Sha256, str], list[Verdict]] = defaultdict(list)
         for point in self.points:
             key = point.main_choice if by == "decision" else point.main_action_sha256
-            outcomes[point.state_sha256, key].append(point.outcome)
+            outcomes[point.checkpoint.artifact_id, point.state_sha256, key].append(point.outcome)
         return {
             key: "verified_correct"
             if "pass" in values
@@ -232,6 +244,7 @@ def extract_decision_points(
                         study=reference,
                         branch=branch.index,
                         call=call,
+                        checkpoint=study.spec.checkpoint,
                         lineage=task.lineage_group_id,
                         task_id=task.task_id,
                         state_sha256=sha256_json(state),
