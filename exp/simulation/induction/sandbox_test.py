@@ -13,7 +13,7 @@ from exp.common.core.artifacts import JsonObject
 from exp.simulation.induction import runner
 from exp.simulation.induction import sandbox as sandbox_module
 from exp.simulation.induction.contracts import SandboxLimits, TransitionProgram
-from exp.simulation.induction.runner_test import COUNTER, FORMATTER_ESCAPE
+from exp.simulation.induction.runner_test import COUNTER, SECRET, formatter_escape, secret_file
 from exp.simulation.induction.sandbox import ProgramSandbox, SandboxUnavailableError
 
 APPEND = TransitionProgram(
@@ -51,21 +51,22 @@ def test_a_wall_clock_overrun_kills_the_worker_and_the_next_call_gets_a_fresh_on
         assert sandbox.run(APPEND, {"items": []}, {"value": 1}, {}).status == "reply"
 
 
-def test_memory_and_file_access_are_contained_by_the_worker_limits() -> None:
+def test_memory_and_file_access_are_contained_by_the_worker_limits(tmp_path: Path) -> None:
     """Huge allocations fail inside the address-space limit and no file can be opened."""
     with ProgramSandbox() as sandbox:
         memory = sandbox.run(_program("    return [0] * (10 ** 10)\n"), {}, {}, {})
         assert memory.status == "failed" and "MemoryError" in str(memory.detail)
-        reading = sandbox.run(_program("    return open('/etc/hostname').read()\n"), {}, {}, {})
-        assert reading.status == "failed"
+        path = secret_file(tmp_path)
+        reading = sandbox.run(_program(f"    return open({str(path)!r}).read()\n"), {}, {}, {})
+        assert reading.status == "failed" and SECRET not in reading.model_dump_json()
 
 
-def test_the_formatter_escape_reaches_no_host_file() -> None:
+def test_the_formatter_escape_reaches_no_host_file(tmp_path: Path) -> None:
     """The reproduced string-driven escape fails in the worker instead of reading a host file."""
-    escape = TransitionProgram(tool="fixture", source=FORMATTER_ESCAPE)
+    escape = TransitionProgram(tool="fixture", source=formatter_escape(secret_file(tmp_path)))
     with ProgramSandbox() as sandbox:
         outcome = sandbox.run(escape, {}, {}, {})
-    assert outcome.status == "failed" and outcome.reply is None
+    assert outcome.status == "failed" and SECRET not in outcome.model_dump_json()
 
 
 def test_refused_programs_never_reach_the_worker() -> None:

@@ -122,17 +122,31 @@ def test_imported_modules_expose_only_public_non_module_attributes() -> None:
     assert outcome.status == "failed" and "AttributeError" in str(outcome.detail)
 
 
-# Attribute paths written as strings never reach the static check, so every entry point that
-# walks them must be unreachable; the first is the reproduced escape to the real builtins.
-FORMATTER_ESCAPE = """
+SECRET = "fixture-secret-outside-the-sandbox"
+
+
+def secret_file(directory: Path) -> Path:
+    """Create the host file a contained program must never read, holding :data:`SECRET`."""
+    path = directory / "secret.txt"
+    path.write_text(SECRET, encoding="utf-8")
+    return path
+
+
+def formatter_escape(path: Path) -> str:
+    """Return the reproduced escape to the real builtins, reading ``path`` if it succeeds.
+
+    Attribute paths written as strings never reach the static check, so every entry point that
+    walks them must be unreachable.
+    """
+    return f"""
 import json
 import string
 
 
 def transition(state, args, facts):
     field = "0.__init__.__globals__[__builtins__][open]"
-    opener, _ = string.Formatter().get_field(field, (json.JSONEncoder,), {})
-    return opener("/etc/hostname").read()
+    opener, _ = string.Formatter().get_field(field, (json.JSONEncoder,), {{}})
+    return opener({str(path)!r}).read()
 """
 
 
@@ -157,11 +171,13 @@ def test_string_driven_attribute_walks_are_unreachable(body: str) -> None:
     assert "AttributeError" in str(outcome.detail) or "NameError" in str(outcome.detail)
 
 
-def test_the_formatter_escape_to_the_real_builtins_fails() -> None:
+def test_the_formatter_escape_to_the_real_builtins_fails(tmp_path: Path) -> None:
     """The reproduced escape passes the static check but finds no ``string.Formatter``."""
-    check_source(FORMATTER_ESCAPE)
-    outcome = _run(FORMATTER_ESCAPE)
+    source = formatter_escape(secret_file(tmp_path))
+    check_source(source)
+    outcome = _run(source)
     assert outcome.status == "failed" and "Formatter" in str(outcome.detail)
+    assert SECRET not in outcome.model_dump_json()
 
 
 @pytest.mark.parametrize(
@@ -186,8 +202,11 @@ def test_module_views_expose_exactly_the_listed_names() -> None:
         assert sorted(vars(runner._module_view(name))) == sorted(exported)
 
 
-def _under_limits(probe: str) -> str:
-    """Run one probe after the real worker limits are installed and return its output."""
+def _under_limits(probe: str, fixture: Path) -> str:
+    """Run one probe after the real worker limits are installed and return its output.
+
+    The probe reads the path of an existing fixture file as ``sys.argv[2]``.
+    """
     script = (
         "import errno, importlib.util, os, sys\n"
         "spec = importlib.util.spec_from_file_location('runner', sys.argv[1])\n"
@@ -197,7 +216,7 @@ def _under_limits(probe: str) -> str:
         f"{probe}"
     )
     result = subprocess.run(  # noqa: S603 - fixed interpreter and test script
-        (sys.executable, "-S", "-c", script, str(Path(runner.__file__))),
+        (sys.executable, "-S", "-c", script, str(Path(runner.__file__)), str(fixture)),
         capture_output=True,
         text=True,
         check=True,
@@ -206,26 +225,25 @@ def _under_limits(probe: str) -> str:
     return result.stdout.strip()
 
 
-def test_installed_limits_leave_no_free_descriptor_slot() -> None:
+def test_installed_limits_leave_no_free_descriptor_slot(tmp_path: Path) -> None:
     """Even the real ``open`` fails once limits are installed: every slot below the cap is held."""
     probe = (
         "try:\n"
-        "    open('/etc/hostname')\n"
+        "    open(sys.argv[2])\n"
         "except OSError as error:\n"
         "    print(error.errno == errno.EMFILE)\n"
     )
-    assert _under_limits(probe) == "True"
+    assert _under_limits(probe, secret_file(tmp_path)) == "True"
 
 
-def test_the_descriptor_limit_is_documented_as_a_backstop_only() -> None:
+def test_the_descriptor_limit_is_documented_as_a_backstop_only(tmp_path: Path) -> None:
     """Closing a held descriptor frees a slot, so the docs promise no escaped-code containment.
 
     Code that escaped the subset with ``os.close`` could open a file in the freed slot; the
     module documentation therefore names the language subset as the containment.
     """
-    assert _under_limits("os.close(0)\nopen('/etc/hostname').close()\nprint('opened')") == (
-        "opened"
-    )
+    probe = "os.close(0)\nprint(open(sys.argv[2]).read())\n"
+    assert _under_limits(probe, secret_file(tmp_path)) == SECRET
     documentation = " ".join(str(runner.__doc__).split())
     assert "code that escaped the subset could close one and reuse its slot" in documentation
     assert "even if it escaped" not in documentation
