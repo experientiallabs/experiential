@@ -42,7 +42,7 @@ class Protocol:
 PROTOCOLS = (
     Protocol(
         "exp.optimize.evaluation.tasks.calibration:CALIBRATION_PROTOCOL",
-        "task-calibration-v4",
+        "task-calibration-v6",
         (
             "exp.optimize.evaluation.tasks.calibration",
             "exp.optimize.evaluation.tasks.admission",
@@ -50,7 +50,7 @@ PROTOCOLS = (
             "exp.simulation.evaluation.tasks",
             "exp.simulation.evaluation.admission",
         ),
-        "848411f148528e9ecdc1f929417a98f5e9fcd604f40e22e3eeb5c8fa3d659665",
+        "b050c28a545628c3baf96e1768cfa24d98cab0852a7d538ce350ef05004c1630",
     ),
     Protocol(
         "exp.optimize.evaluation.tasks.challenges:CHALLENGE_PROTOCOL",
@@ -60,7 +60,7 @@ PROTOCOLS = (
             "exp.simulation.evaluation.calibration:task_decision",
             "exp.simulation.evaluation.calibration:blinded_case",
         ),
-        "8f2743cfa26bf79dfa2332995b93b1d45b02d313bfdc2bc89733028578017fab",
+        "4a503a8fc8bf754d115bb4a2a7eccd9b709378fbf6ad0bb02842a11eba368e18",
     ),
     Protocol(
         "exp.optimize.evaluation.council.runner:COUNCIL_HARNESS_PROTOCOL",
@@ -72,7 +72,7 @@ PROTOCOLS = (
             "exp.simulation.actor:run_actor_workflow",
             "exp.simulation.world_model.grounded_session:open_grounded_session",
         ),
-        "b048a8d7ba2aaf0b5136c71684c53983a2d8cc532a9e17d504f8dccaaeb2da8e",
+        "c3cc35dd94e6cc7583b095211d7370ffc29672575d3cf39d2beb0f34977f5259",
     ),
     Protocol(
         "exp.optimize.evaluation.tasks.refinement:REFINEMENT_REQUEST_PROTOCOL",
@@ -107,7 +107,7 @@ PROTOCOLS = (
         "exp.runtime.environments.workbook_edits:XLSX_ROW_EDITS_PROTOCOL",
         "xlsx-row-edits-v3",
         ("exp.runtime.environments.workbook_edits",),
-        "e98496c391918efdef29f6425793c7c8c41e10b3114ce167065fa0c475127abe",
+        "b1423d44f246df1382ea532deaadd773c31f8891eb65cf55d71b691017032d64",
     ),
     Protocol(
         "exp.runtime.environments.artifact_world:ARTIFACT_WORLD_PROTOCOL",
