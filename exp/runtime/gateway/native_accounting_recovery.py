@@ -54,18 +54,29 @@ class FairRecovery[T]:
         return selected
 
 
+def recovery_drained(accounting: NativeAttemptAccounting) -> bool:
+    """Distinguish a healthy in-progress commit from a transport safe to close."""
+    with accounting._lock:
+        active = accounting._active_settlements > 0
+    return (
+        not active
+        and not accounting.request_settlements.outstanding
+        and accounting.accounting_healthy
+    )
+
+
 def recover_until_stopped(accounting: NativeAttemptAccounting, interval_seconds: float) -> None:
     """Keep transport ownership until retained and in-progress terminal writes finish."""
     while True:
         closing = accounting._stop_sweeper.wait(interval_seconds)
-        if closing and accounting.accounting_healthy:
+        if closing and recovery_drained(accounting):
             return
         try:
             accounting.sweep_expired()
         except Exception as error:  # noqa: BLE001 - failed writes remain owned for retry.
             _logger.warning("gateway recovery pass failed: %s", type(error).__name__)
         if closing:
-            if accounting.accounting_healthy:
+            if recovery_drained(accounting):
                 return
             time.sleep(min(interval_seconds, 0.1))
 

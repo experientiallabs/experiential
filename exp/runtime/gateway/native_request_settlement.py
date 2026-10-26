@@ -25,6 +25,7 @@ class _Settlement:
         certify_no_effects: Whether accounting can certify no paid work occurred.
         web_search_requests: Completed search count to persist with the request.
         retained: Whether a failed write needs recovery, false initially.
+        committed: Durable result shared by concurrent callers, initially unknown.
         lock: Per-request lock serializing terminal writes and recovery attempts.
     """
 
@@ -33,6 +34,7 @@ class _Settlement:
     certify_no_effects: bool
     web_search_requests: int
     retained: bool = False
+    committed: bool | None = None
     lock: threading.Lock = field(default_factory=threading.Lock)
 
 
@@ -101,6 +103,8 @@ class RequestSettlements:
     def _commit(self, settlement: _Settlement) -> bool:
         """Serialize duplicate finish/sweep writers without blocking other requests."""
         with settlement.lock:
+            if settlement.committed is not None:
+                return settlement.committed
             try:
                 committed = self._ledger.finish_request(
                     authorization=settlement.authorization,
@@ -112,10 +116,11 @@ class RequestSettlements:
                 with self._lock:
                     settlement.retained = True
                 raise
+            settlement.committed = committed is True
             with self._lock:
                 if self._pending.get(settlement.authorization.request_id) is settlement:
                     del self._pending[settlement.authorization.request_id]
-            return committed is True
+            return settlement.committed
 
     def retry(self, limit: int) -> None:
         """Replay bounded retained writes verbatim; a repeated failure keeps its owner."""

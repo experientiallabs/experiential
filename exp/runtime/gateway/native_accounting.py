@@ -49,6 +49,7 @@ from exp.runtime.gateway.native_accounting_recovery import (
     FairRecovery,
     recover_expired,
     recover_until_stopped,
+    recovery_drained,
 )
 from exp.runtime.gateway.native_attempt_pricing import deployment_priced_at, priced_attempt
 from exp.runtime.gateway.native_components import SyncWriteLedger
@@ -200,11 +201,11 @@ class NativeAttemptAccounting:
     def accounting_healthy(self) -> bool:
         """Return whether every durable terminal write has landed."""
         with self._lock:
-            pending = self._active_settlements > 0 or any(
+            pending = any(
                 entry.pending_settlement is not None or entry.pending_abandon is not None
                 for entry in self._inflight.values()
             )
-        return not pending and not self.request_settlements.outstanding
+        return not pending and not self.request_settlements.pending
 
     def require_clear(self, organization_id: str) -> None:
         """Refuse only the organization whose prior accounting is recovering."""
@@ -927,7 +928,7 @@ class NativeAttemptAccounting:
             raise ValueError("recovery shutdown timeout must be between zero and 300 seconds")
         self._stop_sweeper.set()
         self._sweeper.join(timeout_seconds)
-        return not self._sweeper.is_alive() and self.accounting_healthy
+        return not self._sweeper.is_alive() and recovery_drained(self)
 
     def sweep_expired(self) -> None:
         """Recover a fair bounded selection without running in admission callbacks."""

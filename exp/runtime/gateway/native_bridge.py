@@ -177,9 +177,8 @@ class NativeControlPlane(
 ):
     """Authority and accounting callbacks for the native data plane.
 
-    Rust worker threads share the group-commit writer and the locked in-flight
-    registry. Opportunistic sweeps bound abandoned reservations to the request
-    deadline plus the sweep grace.
+    Rust worker threads share the writer and in-flight registry. Background
+    recovery bounds abandoned reservations to their deadline plus sweep grace.
     """
 
     def __init__(
@@ -237,8 +236,7 @@ class NativeControlPlane(
         self._capture = capture
         # Optional batch lane; without it every batch route answers not-enabled.
         self._batches = getattr(components, "batches", None)
-        # Hosted compositions have no local group-commit writer; they settle
-        # directly through their own synchronous ledger.
+        # Hosted compositions settle directly through their synchronous ledger.
         group_writer = getattr(components, "write_ledger", None)
         self._write_ledger: SyncWriteLedger = (
             SyncGroupCommitLedger(group_writer) if group_writer is not None else components.ledger
@@ -267,9 +265,7 @@ class NativeControlPlane(
             default_lane_bound=default_lane_bound,
         )
         self._bind_videos()  # the optional /v1/videos engine and its settlement poller
-        # Every reservation tokenizes its prompt; build the packaged BPE now so
-        # a fresh process pays that once at bind time, never on its first
-        # request, and a corrupt table fails startup with its own message.
+        # Build BPE once at bind time; a corrupt table must fail startup.
         reservation_encoder()
 
     def close(self, timeout_seconds: float = 10.0) -> bool:

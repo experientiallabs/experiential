@@ -4881,7 +4881,7 @@ def test_shutdown_keeps_recovery_alive_for_an_in_progress_terminal_write(
     writer.start()
     try:
         assert entered.wait(5)
-        assert not accounting.accounting_healthy
+        assert accounting.accounting_healthy
         accounting.require_clear(entry.authorization.organization_id)
         assert not accounting.close(0.01)
     finally:

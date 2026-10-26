@@ -116,6 +116,53 @@ def test_normal_in_progress_terminal_write_does_not_block_unrelated_admission() 
     assert results == [True]
 
 
+def test_concurrent_terminal_callers_share_the_acknowledged_commit() -> None:
+    """A waiter cannot start another write after shutdown observes an empty registry."""
+    from exp.runtime.gateway.native_request_settlement import _Settlement
+
+    accounting, ledger, entry = _registry()
+    pending = accounting.request_settlements
+    entered, second_selected, release = threading.Event(), threading.Event(), threading.Event()
+    original_commit = pending._commit  # noqa: SLF001 - synchronize after identity selection.
+    calls: list[int] = []
+    results: list[bool] = []
+    failure = GatewayFailure(failure_class=GatewayFailureClass.CANCELLED, safe_message="cancelled")
+
+    def commit(settlement: _Settlement) -> bool:
+        """Observe that both callers have selected the same retained identity."""
+        if entered.is_set():
+            second_selected.set()
+        return original_commit(settlement)
+
+    def write(**_kwargs: object) -> bool:
+        """Hold the first durable write while its duplicate selects the same record."""
+        calls.append(1)
+        entered.set()
+        assert release.wait(5)
+        return True
+
+    def finish() -> None:
+        """Request the same terminal disposition from two concurrent callbacks."""
+        results.append(pending.finish(entry.authorization, failure))
+
+    first, second = threading.Thread(target=finish), threading.Thread(target=finish)
+    with patch.object(pending, "_commit", commit), patch.object(ledger, "finish_request", write):
+        first.start()
+        try:
+            assert entered.wait(5)
+            second.start()
+            assert second_selected.wait(5)
+        finally:
+            release.set()
+            first.join(5)
+            if second.ident is not None:
+                second.join(5)
+    assert results == [True, True]
+    assert calls == [1]
+    assert not pending.outstanding
+    assert accounting.close(5)
+
+
 @pytest.mark.parametrize("termination", ["deadline", "budget", "reservation", "abandon"])
 def test_registered_search_meter_survives_unattempted_termination(termination: str) -> None:
     """Every registered terminal path preserves paid search with no invented attempt."""
