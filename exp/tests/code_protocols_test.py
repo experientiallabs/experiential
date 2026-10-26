@@ -216,7 +216,7 @@ PROTOCOLS = (
     ),
     Protocol(
         "exp.optimize.evaluation.analysis.decision_cascade:CASCADE_FIT_PROTOCOL",
-        "decision-cascade-fit-v3",
+        "decision-cascade-fit-v4",
         (
             "exp.optimize.evaluation.analysis.decision_cascade:CascadeObjective.non_inferior",
             "exp.optimize.evaluation.analysis.decision_cascade:estimate_threshold",
@@ -224,7 +224,7 @@ PROTOCOLS = (
             "exp.optimize.evaluation.analysis.decision_points:DecisionPointSet.labels",
             "exp.optimize.evaluation.analysis.decision_points:state_request",
         ),
-        "5638aed43990c9c7497aa45ccf728123c6c21e44f3ebb54ad979ba8344689e6d",
+        "55d3b4dd0ca262eac0e8bba7debe1e0803ad16f6a593ea1b7151620c33a4deb8",
     ),
     Protocol(
         "exp.runtime.agents.cascade_deciders:DECIDER_PROTOCOL",

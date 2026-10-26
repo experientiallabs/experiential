@@ -8,8 +8,9 @@ The procedure is registered before any decider answer is read:
 2. Label the reached states: every main-model decision in the saved development studies, with
    its trajectory's verified outcome (``decision_points``).
 3. Ask the decider once per distinct reached state (a shadow pass). Each answer is a durable
-   receipt; an interrupted dispatch stays unknown and never redraws, and an unknown answer is
-   never delegated, exactly as at runtime.
+   receipt; an interrupted dispatch stays unknown and never redraws. As at runtime, where an
+   unknown or failed decider dispatch stops the episode, a trajectory reaching a state without
+   an answer stops there and counts as a task failure and a policy violation.
 4. Estimate each grid threshold offline. A trajectory keeps its verified outcome unless the
    cascade would have accepted a decision differing from the main model's. From that reached
    state the cascade follows the decider, so the trajectories that took the decider's decision
@@ -77,7 +78,7 @@ from exp.runtime.sessions.dispatch_ledger import DispatchLedger
 
 # Identity of the estimator and selection rule below, in place of their source text. Bump it
 # when either changes; exp/tests/code_protocols_test.py records the covered source.
-CASCADE_FIT_PROTOCOL = "decision-cascade-fit-v3"
+CASCADE_FIT_PROTOCOL = "decision-cascade-fit-v4"
 FIT_SCOPE = (
     "development fit on the main model's own trajectories; offline estimate splicing observed "
     "continuations at accepted disagreements and failing a trajectory without one; states the "
@@ -205,6 +206,9 @@ class ThresholdRow(ContractModel):
         verified_correct: Delegated decisions verified correct at their state.
         verified_error: Delegated decisions verified wrong at their state.
         affected_trajectories: Trajectories with at least one delegated disagreement.
+        stopped_trajectories: Trajectories that reach a state without a decider answer before
+            any delegated disagreement; the cascade would stop there, so each counts as a task
+            failure and a policy violation.
         success: Paired lineage difference, cascade estimate minus main, of task success.
         compliance: Paired lineage difference, cascade minus main, of policy compliance.
         feasible: Whether both differences meet the registered objective.
@@ -219,6 +223,7 @@ class ThresholdRow(ContractModel):
     verified_correct: int
     verified_error: int
     affected_trajectories: int
+    stopped_trajectories: int
     success: JsonObject
     compliance: JsonObject
     feasible: bool
@@ -277,20 +282,39 @@ def estimate_threshold(
     unknown donor counts as a failure, and an unknown main outcome of a trajectory the cascade
     would change counts as a main success. Splicing always moves to a later disagreement, so the
     recursion ends.
+
+    The runtime is mirrored at every state. A state without a decider answer (an unknown or
+    failed shadow dispatch) stops a trajectory still on the main path, as the deployed cascade
+    stops the episode, and the stopped trajectory counts as a failure; a content error at
+    deployment would leave the main model responsible, so this bound is conservative.
+
+    Args:
+        points: Labelled decision points and trajectories.
+        predictions: The decider's answer at every distinct state, None without one.
+        threshold: Grid value.
+        spec: Registration, for the restrictions and the objective.
+
+    Returns:
+        The threshold's delegation counts and paired lineage differences.
     """
     decision_labels = points.labels(by="decision")
     action_labels = points.labels(by="action")
     delegated = avoided = agreed = correct = wrong = 0
     diverges: dict[Trajectory, tuple[str, Sha256, str]] = {}
+    stopped: set[Trajectory] = set()
     takes: dict[tuple[str, Sha256, str], list[Trajectory]] = defaultdict(list)
     for point in points.points:
         trajectory = (point.study.artifact_id, point.branch)
         world = point.checkpoint.artifact_id
         takes[world, point.state_sha256, point.main_choice].append(trajectory)
         takes[world, point.state_sha256, point.main_action_sha256].append(trajectory)
-        decision = predictions.get(point.state_sha256)
+        decision = predictions[point.state_sha256]
+        if decision is None:
+            if trajectory not in diverges:
+                stopped.add(trajectory)
+            continue
         allowed = tuple(name for name in point.candidates if name not in spec.never_delegate)
-        if decision is None or not delegates(
+        if not delegates(
             decision.selected, decision.confidence, threshold=threshold, allowed=allowed
         ):
             continue
@@ -306,7 +330,7 @@ def estimate_threshold(
         agreed += same
         correct += label == "verified_correct"
         wrong += label == "verified_error"
-        if not same:
+        if not same and trajectory not in stopped:
             diverges.setdefault(trajectory, (world, point.state_sha256, taken))
     verdicts = {
         (row.study.artifact_id, row.branch): {"success": row.outcome, "compliance": row.policy}
@@ -317,10 +341,13 @@ def estimate_threshold(
     def spliced(trajectory: Trajectory, name: str) -> float:
         """Return the cascade estimate of one trajectory, an unknown outcome counted as failed.
 
-        Counting an unknown donor as a failure is the bound adverse to the cascade.
+        Counting an unknown donor, or a stopped trajectory, as a failure is the bound adverse to
+        the cascade.
         """
         if (trajectory, name) not in memo:
-            if trajectory not in diverges:
+            if trajectory in stopped:
+                memo[trajectory, name] = 0.0
+            elif trajectory not in diverges:
                 observed = _known(verdicts[trajectory][name])
                 memo[trajectory, name] = 0.0 if observed is None else observed
             else:
@@ -336,7 +363,7 @@ def estimate_threshold(
             observed = _known(verdicts[trajectory][name])
             main[name].setdefault(row.lineage, [])
             cascade[name].setdefault(row.lineage, [])
-            if trajectory in diverges:
+            if trajectory in diverges or trajectory in stopped:
                 # An unknown main outcome is bounded against the cascade, as in confirmation.
                 main[name][row.lineage].append(1.0 if observed is None else observed)
                 cascade[name][row.lineage].append(spliced(trajectory, name))
@@ -358,6 +385,7 @@ def estimate_threshold(
         verified_correct=correct,
         verified_error=wrong,
         affected_trajectories=len(diverges),
+        stopped_trajectories=len(stopped),
         success=success,
         compliance=compliance,
         feasible=spec.objective.non_inferior(success, spec.objective.success_margin)

@@ -246,10 +246,17 @@ def branch(
     return row, point
 
 
+CLOSE = NextActionDecision(
+    selected="close", probabilities={"close": 1.0, "open": 0.0, RESPOND: 0.0, OTHER: 0.0}
+)
+
+
 def offline(
-    branches: list[tuple[Trajectory, DecisionPoint]], lineages: tuple[str, ...]
+    branches: list[tuple[Trajectory, DecisionPoint]],
+    lineages: tuple[str, ...],
+    answer: NextActionDecision | None = CLOSE,
 ) -> ThresholdRow:
-    """Estimate threshold 0.9 when the decider always closes with full confidence."""
+    """Estimate threshold 0.9 when the decider gives ``answer`` at the shared state."""
     model = snapshot("main-v1")
     points = DecisionPointSet(
         main_model=model,
@@ -274,10 +281,7 @@ def offline(
         maximum_physical_attempts=10,
         deadline=datetime.now(UTC) + timedelta(hours=1),
     )
-    close = NextActionDecision(
-        selected="close", probabilities={"close": 1.0, "open": 0.0, RESPOND: 0.0, OTHER: 0.0}
-    )
-    return estimate_threshold(points, {STATE: close}, 0.9, spec)
+    return estimate_threshold(points, {STATE: answer}, 0.9, spec)
 
 
 def test_donors_and_labels_never_cross_worlds_that_share_a_visible_state() -> None:
@@ -302,3 +306,11 @@ def test_unknown_donors_and_main_outcomes_stay_bounds_against_the_cascade() -> N
     # The changed failure gains 0.25; the unknown main outcome, bounded at 1, loses 0.75. The
     # unchanged pass is paired with itself; unchanged unknowns carry no paired evidence.
     assert row.success["estimate"] == pytest.approx((0.25 + 0.25 + 1.0) / 3 - (0.0 + 1.0 + 1.0) / 3)
+
+
+def test_a_state_without_a_decider_answer_stops_the_cascade_trajectory() -> None:
+    """The deployed cascade stops on an unknown decider dispatch, so the fit keeps no main pass."""
+    row = offline([branch("world-x", "a", 0, "close", "pass")], ("a",), answer=None)
+    assert row.delegated == 0 and row.stopped_trajectories == 1
+    assert row.success["unit_differences"] == {"a": -1.0}
+    assert not row.feasible

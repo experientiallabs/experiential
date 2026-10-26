@@ -89,8 +89,10 @@ dispatch outcome stops the step instead: it is never resolved by a fresh main-mo
   of that checkpoint is labelled `verified_correct` (some trajectory taking it from there passed),
   `verified_error` (every assessed one failed) or `unverified`.
 - **Shadow pass.** The decider is asked once per distinct reached state. Each answer is a durable
-  receipt written after its intent; an interrupted dispatch stays unknown and is never redrawn,
-  and an unknown answer is never delegated, as at runtime.
+  receipt written after its intent; an interrupted dispatch stays unknown and is never redrawn.
+  As at runtime, where an unknown or failed decider dispatch stops the episode, a trajectory that
+  reaches a state without an answer before any delegated disagreement stops there and counts as
+  a task failure and a policy violation (`stopped_trajectories`).
 - **Estimate.** For every grid value a trajectory keeps its verified outcome unless the cascade
   would have accepted a decision different from the main model's (for a draft, a different
   complete action, ignoring call IDs). From that state the trajectories that took the decider's
