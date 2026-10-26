@@ -107,3 +107,12 @@ def test_one_worker_gives_repeated_and_interleaved_requests_identical_results() 
             replies.append(sandbox.run(counter, {}, {}, {}).reply)
             replies.append(sandbox.run(dumps, {}, {}, {}).reply)
     assert replies == [1, "[1, 2, 3]"] * 3
+
+
+def test_the_cpu_limit_applies_to_each_request_not_the_worker_lifetime() -> None:
+    """Requests that each fit the limit all reply, though together they use several times it."""
+    busy = _program("    return sum(range(3 * 10 ** 7)) > 0\n")
+    limits = SandboxLimits(cpu_seconds=1, request_timeout_seconds=30.0)
+    with ProgramSandbox(limits) as sandbox:
+        outcomes = [sandbox.run(busy, {}, {}, {}) for _ in range(8)]
+    assert [outcome.status for outcome in outcomes] == ["reply"] * 8

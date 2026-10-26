@@ -5,9 +5,9 @@ environment it builds from scratch (only a fixed hash seed and locale), no site 
 script-directory import path and a private working directory. The worker refuses to start with
 randomized hashing, so set and dict iteration order is reproducible across runs. Before it reads any
 program the worker imports the allowlisted modules, then installs kernel resource limits on
-itself: CPU time, address space, no file creation and no free file-descriptor slot, so a program
-can open no file, socket or pipe even if it escaped the language subset. It then speaks one JSON
-line per request on standard input and output.
+itself: CPU time per request, address space, no file creation and no free file-descriptor slot,
+so a program can open no file, socket or pipe even if it escaped the language subset. It then
+speaks one JSON line per request on standard input and output.
 
 A program is one Python module that defines ``transition(state, args, facts)``. ``state`` maps
 the call's visible state domains to JSON values and is edited in place; ``args`` are the call's
@@ -49,7 +49,7 @@ from typing import cast
 
 # Identity of the code that decides how programs execute, in place of its source text. Bump it
 # when behavior changes; exp/tests/code_protocols_test.py guards the covered source.
-RUNNER_PROTOCOL = "induced-program-runner-v3"
+RUNNER_PROTOCOL = "induced-program-runner-v4"
 ENTRYPOINT = "transition"
 PROGRAM_FILENAME = "<induced-program>"
 MAXIMUM_SOURCE_CHARACTERS = 20_000
@@ -499,11 +499,28 @@ def run_request(request: dict[str, object], cache: dict[str, types.CodeType]) ->
     return outcome
 
 
+def _arm_cpu_limit(cpu_seconds: int) -> None:
+    """Allow the next request ``cpu_seconds`` of CPU time beyond what the worker already used.
+
+    The kernel counts CPU time over the whole process, so the soft limit is re-armed before
+    every request; a request's acceptance never depends on CPU spent by earlier requests. A
+    finite hard limit the worker inherited still caps the total.
+    """
+    import resource  # noqa: PLC0415 - POSIX-only; the runner is started only on POSIX hosts
+
+    usage = resource.getrusage(resource.RUSAGE_SELF)
+    soft = math.ceil(usage.ru_utime + usage.ru_stime) + cpu_seconds
+    _, hard = resource.getrlimit(resource.RLIMIT_CPU)
+    if hard != resource.RLIM_INFINITY:
+        soft = min(soft, hard)
+    resource.setrlimit(resource.RLIMIT_CPU, (soft, hard))
+
+
 def _install_limits(memory_bytes: int, cpu_seconds: int) -> None:
     """Limit CPU, memory, file size and descriptors before any program text is read."""
     import resource  # noqa: PLC0415 - POSIX-only; the runner is started only on POSIX hosts
 
-    resource.setrlimit(resource.RLIMIT_CPU, (cpu_seconds, cpu_seconds + 1))
+    _arm_cpu_limit(cpu_seconds)
     resource.setrlimit(resource.RLIMIT_FSIZE, (0, 0))
     resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
     memory_limited = False
@@ -543,12 +560,14 @@ def main() -> None:
         raise SystemExit(64)
     if sys.flags.hash_randomization:
         raise SystemExit(72)
-    _install_limits(int(sys.argv[1]), int(sys.argv[2]))
+    cpu_seconds = int(sys.argv[2])
+    _install_limits(int(sys.argv[1]), cpu_seconds)
     output = sys.stdout
     output.write(json.dumps({"ready": True, "protocol": RUNNER_PROTOCOL}) + "\n")
     output.flush()
     cache: dict[str, types.CodeType] = {}
     for line in sys.stdin:
+        _arm_cpu_limit(cpu_seconds)
         try:
             request = json.loads(line)
             response = run_request(request, cache)

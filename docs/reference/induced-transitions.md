@@ -139,6 +139,8 @@ The worker runs under these conditions:
 - Before it reads any program it sets its own limits on CPU time, address space and file size,
   and its descriptor limit leaves no free slot. Even an escaped program can open no file, socket
   or pipe.
+- The CPU limit is re-armed before every request, so each request gets the full budget whatever
+  earlier requests used.
 - Only compiled programs are cached. Each request runs the program's top level in fresh globals
   with fresh module views, so no request sees state that an earlier request or another program
   left behind.

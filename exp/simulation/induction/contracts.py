@@ -51,7 +51,7 @@ class SandboxLimits(ContractModel):
 
     Attributes:
         memory_bytes: Address-space limit of the worker process.
-        cpu_seconds: CPU-time limit of one worker process across its requests.
+        cpu_seconds: CPU-time limit of one request, re-armed in the worker before each one.
         request_timeout_seconds: Wall-clock limit of one execution, including transfer.
         maximum_steps: Program lines one execution may run before it fails.
         maximum_output_bytes: Largest accepted worker response line.
