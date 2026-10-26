@@ -53,6 +53,20 @@ class CaseScope(ContractModel):
     actor: Sha256
 
 
+class CalibratedScope(ContractModel):
+    """One unit, world and actor combination a dimension was measured on together.
+
+    Attributes:
+        unit: Independent unit under the dimension's rule.
+        world: Digest of the candidate world's identity.
+        actor: Digest of the frozen actor model snapshot.
+    """
+
+    unit: str
+    world: Sha256
+    actor: Sha256
+
+
 class DimensionCalibration(ContractModel):
     """One dimension's family-clustered measurement and verdict against its margin.
 
@@ -60,7 +74,9 @@ class DimensionCalibration(ContractModel):
         dimension: Measured dimension.
         status: Admitted, refused or unassessable under the policy's margin.
         reason: Concrete statistic, bound or missing evidence behind the status.
-        units: Independent units with known candidate pairs, the calibrated scope.
+        units: Independent units with known candidate pairs.
+        scopes: Unit, world and actor combinations of those known candidate pairs, sorted; the
+            calibrated scope.
         planned_pairs: Planned pairs per condition.
         unknown_pairs: Pairs with an unassessable side, per condition.
         inapplicable_pairs: Pairs where the dimension applied to neither side, per condition.
@@ -75,6 +91,7 @@ class DimensionCalibration(ContractModel):
     status: Verdict
     reason: str
     units: tuple[str, ...]
+    scopes: tuple[CalibratedScope, ...]
     planned_pairs: dict[str, int]
     unknown_pairs: dict[str, int]
     inapplicable_pairs: dict[str, int]
@@ -105,7 +122,10 @@ class PolicyCalibration(ContractModel):
         return self.dimensions[DIMENSIONS.index(dimension)]
 
     def covers(self, dimension: Dimension, unit: str, world: Sha256, actor: Sha256) -> bool:
-        """Whether a trajectory's unit, world and actor lie inside one dimension's scope.
+        """Whether a trajectory's unit, world and actor were measured together on one dimension.
+
+        A unit measured only on another world or actor is outside the scope, even when some other
+        case ran this world and actor.
 
         Args:
             dimension: Dimension being admitted.
@@ -114,11 +134,10 @@ class PolicyCalibration(ContractModel):
             actor: Digest of the trajectory's actor model snapshot.
 
         Returns:
-            True when the unit was measured and some case ran the same world and actor.
+            True when some known candidate pair of this unit ran the same world and actor.
         """
-        return unit in self.dimension(dimension).units and any(
-            case.world == world and case.actor == actor for case in self.cases
-        )
+        scope = CalibratedScope(unit=unit, world=world, actor=actor)
+        return scope in self.dimension(dimension).scopes
 
 
 def calibrate(
@@ -138,12 +157,12 @@ def calibrate(
     Returns:
         The per-dimension calibration with family-clustered intervals.
     """
-    lineage = {case.case: case.lineage for case in cases}
+    scopes = {case.case: case for case in cases}
     return PolicyCalibration(
         policy=policy_ref,
         cases=tuple(cases),
         dimensions=tuple(
-            _dimension(policy.rule(dimension), policy, measurements, lineage)
+            _dimension(policy.rule(dimension), policy, measurements, scopes)
             for dimension in DIMENSIONS
         ),
     )
@@ -153,7 +172,7 @@ def _dimension(
     rule: DimensionRule,
     policy: AdmissionPolicy,
     measurements: Sequence[PairMeasurement],
-    lineage: dict[int, str],
+    cases: dict[int, CaseScope],
 ) -> DimensionCalibration:
     """Group one dimension's pairs by unit and decide it against the rule's margin."""
     index = DIMENSIONS.index(rule.dimension)
@@ -165,8 +184,10 @@ def _dimension(
     unknown = dict.fromkeys(conditions, 0)
     inapplicable = dict.fromkeys(conditions, 0)
     support: set[str] = set()
+    measured: set[tuple[str, Sha256, Sha256]] = set()
     for row in measurements:
-        unit = policy.unit(rule.dimension, lineage[row.case])
+        case = cases[row.case]
+        unit = policy.unit(rule.dimension, case.lineage)
         planned[row.condition] += 1
         if not row.dimensions:
             unknown[row.condition] += 1
@@ -182,6 +203,8 @@ def _dimension(
             float(pair.agreement == "different")
         )
         false_pass[row.condition].setdefault(unit, []).append(float(pair.other_only_admitted))
+        if row.condition == "candidate":
+            measured.add((unit, case.world, case.actor))
         reference = (
             row.dimensions[goal].reference if rule.dimension == "state_fidelity" else pair.reference
         )
@@ -196,6 +219,10 @@ def _dimension(
         status=status,
         reason=reason,
         units=tuple(sorted(disagreement["candidate"])),
+        scopes=tuple(
+            CalibratedScope(unit=unit, world=world, actor=actor)
+            for unit, world, actor in sorted(measured)
+        ),
         planned_pairs=planned,
         unknown_pairs=unknown,
         inapplicable_pairs=inapplicable,

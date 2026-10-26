@@ -95,8 +95,10 @@ registered again.
   Refused and unassessable branches are still exported, so the evidence denominator stays
   complete.
 
-A calibration applies only to the units it measured and to the same candidate world identity and
-actor model. New families, worlds and actors start outside that scope and stay unassessable.
+A calibration applies only to the unit, candidate world identity and actor model combinations it
+measured together on a dimension's known candidate pairs. A family measured only on one world or
+actor stays outside the scope for the panel's other worlds and actors, and new families, worlds
+and actors start outside it too; all of them stay unassessable.
 
 ## Limits
 

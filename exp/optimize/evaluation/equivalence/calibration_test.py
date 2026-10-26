@@ -100,6 +100,21 @@ def test_agreement_over_enough_families_admits_and_counts_families_not_cases() -
     assert not result.covers("goal_success", "family:lineage-1", sha256_json("other"), ACTOR)
 
 
+def test_coverage_needs_the_unit_world_and_actor_measured_together() -> None:
+    """A family measured only on one world is not calibrated for another world in the panel."""
+    measurements, scopes = panel(3, 2, SIMULATED_PASS)
+    other = sha256_json("other world")
+    mixed = [
+        scope.model_copy(update={"world": other}) if scope.lineage == "lineage-2" else scope
+        for scope in scopes
+    ]
+    result = calibrated(fixture_policy(), (measurements, mixed))
+    assert result.covers("goal_success", "family:lineage-0", WORLD, ACTOR)
+    assert result.covers("goal_success", "family:lineage-2", other, ACTOR)
+    assert not result.covers("goal_success", "family:lineage-0", other, ACTOR)
+    assert not result.covers("goal_success", "family:lineage-2", WORLD, ACTOR)
+
+
 def test_declared_families_merge_lineages_into_fewer_units() -> None:
     """Three lineages of one declared family cannot pass as three independent worlds."""
     families = {f"lineage-{index}": "orders" for index in range(3)}
