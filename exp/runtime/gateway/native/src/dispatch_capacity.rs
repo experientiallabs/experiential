@@ -220,7 +220,14 @@ mod tests {
                 let shares = DispatchCapacity::new(Some(1), None);
                 let global = Arc::new(Semaphore::new(3));
                 let queue = PermitQueue::new(None);
-                assert!(shares.acquire(None, &global, &queue, None).await.is_err());
+                let error = shares
+                    .acquire(None, &global, &queue, None)
+                    .await
+                    .err()
+                    .unwrap();
+                assert_eq!(error.status_code, 401);
+                assert_eq!(error.code, "invalid_key");
+                assert_eq!(error.retry_after_seconds, None);
                 assert_eq!(global.available_permits(), 3);
                 let held = shares
                     .acquire(Some("org"), &global, &queue, None)

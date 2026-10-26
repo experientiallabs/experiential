@@ -224,7 +224,7 @@ async fn pre_admission_permit(
     );
     match tokio::time::timeout_at(deadline.into(), acquire).await {
         Ok(Ok(permit)) => Ok(permit),
-        Ok(Err(_)) => Err(PublicError::draining()),
+        Ok(Err(error)) => Err(error),
         Err(_) => Err(Failure::new(
             FailureClass::Timeout,
             "gateway execution queue deadline exceeded",

@@ -379,14 +379,14 @@ pub(crate) async fn acquire_permit(
             METRICS.permit_wait_ms.record(permit_wait_started.elapsed());
             Ok(permit)
         }
-        Ok(Err(_)) => {
-            guard
-                .abandon(&Failure::new(
-                    FailureClass::Cancelled,
-                    "gateway is draining and is not accepting new requests",
-                ))
-                .await;
-            Err(Box::new(error_response(&PublicError::draining())))
+        Ok(Err(error)) => {
+            let class = match error.code.as_str() {
+                "invalid_key" => FailureClass::Authentication,
+                "gateway_draining" => FailureClass::Cancelled,
+                _ => FailureClass::Internal,
+            };
+            guard.abandon(&Failure::new(class, &error.message)).await;
+            Err(Box::new(error_response(&error)))
         }
         Err(_) => {
             let failure = Failure::new(
