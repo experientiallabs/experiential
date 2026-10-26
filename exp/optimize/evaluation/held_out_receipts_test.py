@@ -15,7 +15,7 @@ from exp.common.project import ProjectStore
 from exp.common.traces import Trace
 from exp.common.traces.store import load_trace_dataset
 from exp.optimize.evaluation.held_out_audit_test import FailingOnce, audit, clock, run
-from exp.optimize.evaluation.held_out_exposure import held_out_exposure
+from exp.optimize.evaluation.held_out_exposure import LineageExposure, held_out_exposure
 from exp.optimize.evaluation.held_out_fidelity_test import (
     PROJECT,
     USERS,
@@ -29,8 +29,10 @@ from exp.optimize.evaluation.held_out_fidelity_test import (
 )
 from exp.optimize.evaluation.held_out_receipts import (
     QUALIFIED,
+    AuditNotice,
     audit_receipts,
     receipt_view,
+    record_notice,
     record_report,
 )
 from exp.optimize.evaluation.trace_learning import learning_plan, recorded_plan
@@ -277,6 +279,17 @@ def test_a_trace_reattempt_qualifies_the_headline_and_reports_both_subsets(
         f"({child.claimed_slots} claimed slots); step 1 re-dispatched after an unknown outcome "
         "(prediction, 2 attempts)"
     ) in held_out_command(root, 2) + " " + audit_report(store)
+    # A later invalidation keeps the qualification beside it, never replacing either.
+    notice = AuditNotice(
+        receipt=receipt.receipt_id,
+        at=clock(),
+        ledger=receipt.ledger,
+        exposed=(LineageExposure(lineage=receipt.lineages[0]),),
+    )
+    assert record_notice(store, receipt, notice)
+    assert receipt_view(store, receipt).headline == (
+        "independent, invalidated: predating exposure, qualified: trace re-attempts"
+    )
 
 
 def vertex(trace: Trace) -> str:
