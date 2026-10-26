@@ -93,4 +93,5 @@ def test_cli_climbs_one_round_proposes_dry_and_reports_the_final_line(
     assert "Final comparison" in _invoke(tmp_path, "report", report, "--dry-run")
     final = _invoke(tmp_path, "report", report, "--yes")
     assert "Climb after 1 rounds (1 kept): merge" in final
+    assert "not an independent holdout estimate" in final
     assert json.loads(_report_path(final).read_text())["verdict"] == "merge"

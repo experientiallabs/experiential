@@ -113,8 +113,10 @@ drawing a new one; under another code revision it is refused.
 ## Limits
 
 - The test lineages are reused by every confirmation. Only keep bits flow back to the proposer,
-  and the final comparison uses fresh repeats, but the same lineages; for an independent claim,
-  audit the best prompt on lineages the climb never touched.
+  and the final comparison uses fresh repeats, but the same lineages that selected the best
+  prompt, so `merge` is optimistic. The report's `scope` (also printed) says it is not an
+  independent holdout estimate; for an independent claim, audit the best prompt on lineages the
+  climb never touched.
 - Unknown outcomes never enter an interval; a confirmation or final comparison with any unknown
   outcome does not keep.
 - A case bootstrap over few lineages is narrow; read it with the printed lineage count, or select

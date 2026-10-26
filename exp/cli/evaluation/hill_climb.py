@@ -165,5 +165,6 @@ def handle_climb_report(context: ContinuationContext, spec: ClimbReportSpec) -> 
     console.print(Text(f"Climb after {len(report.rounds)} rounds ({kept} kept): {report.verdict}"))
     if report.final is not None:
         console.print(_stage_line(report.final))
+        console.print(Text(f"  scope: {report.scope}"), soft_wrap=True)
     console.print(Text(f"  best prompt version {report.best.artifact_id}"))
     _report(console, store, spec.identity(), report)

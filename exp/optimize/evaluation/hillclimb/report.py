@@ -2,12 +2,14 @@
 
 The best prompt is the last kept candidate after the reported rounds. A final panel compares it
 with the baseline on the test lineages with ``final_repeats`` fresh continuations per arm, and the
-same keep rule decides the verdict. The final comparison is registered once per baseline and best
-pair, with its deadline and code revision: a later report whose best prompt is unchanged (every
-later round reverted) replays that comparison and its unknowns instead of drawing a new one, so
-an unchanged prompt cannot be final-tested again until one run says merge. "Within noise, do not
-merge" is a complete, valid result, as is "no edit kept" when every round reverted. The report
-lists every round, kept and reverted.
+same keep rule decides the verdict. Those lineages already confirmed every kept edit, so the best
+prompt was selected on them: the verdict is a development reading, not an independent holdout
+estimate, and the report says so in its scope. The final comparison is registered once per
+baseline and best pair, with its deadline and code revision: a later report whose best prompt is
+unchanged (every later round reverted) replays that comparison and its unknowns instead of
+drawing a new one, so an unchanged prompt cannot be final-tested again until one run says merge.
+"Within noise, do not merge" is a complete, valid result, as is "no edit kept" when every round
+reverted. The report lists every round, kept and reverted.
 """
 
 from datetime import UTC, datetime
@@ -42,6 +44,11 @@ from exp.optimize.evaluation.hillclimb.stages import (
 
 REPORT_TYPE = "hill-climb-report"
 FINAL_TYPE = "hill-climb-final-registration"
+FINAL_SCOPE = (
+    "fresh repeats on the test lineages that already confirmed every kept edit, so the best "
+    "prompt was selected on these lineages and merge is optimistic; not an independent holdout "
+    "estimate: audit the best prompt on lineages the climb never touched before claiming a gain"
+)
 Verdict = Literal["merge", "within noise, do not merge", "no edit kept"]
 
 
@@ -161,6 +168,7 @@ class ClimbReport(ContractModel):
         best_system_prompt: Its complete prompt.
         final: Fresh test comparison of baseline and best, absent when no edit was kept.
         verdict: ``merge`` only when the final comparison passes the keep rule.
+        scope: Interpretation limits of the final comparison.
     """
 
     climb: str
@@ -170,6 +178,7 @@ class ClimbReport(ContractModel):
     best_system_prompt: str | None
     final: StageMeasurement | None
     verdict: Verdict
+    scope: str = FINAL_SCOPE
 
 
 def report_jobs(project: ProjectStore, spec: ClimbReportSpec) -> tuple[ContinuationJob, ...]:
