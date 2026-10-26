@@ -282,7 +282,7 @@ def _run_gateway(
     control_plane = None
     try:
         with usage_error(ValueError):
-            with gateway_instance_lock(root, port=port):
+            with gateway_instance_lock(root, port=port) as ownership:
                 try:
                     project_repository = LocalArtifactProjectActivationRepository(
                         root,
@@ -382,6 +382,7 @@ def _run_gateway(
                     # Teardown runs under the instance lock, so another gateway on this root
                     # cannot start reconciling while these workers may still write.
                     _close_owned(control_plane, components, guardrails, graceful_timeout)
+                    ownership.teardown_complete()
     except typer.BadParameter:
         if setup is not None:
             _emit_setup_recovery(setup=setup)

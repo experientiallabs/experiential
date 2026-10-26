@@ -24,6 +24,7 @@ from exp.cli.app import app
 from exp.cli.gateway.compatibility import ProjectGatewayCompatibility
 from exp.cli.gateway.setup import InteractiveSetupResult
 from exp.runtime.gateway.auth import IssuedVirtualKey
+from exp.runtime.gateway.instance_lock import GatewayOwnership
 from exp.runtime.gateway.native_bridge import NativeControlPlane
 from exp.runtime.gateway.sqlite.alias_activation import AliasActivationOutcomeUnknownError
 
@@ -206,7 +207,7 @@ def test_project_option_launches_the_native_gateway_on_loopback(
         return plane
 
     @contextmanager
-    def instance_lock(root: Path, *, port: int) -> Iterator[None]:
+    def instance_lock(root: Path, *, port: int) -> Iterator[GatewayOwnership]:
         """Capture and provide the local single-instance boundary.
 
         Args:
@@ -214,14 +215,16 @@ def test_project_option_launches_the_native_gateway_on_loopback(
             port: Requested loopback port.
 
         Yields:
-            Control while the test owns the synthetic lock.
+            Ownership on which serving records its finished teardown.
         """
         assert root == Path("/tmp/local-exp")
         assert port == 8123
+        ownership = GatewayOwnership()
         try:
-            yield
+            yield ownership
         finally:
-            resource_closes.append(("lock released", 0.0))
+            if ownership.torn_down:
+                resource_closes.append(("lock released", 0.0))
 
     def serve(value: object, *, host: str, port: int, **kwargs: object) -> None:
         """Capture the control plane and loopback bind without serving.
@@ -480,10 +483,10 @@ def test_first_run_delivers_credentials_before_readiness_failure(
         )
 
     @contextmanager
-    def instance_lock(root: Path, *, port: int) -> Iterator[None]:
+    def instance_lock(root: Path, *, port: int) -> Iterator[GatewayOwnership]:
         """Provide the single-process seam without creating a real gateway lock."""
         del root, port
-        yield
+        yield GatewayOwnership()
 
     monkeypatch.setattr(run_app, "_console", console)
     monkeypatch.setattr("exp.cli.gateway.setup.interactive_gateway_setup", interactive_setup)
