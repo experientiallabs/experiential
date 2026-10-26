@@ -88,11 +88,12 @@ def reconcile_terminal_attempt(
         terminal is not None
         and terminal.accounting_release_reservation
         and (row["accounting_recovery"] or row["state"] in {"cancelled", "unknown_after_crash"})
-        and (row["usage_source"] == "unknown" or row["budget_settled_nano_usd"] == 0)
     ):
         # A late customer waiver can follow an earlier provisional cleanup.
         # Keep provider evidence and the original delivery outcome. An already
         # waived row also acknowledges retry after a late exact meter commits.
+        # Provider evidence and the customer waiver are independent: either
+        # can arrive first after a crash or a lost job-store acknowledgment.
         _replace_budget_charges(
             connection, attempt_id, optional_int(row["budget_settled_nano_usd"]), 0
         )

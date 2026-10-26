@@ -892,8 +892,9 @@ def test_recovery_provenance_is_internal_and_cannot_be_invented_by_public_payloa
 
 @pytest.mark.parametrize("maximum", [None, 300])
 @pytest.mark.parametrize("crashed", [False, True])
+@pytest.mark.parametrize("observed_first", [False, True])
 def test_customer_waiver_can_follow_unknown_recovery_without_losing_provider_meter(
-    tmp_path: Path, maximum: int | None, crashed: bool
+    tmp_path: Path, maximum: int | None, crashed: bool, observed_first: bool
 ) -> None:
     """A timeout releases provisional or crash-held liability while retaining late meters."""
     clock, store, ledger, budgets, attempt = _started(tmp_path, maximum=maximum)
@@ -910,6 +911,9 @@ def test_customer_waiver_can_follow_unknown_recovery_without_losing_provider_met
             failure=failure,
         )
     before = dict(_attempt_row(tmp_path, attempt))
+    if observed_first:
+        ledger.finish_attempt(attempt_id=attempt, terminal_event=_observed(), failure=None)
+        _assert_allocations(budgets, settled=40)
     timeout = GatewayFailure(
         failure_class=GatewayFailureClass.TIMEOUT, safe_message="settlement deadline reached"
     )
@@ -917,8 +921,8 @@ def test_customer_waiver_can_follow_unknown_recovery_without_losing_provider_met
     for _ in range(2):
         ledger.finish_attempt(attempt_id=attempt, terminal_event=waiver, failure=timeout)
     row = _attempt_row(tmp_path, attempt)
-    assert row["usage_source"] == "unknown"
-    assert row["estimated_cost_nano_usd"] is None
+    assert row["usage_source"] == ("observed" if observed_first else "unknown")
+    assert row["estimated_cost_nano_usd"] == (40 if observed_first else None)
     assert row["failure_class"] == before["failure_class"]
     assert row["state"] == before["state"]
     assert row["terminal_at"] == before["terminal_at"]
@@ -933,6 +937,33 @@ def test_customer_waiver_can_follow_unknown_recovery_without_losing_provider_met
     assert row["estimated_cost_nano_usd"] == 40
     assert row["budget_settled_nano_usd"] == 0
     _assert_allocations(budgets, settled=0)
+
+
+@pytest.mark.parametrize("failed", [False, True])
+def test_customer_waiver_does_not_replace_an_ordinary_exact_provider_terminal(
+    tmp_path: Path, failed: bool
+) -> None:
+    """A timeout disposition cannot convert an ordinary observed terminal into recovery."""
+    _, _, ledger, budgets, attempt = _started(tmp_path)
+    failure = GatewayFailure(
+        failure_class=GatewayFailureClass.PROVIDER_INTERNAL, safe_message="provider failed"
+    )
+    event = _observed()
+    if failed:
+        event = event.model_copy(update={"kind": GatewayEventKind.FAILED, "failure": failure})
+    ledger.finish_attempt(attempt_id=attempt, terminal_event=event, failure=event.failure)
+    before = dict(_attempt_row(tmp_path, attempt))
+    timeout = GatewayFailure(
+        failure_class=GatewayFailureClass.TIMEOUT, safe_message="settlement deadline reached"
+    )
+    waiver = GatewayEvent.for_accounting_recovery(failure=timeout, release_reservation=True)
+    if failed:
+        ledger.finish_attempt(attempt_id=attempt, terminal_event=waiver, failure=timeout)
+    else:
+        with pytest.raises(GatewayLedgerError, match="another terminal state"):
+            ledger.finish_attempt(attempt_id=attempt, terminal_event=waiver, failure=timeout)
+    assert dict(_attempt_row(tmp_path, attempt)) == before
+    _assert_allocations(budgets, settled=40)
 
 
 def test_schema32_preserves_legacy_failure_without_inventing_recovery(
