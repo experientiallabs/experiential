@@ -79,7 +79,9 @@ class PairDimension(ContractModel):
         other: Observation on the candidate or repeated-reference execution.
         agreement: ``inapplicable`` when neither side applies, ``unassessable`` when an
             applicable side is unassessable, else whether the two labels match. State fidelity
-            uses the pair's declared material-state agreement instead of the two labels.
+            is ``inapplicable`` when neither side executed a tool, ``unassessable`` when the
+            reference's replies are not all native, and otherwise the pair's declared
+            material-state agreement instead of the two labels.
         other_only_admitted: Whether the other side admitted what the reference refused.
     """
 
@@ -213,7 +215,7 @@ def pair_dimensions(
     for left, right in pairs:
         agreement: PairAgreement
         if left.dimension == "state_fidelity":
-            agreement = material_agreement
+            agreement = _fidelity_agreement(left, right, material_agreement)
         elif not left.applicable and not right.applicable:
             agreement = "inapplicable"
         elif any(side.applicable and side.status == "unassessable" for side in (left, right)):
@@ -233,6 +235,24 @@ def pair_dimensions(
             )
         )
     return tuple(rows)
+
+
+def _fidelity_agreement(
+    reference: DimensionObservation,
+    other: DimensionObservation,
+    material_agreement: Literal["match", "different", "unassessable"],
+) -> PairAgreement:
+    """Compare state fidelity only where a tool ran and the reference's replies are native.
+
+    A pair in which neither side executed a tool never exercised the world, so its agreement says
+    nothing about fidelity. A reference reply without a native receipt for its exact action is
+    not truth, so the pair cannot be assessed against it.
+    """
+    if not reference.applicable and not other.applicable:
+        return "inapplicable"
+    if reference.applicable and reference.status != "admitted":
+        return "unassessable"
+    return material_agreement
 
 
 def _label(observation: DimensionObservation) -> str:

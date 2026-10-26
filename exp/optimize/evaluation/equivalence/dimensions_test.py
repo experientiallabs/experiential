@@ -213,3 +213,20 @@ def test_pairs_compare_labels_and_flag_simulator_only_admissions() -> None:
         material_agreement="unassessable",
     )
     assert {row.dimension: row.agreement for row in unknown}["tool_validity"] == "unassessable"
+
+
+def test_state_fidelity_pairs_need_an_executed_tool_and_a_native_reference() -> None:
+    """No-tool pairs are inapplicable; an unproven reference reply is not truth to compare to."""
+    candidate = branch(step("edit", owner="simulated"))
+    cases = (
+        (branch(), branch(), "inapplicable"),
+        (branch(step("edit", owner=None)), candidate, "unassessable"),
+        (branch(step("edit", owner="simulated")), candidate, "unassessable"),
+        (branch(step("edit")), candidate, "match"),
+        (branch(), candidate, "match"),
+    )
+    for reference, other, expected in cases:
+        rows = pair_dimensions(
+            reference, other, verifier=GOAL, tools=TOOLS, material_agreement="match"
+        )
+        assert {row.dimension: row.agreement for row in rows}["state_fidelity"] == expected

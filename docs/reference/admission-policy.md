@@ -37,6 +37,10 @@ Each `DimensionRule` declares:
 - `unit` (`task_family` or `lineage`) and `minimum_units`: the independent unit of uncertainty
   and the fewest units a conclusive calibration needs.
 
+A paired panel calibrates `state_fidelity` only on pairs that exercised the world: a pair in which
+neither side executed a tool is inapplicable, and a pair whose reference reply lacks a native
+receipt for its exact action is unassessable, so neither can count as agreement.
+
 `AdmissionPolicy.families` maps source lineages to a declared task family. Lineages in one family
 are one independent unit; cases, actors and repeats inside a unit are averaged first.
 

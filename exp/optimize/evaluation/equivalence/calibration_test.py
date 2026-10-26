@@ -100,6 +100,18 @@ def test_agreement_over_enough_families_admits_and_counts_families_not_cases() -
     assert not result.covers("goal_success", "family:lineage-1", sha256_json("other"), ACTOR)
 
 
+def test_state_fidelity_is_never_calibrated_on_pairs_where_no_tool_ran() -> None:
+    """Answers without a tool call never exercise the simulator, so they admit no fidelity."""
+    answered = branch()
+    result = calibrated(
+        fixture_policy(), panel(3, 2, answered, reference=answered, control=answered)
+    )
+    fidelity = result.dimension("state_fidelity")
+    assert fidelity.status == "unassessable", fidelity.reason
+    assert fidelity.inapplicable_pairs == {"candidate": 6, "reference_control": 6}
+    assert fidelity.reference_support == 0 and fidelity.units == ()
+
+
 def test_coverage_needs_the_unit_world_and_actor_measured_together() -> None:
     """A family measured only on one world is not calibrated for another world in the panel."""
     measurements, scopes = panel(3, 2, SIMULATED_PASS)
