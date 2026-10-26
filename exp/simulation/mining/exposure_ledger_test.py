@@ -204,6 +204,28 @@ def test_unknown_schemes_linked_only_to_each_other_still_resolve_from_sources(
     assert new.snapshot().unknown_schemes([TRACE_CONTENT.identity]) == ()
 
 
+def test_resolution_follows_an_equivalence_chain_from_one_recoverable_endpoint(
+    tmp_path: Path,
+) -> None:
+    """Two sources share a task-only vertex; recovering one source resolves the whole chain."""
+    recoverable, lost = trace(1), trace(2).model_copy(update={"task": trace(1).task})
+    build(ExposureLedger(tmp_path, schemes=(OLD, TASK_ONLY)), "one", recoverable, lost)
+    new = ExposureLedger(tmp_path, schemes=(TRACE_CONTENT,))
+    snapshot = new.snapshot()
+    assert len(snapshot.records.equivalences) == 2, "one per source, joined at the task vertex"
+    unknown = {row.scheme: row.nodes for row in snapshot.unknown_schemes([TRACE_CONTENT.identity])}
+    assert unknown == {OLD.identity: 2, TASK_ONLY.identity: 2}
+    assert new.resolve_sources(lambda source: recoverable if source.trace_id == "trace-1" else None)
+    resolved = new.snapshot()
+    assert resolved.unknown_schemes([TRACE_CONTENT.identity]) == ()
+    [far] = [
+        node
+        for node in resolved.records.nodes
+        if node.scheme == OLD.identity and node.source.trace_id == "trace-2"
+    ]
+    assert far.vertex in resolved.resolved_vertices([TRACE_CONTENT.identity])
+
+
 def test_scheme_identity_conflicts_are_refused(tmp_path: Path) -> None:
     """A4: a spec edit without a version bump is refused; so is a conflicting import."""
     ledger = ExposureLedger(tmp_path / "here")
