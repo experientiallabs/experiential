@@ -915,7 +915,9 @@ class NativeAttemptAccounting:
             # Closing recovery retains ownership and its retry cadence until
             # every known meter has reached the durable ledger.
             if closing:
-                time.sleep(_SWEEP_INTERVAL_SECONDS)
+                if self.accounting_healthy:
+                    return
+                time.sleep(min(_SWEEP_INTERVAL_SECONDS, 0.1))
 
     def close(self, timeout_seconds: float = 10.0) -> bool:
         """Stop owned recovery before a host closes its durable transport.

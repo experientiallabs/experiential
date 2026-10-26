@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import sys
 from pathlib import Path
 
@@ -25,6 +26,7 @@ DEFAULT_REQUEST_TIMEOUT_SECONDS = 120.0
 # that a stuck request still ends on its own.
 MAXIMUM_REQUEST_TIMEOUT_SECONDS = 3600.0
 _console = Console(theme=EXP_THEME)
+_logger = logging.getLogger(__name__)
 _EXP_WORDMARK = "\n".join(
     (
         "███████╗██╗  ██╗██████╗ ",
@@ -345,14 +347,13 @@ def _run_gateway(
                         )
                         _emit_unavailable_aliases(components.unavailable_aliases)
 
-                if check:
-                    announce_ready()
-                    return
-
                 # Readiness is announced by the native server itself, from
                 # its bound-listener callback, so a launch that cannot own
                 # the port fails without ever printing a ready receipt.
                 try:
+                    if check:
+                        announce_ready()
+                        return
                     serve_native_gateway(
                         control_plane,
                         host=_LOOPBACK_HOST,
@@ -365,6 +366,10 @@ def _run_gateway(
                 except NativeGatewayServerError as exc:
                     raise typer.BadParameter(str(exc)) from exc
                 finally:
+                    while not control_plane.close(
+                        timeout_seconds=min(300.0, max(0.1, graceful_timeout))
+                    ):
+                        _logger.warning("Waiting for retained gateway accounting before shutdown")
                     if capture_controller is not None:
                         capture_controller.native.close(0)
     except typer.BadParameter:

@@ -21,7 +21,9 @@ import logging
 import secrets
 import threading
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
+from contextlib import contextmanager
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 
 from exp.common.models.catalog_prices import BilledUnitKind
@@ -32,6 +34,7 @@ from exp.runtime.gateway.guardrails.enforcement import GuardrailEngine
 from exp.runtime.gateway.guardrails.native import require_unguarded_surface
 from exp.runtime.gateway.model_chain_authority import authorize_serving_model_chains
 from exp.runtime.gateway.native_accounting_errors import NativeBridgeError, authority_error
+from exp.runtime.gateway.native_accounting_recovery import FairRecovery
 from exp.runtime.gateway.native_components import NativeGatewayComponents, SyncWriteLedger
 from exp.runtime.gateway.native_execution import (
     _resolve_deployment_profile,  # The identity-checked resolver every admission uses.
@@ -119,6 +122,38 @@ def _zero_units(variant: str) -> GatewayUsage:
     )
 
 
+@dataclass
+class _PendingSettlement:
+    """Retain the first terminal observation until both durable writes complete.
+
+    Attributes:
+        job: Open durable job associated with this observation.
+        closed: Exact terminal job to persist after accounting succeeds.
+        event: Original terminal meter, unchanged across retries.
+        failure: Original provider failure, if any.
+        ledger_written: Whether accounting acknowledged the terminal meter.
+    """
+
+    job: VideoJob
+    closed: VideoJob
+    event: GatewayEvent
+    failure: GatewayFailure | None
+    ledger_written: bool = False
+
+
+@dataclass
+class _JobGate:
+    """Serialize one video while retaining the gate across waiting callers.
+
+    Attributes:
+        lock: Serializes provider refresh and settlement delivery for this job.
+        users: Holders and waiters retaining this gate, initially zero.
+    """
+
+    lock: threading.Lock = field(default_factory=threading.Lock)
+    users: int = 0
+
+
 class VideoEngine:
     """Video job lifecycle over the native control plane's shared seams.
 
@@ -160,6 +195,13 @@ class VideoEngine:
         self._clock = clock
         self._poll_interval = timedelta(seconds=max(0.0, poll_interval_seconds))
         self._outputs = outputs
+        self._pending_lock = threading.Lock()
+        self._pending: dict[str, _PendingSettlement] = {}
+        self._job_gates: dict[str, _JobGate] = {}
+        self._recovery = FairRecovery[_PendingSettlement](lambda item: item.job.organization_id)
+        self._poll_stop = threading.Event()
+        self._poller_lock = threading.Lock()
+        self._poller: threading.Thread | None = None
 
     # -- create -----------------------------------------------------------------
 
@@ -560,13 +602,38 @@ class VideoEngine:
 
     def poll_open(self) -> int:
         """Advance every open job one step; returns how many were examined."""
+        self._retry_settlements()
         jobs = self._jobs.open_jobs(limit=_POLLER_BATCH)
+        examined = 0
         for job in jobs:
+            if self._poll_stop.is_set():
+                break
             try:
-                self.refresh(job)
+                with self._job_gate(job.video_id, blocking=False) as acquired:
+                    if acquired:
+                        self._refresh(job)
+                        examined += 1
             except Exception:  # noqa: BLE001 - one bad job never stalls the rest.
                 _LOGGER.exception("video %s poll failed; will retry", job.video_id)
-        return len(jobs)
+        return examined
+
+    @contextmanager
+    def _job_gate(self, video_id: str, *, blocking: bool = True) -> Iterator[bool]:
+        """Retain one job gate through waiters; never hold the registry across I/O."""
+        with self._pending_lock:
+            gate = self._job_gates.setdefault(video_id, _JobGate())
+            gate.users += 1
+        acquired = False
+        try:
+            acquired = gate.lock.acquire(blocking=blocking)
+            yield acquired
+        finally:
+            if acquired:
+                gate.lock.release()
+            with self._pending_lock:
+                gate.users -= 1
+                if gate.users == 0:
+                    del self._job_gates[video_id]
 
     def refresh(self, job: VideoJob) -> VideoJob:
         """Bring one job up to date with its provider, settling a terminal state.
@@ -577,7 +644,19 @@ class VideoEngine:
         Returns:
             The current job (re-read when another writer settled it first).
         """
-        if job.settled:
+        with self._job_gate(job.video_id):
+            return self._refresh(job)
+
+    def _refresh(self, job: VideoJob) -> VideoJob:
+        """Re-read durable state under the job gate before constructing an observation."""
+        with self._pending_lock:
+            pending = self._pending.get(job.video_id)
+        if pending is not None:
+            return self._deliver_settlement(pending)
+        current = self._jobs.load_any(video_id=job.video_id)
+        if current is not None:
+            job = current
+        if job.settled or self._poll_stop.is_set():
             return job
         now = self._clock()
         if job.provider_job_id is None:
@@ -690,20 +769,6 @@ class VideoEngine:
                 failure=failure,
                 usage=_zero_units(job.variant) if observed_zero else None,
             )
-        try:
-            self._ledger.finish_attempt(
-                attempt_id=job.attempt_id,
-                terminal_event=event,
-                failure=failure,
-                finalize_request=True,
-            )
-        except Exception:  # noqa: BLE001 - kept open for retry until well past the bound.
-            if now < job.settle_by + timedelta(seconds=VIDEO_LEDGER_DEADLINE_SLACK_SECONDS):
-                _LOGGER.exception("video %s settlement failed; will retry", job.video_id)
-                return job
-            # Past the ledger deadline the attempt was already terminalized
-            # (crash reconciliation); the job closes so it stops polling.
-            _LOGGER.exception("video %s attempt was terminalized elsewhere", job.video_id)
         if completed:
             assert snapshot is not None
             lifetime = snapshot.asset_lifetime_seconds
@@ -723,7 +788,44 @@ class VideoEngine:
             assert failure is not None
             code = None if snapshot is None else snapshot.error_code
             closed = _closed(job, failure, settled_milli=billed, now=now, code=code)
-        return self._save(closed)
+        with self._pending_lock:
+            pending = self._pending.setdefault(
+                job.video_id, _PendingSettlement(job, closed, event, failure)
+            )
+        return self._deliver_settlement(pending)
+
+    def _deliver_settlement(self, pending: _PendingSettlement) -> VideoJob:
+        """Deliver under the job gate; uncertainty never erases the exact terminal meter."""
+        try:
+            if not pending.ledger_written:
+                self._ledger.finish_attempt(
+                    attempt_id=pending.job.attempt_id,
+                    terminal_event=pending.event,
+                    failure=pending.failure,
+                    finalize_request=True,
+                )
+                pending.ledger_written = True
+            saved = self._save(pending.closed)
+            if not saved.settled:
+                return pending.job
+        except Exception as error:  # noqa: BLE001 - retain the exact record for fair retry.
+            _LOGGER.warning("video settlement retained: %s", type(error).__name__)
+            return pending.job
+        with self._pending_lock:
+            del self._pending[pending.job.video_id]
+        return saved
+
+    def _retry_settlements(self) -> None:
+        """Give each organization a bounded turn without polling providers again."""
+        with self._pending_lock:
+            selected = self._recovery.select(list(self._pending.values()), _POLLER_BATCH)
+        for pending in selected:
+            with self._job_gate(pending.job.video_id, blocking=False) as acquired:
+                if acquired:
+                    with self._pending_lock:
+                        current = self._pending.get(pending.job.video_id)
+                    if current is pending:
+                        self._deliver_settlement(pending)
 
     def _resolve(self, job: VideoJob) -> tuple[GatewayWireProfile, VideoProviderClient] | None:
         """Re-resolve the job's frozen deployment on a currently loaded catalog.
@@ -762,19 +864,43 @@ class VideoEngine:
         Returns:
             The started thread.
         """
+        if not 0 < interval_seconds <= 300:
+            raise ValueError("video poll interval must be positive and at most 300 seconds")
 
         def loop() -> None:
-            """Poll open jobs for the life of the process."""
+            """Stop new polls at shutdown but retain ownership of known terminal writes."""
             while True:
-                time.sleep(interval_seconds)
+                closing = self._poll_stop.wait(interval_seconds)
                 try:
-                    self.poll_open()
+                    if closing:
+                        self._retry_settlements()
+                        with self._pending_lock:
+                            if not self._pending:
+                                return
+                    else:
+                        self.poll_open()
                 except Exception:  # noqa: BLE001 - the poller must outlive store hiccups.
                     _LOGGER.exception("video poller pass failed")
+                if closing:
+                    time.sleep(min(interval_seconds, 0.1))
 
-        thread = threading.Thread(target=loop, name="gateway-video-poller", daemon=True)
-        thread.start()
-        return thread
+        with self._poller_lock:
+            if self._poller is None:
+                self._poller = threading.Thread(
+                    target=loop, name="gateway-video-poller", daemon=True
+                )
+                self._poller.start()
+            return self._poller
+
+    def close(self, timeout_seconds: float = 10.0) -> bool:
+        """Join provider polling and exact-meter recovery before releasing the ledger."""
+        if not 0 <= timeout_seconds <= 300:
+            raise ValueError("video shutdown timeout must be between zero and 300 seconds")
+        self._poll_stop.set()
+        thread = self.start_poller()
+        thread.join(timeout_seconds)
+        with self._pending_lock:
+            return not thread.is_alive() and not self._pending
 
 
 def _unsupported_failure() -> GatewayFailure:

@@ -125,10 +125,12 @@ def test_run_command_starts_the_gateway_directly(
 
 @pytest.mark.parametrize("ghost", [False, True])
 @pytest.mark.parametrize("check", [False, True])
+@pytest.mark.parametrize("graceful_timeout", [0.25, 600.0])
 def test_project_option_launches_the_native_gateway_on_loopback(
     monkeypatch: pytest.MonkeyPatch,
     ghost: bool,
     check: bool,
+    graceful_timeout: float,
 ) -> None:
     """Both project compatibility modes launch the ordinary native gateway.
 
@@ -136,11 +138,14 @@ def test_project_option_launches_the_native_gateway_on_loopback(
         monkeypatch: Scoped replacements for runtime and server boundaries.
         ghost: Whether the invocation disables durable interaction state.
         check: Whether readiness returns before starting the native server.
+        graceful_timeout: Native serving budget, independent of bounded accounting joins.
     """
     prepared: list[tuple[str, Path, str | None]] = []
     loaded: list[tuple[Path, frozenset[str] | None]] = []
     served: list[tuple[object, str, int]] = []
     control_planes: list[object] = []
+    owner_events: list[str] = []
+    drain_results = iter((False, True))
     closed: list[float] = []
     guardrails = SimpleNamespace(close=lambda *, timeout_seconds: closed.append(timeout_seconds))
 
@@ -198,9 +203,16 @@ def test_project_option_launches_the_native_gateway_on_loopback(
             components=value,
             reconciled_expired_requests=0,
             reconciled_unknown_attempts=0,
+            close=drain,
         )
         control_planes.append(plane)
         return plane
+
+    def drain(*, timeout_seconds: float) -> bool:
+        """Keep the instance lock until the retained meter has been recovered."""
+        assert timeout_seconds == min(300.0, graceful_timeout)
+        owner_events.append("drain")
+        return next(drain_results)
 
     @contextmanager
     def instance_lock(root: Path, *, port: int) -> Iterator[None]:
@@ -216,6 +228,7 @@ def test_project_option_launches_the_native_gateway_on_loopback(
         assert root == Path("/tmp/local-exp")
         assert port == 8123
         yield
+        owner_events.append("unlock")
 
     def serve(value: object, *, host: str, port: int, **kwargs: object) -> None:
         """Capture the control plane and loopback bind without serving.
@@ -258,7 +271,7 @@ def test_project_option_launches_the_native_gateway_on_loopback(
         "8123",
         "--json",
         "--graceful-timeout",
-        "0.25",
+        str(graceful_timeout),
     ]
     if ghost:
         arguments.append("--ghost")
@@ -270,7 +283,8 @@ def test_project_option_launches_the_native_gateway_on_loopback(
     assert prepared == [("project-a", Path("/tmp/local-exp"), "policy-a")]
     assert loaded == [(Path("/tmp/local-exp"), frozenset({"project-a"}))]
     assert served == ([] if check else [(control_planes[0], "127.0.0.1", 8123)])
-    assert closed == [0.25]
+    assert closed == [graceful_timeout]
+    assert owner_events == ["drain", "drain", "unlock"]
     receipt = json.loads(result.stdout)
     assert receipt["launch_mode"] == "project_alias"
     assert receipt["base_url"] == "http://127.0.0.1:8123/v1"
@@ -337,6 +351,7 @@ def test_unbindable_port_fails_before_any_ready_receipt(
             reconciled_unknown_attempts=0,
             request_timeout_seconds=120.0,
             guardrail_detectors={},
+            close=lambda *, timeout_seconds: True,
         ),
     )
 

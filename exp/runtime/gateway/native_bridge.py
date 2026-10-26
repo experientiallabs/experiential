@@ -274,7 +274,12 @@ class NativeControlPlane(
 
     def close(self, timeout_seconds: float = 10.0) -> bool:
         """Stop background recovery after the native data plane has drained."""
-        return self._accounting.close(timeout_seconds)
+        if not 0 <= timeout_seconds <= 300:
+            raise ValueError("gateway shutdown timeout must be between zero and 300 seconds")
+        deadline = time.monotonic() + timeout_seconds
+        videos_closed = self._videos is None or self._videos.close(timeout_seconds)
+        accounting_closed = self._accounting.close(max(0.0, deadline - time.monotonic()))
+        return videos_closed and accounting_closed
 
     @property
     def guardrail_detectors(self) -> dict[str, deterministic.NativeDetector]:

@@ -11,10 +11,12 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from unittest.mock import patch
 
 import httpx
 import pytest
@@ -34,6 +36,7 @@ from exp.runtime.gateway.catalog_authority import upsert_connection, upsert_sing
 from exp.runtime.gateway.lifecycle import LocalGatewayComponents, load_gateway_components
 from exp.runtime.gateway.management import GatewayManagement
 from exp.runtime.gateway.native_accounting_errors import NativeBridgeError
+from exp.runtime.gateway.stream_contracts import GatewayEvent, GatewayFailure
 from exp.runtime.gateway.tests.certified_pool_fixture_test import upsert_certified_pool
 from exp.runtime.gateway.video.contracts import (
     VIDEO_JOB_SETTLEMENT_SECONDS,
@@ -262,6 +265,7 @@ def _setup(tmp_path: Path) -> Iterator[_Setup]:
     try:
         yield _Setup(components, raw_key, engine, provider, clock, manager.database_path)
     finally:
+        assert engine.close(5)
         components.write_ledger.close()
 
 
@@ -400,6 +404,121 @@ def test_racing_settlements_bill_once(setup: _Setup) -> None:
     assert first.billed_seconds_milli == second.billed_seconds_milli == 8_000
     (attempt,) = _attempts(setup)
     assert attempt["estimated_cost_nano_usd"] == 8 * _VEO_RATE
+
+
+def test_failed_terminal_write_keeps_the_original_meter_through_shutdown(setup: _Setup) -> None:
+    """A later timeout cannot replace a completed render retained after a ledger failure."""
+    job = _create(setup, alias="grok-video", seconds=6)
+    finish = setup.components.ledger.finish_attempt
+    observed_at = setup.clock.now
+    with patch.object(
+        setup.components.ledger, "finish_attempt", side_effect=RuntimeError("offline")
+    ) as failed:
+        assert not setup.engine.refresh(job).settled
+    original = failed.call_args.kwargs
+    setup.clock.now += timedelta(seconds=VIDEO_JOB_SETTLEMENT_SECONDS + 1)
+    setup.provider.poll_status = 503
+    with patch.object(setup.components.ledger, "finish_attempt", wraps=finish) as recovered:
+        assert setup.engine.close(5)
+    assert recovered.call_args.kwargs == original
+    jobs = setup.components.video_jobs
+    assert jobs is not None
+    current = jobs.load_any(video_id=job.video_id)
+    assert current is not None and current.settled
+    assert current.status is VideoStatus.COMPLETED
+    assert current.completed_at == observed_at
+    assert current.billed_seconds_milli == 5_000
+    assert _attempts(setup)[0]["budget_settled_nano_usd"] == 5 * _XAI_RATE
+
+
+def test_job_store_retry_does_not_repeat_acknowledged_accounting(setup: _Setup) -> None:
+    """Once accounting succeeds, only the exact terminal job write is retried."""
+    job = _create(setup)
+    jobs = setup.components.video_jobs
+    assert jobs is not None
+    with patch.object(
+        setup.components.ledger, "finish_attempt", wraps=setup.components.ledger.finish_attempt
+    ) as finish:
+        with patch.object(jobs, "save_open", side_effect=RuntimeError("offline")):
+            assert not setup.engine.refresh(job).settled
+        assert setup.engine.close(5)
+        assert finish.call_count == 1
+    assert _attempts(setup)[0]["budget_settled_nano_usd"] == 8 * _VEO_RATE
+
+
+def test_stale_waiter_observes_the_settled_winner_after_deadline(setup: _Setup) -> None:
+    """Concurrent stale readers cannot replace completion with a later timeout."""
+    job = _create(setup)
+    entered = threading.Event()
+    release = threading.Event()
+    finish = setup.components.ledger.finish_attempt
+    results: list[VideoJob] = []
+
+    def blocked_finish(
+        *,
+        attempt_id: str,
+        terminal_event: GatewayEvent | None,
+        failure: GatewayFailure | None,
+        finalize_request: bool,
+    ) -> None:
+        """Hold the first completed observation while a stale reader starts waiting."""
+        entered.set()
+        assert release.wait(5)
+        finish(
+            attempt_id=attempt_id,
+            terminal_event=terminal_event,
+            failure=failure,
+            finalize_request=finalize_request,
+        )
+
+    with patch.object(
+        setup.components.ledger, "finish_attempt", side_effect=blocked_finish
+    ) as calls:
+        first = threading.Thread(target=lambda: results.append(setup.engine.refresh(job)))
+        second = threading.Thread(target=lambda: results.append(setup.engine.refresh(job)))
+        first.start()
+        try:
+            assert entered.wait(5)
+            second.start()
+            setup.clock.now += timedelta(seconds=VIDEO_JOB_SETTLEMENT_SECONDS + 1)
+        finally:
+            release.set()
+            first.join(5)
+            if second.ident is not None:
+                second.join(5)
+        assert calls.call_count == 1
+    assert len(results) == 2
+    assert all(result.settled and result.status is VideoStatus.COMPLETED for result in results)
+    assert setup.engine.close(5)
+
+
+def test_shutdown_joins_active_poll_and_does_not_start_the_next_job(setup: _Setup) -> None:
+    """The owned poller completes its current observation and stops the open-job batch."""
+    _create(setup)
+    _create(setup)
+    entered = threading.Event()
+    release = threading.Event()
+    handle = setup.provider.handle
+    polls: list[str] = []
+
+    def blocked_poll(request: httpx.Request) -> httpx.Response:
+        """Retain one in-progress provider response across a bounded close."""
+        polls.append(str(request.url))
+        entered.set()
+        assert release.wait(5)
+        return handle(request)
+
+    with patch.object(setup.provider, "handle", side_effect=blocked_poll):
+        thread = setup.engine.start_poller(interval_seconds=0.01)
+        try:
+            assert entered.wait(5)
+            assert not setup.engine.close(0.01)
+        finally:
+            release.set()
+        assert setup.engine.close(5)
+        assert not thread.is_alive()
+    assert len(polls) == 1
+    assert sorted(row["state"] for row in _attempts(setup)) == ["completed", "dispatched"]
 
 
 def test_xai_bills_the_rendered_seconds_never_more_than_requested(setup: _Setup) -> None:

@@ -152,7 +152,9 @@ def _install_common_stubs(
     )
     monkeypatch.setattr(
         "exp.runtime.router.application.NativeControlPlane",
-        lambda components, **_kwargs: SimpleNamespace(components=components),
+        lambda components, **_kwargs: SimpleNamespace(
+            components=components, close=lambda _timeout: True
+        ),
     )
     monkeypatch.setattr(
         "exp.runtime.router.application.importlib",
@@ -292,6 +294,37 @@ def test_load_router_control_plane_failure_closes_the_loaded_engine(
     assert _Management.revoked == [_Management.issued[0][1]]
 
 
+def test_startup_failure_retains_cleanup_ownership_until_recovered(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failed startup has no returned client to retry a timed-out accounting drain."""
+    events: list[str] = []
+    components = SimpleNamespace(
+        selection_workers=SimpleNamespace(shutdown=lambda: events.append("workers")),
+        write_ledger=SimpleNamespace(close=lambda: events.append("ledger")),
+    )
+    _install_common_stubs(monkeypatch, tmp_path, prepared=[], loaded=[], components=components)
+    results = iter((False, True))
+
+    def drain(_timeout: float) -> bool:
+        """Recover only on the second owned cleanup pass."""
+        events.append("drain")
+        return next(results)
+
+    def fail_serve(*_args: object, **_kwargs: object) -> None:
+        """Reject listener startup after its accounting owner exists."""
+        raise NativeGatewayServerError("bind refused")
+
+    monkeypatch.setattr(
+        application, "NativeControlPlane", lambda *_args, **_kwargs: SimpleNamespace(close=drain)
+    )
+    monkeypatch.setattr(application, "serve_native_gateway", fail_serve)
+    with pytest.raises(RouterApplicationError, match="failed to start"):
+        load_router("support", root=tmp_path)
+    assert events == ["drain", "drain", "workers", "ledger"]
+    assert _Management.revoked == [_Management.issued[0][1]]
+
+
 def test_owned_gateway_shares_join_and_observation_drain_deadline(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -325,7 +358,7 @@ def test_owned_gateway_shares_join_and_observation_drain_deadline(
         joined.append(timeout)
         clock[0] += 0.75
 
-    gateway.thread = cast(threading.Thread, SimpleNamespace(join=join))
+    gateway.thread = cast(threading.Thread, SimpleNamespace(join=join, is_alive=lambda: False))
     monkeypatch.setattr(application, "time", SimpleNamespace(monotonic=lambda: clock[0]))
     monkeypatch.setattr(application, "_SHUTDOWN_JOIN_SECONDS", 1.0)
     gateway.stop()
@@ -333,6 +366,39 @@ def test_owned_gateway_shares_join_and_observation_drain_deadline(
     assert closed == [0.25]
     assert released == ["workers", "ledger"]
     assert _Management.revoked == ["owned-key"]
+
+
+@pytest.mark.parametrize("serving", [False, True])
+def test_owned_gateway_keeps_dependencies_until_recovery_completes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, serving: bool
+) -> None:
+    """A timed-out close retains the ledger and can be retried by the same owner."""
+    released: list[str] = []
+    components = SimpleNamespace(
+        selection_workers=SimpleNamespace(shutdown=lambda: released.append("workers")),
+        write_ledger=SimpleNamespace(close=lambda: released.append("ledger")),
+    )
+    _install_common_stubs(monkeypatch, tmp_path, prepared=[], loaded=[], components=components)
+    gateway = application._OwnedGateway(
+        components=cast(LocalGatewayComponents, components),
+        manager=cast(GatewayManagement, _Management(tmp_path)),
+        key_id="recovering-key",
+        port=8123,
+    )
+    healthy = [False]
+    gateway.thread = cast(
+        threading.Thread,
+        SimpleNamespace(join=lambda *, timeout: None, is_alive=lambda: serving and not healthy[0]),
+    )
+    monkeypatch.setattr(gateway.control_plane, "close", lambda _timeout: healthy[0])
+    with pytest.raises(RouterApplicationError, match="retry close"):
+        gateway.stop()
+    assert released == []
+    assert _Management.revoked == []
+    healthy[0] = True
+    gateway.stop()
+    assert released == ["workers", "ledger"]
+    assert _Management.revoked == ["recovering-key"]
 
 
 def test_ghost_compatibility_rejects_a_persistent_project_decision_sink(tmp_path: Path) -> None:
