@@ -890,6 +890,51 @@ def test_recovery_provenance_is_internal_and_cannot_be_invented_by_public_payloa
     _assert_allocations(budgets, settled=0 if release_reservation else 40)
 
 
+@pytest.mark.parametrize("maximum", [None, 300])
+@pytest.mark.parametrize("crashed", [False, True])
+def test_customer_waiver_can_follow_unknown_recovery_without_losing_provider_meter(
+    tmp_path: Path, maximum: int | None, crashed: bool
+) -> None:
+    """A timeout releases provisional or crash-held liability while retaining late meters."""
+    clock, store, ledger, budgets, attempt = _started(tmp_path, maximum=maximum)
+    failure = GatewayFailure(
+        failure_class=GatewayFailureClass.INTERNAL, safe_message="dispatch unconfirmed"
+    )
+    if crashed:
+        clock.advance(60)
+        assert ledger.reconcile_crashed_requests(cleanup_grace=timedelta()) == (0, 1)
+    else:
+        ledger.finish_attempt(
+            attempt_id=attempt,
+            terminal_event=GatewayEvent.for_accounting_recovery(failure=failure),
+            failure=failure,
+        )
+    before = dict(_attempt_row(tmp_path, attempt))
+    timeout = GatewayFailure(
+        failure_class=GatewayFailureClass.TIMEOUT, safe_message="settlement deadline reached"
+    )
+    waiver = GatewayEvent.for_accounting_recovery(failure=timeout, release_reservation=True)
+    for _ in range(2):
+        ledger.finish_attempt(attempt_id=attempt, terminal_event=waiver, failure=timeout)
+    row = _attempt_row(tmp_path, attempt)
+    assert row["usage_source"] == "unknown"
+    assert row["estimated_cost_nano_usd"] is None
+    assert row["failure_class"] == before["failure_class"]
+    assert row["state"] == before["state"]
+    assert row["terminal_at"] == before["terminal_at"]
+    assert row["budget_settled_nano_usd"] == 0
+    _assert_allocations(budgets, settled=0)
+    ledger = SQLiteAttemptLedger(store.database_path)
+    for _ in range(2):
+        ledger.finish_attempt(attempt_id=attempt, terminal_event=_observed(), failure=None)
+        ledger.finish_attempt(attempt_id=attempt, terminal_event=waiver, failure=timeout)
+    row = _attempt_row(tmp_path, attempt)
+    assert row["usage_source"] == "observed"
+    assert row["estimated_cost_nano_usd"] == 40
+    assert row["budget_settled_nano_usd"] == 0
+    _assert_allocations(budgets, settled=0)
+
+
 def test_schema32_preserves_legacy_failure_without_inventing_recovery(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

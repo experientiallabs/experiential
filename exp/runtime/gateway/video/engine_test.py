@@ -34,7 +34,8 @@ from exp.common.models import (
 )
 from exp.runtime.gateway.budgets import BudgetScope, BudgetScopeKind, SQLiteBudgetStore
 from exp.runtime.gateway.catalog_authority import upsert_connection, upsert_singleton_deployment
-from exp.runtime.gateway.ledger import GatewayLedgerError
+from exp.runtime.gateway.ledger import GatewayLedgerError, SQLiteAttemptLedger
+from exp.runtime.gateway.ledger_test import FakeLedgerClock
 from exp.runtime.gateway.lifecycle import LocalGatewayComponents, load_gateway_components
 from exp.runtime.gateway.management import GatewayManagement
 from exp.runtime.gateway.native_accounting_errors import NativeBridgeError
@@ -357,12 +358,24 @@ def test_an_ambiguous_submit_settles_conservatively_and_is_never_resent(setup: _
     assert len(setup.provider.posts) == 1
 
 
-def test_a_job_still_running_at_its_bound_preserves_unknown_usage(setup: _Setup) -> None:
+@pytest.mark.parametrize("crashed", [False, True])
+def test_a_job_still_running_at_its_bound_preserves_unknown_usage(
+    setup: _Setup, crashed: bool
+) -> None:
     """A timeout releases the customer reservation without inventing zero provider usage."""
     setup.provider.done = False
     job = _create(setup)
     assert setup.engine.refresh(job).status is VideoStatus.IN_PROGRESS
     setup.clock.now += timedelta(seconds=VIDEO_JOB_SETTLEMENT_SECONDS)
+    if crashed:
+        with sqlite3.connect(setup.database) as connection:
+            (deadline,) = connection.execute(
+                "SELECT deadline_at FROM gateway_requests WHERE request_id = ?", (job.request_id,)
+            ).fetchone()
+        recovery_clock = FakeLedgerClock()
+        recovery_clock.wall = datetime.fromisoformat(deadline) + timedelta(seconds=1)
+        recovery = SQLiteAttemptLedger(setup.database, clock=recovery_clock)
+        assert recovery.reconcile_crashed_requests(cleanup_grace=timedelta()) == (0, 1)
     assert setup.engine.poll_open() == 1
     jobs = setup.components.video_jobs
     assert jobs is not None
@@ -374,7 +387,8 @@ def test_a_job_still_running_at_its_bound_preserves_unknown_usage(setup: _Setup)
     assert current.billed_seconds_milli is None
     (attempt,) = _attempts(setup)
     assert attempt["usage_source"] == "unknown"
-    assert attempt["accounting_recovery"] == 1
+    assert attempt["accounting_recovery"] == (0 if crashed else 1)
+    assert attempt["state"] == ("unknown_after_crash" if crashed else "failed")
     assert attempt["billed_quantity_milli"] is None
     assert attempt["estimated_cost_nano_usd"] is None
     assert attempt["budget_settled_nano_usd"] == 0

@@ -84,6 +84,23 @@ def reconcile_terminal_attempt(
         (attempt_id,),
     ).fetchone()
     assert row is not None
+    if (
+        terminal is not None
+        and terminal.accounting_release_reservation
+        and (row["accounting_recovery"] or row["state"] in {"cancelled", "unknown_after_crash"})
+        and (row["usage_source"] == "unknown" or row["budget_settled_nano_usd"] == 0)
+    ):
+        # A late customer waiver can follow an earlier provisional cleanup.
+        # Keep provider evidence and the original delivery outcome. An already
+        # waived row also acknowledges retry after a late exact meter commits.
+        _replace_budget_charges(
+            connection, attempt_id, optional_int(row["budget_settled_nano_usd"]), 0
+        )
+        connection.execute(
+            "UPDATE gateway_attempts SET budget_settled_nano_usd = 0 WHERE attempt_id = ?",
+            (attempt_id,),
+        )
+        return
     complete = (
         terminal is not None
         and not terminal.usage_estimated
