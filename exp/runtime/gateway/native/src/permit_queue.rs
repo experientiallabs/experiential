@@ -16,7 +16,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use tokio::sync::{AcquireError, Notify, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{AcquireError, Notify, OwnedSemaphorePermit, Semaphore, TryAcquireError};
 
 /// How often a waiting request re-checks its standing without an event, so
 /// aging can promote it while nothing arrives or leaves.
@@ -27,12 +27,14 @@ struct Waiter {
     id: u64,
     class: u8,
     since: Instant,
+    scope: Option<Arc<Semaphore>>,
 }
 
 #[derive(Debug, Default)]
 struct Waiters {
     next_id: u64,
     entries: Vec<Waiter>,
+    closed: bool,
 }
 
 /// The worker's permit queue; FIFO (the plain semaphore) when `aging` is `None`.
@@ -40,7 +42,22 @@ struct Waiters {
 pub(crate) struct PermitQueue {
     aging: Option<Duration>,
     waiters: Mutex<Waiters>,
-    changed: Notify,
+    changed: Arc<Notify>,
+}
+
+/// Release both capacities before waking the next eligible organization.
+pub(crate) struct ScopedPermit {
+    global: Option<OwnedSemaphorePermit>,
+    scope: Option<OwnedSemaphorePermit>,
+    changed: Arc<Notify>,
+}
+
+impl Drop for ScopedPermit {
+    fn drop(&mut self) {
+        drop(self.global.take());
+        drop(self.scope.take());
+        self.changed.notify_waiters();
+    }
 }
 
 /// Removes its waiter on every exit (permit, deadline, disconnect).
@@ -68,7 +85,76 @@ impl PermitQueue {
         Self {
             aging,
             waiters: Mutex::new(Waiters::default()),
-            changed: Notify::new(),
+            changed: Arc::new(Notify::new()),
+        }
+    }
+
+    /// Stop waiting admissions before draining already-running streams.
+    pub(crate) fn close(&self) {
+        if let Ok(mut waiters) = self.waiters.lock() {
+            waiters.closed = true;
+        }
+        self.changed.notify_waiters();
+    }
+
+    /// Grant global and tenant capacity together, without holding either while waiting.
+    pub(crate) async fn acquire_scoped(
+        &self,
+        global: &Arc<Semaphore>,
+        scope: &Arc<Semaphore>,
+        class: Option<u8>,
+    ) -> Result<ScopedPermit, TryAcquireError> {
+        let id = {
+            let mut waiters = self.waiters.lock().map_err(|_| TryAcquireError::Closed)?;
+            if waiters.closed || global.is_closed() || scope.is_closed() {
+                return Err(TryAcquireError::Closed);
+            }
+            let id = waiters.next_id;
+            waiters.next_id += 1;
+            waiters.entries.push(Waiter {
+                id,
+                class: if self.aging.is_some() {
+                    class.unwrap_or(0)
+                } else {
+                    0
+                },
+                since: Instant::now(),
+                scope: Some(scope.clone()),
+            });
+            id
+        };
+        self.changed.notify_waiters();
+        let _registration = Registration { queue: self, id };
+        loop {
+            let notified = self.changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            {
+                let waiters = self.waiters.lock().map_err(|_| TryAcquireError::Closed)?;
+                if waiters.closed || global.is_closed() || scope.is_closed() {
+                    return Err(TryAcquireError::Closed);
+                }
+                let aging = self.aging.unwrap_or(Duration::MAX);
+                if head(&waiters.entries, aging, Instant::now()) == Some(id) {
+                    if let Ok(global_permit) = global.clone().try_acquire_owned() {
+                        match scope.clone().try_acquire_owned() {
+                            Ok(scope_permit) => {
+                                return Ok(ScopedPermit {
+                                    global: Some(global_permit),
+                                    scope: Some(scope_permit),
+                                    changed: self.changed.clone(),
+                                })
+                            }
+                            Err(TryAcquireError::Closed) => return Err(TryAcquireError::Closed),
+                            Err(TryAcquireError::NoPermits) => drop(global_permit),
+                        }
+                    }
+                }
+            }
+            tokio::select! {
+                _ = &mut notified => {},
+                _ = tokio::time::sleep(REEVALUATE) => {},
+            }
         }
     }
 
@@ -96,6 +182,7 @@ impl PermitQueue {
                 id,
                 class: class.unwrap_or(0),
                 since: Instant::now(),
+                scope: None,
             });
             id
         };
@@ -103,6 +190,9 @@ impl PermitQueue {
         self.changed.notify_waiters();
         let _registration = Registration { queue: self, id };
         loop {
+            if permits.is_closed() {
+                return permits.clone().acquire_owned().await;
+            }
             let notified = self.changed.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
@@ -140,6 +230,12 @@ fn head(entries: &[Waiter], aging: Duration, now: Instant) -> Option<u64> {
     };
     entries
         .iter()
+        .filter(|waiter| {
+            waiter
+                .scope
+                .as_ref()
+                .is_none_or(|scope| scope.available_permits() > 0)
+        })
         .max_by(|left, right| {
             effective(left)
                 .total_cmp(&effective(right))
@@ -153,7 +249,12 @@ mod tests {
     use super::*;
 
     fn waiter(id: u64, class: u8, since: Instant) -> Waiter {
-        Waiter { id, class, since }
+        Waiter {
+            id,
+            class,
+            since,
+            scope: None,
+        }
     }
 
     #[test]

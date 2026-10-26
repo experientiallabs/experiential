@@ -379,6 +379,7 @@ uv run pytest -q
     | Provider calls and retries | `exp/runtime/models/registry.py`, `exp/runtime/models/providers/transport.py` | `RuntimeModelCatalog`, `RetryPolicy` |
     | Producer revision | `exp/common/release_revision.py` | `installed_release_revision` |
     | Gateway callback tenant scheduling | `exp/runtime/gateway/native/src/callback_capacity.rs` | `CallbackCapacity` resolves trusted host tokens and admitted request scopes before shared callback permits |
+    | Gateway active-request tenant scheduling | `exp/runtime/gateway/native/src/permit_queue.rs`, `exp/runtime/gateway/native/src/dispatch_capacity.rs` | `PermitQueue.acquire_scoped` grants global and organization capacity together; `DispatchPermit` retains both through stream or upload completion |
     | Gateway accounting recovery fairness | `exp/runtime/gateway/native_accounting_recovery.py` | `FairRecovery` rotates bounded retained work across organizations; admission never runs recovery I/O |
 
     Keep this table current. A change that introduces an owner for a new concern adds its row in

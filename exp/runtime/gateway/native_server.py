@@ -124,7 +124,8 @@ def serve_native_gateway(
         port: Public listener port.
         max_active_requests: Native concurrent-admission bound.
         max_active_per_organization: Maximum active requests for a trusted organization,
-            held through upload or stream completion. None disables the tenant bound.
+            held through upload or stream completion. Requires callback_scopes; missing
+            trusted scopes fail closed. None preserves legacy local/embedded capacity.
         callback_permits: Serving callback workers, 1 through 256. The native
             bridge reserves a separate settlement pool of max(2, permits/4)
             workers and bounds each admitted organization to half each pool.
@@ -209,6 +210,8 @@ def serve_native_gateway(
         and not 1 <= max_active_per_organization <= max_active_requests
     ):
         raise ValueError("max_active_per_organization must be between 1 and max_active_requests")
+    if max_active_per_organization is not None and callback_scopes is None:
+        raise ValueError("max_active_per_organization requires a trusted callback_scopes registry")
     try:
         native = importlib.import_module("exp_gateway_native")
     except ModuleNotFoundError as exc:

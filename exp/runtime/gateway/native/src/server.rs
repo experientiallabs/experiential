@@ -327,6 +327,8 @@ pub async fn run(
     } else {
         app
     };
+    let permits = state.permits.clone();
+    let permit_queue = state.permit_queue.clone();
     let app = app.fallback(unknown_route).with_state(state);
     let listener = tokio::net::TcpListener::bind((config.host.as_str(), config.port))
         .await
@@ -343,14 +345,22 @@ pub async fn run(
             .map_err(|error| format!("on_listening callback failed: {error}"))?;
     }
     let graceful = Duration::from_secs_f64(config.graceful_timeout_seconds.max(0.1));
-    let server =
-        axum::serve(listener, app).with_graceful_shutdown(shutdown_requested(shutdown.clone()));
+    let server_shutdown = shutdown.clone();
+    let drain_permits = permits.clone();
+    let drain_queue = permit_queue.clone();
+    let server = axum::serve(listener, app).with_graceful_shutdown(async move {
+        shutdown_requested(server_shutdown).await;
+        drain_permits.close();
+        drain_queue.close();
+    });
     // A stop request starts the graceful drain above; the arm below bounds
     // it, so a stuck stream cannot hold shutdown past the configured timeout.
     let outcome = tokio::select! {
         outcome = server => outcome.map_err(|error| format!("gateway server failed: {error}")),
         _ = async {
             shutdown_requested(shutdown).await;
+            permits.close();
+            permit_queue.close();
             tokio::time::sleep(graceful).await;
         } => Ok(()),
     };

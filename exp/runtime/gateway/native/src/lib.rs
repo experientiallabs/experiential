@@ -225,6 +225,11 @@ fn serve(
     let config: ServeConfig = serde_json::from_str(config_json)
         .map_err(|error| PyValueError::new_err(format!("invalid serve config: {error}")))?;
     retained::configure(config.maximum_retained_output_bytes);
+    if config.max_active_per_organization.is_some() && callback_scopes.is_none() {
+        return Err(PyValueError::new_err(
+            "max_active_per_organization requires a trusted callback_scopes registry",
+        ));
+    }
     let detectors = Arc::new(collect_detectors(guardrail_detectors)?);
     let mut bridge =
         Bridge::new(control_plane, config.callback_permits).map_err(PyRuntimeError::new_err)?;
