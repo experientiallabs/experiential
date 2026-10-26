@@ -251,6 +251,51 @@ def test_unverified_rollback_closes_the_world_and_stops_the_episode() -> None:
             world.execute(_call("later", tool="boom", value="x", delay=1))
 
 
+class FailingBackend(DictBackend):
+    """A backend whose release fails, as a lost remote sandbox would."""
+
+    def close(self) -> None:
+        """Fail to release."""
+        raise OSError("backend release failed")
+
+
+class FaultyRollbackFactory(DictFactory):
+    """Fail one step of a rollback: the restore, the restored release or the old release."""
+
+    def __init__(self, values: dict[str, str], fault: str) -> None:
+        """Bind the fault to inject."""
+        super().__init__(values)
+        self.fault = fault
+
+    def create(self, task: TaskCase) -> DictBackend:
+        """Return an initial backend, failing on release for the old-release fault."""
+        del task
+        return (FailingBackend if self.fault == "old_close" else DictBackend)(dict(self.values))
+
+    def restore(self, image: NativeImage) -> DictBackend:
+        """Fail, or return a corrupt backend that also fails on release, or restore exactly."""
+        if self.fault == "restore":
+            raise OSError("restore failed")
+        if self.fault == "restored_close":
+            return FailingBackend({name: "corrupt" for name in image.parts})
+        return super().restore(image)
+
+
+@pytest.mark.parametrize("fault", ["restore", "restored_close", "old_close"])
+def test_a_failing_rollback_step_always_closes_the_world(fault: str) -> None:
+    """No restore or cleanup failure leaves the world usable or replaces the restore failure."""
+    runtime = ExecutableWorldRuntime(
+        _manifest(), FaultyRollbackFactory({"a": "0", "b": "0"}, fault)
+    )
+    with runtime.open(_task()) as world:
+        with pytest.raises(RestoreError, match="it is closed") as error:
+            world.execute(_call("later", tool="boom", value="x", delay=1))
+        if fault == "restored_close":
+            assert error.value.__notes__ == ["backend cleanup also failed: OSError"]
+        with pytest.raises(RuntimeError, match="world is closed"):
+            world.execute(_call("get"))
+
+
 def test_undeclared_tools_and_domains_are_refused() -> None:
     """Every task tool needs a policy; access to an unknown domain is never admitted."""
     runtime = _runtime()

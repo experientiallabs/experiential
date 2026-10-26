@@ -23,7 +23,7 @@ import hashlib
 import threading
 from collections.abc import Iterator, Mapping
 from contextlib import AbstractContextManager, contextmanager
-from typing import Literal, Protocol, Self, runtime_checkable
+from typing import Literal, NoReturn, Protocol, Self, runtime_checkable
 
 from pydantic import ConfigDict, Field, model_validator
 
@@ -706,24 +706,43 @@ class ExecutableWorld:
         """Replace the backend with a fresh instance verified to hold the pre-call image.
 
         Raises:
-            RestoreError: The pre-call image could not be restored or verified. The world is
-                closed first, because its backend may still hold the failed call's effects.
+            RestoreError: The pre-call image could not be restored or verified, or the
+                replaced backend could not be released. The world is closed before any
+                cleanup, because a backend may still hold the failed call's effects.
         """
         restored = None
         try:
             restored = self._runtime.factory.restore(image)
             if restored.domain_digests() != image.domains:
                 raise RestoreError("restored backend does not hold the pre-call state")
-        except Exception as error:
-            if restored is not None:
-                restored.close()
-            self.close()
-            raise RestoreError(
-                "rollback failed, so the world may hold a failed call's effects; it is closed, "
-                "restore a checkpoint to continue"
-            ) from error
-        self._backend.close()
-        self._backend = restored
+        except Exception as error:  # noqa: BLE001 - _stop closes the world and re-raises.
+            self._stop((restored, self._backend), "rollback failed", error)
+        replaced, self._backend = self._backend, restored
+        try:
+            replaced.close()
+        except Exception as error:  # noqa: BLE001 - _stop closes the world and re-raises.
+            self._stop((restored,), "the rolled-back backend could not be released", error)
+
+    def _stop(
+        self, backends: tuple[WorldBackend | None, ...], cause: str, error: Exception
+    ) -> NoReturn:
+        """Close the world first, release every backend, then raise one restore failure.
+
+        A cleanup failure is attached as a note so it never replaces the restore failure.
+        """
+        self._closed = True
+        failure = RestoreError(
+            f"{cause}, so the world may hold a failed call's effects; it is closed, restore a "
+            "checkpoint to continue"
+        )
+        for backend in backends:
+            if backend is None:
+                continue
+            try:
+                backend.close()
+            except Exception as cleanup:  # noqa: BLE001 - kept as a note on the raised failure.
+                failure.add_note(f"backend cleanup also failed: {type(cleanup).__name__}")
+        raise failure from error
 
     def _commit(self, context: WorldContext) -> None:
         """Adopt a successful call's staged events, cancellations and random draws."""
