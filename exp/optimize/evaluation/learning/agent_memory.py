@@ -599,7 +599,7 @@ def _merge_kind(
 
     Chunks of one round are independent and run concurrently. A failed merge leaves its
     chunk's candidates unmerged and out of every later round, so no other request asks about
-    them again; they follow the merged lessons in the order their merges failed.
+    them again; they follow the merged lessons in round and chunk order.
     """
     unmerged: list[Lesson] = []
     for _ in range(MERGE_ROUNDS):

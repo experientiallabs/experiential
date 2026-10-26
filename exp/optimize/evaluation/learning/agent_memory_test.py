@@ -309,14 +309,9 @@ def test_any_other_failure_stops_the_stage_without_saving_it(
     assert store.artifacts.list_ids(artifact_type="agent-memory-candidates") == ()
 
 
-def test_candidates_of_a_failed_merge_are_never_asked_about_again(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A lost merge beside a shrinking one keeps its candidates out of every later request."""
-    _, prepared = prepared_memory(
-        tmp_path, monkeypatch, batch_bytes=10_000, maximum_trace_bytes=5_000
-    )
-    rows = [
+def long_candidates(*names: str) -> list[Lesson]:
+    """Procedure candidates of about 4,000 shown bytes each, two to a 10,000-byte chunk."""
+    return [
         Lesson(
             kind="procedure",
             statement=f"{name} " + "x" * 4_000,
@@ -324,22 +319,75 @@ def test_candidates_of_a_failed_merge_are_never_asked_about_again(
             evidence=("e",),
             traces=("t",),
         )
-        for name in ("a1", "a2", "b1", "b2")
+        for name in names
     ]
+
+
+@pytest.mark.parametrize(
+    ("failure", "status"),
+    [
+        (DispatchOutcomeUnknown("lost"), "unknown"),
+        (ReturnedOutputRejected("not a proposal"), "rejected"),
+    ],
+)
+def test_candidates_of_a_failed_merge_are_never_asked_about_again(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: Exception, status: str
+) -> None:
+    """A lost or refused merge beside a shrinking one keeps its candidates out of later rounds."""
+    _, prepared = prepared_memory(
+        tmp_path, monkeypatch, batch_bytes=10_000, maximum_trace_bytes=5_000
+    )
+    rows = long_candidates("a1", "a2", "b1", "b2")
     asked: list[str] = []
 
     def merge(body: JsonObject) -> JsonObject:
-        """Merge the a candidates into one lesson; lose every request showing a b candidate."""
+        """Merge the a candidates into one lesson; fail every request showing a b candidate."""
         text = json.dumps(body)
         asked.append(text)
         if "b1 " in text or "b2 " in text:
-            raise DispatchOutcomeUnknown("lost")
+            raise failure
         return {"lessons": [{"statement": "m", "applies_when": "w", "sources": [0, 1]}]}
 
     failed: list[FailedCall] = []
     merged = agent_memory._merge_kind(prepared, rows, scripted({"merge": merge})(), failed)
     assert [row.statement for row in merged] == ["m", *(row.statement for row in rows[2:])]
     assert sum("b1 " in text for text in asked) == 1
+    assert [row.status for row in failed] == [status]
+
+
+def test_a_resumed_merge_never_asks_about_a_failed_chunk_again(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A run stopped in round two resumes with the same requests, none over the lost chunk."""
+    _, prepared = prepared_memory(
+        tmp_path, monkeypatch, batch_bytes=10_000, maximum_trace_bytes=5_000
+    )
+    rows = long_candidates("a1", "a2", "a3", "a4", "b1", "b2")
+    asked: list[str] = []
+    stopped: list[str] = []
+
+    def merge(body: JsonObject) -> JsonObject:
+        """Merge a pairs, lose the b pair, and stop once at the first round-two request."""
+        text = json.dumps(body)
+        asked.append(text)
+        if "b1 " in text or "b2 " in text:
+            raise DispatchOutcomeUnknown("lost")
+        later = "merged-a1" in text
+        if later and not stopped:
+            stopped.append(text)
+            raise TimeoutError("completion deadline reached before dispatch")
+        statement = "merged-a1" if later or "a1 " in text else "merged-a3"
+        return {"lessons": [{"statement": statement, "applies_when": "w", "sources": [0, 1]}]}
+
+    with pytest.raises(TimeoutError):
+        agent_memory._merge_kind(prepared, rows, scripted({"merge": merge})(), [])
+    failed: list[FailedCall] = []
+    merged = agent_memory._merge_kind(prepared, rows, scripted({"merge": merge})(), failed)
+    assert [row.statement for row in merged] == [
+        "merged-a1",
+        *(row.statement for row in rows[4:]),
+    ]
+    assert len({text for text in asked if "b1 " in text}) == 1
     assert [row.status for row in failed] == ["unknown"]
 
 
