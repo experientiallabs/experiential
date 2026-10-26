@@ -422,21 +422,21 @@ def screen_misses(
                     )
                     response: JsonObject | None = None
                 else:
-                    # Resolve credentials before the intent: a refusal here dispatched nothing,
-                    # so the miss must stay retryable rather than become an unknown outcome.
+                    # Resolve credentials and the decision wire before the intent: a refusal
+                    # here dispatched nothing, so the miss must stay retryable rather than
+                    # become an unknown outcome.
                     if resolved is None:
                         resolved = RuntimeModelCatalog(
                             load_model_catalog(project.model_catalog_path)
                         ).resolve(alias)
+                    decide = _decider(project, identity, resolved, deadline, clock, code_revision)
                     store.write_json(
                         artifact_id=intent,
                         artifact_type=SCREENING_TYPE + "-intent",
                         envelope=envelope.model_copy(update={"inputs": (miss.record,)}),
                         files={"request.json": request},
                     )
-                    screening, response = _dispatch(
-                        project, miss, request, identity, resolved, deadline, clock, code_revision
-                    )
+                    screening, response = _dispatch(project, miss, request, identity, decide)
                 cited = sorted(
                     {artifact_input(store.read(intent).manifest), miss.record, miss.source},
                     key=lambda ref: ref.artifact_id,
@@ -457,31 +457,40 @@ def screen_misses(
     return tuple(outcomes)
 
 
-def _dispatch(
+def _decider(
     project: ProjectStore,
-    miss: LearningMiss,
-    request: DecisionRequest,
     identity: str,
     resolved: ResolvedModel,
     deadline: datetime,
     clock: Callable[[], datetime],
     code_revision: str,
+) -> Callable[[DecisionRequest], JsonObject]:
+    """The decision caller on a one-attempt ledger; refuses a non-native alias before sending."""
+    store = project.artifacts
+    transport = AdmittedJsonTransport(
+        HttpxJsonTransport(),
+        ledger=DispatchLedger(
+            store.project_directory / (identity + ".sqlite"), 1, sha256_json(identity)
+        ),
+        artifacts=store,
+        code_revision=code_revision,
+        deadline=deadline,
+        clock=clock,
+    )
+    return decision_caller(resolved, transport, deadline, clock)
+
+
+def _dispatch(
+    project: ProjectStore,
+    miss: LearningMiss,
+    request: DecisionRequest,
+    identity: str,
+    decide: Callable[[DecisionRequest], JsonObject],
 ) -> tuple[MissScreening, JsonObject | None]:
-    """Send one decision on a one-attempt ledger and decode its probabilities."""
+    """Send one decision under its saved intent and decode its probabilities."""
     store = project.artifacts
     base = MissScreening(miss=miss, status="unknown", request_sha256=sha256_json(request))
     try:
-        transport = AdmittedJsonTransport(
-            HttpxJsonTransport(),
-            ledger=DispatchLedger(
-                store.project_directory / (identity + ".sqlite"), 1, sha256_json(identity)
-            ),
-            artifacts=store,
-            code_revision=code_revision,
-            deadline=deadline,
-            clock=clock,
-        )
-        decide = decision_caller(resolved, transport, deadline, clock)
         with canonical_call(artifact_input(store.read(identity + "-intent").manifest)):
             response = decide(request)
     except (OSError, RuntimeError, ValueError) as error:

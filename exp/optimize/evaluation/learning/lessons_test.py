@@ -10,6 +10,7 @@ import json
 from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from unittest.mock import Mock
 
 import pytest
 from typer.testing import CliRunner
@@ -258,6 +259,16 @@ def test_a_missing_credential_leaves_every_screening_retryable(
         screen()
     assert not store.artifacts.list_ids(artifact_type=SCREENING_TYPE + "-intent")
     monkeypatch.setenv("HELD_OUT_TEST_KEY", "fixture-only")
+    # A decision wire refused before sending is just as retryable.
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            screening,
+            "decision_caller",
+            Mock(side_effect=ValueError("JEV alias does not expose the native decision wire")),
+        )
+        with pytest.raises(ValueError, match="native decision wire"):
+            screen()
+    assert not store.artifacts.list_ids(artifact_type=SCREENING_TYPE + "-intent")
     assert {row.status for row in screen()} == {"answered"}
 
 
