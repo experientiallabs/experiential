@@ -8,6 +8,7 @@ import pytest
 
 from exp.common.models import load_model_catalog
 from exp.common.project import artifact_input
+from exp.common.project.causality import cites
 from exp.optimize.evaluation.continuations.admission import (
     ContinuationAdmission,
     admit_continuations,
@@ -22,7 +23,7 @@ from exp.optimize.evaluation.continuations.job import (
 )
 from exp.optimize.evaluation.continuations.job_test import job_fixture
 from exp.optimize.evaluation.equivalence.evidence import equivalence_metrics
-from exp.optimize.evaluation.equivalence.policy_test import registered_policy
+from exp.optimize.evaluation.equivalence.policy_test import fixture_policy, registered_policy
 from exp.optimize.evaluation.equivalence.review import ReviewModel
 from exp.optimize.evaluation.equivalence.runner import (
     EquivalenceCase,
@@ -201,6 +202,8 @@ def test_saved_comparison_only_attaches_to_its_exact_candidate(
             "study": compared.study.model_copy(update={"actor_model": judge.model}),
         }
     )
+    # The comparison is registered under its own policy, which the study then reaches by citation.
+    comparison_policy = registered_policy(project.artifacts, fixture_policy(margin=0.4))
     spec = EquivalenceSpec(
         cases=(
             EquivalenceCase(
@@ -220,6 +223,7 @@ def test_saved_comparison_only_attaches_to_its_exact_candidate(
         analysts=(judge,),
         maximum_review_attempts=6,
         deadline=compared.deadline,
+        policy=comparison_policy,
     )
     call = workbook_case().first
     actor = ScriptedJsonTransport(
@@ -313,5 +317,20 @@ def test_saved_comparison_only_attaches_to_its_exact_candidate(
         with pytest.raises(ValueError, match="outside"):
             qualified_training_job(
                 project, qualification=qualification, comparison=reference, comparison_case=2
+            )
+        # A study carrying that comparison cites its policy, yet only the pinned one admits it.
+        job_fixture(tmp_path / "transport", monkeypatch)
+        execute_continuation_job(project, prepared, code_revision="test")
+        result = continuation_result_reference(project, prepared, code_revision="test")
+        registration = result.artifact_id.removesuffix("-result")
+        assert cites(project.artifacts, registration, comparison_policy)
+        assert prepared.study.admission_policy != comparison_policy
+        with pytest.raises(ValueError, match="only the policy a study pins"):
+            admit_continuations(
+                project.artifacts,
+                result,
+                policy=comparison_policy,
+                created_at=datetime.now(UTC),
+                code_revision="test",
             )
     assert len(actor.requests) == 12 and len(reviews.requests) == 6
