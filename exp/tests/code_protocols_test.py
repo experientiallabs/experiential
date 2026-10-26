@@ -54,7 +54,7 @@ PROTOCOLS = (
     ),
     Protocol(
         "exp.optimize.evaluation.tasks.challenges:CHALLENGE_PROTOCOL",
-        "judge-challenge-v3",
+        "judge-challenge-v4",
         (
             "exp.optimize.evaluation.tasks.challenges",
             "exp.simulation.evaluation.calibration:task_decision",

@@ -358,12 +358,15 @@ def test_judge_failures_are_not_abstentions_flips_or_detections() -> None:
     assert isinstance(identity, dict)
     assert identity["judge_failures"] == 1 and identity["compared"] == 1
     assert identity["decision_flips"] == 0
+    # Over every planned pair the failed one is unknown: stable or not, it stays a bound.
+    assert identity["variants"] == 2 and identity["stability_planned_bounds"] == [0.5, 1.0]
     sensitivity = careful["sensitivity"]
     assert isinstance(sensitivity, dict)
     extra = sensitivity["unauthorized_write"]
     assert isinstance(extra, dict)
     assert extra["judge_failed"] == 1 and extra["judge_abstained"] == 0
     assert extra["detected_by_judge"] == 1 and extra["accepted_by_judge"] == 0
+    assert extra["judge_sensitivity_planned_bounds"] == [0.5, 1.0]
     majority = section(report, "panels", "majority")
     assert majority["base_judge_failures"] == 0, "the other members still decide the panel"
 

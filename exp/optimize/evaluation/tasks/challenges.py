@@ -32,7 +32,7 @@ from exp.common.core.artifacts import (
     stable_id,
 )
 from exp.common.evaluations.reconstruction import AxisOutcome, JudgeConfig, WorkflowEvidence
-from exp.common.evaluations.uncertainty import proportion_summary
+from exp.common.evaluations.uncertainty import missing_outcome_bounds, proportion_summary
 from exp.common.project import ProjectStore, artifact_input
 from exp.simulation.evaluation.calibration import (
     CalibrationCase,
@@ -46,7 +46,7 @@ from exp.simulation.evaluation.tasks import Verdict, grade
 # Identity of the code that decides this artifact's behavior, in place of its source text.
 # Bump it when behavior changes. exp/tests/code_protocols_test.py fails when the covered
 # source changes until it is bumped or, for a pure refactor, its digest is updated.
-CHALLENGE_PROTOCOL = "judge-challenge-v3"
+CHALLENGE_PROTOCOL = "judge-challenge-v4"
 
 IrrelevantFactor = Literal[
     "actor_identity", "candidate_order", "explanation_length", "action_order"
@@ -336,7 +336,9 @@ def assess_challenge_study(
         Per-arm and per-panel base-label errors, invariance stability and defect sensitivity
         by factor, with Wilson intervals at the count of independent base lineages, judge
         failures kept apart from abstentions, repeat consistency and defects every panel
-        member missed.
+        member missed. Each rate's interval is conditional on the judgments obtained; its
+        ``planned_bounds`` cover every planned trial, a missing or failed judgment counted
+        once as a miss and once as a success.
 
     Raises:
         ValueError: A judgment repeats, names an unknown arm or output, or is bound to
@@ -376,7 +378,12 @@ def assess_challenge_study(
             **_measure(study, items, first),
             "repeat_consistency": None
             if arm.repeats == 1
-            else proportion_summary(sum(consistent), len(consistent)),
+            else {
+                **proportion_summary(sum(consistent), len(consistent)),
+                "planned_bounds": missing_outcome_bounds(
+                    sum(consistent), len(items) - len(consistent), len(items)
+                ),
+            },
         }
     report_panels: JsonObject = {}
     for panel in study.panels:
@@ -647,13 +654,14 @@ def _stability(
 
     A pair where either judgment failed is not compared: a lost judgment is not a flip.
     """
-    stable = flips = compared = failures = 0
+    stable = flips = compared = failures = missing = 0
     shifts: list[int] = []
     lineages: set[str] = set()
     for item in rows:
         variant = decisions[item.item_id]
         base = decisions["base:" + item.case.challenge.id]
         if variant is None or base is None:
+            missing += 1
             continue
         if variant.failed or base.failed:
             failures += 1
@@ -678,6 +686,7 @@ def _stability(
         "decision_flips": flips,
         "largest_score_shift": max(shifts, default=None),
         "stability": proportion_summary(stable, compared, units=len(lineages) or None),
+        "stability_planned_bounds": missing_outcome_bounds(stable, failures + missing, len(rows)),
     }
 
 
@@ -686,6 +695,7 @@ def _sensitivity(rows: list[ChallengeOutput], decisions: dict[str, _Decision | N
     known = [(item, decision) for item in rows if (decision := decisions[item.item_id]) is not None]
     decided = [(item, decision) for item, decision in known if decision.judge != "unassessable"]
     failed = sum(decision.failed for _, decision in known)
+    detected = sum(decision.judge == "fail" for _, decision in decided)
     return {
         "variants": len(rows),
         "judged": len(known),
@@ -696,9 +706,13 @@ def _sensitivity(rows: list[ChallengeOutput], decisions: dict[str, _Decision | N
         "detected_by_task_decision": sum(decision.task == "fail" for _, decision in known),
         "detected_by_verifier": sum(decision.verifier == "fail" for _, decision in known),
         "judge_sensitivity": proportion_summary(
-            sum(decision.judge == "fail" for _, decision in decided),
+            detected,
             len(decided),
             units=len({item.case.lineage for item, _ in decided}) or None,
+        ),
+        # An abstention is a known miss; a failed or missing judgment is an unknown outcome.
+        "judge_sensitivity_planned_bounds": missing_outcome_bounds(
+            detected, len(rows) - len(known) + failed, len(rows)
         ),
     }
 
