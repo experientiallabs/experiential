@@ -5,7 +5,8 @@ reply that no native world receipt proves is a simulated observation: a dimensio
 ``calibrated`` is admitted only when a calibration under the same policy covers the
 trajectory's unit, world and actor and admits that dimension. Calibration can withhold an
 admission, never rescue a refusal. ``state_fidelity`` of a simulated trajectory is decided by
-calibration alone, and a calibration that refuses it refuses the trajectory's fidelity.
+calibration alone, and a calibration that refuses it refuses the trajectory's fidelity. Any
+covering refusal wins over covering admissions, whatever the order calibrations are supplied in.
 
 The trajectory verdict follows the gates: refused when a gating dimension is refused,
 unassessable when one is unassessable, admitted only when every gating dimension is admitted.
@@ -231,16 +232,18 @@ def _calibrated(
             "worlds and actors start outside the calibrated scope",
             None,
         )
+    # A covering refusal wins over any covering admission, whatever the order supplied: one
+    # favorable report never masks a demonstrated disagreement.
+    for row in covering:
+        measured = row.calibration.dimension(dimension)
+        if measured.status == "refused":
+            status: Verdict = "refused" if dimension == "state_fidelity" else "unassessable"
+            return status, f"calibration refused: {measured.reason}", row.report.artifact_id
     for row in covering:
         measured = row.calibration.dimension(dimension)
         if measured.status == "admitted":
             prefix = "" if dimension == "state_fidelity" else observed.reason + "; "
             return "admitted", f"{prefix}calibrated: {measured.reason}", row.report.artifact_id
-    if dimension == "state_fidelity":
-        for row in covering:
-            measured = row.calibration.dimension(dimension)
-            if measured.status == "refused":
-                return "refused", f"calibration refused: {measured.reason}", row.report.artifact_id
     first = covering[0]
     return (
         "unassessable",

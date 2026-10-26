@@ -232,3 +232,32 @@ def test_an_authored_world_policy_trusts_observations_and_records_fidelity(
     assert verdict.status == "admitted" and verdict.simulated
     fidelity = next(row for row in verdict.dimensions if row.dimension == "state_fidelity")
     assert (fidelity.gate, fidelity.status) == ("recorded", "unassessable")
+
+
+def test_a_covering_refusal_wins_over_an_admission_in_either_order(
+    store: ArtifactStore,
+) -> None:
+    """One favorable report never masks a demonstrated disagreement, whatever the list order."""
+    policy = fixture_policy()
+    reference = registered_policy(store, policy)
+    admitting = calibration_of(reference, policy, store, (0, 1, 2))
+    refused = tuple(
+        row.model_copy(update={"status": "refused", "reason": "demonstrated disagreement"})
+        if row.dimension in ("state_fidelity", "goal_success")
+        else row
+        for row in admitting.calibration.dimensions
+    )
+    refusing = CalibrationEvidence(
+        report=REPORT.model_copy(update={"artifact_id": "actor-equivalence-refusing-result"}),
+        calibration=admitting.calibration.model_copy(update={"dimensions": refused}),
+    )
+    point, branch = run(store, 1, simulated=True)
+    for calibrations in ((admitting, refusing), (refusing, admitting)):
+        verdict = admitted(reference, policy, point, branch, calibrations)
+        rows = {row.dimension: row for row in verdict.dimensions}
+        assert verdict.status == "refused"
+        assert rows["state_fidelity"].status == "refused"
+        assert rows["goal_success"].status == "unassessable"
+        assert {rows[name].calibration for name in ("state_fidelity", "goal_success")} == {
+            refusing.report.artifact_id
+        }

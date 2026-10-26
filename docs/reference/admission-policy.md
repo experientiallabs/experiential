@@ -42,7 +42,8 @@ are one independent unit; cases, actors and repeats inside a unit are averaged f
 
 The trajectory verdict is `refused` when any gating dimension is refused, `unassessable` when any
 is unassessable, and `admitted` only when every gating dimension is admitted. Calibration can
-withhold an admission but never rescues a refusal.
+withhold an admission but never rescues a refusal. When several supplied calibrations cover a
+trajectory, any one that refuses a dimension wins over those that admit it, in any order.
 
 ## Registration and replay
 
