@@ -69,6 +69,7 @@ from exp.common.traces.ingest.trace_extensions import (
     REQUEST_CONTEXT_KEY,
 )
 from exp.common.traces.ingest.vendor_records import VendorTraceFormatError
+from exp.optimize.evaluation.continuations.admission import require_pinned_policy
 from exp.optimize.evaluation.continuations.prefix import _executed_parent
 from exp.optimize.evaluation.continuations.records import load_study
 from exp.optimize.evaluation.continuations.study import ContinuationBranch, ContinuationStudy
@@ -77,7 +78,6 @@ from exp.optimize.evaluation.equivalence.policy import (
     AdmissionPolicy,
     Verdict,
     load_admission_policy,
-    require_policy_precedes,
 )
 from exp.optimize.evaluation.equivalence.verdicts import (
     CalibrationEvidence,
@@ -255,7 +255,7 @@ def export_trajectory_traces(
 
     Raises:
         ValueError: A generator differs from its saved artifact or reaches no study, the
-            policy was registered after a study, or a calibration is not under the policy.
+            policy is not the one a study pinned, or a calibration is not under the policy.
     """
     destination = validate_local_id(spec.project or project.paths.project_id, label="project ID")
     store = project.artifacts
@@ -276,9 +276,7 @@ def export_trajectory_traces(
     for study_id in sorted(studies):
         reference, generators = studies[study_id]
         study = load_study(store, reference)
-        require_policy_precedes(
-            store, spec.policy, study_id.removesuffix("-result"), subject="continuation study"
-        )
+        require_pinned_policy(store, reference, study, spec.policy)
         for branch in study.branches:
             branches += 1
             converted = _trajectory(project, study, branch, reference, generators, admission)

@@ -14,12 +14,15 @@ from exp.common.project import ProjectStore, artifact_input
 from exp.optimize.evaluation.continuations.admission import (
     ContinuationAdmission,
     admit_continuations,
+    require_pinned_policy,
 )
+from exp.optimize.evaluation.continuations.records import load_study
 from exp.optimize.evaluation.continuations.study import (
     ContinuationStudySpec,
     run_continuation_study,
 )
 from exp.optimize.evaluation.continuations.study_test import probe, workbook_runtime
+from exp.optimize.evaluation.equivalence import policy as policy_module
 from exp.optimize.evaluation.equivalence.policy import AdmissionPolicy
 from exp.optimize.evaluation.equivalence.policy_test import fixture_policy, registered_policy
 from exp.runtime.agents.chat_test import _Model, _response
@@ -234,9 +237,7 @@ def test_a_policy_registered_after_the_study_cannot_admit_it(tmp_path: Path) -> 
     late = registered_policy(
         project.artifacts, fixture_policy(margin=0.4), at=datetime.now(UTC) - timedelta(days=1)
     )
-    with pytest.raises(
-        ValueError, match="register it first, pin it in the registration of fresh results"
-    ):
+    with pytest.raises(ValueError, match="only the policy a study pins"):
         admit_continuations(
             project.artifacts,
             admission.study,
@@ -244,3 +245,30 @@ def test_a_policy_registered_after_the_study_cannot_admit_it(tmp_path: Path) -> 
             created_at=datetime.now(UTC),
             code_revision="test",
         )
+
+
+def test_only_the_pinned_policy_admits_even_when_another_is_reached_by_citation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A policy the registration reaches through other evidence never stands in for the pin."""
+    project = ProjectStore(tmp_path, "case")
+    admission = ContinuationAdmission.model_validate_json(
+        project.artifacts.read_bytes(admitted_workbook_study(project).artifact_id, "admission.json")
+    )
+    other = registered_policy(project.artifacts, fixture_policy(margin=0.4))
+    # As if a comparison cited by the study's training evidence were registered under ``other``.
+    monkeypatch.setattr(policy_module, "require_cites", lambda *args, **kwargs: None)
+    with pytest.raises(ValueError, match=f"pins {admission.policy.artifact_id}, not "):
+        admit_continuations(
+            project.artifacts,
+            admission.study,
+            policy=other,
+            created_at=datetime.now(UTC),
+            code_revision="test",
+        )
+    study = load_study(project.artifacts, admission.study)
+    unpinned = study.model_copy(
+        update={"spec": study.spec.model_copy(update={"admission_policy": None})}
+    )
+    with pytest.raises(ValueError, match="pins no admission policy"):
+        require_pinned_policy(project.artifacts, admission.study, unpinned, other)

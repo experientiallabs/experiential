@@ -41,7 +41,8 @@ from exp.optimize.evaluation.continuations.traces import (
     export_trajectory_traces,
     trajectory_studies,
 )
-from exp.optimize.evaluation.equivalence.policy_test import registered_policy
+from exp.optimize.evaluation.equivalence import policy as policy_module
+from exp.optimize.evaluation.equivalence.policy_test import fixture_policy, registered_policy
 from exp.optimize.evaluation.fidelity.replay import recorded_exchanges
 from exp.runtime.agents.chat import ChatAgentRuntime
 from exp.runtime.agents.chat_test import _Model, _response
@@ -532,6 +533,21 @@ def test_branches_without_world_evidence_are_skipped_and_generators_must_reach_s
     stale = result.model_copy(update={"sha256": "0" * 64})
     with pytest.raises(ValueError, match="differs from its saved artifact"):
         trajectory_studies(store, stale)
+
+
+def test_export_refuses_a_policy_the_study_did_not_pin(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Reaching a policy through a study's cited evidence never lets it judge the study."""
+    project = ProjectStore(tmp_path, PROJECT)
+    [result] = ticket_studies(project.artifacts, 1)
+    other = registered_policy(project.artifacts, fixture_policy(margin=0.4))
+    # As if a comparison cited by the study's training evidence were registered under ``other``.
+    monkeypatch.setattr(policy_module, "require_cites", lambda *args, **kwargs: None)
+    with pytest.raises(ValueError, match=f"not {other.artifact_id}; only the policy a study pins"):
+        export_trajectory_traces(
+            project, TrajectoryTraceExport(policy=other, generators=(result,)), dry_run=True
+        )
 
 
 def exchanges(traces: Sequence[Trace]) -> list[tuple[str, JsonValue, JsonValue]]:
