@@ -13,8 +13,8 @@ supersede the previous accepted rules, and every attempt, accepted or rejected, 
 ``research``.
 
 An attempt is registered once under its ``run_id`` and never re-run: a completed attempt
-replays its saved result, and an interrupted one needs a new ``run_id`` (its completed replays
-are content-addressed and replay without calls).
+replays its saved result for the same request and refuses any other, and an interrupted one
+needs a new ``run_id`` (its completed replays are content-addressed and replay without calls).
 """
 
 import json
@@ -281,7 +281,7 @@ def preflight_evolution(project: ProjectStore, spec: LessonEvolutionRequest) -> 
     selected = (*attempt.held_out, *attempt.protected)
     return EvolutionPreflight(
         run_id=spec.run_id,
-        saved=project.artifacts.exists(_result_id(spec)),
+        saved=saved_evolution(project, spec) is not None,
         training=len(attempt.training),
         held_out=tuple(case.case_id for case in attempt.held_out),
         protected=tuple(case.case_id for case in attempt.protected),
@@ -291,10 +291,22 @@ def preflight_evolution(project: ProjectStore, spec: LessonEvolutionRequest) -> 
 
 
 def saved_evolution(project: ProjectStore, spec: LessonEvolutionRequest) -> EvolutionResult | None:
-    """The completed attempt's saved result, if it completed."""
+    """The completed attempt's saved result, if it completed.
+
+    Raises:
+        ValueError: The run ID already records a different request.
+    """
     identity = _result_id(spec)
     if not project.artifacts.exists(identity):
         return None
+    saved = LessonEvolutionRequest.model_validate_json(
+        project.artifacts.read_bytes(identity, "request.json")
+    )
+    if saved != spec:
+        raise ValueError(
+            f"lesson evolution run {spec.run_id!r} already records a different request; "
+            "choose a new run_id"
+        )
     return EvolutionResult.model_validate_json(
         project.artifacts.read_bytes(identity, "result.json")
     )
@@ -428,7 +440,7 @@ def evolve_lessons(
             code_revision=code_revision,
             inputs=(artifact_input(store.read(outcome.library.library_id).manifest),),
         ),
-        files={"result.json": result},
+        files={"result.json": result, "request.json": spec},
     )
     return result
 

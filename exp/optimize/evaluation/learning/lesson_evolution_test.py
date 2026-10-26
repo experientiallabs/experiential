@@ -6,6 +6,7 @@ simulator, so a useful edit gains on held-out fit traces and a useless one regre
 """
 
 import json
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -136,3 +137,22 @@ def test_lineages_the_parent_rules_were_learned_from_never_select_the_edit(
         selected[case].task.lineage_group_id for case in (*widened.held_out, *widened.protected)
     }
     assert learned.task.lineage_group_id not in chosen
+
+
+def test_a_completed_run_id_refuses_a_different_request(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Reusing a run ID with other settings is refused instead of replaying another result."""
+    root, store, provider, reference = screened_project(tmp_path, monkeypatch)
+    operation = evolve(reference, "edit-one")
+    continuation(root, tmp_path, operation, "--yes", "--non-interactive")
+    purchased = len(provider.requests)
+    request = LessonEvolutionRequest.model_validate(operation["learning_repair"])
+    changed = request.model_copy(update={"minimum_gain": 0.5})
+    with pytest.raises(ValueError, match="already records a different request"):
+        preflight_evolution(store, changed)
+    with pytest.raises(ValueError, match="already records a different request"):
+        lesson_evolution.evolve_lessons(
+            store, changed, code_revision="c", clock=lambda: datetime.now(UTC)
+        )
+    assert len(provider.requests) == purchased
