@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from exp.common.core.artifacts import ArtifactEnvelope
+from exp.common.core.artifacts import ArtifactEnvelope, ArtifactInput
 from exp.common.project import ProjectStore, artifact_input
 from exp.common.tasks import TaskCase
 from exp.simulation.capability_briefs import (
@@ -122,3 +122,48 @@ def test_a_simulated_artifact_cannot_back_a_recorded_observation(tmp_path: Path)
         persist_capability_brief(
             project.artifacts, mislabelled, created_at=datetime.now(UTC), code_revision="test"
         )
+
+
+def test_recorded_observations_need_a_wholly_recorded_provenance_closure(tmp_path: Path) -> None:
+    """Recorded ancestry is accepted; a recorded-type source with generated ancestry is refused."""
+    project = ProjectStore(tmp_path, "case")
+    now = datetime.now(UTC)
+
+    def saved(identity: str, kind: str, *inputs: ArtifactInput) -> ArtifactInput:
+        """Save one artifact of a type with explicit inputs."""
+        return artifact_input(
+            project.artifacts.write_json(
+                artifact_id=identity,
+                artifact_type=kind,
+                envelope=ArtifactEnvelope(
+                    schema_version=1, created_at=now, inputs=inputs, code_revision="test"
+                ),
+                files={"record.json": {"id": identity}},
+            )
+        )
+
+    def observed(source: ArtifactInput) -> CapabilityBrief:
+        """A brief whose only assumption cites one source as a recorded observation."""
+        assumption = CapabilityAssumption(
+            statement="Edits serialize", authority="recorded_observation", sources=(source,)
+        )
+        return brief().model_copy(update={"assumptions": (assumption,)})
+
+    traces = saved("recorded-traces", "trace-dataset")
+    persist_capability_brief(project.artifacts, observed(traces), created_at=now, code_revision="t")
+    laundered = saved("laundered", "trace-dataset", saved("predicted", "world-checkpoint"))
+    with pytest.raises(ValueError, match="not recorded evidence"):
+        persist_capability_brief(
+            project.artifacts, observed(laundered), created_at=now, code_revision="t"
+        )
+    # A brief saved without publication checks is refused again when loaded.
+    stored = project.artifacts.write_json(
+        artifact_id="unchecked-brief",
+        artifact_type="capability-brief",
+        envelope=ArtifactEnvelope(
+            schema_version=1, created_at=now, inputs=(laundered,), code_revision="test"
+        ),
+        files={"brief.json": observed(laundered)},
+    )
+    with pytest.raises(ValueError, match="not recorded evidence"):
+        load_capability_brief(project.artifacts, artifact_input(stored))
