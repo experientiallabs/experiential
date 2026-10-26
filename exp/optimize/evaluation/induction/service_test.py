@@ -9,7 +9,11 @@ import pytest
 from exp.common.core.artifacts import sha256_json
 from exp.common.models import load_model_catalog
 from exp.common.project import ProjectStore
+from exp.common.tasks import ToolSchema
+from exp.common.traces import Trace
+from exp.common.traces.store import LoadedTraceDataset, load_trace_dataset
 from exp.optimize.evaluation.audit.panel_test import SimulatedProvider, _tool_reply, build_project
+from exp.optimize.evaluation.induction import episodes as induction_episodes
 from exp.optimize.evaluation.induction import service
 from exp.optimize.evaluation.induction.service import (
     InductionSpec,
@@ -126,6 +130,40 @@ def test_fit_episodes_exclude_held_out_traces(
     }
     assert {partitions[row.episode_id] for row in episodes} == {"fit"}
     assert "held_out" in partitions.values()
+
+
+def test_tool_schemas_come_only_from_fit_traces(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A schema only a held-out trace declares never reaches the inducer, even when it is first."""
+    project, spec, _ = induction_fixture(tmp_path, monkeypatch)
+    build = project.load_project().build
+    assert build is not None
+    held_out = {
+        row.trace_id
+        for row in load_completed_build_rag_lineage_bindings(project.artifacts, build)
+        if row.partition == "held_out"
+    }
+    loaded = load_trace_dataset(project.artifacts, build.trace_dataset.artifact_id)
+
+    def declaring(trace: Trace, description: str) -> Trace:
+        """Return the trace declaring every manifest tool with one description."""
+        tools = tuple(
+            ToolSchema(name=tool.name, description=description, input_schema={})
+            for tool in spec.manifest.tools
+        )
+        return trace.model_copy(update={"tools": tools})
+
+    hidden = tuple(
+        declaring(row, "HELD-OUT-MARKER") for row in loaded.traces if row.trace_id in held_out
+    )
+    fit = tuple(declaring(row, "fit") for row in loaded.traces if row.trace_id not in held_out)
+    assert hidden and fit
+    reordered = LoadedTraceDataset(dataset=loaded.dataset, traces=hidden + fit)
+    monkeypatch.setattr(induction_episodes, "load_trace_dataset", lambda *_: reordered)
+    schemas = service._tool_schemas(project, spec)
+    assert [schema.name for schema in schemas] == sorted(tool.name for tool in spec.manifest.tools)
+    assert {schema.description for schema in schemas} == {"fit"}
 
 
 def test_a_draw_with_an_unknown_outcome_is_never_redrawn(

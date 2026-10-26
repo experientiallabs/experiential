@@ -6,7 +6,7 @@ trace package supplies, and the operator-declared starting state of the world. H
 are never read here; they belong to the audit owner.
 """
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
 
 from exp.common.core.artifacts import JsonObject, JsonValue, stable_id
 from exp.common.project import ProjectStore
@@ -40,27 +40,17 @@ def fit_episodes(
     Raises:
         ValueError: The project has no completed build or a trace's facts are invalid.
     """
-    build = project.load_project().build
-    if build is None:
-        raise ValueError("induction needs a completed build; run exp build first")
-    bindings = {
-        row.trace_id: row
-        for row in load_completed_build_rag_lineage_bindings(project.artifacts, build)
-    }
     names = set(tools)
     episodes = []
-    for trace in load_trace_dataset(project.artifacts, build.trace_dataset.artifact_id).traces:
-        binding = bindings.get(trace.trace_id)
-        if binding is None or binding.partition != "fit":
-            continue
-        exchanges = recorded_exchanges(trace, binding.lineage_id)
+    for trace, lineage in fit_traces(project):
+        exchanges = recorded_exchanges(trace, lineage)
         if not any(row.name in names for row in exchanges):
             continue
         episodes.append(
             InductionEpisode(
                 episode_id=trace.trace_id,
                 initial_state=dict(initial_state or {}),
-                facts=_starting_facts(trace, binding.lineage_id),
+                facts=_starting_facts(trace, lineage),
                 steps=tuple(
                     InductionStep(
                         tool=row.name,
@@ -75,6 +65,32 @@ def fit_episodes(
         if len(episodes) == maximum_episodes:
             break
     return tuple(episodes)
+
+
+def fit_traces(project: ProjectStore) -> Iterator[tuple[Trace, str]]:
+    """Yield each fit-partition trace of the completed build with its lineage, in dataset order.
+
+    Args:
+        project: Project with a completed build.
+
+    Yields:
+        ``(trace, lineage_id)`` for every trace the build's lineage bindings place in ``fit``;
+        held-out and unbound traces are never yielded.
+
+    Raises:
+        ValueError: The project has no completed build.
+    """
+    build = project.load_project().build
+    if build is None:
+        raise ValueError("induction needs a completed build; run exp build first")
+    bindings = {
+        row.trace_id: row
+        for row in load_completed_build_rag_lineage_bindings(project.artifacts, build)
+    }
+    for trace in load_trace_dataset(project.artifacts, build.trace_dataset.artifact_id).traces:
+        binding = bindings.get(trace.trace_id)
+        if binding is not None and binding.partition == "fit":
+            yield trace, binding.lineage_id
 
 
 def _is_error(reply: JsonValue) -> bool:

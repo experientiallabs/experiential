@@ -31,8 +31,7 @@ from exp.common.core.artifacts import (
 from exp.common.models import ModelRequest, ModelResponse, ModelSnapshot, load_model_catalog
 from exp.common.project import ArtifactStore, ProjectStore, artifact_input
 from exp.common.tasks import ToolSchema
-from exp.common.traces.store import load_trace_dataset
-from exp.optimize.evaluation.induction.episodes import fit_episodes
+from exp.optimize.evaluation.induction.episodes import fit_episodes, fit_traces
 from exp.runtime.environments.world_contracts import WorldManifest
 from exp.runtime.models.providers.admitted_transport import (
     AdmittedJsonTransport,
@@ -345,13 +344,13 @@ def _episodes(project: ProjectStore, spec: InductionSpec) -> tuple[InductionEpis
 
 
 def _tool_schemas(project: ProjectStore, spec: InductionSpec) -> tuple[ToolSchema, ...]:
-    """Return actor-visible schemas of the manifest's tools as the fit traces declare them."""
-    build = project.load_project().build
-    if build is None:
-        raise ValueError("induction needs a completed build; run exp build first")
+    """Return actor-visible schemas of the manifest's tools as the fit traces declare them.
+
+    Held-out traces are never read, so none of their content reaches the inducer prompt.
+    """
     names = {tool.name for tool in spec.manifest.tools}
     schemas = {}
-    for trace in load_trace_dataset(project.artifacts, build.trace_dataset.artifact_id).traces:
+    for trace, _ in fit_traces(project):
         for tool in trace.tools:
             if tool.name in names:
                 schemas.setdefault(tool.name, tool)
