@@ -7,6 +7,7 @@ from zipfile import ZipFile
 
 import pytest
 from openpyxl import Workbook, load_workbook
+from openpyxl.workbook.defined_name import DefinedName
 
 from exp.common.models import ToolCall
 from exp.runtime.environments.workbook_edits import WorkbookEditAdapter
@@ -75,6 +76,18 @@ def test_formula_dependency_is_not_silently_broken() -> None:
         WorkbookEditAdapter().apply(
             {"input.xlsx": workbook_bytes(formula=True)}, (edit(),), ("output.xlsx",)
         )
+
+
+def test_worksheet_scoped_defined_name_is_refused() -> None:
+    """A sheet-local named range would not shift with deleted rows, so it is refused."""
+    workbook = load_workbook(io.BytesIO(workbook_bytes()))
+    sheet = workbook["Tickets"]
+    sheet.defined_names["Local"] = DefinedName("Local", attr_text="Tickets!$A$3:$A$3")
+    buffer = io.BytesIO()
+    workbook.save(buffer)
+    assert not load_workbook(io.BytesIO(buffer.getvalue())).defined_names
+    with pytest.raises(ValueError, match="defined names"):
+        WorkbookEditAdapter().apply({"input.xlsx": buffer.getvalue()}, (edit(),), ("output.xlsx",))
 
 
 def test_workbook_core_property_type_namespaces_remain_bound() -> None:

@@ -77,7 +77,7 @@ class WorkbookEditAdapter:
     def definition(self) -> JsonObject:
         """Bind the exact adapter source, dependencies and supported operation schema."""
         return {
-            "name": "xlsx-row-edits-v1",
+            "name": "xlsx-row-edits-v2",
             "source_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
             "python": sys.version,
             "zlib": zlib.ZLIB_RUNTIME_VERSION,
@@ -150,7 +150,7 @@ def read_supported_workbook(payload: bytes) -> Workbook:
                 ):
                     raise ValueError("external workbook relationships are unsupported")
     workbook = load_workbook(io.BytesIO(payload), data_only=False, keep_links=False)
-    if workbook.defined_names:
+    if workbook.defined_names or any(sheet.defined_names for sheet in workbook):
         raise ValueError("defined names require a full workbook dependency adapter")
     if sum(sheet.max_row * sheet.max_column for sheet in workbook) > 100000:
         raise ValueError("workbook exceeds the projected cell allowance")
