@@ -27,6 +27,7 @@ from exp.runtime.gateway.contracts import (
 )
 from exp.runtime.gateway.group_commit import GroupCommitAttemptLedger, SyncGroupCommitLedger
 from exp.runtime.gateway.ledger import GatewayLedgerError, SQLiteAttemptLedger
+from exp.runtime.gateway.ledger_errors import AccountingRecoverySupersededError
 from exp.runtime.gateway.ledger_test import (
     FakeLedgerClock,
     _attempt_row,
@@ -957,10 +958,8 @@ def test_customer_waiver_does_not_replace_an_ordinary_exact_provider_terminal(
         failure_class=GatewayFailureClass.TIMEOUT, safe_message="settlement deadline reached"
     )
     waiver = GatewayEvent.for_accounting_recovery(failure=timeout, release_reservation=True)
-    if failed:
-        ledger.finish_attempt(attempt_id=attempt, terminal_event=waiver, failure=timeout)
-    else:
-        with pytest.raises(GatewayLedgerError, match="another terminal state"):
+    for _ in range(2):
+        with pytest.raises(AccountingRecoverySupersededError, match="immutable provider terminal"):
             ledger.finish_attempt(attempt_id=attempt, terminal_event=waiver, failure=timeout)
     assert dict(_attempt_row(tmp_path, attempt)) == before
     _assert_allocations(budgets, settled=40)

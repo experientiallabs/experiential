@@ -44,6 +44,7 @@ from exp.runtime.gateway.stream_contracts import (
     GatewayEvent,
     GatewayEventKind,
     GatewayFailure,
+    GatewayFailureClass,
     GatewayUsage,
 )
 from exp.runtime.gateway.tests.certified_pool_fixture_test import upsert_certified_pool
@@ -500,6 +501,128 @@ def test_another_owner_timeout_cannot_discard_a_retained_exact_completion(setup:
         assert attempt["billed_quantity_milli"] == 5_000
         assert attempt["estimated_cost_nano_usd"] == 5 * _XAI_RATE
         assert attempt["budget_settled_nano_usd"] == 0
+        assert len(setup.provider.posts) == 1
+    finally:
+        assert other.close(5)
+
+
+@pytest.mark.parametrize("provenance", ["cleanup", "crash", "provider"])
+@pytest.mark.parametrize("winner_during_retry", [False, True])
+def test_retained_timeout_waiver_outlives_a_competing_exact_job(
+    setup: _Setup, provenance: str, winner_during_retry: bool
+) -> None:
+    """A published exact job cannot acknowledge or silently defeat a retained customer waiver."""
+    jobs = setup.components.video_jobs
+    assert jobs is not None
+    other = _stored_engine(setup, InMemoryVideoOutputStore())
+    budgets = SQLiteBudgetStore(setup.database)
+    period = datetime.now(UTC).strftime("%Y-%m")
+    budgets.set_limit(
+        organization_id=setup.components.organization_id,
+        period=period,
+        scope=BudgetScope(kind=BudgetScopeKind.TEAM),
+        limit_nano_usd=2_000_000_000,
+    )
+    job = _create(setup, alias="grok-video", seconds=6)
+    finish = setup.components.ledger.finish_attempt
+    observed_at = setup.clock.now
+    winners: list[VideoJob] = []
+    if provenance == "cleanup":
+        failure = GatewayFailure(
+            failure_class=GatewayFailureClass.INTERNAL, safe_message="dispatch unconfirmed"
+        )
+        finish(
+            attempt_id=job.attempt_id,
+            terminal_event=GatewayEvent.for_accounting_recovery(failure=failure),
+            failure=failure,
+        )
+    elif provenance == "crash":
+        with sqlite3.connect(setup.database) as connection:
+            (deadline,) = connection.execute(
+                "SELECT deadline_at FROM gateway_requests WHERE request_id = ?", (job.request_id,)
+            ).fetchone()
+        clock = FakeLedgerClock()
+        clock.wall = datetime.fromisoformat(deadline) + timedelta(seconds=1)
+        recovery = SQLiteAttemptLedger(setup.database, clock=clock)
+        assert recovery.reconcile_crashed_requests(cleanup_grace=timedelta()) == (0, 1)
+    else:
+        assert provenance == "provider"
+
+    def publish_winner() -> None:
+        """Let a second owner commit the actual provider meter and terminal job."""
+        setup.clock.now = observed_at
+        winner = other.refresh(job)
+        assert winner.settled
+        assert winner.status is VideoStatus.COMPLETED
+        assert winner.billed_seconds_milli == 5_000
+        winners.append(winner)
+
+    def fail_waiver_after_winner(
+        *,
+        attempt_id: str,
+        terminal_event: GatewayEvent | None,
+        failure: GatewayFailure | None,
+        finalize_request: bool,
+    ) -> None:
+        """Fail the waiver independently of the second owner's successful exact settlement."""
+        assert terminal_event is not None
+        if terminal_event.accounting_release_reservation:
+            if winner_during_retry:
+                publish_winner()
+            raise RuntimeError("waiver write unavailable")
+        finish(
+            attempt_id=attempt_id,
+            terminal_event=terminal_event,
+            failure=failure,
+            finalize_request=finalize_request,
+        )
+
+    try:
+        setup.clock.now += timedelta(seconds=VIDEO_JOB_SETTLEMENT_SECONDS + 1)
+        with patch.object(
+            setup.components.ledger, "finish_attempt", side_effect=RuntimeError("offline")
+        ):
+            assert not setup.engine.refresh(job).settled
+        retained = setup.engine._pending[job.video_id]
+        assert retained.event is not None and retained.event.accounting_release_reservation
+        assert not retained.ledger_written
+        if not winner_during_retry:
+            publish_winner()
+        with patch.object(
+            setup.components.ledger, "finish_attempt", side_effect=fail_waiver_after_winner
+        ):
+            setup.engine._retry_settlements()
+        assert setup.engine._pending[job.video_id] is retained
+        assert not retained.ledger_written
+        assert _attempts(setup)[0]["budget_settled_nano_usd"] == 5 * _XAI_RATE
+        with patch.object(setup.components.ledger, "finish_attempt", wraps=finish) as retried:
+            setup.engine._retry_settlements()
+        assert retried.call_count == 1
+        assert retried.call_args.kwargs["terminal_event"] is retained.event
+        assert job.video_id not in setup.engine._pending
+        assert setup.engine.close(5)
+        assert other.close(5)
+        assert len(winners) == 1
+        assert jobs.load_any(video_id=job.video_id) == winners[0]
+        (attempt,) = _attempts(setup)
+        assert (
+            attempt["state"]
+            == {"cleanup": "failed", "crash": "unknown_after_crash", "provider": "completed"}[
+                provenance
+            ]
+        )
+        assert attempt["accounting_recovery"] == (1 if provenance == "cleanup" else 0)
+        assert attempt["usage_source"] == "observed"
+        assert attempt["billed_quantity_milli"] == 5_000
+        assert attempt["estimated_cost_nano_usd"] == 5 * _XAI_RATE
+        charge = 5 * _XAI_RATE if provenance == "provider" else 0
+        assert attempt["budget_settled_nano_usd"] == charge
+        (allocation,) = budgets.remaining(
+            organization_id=setup.components.organization_id, period=period
+        )
+        assert allocation.reserved_nano_usd == 0
+        assert allocation.settled_nano_usd == charge
+        assert allocation.unknown_cost_attempts == 0
         assert len(setup.provider.posts) == 1
     finally:
         assert other.close(5)

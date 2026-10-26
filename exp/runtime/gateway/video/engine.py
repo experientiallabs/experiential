@@ -32,6 +32,7 @@ from exp.runtime.gateway.client_apps import with_client_identity
 from exp.runtime.gateway.contracts import AuthorizationSnapshot, DirectTarget
 from exp.runtime.gateway.guardrails.enforcement import GuardrailEngine
 from exp.runtime.gateway.guardrails.native import require_unguarded_surface
+from exp.runtime.gateway.ledger_errors import AccountingRecoverySupersededError
 from exp.runtime.gateway.model_chain_authority import authorize_serving_model_chains
 from exp.runtime.gateway.native_accounting_errors import NativeBridgeError, authority_error
 from exp.runtime.gateway.native_accounting_recovery import FairRecovery
@@ -810,7 +811,10 @@ class VideoEngine:
             # is published only after its ledger write; an open or unreadable
             # row cannot establish that the original evidence is recoverable.
             try:
-                saved = self._settled_job_winner(pending)
+                saved = self._settled_job_winner(
+                    pending,
+                    recovery_superseded=isinstance(error, AccountingRecoverySupersededError),
+                )
             except Exception:  # noqa: BLE001 - a failed reread never releases ownership.
                 saved = None
             if saved is None:
@@ -821,8 +825,10 @@ class VideoEngine:
                 del self._pending[pending.job.video_id]
         return saved
 
-    def _settled_job_winner(self, pending: PendingSettlement) -> VideoJob | None:
-        """Accept a durable winner only after it accounts for any retained exact meter."""
+    def _settled_job_winner(
+        self, pending: PendingSettlement, *, recovery_superseded: bool = False
+    ) -> VideoJob | None:
+        """Require acknowledgment of retained meters and waivers before accepting a winner."""
         current = self._jobs.load_any(video_id=pending.job.video_id)
         if current is None or not current.settled:
             return None
@@ -838,13 +844,19 @@ class VideoEngine:
             pending.job.attempt_id,
         ):
             raise RuntimeError("video settlement winner changed request or attempt identity")
-        if (
-            current.billed_seconds_milli is None
-            and pending.closed.billed_seconds_milli is not None
-            and not pending.ledger_written
+        if not pending.ledger_written and (
+            (
+                current.billed_seconds_milli is None
+                and pending.closed.billed_seconds_milli is not None
+            )
+            or (
+                pending.event is not None
+                and pending.event.accounting_release_reservation
+                and not recovery_superseded
+            )
         ):
-            # A published unknown outcome cannot acknowledge a retained exact
-            # meter. Replay accounting first, then preserve the delivery winner.
+            # A published job proves neither an exact meter after unknown cleanup
+            # nor a separate customer waiver. Accounting must acknowledge each.
             return None
         return current
 

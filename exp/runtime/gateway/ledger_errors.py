@@ -7,6 +7,14 @@ class GatewayLedgerError(ValueError):
     """A request or attempt transition violates the content-free ledger contract."""
 
 
+class AccountingRecoverySupersededError(GatewayLedgerError):
+    """An immutable provider terminal supersedes a trusted customer-waiver request.
+
+    Accounting did not change. A recovery owner may release its pending waiver
+    only after independently verifying the matching durable delivery outcome.
+    """
+
+
 class AttemptRejectedError(GatewayLedgerError):
     """A typed pre-dispatch rejection during authorization, acceptance or reservation.
 

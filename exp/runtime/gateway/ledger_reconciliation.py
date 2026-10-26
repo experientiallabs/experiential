@@ -12,7 +12,10 @@ from exp.runtime.gateway.contracts import (
     GatewayServiceTierSettlement,
     GatewayUsage,
 )
-from exp.runtime.gateway.ledger_errors import GatewayLedgerError
+from exp.runtime.gateway.ledger_errors import (
+    AccountingRecoverySupersededError,
+    GatewayLedgerError,
+)
 from exp.runtime.gateway.ledger_service_tiers import (
     reconcile_tier_receipt,
     settle_tier,
@@ -84,6 +87,20 @@ def reconcile_terminal_attempt(
         (attempt_id,),
     ).fetchone()
     assert row is not None
+    if (
+        terminal is not None
+        and terminal.accounting_release_reservation
+        and not row["accounting_recovery"]
+        and row["state"] not in {"cancelled", "unknown_after_crash"}
+        and row["usage_source"] == "observed"
+        and (
+            row["billed_quantity_milli"] is not None
+            or (row["input_tokens"] is not None and row["output_tokens"] is not None)
+        )
+    ):
+        raise AccountingRecoverySupersededError(
+            "accounting recovery was superseded by an immutable provider terminal"
+        )
     if (
         terminal is not None
         and terminal.accounting_release_reservation
