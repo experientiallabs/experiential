@@ -188,6 +188,33 @@ def test_malformed_simulator_proposal_is_not_an_actor_failure(
     )
 
 
+def test_dispatched_simulator_failure_is_an_unknown_outcome(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A provider error after dispatch saves no proposal and is not blamed on the actor."""
+    session, project, _, _ = setup(tmp_path)
+    initial = session.state
+
+    def timeout(body: object, identity: object) -> object:
+        """Fail after the simulator call was dispatched, as a read timeout does."""
+        raise TimeoutError("simulator read timed out")
+
+    monkeypatch.setattr(session, "_complete", timeout)
+    result = run_actor_workflow(
+        session,
+        _task(),
+        agent=_Actor((ToolCall(call_id="valid", name="append", arguments={"item": "a"}),)),
+        model=_UnusedModel(),
+        artifacts=project.artifacts,
+        clock=lambda: NOW,
+        code_revision="fixture",
+    )
+    assert result.evidence.stop_reason == "simulator_outcome_unknown"
+    assert result.error_type == "TimeoutError"
+    assert not session.has_recorded_proposal("actor-step-0")
+    assert session.state == initial and session.transitions == ()
+
+
 def test_actor_provider_failure_is_not_a_simulator_failure(tmp_path: Path) -> None:
     """A failed actor call reaches no simulator operation and stays actor-attributed."""
     session, project, _, _ = setup(tmp_path)

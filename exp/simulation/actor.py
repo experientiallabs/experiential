@@ -37,7 +37,13 @@ class _RecordingEnvironment:
         self._session = session
         self._steps: list[WorkflowStep] = []
         self._failure_reason: (
-            Literal["actor_failure", "simulator_failure", "simulator_budget_exhausted"] | None
+            Literal[
+                "actor_failure",
+                "simulator_failure",
+                "simulator_outcome_unknown",
+                "simulator_budget_exhausted",
+            ]
+            | None
         ) = None
 
     def execute(self, action: ToolCall) -> Observation:
@@ -57,6 +63,8 @@ class _RecordingEnvironment:
                 if isinstance(error, ProviderBudgetExhaustedError)
                 else "simulator_failure"
                 if self._session.has_recorded_proposal(operation_id)
+                else "simulator_outcome_unknown"
+                if self._session.outcome_unknown(operation_id)
                 else "actor_failure"
             )
             self._steps.append(
