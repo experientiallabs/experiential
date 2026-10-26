@@ -20,6 +20,7 @@ struct AdmissionScope {
 #[derive(Default, Deserialize)]
 struct RequestIdentity {
     request_id: Option<String>,
+    #[serde(alias = "bearer_key")]
     raw_key: Option<String>,
     finalize: Option<bool>,
 }
@@ -272,7 +273,7 @@ mod tests {
                 .await
                 .unwrap();
             let second = capacity
-                .acquire("authenticate", r#"{"raw_key":"hot-2"}"#)
+                .acquire("batch_create", r#"{"bearer_key":"hot-2"}"#)
                 .await
                 .unwrap();
             assert!(tokio::time::timeout(
@@ -282,7 +283,7 @@ mod tests {
             .await
             .is_err());
             let quiet = capacity
-                .acquire("authenticate", r#"{"raw_key":"quiet-1"}"#)
+                .acquire("video_create", r#"{"bearer_key":"quiet-1"}"#)
                 .await
                 .unwrap();
             drop((first, second, quiet));

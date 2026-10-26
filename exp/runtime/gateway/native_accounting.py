@@ -211,7 +211,7 @@ class NativeAttemptAccounting:
         with self._lock:
             pending = any(
                 entry.authorization.organization_id == organization_id
-                and (entry.pending_settlement is not None or entry.pending_abandon is not None)
+                and (entry.pending_settlement is not None or entry.abandon_write_failed)
                 for entry in self._inflight.values()
             )
         if pending:
@@ -857,6 +857,8 @@ class NativeAttemptAccounting:
                         else 0,
                     )
             except Exception as exc:  # noqa: BLE001 - the data plane retries.
+                with self._lock:
+                    entry.abandon_write_failed = True
                 raise authority_error(exc) from exc
             with self._lock:
                 discard_guardrails(self._inflight.pop(request_id, None))
@@ -903,7 +905,10 @@ class NativeAttemptAccounting:
         """Periodically reconcile retained or expired attempts for the process lifetime."""
         while True:
             time.sleep(_SWEEP_INTERVAL_SECONDS)
-            self.sweep_expired()
+            try:
+                self.sweep_expired()
+            except Exception as error:  # noqa: BLE001 - retain work and keep recovery alive.
+                _logger.warning("gateway recovery pass failed: %s", type(error).__name__)
 
     def sweep_expired(self) -> None:
         """Recover a fair bounded selection without running in admission callbacks."""

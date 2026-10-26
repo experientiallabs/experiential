@@ -378,6 +378,8 @@ uv run pytest -q
     | Model choice | `exp/common/models/catalog_roles.py` | Catalog roles, not new flags |
     | Provider calls and retries | `exp/runtime/models/registry.py`, `exp/runtime/models/providers/transport.py` | `RuntimeModelCatalog`, `RetryPolicy` |
     | Producer revision | `exp/common/release_revision.py` | `installed_release_revision` |
+    | Gateway callback tenant scheduling | `exp/runtime/gateway/native/src/callback_capacity.rs` | `CallbackCapacity` resolves trusted host tokens and admitted request scopes before shared callback permits |
+    | Gateway accounting recovery fairness | `exp/runtime/gateway/native_accounting_recovery.py` | `FairRecovery` rotates bounded retained work across organizations; admission never runs recovery I/O |
 
     Keep this table current. A change that introduces an owner for a new concern adds its row in
     the same commit.
