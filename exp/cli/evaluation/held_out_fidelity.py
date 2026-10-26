@@ -40,6 +40,7 @@ from exp.optimize.evaluation.held_out_audit import (
     HeldOutAudit,
     open_held_out_audit,
     outcome_unknown,
+    require_held_out_selection,
 )
 from exp.optimize.evaluation.held_out_exposure import LIMITS, LineageExposure
 from exp.optimize.evaluation.held_out_fidelity import AuditCheckpoint, saved_held_out_results
@@ -678,6 +679,8 @@ def run_audit(
                 "the audit learns a fit-only memory and needs a native decision model to "
                 "recall it (for example cloudflare/clef-flash); add one to the model catalog"
             )
+        # An exhausted panel refuses here, before fit learning asks to spend anything.
+        require_held_out_selection(store, count, include_inspected=include_inspected)
     heading(console, project, "Held-out simulation fidelity")
     buffer = io.StringIO()
     details = Console(file=buffer, width=110, theme=EXP_THEME, no_color=True)

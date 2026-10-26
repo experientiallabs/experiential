@@ -48,6 +48,7 @@ from exp.optimize.evaluation.held_out_fidelity import (
     HeldOutPanel,
     PlannedPanel,
     Profile,
+    held_out_cases,
     panel_slots,
     plan_held_out_panel,
     register_planned_panel,
@@ -67,6 +68,7 @@ from exp.optimize.evaluation.held_out_receipts import (
     record_redispatches,
     save_receipt,
 )
+from exp.optimize.evaluation.trace_learning import fit_calls
 from exp.simulation.mining.exposure_ledger import (
     ExposureLedger,
     LedgerRelease,
@@ -192,21 +194,7 @@ def open_held_out_audit(
     refresh_ledger(project, ledger)
     for _ in range(SELECTION_ROUNDS):
         snapshot = ledger.snapshot()
-        owner = _open_receipt(project, request, snapshot)
-        if owner is not None and any(
-            report.detail_shown for report in receipt_view(project, owner).reports
-        ):
-            owner = None  # it showed per-trace detail; the request moves on to fresh content
-        exposure = held_out_exposure(project, snapshot, owner.receipt_id if owner else None)
-        if exposure.unknown and not include_inspected:
-            raise ValueError(unknown_scheme_refusal(exposure.unknown))
-        # The owner keeps its own cases, so later links are reassessed under its lease.
-        own = frozenset(owner.lineages) if owner else frozenset()
-        excluded = (
-            frozenset()
-            if include_inspected
-            else frozenset(item.lineage for item in exposure.exposed if item.lineage not in own)
-        )
+        owner, exposure, excluded = _selection(project, request, snapshot)
         planned = plan_held_out_panel(
             project, count, profile=profile, clock=clock, excluded=excluded
         )
@@ -277,6 +265,33 @@ def open_held_out_audit(
     raise ValueError(
         "other audits kept reserving the selected held-out content; run the command again"
     )
+
+
+def require_held_out_selection(
+    project: ProjectStore,
+    count: int,
+    *,
+    include_inspected: bool = False,
+) -> None:
+    """Refuse a memory audit that could select nothing, before it learns or calls anything.
+
+    The memory profile learns its fit-only memory before the panel is planned, so this runs
+    the same exposure decision and case selection that opening will, without the memory.
+
+    Args:
+        project: Project with a completed build.
+        count: Maximum held-out traces.
+        include_inspected: Also select exposed or reserved lineages, as a development re-audit.
+
+    Raises:
+        ValueError: Unknown fingerprint schemes block an independent audit, or no held-out
+            lineage is left to select.
+    """
+    ledger = ExposureLedger(project.paths.root)
+    request = AuditRequest(profile="memory", count=count, include_inspected=include_inspected)
+    refresh_ledger(project, ledger)
+    _, _, excluded = _selection(project, request, ledger.snapshot())
+    held_out_cases(project, count, fit_calls(project), excluded=excluded)
 
 
 def release_held_out_audit(
@@ -376,6 +391,32 @@ def _notice(
         receipt,
         AuditNotice(receipt=receipt.receipt_id, at=clock(), ledger=ledger, exposed=blocked),
     )
+
+
+def _selection(
+    project: ProjectStore, request: AuditRequest, snapshot: LedgerSnapshot
+) -> tuple[AuditReceipt | None, HeldOutExposure, frozenset[str]]:
+    """The receipt the request resumes, the exposure decision and the lineages left out.
+
+    Raises:
+        ValueError: Unknown fingerprint schemes block an independent audit.
+    """
+    owner = _open_receipt(project, request, snapshot)
+    if owner is not None and any(
+        report.detail_shown for report in receipt_view(project, owner).reports
+    ):
+        owner = None  # it showed per-trace detail; the request moves on to fresh content
+    exposure = held_out_exposure(project, snapshot, owner.receipt_id if owner else None)
+    if exposure.unknown and not request.include_inspected:
+        raise ValueError(unknown_scheme_refusal(exposure.unknown))
+    # The owner keeps its own cases, so later links are reassessed under its lease.
+    own = frozenset(owner.lineages) if owner else frozenset()
+    excluded = (
+        frozenset()
+        if request.include_inspected
+        else frozenset(item.lineage for item in exposure.exposed if item.lineage not in own)
+    )
+    return owner, exposure, excluded
 
 
 def _open_receipt(

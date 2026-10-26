@@ -33,7 +33,7 @@ from exp.optimize.evaluation.held_out_receipts import (
     receipt_view,
     record_report,
 )
-from exp.optimize.evaluation.trace_learning import learning_plan
+from exp.optimize.evaluation.trace_learning import learning_plan, recorded_plan
 from exp.simulation.mining.exposure_ledger import (
     ExposureLedger,
 )
@@ -93,6 +93,20 @@ def test_exhausted_held_out_panel_refuses_without_provider_calls(
     assert len(provider.requests) == purchased
     with audit(store, include_inspected=True) as reaudit:
         assert reaudit.receipt.basis == "development-re-audit"
+
+
+def test_the_audit_command_refuses_an_exhausted_panel_before_fit_learning(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``exp eval --audit`` checks the panel before its paid fit-learning step."""
+    provider = SimulatedProvider([episode(i) for i in range(USERS)])
+    root, store, _ = build_project(tmp_path, monkeypatch, provider)
+    with audit(store, USERS) as opened:
+        assert set(opened.receipt.lineages) == held_out_lineages(store)
+    purchased = len(provider.requests)
+    refusal = held_out_command(root, 1, exit_code=2)
+    assert "independent audit needs fresh traces" in refusal
+    assert len(provider.requests) == purchased and not recorded_plan(store, "fit")
 
 
 def test_exposure_follows_content_across_projects_imports_and_regrouping(
