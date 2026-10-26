@@ -8,6 +8,7 @@ call. A stage whose result is saved replays without consent or calls.
 """
 
 from datetime import UTC, datetime
+from functools import partial
 
 from exp.cli.evaluation.continuation_context import ContinuationContext
 from exp.cli.evaluation.learning_summary import save_details
@@ -63,7 +64,9 @@ def handle_learn_agent_memory(context: ContinuationContext, spec: AgentMemorySpe
         remaining=True,
     ):
         return
-    completions = stage_completions(
+    # Each stage builds its completions only after its own consent installed the ceiling.
+    completions = partial(
+        stage_completions,
         store,
         prepared,
         hours=spec.hours,

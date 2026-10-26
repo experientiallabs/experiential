@@ -128,7 +128,7 @@ PROTOCOLS = (
             "exp.optimize.evaluation.learning.agent_memory:_accepted_shown",
             "exp.optimize.evaluation.learning.screening:screening_score",
         ),
-        "a257995d51a6b095314c84ad961eb538dfc86c988083e825f5f2aa9553290735",
+        "67701ab8c68d4a76a69c5119de3f1f5d343965752bae2325115fb77dfe9dc89d",
     ),
     Protocol(
         "exp.optimize.evaluation.learning.screening:SCREENING_PROTOCOL",

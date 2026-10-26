@@ -6,6 +6,7 @@ transport is scripted, so admission, spend consent, request budgets, replay and 
 
 import json
 from collections.abc import Mapping
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -14,10 +15,21 @@ from typer.testing import CliRunner
 from exp.cli.app import app
 from exp.common.core.artifacts import JsonObject
 from exp.common.project import ProjectStore
+from exp.common.release_revision import installed_execution_revision
 from exp.optimize.evaluation.learning import agent_memory
-from exp.optimize.evaluation.learning.agent_memory import memory_identity
-from exp.optimize.evaluation.learning.agent_memory_contracts import AgentMemory
-from exp.optimize.evaluation.learning.agent_memory_test import at, project_root
+from exp.optimize.evaluation.learning.agent_memory import (
+    extract_candidates,
+    memory_identity,
+    prepare_agent_memory,
+)
+from exp.optimize.evaluation.learning.agent_memory_contracts import AgentMemory, AgentMemorySpec
+from exp.optimize.evaluation.learning.agent_memory_test import (
+    at,
+    lesson,
+    project_root,
+    scripted,
+    shown_labels,
+)
 from exp.runtime.models.providers.transport import JsonHttpResponse, RecordedRequest
 
 PROJECT = "memory"
@@ -240,6 +252,39 @@ def test_a_refused_answer_is_recorded_never_redrawn_and_leaves_its_lessons_unexp
     calls = len(wire.requests)
     learn(root, tmp_path, wire, monkeypatch, "--non-interactive")
     assert len(wire.requests) == calls
+
+
+def test_a_resumed_consolidation_reserves_against_its_consented_ceiling(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Saved candidates skip extraction consent; merging still reserves before it dispatches."""
+    root = project_root(tmp_path, monkeypatch)
+    store = ProjectStore(root, PROJECT)
+    command = operation(tmp_path)
+    prepared = prepare_agent_memory(
+        store,
+        AgentMemorySpec.model_validate(command["agent_memory"]),
+        code_revision=installed_execution_revision(),
+        clock=lambda: datetime.now(UTC),
+    )
+    extract_candidates(
+        store,
+        prepared,
+        scripted({"extract": lambda body: {"lessons": [lesson(CONTRACT, shown_labels(body))]}}),
+        code_revision=installed_execution_revision(),
+        clock=lambda: datetime.now(UTC),
+    )
+    wire = ScriptedWire()
+    monkeypatch.setattr(agent_memory, "HttpxJsonTransport", lambda: wire)
+    path = tmp_path / "operation.json"
+    path.write_text(json.dumps({**command, "spend": {"ceiling_usd": 0.000001}}))
+    result = CliRunner().invoke(
+        app,
+        ["eval", PROJECT, "--root", str(root), "--continuations", str(path), "--yes"],
+    )
+    assert result.exit_code == 1
+    assert "Raise spend.ceiling_usd" in " ".join(result.output.split())
+    assert wire.requests == []
 
 
 def test_dry_run_prints_the_preflight_and_makes_no_call(

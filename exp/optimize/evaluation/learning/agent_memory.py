@@ -342,7 +342,9 @@ def stage_completions(
 
     The first call registers the plan's window, ``hours`` from now; later calls reuse it, so
     every request keeps its fingerprint and saved answers replay. Credentials are read here,
-    so callers build these only after spend consent.
+    so callers build these only after spend consent, and building refuses unless that consent
+    installed the operation's spend ceiling: the transport reserves against the ceiling it
+    finds here, so completions built earlier would dispatch unreserved.
 
     Args:
         project: Project owning the window, budget ledger and call artifacts.
@@ -354,6 +356,9 @@ def stage_completions(
 
     Returns:
         The three stage completions.
+
+    Raises:
+        ValueError: No operation spend ceiling is installed.
     """
     plan = prepared.plan
     identity = plan.plan_id
@@ -370,6 +375,11 @@ def stage_completions(
         deadline=deadline,
         clock=clock,
     )
+    if transport.spend_ceiling is None:
+        raise ValueError(
+            "agent memory dispatches only under the operation spend ceiling; build its stage "
+            "completions after the stage's spend consent"
+        )
     resolved = RuntimeModelCatalog(
         load_model_catalog(project.model_catalog_path), transport_factory=lambda: transport
     ).resolve(plan.settings.alias)
@@ -424,7 +434,7 @@ def memory_identity(candidates: ArtifactInput) -> str:
 def extract_candidates(
     project: ProjectStore,
     prepared: PreparedMemory,
-    completions: Completions,
+    completions: Callable[[], Completions],
     *,
     code_revision: str,
     clock: Callable[[], datetime],
@@ -434,7 +444,7 @@ def extract_candidates(
     Args:
         project: Project owning the candidate set.
         prepared: Registered plan.
-        completions: Stage completions.
+        completions: Builds the stage completions, called only when the stage dispatches.
         code_revision: Recording implementation identity.
         clock: Aware clock.
 
@@ -444,6 +454,7 @@ def extract_candidates(
     identity = candidates_identity(prepared)
     if project.artifacts.exists(identity):
         return _read(project, identity, "candidates.json", CandidateSet)
+    stages = completions()
     failed: list[FailedCall] = []
 
     def ask(position: int) -> tuple[Lesson, ...]:
@@ -455,7 +466,7 @@ def extract_candidates(
         body = _extract_body(prepared, prepared.batches[position])
         labels = [trace.label for trace in shown]
         lessons = _ask(
-            completions.extract,
+            stages.extract,
             body,
             logical_id,
             "extract",
@@ -474,7 +485,7 @@ def extract_candidates(
             for row in lessons or ()
         )
 
-    found = _in_parallel(ask, range(len(prepared.batches)), completions.concurrency)
+    found = _in_parallel(ask, range(len(prepared.batches)), stages.concurrency)
     candidates = CandidateSet(
         schema_version=1,
         created_at=clock(),
@@ -492,7 +503,7 @@ def consolidate(
     project: ProjectStore,
     prepared: PreparedMemory,
     candidates: tuple[ArtifactInput, CandidateSet],
-    completions: Completions,
+    completions: Callable[[], Completions],
     *,
     code_revision: str,
     clock: Callable[[], datetime],
@@ -503,7 +514,7 @@ def consolidate(
         project: Project owning the memory.
         prepared: Registered plan.
         candidates: The extraction stage's saved set and its reference.
-        completions: Stage completions.
+        completions: Builds the stage completions, called only when the stage dispatches.
         code_revision: Recording implementation identity.
         clock: Aware clock.
 
@@ -514,17 +525,18 @@ def consolidate(
     identity = memory_identity(reference)
     if project.artifacts.exists(identity):
         return _read(project, identity, "memory.json", AgentMemory)
+    stages = completions()
     failed: list[FailedCall] = []
     merged = [
         lesson
         for kind in KINDS
         for lesson in _merge_kind(
-            prepared, [row for row in found.candidates if row.kind == kind], completions, failed
+            prepared, [row for row in found.candidates if row.kind == kind], stages, failed
         )
     ]
     merged.sort(key=lambda row: (-len(row.traces), KINDS.index(row.kind), row.statement))
     outcomes = {trace.trace_id: trace.outcome for trace in prepared.traces}
-    screened = _screen(prepared, merged, outcomes, completions, failed)
+    screened = _screen(prepared, merged, outcomes, stages, failed)
     memory = AgentMemory(
         schema_version=1,
         created_at=clock(),

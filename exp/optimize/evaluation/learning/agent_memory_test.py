@@ -40,6 +40,8 @@ from exp.optimize.evaluation.learning.agent_memory_contracts import (
     CandidateSet,
     Lesson,
 )
+from exp.optimize.evaluation.spending import operation_spend_ceiling
+from exp.runtime.models.spend_ceiling import install_spend_ceiling, operation_spend_scope
 from exp.runtime.models.structured_completion import ReturnedOutputRejected
 
 NOW = datetime(2026, 10, 24, 12, tzinfo=UTC)
@@ -157,14 +159,16 @@ def prepared_memory(
     return store, prepare_agent_memory(store, spec, code_revision="test", clock=clock)
 
 
-def scripted(answers: dict[str, Callable[[JsonObject], JsonObject]]) -> Completions:
-    """Stage completions that answer from the request body, recording nothing."""
+def scripted(
+    answers: dict[str, Callable[[JsonObject], JsonObject]],
+) -> Callable[[], Completions]:
+    """Builds stage completions that answer from the request body, recording nothing."""
 
     def stage(name: str) -> Callable[[JsonObject, str], JsonObject]:
         """One stage's completion."""
         return lambda body, _logical_id: answers[name](body)
 
-    return Completions(
+    return lambda: Completions(
         extract=stage("extract"), merge=stage("merge"), screen=stage("screen"), concurrency=2
     )
 
@@ -316,18 +320,29 @@ def test_the_plan_replays_and_the_window_is_fixed_by_the_first_paid_stage(
     )
     assert again.reference == first.reference
     assert store.artifacts.list_ids(artifact_type="agent-memory-window") == ()
-    for hours_later in (0, 9):
-        stage_completions(
-            store,
-            first,
-            hours=2,
-            concurrency=1,
-            code_revision="t",
-            clock=partial(operator.add, NOW, timedelta(hours=hours_later)),
-        )
+    with operation_spend_scope():
+        install_spend_ceiling(operation_spend_ceiling(store, "operation"))
+        for hours_later in (0, 9):
+            stage_completions(
+                store,
+                first,
+                hours=2,
+                concurrency=1,
+                code_revision="t",
+                clock=partial(operator.add, NOW, timedelta(hours=hours_later)),
+            )
     (window_id,) = store.artifacts.list_ids(artifact_type="agent-memory-window")
     saved = json.loads(store.artifacts.read_bytes(window_id, "window.json"))
     assert datetime.fromisoformat(saved["deadline"]) == NOW + timedelta(hours=2)
+
+
+def test_stage_completions_are_refused_before_consent_installs_the_ceiling(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Completions built before consent would dispatch unreserved, so building refuses."""
+    store, prepared = prepared_memory(tmp_path, monkeypatch)
+    with operation_spend_scope(), pytest.raises(ValueError, match="after the stage's spend"):
+        stage_completions(store, prepared, hours=2, concurrency=1, code_revision="t", clock=clock)
 
 
 def test_exclusions_are_refused_unless_allowed(
