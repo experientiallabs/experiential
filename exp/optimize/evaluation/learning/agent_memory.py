@@ -46,7 +46,7 @@ from exp.common.core.artifacts import (
     sha256_json,
     stable_id,
 )
-from exp.common.models import load_model_catalog
+from exp.common.models import ModelCatalog, load_model_catalog
 from exp.common.models.unknown_outcome import DispatchOutcomeUnknown
 from exp.common.project import ProjectStore, artifact_input
 from exp.common.traces.ingest.dataset import persist_trace_dataset
@@ -121,12 +121,15 @@ class PreparedMemory:
         reference: The plan's exact artifact reference.
         traces: Renderings in dataset order.
         batches: Trace positions per extraction batch.
+        alias_sha256: Digest of the alias's catalog record and connection as planned and
+            priced; dispatch refuses a catalog whose alias no longer matches it.
     """
 
     plan: AgentMemoryPlan
     reference: ArtifactInput
     traces: tuple[RenderedTrace, ...]
     batches: tuple[tuple[int, ...], ...]
+    alias_sha256: str
 
 
 @dataclass(frozen=True)
@@ -233,6 +236,7 @@ def prepare_agent_memory(
         reference=plan_reference,
         traces=traces,
         batches=batches(traces, spec.batch_bytes),
+        alias_sha256=_alias_sha256(catalog, spec.alias),
     )
 
 
@@ -365,8 +369,8 @@ def stage_completions(
         The three stage completions.
 
     Raises:
-        ValueError: No operation spend ceiling is installed, or the alias no longer resolves
-            to the plan's model snapshot.
+        ValueError: No operation spend ceiling is installed, or the alias's catalog record or
+            connection changed since planning, including its capabilities and prices.
     """
     plan = prepared.plan
     identity = plan.plan_id
@@ -388,10 +392,14 @@ def stage_completions(
             "agent memory dispatches only under the operation spend ceiling; build its stage "
             "completions after the stage's spend consent"
         )
-    resolved = RuntimeModelCatalog(
-        load_model_catalog(project.model_catalog_path), transport_factory=lambda: transport
-    ).resolve(plan.settings.alias)
-    if resolved.snapshot != plan.model:
+    catalog = load_model_catalog(project.model_catalog_path)
+    resolved = RuntimeModelCatalog(catalog, transport_factory=lambda: transport).resolve(
+        plan.settings.alias
+    )
+    if (
+        resolved.snapshot != plan.model
+        or _alias_sha256(catalog, plan.settings.alias) != prepared.alias_sha256
+    ):
         raise ValueError(
             f"model alias {plan.settings.alias!r} changed in the model catalog after the plan "
             f"was registered with {plan.model.model_id!r}; restore it, or rerun to plan anew"
@@ -821,6 +829,17 @@ def _chunks[ItemT](
         chunks[-1].append(row)
         size += length
     return chunks
+
+
+def _alias_sha256(catalog: ModelCatalog, alias: str) -> str:
+    """Digest of one alias's whole catalog record and its connection."""
+    record = catalog.models[alias]
+    return sha256_json(
+        {
+            "record": record.model_dump(mode="json"),
+            "connection": catalog.connections[record.connection].model_dump(mode="json"),
+        }
+    )
 
 
 def _json_bytes(value: JsonObject) -> int:

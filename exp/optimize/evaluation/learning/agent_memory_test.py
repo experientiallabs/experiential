@@ -219,6 +219,7 @@ def test_merging_unites_citations_and_evidence_and_never_adds_a_trace(
         reference=prepared.reference,
         traces=prepared.traces,
         batches=((0,), (1, 2)),
+        alias_sha256=prepared.alias_sha256,
     )
     completions = scripted(
         {
@@ -429,15 +430,41 @@ def test_stage_completions_are_refused_before_consent_installs_the_ceiling(
         stage_completions(store, prepared, hours=2, concurrency=1, code_revision="t", clock=clock)
 
 
-def test_stage_completions_refuse_a_catalog_edited_after_planning(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A changed alias would dispatch another model under the plan, so building refuses."""
-    store, prepared = prepared_memory(tmp_path, monkeypatch)
-    catalog = load_model_catalog(store.model_catalog_path)
+def edited_model(catalog: ModelCatalog) -> ModelCatalog:
+    """The learning alias pointed at another model."""
     record = catalog.models["learner"].model_copy(update={"model": "glm-6"})
+    return catalog.model_copy(update={"models": {"learner": record}})
+
+
+def edited_capabilities(catalog: ModelCatalog) -> ModelCatalog:
+    """The learning alias with another output price and nothing else changed."""
+    record = catalog.models["learner"]
+    assert record.capabilities is not None
+    capabilities = record.capabilities.model_copy(
+        update={"output_cost_per_million_tokens_usd": 9.9}
+    )
+    edited = record.model_copy(update={"capabilities": capabilities})
+    return catalog.model_copy(update={"models": {"learner": edited}})
+
+
+def edited_connection(catalog: ModelCatalog) -> ModelCatalog:
+    """The learning alias's connection pointed at another endpoint."""
+    connection = catalog.connections["provider"].model_copy(
+        update={"base_url": "https://other.experientiallabs.ai/v1"}
+    )
+    return catalog.model_copy(update={"connections": {"provider": connection}})
+
+
+@pytest.mark.parametrize("edit", [edited_model, edited_capabilities, edited_connection])
+def test_stage_completions_refuse_a_catalog_edited_after_planning(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    edit: Callable[[ModelCatalog], ModelCatalog],
+) -> None:
+    """A changed model, capability or connection would dispatch under the plan, so it refuses."""
+    store, prepared = prepared_memory(tmp_path, monkeypatch)
     write_model_catalog(
-        store.model_catalog_path, catalog.model_copy(update={"models": {"learner": record}})
+        store.model_catalog_path, edit(load_model_catalog(store.model_catalog_path))
     )
     with operation_spend_scope():
         install_spend_ceiling(operation_spend_ceiling(store, "operation"))
