@@ -233,17 +233,17 @@ def test_native_witness_requires_explicit_replay_and_exact_labeled_trajectory(
         project.artifacts, challenge, label="pass", compared=(acceptance(),), record_runtime=replay
     )
     assert refusal is not None and refusal.reason == "self_approval"
-    changed = {**result.outcome, "steps": []}
-    with pytest.raises(ValueError, match="steps"):
-        record_label_witness(
-            project.artifacts,
-            specification=spec,
-            outcome=changed,
-            receipt=ref,
-            created_at=NOW,
-            code_revision="test",
-            record_runtime=replay,
-        )
+    for key, value in (("steps", []), ("final_answer", "The address is updated.")):
+        with pytest.raises(ValueError, match=key):
+            record_label_witness(
+                project.artifacts,
+                specification=spec,
+                outcome={**result.outcome, key: value},
+                receipt=ref,
+                created_at=NOW,
+                code_revision="test",
+                record_runtime=replay,
+            )
 
 
 def test_changed_native_semantics_and_missing_evidence_refuse(tmp_path: Path) -> None:

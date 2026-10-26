@@ -754,7 +754,7 @@ def _native_observation(
             )
         execution = verify_record_execution(store, reference, record_runtime)
         value = _outcome_value(outcome)
-        for key in ("initial_state", "steps", "final_state", "stop_reason"):
+        for key in ("initial_state", "steps", "final_state", "final_answer", "stop_reason"):
             if key not in value or not strict_equal(value[key], execution.outcome[key]):
                 raise ValueError(f"record receipt differs from the labeled outcome's {key}")
         return execution.outcome
