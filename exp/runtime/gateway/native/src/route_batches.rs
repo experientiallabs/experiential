@@ -62,10 +62,9 @@ pub(crate) async fn acquire_batch_permit(
     state: &AppState,
     headers: &HeaderMap,
 ) -> Result<crate::dispatch_capacity::DispatchPermit, PublicError> {
-    let token = bearer_key(headers)?;
-    let organization = state.bridge.capacity.organization(None, Some(&token));
+    bearer_key(headers)?;
     let acquire = state.dispatch_capacity.acquire(
-        organization.as_deref(),
+        state.bridge.execution.as_ref(),
         &state.permits,
         &state.permit_queue,
         None,

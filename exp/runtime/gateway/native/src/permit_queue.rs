@@ -45,7 +45,7 @@ pub(crate) struct PermitQueue {
     changed: Arc<Notify>,
 }
 
-/// Release both capacities before waking the next eligible organization.
+/// Release both capacities before waking the next eligible waiter.
 pub(crate) struct ScopedPermit {
     global: Option<OwnedSemaphorePermit>,
     scope: Option<OwnedSemaphorePermit>,
@@ -97,7 +97,7 @@ impl PermitQueue {
         self.changed.notify_waiters();
     }
 
-    /// Grant global and tenant capacity together, without holding either while waiting.
+    /// Grant global and supplied capacity together, without holding either while waiting.
     pub(crate) async fn acquire_scoped(
         &self,
         global: &Arc<Semaphore>,

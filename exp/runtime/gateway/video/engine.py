@@ -35,7 +35,7 @@ from exp.runtime.gateway.guardrails.native import require_unguarded_surface
 from exp.runtime.gateway.ledger_errors import AccountingRecoverySupersededError
 from exp.runtime.gateway.model_chain_authority import authorize_serving_model_chains
 from exp.runtime.gateway.native_accounting_errors import NativeBridgeError, authority_error
-from exp.runtime.gateway.native_accounting_recovery import FairRecovery
+from exp.runtime.gateway.native_accounting_recovery import RecoveryRotation
 from exp.runtime.gateway.native_components import NativeGatewayComponents, SyncWriteLedger
 from exp.runtime.gateway.native_execution import (
     _resolve_deployment_profile,  # The identity-checked resolver every admission uses.
@@ -162,7 +162,7 @@ class VideoEngine:
         self._active_creates = 0
         self._pending: dict[str, PendingSettlement] = {}
         self._job_gates: dict[str, JobGate] = {}
-        self._recovery = FairRecovery[PendingSettlement](lambda item: item.job.organization_id)
+        self._recovery = RecoveryRotation[PendingSettlement](lambda item: item.job.video_id)
         self._poll_stop = threading.Event()
         self._poller_lock = threading.Lock()
         self._poller: threading.Thread | None = None

@@ -11,6 +11,7 @@ module keeps only the request-serving authority path.
 from __future__ import annotations
 
 import json
+import time
 from collections.abc import Callable
 from typing import TYPE_CHECKING, cast
 
@@ -28,12 +29,14 @@ from exp.runtime.gateway.native_accounting import (
 from exp.runtime.gateway.native_accounting import (
     authority_error as _authority_error,
 )
+from exp.runtime.gateway.native_accounting_recovery import recovery_drained
 from exp.runtime.gateway.native_components import NativeGatewayComponents
 from exp.runtime.gateway.native_metrics_text import render_metrics_text
 from exp.runtime.gateway.usage import GatewayUsageReport, read_usage_report, usage_html
 
 if TYPE_CHECKING:
     from exp.runtime.gateway.guardrails.enforcement import GuardrailEngine
+    from exp.runtime.gateway.video.engine import VideoEngine
 
 
 class NativeObservabilityMixin:
@@ -45,6 +48,8 @@ class NativeObservabilityMixin:
     _usage_reporter: Callable[[], JsonObject] | None
     _readiness_probe: Callable[[], bool] | None
     _guardrails: GuardrailEngine | None
+    _background_recovery: bool
+    _videos: VideoEngine | None
 
     def models(self, argument: str) -> str:
         """Return the granted model list body for one authenticated key."""
@@ -205,13 +210,12 @@ class NativeObservabilityMixin:
     def readiness(self, argument: str) -> str:
         """Return whether bridge settlement and composition accounting stay healthy.
 
-        Retained writes block their organization's admission, not other tenants
-        or whole-process readiness. Infrastructure accounting failures and an
-        injected hosted lifecycle probe still fail closed.
+        This instance's retained writes and infrastructure failures fail closed.
+        A host composing several instances owns process readiness separately.
         """
         del argument
         try:
-            if not self._components.accounting_healthy:
+            if not self._components.accounting_healthy or not self._accounting.accounting_healthy:
                 return "false"
         except Exception:  # noqa: BLE001 - readiness fails closed at the boundary.
             return "false"
@@ -221,6 +225,35 @@ class NativeObservabilityMixin:
             except Exception:  # noqa: BLE001 - readiness fails closed at the boundary.
                 return "false"
         return "true"
+
+    def close(self, timeout_seconds: float = 10.0) -> bool:
+        """Stop background recovery after the native data plane has drained."""
+        if not 0 <= timeout_seconds <= 300:
+            raise ValueError("gateway shutdown timeout must be between zero and 300 seconds")
+        deadline = time.monotonic() + timeout_seconds
+        videos_closed = self._videos is None or self._videos.close(timeout_seconds)
+        accounting_closed = self._accounting.close(max(0.0, deadline - time.monotonic()))
+        return videos_closed and accounting_closed
+
+    @property
+    def accounting_drained(self) -> bool:
+        """Whether this instance owns no accepted work or accounting write still in progress.
+
+        A host must also stop new execution before closing an idle instance. A
+        durable acknowledgment can finish this lifetime while its ledger retains
+        an unresolved financial hold for a later authoritative usage receipt.
+        """
+        return recovery_drained(self._accounting)
+
+    def recover_accounting(self) -> None:
+        """Run one bounded recovery pass when the host explicitly owns its scheduling.
+
+        Calls on one instance must be serialized. Recovery must continue while
+        accepted work or failed writes remain, even after its HTTP callers leave.
+        """
+        if self._background_recovery:
+            raise RuntimeError("this control plane already owns a background recovery thread")
+        self._accounting.sweep_expired()
 
     def close_thread_resources(self, argument: str) -> str:
         """Release the calling thread's cached resources before it exits.

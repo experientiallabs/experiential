@@ -60,7 +60,7 @@ def internal_protocol_error() -> OpenAIProtocolError:
 
 
 def accounting_recovering_error() -> OpenAIProtocolError:
-    """Return an organization-scoped retryable accounting refusal."""
+    """Return a retryable refusal while this control plane recovers accounting."""
     return OpenAIProtocolError(
         status_code=503,
         code="accounting_unavailable",

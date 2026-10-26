@@ -19,36 +19,29 @@ _SWEEP_GRACE_SECONDS = 5.0
 _logger = logging.getLogger(__name__)
 
 
-class FairRecovery[T]:
-    """Rotate organizations and their retained writes across bounded sweeps."""
+class RecoveryRotation[T]:
+    """Rotate retained work by its stable identity across bounded sweeps."""
 
-    def __init__(self, organization: Callable[[T], str]) -> None:
-        """Bind the trusted scope extractor; callers serialize selection."""
-        self._organization = organization
-        self._organizations: deque[str] = deque()
-        self._positions: dict[str, int] = {}
+    def __init__(self, identity: Callable[[T], str]) -> None:
+        """Bind the work identity extractor; callers serialize selection."""
+        self._identity = identity
+        self._order: deque[str] = deque()
 
     def select(self, items: list[T], limit: int) -> list[T]:
-        """Choose work fairly, retaining no request objects between sweeps."""
-        groups: dict[str, list[T]] = {}
-        for item in items:
-            groups.setdefault(self._organization(item), []).append(item)
-        self._organizations = deque(org for org in self._organizations if org in groups)
-        present = set(self._organizations)
-        self._organizations.extend(org for org in groups if org not in present)
-        self._positions = {org: self._positions.get(org, 0) for org in groups}
+        """Visit each pending identity without retaining payloads or replaying one twice."""
+        if limit < 0:
+            raise ValueError("recovery selection limit must be nonnegative")
+        pending = {self._identity(item): item for item in items}
+        if len(pending) != len(items):
+            raise ValueError("recovery work identities must be unique")
+        self._order = deque(identity for identity in self._order if identity in pending)
+        present = set(self._order)
+        self._order.extend(identity for identity in pending if identity not in present)
         selected: list[T] = []
-        counts: dict[str, int] = {}
-        while self._organizations and len(selected) < min(limit, len(items)):
-            org = self._organizations.popleft()
-            values = groups[org]
-            count = counts.get(org, 0)
-            if count < len(values):
-                position = self._positions[org] % len(values)
-                selected.append(values[position])
-                self._positions[org] = position + 1
-                counts[org] = count + 1
-            self._organizations.append(org)
+        for _ in range(min(limit, len(pending))):
+            identity = self._order.popleft()
+            selected.append(pending[identity])
+            self._order.append(identity)
         return selected
 
 
@@ -85,7 +78,7 @@ def recover_expired(accounting: NativeAttemptAccounting) -> None:
     Retained writes replay the original outcome, usage, and finalize flag.
     Expired requests close as cancelled through their active attempt, or request row
     if none exists. This covers broken wire contracts and data-plane crashes short
-    of process death. Repeated failures retain only their organization's admission fence.
+    of process death. Failed writes retain this control plane's admission fence.
     """
     accounting.request_settlements.retry(_SWEEP_BATCH)
     now = time.monotonic()
@@ -116,7 +109,7 @@ def recover_expired(accounting: NativeAttemptAccounting) -> None:
             continue
         try:
             finished = accounting._settle_swept(request_id, entry, settlement)
-        except Exception as error:  # noqa: BLE001 - one poison item cannot stop another tenant.
+        except Exception as error:  # noqa: BLE001 - one poison item cannot stop later work.
             _logger.warning("retained gateway recovery failed: %s", type(error).__name__)
             continue
         if finished:

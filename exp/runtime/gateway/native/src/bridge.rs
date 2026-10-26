@@ -20,8 +20,8 @@ use std::thread::JoinHandle;
 use pyo3::prelude::*;
 use tokio::sync::{oneshot, OwnedSemaphorePermit, Semaphore};
 
-use crate::callback_capacity::CallbackCapacity;
 use crate::errors::PublicError;
+use crate::execution_binding::ExecutionLease;
 
 /// One queued control-plane call and the responder that hands its outcome
 /// back to the awaiting request task.
@@ -31,8 +31,8 @@ struct Job {
     responder: oneshot::Sender<Result<String, PublicError>>,
     // Cancellation of the awaiting request cannot release queued/running capacity.
     _permit: OwnedSemaphorePermit,
-    _tenant_permit: OwnedSemaphorePermit,
-    capacity: Arc<CallbackCapacity>,
+    _execution_permit: Option<OwnedSemaphorePermit>,
+    execution: Option<Arc<ExecutionLease>>,
 }
 
 /// Bounded bridge to one Python `NativeControlPlane` instance.
@@ -41,12 +41,17 @@ struct Job {
 /// its `close_thread_resources` cleanup, and joins the threads, so a stopped
 /// server leaves no cached per-thread connection behind.
 pub struct Bridge {
+    pool: Arc<WorkerPool>,
+    pub(crate) execution: Option<Arc<ExecutionLease>>,
+}
+
+/// One process owns the workers; bound request views share them without adding threads.
+struct WorkerPool {
     queue: Mutex<Option<mpsc::Sender<Job>>>,
     workers: Mutex<Vec<JoinHandle<()>>>,
     permits: Arc<Semaphore>,
     settlement_queue: Mutex<Option<mpsc::Sender<Job>>>,
     settlement_permits: Arc<Semaphore>,
-    pub(crate) capacity: Arc<CallbackCapacity>,
 }
 
 impl Bridge {
@@ -82,13 +87,23 @@ impl Bridge {
             workers.push(handle);
         }
         Ok(Self {
-            settlement_queue: Mutex::new(Some(settlement_sender)),
-            settlement_permits: Arc::new(Semaphore::new(settlement_count)),
-            capacity: Arc::new(CallbackCapacity::new(worker_count, settlement_count)),
-            queue: Mutex::new(Some(sender)),
-            workers: Mutex::new(workers),
-            permits: Arc::new(Semaphore::new(worker_count)),
+            pool: Arc::new(WorkerPool {
+                settlement_queue: Mutex::new(Some(settlement_sender)),
+                settlement_permits: Arc::new(Semaphore::new(settlement_count)),
+                queue: Mutex::new(Some(sender)),
+                workers: Mutex::new(workers),
+                permits: Arc::new(Semaphore::new(worker_count)),
+            }),
+            execution: None,
         })
+    }
+
+    /// Bind a request to the host's supplied target and resources, without new workers.
+    pub(crate) fn bind(&self, execution: Arc<ExecutionLease>) -> Self {
+        Self {
+            pool: self.pool.clone(),
+            execution: Some(execution),
+        }
     }
 
     /// Call one control-plane method with a JSON-string argument.
@@ -97,17 +112,34 @@ impl Bridge {
         method: &'static str,
         argument: String,
     ) -> Result<String, PublicError> {
-        let tenant_permit = self.capacity.acquire(method, &argument).await?;
-        let settlement = CallbackCapacity::is_settlement(method);
-        let pool = if settlement {
-            &self.settlement_permits
+        let settlement = matches!(method, "settle" | "abandon");
+        // Supplied capacity is acquired before a shared worker. Individual
+        // execution has no additional pool, identity lookup or allocation policy.
+        let execution_permit = if let Some(execution) = &self.execution {
+            let capacity = if settlement {
+                &execution.resources.settlement
+            } else {
+                &execution.resources.serving
+            };
+            Some(
+                capacity
+                    .clone()
+                    .acquire_owned()
+                    .await
+                    .map_err(|_| PublicError::internal())?,
+            )
         } else {
-            &self.permits
+            None
+        };
+        let pool = if settlement {
+            &self.pool.settlement_permits
+        } else {
+            &self.pool.permits
         };
         let queue = if settlement {
-            &self.settlement_queue
+            &self.pool.settlement_queue
         } else {
-            &self.queue
+            &self.pool.queue
         };
         let permit = pool
             .clone()
@@ -126,8 +158,8 @@ impl Bridge {
                         argument,
                         responder,
                         _permit: permit,
-                        _tenant_permit: tenant_permit,
-                        capacity: self.capacity.clone(),
+                        _execution_permit: execution_permit,
+                        execution: self.execution.clone(),
                     })
                     .is_ok(),
                 None => false,
@@ -148,7 +180,7 @@ impl Bridge {
     }
 }
 
-impl Drop for Bridge {
+impl Drop for WorkerPool {
     /// Close the queue and join every worker after its per-thread cleanup.
     ///
     /// Joining waits for each worker to reacquire the interpreter and run its
@@ -195,12 +227,13 @@ fn worker_loop(receiver: &Mutex<mpsc::Receiver<Job>>, object: &Py<PyAny>) {
             // the receive lock, so one poisoned call cannot take down the
             // pool.
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                control_plane_call(py, object, job.method, &job.argument)
+                let target = job
+                    .execution
+                    .as_ref()
+                    .map_or(object, |execution| &execution.resources.target);
+                control_plane_call(py, target, job.method, &job.argument)
             }))
             .unwrap_or_else(|_| Err(PublicError::internal()));
-            if let Ok(reply) = &outcome {
-                job.capacity.completed(job.method, &job.argument, reply);
-            }
             let _ = job.responder.send(outcome);
         }
         // The control plane caches one SQLite connection per worker thread;
@@ -391,7 +424,7 @@ class Plane:
             .expect("callback starts");
             task.abort();
             assert!(task.await.unwrap_err().is_cancelled());
-            let free_while_running = bridge.permits.available_permits();
+            let free_while_running = bridge.pool.permits.available_permits();
             Python::attach(|py| {
                 observer
                     .bind(py)
@@ -401,7 +434,7 @@ class Plane:
                     .unwrap();
             });
             tokio::time::timeout(std::time::Duration::from_secs(5), async {
-                while bridge.permits.available_permits() == 0 {
+                while bridge.pool.permits.available_permits() == 0 {
                     tokio::task::yield_now().await;
                 }
             })
@@ -413,6 +446,69 @@ class Plane:
             );
             assert_eq!(bridge.call("echo", "next".into()).await.unwrap(), "next");
         });
+    }
+
+    #[test]
+    fn bound_job_keeps_its_target_after_the_request_and_front_leave() {
+        use crate::execution_binding::{ExecutionBindings, ExecutionHandle};
+
+        let process = plane();
+        let process_observer = Python::attach(|py| process.clone_ref(py));
+        let target = plane();
+        let observer = Python::attach(|py| target.clone_ref(py));
+        let handle = ExecutionHandle::new(target, 128, 1, 1).unwrap();
+        let bindings = ExecutionBindings::new(1).unwrap();
+        let token = "x".repeat(32);
+        bindings.register(token.clone(), &handle).unwrap();
+        let bridge = Bridge::new(process, 2).unwrap();
+        let bound = bridge.bind(bindings.claim(&token).unwrap());
+        block_on(async {
+            let request = tokio::spawn(async move { bound.call("block", "accepted".into()).await });
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while !Python::attach(|py| {
+                    observer
+                        .bind(py)
+                        .getattr("started")
+                        .unwrap()
+                        .call_method0("is_set")
+                        .unwrap()
+                        .extract::<bool>()
+                        .unwrap()
+                }) {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            bindings.remove(&token).unwrap();
+            request.abort();
+            assert!(request.await.unwrap_err().is_cancelled());
+            assert!(handle.in_use());
+            assert_eq!(bridge.pool.permits.available_permits(), 1);
+            // The original process target remains available while another target blocks.
+            assert_eq!(
+                bridge.call("echo", "process".into()).await.unwrap(),
+                "process"
+            );
+            Python::attach(|py| {
+                observer
+                    .bind(py)
+                    .getattr("release")
+                    .unwrap()
+                    .call_method0("set")
+                    .unwrap();
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while handle.in_use() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+        });
+        drop(bridge);
+        assert_eq!(attribute_length(&observer, "closed_threads"), 0);
+        assert_eq!(attribute_length(&process_observer, "closed_threads"), 4);
     }
 
     #[test]

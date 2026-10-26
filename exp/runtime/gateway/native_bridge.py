@@ -200,6 +200,7 @@ class NativeControlPlane(
         default_lane_bound: int | None = None,
         explicit_cache: ExplicitCacheHost | None = None,
         automatic_cache: AutomaticCacheHost | None = None,
+        background_recovery: bool = True,
     ) -> None:
         """Bind loaded gateway components for serving.
 
@@ -226,10 +227,14 @@ class NativeControlPlane(
                 No client markers are required; content never enters host callbacks.
             explicit_cache: Durable host policy and resource accounting for marked Google
                 prefixes. None disables explicit cache operations; generation is unchanged.
+            background_recovery: Own a periodic recovery thread by default. False
+                lets a host schedule serialized recover_accounting calls, including
+                after native execution stops until accounting_drained is true.
         """
         if request_timeout_seconds <= 0:
             raise ValueError("request_timeout_seconds must be positive")
         self._components = components
+        self._background_recovery = background_recovery
         validate_guardrail_engine(guardrails)
         self._automatic_cache = automatic_cache
         self._explicit_cache = validate_cache_hosts(explicit_cache, automatic_cache)
@@ -263,19 +268,11 @@ class NativeControlPlane(
             cache_sample_gate=cache_sample_gate,
             recovery_host=recovery_host,
             default_lane_bound=default_lane_bound,
+            background_recovery=background_recovery,
         )
         self._bind_videos()  # the optional /v1/videos engine and its settlement poller
         # Build BPE once at bind time; a corrupt table must fail startup.
         reservation_encoder()
-
-    def close(self, timeout_seconds: float = 10.0) -> bool:
-        """Stop background recovery after the native data plane has drained."""
-        if not 0 <= timeout_seconds <= 300:
-            raise ValueError("gateway shutdown timeout must be between zero and 300 seconds")
-        deadline = time.monotonic() + timeout_seconds
-        videos_closed = self._videos is None or self._videos.close(timeout_seconds)
-        accounting_closed = self._accounting.close(max(0.0, deadline - time.monotonic()))
-        return videos_closed and accounting_closed
 
     @property
     def guardrail_detectors(self) -> dict[str, deterministic.NativeDetector]:
@@ -338,7 +335,7 @@ class NativeControlPlane(
             )
             authorization = authorize_serving_model_chains(self._components, authorization)
             authorization = with_client_identity(authorization, data)  # reporting-only app facts
-            self._accounting.require_clear(authorization.organization_id)
+            self._accounting.require_clear()
         except Exception as exc:  # noqa: BLE001 - boundary sanitizes every failure.
             mapped = _authority_error(exc)
             pointer = self._batch_pointer_error(alias=decoded.alias, mapped=mapped)

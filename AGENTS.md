@@ -378,9 +378,9 @@ uv run pytest -q
     | Model choice | `exp/common/models/catalog_roles.py` | Catalog roles, not new flags |
     | Provider calls and retries | `exp/runtime/models/registry.py`, `exp/runtime/models/providers/transport.py` | `RuntimeModelCatalog`, `RetryPolicy` |
     | Producer revision | `exp/common/release_revision.py` | `installed_release_revision` |
-    | Gateway callback tenant scheduling | `exp/runtime/gateway/native/src/callback_capacity.rs` | `CallbackCapacity` resolves trusted host tokens and admitted request scopes before shared callback permits |
-    | Gateway active-request tenant scheduling | `exp/runtime/gateway/native/src/permit_queue.rs`, `exp/runtime/gateway/native/src/dispatch_capacity.rs` | `PermitQueue.acquire_scoped` grants global and organization capacity together; `DispatchPermit` retains both through stream or upload completion |
-    | Gateway accounting recovery fairness | `exp/runtime/gateway/native_accounting_recovery.py` | `FairRecovery` rotates bounded retained work across organizations; admission never runs recovery I/O |
+    | Gateway execution bindings | `exp/runtime/gateway/native/src/execution_binding.rs`, `exp/runtime/gateway/native/src/bridge.rs` | Hosts explicitly supply callback targets and resource handles; bound bridges retain them through requests, callbacks and detached cleanup. Individual execution uses the direct process bridge. Hosted identity and allocation policy belong to the host |
+    | Gateway active-request capacity | `exp/runtime/gateway/native/src/permit_queue.rs`, `exp/runtime/gateway/native/src/dispatch_capacity.rs` | `PermitQueue.acquire_scoped` grants global and supplied capacity together; shared `DispatchPermit` ownership retains both through terminal accounting |
+    | Gateway accounting recovery rotation | `exp/runtime/gateway/native_accounting_recovery.py` | `RecoveryRotation` rotates stable work identities within one control plane; admission never runs recovery I/O |
 
     Keep this table current. A change that introduces an owner for a new concern adds its row in
     the same commit.

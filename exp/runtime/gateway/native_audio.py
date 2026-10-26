@@ -344,7 +344,7 @@ def _accept(
         authorization = with_client_identity(authorization, data)  # reporting-only app facts
     except Exception as exc:  # noqa: BLE001 - boundary sanitizes every failure.
         raise authority_error(exc) from exc
-    plane._accounting.require_clear(authorization.organization_id)  # noqa: SLF001
+    plane._accounting.require_clear()  # noqa: SLF001
     require_unguarded_surface(plane._guardrails, authorization, surface)  # noqa: SLF001
     if time.monotonic() >= deadline:
         raise NativeBridgeError(audio_deadline_error())

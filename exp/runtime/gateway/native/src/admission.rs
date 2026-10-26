@@ -364,12 +364,8 @@ pub(crate) async fn acquire_permit(
     priority_class: Option<u8>,
 ) -> Result<crate::dispatch_capacity::DispatchPermit, Box<Response>> {
     let permit_wait_started = Instant::now();
-    let organization = state
-        .bridge
-        .capacity
-        .organization(Some(guard.request_id()), None);
     let acquire = state.dispatch_capacity.acquire(
-        organization.as_deref(),
+        guard.bridge.execution.as_ref(),
         &state.permits,
         &state.permit_queue,
         priority_class,
@@ -377,6 +373,7 @@ pub(crate) async fn acquire_permit(
     match tokio::time::timeout_at(deadline.into(), acquire).await {
         Ok(Ok(permit)) => {
             METRICS.permit_wait_ms.record(permit_wait_started.elapsed());
+            guard.hold_dispatch(permit.clone());
             Ok(permit)
         }
         Ok(Err(error)) => {

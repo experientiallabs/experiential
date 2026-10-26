@@ -282,6 +282,7 @@ pub struct AttemptGuard {
     /// finalizing settlement.
     tool_search_requests: u32,
     observation: Observation,
+    dispatch: Option<crate::dispatch_capacity::DispatchPermit>,
 }
 
 /// Holds one unit of the shutdown drain counter for a detached stream task,
@@ -303,9 +304,9 @@ impl Drop for SettlementTask {
 }
 
 impl AttemptGuard {
-    /// The engine-owned request identity used for tenant scheduling.
-    pub(crate) fn request_id(&self) -> &str {
-        &self.request_id
+    /// Keep active execution capacity through final accounting, including detached cleanup.
+    pub(crate) fn hold_dispatch(&mut self, permit: crate::dispatch_capacity::DispatchPermit) {
+        self.dispatch = Some(permit);
     }
     /// Count the owning detached task against graceful-shutdown draining.
     pub fn hold_task(&self) -> SettlementTask {
@@ -338,6 +339,7 @@ impl AttemptGuard {
             web_search: WebSearchMeter::default(),
             tool_search_requests: 0,
             observation: Observation::default(),
+            dispatch: None,
         }
     }
 
@@ -802,9 +804,11 @@ impl Drop for AttemptGuard {
             return;
         };
         let bridge = self.bridge.clone();
+        let dispatch = self.dispatch.take();
         let pending = self.pending.clone();
         pending.fetch_add(1, Ordering::SeqCst);
         handle.spawn(async move {
+            let _dispatch = dispatch;
             deliver(&bridge, method, argument).await;
             pending.fetch_sub(1, Ordering::SeqCst);
         });

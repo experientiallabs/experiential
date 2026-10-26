@@ -1,75 +1,50 @@
-//! Tenant shares held for the entire lifetime of an active request or upload.
+//! Explicit execution resources acquired together with process capacity.
 
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::Arc;
 
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::errors::PublicError;
+use crate::execution_binding::ExecutionLease;
 use crate::permit_queue::{PermitQueue, ScopedPermit};
 
-/// Both capacities travel with a response stream and survive handler cancellation.
+/// Capacity survives all clones, including a request's detached final accounting.
+#[derive(Clone)]
 pub(crate) struct DispatchPermit {
+    _held: Arc<HeldCapacity>,
+}
+
+struct HeldCapacity {
     _global: Option<OwnedSemaphorePermit>,
     _scoped: Option<ScopedPermit>,
-    _organization_pool: Option<Arc<OrganizationPool>>,
+    _execution: Option<Arc<ExecutionLease>>,
 }
 
-/// The global queue grants this share together with its own capacity.
-struct OrganizationPool {
-    semaphore: Arc<Semaphore>,
-}
-
-impl OrganizationPool {
-    fn new(limit: usize) -> Self {
-        Self {
-            semaphore: Arc::new(Semaphore::new(limit)),
-        }
-    }
-}
-
-pub(crate) struct DispatchCapacity {
-    limit: Option<usize>,
-    scopes: Mutex<HashMap<String, Weak<OrganizationPool>>>,
-}
+pub(crate) struct DispatchCapacity;
 
 impl DispatchCapacity {
-    pub(crate) fn new(limit: Option<usize>, _aging: Option<f64>) -> Self {
-        Self {
-            limit,
-            scopes: Mutex::new(HashMap::new()),
-        }
+    pub(crate) fn new() -> Self {
+        Self
     }
 
     pub(crate) async fn acquire(
         &self,
-        organization: Option<&str>,
+        execution: Option<&Arc<ExecutionLease>>,
         global: &Arc<Semaphore>,
         queue: &PermitQueue,
         class: Option<u8>,
     ) -> Result<DispatchPermit, PublicError> {
-        if let Some(limit) = self.limit {
-            let organization = organization.ok_or_else(PublicError::invalid_key)?;
-            let pool = {
-                let mut scopes = self.scopes.lock().map_err(|_| PublicError::internal())?;
-                scopes.retain(|_, pool| pool.strong_count() > 0);
-                match scopes.get(organization).and_then(Weak::upgrade) {
-                    Some(pool) => pool,
-                    None => {
-                        let pool = Arc::new(OrganizationPool::new(limit));
-                        scopes.insert(organization.to_owned(), Arc::downgrade(&pool));
-                        pool
-                    }
-                }
-            };
+        if let Some(execution) = execution {
             let permit = queue
-                .acquire_scoped(global, &pool.semaphore, class)
+                .acquire_scoped(global, &execution.resources.active, class)
                 .await
                 .map_err(|_| PublicError::draining())?;
             return Ok(DispatchPermit {
-                _global: None,
-                _scoped: Some(permit),
-                _organization_pool: Some(pool),
+                _held: Arc::new(HeldCapacity {
+                    _global: None,
+                    _scoped: Some(permit),
+                    _execution: Some(execution.clone()),
+                }),
             });
         }
         let global = queue
@@ -77,9 +52,11 @@ impl DispatchCapacity {
             .await
             .map_err(|_| PublicError::draining())?;
         Ok(DispatchPermit {
-            _global: Some(global),
-            _scoped: None,
-            _organization_pool: None,
+            _held: Arc::new(HeldCapacity {
+                _global: Some(global),
+                _scoped: None,
+                _execution: None,
+            }),
         })
     }
 }
@@ -87,27 +64,30 @@ impl DispatchCapacity {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::execution_binding::tests::lease;
+    use std::sync::Mutex;
     use std::time::Duration;
 
     #[test]
-    fn a_high_class_waiter_overtakes_a_low_class_waiter_inside_one_organization() {
+    fn a_high_class_waiter_overtakes_a_low_class_waiter_inside_one_binding() {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap()
             .block_on(async {
-                let shares = DispatchCapacity::new(Some(1), Some(10.0));
+                let shares = DispatchCapacity::new();
+                let first_binding = lease(1, 2, 1);
                 let global = Arc::new(Semaphore::new(4));
                 let queue = PermitQueue::new(Some(10.0));
                 let held = shares
-                    .acquire(Some("org"), &global, &queue, None)
+                    .acquire(Some(&first_binding), &global, &queue, None)
                     .await
                     .unwrap();
                 let order = Mutex::new(Vec::new());
                 tokio::join!(
                     async {
                         let _permit = shares
-                            .acquire(Some("org"), &global, &queue, Some(0))
+                            .acquire(Some(&first_binding), &global, &queue, Some(0))
                             .await
                             .unwrap();
                         order.lock().unwrap().push("low");
@@ -115,7 +95,7 @@ mod tests {
                     async {
                         tokio::task::yield_now().await;
                         let _permit = shares
-                            .acquire(Some("org"), &global, &queue, Some(8))
+                            .acquire(Some(&first_binding), &global, &queue, Some(8))
                             .await
                             .unwrap();
                         order.lock().unwrap().push("high");
@@ -130,38 +110,40 @@ mod tests {
     }
 
     #[test]
-    fn hot_streams_and_cancelled_waiters_leave_capacity_for_other_organizations() {
+    fn hot_streams_and_cancelled_waiters_leave_capacity_for_other_bindings() {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap()
             .block_on(async {
-                let shares = DispatchCapacity::new(Some(2), None);
+                let shares = DispatchCapacity::new();
+                let first_binding = lease(2, 2, 1);
+                let second_binding = lease(2, 2, 1);
                 let global = Arc::new(Semaphore::new(4));
                 let queue = PermitQueue::new(None);
                 let first = shares
-                    .acquire(Some("hot"), &global, &queue, None)
+                    .acquire(Some(&first_binding), &global, &queue, None)
                     .await
                     .unwrap();
                 let second = shares
-                    .acquire(Some("hot"), &global, &queue, None)
+                    .acquire(Some(&first_binding), &global, &queue, None)
                     .await
                     .unwrap();
                 assert!(tokio::time::timeout(
                     Duration::from_millis(10),
-                    shares.acquire(Some("hot"), &global, &queue, Some(8))
+                    shares.acquire(Some(&first_binding), &global, &queue, Some(8))
                 )
                 .await
                 .is_err());
                 assert_eq!(global.available_permits(), 2);
                 let quiet = shares
-                    .acquire(Some("quiet"), &global, &queue, None)
+                    .acquire(Some(&second_binding), &global, &queue, None)
                     .await
                     .unwrap();
                 assert_eq!(global.available_permits(), 1);
                 drop(first);
                 let retry = shares
-                    .acquire(Some("hot"), &global, &queue, None)
+                    .acquire(Some(&first_binding), &global, &queue, None)
                     .await
                     .unwrap();
                 drop((second, quiet, retry));
@@ -170,24 +152,26 @@ mod tests {
     }
 
     #[test]
-    fn globally_waiting_low_priority_does_not_reserve_the_tenant_share() {
+    fn globally_waiting_low_priority_does_not_reserve_supplied_capacity() {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap()
             .block_on(async {
-                let shares = DispatchCapacity::new(Some(1), Some(10.0));
+                let shares = DispatchCapacity::new();
+                let first_binding = lease(1, 2, 1);
+                let second_binding = lease(1, 2, 1);
                 let global = Arc::new(Semaphore::new(1));
                 let queue = PermitQueue::new(Some(10.0));
                 let held = shares
-                    .acquire(Some("other"), &global, &queue, None)
+                    .acquire(Some(&second_binding), &global, &queue, None)
                     .await
                     .unwrap();
                 let order = Mutex::new(Vec::new());
                 tokio::join!(
                     async {
                         let _permit = shares
-                            .acquire(Some("org"), &global, &queue, Some(0))
+                            .acquire(Some(&first_binding), &global, &queue, Some(0))
                             .await
                             .unwrap();
                         order.lock().unwrap().push("low");
@@ -195,7 +179,7 @@ mod tests {
                     async {
                         tokio::task::yield_now().await;
                         let _permit = shares
-                            .acquire(Some("org"), &global, &queue, Some(8))
+                            .acquire(Some(&first_binding), &global, &queue, Some(8))
                             .await
                             .unwrap();
                         order.lock().unwrap().push("high");
@@ -211,55 +195,29 @@ mod tests {
     }
 
     #[test]
-    fn shutdown_rejects_waiters_and_missing_scope_without_taking_capacity() {
+    fn individual_execution_uses_the_full_process_capacity() {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap()
             .block_on(async {
-                let shares = DispatchCapacity::new(Some(1), None);
+                let capacity = DispatchCapacity::new();
                 let global = Arc::new(Semaphore::new(3));
                 let queue = PermitQueue::new(None);
-                let error = shares
-                    .acquire(None, &global, &queue, None)
-                    .await
-                    .err()
-                    .unwrap();
-                assert_eq!(error.status_code, 401);
-                assert_eq!(error.code, "invalid_key");
-                assert_eq!(error.retry_after_seconds, None);
-                assert_eq!(global.available_permits(), 3);
-                let held = shares
-                    .acquire(Some("org"), &global, &queue, None)
-                    .await
-                    .unwrap();
-                tokio::join!(
-                    async {
-                        assert!(shares
-                            .acquire(Some("org"), &global, &queue, None)
-                            .await
-                            .is_err());
-                    },
-                    async {
-                        tokio::task::yield_now().await;
-                        global.close();
-                        queue.close();
-                    }
-                );
-                assert!(shares
-                    .acquire(Some("new-org"), &global, &queue, None)
-                    .await
-                    .is_err());
-                assert_eq!(global.available_permits(), 2);
-                drop(held);
-                assert_eq!(global.available_permits(), 3);
-                let legacy = DispatchCapacity::new(None, None);
-                let global = Arc::new(Semaphore::new(1));
-                let queue = PermitQueue::new(None);
-                let legacy_permit = legacy.acquire(None, &global, &queue, None).await.unwrap();
+                let first = capacity.acquire(None, &global, &queue, None).await.unwrap();
+                let second = capacity.acquire(None, &global, &queue, None).await.unwrap();
+                let third = capacity.acquire(None, &global, &queue, None).await.unwrap();
                 assert_eq!(global.available_permits(), 0);
-                drop(legacy_permit);
+                let cleanup = first.clone();
+                drop(first);
+                assert_eq!(global.available_permits(), 0);
+                drop(cleanup);
                 assert_eq!(global.available_permits(), 1);
+                queue.close();
+                global.close();
+                assert!(capacity.acquire(None, &global, &queue, None).await.is_err());
+                drop((second, third));
+                assert_eq!(global.available_permits(), 3);
             });
     }
 }

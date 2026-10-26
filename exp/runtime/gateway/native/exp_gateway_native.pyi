@@ -95,9 +95,25 @@ class CaptureCollector:
     def counts(self) -> tuple[int, int, int, int, int, int]: ...
     def maintenance_failures(self) -> int: ...
 
-class CallbackScopes:
+class ExecutionHandle:
+    """Host-selected callback target and explicit execution resources."""
+
+    def __init__(
+        self,
+        control_plane: _ControlPlane,
+        *,
+        max_active_requests: int,
+        callback_permits: int,
+        settlement_permits: int,
+    ) -> None: ...
+    @property
+    def in_use(self) -> bool: ...
+
+class ExecutionBindings:
+    """Bounded one-use relay bindings; removal never revokes already claimed work."""
+
     def __init__(self, capacity: int = 4096) -> None: ...
-    def register(self, token: str, organization: str) -> None: ...
+    def register(self, token: str, handle: ExecutionHandle) -> None: ...
     def remove(self, token: str) -> None: ...
 
 def shutdown_handle() -> ShutdownHandle: ...
@@ -108,7 +124,7 @@ def serve(
     on_listening: Callable[[], None] | None = None,
     guardrail_detectors: Mapping[str, _DeterministicDetector] | None = None,
     capture: CaptureCollector | None = None,
-    callback_scopes: CallbackScopes | None = None,
+    execution_bindings: ExecutionBindings | None = None,
 ) -> None: ...
 def metrics_snapshot_json() -> str: ...
 def encode_chat_fixture(

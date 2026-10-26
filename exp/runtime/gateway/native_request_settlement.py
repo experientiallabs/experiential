@@ -11,7 +11,7 @@ from exp.runtime.gateway.native_accounting_errors import (
     NativeBridgeError,
     accounting_recovering_error,
 )
-from exp.runtime.gateway.native_accounting_recovery import FairRecovery
+from exp.runtime.gateway.native_accounting_recovery import RecoveryRotation
 from exp.runtime.gateway.native_components import SyncWriteLedger
 
 
@@ -55,7 +55,7 @@ class RequestSettlements:
         self._ledger = ledger
         self._pending: dict[str, _Settlement] = {}
         self._lock = threading.Lock()
-        self._recovery = FairRecovery[_Settlement](lambda item: item.authorization.organization_id)
+        self._recovery = RecoveryRotation[_Settlement](lambda item: item.authorization.request_id)
 
     @property
     def pending(self) -> bool:
@@ -69,14 +69,9 @@ class RequestSettlements:
         with self._lock:
             return bool(self._pending)
 
-    def require_clear(self, organization_id: str) -> None:
-        """Refuse the affected organization while its original meter is uncommitted."""
-        with self._lock:
-            pending = any(
-                item.retained and item.authorization.organization_id == organization_id
-                for item in self._pending.values()
-            )
-        if pending:
+    def require_clear(self) -> None:
+        """Refuse new paid work while this registry retains a failed meter write."""
+        if self.pending:
             raise NativeBridgeError(accounting_recovering_error())
 
     def finish(

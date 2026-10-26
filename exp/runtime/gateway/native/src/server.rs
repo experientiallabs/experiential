@@ -51,9 +51,6 @@ pub struct ServeConfig {
     pub port: u16,
     #[serde(default = "default_max_active_requests")]
     pub max_active_requests: usize,
-    /// Per-organization share, acquired before the global dispatch queue.
-    #[serde(default)]
-    pub max_active_per_organization: Option<usize>,
     #[serde(default = "default_request_timeout_seconds")]
     pub request_timeout_seconds: f64,
     /// Fail-fast bound on the TCP+TLS connect phase of every provider call.
@@ -224,28 +221,18 @@ pub async fn run(
     on_listening: Option<Py<PyAny>>,
     guardrail_detectors: Arc<DetectorMap>,
     capture: Option<Arc<crate::capture::collector::Collector>>,
+    execution_bindings: Option<crate::execution_binding::ExecutionBindings>,
 ) -> Result<(), String> {
     let connect_timeout = Duration::from_secs_f64(config.connect_timeout_seconds.max(0.001));
     let http = crate::upstream::build_client(connect_timeout, config.public_upstreams_only)?;
     let pending_settlements = Arc::new(AtomicUsize::new(0));
     let max_active_requests = config.max_active_requests.max(1);
-    if config
-        .max_active_per_organization
-        .is_some_and(|limit| limit == 0 || limit > max_active_requests)
-    {
-        return Err(
-            "max_active_per_organization must be between 1 and max_active_requests".to_owned(),
-        );
-    }
     let handled_requests = Arc::new(AtomicUsize::new(0));
     let state = AppState {
         bridge,
         http,
         permits: Arc::new(Semaphore::new(max_active_requests)),
-        dispatch_capacity: Arc::new(crate::dispatch_capacity::DispatchCapacity::new(
-            config.max_active_per_organization,
-            config.permit_priority_aging_seconds,
-        )),
+        dispatch_capacity: Arc::new(crate::dispatch_capacity::DispatchCapacity::new()),
         permit_queue: Arc::new(crate::permit_queue::PermitQueue::new(
             config.permit_priority_aging_seconds,
         )),
@@ -329,7 +316,20 @@ pub async fn run(
     };
     let permits = state.permits.clone();
     let permit_queue = state.permit_queue.clone();
-    let app = app.fallback(unknown_route).with_state(state);
+    let app = app.fallback(unknown_route);
+    let bindings_enabled = execution_bindings.is_some();
+    let app = if let Some(bindings) = execution_bindings {
+        app.layer(axum::middleware::from_fn_with_state(
+            bindings,
+            crate::execution_context::bind_execution,
+        ))
+    } else {
+        app
+    };
+    let app = app.with_state(crate::execution_context::ServerState {
+        base: state,
+        bindings_enabled,
+    });
     let listener = tokio::net::TcpListener::bind((config.host.as_str(), config.port))
         .await
         .map_err(|error| format!("failed to bind {}:{}: {error}", config.host, config.port))?

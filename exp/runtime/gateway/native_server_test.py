@@ -34,7 +34,7 @@ def test_host_passes_the_serve_configuration(
         on_listening: object,
         guardrail_detectors: object,
         capture: object,
-        callback_scopes: object,
+        execution_bindings: object,
     ) -> None:
         """Capture the extension boundary call."""
         captured["control_plane"] = control_plane
@@ -43,22 +43,21 @@ def test_host_passes_the_serve_configuration(
         captured["on_listening"] = on_listening
         captured["guardrail_detectors"] = guardrail_detectors
         captured["capture"] = capture
-        captured["callback_scopes"] = callback_scopes
+        captured["execution_bindings"] = execution_bindings
 
     native = SimpleNamespace(serve=serve)
     monkeypatch.setattr(native_server.importlib, "import_module", lambda _name: native)
     monkeypatch.setenv(PRE_FIRST_BYTE_RESERVE_ENV, "20")
     monkeypatch.setenv(PRE_FIRST_BYTE_MAX_ENV, "480")
     control = SimpleNamespace(guardrail_detectors={}, request_timeout_seconds=37.0)
-    scopes = cast("native_server.CallbackScopes", object())
+    scopes = cast("native_server.ExecutionBindings", object())
 
     serve_native_gateway(
         control,
         host="0.0.0.0",
         port=8080,
         max_active_requests=23,
-        max_active_per_organization=7,
-        callback_scopes=scopes,
+        execution_bindings=scopes,
         graceful_timeout_seconds=45.0,
         connect_timeout_seconds=4.0,
         public_upstreams_only=public_only,
@@ -68,13 +67,13 @@ def test_host_passes_the_serve_configuration(
     )
 
     assert captured["control_plane"] is control
-    assert captured["callback_scopes"] is scopes
+    assert captured["execution_bindings"] is scopes
     assert captured["shutdown"] is None
     config = cast("dict[str, object]", captured["config"])
     assert config["host"] == "0.0.0.0"
     assert config["port"] == 8080
     assert config["max_active_requests"] == 23
-    assert config["max_active_per_organization"] == 7
+    assert "max_active_per_organization" not in config
     assert config["request_timeout_seconds"] == 37.0
     assert config["graceful_timeout_seconds"] == 45.0
     assert config["connect_timeout_seconds"] == 4.0
@@ -101,7 +100,7 @@ def test_host_forwards_an_embedder_owned_shutdown_handle(
         on_listening: object,
         guardrail_detectors: object,
         capture: object,
-        callback_scopes: object,
+        execution_bindings: object,
     ) -> None:
         """Capture the extension boundary call."""
         del control_plane, config_json, on_listening, guardrail_detectors, capture

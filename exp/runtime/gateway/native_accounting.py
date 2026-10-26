@@ -45,7 +45,7 @@ from exp.runtime.gateway.native_accounting_errors import (
     internal_protocol_error,
 )
 from exp.runtime.gateway.native_accounting_recovery import (
-    FairRecovery,
+    RecoveryRotation,
     recover_expired,
     recover_until_stopped,
     recovery_drained,
@@ -120,7 +120,7 @@ class NativeAttemptAccounting:
     """Registry of admitted requests and their durable attempt settlements.
 
     A lock protects Rust callbacks; a background sweep owns abandoned reservations.
-    Failed terminal writes block only the affected organization until recovery.
+    Failed terminal writes block this control plane's admission until recovery.
     """
 
     def __init__(
@@ -131,6 +131,7 @@ class NativeAttemptAccounting:
         cache_sample_gate: Callable[[str], bool] | None = None,
         recovery_host: RecoveryHost | None = None,
         default_lane_bound: int | None = None,
+        background_recovery: bool = True,
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
     ) -> None:
         """Bind the durable ledger and start the settlement sweep.
@@ -139,6 +140,8 @@ class NativeAttemptAccounting:
             write_ledger: Blocking durable request and attempt ledger.
             budget_error_factory: Optional mapping for a rejected reservation.
             default_lane_bound: Per-worker cap for rungs authoring no bound (lane_saturation).
+            background_recovery: Start the owned recovery thread. False requires
+                the host to serialize periodic sweeps and keep doing so through close.
             clock: Aware wall clock that dates each attempt's start for off-peak pricing.
             cache_sample_gate: Predicate admitting a settled attempt to the cache-priority
                 EWMA. Hosts exclude promo-funded samples so subsidized replay cannot buy
@@ -159,11 +162,11 @@ class NativeAttemptAccounting:
         self._inflight: dict[str, InflightRequest] = {}
         self._lock = threading.Lock()
         self._active_settlements = 0
-        self._retained_recovery = FairRecovery[tuple[str, InflightRequest]](
-            lambda item: item[1].authorization.organization_id
+        self._retained_recovery = RecoveryRotation[tuple[str, InflightRequest]](
+            lambda item: item[0]
         )
-        self._abandoned_recovery = FairRecovery[tuple[str, InflightRequest]](
-            lambda item: item[1].authorization.organization_id
+        self._abandoned_recovery = RecoveryRotation[tuple[str, InflightRequest]](
+            lambda item: item[0]
         )
         self._sweep_retained_replayed = 0
         self._sweep_abandoned_cancelled = 0
@@ -189,12 +192,14 @@ class NativeAttemptAccounting:
         self._throttle_backoff_forced = 0
         # Reconcile retained writes and abandoned requests even without new traffic.
         self._stop_sweeper = threading.Event()
-        self._sweeper = threading.Thread(
-            target=self._sweep_loop,
-            name="exp-native-settlement-sweep",
-            daemon=True,
-        )
-        self._sweeper.start()
+        self._sweeper: threading.Thread | None = None
+        if background_recovery:
+            self._sweeper = threading.Thread(
+                target=self._sweep_loop,
+                name="exp-native-settlement-sweep",
+                daemon=True,
+            )
+            self._sweeper.start()
 
     @property
     def accounting_healthy(self) -> bool:
@@ -206,13 +211,12 @@ class NativeAttemptAccounting:
             )
         return not pending and not self.request_settlements.pending
 
-    def require_clear(self, organization_id: str) -> None:
-        """Refuse only the organization whose prior accounting is recovering."""
-        self.request_settlements.require_clear(organization_id)
+    def require_clear(self) -> None:
+        """Refuse new work while this control plane owns a failed accounting write."""
+        self.request_settlements.require_clear()
         with self._lock:
             pending = any(
-                entry.authorization.organization_id == organization_id
-                and (entry.settlement_write_failed or entry.abandon_write_failed)
+                entry.settlement_write_failed or entry.abandon_write_failed
                 for entry in self._inflight.values()
             )
         if pending:
@@ -945,8 +949,11 @@ class NativeAttemptAccounting:
         if not 0 <= timeout_seconds <= 300:
             raise ValueError("recovery shutdown timeout must be between zero and 300 seconds")
         self._stop_sweeper.set()
-        self._sweeper.join(timeout_seconds)
-        return not self._sweeper.is_alive() and recovery_drained(self)
+        if self._sweeper is not None:
+            self._sweeper.join(timeout_seconds)
+            if self._sweeper.is_alive():
+                return False
+        return recovery_drained(self)
 
     def sweep_expired(self) -> None:
         """Recover a fair bounded selection without running in admission callbacks."""

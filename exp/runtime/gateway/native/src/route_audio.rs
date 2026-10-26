@@ -213,11 +213,10 @@ const MAXIMUM_SPEECH_BODY_BYTES: usize = 128 * 1024;
 async fn pre_admission_permit(
     state: &AppState,
     deadline: Instant,
-    raw_key: &str,
+    _raw_key: &str,
 ) -> Result<DispatchPermit, PublicError> {
-    let organization = state.bridge.capacity.organization(None, Some(raw_key));
     let acquire = state.dispatch_capacity.acquire(
-        organization.as_deref(),
+        state.bridge.execution.as_ref(),
         &state.permits,
         &state.permit_queue,
         None,
@@ -287,6 +286,7 @@ async fn serve(
         _ => return wire_drift_response(state, &admission_value, started).await,
     };
     let mut guard = new_guard(state, admission.request_id.clone(), started);
+    guard.hold_dispatch(permit.clone());
     let _permit = permit;
     match run_ladder(state, &admission, raw_key, &mut guard, deadline, &job).await {
         Err(error) => error_response(&error),

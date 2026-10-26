@@ -1004,7 +1004,7 @@ def _settle(
     )
 
 
-def test_poison_recovery_item_retains_its_meter_and_does_not_block_another_org(
+def test_poison_recovery_item_retains_its_meter_without_stopping_later_recovery(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A failing host observation cannot terminate or starve the recovery loop."""
@@ -1043,12 +1043,34 @@ def test_poison_recovery_item_retains_its_meter_and_does_not_block_another_org(
         accounting.sweep_expired()
     assert first.pending_settlement == retained
     assert accounting.entry("healthy") is None
-    accounting.require_clear("second")
     with pytest.raises(NativeBridgeError):
-        accounting.require_clear("first")
+        accounting.require_clear()
     accounting.sweep_expired()
     assert accounting.entry("poison") is None
     assert len(ledger.finished) == 2
+
+
+def test_host_scheduled_recovery_keeps_failed_close_owned_until_acknowledged() -> None:
+    """Manual scheduling creates no thread and preserves a failed meter across close."""
+    ledger = _RecordingLedger()
+    accounting = NativeAttemptAccounting(ledger, background_recovery=False)
+    assert accounting._sweeper is None
+    deployments = (_deployment("lead", connection_sha256="b" * 64),)
+    entry = _admit(accounting, deployments, request_id="request-one")
+    attempt = _start(accounting, ordinal=0)
+    ledger.fail_finishes = 1
+    with pytest.raises(NativeBridgeError):
+        _settle(
+            accounting, attempt_id=str(attempt["attempt_id"]), outcome="completed", finalize=True
+        )
+    assert not accounting.close(timeout_seconds=0)
+    assert accounting.entry(entry.authorization.request_id) is entry
+    with pytest.raises(NativeBridgeError):
+        accounting.require_clear()
+    accounting.sweep_expired()
+    assert accounting.close(timeout_seconds=0)
+    assert accounting.entry(entry.authorization.request_id) is None
+    assert len(ledger.finished) == 1
 
 
 def _retryable_failure() -> JsonObject:
@@ -4468,7 +4490,7 @@ def test_abandon_during_committed_reservation_retains_and_closes_late_attempt(
         accounting.abandon(json.dumps({"request_id": "late-reservation"}))
         # Cancellation intent while reserve still owns the request lock is not
         # a failed ledger write and must not fence sibling admissions.
-        accounting.require_clear(entry.authorization.organization_id)
+        accounting.require_clear()
         assert not accounting.accounting_healthy
         assert accounting.entry("late-reservation") is entry
         assert not ledger.finished_requests and not ledger.finished
@@ -4483,8 +4505,7 @@ def test_abandon_during_committed_reservation_retains_and_closes_late_attempt(
         assert not results and accounting.entry("late-reservation") is entry
         assert entry.active_attempt_id is not None and not ledger.finished
         with pytest.raises(NativeBridgeError):
-            accounting.require_clear(entry.authorization.organization_id)
-        accounting.require_clear("another-organization")
+            accounting.require_clear()
         accounting.sweep_expired()
     else:
         assert not errors and results and results[0].get("exhausted") is True
@@ -4583,6 +4604,7 @@ def _retained_settlement(
     monkeypatch.setattr(NativeAttemptAccounting, "_sweep_loop", lambda self: None)
     ledger, host, clock = _RecordingLedger(), RecoveryHostFake(), Clock(now=990)
     accounting = NativeAttemptAccounting(ledger, recovery_host=host)
+    assert accounting._sweeper is not None
     accounting._sweeper.join(timeout=5)
     accounting.recovery = SessionRecoveryRegistry(clock=clock)
     entry = recovery_entry()
@@ -4825,7 +4847,7 @@ def test_observed_meter_owns_abandonment_before_waiting_for_execution_gate(
         """Run competing cleanup exactly before the observed callback takes its gate."""
 
         def __enter__(self) -> None:
-            accounting.require_clear(entry.authorization.organization_id)
+            accounting.require_clear()
             assert accounting.accounting_healthy
             cleanups.append(
                 json.loads(accounting.abandon(json.dumps({"request_id": "request-one"})))
@@ -4941,7 +4963,7 @@ def test_shutdown_keeps_recovery_alive_for_an_in_progress_terminal_write(
     try:
         assert entered.wait(5)
         assert accounting.accounting_healthy
-        accounting.require_clear(entry.authorization.organization_id)
+        accounting.require_clear()
         if not request_only:
             entry.deadline_monotonic = time.monotonic() - 10
             assert json.loads(
