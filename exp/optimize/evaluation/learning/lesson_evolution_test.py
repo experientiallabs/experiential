@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pytest
 
-from exp.common.core.artifacts import ArtifactInput, JsonObject, JsonValue
+from exp.common.core.artifacts import ArtifactEnvelope, ArtifactInput, JsonObject, JsonValue
 from exp.common.project import ArtifactStore
 from exp.optimize.evaluation.learning import lesson_evolution
 from exp.optimize.evaluation.learning.lesson_evolution import (
@@ -179,3 +179,21 @@ def test_a_completed_run_id_refuses_a_different_request(
             store, changed, code_revision="c", clock=lambda: datetime.now(UTC)
         )
     assert len(provider.requests) == purchased
+
+    # A result saved without its request cannot prove which request it answered.
+    legacy = request.model_copy(update={"run_id": "legacy"})
+    saved = store.artifacts.read(lesson_evolution._result_id(request))
+    store.artifacts.write_json(
+        artifact_id=lesson_evolution._result_id(legacy),
+        artifact_type=RESULT_TYPE,
+        envelope=ArtifactEnvelope(
+            schema_version=1, created_at=datetime.now(UTC), code_revision="c"
+        ),
+        files={
+            "result.json": json.loads(
+                store.artifacts.read_bytes(saved.manifest.artifact_id, "result.json")
+            )
+        },
+    )
+    with pytest.raises(ValueError, match="without its request binding"):
+        preflight_evolution(store, legacy)

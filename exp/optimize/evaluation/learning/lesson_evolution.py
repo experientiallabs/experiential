@@ -306,11 +306,18 @@ def saved_evolution(project: ProjectStore, spec: LessonEvolutionRequest) -> Evol
     """The completed attempt's saved result, if it completed.
 
     Raises:
-        ValueError: The run ID already records a different request.
+        ValueError: The run ID already records a different request, or its result was saved
+            without the request it answered.
     """
     identity = _result_id(spec)
     if not project.artifacts.exists(identity):
         return None
+    files = {row.path for row in project.artifacts.read(identity).manifest.files}
+    if "request.json" not in files:
+        raise ValueError(
+            f"lesson evolution run {spec.run_id!r} was saved without its request binding, so "
+            "it cannot be replayed for this request; choose a new run_id"
+        )
     saved = LessonEvolutionRequest.model_validate_json(
         project.artifacts.read_bytes(identity, "request.json")
     )
