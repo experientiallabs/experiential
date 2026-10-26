@@ -99,7 +99,7 @@ from exp.simulation.engines.transition import Completion
 # Identity of the code that decides this artifact's behavior, in place of its source text.
 # Bump it when behavior changes. exp/tests/code_protocols_test.py fails when the covered
 # source changes until it is bumped or, for a pure refactor, its digest is updated.
-AGENT_MEMORY_PROTOCOL = "agent-memory-v1"
+AGENT_MEMORY_PROTOCOL = "agent-memory-v2"
 PLAN_TYPE = "agent-memory-plan"
 WINDOW_TYPE = "agent-memory-window"
 CANDIDATES_TYPE = "agent-memory-candidates"
@@ -584,29 +584,36 @@ def _merge_kind(
 ) -> list[Lesson]:
     """Merge one kind's candidates in rounds until one request holds them all, at most four.
 
-    Chunks of one round are independent and run concurrently. A failed merge keeps its chunk's
-    candidates unmerged for the next round.
+    Chunks of one round are independent and run concurrently. A failed merge leaves its
+    chunk's candidates unmerged and out of every later round, so no other request asks about
+    them again; they follow the merged lessons in the order their merges failed.
     """
+    unmerged: list[Lesson] = []
     for _ in range(MERGE_ROUNDS):
         chunks = _chunks(rows, prepared.plan.settings.batch_bytes, _shown_candidate)
-        rows = [
-            row
-            for merged in _in_parallel(
-                lambda chunk: _merge_chunk(chunk, completions, failed, prepared.plan.plan_id),
-                chunks,
-                completions.concurrency,
-            )
-            for row in merged
-        ]
+        results = _in_parallel(
+            lambda chunk: _merge_chunk(chunk, completions, failed, prepared.plan.plan_id),
+            chunks,
+            completions.concurrency,
+        )
+        rows = []
+        for chunk, merged in zip(chunks, results, strict=True):
+            if merged is None:
+                unmerged.extend(chunk)
+            else:
+                rows.extend(merged)
         if len(chunks) <= 1:
             break
-    return rows
+    return rows + unmerged
 
 
 def _merge_chunk(
     chunk: Sequence[Lesson], completions: Completions, failed: list[FailedCall], plan_id: str
-) -> list[Lesson]:
-    """One merge call: each group becomes one lesson citing all its sources' traces."""
+) -> list[Lesson] | None:
+    """One merge call: each group becomes one lesson citing all its sources' traces.
+
+    A lone candidate needs no call and is returned as it is; a failed merge returns None.
+    """
     if len(chunk) < 2:
         return list(chunk)
     kind = chunk[0].kind
@@ -623,7 +630,7 @@ def _merge_chunk(
         partial(decode_merge, candidates=len(chunk)),
     )
     if groups is None:
-        return list(chunk)
+        return None
     return [
         Lesson(
             kind=kind,
@@ -718,8 +725,7 @@ def _ask[DecodedT](
 def _distinct(failed: Sequence[FailedCall]) -> tuple[FailedCall, ...]:
     """Each failed request once, in stage and identity order.
 
-    A merge that failed leaves its chunk unchanged, so a later round can replay the same
-    request and record it again.
+    Requests with identical bodies share one logical identity and are listed once.
     """
     unique = {row.logical_id: row for row in failed}
     return tuple(sorted(unique.values(), key=lambda row: (row.stage, row.logical_id)))

@@ -38,6 +38,7 @@ from exp.optimize.evaluation.learning.agent_memory import (
 from exp.optimize.evaluation.learning.agent_memory_contracts import (
     AgentMemorySpec,
     CandidateSet,
+    FailedCall,
     Lesson,
 )
 from exp.optimize.evaluation.spending import operation_spend_ceiling
@@ -305,6 +306,40 @@ def test_any_other_failure_stops_the_stage_without_saving_it(
             clock=clock,
         )
     assert store.artifacts.list_ids(artifact_type="agent-memory-candidates") == ()
+
+
+def test_candidates_of_a_failed_merge_are_never_asked_about_again(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A lost merge beside a shrinking one keeps its candidates out of every later request."""
+    _, prepared = prepared_memory(
+        tmp_path, monkeypatch, batch_bytes=10_000, maximum_trace_bytes=5_000
+    )
+    rows = [
+        Lesson(
+            kind="procedure",
+            statement=f"{name} " + "x" * 4_000,
+            applies_when="w",
+            evidence=("e",),
+            traces=("t",),
+        )
+        for name in ("a1", "a2", "b1", "b2")
+    ]
+    asked: list[str] = []
+
+    def merge(body: JsonObject) -> JsonObject:
+        """Merge the a candidates into one lesson; lose every request showing a b candidate."""
+        text = json.dumps(body)
+        asked.append(text)
+        if "b1 " in text or "b2 " in text:
+            raise DispatchOutcomeUnknown("lost")
+        return {"lessons": [{"statement": "m", "applies_when": "w", "sources": [0, 1]}]}
+
+    failed: list[FailedCall] = []
+    merged = agent_memory._merge_kind(prepared, rows, scripted({"merge": merge})(), failed)
+    assert [row.statement for row in merged] == ["m", *(row.statement for row in rows[2:])]
+    assert sum("b1 " in text for text in asked) == 1
+    assert [row.status for row in failed] == ["unknown"]
 
 
 def test_the_plan_replays_and_the_window_is_fixed_by_the_first_paid_stage(

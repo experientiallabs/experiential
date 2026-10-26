@@ -115,7 +115,7 @@ PROTOCOLS = (
     ),
     Protocol(
         "exp.optimize.evaluation.learning.agent_memory:AGENT_MEMORY_PROTOCOL",
-        "agent-memory-v1",
+        "agent-memory-v2",
         (
             "exp.optimize.evaluation.learning.agent_memory_requests",
             "exp.optimize.evaluation.learning.agent_memory:extract_candidates",
@@ -128,7 +128,7 @@ PROTOCOLS = (
             "exp.optimize.evaluation.learning.agent_memory:_accepted_shown",
             "exp.optimize.evaluation.learning.screening:screening_score",
         ),
-        "67701ab8c68d4a76a69c5119de3f1f5d343965752bae2325115fb77dfe9dc89d",
+        "b2ad035dc43ea9120bde4ccad4a94b337ae7b2972da3a4b09090c914228361b6",
     ),
     Protocol(
         "exp.optimize.evaluation.learning.screening:SCREENING_PROTOCOL",
