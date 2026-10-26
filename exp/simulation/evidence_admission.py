@@ -6,7 +6,8 @@ never by a caller's approval. Two witness kinds exist:
 - ``specification_check``: an independent saved specification graded on the labeled outcome;
 - ``native_execution``: the same kind of specification graded on the observation of a saved
   native materialization receipt whose input bytes, adapter digest, edit plan and output bytes
-  are re-checked, and whose edit plan is exactly the one the labeled outcome proposed.
+  are re-checked, whose output bytes and projection a maintained adapter re-derives from the
+  input bytes, and whose edit plan is exactly the one the labeled outcome proposed.
 
 Every refusal carries one named reason, so qualification and paid work stop with a cause
 the caller can act on:
@@ -42,7 +43,11 @@ from exp.common.core.artifacts import (
 )
 from exp.common.evaluations.reconstruction import WorkflowEvidence, strict_equal
 from exp.common.project import ArtifactStore, ArtifactStoreError, artifact_input
-from exp.runtime.environments.artifact_edits import NativeArtifactBinding, NativeArtifactPlan
+from exp.runtime.environments.artifact_edits import (
+    ArtifactEditAdapter,
+    NativeArtifactBinding,
+    NativeArtifactPlan,
+)
 from exp.simulation.evaluation_tasks import (
     WITNESSED_AUTHORITIES,
     EvaluationTask,
@@ -547,13 +552,65 @@ def _native_observation(
     proposed = _proposed_plan(_outcome_value(outcome), binding.plan_key)
     if not strict_equal(proposed, plan.model_dump(mode="json")):
         raise ValueError("native receipt executed a different plan than the labeled outcome")
+    outputs = {
+        path: store.read_bytes(reference.artifact_id, "outputs/" + path)
+        for path in binding.output_paths
+    }
+    _require_rederived(store, binding, plan, outputs, projection)
     return {
         "native_projection": projection,
-        "outputs": {
-            path: sha256_bytes(store.read_bytes(reference.artifact_id, "outputs/" + path))
-            for path in binding.output_paths
-        },
+        "outputs": {path: sha256_bytes(payload) for path, payload in outputs.items()},
     }
+
+
+def maintained_native_adapters() -> tuple[ArtifactEditAdapter, ...]:
+    """The adapters trusted to re-derive native receipts, never chosen by receipt contents.
+
+    Raises:
+        ValueError: The optional ``artifact-edits`` dependencies are not installed.
+    """
+    try:
+        from exp.runtime.environments.workbook_edits import WorkbookEditAdapter
+    except ImportError as error:
+        raise ValueError(
+            "re-deriving a native workbook receipt needs the artifact-edits extra"
+        ) from error
+    return (WorkbookEditAdapter(),)
+
+
+def _require_rederived(
+    store: ArtifactStore,
+    binding: NativeArtifactBinding,
+    plan: NativeArtifactPlan,
+    outputs: dict[str, bytes],
+    projection: JsonObject,
+) -> None:
+    """Re-run the receipt's pure transformation and require its saved bytes and projection.
+
+    A receipt is a store artifact anyone can write, so its projection is evidence only when
+    the maintained adapter it names derives that projection and those output bytes again from
+    the bound input bytes.
+    """
+    adapter = next(
+        (
+            row
+            for row in maintained_native_adapters()
+            if sha256_json(row.definition) == binding.adapter_sha256
+        ),
+        None,
+    )
+    if adapter is None:
+        raise ValueError(
+            "no maintained native adapter matches the receipt's adapter digest, so its "
+            "observation cannot be re-derived; materialize under a maintained adapter"
+        )
+    manifest = store.read(binding.input_artifact.artifact_id).manifest
+    files = {row.path: store.read_bytes(manifest.artifact_id, row.path) for row in manifest.files}
+    native = adapter.apply(files, plan.operations, binding.output_paths)
+    if dict(native.files) != outputs:
+        raise ValueError("native output bytes differ from what the adapter derives")
+    if not strict_equal(native.projection, projection):
+        raise ValueError("native projection differs from what the adapter derives")
 
 
 def _proposed_plan(value: JsonObject, plan_key: str) -> JsonValue:

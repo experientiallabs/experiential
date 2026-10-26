@@ -27,8 +27,9 @@ from exp.optimize.evaluation.held_out_fidelity_test import (
     held_out_lineages,
 )
 from exp.optimize.evaluation.native_artifacts import materialize_native_artifacts
-from exp.optimize.evaluation.native_artifacts_test import native_fixture
+from exp.optimize.evaluation.native_artifacts_test import TextAdapter, native_fixture
 from exp.optimize.evaluation.tests.knowledge_exposure_test import OWN, bound
+from exp.simulation import evidence_admission as witness_admission
 from exp.simulation.engines.text.knowledge import SimulationKnowledge
 from exp.simulation.evaluation_calibration import CalibrationCase, CalibrationPack
 from exp.simulation.evaluation_tasks import (
@@ -39,6 +40,7 @@ from exp.simulation.evaluation_tasks import (
     persist_evaluation_task,
 )
 from exp.simulation.evidence_admission import (
+    NATIVE_RECEIPT_TYPE,
     EvaluationSpecification,
     EvidenceAdmissionError,
     persist_specification,
@@ -67,6 +69,14 @@ NATIVE = TaskVerifier(
         OutcomeRule(path="/native_projection/text", operator="equals", value="initial changed"),
     ),
 )
+
+MAINTAINED_ADAPTERS = witness_admission.maintained_native_adapters
+
+
+@pytest.fixture(autouse=True)
+def trusted_text_adapter(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Trust the text fixture adapter so native receipts re-derive without a workbook."""
+    monkeypatch.setattr(witness_admission, "maintained_native_adapters", lambda: (TextAdapter(),))
 
 
 def outcome(status: str, marker: str, **state: object) -> JsonObject:
@@ -194,6 +204,43 @@ def test_native_witness_must_reproduce_input_adapter_plan_and_observation(
     assert refusal is not None
     assert refusal.reason == "unverifiable_witness"
     assert "does not re-verify" in refusal.detail
+
+
+def test_native_witness_rederives_the_receipt_projection_from_its_bytes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A receipt written straight to the store with an invented projection is refused."""
+    project, challenge, receipt = native_label(tmp_path)
+    stored = project.artifacts.read(receipt.artifact_id).manifest
+    files = {
+        row.path: project.artifacts.read_bytes(receipt.artifact_id, row.path)
+        for row in stored.files
+    }
+    forged_receipt = json.loads(files["receipt.json"])
+    forged_receipt["native_projection"] = {"text": "invented"}
+    forged = artifact_input(
+        project.artifacts.write(
+            artifact_id="forged-native-receipt",
+            artifact_type=NATIVE_RECEIPT_TYPE,
+            envelope=ArtifactEnvelope(
+                schema_version=1, created_at=NOW, inputs=stored.inputs, code_revision="test"
+            ),
+            files={**files, "receipt.json": json.dumps(forged_receipt).encode()},
+        )
+    )
+    native_spec = specification(project, NATIVE, subject="native_observation")
+    with pytest.raises(ValueError, match="projection differs from what the adapter derives"):
+        record_label_witness(
+            project.artifacts,
+            specification=native_spec,
+            outcome=challenge.outcome,
+            receipt=forged,
+            created_at=NOW,
+            code_revision="test",
+        )
+    monkeypatch.setattr(witness_admission, "maintained_native_adapters", MAINTAINED_ADAPTERS)
+    refusal = verify_label_witness(project.artifacts, challenge, label="pass", compared=())
+    assert refusal is not None and "no maintained native adapter" in refusal.detail
 
 
 def calibration(
