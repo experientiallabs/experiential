@@ -25,6 +25,7 @@ from exp.runtime.gateway.native_settlement import (
     exhausted_attempt_payload,
     failure_from_boundary_payload,
     first_token_at_from_settlement,
+    graceful_transport_retirement,
     settlement_metadata,
     settlement_rate_limit,
     streamed_output_from_settlement,
@@ -40,6 +41,47 @@ from exp.runtime.gateway.native_settlement import (
     web_search_requests_kwarg,
     web_search_results_from_settlement,
 )
+
+
+def test_graceful_retirement_keeps_unknown_usage_and_no_rejection_certificate() -> None:
+    """A health-only connection hint cannot release an unresolved provider attempt."""
+    data: JsonObject = {
+        "outcome": "failed",
+        "failure": {"failure_class": "transport", "safe_message": "transport failed"},
+        "usage": None,
+        "opened": False,
+        "graceful_transport_retirement": True,
+    }
+    terminal, failure = terminal_from_settlement(data)
+    assert graceful_transport_retirement(data, failure)
+    assert terminal.usage is None
+    assert not terminal.decision_provider_rejected
+    assert not terminal.accounting_release_reservation
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"opened": True},
+        {"opened": "false"},
+        {"usage": {"input_tokens": 1, "output_tokens": 1}},
+        {"outcome": "completed"},
+        {"failure": {"failure_class": "cancelled", "safe_message": "cancelled"}},
+        {"graceful_transport_retirement": "true"},
+    ],
+)
+def test_graceful_retirement_rejects_inconsistent_native_evidence(change: JsonObject) -> None:
+    """Midstream and metered outcomes cannot carry the open-only health hint."""
+    data: JsonObject = {
+        "outcome": "failed",
+        "failure": {"failure_class": "transport", "safe_message": "transport failed"},
+        "usage": None,
+        "opened": False,
+        "graceful_transport_retirement": True,
+        **change,
+    }
+    with pytest.raises(ValueError):
+        terminal_from_settlement(data)
 
 
 @pytest.mark.parametrize(

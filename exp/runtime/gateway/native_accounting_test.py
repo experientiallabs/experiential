@@ -1334,6 +1334,71 @@ def test_replayed_cancellation_preserves_successful_open_health(opened: bool, sw
     assert registry.health.suppressed(key) is (not opened)
 
 
+@pytest.mark.parametrize("swept", [False, True])
+def test_graceful_retirements_preserve_retries_prior_failures_and_unknown_usage(
+    monkeypatch: pytest.MonkeyPatch, swept: bool
+) -> None:
+    """Two connection retirements retain both receipts without tripping or healing the circuit."""
+    registry, ledger, entry = _registry()
+    registry.recovery_host = RecoveryHostFake()
+
+    def unexpected_observation(*_args: object, **_kwargs: object) -> None:
+        """A graceful retirement must produce neither a departure nor a success."""
+        raise AssertionError("connection retirement reached recovery history")
+
+    monkeypatch.setattr(
+        "exp.runtime.gateway.native_accounting.record_session_outcome", unexpected_observation
+    )
+    key = deployment_health_key(entry.authorization, entry.route.deployment)
+    transport = GatewayFailure(
+        failure_class=GatewayFailureClass.TRANSPORT, safe_message="transport failure"
+    )
+    registry.health.failed(key, transport)
+    for ordinal in range(2):
+        started = _start(
+            registry,
+            ordinal=ordinal,
+            current_depth=None if ordinal == 0 else 0,
+            failure=None
+            if ordinal == 0
+            else {
+                "failure_class": "transport",
+                "safe_message": "transport failure",
+                "retryable_same_deployment": True,
+                "failover_eligible": True,
+            },
+        )
+        argument = json.dumps(
+            {
+                "request_id": entry.authorization.request_id,
+                "attempt_id": started["attempt_id"],
+                "outcome": "failed",
+                "failure": {"failure_class": "transport", "safe_message": "transport failure"},
+                "usage": None,
+                "opened": False,
+                "graceful_transport_retirement": True,
+                "finalize": ordinal == 1,
+            }
+        )
+        if swept:
+            ledger.fail_finishes = 1
+            with pytest.raises(NativeBridgeError):
+                registry.settle(argument)
+            assert entry.pending_settlement == json.loads(argument)
+            registry.sweep_expired()
+        else:
+            registry.settle(argument)
+        assert not registry.health.suppressed(key)
+    assert len(ledger.finished) == 2
+    assert len({row["attempt_id"] for row in ledger.finished}) == 2
+    for terminal in ledger.terminal_events:
+        assert terminal is not None and terminal.usage is None
+        assert not terminal.decision_provider_rejected
+        assert not terminal.accounting_release_reservation
+    registry.health.failed(key, transport)
+    assert registry.health.suppressed(key)
+
+
 def test_sweep_cancels_the_active_attempt_after_the_deadline() -> None:
     """The deadline sweep closes an unsettled reservation as cancelled."""
     registry, ledger, entry = _registry()

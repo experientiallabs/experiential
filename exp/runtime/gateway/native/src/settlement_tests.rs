@@ -1,6 +1,47 @@
 use super::*;
 use pyo3::prelude::*;
 
+#[test]
+fn graceful_retirement_is_only_an_unopened_health_hint() {
+    let mut failure = Failure::new(FailureClass::Transport, "transport failed");
+    failure.graceful_transport_retirement = true;
+    for opened in [false, true] {
+        let argument = settle_argument(
+            "request",
+            "attempt",
+            "failed",
+            None,
+            &[],
+            Some(&failure),
+            false,
+            opened,
+            None,
+            None,
+            None,
+            WebSearchMeter::default(),
+            0,
+        );
+        let value: Value = serde_json::from_str(&argument).unwrap();
+        assert_eq!(
+            value.get("graceful_transport_retirement"),
+            (!opened).then_some(&json!(true))
+        );
+        assert!(value["usage"].is_null());
+        assert_eq!(value["decision_provider_rejected"], false);
+    }
+}
+
+#[test]
+fn serialized_failure_cannot_invent_a_graceful_retirement_hint() {
+    let mut failure = Failure::new(FailureClass::Transport, "transport failed");
+    failure.graceful_transport_retirement = true;
+    let mut value = serde_json::to_value(&failure).unwrap();
+    assert!(value.get("graceful_transport_retirement").is_none());
+    value["graceful_transport_retirement"] = json!(true);
+    let decoded: Failure = serde_json::from_value(value).unwrap();
+    assert!(!decoded.graceful_transport_retirement);
+}
+
 #[tokio::test]
 async fn denied_input_retry_keeps_the_meter_without_abandoning_the_attempt() {
     Python::initialize();

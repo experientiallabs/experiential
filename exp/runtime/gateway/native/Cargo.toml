@@ -23,6 +23,7 @@ tokio-stream = "0.1"
 axum = { version = "0.8", features = ["ws", "multipart"] }
 http = "1"
 httpdate = "1"
+h2 = "0.4"
 http-body-util = "0.1"
 base64 = "0.22"
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
@@ -42,9 +43,3 @@ rusqlite = { version = "0.38", features = ["bundled"] }
 [profile.release]
 lto = "thin"
 codegen-units = 1
-
-[dev-dependencies]
-# Frame-level HTTP/2 server control for the reset/goaway regression tests:
-# the production wire to fronting proxies negotiates h2, so mid-stream aborts
-# arrive as RST_STREAM/GOAWAY, a different reqwest path than h1 truncation.
-h2 = "0.4"

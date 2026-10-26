@@ -320,6 +320,10 @@ pub struct Failure {
     /// Only the transport may set this; unknown outcomes remain false.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub decision_provider_rejected: bool,
+    /// A typed remote HTTP/2 graceful retirement during open. Health-only:
+    /// the connection error does not prove this request was never processed.
+    #[serde(skip)]
+    pub graceful_transport_retirement: bool,
     /// The bounded category of a refusal, set by every refusal builder so
     /// the public error and the settlement ledger can name which policy
     /// declined the content without parsing `provider_detail`.
@@ -386,6 +390,7 @@ impl Failure {
             retry_after_seconds: None,
             customer_owned: false,
             decision_provider_rejected: false,
+            graceful_transport_retirement: false,
             refusal_reason: None,
             rate_limit_headers: None,
             encrypted_reasoning_rejected: false,

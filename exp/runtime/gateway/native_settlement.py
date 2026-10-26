@@ -221,6 +221,7 @@ class NativeSettlementPayload(BaseModel):
     """
 
     model_config = ConfigDict(extra="ignore")
+    graceful_transport_retirement: bool = Field(default=False, strict=True)
     dispatched: bool = Field(default=False, strict=True)
     finalize: bool = Field(default=True, strict=True)
     usage_incomplete_due_to_disconnect: bool = Field(default=False, strict=True)
@@ -269,6 +270,26 @@ class NativeSettlementPayload(BaseModel):
         ):
             raise ValueError("incomplete disconnect usage requires dispatched cancelled work")
         return self.usage_incomplete_due_to_disconnect
+
+
+def graceful_transport_retirement(data: JsonObject | None, failure: GatewayFailure | None) -> bool:
+    """Validate a native health hint without inferring whether provider work occurred.
+
+    Remote GOAWAY/NO_ERROR can represent an already-enqueued request, so this
+    marker affects circuit observations only. It never certifies no effects.
+    """
+    if data is None or "graceful_transport_retirement" not in data:
+        return False
+    marked = NativeSettlementPayload.model_validate(data).graceful_transport_retirement
+    if marked and (
+        data.get("outcome") != "failed"
+        or data.get("opened") is not False
+        or data.get("usage") is not None
+        or failure is None
+        or failure.failure_class is not GatewayFailureClass.TRANSPORT
+    ):
+        raise ValueError("graceful retirement requires an unmetered open transport failure")
+    return marked
 
 
 class StreamedOutput(BaseModel):
@@ -386,6 +407,7 @@ def terminal_from_settlement(
         # deadness that pages.
         failure = ledger_failure(failure)
     kind = _TERMINAL_KINDS[str(data["outcome"])]
+    graceful_transport_retirement(data, failure)
     terminal = GatewayEvent(
         kind=kind,
         sequence_number=0,

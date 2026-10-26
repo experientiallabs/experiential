@@ -170,6 +170,10 @@ fn settle_argument(
         // retention-free upstream answered.
         "upstream_provider": upstream_provider,
     });
+    if !opened && failure.is_some_and(|failure| failure.graceful_transport_retirement) {
+        // Health hints cannot certify zero usage or release an unknown hold.
+        argument["graceful_transport_retirement"] = json!(true);
+    }
     // The gateway's own pre-dispatch web searches, a request-level cost the
     // control plane bills once: only the settlement that closes the request
     // carries the count, so a failed rung's non-finalizing settlement can

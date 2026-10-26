@@ -271,8 +271,10 @@ async fn classify_open(
             // The failure stays a content-free transport class on the wire;
             // the engine's own account of WHICH transport fault (never
             // provider text) rides to the ledger so the row is diagnosable.
-            return Err(transport_failure(None)
-                .with_provider_detail(Some(transport_error_detail("open", &error))));
+            let mut failure = transport_failure(None)
+                .with_provider_detail(Some(transport_error_detail("open", &error)));
+            failure.graceful_transport_retirement = graceful_transport_retirement(&error);
+            return Err(failure);
         }
         Err(_) => return Err(open_timeout_failure()),
     };
@@ -297,6 +299,20 @@ async fn classify_open(
         });
     }
     Ok(response)
+}
+
+/// Recognize graceful connection retirement for health, never zero-work accounting.
+/// Hyper can substitute a connection-wide GOAWAY after enqueueing a request,
+/// so even this typed open error does not establish per-request non-processing.
+fn graceful_transport_retirement(error: &reqwest::Error) -> bool {
+    let mut source = std::error::Error::source(error);
+    while let Some(inner) = source {
+        if let Some(h2) = inner.downcast_ref::<h2::Error>() {
+            return h2.is_remote() && h2.is_go_away() && h2.reason() == Some(h2::Reason::NO_ERROR);
+        }
+        source = inner.source();
+    }
+    false
 }
 
 /// Open one streaming POST on any wire; see [`open_upstream`].

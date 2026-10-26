@@ -88,6 +88,7 @@ from exp.runtime.gateway.native_settlement import (
     budget_quota_protocol_error,
     exhausted_attempt_payload,
     failure_from_boundary_payload,
+    graceful_transport_retirement,
     ledger_failure,
     settlement_metadata,
     terminal_from_settlement,
@@ -803,14 +804,15 @@ class NativeAttemptAccounting:
             settlement=data,
         )
         self._record_cache_fraction(entry, attempt_id, terminal)
-        record_session_outcome(
-            self.recovery,
-            self.recovery_host,
-            entry,
-            attempt_id,
-            None if terminal.usage_estimated else terminal.usage,
-            recovery_failure(data, failure),
-        )
+        if not graceful_transport_retirement(data, failure):
+            record_session_outcome(
+                self.recovery,
+                self.recovery_host,
+                entry,
+                attempt_id,
+                None if terminal.usage_estimated else terminal.usage,
+                recovery_failure(data, failure),
+            )
         with self._lock:
             if entry.pending_settlement == data:
                 entry.pending_settlement = None

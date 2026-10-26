@@ -49,7 +49,10 @@ from exp.runtime.gateway.native_execution import (
     throttle_disposition,
 )
 from exp.runtime.gateway.native_fallback_rules import route_fallback_rules
-from exp.runtime.gateway.native_settlement import settlement_rate_limit
+from exp.runtime.gateway.native_settlement import (
+    graceful_transport_retirement,
+    settlement_rate_limit,
+)
 from exp.runtime.gateway.routing import GatewayRoute
 from exp.runtime.gateway.rung_admission import RungLoadRegistry, RungShed, RungShedReason
 from exp.runtime.gateway.sticky_affinity import StickySpillRegistry
@@ -587,6 +590,11 @@ def record_attempt_health(
         return
     deployment = entry.route.deployments[depth]
     key = deployment_health_key(entry.authorization, deployment)
+    if graceful_transport_retirement(settlement, failure):
+        # Retiring a connection says nothing about provider health. Release
+        # a probe without clearing prior real failures or recording success.
+        health.release_probe(key)
+        return
     if opened:
         health.dispatch_opened(key)
     if failure is not None:
