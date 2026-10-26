@@ -23,7 +23,7 @@ def test_every_owner_in_the_prior_art_map_exists() -> None:
     missing = [
         path
         for row in rows
-        for path in re.findall(r"`(exp/[\w/]+\.py)`", row.split("|")[2])
+        for path in re.findall(r"`(exp/[\w/]+\.(?:py|rs))`", row.split("|")[2])
         if not (REPO_ROOT / path).is_file()
     ]
     assert not missing, f"prior-art map names missing owners: {missing}"
@@ -33,10 +33,14 @@ def test_every_named_entry_point_is_defined_in_its_owner() -> None:
     """Each function or class the map tells callers to use is defined in a module it names."""
     for row in _map_rows():
         cells = row.split("|")
-        owners = [REPO_ROOT / p for p in re.findall(r"`(exp/[\w/]+\.py)`", cells[2] + cells[3])]
+        owners = [
+            REPO_ROOT / p for p in re.findall(r"`(exp/[\w/]+\.(?:py|rs))`", cells[2] + cells[3])
+        ]
         source = "\n".join(owner.read_text(encoding="utf-8") for owner in owners)
         named = re.findall(r"`([A-Za-z_][A-Za-z0-9_]*)`", cells[3])
         for name in named:
-            assert re.search(rf"^(def|class) {name}\b|^{name}\b\s*[:=]", source, re.M), (
+            python_definition = rf"^(def|class) {name}\b|^{name}\b\s*[:=]"
+            rust_definition = rf"^(?:pub(?:\([^)]*\))?\s+)?(?:struct|enum|fn|type|const) {name}\b"
+            assert re.search(f"{python_definition}|{rust_definition}", source, re.M), (
                 f"{name} is not defined in {[o.name for o in owners]}"
             )

@@ -49,6 +49,13 @@ fn streamed_chunks_land_in_order_and_the_last_handle_removes_the_file() {
     assert_eq!(store.shared.used.load(Ordering::Acquire), 100_000);
     let path = file.path().to_owned();
     drop(file);
+    // Completion wakes the reader before the writer drops its final handle.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while (path.exists() || store.shared.used.load(Ordering::Acquire) != 0)
+        && std::time::Instant::now() < deadline
+    {
+        std::thread::sleep(Duration::from_millis(1));
+    }
     assert!(!path.exists());
     assert_eq!(store.shared.used.load(Ordering::Acquire), 0);
 }
