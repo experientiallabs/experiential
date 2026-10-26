@@ -50,7 +50,7 @@ PROTOCOLS = (
             "exp.simulation.evaluation.tasks",
             "exp.simulation.evaluation.admission",
         ),
-        "04713c2d37d0f5512507a26caa1ba2ea63cd18ec26eeb806f9df923773317328",
+        "098aea4090b56992b1a19ad02b1b44e1b64249322d58b7d09b786ecf53c6ab1b",
     ),
     Protocol(
         "exp.optimize.evaluation.tasks.challenges:CHALLENGE_PROTOCOL",

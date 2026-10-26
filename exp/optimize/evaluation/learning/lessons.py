@@ -54,6 +54,7 @@ from exp.optimize.evaluation.learning.screening import (
     save_fit,
     screen_misses,
     screening_cost,
+    screening_dispatched,
 )
 from exp.optimize.evaluation.learning.traces import (
     LearningPlan,
@@ -263,10 +264,12 @@ def preflight_screening(project: ProjectStore, spec: LessonScreeningSpec) -> Scr
         if request is not None
         and identity is not None
         and not store.exists(identity)
-        and not store.exists(identity + "-intent")
+        and not screening_dispatched(project, identity)
     ]
     unknown = sum(
-        identity is not None and not store.exists(identity) and store.exists(identity + "-intent")
+        identity is not None
+        and not store.exists(identity)
+        and screening_dispatched(project, identity)
         for _, _, identity in planned
     )
     return ScreeningPreflight(

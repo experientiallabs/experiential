@@ -29,6 +29,7 @@ A miss without an investigation hypothesis is screened out without a call.
 import json
 from collections.abc import Callable, Sequence
 from datetime import datetime
+from pathlib import Path
 from typing import Literal
 
 from filelock import FileLock
@@ -413,7 +414,7 @@ def screen_misses(
                     schema_version=1, created_at=clock(), code_revision=code_revision
                 )
                 intent = identity + "-intent"
-                if store.exists(intent):
+                if screening_dispatched(project, identity):
                     screening = MissScreening(
                         miss=miss,
                         status="unknown",
@@ -430,12 +431,13 @@ def screen_misses(
                             load_model_catalog(project.model_catalog_path)
                         ).resolve(alias)
                     decide = _decider(project, identity, resolved, deadline, clock, code_revision)
-                    store.write_json(
-                        artifact_id=intent,
-                        artifact_type=SCREENING_TYPE + "-intent",
-                        envelope=envelope.model_copy(update={"inputs": (miss.record,)}),
-                        files={"request.json": request},
-                    )
+                    if not store.exists(intent):
+                        store.write_json(
+                            artifact_id=intent,
+                            artifact_type=SCREENING_TYPE + "-intent",
+                            envelope=envelope.model_copy(update={"inputs": (miss.record,)}),
+                            files={"request.json": request},
+                        )
                     screening, response = _dispatch(project, miss, request, identity, decide)
                 cited = sorted(
                     {artifact_input(store.read(intent).manifest), miss.record, miss.source},
@@ -457,6 +459,26 @@ def screen_misses(
     return tuple(outcomes)
 
 
+def screening_dispatched(project: ProjectStore, identity: str) -> bool:
+    """Whether a screening may have reached the provider: its one ledger slot was claimed.
+
+    The admitted transport claims the slot only after every local refusal (deadline, spend
+    reservation, host admission, request retention) and immediately before sending, so an intent
+    with an unclaimed ledger provably sent nothing and is dispatched again. The ledger is created
+    before the intent is written, so an intent without its ledger has lost that evidence and
+    counts as dispatched.
+    """
+    path = project.artifacts.project_directory / (identity + ".sqlite")
+    return project.artifacts.exists(identity + "-intent") and (
+        not path.exists() or _ledger(path, identity).used() > 0
+    )
+
+
+def _ledger(path: Path, identity: str) -> DispatchLedger:
+    """The one-attempt dispatch ledger of one screening."""
+    return DispatchLedger(path, 1, sha256_json(identity))
+
+
 def _decider(
     project: ProjectStore,
     identity: str,
@@ -469,9 +491,7 @@ def _decider(
     store = project.artifacts
     transport = AdmittedJsonTransport(
         HttpxJsonTransport(),
-        ledger=DispatchLedger(
-            store.project_directory / (identity + ".sqlite"), 1, sha256_json(identity)
-        ),
+        ledger=_ledger(store.project_directory / (identity + ".sqlite"), identity),
         artifacts=store,
         code_revision=code_revision,
         deadline=deadline,
@@ -494,6 +514,9 @@ def _dispatch(
         with canonical_call(artifact_input(store.read(identity + "-intent").manifest)):
             response = decide(request)
     except (OSError, RuntimeError, ValueError) as error:
+        if not screening_dispatched(project, identity):
+            # Refused locally before the slot claim: nothing was sent, so a later run retries.
+            raise
         return base.model_copy(update={"reason": f"dispatch failed: {type(error).__name__}"}), None
     probabilities = _probabilities(response)
     if probabilities is None:

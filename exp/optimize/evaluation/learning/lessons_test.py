@@ -16,7 +16,13 @@ import pytest
 from typer.testing import CliRunner
 
 from exp.cli.app import app
-from exp.common.core.artifacts import ArtifactEnvelope, ArtifactInput, JsonObject, JsonValue
+from exp.common.core.artifacts import (
+    ArtifactEnvelope,
+    ArtifactInput,
+    JsonObject,
+    JsonValue,
+    sha256_json,
+)
 from exp.common.project import ProjectStore
 from exp.optimize.evaluation.audit.panel import MemoryProfile, plan_held_out_panel
 from exp.optimize.evaluation.audit.panel_test import (
@@ -38,14 +44,21 @@ from exp.optimize.evaluation.learning.lessons import (
     latest_lesson_set,
     load_lesson_set,
     load_library,
+    preflight_screening,
     screening_plan,
 )
 from exp.optimize.evaluation.learning.screening import (
     SCREENING_TYPE,
+    LessonScreeningSpec,
     learning_misses,
     planned_screenings,
 )
-from exp.runtime.models.providers.transport import JsonHttpResponse, RecordedRequest
+from exp.runtime.models.providers.transport import (
+    JsonHttpResponse,
+    RecordedRequest,
+    ScriptedJsonTransport,
+)
+from exp.runtime.sessions.dispatch_ledger import DispatchLedger
 
 INSTANCE_DATA = "get_order_details"
 
@@ -163,10 +176,16 @@ def screened_project(
     return root, store, provider, latest_lesson_set(store, plan.lineage, head.version)
 
 
+@pytest.mark.parametrize("ledger", ["claimed", "missing"])
 def test_screening_keeps_behavioural_misses_and_replays_without_calls(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, ledger: str
 ) -> None:
-    """Dry-run writes nothing; screening fits its threshold and publishes unresolved rules."""
+    """Dry-run writes nothing; screening fits its threshold and publishes unresolved rules.
+
+    The lost dispatch is a saved intent whose ledger slot was claimed, or whose ledger is gone:
+    the ledger is created before the intent, so a missing one is lost evidence, never proof that
+    nothing was sent.
+    """
     provider = LessonProvider([episode(i) for i in range(USERS)])
     root, store, _ = build_project(tmp_path, monkeypatch, provider)
     monkeypatch.setattr(screening, "HttpxJsonTransport", lambda: provider)
@@ -187,6 +206,10 @@ def test_screening_keeps_behavioural_misses_and_replays_without_calls(
         envelope=ArtifactEnvelope(schema_version=1, created_at=head.created_at, code_revision="c"),
         files={"request.json": {"lost": True}},
     )
+    if ledger == "claimed":
+        DispatchLedger(
+            store.artifacts.project_directory / (lost[1] + ".sqlite"), 1, sha256_json(lost[1])
+        ).claim(head.created_at.isoformat())
 
     operation: JsonObject = {
         "action": "repair-learning",
@@ -243,13 +266,13 @@ def test_a_missing_credential_leaves_every_screening_retryable(
     )
     now = datetime.now(UTC)
 
-    def screen() -> tuple[screening.MissScreening, ...]:
-        """Screen every planned miss with the fixture's clock."""
+    def screen(hours: float = 1) -> tuple[screening.MissScreening, ...]:
+        """Screen every planned miss with a dispatch deadline ``hours`` from now."""
         return screening.screen_misses(
             store,
             planned,
             alias=plan.recall.jev_alias,
-            deadline=now + timedelta(hours=1),
+            deadline=now + timedelta(hours=hours),
             clock=lambda: datetime.now(UTC),
             code_revision="c",
         )
@@ -269,7 +292,21 @@ def test_a_missing_credential_leaves_every_screening_retryable(
         with pytest.raises(ValueError, match="native decision wire"):
             screen()
     assert not store.artifacts.list_ids(artifact_type=SCREENING_TYPE + "-intent")
-    assert {row.status for row in screen()} == {"answered"}
+    # The transport refuses an expired deadline after the intent but before claiming its
+    # slot: nothing was sent, so the saved intents stay retryable.
+    with pytest.raises(TimeoutError, match="before physical dispatch"):
+        screen(hours=-1)
+    assert store.artifacts.list_ids(artifact_type=SCREENING_TYPE + "-intent")
+    assert not store.artifacts.list_ids(artifact_type=SCREENING_TYPE)
+    preview = preflight_screening(store, LessonScreeningSpec(resolution="screen-lessons"))
+    assert preview.unknown == 0 and preview.to_dispatch == len(misses)
+    # A failure after the slot claim may have reached the provider: unknown, never redrawn.
+    failing = ScriptedJsonTransport([JsonHttpResponse(status_code=500, body={}) for _ in misses])
+    monkeypatch.setattr(screening, "HttpxJsonTransport", lambda: failing)
+    assert {row.status for row in screen()} == {"unknown"}
+    assert len(failing.requests) == len(misses)
+    assert {row.status for row in screen()} == {"unknown"}
+    assert len(failing.requests) == len(misses)
 
 
 def test_audit_compares_memory_profiles_on_identical_specs(
