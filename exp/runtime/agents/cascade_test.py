@@ -16,6 +16,7 @@ from exp.common.models import (
     ToolCall,
     ToolChoice,
 )
+from exp.common.models.unknown_outcome import DispatchOutcomeUnknown
 from exp.common.tasks import ToolSchema
 from exp.runtime.agents.cascade import (
     OTHER,
@@ -31,6 +32,8 @@ from exp.runtime.agents.cascade import (
     delegates,
 )
 from exp.runtime.agents.chat_test import _Model, _response
+from exp.runtime.models.providers.transport import ProviderTransportError
+from exp.runtime.sessions.dispatch_ledger import DispatchCapExhaustedError
 
 
 def snapshot(model_id: str) -> ModelSnapshot:
@@ -174,7 +177,7 @@ def test_below_threshold_restricted_and_failed_decisions_leave_the_main_model_re
             ranked("close_ticket", 0.5, CANDIDATES),
             ranked("open_ticket", 1.0, CANDIDATES),
             ranked(OTHER, 1.0, CANDIDATES),
-            RuntimeError("decision provider unavailable"),
+            ValueError("System One returned no next-action choice"),
         ],
     )
     cascade = CascadeModelClient(
@@ -192,10 +195,31 @@ def test_below_threshold_restricted_and_failed_decisions_leave_the_main_model_re
         "below_threshold",
         "restricted",
         "abstained",
-        "decider_failure:RuntimeError",
+        "decider_failure:ValueError",
     ]
     assert {row.decided_by for row in cascade.records} == {"main"}
     assert cascade.records[0].decision_model == responses[0].model
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        DispatchOutcomeUnknown("decision dispatch saved no response"),
+        ProviderTransportError("decision provider unavailable"),
+        TimeoutError("decision deadline passed"),
+        DispatchCapExhaustedError("decision dispatch cap reached"),
+    ],
+)
+def test_decider_dispatch_failures_stop_the_step_without_a_main_draw(failure: Exception) -> None:
+    """An unknown or failed decider dispatch is never resolved by a fresh main-model draw."""
+    main = _Model((_response(AssistantAction(content="done")),))
+    decider = Decider("systemone", [failure])
+    cascade = CascadeModelClient(
+        main=main, decider=decider, policy=CascadePolicy(decider=decider.definition, threshold=0.9)
+    )
+    with pytest.raises(type(failure)):
+        cascade.complete(request("close_ticket", "open_ticket"))
+    assert not main.requests and not cascade.records
 
 
 def test_accepted_draft_avoids_the_main_call_but_invalid_drafts_do_not() -> None:

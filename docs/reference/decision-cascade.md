@@ -53,8 +53,10 @@ The acceptance rule is shared by deployment, fitting and fixed-question measurem
 (`delegates` in `exp/runtime/agents/cascade.py`): the decider is responsible only when its
 choice is not `OTHER`, the policy's `never_delegate` restrictions allow it, and its probability
 is at least the threshold. Restrictions apply before confidence, so a high probability never
-overrides them. A decider failure, an abstention, a restricted or below-threshold choice and an
-invalid draft all leave the main model responsible for that step.
+overrides them. A decider content error (a malformed distribution or an off-option answer), an
+abstention, a restricted or below-threshold choice and an invalid draft all leave the main model
+responsible for that step. A decider transport failure, deadline, dispatch cap or unknown
+dispatch outcome stops the step instead: it is never resolved by a fresh main-model draw.
 
 ## Fit
 
@@ -141,7 +143,7 @@ lineages disjoint from the fit; the project's reserved held-out tasks stay close
 
 ## Deployment
 
-A `CascadePolicy` (`version: "decision-cascade-v1"`) binds the exact decider definition, the
+A `CascadePolicy` (`version: "decision-cascade-v2"`) binds the exact decider definition, the
 threshold and the hard restrictions. It is an explicit option wherever an actor runs:
 
 - `ContinuationStudySpec.cascade` and `PanelActor.cascade` run continuation episodes with the

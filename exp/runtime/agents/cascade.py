@@ -37,8 +37,9 @@ from exp.common.models import (
     ModelSnapshot,
     ToolChoice,
 )
+from exp.common.models.unknown_outcome import DispatchOutcomeUnknown
 
-CASCADE_VERSION = "decision-cascade-v1"
+CASCADE_VERSION = "decision-cascade-v2"
 RESPOND = "respond"
 OTHER = "OTHER"
 
@@ -147,7 +148,7 @@ class CascadePolicy(ContractModel):
             responsible for them whatever the confidence.
     """
 
-    version: Literal["decision-cascade-v1"] = CASCADE_VERSION
+    version: Literal["decision-cascade-v2"] = CASCADE_VERSION
     decider: DeciderDefinition
     threshold: float = Field(ge=0, le=1, allow_inf_nan=False)
     never_delegate: tuple[str, ...] = ()
@@ -229,7 +230,8 @@ class NextActionDecider(Protocol):
             candidates: Ordered options from ``decision_candidates``.
 
         Returns:
-            The decision; failures raise and leave the main model responsible.
+            The decision. A ``ValueError`` about the answer's content leaves the main model
+            responsible; every other failure, and ``DispatchOutcomeUnknown``, stops the step.
         """
         ...
 
@@ -299,8 +301,16 @@ class CascadeModelClient:
         Args:
             request: Actor request at the reached state.
 
+        Only a decider content error, such as a malformed distribution or an off-option answer,
+        leaves the main model responsible. Transport failures, deadlines, dispatch caps and
+        unknown dispatch outcomes propagate: the decider's step stays undecided rather than being
+        redrawn from the main model.
+
         Returns:
             The drafted response, the forced main response, or the unchanged main response.
+
+        Raises:
+            DispatchOutcomeUnknown: The decider's dispatch may have been answered and billed.
         """
         candidates: tuple[str, ...] = ()
         if request.tool_choice not in (None, "auto"):
@@ -310,7 +320,9 @@ class CascadeModelClient:
             decision = self._decider.decide(request, candidates)
             if set(decision.probabilities) != {*candidates, OTHER}:
                 raise ValueError("decision distribution differs from the offered options")
-        except (ValueError, RuntimeError, OSError) as error:
+        except DispatchOutcomeUnknown:
+            raise
+        except ValueError as error:
             return self._main_decides(
                 request, candidates, None, f"decider_failure:{type(error).__name__}"
             )
