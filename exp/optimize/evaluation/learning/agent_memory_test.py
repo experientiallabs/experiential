@@ -18,6 +18,7 @@ from exp.common.models.catalog import (
     ConnectionConfig,
     ModelCatalog,
     ModelRecord,
+    load_model_catalog,
     write_model_catalog,
 )
 from exp.common.models.discovery import DiscoveredModel, resolve_discovered_model
@@ -378,6 +379,24 @@ def test_stage_completions_are_refused_before_consent_installs_the_ceiling(
     store, prepared = prepared_memory(tmp_path, monkeypatch)
     with operation_spend_scope(), pytest.raises(ValueError, match="after the stage's spend"):
         stage_completions(store, prepared, hours=2, concurrency=1, code_revision="t", clock=clock)
+
+
+def test_stage_completions_refuse_a_catalog_edited_after_planning(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A changed alias would dispatch another model under the plan, so building refuses."""
+    store, prepared = prepared_memory(tmp_path, monkeypatch)
+    catalog = load_model_catalog(store.model_catalog_path)
+    record = catalog.models["learner"].model_copy(update={"model": "glm-6"})
+    write_model_catalog(
+        store.model_catalog_path, catalog.model_copy(update={"models": {"learner": record}})
+    )
+    with operation_spend_scope():
+        install_spend_ceiling(operation_spend_ceiling(store, "operation"))
+        with pytest.raises(ValueError, match="changed in the model catalog after the plan"):
+            stage_completions(
+                store, prepared, hours=2, concurrency=1, code_revision="t", clock=clock
+            )
 
 
 def test_exclusions_are_refused_unless_allowed(

@@ -358,7 +358,8 @@ def stage_completions(
         The three stage completions.
 
     Raises:
-        ValueError: No operation spend ceiling is installed.
+        ValueError: No operation spend ceiling is installed, or the alias no longer resolves
+            to the plan's model snapshot.
     """
     plan = prepared.plan
     identity = plan.plan_id
@@ -383,6 +384,11 @@ def stage_completions(
     resolved = RuntimeModelCatalog(
         load_model_catalog(project.model_catalog_path), transport_factory=lambda: transport
     ).resolve(plan.settings.alias)
+    if resolved.snapshot != plan.model:
+        raise ValueError(
+            f"model alias {plan.settings.alias!r} changed in the model catalog after the plan "
+            f"was registered with {plan.model.model_id!r}; restore it, or rerun to plan anew"
+        )
     budget = RequestBudget(project, identity=identity)
     limit = resolved.capabilities.maximum_output_tokens
 
