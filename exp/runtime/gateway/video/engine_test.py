@@ -431,6 +431,106 @@ def test_failed_terminal_write_keeps_the_original_meter_through_shutdown(setup: 
     assert _attempts(setup)[0]["budget_settled_nano_usd"] == 5 * _XAI_RATE
 
 
+@pytest.mark.parametrize("outcome", [400, httpx.ReadTimeout])
+def test_failed_create_settlement_retains_exact_rejection_or_unknown_usage(
+    setup: _Setup, outcome: int | type[Exception]
+) -> None:
+    """Create failures retain their original known-zero or unknown terminal evidence."""
+    setup.provider.submits = [outcome]
+    finish = setup.components.ledger.finish_attempt
+    with patch.object(
+        setup.components.ledger, "finish_attempt", side_effect=RuntimeError("offline")
+    ) as failed:
+        with pytest.raises(NativeBridgeError):
+            _create(setup, alias="grok-video", seconds=6)
+        assert not setup.engine.close(0.01)
+    original = failed.call_args.kwargs
+    with patch.object(setup.components.ledger, "finish_attempt", wraps=finish) as recovered:
+        assert setup.engine.close(5)
+    assert recovered.call_args.kwargs == original
+    assert len(setup.provider.posts) == 1
+    (attempt,) = _attempts(setup)
+    if isinstance(outcome, int):
+        assert attempt["billed_quantity_milli"] == 0
+        assert attempt["budget_settled_nano_usd"] == 0
+    else:
+        assert attempt["usage_source"] == "unknown"
+        assert attempt["budget_settled_nano_usd"] == 6 * _XAI_RATE
+
+
+def test_failed_create_request_finish_is_owned_by_shutdown(setup: _Setup) -> None:
+    """A refused unpriced request retains its no-effects certificate until committed."""
+    finish = setup.components.ledger.finish_request
+    with patch.object(
+        setup.components.ledger, "finish_request", side_effect=RuntimeError("offline")
+    ) as failed:
+        with pytest.raises(NativeBridgeError):
+            _create(setup, alias="veo-unpriced")
+        assert not setup.engine.close(0.01)
+    original = failed.call_args.kwargs
+    with patch.object(setup.components.ledger, "finish_request", wraps=finish) as recovered:
+        assert setup.engine.close(5)
+    assert recovered.call_args.kwargs == original
+    assert original["certify_no_effects"] is True
+    assert not _attempts(setup) and not setup.provider.posts
+    with sqlite3.connect(setup.database) as connection:
+        assert connection.execute("SELECT state FROM gateway_requests").fetchall() == [("failed",)]
+
+
+def test_retained_rejection_cannot_finalize_the_next_video_rung(setup: _Setup) -> None:
+    """A delayed known-zero first rung keeps its non-final settlement across failover."""
+    setup.provider.submits = [503, None]
+    finish = setup.components.ledger.finish_attempt
+    with patch.object(
+        setup.components.ledger, "finish_attempt", side_effect=RuntimeError("offline")
+    ):
+        job = _create(setup)
+    assert len(setup.provider.posts) == 2
+    with patch.object(setup.components.ledger, "finish_attempt", wraps=finish) as recovered:
+        setup.engine._retry_settlements()
+        assert recovered.call_args.kwargs["finalize_request"] is False
+    first, second = _attempts(setup)
+    assert first["budget_settled_nano_usd"] == 0
+    assert second["state"] == "dispatched"
+    assert setup.engine.refresh(job).settled
+    assert _attempts(setup)[1]["budget_settled_nano_usd"] == 8 * _VEO_RATE
+
+
+def test_shutdown_retains_a_create_before_its_terminal_write(setup: _Setup) -> None:
+    """An active provider submit cannot outlive the recovery owner that receives its failure."""
+    entered, release = threading.Event(), threading.Event()
+    handle = setup.provider.handle
+    setup.provider.submits = [400]
+    errors: list[NativeBridgeError] = []
+
+    def blocked_submit(request: httpx.Request) -> httpx.Response:
+        """Pause the provider response until close has attempted its bounded join."""
+        entered.set()
+        assert release.wait(5)
+        return handle(request)
+
+    def create() -> None:
+        """Finish a rejected create through the real ledger and job store."""
+        try:
+            _create(setup, alias="grok-video", seconds=6)
+        except NativeBridgeError as error:
+            errors.append(error)
+
+    with patch.object(setup.provider, "handle", side_effect=blocked_submit):
+        worker = threading.Thread(target=create)
+        worker.start()
+        try:
+            assert entered.wait(5)
+            assert not setup.engine.close(0.01)
+        finally:
+            release.set()
+            worker.join(5)
+        assert not worker.is_alive()
+    assert len(errors) == 1
+    assert setup.engine.close(5)
+    assert _attempts(setup)[0]["budget_settled_nano_usd"] == 0
+
+
 def test_job_store_retry_does_not_repeat_acknowledged_accounting(setup: _Setup) -> None:
     """Once accounting succeeds, only the exact terminal job write is retried."""
     job = _create(setup)

@@ -12,8 +12,24 @@ from typing import Any, cast
 
 import pytest
 
+from exp.runtime.gateway.contracts import AuthorizationSnapshot, GatewayFailure
 from exp.runtime.gateway.native_accounting_errors import NativeBridgeError
 from exp.runtime.gateway.native_videos import NativeVideosMixin
+
+
+class _Ledger:
+    """Expose the required terminal signature without permitting fixture accounting."""
+
+    def finish_request(
+        self,
+        *,
+        authorization: AuthorizationSnapshot,
+        failure: GatewayFailure,
+        certify_no_effects: bool = False,
+        web_search_requests: int = 0,
+    ) -> bool:
+        """Reject any write from these argument-validation-only tests."""
+        raise AssertionError("argument validation must not reach accounting")
 
 
 class _Plane(NativeVideosMixin):
@@ -22,7 +38,7 @@ class _Plane(NativeVideosMixin):
     def __init__(self, video_jobs: object | None) -> None:
         """Bind a components stub with an optional video job store."""
         self._components = cast(Any, SimpleNamespace(video_jobs=video_jobs))
-        self._write_ledger = cast(Any, object())
+        self._write_ledger = cast(Any, _Ledger())
         self._guardrails = None
         self._bind_videos(start_poller=False)
 

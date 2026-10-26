@@ -134,12 +134,12 @@ def _frozen_cached_fraction(
     attempt_id = data.get("attempt_id")
     if not isinstance(attempt_id, str):
         return 0.0
-    with entry.execution_lock:
+    with entry.recovery_observation_lock:
         frozen = entry.estimated_cache_fractions.get(attempt_id)
     if frozen is not None:
         return frozen
     observed = _recent_cached_fraction(loads, entry, attempt_id)
-    with entry.execution_lock:
+    with entry.recovery_observation_lock:
         return entry.estimated_cache_fractions.setdefault(attempt_id, observed)
 
 

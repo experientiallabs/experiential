@@ -11,8 +11,6 @@ from collections import deque
 from collections.abc import Callable
 from typing import TYPE_CHECKING
 
-from exp.runtime.gateway.disconnect_estimate import settled_terminal
-
 if TYPE_CHECKING:
     from exp.runtime.gateway.native_accounting import NativeAttemptAccounting
 
@@ -57,7 +55,7 @@ class FairRecovery[T]:
 def recovery_drained(accounting: NativeAttemptAccounting) -> bool:
     """Distinguish a healthy in-progress commit from a transport safe to close."""
     with accounting._lock:
-        active = accounting._active_settlements > 0
+        active = accounting._active_settlements > 0 or bool(accounting._inflight)
     return (
         not active
         and not accounting.request_settlements.outstanding
@@ -117,16 +115,7 @@ def recover_expired(accounting: NativeAttemptAccounting) -> None:
         if settlement is None:
             continue
         try:
-            terminal, failure = settled_terminal(settlement, entry, loads=accounting._loads)
-            finished = accounting._settle_swept(
-                request_id,
-                entry,
-                attempt_id=str(settlement["attempt_id"]),
-                terminal=terminal,
-                failure=failure,
-                finalize=bool(settlement.get("finalize", True)),
-                settlement=settlement,
-            )
+            finished = accounting._settle_swept(request_id, entry, settlement)
         except Exception as error:  # noqa: BLE001 - one poison item cannot stop another tenant.
             _logger.warning("retained gateway recovery failed: %s", type(error).__name__)
             continue

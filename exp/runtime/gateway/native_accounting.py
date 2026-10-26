@@ -746,6 +746,17 @@ class NativeAttemptAccounting:
             entry = self._inflight.get(request_id)
         if entry is None:
             return "{}"
+        with entry.execution_lock:
+            if self.entry(request_id) is not entry:
+                return "{}"
+            if entry.pending_settlement is not None:
+                if entry.pending_settlement["attempt_id"] != data["attempt_id"]:
+                    raise NativeBridgeError(accounting_recovering_error())
+                data = entry.pending_settlement
+            return self._commit_settlement(request_id, entry, data)
+
+    def _commit_settlement(self, request_id: str, entry: InflightRequest, data: JsonObject) -> str:
+        """Write the exact observed meter while holding the request execution gate."""
         attempt_id = str(data["attempt_id"])
         finalize = bool(data.get("finalize", True))
         opened = bool(data.get("opened", False))
@@ -842,6 +853,8 @@ class NativeAttemptAccounting:
         try:
             if self.entry(request_id) is not entry:
                 return '{"terminalized":true}'
+            if entry.pending_settlement is not None:
+                return '{"terminalized":false}'
             try:
                 if entry.active_attempt_id is not None:
                     record_attempt_health(
@@ -938,62 +951,17 @@ class NativeAttemptAccounting:
         self,
         request_id: str,
         entry: InflightRequest,
-        *,
-        attempt_id: str,
-        terminal: GatewayEvent,
-        failure: GatewayFailure | None,
-        finalize: bool,
-        settlement: JsonObject | None = None,
+        settlement: JsonObject,
     ) -> bool:
-        """Replay the retained settlement, keeping it for another retry on failure.
-
-        Returns:
-            Whether the swept terminal write reached the ledger.
-        """
+        """Replay owned evidence, skipping busy requests and stale sweep selections."""
+        if not entry.execution_lock.acquire(blocking=False):
+            return False
         try:
-            self._finish_attempt(
-                attempt_id=attempt_id,
-                terminal_event=terminal,
-                failure=failure,
-                finalize_request=finalize,
-                **settlement_metadata(
-                    settlement,
-                    self._finish_attempt,
-                    **tier_settlement(entry, attempt_id),
-                ),
-                **web_search_requests_kwarg(
-                    self._finish_attempt, web_search_requests_from_terminal(terminal)
-                ),
-                **tool_search_requests_kwarg(
-                    self._finish_attempt, tool_search_requests_from_terminal(terminal)
-                ),
-            )
+            if self.entry(request_id) is not entry or entry.pending_settlement != settlement:
+                return False
+            self._commit_settlement(request_id, entry, settlement)
+            return True
         except Exception:  # noqa: BLE001 - keep the entry; the sweep retries.
             return False
-        failure = terminal.failure
-        opened = settlement is not None and settlement.get("opened") is True
-        record_attempt_health(
-            self._health,
-            self._loads,
-            entry,
-            attempt_id,
-            opened=opened,
-            failure=failure,
-            settlement=settlement,
-        )
-        # Cache-priority observations must not depend on which settlement path succeeds.
-        self._record_cache_fraction(entry, attempt_id, terminal)
-        record_session_outcome(
-            self.recovery,
-            self.recovery_host,
-            entry,
-            attempt_id,
-            None if terminal.usage_estimated else terminal.usage,
-            recovery_failure(settlement, failure),
-        )
-        with self._lock:
-            if finalize:
-                discard_guardrails(self._inflight.pop(request_id, None))
-            elif entry.active_attempt_id == attempt_id:
-                entry.active_attempt_id = None
-        return True
+        finally:
+            entry.execution_lock.release()

@@ -151,12 +151,12 @@ class InflightRequest:
             empty; untiered and customer-managed attempts have no entry.
         recovery_observed_at: First validated terminal receipt epoch per reserved attempt;
             retries never renew cache residency or failure cooldowns.
-        recovery_observation_lock: Serializes recovery observation timestamps and effects
+        recovery_observation_lock: Serializes recovery timestamps, effects and frozen estimates
             for this request only, never held across ledger I/O or host callbacks.
         estimated_cache_fractions: First cached-fraction sample used to price each attempt's
             disconnect estimate; retained retries reuse it without creating observed warmth.
-        execution_lock: Serializes reservation, abandonment and estimated-fraction retention
-            for this request only; fraction reads and tokenization run outside it.
+        execution_lock: Serializes reservation, settlement and abandonment for this request
+            only, so cleanup cannot replace an observed meter while it is being committed.
         pending_abandon: Terminal failure retained while a reservation is in flight.
         abandon_write_failed: Whether abandonment attempted durable cleanup and failed;
             waiting for an active execution alone is not an accounting failure.

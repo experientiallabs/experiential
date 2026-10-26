@@ -23,7 +23,6 @@ import threading
 import time
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
-from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 
 from exp.common.models.catalog_prices import BilledUnitKind
@@ -41,6 +40,7 @@ from exp.runtime.gateway.native_execution import (
     dispatchable_route_profiles,
     select_route_deployments,
 )
+from exp.runtime.gateway.native_request_settlement import RequestSettlements
 from exp.runtime.gateway.native_settlement import gateway_updating_failure
 from exp.runtime.gateway.stream_contracts import (
     BilledUnits,
@@ -69,6 +69,7 @@ from exp.runtime.gateway.video.providers import (
     default_video_clients,
     video_dialect,
 )
+from exp.runtime.gateway.video.settlement import JobGate, PendingSettlement, closed_job, zero_units
 from exp.runtime.gateway.video.store import ListOrder, VideoJobStore
 from exp.runtime.models.providers.base import GatewayWireProfile
 from exp.runtime.openai_protocol.errors import OpenAIProtocolError, public_failure_error
@@ -113,47 +114,6 @@ def video_not_found_error(video_id: str) -> OpenAIProtocolError:
     )
 
 
-def _zero_units(variant: str) -> GatewayUsage:
-    """Observed usage for a render that produced nothing: zero video seconds."""
-    return GatewayUsage(
-        billed_units=BilledUnits(
-            kind=BilledUnitKind.VIDEO_SECOND, variant=variant, quantity_milli=0
-        )
-    )
-
-
-@dataclass
-class _PendingSettlement:
-    """Retain the first terminal observation until both durable writes complete.
-
-    Attributes:
-        job: Open durable job associated with this observation.
-        closed: Exact terminal job to persist after accounting succeeds.
-        event: Original terminal meter, unchanged across retries.
-        failure: Original provider failure, if any.
-        ledger_written: Whether accounting acknowledged the terminal meter.
-    """
-
-    job: VideoJob
-    closed: VideoJob
-    event: GatewayEvent
-    failure: GatewayFailure | None
-    ledger_written: bool = False
-
-
-@dataclass
-class _JobGate:
-    """Serialize one video while retaining the gate across waiting callers.
-
-    Attributes:
-        lock: Serializes provider refresh and settlement delivery for this job.
-        users: Holders and waiters retaining this gate, initially zero.
-    """
-
-    lock: threading.Lock = field(default_factory=threading.Lock)
-    users: int = 0
-
-
 class VideoEngine:
     """Video job lifecycle over the native control plane's shared seams.
 
@@ -189,6 +149,7 @@ class VideoEngine:
         """
         self._components = components
         self._ledger = ledger
+        self._request_settlements = RequestSettlements(ledger)
         self._jobs = jobs
         self._guardrails = guardrails
         self._clients = dict(clients) if clients is not None else default_video_clients()
@@ -196,9 +157,10 @@ class VideoEngine:
         self._poll_interval = timedelta(seconds=max(0.0, poll_interval_seconds))
         self._outputs = outputs
         self._pending_lock = threading.Lock()
-        self._pending: dict[str, _PendingSettlement] = {}
-        self._job_gates: dict[str, _JobGate] = {}
-        self._recovery = FairRecovery[_PendingSettlement](lambda item: item.job.organization_id)
+        self._active_creates = 0
+        self._pending: dict[str, PendingSettlement] = {}
+        self._job_gates: dict[str, JobGate] = {}
+        self._recovery = FairRecovery[PendingSettlement](lambda item: item.job.organization_id)
         self._poll_stop = threading.Event()
         self._poller_lock = threading.Lock()
         self._poller: threading.Thread | None = None
@@ -229,34 +191,42 @@ class VideoEngine:
         Raises:
             NativeBridgeError: Any refusal, with its public error.
         """
-        deadline = (
-            time.monotonic() + VIDEO_JOB_SETTLEMENT_SECONDS + VIDEO_LEDGER_DEADLINE_SLACK_SECONDS
-        )
+        with self._pending_lock:
+            if self._poll_stop.is_set():
+                raise NativeBridgeError(_unavailable_error())
+            self._active_creates += 1
         try:
-            authorization = self._components.store.authorize_request(
-                raw_key=raw_key, alias=alias, request=request, deadline_monotonic=deadline
+            deadline = (
+                time.monotonic()
+                + VIDEO_JOB_SETTLEMENT_SECONDS
+                + VIDEO_LEDGER_DEADLINE_SLACK_SECONDS
             )
-            authorization = authorize_serving_model_chains(self._components, authorization)
-            authorization = with_client_identity(authorization, client_headers)
-        except Exception as exc:  # noqa: BLE001 - boundary sanitizes every failure.
-            raise authority_error(exc) from exc
-        require_unguarded_surface(self._guardrails, authorization, "video")
-        try:
-            self._ledger.accept_request(authorization=authorization)
-        except Exception as exc:  # noqa: BLE001 - boundary sanitizes every failure.
-            raise authority_error(exc) from exc
-        return self._dispatch(authorization, request, reference_image)
+            try:
+                authorization = self._components.store.authorize_request(
+                    raw_key=raw_key, alias=alias, request=request, deadline_monotonic=deadline
+                )
+                authorization = authorize_serving_model_chains(self._components, authorization)
+                authorization = with_client_identity(authorization, client_headers)
+            except Exception as exc:  # noqa: BLE001 - boundary sanitizes every failure.
+                raise authority_error(exc) from exc
+            require_unguarded_surface(self._guardrails, authorization, "video")
+            try:
+                self._ledger.accept_request(authorization=authorization)
+            except Exception as exc:  # noqa: BLE001 - boundary sanitizes every failure.
+                raise authority_error(exc) from exc
+            return self._dispatch(authorization, request, reference_image)
+        finally:
+            with self._pending_lock:
+                self._active_creates -= 1
 
     def _finish_request(
         self, authorization: AuthorizationSnapshot, failure: GatewayFailure
     ) -> None:
-        """Terminalize an accepted request that never dispatched, logging any write loss."""
+        """Retain a refused request's exact terminal write before attempting delivery."""
         try:
-            self._ledger.finish_request(
-                authorization=authorization, failure=failure, certify_no_effects=True
-            )
-        except Exception:  # noqa: BLE001 - the caller already gets the refusal.
-            _LOGGER.exception("video request %s could not be finished", authorization.request_id)
+            self._request_settlements.finish(authorization, failure, certify_no_effects=True)
+        except Exception as error:  # noqa: BLE001 - the caller already gets the refusal.
+            _LOGGER.warning("video request settlement retained: %s", type(error).__name__)
 
     def _dispatch(
         self,
@@ -434,29 +404,37 @@ class VideoEngine:
         )
 
     def _settle_unsent(self, job: VideoJob, failure: GatewayFailure, *, finalize: bool) -> None:
-        """Settle a rung whose provider created nothing at zero and hide its row."""
-        self._ledger.finish_attempt(
-            attempt_id=job.attempt_id,
-            terminal_event=GatewayEvent(
-                kind=GatewayEventKind.FAILED,
-                sequence_number=0,
-                failure=failure,
-                usage=_zero_units(job.variant),
-            ),
+        """Retain an observed zero-cost rejection, including its exact failover boundary."""
+        event = GatewayEvent(
+            kind=GatewayEventKind.FAILED,
+            sequence_number=0,
             failure=failure,
-            finalize_request=finalize,
+            usage=zero_units(job.variant),
         )
-        # The caller never receives this id, so the row never lists.
-        closed = _closed(job, failure, settled_milli=0, now=self._clock())
-        self._jobs.save_open(job=closed.model_copy(update={"deleted": True}))
+        self._settle_created(job, event, failure, finalize=finalize, settled_milli=0)
 
     def _settle_unknown(self, job: VideoJob, failure: GatewayFailure) -> None:
-        """Settle a submit the provider may have accepted with no usage (conservative)."""
-        self._ledger.finish_attempt(
-            attempt_id=job.attempt_id, terminal_event=None, failure=failure, finalize_request=True
-        )
-        closed = _closed(job, failure, settled_milli=None, now=self._clock())
-        self._jobs.save_open(job=closed.model_copy(update={"deleted": True}))
+        """Retain a submit the provider may have accepted without inventing zero usage."""
+        self._settle_created(job, None, failure, finalize=True, settled_milli=None)
+
+    def _settle_created(
+        self,
+        job: VideoJob,
+        event: GatewayEvent | None,
+        failure: GatewayFailure,
+        *,
+        finalize: bool,
+        settled_milli: int | None,
+    ) -> None:
+        """Own a create-path terminal observation before either durable write starts."""
+        closed = closed_job(job, failure, settled_milli=settled_milli, now=self._clock())
+        closed = closed.model_copy(update={"deleted": True})
+        with self._job_gate(job.video_id):
+            with self._pending_lock:
+                pending = self._pending.setdefault(
+                    job.video_id, PendingSettlement(job, closed, event, failure, finalize)
+                )
+            self._deliver_settlement(pending)
 
     # -- reads ------------------------------------------------------------------
 
@@ -621,7 +599,7 @@ class VideoEngine:
     def _job_gate(self, video_id: str, *, blocking: bool = True) -> Iterator[bool]:
         """Retain one job gate through waiters; never hold the registry across I/O."""
         with self._pending_lock:
-            gate = self._job_gates.setdefault(video_id, _JobGate())
+            gate = self._job_gates.setdefault(video_id, JobGate())
             gate.users += 1
         acquired = False
         try:
@@ -767,7 +745,7 @@ class VideoEngine:
                 kind=GatewayEventKind.FAILED,
                 sequence_number=0,
                 failure=failure,
-                usage=_zero_units(job.variant) if observed_zero else None,
+                usage=zero_units(job.variant) if observed_zero else None,
             )
         if completed:
             assert snapshot is not None
@@ -787,14 +765,14 @@ class VideoEngine:
         else:
             assert failure is not None
             code = None if snapshot is None else snapshot.error_code
-            closed = _closed(job, failure, settled_milli=billed, now=now, code=code)
+            closed = closed_job(job, failure, settled_milli=billed, now=now, code=code)
         with self._pending_lock:
             pending = self._pending.setdefault(
-                job.video_id, _PendingSettlement(job, closed, event, failure)
+                job.video_id, PendingSettlement(job, closed, event, failure)
             )
         return self._deliver_settlement(pending)
 
-    def _deliver_settlement(self, pending: _PendingSettlement) -> VideoJob:
+    def _deliver_settlement(self, pending: PendingSettlement) -> VideoJob:
         """Deliver under the job gate; uncertainty never erases the exact terminal meter."""
         try:
             if not pending.ledger_written:
@@ -802,7 +780,7 @@ class VideoEngine:
                     attempt_id=pending.job.attempt_id,
                     terminal_event=pending.event,
                     failure=pending.failure,
-                    finalize_request=True,
+                    finalize_request=pending.finalize_request,
                 )
                 pending.ledger_written = True
             saved = self._save(pending.closed)
@@ -817,6 +795,7 @@ class VideoEngine:
 
     def _retry_settlements(self) -> None:
         """Give each organization a bounded turn without polling providers again."""
+        self._request_settlements.retry(_POLLER_BATCH)
         with self._pending_lock:
             selected = self._recovery.select(list(self._pending.values()), _POLLER_BATCH)
         for pending in selected:
@@ -874,9 +853,8 @@ class VideoEngine:
                 try:
                     if closing:
                         self._retry_settlements()
-                        with self._pending_lock:
-                            if not self._pending:
-                                return
+                        if self._recovery_drained():
+                            return
                     else:
                         self.poll_open()
                 except Exception:  # noqa: BLE001 - the poller must outlive store hiccups.
@@ -896,11 +874,17 @@ class VideoEngine:
         """Join provider polling and exact-meter recovery before releasing the ledger."""
         if not 0 <= timeout_seconds <= 300:
             raise ValueError("video shutdown timeout must be between zero and 300 seconds")
-        self._poll_stop.set()
+        with self._pending_lock:
+            self._poll_stop.set()
         thread = self.start_poller()
         thread.join(timeout_seconds)
+        return not thread.is_alive() and self._recovery_drained()
+
+    def _recovery_drained(self) -> bool:
+        """Keep transport ownership for creates, active refreshes and retained terminal writes."""
         with self._pending_lock:
-            return not thread.is_alive() and not self._pending
+            active = self._active_creates or self._pending or self._job_gates
+        return not active and not self._request_settlements.outstanding
 
 
 def _unsupported_failure() -> GatewayFailure:
@@ -935,26 +919,4 @@ def _internal_failure() -> GatewayFailure:
     return GatewayFailure(
         failure_class=GatewayFailureClass.INTERNAL,
         safe_message="the video job could not be recorded",
-    )
-
-
-def _closed(
-    job: VideoJob,
-    failure: GatewayFailure,
-    *,
-    settled_milli: int | None,
-    now: datetime,
-    code: str | None = None,
-) -> VideoJob:
-    """Return the settled failed form of one job."""
-    return job.model_copy(
-        update={
-            "status": VideoStatus.FAILED,
-            "error_code": code or failure.failure_class.value,
-            "error_message": failure.provider_detail or failure.safe_message,
-            "billed_seconds_milli": settled_milli,
-            "completed_at": now,
-            "last_polled_at": now,
-            "settled": True,
-        }
     )
