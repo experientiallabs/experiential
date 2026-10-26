@@ -16,8 +16,9 @@ beside it as immutable children:
 The receipt's basis is fixed when it is minted: ``independent`` when no audited lineage was
 exposed or reserved by another receipt and no run already had a saved result, otherwise
 ``development-re-audit``. The headline is derived from the basis and every child: any
-re-attempt makes an independent receipt "independent, qualified: trace re-attempts". A replay
-of a fully saved receipt keeps the receipt's headline.
+re-attempt makes an independent receipt "independent, qualified: trace re-attempts", and any
+invalidation notice adds "invalidated: predating exposure" after "independent". A replay of a
+fully saved receipt keeps the receipt's headline.
 """
 
 from collections.abc import Callable
@@ -51,6 +52,7 @@ REPORT_TYPE = "held-out-audit-report"
 NOTICE_TYPE = "held-out-audit-notice"
 DETAIL_REPORT = "exp eval --audit --verbose (per-trace detail)"
 QUALIFIED = "independent, " + QUALIFICATION
+INVALIDATION = "invalidated: predating exposure"
 Basis = Literal["independent", "development-re-audit"]
 ReportKind = Literal["prepared", "stopped", "evaluation", "replay"]
 
@@ -263,10 +265,19 @@ class ReceiptView(ContractModel):
 
     @property
     def headline(self) -> str:
-        """``independent``, the qualified form after any re-attempt, or the re-audit basis."""
+        """The re-audit basis, or ``independent`` marked invalidated and qualified as needed.
+
+        Any invalidation notice marks it invalidated, and any re-attempt qualifies it, so a
+        receipt is plain ``independent`` only with neither.
+        """
         if self.receipt.basis == "development-re-audit":
             return "development re-audit"
-        return QUALIFIED if self.reattempts else "independent"
+        parts = ["independent"]
+        if self.notices:
+            parts.append(INVALIDATION)
+        if self.reattempts:
+            parts.append(QUALIFICATION)
+        return ", ".join(parts)
 
     @property
     def reported(self) -> bool:

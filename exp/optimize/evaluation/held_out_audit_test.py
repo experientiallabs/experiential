@@ -15,6 +15,7 @@ from pathlib import Path
 
 import pytest
 
+from exp.cli.evaluation.held_out_fidelity import title
 from exp.common.core.artifacts import JsonObject
 from exp.common.models import load_model_catalog, write_model_catalog
 from exp.common.project import ProjectStore
@@ -534,6 +535,7 @@ def test_late_links_after_dispatch_append_a_notice_and_later_exposure_never_does
             store, opened.receipt, opened.panel, kind="evaluation", detail_shown=True, clock=clock
         )
         assert not opened.reassess(clock) and opened.view.notices == ()
+        assert opened.view.headline == "independent"
     stored = store.artifacts.read_bytes(opened.receipt.receipt_id, "receipt.json")
     with audit(store, 2) as second:
         run(store, second)
@@ -544,6 +546,9 @@ def test_late_links_after_dispatch_append_a_notice_and_later_exposure_never_does
         assert [item.lineage for item in notice.exposed] == [second.receipt.lineages[0]]
         assert notice.exposed[0].path is not None
         assert notice.exposed[0].path.exposed_node == OUTSIDE
+        invalidated = "independent, invalidated: predating exposure"
+        assert second.view.headline == invalidated
+        assert title(second, second.view) == f"Held-out fidelity ({invalidated})"
     with audit(store, 2) as resumed:
         assert resumed.receipt == second.receipt and len(resumed.view.notices) == 1
     assert store.artifacts.read_bytes(opened.receipt.receipt_id, "receipt.json") == stored

@@ -557,7 +557,8 @@ ledger existed is refused until `exp build` is rerun on the same import to recor
 Grouping links recorded after a reservation are reassessed whenever its receipt is resumed or
 reports. If they reveal exposure that predates the receipt, an undispatched reservation is
 released and the audit refuses to run independently; once execution began, an invalidation
-notice is appended instead. The receipt and its snapshot are never rewritten, and exposure that
+notice is appended instead and the headline becomes "independent, invalidated: predating
+exposure". The receipt and its snapshot are never rewritten, and exposure that
 happens only after the receipt was minted never invalidates it.
 
 An audit runs in a fixed order: reserve, register, claim a dispatch slot, call. Selection reads

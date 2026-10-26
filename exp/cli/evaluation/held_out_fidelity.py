@@ -45,7 +45,6 @@ from exp.optimize.evaluation.held_out_audit import (
 from exp.optimize.evaluation.held_out_exposure import LIMITS, LineageExposure
 from exp.optimize.evaluation.held_out_fidelity import AuditCheckpoint, saved_held_out_results
 from exp.optimize.evaluation.held_out_receipts import (
-    QUALIFIED,
     AuditReceipt,
     AuditReport,
     ReceiptView,
@@ -281,13 +280,13 @@ def _run_audit(
 
 
 def title(audit: HeldOutAudit, view: ReceiptView) -> str:
-    """The aggregate's label: never plain independent once exposed, re-audited or re-attempted."""
+    """The aggregate's label: never plain independent once invalidated, re-audited or retried."""
     if audit.receipt.reaudited:
         return REAUDIT_TITLE
     if view.receipt.basis == "development-re-audit":
         return "Held-out re-audit (development)"
-    if view.headline == QUALIFIED:
-        return "Held-out fidelity (independent, qualified: trace re-attempts)"
+    if view.headline != "independent":
+        return f"Held-out fidelity ({view.headline})"
     return "Held-out fidelity"
 
 
