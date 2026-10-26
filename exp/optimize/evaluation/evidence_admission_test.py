@@ -544,3 +544,27 @@ def test_refinement_refuses_development_labels_on_a_held_out_task(
     with pytest.raises(EvidenceAdmissionError, match=r"\[sealed_partition_breach\]") as error:
         refine(held_out)
     assert f"held-out evaluation lineage {held_out.lineage_group_id}" in str(error.value)
+
+
+def test_rerunning_a_calibration_spec_refuses_a_stale_qualified_report(tmp_path: Path) -> None:
+    """A refusal that appears after the first run is not hidden behind the saved report."""
+    project, _, _ = native_label(tmp_path)
+    spec = calibration(project, witnessed_cases(project, specification(project)))
+    reference = execute_calibration(project, spec, code_revision="test")
+    assert reference is not None
+    assert execute_calibration(project, spec, code_revision="test") == reference
+    project.artifacts.write_json(
+        artifact_id="role-proposal",
+        artifact_type="task-refinement-proposal",
+        envelope=ArtifactEnvelope(schema_version=1, created_at=NOW, code_revision="test"),
+        files={
+            "proposal.json": {
+                "verifier": {
+                    "description": REFERENCE.description,
+                    "rules": [{"path": "/final_answer", "operator": "equals", "value": "done"}],
+                }
+            }
+        },
+    )
+    with pytest.raises(ValueError, match="re-run under a fresh run ID"):
+        execute_calibration(project, spec, code_revision="test")

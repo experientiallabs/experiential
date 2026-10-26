@@ -177,6 +177,13 @@ def execute_calibration(
     )
     if project.artifacts.exists(identity):
         reference = artifact_input(project.artifacts.read(identity).manifest)
+        saved = json.loads(project.artifacts.read_bytes(identity, "report.json"))
+        if sha256_json(saved) != sha256_json(result):
+            raise ValueError(
+                f"calibration run {spec.run_id} was saved as {saved.get('qualification')}, but "
+                f"the current evidence gives {result['qualification']}; the project's exposure "
+                "ledger or generated proposals changed since, so re-run under a fresh run ID"
+            )
         project.select_evaluation_task(reference)
         _deliver(project, spec, reference)
         return reference
