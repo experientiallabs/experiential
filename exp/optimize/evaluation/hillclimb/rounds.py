@@ -293,6 +293,9 @@ def run_climb_round(
                     )
                 },
             )
+            registration = saved_registration(store, climb, request.round)
+            assert registration is not None
+        # The saved deadline, not the request's equal instant in another offset, keys both panels.
         screen = run_stage(
             project,
             spec,
@@ -300,7 +303,7 @@ def run_climb_round(
             "screen",
             f"round {request.round} screen",
             plan.arms,
-            request.deadline,
+            registration.deadline,
             code_revision=code_revision,
         )
         confirm = None
@@ -312,7 +315,7 @@ def run_climb_round(
                 "confirm",
                 f"round {request.round} confirm",
                 plan.arms,
-                request.deadline,
+                registration.deadline,
                 code_revision=code_revision,
             )
         decided = confirm or screen

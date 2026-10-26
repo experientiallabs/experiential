@@ -1,6 +1,6 @@
 """A round payload names exactly one edit source."""
 
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -60,5 +60,9 @@ def test_an_interrupted_round_resumes_only_its_registered_panels(
     with pytest.raises(ValueError, match="under code revision test"):
         run_climb_round(project, request, code_revision="other")
     assert not actor.requests
-    record = run_climb_round(project, request, code_revision="test")
+    # The same instant written in another offset resumes the registered panels, not new ones.
+    shifted = request.deadline.astimezone(timezone(timedelta(hours=1)))
+    record = run_climb_round(
+        project, request.model_copy(update={"deadline": shifted}), code_revision="test"
+    )
     assert record.screen.unknown > 0
