@@ -221,13 +221,7 @@ and takes the same ladder as the billed empty stop. The Messages surface
 applies the same rule after commitment, when every committed event was one it cannot render.
 Provider-internal retry layers are disabled so every
 possible billable dispatch is visible to the gateway ledger.
-An open-phase, typed remote HTTP/2 `GOAWAY/NO_ERROR` is a graceful connection
-retirement for health observations: it releases a probe without adding a circuit
-failure or clearing earlier failures. Explicit retries retain their normal attempt
-limits and separate reservations. This health hint does not prove that the request
-was unprocessed; unknown usage and its accounting hold remain unresolved. Ordinary
-transport failures, midstream failures and `REFUSED_STREAM` keep their existing
-health behavior.
+See [graceful connection retirement](gateway-failover-rules.md#graceful-connection-retirement) for the health-only HTTP/2 hint.
 
 **Which rung a failover reaches.** A pre-commit failover-eligible failure advances to the first
 claimable rung this request has NOT dispatched yet, in route order, so a rung skipped earlier (shed

@@ -792,3 +792,6 @@ mod tests;
 #[cfg(test)]
 #[path = "upstream_reseller_tests.rs"]
 mod reseller_tests;
+
+#[cfg(test)]
+mod retirement_tests;

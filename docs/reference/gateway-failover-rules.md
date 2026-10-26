@@ -59,3 +59,13 @@ rungs keep the route's own `fallback_reason`.
 A rung at its per-worker in-flight bound is a different kind of bypass — a policy shed, not a
 failure — and what happens when every rung is shed is described in
 [gateway-lane-saturation.md](gateway-lane-saturation.md).
+
+## Graceful connection retirement
+
+An open-phase, typed remote HTTP/2 `GOAWAY/NO_ERROR` is a graceful connection
+retirement for health observations: it releases a probe without adding a circuit
+failure or clearing earlier failures. Explicit retries retain their normal attempt
+limits and separate reservations. This health hint does not prove that the request
+was unprocessed; unknown usage and its accounting hold remain unresolved. Ordinary
+transport failures, midstream failures and `REFUSED_STREAM` keep their existing
+health behavior.
