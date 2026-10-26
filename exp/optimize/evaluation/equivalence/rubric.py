@@ -140,7 +140,8 @@ class RubricDraft(ContractModel):
     Attributes:
         spec: Exact bounded derivation contract.
         proposal: Validated criteria and verbatim supporting evidence.
-        source_lineages: Build-resolved source families excluded from evaluation.
+        source_lineages: Build-resolved lineages of every source and ancestor trajectory,
+            excluded from evaluation.
     """
 
     spec: RubricDerivationSpec
@@ -239,20 +240,10 @@ def _sources(
     )
     allowed: dict[str, str] = {}
     sources: JsonObject = {}
-    lineages = set()
     if len(set(spec.sources)) != len(spec.sources):
         raise ValueError("rubric sources must be distinct")
     for reference in spec.sources:
-        manifest = project.artifacts.read(reference.artifact_id).manifest
-        if manifest.artifact_type != "actor-rubric-trajectory":
-            raise ValueError("rubric sources must be registered development trajectories")
-        source = RubricTrajectory.model_validate_json(
-            project.artifacts.read_bytes(reference.artifact_id, "trajectory.json")
-        )
-        require_development_task(project.artifacts, source.task)
-        if source.task.instruction != source.trajectory.task:
-            raise ValueError("rubric source task and chronology differ")
-        lineages.add(source.task.lineage_group_id)
+        source = _trajectory(project, reference)
         fields: JsonObject = {
             "task": source.trajectory.task,
             "task_context": source.trajectory.task_context,
@@ -273,7 +264,43 @@ def _sources(
                 if isinstance(value, str)
                 else json.dumps(value, ensure_ascii=False, sort_keys=True)
             )
-    return sources, allowed, tuple(sorted(lineages)), admissions
+    return sources, allowed, _lineages(project, spec.sources), admissions
+
+
+def _trajectory(project: ProjectStore, reference: ArtifactInput) -> RubricTrajectory:
+    """Load one registered development trajectory, refusing any other artifact."""
+    manifest = project.artifacts.read(reference.artifact_id).manifest
+    if manifest.artifact_type != "actor-rubric-trajectory":
+        raise ValueError(
+            "rubric sources and their ancestors must be registered development trajectories"
+        )
+    source = RubricTrajectory.model_validate_json(
+        project.artifacts.read_bytes(reference.artifact_id, "trajectory.json")
+    )
+    require_development_task(project.artifacts, source.task)
+    if source.task.instruction != source.trajectory.task:
+        raise ValueError("rubric source task and chronology differ")
+    return source
+
+
+def _lineages(project: ProjectStore, roots: tuple[ArtifactInput, ...]) -> tuple[str, ...]:
+    """Task lineage of every trajectory in the admitted ancestry, sources and ancestors alike.
+
+    A trajectory may descend from material of another family, which then shaped the rubric as
+    much as its own. Every ancestor must therefore be a trajectory whose lineage is known; the
+    caller has already admitted and bounded this ancestry.
+    """
+    pending = list(roots)
+    seen: set[ArtifactInput] = set()
+    lineages: set[str] = set()
+    while pending:
+        reference = pending.pop()
+        if reference in seen:
+            continue
+        seen.add(reference)
+        lineages.add(_trajectory(project, reference).task.lineage_group_id)
+        pending.extend(project.artifacts.read(reference.artifact_id).manifest.inputs)
+    return tuple(sorted(lineages))
 
 
 def _validate(

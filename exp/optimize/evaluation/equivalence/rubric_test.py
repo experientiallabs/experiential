@@ -436,3 +436,51 @@ def test_declared_families_exclude_every_lineage_of_a_development_family(
         load_equivalence_rubric(
             project, frozen, evaluation_lineages=("sibling",), families=families
         )
+
+
+def test_a_rubric_never_judges_a_family_its_sources_descend_from(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A source citing another family's trajectory excludes that family too."""
+    project, spec, _ = derivation_fixture(tmp_path, monkeypatch)
+    parent = spec.sources[0]
+    source = RubricTrajectory.model_validate_json(
+        project.artifacts.read_bytes(parent.artifact_id, "trajectory.json")
+    )
+    task = source.task.model_copy(update={"task_id": "child", "lineage_group_id": "child-family"})
+    child = register_rubric_trajectory(
+        project, source.model_copy(update={"task": task}), inputs=(parent,), code_revision="test"
+    )
+    access = declare_source_access(
+        project.artifacts, child, scope="development", rationale="Child", code_revision="test"
+    )
+    spec = spec.model_copy(update={"sources": (child,)})
+    monkeypatch.setattr(
+        owner, "review_call", Mock(return_value=rubric_proposal(child).model_dump(mode="json"))
+    )
+    draft = derive_equivalence_rubric(project, spec, code_revision="test")
+    frozen = freeze_equivalence_rubric(
+        project,
+        RubricReview(draft=draft, reviewer="author", rationale="Reviewed provisional criteria."),
+        code_revision="test",
+    )
+    assert load_equivalence_rubric(project, frozen, evaluation_lineages=("untouched",))
+    with pytest.raises(ValueError, match="lineages overlap"):
+        load_equivalence_rubric(project, frozen, evaluation_lineages=("rubric-source-family",))
+
+    # An ancestor whose lineage is unknown cannot prove separation, so it is refused.
+    declare_source_access(
+        project.artifacts,
+        access,
+        scope="development",
+        rationale="Not a trajectory",
+        code_revision="test",
+    )
+    opaque = register_rubric_trajectory(
+        project, source.model_copy(update={"task": task}), inputs=(access,), code_revision="test"
+    )
+    declare_source_access(
+        project.artifacts, opaque, scope="development", rationale="Opaque", code_revision="test"
+    )
+    with pytest.raises(ValueError, match="ancestors must be registered development trajectories"):
+        preflight_rubric_derivation(project, spec.model_copy(update={"sources": (opaque,)}))
