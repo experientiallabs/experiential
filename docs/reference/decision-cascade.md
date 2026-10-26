@@ -98,7 +98,9 @@ dispatch outcome stops the step instead: it is never resolved by a fresh main-mo
   complete action, ignoring call IDs). From that state the trajectories that took the decider's
   decision from the same state of the same checkpoint stand in for what would have followed
   (variants of one task can share a visible state over different hidden worlds); with none observed, the
-  trajectory counts as a task failure and a policy violation. Unknown outcomes stay bounds
+  trajectory counts as a task failure and a policy violation. A drafted answer is checked with
+  the runtime's own draft admission (visible tools, valid arguments and `never_delegate` on every
+  call); a draft the runtime would refuse is never delegated. Unknown outcomes stay bounds
   adverse to the cascade: an unknown donor counts as a failure, and an unknown main outcome of a
   trajectory the cascade changes counts as a main success. Task success and policy
   compliance are compared per lineage as the paired difference cascade minus main.

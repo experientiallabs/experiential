@@ -30,7 +30,7 @@ held-out lineages before anyone may claim it is non-inferior.
 """
 
 from collections import defaultdict
-from collections.abc import Mapping
+from collections.abc import Collection, Mapping
 from datetime import UTC, datetime
 from typing import Literal, Self
 
@@ -48,7 +48,7 @@ from exp.common.core.artifacts import (
 )
 from exp.common.evaluations.uncertainty import unit_difference_summary, unit_mean_summary
 from exp.common.models import ModelRequest, ModelSnapshot, load_model_catalog
-from exp.common.project import ProjectStore, artifact_input
+from exp.common.project import ArtifactStore, ProjectStore, artifact_input
 from exp.optimize.evaluation.analysis.decision_points import (
     DecisionPointSet,
     extract_decision_points,
@@ -67,6 +67,7 @@ from exp.runtime.agents.cascade import (
     DeciderDefinition,
     NextActionDecision,
     action_projection,
+    admitted_draft,
     decision_candidates,
     delegates,
 )
@@ -78,7 +79,7 @@ from exp.runtime.sessions.dispatch_ledger import DispatchLedger
 
 # Identity of the estimator and selection rule below, in place of their source text. Bump it
 # when either changes; exp/tests/code_protocols_test.py records the covered source.
-CASCADE_FIT_PROTOCOL = "decision-cascade-fit-v4"
+CASCADE_FIT_PROTOCOL = "decision-cascade-fit-v5"
 FIT_SCOPE = (
     "development fit on the main model's own trajectories; offline estimate splicing observed "
     "continuations at accepted disagreements and failing a trajectory without one; states the "
@@ -270,6 +271,7 @@ def estimate_threshold(
     predictions: Mapping[Sha256, NextActionDecision | None],
     threshold: float,
     spec: CascadeFitSpec,
+    refused_drafts: Collection[Sha256] = (),
 ) -> ThresholdRow:
     """Estimate one threshold by splicing observed continuations at accepted disagreements.
 
@@ -286,13 +288,16 @@ def estimate_threshold(
     The runtime is mirrored at every state. A state without a decider answer (an unknown or
     failed shadow dispatch) stops a trajectory still on the main path, as the deployed cascade
     stops the episode, and the stopped trajectory counts as a failure; a content error at
-    deployment would leave the main model responsible, so this bound is conservative.
+    deployment would leave the main model responsible, so this bound is conservative. A drafted
+    answer in ``refused_drafts``, which the runtime refuses as an invalid draft, is never
+    delegated.
 
     Args:
         points: Labelled decision points and trajectories.
         predictions: The decider's answer at every distinct state, None without one.
         threshold: Grid value.
         spec: Registration, for the restrictions and the objective.
+        refused_drafts: States whose drafted action ``admitted_draft`` refuses.
 
     Returns:
         The threshold's delegation counts and paired lineage differences.
@@ -314,7 +319,7 @@ def estimate_threshold(
                 stopped.add(trajectory)
             continue
         allowed = tuple(name for name in point.candidates if name not in spec.never_delegate)
-        if not delegates(
+        if point.state_sha256 in refused_drafts or not delegates(
             decision.selected, decision.confidence, threshold=threshold, allowed=allowed
         ):
             continue
@@ -460,7 +465,9 @@ def saved_cascade_fit(
     report = CascadeFitReport.model_validate_json(
         project.artifacts.read_bytes(identity + "-result", "report.json")
     )
-    if report.spec != spec or _derive(spec, report.points, report.predictions) != report:
+    if report.spec != spec or (
+        _derive(project.artifacts, spec, report.points, report.predictions) != report
+    ):
         raise ValueError("saved cascade fit does not reproduce from its registration")
     return report
 
@@ -474,18 +481,49 @@ def load_cascade_fit(project: ProjectStore, reference: ArtifactInput) -> Cascade
         project.artifacts.read_bytes(reference.artifact_id, "report.json")
     )
     if report.spec.identity(manifest.code_revision) + "-result" != reference.artifact_id or (
-        _derive(report.spec, report.points, report.predictions) != report
+        _derive(project.artifacts, report.spec, report.points, report.predictions) != report
     ):
         raise ValueError("cascade fit does not reproduce from its registration")
     return report
 
 
+def refused_drafts(
+    store: ArtifactStore,
+    spec: CascadeFitSpec,
+    points: DecisionPointSet,
+    predictions: tuple[ShadowPrediction, ...],
+) -> frozenset[Sha256]:
+    """Return the states whose drafted answer the runtime would refuse as an invalid draft.
+
+    Each draft is checked by the runtime's own ``admitted_draft`` against the saved request that
+    first reached its state, so visibility, argument schemas and ``never_delegate`` on every
+    call decide delegation exactly as in deployment.
+    """
+    calls = points.states()
+    refused = set()
+    for row in predictions:
+        if row.decision is None or row.decision.action is None:
+            continue
+        request = state_request(
+            ModelRequest.model_validate_json(
+                store.read_bytes(calls[row.state_sha256].artifact_id, "request.json")
+            )
+        )
+        if not admitted_draft(request, row.decision.action, spec.never_delegate):
+            refused.add(row.state_sha256)
+    return frozenset(refused)
+
+
 def _derive(
-    spec: CascadeFitSpec, points: DecisionPointSet, predictions: tuple[ShadowPrediction, ...]
+    store: ArtifactStore,
+    spec: CascadeFitSpec,
+    points: DecisionPointSet,
+    predictions: tuple[ShadowPrediction, ...],
 ) -> CascadeFitReport:
     """Compute every row, the selection and the policy from labels and saved answers."""
     answers = {row.state_sha256: row.decision for row in predictions}
-    rows = tuple(estimate_threshold(points, answers, value, spec) for value in spec.grid)
+    refused = refused_drafts(store, spec, points, predictions)
+    rows = tuple(estimate_threshold(points, answers, value, spec, refused) for value in spec.grid)
     status, selected = select_threshold(rows)
     main: dict[str, dict[str, list[float]]] = defaultdict(dict)
     for row in points.trajectories:
@@ -568,7 +606,7 @@ def run_cascade_fit(
                     state_sha256=state, decision=receipt.decision, failure=receipt.failure
                 )
             )
-        report = _derive(spec, points, tuple(predictions))
+        report = _derive(store, spec, points, tuple(predictions))
         store.write_json(
             artifact_id=identity + "-result",
             artifact_type="decision-cascade-fit",

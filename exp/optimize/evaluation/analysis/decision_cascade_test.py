@@ -8,16 +8,18 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from exp.common.core.artifacts import ArtifactInput, JsonObject, sha256_json
-from exp.common.models import load_model_catalog
+from exp.common.core.artifacts import ArtifactEnvelope, ArtifactInput, JsonObject, sha256_json
+from exp.common.models import AssistantAction, ToolCall, load_model_catalog
 from exp.common.project import ProjectStore
 from exp.optimize.evaluation.analysis import decision_cascade as owner
 from exp.optimize.evaluation.analysis.decision_cascade import (
     CascadeFitSpec,
     CascadeObjective,
+    ShadowPrediction,
     ThresholdRow,
     estimate_threshold,
     preflight_cascade_fit,
+    refused_drafts,
     run_cascade_fit,
     saved_cascade_fit,
 )
@@ -35,7 +37,8 @@ from exp.optimize.evaluation.analysis.decision_points_test import (
     world,
 )
 from exp.runtime.agents.cascade import OTHER, RESPOND, DeciderDefinition, NextActionDecision
-from exp.runtime.agents.cascade_test import snapshot
+from exp.runtime.agents.cascade_test import request, snapshot
+from exp.runtime.agents.chat_test import _response
 from exp.runtime.models.providers.transport import JsonHttpResponse
 from exp.simulation.evaluation.tasks import Verdict
 
@@ -251,12 +254,12 @@ CLOSE = NextActionDecision(
 )
 
 
-def offline(
+def fit_inputs(
     branches: list[tuple[Trajectory, DecisionPoint]],
     lineages: tuple[str, ...],
-    answer: NextActionDecision | None = CLOSE,
-) -> ThresholdRow:
-    """Estimate threshold 0.9 when the decider gives ``answer`` at the shared state."""
+    never_delegate: tuple[str, ...] = (),
+) -> tuple[DecisionPointSet, CascadeFitSpec]:
+    """Return the labelled points of ``branches`` and a threshold-0.9 registration over them."""
     model = snapshot("main-v1")
     points = DecisionPointSet(
         main_model=model,
@@ -264,12 +267,15 @@ def offline(
         trajectories=tuple(row for row, _ in branches),
         points=tuple(point for _, point in branches),
     )
-    decider = DeciderDefinition(kind="systemone", alias="jev", model=snapshot("jev-v1"))
+    decider = DeciderDefinition(
+        kind="sampled_drafts", alias="small", model=snapshot("small-v1"), samples=2
+    )
     spec = CascadeFitSpec(
         sources=points.studies,
         main_model=model,
         development_lineages=lineages,
         decider=decider,
+        never_delegate=never_delegate,
         grid=(0.9,),
         objective=CascadeObjective(
             success_margin=0.1,
@@ -281,6 +287,16 @@ def offline(
         maximum_physical_attempts=10,
         deadline=datetime.now(UTC) + timedelta(hours=1),
     )
+    return points, spec
+
+
+def offline(
+    branches: list[tuple[Trajectory, DecisionPoint]],
+    lineages: tuple[str, ...],
+    answer: NextActionDecision | None = CLOSE,
+) -> ThresholdRow:
+    """Estimate threshold 0.9 when the decider gives ``answer`` at the shared state."""
+    points, spec = fit_inputs(branches, lineages)
     return estimate_threshold(points, {STATE: answer}, 0.9, spec)
 
 
@@ -314,3 +330,39 @@ def test_a_state_without_a_decider_answer_stops_the_cascade_trajectory() -> None
     assert row.delegated == 0 and row.stopped_trajectories == 1
     assert row.success["unit_differences"] == {"a": -1.0}
     assert not row.feasible
+
+
+def test_a_draft_with_a_restricted_later_call_is_never_delegated_in_the_fit(
+    tmp_path: Path,
+) -> None:
+    """The fit refuses the drafts the runtime refuses, so they add no delegation or avoided call."""
+    points, spec = fit_inputs(
+        [branch("world-x", "a", 0, "close", "pass")], ("a",), never_delegate=("open",)
+    )
+    store = ProjectStore(tmp_path, "case").artifacts
+    store.write_json(
+        artifact_id=points.points[0].call.artifact_id,
+        artifact_type="continuation-actor-request",
+        envelope=ArtifactEnvelope(
+            schema_version=1, created_at=datetime.now(UTC), code_revision="test"
+        ),
+        files={"request.json": request("close", "open")},
+    )
+    calls = tuple(
+        ToolCall(call_id=f"c-{name}", name=name, arguments={"ticket": 1})
+        for name in ("close", "open")
+    )
+    draft = AssistantAction(tool_calls=calls)
+    decision = NextActionDecision(
+        selected="close",
+        probabilities={"close": 1.0, "open": 0.0, RESPOND: 0.0, OTHER: 0.0},
+        action=draft,
+        response=_response(draft).model_copy(update={"model": spec.decider.model}),
+    )
+    refused = refused_drafts(
+        store, spec, points, (ShadowPrediction(state_sha256=STATE, decision=decision),)
+    )
+    assert refused == {STATE}
+    row = estimate_threshold(points, {STATE: decision}, 0.9, spec, refused)
+    assert row.delegated == row.calls_avoided == 0
+    assert estimate_threshold(points, {STATE: decision}, 0.9, spec).calls_avoided == 1

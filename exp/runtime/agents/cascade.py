@@ -342,7 +342,7 @@ class CascadeModelClient:
             )
             return self._main_decides(request, candidates, decision, note)
         if decision.action is not None:
-            if decision.response is None or not _valid_draft(
+            if decision.response is None or not admitted_draft(
                 request, decision.action, self._policy.never_delegate
             ):
                 return self._main_decides(request, candidates, decision, "invalid_draft")
@@ -423,7 +423,7 @@ class CascadeModelClient:
         return response
 
 
-def _valid_draft(
+def admitted_draft(
     request: ModelRequest, action: AssistantAction, never_delegate: Collection[str]
 ) -> bool:
     """Accept a draft only when every call names a visible, delegable tool with valid arguments.
