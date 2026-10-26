@@ -143,6 +143,7 @@ def validate_brief_sources(
     for source in sources:
         if artifact_input(store.read(source.artifact_id).manifest) != source:
             raise ValueError("capability source differs from its saved digest")
+    _require_recorded_observations(store, brief)
     return sources
 
 
@@ -160,4 +161,25 @@ def load_capability_brief(store: ArtifactStore, reference: ArtifactInput) -> Cap
     for source in sources:
         if artifact_input(store.read(source.artifact_id).manifest) != source:
             raise ValueError("capability source differs from its saved digest")
+    _require_recorded_observations(store, brief)
     return brief
+
+
+def _require_recorded_observations(store: ArtifactStore, brief: CapabilityBrief) -> None:
+    """Refuse a recorded observation backed by simulated or generated output.
+
+    Raises:
+        ValueError: A ``recorded_observation`` source's provenance leaves recorded evidence.
+    """
+    # Admission imports evaluation tasks, which import this module, so import it here.
+    from exp.simulation.evaluation.admission import generated_ancestor
+
+    for row in brief.assumptions:
+        if row.authority != "recorded_observation":
+            continue
+        for source in row.sources:
+            if (generated := generated_ancestor(store, source)) is not None:
+                raise ValueError(
+                    f"recorded observation '{row.statement}' derives from {generated}, which "
+                    "is not recorded evidence; cite recorded artifacts or mark it speculation"
+                )

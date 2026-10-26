@@ -5,7 +5,8 @@ from pathlib import Path
 
 import pytest
 
-from exp.common.project import ProjectStore
+from exp.common.core.artifacts import ArtifactEnvelope
+from exp.common.project import ProjectStore, artifact_input
 from exp.common.tasks import TaskCase
 from exp.simulation.capability_briefs import (
     CapabilityAssumption,
@@ -94,4 +95,30 @@ def test_a_source_label_without_evidence_is_not_an_observation() -> None:
     with pytest.raises(ValueError, match="immutable sources"):
         CapabilityAssumption(
             statement="Concurrent edits serialize", authority="recorded_observation"
+        )
+
+
+def test_a_simulated_artifact_cannot_back_a_recorded_observation(tmp_path: Path) -> None:
+    """Simulator output labelled as a recorded observation cannot clear a qualification blocker."""
+    project = ProjectStore(tmp_path, "case")
+    predicted = artifact_input(
+        project.artifacts.write_json(
+            artifact_id="simulated-prediction",
+            artifact_type="world-checkpoint",
+            envelope=ArtifactEnvelope(
+                schema_version=1, created_at=datetime.now(UTC), code_revision="test"
+            ),
+            files={"checkpoint.json": {"serialized": True}},
+        )
+    )
+    observed = CapabilityAssumption(
+        statement="Concurrent edits serialize per workbook",
+        authority="recorded_observation",
+        sources=(predicted,),
+    )
+    mislabelled = brief().model_copy(update={"assumptions": (observed,)})
+    assert mislabelled.blockers() == ()
+    with pytest.raises(ValueError, match="not recorded evidence"):
+        persist_capability_brief(
+            project.artifacts, mislabelled, created_at=datetime.now(UTC), code_revision="test"
         )

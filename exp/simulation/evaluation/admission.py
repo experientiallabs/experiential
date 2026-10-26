@@ -430,7 +430,7 @@ def verify_label_witness(
     try:
         witness = _witness(store, challenge.witness)
         specification = _specification(store, witness.specification)
-        generated = _generated_ancestor(store, witness.specification)
+        generated = generated_ancestor(store, witness.specification)
     except (ArtifactStoreError, OSError, ValueError, ValidationError) as error:
         return refuse("unverifiable_witness", f"witness cannot be re-read: {error}")
     if generated is not None:
@@ -673,8 +673,12 @@ def _specification(store: ArtifactStore, reference: ArtifactInput) -> Evaluation
     )
 
 
-def _generated_ancestor(store: ArtifactStore, reference: ArtifactInput) -> str | None:
-    """The first model-generated artifact in a specification's provenance closure, if any."""
+def generated_ancestor(store: ArtifactStore, reference: ArtifactInput) -> str | None:
+    """The first model-generated artifact in a provenance closure, if any.
+
+    Raises:
+        ValueError: An artifact in the closure differs from its declared digest.
+    """
     queue, seen = deque((reference,)), set[str]()
     while queue:
         current = queue.popleft()
