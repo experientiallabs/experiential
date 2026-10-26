@@ -552,6 +552,8 @@ def test_rerunning_a_calibration_spec_refuses_a_stale_qualified_report(tmp_path:
     spec = calibration(project, witnessed_cases(project, specification(project)))
     reference = execute_calibration(project, spec, code_revision="test")
     assert reference is not None
+    report = json.loads(project.artifacts.read_bytes(reference.artifact_id, "report.json"))
+    assert report["qualification_refusals"] == []
     assert execute_calibration(project, spec, code_revision="test") == reference
     project.artifacts.write_json(
         artifact_id="role-proposal",
@@ -566,5 +568,7 @@ def test_rerunning_a_calibration_spec_refuses_a_stale_qualified_report(tmp_path:
             }
         },
     )
-    with pytest.raises(ValueError, match="re-run under a fresh run ID"):
+    refused = admit_calibration_evidence(project, spec.pack).refusals
+    assert refused and {row.reason for row in refused} == {"self_approval"}
+    with pytest.raises(ValueError, match="was saved as .* re-run under a fresh run ID"):
         execute_calibration(project, spec, code_revision="test")
