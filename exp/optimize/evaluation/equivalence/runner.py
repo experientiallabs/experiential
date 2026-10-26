@@ -402,27 +402,29 @@ def _assemble(
 
         The rubric's development sources are re-admitted under the source-access lock before
         each disclosure, so a source protected after the rubric was frozen stops later reviews.
+        The lock is released before the provider call; when it is busy, its ``Timeout`` stops
+        the report before anything is sent, and a later run retries the same request.
         """
         try:
             with CoordinationLock(
                 project.artifacts.project_directory / "source-access.lock", timeout=0
             ):
                 _rubric(project, spec)
-                return review_call(
-                    project,
-                    reviewer,
-                    body,
-                    identity=key,
-                    panel_id=identity,
-                    catalog_sha256=spec.cases[0].reference.catalog_sha256,
-                    maximum_attempts=spec.maximum_review_attempts,
-                    maximum_call_attempts=spec.review_attempt_allowance(),
-                    deadline=spec.deadline,
-                    sources=base_sources,
-                    code_revision=revision,
-                    allow_dispatch=allow_dispatch,
-                    consumer=consumer,
-                )
+            return review_call(
+                project,
+                reviewer,
+                body,
+                identity=key,
+                panel_id=identity,
+                catalog_sha256=spec.cases[0].reference.catalog_sha256,
+                maximum_attempts=spec.maximum_review_attempts,
+                maximum_call_attempts=spec.review_attempt_allowance(),
+                deadline=spec.deadline,
+                sources=base_sources,
+                code_revision=revision,
+                allow_dispatch=allow_dispatch,
+                consumer=consumer,
+            )
         finally:
             sources.update(review_inputs(project, key))
 

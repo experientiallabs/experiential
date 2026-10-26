@@ -6,6 +6,7 @@ import json
 from collections.abc import Callable, Sequence
 from typing import Literal
 
+from filelock import Timeout
 from pydantic import Field, model_validator
 
 from exp.common.core.artifacts import ContractModel, JsonObject, Sha256, sha256_json
@@ -193,6 +194,10 @@ def evaluate_actor_equivalence(
 
     Returns:
         All five criterion statuses, including explicit request/validation failures.
+
+    Raises:
+        Timeout: A coordination lock the completion path takes was busy. Nothing was judged,
+            so the caller retries the same request instead of recording a failure.
     """
     comparison_id = sha256_json(pair)
     judge_id = sha256_json(
@@ -292,6 +297,8 @@ def evaluate_actor_equivalence(
             axes=outcomes,
             score_100=rubric_score_100(outcomes),
         )
+    except Timeout:
+        raise
     except (ValueError, RuntimeError, TimeoutError, OSError) as error:
         axes = tuple(
             AxisOutcome(dimension_id=key, status="judge_failure", rationale=type(error).__name__)
