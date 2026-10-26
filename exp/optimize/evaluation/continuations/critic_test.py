@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from exp.common.core.artifacts import sha256_json
+from exp.common.models import ModelCatalog, load_model_catalog, write_model_catalog
 from exp.common.project import ProjectStore
 from exp.optimize.evaluation.continuations import critic as actor_critic
 from exp.optimize.evaluation.continuations.critic import (
@@ -139,6 +140,29 @@ def test_critic_estimate_binds_later_continuations_and_cannot_change_actor_polic
             verifier_sha256=spec.verifier_sha256,
             probe_sha256=spec.probe_sha256,
         )
+
+
+def test_critic_dispatches_the_catalog_its_preflight_checked(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A catalog edited after preflight cannot redirect the frozen request to another model."""
+    project, job, spec, transport = critic_fixture(tmp_path, monkeypatch)
+    path = project.model_catalog_path
+
+    def load_then_drift(source: Path) -> ModelCatalog:
+        """Return the checked catalog, then point the critic alias at another model."""
+        checked = load_model_catalog(source)
+        record = checked.models[job.actor_alias].model_copy(update={"model": "drifted"})
+        write_model_catalog(
+            path,
+            checked.model_copy(update={"models": {**checked.models, job.actor_alias: record}}),
+        )
+        return checked
+
+    monkeypatch.setattr(actor_critic, "load_model_catalog", load_then_drift)
+    predict_success(project, spec, code_revision="test")
+    (request,) = transport.requests
+    assert request.payload["model"] == spec.critic_model.model_id
 
 
 def test_invalid_saved_estimate_is_not_redrawn(

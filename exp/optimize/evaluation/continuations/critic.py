@@ -15,6 +15,7 @@ from exp.common.core.artifacts import (
     stable_id,
 )
 from exp.common.models import (
+    ModelCatalog,
     ModelMessage,
     ModelRequest,
     ModelResponse,
@@ -159,8 +160,11 @@ def critic_request(store: ArtifactStore, spec: CriticSpec) -> ModelRequest:
     return request
 
 
-def preflight_critic(project: ProjectStore, spec: CriticSpec) -> None:
-    """Validate model and public projection before credentials, runtime imports or any call."""
+def preflight_critic(project: ProjectStore, spec: CriticSpec) -> ModelCatalog:
+    """Validate model and public projection before credentials, runtime imports or any call.
+
+    Returns the validated catalog, so dispatch resolves the critic from exactly what was checked.
+    """
     request = critic_request(project.artifacts, spec)
     catalog = load_model_catalog(project.model_catalog_path)
     if sha256_json(catalog.model_dump(mode="json")) != spec.catalog_sha256:
@@ -196,6 +200,7 @@ def preflight_critic(project: ProjectStore, spec: CriticSpec) -> None:
         "azure",
     }:
         raise ValueError("critic requires a provider using the admitted HTTP transport")
+    return catalog
 
 
 def load_critic_prediction(store: ArtifactStore, reference: ArtifactInput) -> CriticPrediction:
@@ -297,7 +302,7 @@ def predict_success(
             reference = artifact_input(store.read(identity).manifest)
             load_critic_prediction(store, reference)
             return reference
-        preflight_critic(project, spec)
+        catalog = preflight_critic(project, spec)
         request = critic_request(store, spec)
         intent_id, response_id = identity + "-intent", identity + "-response"
         if not store.exists(response_id):
@@ -325,9 +330,7 @@ def predict_success(
                     sha256_json(spec),
                 ),
             )
-            registry = RuntimeModelCatalog(
-                load_model_catalog(project.model_catalog_path), transport_factory=lambda: transport
-            )
+            registry = RuntimeModelCatalog(catalog, transport_factory=lambda: transport)
             response = registry.resolve(spec.critic_alias).client.complete(request)
             store.write_json(
                 artifact_id=response_id,
