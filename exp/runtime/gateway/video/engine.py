@@ -775,23 +775,53 @@ class VideoEngine:
     def _deliver_settlement(self, pending: PendingSettlement) -> VideoJob:
         """Deliver under the job gate; uncertainty never erases the exact terminal meter."""
         try:
-            if not pending.ledger_written:
-                self._ledger.finish_attempt(
-                    attempt_id=pending.job.attempt_id,
-                    terminal_event=pending.event,
-                    failure=pending.failure,
-                    finalize_request=pending.finalize_request,
-                )
-                pending.ledger_written = True
-            saved = self._save(pending.closed)
-            if not saved.settled:
-                return pending.job
+            saved = self._settled_job_winner(pending)
+            if saved is None:
+                if not pending.ledger_written:
+                    self._ledger.finish_attempt(
+                        attempt_id=pending.job.attempt_id,
+                        terminal_event=pending.event,
+                        failure=pending.failure,
+                        finalize_request=pending.finalize_request,
+                    )
+                    pending.ledger_written = True
+                saved = self._save(pending.closed)
+                if not saved.settled:
+                    return pending.job
         except Exception as error:  # noqa: BLE001 - retain the exact record for fair retry.
-            _LOGGER.warning("video settlement retained: %s", type(error).__name__)
-            return pending.job
+            # Another process may have won after our first read. A settled job
+            # is published only after its ledger write; an open or unreadable
+            # row cannot establish that the original evidence is recoverable.
+            try:
+                saved = self._settled_job_winner(pending)
+            except Exception:  # noqa: BLE001 - a failed reread never releases ownership.
+                saved = None
+            if saved is None:
+                _LOGGER.warning("video settlement retained: %s", type(error).__name__)
+                return pending.job
         with self._pending_lock:
-            del self._pending[pending.job.video_id]
+            if self._pending.get(pending.job.video_id) is pending:
+                del self._pending[pending.job.video_id]
         return saved
+
+    def _settled_job_winner(self, pending: PendingSettlement) -> VideoJob | None:
+        """Accept only a durable terminal record for this exact request and attempt."""
+        current = self._jobs.load_any(video_id=pending.job.video_id)
+        if current is None or not current.settled:
+            return None
+        if (
+            current.video_id,
+            current.organization_id,
+            current.request_id,
+            current.attempt_id,
+        ) != (
+            pending.job.video_id,
+            pending.job.organization_id,
+            pending.job.request_id,
+            pending.job.attempt_id,
+        ):
+            raise RuntimeError("video settlement winner changed request or attempt identity")
+        return current
 
     def _retry_settlements(self) -> None:
         """Give each organization a bounded turn without polling providers again."""

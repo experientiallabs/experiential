@@ -459,13 +459,13 @@ def test_failed_create_settlement_retains_exact_rejection_or_unknown_usage(
 
 
 def test_failed_create_request_finish_is_owned_by_shutdown(setup: _Setup) -> None:
-    """A refused unpriced request retains its no-effects certificate until committed."""
+    """An admitted unsupported duration retains its no-effects certificate until committed."""
     finish = setup.components.ledger.finish_request
     with patch.object(
         setup.components.ledger, "finish_request", side_effect=RuntimeError("offline")
     ) as failed:
         with pytest.raises(NativeBridgeError):
-            _create(setup, alias="veo-unpriced")
+            _create(setup, alias="grok-video", seconds=16)
         assert not setup.engine.close(0.01)
     original = failed.call_args.kwargs
     with patch.object(setup.components.ledger, "finish_request", wraps=finish) as recovered:
@@ -544,6 +544,64 @@ def test_job_store_retry_does_not_repeat_acknowledged_accounting(setup: _Setup) 
         assert setup.engine.close(5)
         assert finish.call_count == 1
     assert _attempts(setup)[0]["budget_settled_nano_usd"] == 8 * _VEO_RATE
+
+
+@pytest.mark.parametrize("delay_winner_job", [False, True])
+def test_another_engine_settlement_winner_releases_the_losing_retry_owner(
+    setup: _Setup, delay_winner_job: bool
+) -> None:
+    """A conflicting timeout drains only after the completed winner is durably published."""
+    job = _create(setup, alias="grok-video", seconds=6)
+    other = _stored_engine(setup, InMemoryVideoOutputStore())
+    jobs = setup.components.video_jobs
+    assert jobs is not None
+    finish = setup.components.ledger.finish_attempt
+    observed_at = setup.clock.now
+    setup.clock.now += timedelta(seconds=VIDEO_JOB_SETTLEMENT_SECONDS + 1)
+    winner_started = False
+
+    def finish_after_winner(
+        *,
+        attempt_id: str,
+        terminal_event: GatewayEvent | None,
+        failure: GatewayFailure | None,
+        finalize_request: bool,
+    ) -> None:
+        """Commit another engine's completion after the loser's initial durable read."""
+        nonlocal winner_started
+        if not winner_started:
+            winner_started = True
+            setup.clock.now = observed_at
+            if delay_winner_job:
+                with patch.object(jobs, "save_open", side_effect=RuntimeError("offline")):
+                    assert not other.refresh(job).settled
+            else:
+                assert other.refresh(job).settled
+        finish(
+            attempt_id=attempt_id,
+            terminal_event=terminal_event,
+            failure=failure,
+            finalize_request=finalize_request,
+        )
+
+    with patch.object(setup.components.ledger, "finish_attempt", side_effect=finish_after_winner):
+        result = setup.engine.refresh(job)
+    if delay_winner_job:
+        assert not result.settled
+        assert not setup.engine.close(0.01)
+    else:
+        assert result.settled and result.status is VideoStatus.COMPLETED
+        assert result.billed_seconds_milli == 5_000
+    assert other.close(5)
+    assert setup.engine.close(5)
+    current = jobs.load_any(video_id=job.video_id)
+    assert current is not None and current.settled
+    assert current.status is VideoStatus.COMPLETED
+    assert current.billed_seconds_milli == 5_000
+    (attempt,) = _attempts(setup)
+    assert attempt["state"] == "completed"
+    assert attempt["billed_quantity_milli"] == 5_000
+    assert attempt["budget_settled_nano_usd"] == 5 * _XAI_RATE
 
 
 def test_stale_waiter_observes_the_settled_winner_after_deadline(setup: _Setup) -> None:

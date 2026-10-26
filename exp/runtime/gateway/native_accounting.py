@@ -202,7 +202,7 @@ class NativeAttemptAccounting:
         """Return whether every durable terminal write has landed."""
         with self._lock:
             pending = any(
-                entry.pending_settlement is not None or entry.pending_abandon is not None
+                entry.settlement_write_failed or entry.pending_abandon is not None
                 for entry in self._inflight.values()
             )
         return not pending and not self.request_settlements.pending
@@ -213,7 +213,7 @@ class NativeAttemptAccounting:
         with self._lock:
             pending = any(
                 entry.authorization.organization_id == organization_id
-                and (entry.pending_settlement is not None or entry.abandon_write_failed)
+                and (entry.settlement_write_failed or entry.abandon_write_failed)
                 for entry in self._inflight.values()
             )
         if pending:
@@ -744,15 +744,17 @@ class NativeAttemptAccounting:
         request_id = str(data["request_id"])
         with self._lock:
             entry = self._inflight.get(request_id)
-        if entry is None:
-            return "{}"
-        with entry.execution_lock:
-            if self.entry(request_id) is not entry:
+            if entry is None:
                 return "{}"
             if entry.pending_settlement is not None:
                 if entry.pending_settlement["attempt_id"] != data["attempt_id"]:
                     raise NativeBridgeError(accounting_recovering_error())
                 data = entry.pending_settlement
+            else:
+                entry.pending_settlement = data
+        with entry.execution_lock:
+            if self.entry(request_id) is not entry or entry.pending_settlement is not data:
+                return "{}"
             return self._commit_settlement(request_id, entry, data)
 
     def _commit_settlement(self, request_id: str, entry: InflightRequest, data: JsonObject) -> str:
@@ -785,6 +787,7 @@ class NativeAttemptAccounting:
             # Both retry paths retain the original outcome, usage and tier evidence.
             with self._lock:
                 entry.pending_settlement = data
+                entry.settlement_write_failed = True
             raise authority_error(exc) from exc
         failure = terminal.failure
         record_attempt_health(
@@ -808,6 +811,7 @@ class NativeAttemptAccounting:
         with self._lock:
             if entry.pending_settlement == data:
                 entry.pending_settlement = None
+                entry.settlement_write_failed = False
             if finalize:
                 discard_guardrails(self._inflight.pop(request_id, None))
             elif entry.active_attempt_id == attempt_id:
@@ -851,10 +855,11 @@ class NativeAttemptAccounting:
         if not entry.execution_lock.acquire(blocking=False):
             return '{"terminalized":false}'
         try:
-            if self.entry(request_id) is not entry:
-                return '{"terminalized":true}'
-            if entry.pending_settlement is not None:
-                return '{"terminalized":false}'
+            with self._lock:
+                if self._inflight.get(request_id) is not entry:
+                    return '{"terminalized":true}'
+                if entry.pending_settlement is not None:
+                    return '{"terminalized":false}'
             try:
                 if entry.active_attempt_id is not None:
                     record_attempt_health(
@@ -886,6 +891,11 @@ class NativeAttemptAccounting:
                     entry.abandon_write_failed = True
                 raise authority_error(exc) from exc
             with self._lock:
+                # A meter may arrive while the unknown cancellation is writing.
+                # MemoryDB can upgrade pending usage; a conflicting terminal
+                # owner must retain the evidence instead of reporting a drain.
+                if entry.pending_settlement is not None:
+                    return '{"terminalized":false}'
                 discard_guardrails(self._inflight.pop(request_id, None))
             return '{"terminalized":true}'
         finally:

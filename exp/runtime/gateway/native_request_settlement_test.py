@@ -160,6 +160,9 @@ def test_concurrent_terminal_callers_share_the_acknowledged_commit() -> None:
     assert results == [True, True]
     assert calls == [1]
     assert not pending.outstanding
+    # This fixture separately registered an admitted request. The lower-level
+    # RequestSettlements owner cannot remove that native registry entry.
+    accounting.abandon(json.dumps({"request_id": entry.authorization.request_id}))
     assert accounting.close(5)
 
 

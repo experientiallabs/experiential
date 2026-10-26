@@ -4812,6 +4812,57 @@ def test_idle_recovery_shutdown_flushes_retained_request_meter() -> None:
     assert accounting.accounting_healthy
 
 
+def test_observed_meter_owns_abandonment_before_waiting_for_execution_gate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cleanup winning the gate after observation cannot replace the exact meter."""
+    accounting, ledger, entry = _registry()
+    attempt_id = str(_start(accounting, ordinal=0)["attempt_id"])
+    gate = entry.execution_lock
+    cleanups: list[object] = []
+
+    class InterceptGate:
+        """Run competing cleanup exactly before the observed callback takes its gate."""
+
+        def __enter__(self) -> None:
+            accounting.require_clear(entry.authorization.organization_id)
+            assert accounting.accounting_healthy
+            cleanups.append(
+                json.loads(accounting.abandon(json.dumps({"request_id": "request-one"})))
+            )
+            gate.acquire()
+
+        def __exit__(self, *_exception: object) -> None:
+            gate.release()
+
+        def acquire(self, *, blocking: bool) -> bool:
+            return gate.acquire(blocking=blocking)
+
+        def release(self) -> None:
+            gate.release()
+
+    monkeypatch.setattr(entry, "execution_lock", InterceptGate())
+    accounting.settle(
+        json.dumps(
+            {
+                "request_id": entry.authorization.request_id,
+                "attempt_id": attempt_id,
+                "outcome": "completed",
+                "usage": {"input_tokens": 123, "output_tokens": 12},
+                "finalize": True,
+                "opened": True,
+            }
+        )
+    )
+    assert cleanups == [{"terminalized": False}]
+    assert len(ledger.finished) == 1
+    terminal = ledger.terminal_events[-1]
+    assert terminal is not None and terminal.kind is GatewayEventKind.COMPLETED
+    assert terminal.usage is not None
+    assert (terminal.usage.input_tokens, terminal.usage.output_tokens) == (123, 12)
+    assert accounting.close(5)
+
+
 def test_shutdown_waits_for_an_admitted_attempt_before_its_terminal_callback() -> None:
     """A dropped data-plane task keeps recovery ownership until deadline abandonment."""
     accounting, ledger, entry = _registry()
@@ -4908,3 +4959,118 @@ def test_shutdown_keeps_recovery_alive_for_an_in_progress_terminal_write(
         assert terminal is not None and terminal.kind is GatewayEventKind.COMPLETED
         assert terminal.usage is not None
         assert (terminal.usage.input_tokens, terminal.usage.output_tokens) == (123, 12)
+
+
+@pytest.mark.parametrize("fail_observed_write", [False, True])
+def test_meter_arriving_during_abandonment_stays_owned_until_exact_ack(
+    monkeypatch: pytest.MonkeyPatch, fail_observed_write: bool
+) -> None:
+    """An unknown write already in flight cannot erase a newly retained exact meter."""
+    from unittest.mock import DEFAULT, Mock
+
+    monkeypatch.setattr(NativeAttemptAccounting, "_sweep_loop", lambda self: None)
+    accounting, ledger, entry = _registry()
+    attempt_id = str(_start(accounting, ordinal=0)["attempt_id"])
+    abandoned_write, release, observed_waiting = (
+        threading.Event(),
+        threading.Event(),
+        threading.Event(),
+    )
+    gate = entry.execution_lock
+
+    class ObservedGate:
+        """Signal after the observed callback retains its meter but before it gets the gate."""
+
+        def __enter__(self) -> None:
+            observed_waiting.set()
+            gate.acquire()
+
+        def __exit__(self, *_exception: object) -> None:
+            gate.release()
+
+        def acquire(self, *, blocking: bool) -> bool:
+            return gate.acquire(blocking=blocking)
+
+        def release(self) -> None:
+            gate.release()
+
+    fail_next_observed = fail_observed_write
+
+    def delayed_abandonment(**fields: object) -> object:
+        """Pause the unknown write, then optionally reject the first exact-meter delivery."""
+        nonlocal fail_next_observed
+        terminal = fields["terminal_event"]
+        assert isinstance(terminal, GatewayEvent)
+        if terminal.kind is GatewayEventKind.FAILED:
+            abandoned_write.set()
+            assert release.wait(5)
+        elif fail_next_observed:
+            fail_next_observed = False
+            raise RuntimeError("exact write temporarily unavailable")
+        return DEFAULT
+
+    monkeypatch.setattr(entry, "execution_lock", ObservedGate())
+    finish = Mock(wraps=ledger.finish_attempt, side_effect=delayed_abandonment)
+    monkeypatch.setattr(accounting, "_finish_attempt", finish)
+    payload = {
+        "request_id": entry.authorization.request_id,
+        "attempt_id": attempt_id,
+        "outcome": "completed",
+        "usage": {"input_tokens": 123, "output_tokens": 12},
+        "finalize": True,
+        "opened": True,
+    }
+    abandonment: list[object] = []
+    failures: list[BaseException] = []
+
+    def abandon() -> None:
+        """Begin conservative cleanup before the observed callback arrives."""
+        try:
+            abandonment.append(
+                json.loads(accounting.abandon(json.dumps({"request_id": "request-one"})))
+            )
+        except BaseException as error:  # noqa: BLE001 - propagate worker failures to the test.
+            failures.append(error)
+
+    def settle() -> None:
+        """Deliver exact usage while the abandonment writer holds the execution gate."""
+        try:
+            accounting.settle(json.dumps(payload))
+        except BaseException as error:  # noqa: BLE001 - propagate worker failures to the test.
+            failures.append(error)
+
+    cleanup = threading.Thread(target=abandon)
+    observed = threading.Thread(target=settle)
+    cleanup.start()
+    try:
+        assert abandoned_write.wait(5)
+        observed.start()
+        assert observed_waiting.wait(5)
+        assert entry.pending_settlement == payload
+    finally:
+        release.set()
+        cleanup.join(5)
+        if observed.ident is not None:
+            observed.join(5)
+    assert not cleanup.is_alive() and not observed.is_alive()
+    assert abandonment == [{"terminalized": False}]
+    if fail_observed_write:
+        assert len(failures) == 1 and isinstance(failures[0], NativeBridgeError)
+        assert accounting.entry("request-one") is entry
+        assert entry.pending_settlement == payload
+        assert not accounting.close(0.01)
+        first_observed = finish.call_args.kwargs
+        accounting.sweep_expired()
+        assert finish.call_args.kwargs == first_observed
+    else:
+        assert not failures
+    assert finish.call_count == (3 if fail_observed_write else 2)
+    assert accounting.entry("request-one") is None
+    assert accounting.close(5)
+    assert len(ledger.finished) == 2
+    unknown, exact = ledger.terminal_events
+    assert unknown is not None and unknown.kind is GatewayEventKind.FAILED
+    assert unknown.usage is None
+    assert exact is not None and exact.kind is GatewayEventKind.COMPLETED
+    assert exact.usage is not None
+    assert (exact.usage.input_tokens, exact.usage.output_tokens) == (123, 12)
