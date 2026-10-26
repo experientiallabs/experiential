@@ -5,7 +5,7 @@ transport is scripted, so admission, spend consent, request budgets, replay and 
 """
 
 import json
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -256,16 +256,28 @@ def test_a_refused_answer_is_recorded_never_redrawn_and_leaves_its_lessons_unexp
     assert len(wire.requests) == calls
 
 
+def contract_per_trace(body: JsonObject) -> JsonObject:
+    """An extraction answer proposing the shared contract once per shown trace."""
+    return {"lessons": [lesson(CONTRACT, [label]) for label in shown_labels(body)]}
+
+
 def saved_candidates(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    extract: Callable[[JsonObject], JsonObject] = contract_per_trace,
+    **settings: int,
 ) -> tuple[Path, ProjectStore, JsonObject, str]:
     """A root whose candidate set is already saved, as an interrupted run leaves it.
 
-    Returns the root, its store, the operation and the plan identity.
+    ``extract`` answers the extraction request and ``settings`` override the operation's
+    agent memory bounds. Returns the root, its store, the operation and the plan identity.
     """
     root = project_root(tmp_path, monkeypatch)
     store = ProjectStore(root, PROJECT)
     command = operation(tmp_path)
+    memory = command["agent_memory"]
+    assert isinstance(memory, dict)
+    memory.update(settings)
     prepared = prepare_agent_memory(
         store,
         AgentMemorySpec.model_validate(command["agent_memory"]),
@@ -275,13 +287,7 @@ def saved_candidates(
     extract_candidates(
         store,
         prepared,
-        scripted(
-            {
-                "extract": lambda body: {
-                    "lessons": [lesson(CONTRACT, [label]) for label in shown_labels(body)]
-                }
-            }
-        ),
+        scripted({"extract": extract}),
         code_revision=installed_execution_revision(),
         clock=lambda: datetime.now(UTC),
     )
@@ -349,6 +355,55 @@ def test_a_resumed_consolidation_dispatches_only_while_its_reservation_is_held(
     stages = {row.stage for row in summary.authorizations}
     assert sha256_json({"plan": plan_id, "stage": "consolidate"}) in stages
     assert sha256_json({"plan": plan_id, "stage": "extract"}) not in stages
+
+
+def test_a_merge_lost_in_flight_is_sent_once_across_the_run_and_its_resume(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A dispatch with no answer stops the run; the resume records it and never resends it."""
+
+    def long_pairs(body: JsonObject) -> JsonObject:
+        """Four candidates of about 4,000 bytes, packed two to a merge request."""
+        label = shown_labels(body)[0]
+        rows = [lesson(f"{name} " + "x" * 4_000, [label]) for name in ("a1", "a2", "b1", "b2")]
+        return {"lessons": rows}
+
+    root, _, command, _ = saved_candidates(
+        tmp_path, monkeypatch, long_pairs, batch_bytes=10_000, maximum_trace_bytes=5_000
+    )
+    lost: list[RecordedRequest] = []
+
+    class LosingWire(ScriptedWire):
+        """Loses the response to every merge request that shows the b candidates."""
+
+        def post(
+            self,
+            url: str,
+            *,
+            headers: Mapping[str, str],
+            payload: JsonObject,
+            timeout_seconds: float,
+        ) -> JsonHttpResponse:
+            """Count and lose a b merge; answer every other request."""
+            text = json.dumps(payload)
+            if "b1 " in text and '"sources"' in text:
+                lost.append(RecordedRequest(url, headers, payload))
+                raise ConnectionError("connection reset after the request was sent")
+            return super().post(
+                url, headers=headers, payload=payload, timeout_seconds=timeout_seconds
+            )
+
+    wire = LosingWire()
+    monkeypatch.setattr(agent_memory, "HttpxJsonTransport", lambda: wire)
+    code, _ = resume(root, tmp_path, command)
+    # The wire's own retries resend the same attempt under one idempotency key.
+    sent = len(lost)
+    assert code != 0 and sent >= 1
+    assert len({request.headers["Idempotency-Key"] for request in lost}) == 1
+    code, output = resume(root, tmp_path, command)
+    assert code == 0, output
+    assert len(lost) == sent
+    assert "1 requests unusable" in output and "unusable merge" in output
 
 
 def test_dry_run_prints_the_preflight_and_makes_no_call(
