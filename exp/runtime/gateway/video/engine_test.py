@@ -288,7 +288,8 @@ def _attempts(setup: _Setup) -> list[sqlite3.Row]:
         return connection.execute(
             """
             SELECT state, budget_reserved_nano_usd, budget_settled_nano_usd,
-                   estimated_cost_nano_usd, billed_quantity_milli, usage_source, deployment_id
+                   estimated_cost_nano_usd, billed_quantity_milli, usage_source, deployment_id,
+                   failure_class, accounting_recovery
             FROM gateway_attempts ORDER BY rowid
             """
         ).fetchall()
@@ -669,6 +670,148 @@ def test_late_provider_acceptance_recovers_after_another_owner_commits_unknown(
         assert allocation.settled_nano_usd == 5 * _XAI_RATE
         assert allocation.unknown_cost_attempts == 0
     finally:
+        assert other.close(5)
+
+
+@pytest.mark.parametrize("publish_unknown", [False, True])
+def test_retained_exact_meter_outlives_competing_unknown_job_publication(
+    setup: _Setup,
+    publish_unknown: bool,
+) -> None:
+    """A settled unknown job cannot acknowledge another owner's retained exact video meter."""
+    jobs = setup.components.video_jobs
+    assert jobs is not None
+    other = _stored_engine(setup, InMemoryVideoOutputStore())
+    entered_submit, release_submit = threading.Event(), threading.Event()
+    entered_unknown, release_unknown = threading.Event(), threading.Event()
+    handle, finish, save = (
+        setup.provider.handle,
+        setup.components.ledger.finish_attempt,
+        jobs.save_open,
+    )
+    accepted: list[VideoJob] = []
+    cleaned: list[VideoJob] = []
+    errors: list[BaseException] = []
+
+    def blocked_submit(request: httpx.Request) -> httpx.Response:
+        """Keep the first provider acceptance outstanding while cleanup starts."""
+        if request.method == "POST":
+            entered_submit.set()
+            assert release_submit.wait(5)
+        return handle(request)
+
+    def interrupted_accounting(
+        *,
+        attempt_id: str,
+        terminal_event: GatewayEvent | None,
+        failure: GatewayFailure | None,
+        finalize_request: bool,
+    ) -> None:
+        """Delay unknown cleanup and reject the first owner's exact completion write."""
+        assert terminal_event is not None
+        if terminal_event.accounting_recovery:
+            entered_unknown.set()
+            assert release_unknown.wait(5)
+        else:
+            raise RuntimeError("exact accounting temporarily unavailable")
+        finish(
+            attempt_id=attempt_id,
+            terminal_event=terminal_event,
+            failure=failure,
+            finalize_request=finalize_request,
+        )
+
+    def save_competing_job(*, job: VideoJob) -> bool:
+        """Exercise both publication outcomes after the competing ledger write commits."""
+        if not publish_unknown and job.settled and job.billed_seconds_milli is None:
+            raise RuntimeError("unknown job publication unavailable")
+        return save(job=job)
+
+    def create() -> None:
+        """Run the actual provider submit and persist its late returned job ID."""
+        try:
+            accepted.append(_create(setup, alias="grok-video", seconds=6))
+        except BaseException as error:  # noqa: BLE001 - expose thread failures to the test.
+            errors.append(error)
+
+    def clean_unknown(job: VideoJob) -> None:
+        """Let the second engine own the unconfirmed dispatch cleanup."""
+        try:
+            cleaned.append(other.refresh(job))
+        except BaseException as error:  # noqa: BLE001 - expose thread failures to the test.
+            errors.append(error)
+
+    creator = threading.Thread(target=create)
+    cleanup: threading.Thread | None = None
+    try:
+        with (
+            patch.object(setup.provider, "handle", side_effect=blocked_submit),
+            patch.object(
+                setup.components.ledger, "finish_attempt", side_effect=interrupted_accounting
+            ),
+            patch.object(jobs, "save_open", side_effect=save_competing_job),
+        ):
+            creator.start()
+            try:
+                assert entered_submit.wait(5)
+                (open_job,) = jobs.open_jobs(limit=2)
+                assert open_job.provider_job_id is None
+                setup.clock.now += timedelta(seconds=DISPATCH_GRACE_SECONDS + 1)
+                cleanup = threading.Thread(target=clean_unknown, args=(open_job,))
+                cleanup.start()
+                assert entered_unknown.wait(5)
+                release_submit.set()
+                creator.join(5)
+                assert not creator.is_alive()
+                assert not errors
+                (job,) = accepted
+                assert job.provider_job_id is not None
+                assert not setup.engine.refresh(job).settled
+                assert job.video_id in setup.engine._pending
+            finally:
+                release_submit.set()
+                release_unknown.set()
+                creator.join(5)
+                if cleanup is not None:
+                    cleanup.join(5)
+        assert cleanup is not None and not cleanup.is_alive()
+        assert not errors
+        (unknown,) = cleaned
+        assert unknown.settled is publish_unknown
+        (attempt,) = _attempts(setup)
+        assert attempt["usage_source"] == "unknown"
+        assert attempt["accounting_recovery"] == 1
+        assert attempt["budget_settled_nano_usd"] == 6 * _XAI_RATE
+        # Even a published unknown winner cannot release an exact meter while
+        # its reconciliation write is still failing.
+        with patch.object(
+            setup.components.ledger, "finish_attempt", side_effect=RuntimeError("offline")
+        ):
+            setup.engine._retry_settlements()
+        assert job.video_id in setup.engine._pending
+        setup.engine._retry_settlements()
+        assert job.video_id not in setup.engine._pending
+        assert setup.engine.close(5)
+        assert other.close(5)
+        current = jobs.load_any(video_id=job.video_id)
+        assert current is not None and current.settled
+        assert current.status is (VideoStatus.FAILED if publish_unknown else VideoStatus.COMPLETED)
+        assert current.billed_seconds_milli == (None if publish_unknown else 5_000)
+        (attempt,) = _attempts(setup)
+        assert attempt["state"] == "failed"
+        assert attempt["failure_class"] == "internal"
+        assert attempt["usage_source"] == "observed"
+        assert attempt["billed_quantity_milli"] == 5_000
+        assert attempt["estimated_cost_nano_usd"] == 5 * _XAI_RATE
+        assert attempt["budget_settled_nano_usd"] == 5 * _XAI_RATE
+        assert len(setup.provider.posts) == 1
+    finally:
+        release_submit.set()
+        release_unknown.set()
+        if creator.ident is not None:
+            creator.join(5)
+        if cleanup is not None:
+            cleanup.join(5)
         assert other.close(5)
 
 

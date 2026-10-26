@@ -815,7 +815,7 @@ class VideoEngine:
         return saved
 
     def _settled_job_winner(self, pending: PendingSettlement) -> VideoJob | None:
-        """Accept only a durable terminal record for this exact request and attempt."""
+        """Accept a durable winner only after it accounts for any retained exact meter."""
         current = self._jobs.load_any(video_id=pending.job.video_id)
         if current is None or not current.settled:
             return None
@@ -831,6 +831,14 @@ class VideoEngine:
             pending.job.attempt_id,
         ):
             raise RuntimeError("video settlement winner changed request or attempt identity")
+        if (
+            current.billed_seconds_milli is None
+            and pending.closed.billed_seconds_milli is not None
+            and not pending.ledger_written
+        ):
+            # A published unknown outcome cannot acknowledge a retained exact
+            # meter. Replay accounting first, then preserve the delivery winner.
+            return None
         return current
 
     def _retry_settlements(self) -> None:

@@ -106,8 +106,9 @@ def test_both_published_v22_layouts_preserve_attempt_evidence(
             "billed_quantity_milli",
             "billed_unit_rate",
         }
-        assert after.keys() - before.keys() == added
+        assert after.keys() - before.keys() == added | {"accounting_recovery"}
         assert all(after[column] is None for column in added)
+        assert after["accounting_recovery"] == 0
         assert after["service_tier_admission"] is None
         assert after["service_tier_settlement"] is None
         assert connection.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION

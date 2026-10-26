@@ -593,28 +593,29 @@ def test_serialized_disconnect_replay_preserves_durable_unknown_billing(
 @pytest.mark.parametrize(
     "failure_class",
     [
-        None,
         GatewayFailureClass.PROVIDER_INTERNAL,
         GatewayFailureClass.TRANSPORT,
         GatewayFailureClass.INTERNAL,
     ],
 )
+@pytest.mark.parametrize("separate_failure", [False, True])
 def test_failed_provider_observation_does_not_prove_recovery(
     tmp_path: Path,
-    failure_class: GatewayFailureClass | None,
+    failure_class: GatewayFailureClass,
+    separate_failure: bool,
 ) -> None:
     """A provider's unmetered failure is immutable even if its class resembles cleanup."""
     _, _, ledger, budgets, attempt = _started(tmp_path)
-    failure = (
-        None
-        if failure_class is None
-        else GatewayFailure(
-            failure_class=failure_class,
-            safe_message="provider failure",
-        )
+    failure = GatewayFailure(
+        failure_class=failure_class,
+        safe_message="provider failure",
     )
     terminal = GatewayEvent(kind=GatewayEventKind.FAILED, sequence_number=0, failure=failure)
-    ledger.finish_attempt(attempt_id=attempt, terminal_event=terminal, failure=failure)
+    ledger.finish_attempt(
+        attempt_id=attempt,
+        terminal_event=terminal,
+        failure=failure if separate_failure else None,
+    )
     before = dict(_attempt_row(tmp_path, attempt))
     assert before["accounting_recovery"] == 0
     for _ in range(2):
