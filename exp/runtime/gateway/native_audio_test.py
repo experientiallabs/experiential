@@ -131,7 +131,7 @@ def test_an_upload_that_spent_the_budget_is_refused_before_acceptance(
 
     plane = SimpleNamespace(
         _request_timeout_seconds=600.0,
-        _accounting=SimpleNamespace(require_clear=lambda _organization: None),
+        _accounting=SimpleNamespace(require_clear=lambda: None),
         _components=SimpleNamespace(store=SimpleNamespace(authorize_request=authorize_request)),
         _guardrails=None,
         _write_ledger=SimpleNamespace(accept_request=lambda **fields: accepted.append(fields)),
