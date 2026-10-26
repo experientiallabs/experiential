@@ -643,6 +643,8 @@ class ExecutableWorld:
                 event_id=event.event_id, at=self.clock, status="refused", detail=str(exc)
             )
         except Exception as exc:  # noqa: BLE001 - the call was rolled back; keep the episode
+            if self._closed:
+                raise  # The rollback failed and closed the world; the episode cannot continue.
             return FiredEvent(
                 event_id=event.event_id, at=self.clock, status="failed", detail=type(exc).__name__
             )
@@ -668,16 +670,15 @@ class ExecutableWorld:
         context = WorldContext(self)
         try:
             observation = self._backend.execute(action, context)
+            changed = _changed(image.domains, self._backend.domain_digests())
+            if not changed <= access.writes:
+                raise UndeclaredEffectError(
+                    f"tool {action.name!r} changed {sorted(changed - access.writes)!r} beyond "
+                    "its resolved writes; the call was rolled back"
+                )
         except BaseException:
             self._rollback(image)
             raise
-        changed = _changed(image.domains, self._backend.domain_digests())
-        if not changed <= access.writes:
-            self._rollback(image)
-            raise UndeclaredEffectError(
-                f"tool {action.name!r} changed {sorted(changed - access.writes)!r} beyond its "
-                "resolved writes; the call was rolled back"
-            )
         self._commit(context)
         return observation
 
@@ -702,8 +703,25 @@ class ExecutableWorld:
             )
 
     def _rollback(self, image: NativeImage) -> None:
-        """Replace the backend with a fresh instance holding the pre-call image."""
-        restored = self._runtime.factory.restore(image)
+        """Replace the backend with a fresh instance verified to hold the pre-call image.
+
+        Raises:
+            RestoreError: The pre-call image could not be restored or verified. The world is
+                closed first, because its backend may still hold the failed call's effects.
+        """
+        restored = None
+        try:
+            restored = self._runtime.factory.restore(image)
+            if restored.domain_digests() != image.domains:
+                raise RestoreError("restored backend does not hold the pre-call state")
+        except Exception as error:
+            if restored is not None:
+                restored.close()
+            self.close()
+            raise RestoreError(
+                "rollback failed, so the world may hold a failed call's effects; it is closed, "
+                "restore a checkpoint to continue"
+            ) from error
         self._backend.close()
         self._backend = restored
 

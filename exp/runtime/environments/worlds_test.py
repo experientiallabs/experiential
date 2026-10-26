@@ -187,6 +187,70 @@ def test_backend_failure_rolls_back_state_and_staged_events() -> None:
         assert world.checkpoint() == before
 
 
+class BlindingBackend(DictBackend):
+    """A backend whose state digest fails after any write, as a crashed probe would."""
+
+    def __init__(self, values: dict[str, str]) -> None:
+        """Start with a readable digest."""
+        super().__init__(values)
+        self.blind = False
+
+    def execute(self, action: ToolCall, context: WorldContext) -> Observation:
+        """Apply the call, then lose the ability to digest the mutated state."""
+        observation = super().execute(action, context)
+        self.blind = True
+        return observation
+
+    def domain_digests(self) -> dict[str, Sha256]:
+        """Raise once a call has mutated state."""
+        if self.blind:
+            raise OSError("state digest unavailable")
+        return super().domain_digests()
+
+
+class BlindingFactory(DictFactory):
+    """Create blinding backends; restore yields a fresh, readable one."""
+
+    def create(self, task: TaskCase) -> DictBackend:
+        """Return a blinding backend over the initial values."""
+        del task
+        return BlindingBackend(dict(self.values))
+
+
+class CorruptRestoreFactory(DictFactory):
+    """Restore every image as different state, so a rollback cannot be verified."""
+
+    def restore(self, image: NativeImage) -> DictBackend:
+        """Return a backend that does not hold the captured image."""
+        return DictBackend({name: "corrupt" for name in image.parts})
+
+
+def test_failed_post_call_digest_rolls_back_the_call() -> None:
+    """A digest failure after execution is inside the rollback scope, not a kept mutation."""
+    runtime = ExecutableWorldRuntime(_manifest(), BlindingFactory({"a": "0", "b": "0"}))
+    with runtime.open(_task()) as world:
+        before = world.checkpoint()
+        with pytest.raises(OSError, match="digest unavailable"):
+            world.execute(_call("set", domain="a", value="mutated"))
+        assert world.checkpoint() == before
+
+
+def test_unverified_rollback_closes_the_world_and_stops_the_episode() -> None:
+    """A restore that does not reproduce the pre-call state never leaves a world in use."""
+    runtime = ExecutableWorldRuntime(_manifest(), CorruptRestoreFactory({"a": "0", "b": "0"}))
+    with runtime.open(_task()) as world:
+        with pytest.raises(RestoreError, match="rollback failed") as error:
+            world.execute(_call("boom", domain="a"))
+        assert isinstance(error.value.__cause__, RestoreError)
+        with pytest.raises(RuntimeError, match="closed"):
+            world.execute(_call("get"))
+    with runtime.open(_task()) as world:
+        # The event fires as the call's duration elapses; its failed rollback is not retained
+        # as a "failed" event outcome.
+        with pytest.raises(RestoreError, match="rollback failed"):
+            world.execute(_call("later", tool="boom", value="x", delay=1))
+
+
 def test_undeclared_tools_and_domains_are_refused() -> None:
     """Every task tool needs a policy; access to an unknown domain is never admitted."""
     runtime = _runtime()
