@@ -4,7 +4,7 @@ import pytest
 
 from exp.common.core.artifacts import JsonObject
 from exp.simulation.induction.contracts import SandboxLimits, TransitionProgram
-from exp.simulation.induction.runner_test import FORMATTER_ESCAPE
+from exp.simulation.induction.runner_test import COUNTER, FORMATTER_ESCAPE
 from exp.simulation.induction.sandbox import ProgramSandbox
 
 APPEND = TransitionProgram(
@@ -90,3 +90,20 @@ def test_non_json_replies_are_failed_outcomes() -> None:
     with ProgramSandbox() as sandbox:
         outcome = sandbox.run(_program("    return float('nan')\n"), {}, {}, {})
     assert outcome.status == "failed" and "unencodable" in str(outcome.detail)
+
+
+def test_one_worker_gives_repeated_and_interleaved_requests_identical_results() -> None:
+    """A long-lived worker keeps no program state between requests or across programs."""
+    counter = TransitionProgram(tool="counter", source=COUNTER)
+    dumps = TransitionProgram(
+        tool="dumps",
+        source=(
+            "import json\ndef transition(state, args, facts):\n    return json.dumps([1, 2, 3])\n"
+        ),
+    )
+    with ProgramSandbox() as sandbox:
+        replies = []
+        for _ in range(3):
+            replies.append(sandbox.run(counter, {}, {}, {}).reply)
+            replies.append(sandbox.run(dumps, {}, {}, {}).reply)
+    assert replies == [1, "[1, 2, 3]"] * 3

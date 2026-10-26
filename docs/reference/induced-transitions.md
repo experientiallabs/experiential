@@ -139,6 +139,9 @@ The worker runs under these conditions:
 - Before it reads any program it sets its own limits on CPU time, address space and file size,
   and its descriptor limit leaves no free slot. Even an escaped program can open no file, socket
   or pipe.
+- Only compiled programs are cached. Each request runs the program's top level in fresh globals
+  with fresh module views, so no request sees state that an earlier request or another program
+  left behind.
 - Every request has a wall-clock deadline. A worker that misses it, crashes or breaks protocol is
   killed with its process group. Its outcome is `failed`.
 
@@ -150,7 +153,8 @@ Programs must stay within a Python subset:
   resolves attribute names from a string, such as `string.Formatter`, is reachable.
 - Plain functions and constant assignments are allowed.
 - Classes, `global`, `with`, `yield`, bare `except`, dunder names, underscore attributes,
-  frame and traceback attributes, and `str.format` are not allowed.
+  attribute assignment or deletion, frame and traceback attributes, and `str.format` are not
+  allowed.
 - Only the listed safe builtins exist.
 - A program defines `transition(state, args, facts)`. It edits `state` in place and returns the
   reply. It raises `ToolError(reply)` for an error reply and `OutOfDomain(reason)` for an input

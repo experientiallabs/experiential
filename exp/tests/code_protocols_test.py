@@ -244,9 +244,9 @@ PROTOCOLS = (
     ),
     Protocol(
         "exp.simulation.induction.runner:RUNNER_PROTOCOL",
-        "induced-program-runner-v2",
+        "induced-program-runner-v3",
         ("exp.simulation.induction.runner", "exp.simulation.induction.sandbox"),
-        "122c03734209c38102092ab614efc8449f66f6c1519c9e046a61cecdefe17e7a",
+        "b950c78b8b064e4a49fef7df1e00c23b8ba5c0f524f9c77e0fe3ae66993f5bbb",
     ),
     Protocol(
         "exp.simulation.induction.backend:INDUCED_WORLD_PROTOCOL",

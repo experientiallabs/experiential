@@ -17,10 +17,14 @@ error reply, or raises ``OutOfDomain(reason)`` for an input it does not model.
 
 The static check (:func:`check_source`) admits a small subset: top-level imports of allowlisted
 modules, each a view of the listed names in :data:`ALLOWED_MODULES` only, plain function
-definitions and constant assignments; no classes, ``global``,
-``with``, ``yield``, bare ``except``, dunder names or underscore attributes, and none of the
-reflective builtins. Every executed program line is reported, so callers can bound a program to
-the code paths that validation actually exercised.
+definitions and constant assignments; no classes, ``global``, ``with``, ``yield``, bare
+``except``, dunder names or underscore attributes, no attribute assignment or deletion, and none
+of the reflective builtins. Every executed program line is reported, so callers can bound a
+program to the code paths that validation actually exercised.
+
+Only compiled code is cached. Every request executes the program's top level in fresh globals
+with fresh module views, so no request sees what an earlier request or another program bound or
+mutated, and a replayed request behaves exactly as it did during validation.
 
 This file imports only the standard library: it must run with no site packages.
 """
@@ -45,7 +49,7 @@ from typing import cast
 
 # Identity of the code that decides how programs execute, in place of its source text. Bump it
 # when behavior changes; exp/tests/code_protocols_test.py guards the covered source.
-RUNNER_PROTOCOL = "induced-program-runner-v2"
+RUNNER_PROTOCOL = "induced-program-runner-v3"
 ENTRYPOINT = "transition"
 PROGRAM_FILENAME = "<induced-program>"
 MAXIMUM_SOURCE_CHARACTERS = 20_000
@@ -357,6 +361,11 @@ def _check_node(node: ast.AST, *, top_level: bool) -> None:
         node.attr.startswith("_") or node.attr in FORBIDDEN_ATTRIBUTES
     ):
         raise ProgramRefused(f"attribute {node.attr!r} is refused in transition programs")
+    if isinstance(node, ast.Attribute) and not isinstance(node.ctx, ast.Load):
+        raise ProgramRefused(
+            f"assigning or deleting attribute {node.attr!r} is refused; programs edit state "
+            "through subscripts"
+        )
     if isinstance(node, ast.arg) and node.arg.startswith("__"):
         raise ProgramRefused(f"argument {node.arg!r} is refused in transition programs")
 
@@ -375,9 +384,8 @@ def _restricted_import(
     return _module_view(name)
 
 
-@functools.cache
 def _module_view(name: str) -> types.SimpleNamespace:
-    """Expose only the listed names of an allowlisted module."""
+    """Build a new view of the listed names of an allowlisted module for one execution."""
     module, names = ALLOWED_MODULES[name]
     return types.SimpleNamespace(**{key: getattr(module, key) for key in names})
 
@@ -393,16 +401,27 @@ def _namespace() -> dict[str, object]:
     return {"__builtins__": safe, "__name__": "induced_program"}
 
 
-def load_program(source: str) -> Callable[[object, object, object], object]:
-    """Check, compile and execute one program's top level, returning its entry function.
+def compile_program(source: str) -> types.CodeType:
+    """Check and compile one program; the code object holds no state of any execution.
 
     Raises:
-        ProgramRefused: The program fails the static check or its top level fails.
+        ProgramRefused: The program fails the static check.
     """
-    tree = check_source(source)
+    return compile(check_source(source), PROGRAM_FILENAME, "exec")
+
+
+def load_program(code: types.CodeType) -> Callable[[object, object, object], object]:
+    """Execute a compiled program's top level in fresh globals, returning its entry function.
+
+    Every call builds new globals and new module views, so nothing one execution binds or
+    mutates is visible to another execution of this or any other program.
+
+    Raises:
+        ProgramRefused: The program's top level fails.
+    """
     namespace = _namespace()
     try:
-        exec(compile(tree, PROGRAM_FILENAME, "exec"), namespace)  # noqa: S102 - checked subset
+        exec(code, namespace)  # noqa: S102 - checked subset
     except Exception as error:  # noqa: BLE001 - reported as a refused program
         raise ProgramRefused(f"program top level failed: {type(error).__name__}") from None
     entry = namespace.get(ENTRYPOINT)
@@ -411,14 +430,13 @@ def load_program(source: str) -> Callable[[object, object, object], object]:
     return cast("Callable[[object, object, object], object]", entry)
 
 
-def run_request(
-    request: dict[str, object], cache: dict[str, Callable[[object, object, object], object]]
-) -> dict[str, object]:
-    """Execute one request and describe its outcome as one JSON-ready object.
+def run_request(request: dict[str, object], cache: dict[str, types.CodeType]) -> dict[str, object]:
+    """Execute one request in fresh globals and describe its outcome as one JSON-ready object.
 
     Args:
         request: ``source``, ``state``, ``args``, ``facts`` and ``maximum_steps``.
-        cache: Loaded programs keyed by exact source text.
+        cache: Compiled programs keyed by exact source text; only code objects are kept, so
+            no request sees what an earlier one bound or mutated.
 
     Returns:
         ``{"status": "reply" | "error_reply", "reply", "state", "lines"}`` on success, or
@@ -429,11 +447,12 @@ def run_request(
     if not isinstance(source, str) or not isinstance(steps, int):
         return {"status": "refused", "detail": "malformed request", "lines": []}
     try:
-        entry = cache.get(source) or load_program(source)
+        code = cache.get(source) or compile_program(source)
+        if len(cache) < 64:
+            cache[source] = code
+        entry = load_program(code)
     except ProgramRefused as error:
         return {"status": "refused", "detail": str(error), "lines": []}
-    if len(cache) < 64:
-        cache[source] = entry
     state, args, facts = request["state"], request["args"], request["facts"]
     lines: set[int] = set()
     counter = [0]
@@ -525,12 +544,10 @@ def main() -> None:
     if sys.flags.hash_randomization:
         raise SystemExit(72)
     _install_limits(int(sys.argv[1]), int(sys.argv[2]))
-    for name in ALLOWED_MODULES:
-        _module_view(name)
     output = sys.stdout
     output.write(json.dumps({"ready": True, "protocol": RUNNER_PROTOCOL}) + "\n")
     output.flush()
-    cache: dict[str, Callable[[object, object, object], object]] = {}
+    cache: dict[str, types.CodeType] = {}
     for line in sys.stdin:
         try:
             request = json.loads(line)

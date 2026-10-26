@@ -2,6 +2,7 @@
 
 import subprocess
 import sys
+import types
 from pathlib import Path
 
 import pytest
@@ -206,3 +207,38 @@ def test_installed_limits_leave_no_free_descriptor_slot() -> None:
         timeout=30,
     )
     assert result.stdout.strip() == "True"
+
+
+COUNTER = """
+SEEN = []
+
+
+def transition(state, args, facts):
+    SEEN.append(1)
+    return len(SEEN)
+"""
+
+
+def test_module_level_values_do_not_persist_across_requests() -> None:
+    """Each request runs in fresh globals, so a module-level list starts empty every time."""
+    cache: dict[str, types.CodeType] = {}
+    request = {"source": COUNTER, "state": {}, "args": {}, "facts": {}, "maximum_steps": 1000}
+    replies = [run_request(dict(request), cache)["reply"] for _ in range(3)]
+    assert replies == [1, 1, 1]
+    assert set(cache) == {COUNTER}
+
+
+@pytest.mark.parametrize(
+    "statement",
+    ["json.dumps = len", "del json.dumps", "json.dumps += 1", "state.items = 1"],
+)
+def test_attribute_assignment_and_deletion_are_refused(statement: str) -> None:
+    """A program cannot rebind another object's attribute, so module views stay unchanged."""
+    source = f"import json\ndef transition(state, args, facts):\n    {statement}\n    return 1\n"
+    with pytest.raises(ProgramRefused, match="assigning or deleting attribute"):
+        check_source(source)
+
+
+def test_module_views_are_fresh_for_every_import() -> None:
+    """Two imports never share a view object, even of the same module."""
+    assert runner._module_view("json") is not runner._module_view("json")
