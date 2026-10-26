@@ -11,6 +11,7 @@ from exp.cli.app import app
 from exp.common.core.artifacts import ArtifactEnvelope, ArtifactInput, JsonObject
 from exp.common.project import ProjectStore, artifact_input
 from exp.optimize.evaluation import task_refinement, trace_council
+from exp.optimize.evaluation.fidelity import FidelitySpec
 from exp.optimize.evaluation.tests.fidelity_memory_test import structured_reply
 from exp.optimize.evaluation.trace_council_test import sequence, spec_project
 from exp.runtime.models.providers.transport import ScriptedJsonTransport
@@ -71,6 +72,15 @@ def verifier(*, strict: bool) -> TaskVerifier:
     )
 
 
+def fit_council_project(
+    tmp_path: Path,
+) -> tuple[ProjectStore, trace_council.TraceCouncilSpec, FidelitySpec]:
+    """Council over the fixture task as a fit task: refinement never sees held-out labels."""
+    project, council, fidelity = spec_project(tmp_path)
+    task = council.tasks[0].model_copy(update={"partition": "fit"})
+    return project, council.model_copy(update={"tasks": (task,)}), fidelity
+
+
 @pytest.mark.parametrize(
     "change_prompt,failed_judge,bad_verifier,hacker_succeeds",
     [
@@ -90,7 +100,7 @@ def test_refinement_keeps_confirmation_private_and_replays_without_calls(
     hacker_succeeds: bool,
 ) -> None:
     """Exercise source capture, proposing roles, child actors, grading and zero-call replay."""
-    project, council, fidelity = spec_project(tmp_path)
+    project, council, fidelity = fit_council_project(tmp_path)
     source_wire = ScriptedJsonTransport(sequence(fidelity))
     monkeypatch.setattr(trace_council, "HttpxJsonTransport", lambda: source_wire)
     monkeypatch.setenv("FIDELITY_TEST_KEY", "fixture-only")
@@ -347,7 +357,7 @@ def test_refinement_refuses_unqualifiable_labels_before_any_paid_call(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, defect: str
 ) -> None:
     """A generated-label chain or too few witnessed labels stop before registration or spend."""
-    project, council, fidelity = spec_project(tmp_path)
+    project, council, fidelity = fit_council_project(tmp_path)
     source_wire = ScriptedJsonTransport(sequence(fidelity))
     monkeypatch.setattr(trace_council, "HttpxJsonTransport", lambda: source_wire)
     monkeypatch.setenv("FIDELITY_TEST_KEY", "fixture-only")

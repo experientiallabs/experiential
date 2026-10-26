@@ -56,7 +56,11 @@ def admit_calibration_evidence(project: ProjectStore, pack: CalibrationPack) -> 
     )
     refusals += knowledge_refusals(project, task.world_model, task.task)
     refusals += _authoring_refusals(project.artifacts, task, pack.cases)
-    ledger_refusals, ledger = _ledger_refusals(project, task.task, pack.cases)
+    ledger_refusals, ledger = _ledger_refusals(
+        project,
+        task.task,
+        tuple((case.challenge.id, case.lineage, case.partition) for case in pack.cases),
+    )
     return EvidenceAdmission(verified=verified, refusals=refusals + ledger_refusals, ledger=ledger)
 
 
@@ -83,7 +87,9 @@ def require_refinement_admission(
         IDs of witnessed labels whose saved witness re-verified.
 
     Raises:
-        EvidenceAdmissionError: Any named refusal, including too few admitted labels.
+        EvidenceAdmissionError: Any named refusal, including too few admitted labels, a
+            development label on a held-out task, or a held-out task the exposure ledger
+            cannot show independent.
     """
     challenges = (*development, *confirmation)
     verified, refusals = _verify(
@@ -107,6 +113,15 @@ def require_refinement_admission(
         ),
         partitions=("development", "confirmation"),
     )
+    refusals += _ledger_refusals(
+        project,
+        task,
+        tuple(
+            (row.id, task.lineage_group_id, partition)
+            for partition, rows in (("development", development), ("confirmation", confirmation))
+            for row in rows
+        ),
+    )[0]
     require_admitted(admission.model_copy(update={"refusals": refusals}))
     return ids
 
@@ -195,9 +210,18 @@ def _authoring_refusals(
 
 
 def _ledger_refusals(
-    project: ProjectStore, task: TaskCase, cases: Sequence[CalibrationCase]
+    project: ProjectStore, task: TaskCase, labels: Sequence[tuple[str, str, str]]
 ) -> tuple[tuple[AdmissionRefusal, ...], str | None]:
-    """Decide sealed-partition overlap and held-out exposure with the root exposure ledger."""
+    """Decide sealed-partition overlap and held-out exposure with the root exposure ledger.
+
+    Args:
+        project: Project holding the build and the exposure ledger.
+        task: Public task the labels evaluate.
+        labels: Label ID, source lineage and partition of every label.
+
+    Returns:
+        Every named refusal, and the ledger consulted when a held-out lineage is involved.
+    """
     build = project.load_project().build
     if build is None:
         if task.partition != "held_out":
@@ -214,19 +238,21 @@ def _ledger_refusals(
         ), None
     bindings = load_task_set_lineage_bindings(project.artifacts, build.task_set.artifact_id)
     held_out = {row.lineage_id for row in bindings.bindings if row.partition == "held_out"}
+    if task.partition == "held_out":
+        held_out.add(task.lineage_group_id)
     refusals = [
         AdmissionRefusal(
             reason="sealed_partition_breach",
-            subject=case.challenge.id,
+            subject=subject,
             detail=(
-                f"this {case.partition} label uses held-out evaluation lineage {case.lineage}, "
+                f"this {partition} label uses held-out evaluation lineage {lineage}, "
                 "which only confirmation may touch; relabel it from a fit lineage"
             ),
         )
-        for case in cases
-        if case.lineage in held_out and case.partition != "confirmation"
+        for subject, lineage, partition in labels
+        if lineage in held_out and partition != "confirmation"
     ]
-    sealed = {case.lineage for case in cases if case.lineage in held_out}
+    sealed = {lineage for _, lineage, _ in labels if lineage in held_out}
     if task.partition == "held_out":
         sealed.add(task.lineage_group_id)
     if not sealed:
@@ -259,7 +285,7 @@ def _ledger_refusals(
                     subject=row.lineage,
                     detail=(
                         f"held-out lineage {row.lineage} is {row.kind} in the exposure ledger; "
-                        "calibrate on an independent lineage"
+                        "label an independent lineage"
                     ),
                 )
             )

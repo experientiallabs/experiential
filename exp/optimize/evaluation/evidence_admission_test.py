@@ -459,3 +459,41 @@ def test_refinement_refuses_inadequate_or_self_approving_labels_before_spend(
             world_model=world,
             task=task,
         )
+
+
+def test_refinement_refuses_development_labels_on_a_held_out_task(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Refinement shows development labels to proposers, so a held-out task is sealed."""
+    provider = SimulatedProvider([episode(i) for i in range(USERS)])
+    _, store, _ = build_project(tmp_path, monkeypatch, provider)
+    build = store.load_project().build
+    assert build is not None
+    tasks = load_task_set(store.artifacts, build.task_set.artifact_id).tasks
+    spec_ref = specification(store)
+    development, confirmation = (
+        [
+            label(store, spec_ref, f"{name}-{status}-{n}", outcome(status, f"{name}{n}"))
+            for status in ("done", "pending")
+            for n in (1, 2)
+        ]
+        for name in ("dev", "conf")
+    )
+
+    def refine(task: TaskCase) -> frozenset[str]:
+        """Run refinement admission for one built task over the same witnessed labels."""
+        return require_refinement_admission(
+            store,
+            verifier=PARENT,
+            development=development,
+            confirmation=confirmation,
+            world_model=build.world_model,
+            task=task,
+        )
+
+    fit = next(task for task in tasks if task.partition == "fit")
+    assert len(refine(fit)) == 8
+    held_out = next(task for task in tasks if task.partition == "held_out")
+    with pytest.raises(EvidenceAdmissionError, match=r"\[sealed_partition_breach\]") as error:
+        refine(held_out)
+    assert f"held-out evaluation lineage {held_out.lineage_group_id}" in str(error.value)
