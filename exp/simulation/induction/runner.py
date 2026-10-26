@@ -9,7 +9,10 @@ itself: CPU time per request, address space, no file creation and no free file-d
 The language subset is the containment; these limits are only a backstop. The descriptor limit
 stops new files, sockets and pipes only while every held descriptor stays open: code that escaped
 the subset could close one and reuse its slot, and the worker has no filesystem or network
-isolation of its own. It then speaks one JSON line per request on standard input and output.
+isolation of its own. It then speaks one JSON line per request on standard input and output:
+``{"outcome": ..., "rotate": bool}``, where ``rotate`` asks the parent to replace the worker
+because an inherited finite hard CPU limit leaves less than one more full request, or
+``{"unstarted": true}`` when such a worker read a request it then never ran.
 
 A program is one Python module that defines ``transition(state, args, facts)``. ``state`` maps
 the call's visible state domains to JSON values and is edited in place; ``args`` are the call's
@@ -43,6 +46,7 @@ import json
 import math
 import os
 import re
+import signal
 import string
 import sys
 import types
@@ -51,8 +55,10 @@ from typing import cast
 
 # Identity of the code that decides how programs execute, in place of its source text. Bump it
 # when behavior changes; exp/tests/code_protocols_test.py guards the covered source.
-RUNNER_PROTOCOL = "induced-program-runner-v4"
+RUNNER_PROTOCOL = "induced-program-runner-v5"
 ENTRYPOINT = "transition"
+# CPU seconds kept in reserve when deciding whether an inherited hard limit fits one more request.
+_ROTATION_MARGIN_SECONDS = 1
 PROGRAM_FILENAME = "<induced-program>"
 MAXIMUM_SOURCE_CHARACTERS = 20_000
 # The names each allowlisted module exposes: pure functions, container types and immutable
@@ -501,28 +507,69 @@ def run_request(request: dict[str, object], cache: dict[str, types.CodeType]) ->
     return outcome
 
 
-def _arm_cpu_limit(cpu_seconds: int) -> None:
-    """Allow the next request ``cpu_seconds`` of CPU time beyond what the worker already used.
+def _cpu_soft_limit(used_seconds: float, cpu_seconds: int, hard: int | None) -> int | None:
+    """Return the soft CPU limit that gives one request its full budget, or None if none can.
 
-    The kernel counts CPU time over the whole process, so the soft limit is re-armed before
-    every request; a request's acceptance never depends on CPU spent by earlier requests. A
-    finite hard limit the worker inherited still caps the total.
+    Args:
+        used_seconds: CPU seconds the worker has used so far.
+        cpu_seconds: Budget of one request.
+        hard: Inherited hard CPU limit in seconds, or None when unlimited.
+
+    Returns:
+        The used seconds rounded up plus the budget, or None when that passes ``hard``.
     """
+    soft = math.ceil(used_seconds) + cpu_seconds
+    return None if hard is not None and soft > hard else soft
+
+
+def _cpu_usage() -> tuple[float, int | None]:
+    """Return the CPU seconds this worker used and its hard CPU limit (None when unlimited)."""
     import resource  # noqa: PLC0415 - POSIX-only; the runner is started only on POSIX hosts
 
     usage = resource.getrusage(resource.RUSAGE_SELF)
-    soft = math.ceil(usage.ru_utime + usage.ru_stime) + cpu_seconds
     _, hard = resource.getrlimit(resource.RLIMIT_CPU)
-    if hard != resource.RLIM_INFINITY:
-        soft = min(soft, hard)
-    resource.setrlimit(resource.RLIMIT_CPU, (soft, hard))
+    return usage.ru_utime + usage.ru_stime, None if hard == resource.RLIM_INFINITY else hard
+
+
+def _arm_cpu_limit(cpu_seconds: int) -> bool:
+    """Allow the next request ``cpu_seconds`` of CPU time beyond what the worker already used.
+
+    The kernel counts CPU time over the whole process, so the soft limit is re-armed before
+    every request; a request's acceptance never depends on CPU spent by earlier requests.
+
+    Returns:
+        False, with no limit changed, when an inherited finite hard limit leaves less than one
+        full budget; the request must then go to a fresh worker.
+    """
+    import resource  # noqa: PLC0415 - POSIX-only; the runner is started only on POSIX hosts
+
+    used, hard = _cpu_usage()
+    soft = _cpu_soft_limit(used, cpu_seconds, hard)
+    if soft is None:
+        return False
+    resource.setrlimit(
+        resource.RLIMIT_CPU, (soft, resource.RLIM_INFINITY if hard is None else hard)
+    )
+    return True
+
+
+def _must_rotate(cpu_seconds: int) -> bool:
+    """Return whether an inherited hard limit leaves too little CPU for one more full request.
+
+    The margin covers the CPU the worker spends between this check and arming the next request.
+    """
+    used, hard = _cpu_usage()
+    return _cpu_soft_limit(used + _ROTATION_MARGIN_SECONDS, cpu_seconds, hard) is None
 
 
 def _install_limits(memory_bytes: int, cpu_seconds: int) -> None:
     """Limit CPU, memory, file size and descriptors before any program text is read."""
     import resource  # noqa: PLC0415 - POSIX-only; the runner is started only on POSIX hosts
 
-    _arm_cpu_limit(cpu_seconds)
+    # An ignored SIGXCPU inherited across exec would let a request run past its soft limit.
+    signal.signal(signal.SIGXCPU, signal.SIG_DFL)
+    if _must_rotate(cpu_seconds) or not _arm_cpu_limit(cpu_seconds):
+        raise SystemExit(74)
     resource.setrlimit(resource.RLIMIT_FSIZE, (0, 0))
     resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
     memory_limited = False
@@ -568,7 +615,11 @@ def main() -> None:
     output.flush()
     cache: dict[str, types.CodeType] = {}
     for line in sys.stdin:
-        _arm_cpu_limit(cpu_seconds)
+        if not _arm_cpu_limit(cpu_seconds):
+            # The request was read but never run; the parent sends it to a fresh worker.
+            output.write(json.dumps({"unstarted": True}) + "\n")
+            output.flush()
+            return
         try:
             request = json.loads(line)
             response = run_request(request, cache)
@@ -577,7 +628,8 @@ def main() -> None:
             text = json.dumps(
                 {"status": "failed", "detail": f"unencodable outcome: {error}"[:500], "lines": []}
             )
-        output.write(text + "\n")
+        rotate = json.dumps(_must_rotate(cpu_seconds))
+        output.write(f'{{"outcome":{text},"rotate":{rotate}}}\n')
         output.flush()
 
 

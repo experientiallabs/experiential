@@ -8,7 +8,8 @@ memory, file-size and file-descriptor limits before it reads any program, and th
 language check runs both here and in the worker. Each request has a wall-clock deadline; a
 worker that misses it, crashes or breaks protocol is killed with its process group and a fresh
 one starts on the next request. Every such event is a ``failed`` outcome, never an exception
-that a caller could mistake for a reply.
+that a caller could mistake for a reply. A worker that an inherited hard CPU limit leaves too
+little CPU for a full request is replaced before it runs one.
 
 The sandbox is stateless across requests: state goes in with each call and comes back in the
 outcome, so one worker safely serves every backend instance, fork and validation replay.
@@ -40,6 +41,7 @@ _EXIT_REASONS = {
     71: "this platform cannot limit worker memory",
     72: "worker hashing is randomized",
     73: "worker could not hold every descriptor slot below its limit",
+    74: "the inherited hard CPU limit leaves less than one request's CPU budget",
 }
 
 
@@ -121,16 +123,36 @@ class ProgramSandbox:
         with self._lock:
             if self._closed:
                 raise RuntimeError("program sandbox is closed; open a new one")
+            return self._dispatch(request + b"\n")
+
+    def _dispatch(self, payload: bytes) -> ProgramOutcome:
+        """Run one request, moving it once to a fresh worker if the old one never started it.
+
+        A worker whose inherited hard CPU limit leaves less than one full request either asks
+        to be replaced after its reply or answers ``unstarted`` without running the request,
+        so no request ever runs on less than its full CPU budget and none runs twice.
+        """
+        for _ in range(2):
             process = self._process or self._start()
             try:
-                line = self._exchange(process, request + b"\n")
+                message = json.loads(self._exchange(process, payload))
             except _WorkerLost as error:
                 self._stop()
                 return ProgramOutcome(status="failed", detail=str(error))
-        try:
-            return ProgramOutcome.model_validate_json(line)
-        except ValueError:
-            return ProgramOutcome(status="failed", detail="worker returned a malformed outcome")
+            except ValueError:
+                message = None
+            if message == {"unstarted": True}:
+                self._stop()
+                continue
+            if not isinstance(message, dict) or set(message) != {"outcome", "rotate"}:
+                return ProgramOutcome(status="failed", detail="worker returned a malformed outcome")
+            if message["rotate"] is True:
+                self._stop()
+            try:
+                return ProgramOutcome.model_validate(message["outcome"])
+            except ValueError:
+                return ProgramOutcome(status="failed", detail="worker returned a malformed outcome")
+        raise SandboxUnavailableError("a fresh induced-program worker did not start the request")
 
     def close(self) -> None:
         """Stop the worker and refuse later requests."""

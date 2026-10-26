@@ -264,3 +264,21 @@ def test_attribute_assignment_and_deletion_are_refused(statement: str) -> None:
 def test_module_views_are_fresh_for_every_import() -> None:
     """Two imports never share a view object, even of the same module."""
     assert runner._module_view("json") is not runner._module_view("json")
+
+
+@pytest.mark.parametrize(
+    ("used", "hard", "soft"),
+    [
+        (0.2, None, 2),
+        (100.3, None, 102),
+        (0.2, 5, 2),
+        (3.0, 5, 4),
+        (4.5, 5, None),
+        (4.0, 4, None),
+    ],
+)
+def test_the_cpu_soft_limit_gives_each_request_its_full_budget_or_none(
+    used: float, hard: int | None, soft: int | None
+) -> None:
+    """A request gets one full budget past the CPU already used, never a hard-limit remainder."""
+    assert runner._cpu_soft_limit(used, 1, hard) == soft

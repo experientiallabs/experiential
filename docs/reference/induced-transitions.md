@@ -142,7 +142,10 @@ The worker runs under these conditions:
   open, so code that escaped the language subset could close one and reuse its slot. The worker
   has no filesystem or network isolation of its own; the language subset is the containment.
 - The CPU limit is re-armed before every request, so each request gets the full budget whatever
-  earlier requests used.
+  earlier requests used. The worker restores the default `SIGXCPU` action, so an inherited
+  ignored signal cannot disable the limit. When an inherited finite hard CPU limit leaves less
+  than one more full request, the worker is replaced before it runs one; a request it read but
+  could not start goes once to a fresh worker.
 - Only compiled programs are cached. Each request runs the program's top level in fresh globals
   with fresh module views, so no request sees state that an earlier request or another program
   left behind.

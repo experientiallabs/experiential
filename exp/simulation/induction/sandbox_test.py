@@ -1,5 +1,10 @@
 """The bounded worker process: limits, deadlines, restarts and protocol checks."""
 
+import subprocess
+import sys
+import time
+from pathlib import Path
+
 import pytest
 
 from exp.common.core.artifacts import JsonObject
@@ -109,10 +114,77 @@ def test_one_worker_gives_repeated_and_interleaved_requests_identical_results() 
     assert replies == [1, "[1, 2, 3]"] * 3
 
 
+def _busy_size(cpu_seconds: float) -> int:
+    """Return a ``sum(range(n))`` size that spends about ``cpu_seconds`` of CPU on this host."""
+    size = 10**7
+    start = time.process_time()
+    sum(range(size))
+    return int(size * cpu_seconds / max(time.process_time() - start, 1e-3))
+
+
+def _busy(cpu_seconds: float) -> TransitionProgram:
+    """Return a program whose every request spends about ``cpu_seconds`` of CPU."""
+    return _program(f"    return sum(range({_busy_size(cpu_seconds)})) > 0\n")
+
+
+def _contained_run(script: str, *arguments: str) -> str:
+    """Run one sandbox script in a separate interpreter, so its process limits stay there."""
+    result = subprocess.run(  # noqa: S603 - fixed interpreter and test script
+        (sys.executable, "-c", script, *arguments),
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=120,
+        cwd=Path(__file__).parents[3],
+    )
+    return result.stdout.strip()
+
+
 def test_the_cpu_limit_applies_to_each_request_not_the_worker_lifetime() -> None:
     """Requests that each fit the limit all reply, though together they use several times it."""
-    busy = _program("    return sum(range(3 * 10 ** 7)) > 0\n")
     limits = SandboxLimits(cpu_seconds=1, request_timeout_seconds=30.0)
+    busy = _busy(0.4)
     with ProgramSandbox(limits) as sandbox:
         outcomes = [sandbox.run(busy, {}, {}, {}) for _ in range(8)]
     assert [outcome.status for outcome in outcomes] == ["reply"] * 8
+
+
+_SANDBOX_SCRIPT = """
+import math, resource, signal, sys
+from exp.simulation.induction.contracts import SandboxLimits, TransitionProgram
+from exp.simulation.induction.sandbox import ProgramSandbox
+
+mode, size, count = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+if mode == "hard":
+    usage = resource.getrusage(resource.RUSAGE_SELF)
+    hard = math.ceil(usage.ru_utime + usage.ru_stime) + 4
+    resource.setrlimit(resource.RLIMIT_CPU, (hard, hard))
+else:
+    signal.signal(signal.SIGXCPU, signal.SIG_IGN)
+source = f"def transition(state, args, facts):\\n    return sum(range({size})) > 0\\n"
+busy = TransitionProgram(tool="busy", source=source)
+workers = set()
+with ProgramSandbox(SandboxLimits(cpu_seconds=1, request_timeout_seconds=60.0)) as sandbox:
+    for _ in range(count):
+        status = sandbox.run(busy, {}, {}, {}).status
+        if sandbox._process is not None:
+            workers.add(sandbox._process.pid)
+        print(status)
+print(len(workers) > 1)
+"""
+
+
+def test_a_finite_inherited_hard_limit_rotates_workers_instead_of_failing_requests() -> None:
+    """Under a four-second hard CPU limit, twelve half-second requests all reply.
+
+    Each worker can serve only a few of them, so the sandbox replaces a worker before its
+    remaining allowance falls below one full request instead of letting the kernel kill it.
+    """
+    lines = _contained_run(_SANDBOX_SCRIPT, "hard", str(_busy_size(0.5)), "12").splitlines()
+    assert lines == ["reply"] * 12 + ["True"]
+
+
+def test_an_inherited_ignored_sigxcpu_cannot_defeat_the_cpu_limit() -> None:
+    """The worker restores the default SIGXCPU action, so a request over its budget stops."""
+    lines = _contained_run(_SANDBOX_SCRIPT, "ignored", str(_busy_size(3.0)), "1").splitlines()
+    assert lines[0] == "failed"
