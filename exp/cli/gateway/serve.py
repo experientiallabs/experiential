@@ -396,15 +396,26 @@ def _close_owned(
 ) -> None:
     """Close what serving created, pollers first, then local workers, then guardrails.
 
-    A failed drain raises before its dependencies close, so a live worker keeps them for an
-    explicit retry.
+    A failed drain raises before its dependencies close, so a live worker keeps them, and it
+    is reported as unfinished teardown so this process keeps owning the root.
+
+    Raises:
+        GatewayTeardownIncomplete: A drain failed or timed out while workers may still write.
     """
-    if control_plane is not None:
-        control_plane.close(timeout_seconds=timeout_seconds)
-    if components is not None:
-        components.close(timeout_seconds=timeout_seconds)
-    if guardrails is not None:
-        guardrails.close(timeout_seconds=timeout_seconds)
+    from exp.runtime.gateway.instance_lock import GatewayTeardownIncomplete
+
+    try:
+        if control_plane is not None:
+            control_plane.close(timeout_seconds=timeout_seconds)
+        if components is not None:
+            components.close(timeout_seconds=timeout_seconds)
+        if guardrails is not None:
+            guardrails.close(timeout_seconds=timeout_seconds)
+    except Exception as exc:
+        raise GatewayTeardownIncomplete(
+            f"gateway workers did not stop cleanly ({type(exc).__name__}); this process keeps "
+            "the root until it exits"
+        ) from exc
 
 
 def _unavailable_alias_entries(

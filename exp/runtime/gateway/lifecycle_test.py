@@ -50,7 +50,6 @@ from exp.runtime.gateway.lifecycle import (
     _serve_or_fallback,
     _served_triple,
     _ServedFallback,
-    gateway_instance_lock,
     load_gateway_components,
 )
 from exp.runtime.gateway.management import GatewayAliasView, GatewayManagement
@@ -229,14 +228,6 @@ def test_component_loading_builds_readiness_proof_from_real_state(tmp_path: Path
     assert components.accounting_healthy is True
     assert _granted_authorities(components, raw_key) == {"coding": "revision-one"}
     assert manager.status().active_aliases == 1
-
-
-def test_instance_lock_rejects_a_second_owner_for_the_same_root(tmp_path: Path) -> None:
-    """A second local process cannot concurrently own one gateway database."""
-    with gateway_instance_lock(tmp_path, port=8000):
-        with pytest.raises(GatewayLifecycleError, match="already owns"):
-            with gateway_instance_lock(tmp_path, port=9000):
-                raise AssertionError("second lock unexpectedly acquired")
 
 
 def test_readiness_requires_an_explicit_grant(tmp_path: Path) -> None:

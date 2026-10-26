@@ -586,3 +586,28 @@ def test_request_timeout_rejects_values_outside_its_bounds(tmp_path: Path) -> No
         )
         assert result.exit_code != 0
         assert "--request-timeout" in result.output
+
+
+def test_a_failed_drain_is_reported_as_unfinished_teardown() -> None:
+    """A drain timeout keeps later dependencies open and keeps this process the root's owner."""
+    from exp.runtime.gateway.instance_lock import GatewayTeardownIncomplete
+    from exp.runtime.gateway.lifecycle import LocalGatewayComponents
+    from exp.runtime.gateway.native_bridge import NativeControlPlane
+
+    closed: list[str] = []
+
+    def stuck(*, timeout_seconds: float) -> None:
+        """Fail the drain the way a worker that outlives its budget does."""
+        del timeout_seconds
+        raise TimeoutError("selection workers remain active")
+
+    plane = SimpleNamespace(close=stuck)
+    components = SimpleNamespace(close=lambda *, timeout_seconds: closed.append("components"))
+    with pytest.raises(GatewayTeardownIncomplete, match="keeps the root"):
+        run_app._close_owned(
+            cast(NativeControlPlane, plane),
+            cast(LocalGatewayComponents, components),
+            None,
+            0.25,
+        )
+    assert closed == []

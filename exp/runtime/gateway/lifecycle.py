@@ -5,14 +5,12 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from collections.abc import Callable, Iterator, Mapping
-from contextlib import ExitStack, contextmanager
+from collections.abc import Callable, Mapping
+from contextlib import ExitStack
 from dataclasses import dataclass, field
 from datetime import timedelta
 from pathlib import Path
 from typing import cast
-
-from filelock import FileLock, Timeout
 
 from exp.common.config import ARTIFACT_DIR
 from exp.common.core.artifacts import sha256_json
@@ -37,6 +35,7 @@ from exp.runtime.gateway.contracts import (
 from exp.runtime.gateway.embeddings_contracts import ServingRequest
 from exp.runtime.gateway.execution_snapshot import ExecutionSnapshot
 from exp.runtime.gateway.group_commit import GroupCommitAttemptLedger
+from exp.runtime.gateway.instance_lock import gateway_instance_lock as gateway_instance_lock
 from exp.runtime.gateway.interfaces import GatewayControlStore, ProjectTargetResolver
 from exp.runtime.gateway.ledger import SQLiteAttemptLedger
 from exp.runtime.gateway.lifecycle_fields import (
@@ -396,35 +395,6 @@ class _ReadyControlStore:
         if served is not None:
             return served
         raise GatewayRoutingError("authorized alias revision is unavailable in this process")
-
-
-@contextmanager
-def gateway_instance_lock(root: Path, *, port: int) -> Iterator[None]:
-    """Hold the single live gateway owner lock for one EXP root.
-
-    Args:
-        root: EXP root whose gateway database and snapshots are served.
-        port: Requested loopback port, included only in actionable diagnostics.
-
-    Yields:
-        None while this process exclusively owns the local gateway.
-
-    Raises:
-        GatewayLifecycleError: Another process currently owns the root.
-    """
-    state_dir = root / "gateway"
-    state_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-    lock = FileLock(state_dir / "run.lock", timeout=0, mode=0o600)
-    try:
-        lock.acquire()
-    except Timeout:
-        raise GatewayLifecycleError(
-            f"another gateway process already owns {root} (requested port {port})"
-        ) from None
-    try:
-        yield
-    finally:
-        lock.release()
 
 
 @dataclass(frozen=True)
