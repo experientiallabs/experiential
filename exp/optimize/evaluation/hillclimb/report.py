@@ -2,8 +2,12 @@
 
 The best prompt is the last kept candidate after the reported rounds. A final panel compares it
 with the baseline on the test lineages with ``final_repeats`` fresh continuations per arm, and the
-same keep rule decides the verdict. "Within noise, do not merge" is a complete, valid result, as
-is "no edit kept" when every round reverted. The report lists every round, kept and reverted.
+same keep rule decides the verdict. The final comparison is registered once per baseline and best
+pair, with its deadline and code revision: a later report whose best prompt is unchanged (every
+later round reverted) replays that comparison and its unknowns instead of drawing a new one, so
+an unchanged prompt cannot be final-tested again until one run says merge. "Within noise, do not
+merge" is a complete, valid result, as is "no edit kept" when every round reverted. The report
+lists every round, kept and reverted.
 """
 
 from datetime import UTC, datetime
@@ -13,7 +17,7 @@ from filelock import FileLock
 from pydantic import AwareDatetime, Field
 
 from exp.common.core.artifacts import ArtifactEnvelope, ArtifactInput, ContractModel, stable_id
-from exp.common.project import ProjectStore, artifact_input
+from exp.common.project import ArtifactStore, ProjectStore, artifact_input
 from exp.optimize.evaluation.continuations.job import ContinuationJob
 from exp.optimize.evaluation.hillclimb.design import ClimbSpec, climb_split
 from exp.optimize.evaluation.hillclimb.history import (
@@ -23,6 +27,7 @@ from exp.optimize.evaluation.hillclimb.history import (
 )
 from exp.optimize.evaluation.hillclimb.measurement import StageMeasurement
 from exp.optimize.evaluation.hillclimb.prompts import (
+    PromptVersion,
     baseline_version,
     load_prompt_version,
     persist_prompt_version,
@@ -36,6 +41,7 @@ from exp.optimize.evaluation.hillclimb.stages import (
 )
 
 REPORT_TYPE = "hill-climb-report"
+FINAL_TYPE = "hill-climb-final-registration"
 Verdict = Literal["merge", "within noise, do not merge", "no edit kept"]
 
 
@@ -55,6 +61,71 @@ class ClimbReportSpec(ContractModel):
     def identity(self) -> str:
         """Report identity: one final comparison per climb and round count."""
         return stable_id(REPORT_TYPE, {"climb": self.climb.identity(), "rounds": self.rounds})
+
+
+class FinalRegistration(ContractModel):
+    """The one final comparison of a baseline and best pair, fixed before its first dispatch.
+
+    Attributes:
+        climb: Climb identity.
+        baseline: Baseline prompt version.
+        best: Best prompt version compared against it.
+        deadline: Deadline of every final continuation.
+        code_revision: Execution revision the final panel runs under.
+    """
+
+    climb: str
+    baseline: ArtifactInput
+    best: ArtifactInput
+    deadline: AwareDatetime
+    code_revision: str = Field(min_length=1)
+
+
+def final_identity(climb: str, baseline: PromptVersion, best: PromptVersion) -> str:
+    """Identity of a pair's final comparison, independent of the reported round count."""
+    return stable_id(
+        FINAL_TYPE, {"climb": climb, "baseline": baseline.identity, "best": best.identity}
+    )
+
+
+def _final_registration(
+    store: ArtifactStore,
+    identity: str,
+    registration: FinalRegistration,
+    *,
+    created_at: datetime,
+) -> FinalRegistration:
+    """Save a pair's final registration once and return the saved one.
+
+    Raises:
+        ValueError: The pair's final comparison was registered under another code revision.
+    """
+    if not store.exists(identity):
+        store.write_json(
+            artifact_id=identity,
+            artifact_type=FINAL_TYPE,
+            envelope=ArtifactEnvelope(
+                schema_version=1,
+                created_at=created_at,
+                code_revision=registration.code_revision,
+                inputs=tuple(
+                    sorted(
+                        (registration.baseline, registration.best),
+                        key=lambda ref: ref.artifact_id,
+                    )
+                ),
+            ),
+            files={"registration.json": registration},
+        )
+    if store.read(identity).manifest.artifact_type != FINAL_TYPE:
+        raise ValueError("saved final registration has the wrong artifact type")
+    saved = FinalRegistration.model_validate_json(store.read_bytes(identity, "registration.json"))
+    if saved.code_revision != registration.code_revision:
+        raise ValueError(
+            f"the final comparison of this best prompt was registered under code revision "
+            f"{saved.code_revision}; report under that revision so it replays, never redraws"
+        )
+    return saved
 
 
 class RoundSummary(ContractModel):
@@ -161,7 +232,11 @@ def run_climb_report(
         code_revision: Installed execution revision of the final panel.
 
     Returns:
-        The saved report; a saved one replays without calls.
+        The saved report; a saved one replays without calls, and a best prompt already
+        final-tested replays its registered comparison.
+
+    Raises:
+        ValueError: The best prompt's final comparison was registered under another revision.
     """
     climb = spec.climb.identity()
     store = project.artifacts
@@ -179,15 +254,30 @@ def run_climb_report(
         best = persist_prompt_version(store, best_v, created_at=now, code_revision=code_revision)
         final = None
         verdict: Verdict = "no edit kept"
+        registered: set[ArtifactInput] = set()
         if best_v != baseline_v:
+            pair = final_identity(climb, baseline_v, best_v)
+            registration = _final_registration(
+                store,
+                pair,
+                FinalRegistration(
+                    climb=climb,
+                    baseline=baseline,
+                    best=best,
+                    deadline=spec.deadline,
+                    code_revision=code_revision,
+                ),
+                created_at=now,
+            )
+            registered.add(artifact_input(store.read(pair).manifest))
             final = run_stage(
                 project,
                 spec.climb,
                 climb_split(project, spec.climb),
                 "final",
-                f"final after round {spec.rounds}",
+                f"final {pair}",
                 (baseline_v, best_v),
-                spec.deadline,
+                registration.deadline,
                 code_revision=code_revision,
             )
             verdict = "merge" if final.passed else "within noise, do not merge"
@@ -220,6 +310,7 @@ def run_climb_report(
             best,
             *(artifact_input(store.read(round_identity(climb, r.round)).manifest) for r in history),
             *(() if final is None else (final.panel,)),
+            *registered,
         }
         store.write_json(
             artifact_id=spec.identity(),

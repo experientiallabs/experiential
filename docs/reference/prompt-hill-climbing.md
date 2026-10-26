@@ -105,7 +105,10 @@ and final messages are cut to `maximum_reply_bytes` with a label.
 The report lists every round, kept and reverted, with its change note and reason. When an edit
 was kept, baseline and best are compared on the test lineages with `final_repeats` fresh repeats
 under the keep rule. The verdict is `merge`, `within noise, do not merge` or `no edit kept`;
-the second is a valid result, not a failure.
+the second is a valid result, not a failure. The final comparison is registered once per baseline
+and best prompt pair, with its deadline and code revision. A later report whose best prompt is
+unchanged (every later round reverted) replays that comparison, unknowns included, instead of
+drawing a new one; under another code revision it is refused.
 
 ## Limits
 
