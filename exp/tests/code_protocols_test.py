@@ -109,12 +109,12 @@ PROTOCOLS = (
     ),
     Protocol(
         "exp.optimize.evaluation.learning.lesson_evolution:EVOLUTION_PROTOCOL",
-        "lesson-evolution-v2",
+        "lesson-evolution-v3",
         (
             "exp.optimize.evaluation.learning.lesson_evolution:_attempt",
             "exp.optimize.evaluation.learning.lesson_evolution:evolve_lessons",
         ),
-        "35c82de08bdac40651aa68bcdba90eb0292573e04bd7cf2830ff0390e9ae9898",
+        "89ba387276193e7a3435a0e5617821c0b37db5ad2654aff1509f2a00051f0a74",
     ),
     Protocol(
         "exp.runtime.models.providers.attempt_timeouts:ATTEMPT_TIMEOUT_PROTOCOL",

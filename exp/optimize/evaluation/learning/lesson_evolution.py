@@ -57,7 +57,6 @@ from exp.optimize.evaluation.learning.traces import (
     SCOPES,
     LearningPlan,
     fit_cases,
-    learning_cases,
     learning_plan,
     recorded_plan,
 )
@@ -71,6 +70,7 @@ from exp.runtime.models.structured_completion import CompletionPlan, StructuredC
 from exp.runtime.sessions.dispatch_ledger import DispatchLedger
 from exp.simulation.engines.text.knowledge import SimulationKnowledge
 from exp.simulation.reconstruction.library import LibrarySnapshot, resolve_library_entry
+from exp.simulation.retrieval.build_inputs import load_completed_build_rag_lineage_bindings
 from exp.simulation.world_model.artifact import persist_grounded_world_model
 from exp.simulation.world_model.runtime import load_grounded_world_model_artifact
 
@@ -79,7 +79,7 @@ RESULT_TYPE = "lesson-evolution-result"
 # Identity of the case selection and evaluator, recorded as the attempt's evaluator. Bump it when
 # behavior changes; exp/tests/code_protocols_test.py fails when the covered source changes until
 # it is bumped or, for a pure refactor, its digest is updated.
-EVOLUTION_PROTOCOL = "lesson-evolution-v2"
+EVOLUTION_PROTOCOL = "lesson-evolution-v3"
 
 
 class EvolutionPreflight(ContractModel):
@@ -218,17 +218,29 @@ def _attempt(project: ProjectStore, spec: LessonEvolutionRequest) -> _Attempt:
             + json.dumps((row.miss.investigation or {}).get("hypothesis")),
         )
     # The parent rules already carry what their source traces taught, so those lineages are as
-    # exposed as the training lessons' and cannot select or protect the edit.
-    lineages = {
-        case.trace_id: case.task.lineage_group_id for case in learning_cases(project, "all")
+    # exposed as the training lessons' and cannot select or protect the edit. The build's
+    # bindings resolve them without reading any trace content.
+    build = project.load_project().build
+    if build is None:
+        raise ValueError("lesson evolution needs a completed build; run exp build first")
+    bindings = {
+        row.trace_id: row
+        for row in load_completed_build_rag_lineage_bindings(project.artifacts, build)
     }
-    if not set(parent.source_trace_ids) <= lineages.keys():
+    if not set(parent.source_trace_ids) <= bindings.keys():
         raise ValueError(
             "the accepted rules cite traces outside this build; evolve them in the project "
             "that learned them, or start from a library without accepted rules"
         )
+    if plan.scope == "fit" and any(
+        bindings[trace].partition != "fit" for trace in parent.source_trace_ids
+    ):
+        raise ValueError(
+            "the accepted rules were learned from held-out traces this fit-only plan reserves; "
+            "start from a library without accepted rules"
+        )
     exposed = {case.lineage_id for case in training} | {
-        lineages[trace] for trace in parent.source_trace_ids
+        bindings[trace].lineage_id for trace in parent.source_trace_ids
     }
     chosen: list[ReplayCase] = []
     seen: set[str] = set()

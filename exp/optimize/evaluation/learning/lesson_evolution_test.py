@@ -27,6 +27,7 @@ from exp.optimize.evaluation.learning.lessons import (
 from exp.optimize.evaluation.learning.lessons_test import continuation, screened_project
 from exp.optimize.evaluation.learning.traces import fit_cases
 from exp.simulation.reconstruction.library import LibraryEntry
+from exp.simulation.retrieval.build_inputs import load_completed_build_rag_lineage_bindings
 
 
 def evolve(
@@ -121,14 +122,15 @@ def test_lineages_the_parent_rules_were_learned_from_never_select_the_edit(
     selected = {case.task.task_id: case for case in fit_cases(store)}
     learned = selected[first.held_out[0]]
     resolve = lesson_evolution.resolve_library_entry
+    extra: list[str] = [learned.trace_id]
 
     def wider(artifacts: ArtifactStore, entry: LibraryEntry) -> JsonValue:
-        """The accepted rules, as if also learned from the first selection trace."""
+        """The accepted rules, as if also learned from the ``extra`` traces."""
         payload = resolve(artifacts, entry)
         assert isinstance(payload, dict) and isinstance(payload["knowledge"], dict)
         sources = payload["knowledge"]["source_trace_ids"]
         assert isinstance(sources, list)
-        payload["knowledge"]["source_trace_ids"] = sorted([*sources, learned.trace_id])
+        payload["knowledge"]["source_trace_ids"] = sorted([*sources, *extra])
         return payload
 
     monkeypatch.setattr(lesson_evolution, "resolve_library_entry", wider)
@@ -137,6 +139,27 @@ def test_lineages_the_parent_rules_were_learned_from_never_select_the_edit(
         selected[case].task.lineage_group_id for case in (*widened.held_out, *widened.protected)
     }
     assert learned.task.lineage_group_id not in chosen
+
+    # Every other fit lineage taught the rules too: nothing is left to select on.
+    extra[:] = [case.trace_id for case in selected.values()]
+    with pytest.raises(ValueError, match="selection needs 3 fit lineages"):
+        preflight_evolution(store, request)
+    # A source the build never bound has no known lineage.
+    extra[:] = ["unbound-trace"]
+    with pytest.raises(ValueError, match="cite traces outside this build"):
+        preflight_evolution(store, request)
+    # A held-out trace is evidence this fit-only plan reserves, never a parent source.
+    build = store.load_project().build
+    assert build is not None
+    extra[:] = [
+        next(
+            row.trace_id
+            for row in load_completed_build_rag_lineage_bindings(store.artifacts, build)
+            if row.partition == "held_out"
+        )
+    ]
+    with pytest.raises(ValueError, match="held-out traces this fit-only plan reserves"):
+        preflight_evolution(store, request)
 
 
 def test_a_completed_run_id_refuses_a_different_request(
