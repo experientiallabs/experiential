@@ -67,8 +67,9 @@ VIDEO_JOB_SETTLEMENT_SECONDS = 2 * 60 * 60
 
 Provider renders take seconds to a few minutes (Veo documents 11 s to 6 min), and
 the gateway's own poller drives every job to a terminal state without the
-caller polling, so this bound only ever fires on a provider job that never
-finishes. Such a job finalizes as failed and releases its reservation."""
+caller polling. The bound finalizes an unconfirmed job as failed and releases its
+customer reservation without declaring its provider usage zero. Late observed
+usage can still reconcile provider cost, preserving the customer waiver."""
 
 VIDEO_LEDGER_DEADLINE_SLACK_SECONDS = 10 * 60
 """Extra time on the ledger request deadline past the settlement bound, so the

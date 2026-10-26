@@ -832,10 +832,20 @@ def test_real_sqlite_native_abandonment_retains_then_commits_the_late_meter(
     assert allocation.unknown_cost_attempts == 0
 
 
-@pytest.mark.parametrize("field", ["accounting_recovery", "_accounting_recovery"])
+@pytest.mark.parametrize(
+    "field",
+    [
+        "accounting_recovery",
+        "_accounting_recovery",
+        "accounting_release_reservation",
+        "_accounting_release_reservation",
+    ],
+)
+@pytest.mark.parametrize("release_reservation", [False, True])
 def test_recovery_provenance_is_internal_and_cannot_be_invented_by_public_payloads(
     tmp_path: Path,
     field: str,
+    release_reservation: bool,
 ) -> None:
     """Only the trusted constructor can create a recovery-capable failed terminal."""
     _, store, ledger, budgets, attempt = _started(tmp_path)
@@ -843,9 +853,14 @@ def test_recovery_provenance_is_internal_and_cannot_be_invented_by_public_payloa
         failure_class=GatewayFailureClass.INTERNAL,
         safe_message="local recovery",
     )
-    recovery = GatewayEvent.for_accounting_recovery(failure=failure)
+    recovery = GatewayEvent.for_accounting_recovery(
+        failure=failure, release_reservation=release_reservation
+    )
     assert recovery.accounting_recovery
-    assert not GatewayEvent.model_validate_json(recovery.model_dump_json()).accounting_recovery
+    assert recovery.accounting_release_reservation is release_reservation
+    serialized = GatewayEvent.model_validate_json(recovery.model_dump_json())
+    assert not serialized.accounting_recovery
+    assert not serialized.accounting_release_reservation
     request = AttemptSettlementRequest(
         organization_id="org-one",
         attempt_id=attempt,
@@ -863,6 +878,8 @@ def test_recovery_provenance_is_internal_and_cannot_be_invented_by_public_payloa
     _assert_allocations(budgets, settled=0, reserved=300)
     ledger.finish_attempt(attempt_id=attempt, terminal_event=recovery, failure=failure)
     assert _attempt_row(tmp_path, attempt)["accounting_recovery"] == 1
+    _assert_allocations(budgets, settled=0 if release_reservation else 300)
+    ledger = SQLiteAttemptLedger(store.database_path)
     for _ in range(2):
         ledger.finish_attempt(attempt_id=attempt, terminal_event=_observed(), failure=None)
     row = _attempt_row(tmp_path, attempt)
@@ -870,7 +887,7 @@ def test_recovery_provenance_is_internal_and_cannot_be_invented_by_public_payloa
     assert row["failure_class"] == "internal"
     assert row["usage_source"] == "observed"
     assert row["estimated_cost_nano_usd"] == 40
-    _assert_allocations(budgets, settled=40)
+    _assert_allocations(budgets, settled=0 if release_reservation else 40)
 
 
 def test_schema32_preserves_legacy_failure_without_inventing_recovery(

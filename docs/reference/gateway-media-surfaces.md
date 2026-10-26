@@ -238,6 +238,8 @@ from Google Veo and xAI rungs. Aliases opt in with the gateway deployment capabi
   (at most one provider poll per job every 5 seconds), and every gateway worker runs a background
   poller that drives open jobs to settlement, so a job nobody polls still settles. A job still
   running 2 hours after acceptance is finalized as failed and its reservation released; the
+  provider usage remains unknown until an exact observation arrives. A late observation records
+  provider cost without reversing that customer waiver. The
   ledger deadline sits 10 minutes past that, so crash reconciliation never claims a job the poller
   still owns. A job whose provider dispatch was interrupted before its handle was recorded closes
   after 5 minutes at its reservation.

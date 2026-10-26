@@ -654,9 +654,10 @@ class SQLiteAttemptLedger(LocalSnapshotMemoOwner):
         budget_settlement = (
             budget_settlement_nano_usd(row, cost, usage, terminal_event) if tier is None else cost
         )
-        if failure is not None and failure.safe_details.get("input_guardrail_denied") is True:
-            # Usage/list cost remains provider-cost evidence. The caller's
-            # reservation is released because no output passed the input gate.
+        if (failure is not None and failure.safe_details.get("input_guardrail_denied") is True) or (
+            terminal_event is not None and terminal_event.accounting_release_reservation
+        ):
+            # Waive the customer charge without changing provider usage or cost.
             budget_settlement = 0
         usage_source = usage_source_label(
             usage, estimated=terminal_event is not None and terminal_event.usage_estimated

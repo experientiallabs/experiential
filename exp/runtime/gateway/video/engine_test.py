@@ -34,10 +34,17 @@ from exp.common.models import (
 )
 from exp.runtime.gateway.budgets import BudgetScope, BudgetScopeKind, SQLiteBudgetStore
 from exp.runtime.gateway.catalog_authority import upsert_connection, upsert_singleton_deployment
+from exp.runtime.gateway.ledger import GatewayLedgerError
 from exp.runtime.gateway.lifecycle import LocalGatewayComponents, load_gateway_components
 from exp.runtime.gateway.management import GatewayManagement
 from exp.runtime.gateway.native_accounting_errors import NativeBridgeError
-from exp.runtime.gateway.stream_contracts import GatewayEvent, GatewayFailure
+from exp.runtime.gateway.stream_contracts import (
+    BilledUnits,
+    GatewayEvent,
+    GatewayEventKind,
+    GatewayFailure,
+    GatewayUsage,
+)
 from exp.runtime.gateway.tests.certified_pool_fixture_test import upsert_certified_pool
 from exp.runtime.gateway.video.contracts import (
     VIDEO_JOB_SETTLEMENT_SECONDS,
@@ -350,8 +357,8 @@ def test_an_ambiguous_submit_settles_conservatively_and_is_never_resent(setup: _
     assert len(setup.provider.posts) == 1
 
 
-def test_a_job_still_running_at_its_bound_finalizes_at_zero(setup: _Setup) -> None:
-    """The settlement bound releases a provider job that never finishes."""
+def test_a_job_still_running_at_its_bound_preserves_unknown_usage(setup: _Setup) -> None:
+    """A timeout releases the customer reservation without inventing zero provider usage."""
     setup.provider.done = False
     job = _create(setup)
     assert setup.engine.refresh(job).status is VideoStatus.IN_PROGRESS
@@ -364,7 +371,12 @@ def test_a_job_still_running_at_its_bound_finalizes_at_zero(setup: _Setup) -> No
     assert current.status is VideoStatus.FAILED
     assert current.error_code == "timeout"
     assert current.settled
+    assert current.billed_seconds_milli is None
     (attempt,) = _attempts(setup)
+    assert attempt["usage_source"] == "unknown"
+    assert attempt["accounting_recovery"] == 1
+    assert attempt["billed_quantity_milli"] is None
+    assert attempt["estimated_cost_nano_usd"] is None
     assert attempt["budget_settled_nano_usd"] == 0
     assert setup.engine.poll_open() == 0
 
@@ -431,6 +443,104 @@ def test_failed_terminal_write_keeps_the_original_meter_through_shutdown(setup: 
     assert current.completed_at == observed_at
     assert current.billed_seconds_milli == 5_000
     assert _attempts(setup)[0]["budget_settled_nano_usd"] == 5 * _XAI_RATE
+
+
+def test_another_owner_timeout_cannot_discard_a_retained_exact_completion(setup: _Setup) -> None:
+    """A durable local timeout preserves the exact receipt another owner still must commit."""
+    jobs = setup.components.video_jobs
+    assert jobs is not None
+    other = _stored_engine(setup, InMemoryVideoOutputStore())
+    job = _create(setup, alias="grok-video", seconds=6)
+    try:
+        with patch.object(
+            setup.components.ledger, "finish_attempt", side_effect=RuntimeError("offline")
+        ):
+            assert not setup.engine.refresh(job).settled
+        assert job.video_id in setup.engine._pending
+        setup.clock.now += timedelta(seconds=VIDEO_JOB_SETTLEMENT_SECONDS + 1)
+        timed_out = other.refresh(job)
+        assert timed_out.settled
+        assert timed_out.status is VideoStatus.FAILED
+        assert timed_out.error_code == "timeout"
+        assert timed_out.billed_seconds_milli is None
+        (attempt,) = _attempts(setup)
+        assert attempt["failure_class"] == "timeout"
+        assert attempt["accounting_recovery"] == 1
+        assert attempt["usage_source"] == "unknown"
+        assert attempt["estimated_cost_nano_usd"] is None
+        assert attempt["budget_settled_nano_usd"] == 0
+        with patch.object(
+            setup.components.ledger, "finish_attempt", side_effect=RuntimeError("offline")
+        ):
+            setup.engine._retry_settlements()
+        assert job.video_id in setup.engine._pending
+        setup.engine._retry_settlements()
+        assert job.video_id not in setup.engine._pending
+        assert setup.engine.close(5)
+        assert other.close(5)
+        assert jobs.load_any(video_id=job.video_id) == timed_out
+        (attempt,) = _attempts(setup)
+        assert attempt["state"] == "failed"
+        assert attempt["failure_class"] == "timeout"
+        assert attempt["usage_source"] == "observed"
+        assert attempt["billed_quantity_milli"] == 5_000
+        assert attempt["estimated_cost_nano_usd"] == 5 * _XAI_RATE
+        assert attempt["budget_settled_nano_usd"] == 0
+        assert len(setup.provider.posts) == 1
+    finally:
+        assert other.close(5)
+
+
+@pytest.mark.parametrize("rejection", ["submit", "poll"])
+def test_actual_provider_zero_remains_an_immutable_settlement(
+    setup: _Setup,
+    rejection: str,
+) -> None:
+    """Provider rejection and failed-render evidence cannot become a recovery charge."""
+    if rejection == "submit":
+        setup.provider.submits = [400]
+        with pytest.raises(NativeBridgeError):
+            _create(setup, alias="grok-video", seconds=6)
+    else:
+        job = _create(setup, alias="grok-video", seconds=6)
+        with patch.object(
+            setup.provider,
+            "handle",
+            return_value=httpx.Response(
+                200,
+                json={"status": "failed", "error": "provider reported render failure"},
+            ),
+        ):
+            failed = setup.engine.refresh(job)
+        assert failed.settled
+        assert failed.status is VideoStatus.FAILED
+        assert failed.billed_seconds_milli == 0
+    (before,) = _attempts(setup)
+    assert before["usage_source"] == "observed"
+    assert before["accounting_recovery"] == 0
+    assert before["billed_quantity_milli"] == 0
+    assert before["estimated_cost_nano_usd"] == 0
+    assert before["budget_settled_nano_usd"] == 0
+    with sqlite3.connect(setup.database) as connection:
+        (attempt_id,) = connection.execute("SELECT attempt_id FROM gateway_attempts").fetchone()
+    with pytest.raises(GatewayLedgerError, match="differs from durable accounting evidence"):
+        setup.components.ledger.finish_attempt(
+            attempt_id=attempt_id,
+            terminal_event=GatewayEvent(
+                kind=GatewayEventKind.COMPLETED,
+                sequence_number=0,
+                usage=GatewayUsage(
+                    billed_units=BilledUnits(
+                        kind=BilledUnitKind.VIDEO_SECOND,
+                        variant="720p",
+                        quantity_milli=5_000,
+                    )
+                ),
+            ),
+            failure=None,
+        )
+    (after,) = _attempts(setup)
+    assert dict(after) == dict(before)
 
 
 @pytest.mark.parametrize("outcome", [400, httpx.ReadTimeout])

@@ -239,6 +239,7 @@ class GatewayEvent(ContractModel):
     kind: GatewayEventKind
     sequence_number: int = Field(ge=0)
     _accounting_recovery: bool = PrivateAttr(default=False)
+    _accounting_release_reservation: bool = PrivateAttr(default=False)
     text_delta: str | None = None
     reasoning_summary_output_index: int | None = Field(default=None, ge=0)
     reasoning_summary_index: int | None = Field(default=None, ge=0)
@@ -307,16 +308,29 @@ class GatewayEvent(ContractModel):
         """Whether trusted local cleanup created this provisional, unmetered terminal."""
         return self._accounting_recovery
 
+    @property
+    def accounting_release_reservation(self) -> bool:
+        """Whether trusted recovery explicitly waives the customer charge, not provider usage."""
+        return self._accounting_recovery and self._accounting_release_reservation
+
     @classmethod
-    def for_accounting_recovery(cls, *, failure: GatewayFailure) -> GatewayEvent:
+    def for_accounting_recovery(
+        cls, *, failure: GatewayFailure, release_reservation: bool = False
+    ) -> GatewayEvent:
         """Mark an internal unknown-liability write without accepting provenance from JSON.
 
         The private attribute is absent from both the serialized event and its
         input fields. Only recovery callers use this constructor; ordinary
         provider terminal observations never acquire this capability.
+
+        Args:
+            failure: The locally inferred delivery outcome, without a provider meter.
+            release_reservation: Explicit customer waiver required by the recovery policy.
+                Provider usage stays unknown and a late exact meter cannot revoke the waiver.
         """
         event = cls(kind=GatewayEventKind.FAILED, sequence_number=0, failure=failure)
         event._accounting_recovery = True
+        event._accounting_release_reservation = release_reservation
         return event
 
     @model_validator(mode="after")

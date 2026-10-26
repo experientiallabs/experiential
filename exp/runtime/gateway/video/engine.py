@@ -11,8 +11,9 @@ The accepted attempt stays dispatched while the provider renders, holding its
 reservation. Whichever process first observes the terminal state (the owner's
 poll or the server-side poller) settles it exactly once: a completed video
 bills its rendered seconds, never more than requested, at the frozen rate for
-its resolution; a failed or filtered render bills zero. A job that is still
-running at its settlement bound finalizes as failed and releases the hold.
+its resolution; a provider-reported failed or filtered render bills zero. A
+local settlement timeout finalizes delivery as failed and releases the customer
+reservation while preserving unknown provider usage for later reconciliation.
 """
 
 from __future__ import annotations
@@ -656,7 +657,9 @@ class VideoEngine:
                 failure_class=GatewayFailureClass.TIMEOUT,
                 safe_message="the provider did not finish the video in time",
             )
-            return self._finalize(job, None, failure=failure, observed_zero=True)
+            return self._finalize(
+                job, None, failure=failure, observed_zero=False, release_reservation=True
+            )
         if job.last_polled_at is not None and now - job.last_polled_at < self._poll_interval:
             return job
         resolved = self._resolve(job)
@@ -717,12 +720,14 @@ class VideoEngine:
         *,
         failure: GatewayFailure | None,
         observed_zero: bool,
+        release_reservation: bool = False,
     ) -> VideoJob:
         """Settle one job's attempt exactly once and persist its terminal state.
 
         A completed snapshot bills ``min(rendered, requested)`` seconds; any
-        failure bills zero observed seconds, except a lost dispatch whose
-        provider outcome is unknown, which settles conservatively.
+        provider failure bills zero observed seconds. Local recovery has unknown
+        provider usage; a timeout explicitly releases the customer reservation
+        without claiming zero provider units or cost.
         """
         now = self._clock()
         completed = snapshot is not None and snapshot.status is VideoStatus.COMPLETED
@@ -748,7 +753,9 @@ class VideoEngine:
                 )
             billed = 0 if observed_zero else None
             event = (
-                GatewayEvent.for_accounting_recovery(failure=failure)
+                GatewayEvent.for_accounting_recovery(
+                    failure=failure, release_reservation=release_reservation
+                )
                 if snapshot is None and not observed_zero
                 else GatewayEvent(
                     kind=GatewayEventKind.FAILED,
