@@ -43,8 +43,8 @@ Two deciders are maintained (`DeciderDefinition.kind`):
 - `sampled_drafts` asks a small chat model for `samples` complete drafts (at least two). Its
   confidence is the share of drafts making the modal decision, a readout of agreement on the
   decision rather than on the arguments. When it is accepted, the first modal draft is executed
-  as is, if every call names a visible tool with schema-valid arguments, and the main call is
-  avoided.
+  as is, if every call names a visible tool that `never_delegate` allows, with schema-valid
+  arguments, and the main call is avoided.
 
 Both read only the actor-visible messages and tool schemas. A long conversation keeps its first
 message and latest turns within the decision wire's input bound and counts what was omitted.
@@ -143,7 +143,7 @@ lineages disjoint from the fit; the project's reserved held-out tasks stay close
 
 ## Deployment
 
-A `CascadePolicy` (`version: "decision-cascade-v2"`) binds the exact decider definition, the
+A `CascadePolicy` (`version: "decision-cascade-v3"`) binds the exact decider definition, the
 threshold and the hard restrictions. It is an explicit option wherever an actor runs:
 
 - `ContinuationStudySpec.cascade` and `PanelActor.cascade` run continuation episodes with the

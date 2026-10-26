@@ -39,7 +39,7 @@ from exp.common.models import (
 )
 from exp.common.models.unknown_outcome import DispatchOutcomeUnknown
 
-CASCADE_VERSION = "decision-cascade-v2"
+CASCADE_VERSION = "decision-cascade-v3"
 RESPOND = "respond"
 OTHER = "OTHER"
 
@@ -148,7 +148,7 @@ class CascadePolicy(ContractModel):
             responsible for them whatever the confidence.
     """
 
-    version: Literal["decision-cascade-v2"] = CASCADE_VERSION
+    version: Literal["decision-cascade-v3"] = CASCADE_VERSION
     decider: DeciderDefinition
     threshold: float = Field(ge=0, le=1, allow_inf_nan=False)
     never_delegate: tuple[str, ...] = ()
@@ -342,7 +342,9 @@ class CascadeModelClient:
             )
             return self._main_decides(request, candidates, decision, note)
         if decision.action is not None:
-            if decision.response is None or not _valid_draft(request, decision.action):
+            if decision.response is None or not _valid_draft(
+                request, decision.action, self._policy.never_delegate
+            ):
                 return self._main_decides(request, candidates, decision, "invalid_draft")
             return self._finish(
                 decision.response,
@@ -421,11 +423,18 @@ class CascadeModelClient:
         return response
 
 
-def _valid_draft(request: ModelRequest, action: AssistantAction) -> bool:
-    """Accept a draft only when every call names a visible tool with schema-valid arguments."""
+def _valid_draft(
+    request: ModelRequest, action: AssistantAction, never_delegate: Collection[str]
+) -> bool:
+    """Accept a draft only when every call names a visible, delegable tool with valid arguments.
+
+    The acceptance rule sees only the draft's first call, so the hard restrictions are applied
+    again to every later call: a draft never executes a tool the decider may not take.
+    """
     tools = {tool.name: tool for tool in request.tools}
     return all(
         call.name in tools
+        and call.name not in never_delegate
         and Draft202012Validator(expand_local_references(tools[call.name].input_schema)).is_valid(
             call.arguments
         )

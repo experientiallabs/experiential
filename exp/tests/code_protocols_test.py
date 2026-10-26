@@ -203,7 +203,7 @@ PROTOCOLS = (
     ),
     Protocol(
         "exp.runtime.agents.cascade:CASCADE_VERSION",
-        "decision-cascade-v2",
+        "decision-cascade-v3",
         (
             "exp.runtime.agents.cascade:action_key",
             "exp.runtime.agents.cascade:action_projection",
@@ -212,7 +212,7 @@ PROTOCOLS = (
             "exp.runtime.agents.cascade:CascadeModelClient",
             "exp.runtime.agents.cascade:_valid_draft",
         ),
-        "60260cb35f1f65ecb7eb1a766b78dbdd04d93e3974e501d6a7336df74b87b055",
+        "5fe808398eb2a69a4cc3c1d8193020b842290d67659de4b91834366c3fca7afb",
     ),
     Protocol(
         "exp.optimize.evaluation.analysis.decision_cascade:CASCADE_FIT_PROTOCOL",

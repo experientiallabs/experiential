@@ -253,6 +253,29 @@ def test_accepted_draft_avoids_the_main_call_but_invalid_drafts_do_not() -> None
     ]
 
 
+def test_draft_with_a_restricted_later_call_falls_back_to_the_main_model() -> None:
+    """Every drafted call is checked against never_delegate, not only the first."""
+    small = definition("sampled_drafts")
+    restricted = ToolCall(call_id="c2", name="open_ticket", arguments={"ticket": 1})
+    draft = AssistantAction(tool_calls=(CLOSE, restricted))
+    response = _response(draft).model_copy(update={"model": small.model})
+    decision = NextActionDecision(
+        selected="close_ticket",
+        probabilities={"close_ticket": 1.0, "open_ticket": 0.0, RESPOND: 0.0, OTHER: 0.0},
+        action=draft,
+        response=response,
+    )
+    main = _Model((_response(AssistantAction(content="main")),))
+    cascade = CascadeModelClient(
+        main=main,
+        decider=Decider("sampled_drafts", [decision]),
+        policy=CascadePolicy(decider=small, threshold=1.0, never_delegate=("open_ticket",)),
+    )
+    result = cascade.complete(request("close_ticket", "open_ticket"))
+    assert result.output.content == "main"
+    assert [(row.decided_by, row.note) for row in cascade.records] == [("main", "invalid_draft")]
+
+
 def test_caller_forced_requests_and_foreign_deciders_are_not_reinterpreted() -> None:
     """A caller's own tool choice is never overridden, and only the bound decider is accepted."""
     main = _Model((_response(AssistantAction(content="done")),))
