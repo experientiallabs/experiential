@@ -57,7 +57,10 @@ from exp.runtime.gateway.native_execution import (
 from exp.runtime.gateway.native_settlement import gateway_updating_failure
 from exp.runtime.gateway.routing import GatewayRoutingError
 from exp.runtime.models.providers import require_gateway_provider
-from exp.runtime.models.providers.openai_compatible import openai_images_request
+from exp.runtime.models.providers.openai_compatible import (
+    openai_images_request,
+    returns_base64_images_only,
+)
 from exp.runtime.models.providers.xai import is_xai_images_url
 from exp.runtime.openai_protocol.errors import OpenAIProtocolError
 
@@ -97,6 +100,20 @@ def unpriced_variant_error(variant: str) -> OpenAIProtocolError:
             "Choose a size and quality listed for the model."
         ),
         param="size",
+    )
+
+
+def base64_only_error(alias: str) -> OpenAIProtocolError:
+    """Build the public 400 for a ``url`` request no rung of the alias can answer."""
+    return OpenAIProtocolError(
+        status_code=400,
+        code="unsupported_value",
+        message=(
+            f"The model {alias!r} returns base64 images only, so response_format 'url' "
+            "is not supported. Remove response_format (or send 'b64_json') and read each "
+            "image from data[].b64_json."
+        ),
+        param="response_format",
     )
 
 
@@ -194,12 +211,18 @@ def _admit_accepted(
         )
     serving: list[int] = []
     unpriced = False
+    base64_only = False
     for index, (profile, _client) in zip(
         dispatchable.indexes, dispatchable.resolved_wires, strict=True
     ):
         capabilities = route.deployments[index].capabilities
         supports = None if capabilities is None else capabilities.supports_image_generation
         if not _images_rung(profile.images_url, supports):
+            continue
+        if request.response_format == "url" and returns_base64_images_only(profile.model_id):
+            # A GPT image model answers base64 only and the gateway hosts no
+            # images to link to, so the rung cannot honor ``url`` (fail-closed).
+            base64_only = True
             continue
         prices = route.deployments[index].gateway.prices
         if _per_image(prices) and per_image_rate(prices, request) is None:
@@ -210,6 +233,8 @@ def _admit_accepted(
         serving.append(index)
     if not serving:
         _finish_unsupported(plane, authorization)
+        if base64_only:
+            raise NativeBridgeError(base64_only_error(authorization.alias))
         if unpriced:
             raise NativeBridgeError(unpriced_variant_error(image_variant(request)))
         raise NativeBridgeError(not_an_image_model_error(authorization.alias))
