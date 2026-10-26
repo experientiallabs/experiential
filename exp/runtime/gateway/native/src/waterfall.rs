@@ -89,6 +89,8 @@ pub struct CommittedAttempt {
     /// The streamed-output pace the control plane set for this attempt
     /// (`output_pacing`); `None` streams unpaced, as every attempt did before.
     pub pace: Option<f64>,
+    /// See [`Served::rate_limit_headers`].
+    pub rate_limit_headers: Vec<(String, String)>,
 }
 
 /// One attempt whose terminal was reached and settled before commitment.
@@ -102,10 +104,12 @@ pub struct SettledAttempt {
     pub empty_completion: bool,
     /// See [`CommittedAttempt::tool_search_rounds`].
     pub tool_search_rounds: Vec<ToolSearchRound>,
+    /// See [`Served::rate_limit_headers`].
+    pub rate_limit_headers: Vec<(String, String)>,
 }
 
 /// The facts of the attempt that served, as the response surfaces name them.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Default)]
 pub struct Served {
     pub depth: usize,
     pub encrypted_reasoning_stripped: bool,
@@ -114,6 +118,10 @@ pub struct Served {
     /// typed 200 under `x-gateway-warning: empty_completion`, the ledger the
     /// typed `empty_completion` failure.
     pub empty_completion: bool,
+    /// The serving rung's provider rate-limit headers, relayed only when it
+    /// dispatched on the caller's own credential
+    /// (`rate_limit_headers::caller_rate_limit_headers`).
+    pub rate_limit_headers: Vec<(String, String)>,
 }
 
 impl CommittedAttempt {
@@ -123,6 +131,7 @@ impl CommittedAttempt {
             depth: self.depth,
             encrypted_reasoning_stripped: self.encrypted_reasoning_stripped,
             empty_completion: false,
+            rate_limit_headers: self.rate_limit_headers.clone(),
         }
     }
 }
@@ -134,6 +143,7 @@ impl SettledAttempt {
             depth: self.depth,
             encrypted_reasoning_stripped: self.encrypted_reasoning_stripped,
             empty_completion: self.empty_completion,
+            rate_limit_headers: self.rate_limit_headers.clone(),
         }
     }
 }
@@ -635,6 +645,7 @@ pub async fn acquire_attempt(ctx: &WaterfallContext<'_>, guard: &mut AttemptGuar
                         encrypted_reasoning_stripped,
                         empty_completion: false,
                         tool_search_rounds: Vec::new(),
+                        rate_limit_headers: Vec::new(),
                     });
                 }
                 if failure.failure_class == FailureClass::EmptyCompletion {
@@ -657,6 +668,7 @@ pub async fn acquire_attempt(ctx: &WaterfallContext<'_>, guard: &mut AttemptGuar
                         encrypted_reasoning_stripped,
                         empty_completion: true,
                         tool_search_rounds: std::mem::take(&mut tool_search_rounds),
+                        rate_limit_headers: Vec::new(),
                     });
                 }
                 let boundary = with_largest_retry_after(boundary, largest_retry_after);

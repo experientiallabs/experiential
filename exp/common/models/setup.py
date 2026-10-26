@@ -10,6 +10,7 @@ from pydantic import Field, SerializerFunctionWrapHandler, model_serializer, mod
 
 from exp.common.core.artifacts import ContractModel
 from exp.common.core.locks import file_write_lock
+from exp.common.models.azure_endpoints import AzureApiSurface
 from exp.common.models.bedrock_connection import require_bedrock_connection_shape
 from exp.common.models.catalog import (
     MODEL_CATALOG_SCHEMA_VERSION,
@@ -50,7 +51,7 @@ class ProviderConnection(ContractModel):
     api_key_env: str | None = Field(default=None, max_length=256)
     base_url: str | None = Field(default=None, max_length=2_048)
     api_version: str | None = Field(default=None, max_length=64)
-    azure_api_surface: Literal["openai_deployments", "model_inference"] | None = None
+    azure_api_surface: AzureApiSurface | None = None
     region: str | None = Field(default=None, max_length=64)
     aws_access_key_id_env: str | None = Field(default=None, max_length=256)
     bedrock_auth_mode: Literal["access_key_pair", "api_key"] | None = None

@@ -72,13 +72,21 @@ from exp.runtime.anthropic_protocol.server_tools import (
     messages_web_search,
     require_served_server_tool_types,
 )
+from exp.runtime.anthropic_protocol.tool_changes import (
+    CustomTool,
+    ToolAdditionBlock,
+    ToolRemovalBlock,
+    decode_tool_change,
+    tool_change_marker,
+    tool_change_text,
+    tools_after_changes,
+)
 from exp.runtime.anthropic_protocol.wire_validation import validate_wire, validation_error
 from exp.runtime.gateway.contracts import (
     GatewayApiSurface,
     GatewayMessage,
     GatewayNamedToolChoice,
     GatewayRequest,
-    GatewayToolDefinition,
     ProviderReasoningBlock,
     RedactedThinkingBlock,
     ThinkingBlock,
@@ -190,6 +198,8 @@ _ContentBlock = (
     | _ToolResultBlock
     | ServerToolUseBlock
     | _WebSearchToolResultBlock
+    | ToolAdditionBlock
+    | ToolRemovalBlock
 )
 
 
@@ -208,35 +218,6 @@ class _Message(AnthropicWireModel):
 
 _MESSAGE_KEYS = frozenset(_Message.model_fields)
 """Keys an Anthropic turn object may carry."""
-
-
-class _Tool(AnthropicWireModel):
-    """One caller-defined custom tool with its JSON Schema declaration.
-
-    Descriptions are preserved without a per-field size limit. The gateway's
-    total request-body cap and provider context limits still apply.
-
-    ``eager_input_streaming``, ``defer_loading``, ``allowed_callers``, and
-    ``input_examples`` are provider-native tool annotations the live API
-    accepts bare (each verified 2026-08-30; Claude Code sends
-    ``eager_input_streaming`` conditionally). They forward verbatim on
-    Anthropic rungs, which own their validity rules, and drop with
-    disclosure elsewhere.
-
-    Attributes:
-        description: Optional verbatim tool instructions; bounded by the aggregate request limit.
-    """
-
-    name: str = Field(min_length=1, max_length=256)
-    description: str | None = None
-    input_schema: JsonObject
-    cache_control: CacheControl | None = None
-    type: Literal["custom"] | None = None
-    strict: bool = False
-    eager_input_streaming: bool | None = None
-    defer_loading: bool | None = None
-    allowed_callers: tuple[str, ...] | None = None
-    input_examples: tuple[JsonObject, ...] | None = None
 
 
 class _ToolChoice(AnthropicWireModel):
@@ -297,7 +278,7 @@ class _MessagesRequest(AnthropicWireModel):
     top_k: int | None = Field(default=None, ge=0)
     stop_sequences: tuple[str, ...] | None = None
     stream: bool = False
-    tools: tuple[_Tool | ServerTool, ...] = ()
+    tools: tuple[CustomTool | ServerTool, ...] = ()
     tool_choice: _ToolChoice | None = None
     metadata: _Metadata | None = None
     thinking: _ThinkingConfig | None = None
@@ -438,6 +419,9 @@ def _decode(
                 + detail["msg"].removeprefix("Value error, ")
                 + ".",
             ) from exc
+    tools, tool_change_disclosures = tools_after_changes(
+        request.tools, [message.content for message in request.messages]
+    )
     parallel_tool_calls: bool | None = None
     if request.tool_choice is not None and request.tool_choice.disable_parallel_tool_use:
         parallel_tool_calls = False
@@ -456,7 +440,7 @@ def _decode(
         canonical = GatewayRequest(
             surface=GatewayApiSurface.MESSAGES,
             messages=tuple(messages),
-            tools=tuple(_gateway_tool(tool) for tool in request.tools if isinstance(tool, _Tool)),
+            tools=tools,
             # Raw payload entries, mirroring thinking: the provider receives
             # each server tool byte-for-byte on Anthropic rungs.
             provider_server_tools=tuple(
@@ -496,6 +480,7 @@ def _decode(
             ignored_parameters=(
                 *unknown_disclosures,
                 *dropped_beta_disclosures,
+                *tool_change_disclosures,
                 *channels.disclosures,
             ),
             gateway=request.gateway,
@@ -701,25 +686,6 @@ def _stop_sequences(sequences: tuple[str, ...] | None) -> tuple[str, ...]:
     return deduped
 
 
-def _gateway_tool(tool: _Tool) -> GatewayToolDefinition:
-    """Convert one Anthropic custom tool to the canonical tool definition."""
-    return GatewayToolDefinition(
-        name=tool.name,
-        description=tool.description,
-        parameters=tool.input_schema,
-        strict=tool.strict,
-        cache_control=(
-            tool.cache_control.model_dump(mode="json", exclude_none=True)
-            if tool.cache_control is not None
-            else None
-        ),
-        eager_input_streaming=tool.eager_input_streaming,
-        defer_loading=tool.defer_loading,
-        allowed_callers=tool.allowed_callers,
-        input_examples=tool.input_examples,
-    )
-
-
 def _gateway_tool_choice(
     choice: _ToolChoice | None,
 ) -> Literal["auto", "none", "required"] | GatewayNamedToolChoice | None:
@@ -833,7 +799,31 @@ def _gateway_messages(message: _Message, index: int) -> list[GatewayMessage]:
         reasoning.clear()
         ordered_blocks.clear()
 
+    previous_change = False
     for block_index, block in enumerate(message.content):
+        if isinstance(block, (ToolAdditionBlock, ToolRemovalBlock)):
+            block_param = f"{param}.content.{block_index}"
+            if message.role != "system":
+                raise invalid_field(
+                    block_param,
+                    f"{block.type} blocks are only valid in system messages.",
+                )
+            # The change applies to the request's tools (``tools_after_changes``)
+            # and is stated here, where it happened, as one instruction line.
+            separator = (
+                "\n" if previous_change else "\n\n" if any(part.text for part in text_parts) else ""
+            )
+            block = _TextBlock(
+                type="text",
+                text=separator + tool_change_text(decode_tool_change(block, block_param)),
+                cache_control=tool_change_marker(block, block_param),
+            )
+            previous_change = True
+        else:
+            if previous_change and isinstance(block, _TextBlock) and block.text:
+                # Caller text after a change line starts its own paragraph.
+                block = block.model_copy(update={"text": "\n\n" + block.text})
+            previous_change = False
         if isinstance(block, _TextBlock):
             if block.citations:
                 if message.role != "assistant":

@@ -91,7 +91,13 @@ MESSAGES_MANIFEST = CompatibilityManifest(
             CompatibilityDisposition.CONDITIONALLY_SUPPORTED,
             "inference_geo",
         ),
-        _field("metadata", CompatibilityDisposition.METADATA_ONLY),
+        # ``metadata.user_id`` reaches Anthropic rungs as the provider's own
+        # end-user attribution; other rungs define no equivalent and omit it.
+        _field(
+            "metadata",
+            CompatibilityDisposition.CONDITIONALLY_SUPPORTED,
+            "end_user_attribution",
+        ),
         # Conscious rejections, each with a recorded reason:
         # - ``thread`` is Anthropic's server-held conversation state (it
         #   replaces ``messages`` upstream); the stateless gateway cannot
@@ -244,6 +250,7 @@ block-vocabulary evidence, exactly as web_search was.
 MESSAGES_BETA_TOKENS_FORWARDED = frozenset(
     {
         "context-1m-2025-08-07",
+        "extended-cache-ttl-2025-04-11",
         "interleaved-thinking-2025-05-14",
         "context-management-2025-06-27",
         "cache-diagnosis-2026-04-07",
@@ -257,7 +264,9 @@ A caller beta header is operator-trust surface, so forwarding is an exact
 allowlist, never a pattern: each listed token's behavior is understood and
 safe to relay. ``context-1m-2025-08-07`` activates the 1M context window
 (Claude Code sends it with 1M-suffixed models; without forwarding, the
-provider serves 200K and long sessions fail). ``interleaved-thinking``
+provider serves 200K and long sessions fail). ``extended-cache-ttl``
+admits ``cache_control.ttl: "1h"`` markers, which the gateway already relays
+byte-for-byte and settles at the one-hour write rate. ``interleaved-thinking``
 gates thinking between tool calls, whose blocks this gateway already
 carries opaquely. The remaining four are the same tokens the gateway
 injects itself when the bound field (``context_management``,

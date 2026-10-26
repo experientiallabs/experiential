@@ -2,7 +2,7 @@
 
 mod deadline;
 pub use deadline::{
-    stream_timeout_failure, DEADLINE_BEFORE_OUTPUT_MESSAGE, DEADLINE_WHILE_GENERATING_MESSAGE,
+    deadline_while_generating, stream_timeout_failure, DEADLINE_BEFORE_OUTPUT_MESSAGE,
 };
 mod progress;
 
@@ -392,10 +392,7 @@ impl UpstreamRelay {
     fn read_failure(&self, deadline: Instant, phase_timeout: Duration) -> Option<Failure> {
         if remaining(deadline).is_zero() {
             if self.last_progress_at.is_some() {
-                return Some(Failure::new(
-                    FailureClass::Timeout,
-                    DEADLINE_WHILE_GENERATING_MESSAGE,
-                ));
+                return Some(deadline_while_generating());
             }
             return Some(stream_timeout_failure(deadline));
         }

@@ -3,7 +3,7 @@
 //! keyed-replay response materialization and capture, and the bounded SSE
 //! delivery tail with its terminal settlement rules.
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use axum::body::Body;
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
@@ -64,6 +64,7 @@ pub(crate) async fn emit_responses_failure(
     let frames = encoder
         .feed(&Event::Failed(failure.clone()))
         .unwrap_or_default();
+    let deadline = terminal_send_deadline(deadline);
     for frame in frames {
         if !send_bounded(sender, deadline, Bytes::from(frame)).await {
             return;
@@ -330,6 +331,19 @@ fn capture_frame_bounded(
     true
 }
 
+/// How long a stream's terminal frames (its failure event, the done
+/// sentinel) may still take to reach a connected caller once the request
+/// deadline itself has run out. Without it the frame that names a deadline
+/// cut is refused by the same deadline, and the caller reads a truncated
+/// answer as a clean end of stream.
+pub(crate) const TERMINAL_FRAME_GRACE: Duration = Duration::from_secs(5);
+
+/// The send bound for a stream's terminal frames: the request deadline, or
+/// a short grace past it when it has already run out.
+pub(crate) fn terminal_send_deadline(deadline: Instant) -> Instant {
+    deadline.max(Instant::now() + TERMINAL_FRAME_GRACE)
+}
+
 /// Deliver one public frame bounded by the request deadline, so a connected
 /// client that stops reading cannot pin the admission permit and the upstream
 /// connection forever. `false` means the client is gone or out of time.
@@ -471,6 +485,7 @@ pub(crate) async fn finish_stream_terminal(
             return;
         }
     }
+    let deadline = terminal_send_deadline(deadline);
     for data in frames {
         if !send_bounded(sender, deadline, data).await {
             log_stream_exit(request_id, "terminal_delivery_closed_or_deadline");

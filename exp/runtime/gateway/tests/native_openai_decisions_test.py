@@ -268,6 +268,39 @@ def _engine(tmp_path_factory: pytest.TempPathFactory) -> Iterator[_ServingEngine
         catalog_sha256=normalized.identity_sha256(),
     )
     manager.add_grant(identity_id="default", alias_id="luna-auth-failover")
+    # A native-decisions alias (SystemOne only): /v1/decisions refuses it and
+    # points the caller at /v1/systemone. It is refused before any dispatch.
+    upsert_connection(
+        root,
+        name="typesafe-main",
+        connection=ConnectionConfig(provider="typesafe", api_key_env="TEST_PROVIDER_KEY"),
+        replace=False,
+    )
+    normalized, snapshot, _changed = upsert_singleton_deployment(
+        root,
+        deployment_alias="jev-decisions",
+        connection_name="typesafe-main",
+        provider_model="jev",
+        exact_model_id="jev-exact",
+        revision=None,
+        capabilities=ModelCapabilities(supports_completions=False, supports_embeddings=False),
+        gateway_capabilities=GatewayDeploymentCapabilities(supports_decisions=True),
+        prices=GatewayTokenPrices(
+            input_nano_usd_per_million_tokens=_INPUT_RATE,
+            output_nano_usd_per_million_tokens=0,
+        ),
+        pricing_source="test-fixture",
+        replace=False,
+    )
+    manager.activate_direct_alias(
+        alias_id="jev-decisions",
+        alias_name="jev-decisions",
+        revision_id="revision-jev",
+        pool_id="jev-decisions",
+        snapshot_ref=f"catalog-snapshots/{snapshot.name}",
+        catalog_sha256=normalized.identity_sha256(),
+    )
+    manager.add_grant(identity_id="default", alias_id="jev-decisions")
     SQLiteBudgetStore(manager.database_path).set_limit(
         organization_id=manager.organization_id,
         period=datetime.now(UTC).strftime("%Y-%m"),
@@ -316,7 +349,7 @@ def _engine(tmp_path_factory: pytest.TempPathFactory) -> Iterator[_ServingEngine
                     )
                     if models.status_code == 200 and sorted(
                         model["id"] for model in models.json()["data"]
-                    ) == ["coding", "luna-auth-failover", "luna-decisions"]:
+                    ) == ["coding", "jev-decisions", "luna-auth-failover", "luna-decisions"]:
                         break
                 except (httpx.HTTPError, ValueError, KeyError, TypeError):
                     pass
@@ -429,3 +462,58 @@ def test_an_answer_outside_the_question_fails_closed(engine: _ServingEngine) -> 
     request, [attempt] = _settled(engine, request_id)
     assert request["terminal_state"] == "failed"
     assert attempt["failure_class"] == "malformed_response"
+
+
+def _refused(engine: _ServingEngine, model: str) -> tuple[httpx.Response, sqlite3.Row]:
+    """POST a decision for ``model`` and read the one request it accepted and failed."""
+    with sqlite3.connect(GatewayManagement(engine.root).database_path) as connection:
+        before = {row[0] for row in connection.execute("SELECT request_id FROM gateway_requests")}
+    response = _post(engine, _body(model=model))
+    with sqlite3.connect(GatewayManagement(engine.root).database_path) as connection:
+        [request_id] = {
+            row[0] for row in connection.execute("SELECT request_id FROM gateway_requests")
+        } - before
+    request, attempts = _settled(engine, request_id)
+    assert attempts == []
+    return response, request
+
+
+def test_a_native_decisions_model_is_pointed_at_systemone(engine: _ServingEngine) -> None:
+    """A SystemOne-only alias gets a 400 naming /v1/systemone and the same model id."""
+    with _DecisionsUpstream.lock:
+        dispatched = len(_DecisionsUpstream.payloads)
+    response, request = _refused(engine, "jev-decisions")
+    assert response.status_code == 400, response.text
+    assert response.json() == {
+        "error": {
+            "message": (
+                "The model 'jev-decisions' supports native decisions, not the OpenAI "
+                "Decisions API. POST /v1/systemone on this same API host with your same API "
+                "key (Authorization: Bearer) and the same model id 'jev-decisions', using "
+                "model, state and questions. Key questions by id; each needs type (noul, "
+                "choice or score) and instructions (choice also needs a criteria object; "
+                "score a criteria array). Read answers[id]; do not send input or a "
+                "questions list."
+            ),
+            "type": "invalid_request_error",
+            "param": "model",
+            "code": "unsupported_capability",
+        }
+    }
+    assert request["api_surface"] == "decisions"
+    assert request["terminal_state"] == "failed"
+    with _DecisionsUpstream.lock:
+        assert len(_DecisionsUpstream.payloads) == dispatched
+
+
+def test_a_chat_model_keeps_the_choose_another_model_refusal(engine: _ServingEngine) -> None:
+    """A model serving neither decisions wire is not sent to /v1/systemone."""
+    response, request = _refused(engine, "coding")
+    assert response.status_code == 400, response.text
+    error = response.json()["error"]
+    assert error["code"] == "unsupported_capability"
+    assert error["message"] == (
+        "The model 'coding' does not serve the OpenAI Decisions API. Choose a decision "
+        "model served by OpenAI from GET /v1/models and resend the request to /v1/decisions."
+    )
+    assert request["terminal_state"] == "failed"

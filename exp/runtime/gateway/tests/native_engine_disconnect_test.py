@@ -236,6 +236,13 @@ class _SseUpstream(BaseHTTPRequestHandler):
                     self.wfile.write(_content_chunk("tick "))
                     self.wfile.flush()
                     time.sleep(0.5)
+            elif prompt == "drip-past-deadline":
+                # Keeps writing, slowly, well past the request deadline, so
+                # the deadline cuts a stream that is still producing output.
+                for _ in range(40):
+                    self.wfile.write(_content_chunk("tick "))
+                    self.wfile.flush()
+                    time.sleep(0.25)
             elif prompt == "flood-token":
                 # Never terminates: the stream grows until the gateway drops
                 # the connection, so no host's TCP buffering can absorb it
@@ -978,6 +985,41 @@ def test_stalled_reader_cannot_pin_the_gateway_past_the_deadline(
         assert settled, "stalled stream was not settled by the request deadline"
     finally:
         client.close()
+
+
+@pytest.mark.parametrize("surface", ["chat", "messages"])
+def test_a_deadline_cut_stream_says_so_instead_of_ending_cleanly(
+    engine: _ServingEngine, surface: str
+) -> None:
+    """A stream still producing output at the deadline ends with a named error.
+
+    The terminal frame is sent after the deadline under a short grace, so a
+    connected caller reads the time-limit error rather than a body that just
+    stops (which reads as a clean end of stream to SSE clients and invites a
+    full-price retry of the same long answer).
+    """
+    body = json.loads(_chat_payload("drip-past-deadline", stream=True))
+    path = "/v1/chat/completions"
+    if surface == "messages":
+        body["max_tokens"] = 128
+        path = "/v1/messages"
+    started = time.monotonic()
+    response = httpx.post(
+        f"{engine.base}{path}",
+        headers={"authorization": f"Bearer {engine.raw_key}"},
+        json=body,
+        timeout=_REQUEST_TIMEOUT_SECONDS + 10,
+    )
+    elapsed = time.monotonic() - started
+    assert response.status_code == 200
+    assert "tick" in response.text
+    assert "time limit" in response.text, response.text[-400:]
+    if surface == "chat":
+        assert response.text.rstrip().endswith("data: [DONE]")
+    else:
+        assert "event: error" in response.text
+        assert "event: message_stop" not in response.text
+    assert elapsed < _REQUEST_TIMEOUT_SECONDS + 3
 
 
 def test_heartbeat_keeps_original_provider_phase_timeout(engine: _ServingEngine) -> None:

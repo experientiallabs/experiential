@@ -38,6 +38,8 @@ _MESSAGE_BLOCK_TYPES = frozenset(
         "web_search_tool_result",
         "tool_search_tool_result",
         "tool_reference",
+        "tool_addition",
+        "tool_removal",
     }
 )
 """Every message content block type the decoder's block union admits.
@@ -144,8 +146,13 @@ def rejected_block_hint(payload: JsonObject) -> tuple[str, str] | None:
                 return f"{param}.type", (
                     f"unsupported content block type '{block_type[:64]}'; message content "
                     "supports text, image, document, thinking, redacted_thinking, "
-                    "tool_use, tool_result, and echoed server tool blocks."
+                    "tool_use, tool_result, tool_addition, tool_removal, and echoed "
+                    "server tool blocks."
                 )
+            if block_type in ("tool_addition", "tool_removal"):
+                change_hint = _tool_change_hint(block_object, param)
+                if change_hint is not None:
+                    return change_hint
             if block_object.get("type") == "tool_result" and isinstance(
                 block_object.get("content"), list
             ):
@@ -164,3 +171,33 @@ def rejected_block_hint(payload: JsonObject) -> tuple[str, str] | None:
                             "sub-blocks are supported."
                         )
     return None
+
+
+def _tool_change_hint(block: JsonObject, param: str) -> tuple[str, str] | None:
+    """Name a tool change the gateway cannot serve before its union miss misdirects.
+
+    MCP references and toolsets need Anthropic's MCP connector, which the
+    gateway does not serve; a by-value definition must be a custom tool
+    (server tools are declared in ``tools`` and added by reference).
+    """
+    tool = block.get("tool")
+    if not isinstance(tool, dict):
+        return None
+    tool_object = cast(JsonObject, tool)
+    tool_type = str(tool_object.get("type"))
+    if tool_type in ("mcp_tool_reference", "mcp_toolset_reference"):
+        return f"{param}.tool.type", (
+            f"{tool_type} is not supported: the gateway serves no MCP connector. Declare "
+            "the tool in tools and add it with a tool_reference."
+        )
+    definition = tool_object.get("definition")
+    if tool_type != "tool_definition" or not isinstance(definition, dict):
+        return None
+    definition_type = cast(JsonObject, definition).get("type")
+    if definition_type in (None, "custom"):
+        return None
+    return f"{param}.tool.definition.type", (
+        f"tool_addition defines a '{str(definition_type)[:64]}' tool; only custom tool "
+        "definitions (name, description, input_schema) can be defined in a message. Declare "
+        "other tools in tools and add them with a tool_reference."
+    )

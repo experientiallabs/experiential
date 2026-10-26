@@ -10,6 +10,7 @@ from pydantic import JsonValue
 
 from exp.common.core.artifacts import JsonObject
 from exp.runtime.openai_protocol.client_field_repairs import (
+    INCLUDE_REASONING_TRANSLATED,
     OUTPUT_CONFIG_DROPPED,
     OUTPUT_CONFIG_EFFORT_IGNORED,
     OUTPUT_CONFIG_EFFORT_TRANSLATED,
@@ -25,6 +26,7 @@ from exp.runtime.openai_protocol.client_field_repairs import (
     accept_responses_stream_options,
     drop_unanchored_output_markers,
     drop_unforwarded_hints,
+    translate_chat_include_reasoning,
     translate_chat_output_config,
 )
 from exp.runtime.openai_protocol.errors import OpenAIProtocolError
@@ -135,6 +137,89 @@ def test_chat_output_config_with_unknown_effort_is_dropped() -> None:
     )
     assert "reasoning_effort" not in repaired
     assert disclosures == (OUTPUT_CONFIG_DROPPED,)
+
+
+_EXCLUDE_DROPPED = "reasoning.exclude->dropped(not_carried)"
+
+
+def test_chat_include_reasoning_false_decodes_as_reasoning_exclude() -> None:
+    """OpenRouter's ``include_reasoning: false`` is ``reasoning: {exclude: true}``."""
+    decoded = decode_chat({**_CHAT_BASE, "include_reasoning": False})
+    reference = decode_chat({**_CHAT_BASE, "reasoning": {"exclude": True}})
+    assert decoded.request.reasoning_effort == reference.request.reasoning_effort is None
+    assert decoded.request.thinking_default_enable is False
+    assert decoded.request.ignored_parameters == (INCLUDE_REASONING_TRANSLATED, _EXCLUDE_DROPPED)
+
+
+@pytest.mark.parametrize("value", (True, None))
+def test_chat_include_reasoning_default_values_are_consumed_silently(value: bool | None) -> None:
+    """``true`` asks for the default and ``null`` for nothing: neither is disclosed."""
+    decoded = decode_chat({**_CHAT_BASE, "include_reasoning": value})
+    assert decoded.request.reasoning_effort is None
+    assert decoded.request.thinking_default_enable is False
+    assert decoded.request.ignored_parameters == ()
+
+
+def test_chat_include_reasoning_false_merges_into_the_reasoning_object() -> None:
+    """The other reasoning controls the caller sent keep their meaning."""
+    repaired, disclosures = translate_chat_include_reasoning(
+        {**_CHAT_BASE, "include_reasoning": False, "reasoning": {"effort": "high"}}
+    )
+    assert "include_reasoning" not in repaired
+    assert repaired["reasoning"] == {"effort": "high", "exclude": True}
+    assert disclosures == (INCLUDE_REASONING_TRANSLATED,)
+    decoded = decode_chat(
+        {**_CHAT_BASE, "include_reasoning": False, "reasoning": {"effort": "high"}}
+    )
+    assert decoded.request.reasoning_effort == "high"
+    assert decoded.request.ignored_parameters == (
+        INCLUDE_REASONING_TRANSLATED,
+        _EXCLUDE_DROPPED,
+        "reasoning->translated(reasoning_effort)",
+    )
+
+
+def test_chat_include_reasoning_false_fills_a_null_reasoning_object() -> None:
+    repaired, _ = translate_chat_include_reasoning(
+        {**_CHAT_BASE, "include_reasoning": False, "reasoning": None}
+    )
+    assert repaired["reasoning"] == {"exclude": True}
+
+
+@pytest.mark.parametrize(("include", "exclude"), ((True, True), (False, False)))
+def test_chat_include_reasoning_contradicting_reasoning_exclude_is_refused(
+    include: bool, exclude: bool
+) -> None:
+    """A conflict is a typed 400 naming both fields, never a silent winner."""
+    with pytest.raises(OpenAIProtocolError) as error:
+        decode_chat({**_CHAT_BASE, "include_reasoning": include, "reasoning": {"exclude": exclude}})
+    assert error.value.status_code == 400
+    assert error.value.detail.code == "invalid_parameter"
+    assert error.value.detail.param == "include_reasoning"
+    assert "include_reasoning" in error.value.detail.message
+    assert "reasoning.exclude" in error.value.detail.message
+
+
+@pytest.mark.parametrize("include", (True, False))
+def test_chat_include_reasoning_agreeing_with_reasoning_exclude_is_served(include: bool) -> None:
+    decoded = decode_chat(
+        {**_CHAT_BASE, "include_reasoning": include, "reasoning": {"exclude": not include}}
+    )
+    assert decoded.request.reasoning_effort is None
+
+
+@pytest.mark.parametrize("value", ("false", 0, {"exclude": True}))
+def test_chat_include_reasoning_non_boolean_is_a_named_400(value: JsonValue) -> None:
+    with pytest.raises(OpenAIProtocolError) as error:
+        decode_chat({**_CHAT_BASE, "include_reasoning": value})
+    assert error.value.detail.code == "invalid_parameter"
+    assert error.value.detail.param == "include_reasoning"
+
+
+def test_chat_include_reasoning_beside_explicit_reasoning_effort_is_served() -> None:
+    decoded = decode_chat({**_CHAT_BASE, "include_reasoning": False, "reasoning_effort": "low"})
+    assert decoded.request.reasoning_effort == "low"
+    assert INCLUDE_REASONING_TRANSLATED in decoded.request.ignored_parameters
 
 
 @pytest.mark.parametrize("modalities", (["image", "text"], ["text"], ["image"], None))
@@ -267,12 +352,25 @@ def test_responses_call_arguments_object_or_double_encoded_are_normalized(
     assert [call.arguments for call in calls] == [{"city": "Paris"}]
 
 
-@pytest.mark.parametrize("arguments", ("not json", "[1, 2]", json.dumps("plain text")))
-def test_responses_call_arguments_that_name_no_object_are_refused_clearly(
-    arguments: str,
+@pytest.mark.parametrize(
+    ("arguments", "treatment"),
+    (
+        ("not json", "invalid_json"),
+        ("[1, 2]", "non_object_json"),
+        (json.dumps("plain text"), "non_object_json"),
+    ),
+)
+def test_responses_call_arguments_that_name_no_object_are_served_with_a_stand_in(
+    arguments: str, treatment: str
 ) -> None:
-    """Arguments that encode no object keep the refusal naming the path."""
-    with pytest.raises(
-        OpenAIProtocolError, match=r"input\.0\.arguments' must encode one JSON object"
-    ):
-        decode_responses(_function_call_input(arguments))
+    """A replayed call whose text names no object keeps its text and gains a wrapper.
+
+    Refusing it bricked the session (every later turn replays the same call);
+    the rung decides which form it sends and discloses a rewrite there.
+    """
+    decoded = decode_responses(_function_call_input(arguments))
+    assert decoded.request.ignored_parameters == ()
+    (call,) = [call for message in decoded.request.messages for call in message.tool_calls]
+    assert call.raw_arguments == arguments
+    assert call.arguments == {"_unparsed_arguments": arguments}
+    assert call.arguments_treatment == treatment

@@ -68,6 +68,7 @@ pub(super) async fn settle_output_less(
     depth: usize,
     encrypted_reasoning_stripped: bool,
     search_rounds: &[ToolSearchRound],
+    rate_limit_headers: Vec<(String, String)>,
 ) -> AttemptEnd {
     if let Some(tracked) = usage.as_ref() {
         events.push(Event::Usage(tracked.clone()));
@@ -108,5 +109,6 @@ pub(super) async fn settle_output_less(
         encrypted_reasoning_stripped,
         empty_completion: false,
         tool_search_rounds: Vec::new(),
+        rate_limit_headers,
     })
 }

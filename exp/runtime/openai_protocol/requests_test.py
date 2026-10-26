@@ -646,27 +646,31 @@ def test_chat_decoder_still_rejects_populated_unsupported_message_fields() -> No
         assert param is not None and param.startswith("messages.0.")
 
 
-def test_invalid_tool_arguments_and_divergent_operation_headers_are_specific() -> None:
-    """Malformed history names its field; independent identity headers both decode."""
-    with pytest.raises(OpenAIProtocolError) as arguments:
-        decode_chat(
-            {
-                "model": "coding",
-                "messages": [
-                    {
-                        "role": "assistant",
-                        "tool_calls": [
-                            {
-                                "id": "call-one",
-                                "type": "function",
-                                "function": {"name": "tool", "arguments": "{"},
-                            }
-                        ],
-                    }
-                ],
-            }
-        )
-    assert arguments.value.detail.param == "messages.0.tool_calls.0.function.arguments"
+def test_cut_off_tool_arguments_and_divergent_operation_headers_both_decode() -> None:
+    """Cut-off history arguments serve with a stand-in; independent identity headers decode."""
+    decoded_history = decode_chat(
+        {
+            "model": "coding",
+            "messages": [
+                {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {
+                            "id": "call-one",
+                            "type": "function",
+                            "function": {"name": "tool", "arguments": "{"},
+                        }
+                    ],
+                }
+            ],
+        }
+    )
+    (call,) = decoded_history.request.messages[0].tool_calls
+    assert (call.raw_arguments, call.arguments, call.arguments_treatment) == (
+        "{",
+        {},
+        "truncated_json",
+    )
 
     # Idempotency-Key names one retriable operation; X-Client-Request-Id is
     # session correlation identity (Codex sends its session id on every

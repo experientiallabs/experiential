@@ -16,7 +16,7 @@ from collections.abc import Mapping, MutableMapping, Sequence
 from dataclasses import dataclass, field
 from functools import partial
 from getpass import getpass
-from typing import Literal, cast
+from typing import cast, get_args
 
 from rich.console import Console
 from rich.prompt import Prompt
@@ -62,6 +62,7 @@ from exp.common.models import (
     resolve_discovered_model,
     served_roles,
 )
+from exp.common.models.azure_endpoints import AzureApiSurface
 from exp.runtime.models.credentials import resolve_or_prompt_connection_api_key
 from exp.runtime.models.providers import (
     ProviderEndpoint,
@@ -369,7 +370,7 @@ def collect_provider_connection(
         return hosted_connection(environment).catalog_config()
     base_url = None
     api_version = None
-    azure_api_surface: Literal["openai_deployments", "model_inference"] | None = None
+    azure_api_surface: AzureApiSurface | None = None
     region = None
     aws_access_key_id_env = None
     bedrock_auth_mode = None
@@ -395,9 +396,9 @@ def collect_provider_connection(
         )
         if not selected_surface:
             return None
-        if selected_surface not in ("openai_deployments", "model_inference"):
+        if selected_surface not in get_args(AzureApiSurface):
             raise ValueError(f"unsupported Azure API surface {selected_surface!r}")
-        azure_api_surface = cast(Literal["openai_deployments", "model_inference"], selected_surface)
+        azure_api_surface = cast(AzureApiSurface, selected_surface)
     if provider == "bedrock":
         region = (
             ask_text(

@@ -20,6 +20,10 @@ _LOOPBACK_HOST = LOOPBACK_HOST
 DEFAULT_GATEWAY_PORT = 8000
 DEFAULT_GRACEFUL_TIMEOUT_SECONDS = 10.0
 DEFAULT_MAX_ACTIVE_REQUESTS = 1024
+DEFAULT_REQUEST_TIMEOUT_SECONDS = 120.0
+# One hour: long enough for the longest single provider answer, short enough
+# that a stuck request still ends on its own.
+MAXIMUM_REQUEST_TIMEOUT_SECONDS = 3600.0
 _console = Console(theme=EXP_THEME)
 _EXP_WORDMARK = "\n".join(
     (
@@ -73,6 +77,16 @@ def run(
         min=1,
         help="Maximum concurrently admitted requests.",
     ),
+    request_timeout: float = typer.Option(
+        DEFAULT_REQUEST_TIMEOUT_SECONDS,
+        "--request-timeout",
+        min=1.0,
+        max=MAXIMUM_REQUEST_TIMEOUT_SECONDS,
+        help=(
+            "Total seconds one request may take, failover included. Raise it for long "
+            "streamed answers; a stream cut at this limit ends with a time-limit error."
+        ),
+    ),
 ) -> None:
     """Start the local gateway directly, optionally with one project-backed alias.
 
@@ -87,6 +101,7 @@ def run(
         check: Whether to validate gateway readiness without binding.
         graceful_timeout: Gateway shutdown drain bound in seconds.
         max_active_requests: Concurrent-admission bound for the data plane.
+        request_timeout: Total per-request budget in seconds, failover included.
 
     Raises:
         typer.BadParameter: The selected project form or activation is invalid.
@@ -102,6 +117,7 @@ def run(
         check=check,
         graceful_timeout=graceful_timeout,
         max_active_requests=max_active_requests,
+        request_timeout=request_timeout,
     )
 
 
@@ -117,6 +133,7 @@ def start_gateway(
     check: bool = False,
     graceful_timeout: float = DEFAULT_GRACEFUL_TIMEOUT_SECONDS,
     max_active_requests: int = DEFAULT_MAX_ACTIVE_REQUESTS,
+    request_timeout: float = DEFAULT_REQUEST_TIMEOUT_SECONDS,
 ) -> None:
     """Start the local gateway, optionally materializing one project-backed alias.
 
@@ -131,6 +148,7 @@ def start_gateway(
         check: Whether to validate gateway readiness without binding.
         graceful_timeout: Gateway shutdown drain bound in seconds.
         max_active_requests: Concurrent-admission bound for the data plane.
+        request_timeout: Total per-request budget in seconds, failover included.
 
     Raises:
         typer.BadParameter: The selected project form or activation is invalid,
@@ -152,6 +170,7 @@ def start_gateway(
         check=check,
         graceful_timeout=graceful_timeout,
         max_active_requests=max_active_requests,
+        request_timeout=request_timeout,
     )
 
 
@@ -185,6 +204,7 @@ def _run_gateway(
     check: bool,
     graceful_timeout: float,
     max_active_requests: int = DEFAULT_MAX_ACTIVE_REQUESTS,
+    request_timeout: float = DEFAULT_REQUEST_TIMEOUT_SECONDS,
 ) -> None:
     """Validate, optionally set up, and serve the native gateway.
 
@@ -205,6 +225,7 @@ def _run_gateway(
         check: Whether to validate gateway readiness without binding.
         graceful_timeout: Gateway shutdown drain bound in seconds.
         max_active_requests: Concurrent-admission bound for the data plane.
+        request_timeout: Total per-request budget in seconds, failover included.
 
     Raises:
         typer.BadParameter: Setup, alias loading, native servability, or the
@@ -283,6 +304,7 @@ def _run_gateway(
                     data_plane_metrics=exp_gateway_native.metrics_snapshot_json,
                     guardrails=guardrails,
                     capture=capture_controller,
+                    request_timeout_seconds=request_timeout,
                 )
                 receipt = {
                     "schema_version": 1,

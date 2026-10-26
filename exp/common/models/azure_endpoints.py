@@ -5,8 +5,14 @@ from __future__ import annotations
 from typing import Literal
 from urllib.parse import urlsplit
 
-AzureApiSurface = Literal["openai_deployments", "model_inference"]
-"""Azure wire surface a connection speaks: classic deployments or Foundry model inference."""
+AzureApiSurface = Literal["openai_deployments", "model_inference", "responses"]
+"""Azure wire surface a connection speaks.
+
+``openai_deployments`` is the Azure OpenAI Chat Completions wire and ``model_inference`` the
+Foundry model-inference wire. ``responses`` is the native OpenAI Responses API that Azure OpenAI
+and Foundry serve for their OpenAI deployments; it is never inferred from a host and must be
+configured explicitly.
+"""
 
 _FOUNDRY_HOST_SUFFIXES = (".services.ai.azure.com", ".inference.ai.azure.com")
 _AZURE_OPENAI_HOST_SUFFIX = ".openai.azure.com"
