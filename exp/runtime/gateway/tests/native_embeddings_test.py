@@ -420,12 +420,15 @@ def test_unbillable_or_failing_provider_answers_fail_closed(
 ) -> None:
     """A vector-count mismatch, a missing prompt_tokens, or a 5xx never reaches the caller."""
     inputs = [selector, "second"]
-    attribution = f"embeddings-failure-{selector}"
+    with sqlite3.connect(GatewayManagement(engine.root).database_path) as connection:
+        (request_watermark,) = connection.execute(
+            "SELECT coalesce(max(rowid), 0) FROM gateway_requests"
+        ).fetchone()
     with _EmbeddingsUpstream.payloads_lock:
         posts_before = sum(
             payload.get("input") == inputs for payload in _EmbeddingsUpstream.payloads
         )
-    response = _post(engine, {"model": "embedder", "input": inputs, "user": attribution})
+    response = _post(engine, {"model": "embedder", "input": inputs})
     assert response.status_code == 502, response.text
     error = response.json()["error"]
     assert error["code"] == "all_routes_failed"
@@ -440,9 +443,9 @@ def test_unbillable_or_failing_provider_answers_fail_closed(
             SELECT a.request_id, a.state, a.attempt_ordinal, a.terminal_at
             FROM gateway_attempts AS a
             JOIN gateway_requests AS r ON r.request_id = a.request_id
-            WHERE r.attribution_label = ? ORDER BY a.attempt_ordinal
+            WHERE r.rowid > ? ORDER BY a.attempt_ordinal
             """,
-            (attribution,),
+            (request_watermark,),
         ).fetchall()
     assert len(attempts) == physical_attempts
     assert len({row[0] for row in attempts}) == 1

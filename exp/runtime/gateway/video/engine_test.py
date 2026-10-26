@@ -474,7 +474,9 @@ def test_failed_create_request_finish_is_owned_by_shutdown(setup: _Setup) -> Non
     assert original["certify_no_effects"] is True
     assert not _attempts(setup) and not setup.provider.posts
     with sqlite3.connect(setup.database) as connection:
-        assert connection.execute("SELECT state FROM gateway_requests").fetchall() == [("failed",)]
+        assert connection.execute("SELECT terminal_state FROM gateway_requests").fetchall() == [
+            ("failed",)
+        ]
 
 
 def test_retained_rejection_cannot_finalize_the_next_video_rung(setup: _Setup) -> None:

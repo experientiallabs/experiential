@@ -42,10 +42,10 @@ from exp.runtime.gateway.ledger_errors import (
 from exp.runtime.gateway.ledger_errors import (
     IdempotencyReplayUnavailableError as IdempotencyReplayUnavailableError,
 )
+from exp.runtime.gateway.ledger_reconciliation import reconcile_terminal_attempt
 from exp.runtime.gateway.ledger_requests import finish_request
 from exp.runtime.gateway.ledger_service_tiers import (
     long_context_values,
-    reconcile_tier_receipt,
     record_tier_admission,
     settle_tier,
     tier_usage_cost,
@@ -641,12 +641,10 @@ class SQLiteAttemptLedger(LocalSnapshotMemoOwner):
             raise GatewayLedgerError("attempt does not exist")
         current_state = str(row["state"])
         if current_state != "dispatched":
-            if current_state == state or (
-                current_state == "unknown_after_crash" and service_tier is not None
-            ):
-                reconcile_tier_receipt(connection, attempt_id, service_tier, terminal_event, usage)
-                return
-            raise GatewayLedgerError("attempt is already settled with another terminal state")
+            reconcile_terminal_attempt(
+                connection, attempt_id, state, terminal_event, failure, usage, service_tier
+            )
+            return
         tier = settle_tier(connection, attempt_id, service_tier)
         cost = (
             observed_usage_cost(row, usage, terminal_event)
