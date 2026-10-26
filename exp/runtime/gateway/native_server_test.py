@@ -43,12 +43,14 @@ def test_host_passes_the_serve_configuration(
         captured["on_listening"] = on_listening
         captured["guardrail_detectors"] = guardrail_detectors
         captured["capture"] = capture
+        captured["callback_scopes"] = callback_scopes
 
     native = SimpleNamespace(serve=serve)
     monkeypatch.setattr(native_server.importlib, "import_module", lambda _name: native)
     monkeypatch.setenv(PRE_FIRST_BYTE_RESERVE_ENV, "20")
     monkeypatch.setenv(PRE_FIRST_BYTE_MAX_ENV, "480")
     control = SimpleNamespace(guardrail_detectors={}, request_timeout_seconds=37.0)
+    scopes = cast("native_server.CallbackScopes", object())
 
     serve_native_gateway(
         control,
@@ -56,6 +58,7 @@ def test_host_passes_the_serve_configuration(
         port=8080,
         max_active_requests=23,
         max_active_per_organization=7,
+        callback_scopes=scopes,
         graceful_timeout_seconds=45.0,
         connect_timeout_seconds=4.0,
         public_upstreams_only=public_only,
@@ -65,6 +68,7 @@ def test_host_passes_the_serve_configuration(
     )
 
     assert captured["control_plane"] is control
+    assert captured["callback_scopes"] is scopes
     assert captured["shutdown"] is None
     config = cast("dict[str, object]", captured["config"])
     assert config["host"] == "0.0.0.0"
