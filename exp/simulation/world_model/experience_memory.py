@@ -709,6 +709,7 @@ def publish_trajectory(
     created_at: datetime,
     code_revision: str,
     publisher: str,
+    evidence: tuple[ArtifactInput, ...] = (),
 ) -> tuple[MemoryVersion, bool]:
     """Consume one completed trajectory into the next lineage version.
 
@@ -726,6 +727,8 @@ def publish_trajectory(
         created_at: Aware publication time.
         code_revision: Publishing implementation identity.
         publisher: Stable run identity; a restart of the same run recovers its own version.
+        evidence: Saved artifacts the trajectory was recorded in, cited by the new version so
+            ancestry checks on memory reach them.
 
     Returns:
         The new (or recovered own) version and True, or the existing head and False when
@@ -752,6 +755,7 @@ def publish_trajectory(
             created_at=created_at,
             code_revision=code_revision,
             publisher=publisher,
+            evidence=evidence,
         )
 
 
@@ -773,6 +777,7 @@ def _publish(
     created_at: datetime,
     code_revision: str,
     publisher: str,
+    evidence: tuple[ArtifactInput, ...],
 ) -> tuple[MemoryVersion, bool]:
     """Publication body; the caller holds the lineage lock."""
     if parent is not None and (
@@ -855,7 +860,7 @@ def _publish(
         created_at=created_at,
         inputs=tuple(
             sorted(
-                [artifact_input(store.read(snapshot.library_id).manifest)]
+                [artifact_input(store.read(snapshot.library_id).manifest), *evidence]
                 + ([] if parent is None else [_input(store, lineage, parent.version)]),
                 key=lambda row: row.artifact_id,
             )

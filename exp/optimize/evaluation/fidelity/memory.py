@@ -84,7 +84,8 @@ def consume_trajectory(project: ProjectStore, prepared: PreparedFidelity, now: d
 
     Deterministic code decides admission: only a learning spec whose every planned step
     was predicted and disclosed is consumed. Model-authored investigations enter as
-    unresolved research, never as accepted rules.
+    unresolved research, never as accepted rules. A plan or report excluded from
+    qualification refuses publication, including on replay of a saved report.
     """
     spec = prepared.spec
     receipt_id = prepared.id + "-memory"
@@ -95,6 +96,11 @@ def consume_trajectory(project: ProjectStore, prepared: PreparedFidelity, now: d
         or project.artifacts.exists(receipt_id)
     ):
         return
+    # A saved report may have been excluded after it was written; its evidence then never
+    # enters memory, and the version cites the report so later ancestry checks reach it.
+    plan = artifact_input(project.artifacts.read(prepared.id).manifest)
+    report = artifact_input(project.artifacts.read(prepared.id + "-report").manifest)
+    refuse_known_ineligible_sources(project.artifacts, (plan, report), maximum_artifacts=100_000)
     pinned = json.loads(project.artifacts.read_bytes(prepared.id + "-execution", "execution.json"))
     memory = pinned.get("memory")
     if not isinstance(memory, dict) or memory.get("lineage") != spec.memory.lineage:
@@ -154,6 +160,7 @@ def consume_trajectory(project: ProjectStore, prepared: PreparedFidelity, now: d
                 created_at=now,
                 code_revision=prepared.code_revision,
                 publisher=prepared.id,
+                evidence=(report,),
             )
         except ReservedTaskError as error:
             outcome |= {"published": False, "reason": str(error)}
@@ -173,7 +180,7 @@ def consume_trajectory(project: ProjectStore, prepared: PreparedFidelity, now: d
             schema_version=1,
             created_at=now,
             code_revision=prepared.code_revision,
-            inputs=(artifact_input(project.artifacts.read(prepared.id + "-report").manifest),),
+            inputs=(report,),
         ),
         files={"memory.json": outcome},
     )

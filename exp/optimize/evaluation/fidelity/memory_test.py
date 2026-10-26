@@ -15,10 +15,18 @@ from exp.optimize.evaluation.fidelity import runner as fidelity
 from exp.optimize.evaluation.fidelity.runner import FidelitySpec, PreparedFidelity
 from exp.optimize.evaluation.learning import profile
 from exp.optimize.evaluation.learning.traces import LearningPlan, Scope
-from exp.optimize.evaluation.tests.fidelity_memory_test import memory_project, minimal, trajectory
+from exp.optimize.evaluation.tests.fidelity_memory_test import (
+    RoutedTransport,
+    judged,
+    memory_project,
+    minimal,
+    predicted,
+    trajectory,
+)
 from exp.runtime.models.registry import RuntimeModelCatalog
 from exp.simulation.world_model.experience_memory import (
     MemoryVersion,
+    memory_head,
     memory_version_id,
     publish_trajectory,
 )
@@ -50,6 +58,16 @@ def _published(
 
 def _exclude(project: ProjectStore, version: MemoryVersion) -> ArtifactInput:
     """Declare one exact checkpoint ineligible using an immutable audit artifact."""
+    return _exclude_source(
+        project,
+        artifact_input(
+            project.artifacts.read(memory_version_id(version.lineage, version.version)).manifest
+        ),
+    )
+
+
+def _exclude_source(project: ProjectStore, source: ArtifactInput) -> ArtifactInput:
+    """Declare one exact artifact ineligible using an immutable audit artifact."""
     audit = project.artifacts.write_json(
         artifact_id="qualification-audit",
         artifact_type="qualification-audit",
@@ -57,9 +75,6 @@ def _exclude(project: ProjectStore, version: MemoryVersion) -> ArtifactInput:
             schema_version=1, created_at=datetime.now(UTC), code_revision="test"
         ),
         files={"audit.json": {"reason": "A completed keyed result was replaced"}},
-    )
-    source = artifact_input(
-        project.artifacts.read(memory_version_id(version.lineage, version.version)).manifest
     )
     return exclude_source_from_qualification(
         project.artifacts,
@@ -194,3 +209,46 @@ def test_freeze_and_bind_refuse_exclusion_before_memory_or_credentials(
             created_at=datetime.now(UTC),
             code_revision="test",
         )
+
+
+@pytest.mark.parametrize("excluded_before_replay", [True, False])
+def test_saved_report_publication_checks_and_cites_the_report(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, excluded_before_replay: bool
+) -> None:
+    """A replayed report publishes only while eligible, and its memory cites it for later checks."""
+    project, base = memory_project(tmp_path)
+    spec = trajectory(base, "cached-publication", "alpha", "learn")
+    assert spec.memory is not None
+    prepared = fidelity.prepare_fidelity_evaluation(project, spec, code_revision="fixture")
+    wire = RoutedTransport(
+        [
+            predicted("cached-publication-0", "alpha-reply-0"),
+            predicted("cached-publication-1", "alpha-reply-1"),
+            judged(spec),
+        ]
+    )
+    monkeypatch.setenv("FIDELITY_TEST_KEY", "fixture-only")
+    monkeypatch.setattr(fidelity, "HttpxJsonTransport", lambda: wire)
+
+    def interrupted(_project: ProjectStore, _prepared: PreparedFidelity, _now: datetime) -> None:
+        """Stop after the durable report, before memory publication."""
+        raise RuntimeError("publication interrupted")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(fidelity, "consume_trajectory", interrupted)
+        with pytest.raises(RuntimeError, match="publication interrupted"):
+            fidelity.execute_fidelity_evaluation(project, prepared)
+    report = artifact_input(project.artifacts.read(prepared.id + "-report").manifest)
+    if excluded_before_replay:
+        _exclude_source(project, report)
+        with pytest.raises(ValueError, match="excluded from qualification"):
+            fidelity.execute_fidelity_evaluation(project, prepared)
+        assert lifecycle.saved_memory_receipt(project, prepared) is None
+        assert memory_head(project.artifacts, spec.memory.lineage) is None
+        return
+    fidelity.execute_fidelity_evaluation(project, prepared)
+    head = memory_head(project.artifacts, spec.memory.lineage)
+    assert head is not None and report in head.inputs
+    _exclude_source(project, report)
+    with pytest.raises(ValueError, match="excluded from qualification"):
+        lifecycle.refuse_ineligible_memory(project, spec.memory.lineage)
