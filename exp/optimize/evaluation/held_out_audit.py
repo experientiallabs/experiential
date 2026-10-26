@@ -288,7 +288,9 @@ def require_held_out_selection(
     """Refuse a memory audit that could select nothing, before it learns or calls anything.
 
     The memory profile learns its fit-only memory before the panel is planned, so this runs
-    the same exposure decision and case selection that opening will, without the memory.
+    the same exposure decision and case selection that opening will, without the memory. It
+    reserves nothing: another audit can still take the remaining lineages before opening, which
+    then refuses after the learning was bought.
 
     Args:
         project: Project with a completed build.

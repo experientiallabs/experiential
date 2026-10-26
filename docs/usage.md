@@ -600,7 +600,9 @@ By default an audit selects only unexposed, unreserved, resolved held-out lineag
 many it skipped and why. `--include-inspected` re-runs them too; the report then labels the panel
 "Re-audit on inspected cases (development)" and never independent. When none remain, the
 command refuses before any provider call: an independent audit needs fresh traces, a new import
-with new content. Every report states the ledger's limits: an
+with new content. The check runs when the command starts; if another audit reserves the last
+eligible lineages while this one learns its fit-only memory, the refusal comes only after that
+learning, which is saved and replays without calls on the next run. Every report states the ledger's limits: an
 unmerged ledger on another machine cannot show its exposure, paraphrased or regenerated variants
 that near-duplicate grouping misses are not caught, knowledge a person carries over by hand is
 not tracked, atomicity is same-host only, and matching ignores call order.
