@@ -249,10 +249,14 @@ def test_a_claimed_slot_makes_the_reservation_permanent_after_a_crash(
         assert resumed.receipt == receipt and not resumed.panel.retirements
         with pytest.raises(ValueError, match="--retry-incomplete"):
             run(store, resumed)
-    # Any other evaluation of those cases is a development re-audit with its own receipt.
-    with audit(store, include_inspected=True) as other:
-        assert other.receipt != receipt and other.receipt.basis == "development-re-audit"
-        assert other.receipt.reaudited == receipt.lineages
+    # No other receipt may finish the owner's run: a development re-audit over those cases
+    # refuses before it mints a receipt or sends anything.
+    with (
+        pytest.raises(ValueError, match=f"under receipt {receipt.receipt_id}.*only that receipt"),
+        audit(store, include_inspected=True),
+    ):
+        pass
+    assert len(audit_receipts(store)) == 1
     # The owner completes it with --retry-incomplete: the same run resumes in place, and the
     # lost request sent again is an in-place re-attempt child, never a new receipt.
     with audit(store) as completed:
@@ -274,6 +278,14 @@ def test_a_claimed_slot_makes_the_reservation_permanent_after_a_crash(
         assert not replayed.panel.retirements
         run(store, replayed)
         assert replayed.view.headline == QUALIFIED and len(replayed.view.attempts) == 1
+    # Once it finished, a development re-audit replays it with its own re-attempt child; the
+    # owner's child is never shared with, or shadowed by, another receipt's.
+    with audit(store, include_inspected=True) as other:
+        assert other.receipt != receipt and other.receipt.basis == "development-re-audit"
+        assert other.receipt.reaudited == receipt.lineages
+        [reaudited] = other.view.attempts
+        assert reaudited.receipt == other.receipt.receipt_id and reaudited.in_place
+    assert len(receipt_view(store, receipt).attempts) == 1
     assert len(audit_receipts(store)) == 2
 
 

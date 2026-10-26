@@ -28,7 +28,7 @@ from pydantic import AwareDatetime, Field
 
 from exp.common.core.artifacts import ArtifactEnvelope, ArtifactInput, ContractModel, stable_id
 from exp.common.project import ProjectStore
-from exp.optimize.evaluation.fidelity import unknown_outcomes
+from exp.optimize.evaluation.fidelity import PreparedFidelity, unknown_outcomes
 from exp.optimize.evaluation.fidelity_recovery import (
     QUALIFICATION,
     UnknownOutcome,
@@ -330,6 +330,29 @@ def receipt_view(project: ProjectStore, receipt: AuditReceipt) -> ReceiptView:
     )
 
 
+def current_registration(project: ProjectStore, base_run: str) -> PreparedFidelity | None:
+    """The latest saved attempt generation of one first-generation run.
+
+    Args:
+        project: Project holding the registrations.
+        base_run: First-generation run ID.
+
+    Returns:
+        The latest registration, or None when the run was never registered.
+    """
+    current = None
+    generation = 1
+    while True:
+        run_id = base_run if generation == 1 else f"{base_run}-r{generation}"
+        plan_id = stable_id("fidelity", {"run_id": run_id})
+        if not project.artifacts.exists(plan_id):
+            return current
+        current = PreparedFidelity.model_validate_json(
+            project.artifacts.read_bytes(plan_id, "plan.json")
+        )
+        generation += 1
+
+
 def save_receipt(project: ProjectStore, receipt: AuditReceipt) -> None:
     """Write a newly minted receipt once.
 
@@ -376,7 +399,9 @@ def record_attempts(
             claimed_slots=item.claimed_slots,
             at=now,
         )
-        identity = stable_id(ATTEMPT_TYPE, {"retired_run": item.retired})
+        identity = stable_id(
+            ATTEMPT_TYPE, {"receipt": receipt.receipt_id, "retired_run": item.retired}
+        )
         _write(project, ATTEMPT_TYPE, identity, "record.json", attempt, receipt)
         attempts.append(attempt)
     return tuple(attempts)
@@ -412,7 +437,9 @@ def record_redispatches(
 
     The caller holds the panel lease. Each run's retries are read from its durable recovery
     log, so a retry recorded by an invocation that stopped before reporting is still appended.
-    A run whose retries grew since its last child gets a new child; nothing is rewritten.
+    A run whose retries grew since its last child gets a new child; nothing is rewritten. The
+    child's identity names its receipt, so a child another receipt recorded over the same run
+    never stands in for this receipt's own.
 
     Args:
         project: Project audited.
@@ -431,7 +458,11 @@ def record_redispatches(
         run = prepared.spec.run_id
         identity = stable_id(
             ATTEMPT_TYPE,
-            {"resumed_run": run, "redispatched": [row.model_dump(mode="json") for row in rows]},
+            {
+                "receipt": receipt.receipt_id,
+                "resumed_run": run,
+                "redispatched": [row.model_dump(mode="json") for row in rows],
+            },
         )
         if project.artifacts.exists(identity):
             continue

@@ -12,7 +12,9 @@ dispatch ledger's ``BEGIN IMMEDIATE``. No earlier lock is taken while a later on
   its reservation committed against that snapshot.
 - Resuming: an invocation with the same request continues the latest receipt that still holds
   its reservation, when the selected cases, panel identity and code revision all match its
-  frozen configuration. Replaced registrations become that receipt's children.
+  frozen configuration. Replaced registrations become that receipt's children. A run that an
+  earlier receipt still holding its reservation dispatched and never finished is completed only
+  by that receipt; any later receipt over it refuses to open.
 - Configuration change: with zero claimed slots the old reservation is released under its
   lease and a new receipt is minted; with any claimed slot the old reservation is permanent and
   the new receipt over those cases is a development re-audit.
@@ -49,6 +51,7 @@ from exp.optimize.evaluation.held_out_fidelity import (
     panel_slots,
     plan_held_out_panel,
     register_planned_panel,
+    run_slots,
 )
 from exp.optimize.evaluation.held_out_receipts import (
     AuditCase,
@@ -57,6 +60,7 @@ from exp.optimize.evaluation.held_out_receipts import (
     AuditRequest,
     ReceiptView,
     audit_receipts,
+    current_registration,
     receipt_view,
     record_attempts,
     record_notice,
@@ -223,6 +227,7 @@ def open_held_out_audit(
                         current = transaction.snapshot()
                         if not current.active(owner.receipt_id):
                             continue
+                        _require_unclaimed(project, current, owner.base_runs, owner.sequence)
                         blocked = late_exposure(project, ledger, current, owner)
                         dispatched = bool(blocked) and bool(panel_slots(project, owner.base_runs))
                         if blocked and not dispatched:
@@ -422,9 +427,11 @@ def _reserve(
         touched = tuple(lineage for lineage in planned.lineages if lineage in exposure.lineages)
         if not request.include_inspected and set(touched) - allowed:
             return None
+        sequence = len(audit_receipts(project)) + 1
+        _require_unclaimed(project, snapshot, planned.base_runs, sequence)
         saved = _any_saved(project, planned.base_runs)
         receipt = AuditReceipt(
-            sequence=len(audit_receipts(project)) + 1,
+            sequence=sequence,
             opened_at=clock(),
             project=project.paths.project_id,
             request=request,
@@ -472,6 +479,38 @@ def _reserve(
             )
         )
         return receipt
+
+
+def _require_unclaimed(
+    project: ProjectStore, snapshot: LedgerSnapshot, base_runs: tuple[str, ...], sequence: int
+) -> None:
+    """Refuse a run an earlier active receipt dispatched and has not finished.
+
+    A run's ID never names a receipt, so a development re-audit over the same cases registers
+    the very runs an interrupted receipt claimed slots for. Only the receipt that reserved the
+    run first may resume it; otherwise its lost requests would be re-dispatched, and its result
+    reported, under another receipt.
+
+    Raises:
+        ValueError: An earlier receipt still holding its reservation owns an unfinished run.
+    """
+    for other in audit_receipts(project):
+        if other.sequence >= sequence:
+            return
+        if not snapshot.active(other.receipt_id):
+            continue
+        for base in frozenset(base_runs).intersection(other.base_runs):
+            current = current_registration(project, base)
+            if (
+                current is not None
+                and run_slots(project, current.spec.run_id)
+                and saved_fidelity_report(project, current) is None
+            ):
+                raise ValueError(
+                    f"run {current.spec.run_id} was dispatched under receipt "
+                    f"{other.receipt_id} and has no saved result; only that receipt can "
+                    "complete it: repeat the request that opened it with --retry-incomplete"
+                )
 
 
 def _any_saved(project: ProjectStore, base_runs: tuple[str, ...]) -> bool:
