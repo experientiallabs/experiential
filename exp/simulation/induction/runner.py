@@ -55,7 +55,7 @@ from typing import cast
 
 # Identity of the code that decides how programs execute, in place of its source text. Bump it
 # when behavior changes; exp/tests/code_protocols_test.py guards the covered source.
-RUNNER_PROTOCOL = "induced-program-runner-v6"
+RUNNER_PROTOCOL = "induced-program-runner-v7"
 ENTRYPOINT = "transition"
 # CPU seconds kept in reserve when deciding whether an inherited hard limit fits one more request.
 _ROTATION_MARGIN_SECONDS = 1

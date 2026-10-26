@@ -135,23 +135,17 @@ class ProgramSandbox:
         for _ in range(2):
             process = self._process or self._start()
             try:
-                message = json.loads(self._exchange(process, payload))
+                envelope = _envelope(self._exchange(process, payload))
             except _WorkerLost as error:
                 self._stop()
                 return ProgramOutcome(status="failed", detail=str(error))
-            except ValueError:
-                message = None
-            if message == {"unstarted": True}:
+            if envelope is None:
                 self._stop()
                 continue
-            if not isinstance(message, dict) or set(message) != {"outcome", "rotate"}:
-                return ProgramOutcome(status="failed", detail="worker returned a malformed outcome")
-            if message["rotate"] is True:
+            outcome, rotate = envelope
+            if rotate:
                 self._stop()
-            try:
-                return ProgramOutcome.model_validate(message["outcome"])
-            except ValueError:
-                return ProgramOutcome(status="failed", detail="worker returned a malformed outcome")
+            return outcome
         raise SandboxUnavailableError("a fresh induced-program worker did not start the request")
 
     def close(self) -> None:
@@ -187,7 +181,7 @@ class ProgramSandbox:
         os.set_blocking(process.stdin.fileno(), False)
         try:
             ready = json.loads(self._read_line(process, time.monotonic() + _READY_SECONDS))
-        except (_WorkerLost, ValueError) as error:
+        except (_WorkerLost, ValueError, RecursionError) as error:
             code = process.poll()
             self._stop()
             reason = _EXIT_REASONS.get(code or 0, str(error))
@@ -258,6 +252,32 @@ class ProgramSandbox:
         directory, self._directory = self._directory, None
         if directory is not None:
             shutil.rmtree(directory, ignore_errors=True)
+
+
+def _envelope(line: bytes) -> tuple[ProgramOutcome, bool] | None:
+    """Decode one worker reply: the outcome and whether to rotate, or None for ``unstarted``.
+
+    Raises:
+        _WorkerLost: The line is not exactly one of the two envelopes the worker speaks.
+    """
+    try:
+        message = json.loads(line)
+    except (ValueError, RecursionError):
+        # Deeply nested JSON exhausts the decoder's recursion before it can be rejected.
+        raise _WorkerLost("worker returned a malformed outcome; it was restarted") from None
+    if isinstance(message, dict) and set(message) == {"unstarted"}:
+        if message["unstarted"] is True:
+            return None
+    elif (
+        isinstance(message, dict)
+        and set(message) == {"outcome", "rotate"}
+        and isinstance(message["rotate"], bool)
+    ):
+        try:
+            return ProgramOutcome.model_validate(message["outcome"]), message["rotate"]
+        except (ValueError, RecursionError):
+            pass
+    raise _WorkerLost("worker returned a malformed outcome; it was restarted")
 
 
 class _WorkerLost(RuntimeError):

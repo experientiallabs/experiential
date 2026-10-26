@@ -1,16 +1,20 @@
 """The bounded worker process: limits, deadlines, restarts and protocol checks."""
 
+import json
 import subprocess
 import sys
 import time
+from collections.abc import Sequence
 from pathlib import Path
 
 import pytest
 
 from exp.common.core.artifacts import JsonObject
+from exp.simulation.induction import runner
+from exp.simulation.induction import sandbox as sandbox_module
 from exp.simulation.induction.contracts import SandboxLimits, TransitionProgram
 from exp.simulation.induction.runner_test import COUNTER, FORMATTER_ESCAPE
-from exp.simulation.induction.sandbox import ProgramSandbox
+from exp.simulation.induction.sandbox import ProgramSandbox, SandboxUnavailableError
 
 APPEND = TransitionProgram(
     tool="append",
@@ -152,7 +156,9 @@ def test_the_cpu_limit_applies_to_each_request_not_the_worker_lifetime() -> None
 _SANDBOX_SCRIPT = """
 import math, resource, signal, sys
 from exp.simulation.induction.contracts import SandboxLimits, TransitionProgram
-from exp.simulation.induction.sandbox import ProgramSandbox
+from exp.simulation.induction import runner
+from exp.simulation.induction import sandbox as sandbox_module
+from exp.simulation.induction.sandbox import ProgramSandbox, SandboxUnavailableError
 
 mode, size, count = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
 if mode == "hard":
@@ -212,3 +218,111 @@ def test_a_fresh_worker_is_admitted_when_its_hard_limit_fits_exactly_one_request
     """A two-second hard limit fits one one-second budget at startup, so the worker runs it."""
     assert _contained_run(_ADMISSION_SCRIPT, "2") == "reply"
     assert "hard CPU limit" in _contained_run(_ADMISSION_SCRIPT, "1")
+
+
+_FAKE_WORKER = """
+import json, pathlib, sys
+here = pathlib.Path(__file__).parent
+starts = here / "starts"
+starts.write_text(str(int(starts.read_text() or 0) + 1) if starts.exists() else "1")
+replies = json.loads((here / "replies.json").read_text())
+print(json.dumps({"ready": True, "protocol": PROTOCOL}), flush=True)
+for line in sys.stdin:
+    reply = replies.pop(0) if replies else None
+    (here / "replies.json").write_text(json.dumps(replies))
+    if reply is None:
+        sys.exit(0)
+    print(reply, flush=True)
+"""
+
+
+def _fake_sandbox(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, replies: Sequence[str | None]
+) -> ProgramSandbox:
+    """Return a sandbox whose workers answer requests with ``replies`` in order.
+
+    A ``None`` reply makes the worker exit without answering, as a lost worker does.
+    """
+    worker = tmp_path / "worker.py"
+    worker.write_text(_FAKE_WORKER.replace("PROTOCOL", repr(runner.RUNNER_PROTOCOL)))
+    (tmp_path / "replies.json").write_text(json.dumps(list(replies)))
+    monkeypatch.setattr(sandbox_module, "_RUNNER", worker)
+    return ProgramSandbox()
+
+
+def _starts(tmp_path: Path) -> int:
+    """Return how many fake workers have started."""
+    return int((tmp_path / "starts").read_text())
+
+
+_REPLY = json.dumps(
+    {"outcome": {"status": "reply", "reply": 1, "state": {}, "lines": [2]}, "rotate": False}
+)
+
+
+def test_an_unstarted_request_runs_once_on_a_fresh_worker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A worker that read but never ran the request is replaced and the request sent once more."""
+    with _fake_sandbox(tmp_path, monkeypatch, ['{"unstarted": true}', _REPLY]) as sandbox:
+        outcome = sandbox.run(APPEND, {"items": []}, {"value": 1}, {})
+    assert outcome.status == "reply" and _starts(tmp_path) == 2
+
+
+def test_a_second_unstarted_answer_makes_the_sandbox_unavailable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The move to a fresh worker happens once; a fresh worker that cannot start is an error."""
+    replies = ['{"unstarted": true}', '{"unstarted": true}']
+    with _fake_sandbox(tmp_path, monkeypatch, replies) as sandbox:
+        with pytest.raises(SandboxUnavailableError, match="did not start"):
+            sandbox.run(APPEND, {"items": []}, {"value": 1}, {})
+    assert _starts(tmp_path) == 2
+
+
+def test_a_deeply_nested_ready_line_makes_the_sandbox_unavailable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A ready line nested past the decoder's recursion limit is a worker that did not start."""
+    worker = tmp_path / "worker.py"
+    worker.write_text('print("[" * 100_000 + "]" * 100_000, flush=True)\n')
+    monkeypatch.setattr(sandbox_module, "_RUNNER", worker)
+    with ProgramSandbox() as sandbox:
+        with pytest.raises(SandboxUnavailableError, match="did not start"):
+            sandbox.run(APPEND, {"items": []}, {"value": 1}, {})
+
+
+def test_a_lost_response_is_failed_and_never_retried(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A worker that exits mid-request fails that request; only the next request restarts it."""
+    with _fake_sandbox(tmp_path, monkeypatch, [None, _REPLY]) as sandbox:
+        lost = sandbox.run(APPEND, {"items": []}, {"value": 1}, {})
+        assert lost.status == "failed" and _starts(tmp_path) == 1
+        assert sandbox.run(APPEND, {"items": []}, {"value": 1}, {}).status == "reply"
+    assert _starts(tmp_path) == 2
+
+
+@pytest.mark.parametrize(
+    "reply",
+    [
+        "not json",
+        '{"unstarted": 1}',
+        '{"unstarted": true, "extra": 1}',
+        json.dumps({"outcome": {"status": "reply", "reply": 1, "lines": []}, "rotate": 1}),
+        json.dumps({"outcome": {"status": "reply", "reply": 1, "lines": []}, "rotate": "yes"}),
+        json.dumps({"outcome": {"status": "nonsense"}, "rotate": False}),
+        json.dumps({"status": "reply", "reply": 1, "lines": []}),
+        "[" * 100_000 + "]" * 100_000,
+    ],
+    ids=lambda reply: reply if len(reply) < 80 else "deeply nested",
+)
+def test_a_protocol_violation_fails_the_request_and_stops_the_worker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, reply: str
+) -> None:
+    """Anything but the two exact envelopes, with a Boolean ``rotate``, discards the worker."""
+    with _fake_sandbox(tmp_path, monkeypatch, [reply]) as sandbox:
+        outcome = sandbox.run(APPEND, {"items": []}, {"value": 1}, {})
+        assert outcome.status == "failed" and "malformed" in str(outcome.detail)
+        assert sandbox._process is None
+    assert _starts(tmp_path) == 1
