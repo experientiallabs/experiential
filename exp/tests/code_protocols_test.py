@@ -141,7 +141,7 @@ PROTOCOLS = (
             "exp.optimize.evaluation.hillclimb.stages",
             "exp.optimize.evaluation.hillclimb.rounds:run_climb_round",
         ),
-        "b688caac96e1afc123f461d66bd58a39f67104749e6381f5d74a0b9b72d475a0",
+        "0a8bed3a95de3534e0a74c48a9caba76df3be5c9b9dee9094886041389c421a6",
     ),
     Protocol(
         "exp.optimize.evaluation.hillclimb.proposals:EDIT_PROPOSAL_PROTOCOL",
@@ -216,7 +216,7 @@ PROTOCOLS = (
     ),
     Protocol(
         "exp.optimize.evaluation.analysis.decision_cascade:CASCADE_FIT_PROTOCOL",
-        "decision-cascade-fit-v5",
+        "decision-cascade-fit-v6",
         (
             "exp.optimize.evaluation.analysis.decision_cascade:CascadeObjective.non_inferior",
             "exp.optimize.evaluation.analysis.decision_cascade:estimate_threshold",
@@ -225,7 +225,7 @@ PROTOCOLS = (
             "exp.optimize.evaluation.analysis.decision_points:DecisionPointSet.labels",
             "exp.optimize.evaluation.analysis.decision_points:state_request",
         ),
-        "ae785677795b32cfd361ae855f579392fb767e2813fb5e198beb77876fe04690",
+        "3c1a106e375bd744bbb42a0a0351d6d1b9b0c62e8c02c49209b2f03b84a028af",
     ),
     Protocol(
         "exp.runtime.agents.cascade_deciders:DECIDER_PROTOCOL",

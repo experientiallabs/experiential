@@ -2,24 +2,24 @@
 
 from __future__ import annotations
 
+import json
+from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
 
-from exp.common.core.artifacts import ArtifactEnvelope, ArtifactInput, JsonObject, sha256_json
-from exp.common.models import AssistantAction, ToolCall, load_model_catalog
+from exp.common.core.artifacts import ArtifactInput, JsonObject, sha256_json
+from exp.common.models import load_model_catalog
 from exp.common.project import ProjectStore
 from exp.optimize.evaluation.analysis import decision_cascade as owner
 from exp.optimize.evaluation.analysis.decision_cascade import (
     CascadeFitSpec,
     CascadeObjective,
-    ShadowPrediction,
     ThresholdRow,
     estimate_threshold,
     preflight_cascade_fit,
-    refused_drafts,
     run_cascade_fit,
     saved_cascade_fit,
 )
@@ -37,8 +37,7 @@ from exp.optimize.evaluation.analysis.decision_points_test import (
     world,
 )
 from exp.runtime.agents.cascade import OTHER, RESPOND, DeciderDefinition, NextActionDecision
-from exp.runtime.agents.cascade_test import request, snapshot
-from exp.runtime.agents.chat_test import _response
+from exp.runtime.agents.cascade_test import snapshot
 from exp.runtime.models.providers.transport import JsonHttpResponse
 from exp.simulation.evaluation.tasks import Verdict
 
@@ -225,20 +224,31 @@ def reference(name: str) -> ArtifactInput:
     return ArtifactInput(artifact_id=name, sha256=sha256_json(name))
 
 
+LATER = sha256_json({"state": "second"})
+
+
 def branch(
-    checkpoint: str, lineage: str, index: int, choice: str, outcome: Verdict
+    checkpoint: str,
+    lineage: str,
+    index: int,
+    choice: str,
+    outcome: Verdict,
+    state: str = STATE,
 ) -> tuple[Trajectory, DecisionPoint]:
-    """Return one branch of one study that makes ``choice`` at the shared visible state."""
+    """Return one branch of one study that makes ``choice`` at ``state``.
+
+    Calling it again with the same branch and another state adds a later point of that branch.
+    """
     study = reference(f"study-{checkpoint}")
     point = DecisionPoint(
-        id=f"{checkpoint}-{index}",
+        id=f"{checkpoint}-{index}-{state}",
         study=study,
         branch=index,
-        call=reference(f"call-{checkpoint}-{index}"),
+        call=reference(f"call-{checkpoint}-{index}-{state}"),
         checkpoint=reference(checkpoint),
         lineage=lineage,
         task_id=f"task-{lineage}",
-        state_sha256=STATE,
+        state_sha256=state,
         candidates=OPTIONS,
         main_choice=choice,
         main_action_sha256=sha256_json(choice),
@@ -264,7 +274,7 @@ def fit_inputs(
     points = DecisionPointSet(
         main_model=model,
         studies=tuple(dict.fromkeys(row.study for row, _ in branches)),
-        trajectories=tuple(row for row, _ in branches),
+        trajectories=tuple(dict.fromkeys(row for row, _ in branches)),
         points=tuple(point for _, point in branches),
     )
     decider = DeciderDefinition(
@@ -294,10 +304,11 @@ def offline(
     branches: list[tuple[Trajectory, DecisionPoint]],
     lineages: tuple[str, ...],
     answer: NextActionDecision | None = CLOSE,
+    later: NextActionDecision | None = CLOSE,
 ) -> ThresholdRow:
-    """Estimate threshold 0.9 when the decider gives ``answer`` at the shared state."""
+    """Estimate threshold 0.9 with ``answer`` at the first state and ``later`` at the second."""
     points, spec = fit_inputs(branches, lineages)
-    return estimate_threshold(points, {STATE: answer}, 0.9, spec)
+    return estimate_threshold(points, {STATE: answer, LATER: later}, 0.9, spec, frozenset())
 
 
 def test_donors_and_labels_never_cross_worlds_that_share_a_visible_state() -> None:
@@ -332,37 +343,104 @@ def test_a_state_without_a_decider_answer_stops_the_cascade_trajectory() -> None
     assert not row.feasible
 
 
-def test_a_draft_with_a_restricted_later_call_is_never_delegated_in_the_fit(
-    tmp_path: Path,
+class TwoCallDrafts(ScriptedProviders):
+    """Append a duplicate ``open_ticket`` call to every call the small drafter makes."""
+
+    def post(
+        self,
+        url: str,
+        *,
+        headers: Mapping[str, str],
+        payload: JsonObject,
+        timeout_seconds: float,
+    ) -> JsonHttpResponse:
+        """Answer as scripted, then extend each drafted tool call with a restricted one."""
+        response = super().post(
+            url, headers=headers, payload=payload, timeout_seconds=timeout_seconds
+        )
+        choices = response.body["choices"]
+        assert isinstance(choices, list) and isinstance(choices[0], dict)
+        message = choices[0]["message"]
+        assert isinstance(message, dict)
+        calls = message.get("tool_calls")
+        if payload.get("model") == "judge-v1" and isinstance(calls, list):
+            duplicate = {"title": "Duplicate", "priority": "low"}
+            calls.append(
+                {
+                    "id": "dup",
+                    "type": "function",
+                    "function": {"name": "open_ticket", "arguments": json.dumps(duplicate)},
+                }
+            )
+        return response
+
+
+def test_the_fit_refuses_drafts_the_runtime_refuses(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The fit refuses the drafts the runtime refuses, so they add no delegation or avoided call."""
-    points, spec = fit_inputs(
-        [branch("world-x", "a", 0, "close", "pass")], ("a",), never_delegate=("open",)
+    """A draft whose later call is restricted adds no delegation, avoided call or splice."""
+    project = project_fixture(tmp_path, monkeypatch)
+    studies = tuple(main_study(project, "tickets", lineage) for lineage in DEVELOPMENT)
+    transport = TwoCallDrafts("tickets")
+    monkeypatch.setattr(owner, "HttpxJsonTransport", lambda: transport)
+    spec = fit_spec(project, studies, drafts(project), grid=(1.0,))
+    admitted = run_cascade_fit(project, spec, code_revision="t").rows[0]
+    assert admitted.delegated == admitted.decisions and admitted.affected_trajectories > 0
+    estimate = admitted.success["estimate"]
+    assert isinstance(estimate, float) and estimate < 0
+    report = run_cascade_fit(
+        project, spec.model_copy(update={"never_delegate": ("open_ticket",)}), code_revision="t"
     )
-    store = ProjectStore(tmp_path, "case").artifacts
-    store.write_json(
-        artifact_id=points.points[0].call.artifact_id,
-        artifact_type="continuation-actor-request",
-        envelope=ArtifactEnvelope(
-            schema_version=1, created_at=datetime.now(UTC), code_revision="test"
-        ),
-        files={"request.json": request("close", "open")},
+    row = report.rows[0]
+    initial = sum(point.main_choice != RESPOND for point in report.points.points)
+    assert initial > 0
+    assert row.delegated == row.calls_avoided == row.decisions - initial
+    assert row.affected_trajectories == 0 and row.success["estimate"] == 0
+
+
+def test_points_after_a_stop_earn_no_delegation() -> None:
+    """A stopped episode never reaches its later states, so they add no delegated share."""
+    row = offline(
+        [
+            branch("world-x", "a", 0, "close", "pass"),
+            branch("world-x", "a", 0, "close", "pass", state=LATER),
+        ],
+        ("a",),
+        answer=None,
     )
-    calls = tuple(
-        ToolCall(call_id=f"c-{name}", name=name, arguments={"ticket": 1})
-        for name in ("close", "open")
+    assert (row.delegated, row.calls_avoided, row.agreement) == (0, 0, None)
+    assert row.verified_correct == 0 and row.stopped_trajectories == 1
+    assert row.success["unit_differences"] == {"a": -1.0}
+
+
+def test_a_stopped_donor_and_an_unknown_stopped_main_outcome_count_against_the_cascade() -> None:
+    """A donor that stops later stands in as a failure; an unknown stopped outcome is bounded."""
+    row = offline(
+        [
+            branch("world-x", "a", 0, "open", "fail"),
+            branch("world-x", "a", 1, "close", "pass"),
+            branch("world-x", "a", 1, "close", "pass", state=LATER),
+            branch("world-y", "b", 0, "close", "unassessable", state=LATER),
+        ],
+        ("a", "b"),
+        later=None,
     )
-    draft = AssistantAction(tool_calls=calls)
-    decision = NextActionDecision(
-        selected="close",
-        probabilities={"close": 1.0, "open": 0.0, RESPOND: 0.0, OTHER: 0.0},
-        action=draft,
-        response=_response(draft).model_copy(update={"model": spec.decider.model}),
+    assert row.affected_trajectories == 1 and row.stopped_trajectories == 2
+    # a: the changed failure takes its stopped donor's 0, the donor itself stops at 0 against a
+    # main pass; b: the unknown main outcome is bounded at 1 against the stopped cascade's 0.
+    assert row.success["unit_differences"] == {"a": -0.5, "b": -1.0}
+
+
+def test_a_trajectory_that_left_the_main_path_is_not_stopped_by_a_later_state() -> None:
+    """After a delegated disagreement the cascade follows the donor, not the main path."""
+    row = offline(
+        [
+            branch("world-x", "a", 0, "open", "fail"),
+            branch("world-x", "a", 0, "open", "fail", state=LATER),
+            branch("world-x", "a", 1, "close", "pass"),
+        ],
+        ("a",),
+        later=None,
     )
-    refused = refused_drafts(
-        store, spec, points, (ShadowPrediction(state_sha256=STATE, decision=decision),)
-    )
-    assert refused == {STATE}
-    row = estimate_threshold(points, {STATE: decision}, 0.9, spec, refused)
-    assert row.delegated == row.calls_avoided == 0
-    assert estimate_threshold(points, {STATE: decision}, 0.9, spec).calls_avoided == 1
+    assert row.affected_trajectories == 1 and row.stopped_trajectories == 0
+    assert row.success["unit_differences"] == {"a": 0.5}

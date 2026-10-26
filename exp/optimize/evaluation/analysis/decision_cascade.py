@@ -79,7 +79,7 @@ from exp.runtime.sessions.dispatch_ledger import DispatchLedger
 
 # Identity of the estimator and selection rule below, in place of their source text. Bump it
 # when either changes; exp/tests/code_protocols_test.py records the covered source.
-CASCADE_FIT_PROTOCOL = "decision-cascade-fit-v5"
+CASCADE_FIT_PROTOCOL = "decision-cascade-fit-v6"
 FIT_SCOPE = (
     "development fit on the main model's own trajectories; offline estimate splicing observed "
     "continuations at accepted disagreements and failing a trajectory without one; states the "
@@ -199,7 +199,7 @@ class ThresholdRow(ContractModel):
     Attributes:
         threshold: Grid value.
         decisions: Every decision point.
-        delegated: Points the policy would delegate.
+        delegated: Points the policy would delegate, excluding points after a stop.
         calls_avoided: Delegated points answered with a drafted action, so no main call.
         delegated_share: Delegated over every point.
         agreement: Delegated points matching the main model's decision (and complete action
@@ -271,7 +271,7 @@ def estimate_threshold(
     predictions: Mapping[Sha256, NextActionDecision | None],
     threshold: float,
     spec: CascadeFitSpec,
-    refused_drafts: Collection[Sha256] = (),
+    refused_drafts: Collection[Sha256],
 ) -> ThresholdRow:
     """Estimate one threshold by splicing observed continuations at accepted disagreements.
 
@@ -287,10 +287,11 @@ def estimate_threshold(
 
     The runtime is mirrored at every state. A state without a decider answer (an unknown or
     failed shadow dispatch) stops a trajectory still on the main path, as the deployed cascade
-    stops the episode, and the stopped trajectory counts as a failure; a content error at
+    stops the episode, and the stopped trajectory counts as a failure and contributes no
+    delegation at its later points, which deployment never reaches; a content error at
     deployment would leave the main model responsible, so this bound is conservative. A drafted
     answer in ``refused_drafts``, which the runtime refuses as an invalid draft, is never
-    delegated.
+    delegated; callers compute them with ``refused_drafts``.
 
     Args:
         points: Labelled decision points and trajectories.
@@ -313,6 +314,9 @@ def estimate_threshold(
         world = point.checkpoint.artifact_id
         takes[world, point.state_sha256, point.main_choice].append(trajectory)
         takes[world, point.state_sha256, point.main_action_sha256].append(trajectory)
+        if trajectory in stopped:
+            # The deployed episode ended at an earlier state, so this point is never reached.
+            continue
         decision = predictions[point.state_sha256]
         if decision is None:
             if trajectory not in diverges:
@@ -335,7 +339,7 @@ def estimate_threshold(
         agreed += same
         correct += label == "verified_correct"
         wrong += label == "verified_error"
-        if not same and trajectory not in stopped:
+        if not same:
             diverges.setdefault(trajectory, (world, point.state_sha256, taken))
     verdicts = {
         (row.study.artifact_id, row.branch): {"success": row.outcome, "compliance": row.policy}
