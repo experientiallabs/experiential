@@ -258,9 +258,12 @@ def consolidation_cost(
 ) -> tuple[CostComponent, CostComponent]:
     """Conservative cost of merging and screening a candidate set.
 
-    Every merge round is charged the first round's requests again, as if no round merged
-    anything. Every screening block is charged its own candidates, as if none had merged, plus
-    the most accepted lessons it can show.
+    The first merge round is charged its exact chunks. A merge answer can rewrite lessons
+    longer than their sources, so a later round may pack into more chunks; but a merge never
+    returns more lessons than it was shown, so a later round sends at most one request per two
+    of the kind's candidates, each within the chunk limit. A kind that fits one chunk has no
+    later round. Every screening block is charged its own candidates, as if none had merged,
+    plus the most accepted lessons it can show.
 
     Args:
         project: Project whose catalog prices the learning model.
@@ -277,18 +280,22 @@ def consolidation_cost(
         rows = [row for row in candidates.candidates if row.kind == kind]
         shown = [_json_bytes(_shown_candidate(row)) for row in rows]
         # The same packer as execution, so each chunk is one merge request of the first round.
+        chunks = _chunks(rows, limit, _shown_candidate)
         merge.extend(
             sum(_json_bytes(_shown_candidate(row)) for row in chunk) + REQUEST_MARGIN_BYTES
-            for chunk in _chunks(rows, limit, _shown_candidate)
+            for chunk in chunks
             if len(chunk) > 1
         )
+        if len(chunks) > 1:
+            later = (MERGE_ROUNDS - 1) * (len(rows) // 2)
+            merge.extend([limit + REQUEST_MARGIN_BYTES] * later)
         accepted = min(sum(shown), limit)
         screen.extend(
             sum(shown[start : start + SCREEN_BLOCK]) + accepted + REQUEST_MARGIN_BYTES
             for start in range(0, len(shown), SCREEN_BLOCK)
         )
     return (
-        _priced(project, prepared, len(merge) * MERGE_ROUNDS, "merge", max(merge, default=0)),
+        _priced(project, prepared, len(merge), "merge", max(merge, default=0)),
         _priced(project, prepared, len(screen), "screen", max(screen, default=0)),
     )
 

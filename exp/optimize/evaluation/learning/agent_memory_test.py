@@ -437,7 +437,7 @@ def test_costs_price_every_request_at_the_spend_ceilings_whole_generation_bound(
         for kind in ("procedure", "pitfall")
     )
     merge, screen = consolidation_cost(store, prepared, candidates(*rows))
-    assert merge.attempts == 2 * agent_memory.MERGE_ROUNDS
+    assert merge.attempts == 2
     assert screen.attempts == 4
     assert consolidation_cost(store, prepared, candidates())[0].attempts == 0
     large = tuple(
@@ -451,4 +451,42 @@ def test_costs_price_every_request_at_the_spend_ceilings_whole_generation_bound(
         for _ in range(10)
     )
     merge, _ = consolidation_cost(store, prepared, candidates(*large))
-    assert merge.attempts == 5 * agent_memory.MERGE_ROUNDS
+    assert merge.attempts == 5 + (agent_memory.MERGE_ROUNDS - 1) * 5
+
+
+def test_the_merge_estimate_covers_later_rounds_that_lengthen_lessons(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Answers longer than their sources pack into more chunks than the first round had."""
+    store, prepared = prepared_memory(
+        tmp_path, monkeypatch, batch_bytes=10_000, maximum_trace_bytes=5_000
+    )
+    rows = [
+        Lesson(
+            kind="procedure",
+            statement=f"c{index} " + "x" * 3_200,
+            applies_when="w",
+            evidence=("e",),
+            traces=("t",),
+        )
+        for index in range(6)
+    ]
+    sent: list[int] = []
+
+    def lengthen(body: JsonObject) -> JsonObject:
+        """Keep every candidate apart, each rewritten longer than it was shown."""
+        last = at(body, "response_schema", "properties", "lessons", "items", "properties")
+        last = at(last, "sources", "items", "maximum")
+        assert isinstance(last, int)
+        sent.append(last + 1)
+        return {
+            "lessons": [
+                {"statement": f"m{index} " + "y" * 4_800, "applies_when": "w", "sources": [index]}
+                for index in range(last + 1)
+            ]
+        }
+
+    agent_memory._merge_kind(prepared, rows, scripted({"merge": lengthen})(), [])
+    merge, _ = consolidation_cost(store, prepared, candidates(*rows))
+    assert sent[:2] == [3, 3] and len(sent) > 2 * agent_memory.MERGE_ROUNDS
+    assert merge.attempts >= len(sent)
