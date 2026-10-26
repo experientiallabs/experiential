@@ -54,8 +54,10 @@ made after the previous round.
    baseline. An edit that reproduces any prompt already measured in this climb is refused.
 2. Before the first dispatch the incumbent and candidate prompt versions are saved
    (`agent-prompt-version`, each naming its parent, edit and change note) and registered under
-   the round number. An interrupted round resumes with the same edit; a different edit for a
-   registered round is refused.
+   the round number with the round's `deadline` and code revision, which fix both stage panels.
+   An interrupted round resumes the same panels, reusing their completed and unknown cells; a
+   different edit, deadline or code revision for a registered round is refused, since it would
+   redraw the stages.
 3. Screening runs an actor panel (`compare-actors` machinery) of the incumbent against the
    candidate on the train lineages. A prompt is part of the chat actor's saved context, so the
    candidate arm starts from each case's initial checkpoint re-instructed under its prompt

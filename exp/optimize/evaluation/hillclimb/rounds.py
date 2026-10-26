@@ -2,8 +2,10 @@
 
 The round's edit is written by a person or chosen from an analyst proposal set made after the
 previous round. Before any dispatch the round saves the incumbent and candidate prompt versions
-and registers them under the round number, so a resumed round measures the same edit and the
-round can never be re-run with another. Screening compares the two prompts on the train lineages;
+and registers them, with the round's deadline and code revision, under the round number. A
+resumed round therefore measures the same edit on the same stage panels, reusing their completed
+and unknown cells; it can never be re-run with another edit or redrawn under a new deadline or
+revision. Screening compares the two prompts on the train lineages;
 an edit that passes is confirmed on the test lineages with fresh repeats. The record keeps the
 edit only when confirmation passes, and every candidate stays saved either way.
 """
@@ -238,8 +240,8 @@ def run_climb_round(
         The decided round record.
 
     Raises:
-        ValueError: The plan is invalid, the round is registered for another edit, or the
-            train set is saturated for the incumbent.
+        ValueError: The plan is invalid, the round is registered for another edit, deadline or
+            code revision, or the train set is saturated for the incumbent.
         filelock.Timeout: Another process holds this climb or one of its continuations.
     """
     spec, store = request.climb, project.artifacts
@@ -254,6 +256,16 @@ def run_climb_round(
             _require_registered_edit(
                 project, request, registration.incumbent, registration.candidate
             )
+            if (registration.deadline, registration.code_revision) != (
+                request.deadline,
+                code_revision,
+            ):
+                raise ValueError(
+                    f"round {request.round} was registered with deadline "
+                    f"{registration.deadline.isoformat()} under code revision "
+                    f"{registration.code_revision}; resume it with both so its stage panels are "
+                    "reused, never redrawn"
+                )
         plan = plan_round(project, request)
         references = tuple(
             persist_prompt_version(store, version, created_at=now, code_revision=code_revision)
@@ -276,6 +288,8 @@ def run_climb_round(
                         round=request.round,
                         incumbent=references[0],
                         candidate=references[1],
+                        deadline=request.deadline,
+                        code_revision=code_revision,
                     )
                 },
             )

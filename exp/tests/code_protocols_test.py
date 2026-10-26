@@ -134,7 +134,7 @@ PROTOCOLS = (
     ),
     Protocol(
         "exp.optimize.evaluation.hillclimb.design:HILL_CLIMB_PROTOCOL",
-        "hill-climb-v1",
+        "hill-climb-v2",
         (
             "exp.optimize.evaluation.hillclimb.design:climb_split",
             "exp.optimize.evaluation.hillclimb.measurement",

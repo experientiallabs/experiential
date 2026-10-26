@@ -20,7 +20,7 @@ from exp.runtime.agents.chat import normalize_chat_system_prompt
 # Identity of the code that decides a climb's split, measurements and keep decisions, in place of
 # its source text. Bump it when behavior changes. exp/tests/code_protocols_test.py fails when the
 # covered source changes until it is bumped or, for a pure refactor, its digest is updated.
-HILL_CLIMB_PROTOCOL = "hill-climb-v1"
+HILL_CLIMB_PROTOCOL = "hill-climb-v2"
 
 Stage = Literal["screen", "confirm", "final"]
 

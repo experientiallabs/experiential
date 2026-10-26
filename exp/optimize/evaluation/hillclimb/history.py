@@ -1,15 +1,15 @@
 """A climb's saved rounds: registrations before dispatch, records after the decision.
 
-Round ``n`` of a climb is registered with its incumbent and candidate prompt versions before its
-first panel dispatches, so an interrupted round resumes with the same edit and can never be
-swapped for another. Its record saves both stage measurements and the keep decision. Rounds run
-in order: round ``n`` needs every earlier round's record, and its incumbent is the last kept
-candidate (or the baseline).
+Round ``n`` of a climb is registered with its incumbent and candidate prompt versions, its deadline
+and its code revision before its first panel dispatches, so an interrupted round resumes the same
+stage panels with the same edit and can never be swapped for another or redrawn. Its record saves
+both stage measurements and the keep decision. Rounds run in order: round ``n`` needs every
+earlier round's record, and its incumbent is the last kept candidate (or the baseline).
 """
 
 from collections.abc import Sequence
 
-from pydantic import Field
+from pydantic import AwareDatetime, Field
 
 from exp.common.core.artifacts import ArtifactInput, ContractModel, stable_id
 from exp.common.project import ArtifactStore, ProjectStore
@@ -27,19 +27,24 @@ RECORD_TYPE = "hill-climb-round"
 
 
 class RoundRegistration(ContractModel):
-    """The edit a round measures, fixed before its first dispatch.
+    """The edit and stage panels a round measures, fixed before its first dispatch.
 
     Attributes:
         climb: Climb identity.
         round: One-based round number.
         incumbent: Prompt version the edit changes.
         candidate: Edited prompt version.
+        deadline: Deadline of every stage continuation; with the prompts, the design and the
+            code revision it fixes each stage panel's identity.
+        code_revision: Execution revision the stage panels run under.
     """
 
     climb: str
     round: int = Field(ge=1)
     incumbent: ArtifactInput
     candidate: ArtifactInput
+    deadline: AwareDatetime
+    code_revision: str = Field(min_length=1)
 
 
 class RoundRecord(ContractModel):
