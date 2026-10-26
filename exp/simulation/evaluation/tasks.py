@@ -564,12 +564,13 @@ def _grade_policy(verifier: TaskVerifier, value: JsonObject, *, complete: bool) 
             missing.append(f"initial state comparison unavailable: {pointer}")
             continue
         for state in states:
+            if state is None:
+                missing.append(f"state comparison unavailable: {pointer}")
+                continue
             try:
-                if state is None:
-                    raise ValueError("missing state observation")
                 observed = resolve(state, pointer)
             except ValueError:
-                missing.append(f"state comparison unavailable: {pointer}")
+                violations.append(f"protected state removed: {pointer}")
                 continue
             if not strict_equal(initial, observed):
                 violations.append(f"protected state changed: {pointer}")

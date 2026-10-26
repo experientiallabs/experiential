@@ -254,7 +254,9 @@ def test_changed_native_semantics_and_missing_evidence_refuse(tmp_path: Path) ->
     with pytest.raises(ValueError, match="backend definition"):
         verify_record_execution(project.artifacts, ref, other)
     result = load_record_execution(project.artifacts, ref)
-    assert grade(acceptance(), {**result.outcome, "final_state": {}}).status == "unassessable"
+    assert grade(acceptance(), {**result.outcome, "final_state": None}).status == "unassessable"
+    # An observed but emptied state removed protected records: a violation, not missing evidence.
+    assert grade(acceptance(), {**result.outcome, "final_state": {}}).status == "fail"
 
 
 def test_receipt_binds_scheduled_outage_and_refusal_without_reroll(tmp_path: Path) -> None:

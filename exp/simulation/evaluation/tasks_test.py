@@ -498,6 +498,13 @@ def test_argument_policy_and_protected_state_are_independent_of_goal() -> None:
     result = grade(check, changed_then_restored)
     assert result.goal.status == "pass"
     assert result.policy.status == "fail"
+    deleted = {
+        **value,
+        "steps": [{**value["steps"][0], "after": {"draft": "sent"}}],
+    }
+    result = grade(check, deleted)
+    assert result.policy.status == "fail"
+    assert result.policy.reason == "protected state removed: /ledger"
 
 
 def test_incomplete_action_inventory_cannot_prove_compliance() -> None:
