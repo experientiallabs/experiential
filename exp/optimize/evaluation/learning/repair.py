@@ -26,6 +26,7 @@ from exp.common.core.artifacts import (
 from exp.common.core.locks import CoordinationLock
 from exp.common.evaluations.reconstruction import WorkflowEvidence
 from exp.common.project import ProjectStore, artifact_input
+from exp.optimize.evaluation.analysis.source_access import refuse_known_ineligible_sources
 from exp.optimize.evaluation.fidelity.memory import (
     DUPLICATE,
     INCOMPLETE,
@@ -252,6 +253,8 @@ def repair_learning(
             or saved_fidelity_report(project, prepared) is None
         ):
             raise ValueError("repair requires finalized, unconsumed learning with failed research")
+        # The repaired memory cites the report, so an excluded run or report never enters it.
+        refuse_known_ineligible_sources(store, (spec.run, spec.report), maximum_artifacts=100_000)
         evidence = WorkflowEvidence.model_validate_json(
             store.read_bytes(prepared.id + "-report-intent", "evidence.json")
         )
@@ -368,6 +371,7 @@ def repair_learning(
             created_at=now,
             code_revision=code_revision,
             publisher=identity,
+            evidence=(spec.report,),
         )
         outcome: JsonObject = {
             "published": consumed,

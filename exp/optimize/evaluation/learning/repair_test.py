@@ -15,9 +15,14 @@ from exp.cli.evaluation.continuations import ContinuationCommand
 from exp.common.core.artifacts import ArtifactEnvelope, JsonValue
 from exp.common.project import ProjectStore, artifact_input
 from exp.common.project.manifests import ArtifactManifest
+from exp.optimize.evaluation.analysis.source_access import exclude_source_from_qualification
 from exp.optimize.evaluation.audit.panel import plan_held_out_panel
 from exp.optimize.evaluation.audit.panel_test import REVISION, build_project, episode
-from exp.optimize.evaluation.fidelity.memory import saved_memory_receipt, trajectory_record
+from exp.optimize.evaluation.fidelity.memory import (
+    refuse_ineligible_memory,
+    saved_memory_receipt,
+    trajectory_record,
+)
 from exp.optimize.evaluation.fidelity.runner import PreparedFidelity
 from exp.optimize.evaluation.learning import repair as learning_repair
 from exp.optimize.evaluation.learning.repair import LearningRepairSpec, repair_learning
@@ -102,6 +107,45 @@ def test_repair_advances_named_head_without_changing_any_prediction_or_score(
         repair_learning(
             project, spec.model_copy(update={"reason": "Different reason"}), code_revision=REVISION
         )
+
+
+@pytest.mark.parametrize("excluded_before_repair", [True, False])
+def test_repair_refuses_an_excluded_report_and_cites_the_one_it_publishes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, excluded_before_repair: bool
+) -> None:
+    """Excluded evidence never enters repaired memory, and later ancestry checks reach it."""
+    project, _, _, spec = failed_run(tmp_path, monkeypatch)
+    store = project.artifacts
+    audit = store.write_json(
+        artifact_id="qualification-audit",
+        artifact_type="qualification-audit",
+        envelope=ArtifactEnvelope(schema_version=1, created_at=now(), code_revision="test"),
+        files={"audit.json": {"reason": "The report's evidence was audited unsafe"}},
+    )
+
+    def exclude() -> None:
+        """Exclude the run's exact report from qualification."""
+        exclude_source_from_qualification(
+            store,
+            spec.report,
+            audit=artifact_input(audit),
+            rationale="Audited unsafe report",
+            code_revision="test",
+        )
+
+    if excluded_before_repair:
+        exclude()
+        before = set(store.list_ids())
+        with pytest.raises(ValueError, match="excluded from qualification"):
+            repair_learning(project, spec, code_revision=REVISION)
+        assert set(store.list_ids()) == before
+        return
+    lineage = str(repair_learning(project, spec, code_revision=REVISION)["lineage"])
+    head = memory_head(store, lineage)
+    assert head is not None and spec.report in head.inputs
+    exclude()
+    with pytest.raises(ValueError, match="excluded from qualification"):
+        refuse_ineligible_memory(project, lineage)
 
 
 def test_stale_parent_refuses_before_writing_and_explicit_repair_keeps_unknowns(
