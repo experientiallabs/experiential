@@ -45,7 +45,11 @@ from exp.runtime.gateway.native_accounting_errors import (
     authority_error,
     internal_protocol_error,
 )
-from exp.runtime.gateway.native_accounting_recovery import FairRecovery, recover_expired
+from exp.runtime.gateway.native_accounting_recovery import (
+    FairRecovery,
+    recover_expired,
+    recover_until_stopped,
+)
 from exp.runtime.gateway.native_attempt_pricing import deployment_priced_at, priced_attempt
 from exp.runtime.gateway.native_components import SyncWriteLedger
 from exp.runtime.gateway.native_execution import (
@@ -99,8 +103,7 @@ from exp.runtime.openai_protocol.errors import public_failure_error
 
 _SWEEP_INTERVAL_SECONDS = 5.0
 
-# The request deadline ran out between attempts, before any provider answered.
-# The streaming relay names the other case (output already flowing) itself.
+# The deadline expired before a provider answered; the relay names the streaming case.
 DEADLINE_BEFORE_ANSWER_MESSAGE: Final = (
     "the request reached the gateway's time limit before any provider finished "
     "answering; retry the request"
@@ -155,6 +158,7 @@ class NativeAttemptAccounting:
         self._sticky = StickySpillRegistry()
         self._inflight: dict[str, InflightRequest] = {}
         self._lock = threading.Lock()
+        self._active_settlements = 0
         self._retained_recovery = FairRecovery[tuple[str, InflightRequest]](
             lambda item: item[1].authorization.organization_id
         )
@@ -163,16 +167,12 @@ class NativeAttemptAccounting:
         )
         self._sweep_retained_replayed = 0
         self._sweep_abandoned_cancelled = 0
-        # Admission-time dead-rung skips: a request served off a fallback
-        # because a certified rung could not be resolved for dispatch, and the
-        # subset of those where the skipped rung was the lead.
+        # Unresolvable certified rungs skipped at admission, including skipped leads.
         self._admission_dead_rungs_skipped = 0
         self._admission_parameter_coercions = 0
         self._admission_lead_rungs_skipped = 0
-        # Dispatch-policy outcomes: rungs bypassed at their bound, rate
-        # window, fresh-session threshold, or their organization's fair
-        # share, and dispatches forced past a bound because no other rung
-        # could serve. The per-reason counters split the aggregate.
+        # Count bypasses by bound, rate, fresh-session and tenant-share limits,
+        # plus forced dispatches when no other rung can serve.
         self._rung_admission_sheds = 0
         self._rung_saturated_overflows = 0
         self._rung_saturation_refusals = 0
@@ -200,11 +200,11 @@ class NativeAttemptAccounting:
     def accounting_healthy(self) -> bool:
         """Return whether every durable terminal write has landed."""
         with self._lock:
-            pending = any(
+            pending = self._active_settlements > 0 or any(
                 entry.pending_settlement is not None or entry.pending_abandon is not None
                 for entry in self._inflight.values()
             )
-        return not pending and not self.request_settlements.pending
+        return not pending and not self.request_settlements.outstanding
 
     def require_clear(self, organization_id: str) -> None:
         """Refuse only the organization whose prior accounting is recovering."""
@@ -729,6 +729,16 @@ class NativeAttemptAccounting:
             NativeBridgeError: The terminal write failed; the retained entry lets either
                 the data plane or the deadline sweep retry the original settlement.
         """
+        with self._lock:
+            self._active_settlements += 1
+        try:
+            return self._settle(argument)
+        finally:
+            with self._lock:
+                self._active_settlements -= 1
+
+    def _settle(self, argument: str) -> str:
+        """Commit one observed outcome while the caller retains shutdown ownership."""
         data = json.loads(argument)
         request_id = str(data["request_id"])
         with self._lock:
@@ -904,20 +914,7 @@ class NativeAttemptAccounting:
 
     def _sweep_loop(self) -> None:
         """Periodically reconcile retained or expired attempts for the process lifetime."""
-        while True:
-            closing = self._stop_sweeper.wait(_SWEEP_INTERVAL_SECONDS)
-            if closing and self.accounting_healthy:
-                return
-            try:
-                self.sweep_expired()
-            except Exception as error:  # noqa: BLE001 - retain work and keep recovery alive.
-                _logger.warning("gateway recovery pass failed: %s", type(error).__name__)
-            # Closing recovery retains ownership and its retry cadence until
-            # every known meter has reached the durable ledger.
-            if closing:
-                if self.accounting_healthy:
-                    return
-                time.sleep(min(_SWEEP_INTERVAL_SECONDS, 0.1))
+        recover_until_stopped(self, _SWEEP_INTERVAL_SECONDS)
 
     def close(self, timeout_seconds: float = 10.0) -> bool:
         """Stop owned recovery before a host closes its durable transport.

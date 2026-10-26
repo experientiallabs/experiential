@@ -4832,3 +4832,61 @@ def test_idle_recovery_shutdown_flushes_retained_request_meter() -> None:
     assert accounting.close(5)
     assert ledger.request_search_meters == [1]
     assert accounting.accounting_healthy
+
+
+@pytest.mark.parametrize("request_only", [False, True])
+def test_shutdown_keeps_recovery_alive_for_an_in_progress_terminal_write(
+    monkeypatch: pytest.MonkeyPatch, request_only: bool
+) -> None:
+    """A first commit failing after close starts still has an owner to retry its meter."""
+    from unittest.mock import DEFAULT, Mock
+
+    accounting, ledger, entry = _registry()
+    attempt_id = "" if request_only else str(_start(accounting, ordinal=0)["attempt_id"])
+    entered, release = threading.Event(), threading.Event()
+    failure = GatewayFailure(failure_class=GatewayFailureClass.CANCELLED, safe_message="cancelled")
+
+    def delayed_first_write(*_args: object, **_kwargs: object) -> object:
+        """Fail only the first commit, after shutdown has attempted a bounded join."""
+        if not entered.is_set():
+            entered.set()
+            assert release.wait(5)
+            raise RuntimeError("write failed after close began")
+        return DEFAULT
+
+    if request_only:
+        monkeypatch.setattr(
+            ledger,
+            "finish_request",
+            Mock(wraps=ledger.finish_request, side_effect=delayed_first_write),
+        )
+    else:
+        monkeypatch.setattr(
+            accounting,
+            "_finish_attempt",
+            Mock(wraps=ledger.finish_attempt, side_effect=delayed_first_write),
+        )
+
+    def finish() -> None:
+        """Deliver one terminal callback and allow its failure to transfer to recovery."""
+        with pytest.raises((RuntimeError, NativeBridgeError)):
+            if request_only:
+                accounting.request_settlements.finish(
+                    entry.authorization, failure, web_search_requests=1
+                )
+            else:
+                _settle(accounting, attempt_id=attempt_id, outcome="completed", finalize=True)
+
+    writer = threading.Thread(target=finish)
+    writer.start()
+    try:
+        assert entered.wait(5)
+        assert not accounting.accounting_healthy
+        accounting.require_clear(entry.authorization.organization_id)
+        assert not accounting.close(0.01)
+    finally:
+        release.set()
+        writer.join(5)
+    assert accounting.close(5)
+    assert ledger.request_search_meters == ([1] if request_only else [])
+    assert len(ledger.finished) == (0 if request_only else 1)

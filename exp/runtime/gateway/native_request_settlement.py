@@ -61,6 +61,12 @@ class RequestSettlements:
         with self._lock:
             return any(settlement.retained for settlement in self._pending.values())
 
+    @property
+    def outstanding(self) -> bool:
+        """Whether any terminal write still owns the transport, including its first commit."""
+        with self._lock:
+            return bool(self._pending)
+
     def require_clear(self, organization_id: str) -> None:
         """Refuse the affected organization while its original meter is uncommitted."""
         with self._lock:
