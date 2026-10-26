@@ -65,7 +65,7 @@ PROTOCOLS = (
             "exp.simulation.evaluation.tasks",
             "exp.simulation.evaluation.admission",
         ),
-        "098aea4090b56992b1a19ad02b1b44e1b64249322d58b7d09b786ecf53c6ab1b",
+        "8cc16410f284caf35e9c321c62c04b75cc7c8869f0f379e56383daabe2d1ba89",
     ),
     Protocol(
         "exp.optimize.evaluation.tasks.challenges:CHALLENGE_PROTOCOL",
@@ -88,7 +88,7 @@ PROTOCOLS = (
             "exp.simulation.actor:run_actor_workflow",
             "exp.simulation.world_model.grounded_session:open_grounded_session",
         ),
-        "c3cc35dd94e6cc7583b095211d7370ffc29672575d3cf39d2beb0f34977f5259",
+        "b603ad527f8e08fdbda0a891de4226abda96ab7aa3f92608f2d14e784063ccea",
     ),
     Protocol(
         "exp.optimize.evaluation.tasks.refinement:REFINEMENT_REQUEST_PROTOCOL",

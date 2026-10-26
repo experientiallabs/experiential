@@ -728,7 +728,7 @@ def publish_trajectory(
         code_revision: Publishing implementation identity.
         publisher: Stable run identity; a restart of the same run recovers its own version.
         evidence: Saved artifacts the trajectory was recorded in, cited by the new version so
-            ancestry checks on memory reach them.
+            ancestry checks on memory reach them. A recovered own version must cite them too.
 
     Returns:
         The new (or recovered own) version and True, or the existing head and False when
@@ -736,8 +736,9 @@ def publish_trajectory(
 
     Raises:
         ReservedTaskError: The trajectory's task lineage is reserved for evaluation.
-        ValueError: The trajectory lacks a task lineage, or its actions and replies are
-            malformed or unequal in number.
+        ValueError: The trajectory lacks a task lineage, its actions and replies are
+            malformed or unequal in number, or this publisher's earlier version lacks the
+            evidence citations.
     """
     require_consumed_trajectory(trajectory)
     artifact = load_grounded_world_model_artifact(store, world_model)
@@ -801,6 +802,13 @@ def _publish(
         index = head.consumed.index(digest)
         own = read_memory_version(store, lineage, index + 1)
         if own.publisher == publisher and index == (parent.version if parent else 0):
+            missing = sorted(ref.artifact_id for ref in set(evidence) - set(own.inputs))
+            if missing:
+                raise ValueError(
+                    f"memory version {own.version} of {lineage!r} was published without citing "
+                    f"{', '.join(missing)}, so its provenance cannot be recovered; exclude that "
+                    "version from qualification or learn into a fresh memory lineage"
+                )
             _materialize(store, own)
             return own, True
         return head, False

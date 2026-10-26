@@ -109,9 +109,12 @@ def test_repair_advances_named_head_without_changing_any_prediction_or_score(
         )
 
 
-@pytest.mark.parametrize("excluded_before_repair", [True, False])
-def test_repair_refuses_an_excluded_report_and_cites_the_one_it_publishes(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, excluded_before_repair: bool
+@pytest.mark.parametrize(
+    ("source", "when"),
+    [("report", "before"), ("run", "before"), ("run", "dry_run"), ("report", "after")],
+)
+def test_repair_refuses_excluded_evidence_and_cites_what_it_publishes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, source: str, when: str
 ) -> None:
     """Excluded evidence never enters repaired memory, and later ancestry checks reach it."""
     project, _, _, spec = failed_run(tmp_path, monkeypatch)
@@ -120,32 +123,66 @@ def test_repair_refuses_an_excluded_report_and_cites_the_one_it_publishes(
         artifact_id="qualification-audit",
         artifact_type="qualification-audit",
         envelope=ArtifactEnvelope(schema_version=1, created_at=now(), code_revision="test"),
-        files={"audit.json": {"reason": "The report's evidence was audited unsafe"}},
+        files={"audit.json": {"reason": "The run's evidence was audited unsafe"}},
     )
 
     def exclude() -> None:
-        """Exclude the run's exact report from qualification."""
+        """Exclude the run or its exact report from qualification."""
         exclude_source_from_qualification(
             store,
-            spec.report,
+            spec.run if source == "run" else spec.report,
             audit=artifact_input(audit),
-            rationale="Audited unsafe report",
+            rationale="Audited unsafe evidence",
             code_revision="test",
         )
 
-    if excluded_before_repair:
+    if when != "after":
         exclude()
         before = set(store.list_ids())
         with pytest.raises(ValueError, match="excluded from qualification"):
-            repair_learning(project, spec, code_revision=REVISION)
+            repair_learning(project, spec, code_revision=REVISION, dry_run=when == "dry_run")
         assert set(store.list_ids()) == before
         return
     lineage = str(repair_learning(project, spec, code_revision=REVISION)["lineage"])
     head = memory_head(store, lineage)
-    assert head is not None and spec.report in head.inputs
+    assert head is not None and {spec.run, spec.report} <= set(head.inputs)
     exclude()
     with pytest.raises(ValueError, match="excluded from qualification"):
         refuse_ineligible_memory(project, lineage)
+
+
+def test_a_version_published_without_its_evidence_is_never_recovered(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A repair interrupted after an uncited publication fails closed instead of recovering."""
+    project, _, _, spec = failed_run(tmp_path, monkeypatch)
+    original_write = project.artifacts.write_json
+
+    def crash(
+        *,
+        artifact_id: str,
+        artifact_type: str,
+        envelope: ArtifactEnvelope,
+        files: Mapping[str, BaseModel | JsonValue],
+    ) -> ArtifactManifest:
+        """Simulate process loss precisely after the memory owner published."""
+        if artifact_type == "fidelity-learning-repair-result":
+            raise KeyboardInterrupt("loss before receipt")
+        return original_write(
+            artifact_id=artifact_id, artifact_type=artifact_type, envelope=envelope, files=files
+        )
+
+    uncited = Mock(
+        side_effect=lambda *args, evidence, **kwargs: publish_trajectory(*args, **kwargs)
+    )
+    with monkeypatch.context() as patch:
+        patch.setattr(project.artifacts, "write_json", crash)
+        patch.setattr(learning_repair, "publish_trajectory", uncited)
+        with pytest.raises(KeyboardInterrupt):
+            repair_learning(project, spec, code_revision=REVISION)
+    assert uncited.call_count == 1
+    with pytest.raises(ValueError, match="published without citing"):
+        repair_learning(project, spec, code_revision=REVISION)
 
 
 def test_stale_parent_refuses_before_writing_and_explicit_repair_keeps_unknowns(

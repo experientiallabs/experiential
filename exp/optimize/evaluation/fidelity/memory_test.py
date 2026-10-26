@@ -248,7 +248,39 @@ def test_saved_report_publication_checks_and_cites_the_report(
         return
     fidelity.execute_fidelity_evaluation(project, prepared)
     head = memory_head(project.artifacts, spec.memory.lineage)
-    assert head is not None and report in head.inputs
+    plan = artifact_input(project.artifacts.read(prepared.id).manifest)
+    assert head is not None and {plan, report} <= set(head.inputs)
     _exclude_source(project, report)
     with pytest.raises(ValueError, match="excluded from qualification"):
         lifecycle.refuse_ineligible_memory(project, spec.memory.lineage)
+
+
+def test_a_publisher_recovers_its_version_only_with_the_same_evidence(tmp_path: Path) -> None:
+    """A version published without citing its evidence is refused, never silently recovered."""
+    project, base = memory_project(tmp_path)
+    spec = trajectory(base, "recovered-memory", "one", "learn")
+    first = _published(project, spec, None)
+    assert spec.memory is not None and spec.memory_selection_identity is not None
+    evidence = artifact_input(project.artifacts.read(spec.world_model.artifact_id).manifest)
+
+    def again(cited: tuple[ArtifactInput, ...]) -> MemoryVersion:
+        """Publish the same trajectory again as the same publisher."""
+        assert spec.memory is not None and spec.memory_selection_identity is not None
+        version, _ = publish_trajectory(
+            project.artifacts,
+            lineage=spec.memory.lineage,
+            parent=None,
+            world_model=spec.world_model,
+            selection_policy_sha256=spec.memory_selection_identity,
+            trajectory=minimal("first"),
+            research=(),
+            created_at=datetime.now(UTC),
+            code_revision="test",
+            publisher="fixture",
+            evidence=cited,
+        )
+        return version
+
+    assert again(()) == first
+    with pytest.raises(ValueError, match="published without citing"):
+        again((evidence,))

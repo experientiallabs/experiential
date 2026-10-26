@@ -97,7 +97,7 @@ def consume_trajectory(project: ProjectStore, prepared: PreparedFidelity, now: d
     ):
         return
     # A saved report may have been excluded after it was written; its evidence then never
-    # enters memory, and the version cites the report so later ancestry checks reach it.
+    # enters memory, and the version cites the plan and report so later checks reach them.
     plan = artifact_input(project.artifacts.read(prepared.id).manifest)
     report = artifact_input(project.artifacts.read(prepared.id + "-report").manifest)
     refuse_known_ineligible_sources(project.artifacts, (plan, report), maximum_artifacts=100_000)
@@ -160,7 +160,7 @@ def consume_trajectory(project: ProjectStore, prepared: PreparedFidelity, now: d
                 created_at=now,
                 code_revision=prepared.code_revision,
                 publisher=prepared.id,
-                evidence=(report,),
+                evidence=(plan, report),
             )
         except ReservedTaskError as error:
             outcome |= {"published": False, "reason": str(error)}

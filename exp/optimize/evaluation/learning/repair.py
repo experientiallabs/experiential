@@ -253,7 +253,7 @@ def repair_learning(
             or saved_fidelity_report(project, prepared) is None
         ):
             raise ValueError("repair requires finalized, unconsumed learning with failed research")
-        # The repaired memory cites the report, so an excluded run or report never enters it.
+        # The repaired memory cites the run and report, so an excluded one never enters it.
         refuse_known_ineligible_sources(store, (spec.run, spec.report), maximum_artifacts=100_000)
         evidence = WorkflowEvidence.model_validate_json(
             store.read_bytes(prepared.id + "-report-intent", "evidence.json")
@@ -371,7 +371,7 @@ def repair_learning(
             created_at=now,
             code_revision=code_revision,
             publisher=identity,
-            evidence=(spec.report,),
+            evidence=(spec.run, spec.report),
         )
         outcome: JsonObject = {
             "published": consumed,
