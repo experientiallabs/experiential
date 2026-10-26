@@ -422,16 +422,18 @@ def screen_misses(
                     )
                     response: JsonObject | None = None
                 else:
+                    # Resolve credentials before the intent: a refusal here dispatched nothing,
+                    # so the miss must stay retryable rather than become an unknown outcome.
+                    if resolved is None:
+                        resolved = RuntimeModelCatalog(
+                            load_model_catalog(project.model_catalog_path)
+                        ).resolve(alias)
                     store.write_json(
                         artifact_id=intent,
                         artifact_type=SCREENING_TYPE + "-intent",
                         envelope=envelope.model_copy(update={"inputs": (miss.record,)}),
                         files={"request.json": request},
                     )
-                    if resolved is None:
-                        resolved = RuntimeModelCatalog(
-                            load_model_catalog(project.model_catalog_path)
-                        ).resolve(alias)
                     screening, response = _dispatch(
                         project, miss, request, identity, resolved, deadline, clock, code_revision
                     )

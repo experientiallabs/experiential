@@ -8,6 +8,7 @@ decisions answer by tool, so the fit must keep the behavioural miss and drop the
 
 import json
 from collections.abc import Mapping
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -224,6 +225,40 @@ def test_screening_keeps_behavioural_misses_and_replays_without_calls(
     assert len(provider.requests) == purchased, "saved decisions and the lesson set replay"
     assert '"screened_in": 1' in again
     assert len(store.artifacts.list_ids(artifact_type=LESSON_SET_TYPE)) == 1
+
+
+def test_a_missing_credential_leaves_every_screening_retryable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A credential refusal dispatched nothing, so it saves no intent and a retry answers."""
+    provider = LessonProvider([episode(i) for i in range(USERS)])
+    root, store, _ = build_project(tmp_path, monkeypatch, provider)
+    monkeypatch.setattr(screening, "HttpxJsonTransport", lambda: provider)
+    learn_fit(root, store)
+    plan, head = screening_plan(store, "fit")
+    misses = learning_misses(store, plan, head)
+    planned = planned_screenings(
+        store, misses, [], alias=plan.recall.jev_alias, maximum_reply_bytes=4_000
+    )
+    now = datetime.now(UTC)
+
+    def screen() -> tuple[screening.MissScreening, ...]:
+        """Screen every planned miss with the fixture's clock."""
+        return screening.screen_misses(
+            store,
+            planned,
+            alias=plan.recall.jev_alias,
+            deadline=now + timedelta(hours=1),
+            clock=lambda: datetime.now(UTC),
+            code_revision="c",
+        )
+
+    monkeypatch.delenv("HELD_OUT_TEST_KEY")
+    with pytest.raises(ValueError, match="HELD_OUT_TEST_KEY"):
+        screen()
+    assert not store.artifacts.list_ids(artifact_type=SCREENING_TYPE + "-intent")
+    monkeypatch.setenv("HELD_OUT_TEST_KEY", "fixture-only")
+    assert {row.status for row in screen()} == {"answered"}
 
 
 def test_audit_compares_memory_profiles_on_identical_specs(
