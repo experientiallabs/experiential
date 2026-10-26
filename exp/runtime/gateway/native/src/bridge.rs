@@ -12,7 +12,9 @@
 //! would track every blocking thread that ever ran a callback. A fixed set of
 //! workers pins the cache to exactly `worker_count` threads for the life of
 //! the bridge, and each worker releases its cached resources through the
-//! control plane's `close_thread_resources` callback before it exits.
+//! control plane's `close_thread_resources` callback before it exits. Bound
+//! targets share these workers, so their thread-local resources close after
+//! every callback, before its execution lease can retire.
 
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread::JoinHandle;
@@ -226,14 +228,29 @@ fn worker_loop(receiver: &Mutex<mpsc::Receiver<Job>>, object: &Py<PyAny>) {
             // A panic maps to the shared internal error and never poisons
             // the receive lock, so one poisoned call cannot take down the
             // pool.
+            let target = job
+                .execution
+                .as_ref()
+                .map_or(object, |execution| &execution.resources.target);
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let target = job
-                    .execution
-                    .as_ref()
-                    .map_or(object, |execution| &execution.resources.target);
                 control_plane_call(py, target, job.method, &job.argument)
             }))
             .unwrap_or_else(|_| Err(PublicError::internal()));
+            // Shared workers must not retain a departed target's per-path
+            // caches. Run cleanup even after a failed callback or cancelled
+            // waiter, while the job still owns its target and both permits.
+            // The individual process bridge retains its fixed-worker cache.
+            if job.execution.is_some() {
+                let cleanup = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    control_plane_call(py, target, "close_thread_resources", "{}")
+                }))
+                .unwrap_or_else(|_| Err(PublicError::internal()));
+                if cleanup.is_err() {
+                    // Cleanup cannot change a committed accounting outcome.
+                    // Never print the callback's exception or target identity.
+                    eprintln!("bound gateway callback thread-resource cleanup failed");
+                }
+            }
             let _ = job.responder.send(outcome);
         }
         // The control plane caches one SQLite connection per worker thread;
@@ -301,6 +318,7 @@ class Plane:
         self.barrier = threading.Barrier(2, timeout=10.0)
         self.started = threading.Event()
         self.release = threading.Event()
+        self.fail_close = False
 
     def block(self, argument):
         self.started.set()
@@ -320,9 +338,14 @@ class Plane:
     def boom(self, argument):
         raise RuntimeError("unsanitized failure")
 
+    def settle(self, argument):
+        return argument
+
     def close_thread_resources(self, argument):
         with self.lock:
             self.closed_threads.append(threading.get_ident())
+        if self.fail_close:
+            raise RuntimeError("cleanup failure with private target information")
         return "{}"
 "#;
 
@@ -506,9 +529,125 @@ class Plane:
             .await
             .unwrap();
         });
+        // The callback is cancelled, but its target is cleaned before its
+        // lease becomes idle, without stopping the shared process bridge.
+        assert_eq!(attribute_length(&observer, "closed_threads"), 1);
         drop(bridge);
-        assert_eq!(attribute_length(&observer, "closed_threads"), 0);
         assert_eq!(attribute_length(&process_observer, "closed_threads"), 4);
+    }
+
+    #[test]
+    fn bound_target_churn_closes_sqlite_on_serving_and_cleanup_workers() {
+        use crate::execution_binding::{ExecutionBindings, ExecutionHandle};
+
+        const SOURCE: &std::ffi::CStr = cr#"
+import sqlite3
+import tempfile
+import threading
+from pathlib import Path
+
+
+class DatabasePlane:
+    def __init__(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.path = Path(self.directory.name) / "gateway.db"
+        self.local = threading.local()
+        self.closed = 0
+
+    def echo(self, argument):
+        if not hasattr(self.local, "connection"):
+            self.local.connection = sqlite3.connect(self.path)
+        self.local.connection.execute("SELECT 1").fetchone()
+        return argument
+
+    def settle(self, argument):
+        return self.echo(argument)
+
+    def boom(self, argument):
+        self.echo(argument)
+        raise RuntimeError("callback failed after opening its database")
+
+    def close_thread_resources(self, argument):
+        connection = self.local.connection
+        connection.close()
+        del self.local.connection
+        try:
+            connection.execute("SELECT 1")
+        except sqlite3.ProgrammingError:
+            self.closed += 1
+        else:
+            raise AssertionError("database descriptor remains usable")
+        return "{}"
+"#;
+        let bridge = Bridge::new(plane(), 2).unwrap();
+        let bindings = ExecutionBindings::new(1).unwrap();
+        for index in 0..16 {
+            let target = Python::attach(|py| {
+                pyo3::types::PyModule::from_code(py, SOURCE, c"database.py", c"database")
+                    .unwrap()
+                    .getattr("DatabasePlane")
+                    .unwrap()
+                    .call0()
+                    .unwrap()
+                    .unbind()
+            });
+            let observer = Python::attach(|py| target.clone_ref(py));
+            let handle = ExecutionHandle::new(target, 128, 1, 1).unwrap();
+            let token = format!("{index:032}");
+            bindings.register(token.clone(), &handle).unwrap();
+            let bound = bridge.bind(bindings.claim(&token).unwrap());
+            block_on(async {
+                assert_eq!(
+                    bound.call("echo", "request".into()).await.unwrap(),
+                    "request"
+                );
+                assert_eq!(
+                    bound.call("settle", "receipt".into()).await.unwrap(),
+                    "receipt"
+                );
+                assert!(bound.call("boom", "failure".into()).await.is_err());
+            });
+            Python::attach(|py| {
+                assert_eq!(
+                    observer
+                        .bind(py)
+                        .getattr("closed")
+                        .unwrap()
+                        .extract::<usize>()
+                        .unwrap(),
+                    3,
+                    "every target's actual SQLite connection closes before its callback returns"
+                );
+            });
+            drop(bound);
+        }
+        // Churn never stops the pool or consumes the process target's capacity.
+        assert_eq!(
+            block_on(bridge.call("echo", "alive".into())).unwrap(),
+            "alive"
+        );
+    }
+
+    #[test]
+    fn cleanup_failure_cannot_change_an_acknowledged_accounting_result() {
+        use crate::execution_binding::{ExecutionBindings, ExecutionHandle};
+
+        let target = plane();
+        Python::attach(|py| target.bind(py).setattr("fail_close", true).unwrap());
+        let observer = Python::attach(|py| target.clone_ref(py));
+        let handle = ExecutionHandle::new(target, 128, 1, 1).unwrap();
+        let bindings = ExecutionBindings::new(1).unwrap();
+        let token = "c".repeat(32);
+        bindings.register(token.clone(), &handle).unwrap();
+        let bridge = Bridge::new(plane(), 2).unwrap();
+        let bound = bridge.bind(bindings.claim(&token).unwrap());
+        assert_eq!(
+            block_on(bound.call("settle", "durable receipt".into())).unwrap(),
+            "durable receipt"
+        );
+        assert_eq!(attribute_length(&observer, "closed_threads"), 1);
+        assert!(block_on(bound.call("boom", "{}".into())).is_err());
+        assert_eq!(attribute_length(&observer, "closed_threads"), 2);
     }
 
     #[test]

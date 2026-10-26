@@ -256,12 +256,13 @@ class NativeObservabilityMixin:
         self._accounting.sweep_expired()
 
     def close_thread_resources(self, argument: str) -> str:
-        """Release the calling thread's cached resources before it exits.
+        """Release resources cached by the calling callback worker.
 
         The data plane pins control-plane callbacks to a fixed pool of worker
-        threads and calls this once per worker as the pool shuts down, so the
-        SQLite connections cached per thread by ``persistent_connection``
-        close with the worker instead of outliving it.
+        threads. The individual process bridge calls this when a worker exits;
+        a host-bound target calls it after each callback, before releasing its
+        execution lease. A shared worker cannot retain an idle target's SQLite
+        connections after the host retires that target.
 
         Args:
             argument: Empty JSON object, matching the callback shape.
