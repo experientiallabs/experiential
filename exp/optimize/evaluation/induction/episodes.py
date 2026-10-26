@@ -2,8 +2,9 @@
 
 Each fit trace becomes one episode: every recorded tool exchange in call order (the public
 prefix included, since state evolves from the trace's start), the starting instance facts the
-trace package supplies, and the operator-declared starting state of the world. Held-out traces
-are never read here; they belong to the audit owner.
+trace package supplies, and the operator-declared starting state of the world. The dataset is
+loaded whole, but held-out traces are skipped before any of their content is used; they belong
+to the audit owner.
 """
 
 from collections.abc import Iterable, Iterator

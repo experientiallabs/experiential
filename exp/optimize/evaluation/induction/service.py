@@ -346,7 +346,8 @@ def _episodes(project: ProjectStore, spec: InductionSpec) -> tuple[InductionEpis
 def _tool_schemas(project: ProjectStore, spec: InductionSpec) -> tuple[ToolSchema, ...]:
     """Return actor-visible schemas of the manifest's tools as the fit traces declare them.
 
-    Held-out traces are never read, so none of their content reaches the inducer prompt.
+    Held-out traces are skipped by the fit-partition filter, so none of their schemas reaches
+    the inducer prompt.
     """
     names = {tool.name for tool in spec.manifest.tools}
     schemas = {}

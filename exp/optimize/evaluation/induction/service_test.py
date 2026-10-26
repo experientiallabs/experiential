@@ -7,11 +7,13 @@ from pathlib import Path
 import pytest
 
 from exp.common.core.artifacts import sha256_json
+from exp.common.core.verified_cache import VerifiedCache
 from exp.common.models import load_model_catalog
 from exp.common.project import ProjectStore
 from exp.common.tasks import ToolSchema
 from exp.common.traces import Trace
-from exp.common.traces.store import LoadedTraceDataset, load_trace_dataset
+from exp.common.traces import store as trace_store
+from exp.common.traces.store import load_trace_dataset
 from exp.optimize.evaluation.audit.panel_test import SimulatedProvider, _tool_reply, build_project
 from exp.optimize.evaluation.induction import episodes as induction_episodes
 from exp.optimize.evaluation.induction import service
@@ -135,32 +137,48 @@ def test_fit_episodes_exclude_held_out_traces(
 def test_tool_schemas_come_only_from_fit_traces(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A schema only a held-out trace declares never reaches the inducer, even when it is first."""
+    """A schema a held-out trace declares first never reaches the inducer.
+
+    The adversarial declarations are injected where every trace is decoded from the saved
+    dataset, so any reader of the build's traces sees them: held-out traces declare a marker,
+    fit traces before the first held-out trace declare nothing, and later fit traces declare
+    the expected description.
+    """
     project, spec, _ = induction_fixture(tmp_path, monkeypatch)
     build = project.load_project().build
     assert build is not None
-    held_out = {
+    bindings = load_completed_build_rag_lineage_bindings(project.artifacts, build)
+    held_out = {row.trace_id for row in bindings if row.partition == "held_out"}
+    order = [
         row.trace_id
-        for row in load_completed_build_rag_lineage_bindings(project.artifacts, build)
-        if row.partition == "held_out"
-    }
-    loaded = load_trace_dataset(project.artifacts, build.trace_dataset.artifact_id)
+        for row in load_trace_dataset(project.artifacts, build.trace_dataset.artifact_id).traces
+    ]
+    first_held_out = min(order.index(trace_id) for trace_id in held_out)
+    assert any(trace_id not in held_out for trace_id in order[first_held_out:])
+    decode = trace_store._decode_trace_record
 
-    def declaring(trace: Trace, description: str) -> Trace:
-        """Return the trace declaring every manifest tool with one description."""
+    def adversarial(line: str, *, legacy: bool) -> Trace:
+        """Decode one saved trace, then give it the declarations this test needs."""
+        trace = decode(line, legacy=legacy)
+        if trace.trace_id in held_out:
+            description = "HELD-OUT-MARKER"
+        elif order.index(trace.trace_id) > first_held_out:
+            description = "fit"
+        else:
+            return trace.model_copy(update={"tools": ()})
         tools = tuple(
             ToolSchema(name=tool.name, description=description, input_schema={})
             for tool in spec.manifest.tools
         )
         return trace.model_copy(update={"tools": tools})
 
-    hidden = tuple(
-        declaring(row, "HELD-OUT-MARKER") for row in loaded.traces if row.trace_id in held_out
+    monkeypatch.setattr(trace_store, "_decode_trace_record", adversarial)
+    monkeypatch.setattr(trace_store, "_DECODED", VerifiedCache(4))
+    # The binding loader re-checks that saved records are canonical, which the injected
+    # declarations break; the bindings themselves are the real ones computed above.
+    monkeypatch.setattr(
+        induction_episodes, "load_completed_build_rag_lineage_bindings", lambda *_: bindings
     )
-    fit = tuple(declaring(row, "fit") for row in loaded.traces if row.trace_id not in held_out)
-    assert hidden and fit
-    reordered = LoadedTraceDataset(dataset=loaded.dataset, traces=hidden + fit)
-    monkeypatch.setattr(induction_episodes, "load_trace_dataset", lambda *_: reordered)
     schemas = service._tool_schemas(project, spec)
     assert [schema.name for schema in schemas] == sorted(tool.name for tool in spec.manifest.tools)
     assert {schema.description for schema in schemas} == {"fit"}
