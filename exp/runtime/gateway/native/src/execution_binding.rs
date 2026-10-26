@@ -80,7 +80,7 @@ impl Drop for ExecutionLease {
 }
 
 /// One-use, in-process execution bindings installed before a host relays a request.
-#[pyclass]
+#[pyclass(from_py_object)]
 #[derive(Clone)]
 pub struct ExecutionBindings {
     entries: Arc<Mutex<HashMap<String, Arc<ExecutionLease>>>>,
