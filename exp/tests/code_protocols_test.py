@@ -64,10 +64,11 @@ PROTOCOLS = (
     ),
     Protocol(
         "exp.optimize.evaluation.council.runner:COUNCIL_HARNESS_PROTOCOL",
-        "council-harness-v3",
+        "council-harness-v4",
         (
             "exp.runtime.agents.chat:ChatAgentRuntime",
             "exp.runtime.agents.pi:PiAgentRuntime",
+            "exp.simulation.actor:_RecordingEnvironment",
             "exp.simulation.actor:run_actor_workflow",
             "exp.simulation.world_model.grounded_session:open_grounded_session",
         ),

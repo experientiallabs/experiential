@@ -82,7 +82,7 @@ from exp.simulation.world_model.runtime import (
 # Identity of the code that decides this artifact's behavior, in place of its source text.
 # Bump it when behavior changes. exp/tests/code_protocols_test.py fails when the covered
 # source changes until it is bumped or, for a pure refactor, its digest is updated.
-COUNCIL_HARNESS_PROTOCOL = "council-harness-v3"
+COUNCIL_HARNESS_PROTOCOL = "council-harness-v4"
 
 
 class CouncilActor(ContractModel):
