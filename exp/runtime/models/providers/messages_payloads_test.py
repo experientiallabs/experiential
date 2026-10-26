@@ -457,3 +457,36 @@ def test_sampling_controls_keep_omitted_thinking_omitted() -> None:
     )
     assert payload.get("temperature") == 0.2
     assert "thinking" not in payload
+
+
+def test_messages_end_user_id_reaches_the_anthropic_wire() -> None:
+    """``metadata.user_id`` is Anthropic's own attribution key and is relayed."""
+    request = decode_messages(
+        {
+            "model": "claude-sonnet-4-5",
+            "max_tokens": 64,
+            "metadata": {"user_id": "user-7f3a"},
+            "messages": [{"role": "user", "content": "hi"}],
+        }
+    ).request
+    payload = anthropic_messages_stream_payload("claude-sonnet-4-5", request)
+    assert payload["metadata"] == {"user_id": "user-7f3a"}
+    without = decode_messages(
+        {
+            "model": "claude-sonnet-4-5",
+            "max_tokens": 64,
+            "messages": [{"role": "user", "content": "hi"}],
+        }
+    ).request
+    assert "metadata" not in anthropic_messages_stream_payload("claude-sonnet-4-5", without)
+
+
+def test_chat_metadata_never_reaches_the_anthropic_wire() -> None:
+    """Chat ``metadata`` is the caller's own store, even when it names a user_id."""
+    request = GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=(GatewayMessage(role="user", content="hi"),),
+        metadata={"user_id": "user-7f3a"},
+        maximum_output_tokens=64,
+    )
+    assert "metadata" not in anthropic_messages_stream_payload("claude-sonnet-4-5", request)

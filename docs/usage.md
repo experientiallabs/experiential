@@ -175,8 +175,18 @@ specific variables avoid overwriting an upstream provider's `OPENAI_API_KEY`. Th
 unavailable alias and provider configuration; fix that configuration and rerun `exp`. If the
 one-time key was not saved, issue a replacement with
 `exp config gateway key issue IDENTITY --key-id KEY --json`.
-The accounting database stays content-free. Local traffic content is captured separately by default;
+The accounting database stays content-free. Local traffic content is captured separately by default
+into a plaintext SQLite file under the root (the launch receipt names it as `traffic_database`);
 use `--ghost` to disable it. See [local traffic capture](reference/local_gateway_traffic.md).
+`exp` reads a `.env` file in the current directory at startup, so provider keys placed there are
+visible to every gateway connection that names them; keep secrets elsewhere if that directory is
+shared. Aggregate PostHog telemetry is on until `exp config telemetry disable`.
+
+`exp run --request-timeout SECONDS` sets the total budget for one request, failover included
+(default 120, at most 3600). A streamed answer cut at that limit ends with an explicit error event
+naming the time limit (Chat: an error chunk then `[DONE]`; Messages: an `error` event with no
+`message_stop`; Responses: `response.failed`), never a stream that simply stops, so a client can
+tell a cut answer from a finished one.
 Raw virtual keys and resolved provider credentials are never copied into capture or accounting.
 `GET /usage` and `GET /usage.json` expose the same schema-v3 content-free overall and per-identity
 counts, token usage, latency, terminal states, and attributed estimated cost. Their attempt-only

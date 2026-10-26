@@ -84,7 +84,8 @@ all categories of the adapter. A question has `instructions` and optional `crite
 describe the `true` and `false` outcomes. `aggregate` is `max` (default) or `mean`, and
 `threshold` is in `(0, 1]`. A request is flagged when any category score is greater than or
 equal to its threshold. One adapter asks at most 32 questions, and the questions plus the
-largest possible window must fit one 256 KiB decision request; load fails otherwise.
+largest possible window must fit one 4 MiB decision request; load fails otherwise.
+This byte budget is separate from the selected model's token context limit.
 
 Bind `decision_model` adapters only to input checks with `block` or `allow`. `block` refuses
 a flagged request; `allow` records the flag without refusing it. Output checks and `modify`

@@ -23,6 +23,7 @@ from exp.common.auth import (
 from exp.common.core.artifacts import ContractModel, JsonObject
 from exp.common.core.locks import FileLockTimeout
 from exp.common.models import ConnectionConfig
+from exp.common.models.azure_endpoints import AzureApiSurface
 from exp.common.models.catalog import SubscriptionKind
 from exp.runtime.gateway.management import GatewayManagement
 from exp.runtime.gateway.sqlite.provider_authority import provider_connection_revision_id
@@ -79,7 +80,7 @@ class GatewayProviderView(ContractModel):
     bedrock_auth_mode: str | None = None
     base_url: str | None = None
     api_version: str | None = None
-    azure_api_surface: Literal["openai_deployments", "model_inference"] | None = None
+    azure_api_surface: AzureApiSurface | None = None
     region: str | None = None
 
 
@@ -308,9 +309,7 @@ def provider_add(
     bedrock_auth_mode: Literal["access_key_pair", "api_key"] | None = (_BEDROCK_AUTH_MODE_OPTION),
     base_url: str | None = _BASE_URL_OPTION,
     api_version: str | None = _API_VERSION_OPTION,
-    azure_api_surface: Literal["openai_deployments", "model_inference"] | None = (
-        _AZURE_API_SURFACE_OPTION
-    ),
+    azure_api_surface: AzureApiSurface | None = (_AZURE_API_SURFACE_OPTION),
     region: str | None = _REGION_OPTION,
     subscription: SubscriptionKind | None = _SUBSCRIPTION_OPTION,
     codex_auth_file: Path | None = _CODEX_AUTH_FILE_OPTION,
@@ -389,9 +388,7 @@ def provider_update(
     bedrock_auth_mode: Literal["access_key_pair", "api_key"] | None = (_BEDROCK_AUTH_MODE_OPTION),
     base_url: str | None = _BASE_URL_OPTION,
     api_version: str | None = _API_VERSION_OPTION,
-    azure_api_surface: Literal["openai_deployments", "model_inference"] | None = (
-        _AZURE_API_SURFACE_OPTION
-    ),
+    azure_api_surface: AzureApiSurface | None = (_AZURE_API_SURFACE_OPTION),
     region: str | None = _REGION_OPTION,
     clear_credentials: bool = _CLEAR_CREDENTIALS_OPTION,
     clear_region: bool = _CLEAR_REGION_OPTION,

@@ -714,12 +714,10 @@ async fn stream_messages(
         }
 
         let mut prefix: std::collections::VecDeque<Event> = committed.prefix.drain(..).collect();
+        let mut send_deadline = deadline;
         loop {
-            if crate::relay::remaining(deadline).is_zero() {
-                committed.relay.close_transport();
-                log_stream_exit(&request_id, "delivery_deadline");
-                guard.settle_cancelled(usage.as_ref(), &tool_names).await;
-                return;
+            if committed.relay.deadline_cut(deadline, &mut send_deadline) {
+                fail_stream!(crate::relay::deadline_while_generating())
             }
             let event = if let Some(event) = prefix.pop_front() {
                 event
@@ -848,7 +846,7 @@ async fn stream_messages(
                     }
                 };
                 for data in encoded {
-                    if !delivery.send(deadline, Bytes::from(data)).await {
+                    if !delivery.send(send_deadline, Bytes::from(data)).await {
                         committed.relay.close_transport();
                         log_stream_exit(&request_id, "subscriber_closed_or_delivery_deadline");
                         settle_stream_end(
@@ -900,6 +898,7 @@ async fn emit_messages_failure(
     let frames = encoder
         .feed(&Event::Failed(failure.clone()))
         .unwrap_or_default();
+    let deadline = crate::respond::terminal_send_deadline(deadline);
     for frame in frames {
         if !send_bounded(sender, deadline, Bytes::from(frame)).await {
             return;

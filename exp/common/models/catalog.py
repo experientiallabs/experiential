@@ -30,6 +30,7 @@ from exp.common.core.artifacts import (
     validate_artifact_id,
 )
 from exp.common.core.files import write_text_atomic
+from exp.common.models.azure_endpoints import AzureApiSurface
 from exp.common.models.bedrock_connection import require_bedrock_connection_shape
 from exp.common.models.catalog_prices import (
     MAXIMUM_RATE_NANO_USD_PER_MILLION_TOKENS as MAXIMUM_RATE_NANO_USD_PER_MILLION_TOKENS,
@@ -147,7 +148,7 @@ class ConnectionConfig(ContractModel):
     base_url: str | None = Field(default=None, max_length=2_048)
     api_key_env: str | None = Field(default=None, max_length=256)
     api_version: str | None = Field(default=None, max_length=64)
-    azure_api_surface: Literal["openai_deployments", "model_inference"] | None = None
+    azure_api_surface: AzureApiSurface | None = None
     region: str | None = Field(default=None, max_length=64)
     inference_geo: Literal["us"] | None = None
     """Operator-enforced Anthropic inference geography, independent of caller input."""

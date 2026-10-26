@@ -38,7 +38,11 @@ from exp.runtime.gateway.native_admission import (
 )
 from exp.runtime.gateway.native_components import NativeGatewayComponents, SyncWriteLedger
 from exp.runtime.gateway.native_dead_rungs import UNAVAILABLE_AT_ADMISSION
-from exp.runtime.gateway.native_decisions import NativeDecisionsMixin, _priced_decision_rung
+from exp.runtime.gateway.native_decisions import (
+    NativeDecisionsMixin,
+    _decisions_rung,
+    _priced_decision_rung,
+)
 from exp.runtime.gateway.native_execution import (
     MAXIMUM_TOTAL_ATTEMPTS,
     InflightRequest,
@@ -71,16 +75,40 @@ class _OpenAIDecisionsPlane(Protocol):
         ...
 
 
-def not_an_openai_decision_model_error(alias: str) -> OpenAIProtocolError:
-    """Return a field-specific refusal for an alias with no OpenAI decisions rung."""
-    return OpenAIProtocolError(
-        status_code=400,
-        code="unsupported_capability",
-        message=(
+def not_an_openai_decision_model_error(
+    alias: str, *, serves_systemone: bool = False
+) -> OpenAIProtocolError:
+    """Return a field-specific refusal for an alias with no OpenAI decisions rung.
+
+    Args:
+        alias: The model id the caller requested.
+        serves_systemone: Whether a dispatchable rung of the alias serves native
+            decisions on ``/v1/systemone``, judged by the SystemOne lane's own
+            rung predicate. The refusal then points the caller there with the
+            same model id instead of telling them to choose another model.
+
+    Returns:
+        The typed 400 the boundary raises before any provider dispatch.
+    """
+    if serves_systemone:
+        message = (
+            f"The model {alias!r} supports native decisions, not the OpenAI Decisions API. "
+            "POST /v1/systemone on this same API host with your same API key "
+            f"(Authorization: Bearer) and the same model id {alias!r}, using model, state "
+            "and questions. Key questions by id; each needs type (noul, choice or score) "
+            "and instructions (choice also needs a criteria object; score a criteria "
+            "array). Read answers[id]; do not send input or a questions list."
+        )
+    else:
+        message = (
             f"The model {alias!r} does not serve the OpenAI Decisions API. Choose a "
             "decision model served by OpenAI from GET /v1/models and resend the request "
             "to /v1/decisions."
-        ),
+        )
+    return OpenAIProtocolError(
+        status_code=400,
+        code="unsupported_capability",
+        message=message,
         param="model",
     )
 
@@ -215,8 +243,22 @@ def _admit_accepted(
         )
     )
     if not capable:
-        _finish_unsupported(plane, authorization)
-        raise NativeBridgeError(not_an_openai_decision_model_error(authorization.alias))
+        # The SystemOne lane's own rung predicate decides whether the same model
+        # id is servable on /v1/systemone; there is no second rule here.
+        serves_systemone = any(
+            _decisions_rung(
+                profile, route.deployments[index].gateway.capabilities.supports_decisions
+            )
+            for index, (profile, _client) in zip(
+                dispatchable.indexes, dispatchable.resolved_wires, strict=True
+            )
+        )
+        _finish_unsupported(plane, authorization, serves_systemone=serves_systemone)
+        raise NativeBridgeError(
+            not_an_openai_decision_model_error(
+                authorization.alias, serves_systemone=serves_systemone
+            )
+        )
     serving = tuple(
         index for index in capable if _priced_decision_rung(route.deployments[index].gateway.prices)
     )[:MAXIMUM_TOTAL_ATTEMPTS]
@@ -283,13 +325,23 @@ def _admit_accepted(
     return serialized
 
 
-def _finish_unsupported(plane: _OpenAIDecisionsPlane, authorization: AuthorizationSnapshot) -> None:
+def _finish_unsupported(
+    plane: _OpenAIDecisionsPlane,
+    authorization: AuthorizationSnapshot,
+    *,
+    serves_systemone: bool = False,
+) -> None:
     """Finish an accepted request naming an alias that cannot serve OpenAI decisions."""
+    safe_message = (
+        "the model alias serves native decisions on /v1/systemone, not the OpenAI Decisions API"
+        if serves_systemone
+        else "the model alias does not serve the OpenAI Decisions API"
+    )
     plane._accounting.finish_request_quietly(  # noqa: SLF001
         authorization,
         GatewayFailure(
             failure_class=GatewayFailureClass.UNSUPPORTED_CAPABILITY,
-            safe_message="the model alias does not serve the OpenAI Decisions API",
+            safe_message=safe_message,
         ),
     )
 

@@ -343,6 +343,22 @@ def test_admit_decisions_rejects_oversized_state_before_accept(tmp_path: Path) -
     assert _rows(control) == []
 
 
+def test_admit_decisions_preserves_long_state(tmp_path: Path) -> None:
+    """Native admission keeps a 200k-token synthetic state intact in its upstream payload."""
+    control, raw_key = _control_plane(tmp_path)
+    state = "The deployment is healthy. " * 40_000 + "Final evidence: deployment failed."
+    body = {**_body(), "state": state}
+    admitted = _admit(control, raw_key, body)
+    route = admitted["route"]
+    assert isinstance(route, list) and len(route) == 1
+    wire = route[0]
+    assert isinstance(wire, dict)
+    payload = wire["upstream_payload"]
+    assert isinstance(payload, dict)
+    assert payload["state"] == state
+    assert _rows(control) == [("decisions", None)]
+
+
 def test_admit_requires_deployment_decision_capability(tmp_path: Path) -> None:
     """A native URL does not substitute for the positive gateway-only capability flag."""
     control, raw_key = _control_plane(tmp_path, supports_decisions=False)

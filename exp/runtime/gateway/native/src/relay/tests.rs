@@ -2,6 +2,7 @@
 //! credential failures, first-byte stalls, and the tool-search withholder
 //! at the relay's yield point.
 
+use super::deadline::DEADLINE_WHILE_GENERATING_MESSAGE;
 use super::*;
 use crate::dialects::Dialect;
 use crate::events::Event;

@@ -48,7 +48,7 @@ from exp.runtime.models.providers.async_transport import (
     HttpxAsyncJsonTransport,
     ScriptedAsyncJsonTransport,
 )
-from exp.runtime.models.providers.azure import AzureClient
+from exp.runtime.models.providers.azure import AzureClient, AzureResponsesClient
 from exp.runtime.models.providers.base import ProviderHttpClient
 from exp.runtime.models.providers.chatgpt_subscription import ChatGptSubscriptionClient
 from exp.runtime.models.providers.openai import OpenAIClient
@@ -1190,3 +1190,61 @@ def test_capability_only_metadata_keeps_flat_budget_pricing(authored: bool) -> N
             reserve()
     else:
         assert reserve() == pytest.approx(0.000165)
+
+
+@pytest.mark.parametrize(
+    ("api_version", "url"),
+    [
+        ("v1", "https://silen-resource.services.ai.azure.com/openai/v1/responses"),
+        (
+            "2025-04-01-preview",
+            "https://silen-resource.services.ai.azure.com/openai/responses"
+            "?api-version=2025-04-01-preview",
+        ),
+    ],
+)
+def test_azure_responses_surface_dispatches_over_the_native_responses_wire(
+    api_version: str, url: str
+) -> None:
+    """An Azure connection declaring the Responses surface speaks Responses, not Chat.
+
+    GPT deployments on Foundry then receive Responses-only fields (``prompt_cache_key``,
+    reasoning, ``include``) instead of having them dropped by a Chat translation.
+    """
+    catalog = ModelCatalog(
+        connections={
+            "foundry": ConnectionConfig(
+                provider="azure",
+                base_url="https://silen-resource.services.ai.azure.com",
+                api_key_env="FIXTURE_API_KEY",
+                api_version=api_version,
+                azure_api_surface="responses",
+            )
+        },
+        models={
+            "gpt": ModelRecord(
+                connection="foundry",
+                model="gpt-5-6-deployment",
+                billing_source=BillingSource.CUSTOMER_MANAGED,
+                capabilities=ModelCapabilities(supports_completions=True, supports_reasoning=True),
+            )
+        },
+        roles=ModelRoles(candidates=("gpt",), incumbent="gpt"),
+    )
+    runtime = RuntimeModelCatalog(
+        catalog,
+        environment={"FIXTURE_API_KEY": "foundry-secret"},
+        transport_factory=ScriptedJsonTransport,
+    )
+
+    resolved = runtime.resolve("gpt")
+
+    assert isinstance(resolved.client, AzureResponsesClient)
+    profile = resolved.client.gateway_wire_profile()
+    assert profile.dialect == "openai_responses"
+    assert profile.url == url
+    assert profile.model_id == "gpt-5-6-deployment"
+    assert profile.headers["api-key"] == "foundry-secret"
+    assert "Authorization" not in profile.headers
+    assert profile.forwards_prompt_cache_key is True
+    assert profile.forwards_prompt_cache_ttl is False

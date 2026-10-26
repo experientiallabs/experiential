@@ -17,6 +17,7 @@ results, and plans do not live here.
 | `reference/chat-logprobs.md` | Verified Chat probability admission, token records, and guardrail boundaries. |
 | `reference/responses-logprobs.md` | Native Responses probability selectors, lifecycle phases, and continuation behavior. |
 | `reference/gateway-request-policy.md` | Per-request retry bounds, backoff, opaque route selection, replay and physical-attempt accounting. |
+| `reference/gateway-history-tool-arguments.md` | Replayed tool calls whose arguments are not one JSON object: the decoder's stand-in, what each wire receives, and the disclosures. |
 | `reference/gateway-failover-rules.md` | Per-rung conditional failover (`failover_only_on`): the token vocabulary, first-dial and successor rules, the ledger `fallback_reason`, and the fail-closed cases. |
 | `reference/gateway-guardrails.md` | Identity-scoped gateway guardrails: data flow, latency, privacy, standard pack, http_json adapters, and inappropriate-content use. |
 | `reference/gateway-classification-guardrails.md` | Decision-model classification checks: configuration, request window, verdict cache, model scope, observe-then-enforce rollout, and a self-hosted SystemOne server. |

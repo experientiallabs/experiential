@@ -317,6 +317,7 @@ pub(crate) fn served_headers(
     headers.extend(commit_dependent(admission, served.depth));
     headers.extend(replay_repair_headers(served.encrypted_reasoning_stripped));
     headers.extend(empty_completion_headers(served.empty_completion));
+    headers.extend(served.rate_limit_headers);
     headers
 }
 
@@ -472,6 +473,22 @@ mod tests {
         let headers = commit_dependent(&admission(true), 0);
         assert!(headers.contains(&("x-gateway-zdr-constrained".to_string(), "true".to_string())));
         assert!(headers.contains(&("x-gateway-deployment".to_string(), "or-rung".to_string())));
+    }
+
+    #[test]
+    fn served_headers_carry_the_relayed_rate_limits() {
+        let served = Served {
+            rate_limit_headers: vec![(
+                "x-ratelimit-remaining-tokens".to_string(),
+                "149000".to_string(),
+            )],
+            ..Served::default()
+        };
+        let headers = served_headers(&admission(false), None, served);
+        assert!(headers.contains(&(
+            "x-ratelimit-remaining-tokens".to_string(),
+            "149000".to_string()
+        )));
     }
 
     #[test]

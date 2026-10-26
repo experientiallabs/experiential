@@ -33,6 +33,16 @@ _JSON_OBJECT_ADAPTER = TypeAdapter(JsonObject)
 
 ReasoningEffort = Literal["none", "minimal", "low", "medium", "high", "xhigh", "ultra", "max"]
 ChatMaxTokensField = Literal["max_tokens", "max_completion_tokens"]
+ToolArgumentsTreatment = Literal[
+    "double_encoded_json", "truncated_json", "non_object_json", "invalid_json"
+]
+"""How a replayed call's ``arguments`` object stands in for raw text that encodes no object.
+
+``double_encoded_json``: the text is a JSON string whose value encodes the object.
+``truncated_json``: the text is a cut-off object prefix, closed without inventing content.
+``non_object_json``: the text is a JSON value that is not an object, kept verbatim in a wrapper.
+``invalid_json``: the text is not JSON at all, kept verbatim in a wrapper.
+"""
 
 MAXIMUM_TOOL_CALL_ID_CHARACTERS: Final = 65_536
 """Bound opaque tool identifiers, including provider-carried reasoning signatures."""
@@ -277,6 +287,16 @@ class ToolCall(ContractModel):
         max_length=4_000_000,
         exclude=True,
     )
+    arguments_treatment: ToolArgumentsTreatment | None = Field(default=None, exclude=True)
+    """Set when ``raw_arguments`` is a replayed call's exact text that encodes no JSON object.
+
+    Agent sessions replay calls the model itself emitted malformed or cut off
+    at ``max_tokens``; OpenAI's own API treats such text as opaque. The raw
+    text then stays verbatim for wires that take it, and ``arguments`` is the
+    faithful object stand-in every object wire receives (see
+    ``exp.runtime.models.providers.history_tool_arguments``). Excluded from
+    serialization like the other replay fields.
+    """
     cache_control: JsonObject | None = Field(default=None, exclude=True)
     """Validated caller prompt-caching hint attached to this tool call.
 
@@ -357,9 +377,17 @@ class ToolCall(ContractModel):
             The validated tool call.
 
         Raises:
-            ValueError: Raw arguments are invalid JSON, not an object, or change the parsed value.
+            ValueError: Untreated raw arguments are invalid JSON, not an object, or change the
+                parsed value, or a treatment names no raw text.
         """
-        if self.raw_arguments is not None:
+        if self.arguments_treatment is not None:
+            # The raw text deliberately encodes no object; ``arguments`` is
+            # the decoder's stand-in for it, so the two cannot match.
+            if self.raw_arguments is None:
+                raise ValueError(
+                    "a tool arguments treatment requires the raw text it stands in for"
+                )
+        elif self.raw_arguments is not None:
             try:
                 parsed = _JSON_OBJECT_ADAPTER.validate_json(self.raw_arguments)
             except ValidationError as exc:

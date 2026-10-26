@@ -1471,6 +1471,18 @@ def test_caller_beta_tokens_partition_into_allowlist_and_disclosures() -> None:
     assert raised.value.detail.param == "anthropic-beta"
 
 
+def test_the_one_hour_cache_ttl_beta_is_forwarded() -> None:
+    """A one-hour cache marker keeps the beta that admits it.
+
+    The marker itself relays byte-for-byte, so dropping the token would leave
+    the provider to refuse or downgrade a ``ttl: "1h"`` breakpoint the caller
+    priced at the one-hour rate.
+    """
+    decoded = decode_messages(_body(), anthropic_beta="extended-cache-ttl-2025-04-11")
+    assert decoded.request.provider_beta_tokens == ("extended-cache-ttl-2025-04-11",)
+    assert decoded.request.ignored_parameters == ()
+
+
 @pytest.mark.parametrize("length", [65_537, 119_825, 262_145, 1_048_576])
 def test_tool_descriptions_are_preserved_without_a_per_field_limit(length: int) -> None:
     """Messages preserves large descriptions, including their final Unicode character."""
@@ -2880,3 +2892,331 @@ def test_a_malformed_tool_reference_is_rejected_by_field() -> None:
         )
     assert excinfo.value.detail.param is not None
     assert excinfo.value.detail.param.startswith("messages.0.content.0.content.0")
+
+
+def _tool(name: str, *, deferred: bool = False) -> JsonObject:
+    """One custom tool declaration, optionally deferred."""
+    tool: JsonObject = {"name": name, "input_schema": _DEFERRED_SCHEMA}
+    if deferred:
+        tool["defer_loading"] = True
+    return tool
+
+
+def _claude_code_tool_change_body(**overrides: JsonValue) -> JsonObject:
+    """A Messages body shaped like Claude Code's late-tool-additions turn.
+
+    Claude Code (2.1.293 onward) appends a mid-conversation system turn whose
+    reminder text is followed by one ``tool_removal`` per withdrawn tool and
+    one ``tool_addition`` per added tool: by reference for a tool it declared
+    deferred, by value (``inline-tools-2026-09-15``) for one it did not, the
+    cache marker on the last block. Production 2026-10-18 onward: every such
+    ``/v1/messages`` call was a 400 on ``messages.N.content.1.type``.
+    """
+    return _body(
+        tools=[
+            _tool("Bash"),
+            _tool("mcp__github__create_issue", deferred=True),
+            _tool("mcp__slack__post_message", deferred=True),
+        ],
+        messages=[
+            {"role": "user", "content": "open an issue"},
+            {
+                "role": "system",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": "<system-reminder>MCP tools changed.</system-reminder>",
+                    },
+                    {
+                        "type": "tool_removal",
+                        "tool": {"type": "tool_reference", "name": "mcp__slack__post_message"},
+                    },
+                    {
+                        "type": "tool_addition",
+                        "tool": {"type": "tool_reference", "name": "mcp__github__create_issue"},
+                    },
+                    {
+                        "type": "tool_addition",
+                        "tool": {
+                            "type": "tool_definition",
+                            "definition": {
+                                "name": "mcp__linear__create_ticket",
+                                "description": "File a ticket.",
+                                "input_schema": _DEFERRED_SCHEMA,
+                            },
+                        },
+                        "cache_control": {"type": "ephemeral"},
+                    },
+                ],
+            },
+        ],
+        **overrides,
+    )
+
+
+@pytest.mark.parametrize("count_only", [False, True])
+def test_claude_code_tool_changes_apply_to_tools_and_state_themselves(count_only: bool) -> None:
+    """Tool additions and removals decode on both Messages endpoints instead of 400ing.
+
+    The referenced deferred tool is offered immediately, the defined tool
+    joins ``tools``, the removed tool stays declared (and deferred), and the
+    system turn states each change as one line after its reminder, the
+    block's cache marker kept on its line.
+    """
+    body = _claude_code_tool_change_body()
+    if count_only:
+        del body["max_tokens"]
+        decoded = decode_messages_count_tokens(body)
+    else:
+        decoded = decode_messages(body)
+
+    request = decoded.request
+    assert [(tool.name, tool.defer_loading) for tool in request.tools] == [
+        ("Bash", None),
+        ("mcp__github__create_issue", None),
+        ("mcp__slack__post_message", True),
+        ("mcp__linear__create_ticket", None),
+    ]
+    system = request.messages[-1]
+    assert system.role == "system"
+    assert system.content == (
+        "<system-reminder>MCP tools changed.</system-reminder>\n\n"
+        "Tool removed: mcp__slack__post_message. It is no longer available; do not call it.\n"
+        "Tool added: mcp__github__create_issue. Its full definition is now in your tools; "
+        "you can call it.\n"
+        "Tool added: mcp__linear__create_ticket. Its full definition is now in your tools; "
+        "you can call it."
+    )
+    marked = system.provider_text_blocks
+    assert "".join(str(block["text"]) for block in marked) == system.content
+    assert [block.get("cache_control") for block in marked] == [
+        None,
+        None,
+        None,
+        {"type": "ephemeral"},
+    ]
+    assert request.ignored_parameters == (
+        "messages.content.tool_removal->text",
+        "messages.content.tool_addition->tools",
+    )
+
+
+def test_a_tool_definition_replaces_a_declared_tool_in_place() -> None:
+    """A later definition under a declared name replaces it; its marker rides the text."""
+    decoded = decode_messages(
+        _body(
+            tools=[_tool("Lookup", deferred=True), _tool("Bash")],
+            messages=[
+                {"role": "user", "content": "hi"},
+                {
+                    "role": "system",
+                    "content": [
+                        {
+                            "type": "tool_addition",
+                            "tool": {
+                                "type": "tool_definition",
+                                "definition": {
+                                    "name": "Lookup",
+                                    "description": "v2",
+                                    "input_schema": {"type": "object"},
+                                    "cache_control": {"type": "ephemeral"},
+                                },
+                            },
+                        }
+                    ],
+                },
+            ],
+        )
+    )
+    request = decoded.request
+    assert [tool.name for tool in request.tools] == ["Lookup", "Bash"]
+    lookup = request.tools[0]
+    assert lookup.description == "v2"
+    assert lookup.defer_loading is None
+    assert lookup.cache_control is None
+    assert request.messages[-1].provider_text_blocks == (
+        {
+            "type": "text",
+            "text": (
+                "Tool added: Lookup. Its full definition is now in your tools; you can call it."
+            ),
+            "cache_control": {"type": "ephemeral"},
+        },
+    )
+
+
+def test_a_tool_can_be_defined_then_referenced_and_removed_in_later_turns() -> None:
+    """References resolve against earlier by-value definitions, in conversation order."""
+    change = {"type": "tool_reference", "name": "late"}
+    decoded = decode_messages(
+        _body(
+            tools=[_tool("Bash")],
+            messages=[
+                {"role": "user", "content": "hi"},
+                {
+                    "role": "system",
+                    "content": [
+                        {
+                            "type": "tool_addition",
+                            "tool": {"type": "tool_definition", "definition": _tool("late")},
+                        }
+                    ],
+                },
+                {"role": "assistant", "content": "ok"},
+                {"role": "user", "content": "drop it"},
+                {"role": "system", "content": [{"type": "tool_removal", "tool": change}]},
+                {"role": "assistant", "content": "dropped"},
+                {"role": "user", "content": "bring it back"},
+                {"role": "system", "content": [{"type": "tool_addition", "tool": change}]},
+            ],
+        )
+    )
+    assert [tool.name for tool in decoded.request.tools] == ["Bash", "late"]
+    assert [
+        message.content for message in decoded.request.messages if message.role == "system"
+    ] == [
+        "Tool added: late. Its full definition is now in your tools; you can call it.",
+        "Tool removed: late. It is no longer available; do not call it.",
+        "Tool added: late. Its full definition is now in your tools; you can call it.",
+    ]
+
+
+@pytest.mark.parametrize("block_type", ["tool_addition", "tool_removal"])
+def test_a_tool_change_naming_an_undeclared_tool_is_refused_by_field(block_type: str) -> None:
+    """An unresolved reference is a named 400, as on Anthropic (``tool_reference_unresolved``)."""
+    with pytest.raises(OpenAIProtocolError) as excinfo:
+        decode_messages(
+            _body(
+                tools=[_tool("Bash")],
+                messages=[
+                    {"role": "user", "content": "hi"},
+                    {
+                        "role": "system",
+                        "content": [
+                            {"type": "text", "text": "tools changed"},
+                            {
+                                "type": block_type,
+                                "tool": {"type": "tool_reference", "name": "ghost"},
+                            },
+                        ],
+                    },
+                ],
+            )
+        )
+    assert excinfo.value.detail.param == "messages.1.content.1.tool.name"
+    assert f"{block_type} references 'ghost'" in excinfo.value.detail.message
+
+
+def test_a_tool_change_outside_a_system_turn_is_refused() -> None:
+    """Tool changes live in system turns only, as on Anthropic."""
+    with pytest.raises(OpenAIProtocolError) as excinfo:
+        decode_messages(
+            _body(
+                tools=[_tool("Bash", deferred=True), _tool("Read")],
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "hi"},
+                            {
+                                "type": "tool_addition",
+                                "tool": {"type": "tool_reference", "name": "Bash"},
+                            },
+                        ],
+                    }
+                ],
+            )
+        )
+    assert excinfo.value.detail.param == "messages.0.content.1"
+    assert "only valid in system messages" in excinfo.value.detail.message
+
+
+def test_a_tool_definition_may_not_carry_a_second_cache_marker() -> None:
+    """``cache_control`` goes on the block or in the definition, not both."""
+    with pytest.raises(OpenAIProtocolError) as excinfo:
+        decode_messages(
+            _body(
+                messages=[
+                    {"role": "user", "content": "hi"},
+                    {
+                        "role": "system",
+                        "content": [
+                            {
+                                "type": "tool_addition",
+                                "tool": {
+                                    "type": "tool_definition",
+                                    "definition": {
+                                        **_tool("late"),
+                                        "cache_control": {"type": "ephemeral"},
+                                    },
+                                },
+                                "cache_control": {"type": "ephemeral"},
+                            }
+                        ],
+                    },
+                ],
+            )
+        )
+    assert excinfo.value.detail.param == "messages.1.content.0.cache_control"
+
+
+def test_a_tool_definition_reusing_a_server_tool_name_is_refused() -> None:
+    """A definition may not take a server tool's name (``tool_name_conflict``)."""
+    with pytest.raises(OpenAIProtocolError) as excinfo:
+        decode_messages(
+            _body(
+                tools=[{"type": "web_search_20250305", "name": "web_search"}],
+                messages=[
+                    {"role": "user", "content": "hi"},
+                    {
+                        "role": "system",
+                        "content": [
+                            {
+                                "type": "tool_addition",
+                                "tool": {
+                                    "type": "tool_definition",
+                                    "definition": _tool("web_search"),
+                                },
+                            }
+                        ],
+                    },
+                ],
+            )
+        )
+    assert excinfo.value.detail.param == "messages.1.content.0.tool.definition.name"
+    assert "is already used by a server tool" in excinfo.value.detail.message
+
+
+@pytest.mark.parametrize(
+    ("tool", "param", "fragment"),
+    [
+        (
+            {"type": "mcp_toolset_reference", "server_name": "calendar"},
+            "messages.1.content.0.tool.type",
+            "mcp_toolset_reference is not supported",
+        ),
+        (
+            {
+                "type": "tool_definition",
+                "definition": {"type": "mcp_toolset", "mcp_server_name": "calendar"},
+            },
+            "messages.1.content.0.tool.definition.type",
+            "only custom tool definitions",
+        ),
+    ],
+)
+def test_tool_changes_the_gateway_cannot_serve_are_named(
+    tool: JsonObject, param: str, fragment: str
+) -> None:
+    """MCP references and non-custom definitions are named 400s, never a union miss."""
+    with pytest.raises(OpenAIProtocolError) as excinfo:
+        decode_messages(
+            _body(
+                messages=[
+                    {"role": "user", "content": "hi"},
+                    {"role": "system", "content": [{"type": "tool_addition", "tool": tool}]},
+                ]
+            )
+        )
+    assert excinfo.value.detail.param == param
+    assert fragment in excinfo.value.detail.message

@@ -87,3 +87,37 @@ def test_rejected_block_hint_names_the_offending_block() -> None:
         ]
     }
     assert rejected_block_hint(reference_only) is None
+
+
+def test_tool_change_blocks_are_known_block_types() -> None:
+    """A served tool change never takes the unknown-block blame; MCP references are named."""
+    served: JsonObject = {
+        "messages": [
+            {
+                "role": "system",
+                "content": [
+                    {"type": "text", "text": "tools changed"},
+                    {"type": "tool_addition", "tool": {"type": "tool_reference", "name": "a"}},
+                    {"type": "tool_removal", "tool": {"type": "tool_reference", "name": "b"}},
+                ],
+            }
+        ]
+    }
+    assert rejected_block_hint(served) is None
+    mcp: JsonObject = {
+        "messages": [
+            {
+                "role": "system",
+                "content": [
+                    {
+                        "type": "tool_removal",
+                        "tool": {"type": "mcp_tool_reference", "server_name": "s", "name": "t"},
+                    }
+                ],
+            }
+        ]
+    }
+    hint = rejected_block_hint(mcp)
+    assert hint is not None
+    assert hint[0] == "messages.0.content.0.tool.type"
+    assert "mcp_tool_reference is not supported" in hint[1]

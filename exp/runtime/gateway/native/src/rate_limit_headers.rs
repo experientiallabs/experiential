@@ -64,6 +64,32 @@ pub fn harvest_rate_limit_headers(headers: &HeaderMap) -> Option<Map<String, Val
     }
 }
 
+/// The allowlisted rate-limit headers relayed on the caller's own response.
+///
+/// Only a rung that dispatched on the caller's own credential relays them:
+/// those numbers describe the caller's account, the one live quota signal
+/// some providers (Azure AI Foundry) offer. A host-funded rung's headers
+/// describe a shared account and stay settlement-only. `retry-after` is
+/// excluded because a served answer states no wait; a refusal names its own.
+pub fn caller_rate_limit_headers(
+    headers: &HeaderMap,
+    customer_managed: bool,
+) -> Vec<(String, String)> {
+    if !customer_managed {
+        return Vec::new();
+    }
+    ALLOWLISTED_HEADERS
+        .iter()
+        .filter(|name| **name != "retry-after")
+        .filter_map(|name| {
+            headers
+                .get(*name)
+                .and_then(|value| value.to_str().ok())
+                .map(|value| ((*name).to_string(), value.to_string()))
+        })
+        .collect()
+}
+
 /// Parse one `Retry-After` header as whole seconds from now.
 ///
 /// Both wire forms parse: integer seconds verbatim, and an HTTP-date as the
@@ -146,6 +172,27 @@ mod tests {
         .unwrap();
         assert_eq!(harvested.len(), 3);
         assert!(!harvested.contains_key("anthropic-organization-id"));
+    }
+
+    #[test]
+    fn only_the_callers_own_account_relays_its_rate_limits() {
+        let upstream = headers(&[
+            ("retry-after", "30"),
+            ("x-ratelimit-remaining-tokens", "149000"),
+            ("x-ratelimit-limit-tokens", "150000"),
+            ("apim-request-id", "secret"),
+        ]);
+        assert_eq!(
+            caller_rate_limit_headers(&upstream, true),
+            vec![
+                ("x-ratelimit-limit-tokens".to_string(), "150000".to_string()),
+                (
+                    "x-ratelimit-remaining-tokens".to_string(),
+                    "149000".to_string()
+                ),
+            ]
+        );
+        assert!(caller_rate_limit_headers(&upstream, false).is_empty());
     }
 
     #[test]

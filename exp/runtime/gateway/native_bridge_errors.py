@@ -213,16 +213,65 @@ def escalation(reason: str) -> str:
     return json.dumps({"escalate": reason}, separators=(",", ":"))
 
 
-def ledger_capability_message(safe_message: str, public_param: str | None) -> str:
-    """Suffix the public request field onto the ledger's generic capability sentence.
+_CAPABILITY_NOUNS = {
+    "developer_messages": "developer role messages",
+    "forced_tool_choice": "a forced tool_choice",
+    "function_tools": "function tools",
+    "image_input": "image input",
+    "image_url_input": "image input by URL",
+    "video_input": "video input",
+    "video_url_input": "video input by URL",
+    "audio_input": "audio input",
+    "pdf_input": "PDF document input",
+    "pdf_url_input": "PDF document input by URL",
+    "media_handle_input": "provider file handles",
+    "media_handle_provider": "media uploaded to a different provider",
+    "parallel_tool_calls": "the parallel tool call control",
+    "prompt_cache_ttl_12h": "the 12-hour prompt cache lifetime",
+    "service_tier": "the requested service tier",
+    "stop_sequences": "stop sequences",
+    "streaming": "streaming",
+    "streaming_tool_arguments": "streamed tool arguments",
+    "strict_tools": "strict tool schemas",
+    "structured_output": "structured output",
+    "structured_text": "structured output",
+}
+"""Plain-English names for the capability labels the ledger message states.
+
+Several capabilities share one public field (every attachment kind is
+``messages`` on Chat and Messages and ``input`` on Responses; function, strict
+and streamed tools are all ``tools``), so the field alone cannot tell an
+operator which one the route refused (2026-10-26: thousands of
+``(field: messages)`` rows on text-only uncensored lanes that were image input
+but read as anything the conversation could carry). The wording is caller-safe:
+it names the request feature, never the internal label."""
+
+
+def capability_noun(capability: str) -> str | None:
+    """The plain-English name of one capability label, or ``None`` when unnamed."""
+    return _CAPABILITY_NOUNS.get(capability)
+
+
+def ledger_capability_message(
+    safe_message: str, public_param: str | None, capability: str | None = None
+) -> str:
+    """Suffix the public field and the refused capability onto the ledger's sentence.
 
     Args:
         safe_message: The provider-neutral capability rejection text.
         public_param: The caller-facing field the public 400 named, if any.
+        capability: The internal capability label, translated to plain words
+            (never written verbatim) when it has a name.
 
     Returns:
-        The ledger message, with ``(field: <param>)`` appended when known.
+        The ledger message, e.g. ``... (field: messages; this model route does
+        not support image input)``; ``(field: <param>)`` alone when the
+        capability has no name, and the sentence unchanged when neither is known.
     """
-    if not public_param:
+    noun = capability_noun(capability) if capability is not None else None
+    parts = [f"field: {public_param}"] if public_param else []
+    if noun is not None:
+        parts.append(f"this model route does not support {noun}")
+    if not parts:
         return safe_message
-    return f"{safe_message} (field: {public_param})"
+    return f"{safe_message} ({'; '.join(parts)})"
