@@ -336,6 +336,11 @@ def test_request_bounds_cover_media_embeddings_choices_and_defaults() -> None:
         "https://fixture.invalid/v1/embeddings", {"input": "x"}, TARIFF
     )
     assert embedding is not None and embedding[1] == 0
+    embeddings = "https://fixture.invalid/v1/embeddings"
+    batch: JsonObject = {"input": ["x" * 40] * 100}
+    batch_size = len(json.dumps(batch).encode("utf-8"))
+    assert request_token_bounds(embeddings, batch, windowed) == (batch_size, 0)
+    assert request_token_bounds(embeddings, {"input": [{"type": "image"}]}, windowed) is None
     gemini: JsonObject = {
         "generationConfig": {
             "maxOutputTokens": 10,

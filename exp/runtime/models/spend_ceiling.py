@@ -749,7 +749,9 @@ def request_token_bounds(
 
     Input is at most the UTF-8 bytes of the serialized body, the same provider-neutral bound
     the text engine uses, capped by the context window. A body with media parts is bounded
-    only by the context window. Output is the body's explicit allowance (times its requested
+    only by the context window. An embedding route applies its window to each input of a
+    batch, not to the whole body, so its input is the uncapped body size and a media
+    embedding body is unbounded. Output is the body's explicit allowance (times its requested
     choices), the tariff's default allowance, or zero for an embedding route.
 
     Args:
@@ -762,6 +764,10 @@ def request_token_bounds(
     """
     size = len(json.dumps(payload, ensure_ascii=False, allow_nan=False).encode("utf-8"))
     context = tariff.context_window_tokens
+    if is_embedding_endpoint(url):
+        if _carries_media(payload):
+            return None
+        return tariff.repeated_input * (size + tariff.input_framing_tokens), 0
     if _carries_media(payload):
         if context is None:
             return None
@@ -769,8 +775,6 @@ def request_token_bounds(
     elif context is not None:
         size = min(size, context)
     input_tokens = tariff.repeated_input * (size + tariff.input_framing_tokens)
-    if is_embedding_endpoint(url):
-        return input_tokens, 0
     generation = payload.get("generationConfig")
     settings = generation if isinstance(generation, dict) else {}
     explicit = next(
