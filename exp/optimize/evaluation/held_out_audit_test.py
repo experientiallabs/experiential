@@ -352,6 +352,34 @@ def test_a_claimed_run_without_a_recorded_dispatcher_fails_closed(
             pass
 
 
+def test_a_receipt_stopped_before_its_first_claim_owns_nothing(
+    built: tuple[ProjectStore, FailingOnce],
+) -> None:
+    """A dispatch record with no slot claimed behind it never blocks another receipt."""
+    store, _ = built
+    with audit(store) as first:
+        shared = first.panel.prepared[0]
+
+        def stop_after_guard() -> None:
+            """Pass the guard, then stop before the slot is claimed."""
+            first.guard(shared)
+            raise ReservationInactiveError("stopped before the claim")
+
+        # Stop between the guard and the claim: the dispatch record has no slot behind it.
+        with pytest.raises(ReservationInactiveError, match="before the claim"):
+            stop_after_guard()
+    assert dispatch_owner(store, shared.spec.run_id) is None
+    release_held_out_audit(store, first.receipt, clock=clock)
+    with audit(store, include_inspected=True) as other:
+        [current] = other.panel.prepared
+        # The re-audit reuses the unclaimed run: it does not block the other receipt, which
+        # then dispatches and owns it.
+        assert current.spec.run_id == shared.spec.run_id
+        run(store, other, resume=True)
+        assert dispatch_owner(store, current.spec.run_id) == other.receipt.receipt_id
+    assert saved_fidelity_report(store, current) is not None
+
+
 def test_a_reregistration_before_dispatch_does_not_qualify_the_headline(
     built: tuple[ProjectStore, FailingOnce],
 ) -> None:

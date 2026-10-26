@@ -12,8 +12,9 @@ beside it as immutable children:
   an unknown outcome, by stage, with its attempt count;
 - a report record for every invocation: whether it prepared, stopped, evaluated, or replayed,
   and whether per-trace detail was shown;
-- a dispatch record for every run, written by the receipt that claimed its first slot: run IDs
-  never name a receipt, so this is what says which receipt alone may complete the run.
+- dispatch records for every run: a receipt about to claim a run's first slot appends one, and
+  once a slot is claimed no other receipt can, so the latest names the receipt that dispatched
+  it. Run IDs never name a receipt, so this is what says which receipt alone may complete it.
 
 The receipt's basis is fixed when it is minted: ``independent`` when no audited lineage was
 exposed or reserved by another receipt and no run already had a saved result, otherwise
@@ -229,16 +230,21 @@ class AuditNotice(ContractModel):
 
 
 class AuditDispatch(ContractModel):
-    """The receipt that claimed a run's first physical slot; written once, never replaced.
+    """A receipt about to claim a run's first physical slot; immutable.
+
+    A receipt that stopped before its claim leaves a record with no slot behind it, so another
+    receipt may append the next one; the latest record names the dispatcher.
 
     Attributes:
-        receipt: Receipt whose execution claimed the slot.
+        receipt: Receipt about to claim the slot.
         run: Registered run ID.
-        at: When the first claim was guarded.
+        attempt: Position among the run's dispatch records, from 1.
+        at: When the claim was guarded.
     """
 
     receipt: str
     run: str
+    attempt: int = Field(ge=1)
     at: AwareDatetime
 
 
@@ -520,14 +526,13 @@ def dispatch_owner(project: ProjectStore, run_id: str) -> str | None:
         run_id: Registered run ID.
 
     Returns:
-        The owning receipt's identity.
+        The owning receipt's identity, when the run claimed a slot and a dispatch record names
+        who; None otherwise.
     """
-    identity = stable_id(DISPATCH_TYPE, {"run": run_id})
-    if not project.artifacts.exists(identity):
+    records = _dispatch_records(project, run_id)
+    if not records or not run_slots(project, run_id):
         return None
-    return AuditDispatch.model_validate_json(
-        project.artifacts.read_bytes(identity, "record.json")
-    ).receipt
+    return records[-1].receipt
 
 
 def record_dispatch(
@@ -536,10 +541,12 @@ def record_dispatch(
     run_id: str,
     *,
     clock: Callable[[], datetime],
-) -> str:
-    """Make ``receipt`` the run's dispatcher unless another receipt already is.
+) -> str | None:
+    """Make ``receipt`` the run's dispatcher unless another receipt already claimed a slot.
 
-    The caller holds the run's execution lock, so two receipts sharing a run never both write.
+    The caller holds the run's execution lock, so the slot count and records read here cannot
+    change underneath. Before any slot is claimed, a record left by a receipt that stopped
+    before its claim confers nothing, and this receipt's record follows it.
 
     Args:
         project: Project holding the run.
@@ -549,15 +556,30 @@ def record_dispatch(
 
     Returns:
         The dispatching receipt's identity, which differs from ``receipt``'s when another
-        receipt claimed first.
+        receipt claimed first; None when slots were claimed with no record of who claimed them.
     """
-    owner = dispatch_owner(project, run_id)
-    if owner is not None:
-        return owner
-    record = AuditDispatch(receipt=receipt.receipt_id, run=run_id, at=clock())
-    identity = stable_id(DISPATCH_TYPE, {"run": run_id})
+    records = _dispatch_records(project, run_id)
+    if run_slots(project, run_id):
+        return records[-1].receipt if records else None
+    if records and records[-1].receipt == receipt.receipt_id:
+        return receipt.receipt_id
+    attempt = len(records) + 1
+    record = AuditDispatch(receipt=receipt.receipt_id, run=run_id, attempt=attempt, at=clock())
+    identity = stable_id(DISPATCH_TYPE, {"run": run_id, "attempt": attempt})
     _write(project, DISPATCH_TYPE, identity, "record.json", record, receipt)
     return receipt.receipt_id
+
+
+def _dispatch_records(project: ProjectStore, run_id: str) -> tuple[AuditDispatch, ...]:
+    """Every dispatch record of one run, in attempt order."""
+    records = []
+    while project.artifacts.exists(
+        identity := stable_id(DISPATCH_TYPE, {"run": run_id, "attempt": len(records) + 1})
+    ):
+        records.append(
+            AuditDispatch.model_validate_json(project.artifacts.read_bytes(identity, "record.json"))
+        )
+    return tuple(records)
 
 
 def record_report(

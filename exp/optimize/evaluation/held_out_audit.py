@@ -153,8 +153,9 @@ class HeldOutAudit:
 
         The reservation was confirmed active inside the ledger transaction after the lease was
         taken, and only a lease holder can release it, so it stays active while the lease is
-        held. The run's first claim records this receipt as its dispatcher; a run another
-        receipt dispatched first is refused, so only that receipt ever completes it.
+        held. Before the run's first claim this receipt is recorded as its dispatcher; a run
+        another receipt already claimed a slot for is refused, so only that receipt ever
+        completes it.
 
         Args:
             prepared: Registration of the run about to claim a slot.
@@ -169,6 +170,10 @@ class HeldOutAudit:
             )
         run = prepared.spec.run_id
         owner = record_dispatch(self.project, self.receipt, run, clock=self._clock)
+        if owner is None:
+            raise ReservationInactiveError(
+                f"run {run} claimed slots with no recorded dispatcher; refusing to claim a slot"
+            )
         if owner != self.receipt.receipt_id:
             raise ReservationInactiveError(
                 f"run {run} was dispatched under receipt {owner}; refusing to claim a slot"
@@ -557,14 +562,16 @@ def _require_unclaimed(
         current = current_registration(project, base)
         if current is None or saved_fidelity_report(project, current) is not None:
             continue
+        if not run_slots(project, current.spec.run_id):
+            continue
         owner = dispatch_owner(project, current.spec.run_id)
-        if owner is None and run_slots(project, current.spec.run_id):
+        if owner is None:
             raise ValueError(
                 f"run {current.spec.run_id} claimed dispatch slots but no receipt is recorded "
                 "as its dispatcher, so none can be proven to own it; audit this build in a "
                 "fresh project (exp build) to measure it again"
             )
-        if owner is not None and owner != receipt:
+        if owner != receipt:
             raise ValueError(
                 f"run {current.spec.run_id} was dispatched under receipt {owner} and has no "
                 "saved result; only that receipt can complete it: repeat the request that "
