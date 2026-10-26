@@ -1,7 +1,12 @@
 """The program subset check and request execution of the standalone worker."""
 
+import subprocess
+import sys
+from pathlib import Path
+
 import pytest
 
+from exp.simulation.induction import runner
 from exp.simulation.induction.contracts import ProgramOutcome
 from exp.simulation.induction.runner import ProgramRefused, check_source, run_request
 
@@ -114,3 +119,90 @@ def test_imported_modules_expose_only_public_non_module_attributes() -> None:
     """An allowlisted module is a view, so its own imports such as codecs are unreachable."""
     outcome = _run("import json\ndef transition(state, args, facts):\n    return json.codecs\n")
     assert outcome.status == "failed" and "AttributeError" in str(outcome.detail)
+
+
+# Attribute paths written as strings never reach the static check, so every entry point that
+# walks them must be unreachable; the first is the reproduced escape to the real builtins.
+FORMATTER_ESCAPE = """
+import json
+import string
+
+
+def transition(state, args, facts):
+    field = "0.__init__.__globals__[__builtins__][open]"
+    opener, _ = string.Formatter().get_field(field, (json.JSONEncoder,), {})
+    return opener("/etc/hostname").read()
+"""
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "    return string.Formatter().vformat('{0.__class__}', (state,), {})",
+        "    return string.Template('$x').substitute(x=1)",
+        "    return json.JSONEncoder",
+        "    return copy.dispatch_table",
+        "    return format(state, '')",
+    ],
+)
+def test_string_driven_attribute_walks_are_unreachable(body: str) -> None:
+    """No allowed object resolves attribute names from a string, so none reaches the host."""
+    source = (
+        f"import copy\nimport json\nimport string\ndef transition(state, args, facts):\n{body}\n"
+    )
+    check_source(source)
+    outcome = _run(source)
+    assert outcome.status == "failed"
+    assert "AttributeError" in str(outcome.detail) or "NameError" in str(outcome.detail)
+
+
+def test_the_formatter_escape_to_the_real_builtins_fails() -> None:
+    """The reproduced escape passes the static check but finds no ``string.Formatter``."""
+    check_source(FORMATTER_ESCAPE)
+    outcome = _run(FORMATTER_ESCAPE)
+    assert outcome.status == "failed" and "Formatter" in str(outcome.detail)
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "    return '{0.__class__}'.format(state)",
+        "    return '{x.__class__}'.format_map({'x': state})",
+        "    return str.format('{0.__class__}', state)",
+        "    return f'{state.__class__}'",
+        "    return (x for x in state).gi_frame",
+    ],
+)
+def test_format_methods_and_dunder_traversal_are_refused_statically(body: str) -> None:
+    """Format entry points and dunder or frame attributes are refused before execution."""
+    with pytest.raises(ProgramRefused, match="attribute"):
+        check_source(f"def transition(state, args, facts):\n{body}\n")
+
+
+def test_module_views_expose_exactly_the_listed_names() -> None:
+    """Each view carries the curated names only, so nothing else of the module is reachable."""
+    for name, (_, exported) in runner.ALLOWED_MODULES.items():
+        assert sorted(vars(runner._module_view(name))) == sorted(exported)
+
+
+def test_installed_limits_leave_no_free_descriptor_slot() -> None:
+    """Even the real ``open`` fails once limits are installed: every slot below the cap is held."""
+    script = (
+        "import errno, importlib.util, sys\n"
+        "spec = importlib.util.spec_from_file_location('runner', sys.argv[1])\n"
+        "module = importlib.util.module_from_spec(spec)\n"
+        "spec.loader.exec_module(module)\n"
+        "module._install_limits(512 * 1024 * 1024, 10)\n"
+        "try:\n"
+        "    open('/etc/hostname')\n"
+        "except OSError as error:\n"
+        "    print(error.errno == errno.EMFILE)\n"
+    )
+    result = subprocess.run(  # noqa: S603 - fixed interpreter and test script
+        (sys.executable, "-S", "-c", script, str(Path(runner.__file__))),
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=30,
+    )
+    assert result.stdout.strip() == "True"

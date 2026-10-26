@@ -137,16 +137,17 @@ The worker runs under these conditions:
 - It runs in a private temporary directory, with an environment built from scratch and a fixed
   hash seed.
 - Before it reads any program it sets its own limits on CPU time, address space and file size,
-  and it cannot open new file descriptors. Even an escaped program can open no file, socket or
-  pipe.
+  and its descriptor limit leaves no free slot. Even an escaped program can open no file, socket
+  or pipe.
 - Every request has a wall-clock deadline. A worker that misses it, crashes or breaks protocol is
   killed with its process group. Its outcome is `failed`.
 
 Programs must stay within a Python subset:
 
 - Imports are limited to the allowlisted modules: `collections`, `copy`, `functools`,
-  `itertools`, `json`, `math`, `re` and `string`. Each is a view of its public, non-module
-  attributes.
+  `itertools`, `json`, `math`, `re` and `string`. Each is a view of a curated list of names
+  (`ALLOWED_MODULES` in the runner): pure functions, container types and constants. Nothing that
+  resolves attribute names from a string, such as `string.Formatter`, is reachable.
 - Plain functions and constant assignments are allowed.
 - Classes, `global`, `with`, `yield`, bare `except`, dunder names, underscore attributes,
   frame and traceback attributes, and `str.format` are not allowed.

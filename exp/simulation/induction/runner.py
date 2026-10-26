@@ -5,8 +5,8 @@ environment it builds from scratch (only a fixed hash seed and locale), no site 
 script-directory import path and a private working directory. The worker refuses to start with
 randomized hashing, so set and dict iteration order is reproducible across runs. Before it reads any
 program the worker imports the allowlisted modules, then installs kernel resource limits on
-itself: CPU time, address space, no file creation and no new file descriptors, so a program can
-open no file, socket or pipe even if it escaped the language subset. It then speaks one JSON
+itself: CPU time, address space, no file creation and no free file-descriptor slot, so a program
+can open no file, socket or pipe even if it escaped the language subset. It then speaks one JSON
 line per request on standard input and output.
 
 A program is one Python module that defines ``transition(state, args, facts)``. ``state`` maps
@@ -16,7 +16,8 @@ the starting world). The function returns the JSON reply, raises ``ToolError(rep
 error reply, or raises ``OutOfDomain(reason)`` for an input it does not model.
 
 The static check (:func:`check_source`) admits a small subset: top-level imports of allowlisted
-modules, plain function definitions and constant assignments; no classes, ``global``,
+modules, each a view of the listed names in :data:`ALLOWED_MODULES` only, plain function
+definitions and constant assignments; no classes, ``global``,
 ``with``, ``yield``, bare ``except``, dunder names or underscore attributes, and none of the
 reflective builtins. Every executed program line is reported, so callers can bound a program to
 the code paths that validation actually exercised.
@@ -44,19 +45,151 @@ from typing import cast
 
 # Identity of the code that decides how programs execute, in place of its source text. Bump it
 # when behavior changes; exp/tests/code_protocols_test.py guards the covered source.
-RUNNER_PROTOCOL = "induced-program-runner-v1"
+RUNNER_PROTOCOL = "induced-program-runner-v2"
 ENTRYPOINT = "transition"
 PROGRAM_FILENAME = "<induced-program>"
 MAXIMUM_SOURCE_CHARACTERS = 20_000
-ALLOWED_MODULES: dict[str, types.ModuleType] = {
-    "collections": collections,
-    "copy": copy,
-    "functools": functools,
-    "itertools": itertools,
-    "json": json,
-    "math": math,
-    "re": re,
-    "string": string,
+# The names each allowlisted module exposes: pure functions, container types and immutable
+# constants. Nothing listed resolves attribute names from a string (``string.Formatter`` and
+# ``string.Template`` are absent for that reason), so the static check sees every attribute a
+# program reaches, and nothing listed holds state shared by programs (``copy.dispatch_table`` is
+# absent). Anything not listed, including every submodule, is unreachable.
+ALLOWED_MODULES: dict[str, tuple[types.ModuleType, tuple[str, ...]]] = {
+    "collections": (collections, ("Counter", "OrderedDict", "defaultdict", "deque")),
+    "copy": (copy, ("copy", "deepcopy")),
+    "functools": (functools, ("cmp_to_key", "partial", "reduce")),
+    "itertools": (
+        itertools,
+        (
+            "accumulate",
+            "batched",
+            "chain",
+            "combinations",
+            "combinations_with_replacement",
+            "compress",
+            "count",
+            "cycle",
+            "dropwhile",
+            "filterfalse",
+            "groupby",
+            "islice",
+            "pairwise",
+            "permutations",
+            "product",
+            "repeat",
+            "starmap",
+            "takewhile",
+            "tee",
+            "zip_longest",
+        ),
+    ),
+    "json": (json, ("dumps", "loads")),
+    "math": (
+        math,
+        (
+            "acos",
+            "acosh",
+            "asin",
+            "asinh",
+            "atan",
+            "atan2",
+            "atanh",
+            "cbrt",
+            "ceil",
+            "comb",
+            "copysign",
+            "cos",
+            "cosh",
+            "degrees",
+            "dist",
+            "e",
+            "erf",
+            "erfc",
+            "exp",
+            "exp2",
+            "expm1",
+            "fabs",
+            "factorial",
+            "floor",
+            "fmod",
+            "frexp",
+            "fsum",
+            "gamma",
+            "gcd",
+            "hypot",
+            "inf",
+            "isclose",
+            "isfinite",
+            "isinf",
+            "isnan",
+            "isqrt",
+            "lcm",
+            "ldexp",
+            "lgamma",
+            "log",
+            "log10",
+            "log1p",
+            "log2",
+            "modf",
+            "nan",
+            "nextafter",
+            "perm",
+            "pi",
+            "pow",
+            "prod",
+            "radians",
+            "remainder",
+            "sin",
+            "sinh",
+            "sqrt",
+            "sumprod",
+            "tan",
+            "tanh",
+            "tau",
+            "trunc",
+            "ulp",
+        ),
+    ),
+    "re": (
+        re,
+        (
+            "ASCII",
+            "DOTALL",
+            "IGNORECASE",
+            "MULTILINE",
+            "VERBOSE",
+            "A",
+            "I",
+            "M",
+            "S",
+            "X",
+            "compile",
+            "escape",
+            "findall",
+            "finditer",
+            "fullmatch",
+            "match",
+            "search",
+            "split",
+            "sub",
+            "subn",
+        ),
+    ),
+    "string": (
+        string,
+        (
+            "ascii_letters",
+            "ascii_lowercase",
+            "ascii_uppercase",
+            "capwords",
+            "digits",
+            "hexdigits",
+            "octdigits",
+            "printable",
+            "punctuation",
+            "whitespace",
+        ),
+    ),
 }
 SAFE_BUILTINS = (
     "abs",
@@ -244,15 +377,9 @@ def _restricted_import(
 
 @functools.cache
 def _module_view(name: str) -> types.SimpleNamespace:
-    """Expose only public, non-module attributes of an allowlisted module."""
-    module = ALLOWED_MODULES[name]
-    return types.SimpleNamespace(
-        **{
-            key: getattr(module, key)
-            for key in dir(module)
-            if not key.startswith("_") and not isinstance(getattr(module, key), types.ModuleType)
-        }
-    )
+    """Expose only the listed names of an allowlisted module."""
+    module, names = ALLOWED_MODULES[name]
+    return types.SimpleNamespace(**{key: getattr(module, key) for key in names})
 
 
 def _namespace() -> dict[str, object]:
@@ -372,8 +499,23 @@ def _install_limits(memory_bytes: int, cpu_seconds: int) -> None:
             continue
     if not memory_limited:
         raise SystemExit(71)
-    highest = max(int(name) for name in os.listdir("/dev/fd") if name.isdigit())
-    resource.setrlimit(resource.RLIMIT_NOFILE, (highest + 1, highest + 1))
+    # The listing itself holds one descriptor that it closes again, so keep only the descriptors
+    # still open afterwards. They must be exactly 0..n-1: a free slot below the limit would let
+    # an escaped program open a file.
+    listed = sorted(int(name) for name in os.listdir("/dev/fd") if name.isdigit())
+    held = [descriptor for descriptor in listed if _is_open(descriptor)]
+    if held != list(range(len(held))):
+        raise SystemExit(73)
+    resource.setrlimit(resource.RLIMIT_NOFILE, (len(held), len(held)))
+
+
+def _is_open(descriptor: int) -> bool:
+    """Return whether one descriptor number is currently open in this process."""
+    try:
+        os.fstat(descriptor)
+    except OSError:
+        return False
+    return True
 
 
 def main() -> None:

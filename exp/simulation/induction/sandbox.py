@@ -39,6 +39,7 @@ _EXIT_REASONS = {
     64: "worker started with malformed arguments",
     71: "this platform cannot limit worker memory",
     72: "worker hashing is randomized",
+    73: "worker could not hold every descriptor slot below its limit",
 }
 
 

@@ -208,7 +208,9 @@ def program_request(
         "reads": sorted(policy.domains()),
         "writes": sorted(policy.writes),
         "all_tool_effects": effects,
-        "allowed_modules": sorted(runner.ALLOWED_MODULES),
+        "allowed_modules": {
+            name: list(exported) for name, (_, exported) in sorted(runner.ALLOWED_MODULES.items())
+        },
         "episodes": evidence,
     }
     messages = [
@@ -304,9 +306,10 @@ The program must reproduce every recorded reply and every recorded state_after e
 episodes are replayed in order from their initial_state. Other tools' calls change state too; use
 their recorded replies to understand the state layout.
 
-Restrictions: only top-level `import` of the allowed modules, plain function definitions and
-constant assignments at top level; no classes, global, with, yield, bare except, names starting
-with two underscores or attributes starting with an underscore; no file, network, time or random
-access (they are unavailable). Keep the program small and deterministic.
+Restrictions: only top-level `import` of the allowed modules, each exposing only its listed
+names; plain function definitions and constant assignments at top level; no classes, global,
+with, yield, bare except, names starting with two underscores or attributes starting with an
+underscore; no file, network, time or random access (they are unavailable). Keep the program
+small and deterministic.
 
 Submit the complete program with the submit_program tool."""

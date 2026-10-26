@@ -4,6 +4,7 @@ import pytest
 
 from exp.common.core.artifacts import JsonObject
 from exp.simulation.induction.contracts import SandboxLimits, TransitionProgram
+from exp.simulation.induction.runner_test import FORMATTER_ESCAPE
 from exp.simulation.induction.sandbox import ProgramSandbox
 
 APPEND = TransitionProgram(
@@ -48,6 +49,14 @@ def test_memory_and_file_access_are_contained_by_the_worker_limits() -> None:
         assert memory.status == "failed" and "MemoryError" in str(memory.detail)
         reading = sandbox.run(_program("    return open('/etc/hostname').read()\n"), {}, {}, {})
         assert reading.status == "failed"
+
+
+def test_the_formatter_escape_reaches_no_host_file() -> None:
+    """The reproduced string-driven escape fails in the worker instead of reading a host file."""
+    escape = TransitionProgram(tool="fixture", source=FORMATTER_ESCAPE)
+    with ProgramSandbox() as sandbox:
+        outcome = sandbox.run(escape, {}, {}, {})
+    assert outcome.status == "failed" and outcome.reply is None
 
 
 def test_refused_programs_never_reach_the_worker() -> None:
