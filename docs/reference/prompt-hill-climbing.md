@@ -108,7 +108,9 @@ under the keep rule. The verdict is `merge`, `within noise, do not merge` or `no
 the second is a valid result, not a failure. The final comparison is registered once per baseline
 and best prompt pair, with its deadline and code revision. A later report whose best prompt is
 unchanged (every later round reverted) replays that comparison, unknowns included, instead of
-drawing a new one; under another code revision it is refused.
+drawing a new one; a report that would run it under another code revision is refused. A report
+already saved for the same round count replays as saved under any revision, as a decided round
+does: replay makes no call and re-derives the verdict from the saved panel.
 
 ## Limits
 

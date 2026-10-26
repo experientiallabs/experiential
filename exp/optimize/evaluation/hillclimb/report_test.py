@@ -65,3 +65,5 @@ def test_an_unchanged_best_prompt_replays_its_final_comparison(
     assert second.best == first.best and second.final == first.final
     assert first.verdict == "merge" and "not an independent holdout" in first.scope
     assert len(actor.requests) == calls
+    assert run_climb_report(project, later, code_revision="other") == second
+    assert len(actor.requests) == calls

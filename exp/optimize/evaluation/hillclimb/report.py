@@ -245,7 +245,8 @@ def run_climb_report(
         final-tested replays its registered comparison.
 
     Raises:
-        ValueError: The best prompt's final comparison was registered under another revision.
+        ValueError: The best prompt's final comparison was registered under another revision
+            and this report is not yet saved; a saved report replays under any revision.
     """
     climb = spec.climb.identity()
     store = project.artifacts
