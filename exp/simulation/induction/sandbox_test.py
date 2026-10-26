@@ -188,3 +188,27 @@ def test_an_inherited_ignored_sigxcpu_cannot_defeat_the_cpu_limit() -> None:
     """The worker restores the default SIGXCPU action, so a request over its budget stops."""
     lines = _contained_run(_SANDBOX_SCRIPT, "ignored", str(_busy_size(3.0)), "1").splitlines()
     assert lines[0] == "failed"
+
+
+_ADMISSION_SCRIPT = """
+import functools, resource, subprocess, sys
+from exp.simulation.induction import sandbox
+from exp.simulation.induction.contracts import SandboxLimits, TransitionProgram
+
+hard = int(sys.argv[1])
+limit = functools.partial(resource.setrlimit, resource.RLIMIT_CPU, (hard, hard))
+sandbox.subprocess.Popen = functools.partial(subprocess.Popen, preexec_fn=limit)
+source = "def transition(state, args, facts):\\n    return 1\\n"
+program = TransitionProgram(tool="one", source=source)
+try:
+    with sandbox.ProgramSandbox(SandboxLimits(cpu_seconds=1)) as contained:
+        print(contained.run(program, {}, {}, {}).status)
+except sandbox.SandboxUnavailableError as error:
+    print("unavailable:", error)
+"""
+
+
+def test_a_fresh_worker_is_admitted_when_its_hard_limit_fits_exactly_one_request() -> None:
+    """A two-second hard limit fits one one-second budget at startup, so the worker runs it."""
+    assert _contained_run(_ADMISSION_SCRIPT, "2") == "reply"
+    assert "hard CPU limit" in _contained_run(_ADMISSION_SCRIPT, "1")

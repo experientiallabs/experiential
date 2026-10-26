@@ -55,7 +55,7 @@ from typing import cast
 
 # Identity of the code that decides how programs execute, in place of its source text. Bump it
 # when behavior changes; exp/tests/code_protocols_test.py guards the covered source.
-RUNNER_PROTOCOL = "induced-program-runner-v5"
+RUNNER_PROTOCOL = "induced-program-runner-v6"
 ENTRYPOINT = "transition"
 # CPU seconds kept in reserve when deciding whether an inherited hard limit fits one more request.
 _ROTATION_MARGIN_SECONDS = 1
@@ -568,7 +568,9 @@ def _install_limits(memory_bytes: int, cpu_seconds: int) -> None:
 
     # An ignored SIGXCPU inherited across exec would let a request run past its soft limit.
     signal.signal(signal.SIGXCPU, signal.SIG_DFL)
-    if _must_rotate(cpu_seconds) or not _arm_cpu_limit(cpu_seconds):
+    # Admission needs only one full budget; the rotation margin decides whether a worker that
+    # already served requests should take another.
+    if not _arm_cpu_limit(cpu_seconds):
         raise SystemExit(74)
     resource.setrlimit(resource.RLIMIT_FSIZE, (0, 0))
     resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
