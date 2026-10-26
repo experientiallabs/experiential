@@ -13,7 +13,8 @@ import pytest
 from typer.testing import CliRunner
 
 from exp.cli.app import app
-from exp.common.core.artifacts import JsonObject
+from exp.cli.evaluation.continuations import ContinuationCommand, operation_identity
+from exp.common.core.artifacts import JsonObject, sha256_json
 from exp.common.project import ProjectStore
 from exp.common.release_revision import installed_execution_revision
 from exp.optimize.evaluation.learning import agent_memory
@@ -30,6 +31,7 @@ from exp.optimize.evaluation.learning.agent_memory_test import (
     scripted,
     shown_labels,
 )
+from exp.optimize.evaluation.spending import operation_spend_ceiling
 from exp.runtime.models.providers.transport import JsonHttpResponse, RecordedRequest
 
 PROJECT = "memory"
@@ -254,10 +256,13 @@ def test_a_refused_answer_is_recorded_never_redrawn_and_leaves_its_lessons_unexp
     assert len(wire.requests) == calls
 
 
-def test_a_resumed_consolidation_reserves_against_its_consented_ceiling(
+def saved_candidates(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Saved candidates skip extraction consent; merging still reserves before it dispatches."""
+) -> tuple[Path, ProjectStore, JsonObject, str]:
+    """A root whose candidate set is already saved, as an interrupted run leaves it.
+
+    Returns the root, its store, the operation and the plan identity.
+    """
     root = project_root(tmp_path, monkeypatch)
     store = ProjectStore(root, PROJECT)
     command = operation(tmp_path)
@@ -270,21 +275,80 @@ def test_a_resumed_consolidation_reserves_against_its_consented_ceiling(
     extract_candidates(
         store,
         prepared,
-        scripted({"extract": lambda body: {"lessons": [lesson(CONTRACT, shown_labels(body))]}}),
+        scripted(
+            {
+                "extract": lambda body: {
+                    "lessons": [lesson(CONTRACT, [label]) for label in shown_labels(body)]
+                }
+            }
+        ),
         code_revision=installed_execution_revision(),
         clock=lambda: datetime.now(UTC),
     )
-    wire = ScriptedWire()
-    monkeypatch.setattr(agent_memory, "HttpxJsonTransport", lambda: wire)
+    return root, store, command, prepared.plan.plan_id
+
+
+def resume(root: Path, tmp_path: Path, command: JsonObject) -> tuple[int, str]:
+    """Run the operation over its saved candidates; return the exit code and flat output."""
     path = tmp_path / "operation.json"
-    path.write_text(json.dumps({**command, "spend": {"ceiling_usd": 0.000001}}))
+    path.write_text(json.dumps(command))
     result = CliRunner().invoke(
         app,
         ["eval", PROJECT, "--root", str(root), "--continuations", str(path), "--yes"],
     )
-    assert result.exit_code == 1
-    assert "Raise spend.ceiling_usd" in " ".join(result.output.split())
+    return result.exit_code, " ".join(result.output.split())
+
+
+def test_a_resumed_consolidation_reserves_against_its_consented_ceiling(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Saved candidates skip extraction consent; a ceiling too small for a merge stops it."""
+    root, _, command, _ = saved_candidates(tmp_path, monkeypatch)
+    wire = ScriptedWire()
+    monkeypatch.setattr(agent_memory, "HttpxJsonTransport", lambda: wire)
+    code, output = resume(root, tmp_path, {**command, "spend": {"ceiling_usd": 0.000001}})
+    assert code == 1
+    assert "Raise spend.ceiling_usd" in output
     assert wire.requests == []
+
+
+def test_a_resumed_consolidation_dispatches_only_while_its_reservation_is_held(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Each resumed merge and screen is sent with its reservation in the consented ledger."""
+    root, store, command, plan_id = saved_candidates(tmp_path, monkeypatch)
+    ledger = operation_spend_ceiling(
+        store, operation_identity(ContinuationCommand.model_validate(command))
+    )
+    held: list[float] = []
+
+    class ReservedWire(ScriptedWire):
+        """Records the operation's in-flight reservation at the HTTP boundary."""
+
+        def post(
+            self,
+            url: str,
+            *,
+            headers: Mapping[str, str],
+            payload: JsonObject,
+            timeout_seconds: float,
+        ) -> JsonHttpResponse:
+            """Note what the ledger holds for this request, then answer it."""
+            held.append(ledger.summary().in_flight_usd)
+            return super().post(
+                url, headers=headers, payload=payload, timeout_seconds=timeout_seconds
+            )
+
+    wire = ReservedWire()
+    monkeypatch.setattr(agent_memory, "HttpxJsonTransport", lambda: wire)
+    code, output = resume(root, tmp_path, command)
+    assert code == 0, output
+    assert len(held) == 2 and all(amount > 0 for amount in held)
+    summary = ledger.summary()
+    assert summary.in_flight_usd == 0 and summary.settled_usd > 0
+    stages = {row.stage for row in summary.authorizations}
+    assert sha256_json({"plan": plan_id, "stage": "consolidate"}) in stages
+    assert sha256_json({"plan": plan_id, "stage": "extract"}) not in stages
 
 
 def test_dry_run_prints_the_preflight_and_makes_no_call(
