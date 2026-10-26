@@ -10,10 +10,22 @@ from pathlib import Path
 
 import pytest
 
-from exp.common.core.artifacts import ArtifactInput, JsonObject
-from exp.optimize.evaluation.learning.lesson_evolution import RESULT_TYPE, EvolutionResult
-from exp.optimize.evaluation.learning.lessons import load_lesson_set, load_library
+from exp.common.core.artifacts import ArtifactInput, JsonObject, JsonValue
+from exp.common.project import ArtifactStore
+from exp.optimize.evaluation.learning import lesson_evolution
+from exp.optimize.evaluation.learning.lesson_evolution import (
+    RESULT_TYPE,
+    EvolutionResult,
+    preflight_evolution,
+)
+from exp.optimize.evaluation.learning.lessons import (
+    LessonEvolutionRequest,
+    load_lesson_set,
+    load_library,
+)
 from exp.optimize.evaluation.learning.lessons_test import continuation, screened_project
+from exp.optimize.evaluation.learning.traces import fit_cases
+from exp.simulation.reconstruction.library import LibraryEntry
 
 
 def evolve(
@@ -86,3 +98,41 @@ def test_an_edit_is_kept_only_on_held_out_gain_and_rejections_stay_research(
     assert found[rejected.rules_entry].supersedes is None
     assert found[rejected.research_entry].kind == "research"
     assert found[accepted.rules_entry].disposition == "accepted", "the accepted edit stays"
+
+
+def test_lineages_the_parent_rules_were_learned_from_never_select_the_edit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Accepted rules learned from more traces than the lessons expose those traces' lineages."""
+    root, store, _, reference = screened_project(tmp_path, monkeypatch)
+    accepted = result(
+        continuation(root, tmp_path, evolve(reference, "edit-one"), "--yes", "--non-interactive")
+    )
+    request = LessonEvolutionRequest(
+        resolution="evolve-lessons",
+        lessons=reference,
+        library=ArtifactInput.model_validate(accepted.library),
+        run_id="edit-two",
+        held_out=2,
+        protected=1,
+    )
+    first = preflight_evolution(store, request)
+    selected = {case.task.task_id: case for case in fit_cases(store)}
+    learned = selected[first.held_out[0]]
+    resolve = lesson_evolution.resolve_library_entry
+
+    def wider(artifacts: ArtifactStore, entry: LibraryEntry) -> JsonValue:
+        """The accepted rules, as if also learned from the first selection trace."""
+        payload = resolve(artifacts, entry)
+        assert isinstance(payload, dict) and isinstance(payload["knowledge"], dict)
+        sources = payload["knowledge"]["source_trace_ids"]
+        assert isinstance(sources, list)
+        payload["knowledge"]["source_trace_ids"] = sorted([*sources, learned.trace_id])
+        return payload
+
+    monkeypatch.setattr(lesson_evolution, "resolve_library_entry", wider)
+    widened = preflight_evolution(store, request)
+    chosen = {
+        selected[case].task.lineage_group_id for case in (*widened.held_out, *widened.protected)
+    }
+    assert learned.task.lineage_group_id not in chosen

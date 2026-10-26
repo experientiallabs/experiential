@@ -162,7 +162,8 @@ class LessonEvolutionRequest(ContractModel):
         library: Library snapshot to extend; defaults to the lesson set's library. Name the
             snapshot an earlier evolution returned to build on its accepted edit.
         run_id: Fresh attempt identity; a registered attempt is never re-run.
-        held_out: Fit lineages, outside the lessons' lineages, the edit is selected on.
+        held_out: Fit lineages, outside those of the lessons and the parent rules, the edit is
+            selected on.
         protected: Further fit lineages that must not regress.
         minimum_gain: Strict mean exact-reply improvement required on the held-out cases.
     """

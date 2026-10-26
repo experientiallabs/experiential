@@ -4,12 +4,13 @@ The shared-library edit loop (:func:`exp.optimize.simulation.evolution.evolve_li
 on a lesson set. Its training cases are the set's screened-in lessons: their saved learning
 misses are the exposed failures, so the proposer sees them without a new call. It proposes one
 complete replacement of the accepted rules (an addition, correction or removal), and selection
-replays fit traces from lineages outside the lessons' lineages on the learned simulator without
-experience memory, once with the parent rules and once with the proposal pinned as simulator
-knowledge. The metric is the share of exact replies. The edit is accepted only when the mean
-held-out gain strictly exceeds the registered margin and no protected trace regresses; accepted
-edits enter the library as ``accepted`` rules that supersede the previous accepted rules, and
-every attempt, accepted or rejected, stays as ``research``.
+replays fit traces from lineages outside those of the lessons and of the parent rules' sources on
+the learned simulator without experience memory, once with the parent rules and once with the
+proposal pinned as simulator knowledge. The metric is the share of exact replies. The edit is
+accepted only when the mean held-out gain strictly exceeds the registered margin and no
+protected trace regresses; accepted edits enter the library as ``accepted`` rules that
+supersede the previous accepted rules, and every attempt, accepted or rejected, stays as
+``research``.
 
 An attempt is registered once under its ``run_id`` and never re-run: a completed attempt
 replays its saved result, and an interrupted one needs a new ``run_id`` (its completed replays
@@ -56,6 +57,7 @@ from exp.optimize.evaluation.learning.traces import (
     SCOPES,
     LearningPlan,
     fit_cases,
+    learning_cases,
     learning_plan,
     recorded_plan,
 )
@@ -77,7 +79,7 @@ RESULT_TYPE = "lesson-evolution-result"
 # Identity of the case selection and evaluator, recorded as the attempt's evaluator. Bump it when
 # behavior changes; exp/tests/code_protocols_test.py fails when the covered source changes until
 # it is bumped or, for a pure refactor, its digest is updated.
-EVOLUTION_PROTOCOL = "lesson-evolution-v1"
+EVOLUTION_PROTOCOL = "lesson-evolution-v2"
 
 
 class EvolutionPreflight(ContractModel):
@@ -87,7 +89,7 @@ class EvolutionPreflight(ContractModel):
         run_id: Attempt identity.
         saved: The attempt already completed and replays.
         training: Screened-in lessons exposed to the proposer.
-        held_out: Selection traces, one per fit lineage outside the lessons' lineages.
+        held_out: Selection traces, one per fit lineage outside the exposed lineages.
         protected: Protected traces from further fit lineages.
         replays: Paired replays selection runs (parent and proposal per trace).
         proposals: Structured proposer calls (one).
@@ -215,7 +217,19 @@ def _attempt(project: ProjectStore, spec: LessonEvolutionRequest) -> _Attempt:
             feedback="Learning mispredicted this reply; the screened lesson is "
             + json.dumps((row.miss.investigation or {}).get("hypothesis")),
         )
-    exposed = {case.lineage_id for case in training}
+    # The parent rules already carry what their source traces taught, so those lineages are as
+    # exposed as the training lessons' and cannot select or protect the edit.
+    lineages = {
+        case.trace_id: case.task.lineage_group_id for case in learning_cases(project, "all")
+    }
+    if not set(parent.source_trace_ids) <= lineages.keys():
+        raise ValueError(
+            "the accepted rules cite traces outside this build; evolve them in the project "
+            "that learned them, or start from a library without accepted rules"
+        )
+    exposed = {case.lineage_id for case in training} | {
+        lineages[trace] for trace in parent.source_trace_ids
+    }
     chosen: list[ReplayCase] = []
     seen: set[str] = set()
     for case in fit_cases(project):
@@ -226,7 +240,8 @@ def _attempt(project: ProjectStore, spec: LessonEvolutionRequest) -> _Attempt:
     if len(chosen) < spec.held_out + spec.protected:
         raise ValueError(
             f"selection needs {spec.held_out + spec.protected} fit lineages outside the "
-            f"lessons' lineages and only {len(chosen)} exist; lower held_out or protected"
+            f"lineages of the lessons and parent rules and only {len(chosen)} exist; lower "
+            "held_out or protected"
         )
     cases = [
         LibraryCase(
