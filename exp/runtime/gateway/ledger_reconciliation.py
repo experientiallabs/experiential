@@ -54,11 +54,12 @@ def reconcile_terminal_attempt(
     """Upgrade provisional billing atomically while preserving the first delivery outcome.
 
     The caller owns the SQLite write transaction. Complete observed usage can
-    replace an unknown or estimated meter; neither another estimate nor a
-    partial observation can do so. The terminal state, original failure and
-    timestamps remain evidence of what the gateway delivered. An identical
-    observed meter is therefore replayable even when its provider outcome
-    differs from the earlier cancellation or crash outcome.
+    replace an explicitly estimated meter or unknown usage from failure,
+    cancellation or crash recovery. A provider's completed/incomplete terminal
+    without usage remains immutable; another estimate or partial observation
+    cannot replace any terminal meter. The original delivery state, failure and
+    timestamps remain intact. An identical observed meter is replayable even
+    when its outcome differs from the earlier cancellation or crash outcome.
     """
     row = connection.execute(
         "SELECT a.*, r.api_surface FROM gateway_attempts AS a "
@@ -81,6 +82,12 @@ def reconcile_terminal_attempt(
     )
     if complete and row["usage_source"] in {"unknown", "estimated"}:
         assert terminal is not None and usage is not None
+        if row["usage_source"] == "unknown" and row["state"] not in {
+            "cancelled",
+            "failed",
+            "unknown_after_crash",
+        }:
+            raise GatewayLedgerError("attempt settlement replay differs from the durable usage")
         _upgrade_observed(connection, row, attempt_id, terminal, failure, usage, receipt)
         return
     if complete and row["usage_source"] == "observed":

@@ -420,3 +420,98 @@ def test_late_meter_preserves_confirmed_tier_and_charge_disposition(
             failure=None,
             service_tier=tier.settlement(served="priority", resolution="confirmed"),
         )
+
+
+@pytest.mark.parametrize("kind", [GatewayEventKind.COMPLETED, GatewayEventKind.INCOMPLETE])
+@pytest.mark.parametrize("tiered", [False, True])
+def test_provider_terminal_without_usage_is_not_a_recovery_estimate(
+    tmp_path: Path,
+    kind: GatewayEventKind,
+    tiered: bool,
+) -> None:
+    """Missing usage in a final provider observation stays immutable, including receipt omission."""
+    tier = (
+        GatewayServiceTierAdmission(
+            requested="priority",
+            standard_prices=GatewayTokenPrices(),
+            requested_prices=GatewayTokenPrices(
+                input_nano_usd_per_million_tokens=2_000_000,
+                output_nano_usd_per_million_tokens=4_000_000,
+            ),
+        )
+        if tiered
+        else None
+    )
+    _, _, ledger, budgets, attempt = _started(tmp_path, tier=tier)
+    receipt = None if tier is None else tier.settlement(served="priority", resolution="confirmed")
+    terminal = GatewayEvent(kind=kind, sequence_number=0)
+    ledger.finish_attempt(
+        attempt_id=attempt,
+        terminal_event=terminal,
+        failure=None,
+        service_tier=receipt,
+    )
+    before = dict(_attempt_row(tmp_path, attempt))
+    for supplied in (receipt, None):
+        ledger.finish_attempt(
+            attempt_id=attempt,
+            terminal_event=terminal,
+            failure=None,
+            service_tier=supplied,
+        )
+        with pytest.raises(GatewayLedgerError, match="durable usage"):
+            ledger.finish_attempt(
+                attempt_id=attempt,
+                terminal_event=_observed(),
+                failure=None,
+                service_tier=supplied,
+            )
+    assert dict(_attempt_row(tmp_path, attempt)) == before
+    _assert_allocations(budgets, settled=0 if tiered else 300, reserved=300 if tiered else 0)
+
+
+def test_completed_explicit_estimate_can_accept_observed_usage(tmp_path: Path) -> None:
+    """Explicit estimate provenance, unlike absent final-provider usage, permits replacement."""
+    _, _, ledger, budgets, attempt = _started(tmp_path)
+    terminal = _observed(input_tokens=19, output_tokens=7).model_copy(
+        update={"usage_estimated": True}
+    )
+    ledger.finish_attempt(attempt_id=attempt, terminal_event=terminal, failure=None)
+    _assert_allocations(budgets, settled=66)
+    for _ in range(2):
+        ledger.finish_attempt(attempt_id=attempt, terminal_event=_observed(), failure=None)
+    row = _attempt_row(tmp_path, attempt)
+    assert row["state"] == "completed"
+    assert row["usage_source"] == "observed"
+    assert row["estimated_cost_nano_usd"] == 40
+    _assert_allocations(budgets, settled=40)
+
+
+def test_recovered_usage_waits_for_missing_tier_receipt(tmp_path: Path) -> None:
+    """A cancellation's meter and pricing receipt can arrive separately without freeing its hold."""
+    tier = GatewayServiceTierAdmission(
+        requested="priority",
+        standard_prices=GatewayTokenPrices(),
+        requested_prices=GatewayTokenPrices(
+            input_nano_usd_per_million_tokens=2_000_000,
+            output_nano_usd_per_million_tokens=4_000_000,
+        ),
+    )
+    _, _, ledger, budgets, attempt = _started(tmp_path, tier=tier)
+    ledger.finish_attempt(attempt_id=attempt, terminal_event=_cancelled(), failure=_CANCELLED)
+    for _ in range(2):
+        ledger.finish_attempt(attempt_id=attempt, terminal_event=_observed(), failure=None)
+    row = _attempt_row(tmp_path, attempt)
+    assert row["usage_source"] == "observed"
+    assert row["estimated_cost_nano_usd"] is None
+    assert row["budget_settled_nano_usd"] is None
+    _assert_allocations(budgets, settled=0, reserved=300)
+    receipt = tier.settlement(served="priority", resolution="confirmed")
+    for _ in range(2):
+        ledger.finish_attempt(
+            attempt_id=attempt,
+            terminal_event=_observed(),
+            failure=None,
+            service_tier=receipt,
+        )
+    _assert_allocations(budgets, settled=40)
