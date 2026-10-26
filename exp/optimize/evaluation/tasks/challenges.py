@@ -46,7 +46,7 @@ from exp.simulation.evaluation.tasks import Verdict, grade
 # Identity of the code that decides this artifact's behavior, in place of its source text.
 # Bump it when behavior changes. exp/tests/code_protocols_test.py fails when the covered
 # source changes until it is bumped or, for a pure refactor, its digest is updated.
-CHALLENGE_PROTOCOL = "judge-challenge-v4"
+CHALLENGE_PROTOCOL = "judge-challenge-v5"
 
 IrrelevantFactor = Literal[
     "actor_identity", "candidate_order", "explanation_length", "action_order"
@@ -372,6 +372,11 @@ def assess_challenge_study(
             for rows in repeated
             if all(row is not None for row in rows)
         ]
+        # Over planned repeats, observed disagreement is a known inconsistency and agreement
+        # is known only when every repeat was judged; anything else stays unknown.
+        judged = [[row for row in rows if row is not None and not row.failed] for rows in repeated]
+        agreeing = [rows for rows in judged if len({row.judge for row in rows}) <= 1]
+        known_consistent = sum(len(rows) == arm.repeats for rows in agreeing)
         report_arms[arm.arm_id] = {
             "kind": "single",
             "repeats": arm.repeats,
@@ -381,7 +386,7 @@ def assess_challenge_study(
             else {
                 **proportion_summary(sum(consistent), len(consistent)),
                 "planned_bounds": missing_outcome_bounds(
-                    sum(consistent), len(items) - len(consistent), len(items)
+                    known_consistent, len(agreeing) - known_consistent, len(items)
                 ),
             },
         }

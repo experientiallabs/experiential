@@ -513,3 +513,39 @@ def test_an_unauthorized_effect_can_be_added_to_an_existing_object() -> None:
         JudgeChallengeStudy.model_validate(
             {**base.model_dump(), "perturbations": (*base.perturbations, hidden)}
         )
+
+
+def test_agreeing_judged_repeats_with_an_unavailable_one_leave_consistency_unknown() -> None:
+    """Two agreeing judgments of three planned repeats do not establish consistency."""
+    registered = study(repeats=3)
+    unavailable = {":2:case-a-identity", ":2:case-b-order"}
+
+    def third_repeat_fails(
+        judge: JudgeConfig, blinded: JsonObject, key: str
+    ) -> CalibrationJudgment:
+        """Reject the credulous judge's third repeat on a stable and an unstable output."""
+        saved = scripted_judge(judge, blinded, key)
+        if judge.model_identity != "credulous" or not any(map(key.endswith, unavailable)):
+            return saved
+        axes = tuple(axis.model_copy(update={"status": "judge_failure"}) for axis in saved.axes)
+        return saved.model_copy(update={"axes": axes})
+
+    judgments = run_challenge_study(registered, third_repeat_fails)
+    consistency = section(assess_challenge_study(registered, judgments), "arms", "credulous")[
+        "repeat_consistency"
+    ]
+    assert isinstance(consistency, dict)
+    # The stable output may still disagree on its lost repeat; the unstable one already did.
+    assert consistency["planned_bounds"] == [16 / 18, 17 / 18]
+    lost = next(
+        row
+        for row in judgments
+        if row.arm_id == "credulous" and row.repeat == 2 and row.item_id == "case-a-extra-write"
+    )
+    consistency = section(
+        assess_challenge_study(registered, [row for row in judgments if row != lost]),
+        "arms",
+        "credulous",
+    )["repeat_consistency"]
+    assert isinstance(consistency, dict)
+    assert consistency["planned_bounds"] == [15 / 18, 17 / 18]
