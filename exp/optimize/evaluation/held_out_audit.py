@@ -52,6 +52,7 @@ from exp.optimize.evaluation.held_out_fidelity import (
     panel_slots,
     plan_held_out_panel,
     register_planned_panel,
+    run_slots,
 )
 from exp.optimize.evaluation.held_out_receipts import (
     AuditCase,
@@ -544,16 +545,25 @@ def _require_unclaimed(
     the very runs an interrupted receipt claimed slots for. Only the receipt recorded as the
     run's dispatcher may resume it; otherwise its lost requests would be re-dispatched, and its
     result reported, under another receipt. A run that claimed slots is never replaced, so an
-    unfinished dispatched run is always the case's current registration.
+    unfinished dispatched run is always the case's current registration. A run that claimed
+    slots with no recorded dispatcher, dispatched before dispatchers were recorded, has no
+    provable owner, so no receipt may complete it.
 
     Raises:
-        ValueError: Another receipt dispatched an unfinished run of the panel.
+        ValueError: Another receipt dispatched an unfinished run of the panel, or nothing
+            records who dispatched one.
     """
     for base in base_runs:
         current = current_registration(project, base)
         if current is None or saved_fidelity_report(project, current) is not None:
             continue
         owner = dispatch_owner(project, current.spec.run_id)
+        if owner is None and run_slots(project, current.spec.run_id):
+            raise ValueError(
+                f"run {current.spec.run_id} claimed dispatch slots but no receipt is recorded "
+                "as its dispatcher, so none can be proven to own it; audit this build in a "
+                "fresh project (exp build) to measure it again"
+            )
         if owner is not None and owner != receipt:
             raise ValueError(
                 f"run {current.spec.run_id} was dispatched under receipt {owner} and has no "

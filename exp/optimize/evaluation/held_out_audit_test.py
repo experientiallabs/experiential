@@ -326,6 +326,32 @@ def test_the_receipt_that_dispatched_a_shared_run_alone_completes_it(
         assert replayed.receipt == receipt and saved_fidelity_report(store, shared) is not None
 
 
+def test_a_claimed_run_without_a_recorded_dispatcher_fails_closed(
+    built: tuple[ProjectStore, FailingOnce], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A run dispatched before dispatchers were recorded is completed by no receipt."""
+    store, provider = built
+    # Dispatch the way code did before it recorded the dispatching receipt.
+    monkeypatch.setattr(
+        held_out_audit,
+        "record_dispatch",
+        lambda project, receipt, run, *, clock: receipt.receipt_id,
+    )
+    with audit(store) as opened:
+        shared = opened.panel.prepared[0]
+        provider.armed = True
+        with pytest.raises(KeyboardInterrupt):
+            run(store, opened)
+    monkeypatch.undo()
+    assert dispatch_owner(store, shared.spec.run_id) is None
+    for include_inspected in (False, True):
+        with (
+            pytest.raises(ValueError, match="no receipt is recorded as its dispatcher"),
+            audit(store, include_inspected=include_inspected),
+        ):
+            pass
+
+
 def test_a_reregistration_before_dispatch_does_not_qualify_the_headline(
     built: tuple[ProjectStore, FailingOnce],
 ) -> None:
