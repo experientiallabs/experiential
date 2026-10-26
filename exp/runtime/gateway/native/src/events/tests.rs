@@ -76,6 +76,7 @@ fn output_tokens_lead_a_turn_but_control_frames_do_not() {
         index: 0,
         call_id: "call_1".to_string(),
         name: "get".to_string(),
+        thought_signature: None,
     }
     .is_output_token());
     // Usage, terminals, and opaque reasoning-carrier frames never lead.
@@ -505,6 +506,66 @@ fn openai_compatible_usage_folds_an_additive_provider_into_output_tokens() {
 }
 
 #[test]
+fn openai_compatible_usage_reads_a_top_level_reasoning_count() {
+    // Verbatim streamed usage from Azure Foundry DeepSeek-V4.1-Flash
+    // (2026-10-11, reasoning_effort high): the reasoning count sits at the
+    // top level of usage, inside completion_tokens (40 + 20 = 60).
+    let usage = openai_compatible_usage(&json!({
+        "total_tokens": 60,
+        "completion_tokens": 20,
+        "prompt_tokens": 40,
+        "prompt_tokens_details": null,
+        "reasoning_tokens": 18,
+    }))
+    .expect("valid usage");
+    assert_eq!(usage.output_tokens, Some(20));
+    assert_eq!(usage.reasoning_tokens, Some(18));
+    // The nested OpenAI placement wins when a wire carries both.
+    let both = openai_compatible_usage(&json!({
+        "prompt_tokens": 40,
+        "completion_tokens": 20,
+        "total_tokens": 60,
+        "completion_tokens_details": {"reasoning_tokens": 12},
+        "reasoning_tokens": 18,
+    }))
+    .expect("valid usage");
+    assert_eq!(both.reasoning_tokens, Some(12));
+    // A relay's unknown-meter marker keeps a zero placeholder unknown and
+    // refuses a positive top-level count, as it does a nested one.
+    let unreported = openai_compatible_usage(&json!({
+        "prompt_tokens": 40,
+        "completion_tokens": 20,
+        "reasoning_tokens": 0,
+        "unreported_token_details": ["reasoning_tokens"],
+    }))
+    .expect("valid usage");
+    assert_eq!(unreported.reasoning_tokens, None);
+    assert!(openai_compatible_usage(&json!({
+        "prompt_tokens": 40,
+        "completion_tokens": 20,
+        "reasoning_tokens": 18,
+        "unreported_token_details": ["reasoning_tokens"],
+    }))
+    .is_err());
+    // A malformed top-level count is a contract violation, as a nested one is.
+    assert!(openai_compatible_usage(&json!({
+        "prompt_tokens": 40,
+        "completion_tokens": 20,
+        "reasoning_tokens": "18",
+    }))
+    .is_err());
+    // Responses usage keeps reading only output_tokens_details.
+    let responses = openai_usage(Some(&json!({
+        "input_tokens": 40,
+        "output_tokens": 20,
+        "reasoning_tokens": 18,
+    })))
+    .expect("valid usage")
+    .expect("usage present");
+    assert_eq!(responses.reasoning_tokens, None);
+}
+
+#[test]
 fn gemini_usage_folds_thoughts_into_output_tokens() {
     // Verbatim usageMetadata from gemini-3.7-flash (generateContent,
     // 2026-09-03), thinking on: Google's totalTokenCount is prompt +
@@ -787,24 +848,128 @@ fn openai_cache_write_subsets_survive_normalization() {
 }
 
 #[test]
-fn cache_subsets_cannot_exceed_openai_total_input() {
-    for (reads, writes) in [(0, 11), (6, 5), (11, 0)] {
-        assert!(openai_compatible_usage(&json!({
+fn cache_subsets_above_openai_total_input_raise_the_input_total() {
+    // Reads plus writes above the reported input keep every reported cache
+    // token in its own leg and raise the input total to cover them, with no
+    // fresh remainder, so nothing the provider reported is dropped.
+    for (reads, writes, settled) in [(0, 11, 11), (6, 5, 11), (11, 0, 11)] {
+        let chat = openai_compatible_usage(&json!({
             "prompt_tokens": 10, "completion_tokens": 1,
             "prompt_tokens_details": {"cached_tokens": reads, "cache_write_tokens": writes}
         }))
-        .is_err());
-        assert!(openai_usage(Some(&json!({
+        .expect("an overlapping report settles");
+        let responses = openai_usage(Some(&json!({
             "input_tokens": 10, "output_tokens": 1,
             "input_tokens_details": {"cached_tokens": reads, "cache_write_tokens": writes}
         })))
-        .is_err());
+        .expect("an overlapping report settles")
+        .expect("usage");
+        for usage in [chat, responses] {
+            assert_eq!(usage.input_tokens, Some(settled));
+            assert_eq!(usage.cached_input_tokens, Some(reads));
+            assert_eq!(usage.cache_creation_input_tokens, Some(writes));
+            assert_eq!(usage.output_tokens, Some(1));
+        }
     }
     let usage = openai_compatible_usage(&json!({
         "prompt_tokens": 10, "completion_tokens": 1,
         "prompt_tokens_details": {"cached_tokens": 6, "cache_write_tokens": 4}
     }))
     .unwrap();
+    assert_eq!(usage.input_tokens, Some(10));
     assert_eq!(usage.cached_input_tokens, Some(6));
     assert_eq!(usage.cache_creation_input_tokens, Some(4));
+    // An unpersistable subset sum stays a contract violation.
+    assert!(openai_compatible_usage(&json!({
+        "prompt_tokens": 10, "completion_tokens": 1,
+        "prompt_tokens_details": {"cached_tokens": i64::MAX as u64, "cache_write_tokens": 1}
+    }))
+    .is_err());
+}
+
+#[test]
+fn novita_kimi_cache_legs_above_the_prompt_total_settle_instead_of_failing() {
+    // The Moonshot-style Kimi report Novita relays: `prompt_tokens` is
+    // inclusive of both cache legs, and on some prompts the read and write
+    // pages together overshoot it (kimi-k3, 2026-10-22, 37 malformed
+    // attempts). The generation is finished and billed, so it settles.
+    let usage = openai_compatible_usage(&json!({
+        "prompt_tokens": 7588, "completion_tokens": 320, "total_tokens": 7908,
+        "prompt_tokens_details": {"cached_tokens": 7398, "cache_write_tokens": 462},
+        "completion_tokens_details": {"reasoning_tokens": 180}
+    }))
+    .expect("a finished generation settles");
+    assert_eq!(usage.input_tokens, Some(7860));
+    assert_eq!(usage.cached_input_tokens, Some(7398));
+    assert_eq!(usage.cache_creation_input_tokens, Some(462));
+    assert_eq!(usage.output_tokens, Some(320));
+    assert_eq!(usage.reasoning_tokens, Some(180));
+    // The ordinary inclusive Novita shape is untouched.
+    let usage = openai_compatible_usage(&json!({
+        "prompt_tokens": 2259, "completion_tokens": 134, "total_tokens": 2393,
+        "prompt_tokens_details": {"cached_tokens": 974, "cache_write_tokens": 1230}
+    }))
+    .unwrap();
+    assert_eq!(usage.input_tokens, Some(2259));
+    assert_eq!(usage.cached_input_tokens, Some(974));
+    assert_eq!(usage.cache_creation_input_tokens, Some(1230));
+}
+
+#[test]
+fn image_output_tokens_are_read_from_gemini_modalities_and_openrouter_details() {
+    // Gemini: the IMAGE modality inside candidatesTokenCount (gemini-3.1-flash-image, live).
+    let gemini = gemini_usage(&json!({
+        "promptTokenCount": 17,
+        "candidatesTokenCount": 1278,
+        "candidatesTokensDetails": [
+            {"modality": "TEXT", "tokenCount": 158},
+            {"modality": "IMAGE", "tokenCount": 1120},
+        ],
+    }))
+    .unwrap();
+    assert_eq!(gemini.output_tokens, Some(1278));
+    assert_eq!(gemini.image_output_tokens, Some(1120));
+    // No breakdown leaves the subset unknown; a text-only breakdown is a real 0.
+    let unreported = json!({"promptTokenCount": 3, "candidatesTokenCount": 4});
+    assert_eq!(gemini_usage(&unreported).unwrap().image_output_tokens, None);
+    let text = json!({"candidatesTokenCount": 4, "candidatesTokensDetails": [{"modality": "TEXT", "tokenCount": 4}]});
+    assert_eq!(gemini_usage(&text).unwrap().image_output_tokens, Some(0));
+    // A malformed breakdown fails the meter.
+    assert!(gemini_usage(&json!({"candidatesTokensDetails": "IMAGE"})).is_err());
+
+    // OpenRouter: completion_tokens_details.image_tokens; a reported 0 is a
+    // real count (billed at the text rate), an absent key is unknown.
+    let routed = openai_compatible_usage(&json!({
+        "prompt_tokens": 10,
+        "completion_tokens": 1300,
+        "completion_tokens_details": {"reasoning_tokens": 0, "image_tokens": 1290},
+    }))
+    .unwrap();
+    assert_eq!(routed.image_output_tokens, Some(1290));
+    let text_only = openai_compatible_usage(&json!({
+        "prompt_tokens": 10,
+        "completion_tokens": 3,
+        "completion_tokens_details": {"image_tokens": 0},
+    }))
+    .unwrap();
+    assert_eq!(text_only.image_output_tokens, Some(0));
+    let absent =
+        openai_compatible_usage(&json!({"prompt_tokens": 10, "completion_tokens": 3})).unwrap();
+    assert_eq!(absent.image_output_tokens, None);
+}
+
+#[test]
+fn an_image_reported_outside_the_gemini_totals_joins_the_output() {
+    // Gemini 3 Pro Image: IMAGE 1120 beside candidates 55 and thoughts 100.
+    // The image is added so the subset stays inside the output and is billed.
+    let usage = gemini_usage(&json!({
+        "promptTokenCount": 9,
+        "candidatesTokenCount": 55,
+        "thoughtsTokenCount": 100,
+        "candidatesTokensDetails": [{"modality": "IMAGE", "tokenCount": 1120}],
+    }))
+    .unwrap();
+    assert_eq!(usage.output_tokens, Some(1275));
+    assert_eq!(usage.image_output_tokens, Some(1120));
+    assert_eq!(usage.reasoning_tokens, Some(100));
 }

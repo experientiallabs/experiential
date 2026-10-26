@@ -83,7 +83,7 @@ pub(super) async fn prepare(
     repaired: bool,
 ) -> Result<Option<DeploymentWire>, Failure> {
     let prepared = execute(
-        ctx.http,
+        ctx.http.for_origin(wire.tenant_origin),
         wire,
         ctx.request_id,
         ctx.deadline,
@@ -351,7 +351,7 @@ fn ensure_remaining(deadline: Instant) -> Result<(), Failure> {
     if Instant::now() >= deadline {
         Err(Failure::new(
             FailureClass::Timeout,
-            "gateway execution deadline exceeded",
+            crate::relay::DEADLINE_BEFORE_OUTPUT_MESSAGE,
         ))
     } else {
         Ok(())

@@ -15,9 +15,13 @@ from __future__ import annotations
 import hashlib
 import math
 from collections.abc import Sequence
+from urllib.parse import urlsplit
 
 from exp.common.core.artifacts import canonical_json_bytes
+from exp.common.models.catalog import BillingSource
+from exp.common.models.gateway_catalog import ExactModelDeployment
 from exp.runtime.gateway.contracts import GatewayRequest
+from exp.runtime.models.providers.base import GatewayWireProfile
 
 
 def affinity_seed_material(
@@ -126,3 +130,66 @@ def rendezvous_order(
         uniform = (int.from_bytes(digest, "big") + 0.5) / 2.0**64
         scores.append(-weight / math.log(uniform))
     return tuple(sorted(range(len(scores)), key=lambda index: (-scores[index], index)))
+
+
+def affinity_weighted_rungs(
+    deployments: Sequence[ExactModelDeployment],
+) -> tuple[tuple[str, float], ...]:
+    """Return each rung's ``(deployment_id, weight)`` for :func:`rendezvous_order`.
+
+    The weight is the deployment's authored
+    ``GatewayRungDispatchPolicy.affinity_weight``, default 1.0.
+    """
+    return tuple(
+        (
+            deployment.deployment_id,
+            (
+                1.0
+                if deployment.gateway.dispatch is None
+                or deployment.gateway.dispatch.affinity_weight is None
+                else deployment.gateway.dispatch.affinity_weight
+            ),
+        )
+        for deployment in deployments
+    )
+
+
+def house_aggregator_last(
+    order: Sequence[int],
+    deployments: Sequence[ExactModelDeployment],
+    profiles: Sequence[GatewayWireProfile],
+) -> tuple[int, ...]:
+    """Move host-funded OpenRouter rungs behind every other rung of an affinity order.
+
+    OpenRouter is never the first lane (owner rule): it is an aggregator the
+    house buys through, so a direct lane of the same model always leads it.
+    Rendezvous order is blind to that and put a house OpenRouter rung first
+    for its share of fingerprints. The demotion is a stable partition, so the
+    rendezvous order of the other rungs (and of the OpenRouter rungs among
+    themselves) is kept and placement stays deterministic on every worker. A
+    customer-managed OpenRouter rung is the customer's own key and keeps its
+    place, and an all-OpenRouter route is left as it is.
+
+    Args:
+        order: Route indexes in affinity order.
+        deployments: The route's deployments, in route order.
+        profiles: The route's wire profiles, aligned with ``deployments``.
+
+    Returns:
+        ``order`` with every house OpenRouter rung moved to the end.
+    """
+    aggregator = frozenset(
+        index
+        for index, (deployment, profile) in enumerate(zip(deployments, profiles, strict=True))
+        if deployment.billing_source == BillingSource.HOST_MANAGED
+        and (
+            deployment.provider == "openrouter"
+            # A Responses-wire rung dials OpenRouter through an ``openai``
+            # connection on OpenRouter's own origin.
+            or (urlsplit(profile.url).hostname or "").lower() == "openrouter.ai"
+        )
+    )
+    return (
+        *(index for index in order if index not in aggregator),
+        *(index for index in order if index in aggregator),
+    )

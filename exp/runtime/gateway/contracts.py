@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from enum import StrEnum
 from typing import Annotated, Literal
 
 from pydantic import Field, StrictBool, StrictInt, field_validator, model_validator
@@ -17,14 +16,10 @@ from exp.common.models.content import (
     VideoContentPart,
     require_attachment_ceilings,
 )
-from exp.common.models.dispatch_policy import GatewayThrottleRedialPolicy
 from exp.common.models.gateway_catalog import (
-    DeploymentId,
     ExactModelId,
     ExactModelPoolId,
-    FailoverMode,
 )
-from exp.common.models.gateway_chains import ModelExecutionStage, ModelTraversalEvent
 from exp.common.models.model import MAXIMUM_TOOL_CALL_ID_CHARACTERS, ReasoningEffort, ToolCall
 from exp.runtime.gateway.client_apps import ClientAttribution
 from exp.runtime.gateway.model_chain_authority import ModelChainAuthority
@@ -45,6 +40,7 @@ from exp.runtime.gateway.reasoning_blocks import (
 from exp.runtime.gateway.reasoning_blocks import ThinkingBlock as ThinkingBlock
 from exp.runtime.gateway.request_policy import GatewayRequestPolicy, RequestedRouteId
 from exp.runtime.gateway.request_surface_fields import require_no_responses_only_fields
+from exp.runtime.gateway.sampling_extras import SamplingExtras
 from exp.runtime.gateway.service_tiers import (
     GatewayServiceTierAdmission as GatewayServiceTierAdmission,
 )
@@ -70,6 +66,9 @@ from exp.runtime.gateway.stream_contracts import (
     GatewayFailureClass as GatewayFailureClass,
 )
 from exp.runtime.gateway.stream_contracts import (
+    GatewayHeaderTimeout as GatewayHeaderTimeout,
+)
+from exp.runtime.gateway.stream_contracts import (
     GatewayRefusalReason as GatewayRefusalReason,
 )
 from exp.runtime.gateway.stream_contracts import (
@@ -81,6 +80,7 @@ from exp.runtime.gateway.stream_contracts import (
 from exp.runtime.gateway.stream_contracts import (
     TokenLogprob as TokenLogprob,
 )
+from exp.runtime.gateway.surfaces import GatewayApiSurface as GatewayApiSurface
 from exp.runtime.gateway.tool_contracts import (
     GatewayNamedToolChoice as GatewayNamedToolChoice,
 )
@@ -124,19 +124,6 @@ class ProjectTarget(ContractModel):
 GatewayTarget = Annotated[DirectTarget | ProjectTarget, Field(discriminator="kind")]
 
 
-class GatewayApiSurface(StrEnum):
-    """Public endpoint family used by one canonical request."""
-
-    CHAT_COMPLETIONS = "chat_completions"
-    RESPONSES = "responses"
-    MESSAGES = "messages"
-    EMBEDDINGS = "embeddings"
-    IMAGES = "images"
-    DECISIONS = "decisions"
-    SPEECH = "speech"
-    TRANSCRIPTION = "transcription"
-
-
 class StructuredTextFormat(ContractModel):
     """A strict structured-text output schema requested by the caller."""
 
@@ -153,6 +140,16 @@ class GatewayMessage(ContractModel):
         capture_only_reasoning: Caller-visible copies accompanying sealed replay.
             Empty by default; excluded from serialization, provider dispatch and
             replay authority. Only content capture consumes this evidence.
+        tool_references: Deferred tools this tool result loads, in caller order
+            (Anthropic ``tool_reference`` sub-blocks a client-side tool search
+            returns). Valid only on tool messages. Native Anthropic Messages
+            re-emits them as reference blocks after the result's own content;
+            every other wire states each one as text and keeps the tool's full
+            definition in the dispatched tools (``tool_references.py`` in the
+            provider package). Excluded from serialization so reference-free
+            digests are unperturbed; a present reference changes what the model
+            can call, so it joins replay identity through
+            :func:`canonical_request_sha256`.
     """
 
     role: Literal["system", "developer", "user", "assistant", "tool"]
@@ -166,6 +163,9 @@ class GatewayMessage(ContractModel):
     )
     tool_is_error: bool = Field(default=False, exclude=True)
     """Whether this tool result reports a failed invocation; retained outside serialization."""
+    tool_references: tuple[Annotated[str, Field(min_length=1, max_length=256)], ...] = Field(
+        default=(), exclude=True
+    )
     provider_specific_fields: JsonObject | None = Field(default=None, exclude=True)
     """LiteLLM's echoed per-message ``provider_specific_fields``: accepted so verbatim
     replays keep working, dropped on every wire with a disclosure, excluded from
@@ -282,8 +282,7 @@ class GatewayMessage(ContractModel):
     the blocks' concatenated text equals ``content`` exactly and Anthropic
     rungs re-emit them verbatim; other wires keep the flattened string and
     disclose the dropped markers. A cache hint changes cost, not semantics,
-    so like the other cache carriers this joins neither serialization nor
-    replay identity.
+    so like the other cache carriers this joins neither serialization nor replay identity.
     """
     content_parts: tuple[MessageContentPart, ...] = ()
     """Ordered caller content parts for a message that carries attachments.
@@ -375,6 +374,8 @@ class GatewayMessage(ContractModel):
             raise ValueError("tool-result attribution is valid only for tool messages")
         if self.role != "tool" and self.tool_is_error:
             raise ValueError("tool_is_error is valid only for tool messages")
+        if self.role != "tool" and self.tool_references:
+            raise ValueError("tool_references are valid only for tool messages")
         if self.cache_control is not None and self.role != "tool":
             raise ValueError("message cache_control is valid only for tool messages")
         if self.provider_text_blocks:
@@ -394,10 +395,14 @@ class GatewayMessage(ContractModel):
                 )
             if all(part.kind == "text" for part in self.content_parts):
                 raise ValueError("content parts are retained only for multimodal messages")
-            if self.role in ("tool", "assistant") and any(
+            if self.role == "tool" and any(
+                part.kind not in ("text", "image", "document") for part in self.content_parts
+            ):
+                raise ValueError("tool messages carry only text, image, and document parts")
+            if self.role == "assistant" and any(
                 part.kind not in ("text", "image") for part in self.content_parts
             ):
-                raise ValueError(f"{self.role} messages carry only text and image parts")
+                raise ValueError("assistant messages carry only text and image parts")
             texts = [part.text for part in self.content_parts if part.kind == "text"]
             if (self.content or "") != "".join(texts):
                 raise ValueError("content parts must flatten to the message content")
@@ -473,6 +478,11 @@ class GatewayRequest(ContractModel):
     top_k: int | None = Field(default=None, ge=0)
     frequency_penalty: float | None = Field(default=None, ge=-2, le=2)
     presence_penalty: float | None = Field(default=None, ge=-2, le=2)
+    sampling_extras: SamplingExtras | None = Field(default=None, exclude=True)
+    """OpenRouter's ``repetition_penalty`` / ``min_p`` / ``top_a``, forwarded per rung.
+
+    Excluded from serialization so extra-free digests are unchanged; a present
+    value joins replay identity through ``canonical_request_sha256``."""
     logprobs: StrictBool | None = None
     top_logprobs: StrictInt | None = Field(default=None, ge=0, le=20)
     include_output_text_logprobs: bool = Field(default=False, exclude=True)
@@ -511,13 +521,10 @@ class GatewayRequest(ContractModel):
     diagnostics: JsonObject | None = Field(default=None, exclude=True)
     """Verbatim caller ``diagnostics`` from the Messages surface.
 
-    Anthropic's diagnostics-correlation object (Claude Code sends
-    ``{"previous_message_id": ...}`` conditionally). Validated only as an
-    object and forwarded byte-for-byte with the required beta header on
-    Anthropic rungs, dropped with disclosure elsewhere; the shape is an
-    evolving provider beta, so validation stays shallow. Excluded from
-    serialization; a present value joins replay identity through
-    :func:`canonical_request_sha256`.
+    Anthropic's diagnostics-correlation object (Claude Code sends ``{"previous_message_id":
+    ...}`` conditionally), validated only as an object (an evolving provider beta) and
+    forwarded byte-for-byte with its beta header on Anthropic rungs, dropped with disclosure
+    elsewhere. Excluded from serialization; a present value joins replay identity.
     """
     safeguards: tuple[JsonObject, ...] | None = Field(default=None, exclude=True)
     """Verbatim Claude Code auto-mode ``safeguards`` (Messages only): sent on
@@ -525,13 +532,10 @@ class GatewayRequest(ContractModel):
     speed: str | None = Field(default=None, max_length=64, exclude=True)
     """Verbatim caller ``speed`` selector from the Messages surface.
 
-    Anthropic's fast-mode selector (Claude Code sends ``"fast"``; accepted
-    live behind its beta header, 2026-08-30). Bounded but deliberately not
-    enumerated: the value set is an evolving provider surface. Forwarded
-    with the required beta header on Anthropic rungs and dropped with
-    disclosure elsewhere. Fast-mode output is provider-priced at a premium,
-    so a present value joins replay identity through
-    :func:`canonical_request_sha256`.
+    Anthropic's fast-mode selector (Claude Code sends ``"fast"``; accepted live behind its
+    beta header, 2026-08-30), bounded but not enumerated (an evolving provider surface).
+    Forwarded with its beta header on Anthropic rungs, dropped with disclosure elsewhere.
+    Fast-mode output is priced at a premium, so a present value joins replay identity.
     """
     provider_cache_control: JsonObject | None = Field(default=None, exclude=True)
     """Verbatim caller top-level ``cache_control`` from the Messages surface.
@@ -546,12 +550,10 @@ class GatewayRequest(ContractModel):
     inference_geo: str | None = Field(default=None, max_length=64, exclude=True)
     """Verbatim caller ``inference_geo`` selector from the Messages surface.
 
-    Anthropic's inference-region selector (accepted bare, verified live
-    2026-08-30). Bounded but deliberately not enumerated: the region set is
-    an evolving provider surface. Forwarded verbatim on Anthropic rungs and
-    dropped with disclosure elsewhere. Where inference runs is a
-    caller-visible processing commitment, so a present value joins replay
-    identity through :func:`canonical_request_sha256`.
+    Anthropic's inference-region selector (accepted bare, verified live 2026-08-30), bounded
+    but not enumerated (an evolving provider surface). Forwarded verbatim on Anthropic rungs,
+    dropped with disclosure elsewhere. Where inference runs is a caller-visible processing
+    commitment, so a present value joins replay identity (:func:`canonical_request_sha256`).
     """
     provider_beta_tokens: tuple[str, ...] = Field(default=(), exclude=True)
     """Allowlisted caller ``anthropic-beta`` tokens from the Messages surface.
@@ -657,9 +659,38 @@ class GatewayRequest(ContractModel):
     conversation stem (the leading system/developer messages, else the first
     user turn), so every request sharing a cacheable prefix lands on the
     provider cache node that holds it while the caller's raw key never leaves
-    the gateway. Excluded from serialization: it is routing state, never
-    request identity.
+    the gateway. Excluded from serialization: it is routing state, never request identity.
     """
+    provider_session_id: str | None = Field(default=None, max_length=128, exclude=True)
+    """Tenant-namespaced per-conversation id for providers that pin by session.
+
+    Derived at admission (``prompt_cache_affinity.provider_session_id``) from
+    the caller's ``prompt_cache_key`` or the conversation's opening, and sent
+    only as Novita's ``x-session-id``. Routing state, never request identity.
+    """
+    prompt_cache_ttl: Literal["12h"] | None = Field(default=None, exclude=True)
+    """OpenAI's 12-hour minimum prompt-cache lifetime (Responses ``prompt_cache_options.ttl``).
+
+    Routed only to rungs declaring ``supports_prompt_cache_ttl_12h`` and refused when none
+    does. Like ``provider_cache_control`` it changes cache-write cost, never semantics, so
+    it joins neither serialization nor replay identity."""
+    prompt_cache_mode: Literal["explicit"] | None = Field(default=None, exclude=True)
+    """OpenAI's ``prompt_cache_options.mode: "explicit"`` (both OpenAI surfaces).
+
+    Turns the provider's implicit breakpoint off so only content blocks marked with
+    ``prompt_cache_breakpoint`` are cached (none marked: nothing is written). Sent only on
+    rungs whose wire carries OpenAI's prompt-cache options; the Anthropic and Bedrock wires
+    already cache only at markers, every other wire drops it with disclosure. ``"implicit"``
+    is the provider default and is never carried. Cost, not semantics: it joins neither
+    serialization nor replay identity."""
+    prompt_cache_breakpoints: bool = Field(default=False, exclude=True)
+    """Whether the caller marked content blocks with OpenAI's ``prompt_cache_breakpoint``.
+
+    Each marker rides the canonical cache carriers as an ephemeral ``cache_control``,
+    so Anthropic and Bedrock rungs cache at the same boundary (their default lifetime).
+    This flag tells OpenAI-wire rungs that carry the field to re-emit those boundaries
+    as ``prompt_cache_breakpoint`` (``{"mode": "explicit"}``, inheriting the request
+    lifetime) and keeps every disclosure in the caller's spelling. Never identity."""
     service_tier: str | None = Field(default=None, max_length=64, exclude=True)
     """Caller provider processing tier, forwarded only on BYOK OpenAI-family
     rungs (routing and billing rules live at streaming_requests and
@@ -803,8 +834,8 @@ class GatewayRequest(ContractModel):
             raise ValueError("include_usage is valid only for streaming requests")
         if self.json_object_output and self.structured_text is not None:
             raise ValueError("json_object_output and structured_text are mutually exclusive")
-        if self.json_object_output and self.surface != GatewayApiSurface.CHAT_COMPLETIONS:
-            raise ValueError("json_object_output is valid only for Chat Completions requests")
+        if self.json_object_output and self.surface not in ("chat_completions", "responses"):
+            raise ValueError("json_object_output is valid only for Chat and Responses requests")
         parts = (part for message in self.messages for part in message.content_parts)
         require_attachment_ceilings(parts)
         if len({handle.provider for handle in self.media_handles}) > 1:
@@ -900,9 +931,15 @@ class AuthorizationSnapshot(ClientAttribution):
         model_chain_authority: Optional backend binding, revalidated at acceptance and reservation.
         fair_share_weight: Organization weight in [1, 1,000,000], default 1.
         priority_admission: Host-vouched 0 free, 1 paying, 2 Pro (lane_saturation caps).
+        priority_class: Host-vouched request class 0..8, higher first (class_throttles.py).
+        output_tokens_per_second: Class stream pace on self-hosted rungs; None never paces.
+        output_pace_saturation: Pace only at or above this rung load fraction; None = always.
+        self_hosted_class_concurrency: Per-worker in-flight cap for the class on a self-hosted rung.
+        fast: The ``:fast`` spelling: priority tier, above every class (class_throttles.py).
         descendant_start_authorized: False unless the host proves root funding
             and policy gates before allowing a request to start at a child.
         zdr_requested: Caller demand for stricter ZDR filtering, default False.
+        prompt_caching_disabled: The org turned prompt caching off (prompt_caching.py).
         requested_route_id: Optional public selector, excluded from durable serialization.
     """
 
@@ -936,64 +973,11 @@ class AuthorizationSnapshot(ClientAttribution):
     allowlist then fails closed, a denylist open). 45 chars fits any IPv6 form."""
     fair_share_weight: int = Field(default=1, ge=1, le=1_000_000)
     priority_admission: int = Field(default=0, ge=0, le=2)
+    priority_class: int | None = Field(default=None, ge=0, le=8)
+    output_tokens_per_second: float | None = Field(default=None, gt=0, allow_inf_nan=False)
+    output_pace_saturation: float | None = Field(default=None, gt=0, allow_inf_nan=False)
+    self_hosted_class_concurrency: int | None = Field(default=None, ge=1)
+    fast: bool = False
     descendant_start_authorized: bool = False
     zdr_requested: bool = False
-
-
-class ExecutionSnapshot(ContractModel):
-    """Route-bound request plan created only after exact-model selection.
-
-    Attributes:
-        model_stages: Frozen ordered stage segments; empty for an unstaged exact-model route.
-        traversal_events: Immutable expansion provenance, not mutable runtime visitation state.
-    """
-
-    authorization: AuthorizationSnapshot
-    exact_model_id: ExactModelId
-    pool_id: ExactModelPoolId
-    deployment_ids: tuple[DeploymentId, ...] = Field(min_length=1)
-    # The pool's per-model failover policy, carried onto the route so the
-    # per-attempt retry/failover decision can honor it.
-    failover_mode: FailoverMode = "maximize_availability"
-    # Optional cache-stakes threshold; otherwise the failover mode decides.
-    throttle_cache_threshold: float | None = Field(default=None, ge=0, le=1, allow_inf_nan=False)
-    # The pool's backoff-and-redial schedule for throttled rungs, carried so
-    # the admission can hand the data plane its frozen retry facts and the
-    # per-attempt decision can honor a post-backoff redial.
-    throttle_redial: GatewayThrottleRedialPolicy | None = None
-    # Rungs the host flagged for OpenRouter's per-request ZDR constraint; the
-    # dispatch builder tightens each and fails closed on a wire that cannot.
-    zdr_constrained_deployment_ids: tuple[DeploymentId, ...] = ()
-    model_stages: tuple[ModelExecutionStage, ...] = ()
-    traversal_events: tuple[ModelTraversalEvent, ...] = ()
-
-    @model_validator(mode="after")
-    def _require_stage_projection(self) -> ExecutionSnapshot:
-        """Require the ordered stage leaves to exactly cover the dispatch cursor."""
-        if (
-            self.model_stages
-            and tuple(d for s in self.model_stages for d in s.deployment_ids) != self.deployment_ids
-        ):
-            raise ValueError("execution stages must exactly cover ordered deployment_ids")
-        return self
-
-    def stage_for_depth(self, depth: int) -> ModelExecutionStage:
-        """Return the exact destination authority, never substitute the root model."""
-        if not 0 <= depth < len(self.deployment_ids):
-            raise ValueError("execution route depth is outside the authorized plan")
-        if not self.model_stages:
-            return ModelExecutionStage(
-                stage_index=0,
-                exact_model_id=self.exact_model_id,
-                pool_id=self.pool_id,
-                deployment_ids=self.deployment_ids,
-                failover_mode=self.failover_mode,
-                throttle_cache_threshold=self.throttle_cache_threshold,
-                throttle_redial=self.throttle_redial,
-            )
-        cursor = 0
-        for stage in self.model_stages:
-            cursor += len(stage.deployment_ids)
-            if depth < cursor:
-                return stage
-        raise ValueError("execution stage projection is incomplete")
+    prompt_caching_disabled: bool = False

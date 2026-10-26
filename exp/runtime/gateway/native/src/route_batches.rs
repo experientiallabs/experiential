@@ -58,7 +58,7 @@ fn envelope_response(rendered: &str) -> Response {
 ///
 /// Batch bodies share the same concurrency budget as synchronous requests,
 /// so a burst of large uploads cannot bypass the plane's memory admission.
-async fn acquire_batch_permit(
+pub(crate) async fn acquire_batch_permit(
     state: &AppState,
 ) -> Result<tokio::sync::OwnedSemaphorePermit, PublicError> {
     match tokio::time::timeout(state.request_timeout, state.permits.clone().acquire_owned()).await {
@@ -78,7 +78,10 @@ async fn acquire_batch_permit(
 /// Mirrors the synchronous routes: authentication happens before the plane
 /// buffers request content, so an unauthenticated caller can never make the
 /// gateway allocate an upload.
-async fn pre_authenticate(state: &AppState, headers: &HeaderMap) -> Result<String, PublicError> {
+pub(crate) async fn pre_authenticate(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<String, PublicError> {
     let key = bearer_key(headers)?;
     let authenticate = compact_json(&json!({"raw_key": key.clone()}));
     state.bridge.call("authenticate", authenticate).await?;

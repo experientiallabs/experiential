@@ -44,6 +44,45 @@ class ProviderCertificationCell(ContractModel):
     limitation: str | None = Field(default=None, min_length=1, max_length=512)
 
 
+def _audio_provider_cells() -> tuple[ProviderCertificationCell, ...]:
+    """Label ElevenLabs on the audio surfaces only, using native HTTP and SQLite evidence.
+
+    The loopback suite drives speech and transcription on ElevenLabs' wire with
+    exact unit settlement, refusals by field, and a refused chat call. It does
+    not certify chat or tool streams, content refusals, or a live account.
+    """
+    evidence = ("exp/runtime/gateway/tests/native_elevenlabs_test.py",)
+    cells: list[ProviderCertificationCell] = []
+    for capability in ProviderCapability:
+        match capability:
+            case ProviderCapability.USAGE | ProviderCapability.CANCELLATION:
+                result = ProviderCertificationResult.PROVIDER_FIXTURE_PASS
+                limitation = "Native ElevenLabs HTTP against a loopback provider and real SQLite."
+            case ProviderCapability.CREDENTIAL_GATED_LIVE:
+                result = ProviderCertificationResult.NOT_RUN_REQUIRES_CREDENTIALS
+                limitation = "The deterministic lane does not call the live ElevenLabs API."
+            case ProviderCapability.TEXT_STREAM | ProviderCapability.TOOL_ARGUMENT_STREAM:
+                result = ProviderCertificationResult.UNSUPPORTED
+                limitation = "ElevenLabs serves buffered audio and transcripts, not chat streams."
+            case ProviderCapability.REFUSAL:
+                result = ProviderCertificationResult.UNSUPPORTED
+                limitation = "ElevenLabs has no certified content-refusal protocol."
+        cells.append(
+            ProviderCertificationCell(
+                provider="elevenlabs",
+                provider_api_surface="POST /v1/text-to-speech and /v1/speech-to-text",
+                client_sdk="reqwest (native HTTP; no ElevenLabs SDK)",
+                gateway_api_surfaces=("speech", "transcription"),
+                capability=capability,
+                result=result,
+                evaluated_at=datetime(2026, 10, 13, tzinfo=UTC),
+                evidence=evidence,
+                limitation=limitation,
+            )
+        )
+    return tuple(cells)
+
+
 class ProviderCertificationMatrix(ContractModel):
     """Complete later-provider matrix that cannot omit an unsupported capability."""
 
@@ -64,6 +103,7 @@ class ProviderCertificationMatrix(ContractModel):
             "anthropic",
             "azure",
             "bedrock",
+            "elevenlabs",
             "gemini",
             "openai",
             "openai-compatible",
@@ -334,6 +374,7 @@ PROVIDER_CERTIFICATION_MATRIX = ProviderCertificationMatrix(
                 *_compatible_provider_cells("azure"),
                 *_compatible_provider_cells("openrouter"),
                 *_decision_provider_cells(),
+                *_audio_provider_cells(),
             ),
             key=lambda cell: (cell.provider, cell.capability.value),
         )

@@ -750,21 +750,65 @@ def test_automatic_cache_skips_unsupported_shapes(shape: str) -> None:
     assert build_automatic_google_cache_plans(profile, request, _payload(request)) == ()
 
 
-def test_automatic_plain_function_tools_are_excluded() -> None:
-    """Unmarked function definitions must not become provider-held automatic resources."""
-    request = _request().model_copy(
+def _vertex_profile() -> GatewayWireProfile:
+    return _profile(
+        f"https://aiplatform.us.rep.googleapis.com/v1/projects/fruit-project/locations/us/publishers/google/models/{_MODEL}:streamGenerateContent"
+    )
+
+
+def _tool_request(*tools: GatewayToolDefinition, tool_choice: str | None = None) -> GatewayRequest:
+    return _request().model_copy(
         update={
             "messages": (
+                GatewayMessage(role="system", content="Follow the fictional inventory."),
                 GatewayMessage(role="user", content="Fictional fruit context. " * 1000),
                 GatewayMessage(role="user", content="Count oranges."),
             ),
-            "tools": (GatewayToolDefinition(name="lookup", parameters={"type": "object"}),),
+            "tools": tools,
+            "tool_choice": tool_choice,
         }
     )
-    profile = _profile(
-        f"https://aiplatform.us.rep.googleapis.com/v1/projects/fruit-project/locations/us/publishers/google/models/{_MODEL}:streamGenerateContent"
-    )
-    assert build_automatic_google_cache_plans(profile, request, _payload(request)) == ()
+
+
+def test_automatic_plans_carry_plain_function_tools_in_the_cache_resource() -> None:
+    """Tools and their calling policy live in the cache, never on the cached generation."""
+    lookup = GatewayToolDefinition(name="lookup", parameters={"type": "object"})
+    request = _tool_request(lookup, tool_choice="required")
+    original = _payload(request)
+    assert "tools" in original and "toolConfig" in original
+    plans = build_automatic_google_cache_plans(_vertex_profile(), request, original)
+    assert plans
+    for plan in plans:
+        resource = plan.create_payload
+        assert resource["tools"] == original["tools"]
+        assert resource["toolConfig"] == original["toolConfig"]
+        generation = plan.generation_payload
+        assert "tools" not in generation and "toolConfig" not in generation
+        restored = deepcopy(generation)
+        for key in ("systemInstruction", "tools", "toolConfig"):
+            restored[key] = resource[key]
+        restored["contents"] = cast("list[JsonValue]", resource.get("contents", [])) + cast(
+            "list[JsonValue]", restored["contents"]
+        )
+        assert restored == original
+
+
+def test_automatic_tool_caches_are_keyed_by_the_toolset() -> None:
+    """The same toolset shares a prefix; a different one never reuses its cache."""
+    lookup = GatewayToolDefinition(name="lookup", parameters={"type": "object"})
+    other = GatewayToolDefinition(name="restock", parameters={"type": "object"})
+    profile = _vertex_profile()
+
+    def digests(request: GatewayRequest) -> set[str]:
+        plans = build_automatic_google_cache_plans(profile, request, _payload(request))
+        assert plans
+        return {plan.prefix_sha256 for plan in plans}
+
+    same = digests(_tool_request(lookup))
+    assert digests(_tool_request(lookup)) == same
+    assert not same & digests(_tool_request(other))
+    assert not same & digests(_tool_request(lookup, tool_choice="required"))
+    assert not same & digests(_tool_request())
 
 
 def test_automatic_cache_stops_before_copying_prefixes_past_the_byte_ceiling(

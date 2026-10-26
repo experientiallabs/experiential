@@ -9,7 +9,8 @@ from exp.runtime.gateway.compatibility import (
     CompatibilityManifest,
 )
 from exp.runtime.gateway.contracts import GatewayApiSurface
-from exp.runtime.openai_protocol.errors import unsupported_field
+from exp.runtime.gateway.sampling_extras import SAMPLING_EXTRA_FIELDS
+from exp.runtime.openai_protocol.errors import invalid_field, unsupported_field
 
 
 def _field(
@@ -78,6 +79,14 @@ CHAT_MANIFEST = CompatibilityManifest(
         # soft preference whose absence still returns a valid answer).
         _field("frequency_penalty", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "penalties"),
         _field("presence_penalty", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "penalties"),
+        # OpenRouter's open-weight sampling extras, matching its behavior: sent
+        # to rungs whose wire carries them (OpenRouter; vLLM-family servers take
+        # repetition_penalty and min_p), dropped with disclosure on every other
+        # rung, never refused. Values stay validated (gateway/sampling_extras).
+        *(
+            _field(path, CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "sampling_extras")
+            for path in SAMPLING_EXTRA_FIELDS
+        ),
         # Accepted only at its no-op default of 1 (the wire model enforces
         # the value): Copilot hardcodes n:1 on every Chat request.
         _field("n", CompatibilityDisposition.SUPPORTED),
@@ -122,21 +131,27 @@ CHAT_MANIFEST = CompatibilityManifest(
         # Audio INPUT rides ``messages`` as an ``input_audio`` content part and
         # is admitted per route; ``audio`` and ``modalities`` request audio
         # OUTPUT, which no route serves.
-        # Explicit prompt-cache boundaries: Chat callers can name cache
-        # breakpoints and retention. No rung honors those selectors yet, so
-        # both stay refused rather than silently dropped. The
-        # ``prompt_cache_boundaries`` capability records that decision for
-        # catalog metadata; implicit prefix caching is a different fact.
+        # OpenAI's prompt-cache options (``mode``, ``ttl``) and the content-block
+        # ``prompt_cache_breakpoint`` markers they govern: forwarded on OpenAI-wire
+        # rungs that carry them (OpenAI, Azure OpenAI, OpenRouter), breakpoints
+        # mapped to ephemeral ``cache_control`` on Anthropic and Bedrock, dropped
+        # with disclosure elsewhere (prompt_cache_breakpoints.py). Chat's lifetime
+        # is "30m" only; "12h" is a named 400 pointing at the Responses API.
         _field(
             "prompt_cache_options",
-            CompatibilityDisposition.UNSUPPORTED,
+            CompatibilityDisposition.CONDITIONALLY_SUPPORTED,
             "prompt_cache_boundaries",
         ),
+        # Retention only sets how long a provider keeps a cached prefix and
+        # ``seed`` is a best-effort determinism hint: neither changes what a
+        # correct answer is, so both are removed with disclosure
+        # (``client_field_repairs.drop_unforwarded_hints``) instead of refused.
         _field(
             "prompt_cache_retention",
-            CompatibilityDisposition.UNSUPPORTED,
+            CompatibilityDisposition.IGNORED,
             "prompt_cache_boundaries",
         ),
+        _field("seed", CompatibilityDisposition.IGNORED),
         *(
             _field(path, CompatibilityDisposition.UNSUPPORTED)
             for path in (
@@ -147,7 +162,6 @@ CHAT_MANIFEST = CompatibilityManifest(
                 "modalities",
                 "moderation",
                 "prediction",
-                "seed",
             )
         ),
     ),
@@ -190,13 +204,22 @@ RESPONSES_MANIFEST = CompatibilityManifest(
         _field("reasoning", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "reasoning"),
         _field("top_k", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "top_k"),
         _field("top_logprobs", CompatibilityDisposition.CONDITIONALLY_SUPPORTED, "logprobs"),
-        # Accepted only at their no-op values (the wire models enforce them):
-        # Copilot hardcodes truncation:"disabled" and
-        # prompt_cache_options:{"mode":"implicit"} on every Responses request,
-        # and both describe exactly the behavior this gateway already serves
-        # (context is never truncated; served routes cache implicitly).
+        # Accepted only at its no-op value (the wire model enforces it): Copilot
+        # hardcodes truncation:"disabled" on every Responses request, and the
+        # gateway never truncates context.
         _field("truncation", CompatibilityDisposition.SUPPORTED),
-        _field("prompt_cache_options", CompatibilityDisposition.SUPPORTED),
+        # Same handling as the Chat surface, plus the "12h" lifetime routed to
+        # rungs declaring it. Copilot's hardcoded {"mode": "implicit"} is the
+        # provider default and is never forwarded.
+        _field(
+            "prompt_cache_options",
+            CompatibilityDisposition.CONDITIONALLY_SUPPORTED,
+            "prompt_cache_boundaries",
+        ),
+        # ``include_obfuscation`` padding is never emitted, so ``false`` is
+        # honored and ``true`` is disclosed as ignored
+        # (``client_field_repairs.accept_responses_stream_options``).
+        _field("stream_options", CompatibilityDisposition.SUPPORTED),
         # The Responses tool-call cap is refused until a route can honor it.
         # ``tool_call_limit`` is the catalog vocabulary for that decision.
         _field("max_tool_calls", CompatibilityDisposition.UNSUPPORTED, "tool_call_limit"),
@@ -220,10 +243,11 @@ RESPONSES_MANIFEST = CompatibilityManifest(
                 "conversation",
                 "moderation",
                 "prompt",
-                "prompt_cache_retention",
-                "stream_options",
             )
         ),
+        # Same hints and the same disclosed removal as the Chat surface.
+        _field("prompt_cache_retention", CompatibilityDisposition.IGNORED),
+        _field("seed", CompatibilityDisposition.IGNORED),
     ),
 )
 
@@ -282,10 +306,50 @@ input is served, but the gateway does not echo the caller's image back), so
 honoring the selector is impossible and accepting it would be silent."""
 
 
+def responses_include_options(include: tuple[str, ...] | None) -> tuple[bool, bool, bool]:
+    """Validate the closed ``include`` selector list.
+
+    Args:
+        include: Raw caller include paths.
+
+    Returns:
+        The encrypted-reasoning, output-text-logprobs and web-search-sources
+        selectors.
+
+    Raises:
+        OpenAIProtocolError: An include path is not supported by this gateway.
+    """
+    if include is None:
+        return False, False, False
+    for path in include:
+        if path not in RESPONSES_INCLUDE_PATHS_ACCEPTED:
+            raise invalid_field(
+                "include",
+                f"The include path {path!r} is not supported by this gateway. "
+                "Only 'reasoning.encrypted_content', 'message.output_text.logprobs' "
+                "and 'web_search_call.action.sources' are available.",
+            )
+    return (
+        "reasoning.encrypted_content" in include,
+        "message.output_text.logprobs" in include,
+        "web_search_call.action.sources" in include,
+    )
+
+
 RESPONSES_INPUT_ITEM_FIELDS_ACCEPTED: dict[str, frozenset[str]] = {
     "message": frozenset({"type", "role", "content", "id", "status", "phase"}),
     "function_call": frozenset(
-        {"type", "call_id", "name", "namespace", "caller", "arguments", "id", "status"}
+        {
+            "type",
+            "call_id",
+            "name",
+            "namespace",
+            "caller",
+            "arguments",
+            "id",
+            "status",
+            "extra_content",
+        }
     ),
     "function_call_output": frozenset(
         {"type", "call_id", "output", "name", "namespace", "caller", "id", "status"}
@@ -307,7 +371,9 @@ replayed without it ("Missing namespace for function_call ..."), which
 wedges every later turn of the session. ``caller`` is SDK 3.0's opaque
 programmatic tool-calling attribution (``{"type": "program", "id": ...}``);
 its internal shape is an evolving provider surface, so it is validated only
-as an object and round-trips verbatim like ``namespace``.
+as an object and round-trips verbatim like ``namespace``. ``extra_content``
+carries Gemini's thought signature (``extra_content.google.thought_signature``,
+the shape this gateway emits on Gemini calls) back with its call.
 """
 
 CHAT_CACHE_CONTROL_PLACEMENTS: dict[str, str] = {
@@ -454,5 +520,19 @@ TRANSCRIPTION_MANIFEST = CompatibilityManifest(
                 "languages",
             )
         ),
+    ),
+)
+
+VIDEO_MANIFEST = CompatibilityManifest(
+    schema_version=1,
+    surface=GatewayApiSurface.VIDEO,
+    fields=(
+        *(
+            _field(path, CompatibilityDisposition.SUPPORTED)
+            for path in ("model", "prompt", "seconds", "size", "input_reference")
+        ),
+        # Sora character references have no equivalent on any served video
+        # provider; the field is refused by name rather than silently dropped.
+        _field("characters", CompatibilityDisposition.UNSUPPORTED),
     ),
 )

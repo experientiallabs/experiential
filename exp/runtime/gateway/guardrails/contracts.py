@@ -8,12 +8,15 @@ from typing import Literal
 from pydantic import Field, model_validator
 
 from exp.common.core.artifacts import ArtifactId, ContractModel, JsonObject, canonical_json_bytes
+from exp.common.models.gateway_catalog import ExactModelPoolId
 from exp.common.models.model import MAXIMUM_TOOL_CALL_ID_CHARACTERS
 from exp.runtime.gateway.contracts import (
+    DirectTarget,
     GatewayFailure,
     GatewayFailureClass,
     GatewayMessage,
     GatewayRequest,
+    GatewayTarget,
     IdentityId,
     OrganizationId,
 )
@@ -122,6 +125,7 @@ class GuardrailPolicy(ContractModel):
         checks: Ordered checks, empty by default.
         max_request_bytes: Complete in-memory input inspection bound, default 1 MiB.
         max_response_bytes: Total canonical output inspection bound, default 1 MiB.
+        target_pool_ids: Exact-model pools the policy covers; empty covers every alias.
     """
 
     policy_id: ArtifactId
@@ -134,6 +138,7 @@ class GuardrailPolicy(ContractModel):
     checks: tuple[GuardrailCheck, ...] = ()
     max_request_bytes: int = Field(default=DEFAULT_MAX_REQUEST_BYTES, ge=1, le=64 * 1024 * 1024)
     max_response_bytes: int = Field(default=DEFAULT_MAX_RESPONSE_BYTES, ge=1, le=64 * 1024 * 1024)
+    target_pool_ids: tuple[ExactModelPoolId, ...] = ()
 
     @model_validator(mode="after")
     def _require_unique_check_ids(self) -> GuardrailPolicy:
@@ -148,6 +153,8 @@ class GuardrailPolicy(ContractModel):
         ids = tuple(check.check_id for check in self.checks)
         if len(set(ids)) != len(ids):
             raise ValueError("guardrail check IDs must be unique")
+        if len(set(self.target_pool_ids)) != len(self.target_pool_ids):
+            raise ValueError("guardrail target_pool_ids must be unique")
         if (self.organization_id is None) != (self.identity_id is None):
             raise ValueError("guardrail scope requires both organization_id and identity_id")
         if self.organization_id is None and not self.protected:
@@ -158,6 +165,20 @@ class GuardrailPolicy(ContractModel):
         ):
             raise ValueError("observation requires read-only input checks")
         return self
+
+    def applies_to(self, target: GatewayTarget) -> bool:
+        """Return whether this policy covers one alias target.
+
+        An empty pool list covers every target. A scoped policy covers a direct
+        alias whose exact-model pool is listed. It also covers every project alias,
+        because learned routing chooses that request's model only after policy
+        resolution, and a listed pool may be among its candidates.
+        """
+        return (
+            not self.target_pool_ids
+            or not isinstance(target, DirectTarget)
+            or target.pool_id in self.target_pool_ids
+        )
 
     def bind(self, organization_id: OrganizationId, identity_id: IdentityId) -> GuardrailPolicy:
         """Capture authenticated decision metadata without changing checks or execution mode."""

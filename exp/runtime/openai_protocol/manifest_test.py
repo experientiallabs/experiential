@@ -48,20 +48,24 @@ def test_manifests_classify_explicit_exclusions() -> None:
     responses = disposition_map(RESPONSES_MANIFEST)
     assert chat["audio"] == CompatibilityDisposition.UNSUPPORTED
     # Value-constrained acceptances: the wire models admit only the no-op
-    # values Copilot hardcodes (n:1, truncation:"disabled",
-    # prompt_cache_options:{"mode":"implicit"}).
+    # values Copilot hardcodes (n:1, truncation:"disabled").
     assert chat["n"] == CompatibilityDisposition.SUPPORTED
     # Retention opt-out admitted at its no-op false (OpenAI agents hardcode it);
     # store:true stays a named rejection in the Chat wire model.
     assert chat["store"] == CompatibilityDisposition.SUPPORTED
     assert responses["truncation"] == CompatibilityDisposition.SUPPORTED
-    assert responses["prompt_cache_options"] == CompatibilityDisposition.SUPPORTED
+    # OpenAI's prompt-cache options: forwarded where the wire carries them.
+    assert responses["prompt_cache_options"] == CompatibilityDisposition.CONDITIONALLY_SUPPORTED
+    assert chat["prompt_cache_options"] == CompatibilityDisposition.CONDITIONALLY_SUPPORTED
     assert chat["logprobs"] == CompatibilityDisposition.CONDITIONALLY_SUPPORTED
     # Chat verbosity is admitted (forwarded on native Responses rungs, dropped
     # with disclosure elsewhere); opencode sends it on every request.
     assert chat["verbosity"] == CompatibilityDisposition.CONDITIONALLY_SUPPORTED
     assert chat["top_logprobs"] == CompatibilityDisposition.CONDITIONALLY_SUPPORTED
     assert chat["top_k"] == CompatibilityDisposition.CONDITIONALLY_SUPPORTED
+    # OpenRouter's sampling extras: forwarded or dropped per rung, never refused.
+    for extra in ("repetition_penalty", "min_p", "top_a"):
+        assert chat[extra] == CompatibilityDisposition.CONDITIONALLY_SUPPORTED
     assert chat["top_p"] == CompatibilityDisposition.SUPPORTED
     # Every enable-thinking spelling is admitted and translated, never dropped.
     for spelling in ("reasoning", "thinking", "chat_template_kwargs", "enable_thinking"):
@@ -75,24 +79,21 @@ def test_manifests_classify_explicit_exclusions() -> None:
     assert responses["top_p"] == CompatibilityDisposition.SUPPORTED
     assert responses["top_k"] == CompatibilityDisposition.CONDITIONALLY_SUPPORTED
     assert responses["top_logprobs"] == CompatibilityDisposition.CONDITIONALLY_SUPPORTED
-    assert chat["prompt_cache_options"] == CompatibilityDisposition.UNSUPPORTED
-    assert chat["prompt_cache_retention"] == CompatibilityDisposition.UNSUPPORTED
     assert responses["max_tool_calls"] == CompatibilityDisposition.UNSUPPORTED
-    assert responses["prompt_cache_retention"] == CompatibilityDisposition.UNSUPPORTED
+    # Hints that cannot change a correct answer are removed with disclosure.
+    for hint in ("prompt_cache_retention", "seed"):
+        assert chat[hint] == CompatibilityDisposition.IGNORED
+        assert responses[hint] == CompatibilityDisposition.IGNORED
 
 
 def test_schema_drift_fields_carry_capability_vocabulary() -> None:
-    """Explicit cache boundaries and the tool-call cap name their catalog slots.
-
-    Implicit Responses ``prompt_cache_options`` stays a no-op acceptance and
-    is not labeled as boundary support.
-    """
+    """Explicit cache boundaries and the tool-call cap name their catalog slots."""
     chat = {field.field_path: field for field in CHAT_MANIFEST.fields}
     responses = {field.field_path: field for field in RESPONSES_MANIFEST.fields}
     assert chat["prompt_cache_options"].capability == "prompt_cache_boundaries"
     assert chat["prompt_cache_retention"].capability == "prompt_cache_boundaries"
     assert responses["max_tool_calls"].capability == "tool_call_limit"
-    assert responses["prompt_cache_options"].capability is None
+    assert responses["prompt_cache_options"].capability == "prompt_cache_boundaries"
 
 
 def _sdk_literal_values(annotation: object) -> frozenset[str]:

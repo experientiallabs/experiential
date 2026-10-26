@@ -280,8 +280,12 @@ def build_automatic_google_cache_plans(
     """Offer bounded whole-message Vertex prefixes without adding caller markers.
 
     Only leading plain system/user text messages qualify, with at least one
-    original user message left uncached. History, media, tools and native carriers
-    retain ordinary generation. Caller cache hints on text (block or top-level
+    original user message left uncached. Plain function definitions and their
+    calling policy move into every candidate resource (Vertex serves them from
+    the cache and forbids repeating them on the generation), so the digest covers
+    the toolset and different toolsets never share a cache. History, media,
+    provider-native or server tools and native carriers retain ordinary
+    generation. Caller cache hints on text (block or top-level
     ``cache_control``) are ignored rather than disqualifying: they only change cost,
     the native wire drops them, and the gateway already caches the whole-message
     prefix they would mark. Up to eight early message boundaries are offered; the
@@ -296,7 +300,6 @@ def build_automatic_google_cache_plans(
         or request.provider_native_tools
         or request.web_search is not None
         or request.tool_search is not None
-        or request.tools
         or not _payload_matches(request, upstream_payload)
     ):
         return ()

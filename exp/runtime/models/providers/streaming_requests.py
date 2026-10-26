@@ -27,10 +27,10 @@ from exp.runtime.models.providers.codex_tools import (
 from exp.runtime.models.providers.dialect_dispatch import (
     CACHE_CONTROL_NOT_FORWARDED_SUFFIX,
     THINKING_HISTORY_DROP_DISCLOSURE,
-    TOOL_RESULT_IMAGE_FOLD_DIALECTS,
-    TOOL_RESULT_IMAGE_FOLD_DISCLOSURE,
     WEB_SEARCH_SOURCES_DROPPED,
     WEB_SEARCH_SOURCES_DROPPED_ON_FALLBACK,
+    disclose_gemini_missing_tool_results,
+    disclose_tool_result_attachment_folds,
     responses_origin_refuses_web_search_sources,
 )
 from exp.runtime.models.providers.dialect_dispatch import (
@@ -55,13 +55,13 @@ from exp.runtime.models.providers.errors import (
     ProviderParameterError,
     UnsupportedReasoningEffortError,
 )
-from exp.runtime.models.providers.fireworks import (
-    require_responses_continuation_channel,
-)
+from exp.runtime.models.providers.fireworks import require_responses_continuation_channel
+from exp.runtime.models.providers.gemini_requests import disclose_dropped_thought_signatures
 from exp.runtime.models.providers.generation_parameter_validation import (
     anthropic_reasoning_disengaged,
     disclose_anthropic_tool_schemas,
     require_assistant_prefill_supported,
+    require_route_reasoning_effort,
     require_tool_names_supported,
     resolve_level_less_enable,
     serves_reasoning_summary,
@@ -86,14 +86,18 @@ from exp.runtime.models.providers.messages_payloads import (
 from exp.runtime.models.providers.messages_payloads import (
     gemini_generate_content_stream_payload as gemini_generate_content_stream_payload,
 )
+from exp.runtime.models.providers.mistral import pin_greedy_top_p
 from exp.runtime.models.providers.openai_payloads import (
     openai_compatible_stream_payload as openai_compatible_stream_payload,
 )
 from exp.runtime.models.providers.openai_payloads import (
     openai_responses_stream_payload as openai_responses_stream_payload,
 )
+from exp.runtime.models.providers.prompt_cache_options import (
+    cache_marker_spelling,
+    prompt_cache_disclosures,
+)
 from exp.runtime.models.providers.reasoning_compat import (
-    REASONING_EFFORTS,
     require_between_tools_support,
     shape_anthropic_thinking_config,
 )
@@ -110,6 +114,7 @@ from exp.runtime.models.providers.thinking_budget import (
     thinking_budget_value,
     thinking_budget_wire_field,
 )
+from exp.runtime.models.providers.tool_references import disclose_client_tool_search
 
 if TYPE_CHECKING:
     from exp.runtime.models.providers.base import GatewayWireProfile
@@ -328,6 +333,7 @@ def route_generation_parameter_requests(
                 minimum=lambda profile: profile.minimum_top_p,
                 maximum=lambda profile: profile.maximum_top_p,
             )
+            pin_greedy_top_p(profiles, request, provider_updates, ignored)
     if request.top_k is not None:
 
         def top_k_supported(profile: GatewayWireProfile) -> bool:
@@ -382,17 +388,7 @@ def route_generation_parameter_requests(
         else:
             provider_updates["reasoning_effort"] = resolved_default
     if request.reasoning_effort is not None:
-        portable_efforts = set(REASONING_EFFORTS)
-        for profile in profiles:
-            portable_efforts.intersection_update(_profile_reasoning_efforts(profile))
-        if request.reasoning_effort not in portable_efforts:
-            raise UnsupportedReasoningEffortError(
-                effort=request.reasoning_effort,
-                supported_efforts=tuple(
-                    effort for effort in REASONING_EFFORTS if effort in portable_efforts
-                ),
-                param=effort_path,
-            )
+        require_route_reasoning_effort(profiles, request, provider_updates, ignored)
     elif budget is None:
         # An omitted caller value remains omitted on the shared request. Each
         # dialect payload injects only its own provider-required default, so a
@@ -457,13 +453,14 @@ def route_generation_parameter_requests(
     if request.json_object_output and any(
         profile.dialect not in _JSON_OBJECT_OUTPUT_DIALECTS for profile in profiles
     ):
+        field = "text.format" if request.surface == "responses" else "response_format"
         raise ProviderParameterError(
             message=(
-                "The parameter 'response_format.type' value 'json_object' is not "
+                f"The parameter '{field}.type' value 'json_object' is not "
                 "supported by every deployment in this model route. Use "
                 "'json_schema' or choose a different model."
             ),
-            param="response_format.type",
+            param=f"{field}.type",
             code="unsupported_parameter",
         )
 
@@ -474,21 +471,15 @@ def route_generation_parameter_requests(
         if disclosure not in ignored:
             ignored.append(disclosure)
 
-    # Every dialect carries a tool-result image: natively inside the tool
-    # result on Anthropic (tool_result image blocks), native Responses (the SDK
-    # function_call_output part list) and Bedrock (toolResult image blocks),
-    # and folded into a user turn that follows the tool run on Chat
-    # Completions and Gemini, whose tool results are text-only. The fold is
-    # disclosed once per route; a rung with no image input at all still
-    # rejects at preflight and the route-wide coercion applies the disclosed
-    # placeholder degrade (the block is baked into the caller's history, so a
-    # rejection would wedge the whole session).
-    if any(message.role == "tool" and message.images for message in request.messages) and any(
-        profile.dialect in TOOL_RESULT_IMAGE_FOLD_DIALECTS for profile in profiles
-    ):
-        if TOOL_RESULT_IMAGE_FOLD_DISCLOSURE not in ignored:
-            ignored.append(TOOL_RESULT_IMAGE_FOLD_DISCLOSURE)
+    # A tool-result attachment rides every route: images natively on
+    # Anthropic, Responses and Bedrock, documents natively on Anthropic
+    # alone, and every other combination folded into a user turn after the
+    # tool run, each disclosed once per route (dialect_dispatch).
+    disclose_tool_result_attachment_folds(profiles, request.messages, ignored)
+    # Tool-result references and deferred tools: see tool_references.py.
+    disclose_client_tool_search(profiles, request, ignored)
 
+    disclose_gemini_missing_tool_results(profiles, request.messages, ignored)
     # Only the Anthropic wire has a tool-result error flag. Every other wire
     # folds the flag into the result text at encoding (a fixed prefix, see
     # ``folded_tool_error_content``) so the model still learns the invocation
@@ -608,10 +599,15 @@ def route_generation_parameter_requests(
             if part.kind == "text" or part.kind == "image" or part.kind == "document"
         )
         for message in request.messages
-    ) and not any(profile.preserves_cache_control for profile in profiles):
-        content_marker = f"messages.content.cache_control{CACHE_CONTROL_NOT_FORWARDED_SUFFIX}"
+    ) and not any(
+        profile.honors_cache_markers(openai_breakpoints=request.prompt_cache_breakpoints)
+        for profile in profiles
+    ):
+        marker = cache_marker_spelling(request)
+        content_marker = f"messages.content.{marker}{CACHE_CONTROL_NOT_FORWARDED_SUFFIX}"
         if content_marker not in ignored:
             ignored.append(content_marker)
+    ignored.extend(d for d in prompt_cache_disclosures(profiles, request) if d not in ignored)
 
     # LiteLLM's echoed provider_specific_fields: no wire takes it; dropped with disclosure.
     if any(message.provider_specific_fields for message in request.messages):
@@ -719,10 +715,13 @@ def route_generation_parameter_requests(
         # actionable for a framework-managed history, and a session that ever
         # touched an exposed model would otherwise die the moment it switches
         # models. Exposing rungs — when the route has any — still forward the
-        # plaintext verbatim; the others omit it at encoding.
+        # plaintext verbatim; the others omit it at encoding. A carrying lead
+        # drops it only if a failover reaches a fallback (the sources rule).
         ignore(
             "messages.reasoning_content",
-            "messages.reasoning_content->dropped(unsupported_by_provider)",
+            "messages.reasoning_content->dropped(unsupported_by_fallback_provider)"
+            if profiles[0].replays_plaintext_reasoning
+            else "messages.reasoning_content->dropped(unsupported_by_provider)",
         )
     history_thinking_present = any(
         block.kind in {"thinking", "redacted_thinking"}
@@ -859,6 +858,7 @@ def route_generation_parameter_requests(
     require_tool_names_supported(profiles, request)
     disclose_anthropic_tool_schemas(profiles, request, ignored)
     disclose_system_fold(profiles, request, ignored)
+    disclose_dropped_thought_signatures(profiles, request, ignored)
 
     if request.include_web_search_sources and not all(
         profile.dialect == "openai_responses" for profile in profiles

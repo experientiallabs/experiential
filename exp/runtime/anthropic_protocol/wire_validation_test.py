@@ -44,7 +44,7 @@ def test_rejected_block_hint_names_the_offending_block() -> None:
                     {
                         "type": "tool_result",
                         "tool_use_id": "t1",
-                        "content": [{"type": "text", "text": "ok"}, {"type": "document"}],
+                        "content": [{"type": "text", "text": "ok"}, {"type": "video"}],
                     }
                 ],
             }
@@ -53,3 +53,37 @@ def test_rejected_block_hint_names_the_offending_block() -> None:
     nested_hint = rejected_block_hint(nested)
     assert nested_hint is not None
     assert nested_hint[0] == "messages.0.content.0.content.1"
+    # A document is a served tool_result sub-block (Claude Code's Read on a
+    # PDF), so it is never the block a hint blames.
+    document_only: JsonObject = {
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "t1",
+                        "content": [{"type": "text", "text": "ok"}, {"type": "document"}],
+                    }
+                ],
+            }
+        ]
+    }
+    assert rejected_block_hint(document_only) is None
+    # A tool_reference is a served tool_result sub-block too (Claude Code's
+    # client-side ToolSearch), so it never takes the blame either.
+    reference_only: JsonObject = {
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "t1",
+                        "content": [{"type": "tool_reference", "tool_name": "Lookup"}],
+                    }
+                ],
+            }
+        ]
+    }
+    assert rejected_block_hint(reference_only) is None

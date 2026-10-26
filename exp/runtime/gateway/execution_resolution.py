@@ -4,11 +4,14 @@ from __future__ import annotations
 
 from dataclasses import replace
 
+from exp.common.models.catalog_prices import BilledUnitKind
 from exp.common.models.gateway_catalog import ExactModelDeployment, NormalizedGatewayCatalog
 from exp.common.models.model import BillingSource
 from exp.runtime.gateway.audio_billing import AudioSurface, billing_mode
+from exp.runtime.gateway.video.providers import video_dialect
 from exp.runtime.models import ResolvedModel, RuntimeModelCatalog
 from exp.runtime.models.providers.base import GatewayWireProfile
+from exp.runtime.models.providers.elevenlabs_audio import ELEVENLABS_AUDIO_DIALECT
 from exp.runtime.models.providers.errors import ProviderCapabilityError
 from exp.runtime.models.providers.protocol import NativeWireClient
 
@@ -65,6 +68,7 @@ def _resolved_wire_profile(
                 and profile.dialect == "openai_responses"
             ),
             billing_customer_managed=(deployment.billing_source == BillingSource.CUSTOMER_MANAGED),
+            tenant_origin=runtime_model.tenant_origin,
             service_tier_pricing_enabled=capabilities.service_tier_pricing_enabled,
             service_tier_cards=frozenset(
                 tier
@@ -194,6 +198,7 @@ def alias_native_blockers(
             )
         else:
             reasons.extend(_audio_claim_blockers(deployment, profile))
+            reasons.extend(_video_claim_blockers(deployment, profile))
     return tuple(dict.fromkeys(reasons))
 
 
@@ -202,10 +207,11 @@ def _audio_claim_blockers(
 ) -> tuple[str, ...]:
     """Name each audio surface a deployment claims but cannot serve or bill.
 
-    A claimed surface without its OpenAI-wire endpoint, or whose price card
-    names no single valid meter (``audio_billing.billing_mode``), could only
-    fail after a request was durably accepted, so the alias is excluded at
-    startup instead.
+    A claimed surface without its endpoint, or whose price card names no
+    single valid meter (``audio_billing.billing_mode``), could only fail after
+    a request was durably accepted, so the alias is excluded at startup
+    instead. An ElevenLabs rung must bill a unit card (characters or audio
+    seconds): its wire reports no token usage.
     """
     capabilities = deployment.gateway.capabilities
     claims: tuple[tuple[AudioSurface, bool, str | None], ...] = (
@@ -226,4 +232,38 @@ def _audio_claim_blockers(
                 f"deployment {deployment.deployment_id!r} claims {surface} without a "
                 "single billable meter"
             )
+        elif (
+            profile.dialect == ELEVENLABS_AUDIO_DIALECT
+            and billing_mode(deployment, surface) != "units"
+        ):
+            reasons.append(
+                f"deployment {deployment.deployment_id!r} claims {surface} on ElevenLabs "
+                "without a unit card"
+            )
     return tuple(reasons)
+
+
+def _video_claim_blockers(
+    deployment: ExactModelDeployment, profile: GatewayWireProfile
+) -> tuple[str, ...]:
+    """Name why a deployment that claims video generation cannot serve or bill it.
+
+    A claimed video surface needs a provider video job dialect (a Veo-capable
+    Gemini connection or xAI's origin) and a ``video_second`` unit card: a job
+    priced any other way could only fail after the request was accepted, so
+    the alias is excluded at startup instead.
+    """
+    if not deployment.gateway.capabilities.supports_video_generation:
+        return ()
+    if video_dialect(profile) is None:
+        return (
+            f"deployment {deployment.deployment_id!r} claims video generation without a "
+            "video job endpoint",
+        )
+    units = deployment.gateway.prices.units
+    if units is None or units.kind != BilledUnitKind.VIDEO_SECOND:
+        return (
+            f"deployment {deployment.deployment_id!r} claims video generation without a "
+            "video_second unit card",
+        )
+    return ()

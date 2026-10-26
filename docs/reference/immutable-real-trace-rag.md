@@ -15,6 +15,12 @@ transition. A terminal assistant response has no following observation and is ex
 world-model predictions, simulator rollouts, teacher data, judgments, evaluations, and manual
 examples cannot enter this index.
 
+An empty tool reply is still an observation. Extraction preserves whitespace in textual tool
+replies and retains explicit JSON null, false and zero results. A result with a matching call ID
+at the call's end time is retained even when both spans have the same start timestamp. Missing
+result fields remain missing evidence; they do not become empty replies. Saved indexes and
+evaluation receipts remain immutable; corrected extraction applies when new evidence is built.
+
 Trace count is not a validation boundary. A corpus with any positive number of valid traces is
 accepted. The 100 to 1,000 range is only a common happy path for useful coverage.
 

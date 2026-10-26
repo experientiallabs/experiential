@@ -138,3 +138,37 @@ def test_a_namespaced_custom_grammar_also_prefers_the_native_rung() -> None:
     assert compatible_generation_parameter_profile_indexes(
         (_AZURE_CHAT, _OPENAI_RESPONSES), request
     ) == (1,)
+
+
+def _bedrock_claude(*, reasoning: bool) -> GatewayWireProfile:
+    """A Bedrock Claude Opus 4.8 rung, with or without the catalog's reasoning claim."""
+    return GatewayWireProfile(
+        dialect="bedrock_converse_stream",
+        url="https://bedrock-runtime.us-east-1.amazonaws.test/model/x/converse-stream",
+        model_id="us.anthropic.claude-opus-4-8",
+        supports_reasoning=reasoning,
+        reasoning_wire_format="anthropic_adaptive" if reasoning else "none",
+        signs_request_body=True,
+    )
+
+
+def test_effort_request_keeps_a_reasoning_bedrock_claude_rung() -> None:
+    """A Chat effort narrows past a plain relay to the reasoning-declared Bedrock rung.
+
+    The claude-opus-4.8 chain leads with a compatible relay that declares no
+    reasoning; before Bedrock carried adaptive thinking the effort narrowed
+    past Bedrock too, leaving the direct Anthropic lane as the only reasoning
+    rung of the model.
+    """
+    relay = GatewayWireProfile(
+        dialect="openai_compatible", url="https://relay.test/v1", model_id="pa/claude-opus-4-8"
+    )
+    request = decode_chat(
+        {
+            "model": "claude-opus-4.8",
+            "messages": [{"role": "user", "content": "hi"}],
+            "reasoning_effort": "high",
+        }
+    ).request
+    profiles = (relay, _bedrock_claude(reasoning=False), _bedrock_claude(reasoning=True))
+    assert compatible_generation_parameter_profile_indexes(profiles, request) == (2,)

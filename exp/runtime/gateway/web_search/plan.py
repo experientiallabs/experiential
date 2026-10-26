@@ -36,7 +36,11 @@ from exp.common.core.artifacts import JsonObject
 from exp.runtime.gateway.contracts import GatewayMessage, GatewayNamedToolChoice, GatewayRequest
 from exp.runtime.gateway.guardrails.bounded import run_on_native_loop
 from exp.runtime.gateway.tool_contracts import GatewayAllowedToolsChoice
-from exp.runtime.gateway.web_search.backend import WebSearchBackend, WebSearchBackendError
+from exp.runtime.gateway.web_search.backend import (
+    WebSearchBackend,
+    WebSearchBackendError,
+    vendor_cost_nano_usd,
+)
 from exp.runtime.gateway.web_search.contracts import GatewayWebSearch, GatewayWebSearchResult
 
 _logger = logging.getLogger(__name__)
@@ -62,6 +66,18 @@ DROPPED_FAILED: Final = "web_search->dropped(search_failed)"
 DROPPED_NO_QUERY: Final = "web_search->dropped(no_query)"
 TOOL_CHOICE_CLEARED: Final = "tool_choice->cleared(no_serviceable_tool)"
 DROPPED_NOT_ALLOWED: Final = "web_search->dropped(not_in_allowed_tools)"
+DROPPED_TOOL_LOOP: Final = "web_search->dropped(tool_loop)"
+"""A search TOOL declared on a turn that answers a tool call: the agent is mid-loop.
+
+A tool declaration (the Responses ``web_search`` tool, the Anthropic
+``web_search_*`` server tool) offers the model a search it may or may not
+use; an agent such as Codex re-declares it on every turn of its loop. The
+gateway pre-searches only on a turn that opens with caller input, never on a
+turn whose latest input is a tool result, so one user question is searched
+once rather than once per loop step. The plugin, ``:online`` and Chat
+``web_search_options`` spellings promise a search per request and keep it."""
+
+_TOOL_DECLARATIONS: Final = frozenset({"responses_tool", "messages_server_tool"})
 
 _WHITESPACE = re.compile(r"\s+")
 _CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
@@ -100,7 +116,10 @@ class WebSearchPlan:
 
     request: GatewayRequest
     admission: JsonObject | None
-    """``{"query", "requests", "results": [{"url", "title"}]}`` for the data plane."""
+    """``{"query", "requests", "results": [{"url", "title"}]}`` for the data plane.
+
+    Plus ``cost_nano_usd`` only when the backend reported the vendor's own
+    price for the search."""
 
 
 def natively_served(search: GatewayWebSearch, dialects: Sequence[str]) -> bool:
@@ -120,6 +139,33 @@ def natively_served(search: GatewayWebSearch, dialects: Sequence[str]) -> bool:
     if search.declared_as == "messages_server_tool":
         return all(dialect == "anthropic_messages" for dialect in dialects)
     return False
+
+
+def answers_tool_call(request: GatewayRequest) -> bool:
+    """Whether the request's latest input answers a tool call (an agent mid-loop).
+
+    True when the last message is a tool result, or when it is user text that
+    directly follows tool results: the canonical form of one Anthropic user
+    turn mixing ``tool_result`` blocks with text (Claude Code appends its
+    reminders that way), which the decoder splits into tool messages followed
+    by the text, in order.
+
+    Args:
+        request: Canonical request.
+
+    Returns:
+        True for a tool-result turn, False for a turn that opens with caller input.
+    """
+    position = len(request.messages) - 1
+    while position >= 0 and request.messages[position].role == "user":
+        position -= 1
+    trailing_user = position < len(request.messages) - 1
+    if position < 0:
+        return False
+    if request.messages[position].role != "tool":
+        return False
+    # A bare tool tail, or user text split off the same tool-result turn.
+    return not trailing_user or position == len(request.messages) - 2
 
 
 def derive_query(request: GatewayRequest) -> str:
@@ -257,8 +303,8 @@ def inject_results(request: GatewayRequest, text: str) -> GatewayRequest:
 
     Returns:
         The request with the injected ``system`` turn positioned so every wire
-        treats it as an instruction (``developer`` would demand the
-        ``supports_developer_messages`` capability a compatible rung may lack).
+        treats it as an instruction (``developer`` would need a Responses rung
+        that declares the role, or a disclosed rewrite on any other wire).
     """
     injected = GatewayMessage(role="system", content=text)
     messages = list(request.messages)
@@ -314,6 +360,8 @@ def plan_web_search(
         # The caller declared the search tool but did not allow it this turn:
         # the gateway must not search on its behalf.
         return _disclosed(request, DROPPED_NOT_ALLOWED)
+    if search.declared_as in _TOOL_DECLARATIONS and answers_tool_call(request):
+        return _disclosed(request, DROPPED_TOOL_LOOP)
     if backend is None:
         return _disclosed(request, DROPPED_UNAVAILABLE)
     query = derive_query(request)
@@ -344,6 +392,7 @@ def plan_web_search(
     except Exception as exc:  # noqa: BLE001 - a vendor fault must never fail the request.
         _logger.warning("gateway web search raised (%s): %s", backend.name, type(exc).__name__)
         return _disclosed(request, DROPPED_FAILED)
+    cost_nano_usd = vendor_cost_nano_usd(results)
     results = tuple(results)[: search.max_results]
     injected = inject_results(
         strip_search_carriers(request), instruction_text(search, query, results)
@@ -356,4 +405,8 @@ def plan_web_search(
         # and lists its sources on the action when the caller asked for them.
         "include_sources": request.include_web_search_sources,
     }
+    if cost_nano_usd is not None:
+        # The vendor's own price for this search (Exa ``costDollars.total``),
+        # settled beside the count so the host can bill the true pass-through.
+        admission["cost_nano_usd"] = cost_nano_usd
     return WebSearchPlan(injected, admission)

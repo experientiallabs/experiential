@@ -19,7 +19,6 @@ from exp.runtime.gateway import model_chain_authority as authority
 from exp.runtime.gateway.contracts import (
     AuthorizationSnapshot,
     DirectTarget,
-    ExecutionSnapshot,
     GatewayApiSurface,
     GatewayEvent,
     GatewayEventKind,
@@ -29,6 +28,7 @@ from exp.runtime.gateway.contracts import (
     GatewayRequest,
     GatewayUsage,
 )
+from exp.runtime.gateway.execution_snapshot import ExecutionSnapshot
 from exp.runtime.gateway.group_commit import (
     GroupCommitAttemptLedger,
     SyncGroupCommitLedger,

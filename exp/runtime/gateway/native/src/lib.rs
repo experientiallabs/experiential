@@ -8,6 +8,7 @@
 
 mod admission;
 mod audio_duration;
+mod audio_elevenlabs;
 mod audio_upload;
 mod bridge;
 mod capture;
@@ -28,9 +29,12 @@ mod logprobs;
 mod logprobs_tests;
 mod memory;
 mod metrics;
+mod output_pacing;
 mod param_attribution;
+mod permit_queue;
 mod rate_limit_headers;
 mod reasoning_display;
+mod reasoning_estimate;
 mod rejection_shapes;
 mod relay;
 mod replay;
@@ -38,6 +42,7 @@ mod replay_repair;
 mod request_policy;
 mod respond;
 mod responses_retention;
+mod retained;
 mod route_audio;
 mod route_batches;
 mod route_chat;
@@ -47,6 +52,7 @@ mod route_images;
 mod route_messages;
 mod route_responses;
 mod route_responses_ws;
+mod route_videos;
 mod server;
 mod service_tier;
 mod settlement;
@@ -211,6 +217,7 @@ fn serve(
 ) -> PyResult<()> {
     let config: ServeConfig = serde_json::from_str(config_json)
         .map_err(|error| PyValueError::new_err(format!("invalid serve config: {error}")))?;
+    retained::configure(config.maximum_retained_output_bytes);
     let detectors = Arc::new(collect_detectors(guardrail_detectors)?);
     let bridge = Arc::new(
         Bridge::new(control_plane, config.callback_permits).map_err(PyRuntimeError::new_err)?,
@@ -497,6 +504,10 @@ fn parse_fixture_events(events_json: &str) -> Result<Vec<events::Event>, String>
                     .get("caller")
                     .filter(|value| value.is_object())
                     .cloned(),
+                thought_signature: object
+                    .get("thought_signature")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string),
             },
             "tool_arguments_delta" => events::Event::ToolArgumentsDelta { index, delta: text },
             "tool_call_completed" => events::Event::ToolCallCompleted {
@@ -520,6 +531,10 @@ fn parse_fixture_events(events_json: &str) -> Result<Vec<events::Event>, String>
                         .get("caller")
                         .filter(|value| value.is_object())
                         .cloned(),
+                    thought_signature: object
+                        .get("thought_signature")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string),
                     provider_item_id: object
                         .get("item_id")
                         .and_then(serde_json::Value::as_str)
@@ -554,6 +569,12 @@ fn parse_fixture_events(events_json: &str) -> Result<Vec<events::Event>, String>
                     .and_then(serde_json::Value::as_u64),
                 billed_units: None,
                 cache_writes_read_back: false,
+                image_output_tokens: object
+                    .get("image_output_tokens")
+                    .and_then(serde_json::Value::as_u64),
+                cache_creation_12h_input_tokens: object
+                    .get("cache_creation_12h_input_tokens")
+                    .and_then(serde_json::Value::as_u64),
             }),
             "hosted_tool_item_started" => events::Event::HostedToolItemStarted {
                 output_index: object

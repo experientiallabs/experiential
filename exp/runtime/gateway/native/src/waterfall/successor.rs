@@ -10,9 +10,11 @@ use crate::relay::remaining;
 use crate::throttle_backoff::{jitter_unit, BackoffQuery, ThrottleRedial};
 
 /// Whether the classified failure leaves any successor dispatch possible
-/// under the rust-side facts (caps, flags, remaining route, deadline). The
+/// under the rust-side facts (caps, flags, untried rungs, deadline). The
 /// control plane re-checks with health and budget state and may still answer
-/// with exhaustion.
+/// with exhaustion. `dispatched` counts physical dispatches per route index:
+/// a failover may land on ANY rung not yet dispatched in this request,
+/// earlier skipped rungs included (`fallback_rules::successor_available`).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn successor_possible(
     policy: RoutePolicy,
@@ -21,6 +23,7 @@ pub(crate) fn successor_possible(
     total_attempts: u32,
     same_deployment_attempts: u32,
     depth: usize,
+    dispatched: &[u32],
     failure: &Failure,
     refusal_eligible: bool,
 ) -> bool {
@@ -35,6 +38,7 @@ pub(crate) fn successor_possible(
     let failover = fallback_rules::successor_available(
         route,
         depth,
+        dispatched,
         failure,
         failure.failover_eligible || refusal_eligible,
     );

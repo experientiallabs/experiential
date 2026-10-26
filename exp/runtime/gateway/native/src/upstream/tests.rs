@@ -247,6 +247,31 @@ async fn a_dropped_provider_sentence_still_relays_the_provider_code() {
 }
 
 #[tokio::test]
+async fn a_plain_text_client_error_relays_its_sentence() {
+    // A relay answering a bare sentence instead of JSON left callers with
+    // "verify the request fields" and nothing to act on.
+    let failure = open_against_body(
+        "400 Bad Request",
+        "tools[0].function.name must match ^[a-zA-Z0-9_-]{1,64}$\n",
+        "m",
+    )
+    .await;
+    assert_eq!(failure.failure_class, FailureClass::InvalidRequest);
+    assert_eq!(
+        failure.public_error().message,
+        "provider rejected the request: tools[0].function.name must match ^[a-zA-Z0-9_-]{1,64}$"
+    );
+    // An HTML error page or a multi-line dump stays generic.
+    for body in [
+        "<html><body>Bad Request</body></html>",
+        "line one\nline two",
+    ] {
+        let failure = open_against_body("400 Bad Request", body, "m").await;
+        assert!(failure.provider_detail.is_none(), "{body}");
+    }
+}
+
+#[tokio::test]
 async fn a_404_for_a_callers_dangling_item_reference_is_the_callers_400() {
     let failure = open_against_body(
         "404 Not Found",
@@ -478,6 +503,60 @@ async fn an_azure_completion_finished_content_filter_under_a_400_is_a_refusal() 
 }
 
 #[tokio::test]
+async fn an_azure_streamed_content_filter_chunk_under_a_400_is_a_refusal() {
+    // Production 2026-10-17 (deepseek-v4-flash on azure_openai, 29 events):
+    // a STREAMING request's 4xx body is one SSE chunk finished
+    // content_filter. It is no JSON document, so it used to relay verbatim
+    // as "provider rejected the request: data: {...}" under invalid_request.
+    let body = "data: {\"created\":1792200000,\"object\":\"chat.completion.chunk\",\
+                \"id\":\"chatcmpl-1\",\"model\":\"\",\"choices\":[{\"delta\":{},\
+                \"finish_reason\":\"content_filter\",\"index\":0,\
+                \"content_filter_results\":{\"error\":{\"code\":\"content_filter\",\
+                \"message\":\"Response content blocked by label \
+                'MultiSeverity_ViolenceScore'.\"}}}]}\n\n";
+    let failure = open_against_body("400 Bad Request", body, "DeepSeek-V4-Flash").await;
+    assert_eq!(failure.failure_class, FailureClass::Refusal);
+    assert_eq!(
+        failure.refusal_reason,
+        Some(crate::errors::RefusalReason::ContentPolicy)
+    );
+    assert!(!failure.failover_eligible);
+    assert_eq!(
+        failure.provider_detail.as_deref(),
+        Some("Response content blocked by label 'MultiSeverity_ViolenceScore'.")
+    );
+    // Chat and Responses read the same public error; Messages wraps it in
+    // the Anthropic envelope with the same bounded reason. No frame text
+    // reaches any caller.
+    let public = failure.public_error();
+    assert_eq!(public.status_code, 400);
+    assert_eq!(public.code, "refusal");
+    assert_eq!(
+        public.message,
+        "provider refused the request: content policy"
+    );
+    let messages = crate::encode_messages::anthropic_error_body(&public);
+    assert_eq!(messages["error"]["type"], "invalid_request_error");
+    assert_eq!(messages["error"]["refusal_reason"], "content_policy");
+    assert_eq!(
+        messages["error"]["message"],
+        "provider refused the request: content policy"
+    );
+    // A chunk with only an error verdict (no finish yet) is the same refusal;
+    // a stream of ordinary chunks stays a request-shape error.
+    let early = "data: {\"object\":\"chat.completion.chunk\",\"choices\":[{\"delta\":{},\
+                 \"index\":0,\"content_filter_results\":{\"error\":\
+                 {\"code\":\"content_filter\",\"message\":\"blocked\"}}}]}\n\n";
+    let failure = open_against_body("400 Bad Request", early, "m").await;
+    assert_eq!(failure.failure_class, FailureClass::Refusal);
+    let ordinary = "data: {\"object\":\"chat.completion.chunk\",\"choices\":[{\"delta\":\
+                    {\"content\":\"hi\"},\"index\":0,\"finish_reason\":\"stop\",\
+                    \"content_filter_results\":{\"hate\":{\"filtered\":false}}}]}\n\n";
+    let failure = open_against_body("400 Bad Request", ordinary, "m").await;
+    assert_eq!(failure.failure_class, FailureClass::InvalidRequest);
+}
+
+#[tokio::test]
 async fn an_aggregator_routing_gate_403_is_not_a_credential_failure() {
     let failure = open_against_body(
         "403 Forbidden",
@@ -677,6 +756,33 @@ async fn a_plain_403_stays_a_credential_failure() {
 }
 
 #[tokio::test]
+async fn an_account_policy_block_is_a_credential_failure_under_any_relay_status() {
+    // OpenRouter's relay of OpenAI's account block on openai/gpt-6.1-sol: the
+    // generic invalid_prompt 400 with OpenAI's document in metadata.raw, and
+    // the flat 403. Both are the ACCOUNT's verdict, so both fail over.
+    let relayed = r#"{"error":{"message":"Provider returned error","code":400,"metadata":{"raw":"{\"error\":{\"message\":\"Policy Violation: this user has been blocked for a previous policy violation\",\"type\":\"invalid_request_error\",\"param\":null,\"code\":\"invalid_prompt\"}}","provider_name":"OpenAI"}}}"#;
+    let flat = r#"{"error":{"message":"Policy Violation: this user has been blocked for a previous policy violation","code":403}}"#;
+    for (status, body) in [("400 Bad Request", relayed), ("403 Forbidden", flat)] {
+        let failure = open_against_body(status, body, "openai/gpt-6.1-sol").await;
+        assert_eq!(failure.failure_class, FailureClass::ProviderAuthentication);
+        assert!(failure.failover_eligible && !failure.retryable_same_deployment);
+        assert!(failure.refusal_reason.is_none());
+        assert!(failure
+            .provider_detail
+            .as_deref()
+            .is_some_and(|detail| detail.ends_with("account_policy_block")));
+    }
+    // The same block arriving in-stream (OpenRouter's response.failed).
+    assert_eq!(
+        crate::stream_errors::classify_stream_error(
+            Some("invalid_prompt"),
+            Some("Policy Violation: this user has been blocked for a previous policy violation"),
+        ),
+        crate::stream_errors::StreamErrorKind::ProviderAuthentication
+    );
+}
+
+#[tokio::test]
 async fn a_lane_limitation_400_keeps_the_class_but_fails_over() {
     let failure = open_against_body(
         "400 Bad Request",
@@ -765,6 +871,12 @@ fn header_phase_timeout_fails_over_without_a_same_deployment_redial() {
     // the same stalled deployment for another full header-timeout window.
     let failure = open_timeout_failure();
     assert_eq!(failure.failure_class, FailureClass::Timeout);
+    // Typed for lane ejection: the rung's own allowance until the waterfall
+    // attributes a budget cut.
+    assert_eq!(
+        failure.header_timeout,
+        Some(crate::errors::HeaderTimeout::Allowance)
+    );
     assert!(
         !failure.retryable_same_deployment,
         "a header-phase stall must not redial the same deployment"

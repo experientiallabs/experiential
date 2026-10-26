@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import os
-import shutil
 import subprocess
 import sys
 import textwrap
@@ -14,13 +13,6 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
 WORKFLOWS = ROOT / ".github" / "workflows"
-
-
-def _step_script(workflow: str, step: str) -> str:
-    """Extract the exact run script of one named workflow step."""
-    text = (WORKFLOWS / workflow).read_text()
-    body = text.split(f"      - name: {step}\n", 1)[1]
-    return textwrap.dedent(body.split("        run: |\n", 1)[1].split("\n\n", 1)[0])
 
 
 def _darwin_scope_program() -> str:
@@ -88,25 +80,6 @@ def test_darwin_scope_skips_version_bumps_but_not_dependency_changes(
         check=True,
     )
     assert output.read_text() == f"required={str(required).lower()}\n"
-
-
-@pytest.mark.skipif(shutil.which("jq") is None, reason="the runner image provides jq")
-@pytest.mark.parametrize(("changed", "count"), [("true", 5), ("false", 1)])
-def test_unchanged_crate_builds_only_the_wheel_that_build_smokes(
-    tmp_path: Path, changed: str, count: int
-) -> None:
-    """Skipping cross-platform wheels must still leave the linux-x86_64 wheel `build` needs."""
-    output = tmp_path / "output"
-    script = _step_script("python-package.yml", "Select wheel targets")
-    subprocess.run(
-        ["bash", "-euo", "pipefail", "-c", script],
-        env={**os.environ, "NATIVE_CHANGED": changed, "GITHUB_OUTPUT": str(output)},
-        check=True,
-    )
-    matrix = json.loads(output.read_text().removeprefix("matrix="))
-    targets = [entry["target"] for entry in matrix["include"]]
-    assert len(targets) == count
-    assert "linux-x86_64" in targets
 
 
 # Run by their own steps: Tinker in the gate job, the evidence suites on macOS.

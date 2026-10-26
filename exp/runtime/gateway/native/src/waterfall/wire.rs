@@ -10,6 +10,7 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::bridge::Bridge;
+use crate::errors::{Failure, HeaderTimeout};
 use crate::throttle_backoff::ThrottleRedial;
 use crate::tool_search::ToolSearchAdmission;
 
@@ -36,6 +37,12 @@ pub struct DeploymentWire {
     /// deadness that fails over.
     #[serde(default)]
     pub billing_customer_managed: bool,
+    /// Whether this rung's origin is customer-addressed (a tenant's own
+    /// endpoint). Every upstream failure on it answers one opaque error, and
+    /// its socket is held to the tenant destination policy (allowed ports,
+    /// never the platform's own infrastructure).
+    #[serde(default)]
+    pub tenant_origin: bool,
     /// Host-authorized Google explicit-cache execution for this attempt.
     /// The host still reserves and settles each cache operation separately.
     #[serde(default)]
@@ -306,6 +313,114 @@ pub(crate) fn first_byte_allowance(
         .unwrap_or(default_slope_seconds_per_million);
     let scaled = slope * (approximate_input_tokens.max(0.0) / 1_000_000.0);
     Duration::from_secs_f64((base + scaled).max(0.001))
+}
+
+/// The default of what the pre-first-byte budget keeps beyond the slowest
+/// authored header allowance (`ServeConfig::pre_first_byte_reserve_seconds`),
+/// so a rung that stalls out its whole allowance still leaves a successor
+/// time to answer its own headers.
+pub(crate) const PRE_FIRST_BYTE_RESERVE: Duration = Duration::from_secs(15);
+
+/// One request's pre-first-byte budget: the configured budget, raised to the
+/// longest AUTHORED first-byte allowance on the route (base plus the input
+/// slope for this request) plus `reserve`.
+///
+/// The configured budget also caps every dial's header wait
+/// (`WaterfallContext::capped`), so a self-hosted lane authoring 300 s for
+/// long prompts was cut at the budget instead: the authored value must win.
+/// Every rung counts, not only route index 0, because the control plane may
+/// dial another rung first (a lead shed at its bound, an open circuit) and a
+/// slow rung reached by failover deserves its allowance too. A rung that
+/// authors neither its base nor its slope adds nothing, so a route of
+/// unauthored lanes keeps the configured budget exactly. `None` (budget
+/// disabled) stays disabled. `ceiling` (`ServeConfig::pre_first_byte_max_seconds`)
+/// bounds how far an authored allowance may raise the budget, so one rung
+/// authoring an hour cannot hold every request before its first byte that
+/// long; it never lowers the configured budget itself.
+pub(crate) fn pre_first_byte_budget(
+    configured: Option<Duration>,
+    reserve: Duration,
+    ceiling: Option<Duration>,
+    route: &[DeploymentWire],
+    default_base: Duration,
+    default_slope_seconds_per_million: f64,
+    approximate_input_tokens: f64,
+) -> Option<Duration> {
+    let configured = configured?;
+    let authored = route
+        .iter()
+        .filter(|wire| {
+            wire.time_to_first_byte_base_seconds.is_some()
+                || wire
+                    .time_to_first_byte_seconds_per_million_input_tokens
+                    .is_some()
+        })
+        .map(|wire| {
+            first_byte_allowance(
+                wire,
+                default_base,
+                default_slope_seconds_per_million,
+                approximate_input_tokens,
+            ) + reserve
+        })
+        .max();
+    let floor = authored.map(|floor| ceiling.map_or(floor, |ceiling| floor.min(ceiling)));
+    Some(floor.map_or(configured, |floor| configured.max(floor)))
+}
+
+/// Attribute a header-phase timeout to the bound that actually expired.
+///
+/// The open phase waits until the nearer of the rung's own allowance and the
+/// request's shared budget (`WaterfallContext::capped`, and the request
+/// deadline). When the shared bound is already spent at the failure, the
+/// budget cut the wait and the timeout is no strike against the lane: a
+/// healthy fallback dialed after a hung lead gets only the reserve, and must
+/// not be ejected for running out of someone else's time.
+pub(crate) fn attribute_header_timeout(
+    ctx: &WaterfallContext<'_>,
+    mut failure: Failure,
+) -> Failure {
+    if failure.header_timeout == Some(HeaderTimeout::Allowance)
+        && crate::relay::remaining(ctx.pre_commit_deadline()).is_zero()
+    {
+        failure.header_timeout = Some(HeaderTimeout::Budget);
+    }
+    failure
+}
+
+/// The default `ceiling` of `pre_first_byte_budget`.
+pub(crate) const PRE_FIRST_BYTE_MAX: Duration = Duration::from_secs(600);
+
+/// Approximate input tokens of a raw request body, for every first-byte and
+/// first-token allowance and for the budget floor: bytes over four, with
+/// base64 data-URL payloads (inline images, audio, files) left out. A timeout
+/// heuristic only, never a billing quantity.
+///
+/// Bytes over four overestimates a body carrying base64 media (a 4 MB image
+/// reads as a million tokens, raising the floor by the full input slope) and,
+/// more mildly, large tool schemas (JSON punctuation tokenizes densely). Media
+/// is cheap and safe to exclude: the payload runs from `;base64,` inside a
+/// `data:` URL to the string's closing quote, and base64 has no quote. Tool
+/// schemas stay counted; the ceiling bounds what they can add.
+pub(crate) fn approximate_input_tokens(body: &str) -> f64 {
+    const MARK: &str = ";base64,";
+    let mut excluded = 0usize;
+    let mut rest = body;
+    while let Some(at) = rest.find(MARK) {
+        let head = &rest[..at];
+        let start = at + MARK.len();
+        let in_data_url = head
+            .rfind("data:")
+            .is_some_and(|data| at - data <= 128 && !head[data..].contains('"'));
+        let end = rest[start..]
+            .find('"')
+            .map_or(rest.len(), |end| start + end);
+        if in_data_url {
+            excluded += end - start;
+        }
+        rest = &rest[end..];
+    }
+    (body.len().saturating_sub(excluded) as f64) / 4.0
 }
 
 /// The effective first-TOKEN allowance for one attempt: the deployment's (or

@@ -124,19 +124,6 @@ lane's medians sat above two minutes. A stall past the allowance is
 `first_byte_timeout_failure()`: class `timeout`, failover-eligible, never redialed on the
 stalled lane, so the ladder advances before anything has reached the caller.
 
-## The pre-first-byte budget
-
-The two allowances above are per attempt, so a chain of slow dials can add up: on 2026-10-07 a
-Fireworks header timeout (59 s) followed by a Novita one (52 s) kept a request silent for 111 s,
-past Cloudflare's 100 s origin limit, and the caller saw the edge's own 504 page instead of the
-gateway's error. `pre_first_byte_budget_seconds` (90 s; zero disables) bounds everything before
-the caller's first byte, across every attempt and failover, measured from the request's start:
-each attempt's header and first-token deadlines are capped at the budget, and no successor
-starts once it is spent. The request then ends with the gateway's own timeout error.
-
-A timeout answers HTTP 503 `deadline_exceeded` with `Retry-After: 2`, not 504: an edge proxy
-replaces a 504 with its own "origin timed out" page, hiding the retryable error body.
-
 ## Generation progress and commitment
 
 After genuine generation begins, the connection's existing `timeout_seconds` bounds the idle

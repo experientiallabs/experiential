@@ -86,7 +86,14 @@ class RAGObservation(ContractModel):
     """One real user or environment observation following an agent action."""
 
     kind: Literal["message", "tool_result"]
-    content: str = Field(min_length=1)
+    content: str
+
+    @model_validator(mode="after")
+    def visible_message(self) -> RAGObservation:
+        """An empty tool result is recorded evidence; a message needs visible content."""
+        if self.kind == "message" and not self.content:
+            raise ValueError("message observations need content")
+        return self
 
 
 class RAGTransition(ContractModel):

@@ -31,6 +31,7 @@ fn exposed_tool_events() -> Vec<Event> {
             index: 0,
             call_id: "call-one".to_string(),
             name: "lookup".to_string(),
+            thought_signature: None,
         },
         Event::ToolArgumentsDelta {
             index: 0,
@@ -47,6 +48,7 @@ fn exposed_tool_events() -> Vec<Event> {
                 provider_item_id: None,
                 provider_status: None,
                 custom: false,
+                thought_signature: None,
             },
         },
         Event::Completed,

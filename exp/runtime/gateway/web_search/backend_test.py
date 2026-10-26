@@ -16,10 +16,12 @@ from exp.runtime.gateway.web_search.backend import (
     ExaWebSearchBackend,
     KeenableWebSearchBackend,
     WebSearchBackendError,
+    WebSearchHits,
     _parse_exa,
     _parse_keenable,
     default_web_search_backend,
     validate_search_url,
+    vendor_cost_nano_usd,
 )
 from exp.runtime.gateway.web_search.contracts import GatewayWebSearchResult
 
@@ -158,6 +160,49 @@ def test_default_backend_honors_a_loopback_or_https_url_override() -> None:
             default_web_search_backend({EXA_API_KEY_ENV: "k", "EXA_SEARCH_URL": hostile})
     assert validate_search_url("http://[::1]:8080/search") == "http://[::1]:8080/search"
     assert validate_search_url("https://proxy.example/exa") == "https://proxy.example/exa"
+
+
+def test_exa_parse_reads_cost_dollars_total_as_the_vendor_cost() -> None:
+    def parse(cost: object) -> int | None:
+        body: dict[str, object] = {"results": [{"url": "https://a.example/x", "title": "A"}]}
+        if cost is not None:
+            body["costDollars"] = cost
+        return vendor_cost_nano_usd(_parse_exa(json.dumps(body).encode(), 5))
+
+    # Exa's documented shape: auto search $0.007 plus five highlights at $0.001.
+    assert parse({"total": 0.012, "search": {"neural": 0.007}}) == 12_000_000
+    assert parse({"total": 0}) == 0
+    assert parse(None) is None
+    for implausible in ({"total": -0.01}, {"total": 1.5}, {"total": "0.012"}, {"total": True}, 3):
+        assert parse(implausible) is None
+    # A plain tuple (any other backend) reports no vendor cost.
+    assert vendor_cost_nano_usd(()) is None
+
+
+def test_exa_backend_returns_the_vendor_cost_with_the_hits() -> None:
+    async def run() -> WebSearchHits:
+        import exp.runtime.gateway.web_search.backend as module
+
+        loop = asyncio.get_running_loop()
+        module._clients[loop] = httpx.AsyncClient(
+            transport=httpx.MockTransport(
+                lambda request: httpx.Response(
+                    200,
+                    json={
+                        "results": [{"url": "https://a.example/x", "highlights": ["h"]}],
+                        "costDollars": {"total": 0.008},
+                    },
+                )
+            )
+        )
+        backend = ExaWebSearchBackend(environ={EXA_API_KEY_ENV: "secret"})
+        return await backend.search(
+            "q", max_results=1, allowed_domains=(), blocked_domains=(), timeout_seconds=1.0
+        )
+
+    hits = asyncio.run(run())
+    assert [hit.url for hit in hits] == ["https://a.example/x"]
+    assert hits.vendor_cost_nano_usd == 8_000_000
 
 
 def test_default_backend_binds_keenable_only_when_named_or_keyed() -> None:

@@ -259,6 +259,7 @@ mod tests {
                 provider_status: None,
                 raw_arguments: arguments.to_string(),
                 custom: false,
+                thought_signature: None,
             },
         }
     }

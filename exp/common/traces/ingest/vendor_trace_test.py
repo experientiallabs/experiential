@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 
+import pytest
+
 from exp.common.core.artifacts import SourceIdentity
 from exp.common.traces.ingest.vendor_observations import (
     VendorModelIdentity,
@@ -93,6 +95,37 @@ def test_build_vendor_traces_pairs_by_tool_name_without_call_ids() -> None:
     assert tool_result.parent_span_id == call.span_id
 
 
+@pytest.mark.parametrize("strict", [False, True])
+def test_idless_parallel_results_do_not_invent_call_pairing(strict: bool) -> None:
+    """Completion order cannot identify which parallel request produced a reply."""
+    model = replace(
+        _MODEL_OBSERVATION,
+        tool_calls=(
+            VendorToolCall(name="get_weather", arguments='{"city":"Paris"}', call_id="a"),
+            VendorToolCall(name="get_weather", arguments='{"city":"Tokyo"}', call_id="b"),
+        ),
+    )
+    result = build_vendor_traces(
+        [
+            model,
+            replace(_TOOL_OBSERVATION, tool_call_id=None),
+            replace(
+                _TOOL_OBSERVATION,
+                source_span_id="span-3",
+                ordinal=3,
+                tool_call_id=None,
+                tool_message="28C",
+            ),
+        ],
+        vendor="langfuse",
+        source=_SOURCE,
+        strict_tool_pairing=strict,
+    )
+    assert result.traces == ()
+    assert len(result.issues) == 1
+    assert "ambiguous" in result.issues[0].message
+
+
 def test_build_vendor_traces_requires_a_model_snapshot_provider() -> None:
     """Model evidence without a provider is retained without resolving a model snapshot."""
     result = build_vendor_traces(
@@ -111,6 +144,36 @@ def test_build_vendor_traces_requires_a_model_snapshot_provider() -> None:
     call = result.traces[0].spans[0]
     assert call.model is None
     assert call.attributes["gen_ai.request.model"] == "gpt-4o"
+
+
+@pytest.mark.parametrize("reply", [None, "", " \n"])
+def test_missing_tool_reply_stays_distinct_from_an_empty_reply(reply: str | None) -> None:
+    """An exporter omitting a result must not manufacture an observed empty answer."""
+    result = build_vendor_traces(
+        [_MODEL_OBSERVATION, replace(_TOOL_OBSERVATION, tool_message=reply)],
+        vendor="langfuse",
+        source=_SOURCE,
+    )
+    assert result.issues == ()
+    attributes = result.traces[0].spans[1].attributes
+    if reply is None:
+        assert "gen_ai.tool.message" not in attributes
+    else:
+        assert attributes["gen_ai.tool.message"] == reply
+
+
+def test_duplicate_pending_call_ids_are_excluded() -> None:
+    """An explicit ID is not evidence of a pairing when two outstanding calls share it."""
+    model = replace(
+        _MODEL_OBSERVATION,
+        tool_calls=(
+            VendorToolCall(name="get_weather", arguments="{}", call_id="call-1"),
+            VendorToolCall(name="get_forecast", arguments="{}", call_id="call-1"),
+        ),
+    )
+    result = build_vendor_traces([model, _TOOL_OBSERVATION], vendor="langfuse", source=_SOURCE)
+    assert result.traces == ()
+    assert "duplicate outstanding tool call ID" in result.issues[0].message
 
 
 def test_build_vendor_traces_excludes_traces_without_a_user_request() -> None:

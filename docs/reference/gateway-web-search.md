@@ -58,11 +58,7 @@ exclusive (the provider's rule) and are forwarded to the vendor as include/exclu
   `wsgw_...`, `status: "completed"`, `action: {"type": "search", "query"}`), exactly where a
   native route streams its own, and `include: ["web_search_call.action.sources"]` adds
   `action.sources` (`{"type": "url", "url"}` per injected result). On a native Responses route
-  the selector is forwarded and the provider's relayed item carries its sources, except on
-  OpenRouter's Responses endpoint, which relays OpenAI's search but refuses the selector: that
-  rung's payload omits it, and the response discloses
-  `include.web_search_call.action.sources->dropped(unsupported_by_provider)` when it leads the
-  route, or `...->dropped(unsupported_by_fallback_provider)` when only a fallback could omit them. A replayed
+  the selector is forwarded and the provider's relayed item carries its sources. A replayed
   `wsgw_` item is the gateway's own output, so the decoder drops it before validation on every
   route; a provider's replayed `web_search_call` is never judged against the SDK's action enum
   (Codex echoes action types the SDK does not list) and forwards byte-for-byte to a native
@@ -91,7 +87,13 @@ A host may pass any `WebSearchBackend` to
 `web_search->dropped(search_unavailable)`; a vendor failure or timeout (8 s, bounded by the request
 deadline, enforced by the gateway even for a backend that ignores it) yields
 `web_search->dropped(search_failed)`; a request with no user text yields
-`web_search->dropped(no_query)`. A `tool_choice` that named the replaced search tool (or demanded
+`web_search->dropped(no_query)`. A search TOOL declaration (the Responses `web_search` tool, the
+Anthropic `web_search_*` server tool) is an offer the model may decline, and agents such as Codex and
+Claude Code re-declare it on every step of their loop; the gateway therefore pre-searches only on a
+turn that opens with caller input, never on a turn whose latest input answers a tool call (a tool
+result, or user text split off the same Anthropic tool-result turn), disclosing
+`web_search->dropped(tool_loop)`. The plugin, the `:online` suffix and Chat `web_search_options`
+promise one search per request and keep it on every turn. A `tool_choice` that named the replaced search tool (or demanded
 "any tool" when the search was the only one) is cleared with
 `tool_choice->cleared(no_serviceable_tool)`. In every case the turn still serves and no search is billed.
 
@@ -99,5 +101,9 @@ deadline, enforced by the gateway even for a backend that ignores it) yields
 
 The data plane reports `web_search_requests` on the finalizing settlement only, so a failed rung
 followed by the winner never bills the search twice; the hosted ledger receives it through the
-feature-probed `finish_attempt(web_search_requests=...)` keyword and prices it. The engine's local
+feature-probed `finish_attempt(web_search_requests=...)` keyword and prices it. Beside the count the
+same settlement carries `web_search_results` (the results the search returned) and, when the vendor
+reported it, `web_search_cost_nano_usd` (Exa's `costDollars.total`, parsed by the backend and
+discarded when missing, negative, non-finite or above $1); both land on the settled
+`GatewayUsage`, absent fields meaning unreported, so a host can measure its search expense. The engine's local
 SQLite ledger accepts the count and does not yet price it.

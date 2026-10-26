@@ -26,8 +26,10 @@ unambiguous, and declared model evidence. Opaque vendor identifiers map to deter
 W3C-shaped identifiers, so the canonical identity is stable while the source identity stays
 readable. Provider and model identity resolves only when the export declares both; a model named
 without a provider stays as `gen_ai.request.model` evidence and is never completed by inference.
-Tool results pair with tool calls by explicit call identifier, falling back to tool name and source
-order only when the export declares no identifier.
+Tool results pair with tool calls by explicit call identifier. When a vendor export declares no
+identifier, pairing by tool name requires exactly one outstanding call to that tool. Multiple
+outstanding calls make the result ambiguous: the trace is excluded with a normalization issue,
+and the export needs call identifiers before it can supply trustworthy action/reply evidence.
 
 A Python caller selects a file source by name through shared ingestion:
 

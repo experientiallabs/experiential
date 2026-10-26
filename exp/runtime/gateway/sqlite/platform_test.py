@@ -61,7 +61,8 @@ from exp.runtime.gateway import (
     UsageAttributionAuthority,
 )
 from exp.runtime.gateway.budgets import BudgetScope, BudgetScopeKind, SQLiteBudgetStore
-from exp.runtime.gateway.contracts import DirectTarget, ExecutionSnapshot
+from exp.runtime.gateway.contracts import DirectTarget
+from exp.runtime.gateway.execution_snapshot import ExecutionSnapshot
 from exp.runtime.gateway.ledger import SQLiteAttemptLedger
 from exp.runtime.gateway.snapshot_integrity import refuse_self_inconsistent_snapshot
 from exp.runtime.gateway.sqlite.platform import SQLiteGatewayPlatform

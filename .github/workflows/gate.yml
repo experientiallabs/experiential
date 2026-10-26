@@ -17,6 +17,23 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  dependency-audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Audit the committed Python and Rust lockfiles
+        env:
+          OSV_SCANNER_VERSION: "2.7.0"
+          OSV_SCANNER_SHA256: "160c6253e2922e9e0a6a9771c5c4c40a4b3c6090b34a3cdd5e80c96cc2e4218b"
+        run: |
+          curl -fsSL --proto '=https' --retry 3 -o "$RUNNER_TEMP/osv-scanner" \
+            "https://github.com/google/osv-scanner/releases/download/v${OSV_SCANNER_VERSION}/osv-scanner_linux_amd64"
+          echo "${OSV_SCANNER_SHA256}  $RUNNER_TEMP/osv-scanner" | sha256sum --check --strict -
+          chmod +x "$RUNNER_TEMP/osv-scanner"
+          "$RUNNER_TEMP/osv-scanner" scan source --config .gitlab/ci/osv-scanner.toml \
+            --lockfile uv.lock --lockfile exp/runtime/gateway/native/Cargo.lock
+
   gate:
     runs-on: ubuntu-latest
     env:
@@ -42,7 +59,7 @@ jobs:
         with:
           workspaces: exp/runtime/gateway/native
       - name: Install the project and its dev extras
-        run: uv sync --extra dev
+        run: uv sync --locked --extra dev
       - name: Crate changes require a crate version bump
         if: github.event_name == 'pull_request'
         env:
@@ -186,10 +203,15 @@ jobs:
         with:
           workspaces: exp/runtime/gateway/native
       - name: Install the project and its dev extras
-        run: uv sync --extra dev
+        run: uv sync --locked --extra dev
       - name: non-live tests
+        # The system-keychain case mocks subprocesses but still stats the real
+        # system path. Keep the other mocked trust-guard cases enabled.
+        # Match GitLab's terminal detection: Typer otherwise forces ANSI for
+        # GITHUB_ACTIONS even when CliRunner captures non-terminal output.
         run: >-
-          uv run pytest -n 4 --dist worksteal -q -k "not live"
+          env -u GITHUB_ACTIONS uv run pytest -n 4 --dist worksteal -q -k "not live"
+          --deselect='exp/runtime/capture/certificates_test.py::test_unsafe_default_keychain_never_installs_trust["/Library/Keychains/System.keychain"]'
           ${{ matrix.paths }}
           --ignore=exp/optimize/router/tests/composition_evidence_test.py
 
@@ -205,13 +227,14 @@ jobs:
         with:
           workspaces: exp/runtime/gateway/native
       - name: Install the minimum-version SDK without capture engine dependencies
-        run: uv sync --extra dev
+        run: uv sync --locked --extra dev
       - name: SDK and Capture command help remain available
         run: |
           uv run exp --help
           uv run exp capture --help
           uv run pytest -q exp/cli/app_test.py exp/cli/capture exp/runtime/capture \
-            exp/tests/release_test.py -k "not installed_wheel"
+            exp/tests/release_test.py -k "not installed_wheel" \
+            --deselect='exp/runtime/capture/certificates_test.py::test_unsafe_default_keychain_never_installs_trust["/Library/Keychains/System.keychain"]'
 
   darwin-scope:
     # The macOS evidence job is the most expensive check here (macOS bills 10x)
@@ -293,7 +316,7 @@ jobs:
       - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
       - name: Install the project and its dev extras
-        run: uv sync --extra dev
+        run: uv sync --locked --extra dev
       - name: Verify real Windows snapshot authority
         # These tests use built-in fixtures only. The suite conftest owns Unix PTY fixtures;
         # its provider-auth isolation is replaced by the empty step-local XDG_DATA_HOME.
@@ -350,9 +373,14 @@ jobs:
       - uses: astral-sh/setup-uv@v6
       - uses: dtolnay/rust-toolchain@stable
       - name: Install the project and its dev extras
-        run: uv sync --extra dev
+        run: uv sync --locked --extra dev
       - name: Capture selective TLS streaming and local redirector lifecycle
-        run: uv run pytest -q exp/runtime/capture exp/cli/capture
+        # Native certificate verification invokes macOS Security utilities. Keep
+        # this job independent of Keychain; OpenSSL verification runs on Linux.
+        run: >-
+          uv run pytest -q exp/runtime/capture exp/cli/capture
+          --deselect=exp/runtime/capture/certificates_test.py::test_real_tls_chains_enforce_exact_dns_and_deny_ip_scope
+          --deselect='exp/runtime/capture/certificates_test.py::test_unsafe_default_keychain_never_installs_trust["/Library/Keychains/System.keychain"]'
       - name: W16 router and bounded local-process evidence
         env:
           EXP_RELEASE_REVISION: ${{ github.sha }}

@@ -82,6 +82,7 @@ def _ranked_profile_indexes(
     # wins when a rung can — the drop is a last resort, not a peer of an exact
     # rung. Only if no rung honors it do the serve-with-drop rungs stand in.
     exact: list[int] = []
+    faithful: list[int] = []
     serviceable: list[int] = []
     thinking_kept: list[int] = []
     rejections: list[ProviderParameterError] = []
@@ -95,14 +96,19 @@ def _ranked_profile_indexes(
         keeps_thinking = not _substitutes_thinking_off(request, provider)
         if keeps_thinking:
             thinking_kept.append(index)
-        if (
-            keeps_thinking
-            and _honors_requested_sampling(request, provider)
-            and _carries_exposed_reasoning(profile, request)
-        ):
-            exact.append(index)
+        if keeps_thinking and _honors_requested_sampling(request, provider):
+            faithful.append(index)
+            if _carries_exposed_reasoning(profile, request):
+                exact.append(index)
     if exact:
-        return tuple(exact)
+        # Plaintext reasoning only RANKS a route: a rung that cannot replay it
+        # drops it per rung at encoding, so every faithful rung stays as a
+        # fallback behind the carrying rung (`plaintext_reasoning_lead_order`
+        # puts the carriers first). Narrowing to the carriers alone left a
+        # one-rung route that could not fail over when its only rung timed
+        # out (glm-5.3-flash, 2026-10-20). Sampling and thinking stay hard:
+        # the route's one shaped request would degrade them on every rung.
+        return tuple(faithful)
     # A rung that substitutes the caller's thinking config (an always-reasoning
     # model's stand-in for "off") never shares a route with one that dispatches
     # it verbatim: the route's one shaped request would carry the substitute
@@ -146,6 +152,35 @@ def _carries_exposed_reasoning(profile: GatewayWireProfile, request: GatewayRequ
         for message in request.messages
         for block in message.provider_reasoning
     )
+
+
+def plaintext_reasoning_lead_order(
+    profiles: Sequence[GatewayWireProfile],
+    request: GatewayRequest,
+    stage_indexes: Sequence[int],
+) -> tuple[int, ...]:
+    """Return the dispatch order that puts plaintext-reasoning carriers first.
+
+    A request replaying plaintext ``reasoning_content`` is best served by a
+    rung that forwards it; the others serve the turn by dropping it, so they
+    follow as fallbacks. The partition is stable and never crosses a model
+    stage boundary (``stage_indexes`` is each rung's stage, nondecreasing in
+    route order), so the result is always a valid route permutation.
+
+    Args:
+        profiles: Ordered wire profiles of the narrowed route.
+        request: The admitted request.
+        stage_indexes: Each rung's model-chain stage index, in route order.
+
+    Returns:
+        A permutation of ``range(len(profiles))``; the identity when the
+        request carries no plaintext reasoning or the route is not mixed.
+    """
+    carries = [_carries_exposed_reasoning(profile, request) for profile in profiles]
+    identity = tuple(range(len(profiles)))
+    if all(carries) or not any(carries):
+        return identity
+    return tuple(sorted(identity, key=lambda index: (stage_indexes[index], not carries[index])))
 
 
 def _substitutes_thinking_off(request: GatewayRequest, provider_request: GatewayRequest) -> bool:

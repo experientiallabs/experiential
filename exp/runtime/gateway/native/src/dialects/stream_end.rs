@@ -87,6 +87,10 @@ impl Normalizer {
             _ => {
                 self.log_stream_end("incomplete");
                 let mut events = Vec::new();
+                if self.dialect == Dialect::OpenAiCompatible {
+                    // Held content is released (or a DSML span parsed) first.
+                    events.extend(self.finish_dsml()?);
+                }
                 if self.dialect == Dialect::OpenAiResponses {
                     events.extend(
                         self.openai_close_unfinished_items(ProviderOutputItemStatus::Incomplete),

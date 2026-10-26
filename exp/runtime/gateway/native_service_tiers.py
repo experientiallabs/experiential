@@ -44,16 +44,32 @@ class SettlementKwarg(TypedDict, total=False):
     service_tier: GatewayServiceTierSettlement
 
 
+class TierSettlementInputs(TypedDict):
+    """One attempt's frozen tier admission, and whether our own server served it."""
+
+    service_tier: GatewayServiceTierAdmission | None
+    self_served: bool
+
+
 def admission_kwarg(tier: GatewayServiceTierAdmission | None) -> AdmissionKwarg:
     """Never send a new keyword to untiered ledger callers."""
     return {} if tier is None else {"service_tier": tier}
 
 
-def settlement_kwarg(tier: GatewayServiceTierAdmission | None, data: JsonObject) -> SettlementKwarg:
-    """Bind native evidence to the exact cards accepted for this physical attempt."""
+def settlement_kwarg(
+    tier: GatewayServiceTierAdmission | None, data: JsonObject, *, self_served: bool = False
+) -> SettlementKwarg:
+    """Bind native evidence to the exact cards accepted for this physical attempt.
+
+    A self-served attempt ran on our own server (a ``:fast`` request on a
+    self-hosted rung, class_throttles.tier_settlement), which reports no tier:
+    the admitted tier is ours to state, so absent evidence confirms it.
+    """
     if tier is None:
         return {}
     observation = TierObservation.model_validate(data.get("service_tier") or {})
+    if self_served and observation.resolution == "missing":
+        observation = TierObservation(served=tier.requested, resolution="confirmed")
     return {
         "service_tier": tier.settlement(
             served=observation.served, resolution=observation.resolution

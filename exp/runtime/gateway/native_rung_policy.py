@@ -23,20 +23,33 @@ import threading
 import time
 from collections.abc import Callable
 
+from exp.common.core.artifacts import JsonObject
 from exp.common.models.gateway_catalog import ExactModelDeployment
-from exp.runtime.gateway.contracts import GatewayEvent, GatewayFailure, GatewayFailureClass
+from exp.runtime.gateway.class_throttles import (
+    class_concurrency_cap,
+    fast_on_rung,
+    fast_reserve_slots,
+)
+from exp.runtime.gateway.contracts import (
+    GatewayEvent,
+    GatewayFailure,
+    GatewayFailureClass,
+    GatewayRequest,
+)
 from exp.runtime.gateway.health import DeploymentHealthKey, DeploymentHealthRegistry
-from exp.runtime.gateway.lane_saturation import priority_overflow_ceiling
+from exp.runtime.gateway.lane_saturation import failover_overflow_cap, priority_overflow_ceiling
 from exp.runtime.gateway.native_execution import (
     THROTTLE_BACKOFF,
     THROTTLE_FAILOVER_COLD,
     InflightRequest,
     ThrottleDisposition,
+    deployment_health_key,
     next_route_candidate,
     rung_load_key,
     throttle_disposition,
 )
 from exp.runtime.gateway.native_fallback_rules import route_fallback_rules
+from exp.runtime.gateway.native_settlement import settlement_rate_limit
 from exp.runtime.gateway.routing import GatewayRoute
 from exp.runtime.gateway.rung_admission import RungLoadRegistry, RungShed, RungShedReason
 from exp.runtime.gateway.sticky_affinity import StickySpillRegistry
@@ -53,6 +66,7 @@ def reserve_rung_slot(
     reserved_tokens: int,
     force: bool,
     rate_retry: bool = False,
+    failover_pass: bool = False,
 ) -> str | RungShed | None:
     """Reserve one policy-bounded slot on a rung, or report the shed.
 
@@ -65,6 +79,11 @@ def reserve_rung_slot(
             against the rung's token window when one is authored.
         force: Admit past soft policy limits when overflow is explicitly allowed.
         rate_retry: Skip only rate-window checks after scheduled backoff.
+        failover_pass: A forced pass of a FAILOVER (``failover_pass``): the
+            rung's bound, refusing or not, admits it while the rung holds
+            fewer than ``failover_overflow_cap(bound)`` such passes in flight,
+            so a request whose rung already failed is not ended by a sibling's
+            saturation bound, yet a dead lane cannot move its whole load here.
 
     Returns:
         An opaque reservation ticket, the shed disclosure, or ``None``
@@ -76,7 +95,9 @@ def reserve_rung_slot(
         or policy.requests_per_minute is not None
         or policy.tokens_per_minute is not None
     )
-    if not authored and loads.default_bound is None:
+    # A host class cap on a self-hosted rung (class_throttles); None elsewhere.
+    class_cap = class_concurrency_cap(entry.authorization, deployment)
+    if not authored and loads.default_bound is None and class_cap is None:
         return None
     # An unauthored bound falls back to the worker's default lane share.
     applies_default = policy is None or policy.concurrency_bound is None
@@ -88,7 +109,13 @@ def reserve_rung_slot(
     # The early threshold
     # only exists on affinity pools AND for requests that carry a fingerprint
     # (chat/Responses admission): a surface with no session concept
-    # (embeddings, images) must never be classed fresh wholesale.
+    # (embeddings, images) must never be classed fresh wholesale. A chat or
+    # Responses request from an organization with prompt caching off has no
+    # fingerprint and no cache to protect, so it is always a fresh session:
+    # turning caching off never buys the warm sessions' top slice.
+    caching_off = entry.authorization.prompt_caching_disabled and isinstance(
+        entry.request, GatewayRequest
+    )
     fresh_fraction = (
         policy.fresh_session_spill_fraction
         if policy is not None
@@ -96,10 +123,10 @@ def reserve_rung_slot(
             entry.route.snapshot.deployment_ids.index(deployment.deployment_id)
         ).failover_mode
         == "maximize_cache_affinity"
-        and entry.affinity_fingerprint is not None
+        and (entry.affinity_fingerprint is not None or caching_off)
         else None
     )
-    warm_session = True
+    warm_session = not caching_off
     if (
         fresh_fraction is not None
         and entry.affinity_fingerprint is not None
@@ -121,6 +148,11 @@ def reserve_rung_slot(
     tokens_per_minute = None if policy is None else policy.tokens_per_minute
     refusing = applies_default or (policy is not None and policy.saturation == "refuse")
     selected_first = entry.route.resolved_route_id is not None and entry.total_attempts == 0
+    # A :fast request on our GPU (class_throttles.fast_on_rung) takes the
+    # upper half of the bound and leaves everyone else the lower half, or, on
+    # a rung with an always-on reserve, the reserved slots stay its own.
+    fast = fast_on_rung(entry.authorization, deployment)
+    fast_reserve = fast_reserve_slots(deployment)
     priority = entry.authorization.priority_admission
     result = loads.reserve(
         rung_load_key(deployment),
@@ -140,7 +172,7 @@ def reserve_rung_slot(
         # hard for a free caller. A priority caller's shed overflows it
         # (lane_saturation.overflow_target), capped by its level; so does its
         # caller-selected first dial, which overflows even a soft bound.
-        hard_bound=refusing and not priority,
+        hard_bound=refusing and not priority and not failover_pass,
         overflow_ceiling=priority_overflow_ceiling(
             bound,
             priority,
@@ -149,9 +181,16 @@ def reserve_rung_slot(
             if policy is None
             else (policy.priority_overflow_paying, policy.priority_overflow_pro),
         )
-        if refusing or selected_first
+        if (refusing or selected_first) and not failover_pass
         else None,
         rate_retry=rate_retry,
+        class_cap=class_cap,
+        fast=fast,
+        fast_reserve=fast_reserve,
+        # A refusing lane's reserve is hard; an overflow lane's stays soft, so
+        # regular traffic past its share overflows as today (fast first claim).
+        fast_reserve_hard=refusing,
+        failover_cap=failover_overflow_cap(bound) if failover_pass else None,
     )
     if isinstance(result, RungShed) and applies_default and result.reason == "queue_bound":
         result = dataclasses.replace(result, default_bound=True)
@@ -516,3 +555,101 @@ def record_cache_fraction(
         cached_tokens=0 if cached is None else cached,
         input_tokens=usage.input_tokens,
     )
+
+
+def record_attempt_health(
+    health: DeploymentHealthRegistry,
+    loads: RungLoadRegistry,
+    entry: InflightRequest,
+    attempt_id: str,
+    *,
+    opened: bool = False,
+    failure: GatewayFailure | None,
+    settlement: JsonObject | None = None,
+) -> None:
+    """Apply one settled attempt's outcome to the deployment circuits and lane ejection.
+
+    Restore successful opens; exhausted provider windows throttle until reset.
+
+    Args:
+        health: The worker's circuit, throttle and lane-ejection registry.
+        loads: The worker's per-rung load registry (slot release, learned ceiling).
+        entry: The owning in-flight request.
+        attempt_id: The settled attempt.
+        opened: Whether the provider dispatch opened successfully.
+        failure: The terminal failure, or ``None`` for a success.
+        settlement: The settlement payload carrying the harvested rate-limit headers.
+    """
+    # Slot and health releases are idempotent across settlement, abandon, and sweep.
+    loads.release_attempt(attempt_id)
+    depth = entry.attempt_depths.get(attempt_id)
+    if depth is None:
+        return
+    deployment = entry.route.deployments[depth]
+    key = deployment_health_key(entry.authorization, deployment)
+    if opened:
+        health.dispatch_opened(key)
+    if failure is not None:
+        policy = deployment.gateway.dispatch
+        if failure.failure_class == GatewayFailureClass.THROTTLED and (
+            policy is not None
+            and (
+                policy.concurrency_bound is not None
+                or policy.requests_per_minute is not None
+                or policy.tokens_per_minute is not None
+            )
+        ):
+            # Clamp the learned ceiling to the observed rate; recovery creep
+            # rediscovers headroom. Only admission-participating rungs reserve
+            # through the registry, providing a real window and enforcing the ceiling.
+            loads.record_throttle(rung_load_key(deployment))
+        health.failed(key, failure)
+    else:
+        health.succeeded(key)
+    exhausted = settlement_rate_limit(settlement).exhausted_reset_after_seconds
+    if exhausted is not None:
+        health.exhausted(key, exhausted)
+
+
+LANE_EJECTED = "lane_ejected"
+"""Dispatch reason of an attempt dialed in place of a rung this worker ejected."""
+
+
+def ejection_disclosure(
+    health: DeploymentHealthRegistry,
+    keys: tuple[DeploymentHealthKey, ...],
+    route: GatewayRoute,
+    ladder: tuple[int, ...],
+    candidate: int,
+    disclosed: tuple[str | None, ExactModelDeployment | None],
+) -> tuple[str | None, ExactModelDeployment | None]:
+    """Name the ejected lane a first dial or failover was ordered past, if any.
+
+    The claim walk orders an ejected lane last (``DeploymentHealthRegistry.order``),
+    so an ejected depth earlier in ``ladder`` than ``candidate`` is the rung
+    this dispatch replaced. It is disclosed as ``dispatch_reason =
+    lane_ejected`` with that rung as the ``preferred_deployment``, exactly like
+    a policy shed, so the ledger tells a worker's dead-lane ejection apart from
+    a platform-side lane hold. A reason another rule already named (a shed,
+    an overflow, a throttle backoff) wins; only an undisclosed attempt or the
+    affinity pool's generic ``rung_dead`` takes the ejection's name.
+
+    Args:
+        health: The worker's circuit and lane-ejection registry.
+        keys: One health key per route depth.
+        route: The request's admitted route.
+        ladder: The depths this walk could claim, in route order.
+        candidate: The depth about to dispatch.
+        disclosed: The ``(dispatch_reason, preferred_deployment)`` already chosen.
+
+    Returns:
+        The disclosure to record.
+    """
+    if disclosed[0] not in (None, "rung_dead"):
+        return disclosed
+    for depth in ladder:
+        if depth >= candidate:
+            break
+        if health.lane_ejected(keys[depth]):
+            return LANE_EJECTED, route.deployments[depth]
+    return disclosed

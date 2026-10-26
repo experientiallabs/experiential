@@ -190,7 +190,7 @@ pub(crate) async fn messages(
         METRICS.record_escalation(classify_escalation(reason.as_str().unwrap_or_default()));
         // No ledger row exists; startup validation guarantees native
         // servability, so an escalation disposition fails closed here.
-        return messages_error_response(&escalation_error());
+        return messages_error_response(&escalation_error(reason.as_str().unwrap_or_default()));
     }
     let mut admission: Admission = match serde_json::from_value(admission_value.clone()) {
         Ok(admission) => admission,
@@ -201,9 +201,9 @@ pub(crate) async fn messages(
         }
     };
     let mut guard = new_guard(&state, admission.request_id.clone(), started);
-    guard.record_web_search_requests(admission.web_search_requests());
+    guard.record_web_search(admission.web_search_meter());
 
-    let permit = match acquire_permit(&state, &mut guard, deadline).await {
+    let permit = match acquire_permit(&state, &mut guard, deadline, admission.class).await {
         Ok(permit) => permit,
         Err(response) => return *response,
     };
@@ -218,14 +218,14 @@ pub(crate) async fn messages(
         route: &admission.route,
         policy: admission.policy(),
         deadline,
-        pre_first_byte_deadline: crate::server::pre_first_byte_deadline(&state, deadline),
+        pre_first_byte_deadline: state.first_byte_budget(deadline, &admission.route, &body_text),
         time_to_first_byte: state.time_to_first_byte,
         time_to_first_byte_slope_seconds_per_million_input_tokens: state
             .time_to_first_byte_slope_seconds_per_million_input_tokens,
         time_to_first_token: state.time_to_first_token,
-        // Bytes over four approximates input tokens; a timeout heuristic
-        // only, never a billing quantity.
-        approximate_input_tokens: (body_text.len() as f64) / 4.0,
+        // Bytes over four, base64 media left out: a timeout heuristic only,
+        // never a billing quantity (shared with the budget floor).
+        approximate_input_tokens: crate::waterfall::approximate_input_tokens(&body_text),
         chat_logprobs: false,
         // A guardrail may rewrite the output the probabilities describe; it is
         // checked first so a guarded request never reserves a sidecar.
@@ -661,7 +661,7 @@ async fn stream_messages(
         let _permit = permit;
         let mut guard = guard;
         let mut committed = committed;
-        let mut delivery = Delivery::new(sender.clone(), false);
+        let mut delivery = Delivery::new(sender.clone(), false).paced(committed.pace);
         let mut encoder =
             MessagesSseEncoder::new_with_ignored(&request_id, &alias, ignored_parameters);
         configure_messages_encoder_for(&mut encoder, &admission);
@@ -714,12 +714,10 @@ async fn stream_messages(
         }
 
         let mut prefix: std::collections::VecDeque<Event> = committed.prefix.drain(..).collect();
+        let mut send_deadline = deadline;
         loop {
-            if crate::relay::remaining(deadline).is_zero() {
-                committed.relay.close_transport();
-                log_stream_exit(&request_id, "delivery_deadline");
-                guard.settle_cancelled(usage.as_ref(), &tool_names).await;
-                return;
+            if committed.relay.deadline_cut(deadline, &mut send_deadline) {
+                fail_stream!(crate::relay::deadline_while_generating())
             }
             let event = if let Some(event) = prefix.pop_front() {
                 event
@@ -831,7 +829,7 @@ async fn stream_messages(
                     return;
                 }
             }
-            for outward in outward_events {
+            for outward in delivery.pace(outward_events, deadline).await {
                 let encoded = match encoder.feed(&outward) {
                     Ok(encoded) => encoded,
                     Err(_) => {
@@ -848,7 +846,7 @@ async fn stream_messages(
                     }
                 };
                 for data in encoded {
-                    if !delivery.send(deadline, Bytes::from(data)).await {
+                    if !delivery.send(send_deadline, Bytes::from(data)).await {
                         committed.relay.close_transport();
                         log_stream_exit(&request_id, "subscriber_closed_or_delivery_deadline");
                         settle_stream_end(
@@ -900,6 +898,7 @@ async fn emit_messages_failure(
     let frames = encoder
         .feed(&Event::Failed(failure.clone()))
         .unwrap_or_default();
+    let deadline = crate::respond::terminal_send_deadline(deadline);
     for frame in frames {
         if !send_bounded(sender, deadline, Bytes::from(frame)).await {
             return;

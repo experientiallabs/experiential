@@ -30,10 +30,11 @@ HAND_AUTHORED_SUFFIXES = {
     ".yaml",
     ".yml",
 }
-ALLOWED_TOP_DIRS = {".claude", ".github", "assets", "docs", "exp"}
+ALLOWED_TOP_DIRS = {".claude", ".github", ".gitlab", "assets", "docs", "exp"}
 ALLOWED_TOP_FILES = {
     ".env.example",
     ".gitignore",
+    ".gitlab-ci.yml",
     "AGENTS.md",
     "CLAUDE.md",
     "LICENSE",
@@ -154,11 +155,11 @@ def test_no_local_state_or_cache_is_tracked() -> None:
 
 
 def test_native_crate_versions_stay_in_lockstep() -> None:
-    """The extension's two manifests and the flagship dependency floor agree.
+    """The extension's two manifests and the flagship's exact native pin agree.
 
     The crate version feeds ``exp_gateway_native.__version__`` from Cargo and
-    the published wheel from its pyproject; the flagship's dependency floor is
-    what forces a fresh wheel onto users. If any of the three drift, a release
+    the published wheel from its pyproject; the flagship's exact pin is what
+    puts that wheel, and only that wheel, under users. If any of the three drift, a release
     can pair new python code with a stale compiled engine (or fail to publish
     at all, since PyPI rejects re-uploads of an existing version's files).
     """
@@ -173,16 +174,16 @@ def test_native_crate_versions_stay_in_lockstep() -> None:
         wheel_version = tomllib.load(handle)["project"]["version"]
     with (REPO_ROOT / "pyproject.toml").open("rb") as handle:
         dependencies = tomllib.load(handle)["project"]["dependencies"]
-    floor = next(
+    pin = next(
         requirement for requirement in dependencies if requirement.startswith("exp-gateway-native")
     )
-    _assert_native_version_contract(cargo_version.group(1), wheel_version, floor)
+    _assert_native_version_contract(cargo_version.group(1), wheel_version, pin)
 
 
 def _assert_native_version_contract(
     cargo_version: str, wheel_version: str, requirement: str
 ) -> None:
-    """Require equivalent package versions and the release's intended native pin.
+    """Require equivalent package versions and an exact pin on that native version.
 
     Args:
         cargo_version: SemVer version declared by the compiled crate.
@@ -194,25 +195,22 @@ def _assert_native_version_contract(
     """
     version = Version(wheel_version)
     assert Version(cargo_version) == version, "native manifest versions differ"
-    if version.is_prerelease:
-        expected = f"exp-gateway-native=={version}"
-    else:
-        ceiling = f"{version.major}.{version.minor + 1}"
-        expected = f"exp-gateway-native>={version},<{ceiling}"
-    assert requirement == expected, "native dependency does not match the release version"
+    assert requirement == f"exp-gateway-native=={version}", (
+        "native dependency does not match the release version"
+    )
 
 
 @pytest.mark.parametrize(
     ("cargo_version", "wheel_version", "requirement"),
     (
-        ("0.3.82", "0.3.82", "exp-gateway-native>=0.3.82,<0.4"),
+        ("0.3.82", "0.3.82", "exp-gateway-native==0.3.82"),
         ("0.3.82-rc.1", "0.3.82rc1", "exp-gateway-native==0.3.82rc1"),
     ),
 )
-def test_native_version_contract_accepts_stable_and_pinned_prerelease(
+def test_native_version_contract_accepts_exact_stable_and_prerelease_pins(
     cargo_version: str, wheel_version: str, requirement: str
 ) -> None:
-    """Stable floors and equivalent pinned prerelease versions satisfy the guard.
+    """Exact pins on the equivalent stable or prerelease version satisfy the guard.
 
     Args:
         cargo_version: Crate version under test.
@@ -225,17 +223,18 @@ def test_native_version_contract_accepts_stable_and_pinned_prerelease(
 @pytest.mark.parametrize(
     ("cargo_version", "wheel_version", "requirement"),
     (
-        ("0.3.81", "0.3.82", "exp-gateway-native>=0.3.82,<0.4"),
-        ("0.3.82", "0.3.82", "exp-gateway-native>=0.3.81,<0.4"),
+        ("0.3.81", "0.3.82", "exp-gateway-native==0.3.82"),
+        ("0.3.82", "0.3.82", "exp-gateway-native==0.3.81"),
+        ("0.3.82", "0.3.82", "exp-gateway-native>=0.3.82,<0.4"),
         ("0.3.82-rc.1", "0.3.82rc2", "exp-gateway-native==0.3.82rc2"),
         ("0.3.82-rc.1", "0.3.82rc1", "exp-gateway-native>=0.3.82rc1,<0.4"),
         ("0.3.82-rc.1", "0.3.82rc1", "exp-gateway-native==0.3.82"),
     ),
 )
-def test_native_version_contract_rejects_drift_and_unpinned_prerelease(
+def test_native_version_contract_rejects_drift_and_ranges(
     cargo_version: str, wheel_version: str, requirement: str
 ) -> None:
-    """Manifest drift and a prerelease's floating native dependency fail closed.
+    """Manifest drift, a stale pin and a native version range all fail closed.
 
     Args:
         cargo_version: Crate version under test.

@@ -6,6 +6,8 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use tokio::sync::mpsc;
 
+use crate::events::Event;
+use crate::output_pacing::{event_output_tokens, OutputPacer};
 use crate::respond::send_bounded;
 
 const HEARTBEAT_PERIOD: Duration = Duration::from_secs(1);
@@ -17,6 +19,7 @@ pub(crate) struct Delivery {
     sender: mpsc::Sender<Result<Bytes, std::io::Error>>,
     keyed: bool,
     last_public: Instant,
+    pacer: Option<OutputPacer>,
 }
 
 impl Delivery {
@@ -25,7 +28,32 @@ impl Delivery {
             sender,
             keyed,
             last_public: Instant::now(),
+            pacer: None,
         }
+    }
+
+    /// Pace released output at the committed attempt's rate, if any (set
+    /// only on a self-hosted rung under the host's class throttle).
+    pub(crate) fn paced(mut self, tokens_per_second: Option<f64>) -> Self {
+        self.pacer = OutputPacer::new(tokens_per_second);
+        self
+    }
+
+    /// Hold one batch of released events until the pace allows it, then hand
+    /// it back. Unpaced streams return at once without awaiting. The wait
+    /// keeps SSE heartbeats flowing, never outlives `deadline`, and ends
+    /// early when an unkeyed subscriber leaves (the next send reports it).
+    pub(crate) async fn pace(&mut self, events: Vec<Event>, deadline: Instant) -> Vec<Event> {
+        let Some(pacer) = self.pacer.as_mut() else {
+            return events;
+        };
+        let tokens = events.iter().map(event_output_tokens).sum();
+        let wait = pacer.delay(tokens, Instant::now());
+        if !wait.is_zero() {
+            let until = (Instant::now() + wait).min(deadline);
+            let _ = self.next(tokio::time::sleep_until(until.into())).await;
+        }
+        events
     }
 
     /// Wait on ONE provider future. Keepalives never recreate that future,
@@ -156,6 +184,51 @@ mod tests {
         .expect("overflowed owner stops on loss")
         .is_none());
         assert_eq!(capture.capacity(), 0);
+    }
+
+    #[tokio::test]
+    async fn unpaced_delivery_returns_events_without_waiting() {
+        let (sender, _receiver) = mpsc::channel(4);
+        let mut delivery = Delivery::new(sender, false);
+        let events = vec![Event::TextDelta("x".repeat(40_000))];
+        let started = Instant::now();
+        let released = tokio::time::timeout(
+            Duration::from_millis(50),
+            delivery.pace(events, Instant::now() + Duration::from_secs(60)),
+        )
+        .await
+        .expect("an unpaced stream never waits");
+        assert_eq!(released.len(), 1);
+        assert!(started.elapsed() < Duration::from_millis(50));
+    }
+
+    #[tokio::test]
+    async fn paced_delivery_holds_output_to_the_rate_and_the_deadline() {
+        let (sender, _receiver) = mpsc::channel(8);
+        let mut delivery = Delivery::new(sender, false);
+        delivery.pacer = OutputPacer::new(Some(100.0));
+        let far = Instant::now() + Duration::from_secs(60);
+        let started = Instant::now();
+        // 400 bytes = 100 tokens: the full one-second burst, released at once.
+        delivery
+            .pace(vec![Event::TextDelta("a".repeat(400))], far)
+            .await;
+        assert!(started.elapsed() < Duration::from_millis(50));
+        // 20 more tokens owe 200 ms at 100 tokens/second.
+        let before = Instant::now();
+        delivery
+            .pace(vec![Event::TextDelta("a".repeat(80))], far)
+            .await;
+        let waited = before.elapsed();
+        assert!(waited >= Duration::from_millis(190), "{waited:?}");
+        assert!(waited < Duration::from_millis(600), "{waited:?}");
+        // A 10-second debt ends at a 150 ms deadline instead.
+        let before = Instant::now();
+        let near = before + Duration::from_millis(150);
+        delivery
+            .pace(vec![Event::TextDelta("a".repeat(4_000))], near)
+            .await;
+        assert!(before.elapsed() < Duration::from_millis(600));
     }
 
     #[tokio::test]

@@ -24,6 +24,8 @@ struct Tap {
     finished: bool,
     permit: Option<OwnedSemaphorePermit>,
     discarded: Arc<AtomicBool>,
+    /// Bytes past the in-memory window, queued to the spill writer.
+    stream: Option<super::spill::SpillStream>,
 }
 
 struct BodyCharge {
@@ -43,6 +45,7 @@ impl Drop for BodyCharge {
 pub(super) struct WireResponse {
     pub(super) relay: Option<super::relay::Relay>,
     bytes: Vec<u8>,
+    spilled: Option<super::spill::SpillFile>,
     sse: bool,
     status: u16,
     truncated: bool,
@@ -62,6 +65,16 @@ impl WireResponse {
     }
 
     pub(super) fn decode(self) -> Option<CapturedResponse> {
+        if let Some(file) = self.spilled {
+            // The destination reads the file into a split record; nothing is decoded here.
+            return Some(CapturedResponse::Spilled(super::split::SpilledResponse {
+                status: self.status,
+                sse: self.sse,
+                truncated: self.truncated,
+                client_disconnected: self.disconnected,
+                file,
+            }));
+        }
         if self.sse {
             let (mut frames, number_sources) = data_frames_with_sources(&self.bytes);
             let mut truncated = self.truncated;
@@ -129,8 +142,37 @@ impl WireResponse {
 }
 
 impl Tap {
-    fn push(&mut self, chunk: &[u8]) {
+    /// Move the in-memory prefix and everything after it to the spill writer.
+    /// The relay only queues reference-counted chunks; it never writes or waits.
+    fn start_spill(&mut self) -> bool {
+        let Some(store) = self.collector.spill().cloned() else {
+            return false;
+        };
+        let Some(mut stream) = store.open_stream() else {
+            return false;
+        };
+        let prefix = std::mem::take(&mut self.bytes);
+        self.collector
+            .release_body(std::mem::take(&mut self.charged));
+        let accepted = prefix.is_empty() || stream.push(bytes::Bytes::from(prefix));
+        self.stream = Some(stream);
+        accepted
+    }
+
+    fn push(&mut self, chunk: &bytes::Bytes) {
         if self.truncated {
+            return;
+        }
+        if let Some(stream) = self.stream.as_mut() {
+            // A discarded response (a bring-your-own-key lane) is never kept;
+            // stop writing it and drop what reached the disk.
+            if self.discarded.load(Ordering::Acquire) {
+                self.stream = None;
+                self.truncated = true;
+            } else if !stream.push(chunk.clone()) {
+                // The file keeps everything queued before the refusal.
+                self.truncated = true;
+            }
             return;
         }
         let Some(required) = self.bytes.len().checked_add(chunk.len()) else {
@@ -139,14 +181,23 @@ impl Tap {
         };
         let maximum = self.collector.config.maximum_response_bytes;
         if required > maximum {
-            self.truncated = true;
+            if self.start_spill() {
+                self.push(chunk);
+            } else {
+                self.truncated = true;
+            }
             return;
         }
         if required > self.bytes.capacity() {
             let target = required.saturating_add(4095).min(maximum);
             let extra = target - self.bytes.capacity();
             if !self.collector.reserve_body(extra) {
-                self.truncated = true;
+                // Memory is full of other captures: this one continues on disk.
+                if self.start_spill() {
+                    self.push(chunk);
+                } else {
+                    self.truncated = true;
+                }
                 return;
             }
             self.charged += extra;
@@ -186,11 +237,17 @@ impl Tap {
         let wire = WireResponse {
             relay: None,
             bytes: std::mem::take(&mut self.bytes),
+            spilled: self.stream.take().map(super::spill::SpillStream::finish),
             sse: self.sse,
             status: self.status,
             truncated: self.truncated,
             disconnected,
-            maximum_bytes: self.collector.config.maximum_response_bytes,
+            // A split record carries a decoded body of any size; never halve frames.
+            maximum_bytes: if self.collector.spill().is_some() {
+                usize::MAX
+            } else {
+                self.collector.config.maximum_response_bytes
+            },
             _charge: BodyCharge {
                 collector: self.collector.clone(),
                 bytes: std::mem::take(&mut self.charged),
@@ -260,11 +317,14 @@ pub(crate) fn capture_response(
         finished: false,
         permit: None,
         discarded,
+        stream: None,
     };
     let stream = futures_util::stream::unfold(
         (body.into_data_stream(), tap, 0u64),
         move |(mut body, mut tap, mut sent)| async move {
-            if tap.permit.is_none() && !tap.finished {
+            // With spill the window is charged as it fills and overflow goes
+            // to disk, so the relay never waits for capture memory.
+            if tap.permit.is_none() && !tap.finished && tap.collector.spill().is_none() {
                 tap.permit = tap.collector.body_permit().await;
             }
             match body.next().await {
@@ -425,3 +485,7 @@ fn normalize(value: &mut Value) {
 #[cfg(test)]
 #[path = "response_test.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "response_spill_test.rs"]
+mod spill_tests;

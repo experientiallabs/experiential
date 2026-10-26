@@ -81,6 +81,11 @@ def validate_continuation(project: ProjectStore, prepared: PreparedModelEvaluati
         )
     ):
         raise ValueError("continuation agent, judge or redaction settings changed")
+    if parent.memory != prepared.memory:
+        raise ValueError(
+            "continuation must read the parent's simulator memory; start a new evaluation "
+            "to use the latest learned memory"
+        )
 
 
 def _verify_pointer(project: ProjectStore, pointer: ArtifactInput, kind: str) -> None:

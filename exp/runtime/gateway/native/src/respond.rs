@@ -3,7 +3,7 @@
 //! keyed-replay response materialization and capture, and the bounded SSE
 //! delivery tail with its terminal settlement rules.
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use axum::body::Body;
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
@@ -64,6 +64,7 @@ pub(crate) async fn emit_responses_failure(
     let frames = encoder
         .feed(&Event::Failed(failure.clone()))
         .unwrap_or_default();
+    let deadline = terminal_send_deadline(deadline);
     for frame in frames {
         if !send_bounded(sender, deadline, Bytes::from(frame)).await {
             return;
@@ -113,10 +114,35 @@ pub(crate) fn unknown_route_error() -> PublicError {
     )
 }
 
-/// The answer to an escalation disposition: startup validation guarantees
-/// every granted alias is natively servable, so reaching this is an internal
-/// error rather than a degraded route.
-pub(crate) fn escalation_error() -> PublicError {
+/// The control plane's escalation reason when every certified deployment of
+/// the route was unavailable at admission (dead connections, a catalog swap
+/// mid-request): a transient routing state, not a servability bug.
+pub(crate) const UNAVAILABLE_AT_ADMISSION: &str =
+    "every certified deployment was unavailable at admission";
+
+/// Seconds a caller should wait before retrying a route unavailable at admission.
+const UNAVAILABLE_RETRY_AFTER_SECONDS: u32 = 2;
+
+/// The answer to an escalation disposition.
+///
+/// A route whose every deployment was unavailable at admission answers the
+/// retryable 503 `unavailable_route` (the Python boundary's routing answer),
+/// so SDKs retry it instead of surfacing an anonymous 500 (2026-10-18: a
+/// paying customer's gemini-3.1-flash-lite traffic took these as 500s every
+/// few minutes). Every other reason stays an internal error: startup
+/// validation guarantees every granted alias is natively servable.
+pub(crate) fn escalation_error(reason: &str) -> PublicError {
+    if reason == UNAVAILABLE_AT_ADMISSION {
+        let mut error = PublicError::new(
+            503,
+            "unavailable_route",
+            "The authorized model route is unavailable. Retry after a short delay; \
+             if this persists, ask the gateway operator to check the alias deployments.",
+            "api_error",
+        );
+        error.retry_after_seconds = Some(UNAVAILABLE_RETRY_AFTER_SECONDS);
+        return error;
+    }
     PublicError::new(
         500,
         "internal_error",
@@ -305,6 +331,19 @@ fn capture_frame_bounded(
     true
 }
 
+/// How long a stream's terminal frames (its failure event, the done
+/// sentinel) may still take to reach a connected caller once the request
+/// deadline itself has run out. Without it the frame that names a deadline
+/// cut is refused by the same deadline, and the caller reads a truncated
+/// answer as a clean end of stream.
+pub(crate) const TERMINAL_FRAME_GRACE: Duration = Duration::from_secs(5);
+
+/// The send bound for a stream's terminal frames: the request deadline, or
+/// a short grace past it when it has already run out.
+pub(crate) fn terminal_send_deadline(deadline: Instant) -> Instant {
+    deadline.max(Instant::now() + TERMINAL_FRAME_GRACE)
+}
+
 /// Deliver one public frame bounded by the request deadline, so a connected
 /// client that stops reading cannot pin the admission permit and the upstream
 /// connection forever. `false` means the client is gone or out of time.
@@ -446,6 +485,7 @@ pub(crate) async fn finish_stream_terminal(
             return;
         }
     }
+    let deadline = terminal_send_deadline(deadline);
     for data in frames {
         if !send_bounded(sender, deadline, data).await {
             log_stream_exit(request_id, "terminal_delivery_closed_or_deadline");
@@ -457,6 +497,38 @@ pub(crate) async fn finish_stream_terminal(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_route_unavailable_at_admission_escalates_as_a_retryable_503() {
+        let error = escalation_error(UNAVAILABLE_AT_ADMISSION);
+        assert_eq!(error.status_code, 503);
+        assert_eq!(error.code, "unavailable_route");
+        assert_eq!(error.retry_after_seconds, Some(2));
+        let response = error_response(&error);
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok()),
+            Some("2")
+        );
+    }
+
+    #[test]
+    fn every_other_escalation_reason_stays_an_internal_error() {
+        for reason in [
+            "host policy does not permit native execution of this route",
+            "no native dialect serves this provider",
+            "",
+            "every certified deployment was unavailable at admission (extra)",
+        ] {
+            let error = escalation_error(reason);
+            assert_eq!(error.status_code, 500, "{reason}");
+            assert_eq!(error.code, "internal_error");
+            assert_eq!(error.retry_after_seconds, None);
+        }
+    }
 
     #[test]
     fn only_certified_429_responses_publish_the_admission_marker() {

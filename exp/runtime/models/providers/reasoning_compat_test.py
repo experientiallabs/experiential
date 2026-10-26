@@ -22,6 +22,7 @@ from exp.runtime.models.providers.reasoning_compat import (
     anthropic_adaptive_only_thinking,
     anthropic_reasoning_effort,
     default_reasoning_effort,
+    gemini_none_rides_minimal,
     gemini_thinking_level,
     openai_reasoning_effort,
     require_sampling_reasoning_compatibility,
@@ -478,10 +479,22 @@ def test_gemini_thinking_levels_follow_exact_model_tables() -> None:
     with pytest.raises(UnsupportedReasoningEffortError):
         gemini_thinking_level("gemini-3.1-flash-lite-image", "low")
     assert gemini_thinking_level("gemini-3.6-flash", "minimal") == "minimal"
+    # gemini-3.8-flash: low, medium and high only (live 2026-10-20).
+    assert gemini_thinking_level("gemini-3.8-flash", "low") == "low"
+    assert gemini_thinking_level("gemini-3.8-flash", "medium") == "medium"
+    for refused in ("none", "minimal", "xhigh"):
+        with pytest.raises(UnsupportedReasoningEffortError):
+            gemini_thinking_level("gemini-3.8-flash", refused)
     with pytest.raises(UnsupportedReasoningEffortError):
         gemini_thinking_level("gemini-2.5-pro", "minimal")
     with pytest.raises(UnsupportedReasoningEffortError):
         gemini_thinking_level("gemini-3.99-unknown", "low")
+    assert gemini_thinking_level("gemini-4-argon", "none") == "none"
+    assert gemini_thinking_level("models/gemini-4-argon", "medium") == "medium"
+    with pytest.raises(UnsupportedReasoningEffortError):
+        gemini_thinking_level("gemini-4-argon", "minimal")
+    with pytest.raises(UnsupportedReasoningEffortError):
+        gemini_thinking_level("gemini-4-argon", "xhigh")
     assert (
         gemini_thinking_level(
             "publishers/google/models/gemini-2.5-pro",
@@ -630,6 +643,27 @@ def test_exact_effort_support_covers_each_reasoning_wire_family() -> None:
         "low",
         "high",
     )
+    for gemini_38_flash in (
+        "gemini-3.8-flash",
+        "models/gemini-3.8-flash",
+        "publishers/google/models/gemini-3.8-flash",
+    ):
+        assert supported_reasoning_efforts(gemini_38_flash, "gemini_thinking") == (
+            "low",
+            "medium",
+            "high",
+        )
+    assert supported_reasoning_efforts("google/gemini-3.8-flash", "reasoning") == (
+        "low",
+        "medium",
+        "high",
+    )
+    assert supported_reasoning_efforts("gemini-4-argon", "gemini_thinking") == (
+        "none",
+        "low",
+        "medium",
+        "high",
+    )
     assert supported_reasoning_efforts("openai/gpt-5-pro", "reasoning") == ("high",)
     assert supported_reasoning_efforts("anthropic/claude-opus-5", "reasoning") == (
         "low",
@@ -661,6 +695,7 @@ def test_default_effort_is_always_valid_for_the_exact_model() -> None:
     assert default_reasoning_effort("gpt-5.6-sol", "openai_responses") == "medium"
     assert default_reasoning_effort("gpt-5-pro", "openai_responses") == "high"
     assert default_reasoning_effort("gemini-3-pro-preview", "gemini_thinking") == "high"
+    assert default_reasoning_effort("gemini-4-argon", "gemini_thinking") == "medium"
     assert default_reasoning_effort("vendor/reasoner", "reasoning") == "medium"
 
 
@@ -735,3 +770,28 @@ def test_all_always_thinking_route_keeps_every_rung_for_thinking_off() -> None:
     public, provider = route_generation_parameter_requests(profiles, request)
     assert provider.provider_thinking_config == {"type": "adaptive", "display": "omitted"}
     assert "thinking.type->adaptive" in public.ignored_parameters
+
+
+def test_only_gemini_3_flash_families_with_minimal_ride_it_for_none() -> None:
+    """``none`` rides MINIMAL only where the exact ladder has minimal and no off level."""
+    for model_id in (
+        "gemini-3.1-flash-lite",
+        "gemini-3.6-flash",
+        "gemini-3-flash-preview",
+        "models/gemini-3.5-flash",
+        "publishers/google/models/gemini-3.5-flash-lite",
+        "google/gemini-3.1-flash-lite",
+    ):
+        assert gemini_none_rides_minimal(model_id), model_id
+    for model_id in (
+        # Flash generations that refuse MINIMAL by name.
+        "gemini-3.7-flash",
+        "gemini-3.8-flash",
+        # Not flash, or a real off level of their own.
+        "gemini-3-pro-preview",
+        "gemini-3.1-pro-preview",
+        "gemini-2.5-flash",
+        "gemini-4-argon",
+        "gemini-3.99-flash-unknown",
+    ):
+        assert not gemini_none_rides_minimal(model_id), model_id

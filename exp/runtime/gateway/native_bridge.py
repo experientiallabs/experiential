@@ -10,6 +10,7 @@ from collections.abc import Callable
 from exp.common.core.artifacts import JsonObject
 from exp.common.models import BillingSource
 from exp.runtime.gateway.attempt_tokens import counted_input_tokens
+from exp.runtime.gateway.class_throttles import admission_priority_class, tier_authorization
 from exp.runtime.gateway.client_apps import with_client_identity
 from exp.runtime.gateway.contracts import (
     AuthorizationSnapshot,
@@ -79,6 +80,7 @@ from exp.runtime.gateway.native_continuation import (
     select_bound_continuation_route as _select_bound_continuation_route,
 )
 from exp.runtime.gateway.native_count_tokens import NativeCountTokensMixin
+from exp.runtime.gateway.native_dead_rungs import UNAVAILABLE_AT_ADMISSION, escalation_failure
 from exp.runtime.gateway.native_decode_boundary import NativeDecodeMixin
 from exp.runtime.gateway.native_dispatch_signing import NativeDispatchSigningMixin
 from exp.runtime.gateway.native_effects import admission_without_effects
@@ -122,6 +124,9 @@ from exp.runtime.gateway.native_settlement import (
     optional_text,
 )
 from exp.runtime.gateway.native_tool_search import NativeToolSearchMixin
+from exp.runtime.gateway.native_videos import NativeVideosMixin
+from exp.runtime.gateway.provider_preferences import reorder_admitted_route as _reorder
+from exp.runtime.gateway.provider_preferences import route_by_provider_preferences
 from exp.runtime.gateway.reasoning_carrier import (
     ReasoningCarrierAuthority,
 )
@@ -167,6 +172,7 @@ class NativeControlPlane(
     NativeEmbeddingsMixin,
     NativeImagesMixin,
     NativeAudioMixin,
+    NativeVideosMixin,
     NativeObservabilityMixin,
 ):
     """Authority and accounting callbacks for the native data plane.
@@ -229,8 +235,7 @@ class NativeControlPlane(
         self._automatic_cache = automatic_cache
         self._explicit_cache = validate_cache_hosts(explicit_cache, automatic_cache)
         self._capture = capture
-        # The optional batch lane: hosts without it leave every batch route
-        # answering the uniform not-enabled error below.
+        # Optional batch lane; without it every batch route answers not-enabled.
         self._batches = getattr(components, "batches", None)
         # Hosted compositions have no local group-commit writer; they settle
         # directly through their own synchronous ledger.
@@ -261,6 +266,7 @@ class NativeControlPlane(
             recovery_host=recovery_host,
             default_lane_bound=default_lane_bound,
         )
+        self._bind_videos()  # the optional /v1/videos engine and its settlement poller
         # Every reservation tokenizes its prompt; build the packaged BPE now so
         # a fresh process pays that once at bind time, never on its first
         # request, and a corrupt table fails startup with its own message.
@@ -460,8 +466,13 @@ class NativeControlPlane(
                 if continuation_context is None
                 else continuation_context.required_route_binding,
             )
+            route, request = route_by_provider_preferences(route, request, self._components)
             # Skip unavailable deployments at admission so a live fallback can still serve.
-            dispatchable = dispatchable_route_profiles(self._components.runtime_catalogs, route)
+            dispatchable = dispatchable_route_profiles(
+                self._components.runtime_catalogs,
+                route,
+                reread=lambda: self._components.runtime_catalogs,
+            )
             record_dead_admission_rungs(
                 self._accounting,
                 authorization,
@@ -475,10 +486,7 @@ class NativeControlPlane(
                 ):
                     raise _continuation_binding_error()
                 # No dispatchable rung remains; finalize the accepted request closed.
-                return self._escalate_accepted(
-                    authorization,
-                    "every certified deployment was unavailable at admission",
-                )
+                return self._escalate_accepted(authorization, UNAVAILABLE_AT_ADMISSION)
             route = select_route_deployments(route, dispatchable.indexes)
             resolved_wires = dispatchable.resolved_wires
             route, resolved_wires, selected_placement = select_single_route_before_search(
@@ -554,8 +562,7 @@ class NativeControlPlane(
                     web_search_requests=int(web_search_admission is not None),
                 )
 
-        # Admission returns the full ordered route; no attempt row exists
-        # until the data plane's first `start_attempt`.
+        # Admission returns the full ordered route; no attempt row before `start_attempt`.
         public_request = request
         provider_request = request.model_copy(update={"stream": True, "include_usage": True})
         try:
@@ -572,6 +579,8 @@ class NativeControlPlane(
                 )
             )
             placement = selected_placement or placement
+            rung_authorization = tier_authorization(authorization, provider_request)
+            route, resolved_wires = _reorder(route, resolved_wires, request, self._components)
             require_route_authority(authorization, request, route)
             require_unmodified_probability_output(
                 request, bool(guardrails and guardrails.output_policies)
@@ -582,13 +591,8 @@ class NativeControlPlane(
             signers: list[GatewayDispatchSigner | None] = []
             dispatch_bindings: list[FrozenDispatchBinding | None] = []
             carrier_authorities: list[ReasoningCarrierAuthority | None] = []
-            # How long a throttle is worth waiting on per rung for THIS
-            # request (the pool's schedule scaled by the cache at stake),
-            # decided here so the data plane never waits on a rung whose
-            # throttle should fail over cold at once. `route` is the admitted
-            # route (dead and incompatible rungs already removed), so its last
-            # rung is the one with no cold alternative; the sticky binding is
-            # the one placement already read.
+            # Per-rung throttle waits for THIS request (pool schedule scaled by the cache
+            # at stake), over the admitted route whose last rung has no cold alternative.
             redial_budgets = throttle_redial_budgets(
                 self._accounting.loads,
                 route,
@@ -598,11 +602,10 @@ class NativeControlPlane(
             for deployment, (profile, client), budget in zip(
                 route.deployments, resolved_wires, redial_budgets, strict=True
             ):
-                # A reasoning-pinned route's fallback rung is frozen WITHOUT
-                # the pinned provider's sealed reasoning (it cannot unseal
-                # it), so a failover past the issuing rung dispatches the
-                # conversation minus that turn's thinking, never a foreign
-                # sealed block.
+                # A reasoning-pinned route's fallback rung is frozen WITHOUT the
+                # pinned provider's sealed reasoning (it cannot unseal it), so a
+                # failover past the issuing rung dispatches the conversation
+                # minus that turn's thinking, never a foreign sealed block.
                 dispatch = build_rung_dispatch(
                     route,
                     deployment,
@@ -610,13 +613,10 @@ class NativeControlPlane(
                     client,
                     provider_request=rung_provider_request(route, deployment, provider_request),
                     public_request=public_request,
-                    authorization=authorization,
+                    authorization=rung_authorization,
                     throttle_redial_budget=budget,
                 )
-                if dispatch.parallel_disclosure is not None:
-                    parallel_disclosures.add(dispatch.parallel_disclosure)
-                if dispatch.output_disclosure is not None:
-                    parallel_disclosures.add(dispatch.output_disclosure)
+                parallel_disclosures.update(dispatch.disclosures)
                 output_bounds.append(dispatch.reserved_output_tokens)
                 wire_route.append(dispatch.wire_entry)
                 signers.append(dispatch.signer)
@@ -743,7 +743,7 @@ class NativeControlPlane(
         plan = None if guardrails is None else guardrails.output_plan()
         self._accounting.register(
             InflightRequest(
-                authorization=authorization,
+                authorization=rung_authorization,
                 route=route,
                 request=provider_request,
                 deadline_monotonic=deadline,
@@ -810,8 +810,7 @@ class NativeControlPlane(
             "caller_scope": f"{authorization.organization_id}:{authorization.identity_id}",
         }
         if route.snapshot.throttle_redial is not None:
-            # The pool's frozen backoff-and-redial schedule; absent (not null) on
-            # pools that keep throttles failover-only: their admission is byte-identical.
+            # Absent (not null) on failover-only pools: their admission is byte-identical.
             response["throttle_redial"] = route.snapshot.throttle_redial.model_dump(mode="json")
         if plan is not None:
             response["guardrail_output_plan"] = plan
@@ -820,13 +819,13 @@ class NativeControlPlane(
         if tool_search_admission is not None:
             response["tool_search"] = tool_search_admission
         if request.surface == GatewayApiSurface.MESSAGES:
-            # Display-only: what `message_start` shows as input when the
-            # upstream reports nothing before its final chunk. The ledger
-            # never reads it; settlement keeps the provider's meters.
+            # Display-only `message_start` input; the ledger never reads it.
             response["input_token_estimate"] = counted_input_tokens(public_request)
         if public_request.maximum_output_tokens is not None:
             # The caller's cap: classifies an output-less, usage-less `stop` (capped -> length).
             response["maximum_output_tokens"] = public_request.maximum_output_tokens
+        if (permit_class := admission_priority_class(authorization)) is not None:
+            response["priority_class"] = permit_class  # the permit queue's order
         if request.surface == GatewayApiSurface.RESPONSES:
             response["surface"] = "responses"
             response["envelope"] = responses_envelope(public_request)
@@ -978,10 +977,7 @@ class NativeControlPlane(
         """Close an accepted request with its prework meter and return its disposition."""
         self._accounting.finish_request_quietly(
             authorization,
-            GatewayFailure(
-                failure_class=GatewayFailureClass.INTERNAL,
-                safe_message="the native engine cannot serve the authorized route",
-            ),
+            escalation_failure(authorization, reason),
             web_search_requests=web_search_requests,
         )
         return _escalation(reason)

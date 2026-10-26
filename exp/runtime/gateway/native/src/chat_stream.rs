@@ -55,7 +55,7 @@ pub(super) async fn stream_response(
         let mut guard = guard;
         let mut lease = lease;
         let mut committed = committed;
-        let mut delivery = Delivery::new(sender.clone(), lease.is_some());
+        let mut delivery = Delivery::new(sender.clone(), lease.is_some()).paced(committed.pace);
         let mut encoder = ChatSseEncoder::new_with_ignored(
             &request_id,
             &alias,
@@ -131,12 +131,10 @@ pub(super) async fn stream_response(
         }
 
         let mut prefix: std::collections::VecDeque<Event> = committed.prefix.drain(..).collect();
+        let mut send_deadline = deadline;
         loop {
-            if crate::relay::remaining(deadline).is_zero() {
-                committed.relay.close_transport();
-                log_stream_exit(&request_id, "delivery_deadline");
-                guard.settle_cancelled(usage.as_ref(), &tool_names).await;
-                return;
+            if committed.relay.deadline_cut(deadline, &mut send_deadline) {
+                fail_stream!(crate::relay::deadline_while_generating())
             }
             let event = if let Some(event) = prefix.pop_front() {
                 event
@@ -221,7 +219,7 @@ pub(super) async fn stream_response(
                     return;
                 }
             }
-            for outward in outward_events {
+            for outward in delivery.pace(outward_events, deadline).await {
                 let encoded = match encoder.feed(&outward) {
                     Ok(encoded) => encoded,
                     Err(_) => {
@@ -258,7 +256,7 @@ pub(super) async fn stream_response(
                         replayable = capture_frame(&mut capture, &data, replayable);
                         delivery.retain_replay(replayable);
                     }
-                    if !delivery.send(deadline, data).await {
+                    if !delivery.send(send_deadline, data).await {
                         committed.relay.close_transport();
                         log_stream_exit(&request_id, "subscriber_closed_or_delivery_deadline");
                         settle_stream_end(&mut guard, None, usage.as_ref(), &tool_names, true)

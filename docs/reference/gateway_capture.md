@@ -284,3 +284,62 @@ after pruning. A concurrent reader can temporarily prevent WAL truncation; this 
 reported as a maintenance failure and retried on idle maintenance, not claimed as
 successful physical erasure. OS snapshots, backups, and storage-device remanence are
 outside this database lifecycle. Expired rows are never returned by the reader API.
+
+## Uncapped capture: disk spill and split records
+
+`CaptureConfiguration(spill=CaptureSpillConfiguration(directory=...))` removes
+the size ceilings without raising worker memory. It applies only to a batched
+destination (`CaptureCollector.batched`); every other constructor refuses it.
+
+- **Responses.** The tap keeps the first `maximum_response_bytes` in memory as
+  before. Past that, it hands the reference-counted chunks to a bounded queue
+  (`maximum_queued_bytes`), and four writer threads append them to a file in
+  `directory`. The relay never writes, waits or copies: forwarded bytes and
+  their timing are unchanged. A spilling tap never reserves a whole response
+  buffer up front, so it never waits for capture memory either.
+- **Requests.** No request is trimmed (`truncate_request` is ignored for
+  spilled content), and the request bound rises to 128 MiB: serving itself
+  refuses bodies above 64 MiB, and the context document can exceed the body it
+  normalizes. A request larger than half the record bound has its messages
+  written to a part by a background writer at admission, which frees the
+  capture's parsed copy as soon as it is on disk (at most four times
+  `maximum_queued_bytes` of request memory is in flight). The capture then
+  keeps only the remaining (small) context until delivery.
+- **Caller bodies.** With `relay_metadata`, a wire body larger than
+  `part_threshold_bytes` is kept raw rather than decoded, and written as a part.
+- **Delivery.** A record that carries spilled content, or whose encoding
+  exceeds `maximum_record_bytes`, reaches the destination as
+  `("split", skeleton, marker, parts)`. `skeleton` is the record's JSON with
+  each large value replaced by `{marker: index}`. The marker carries a
+  per-record nonce, so caller content cannot forge a reference.
+  `parts[index]` is `(kind, path, bytes)`: `"json"` holds the value's exact
+  JSON text, and `"frames"` holds a stream's frames, one compact JSON value
+  per line. A spilled JSON body keeps its structure in the skeleton, with long
+  strings as parts, so a destination can still annotate usage before
+  splicing. The files exist until the destination acknowledges the record;
+  a retry sees the same files.
+- **Honest loss only.** When the disk budget (`maximum_bytes`) or the queue
+  refuses bytes, the file keeps everything written up to that point and the
+  response is marked truncated, exactly like an in-memory prefix. A stream
+  that is abandoned, or whose prompt is discarded at settlement, has its file
+  removed. Back-to-back admissions beyond the background writers' budget fall
+  back to the in-memory accounting, which may skip the capture; that is counted.
+- **Restart.** A new collector removes the `exp-capture-*` files a previous
+  process left in `directory`.
+- **Memory.** Every capture buffer is bounded independently of capture size:
+  - response windows and pending entries by `maximum_pending_bytes`;
+  - the delivery queue by `delivery.maximum_bytes`;
+  - relay chunks awaiting the writers by `maximum_queued_bytes`;
+  - background request writers by `maximum_inflight_bytes`.
+
+  A caller body that would cross the pending budget is dropped from the
+  capture (`body_kind: "dropped"`, marked truncated) rather than skipping the
+  capture. `CaptureRelay(wire_budget_bytes=...)` bounds the wire bodies all
+  in-flight requests retain together. A host sets these so they sum within its
+  capture memory budget. With bounds from a 256 MiB budget, 24 concurrent
+  64 MB streams at about 3 MB/s grew resident memory by 85 MB more than the
+  same streams uncaptured (`stress_shape_capture_memory_stays_under_budget`).
+
+Leaving `spill` unset keeps every bound above unchanged, so it doubles as the
+kill switch.
+

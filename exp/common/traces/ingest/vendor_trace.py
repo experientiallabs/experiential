@@ -13,7 +13,8 @@ The conversion is deliberately narrow:
 - Canonical spans record each observation at its source start instant so ordering and tool pairing
   follow the export's own causality. The full source interval is retained as span attributes.
 - A tool result pairs with an earlier model tool call by explicit vendor call ID, otherwise by tool
-  name in call order. An unpaired call keeps its span but asserts no pairing.
+  name only when exactly one call is outstanding. Ambiguous pairings exclude the trace with an
+  issue. An unpaired call keeps its span but asserts no pairing.
 - Invalid records and traces are excluded with an explicit issue instead of being repaired.
 """
 
@@ -337,6 +338,10 @@ def _model_spans(
         call_id = tool_call.call_id or (
             f"{vendor}-call-{observation.source_span_id}-{index}"  # Deterministic per source span.
         )
+        if any(call.call_id == call_id for calls in pending.values() for call in calls):
+            raise VendorTraceFormatError(
+                f"duplicate outstanding tool call ID {call_id!r}; export unique call IDs"
+            )
         attributes = dict(base)
         attributes["gen_ai.tool.name"] = tool_call.name
         attributes["gen_ai.tool.call.arguments"] = tool_call.arguments
@@ -390,7 +395,8 @@ def _tool_result_span(
     attributes["gen_ai.operation.name"] = "execute_tool"
     attributes["gen_ai.tool.name"] = tool_name
     attributes["gen_ai.tool.call.arguments"] = observation.tool_arguments or ""
-    attributes["gen_ai.tool.message"] = observation.tool_message or ""
+    if observation.tool_message is not None:
+        attributes["gen_ai.tool.message"] = observation.tool_message
     matched = _match_pending_call(pending[tool_name], observation.tool_call_id)
     if strict and matched is None and observation.tool_call_id is not None:
         raise VendorTraceFormatError(
@@ -551,6 +557,11 @@ def _match_pending_call(
                 pending.remove(candidate)
                 return candidate
         return None
+    if len(pending) > 1:
+        raise VendorTraceFormatError(
+            "ambiguous tool result without a call ID; export call IDs for parallel calls "
+            "to the same tool"
+        )
     if pending:
         return pending.popleft()
     return None

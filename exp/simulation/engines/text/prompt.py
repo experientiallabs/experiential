@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Sequence
+from typing import Literal
 
 from pydantic import Field, JsonValue, ValidationError
 
@@ -15,13 +16,14 @@ from exp.common.models import (
     structured_json_text,
 )
 from exp.common.tasks import TaskCase
+from exp.simulation.engines.text.knowledge import SimulationKnowledge
 from exp.simulation.retrieval import RAGAction, RAGMatch
 from exp.simulation.retrieval.contracts import RAG_KEY_SCHEMA_VERSION
 
 WORLD_MODEL_TEXT_PROMPT_VERSION = "text-world-model-v3"
 WORLD_MODEL_TEXT_PROMPT_ID = "world-model-text-v3"
 WORLD_MODEL_TEXT_GROUNDING_SCHEMA_VERSION = "fit-rag-examples-v2"
-WORLD_MODEL_TEXT_SYSTEM_PROMPT = """Protocol version: text-world-model-v3.
+_WORLD_MODEL_INSTRUCTIONS = """Protocol version: text-world-model-v3.
 Simulate the environment for a customer agent using the task, initial context, visible history,
 declared tool schemas, previous environment state, and retrieved real action/observation examples.
 Each grounded example's context_ref identifies its exact task and initial_context in
@@ -35,12 +37,64 @@ Return exactly one result per supplied call_id, in the same order, including par
 Never substitute a user message for a tool result or end the episode before the agent sees it.
 For a text action, generate the next user/environment message or mark the scenario terminal.
 Do not infer or reveal hidden candidate reasoning, reference answers, or grading instructions.
-Return only JSON with these fields:
+"""
+_WORLD_MODEL_TEXT_OUTPUT = """Return only JSON with these fields:
 {"message":"","tool_results":[{"call_id":"id","content":"tool response","is_error":false}],
 "state":{},"terminal":false}
 For tool actions, message must be empty and terminal must be false. For text actions, tool_results
 must be empty and message may be empty only when terminal is true. State is the complete updated
 environment state, retained privately across turns. Do not include markdown fences or other keys."""
+
+WORLD_MODEL_TEXT_SYSTEM_PROMPT = _WORLD_MODEL_INSTRUCTIONS + _WORLD_MODEL_TEXT_OUTPUT
+
+RECONSTRUCTED_TEXT_PROMPT_VERSION = "reconstructed-text-world-model-v2"
+RECONSTRUCTED_TEXT_PROMPT_ID = "reconstructed-world-model-text-v1"
+_RECONSTRUCTED_CONTEXT = """
+Interpret the four context channels separately:
+1. behavioral_knowledge contains frozen rules, tool contracts and explicit unknowns.
+2. grounded_examples, grounding_contexts and library_originals contain historical observations.
+3. task.initial_context, visible_conversation and environment_state concern this instance.
+4. research_history.target and research_history.prior_library contain investigations,
+including rejected or unresolved hypotheses. Neither source is native truth.
+Research history is not native truth. Prior-environment values are not current-instance facts.
+For example, a trace where order A is pending does not prove current order B is pending.
+A rejected hypothesis that every cancellation succeeds must not become a behavioral rule.
+Retain explicit unknowns rather than claiming a missing value was observed.
+"""
+
+RECONSTRUCTED_TEXT_SYSTEM_PROMPT = (
+    WORLD_MODEL_TEXT_SYSTEM_PROMPT.replace(
+        "Protocol version: text-world-model-v3.",
+        "Protocol version: reconstructed-text-world-model-v2.",
+    )
+    + _RECONSTRUCTED_CONTEXT
+)
+
+
+RECONSTRUCTED_JSON_TOOL_SYSTEM_PROMPT = (
+    _WORLD_MODEL_INSTRUCTIONS.replace(
+        "Protocol version: text-world-model-v3.",
+        "Protocol version: grounded-json-transition-v2.",
+    )
+    + """Submit exactly one submit_transition proposal. This answer tool only records your
+proposed consequences; it does not execute the requested environment action.
+Use observations in the supplied call_id order. reply is the native JSON value with encoding
+json, or an exact native text string with encoding text. Do not serialize a JSON object into
+a string. effect is kind edits: only the changes this call makes to environment_state, as
+ordered ops. set {"op":"set","path":[...],"value":...} creates or replaces an object key
+(missing parent objects are created) or an existing list index; delete removes a key or index;
+append adds to an existing list; remove_value removes the first equal list element. Paths are
+lists of object keys and list indexes. Use an empty edits list when the state does not change;
+never restate unchanged state. terminal is false.
+The external observation is serialized by code; you decide every reply value and state effect.
+Fictional format example only: {"observations":[{"call_id":"c1","reply":{"id":"a",
+"optional":null},"encoding":"json","is_error":false}],"effect":{"kind":"edits",
+"edits":[{"op":"set","path":["records","a"],"value":{"id":"a","optional":null}}]},
+"terminal":false}.
+Use actual call IDs, observed formats and current facts, not these fictional fields.
+"""
+    + _RECONSTRUCTED_CONTEXT
+)
 
 
 class SimulatedToolResult(ContractModel):
@@ -92,6 +146,36 @@ class TextWorldModelProtocolError(ValueError):
     """The world model did not return the pinned text-transition JSON contract."""
 
 
+MEMORY_CONTEXT_GUIDANCE = """
+Cross-trajectory memory, when present, keeps the same separation:
+memory_observations are original native replies observed in other, completed instances;
+they belong to the historical-observation channel. research_history.session holds this
+instance's post-prediction feedback and provisional investigations. research_history.
+prior_trajectories holds unresolved hypotheses from earlier trajectories, and
+research_history.memory_overview is the whole memory at reduced resolution, oldest first,
+with older blocks as model-written summaries. None of these describe this instance's current
+state, and hypotheses are not verified rules. Propose any resulting state change through the
+normal transition protocol; never claim an automatic state correction occurred.
+"""
+
+
+class MemoryContext(ContractModel):
+    """Cross-trajectory memory for one prediction, already selected and split by authority.
+
+    Attributes:
+        observations: Original native observations from other completed instances. Rendered
+            in the historical-observation channel as ``memory_observations``.
+        session: This instance's disclosed feedback and provisional investigations.
+        prior_trajectories: Unresolved hypotheses produced by earlier trajectories.
+        overview: Budgeted memory overview of log lines and model-written summaries.
+    """
+
+    observations: tuple[JsonObject, ...] = ()
+    session: tuple[JsonObject, ...] = ()
+    prior_trajectories: tuple[JsonObject, ...] = ()
+    overview: tuple[JsonObject, ...] = ()
+
+
 def build_world_model_request(
     task: TaskCase,
     *,
@@ -100,6 +184,9 @@ def build_world_model_request(
     grounded_examples: Sequence[RAGMatch],
     maximum_output_tokens: int,
     state: JsonObject | None = None,
+    knowledge: SimulationKnowledge | None = None,
+    memory: MemoryContext | None = None,
+    output_protocol: Literal["text", "json-tool"] = "text",
 ) -> ModelRequest:
     """Frame a simulated environment transition without enabling provider tools.
 
@@ -110,6 +197,9 @@ def build_world_model_request(
         grounded_examples: Nearest immutable real transitions after current-lineage exclusion.
         maximum_output_tokens: Explicit non-truncating provider output budget.
         state: Private environment state from the previous world-model turn.
+        knowledge: Frozen behavioral and investigation context, empty for the baseline.
+        memory: Cross-trajectory memory, rendered into the declared authority channels.
+        output_protocol: Text transition or typed-proposal system instructions.
 
     Returns:
         A text-only provider request with the pinned prompt and no candidate hidden state.
@@ -148,9 +238,27 @@ def build_world_model_request(
         "grounding_contexts": contexts,
         "grounded_examples": examples,
     }
+    system_prompt = WORLD_MODEL_TEXT_SYSTEM_PROMPT
+    if knowledge is not None:
+        system_prompt = RECONSTRUCTED_TEXT_SYSTEM_PROMPT
+        evidence["behavioral_knowledge"] = knowledge.behavioral_context()
+        evidence["library_originals"] = knowledge.original_library_evidence()
+        evidence["research_history"] = knowledge.research_context()
+    if output_protocol == "json-tool":
+        system_prompt = RECONSTRUCTED_JSON_TOOL_SYSTEM_PROMPT
+    if memory is not None:
+        system_prompt += MEMORY_CONTEXT_GUIDANCE
+        evidence["memory_observations"] = list(memory.observations)
+        research = evidence.get("research_history")
+        evidence["research_history"] = {
+            **(research if isinstance(research, dict) else {}),
+            "session": list(memory.session),
+            "prior_trajectories": list(memory.prior_trajectories),
+            "memory_overview": list(memory.overview),
+        }
     return ModelRequest(
         messages=(
-            ModelMessage(role="system", content=WORLD_MODEL_TEXT_SYSTEM_PROMPT),
+            ModelMessage(role="system", content=system_prompt),
             ModelMessage(
                 role="user",
                 content=json.dumps(

@@ -70,11 +70,15 @@ pub(in crate::dialects) fn complete_streamed_tool_or_drop_cut(
 /// Drop a tool call the provider never named and never argued: an empty
 /// placeholder entry (`{"id": "", "function": {"name": "", "arguments": ""}}`,
 /// OpenRouter's GLM and Hunyuan relays, live 2026-09-12..15) is not a call, so
-/// it is dropped instead of failing the stream. A NAMELESS call that did carry
-/// arguments is left for the strict completion contract (a name cannot be
-/// invented). Returns whether the entry was dropped.
+/// it is dropped instead of failing the stream. An empty argument object counts
+/// as no argument: vLLM's glm47 parser emits nameless `{}` entries from
+/// model-written markup when the request declares no tools (2026-10-21, GLM
+/// lane: "streamed tool call is incomplete (2 bytes)"). A NAMELESS call that
+/// carried real arguments is left for the strict completion contract (a name
+/// cannot be invented). Nothing of an unstarted entry reached the caller, so
+/// the drop is invisible. Returns whether the entry was dropped.
 pub(in crate::dialects) fn drop_phantom_tool(tool: &mut ToolAccumulator) -> bool {
-    if tool.completed || tool.started || !tool.raw_arguments.is_empty() {
+    if tool.completed || tool.started || !argues_nothing(&tool.raw_arguments) {
         return false;
     }
     let line = serde_json::json!({
@@ -113,4 +117,14 @@ pub(in crate::dialects) fn finish_open_tools_relay(
         }
     }
     Ok((events, truncated))
+}
+
+/// Whether accumulated arguments are blank or one empty JSON object.
+fn argues_nothing(raw_arguments: &str) -> bool {
+    let trimmed = raw_arguments.trim();
+    trimmed.is_empty()
+        || serde_json::from_str::<serde_json::Value>(trimmed)
+            .ok()
+            .and_then(|value| value.as_object().map(serde_json::Map::is_empty))
+            .unwrap_or(false)
 }

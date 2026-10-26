@@ -581,7 +581,7 @@ def test_actual_child_zdr_constraint_and_upstream_identity_survive_fallback(
         json={
             "model": "coding",
             "messages": [{"role": "user", "content": "always-500"}],
-            "provider": {"zdr": False, "data_collection": "allow", "order": ["fixture-upstream"]},
+            "provider": {"zdr": False, "data_collection": "allow"},
         },
         timeout=30,
     )
@@ -593,7 +593,7 @@ def test_actual_child_zdr_constraint_and_upstream_identity_survive_fallback(
     assert content == {
         "from-secondary": True,
         "metadata": "enabled",
-        "provider": {"zdr": True, "data_collection": "deny", "order": ["fixture-upstream"]},
+        "provider": {"zdr": True, "data_collection": "deny"},
     }
     with sqlite3.connect(engine.database_path) as db:
         assert db.execute(

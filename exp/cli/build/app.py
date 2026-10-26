@@ -6,6 +6,7 @@ import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import typer
 from rich.console import Console
@@ -18,12 +19,14 @@ from exp.cli.build.checkpoints import (
 )
 from exp.cli.build.providers import configure_build_providers
 from exp.cli.build.source import load_stored_build_import, project_for_build
+from exp.cli.build.stops import paid_work_stops, require_learning_consent, rerun_command
+from exp.cli.build.summary import render_completed_build
 from exp.cli.build.traces import load_build_traces
 from exp.cli.providers.provider_picker import resolve_setup_providers
 from exp.cli.providers.setup import provider_setup_json_examples
-from exp.cli.shared.consent import SpendBudget, can_prompt, require_spend_consent
+from exp.cli.shared.consent import SpendBudget, can_prompt, one_cost_warning, require_spend_consent
 from exp.cli.shared.options import ROOT_OPTION, usage_error
-from exp.cli.shared.progress import progress_display, qualified
+from exp.cli.shared.progress import Phase, ProgressDisplay, progress_display, qualified
 from exp.cli.shared.theme import EXP_THEME
 from exp.common.core.money import exact_usd
 from exp.common.models import (
@@ -57,9 +60,8 @@ from exp.runtime.models import (
     RuntimeModelCatalog,
 )
 from exp.runtime.models.preflight import preflight_capabilities
-from exp.runtime.models.providers.transport import ProviderTransportError, RetryPolicy
+from exp.runtime.models.providers.transport import RetryPolicy
 from exp.simulation.build import ProjectBuild, TaskSetBuild, build_project, select_completed_build
-from exp.simulation.engines.text.errors import SimulationContentionError
 from exp.simulation.retrieval import (
     RAGEmbedderBinding,
     RAGLineageBinding,
@@ -76,7 +78,16 @@ from exp.simulation.world_model.artifact import (
     persist_grounded_world_model,
 )
 
+if TYPE_CHECKING:  # learning loads the fidelity lifecycle; keep `exp --help` free of it
+    pass
+
 _console = Console(theme=EXP_THEME)
+# The build's single progress line: indexes, then learning, then the retest of misses.
+BUILD_PHASES = (
+    Phase("index", "Building indexes", 0.1),
+    Phase("learning", "Learning", 0.7, driver="Learning from traces", unit="traces"),
+    Phase("retest", "Retesting misses", 0.2, driver="Replaying traces", unit="traces"),
+)
 _PROJECT_ARGUMENT = typer.Argument(..., metavar="PROJECT", help="Local project name.")
 _LEGACY_TRACE_ARGUMENT = typer.Argument(None, metavar="TRACES", hidden=True)
 _TRACE_FILE_OPTION = typer.Option(
@@ -108,6 +119,7 @@ class GroundedBuildCompletion:
     reused: bool
 
 
+@one_cost_warning()
 def build(
     project: str = _PROJECT_ARGUMENT,
     legacy_trace_file: Path | None = _LEGACY_TRACE_ARGUMENT,
@@ -137,7 +149,10 @@ def build(
     yes: bool = typer.Option(
         False,
         "--yes",
-        help="Confirm the estimate, including any budget warning.",
+        help=(
+            "Confirm the estimate, any budget warning, and learning's undefined cost; "
+            "automation that learns needs it."
+        ),
     ),
     maximum_router_cost_usd: float | None = typer.Option(
         None,
@@ -160,6 +175,11 @@ def build(
         help="Require complete model flags and never ask setup or cost questions.",
     ),
     provider: list[str] | None = _PROVIDER_OPTION,
+    retry_incomplete: bool = typer.Option(
+        False,
+        "--retry-incomplete",
+        help="Buy again the calls of a learning trace that stopped incomplete.",
+    ),
 ) -> None:
     """Build a reusable grounded world model and immutable fit evidence.
 
@@ -187,6 +207,7 @@ def build(
         dry_run: Print the complete preflight and stop before credentials or selection.
         no_interactive: Disable inline setup and cost questions even at a terminal.
         provider: Repeatable provider names that skip the opening list during setup.
+        retry_incomplete: Replace an interrupted learning trace, buying it again.
 
     Raises:
         typer.BadParameter: Input, setup, role, cost, project, or artifact validation fails.
@@ -213,48 +234,38 @@ def build(
             )
         from exp.cli.build.wizard import run_build_wizard
 
-        try:
-            run_build_wizard(
-                project,
-                source=source,
-                root=root,
-                world_model=world_model,
-                judge=judge,
-                embedder=embedder,
-                top_k=top_k,
-                maximum_build_cost_usd=maximum_build_cost_usd,
-                maximum_router_cost_usd=maximum_router_cost_usd,
-                providers=tuple(provider or ()),
-                console=_console,
-            )
-        except ArtifactStoreError as exc:
-            raise typer.BadParameter(
-                f"could not save build evidence: {exc}; check the trace file and rerun exp build"
-            ) from exc
-        except (
-            ModelCapabilityError,
-            ModelCatalogError,
-            ModelConnectionError,
-            ProjectStoreError,
-            ValueError,
-        ) as exc:
-            raise typer.BadParameter(str(exc)) from exc
-        except ProviderTransportError as exc:
-            _console.print(f"[red]error[/red] a provider request failed: {exc}")
-            _console.print(
-                "Completed embedding batches and finished steps are saved. Run exp build again "
-                "to resume; an interrupted request may be retried."
-            )
-            raise typer.Exit(code=1) from exc
-        except SimulationContentionError as exc:
-            _console.print(f"[red]error[/red] {exc}")
-            _console.print(
-                "Another process owns in-flight paid work. Completed paid work is saved; "
-                "run exp build again to resume once that process finishes."
-            )
-            raise typer.Exit(code=1) from exc
+        with paid_work_stops(_console):
+            try:
+                run_build_wizard(
+                    project,
+                    source=source,
+                    root=root,
+                    world_model=world_model,
+                    judge=judge,
+                    embedder=embedder,
+                    top_k=top_k,
+                    maximum_build_cost_usd=maximum_build_cost_usd,
+                    maximum_router_cost_usd=maximum_router_cost_usd,
+                    providers=tuple(provider or ()),
+                    console=_console,
+                    retry_incomplete=retry_incomplete,
+                )
+            except ArtifactStoreError as exc:
+                raise typer.BadParameter(
+                    f"could not save build evidence: {exc}; "
+                    "check the trace file and rerun exp build"
+                ) from exc
+            except (
+                ModelCapabilityError,
+                ModelCatalogError,
+                ModelConnectionError,
+                ProjectStoreError,
+                ValueError,
+            ) as exc:
+                raise typer.BadParameter(str(exc)) from exc
         return
     source = source or "otlp"
+    rerun = rerun_command(project, trace_file, import_id, source, identity)
     started = time.monotonic()
     with usage_error(
         ArtifactStoreError,
@@ -363,38 +374,44 @@ def build(
         if dry_run:
             _console.print("[green]dry run complete[/green] No provider calls or build selection.")
             return
+        if not (yes or reused) and (no_interactive or not can_prompt(_console)):
+            require_learning_consent(_console, catalog, root=root, command=rerun)
         remaining_estimate = 0.0 if reused else estimate
         if not require_spend_consent(
             _console,
             root=root,
             yes=yes,
             estimated_cost_usd=remaining_estimate,
-            command=(
-                f"exp build {project} --import-id {import_id}"
-                if import_id is not None
-                else f"exp build {project} {trace_file}"
-            ),
+            command=rerun,
             non_interactive=no_interactive,
             additional_budgets=(
                 SpendBudget("embedding", remaining_estimate, maximum_build_cost_usd),
             ),
         ):
             return
-        with progress_display(_console) as progress:
-            completion = _complete_grounded_build(
-                store,
-                completed,
-                selected=selected,
-                runtime_catalog=runtime_catalog,
-                world_snapshot=world_snapshot,
-                embedder_snapshot=embedder_snapshot,
-                top_k=top_k,
-                estimate=estimate,
-                maximum_build_cost_usd=max(maximum_build_cost_usd, estimate or 0.0),
-                provider_spend_authorized=True,
-                trace_import_id=import_id,
-                progress=progress,
-            )
+        # One progress line from here to the end of the build: indexes, learning, retest.
+        pipeline = ProgressDisplay(_console, BUILD_PHASES)
+        pipeline.start()
+        with paid_work_stops(_console):
+            try:
+                completion = _complete_grounded_build(
+                    store,
+                    completed,
+                    selected=selected,
+                    runtime_catalog=runtime_catalog,
+                    world_snapshot=world_snapshot,
+                    embedder_snapshot=embedder_snapshot,
+                    top_k=top_k,
+                    estimate=estimate,
+                    maximum_build_cost_usd=max(maximum_build_cost_usd, estimate or 0.0),
+                    provider_spend_authorized=True,
+                    trace_import_id=import_id,
+                    progress=pipeline.phase("index"),
+                )
+            except BaseException:
+                pipeline.abort()
+                raise
+        pipeline.complete("index")
         built = completion.artifacts
     _capture_local_build_telemetry(
         completed.artifacts,
@@ -402,7 +419,36 @@ def build(
         indexed_steps=_rag_transition_count(store, built.serving_rag.artifact_id),
         duration_seconds=time.monotonic() - started,
     )
-    _render_completed_build(completed, project=project)
+    # Learning is the default pipeline. It loads the fidelity lifecycle, so it is deferred to
+    # dispatch: `exp --help` stays free of optimization machinery (startup-isolation gate).
+    from exp.cli.build.learning import learn_with_report
+
+    try:
+        with usage_error(ArtifactStoreError, ModelCatalogError, ProjectStoreError, ValueError):
+            learning, report_path = learn_with_report(
+                _console,
+                store,
+                project=project,
+                root=root,
+                yes=yes,
+                non_interactive=no_interactive,
+                code_revision=code_revision,
+                retry_incomplete=retry_incomplete,
+                pipeline=pipeline,
+                command=rerun,
+            )
+    except BaseException:
+        pipeline.abort()
+        raise
+    pipeline.stop()
+    render_completed_build(
+        _console,
+        completed,
+        project=project,
+        learning=learning,
+        report=report_path,
+        duration_seconds=time.monotonic() - started,
+    )
 
 
 def _load_or_setup_catalog(
@@ -896,31 +942,3 @@ def _render_preflight(
     else:
         _console.print(f"  [dim]embedding[/dim]    at most ${estimate:.6f}")
     _console.print(f"  [dim]budget[/dim]       ${ceiling:.6f}")
-
-
-def _render_completed_build(
-    completed: ProjectBuild,
-    *,
-    project: str,
-) -> None:
-    """Present the compact accepted, excluded, and split summary with the next command.
-
-    Args:
-        completed: Persisted project build and mining results.
-        project: Local project identifier used in the next recommended command.
-    """
-    dataset = completed.artifacts.trace_dataset.dataset
-    tasks = completed.artifacts.mining.tasks
-    duplicate_count = len(dataset.trace_ids) - len(completed.artifacts.mining.analysis.candidates)
-    _console.print(
-        f"[green]\u2713[/green] ingested {len(dataset.trace_ids)} traces "
-        f"[dim]({dataset.invalid_trace_count} invalid, {duplicate_count} duplicate)[/dim]"
-    )
-    if len(dataset.trace_ids) < 100 or len(dataset.trace_ids) > 1_000:
-        _console.print("[yellow]guidance[/yellow] 100 to 1,000 traces is the usual starting range")
-    _console.print(
-        f"[green]\u2713[/green] split {sum(task.partition == 'fit' for task in tasks)} fit / "
-        f"{sum(task.partition == 'held_out' for task in tasks)} held out"
-    )
-    _console.print("[green]Complete[/green]")
-    _console.print(f"next: exp optimize router {project}")

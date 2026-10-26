@@ -56,6 +56,13 @@ impl MessagesSseEncoder {
 /// | `cache_read_input_tokens`      | `cached_input_tokens`, else `0` (Anthropic `cache_read_input_tokens`, OpenAI-wire `prompt_tokens_details.cached_tokens` / `input_tokens_details.cached_tokens`, Gemini `cachedContentTokenCount`, Bedrock `cacheReadInputTokens`) |
 /// | `output_tokens`                | `output_tokens` (reasoning folded in where the provider bills it additively) |
 ///
+/// When the provider reported the write lifetimes, `cache_creation` carries
+/// Anthropic's own `ephemeral_5m_input_tokens` / `ephemeral_1h_input_tokens`
+/// split, so a caller pricing writes from this object charges each lifetime
+/// at its own rate. The split is omitted when it was not observed (it is
+/// never inferred) and when a 12-hour subset exists, which Anthropic's two
+/// lifetimes cannot express.
+///
 /// Unknown usage (no provider report) renders every leg as `0`.
 pub(crate) fn messages_usage(usage: Option<&Usage>) -> Value {
     let usage = match usage {
@@ -67,7 +74,7 @@ pub(crate) fn messages_usage(usage: Option<&Usage>) -> Value {
     // Both cache legs come back out of the folded ledger total so callers
     // see the provider's own shape: input_tokens excludes cached reads and
     // cache writes, each reported on its own leg.
-    usage_object(
+    let mut object = usage_object(
         usage
             .input_tokens
             .unwrap_or(0)
@@ -76,7 +83,24 @@ pub(crate) fn messages_usage(usage: Option<&Usage>) -> Value {
         creation,
         cached,
         usage.output_tokens.unwrap_or(0),
-    )
+    );
+    if let Some(split) = write_lifetimes(usage, creation) {
+        object["cache_creation"] = split;
+    }
+    object
+}
+
+/// Anthropic's `cache_creation` lifetime object, present only when the
+/// one-hour subset was observed and no 12-hour subset exists.
+fn write_lifetimes(usage: &Usage, creation: u64) -> Option<Value> {
+    if usage.cache_creation_12h_input_tokens.is_some() {
+        return None;
+    }
+    let hour = usage.cache_creation_1h_input_tokens?.min(creation);
+    Some(json!({
+        "ephemeral_5m_input_tokens": creation - hour,
+        "ephemeral_1h_input_tokens": hour,
+    }))
 }
 
 /// The four-leg Anthropic usage object in Anthropic's own field order.

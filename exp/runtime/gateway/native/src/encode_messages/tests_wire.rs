@@ -17,6 +17,7 @@ fn zero_argument_tool_calls_encode_as_an_empty_object_on_both_paths() {
             index: 0,
             call_id: "call-1".to_string(),
             name: "get_time".to_string(),
+            thought_signature: None,
         },
         Event::ToolArgumentsDelta {
             index: 0,
@@ -37,6 +38,7 @@ fn zero_argument_tool_calls_encode_as_an_empty_object_on_both_paths() {
                 provider_status: None,
                 raw_arguments: "{}".to_string(),
                 custom: false,
+                thought_signature: None,
             },
         },
         Event::Completed,

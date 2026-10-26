@@ -39,6 +39,7 @@ from exp.runtime.gateway.lifecycle_test import _configured_gateway
 from exp.runtime.gateway.native_bridge import NativeBridgeError, NativeControlPlane
 from exp.runtime.gateway.native_bridge_test import _admit, _configured_pool_gateway, _start_first
 from exp.runtime.gateway.native_explicit_cache import CONDITIONAL_CACHE_DISCLOSURE
+from exp.runtime.gateway.prompt_caching import PROMPT_CACHING_OFF_SUFFIX
 from exp.runtime.models.providers.base import GatewayWireProfile
 from exp.runtime.models.providers.dialect_dispatch import CACHE_CONTROL_NOT_FORWARDED_SUFFIX
 from exp.runtime.models.providers.google_cache import VertexCacheProject
@@ -411,10 +412,22 @@ def test_unmarked_request_never_looks_up_authority_or_claims(tmp_path: Path) -> 
     assert CONDITIONAL_CACHE_DISCLOSURE not in ignored
 
 
+@pytest.mark.parametrize(
+    ("restriction", "marker_suffix"),
+    [
+        ("zdr_requested", CACHE_CONTROL_NOT_FORWARDED_SUFFIX),
+        ("prompt_caching_disabled", PROMPT_CACHING_OFF_SUFFIX),
+    ],
+)
 def test_zdr_authority_disables_admission_plans_and_all_cache_operations(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, restriction: str, marker_suffix: str
 ) -> None:
-    """A host-issued ZDR restriction wins even when the marked Google prefix is eligible."""
+    """A host-issued ZDR or caching-off restriction wins over an eligible marked prefix.
+
+    Under ZDR the marker is dropped as on any non-caching route; with the
+    organization's prompt caching off it is removed at admission and
+    disclosed as such.
+    """
     host = _Host(_authority())
     control, key = _control(tmp_path, host)
     original_authorize = control._components.store.authorize_request
@@ -439,7 +452,7 @@ def test_zdr_authority_disables_admission_plans_and_all_cache_operations(
             app_title=app_title,
             client_ip=client_ip,
         )
-        return authorization.model_copy(update={"zdr_requested": True})
+        return authorization.model_copy(update={restriction: True})
 
     monkeypatch.setattr(
         type(control._components.store), "authorize_request", staticmethod(authorize)
@@ -449,7 +462,7 @@ def test_zdr_authority_disables_admission_plans_and_all_cache_operations(
     request_id = admission["request_id"]
     assert isinstance(request_id, str)
     entry = control._accounting.entry(request_id)
-    assert entry is not None and entry.authorization.zdr_requested
+    assert entry is not None and getattr(entry.authorization, restriction)
     assert entry.explicit_cache_state is None
     _start_first(control, admission)
     assert host.authority_calls == []
@@ -457,7 +470,7 @@ def test_zdr_authority_disables_admission_plans_and_all_cache_operations(
     ignored = admission["ignored_parameters"]
     assert isinstance(ignored, list)
     assert CONDITIONAL_CACHE_DISCLOSURE not in ignored
-    assert any(str(item).endswith(CACHE_CONTROL_NOT_FORWARDED_SUFFIX) for item in ignored)
+    assert any(str(item).endswith(marker_suffix) for item in ignored)
 
 
 def test_only_selected_route_can_claim_after_attempt_start(tmp_path: Path, clock: _Clock) -> None:

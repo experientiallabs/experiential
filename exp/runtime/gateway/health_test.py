@@ -4,13 +4,15 @@ from __future__ import annotations
 
 import pytest
 
-from exp.runtime.gateway.contracts import GatewayFailure, GatewayFailureClass
+from exp.runtime.gateway.contracts import GatewayFailure, GatewayFailureClass, GatewayHeaderTimeout
 from exp.runtime.gateway.health import (
     PLAN_WINDOW_MAXIMUM_SECONDS,
     DeploymentHealthKey,
     DeploymentHealthRegistry,
     health_failure_cause,
 )
+from exp.runtime.gateway.lane_ejection import LaneEjectionPolicy
+from exp.runtime.gateway.native_execution import claim_route_from
 
 _KEY: DeploymentHealthKey = ("catalog", "deployment", "connection")
 
@@ -344,3 +346,55 @@ def test_exhaustion_windows_are_clamped_and_never_shortened() -> None:
     registry.exhausted(key, 1)
     now[0] += 900
     assert registry.suppressed(key)
+
+
+def test_an_ejected_lane_is_ordered_last_across_revisions_and_claimed_last() -> None:
+    """Ejection keys on the physical lane, so another catalog revision sees it too."""
+    clock = [0.0]
+    health = DeploymentHealthRegistry(
+        failure_threshold=100,
+        lane_ejection=LaneEjectionPolicy(),
+        clock=lambda: clock[0],
+    )
+    dead = ("revision-one", "deployment-dead", "connection-dead")
+    live = ("revision-one", "deployment-live", "connection-live")
+    for _ in range(3):
+        health.failed(dead, _failure(GatewayFailureClass.TRANSPORT))
+    keys = (dead, live)
+    assert health.order(keys, [0, 1]) == [1, 0]
+    assert claim_route_from(health, keys, 0) == 1
+    # A single-rung route still dials the ejected lane.
+    assert claim_route_from(health, (dead,), 0) == 0
+    other_revision = ("revision-two", "deployment-dead", "connection-dead")
+    assert health.lane_ejected(other_revision)
+    # Half-open after the cooldown: the first claim probes, the rest wait.
+    clock[0] = 31.0
+    assert health.order(keys, [0, 1]) == [0, 1]
+    assert claim_route_from(health, keys, 0) == 0
+    assert health.order(keys, [0, 1]) == [1, 0]
+    health.succeeded(dead)
+    assert health.order(keys, [0, 1]) == [0, 1]
+
+
+def test_a_hung_lane_is_ejected_on_header_timeouts_and_a_byok_variant_is_not() -> None:
+    """Two header timeouts in ten minutes order the lane last; its BYOK variant keeps its order."""
+    clock = [0.0]
+    health = DeploymentHealthRegistry(
+        failure_threshold=100,
+        lane_ejection=LaneEjectionPolicy(),
+        clock=lambda: clock[0],
+    )
+    hung = ("revision-one", "mp-hung", "connection-house")
+    variant = ("revision-one", "mp-hung-c-connection-one", "connection-byok")
+    live = ("revision-one", "mp-live", "connection-house")
+    timeout = GatewayFailure(
+        failure_class=GatewayFailureClass.TIMEOUT,
+        safe_message="provider did not send response headers in time",
+        header_timeout=GatewayHeaderTimeout.ALLOWANCE,
+    )
+    health.failed(hung, timeout)
+    clock[0] = 300.0
+    assert health.order((hung, live), [0, 1]) == [0, 1]
+    health.failed(hung, timeout)
+    assert health.order((hung, live), [0, 1]) == [1, 0]
+    assert not health.lane_ejected(variant)

@@ -12,12 +12,20 @@ import httpx
 from pydantic import Field, ValidationError
 
 from exp.common.core.artifacts import ArtifactId, ContractModel, JsonObject
+from exp.runtime.gateway.guardrails.classification import (
+    DecisionModelAdapterDocument,
+    DecisionModelClassifier,
+)
 from exp.runtime.gateway.guardrails.classifiers import (
     ClassifierRegistry,
     KeywordClassifier,
 )
 from exp.runtime.gateway.guardrails.client import DirectClassifierClient, InspectingClassifier
-from exp.runtime.gateway.guardrails.contracts import GuardrailPolicy
+from exp.runtime.gateway.guardrails.contracts import (
+    GuardrailAction,
+    GuardrailCheckStage,
+    GuardrailPolicy,
+)
 from exp.runtime.gateway.guardrails.enforcement import GuardrailEngine
 from exp.runtime.gateway.guardrails.http_json import (
     DEFAULT_HTTP_JSON_MAX_RESPONSE_BYTES,
@@ -77,9 +85,10 @@ def load_guardrail_engine(
     Missing files leave the gateway unguarded. A valid file with an empty
     policy list is also unguarded: the exact no-engine hot path. The file
     configures global policies and scoped identity assignments. It may register ``keyword``
-    adapters for local tests and ``http_json`` adapters for dedicated
-    classifier endpoints. It never stores raw prompts, responses, detector
-    payloads, or credentials.
+    adapters for local tests, ``http_json`` adapters for dedicated classifier
+    endpoints, and ``decision_model`` adapters that classify a bounded request
+    window with a decision model. It never stores raw prompts, responses,
+    detector payloads, or credentials.
 
     Args:
         root: Initialized EXP root that contains the ``gateway`` directory.
@@ -129,6 +138,7 @@ def engine_from_document(
     """
     adapters = _adapters(payload, http_client=http_client)
     policies = _policies(payload, frozenset(adapters))
+    _require_input_classification(policies, adapters)
     return GuardrailEngine(
         store=MappingGuardrailStore(policies),
         client=DirectClassifierClient(ClassifierRegistry(adapters)),
@@ -152,6 +162,30 @@ def _policies(payload: JsonObject, adapter_ids: frozenset[str]) -> tuple[Guardra
             raise ValueError("each guardrail policy must be an object")
         policies.append(policy_from_authored(cast(Mapping[str, object], item), adapter_ids))
     return tuple(policies)
+
+
+def _require_input_classification(
+    policies: tuple[GuardrailPolicy, ...],
+    adapters: Mapping[str, InspectingClassifier],
+) -> None:
+    """Bind decision-model adapters only to read-only input checks.
+
+    A classification check scores the request window. It has no completion
+    classifier and no replacement text, so output and ``modify`` checks are
+    configuration errors rather than runtime failures.
+
+    Raises:
+        ValueError: A ``decision_model`` adapter backs an output or ``modify`` check.
+    """
+    for policy in policies:
+        for check in policy.checks:
+            if isinstance(adapters[check.adapter_id], DecisionModelClassifier) and (
+                check.stage is GuardrailCheckStage.OUTPUT or check.action is GuardrailAction.MODIFY
+            ):
+                raise ValueError(
+                    "decision_model adapters classify input only; bind them to input checks "
+                    "with block or allow"
+                )
 
 
 def _adapters(
@@ -191,7 +225,9 @@ def _adapter(
         return _http_json_adapter(item, http_client=http_client)
     if kind == "regex":
         return RegexClassifier(RegexAdapterDocument.model_validate(item))
-    raise ValueError("adapter kind must be keyword, regex, or http_json")
+    if kind == "decision_model":
+        return _decision_model_adapter(item, http_client=http_client)
+    raise ValueError("adapter kind must be keyword, regex, http_json, or decision_model")
 
 
 def _keyword_adapter(item: dict[str, object]) -> KeywordClassifier:
@@ -223,6 +259,26 @@ def _http_json_adapter(
         max_response_bytes=authored.max_response_bytes,
         client=http_client,
     )
+
+
+def _decision_model_adapter(
+    item: dict[str, object],
+    *,
+    http_client: httpx.AsyncClient | None,
+) -> DecisionModelClassifier:
+    """Parse one decision-model classification adapter."""
+    try:
+        authored = DecisionModelAdapterDocument.model_validate(item)
+    except ValidationError as exc:
+        raise ValueError(f"decision_model adapter is malformed: {_first_error(exc)}") from exc
+    return DecisionModelClassifier(authored, client=http_client)
+
+
+def _first_error(exc: ValidationError) -> str:
+    """Name the first invalid field and its rule without echoing the authored value."""
+    error = exc.errors(include_input=False, include_url=False)[0]
+    location = ".".join(str(part) for part in error["loc"])
+    return f"{location}: {error['msg']}" if location else error["msg"]
 
 
 def _adapter_id(item: dict[str, object]) -> str:

@@ -32,7 +32,11 @@ engine = GuardrailEngine(
 control = NativeControlPlane(components, guardrails=engine)
 ```
 
-The gateway resolves `policies_for(organization_id, identity_id)` once for admission.
+The gateway resolves `policies_for(authorization)` once for admission. The
+`AuthorizationSnapshot` carries the organization, identity, alias, and frozen alias
+target, so a host store can scope a policy to exact-model pools as well as identities.
+`MappingGuardrailStore` scopes by organization and identity, and by exact-model pool when
+a policy sets `target_pool_ids`.
 The session captures every applicable policy, the original deadline, approval state,
 and output requirements. Continuation expansion, rewrites, gateway search rounds,
 response delivery, cancellation, and settlement all use that session. No later
@@ -50,127 +54,10 @@ request. All policies use the same classifier executor, bounds, verdict actions,
 and content-free decision recorder. Deterministic native detectors are an execution
 strategy of that pipeline, with the same input and completion contracts.
 
-`max_request_bytes` bounds the complete in-memory request, including fields omitted
-from provider serialization, before native or async input inspection. A no-copy
-character bound rejects obviously oversized input before projection; fitting candidates
-receive an exact UTF-8 JSON size check. Tool examples, allowed callers, private tool
-identifiers and search context cannot escape this bound. This does not expand the
-generic HTTP classifier's declared wire projection or certify its coverage.
-
 Embeddings, image generation, and native Decisions cannot yet use that normalized
-inspection contract. An applicable enforcing platform or identity policy rejects those
+inspection contract. An applicable platform or identity policy rejects those
 endpoints before request acceptance, reservation, or provider dispatch. Identities
 with no applicable policy retain access to those surfaces.
-
-## Observation and controlled rollout
-
-`GuardrailPolicy(mode="observe", protected=True, checks=(input_check,))` evaluates
-the same input contract and authored action without blocking, rewriting, withholding,
-cancelling generation, or waiving the customer's normal charge. `mode="enforce"`
-is the default. Observation supports read-only input checks; configuration rejects
-output checks and `modify` actions rather than promising incomplete observation.
-Protected policy ownership remains independent of rollout mode. A host selects the
-mode from authenticated organization scope, then the session freezes it with the
-rest of the policy. Customers cannot choose the operator's mode.
-
-The shared engine admits observations through the same bounded classifier executor
-abstraction with a separate worker pool and adapter quarantine from enforcement.
-It retains at most 8 jobs and 8 MiB of complete subjects by default, configurable
-through `max_observations` and `max_observation_bytes`. Full queues, byte limits, or
-expired request deadlines produce `skipped`, never an uninspected `allow`. A cold,
-starting or unavailable scheduler produces `unavailable` and releases its unused job
-and byte reservation. Optional admission can start the shared callback daemon, but
-does not wait for its startup lock or event-loop readiness; later requests can observe
-once that same loop is ready. Exact
-duplicate subjects share work only within their request. While observation admission
-remains open, each distinct authenticated context, including recovered history, private
-provider fields and gateway tool results, is considered separately. Fields excluded from provider serialization still count toward
-subject identity and retained bytes. Observer capacity or quarantine cannot consume
-the engine's enforcement capacity or quarantine its enforcing calls.
-
-All observing policies share one detached deep snapshot and one complete subject
-encoding per admission boundary. Nested caller-owned containers are copied before
-hashing, byte accounting and asynchronous inspection, so later caller mutations cannot
-change an admitted subject or its deduplication identity.
-The owner grants at most one nonblocking preparation permit, separate from retained
-inspection jobs. New sessions reject before projection or hashing when inspection
-capacity is full, admission is closed, or the original deadline has expired. Rejection
-at admission has no oversized classification because the content was not projected.
-A session with prior fingerprints may use a free permit to deduplicate an equal complete subject
-even with full inspection capacity or an expired deadline. Concurrent preparation never
-waits: `preparation_unavailable` ends that session's optional coverage and records one
-`check=None, skipped` admission outcome per observing policy. This can include an equal
-subject whose identity could not be compared while another preparation held the permit;
-it is neither a classifier verdict nor evidence of a distinct missed subject.
-Size-walk, snapshot, encoding or hashing failures record `check=None, unavailable` coverage
-without exposing input or exception diagnostics, and serving continues.
-
-Within the permit, a cheap character-count bound rejects clearly oversized subjects
-without serializing their text. That rejection closes optional observation for this
-request and records one coverage-admission outcome per observing policy: `unsupported`
-above the policy bound, otherwise `skipped` above the owner's byte capacity. Later contexts
-are not observed after terminal admission failure. The permit remains held until all
-projection and hash temporaries are released, including failure paths, and shutdown
-does not release a permit still held by a request thread. Preparation admits one candidate
-under the owner's conservative size lower bound, in addition to retained-job bytes.
-Canonical JSON can expand that single candidate before the exact byte check. These limits
-do not claim an exact process memory ceiling.
-
-An admitted observation is engine-owned and may finish after its request completes;
-ordinary settlement does not cancel it and bias observations toward fast classifiers.
-Its original absolute request deadline and per-check timeout still apply. Hosts call
-`engine.close(timeout_seconds=...)` after serving drains and before stopping their
-recorder. Shutdown stops observation admission, drains within that budget, and cancels
-remaining work cooperatively. Each owned isolation loop closes its shared HTTP classifier
-client on that loop before destroying it. Slow cleanup keeps its owning worker alive
-without extending the host's shutdown budget; injected clients remain caller-owned.
-A classifier that ignores cancellation retains its job
-and byte reservation until it actually exits; timeout or shutdown cannot admit more
-subjects against that occupied capacity. Work that completes within the drain budget
-retains its actual verdict; cancellation is requested only when that budget expires.
-Observation may still incur classifier cost, so it does not certify that admission had
-no paid effects.
-
-`_record_observation(policy, check, outcome, latency_seconds)` is a content-free host
-recording seam separate from `_record`, which continues to report enforcing actions.
-`GuardrailOutcome` distinguishes `allow`, `flagged`, `unsupported`, `uncertain`,
-`unavailable`, `timeout`, and `skipped`. `check.action` reports the authored action
-that would apply under enforcement. Policy IDs and revisions identify rollout state;
-subject text, replacements, and detector diagnostics never enter either recorder.
-An outcome reports the configured adapter's verdict for its declared input projection,
-not an independent certification that every in-memory field was inspected. Complete-context
-policies must bind an adapter with explicit coverage checks through the shared engine.
-Hosts must count observation outcomes separately from actual customer blocks.
-An outcome with `check=None` records incomplete observation admission or coverage,
-not a classifier verdict. Keep these coverage counts separate from per-check verdict
-denominators; they do not count every distinct missed subject.
-Recording runs on one dedicated daemon worker. Only immutable policy/check metadata,
-outcome and elapsed time enter its bounded queue; request text and callback closures
-never enter that queue. `max_observation_records` defaults to 128 queued plus active
-records. A saturated or closed sink drops metadata without delaying admission;
-`engine.observation_recording_dropped` counts those losses and
-`engine.observation_recording_failed` counts sink exceptions. Hosts should expose both
-counters. The native `/metrics.json` snapshot exposes both values in `control_plane`;
-`/metrics` exports the unlabeled counters
-`exp_gateway_observation_recording_dropped_total` and
-`exp_gateway_observation_recording_failed_total`.
-The inspection owner and metadata recorder share the same overall `close` budget.
-At shutdown expiry queued metadata is discarded and counted, while at most one stalled
-sink call can remain alive holding content-free metadata. Cancellation callbacks may
-arrive after the recorder closes: their attempted `skipped` record then increments the
-dropped counter instead of delivering an outcome. Shutdown therefore does not promise
-delivery of every `skipped` outcome or extend its deadline to wait for a late callback.
-These loss counters are process-local, like the other gateway counters.
-
-The local CLI closes its engine after native serving ends, including readiness-only
-checks and startup failures, with the configured graceful timeout for observation cleanup.
-The owned Python gateway shares its shutdown deadline between joining the native server
-and draining its engine, then releases the ledger and virtual key.
-
-Unsupported surfaces remain available to observation-only callers and record
-`unsupported`. Hosts with additional surfaces, such as provider batches, use
-`engine.record_unsupported_observations(policies)` for that coverage accounting and
-only refuse the surface when an applicable policy has `mode="enforce"`.
 
 ## Input inspection alongside generation
 
@@ -235,30 +122,19 @@ outages and timeouts return `unavailable`, without exposing detector diagnostics
 claiming that content violated policy. Queues and inflight work remain bounded;
 request removal cancels its pending inspection. Unprotected identity checks may
 observe and continue after uncertain classifier results. Platform policies are
-always protected. An adapter requiring complete-context coverage raises
-`ClassifierCoverageError()` when its declared inspection contract cannot cover the context
-or modality; enforcement returns a nonretryable
-`unsupported_capability` error, with no failover and no content-violation accusation.
-The input subject bound has the same coverage semantics. `ClassifierUncertainError()`
-distinguishes an inconclusive result from transport or runtime failure in observation;
-protected enforcement continues to return `unavailable` for either case.
+always protected.
 
-Replay keys include the applicable enforcing policies, execution settings, and revision.
-Adding or revising observation-only policies leaves replay unchanged. Promoting an
-observer to enforcement changes replay identity. Only deterministic detector rules
-referenced by applicable enforcing checks enter that digest.
-
-Version 0.7.166 intentionally establishes a new guarded replay contract. Guarded keys
-accepted on 0.7.161 return `409` after upgrading, even when the authored policy is
-otherwise unchanged. There is no legacy-fingerprint translation. Finish in-flight
-requests before the cutover and use new keys for new operations.
+Replay keys include the full applicable policy set, execution settings, and revision.
 A keyed admission compares its frozen policy revision with the replay claim before
 inspection, acceptance, search, or model dispatch. A reload between claim and admission
 returns `409`; retrying takes a new snapshot. Change `revision` whenever the detector
 or external rollout configuration changes.
 Policies are immutable; compose a new engine snapshot when changing adapters.
 Default inspection bounds are 1 MiB, and the same absolute request deadline applies
-throughout inspection and provider execution.
+throughout inspection and provider execution. An adapter that sends only its own bounded
+window of the request (a `WindowedClassifier`) declares a configuration digest. That digest
+joins the replay revision, and a policy whose input checks are all windowed is not refused
+for its total request size.
 
 Startup requires `GUARDRAIL_CONTRACT_VERSION=3`. Publish coordinated engine and
 native packages before a downstream host updates its exact release pins. There
@@ -324,6 +200,11 @@ Built-in adapter kinds:
   a dedicated classifier endpoint. It never calls `POST /v1/chat/completions`
   or `POST /v1/responses`. Operators bind replaceable hosted adapters,
   including a hosted PII redactor, by `adapter_id`.
+- `decision_model`: input classification with a decision model on the SystemOne
+  wire. It sends a bounded window of the conversation, scores operator categories
+  against thresholds, and caches verdicts. A policy whose input checks are all
+  windowed is not refused for its total request size. See
+  [Classification guardrails](gateway-classification-guardrails.md).
 
 Other adapters may still be injected in code when composing a `GuardrailEngine`.
 
@@ -404,9 +285,8 @@ workers. `http_json` still reuses one keep-alive client per isolation loop.
 Native callbacks submit enforcement onto one shared daemon loop so a Rust
 worker can return while an abandoned inspect still occupies an isolation
 worker. Adapters implement the async contract directly. Request bounds count the
-complete in-memory classifier subject, including provider fields excluded from wire
-serialization. Response bounds count the serialized completion, including context
-and tool-call arguments.
+compact JSON request subject sent to classifiers, including tool definitions,
+structured schemas, and metadata. Response bounds count the serialized completion, including context and tool-call arguments.
 
 ## Privacy
 
@@ -528,31 +408,9 @@ individual checks by check ID (`standard-input-pii`) or `stage.capability`
 stores a credential. The adapter reads that name at inspect time and sends a
 bearer header. Missing values are classifier uncertainty.
 
-Local keyword and regex input checks inspect canonical message text, including the
-generated tool-error prefix, tool arguments, function definitions and examples,
-tool call/result identifiers, names and namespaces, structured
-output schemas, and normalized gateway web/tool-search declarations. Recovered or sealed reasoning, capture-only reasoning,
-multimodal attachments, verbatim native message blocks, context management, raw provider
-thinking/output configuration, nonempty Messages safeguards, opaque provider tool-caller objects, and provider-owned
-native/server tools return unsupported coverage. Regex rewrites only message text; matches in tool arguments or immutable
-tool/schema/search context are refused under modify. Exact flattened text blocks and inert
-cache/replay metadata remain supported for inspection. Cached block text is inspectable,
-but a match is refused under local modify because changing only canonical text cannot
-safely rewrite the provider block. Tool-error text is also immutable under modify:
-rewriting the body cannot remove the typed error flag that generates its prefix.
-
 The `http_json` request includes `capability`, `stage`, `action`, `check_id`,
 and exactly one subject: `request` or `completion`. The request subject is the
-compact deterministic JSON of the public `GatewayRequest` projection. Fields marked
-`exclude=True`, including private reasoning, native provider blocks and configuration,
-and tool examples, are intentionally absent. A hosted modifier may rewrite the visible
-subject while the gateway restores unchanged hidden replay authority; that restoration
-does not inspect the hidden content. An `allow` verdict covers the transmitted projection
-only. Generic `http_json` cannot implement mandatory complete-context criminal inspection
-when private carriers matter. Bind a coverage-aware adapter through the same engine for
-that requirement. This release does not expand the HTTP wire contract.
-
-The response
+compact deterministic JSON of the canonical `GatewayRequest`. The response
 must validate as `ClassifierVerdict`. A non-`modify` check must not return a
 replacement. A flagged `modify` verdict must contain exactly the
 stage-appropriate replacement (`replacement_messages` on input,

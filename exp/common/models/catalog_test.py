@@ -26,10 +26,7 @@ from exp.common.models import (
     normalize_gateway_catalog,
     write_model_catalog,
 )
-from exp.common.models.catalog import (
-    SANE_MAX_MODEL_CATALOG_SCHEMA_VERSION,
-    infer_azure_api_surface,
-)
+from exp.common.models.catalog import SANE_MAX_MODEL_CATALOG_SCHEMA_VERSION
 
 
 def _catalog() -> ModelCatalog:
@@ -551,15 +548,26 @@ def test_trusted_custom_origin_requires_a_base_url_and_a_native_provider() -> No
         )
 
 
-def test_azure_surface_inference_follows_the_resource_host() -> None:
-    """Foundry hosts serve model inference, Azure OpenAI hosts serve deployments."""
-    assert infer_azure_api_surface("https://resource.openai.azure.com") == "openai_deployments"
-    assert (
-        infer_azure_api_surface("https://Resource.Services.AI.Azure.com/models")
-        == "model_inference"
+def test_tenant_origin_requires_https_and_moves_identity_only_when_set() -> None:
+    """A tenant origin names an explicit https endpoint and is its own dispatch identity."""
+    plain = ConnectionConfig(
+        provider="openai-compatible",
+        base_url="https://tenant.example.test/v1",
+        api_key_env="FIXTURE_API_KEY",
     )
-    assert infer_azure_api_surface("https://resource.inference.ai.azure.com") == "model_inference"
-    assert infer_azure_api_surface("https://gateway.example.test/tenant-a") is None
+    tenant = plain.model_copy(update={"tenant_origin": True})
+    assert ConnectionConfig.model_validate(tenant.model_dump()).tenant_origin is True
+    assert tenant.identity_sha256() != plain.identity_sha256()
+    assert "tenant_origin" not in plain.model_dump()
+    assert tenant.model_dump()["tenant_origin"] is True
+    for base_url in (None, "http://tenant.example.test/v1"):
+        with pytest.raises(ValueError, match="tenant_origin requires an explicit https base_url"):
+            ConnectionConfig(
+                provider="openai-compatible",
+                base_url=base_url,
+                api_key_env="FIXTURE_API_KEY",
+                tenant_origin=True,
+            )
 
 
 def test_undeclared_foundry_endpoint_keeps_its_stored_identity() -> None:

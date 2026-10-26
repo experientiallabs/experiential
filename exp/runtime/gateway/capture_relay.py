@@ -24,6 +24,8 @@ if TYPE_CHECKING:
     from exp_gateway_native import CaptureCollector
 
 _LOGGER = logging.getLogger(__name__)
+# Twice the largest body serving accepts; a spilling collector keeps it whole.
+MAXIMUM_WIRE_BYTES = 128 * 1024 * 1024
 _HEADERS = frozenset(
     {
         "authorization",
@@ -114,14 +116,41 @@ def redact_query(query: str) -> str:
     return "&".join(parts)
 
 
+class _WireBudget:
+    """Wire-body bytes every in-flight request may retain together.
+
+    The relay runs on one event loop, so plain integer accounting is exact.
+    """
+
+    def __init__(self, maximum_bytes: int) -> None:
+        self.maximum_bytes = maximum_bytes
+        self.held = 0
+
+    def reserve(self, size: int) -> bool:
+        if self.held + size > self.maximum_bytes:
+            return False
+        self.held += size
+        return True
+
+    def release(self, size: int) -> None:
+        self.held = max(0, self.held - size)
+
+
 class _Observation:
     """Bounded caller-facing facts retained for one in-flight request."""
 
-    def __init__(self, scope: dict[str, object], wire: bool, maximum_bytes: int) -> None:
+    def __init__(
+        self,
+        scope: dict[str, object],
+        wire: bool,
+        maximum_bytes: int,
+        budget: _WireBudget | None = None,
+    ) -> None:
         """Start the request clock and retain the configured wire-body limit."""
         self.scope = scope
         self.wire = wire
         self.maximum_bytes = maximum_bytes
+        self.budget = budget
         self.received_at = datetime.now(UTC).isoformat()
         self.started = time.perf_counter()
         self.first_at: str | None = None
@@ -141,11 +170,19 @@ class _Observation:
         """Count all received bytes while retaining only a bounded prefix."""
         self.total += len(body)
         if not self.truncated:
-            if self.retained + len(body) > self.maximum_bytes:
+            if self.retained + len(body) > self.maximum_bytes or (
+                self.budget is not None and not self.budget.reserve(len(body))
+            ):
                 self.truncated = True
             else:
                 self.chunks.append(body)
                 self.retained += len(body)
+
+    def release(self) -> None:
+        """Return this request's retained bytes to the shared wire budget."""
+        if self.budget is not None:
+            self.budget.release(self.retained)
+            self.retained = 0
 
     def delivered(self, body: bytes) -> None:
         """Record first and last nonempty body delivery without copying content."""
@@ -200,7 +237,13 @@ class CaptureRelay:
         app: Outer caller-facing ASGI app, after presentation decorators.
         collector: Collector configured with relay_metadata=True.
         wire_capture: Existing wire capture kill switch, default false.
-        wire_maximum_bytes: Retained request body bound, default 4 MiB.
+        wire_maximum_bytes: Retained request body bound, default 4 MiB. Up to
+            128 MiB for a collector that spills to split records; serving
+            itself refuses bodies above 64 MiB.
+        wire_budget_bytes: Wire-body bytes all in-flight requests may retain
+            together, unbounded by default. A request whose body would cross
+            it keeps its facts and is marked truncated, so concurrency cannot
+            multiply the per-request bound into worker memory.
     """
 
     def __init__(
@@ -210,21 +253,25 @@ class CaptureRelay:
         *,
         wire_capture: bool = False,
         wire_maximum_bytes: int = 4_194_304,
+        wire_budget_bytes: int | None = None,
     ) -> None:
         """Bind the native collector and the existing wire capture settings."""
-        if not 1 <= wire_maximum_bytes <= 4_194_304:
-            raise ValueError("wire capture limit must be between 1 byte and 4 MiB")
+        if not 1 <= wire_maximum_bytes <= MAXIMUM_WIRE_BYTES:
+            raise ValueError("wire capture limit must be between 1 byte and 128 MiB")
         self.app = cast("_App", app)
         self.collector = collector
         self.wire_capture = wire_capture
         self.wire_maximum_bytes = wire_maximum_bytes
+        if wire_budget_bytes is not None and wire_budget_bytes < 1:
+            raise ValueError("wire capture budget must be positive")
+        self.wire_budget = None if wire_budget_bytes is None else _WireBudget(wire_budget_bytes)
 
     async def __call__(self, scope: dict[str, object], receive: _Receive, send: _Send) -> None:
         """Forward bytes unchanged and hand metadata off only for eligible admissions."""
         if scope.get("type") != "http" or scope.get("path") not in _PATHS:
             await self.app(scope, receive, send)
             return
-        observed = _Observation(scope, self.wire_capture, self.wire_maximum_bytes)
+        observed = _Observation(scope, self.wire_capture, self.wire_maximum_bytes, self.wire_budget)
 
         async def receiving() -> object:
             """Observe request chunks and early disconnects without changing events."""
@@ -254,6 +301,7 @@ class CaptureRelay:
                     observed.request_id = request_id
                 else:
                     observed.chunks.clear()
+                    observed.release()
             terminal = (
                 isinstance(event, dict)
                 and event.get("type") == "http.response.body"
@@ -283,3 +331,6 @@ class CaptureRelay:
                     await asyncio.to_thread(observed.finish, self.collector)
                 except Exception:  # noqa: BLE001 - observational failure must not rewrite serving.
                     _LOGGER.warning("capture.relay_failed request_id=%s", observed.request_id)
+            # The collector owns its copy now; the relay's chunks are released.
+            observed.chunks.clear()
+            observed.release()

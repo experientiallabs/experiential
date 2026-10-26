@@ -272,7 +272,7 @@ async fn serve(
     };
     if let Some(reason) = admission_value.get("escalate") {
         METRICS.record_escalation(classify_escalation(reason.as_str().unwrap_or_default()));
-        return error_response(&escalation_error());
+        return error_response(&escalation_error(reason.as_str().unwrap_or_default()));
     }
     let admission = match serde_json::from_value::<AudioAdmission>(admission_value.clone()) {
         Ok(admission) if admission.billing_modes.len() == admission.route.len() => admission,
@@ -426,6 +426,7 @@ async fn run_ladder(
                     failure =
                         crate::stream_errors::customer_credential_failure(failure, &wire.provider);
                 }
+                failure = failure.with_tenant_origin(wire.tenant_origin);
                 if opened {
                     guard.mark_opened();
                 }
@@ -437,6 +438,7 @@ async fn run_ladder(
                     total_attempts,
                     counts[depth],
                     depth,
+                    &counts,
                     &failure,
                     false,
                 );
@@ -472,7 +474,7 @@ async fn dispatch_speech(
     // From here the provider may execute and bill even if no header arrives.
     guard.mark_dispatched();
     let response = open_stream(
-        &state.http,
+        state.http.for_origin(wire.tenant_origin),
         &wire.url,
         &wire.headers,
         &wire.idempotency_key,
@@ -662,7 +664,7 @@ async fn dispatch_transcription(
     let body = encode_multipart(&boundary, &wire.upstream_payload, upload);
     guard.mark_dispatched();
     let response = open_upload(
-        &state.http,
+        state.http.for_origin(wire.tenant_origin),
         &wire.url,
         &wire.headers,
         &wire.idempotency_key,
@@ -682,6 +684,22 @@ async fn dispatch_transcription(
         .map_err(|f| (f, true))?;
     let payload: Value = serde_json::from_slice(&bytes)
         .map_err(|_| (malformed("transcription response is not JSON"), true))?;
+    if wire.dialect == crate::audio_elevenlabs::ELEVENLABS_AUDIO_DIALECT {
+        if admission.tokens_billed(depth) {
+            // Startup refuses a token-priced ElevenLabs rung; its wire
+            // reports no token usage to bill.
+            return Err((
+                malformed("ElevenLabs transcription has no token meter"),
+                true,
+            ));
+        }
+        return crate::audio_elevenlabs::elevenlabs_transcription(
+            payload,
+            admission.response_format.as_deref(),
+            |seconds| metered_seconds(seconds, admission),
+        )
+        .map_err(|failure| (failure, true));
+    }
     public_transcription(payload, admission, depth).map_err(|failure| (failure, true))
 }
 
@@ -714,28 +732,8 @@ fn public_transcription(
             .and_then(|meter| meter.get("seconds"))
             .or_else(|| object.get("duration"))
             .and_then(Value::as_f64)
-            .filter(|seconds| seconds.is_finite() && *seconds >= 0.0)
             .ok_or_else(|| malformed("transcription response omitted its metered duration"))?;
-        let quantity_milli = (seconds * 1000.0).ceil() as u64;
-        // A meter longer than the measured upload the reservation covered is
-        // inconsistent with the audio sent; refusing it keeps the settle
-        // inside the hold (and the ledger's integer range).
-        if admission
-            .maximum_audio_milli
-            .is_none_or(|maximum| quantity_milli > maximum)
-        {
-            return Err(malformed(
-                "transcription meter exceeds the admitted audio duration",
-            ));
-        }
-        Usage {
-            billed_units: Some(BilledUnits {
-                kind: "audio_second".to_string(),
-                variant: String::new(),
-                quantity_milli,
-            }),
-            ..Usage::default()
-        }
+        metered_seconds(seconds, admission)?
     };
     if admission.response_format.as_deref() == Some("text") {
         return Ok((
@@ -846,7 +844,36 @@ async fn read_bounded_body(
     }
 }
 
-fn malformed(reason: &str) -> Failure {
+/// Bill a provider's metered transcription seconds, bounded by the admitted
+/// audio: a meter longer than the measured upload the reservation covered is
+/// inconsistent with the audio sent, and refusing it keeps the settle inside
+/// the hold (and the ledger's integer range).
+fn metered_seconds(seconds: f64, admission: &AudioAdmission) -> Result<Usage, Failure> {
+    if !seconds.is_finite() || seconds < 0.0 {
+        return Err(malformed(
+            "transcription response omitted its metered duration",
+        ));
+    }
+    let quantity_milli = (seconds * 1000.0).ceil() as u64;
+    if admission
+        .maximum_audio_milli
+        .is_none_or(|maximum| quantity_milli > maximum)
+    {
+        return Err(malformed(
+            "transcription meter exceeds the admitted audio duration",
+        ));
+    }
+    Ok(Usage {
+        billed_units: Some(BilledUnits {
+            kind: "audio_second".to_string(),
+            variant: String::new(),
+            quantity_milli,
+        }),
+        ..Usage::default()
+    })
+}
+
+pub(crate) fn malformed(reason: &str) -> Failure {
     Failure::new(FailureClass::MalformedResponse, reason).with_retry(false, true)
 }
 

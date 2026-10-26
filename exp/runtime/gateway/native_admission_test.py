@@ -7,6 +7,7 @@ import pytest
 
 from exp.common.core.artifacts import JsonObject
 from exp.common.models.catalog import (
+    BillingSource,
     GatewayDeploymentCapabilities,
     GatewayDeploymentMetadata,
     GatewayRungDispatchPolicy,
@@ -22,11 +23,16 @@ from exp.common.models.content import (
 )
 from exp.common.models.gateway_catalog import ExactModelDeployment, FailoverMode
 from exp.common.models.gateway_chains import ModelExecutionStage
-from exp.common.models.model import ModelCapabilities
+from exp.common.models.model import ModelCapabilities, ToolCall
+from exp.runtime.gateway.affinity import (
+    affinity_fingerprint,
+    affinity_seed_material,
+    affinity_weighted_rungs,
+    rendezvous_order,
+)
 from exp.runtime.gateway.contracts import (
     AuthorizationSnapshot,
     DirectTarget,
-    ExecutionSnapshot,
     GatewayApiSurface,
     GatewayFailure,
     GatewayFailureClass,
@@ -35,6 +41,7 @@ from exp.runtime.gateway.contracts import (
     GatewayRequest,
     GatewayToolDefinition,
 )
+from exp.runtime.gateway.execution_snapshot import ExecutionSnapshot
 from exp.runtime.gateway.health import DeploymentHealthRegistry
 from exp.runtime.gateway.native_accounting import NativeAttemptAccounting
 from exp.runtime.gateway.native_admission import (
@@ -47,7 +54,12 @@ from exp.runtime.gateway.native_admission import (
 )
 from exp.runtime.gateway.native_dispatch import NativeWireClient
 from exp.runtime.gateway.native_execution import deployment_health_key
-from exp.runtime.gateway.prompt_size import MAXIMUM_BYTES_PER_TOKEN
+from exp.runtime.gateway.prompt_caching import (
+    PROMPT_CACHING_BEST_EFFORT,
+    PROMPT_CACHING_OFF_SUFFIX,
+)
+from exp.runtime.gateway.prompt_size import MAXIMUM_BYTES_PER_TOKEN, TEMPLATE_RESERVE_TOKENS
+from exp.runtime.gateway.reasoning_blocks import ExposedReasoningContentBlock
 from exp.runtime.gateway.recovery import SessionRecoveryRegistry
 from exp.runtime.gateway.routing import GatewayRoute
 from exp.runtime.gateway.sticky_affinity import StickySpillRegistry
@@ -945,6 +957,73 @@ def test_tool_result_image_degrades_with_disclosure_on_a_non_vision_route(stream
 
 
 @pytest.mark.parametrize("stream", [True, False])
+def test_tool_result_pdf_degrades_with_disclosure_on_a_pdf_incapable_route(stream: bool) -> None:
+    """Claude Code's Read on a PDF serves on a route with no PDF input.
+
+    The document is baked into the caller's history like a screenshot, so a
+    ``pdf_input`` refusal would wedge every later turn; the route answers with a
+    placeholder naming the document and discloses the drop.
+    """
+    from exp.runtime.anthropic_protocol.requests import decode_messages
+    from exp.runtime.gateway.native_accounting import NativeAttemptAccounting
+    from exp.runtime.models.providers.dialect_dispatch import (
+        TOOL_RESULT_DOCUMENT_DROP_DISCLOSURE,
+    )
+
+    pdf: JsonObject = {
+        "type": "document",
+        "source": {"type": "base64", "media_type": "application/pdf", "data": "JVBERi0xLjQK"},
+        "title": "spec.pdf",
+    }
+    body: JsonObject = {
+        "model": "coding",
+        "max_tokens": 128,
+        "stream": stream,
+        "messages": [
+            {"role": "user", "content": "read the spec"},
+            {
+                "role": "assistant",
+                "content": [{"type": "tool_use", "id": "call-1", "name": "Read", "input": {}}],
+            },
+            {
+                "role": "user",
+                "content": [{"type": "tool_result", "tool_use_id": "call-1", "content": [pdf]}],
+            },
+        ],
+    }
+    request = decode_messages(body).request.model_copy(update={"include_usage": True})
+    text_only = GatewayDeploymentMetadata(
+        capabilities=GatewayDeploymentCapabilities(
+            supports_streaming=True,
+            supports_streaming_tool_arguments=True,
+        )
+    )
+    deployments = (_deployment("claude", provider="anthropic", gateway=text_only),)
+    route = _mixed_route("maximize_availability", deployments, GatewayApiSurface.MESSAGES)
+    client = cast(NativeWireClient, object())
+    wires = (
+        (GatewayWireProfile(dialect="anthropic_messages", url="https://anthropic.test"), client),
+    )
+    accounting = _AdmissionCoercionCounter()
+
+    _narrowed, _wires_out, public, provider, _placement = admitted_route_requests(
+        route,
+        wires,
+        request,
+        accounting=cast(NativeAttemptAccounting, accounting),
+        authorization=route.snapshot.authorization,
+    )
+
+    tool_message = provider.messages[-1]
+    assert tool_message.content_parts == ()
+    assert tool_message.content == (
+        "[document 'spec.pdf' omitted: this model route cannot carry documents]"
+    )
+    assert TOOL_RESULT_DOCUMENT_DROP_DISCLOSURE in public.ignored_parameters
+    assert accounting.recorded == 1
+
+
+@pytest.mark.parametrize("stream", [True, False])
 def test_a_chat_tool_screenshot_is_admitted_and_folded_on_a_vision_chat_route(stream: bool) -> None:
     """The Copilot/Codex repro (an ``image_url`` part inside a ``role: "tool"``
     message on /v1/chat/completions) decodes, admits on an image-capable Chat
@@ -1014,8 +1093,9 @@ def test_a_chat_tool_screenshot_is_admitted_and_folded_on_a_vision_chat_route(st
     assert accounting.recorded == 0
 
 
-def test_an_explicit_thinking_budget_is_not_replaced_with_advisory_effort() -> None:
-    """The full admit loop refuses a budget an OpenAI effort dial cannot enforce."""
+def test_an_explicit_thinking_budget_snaps_onto_an_effort_dial_disclosed() -> None:
+    """The full admit loop serves a budget an OpenAI effort dial cannot carry at the
+    nearest tier, disclosed (owner decision 2026-10-19: refusing it ended sessions)."""
     from exp.runtime.gateway.native_accounting import NativeAttemptAccounting
 
     request = GatewayRequest(
@@ -1048,23 +1128,24 @@ def test_an_explicit_thinking_budget_is_not_replaced_with_advisory_effort() -> N
             client,
         ),
     )
-    with pytest.raises(ProviderParameterError) as rejected:
-        admitted_route_requests(
-            route,
-            wires,
-            request,
-            accounting=cast(NativeAttemptAccounting, accounting),
-            authorization=route.snapshot.authorization,
-        )
-    assert rejected.value.param == "thinking.budget_tokens"
-    assert request.provider_thinking_config == {"type": "enabled", "budget_tokens": 8192}
-    assert accounting.recorded == 0
+    _route, _wires, public, provider, _placement = admitted_route_requests(
+        route,
+        wires,
+        request,
+        accounting=cast(NativeAttemptAccounting, accounting),
+        authorization=route.snapshot.authorization,
+    )
+    assert provider.reasoning_effort == "high"
+    assert provider.provider_thinking_config is None
+    assert "thinking.budget_tokens->reasoning_effort:high(route_effort_ladder)" in (
+        public.ignored_parameters
+    )
 
 
 def test_named_processing_tier_fails_closed_when_no_rung_offers_it() -> None:
-    """A flex/priority request rejects fail-closed before reservation when no
-    rung can honor it: a host lane without per-tier pass-through pricing and no
-    BYOK rung. auto/default never reject."""
+    """A flex request rejects fail-closed before reservation when no rung can
+    honor it (a host lane without per-tier pass-through pricing and no BYOK
+    rung); priority runs at standard with disclosure; auto/default never reject."""
     from exp.runtime.gateway.native_accounting import NativeAttemptAccounting
 
     route = _mixed_route(
@@ -1086,21 +1167,33 @@ def test_named_processing_tier_fails_closed_when_no_rung_offers_it() -> None:
     wires = ((GatewayWireProfile(dialect="openai_compatible", url="https://house.test"), client),)
     accounting = cast(NativeAttemptAccounting, _CoercionCounter())
 
-    for tier in ("flex", "priority"):
-        request = GatewayRequest(
-            surface=GatewayApiSurface.CHAT_COMPLETIONS,
-            messages=(GatewayMessage(role="user", content="go"),),
-            service_tier=tier,
+    # Flex asks for a cheaper tier; serving it at standard would bill more
+    # than the caller chose, so it stays refused.
+    request = GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=(GatewayMessage(role="user", content="go"),),
+        service_tier="flex",
+    )
+    with pytest.raises(ProviderCapabilityError) as exc:
+        admitted_route_requests(
+            route,
+            wires,
+            request,
+            accounting=accounting,
+            authorization=route.snapshot.authorization,
         )
-        with pytest.raises(ProviderCapabilityError) as exc:
-            admitted_route_requests(
-                route,
-                wires,
-                request,
-                accounting=accounting,
-                authorization=route.snapshot.authorization,
-            )
-        assert exc.value.capability == "service_tier"
+    assert exc.value.capability == "service_tier"
+    # Priority falls back to standard processing with disclosure: it never
+    # costs the caller more (Codex Fast mode, 213 refusals a day).
+    _route, _wires, public, provider, _placement = admitted_route_requests(
+        route,
+        wires,
+        request.model_copy(update={"service_tier": "priority"}),
+        accounting=accounting,
+        authorization=route.snapshot.authorization,
+    )
+    assert provider.service_tier is None
+    assert public.ignored_parameters == ("service_tier->default(priority_unavailable)",)
 
     # auto/default carry no price, and `scale` (a valid OpenAI tier we do not
     # price as opt-in) is stripped downstream, not rejected: only flex/priority
@@ -1158,6 +1251,92 @@ def test_priority_house_card_excludes_standard_only_lead(mode: str) -> None:
     )
     assert tuple(deployment.deployment_id for deployment in narrowed.deployments) == ("priority",)
     assert provider.service_tier == "priority"
+
+
+def test_fast_asks_for_the_priority_tier_and_never_falls_back_to_standard() -> None:
+    """``:fast`` narrows to priority-carded rungs; with none it refuses (never billed standard)."""
+    gateway = GatewayDeploymentMetadata(
+        capabilities=GatewayDeploymentCapabilities(supports_streaming=True)
+    )
+    route = _mixed_route(
+        "maximize_availability",
+        (_deployment("standard", gateway=gateway), _deployment("priority", gateway=gateway)),
+        GatewayApiSurface.CHAT_COMPLETIONS,
+    )
+    client = cast(NativeWireClient, object())
+    standard = (
+        GatewayWireProfile(dialect="openai_compatible", url="https://standard.test"),
+        client,
+    )
+    priority = (
+        GatewayWireProfile(
+            dialect="openai_compatible",
+            url="https://priority.test",
+            service_tier_pricing_enabled=True,
+            service_tier_cards=frozenset({"priority"}),
+        ),
+        client,
+    )
+    request = GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=(GatewayMessage(role="user", content="go"),),
+    )
+    fast = route.snapshot.authorization.model_copy(update={"fast": True})
+    narrowed, _, _, provider, _ = admitted_route_requests(
+        route,
+        (standard, priority),
+        request,
+        accounting=cast(NativeAttemptAccounting, _CoercionCounter()),
+        authorization=fast,
+    )
+    assert tuple(deployment.deployment_id for deployment in narrowed.deployments) == ("priority",)
+    assert provider.service_tier == "priority"
+    standard_only = _mixed_route(
+        "maximize_availability",
+        (_deployment("standard", gateway=gateway),),
+        GatewayApiSurface.CHAT_COMPLETIONS,
+    )
+    with pytest.raises(ProviderCapabilityError) as refused:
+        admitted_route_requests(
+            standard_only,
+            (standard,),
+            request,
+            accounting=cast(NativeAttemptAccounting, _CoercionCounter()),
+            authorization=standard_only.snapshot.authorization.model_copy(update={"fast": True}),
+        )
+    assert refused.value.capability == "service_tier"
+    assert refused.value.detail is not None and "no fast path" in refused.value.detail
+    # A customer's own rung forwards priority but is never our fast path: a
+    # BYOK rung beside an uncarded house rung refuses rather than letting the
+    # house rung serve :fast at the standard card.
+    byok = (
+        GatewayWireProfile(
+            dialect="openai_compatible", url="https://byok.test", billing_customer_managed=True
+        ),
+        client,
+    )
+    mixed = _mixed_route(
+        "maximize_availability",
+        (_deployment("byok", gateway=gateway), _deployment("standard", gateway=gateway)),
+        GatewayApiSurface.CHAT_COMPLETIONS,
+    )
+    with pytest.raises(ProviderCapabilityError):
+        admitted_route_requests(
+            mixed,
+            (byok, standard),
+            request,
+            accounting=cast(NativeAttemptAccounting, _CoercionCounter()),
+            authorization=mixed.snapshot.authorization.model_copy(update={"fast": True}),
+        )
+    # Without :fast the same request runs untiered, exactly as before.
+    _, _, _, plain, _ = admitted_route_requests(
+        standard_only,
+        (standard,),
+        request,
+        accounting=cast(NativeAttemptAccounting, _CoercionCounter()),
+        authorization=standard_only.snapshot.authorization,
+    )
+    assert plain.service_tier is None
 
 
 def test_tier_priced_host_lane_admits_the_named_tier() -> None:
@@ -1263,15 +1442,17 @@ def test_tier_without_a_card_rejects_while_byok_forwards_any_tier() -> None:
         messages=(GatewayMessage(role="user", content="go"),),
         service_tier="priority",
     )
-    with pytest.raises(ProviderCapabilityError) as exc:
-        admitted_route_requests(
-            flex_only_route,
-            house_wires,
-            priority_request,
-            accounting=accounting,
-            authorization=flex_only_route.snapshot.authorization,
-        )
-    assert exc.value.capability == "service_tier"
+    # Priority without its card dispatches at standard (billed at the base
+    # schedule the provider then runs), disclosed; it is never forwarded.
+    _route, _wires, public, provider, _placement = admitted_route_requests(
+        flex_only_route,
+        house_wires,
+        priority_request,
+        accounting=accounting,
+        authorization=flex_only_route.snapshot.authorization,
+    )
+    assert provider.service_tier is None
+    assert "service_tier->default(priority_unavailable)" in public.ignored_parameters
 
     # A BYOK rung (billing_customer_managed) forwards ANY tier with no card.
     byok_route = _mixed_route(
@@ -1625,6 +1806,38 @@ def test_an_omitted_output_budget_never_copies_a_fallback_cap_across_the_route()
     assert provider.maximum_output_tokens is None
     assert narrowed.snapshot.deployment_ids == ("shim", "native")
     assert wires_out == wires
+
+
+def test_an_output_ceiling_no_window_can_reserve_is_clamped_and_disclosed() -> None:
+    """Production 2026-10-17: max_tokens=10,000,000 on a route with windows but no output max."""
+    deployments = (
+        _deployment("shim", gateway=_TOOL_CAPABLE).model_copy(
+            update={"capabilities": ModelCapabilities(context_window_tokens=32_768)}
+        ),
+        _deployment("native", provider="anthropic", gateway=_TOOL_CAPABLE).model_copy(
+            update={"capabilities": ModelCapabilities(context_window_tokens=131_072)}
+        ),
+    )
+    route = _mixed_route("maximize_availability", deployments)
+    request = GatewayRequest(
+        surface=GatewayApiSurface.MESSAGES,
+        messages=(GatewayMessage(role="user", content="hi"),),
+        maximum_output_tokens=10_000_000,
+        maximum_output_tokens_parameter="max_tokens",
+    )
+    accounting = _CoercionCounter()
+    narrowed, _wires_out, public, provider, _placement = admitted_route_requests(
+        route,
+        _wires(),
+        request,
+        accounting=cast(NativeAttemptAccounting, accounting),
+        authorization=route.snapshot.authorization,
+    )
+    target = 131_072 - len(b"hi") - TEMPLATE_RESERVE_TOKENS
+    assert provider.maximum_output_tokens == target
+    assert narrowed.snapshot.deployment_ids == ("native",)
+    assert f"max_tokens->{target}(context_window)" in public.ignored_parameters
+    assert accounting.recorded == 1
 
 
 def test_a_prompt_certain_to_overflow_the_route_is_refused_before_shaping() -> None:
@@ -2352,7 +2565,6 @@ def test_chat_nested_budget_narrows_to_budget_capable_anthropic_rung(stream: boo
     "dialect,model,reasoning",
     (
         ("openai_compatible", "kimi-k2-thinking", True),
-        ("anthropic_messages", "claude-sonnet-5", True),
         ("anthropic_messages", "claude-haiku-3-5", False),
     ),
 )
@@ -2468,3 +2680,375 @@ def test_reasoning_summary_serves_without_summaries_on_chat_wire_lanes() -> None
     assert public.ignored_parameters == (
         "reasoning.generate_summary->dropped(unsupported_by_provider)",
     )
+
+
+def test_fast_is_placed_by_conversation_like_any_request() -> None:
+    """A :fast conversation keeps its affinity placement (its replica's prefix cache stays warm)."""
+    route, wires = _affinity_fixture()
+    fast = route.snapshot.authorization.model_copy(update={"fast": True})
+    for session in ("session-1", "session-2", "session-3"):
+        placed = [
+            _affinity_ordered_rungs(
+                route,
+                wires,
+                _session_request(session),
+                accounting=_affinity_accounting(),
+                authorization=authorization,
+                continuation=None,
+            )
+            for authorization in (route.snapshot.authorization, fast)
+        ]
+        assert _order(placed[1][0]) == _order(placed[0][0])
+        assert placed[1][2].fingerprint is not None
+
+
+def test_prompt_caching_off_keeps_certified_order_and_adds_no_cache_state() -> None:
+    """An organization with caching off gets no affinity placement, key or marker.
+
+    The affinity pool would otherwise reorder each session by rendezvous and
+    send the tenant cache key; with the switch off every session dispatches in
+    the certified order, the provider request carries neither the key nor the
+    caller's markers, and the public request names what was removed plus the
+    best-effort note for rungs whose provider caches on its own.
+    """
+    route, wires = _affinity_fixture()
+    authorization = route.snapshot.authorization.model_copy(
+        update={"prompt_caching_disabled": True}
+    )
+    route = route.model_copy(
+        update={"snapshot": route.snapshot.model_copy(update={"authorization": authorization})}
+    )
+    for session in ("session-1", "session-2", "session-3"):
+        ordered, _wires_out, placement = _affinity_ordered_rungs(
+            route,
+            wires,
+            _session_request(session),
+            accounting=_affinity_accounting(),
+            authorization=authorization,
+            continuation=None,
+        )
+        assert _order(ordered) == ("dep-house", "dep-fireworks", "dep-openrouter")
+        assert placement.fingerprint is None
+
+    streaming = GatewayDeploymentMetadata(
+        capabilities=GatewayDeploymentCapabilities(
+            supports_streaming=True, supports_streaming_tool_arguments=True
+        )
+    )
+    single = _mixed_route(
+        "maximize_cache_affinity",
+        (_deployment("shim", gateway=streaming),),
+        GatewayApiSurface.CHAT_COMPLETIONS,
+    )
+    request = GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=(
+            GatewayMessage(role="system", content="You are Terminus."),
+            GatewayMessage(
+                role="assistant",
+                tool_calls=(
+                    ToolCall(call_id="call-1", name="ls", cache_control={"type": "ephemeral"}),
+                ),
+            ),
+            GatewayMessage(role="tool", tool_call_id="call-1", content="a.txt"),
+        ),
+        prompt_cache_key="session-7",
+        stream=True,
+        include_usage=True,
+    )
+    _route, _wires, public, provider, placement = admitted_route_requests(
+        single,
+        wires[:1],
+        request,
+        accounting=_affinity_accounting(),
+        authorization=authorization,
+    )
+    assert provider.provider_prompt_cache_key is None
+    assert all(call.cache_control is None for m in provider.messages for call in m.tool_calls)
+    assert placement.fingerprint is None
+    assert public.ignored_parameters == (
+        f"messages.tool_calls.cache_control{PROMPT_CACHING_OFF_SUFFIX}",
+        f"prompt_cache_key{PROMPT_CACHING_OFF_SUFFIX}",
+        PROMPT_CACHING_BEST_EFFORT,
+    )
+
+
+def _aggregator_fixture(
+    *,
+    billing_source: BillingSource,
+    provider: str = "openrouter",
+    url: str = "https://openrouter.ai/api/v1",
+    others: tuple[str, ...] = ("dep-a", "dep-b"),
+) -> tuple[GatewayRoute, tuple[tuple[GatewayWireProfile, NativeWireClient], ...]]:
+    """Build an affinity route whose FIRST rung is an OpenRouter rung of overwhelming weight.
+
+    The weight makes plain rendezvous rank the OpenRouter rung first for every
+    fingerprint, so a test can tell the demotion from the rendezvous draw.
+    """
+    aggregator = _deployment(
+        "dep-openrouter",
+        provider=provider,
+        gateway=GatewayDeploymentMetadata(dispatch=GatewayRungDispatchPolicy(affinity_weight=1e9)),
+    ).model_copy(update={"billing_source": billing_source})
+    deployments = (aggregator, *(_deployment(name) for name in others))
+    route = _mixed_route("maximize_cache_affinity", deployments, GatewayApiSurface.CHAT_COMPLETIONS)
+    client = cast(NativeWireClient, object())
+    wires = (
+        (GatewayWireProfile(dialect="openai_compatible", url=url), client),
+        *(
+            (GatewayWireProfile(dialect="openai_compatible", url=f"https://{name}.test"), client)
+            for name in others
+        ),
+    )
+    return route, wires
+
+
+def _rendezvous_names(route: GatewayRoute, request: GatewayRequest) -> tuple[str, ...]:
+    """The plain rendezvous order the route's rungs would take for ``request``."""
+    authorization = route.snapshot.authorization
+    fingerprint = affinity_fingerprint(
+        organization_id=authorization.organization_id,
+        identity_id=authorization.identity_id,
+        material=affinity_seed_material(
+            request, continuation_episode_key=None, request_id=authorization.request_id
+        ),
+    )
+    order = rendezvous_order(fingerprint, affinity_weighted_rungs(route.deployments))
+    return tuple(route.deployments[index].deployment_id for index in order)
+
+
+class TestHouseOpenRouterNeverLeadsAnAffinityPool:
+    """OpenRouter is never the first lane, whatever the rendezvous draw says."""
+
+    @pytest.mark.parametrize(
+        ("provider", "url"),
+        (
+            ("openrouter", "https://openrouter.ai/api/v1"),
+            # The Responses-wire rung: an ``openai`` connection on OpenRouter's origin.
+            ("openai", "https://openrouter.ai/api/v1"),
+        ),
+    )
+    def test_house_openrouter_moves_behind_the_rendezvous_order(
+        self, provider: str, url: str
+    ) -> None:
+        """[openrouter-house, a, b] with OpenRouter drawn first dispatches a/b first."""
+        for index in range(16):
+            route, wires = _aggregator_fixture(
+                billing_source=BillingSource.HOST_MANAGED, provider=provider, url=url
+            )
+            request = _session_request(f"session-{index}")
+            drawn = _rendezvous_names(route, request)
+            assert drawn[0] == "dep-openrouter"
+            ordered, ordered_wires, _placement = _affinity_ordered_rungs(
+                route,
+                wires,
+                request,
+                accounting=_affinity_accounting(),
+                authorization=route.snapshot.authorization,
+                continuation=None,
+            )
+            # The others keep their rendezvous order; OpenRouter goes last.
+            assert _order(ordered) == (*drawn[1:], "dep-openrouter")
+            assert ordered_wires[-1][0].url == url
+
+    def test_customer_managed_openrouter_keeps_its_rendezvous_place(self) -> None:
+        """A customer's own OpenRouter key may lead: their account, their choice."""
+        route, wires = _aggregator_fixture(billing_source=BillingSource.CUSTOMER_MANAGED)
+        request = _session_request("session-1")
+        ordered, _wires_out, _placement = _affinity_ordered_rungs(
+            route,
+            wires,
+            request,
+            accounting=_affinity_accounting(),
+            authorization=route.snapshot.authorization,
+            continuation=None,
+        )
+        assert _order(ordered) == _rendezvous_names(route, request)
+        assert _order(ordered)[0] == "dep-openrouter"
+
+    def test_a_single_openrouter_rung_still_serves(self) -> None:
+        """With nothing else on the pool the OpenRouter rung remains the route."""
+        route, wires = _aggregator_fixture(billing_source=BillingSource.HOST_MANAGED, others=())
+        ordered, ordered_wires, _placement = _affinity_ordered_rungs(
+            route,
+            wires,
+            _session_request("session-1"),
+            accounting=_affinity_accounting(),
+            authorization=route.snapshot.authorization,
+            continuation=None,
+        )
+        assert _order(ordered) == ("dep-openrouter",)
+        assert len(ordered_wires) == 1
+
+
+def test_plaintext_reasoning_history_leads_on_its_carrier_and_keeps_every_fallback() -> None:
+    """A replayed-reasoning turn dispatches the carrying rung first, the others behind it.
+
+    Admission used to narrow such a turn to the carrying rung ALONE, so a
+    header timeout there had no successor: on 2026-10-20 coding-agent turns
+    replaying reasoning on glm-5.3-flash died on Novita timeouts while the
+    route's Fireworks rung served every turn without that history.
+    """
+    route = _mixed_route(
+        "maximize_availability",
+        tuple(_deployment(name, gateway=_TOOL_CAPABLE) for name in ("plain", "carrier", "later")),
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+    )
+    client = cast(NativeWireClient, object())
+    plain = GatewayWireProfile(dialect="openai_compatible", url="https://plain.test")
+    carrier = GatewayWireProfile(
+        dialect="openai_compatible", url="https://carrier.test", reasoning_output_exposed=True
+    )
+    wires = ((plain, client), (carrier, client), (plain, client))
+    request = GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=(
+            GatewayMessage(role="user", content="run ls"),
+            GatewayMessage(
+                role="assistant",
+                content="done",
+                provider_reasoning=(ExposedReasoningContentBlock(content="list the files"),),
+            ),
+            GatewayMessage(role="user", content="again"),
+        ),
+        stream=True,
+    )
+    narrowed, wires_out, public, _provider, _placement = admitted_route_requests(
+        route,
+        wires,
+        request,
+        accounting=cast(NativeAttemptAccounting, _CoercionCounter()),
+        authorization=route.snapshot.authorization,
+    )
+    assert narrowed.snapshot.deployment_ids == ("carrier", "plain", "later")
+    assert wires_out == (wires[1], wires[0], wires[2])
+    assert (
+        "messages.reasoning_content->dropped(unsupported_by_fallback_provider)"
+        in public.ignored_parameters
+    )
+    # Without replayed reasoning the authored order stands.
+    plain_request = request.model_copy(
+        update={"messages": (GatewayMessage(role="user", content="hi"),)}
+    )
+    narrowed, _wires, _public, _provider, _placement = admitted_route_requests(
+        route,
+        wires,
+        plain_request,
+        accounting=cast(NativeAttemptAccounting, _CoercionCounter()),
+        authorization=route.snapshot.authorization,
+    )
+    assert narrowed.snapshot.deployment_ids == ("plain", "carrier", "later")
+
+
+def test_a_prompt_cap_moves_a_long_prompt_to_the_main_lane_but_never_refuses() -> None:
+    """Applied after the tier filter: with no uncapped carded rung left, the capped one serves."""
+    from exp.common.models.dispatch_policy import GatewayRungDispatchPolicy
+
+    capped = GatewayDeploymentMetadata(
+        capabilities=GatewayDeploymentCapabilities(supports_streaming=True),
+        dispatch=GatewayRungDispatchPolicy(max_prompt_tokens=100),
+    )
+    plain = GatewayDeploymentMetadata(
+        capabilities=GatewayDeploymentCapabilities(supports_streaming=True)
+    )
+    route = _mixed_route(
+        "maximize_availability",
+        (_deployment("fast", gateway=capped), _deployment("main", gateway=plain)),
+        GatewayApiSurface.CHAT_COMPLETIONS,
+    )
+    client = cast(NativeWireClient, object())
+    carded = GatewayWireProfile(
+        dialect="openai_compatible",
+        url="https://lane.test",
+        service_tier_pricing_enabled=True,
+        service_tier_cards=frozenset({"priority"}),
+    )
+    uncarded = GatewayWireProfile(dialect="openai_compatible", url="https://main.test")
+    long_prompt = GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=(GatewayMessage(role="user", content="x" * 8_000),),
+    )
+    fast = route.snapshot.authorization.model_copy(update={"fast": True})
+    # A carded main lane: the long :fast prompt leaves the capped replica.
+    narrowed, _, _, provider, _ = admitted_route_requests(
+        route,
+        ((carded, client), (carded, client)),
+        long_prompt,
+        accounting=cast(NativeAttemptAccounting, _CoercionCounter()),
+        authorization=fast,
+    )
+    assert tuple(d.deployment_id for d in narrowed.deployments) == ("main",)
+    assert provider.service_tier == "priority"
+    # An uncarded main lane: the tier filter leaves only the replica, which serves.
+    narrowed, _, _, provider, _ = admitted_route_requests(
+        route,
+        ((carded, client), (uncarded, client)),
+        long_prompt,
+        accounting=cast(NativeAttemptAccounting, _CoercionCounter()),
+        authorization=fast,
+    )
+    assert tuple(d.deployment_id for d in narrowed.deployments) == ("fast",)
+    assert provider.service_tier == "priority"
+
+
+def _house_openrouter(deployment_id: str = "house-openrouter") -> ExactModelDeployment:
+    """A host-funded OpenRouter rung: the house aggregator of last resort."""
+    return _deployment(deployment_id, provider="openrouter").model_copy(
+        update={"billing_source": BillingSource.HOST_MANAGED}
+    )
+
+
+def test_marker_grouping_never_leads_with_the_house_openrouter_rung() -> None:
+    """GLM-5.3-Flash-uncensored 2026-10-22: the marker grouping put house OpenRouter first.
+
+    The house box drops cache markers and OpenRouter forwards them, so the
+    ``maximize_cache`` grouping moved OpenRouter ahead of the box for every
+    cache-marked request although the platform had ordered it last. The
+    aggregator stays behind the box (owner rule: OpenRouter is never the first
+    lane); a customer's own OpenRouter key keeps the grouping's order.
+    """
+    client = cast(NativeWireClient, object())
+    box = (GatewayWireProfile(dialect="openai_compatible", url="https://box.test"), client)
+    openrouter = (
+        GatewayWireProfile(
+            dialect="openai_compatible",
+            url="https://openrouter.ai/api/v1",
+            forwards_cache_control=True,
+        ),
+        client,
+    )
+    route = _mixed_route("maximize_cache", (_deployment("box"), _house_openrouter()))
+    ordered, wires = _prefer_cache_capable_rungs(route, (box, openrouter), _marked_request())
+    assert _order(ordered) == ("box", "house-openrouter")
+    assert [profile.url for profile, _ in wires] == [
+        "https://box.test",
+        "https://openrouter.ai/api/v1",
+    ]
+
+    byok = _deployment("byok-openrouter", provider="openrouter")
+    route = _mixed_route("maximize_cache", (_deployment("box"), byok))
+    ordered, _ = _prefer_cache_capable_rungs(route, (box, openrouter), _marked_request())
+    assert _order(ordered) == ("byok-openrouter", "box")
+
+
+def test_an_authored_route_the_grouping_leaves_unmoved_stays_as_written() -> None:
+    """quality-review !119: an org-authored [openrouter, X] route is never rewritten.
+
+    The grouping already leads with the marker-forwarding OpenRouter rung, so
+    it moves nothing, and the aggregator rule rides only an actual reorder
+    (as on the stage path): the org's own order stands.
+    """
+    client = cast(NativeWireClient, object())
+    openrouter = (
+        GatewayWireProfile(
+            dialect="openai_compatible",
+            url="https://openrouter.ai/api/v1",
+            forwards_cache_control=True,
+        ),
+        client,
+    )
+    box = (GatewayWireProfile(dialect="openai_compatible", url="https://box.test"), client)
+    route = _mixed_route("maximize_cache", (_house_openrouter(), _deployment("box")))
+    ordered, wires = _prefer_cache_capable_rungs(route, (openrouter, box), _marked_request())
+    assert _order(ordered) == ("house-openrouter", "box")
+    assert ordered is route

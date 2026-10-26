@@ -10,7 +10,7 @@ import pytest
 from pydantic import JsonValue
 
 from exp.common.core.artifacts import JsonObject
-from exp.common.models.content import MAXIMUM_DOCUMENTS_PER_REQUEST
+from exp.common.models.content import MAXIMUM_DOCUMENTS_PER_REQUEST, TextContentPart
 from exp.runtime.anthropic_protocol.requests import decode_messages, decode_messages_count_tokens
 from exp.runtime.gateway.contracts import (
     ExposedReasoningContentBlock,
@@ -610,8 +610,116 @@ def test_malformed_image_source_is_rejected() -> None:
     assert excinfo.value.detail.param == "messages.0.content.0.source"
 
 
-def test_document_block_inside_tool_result_is_rejected() -> None:
-    """Nested unsupported blocks inside tool results are rejected loudly."""
+def test_document_blocks_inside_tool_results_ride_the_tool_message_parts() -> None:
+    """A tool-returned PDF decodes losslessly instead of 400ing the session.
+
+    Anthropic's real API accepts document sub-blocks in tool_result content,
+    and Claude Code's Read tool on a PDF emits one routinely; the block is
+    baked into history, so rejecting it wedges every later turn.
+    """
+    decoded = decode_messages(
+        _body(
+            messages=[
+                {
+                    "role": "user",
+                    "content": "read the file",
+                },
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "tool_use", "id": "call-1", "name": "Read", "input": {}},
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "call-1",
+                            "content": [
+                                {"type": "text", "text": "the file:"},
+                                _pdf_block(title="report.pdf"),
+                            ],
+                        }
+                    ],
+                },
+            ]
+        )
+    )
+    tool_message = decoded.request.messages[-1]
+    assert tool_message.role == "tool"
+    assert tool_message.tool_call_id == "call-1"
+    assert tool_message.content == "the file:"
+    assert [part.kind for part in tool_message.content_parts] == ["text", "document"]
+    assert tool_message.documents[0].data == _PDF_BASE64
+    assert tool_message.documents[0].name == "report.pdf"
+
+
+def test_a_plain_text_document_inside_a_tool_result_stays_text() -> None:
+    """A text-source document in a tool result is the caller's text, exactly
+    as on a user turn: no parts when the result is text-only, a text part
+    beside a screenshot when it is not."""
+    text_document: JsonObject = {
+        "type": "document",
+        "title": "notes.txt",
+        "source": {"type": "text", "media_type": "text/plain", "data": "plain body"},
+    }
+    decoded = decode_messages(
+        _body(
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "call-1",
+                            "content": [text_document],
+                        }
+                    ],
+                }
+            ]
+        )
+    )
+    tool_message = decoded.request.messages[-1]
+    assert tool_message.role == "tool"
+    assert tool_message.content == "notes.txt\n\nplain body"
+    assert tool_message.content_parts == ()
+
+    multimodal = decode_messages(
+        _body(
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "call-1",
+                            "content": [
+                                text_document,
+                                {
+                                    "type": "image",
+                                    "source": {
+                                        "type": "base64",
+                                        "media_type": "image/png",
+                                        "data": _PNG_BASE64,
+                                    },
+                                },
+                            ],
+                        }
+                    ],
+                }
+            ]
+        )
+    )
+    tool_message = multimodal.request.messages[-1]
+    assert [part.kind for part in tool_message.content_parts] == ["text", "image"]
+    text_part = tool_message.content_parts[0]
+    assert isinstance(text_part, TextContentPart)
+    assert text_part.text == "notes.txt\n\nplain body"
+
+
+def test_document_citations_inside_a_tool_result_are_rejected_at_their_path() -> None:
+    """An enabled-citations document in a tool result names its inner path."""
     with pytest.raises(OpenAIProtocolError) as excinfo:
         decode_messages(
             _body(
@@ -622,14 +730,50 @@ def test_document_block_inside_tool_result_is_rejected() -> None:
                             {
                                 "type": "tool_result",
                                 "tool_use_id": "call-1",
-                                "content": [{"type": "document", "source": {}}],
+                                "content": [
+                                    _pdf_block(citations={"enabled": True}),
+                                ],
                             }
                         ],
                     }
                 ]
             )
         )
-    assert "document blocks are not supported" in excinfo.value.detail.message
+    assert excinfo.value.detail.param == "messages.0.content.0.content.0.citations"
+    assert "document citations are not supported" in excinfo.value.detail.message
+
+
+def test_citations_on_a_text_only_tool_result_document_are_refused_not_dropped() -> None:
+    """A text-source document is flattened to text, and its enabled citations
+    are refused exactly as on a user turn rather than silently dropped."""
+    with pytest.raises(OpenAIProtocolError) as excinfo:
+        decode_messages(
+            _body(
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": "call-1",
+                                "content": [
+                                    {
+                                        "type": "document",
+                                        "citations": {"enabled": True},
+                                        "source": {
+                                            "type": "text",
+                                            "media_type": "text/plain",
+                                            "data": "plain body",
+                                        },
+                                    }
+                                ],
+                            }
+                        ],
+                    }
+                ]
+            )
+        )
+    assert excinfo.value.detail.param == "messages.0.content.0.content.0.citations"
 
 
 def _tool_result_image_messages(*, leading_text: str | None = None) -> list[JsonObject]:
@@ -735,6 +879,30 @@ def test_an_unknown_tool_result_sub_block_names_its_index_and_type() -> None:
     assert excinfo.value.detail.param == "messages.0.content.0.content.0"
     assert "unsupported block type 'mystery'" in excinfo.value.detail.message
     assert ".str" not in (excinfo.value.detail.param or "")
+
+
+def test_a_valid_tool_result_document_never_takes_the_blame_for_a_bad_sibling() -> None:
+    """The error names the block that is actually wrong, never a valid PDF beside it."""
+    with pytest.raises(OpenAIProtocolError) as excinfo:
+        decode_messages(
+            _body(
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": "call-1",
+                                "content": [_pdf_block(), {"type": "mystery"}],
+                            }
+                        ],
+                    }
+                ]
+            )
+        )
+    assert excinfo.value.detail.param == "messages.0.content.0.content.1"
+    assert "unsupported block type 'mystery'" in excinfo.value.detail.message
+    assert "text, image, document, and tool_reference sub-blocks" in excinfo.value.detail.message
 
 
 def test_a_union_miss_never_reports_the_string_arm() -> None:
@@ -1301,6 +1469,18 @@ def test_caller_beta_tokens_partition_into_allowlist_and_disclosures() -> None:
     with pytest.raises(OpenAIProtocolError) as raised:
         decode_messages(_body(), anthropic_beta="bad\nvalue")
     assert raised.value.detail.param == "anthropic-beta"
+
+
+def test_the_one_hour_cache_ttl_beta_is_forwarded() -> None:
+    """A one-hour cache marker keeps the beta that admits it.
+
+    The marker itself relays byte-for-byte, so dropping the token would leave
+    the provider to refuse or downgrade a ``ttl: "1h"`` breakpoint the caller
+    priced at the one-hour rate.
+    """
+    decoded = decode_messages(_body(), anthropic_beta="extended-cache-ttl-2025-04-11")
+    assert decoded.request.provider_beta_tokens == ("extended-cache-ttl-2025-04-11",)
+    assert decoded.request.ignored_parameters == ()
 
 
 @pytest.mark.parametrize("length", [65_537, 119_825, 262_145, 1_048_576])
@@ -2459,3 +2639,256 @@ def test_tool_search_result_blocks_in_history_are_accepted() -> None:
         )
     )
     assert len(decoded.request.messages) >= 3
+
+
+def test_plain_text_document_source_decodes_as_the_callers_text() -> None:
+    """Anthropic's ``text`` document source (Claude Code attachments) is served.
+
+    It joins the turn as text, title first, so every wire can carry it.
+    """
+    decoded = decode_messages(
+        _body(
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "Summarize:\n"},
+                        {
+                            "type": "document",
+                            "title": "notes.md",
+                            "source": {
+                                "type": "text",
+                                "media_type": "text/plain",
+                                "data": "line one",
+                            },
+                        },
+                    ],
+                }
+            ]
+        )
+    )
+    (message,) = decoded.request.messages
+    assert message.content == "Summarize:\nnotes.md\n\nline one"
+    assert message.content_parts == ()
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        {"type": "text", "media_type": "text/html", "data": "<p>x</p>"},
+        {"type": "text", "media_type": "text/plain"},
+    ],
+)
+def test_text_document_source_needs_plain_text_data(source: JsonObject) -> None:
+    """A text source carries its data as ``text/plain``, as Anthropic defines it."""
+    with pytest.raises(OpenAIProtocolError) as excinfo:
+        decode_messages(
+            _body(messages=[{"role": "user", "content": [{"type": "document", "source": source}]}])
+        )
+    assert (excinfo.value.detail.param or "").startswith("messages.0.content.0")
+
+
+def test_an_unknown_content_block_type_is_named_instead_of_the_text_arm() -> None:
+    """A block outside the union names its own type, not "Input should be 'text'"."""
+    with pytest.raises(OpenAIProtocolError) as excinfo:
+        decode_messages(
+            _body(
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "hi"},
+                            {"type": "container_upload", "file_id": "file_1"},
+                        ],
+                    }
+                ]
+            )
+        )
+    assert excinfo.value.detail.param == "messages.0.content.1.type"
+    assert "'container_upload'" in excinfo.value.detail.message
+    assert "Input should be 'text'" not in excinfo.value.detail.message
+
+
+def test_claude_code_turn_level_output_config_is_dropped_with_disclosure() -> None:
+    """Production 2026-10-18 onward: Claude Code puts ``output_config`` on a turn.
+
+    claude-cli 2.1.282 through 2.1.310 (cli, sdk-cli, agent-sdk) sends
+    ``output_config`` inside ``messages[1]`` on some requests, and the strict
+    turn model answered 400 ``Unknown parameter 'messages.1.output_config'``
+    for a body Anthropic itself serves. The turn key is removed and named
+    once; the top-level ``output_config`` still carries the effort, and the
+    turn's own content is untouched.
+    """
+    decoded = decode_messages(
+        {
+            "model": "claude-fable-5",
+            "max_tokens": 64000,
+            "output_config": {"effort": "high"},
+            "messages": [
+                {"role": "user", "content": "Summarize the session."},
+                {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "Working on it."}],
+                    "output_config": {"effort": "low"},
+                },
+                {"role": "user", "content": "Go on.", "output_config": {"format": None}},
+            ],
+        }
+    )
+    request = decoded.request
+    assert request.ignored_parameters == ("messages.output_config->dropped(unknown_message_field)",)
+    assert request.reasoning_effort == "high"
+    assert request.provider_output_config == {"effort": "high"}
+    assert [message.role for message in request.messages] == ["user", "assistant", "user"]
+    assert request.messages[1].content == "Working on it."
+
+
+def test_turn_key_drop_leaves_content_blocks_and_defined_turn_keys_strict() -> None:
+    """Only unknown keys on the turn object drop; blocks and defined keys stay refused."""
+    turn_extra = {"role": "user", "content": "hi", "output_config": {"effort": "high"}}
+    with pytest.raises(OpenAIProtocolError) as block_extra:
+        decode_messages(
+            _body(
+                messages=[
+                    turn_extra,
+                    {
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": "x", "output_config": {}}],
+                    },
+                ]
+            )
+        )
+    assert block_extra.value.detail.param == "messages.1.content.0.output_config"
+    with pytest.raises(OpenAIProtocolError) as bad_role:
+        decode_messages(_body(messages=[{**turn_extra, "role": "narrator"}]))
+    assert bad_role.value.detail.param == "messages.0.role"
+
+
+_DEFERRED_SCHEMA: JsonObject = {"type": "object", "properties": {"q": {"type": "string"}}}
+
+
+def _claude_code_tool_search_body(*, stream: bool) -> JsonObject:
+    """A Messages body shaped like Claude Code's client-side ToolSearch turn.
+
+    The caller declares its own ToolSearch tool and two deferred MCP tools
+    (no server tool-search tool), the model called ToolSearch, and the
+    tool_result loads one deferred tool with a ``tool_reference`` block.
+    """
+    return _body(
+        stream=stream,
+        tools=[
+            {"name": "Bash", "input_schema": {"type": "object"}},
+            {"name": "ToolSearch", "input_schema": {"type": "object"}},
+            {
+                "name": "mcp__github__create_issue",
+                "input_schema": _DEFERRED_SCHEMA,
+                "defer_loading": True,
+            },
+            {
+                "name": "mcp__slack__post_message",
+                "input_schema": _DEFERRED_SCHEMA,
+                "defer_loading": True,
+            },
+        ],
+        messages=[
+            {"role": "user", "content": "open an issue"},
+            {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "toolu_1",
+                        "name": "ToolSearch",
+                        "input": {"query": "select:mcp__github__create_issue"},
+                    }
+                ],
+            },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_1",
+                        "content": [
+                            {"type": "tool_reference", "tool_name": "mcp__github__create_issue"}
+                        ],
+                    }
+                ],
+            },
+        ],
+    )
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_tool_reference_blocks_inside_tool_results_ride_the_tool_message(stream: bool) -> None:
+    """Claude Code's ToolSearch result decodes instead of 400ing the session.
+
+    The reference is not content: it rides the tool message's reference
+    carrier, the result text stays empty, and the deferred markers stay on
+    the canonical tools.
+    """
+    decoded = decode_messages(_claude_code_tool_search_body(stream=stream))
+
+    tool_message = decoded.request.messages[-1]
+    assert tool_message.role == "tool"
+    assert tool_message.tool_call_id == "toolu_1"
+    assert tool_message.content == ""
+    assert tool_message.content_parts == ()
+    assert tool_message.tool_references == ("mcp__github__create_issue",)
+    assert decoded.request.stream is stream
+    assert decoded.request.tool_search is None
+    assert [tool.defer_loading for tool in decoded.request.tools] == [None, None, True, True]
+
+
+def test_a_tool_reference_beside_text_keeps_the_text_and_moves_its_marker() -> None:
+    """A mixed result keeps its text; a reference's cache marker lands on the result."""
+    decoded = decode_messages(
+        _body(
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_1",
+                            "content": [
+                                {"type": "text", "text": "found:"},
+                                {
+                                    "type": "tool_reference",
+                                    "tool_name": "Lookup",
+                                    "cache_control": {"type": "ephemeral"},
+                                },
+                            ],
+                        }
+                    ],
+                }
+            ]
+        )
+    )
+    tool_message = decoded.request.messages[-1]
+    assert tool_message.content == "found:"
+    assert tool_message.tool_references == ("Lookup",)
+    assert tool_message.cache_control == {"type": "ephemeral"}
+
+
+def test_a_malformed_tool_reference_is_rejected_by_field() -> None:
+    """A reference without a tool name is still refused, naming the sub-block."""
+    with pytest.raises(OpenAIProtocolError) as excinfo:
+        decode_messages(
+            _body(
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": "toolu_1",
+                                "content": [{"type": "tool_reference"}],
+                            }
+                        ],
+                    }
+                ]
+            )
+        )
+    assert excinfo.value.detail.param is not None
+    assert excinfo.value.detail.param.startswith("messages.0.content.0.content.0")

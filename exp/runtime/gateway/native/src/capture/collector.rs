@@ -38,15 +38,31 @@ pub(crate) struct Configuration {
     /// and retain them as `provider_logprobs`, stripped from the caller's answer.
     #[serde(default)]
     pub capture_logprobs: bool,
+    /// Spill content past the in-memory window to disk and hand the destination
+    /// split records instead of trimming or dropping it. Absent keeps the
+    /// bounded in-memory capture (every limit above applies unchanged).
+    #[serde(default)]
+    pub spill: Option<super::spill::Configuration>,
 }
 
 impl Configuration {
     pub(crate) fn validate(&self) -> Result<(), &'static str> {
         self.delivery.validate()?;
+        // With spill, a request is bounded by what serving accepts, never trimmed.
+        let maximum_request = match &self.spill {
+            Some(spill) => {
+                spill.validate()?;
+                // The context document can exceed the body it normalizes.
+                2 * crate::respond::MAXIMUM_REQUEST_BODY_BYTES
+            }
+            None => 8 * 1024 * 1024,
+        };
         if !(1..=4096).contains(&self.maximum_pending_records)
-            || !(1..=8 * 1024 * 1024).contains(&self.maximum_request_bytes)
+            || !(1..=maximum_request).contains(&self.maximum_request_bytes)
             || !(1..=4 * 1024 * 1024).contains(&self.maximum_response_bytes)
-            || self.maximum_pending_bytes < self.maximum_request_bytes
+            // With spill a large request goes to a background writer, so the
+            // pending budget need not hold one whole.
+            || (self.spill.is_none() && self.maximum_pending_bytes < self.maximum_request_bytes)
             || self.maximum_pending_bytes < self.maximum_response_bytes
             || self.maximum_pending_bytes > 256 * 1024 * 1024
             || !(1..=3600).contains(&self.ttl_seconds)
@@ -161,6 +177,10 @@ impl<S: Sink> Sink for MaintainedSink<S> {
         self.sink.write(prepared)
     }
 
+    fn split_raw_above(&self) -> Option<usize> {
+        self.sink.split_raw_above()
+    }
+
     fn batch_records(&self) -> usize {
         self.sink.batch_records()
     }
@@ -215,6 +235,10 @@ fn expire_pending(pending: &mut Pending, skipped: &AtomicU64) {
 #[path = "collector_logprobs.rs"]
 mod logprobs_sidecar;
 
+// Disk spill for content past the in-memory window (`super::spill`).
+#[path = "collector_spill.rs"]
+mod spill_sidecar;
+
 pub(crate) struct Collector {
     pub config: Configuration,
     delivery: Delivery,
@@ -224,11 +248,28 @@ pub(crate) struct Collector {
     handoff_bytes: Arc<AtomicUsize>,
     body_bytes: AtomicUsize,
     body_capacity: Arc<Semaphore>,
+    spill: Option<Arc<super::spill::SpillStore>>,
 }
 
 impl Collector {
     pub(crate) fn new(config: Configuration, sink: impl Sink) -> Result<Self, &'static str> {
+        if config.spill.is_some() {
+            return Err("capture spill requires a destination that accepts split records");
+        }
+        Self::with_spill(config, sink, None)
+    }
+
+    /// Build a collector whose oversized content goes to `spill`, which the
+    /// destination shares to read split-record parts.
+    pub(crate) fn with_spill(
+        config: Configuration,
+        sink: impl Sink,
+        spill: Option<Arc<super::spill::SpillStore>>,
+    ) -> Result<Self, &'static str> {
         config.validate()?;
+        if config.spill.is_some() != spill.is_some() {
+            return Err("capture spill store does not match its configuration");
+        }
         let pending = Arc::new(Mutex::new(Pending::default()));
         let skipped = Arc::new(AtomicU64::new(0));
         let sink = MaintainedSink {
@@ -245,6 +286,7 @@ impl Collector {
             admissions: Arc::new(AtomicUsize::new(0)),
             handoff_bytes: Arc::new(AtomicUsize::new(0)),
             body_bytes: AtomicUsize::new(0),
+            spill,
         })
     }
 
@@ -255,6 +297,7 @@ impl Collector {
         } else {
             request.json_bytes()
         };
+        let messages_part = self.spill_messages(&mut request, request_bytes);
         let record = Record {
             checkpointed: false,
             schema_version: SCHEMA_VERSION,
@@ -269,6 +312,8 @@ impl Collector {
             gemini_thought_parts: Vec::new(),
             gemini_thought_parts_source_json: None,
             provider_logprobs: None,
+            transport_body: None,
+            messages_part,
             captured_at: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map(|duration| duration.as_secs_f64())
@@ -422,6 +467,8 @@ impl Collector {
             gemini_thought_parts: Vec::new(),
             gemini_thought_parts_source_json: None,
             provider_logprobs: None,
+            transport_body: None,
+            messages_part: entry.record.messages_part.clone(),
             captured_at: entry.record.captured_at,
         };
         // The context Arc is shared; charge the copied identifiers and receipt/queue nodes.
@@ -630,6 +677,17 @@ impl Collector {
             pending.entries.insert(request_id.to_owned(), entry);
             return false;
         }
+        let mut relay = relay;
+        if self
+            .retained_bytes(&pending)
+            .saturating_add(entry.map_bytes())
+            .saturating_add(relay.heap_bytes())
+            > self.config.maximum_pending_bytes
+        {
+            // The caller body alone would cross the capture budget: keep the
+            // capture and the wire facts, drop the body.
+            relay.drop_body();
+        }
         entry.bytes += relay.heap_bytes();
         entry.relay = Some(relay);
         if entry.output_finished && entry.response_allowed {
@@ -723,7 +781,7 @@ impl Collector {
             .get_or_insert_with(String::new);
         let previous = text.capacity();
         let required = text.len().saturating_add(delta.len());
-        if required > self.config.maximum_response_bytes
+        if required > self.retained_text_limit()
             || self
                 .retained_bytes(&pending)
                 .saturating_add(
@@ -767,7 +825,7 @@ impl Collector {
             * std::mem::size_of::<Arc<serde_json::Value>>();
         let heap = super::budget::heap_bytes(&part) + 64;
         let part_bytes = super::budget::json_bytes(&part);
-        if entry.gemini_part_bytes.saturating_add(part_bytes) > self.config.maximum_response_bytes
+        if entry.gemini_part_bytes.saturating_add(part_bytes) > self.retained_text_limit()
             || self
                 .retained_bytes(&pending)
                 .saturating_add(
@@ -840,7 +898,7 @@ impl Collector {
             .get_or_insert_with(|| "[]".to_owned());
         let previous = text.capacity();
         let extra = encoded.len() + 1;
-        if text.len().saturating_add(extra) > self.config.maximum_response_bytes
+        if text.len().saturating_add(extra) > self.retained_text_limit()
             || self
                 .retained_bytes(&pending)
                 .saturating_add(

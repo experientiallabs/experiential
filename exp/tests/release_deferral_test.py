@@ -1,4 +1,4 @@
-"""Execute CI release-deferral guards without GitHub or package publication."""
+"""Execute CI release-deferral guards without a CI runner or package publication."""
 
 from __future__ import annotations
 
@@ -14,6 +14,20 @@ import pytest
 ROOT = Path(__file__).resolve().parents[2]
 MARKER = ".github/deferred-native-release.toml"
 NATIVE = "exp/runtime/gateway/native"
+
+
+def _ci_job(area: str, name: str) -> str:
+    """Return the raw YAML block of one top-level job in a GitLab CI area file.
+
+    Args:
+        area: Area file name under ``.gitlab/ci`` without the ``.yml`` suffix.
+        name: Top-level job name.
+
+    Returns:
+        The job's indented block, without the job name line.
+    """
+    block = (ROOT / ".gitlab" / "ci" / f"{area}.yml").read_text().split(f"\n{name}:\n", 1)[1]
+    return re.split(r"\n(?=\S)", block, maxsplit=1)[0]
 
 
 def _version_gate() -> str:
@@ -84,23 +98,37 @@ def test_release_deferral_requires_unchanged_versions_and_a_combined_bump(
     assert (result.returncode == 0) == success, result.stdout + result.stderr
 
 
-@pytest.mark.parametrize("deferred", [False, True])
+@pytest.mark.parametrize(
+    ("trigger", "deferred", "success"),
+    [
+        ({"CI_COMMIT_TAG": "v0.7.107"}, True, False),
+        ({"PYTHON_PACKAGE_PUBLISH": "true"}, True, False),
+        ({"CI_COMMIT_TAG": "v0.7.107"}, False, True),
+        ({"PYTHON_PACKAGE_PUBLISH": "true"}, False, True),
+        ({"PYTHON_PACKAGE_PUBLISH": "false"}, True, True),
+    ],
+)
 def test_publishing_cannot_pass_with_a_deferred_native_release(
-    tmp_path: Path, deferred: bool
+    tmp_path: Path, trigger: dict[str, str], deferred: bool, success: bool
 ) -> None:
-    """Both release events and explicit replay publishing must pass the build guard."""
-    workflow = (ROOT / ".github/workflows/python-package.yml").read_text()
-    build, publish = workflow.split("  build:\n", 1)[1].split("  publish:\n", 1)
-    step = build.split("      - name: Block publishing unreleased native changes\n", 1)[1]
-    assert (
-        "if: github.event_name == 'release' || inputs.publish == true"
-        in step.split("      - name:", 1)[0]
-    )
-    assert "    needs: [build, capture-release-smoke]\n" in publish
-    command = re.search(r"^        run: (.+)$", step, re.MULTILINE)
-    assert command is not None
+    """Both release tags and explicit replay publishing must pass the build guard."""
+    build = _ci_job("python-package", "python-package-build")
+    publish = _ci_job("python-package", "python-package-publish")
+    assert "    - job: python-package-build\n" in publish
+    assert "    - job: python-package-capture-smoke\n" in publish
+    guard = next(item for item in build.split("    - |\n")[1:] if MARKER in item)
     if deferred:
         (tmp_path / ".github").mkdir()
         (tmp_path / MARKER).touch()
-    result = subprocess.run(["bash", "-ec", command[1]], cwd=tmp_path, check=False)
-    assert (result.returncode == 0) is not deferred
+    environment = {
+        name: value
+        for name, value in os.environ.items()
+        if name not in {"CI_COMMIT_TAG", "PYTHON_PACKAGE_PUBLISH"}
+    }
+    result = subprocess.run(
+        ["bash", "-ec", textwrap.dedent(guard)],
+        cwd=tmp_path,
+        env={**environment, **trigger},
+        check=False,
+    )
+    assert (result.returncode == 0) is success

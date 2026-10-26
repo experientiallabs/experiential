@@ -13,6 +13,7 @@ from exp.common.models import (
     ModelRequest,
     ModelSnapshot,
 )
+from exp.runtime.gateway.organization_tag import organization_tag_key
 from exp.runtime.models.providers.base import ProviderHttpClient
 from exp.runtime.models.providers.errors import ProviderCapabilityError
 from exp.runtime.models.providers.transport import ScriptedJsonTransport
@@ -48,6 +49,7 @@ def test_typesafe_exposes_only_native_systemone_wire() -> None:
     assert profile.images_url is None
     assert profile.supports_temperature is False
     assert profile.supports_top_p is False
+    assert profile.organization_tag_key is None
     assert isinstance(client, ModelClient)
     assert not isinstance(client, EmbeddingClient)
     assert not isinstance(client, ProviderHttpClient)
@@ -85,3 +87,15 @@ def test_typesafe_refuses_an_empty_api_key() -> None:
     """A missing released credential fails before a wire profile can be obtained."""
     with pytest.raises(ValueError, match="non-empty API key"):
         TypeSafeClient(model=_model(), api_key="")
+
+
+def test_self_hosted_origin_carries_a_private_organization_tag_key() -> None:
+    """Only a non-official origin gets the tag key, and it never appears in diagnostics."""
+    client = TypeSafeClient(
+        model=_model(), api_key="provider-secret-canary", base_url="https://clef.example.test/v1"
+    )
+    profile = client.gateway_wire_profile()
+    assert profile.decisions_url == "https://clef.example.test/v1/systemone"
+    assert profile.organization_tag_key == organization_tag_key("provider-secret-canary")
+    assert "organization_tag_key" not in repr(profile)
+    assert "Org-Tag" not in str(profile.headers)

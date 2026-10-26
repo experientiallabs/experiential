@@ -66,7 +66,11 @@ from exp.simulation.world_model.artifact import (
     GroundedWorldModelArtifact,
     grounded_world_model_prompt_sha256,
 )
-from exp.simulation.world_model.runtime import GroundedWorldModel
+from exp.simulation.world_model.runtime import (
+    GroundedWorldModel,
+    load_grounded_world_model_artifact,
+    persist_fit_only_world_model,
+)
 
 
 class _Embedder:
@@ -276,6 +280,20 @@ def test_loaded_world_model_retrieves_real_evidence_before_prediction(tmp_path: 
     assert fit_runtime.retriever.rag_input == artifact_input(fit_rag.manifest)
     assert fit_runtime.artifact_input == artifact_input(artifact.manifest)
     assert fit_runtime.capabilities == world_capabilities
+    fit_only = persist_fit_only_world_model(
+        store.artifacts, artifact_input(artifact.manifest), artifact_input(fit_rag.manifest)
+    )
+    assert fit_only == persist_fit_only_world_model(
+        store.artifacts, artifact_input(artifact.manifest), artifact_input(fit_rag.manifest)
+    )
+    fit_only_artifact = load_grounded_world_model_artifact(store.artifacts, fit_only)
+    assert fit_only_artifact.serving_rag == artifact_input(fit_rag.manifest)
+    assert (fit_only_artifact.model, fit_only_artifact.top_k) == (world_snapshot, 5)
+    assert fit_only_artifact.prompt_sha256 == artifact.artifact.prompt_sha256
+    with pytest.raises(ValueError, match="fit-only"):
+        persist_fit_only_world_model(
+            store.artifacts, artifact_input(artifact.manifest), artifact_input(rag.manifest)
+        )
     fit_runtime.step(task="Reset my password", action=AssistantAction(content="What email?"))
     assert len(client.requests) == 2
     embedding_count = len(embedder.requests)

@@ -1,0 +1,151 @@
+{
+  "name": "E0 workflow dual evaluation",
+  "syllabus": "Judge one complete workflow using only supplied evidence. Native mechanical checks remain separate; unknown evidence requires unassessable, never guessed credit.",
+  "dimensions": [
+    {
+      "dimension_id": "format",
+      "name": "Format",
+      "description": "Conformity to the published tool reply contract.",
+      "min_score": 1,
+      "max_score": 5,
+      "anchors": [
+        {
+          "score": 1,
+          "description": "Unusable output or wrong response type."
+        },
+        {
+          "score": 2,
+          "description": "Major schema omissions or invalid fields."
+        },
+        {
+          "score": 3,
+          "description": "Usable with material formatting/schema defects."
+        },
+        {
+          "score": 4,
+          "description": "Contract followed with minor nonfunctional differences."
+        },
+        {
+          "score": 5,
+          "description": "Fully conforms to all observable format and type requirements."
+        }
+      ]
+    },
+    {
+      "dimension_id": "factuality",
+      "name": "Factuality",
+      "description": "Agreement with available authoritative facts, including identifiers and errors.",
+      "min_score": 1,
+      "max_score": 5,
+      "anchors": [
+        {
+          "score": 1,
+          "description": "Contradicts core observed facts."
+        },
+        {
+          "score": 2,
+          "description": "Multiple consequential factual errors."
+        },
+        {
+          "score": 3,
+          "description": "Mixed correctness with a material unsupported claim."
+        },
+        {
+          "score": 4,
+          "description": "Facts correct except a minor nonconsequential discrepancy."
+        },
+        {
+          "score": 5,
+          "description": "All assessable facts match authoritative evidence without invention."
+        }
+      ]
+    },
+    {
+      "dimension_id": "consistency",
+      "name": "Consistency",
+      "description": "Preservation of entity identity, chronology and carried consequences.",
+      "min_score": 1,
+      "max_score": 5,
+      "anchors": [
+        {
+          "score": 1,
+          "description": "Contradictory causal history or impossible state."
+        },
+        {
+          "score": 2,
+          "description": "Repeated consequential state/identity contradictions."
+        },
+        {
+          "score": 3,
+          "description": "One material carried-state or chronology inconsistency."
+        },
+        {
+          "score": 4,
+          "description": "Coherent history with only minor nonconsequential inconsistency."
+        },
+        {
+          "score": 5,
+          "description": "All observable identities and consequences remain coherent throughout."
+        }
+      ]
+    },
+    {
+      "dimension_id": "realism",
+      "name": "Realism",
+      "description": "Behavior matches available tool constraints and observed success/error regimes.",
+      "min_score": 1,
+      "max_score": 5,
+      "anchors": [
+        {
+          "score": 1,
+          "description": "Behavior impossible under stated constraints."
+        },
+        {
+          "score": 2,
+          "description": "Major deviations from evidenced operation or error behavior."
+        },
+        {
+          "score": 3,
+          "description": "Plausible but materially deviates from known behavior."
+        },
+        {
+          "score": 4,
+          "description": "Matches known behavior with a minor discrepancy."
+        },
+        {
+          "score": 5,
+          "description": "Matches all assessable behavior and boundary constraints; unknowns acknowledged."
+        }
+      ]
+    },
+    {
+      "dimension_id": "quality",
+      "name": "Quality",
+      "description": "Completeness and usefulness for the stated task without unsupported additions.",
+      "min_score": 1,
+      "max_score": 5,
+      "anchors": [
+        {
+          "score": 1,
+          "description": "Missing essential output prevents task use."
+        },
+        {
+          "score": 2,
+          "description": "Major omissions or distracting invented content."
+        },
+        {
+          "score": 3,
+          "description": "Partly useful but an important omission remains."
+        },
+        {
+          "score": 4,
+          "description": "Complete useful output with minor unnecessary content."
+        },
+        {
+          "score": 5,
+          "description": "Complete concise task-relevant output with no unsupported additions."
+        }
+      ]
+    }
+  ]
+}

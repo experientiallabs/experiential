@@ -10,7 +10,6 @@ from exp.common.models.gateway_catalog import ExactModelDeployment
 from exp.runtime.gateway.contracts import (
     AttemptId,
     AuthorizationSnapshot,
-    ExecutionSnapshot,
     GatewayEvent,
     GatewayFailure,
     GatewayRequest,
@@ -18,6 +17,7 @@ from exp.runtime.gateway.contracts import (
     ProjectTarget,
 )
 from exp.runtime.gateway.embeddings_contracts import ServingRequest
+from exp.runtime.gateway.execution_snapshot import ExecutionSnapshot
 
 
 class GatewayControlStore(Protocol):

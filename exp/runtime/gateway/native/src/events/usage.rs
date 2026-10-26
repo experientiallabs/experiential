@@ -5,10 +5,16 @@
 use serde_json::{Map, Value};
 
 use super::Usage;
-use cache_subsets::{cache_subsets, separate_written_reads, validate_cache_subsets};
+use cache_subsets::{cache_subsets, fit_cache_subsets, separate_written_reads};
 
 #[path = "usage/cache_subsets.rs"]
 mod cache_subsets;
+#[path = "usage/cache_ttl.rs"]
+mod cache_ttl;
+#[path = "usage/gemini_modalities.rs"]
+mod gemini_modalities;
+use gemini_modalities::gemini_image_candidates;
+pub use gemini_modalities::gemini_output_covering_image;
 
 impl Usage {
     /// Mark unknown subsets that an OpenAI-compatible shape represents as zero.
@@ -36,13 +42,21 @@ impl Usage {
         let next_hour = newer
             .cache_creation_1h_input_tokens
             .filter(|hour| next_writes.or(writes).is_some_and(|total| *hour <= total));
+        let next_half_day = newer.cache_creation_12h_input_tokens.filter(|half_day| {
+            next_writes
+                .or(writes)
+                .is_some_and(|total| *half_day <= total)
+        });
         if next_writes.is_some() && next_writes > writes {
             // Only growth invalidates the earlier allocation. An equal total
             // with no breakdown adds no evidence, and a lower total is stale.
             self.cache_creation_1h_input_tokens = next_hour;
+            self.cache_creation_12h_input_tokens = next_half_day;
         } else if next_writes.is_none() || next_writes == writes {
             self.cache_creation_1h_input_tokens =
                 self.cache_creation_1h_input_tokens.max(next_hour);
+            self.cache_creation_12h_input_tokens =
+                self.cache_creation_12h_input_tokens.max(next_half_day);
         }
         self.input_tokens = self.input_tokens.max(newer.input_tokens);
         self.output_tokens = self.output_tokens.max(newer.output_tokens);
@@ -51,6 +65,7 @@ impl Usage {
             .cache_creation_input_tokens
             .max(newer.cache_creation_input_tokens);
         self.reasoning_tokens = self.reasoning_tokens.max(newer.reasoning_tokens);
+        self.image_output_tokens = self.image_output_tokens.max(newer.image_output_tokens);
         self.cache_writes_read_back |= newer.cache_writes_read_back;
     }
 
@@ -226,12 +241,19 @@ pub(crate) struct OpenAiUsageAccumulator {
     writes_within_reads: bool,
     // Sparse TTL evidence stays private until a write total can cover it.
     pending_cache_creation_1h_input_tokens: Option<u64>,
+    // The rung asked OpenAI for 12-hour cache writes.
+    twelve_hour_writes_requested: bool,
 }
 
 impl OpenAiUsageAccumulator {
     /// Select the rung's cache-write accounting before any usage arrives.
     pub(crate) fn set_writes_within_reads(&mut self, writes_within_reads: bool) {
         self.writes_within_reads = writes_within_reads;
+    }
+
+    /// Record that the rung asked for 12-hour cache writes before usage arrives.
+    pub(crate) fn set_twelve_hour_writes_requested(&mut self, requested: bool) {
+        self.twelve_hour_writes_requested = requested;
     }
 
     pub(crate) fn update_chat(&mut self, value: &Value) -> Result<Usage, String> {
@@ -273,20 +295,37 @@ impl OpenAiUsageAccumulator {
         let input_tokens = count_if_present(object, input_key, "OpenAI usage")?;
         let output_tokens = count_if_present(object, output_key, "OpenAI usage")?;
         let unreported = unreported_token_details(object, input_details, output_details)?;
-        let reasoning_tokens = optional_usage_detail(
+        let nested_reasoning = optional_usage_detail(
             object,
             output_details,
             "reasoning_tokens",
             "OpenAI reasoning_tokens",
-        )?
-        .filter(|_| !unreported[3]);
-        let total_tokens = count_if_present(object, "total_tokens", "OpenAI usage")?;
-        let (cached_input_tokens, cache_creation_input_tokens) = cache_subsets(
-            object,
-            input_details,
-            input_tokens,
-            self.writes_within_reads,
         )?;
+        // Azure AI Foundry's DeepSeek models report the Chat reasoning subset
+        // as a top-level count; the nested placement wins when both appear.
+        let top_level_reasoning = if chat {
+            count_if_present(object, "reasoning_tokens", "OpenAI usage")?
+        } else {
+            None
+        };
+        if unreported[3] && top_level_reasoning.is_some_and(|count| count != 0) {
+            return Err("an unreported token detail cannot contain a positive count".into());
+        }
+        let reasoning_tokens = nested_reasoning
+            .or(top_level_reasoning)
+            .filter(|_| !unreported[3]);
+        // OpenRouter reports generated-image tokens inside the completion
+        // total. A reported 0 is a real count (a text answer billed at the
+        // text rate); only an absent key leaves the subset unknown.
+        let image_output_tokens = optional_usage_detail(
+            object,
+            output_details,
+            "image_tokens",
+            "OpenAI image_tokens",
+        )?;
+        let total_tokens = count_if_present(object, "total_tokens", "OpenAI usage")?;
+        let (cached_input_tokens, cache_creation_input_tokens) =
+            cache_subsets(object, input_details)?;
         let cached_input_tokens = cached_input_tokens.filter(|_| !unreported[0]);
         let cache_creation_input_tokens = cache_creation_input_tokens.filter(|_| !unreported[1]);
         let cache_creation_1h_input_tokens = optional_usage_detail(
@@ -299,6 +338,17 @@ impl OpenAiUsageAccumulator {
         .max(self.pending_cache_creation_1h_input_tokens);
         let covering_writes =
             cache_creation_input_tokens.or(self.reported.cache_creation_input_tokens);
+        let cache_creation_12h_input_tokens = cache_ttl::resolve_twelve_hour_writes(
+            cache_ttl::twelve_hour_writes(object, input_details)?.filter(|_| !unreported[1]),
+            cache_creation_input_tokens,
+            self.twelve_hour_writes_requested,
+        );
+        if let (Some(half_day), Some(written)) = (cache_creation_12h_input_tokens, covering_writes)
+        {
+            if half_day > written {
+                return Err("12-hour cache writes exceed total cache writes".into());
+            }
+        }
         if let (Some(hour), Some(written)) = (cache_creation_1h_input_tokens, covering_writes) {
             if hour > written {
                 return Err("one-hour cache writes exceed total cache writes".into());
@@ -332,9 +382,11 @@ impl OpenAiUsageAccumulator {
             cached_input_tokens,
             cache_creation_input_tokens,
             cache_creation_1h_input_tokens: covering_writes.and(cache_creation_1h_input_tokens),
+            cache_creation_12h_input_tokens: covering_writes.and(cache_creation_12h_input_tokens),
             reasoning_tokens,
             billed_units: None,
             cache_writes_read_back: false,
+            image_output_tokens,
         });
         // Initial split fragments support a provisional mode until counters
         // change. A coherent raw output/reasoning/total sample may correct it;
@@ -367,7 +419,7 @@ impl OpenAiUsageAccumulator {
         if self.writes_within_reads {
             separate_written_reads(&mut normalized)?;
         }
-        validate_cache_subsets(&normalized)?;
+        fit_cache_subsets(&mut normalized)?;
         normalized.output_tokens = normalized
             .output_tokens
             .map(|output| {
@@ -391,6 +443,20 @@ fn unreported_token_details(
     output_details: &str,
 ) -> Result<[bool; 4], String> {
     let mut unreported = [false; 4];
+    // A gateway upstream's estimated reasoning count (`reasoning_estimate`)
+    // is display only: read it as unreported, never as a billed subset.
+    if let Some(raw) = object.get(crate::reasoning_estimate::ESTIMATED_TOKEN_DETAILS) {
+        let fields = raw
+            .as_array()
+            .ok_or("estimated_token_details must be an array")?;
+        if fields
+            .iter()
+            .any(|field| field.as_str() != Some("reasoning_tokens"))
+        {
+            return Err("estimated_token_details may only name reasoning_tokens".into());
+        }
+        unreported[3] = !fields.is_empty();
+    }
     let Some(raw) = object.get("unreported_token_details") else {
         return Ok(unreported);
     };
@@ -458,8 +524,11 @@ pub fn gemini_usage(value: &Value) -> Result<Usage, String> {
         "candidatesTokenCount",
         "Gemini candidatesTokenCount",
     )?;
-    let output_tokens =
-        bounded_ledger_sum(&[candidates_tokens, reasoning_tokens], "Gemini output")?;
+    let image_output_tokens = gemini_image_candidates(object)?;
+    let output_tokens = gemini_output_covering_image(
+        bounded_ledger_sum(&[candidates_tokens, reasoning_tokens], "Gemini output")?,
+        image_output_tokens,
+    )?;
     Ok(Usage {
         input_tokens: Some(count_or_zero(
             object,
@@ -474,9 +543,11 @@ pub fn gemini_usage(value: &Value) -> Result<Usage, String> {
         )?),
         cache_creation_input_tokens: None,
         cache_creation_1h_input_tokens: None,
+        cache_creation_12h_input_tokens: None,
         reasoning_tokens: Some(reasoning_tokens),
         billed_units: None,
         cache_writes_read_back: false,
+        image_output_tokens,
     })
 }
 
@@ -515,9 +586,11 @@ pub fn bedrock_usage(value: Option<&Value>) -> Result<Usage, String> {
             "Bedrock usage",
         )?,
         cache_creation_1h_input_tokens: bedrock_cache_hour_subset(usage, cache_write)?,
+        cache_creation_12h_input_tokens: None,
         reasoning_tokens: None,
         billed_units: None,
         cache_writes_read_back: false,
+        image_output_tokens: None,
     })
 }
 
@@ -600,346 +673,5 @@ pub fn require_u64(object: &Map<String, Value>, key: &str, label: &str) -> Resul
 }
 
 #[cfg(test)]
-mod sparse_tests {
-    use super::*;
-    use serde_json::json;
-
-    #[test]
-    fn established_reasoning_accounting_survives_sparse_growth_and_stale_totals() {
-        for chat in [false, true] {
-            for additive in [false, true] {
-                let (input, output, details) = if chat {
-                    (
-                        "prompt_tokens",
-                        "completion_tokens",
-                        "completion_tokens_details",
-                    )
-                } else {
-                    ("input_tokens", "output_tokens", "output_tokens_details")
-                };
-                let first = json!({
-                    input: 100, output: 10, details: {"reasoning_tokens": 5},
-                    "total_tokens": if additive { 115 } else { 110 }
-                });
-                let mut accumulator = OpenAiUsageAccumulator::default();
-                for (report, expected_output, expected_reasoning) in [
-                    (first.clone(), if additive { 15 } else { 10 }, 5),
-                    // For additive accounting the retained old total now matches
-                    // input + raw output, but it must not change the dialect.
-                    (json!({output: 15}), if additive { 20 } else { 15 }, 5),
-                    (json!({output: 20}), if additive { 25 } else { 20 }, 5),
-                    (
-                        json!({details: {"reasoning_tokens": 8}}),
-                        if additive { 28 } else { 20 },
-                        8,
-                    ),
-                    (first, if additive { 28 } else { 20 }, 8),
-                    (json!({}), if additive { 28 } else { 20 }, 8),
-                    (
-                        json!({"total_tokens": if additive { 128 } else { 120 }}),
-                        if additive { 28 } else { 20 },
-                        8,
-                    ),
-                ] {
-                    let observed = accumulator
-                        .update(report.as_object().unwrap(), chat)
-                        .unwrap();
-                    assert_eq!(observed.input_tokens, Some(100));
-                    assert_eq!(observed.output_tokens, Some(expected_output), "{report}");
-                    assert_eq!(observed.reasoning_tokens, Some(expected_reasoning));
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn additive_reasoning_growth_rejects_overflow_without_advancing_raw_state() {
-        let mut accumulator = OpenAiUsageAccumulator::default();
-        let first = json!({
-            "input_tokens": 100, "output_tokens": 10,
-            "output_tokens_details": {"reasoning_tokens": 5}, "total_tokens": 115
-        });
-        accumulator.update_responses(Some(&first)).unwrap();
-        assert!(accumulator
-            .update_responses(Some(&json!({"output_tokens": MAXIMUM_LEDGER_COUNT})))
-            .is_err());
-        let observed = accumulator
-            .update_responses(Some(&json!({"output_tokens": 20})))
-            .unwrap()
-            .unwrap();
-        assert_eq!(observed.output_tokens, Some(25));
-        assert_eq!(observed.reasoning_tokens, Some(5));
-    }
-
-    #[test]
-    fn undecided_reasoning_waits_for_a_positive_decisive_total() {
-        for first in [
-            json!({"input_tokens": 100, "output_tokens": 2,
-                "output_tokens_details": {"reasoning_tokens": 5}}),
-            json!({"input_tokens": 100, "output_tokens": 2,
-                "output_tokens_details": {"reasoning_tokens": 0}, "total_tokens": 102}),
-        ] {
-            let mut accumulator = OpenAiUsageAccumulator::default();
-            accumulator.update_responses(Some(&first)).unwrap();
-            let observed = accumulator
-                .update_responses(Some(&json!({
-                    "output_tokens": 10, "output_tokens_details": {"reasoning_tokens": 5},
-                    "total_tokens": 110
-                })))
-                .unwrap()
-                .unwrap();
-            assert_eq!(observed.output_tokens, Some(10));
-            assert!(matches!(
-                accumulator.reasoning_accounting,
-                Some(ReasoningAccounting::Subset)
-            ));
-        }
-    }
-
-    #[test]
-    fn missing_reasoning_does_not_let_a_stale_total_establish_subset_accounting() {
-        let mut accumulator = OpenAiUsageAccumulator::default();
-        for report in [
-            json!({"input_tokens": 100, "output_tokens": 10, "total_tokens": 115}),
-            json!({"output_tokens": 15, "output_tokens_details": {"reasoning_tokens": 5}}),
-        ] {
-            accumulator.update_responses(Some(&report)).unwrap();
-        }
-        let observed = accumulator
-            .update_responses(Some(&json!({
-                "output_tokens": 20, "output_tokens_details": {"reasoning_tokens": 5},
-                "total_tokens": 125
-            })))
-            .unwrap()
-            .unwrap();
-        assert_eq!(observed.output_tokens, Some(25));
-    }
-
-    #[test]
-    fn late_totals_cannot_establish_accounting_after_raw_growth() {
-        for (later_output, late_total) in [(15, 115), (20, 120)] {
-            let mut accumulator = OpenAiUsageAccumulator::default();
-            for report in [
-                json!({"input_tokens": 100, "output_tokens": 10, "total_tokens": 115}),
-                json!({"output_tokens": 15, "output_tokens_details": {"reasoning_tokens": 5}}),
-                json!({"output_tokens": later_output}),
-                json!({"total_tokens": late_total}),
-            ] {
-                accumulator.update_responses(Some(&report)).unwrap();
-            }
-            assert!(accumulator.reasoning_accounting.is_none());
-            for additive in [false, true] {
-                let mut decided = accumulator.clone();
-                let observed = decided
-                    .update_responses(Some(&json!({
-                        "output_tokens": 25, "output_tokens_details": {"reasoning_tokens": 5},
-                        "total_tokens": if additive { 130 } else { 125 }
-                    })))
-                    .unwrap()
-                    .unwrap();
-                assert_eq!(observed.output_tokens, Some(if additive { 30 } else { 25 }));
-            }
-        }
-    }
-
-    #[test]
-    fn coherent_old_snapshot_establishes_mode_from_its_own_raw_counts() {
-        let mut accumulator = OpenAiUsageAccumulator::default();
-        accumulator
-            .update_responses(Some(&json!({"input_tokens": 100, "output_tokens": 20})))
-            .unwrap();
-        let observed = accumulator
-            .update_responses(Some(&json!({
-                "input_tokens": 100, "output_tokens": 10,
-                "output_tokens_details": {"reasoning_tokens": 5}, "total_tokens": 115
-            })))
-            .unwrap()
-            .unwrap();
-        assert_eq!(observed.output_tokens, Some(25));
-    }
-
-    #[test]
-    fn changed_input_cannot_be_reused_in_a_delayed_counter_sample() {
-        let mut accumulator = OpenAiUsageAccumulator::default();
-        for report in [
-            json!({"input_tokens": 100, "output_tokens": 10, "total_tokens": 115}),
-            json!({"input_tokens": 105}),
-            json!({"output_tokens": 10, "output_tokens_details": {"reasoning_tokens": 5},
-                "total_tokens": 115}),
-        ] {
-            accumulator.update_responses(Some(&report)).unwrap();
-        }
-        assert!(accumulator.reasoning_accounting.is_none());
-        let observed = accumulator
-            .update_responses(Some(&json!({
-                "input_tokens": 105, "output_tokens": 15,
-                "output_tokens_details": {"reasoning_tokens": 5}, "total_tokens": 125
-            })))
-            .unwrap()
-            .unwrap();
-        assert_eq!(observed.output_tokens, Some(20));
-    }
-
-    #[test]
-    fn unchanged_initial_fragments_preserve_total_first_accounting() {
-        for additive in [false, true] {
-            let pieces = [
-                json!({"input_tokens": 100}),
-                json!({"output_tokens": 10}),
-                json!({"output_tokens_details": {"reasoning_tokens": 5}}),
-                json!({"total_tokens": if additive { 115 } else { 110 }}),
-            ];
-            for order in [[0, 1, 2, 3], [3, 0, 1, 2], [2, 3, 1, 0], [1, 0, 3, 2]] {
-                let mut accumulator = OpenAiUsageAccumulator::default();
-                let mut observed = None;
-                for index in order {
-                    observed = accumulator.update_responses(Some(&pieces[index])).unwrap();
-                }
-                assert_eq!(
-                    observed.unwrap().output_tokens,
-                    Some(if additive { 15 } else { 10 })
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn unreported_meter_marker_rejects_malformed_or_contradictory_evidence() {
-        for marker in [
-            json!(null),
-            json!({}),
-            json!("cached_tokens"),
-            json!([1]),
-            json!(["other"]),
-            json!(["cached_tokens", "cached_tokens"]),
-        ] {
-            assert!(OpenAiUsageAccumulator::default()
-                .update_chat(&json!({
-                    "prompt_tokens": 10, "completion_tokens": 10,
-                    "unreported_token_details": marker
-                }))
-                .is_err());
-        }
-        for field in [
-            "cached_tokens",
-            "cache_write_tokens",
-            "cache_write_1h_tokens",
-            "reasoning_tokens",
-        ] {
-            for count in [json!(1), json!(-1), json!(true), json!(0.5), json!("0")] {
-                let group = if field == "reasoning_tokens" {
-                    "completion_tokens_details"
-                } else {
-                    "prompt_tokens_details"
-                };
-                let mut report = json!({
-                    "prompt_tokens": 10, "completion_tokens": 10,
-                    "unreported_token_details": [field]
-                });
-                report[group] = json!({field: count});
-                assert!(OpenAiUsageAccumulator::default()
-                    .update_chat(&report)
-                    .is_err());
-            }
-        }
-    }
-
-    #[test]
-    fn sparse_cache_ttl_is_retained_checked_and_invalidated_on_write_growth() {
-        let mut accumulator = OpenAiUsageAccumulator::default();
-        let partial = accumulator
-            .update_chat(&json!({
-                "prompt_tokens_details": {"cache_write_1h_tokens": 3}
-            }))
-            .unwrap();
-        assert_eq!(partial.cache_creation_1h_input_tokens, None);
-        assert!(accumulator
-            .update_chat(&json!({
-                "prompt_tokens": 20,
-                "prompt_tokens_details": {"cache_write_tokens": 2}
-            }))
-            .is_err());
-        let complete = accumulator
-            .update_chat(&json!({
-                "prompt_tokens": 20, "completion_tokens": 2,
-                "prompt_tokens_details": {"cache_write_tokens": 5}
-            }))
-            .unwrap();
-        assert_eq!(complete.cache_creation_1h_input_tokens, Some(3));
-        let grown = accumulator
-            .update_chat(&json!({
-                "prompt_tokens_details": {"cache_write_tokens": 10}
-            }))
-            .unwrap();
-        assert_eq!(grown.cache_creation_1h_input_tokens, None);
-        let zero = accumulator
-            .update_chat(&json!({
-                "prompt_tokens_details": {"cache_write_1h_tokens": 0}
-            }))
-            .unwrap();
-        assert_eq!(zero.cache_creation_1h_input_tokens, Some(0));
-    }
-
-    #[test]
-    fn cache_ttl_refuses_malformed_counts_and_non_subsets() {
-        for bad in [
-            json!(-1),
-            json!(true),
-            json!(1.5),
-            json!("2"),
-            json!(101),
-            json!(MAXIMUM_LEDGER_COUNT + 1),
-        ] {
-            assert!(OpenAiUsageAccumulator::default().update_chat(&json!({
-                "prompt_tokens": 120, "completion_tokens": 10,
-                "prompt_tokens_details": {"cache_write_tokens": 100, "cache_write_1h_tokens": bad}
-            })).is_err());
-            assert!(OpenAiUsageAccumulator::default().update_responses(Some(&json!({
-                "input_tokens": 120, "output_tokens": 10,
-                "input_tokens_details": {"cache_write_tokens": 100, "cache_write_1h_tokens": bad}
-            }))).is_err());
-        }
-    }
-
-    #[test]
-    fn responses_sparse_raw_counters_match_whole_report_and_never_fold_twice() {
-        let full = json!({"input_tokens":100,"output_tokens":10,"output_tokens_details":{"reasoning_tokens":5},"total_tokens":115});
-        let expected = openai_usage(Some(&full)).unwrap().unwrap();
-        let mut accumulator = OpenAiUsageAccumulator::default();
-        for report in [
-            json!({"input_tokens":100}),
-            json!({"output_tokens":10}),
-            json!({"output_tokens_details":{"reasoning_tokens":5},"total_tokens":115}),
-            full.clone(),
-            full,
-        ] {
-            let result = accumulator
-                .update_responses(Some(&report))
-                .unwrap()
-                .unwrap();
-            if report.get("total_tokens").is_some() {
-                assert_eq!(result.input_tokens, expected.input_tokens);
-                assert_eq!(result.output_tokens, expected.output_tokens);
-                assert_eq!(result.reasoning_tokens, expected.reasoning_tokens);
-            }
-        }
-        assert_eq!(expected.output_tokens, Some(15));
-    }
-
-    #[test]
-    fn sparse_response_cache_is_checked_when_input_arrives_later() {
-        let mut accumulator = OpenAiUsageAccumulator::default();
-        accumulator
-            .update_responses(Some(&json!({"input_tokens_details":{"cached_tokens":200}})))
-            .unwrap();
-        assert!(accumulator
-            .update_responses(Some(&json!({"input_tokens":100,"output_tokens":1})))
-            .is_err());
-        let valid = accumulator
-            .update_responses(Some(&json!({"input_tokens":250,"output_tokens":1})))
-            .unwrap()
-            .unwrap();
-        assert_eq!(valid.input_tokens, Some(250));
-        assert_eq!(valid.cached_input_tokens, Some(200));
-    }
-}
+#[path = "usage/sparse_tests.rs"]
+mod sparse_tests;

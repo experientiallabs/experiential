@@ -10,21 +10,22 @@ from exp.common.models.gateway_catalog import ExactModelDeployment
 from exp.runtime.gateway.contracts import (
     AuthorizationSnapshot,
     DirectTarget,
-    ExecutionSnapshot,
     GatewayApiSurface,
 )
+from exp.runtime.gateway.execution_snapshot import ExecutionSnapshot
 from exp.runtime.gateway.lane_saturation import (
     DEFAULT_BOUND_OVERFLOW_FACTORS,
     DEFAULT_LANE_SHARE,
     LANE_SATURATED_RETRY_AFTER_SECONDS,
     PRIORITY_OVERFLOW_FACTORS,
     default_lane_bound,
+    failover_overflow_cap,
     lane_saturated_failure,
     overflow_target,
     priority_overflow_ceiling,
 )
 from exp.runtime.gateway.routing import GatewayRoute
-from exp.runtime.gateway.rung_admission import RungShed
+from exp.runtime.gateway.rung_admission import RungLoadRegistry, RungShed
 from exp.runtime.gateway.stream_contracts import GatewayFailureClass
 
 
@@ -134,6 +135,13 @@ def test_overflow_target_keeps_the_historical_overflow_for_an_authored_bound() -
     assert overflow_target(route, [(0, "queue_bound"), (1, "queue_bound")], sheds) == 0
 
 
+def test_overflow_target_never_forces_a_hard_shed_for_a_free_caller() -> None:
+    """A class cap or the :fast split sheds a forced retry too, so it is refused."""
+    route = _route(_deployment("a", GatewayRungDispatchPolicy(concurrency_bound=2)))
+    sheds = {0: RungShed("queue_bound", overflow_ceiling=True)}
+    assert overflow_target(route, [(0, "queue_bound")], sheds) is None
+
+
 def test_overflow_target_refuses_when_the_first_shed_rung_authors_refuse() -> None:
     """``saturation="refuse"`` on the bypassed rung turns the overflow into a fast refusal."""
     route = _route(
@@ -237,3 +245,41 @@ def test_authored_overflow_multiples_replace_the_default_per_level() -> None:
     assert priority_overflow_ceiling(4, 1, default_bound=False, authored=(None, 1.0)) == 4.0
     # The default bound ignores authored multiples (its factors protect the worker).
     assert priority_overflow_ceiling(32, 2, default_bound=True, authored=(4.0, 4.0)) == 48.0
+
+
+def test_failover_overflow_cap_is_half_the_bound_and_at_least_one() -> None:
+    """Forced failover passes ride on top of the bound: half of it, never zero."""
+    assert failover_overflow_cap(None) is None
+    assert failover_overflow_cap(1) == 1
+    assert failover_overflow_cap(2) == 1
+    assert failover_overflow_cap(8) == 4
+    assert failover_overflow_cap(5) == 3
+
+
+def test_the_registry_counts_forced_failover_passes_apart_and_frees_them() -> None:
+    """A full refusing rung admits forced failovers up to the cap, then sheds as a ceiling hit."""
+    registry = RungLoadRegistry()
+    key = ("deployment-a", "c" * 64)
+
+    def reserve(*, failover: bool) -> str | RungShed:
+        """Reserve one slot on the bound-2 rung, as a refusing first dial or a forced failover."""
+        return registry.reserve(
+            key,
+            organization_id="org",
+            weight=1,
+            bound=2,
+            fair_share=False,
+            hard_bound=not failover,
+            force=failover,
+            failover_cap=1 if failover else None,
+        )
+
+    for _ in range(2):
+        assert isinstance(reserve(failover=False), str)
+    assert isinstance(reserve(failover=False), RungShed)
+    forced = reserve(failover=True)
+    assert isinstance(forced, str)
+    capped = reserve(failover=True)
+    assert isinstance(capped, RungShed) and capped.overflow_ceiling
+    registry.release_ticket(forced)
+    assert isinstance(reserve(failover=True), str)

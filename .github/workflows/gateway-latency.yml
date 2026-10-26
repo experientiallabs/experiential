@@ -33,7 +33,7 @@ jobs:
         with:
           workspaces: exp/runtime/gateway/native
       - name: Install the project and its dev extras
-        run: uv sync --extra dev
+        run: uv sync --locked --extra dev
       - name: Measure Experiential gateway latency against a local mock
         env:
           EXP_TELEMETRY: "0"

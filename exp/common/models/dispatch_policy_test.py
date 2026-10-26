@@ -117,3 +117,18 @@ def test_priority_overflow_multiples_are_at_least_one_and_paying_never_exceeds_p
     both = GatewayRungDispatchPolicy(priority_overflow_paying=1.25, priority_overflow_pro=1.25)
     assert both.priority_overflow_paying == both.priority_overflow_pro
     assert GatewayRungDispatchPolicy().model_dump(exclude_defaults=True) == {}
+
+
+def test_fast_reserve_fraction_is_a_proper_fraction_of_an_authored_bound() -> None:
+    """The reserve needs a bound to keep a share of, and is strictly between 0 and 1."""
+    assert (
+        GatewayRungDispatchPolicy(
+            concurrency_bound=4, fast_reserve_fraction=0.25
+        ).fast_reserve_fraction
+        == 0.25
+    )
+    with pytest.raises(ValidationError, match="requires a concurrency_bound"):
+        GatewayRungDispatchPolicy(fast_reserve_fraction=0.25)
+    for fraction in (0.0, 1.0, -0.1, float("nan")):
+        with pytest.raises(ValidationError):
+            GatewayRungDispatchPolicy(concurrency_bound=4, fast_reserve_fraction=fraction)

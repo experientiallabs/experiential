@@ -1,0 +1,30 @@
+# OSV-Scanner configuration for the gate's dependency audit (gate.yml,
+# gate-dependency-audit). Each entry accepts one reviewed advisory with a
+# reason and an expiry date; any advisory not listed here, including a new
+# one against the same package, fails the gate, and so does each listed one
+# once its date passes.
+
+[[IgnoredVulns]]
+id = "GHSA-xrqw-3rrv-vx5w"
+ignoreUntil = 2026-11-21
+reason = "transformers 5.5.4, sft extra only. The pinned tinker-cookbook 0.4.3 caps transformers at 5.5.4, so the fix (5.10.0+) waits on the tinker-cookbook 0.5 upgrade."
+
+[[IgnoredVulns]]
+id = "GHSA-x9r9-c232-4q39"
+ignoreUntil = 2026-11-21
+reason = "transformers 5.5.4, sft extra only. The pinned tinker-cookbook 0.4.3 caps transformers at 5.5.4, so the fix (5.10.0+) waits on the tinker-cookbook 0.5 upgrade."
+
+[[IgnoredVulns]]
+id = "GHSA-9v8h-qqgm-4m35"
+ignoreUntil = 2026-11-07
+reason = "brotli 1.2.0, capture on Python 3.13+. exp-mitmproxy 12.2.3.post2 caps Brotli at <=1.2.0, so the fix (1.2.1) waits on an exp-mitmproxy release that allows it; then pin brotli==1.2.1 and delete this entry and the next."
+
+[[IgnoredVulns]]
+id = "PYSEC-2026-4322"
+ignoreUntil = 2026-11-07
+reason = "Same brotli 1.2.0 advisory as GHSA-9v8h-qqgm-4m35, published separately by PyPA."
+
+[[IgnoredVulns]]
+id = "GHSA-xmj3-9gf7-h52w"
+ignoreUntil = 2026-10-27
+reason = "setuptools 83.0.0, sft extra only (via torch); Windows-only legacy wheel path. The fix, setuptools 84.1.0, was published 2026-10-19 and clears the 7-day release cooldown on 2026-10-26; then run uv lock -P setuptools and delete this entry."

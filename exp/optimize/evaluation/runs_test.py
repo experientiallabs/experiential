@@ -196,7 +196,7 @@ def test_saved_run_requires_explicit_nullable_spending_limit(tmp_path: Path) -> 
     assert load_run(project, run.run_id) == run
     del payload["spending_limit_usd"]
     records.write(run.run_id, canonical_json_bytes(payload))
-    with pytest.raises(EvaluationPreparationOutdated, match="new cost plan"):
+    with pytest.raises(EvaluationPreparationOutdated, match="new cost and memory plan"):
         load_run(project, run.run_id)
     payload["spending_limit_usd"] = None
     records.write(run.run_id, canonical_json_bytes(payload))

@@ -567,3 +567,46 @@ fn reads_of_this_attempts_own_cache_settle_as_writes_read_back() {
     chat.set_gemini_cache_writes(Some(5));
     assert_eq!(chat.gemini_cache_writes, None);
 }
+
+#[test]
+fn an_interim_image_count_publishes_once_the_candidates_total_covers_it() {
+    // gemini-3-pro-image names the IMAGE modality on the image frame before
+    // its candidatesTokenCount arrives (live 2026-10-19).
+    let image = |usage: Value| {
+        frame(json!({"candidates":[{"content":{"parts":[{"text":"hi"}]}}],"usageMetadata": usage}))
+    };
+    let chunks = vec![
+        image(
+            json!({"promptTokenCount":17,"candidatesTokensDetails":[{"modality":"IMAGE","tokenCount":1120}]}),
+        ),
+        frame(json!({
+            "candidates":[{"finishReason":"STOP"}],
+            "usageMetadata":{"promptTokenCount":17,"candidatesTokenCount":1126,
+                "candidatesTokensDetails":[{"modality":"IMAGE","tokenCount":1120}]},
+        })),
+    ];
+    let (events, failure) = drain_stream_fixture(Dialect::GeminiGenerateContent, &chunks);
+    assert!(failure.is_none(), "{failure:?}");
+    let usage = events.iter().find(|e| e["kind"] == "usage").unwrap();
+    assert_eq!(usage["output_tokens"], 1126);
+    assert_eq!(usage["image_output_tokens"], 1120);
+}
+
+#[test]
+fn a_pro_image_meter_reports_its_image_inside_the_thoughts() {
+    // gemini-3-pro-image: IMAGE 1120 beside candidatesTokenCount 71, the image
+    // counted inside thoughtsTokenCount. The subset is covered by the output.
+    let chunks = vec![
+        text(),
+        frame(json!({
+            "candidates":[{"finishReason":"STOP"}],
+            "usageMetadata":{"promptTokenCount":17,"candidatesTokenCount":71,"thoughtsTokenCount":1263,
+                "candidatesTokensDetails":[{"modality":"IMAGE","tokenCount":1120}]},
+        })),
+    ];
+    let (events, failure) = drain_stream_fixture(Dialect::GeminiGenerateContent, &chunks);
+    assert!(failure.is_none(), "{failure:?}");
+    let usage = events.iter().find(|e| e["kind"] == "usage").unwrap();
+    assert_eq!(usage["output_tokens"], 1334);
+    assert_eq!(usage["image_output_tokens"], 1120);
+}

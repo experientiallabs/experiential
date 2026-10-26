@@ -97,7 +97,7 @@ pub(crate) async fn chat(
             METRICS.record_escalation(classify_escalation(reason.as_str().unwrap_or_default()));
             // No replay claim exists; startup validation guarantees native
             // servability, so an escalation disposition fails closed here.
-            return error_response(&escalation_error());
+            return error_response(&escalation_error(reason.as_str().unwrap_or_default()));
         }
         let key: ReplayKey = match serde_json::from_value(scope_value) {
             Ok(key) => key,
@@ -153,7 +153,7 @@ pub(crate) async fn chat(
         if let Some(mut owner) = lease.take() {
             owner.abandon().await;
         }
-        return error_response(&escalation_error());
+        return error_response(&escalation_error(reason.as_str().unwrap_or_default()));
     }
     let mut admission: Admission =
         match serde_json::from_value::<Admission>(admission_value.clone()) {
@@ -168,7 +168,7 @@ pub(crate) async fn chat(
             }
         };
     let mut guard = new_guard(&state, admission.request_id.clone(), started);
-    guard.record_web_search_requests(admission.web_search_requests());
+    guard.record_web_search(admission.web_search_meter());
     // The replay key was authorized independently of admission. If an alias
     // activation landed between the two, the admitted work belongs to a newer
     // revision than the claimed replay scope, so the request fails closed:
@@ -197,7 +197,7 @@ pub(crate) async fn chat(
         return error_response(&error);
     }
 
-    let permit = match acquire_permit(&state, &mut guard, deadline).await {
+    let permit = match acquire_permit(&state, &mut guard, deadline, admission.class).await {
         Ok(permit) => permit,
         Err(response) => {
             if let Some(mut owner) = lease.take() {
@@ -217,14 +217,14 @@ pub(crate) async fn chat(
         route: &admission.route,
         policy: admission.policy(),
         deadline,
-        pre_first_byte_deadline: crate::server::pre_first_byte_deadline(&state, deadline),
+        pre_first_byte_deadline: state.first_byte_budget(deadline, &admission.route, &body_text),
         time_to_first_byte: state.time_to_first_byte,
         time_to_first_byte_slope_seconds_per_million_input_tokens: state
             .time_to_first_byte_slope_seconds_per_million_input_tokens,
         time_to_first_token: state.time_to_first_token,
-        // Bytes over four approximates input tokens; a timeout heuristic
-        // only, never a billing quantity.
-        approximate_input_tokens: (body_text.len() as f64) / 4.0,
+        // Bytes over four, base64 media left out: a timeout heuristic only,
+        // never a billing quantity (shared with the budget floor).
+        approximate_input_tokens: crate::waterfall::approximate_input_tokens(&body_text),
         chat_logprobs: true,
         // A guardrail may rewrite the output the probabilities describe; it is
         // checked first so a guarded request never reserves a sidecar.

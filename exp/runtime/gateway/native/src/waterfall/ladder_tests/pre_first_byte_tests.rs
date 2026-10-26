@@ -100,3 +100,80 @@ fn without_a_budget_each_stalled_dial_gets_its_own_window() {
         assert!(elapsed >= Duration::from_millis(3_900), "{elapsed:?}");
     });
 }
+
+/// A rung that holds its response headers for `delay`, then streams one frame.
+async fn spawn_slow_header_rung(delay: Duration) -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let address = listener.local_addr().expect("address");
+    tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.expect("accept");
+        let _ = read_request(&mut socket).await;
+        tokio::time::sleep(delay).await;
+        let answer = render(&Answer::Stream(&[TEXT_FRAME]));
+        socket.write_all(answer.as_bytes()).await.expect("write");
+        let _ = socket.shutdown().await;
+    });
+    format!("http://{address}/v1/chat/completions")
+}
+
+#[test]
+fn an_authored_header_allowance_is_not_cut_at_the_configured_budget() {
+    block_on(async {
+        // Scaled down from the GLM lane: the lead authors a header allowance
+        // (3 s) longer than the configured budget (1 s) and answers its
+        // headers at 2 s. The budget is raised to the authored allowance
+        // plus the reserve, so the lead serves instead of timing out.
+        let harness = Harness::new();
+        let mut lead = wire(
+            "lead",
+            &spawn_slow_header_rung(Duration::from_secs(2)).await,
+            0,
+        );
+        lead.time_to_first_byte_base_seconds = Some(3.0);
+        let route = [lead, wire("backup", &spawn_stalled_rung().await, 0)];
+        let budget = super::super::pre_first_byte_budget(
+            Some(Duration::from_secs(1)),
+            super::super::wire::PRE_FIRST_BYTE_RESERVE,
+            None,
+            &route,
+            Duration::from_secs(2),
+            0.0,
+            1.0,
+        );
+        let (won, guard) = run_budgeted(&harness, &route, budget).await;
+        let Won::Committed(committed) = finish(guard, won).await else {
+            panic!("the lead's authored allowance must outlast the configured budget");
+        };
+        assert_eq!(committed.depth, 0);
+    });
+}
+
+#[test]
+fn only_a_lane_that_spent_its_own_allowance_takes_the_header_timeout_strike() {
+    block_on(async {
+        // [A hung, B healthy but slower than what the budget leaves]: A
+        // stalls out its own 1 s allowance; B is cut by the shared 1.5 s
+        // budget half a second into its 5 s allowance.
+        let harness = Harness::new();
+        let mut hung = wire("a", &spawn_stalled_rung().await, 0);
+        hung.time_to_first_byte_base_seconds = Some(1.0);
+        let mut cut = wire("b", &spawn_stalled_rung().await, 0);
+        cut.time_to_first_byte_base_seconds = Some(5.0);
+        let route = [hung, cut];
+        let (won, guard) = run_budgeted(&harness, &route, Some(Duration::from_millis(1_500))).await;
+        assert!(matches!(finish(guard, won).await, Won::Failed(_)));
+        let story = harness.story().await;
+        let settles = story["settles"].as_array().expect("settles");
+        let phases: Vec<&Value> = settles
+            .iter()
+            .map(|settle| &settle["failure"]["header_timeout"])
+            .collect();
+        assert_eq!(
+            phases,
+            [&json!("allowance"), &json!("budget")],
+            "{settles:?}"
+        );
+    });
+}

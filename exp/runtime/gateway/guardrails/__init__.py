@@ -4,6 +4,10 @@ Platform policies and optional identity policies use the same engine, classifier
 contract, approval lifecycle, and accounting owner.
 """
 
+from exp.runtime.gateway.guardrails.classification import (
+    DecisionModelAdapterDocument,
+    DecisionModelClassifier,
+)
 from exp.runtime.gateway.guardrails.classifiers import (
     ClassifierRegistry,
     KeywordClassifier,
@@ -46,6 +50,8 @@ __all__ = [
     "ClassifierRegistry",
     "ClassifierUncertainError",
     "ClassifierVerdict",
+    "DecisionModelAdapterDocument",
+    "DecisionModelClassifier",
     "DirectClassifierClient",
     "GuardrailAction",
     "GuardrailCapabilityKind",

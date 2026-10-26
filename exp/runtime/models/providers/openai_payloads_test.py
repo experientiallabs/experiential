@@ -21,7 +21,7 @@ from exp.runtime.models.providers.openai_payloads import (
     openai_compatible_stream_payload,
     openai_responses_stream_payload,
 )
-from exp.runtime.openai_protocol.requests import decode_chat
+from exp.runtime.openai_protocol.requests import decode_chat, decode_responses
 
 
 def _developer_conversation() -> GatewayRequest:
@@ -586,3 +586,54 @@ def test_a_customer_managed_rung_is_never_asked_for_a_summary() -> None:
         requests_reasoning_summary=False,
     )
     assert payload["reasoning"] == {"effort": "high"}
+
+
+def test_client_minted_item_ids_never_reach_the_openai_wire() -> None:
+    """A ``msg_<uuid>`` or foreign call id is dropped; OpenAI-shaped ids replay exactly.
+
+    OpenAI refused 124 requests a day with "Expected an ID that begins with
+    'msg'" for client-minted ids such as ``msg_dffbfe65-bdcc-...``.
+    """
+    decoded = decode_responses(
+        {
+            "model": "m",
+            "input": [
+                {"role": "user", "content": "go"},
+                {
+                    "type": "message",
+                    "id": "msg_dffbfe65-bdcc-4ff9-a512-7878504afb85",
+                    "role": "assistant",
+                    "status": "completed",
+                    "phase": "commentary",
+                    "content": [{"type": "output_text", "text": "first", "annotations": []}],
+                },
+                {
+                    "type": "function_call",
+                    "id": "call-7b1e",
+                    "call_id": "call_1",
+                    "name": "read",
+                    "arguments": "{}",
+                },
+                {"type": "function_call_output", "call_id": "call_1", "output": "ok"},
+                {
+                    "type": "message",
+                    "id": "msg_9f86d081884c7d659a2feaa0c55ad015",
+                    "role": "assistant",
+                    "status": "completed",
+                    "content": [{"type": "output_text", "text": "second", "annotations": []}],
+                },
+                {"role": "user", "content": "again"},
+            ],
+        }
+    )
+    payload = openai_responses_stream_payload(
+        "gpt-6-luna", decoded.request, supports_temperature=False
+    )
+    items = cast("list[JsonObject]", payload["input"])
+    ids = [item.get("id") for item in items]
+    assert "msg_dffbfe65-bdcc-4ff9-a512-7878504afb85" not in ids
+    assert "call-7b1e" not in ids
+    assert "msg_9f86d081884c7d659a2feaa0c55ad015" in ids
+    assert {"role": "assistant", "content": "first"} in items
+    call = next(item for item in items if item.get("type") == "function_call")
+    assert call["call_id"] == "call_1"

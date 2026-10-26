@@ -37,8 +37,10 @@ from exp.runtime.models.providers.errors import (
     ProviderParameterError,
 )
 from exp.runtime.models.providers.protocol import (
+    DEVELOPER_ROLE_REWRITE_DISCLOSURE,
     BoundedSyncModelClientAdapter,
     SyncModelClientAdapter,
+    developer_role_rewrite_disclosure,
     emulated_gateway_capabilities,
     emulated_stop_sequences,
     preflight_gateway_request,
@@ -275,11 +277,11 @@ def test_preflight_admits_an_undeclared_stop_when_the_data_plane_emulates_it() -
     assert caught.value.capability == "stop_sequences"
 
     assert emulated_gateway_capabilities("openai_responses") == frozenset({"stop_sequences"})
-    assert emulated_gateway_capabilities("openai_compatible") == frozenset()
+    assert emulated_gateway_capabilities("openai_compatible") == frozenset({"developer_messages"})
     # parallel_tool_calls emulation is opt-in: admission's last resort on any wire.
     assert emulated_gateway_capabilities(
         "openai_compatible", emulate_parallel_tool_calls=True
-    ) == frozenset({"parallel_tool_calls"})
+    ) == frozenset({"developer_messages", "parallel_tool_calls"})
     preflight_gateway_request(
         request,
         undeclared,
@@ -569,3 +571,62 @@ def test_preflight_admits_audio_on_a_declared_audio_route() -> None:
     preflight_gateway_request(
         _audio_request(), GatewayDeploymentCapabilities(supports_audio_input=True)
     )
+
+
+@pytest.mark.parametrize(
+    "dialect",
+    (
+        "openai_compatible",
+        "anthropic_messages",
+        "bedrock_converse_stream",
+        "gemini_generate_content",
+    ),
+)
+def test_developer_messages_are_rewritten_on_wires_without_the_role(dialect: str) -> None:
+    """A wire without a ``developer`` role admits one as its instruction role, disclosed."""
+    request = GatewayRequest(
+        surface=GatewayApiSurface.CHAT_COMPLETIONS,
+        messages=(
+            GatewayMessage(role="developer", content="Answer in French."),
+            GatewayMessage(role="user", content="hi"),
+        ),
+    )
+    undeclared = GatewayDeploymentCapabilities()
+
+    with pytest.raises(ProviderCapabilityError) as caught:
+        preflight_gateway_request(request, undeclared)
+    assert caught.value.capability == "developer_messages"
+    preflight_gateway_request(
+        request, undeclared, emulated_capabilities=emulated_gateway_capabilities(dialect)
+    )
+    assert (
+        developer_role_rewrite_disclosure(dialect, request, undeclared)
+        == DEVELOPER_ROLE_REWRITE_DISCLOSURE
+    )
+    # A lane that declares the role serves as before, with nothing to disclose.
+    declared = GatewayDeploymentCapabilities(supports_developer_messages=True)
+    assert developer_role_rewrite_disclosure(dialect, request, declared) is None
+    # No developer message, no rewrite.
+    plain = request.model_copy(update={"messages": request.messages[1:]})
+    assert developer_role_rewrite_disclosure(dialect, plain, undeclared) is None
+
+
+def test_native_responses_still_requires_the_developer_declaration() -> None:
+    """The Responses wire defines ``developer``; it is never rewritten there."""
+    request = GatewayRequest(
+        surface=GatewayApiSurface.RESPONSES,
+        messages=(
+            GatewayMessage(role="developer", content="Answer in French."),
+            GatewayMessage(role="user", content="hi"),
+        ),
+    )
+    undeclared = GatewayDeploymentCapabilities()
+
+    assert "developer_messages" not in emulated_gateway_capabilities("openai_responses")
+    with pytest.raises(ProviderCapabilityError):
+        preflight_gateway_request(
+            request,
+            undeclared,
+            emulated_capabilities=emulated_gateway_capabilities("openai_responses"),
+        )
+    assert developer_role_rewrite_disclosure("openai_responses", request, undeclared) is None

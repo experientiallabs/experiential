@@ -14,6 +14,7 @@ import pytest
 from exp.common.core.artifacts import (
     ArtifactEnvelope,
     ArtifactInput,
+    JsonValue,
     SourceIdentity,
     canonical_json_bytes,
     sha256_json,
@@ -52,7 +53,7 @@ from exp.simulation.retrieval import (
 )
 from exp.simulation.retrieval.embedding import RAGEmbeddingCache
 from exp.simulation.retrieval.embedding_inputs import plan_rag_embedding_inputs
-from exp.simulation.retrieval.transitions import render_rag_key
+from exp.simulation.retrieval.transitions import extract_fit_transitions, render_rag_key
 
 _CREATED_AT = datetime(2026, 8, 13, tzinfo=UTC)
 SourceKind = Literal["file", "otlp", "production", "simulation", "manual", "generated"]
@@ -689,6 +690,104 @@ def _tool_trace(*, with_result: bool, index: int = 1) -> Trace:
             semantic_convention_version="1.37.0",
         ),
     )
+
+
+@pytest.mark.parametrize("reply", ["", " \n", "  account found\n", None, False, 0])
+def test_tool_transition_preserves_every_recorded_reply(reply: JsonValue) -> None:
+    """Empty replies are observations too; text whitespace is evidence, not formatting."""
+    trace = _tool_trace(with_result=True)
+    call, result = trace.spans
+    result = result.model_copy(
+        update={"attributes": {**result.attributes, "gen_ai.tool.message": reply}}
+    )
+    trace = trace.model_copy(update={"spans": (call, result)})
+    transitions = extract_fit_transitions(
+        (trace,),
+        (RAGLineageBinding(trace_id=trace.trace_id, lineage_id="lineage-a", partition="fit"),),
+    )
+    assert len(transitions) == 1
+    expected = reply if isinstance(reply, str) else json.dumps(reply)
+    assert transitions[0].observation.content == expected
+
+
+def test_zero_duration_tool_pair_does_not_depend_on_span_id_sort_order() -> None:
+    """A matched result at the call's end must survive span ID renumbering."""
+    trace = _tool_trace(with_result=True)
+    call, result = trace.spans
+    call = call.model_copy(update={"span_id": "z-call", "ended_at": call.started_at})
+    result = result.model_copy(update={"span_id": "a-result", "started_at": call.started_at})
+    trace = trace.model_copy(update={"spans": (call, result)})
+    transitions = extract_fit_transitions(
+        (trace,),
+        (RAGLineageBinding(trace_id=trace.trace_id, lineage_id="lineage-a", partition="fit"),),
+    )
+    assert len(transitions) == 1
+    assert transitions[0].observation.content == "account found"
+
+
+@pytest.mark.parametrize("parallel", [False, True])
+def test_idless_pairing_requires_one_outstanding_call(parallel: bool) -> None:
+    """Programmatic and OTLP traces cannot bypass the vendor pairing boundary."""
+    first = _tool_trace(with_result=True, index=1)
+    second = _tool_trace(with_result=True, index=2)
+    spans = []
+    for span in (*first.spans, *second.spans):
+        attributes = {
+            key: value for key, value in span.attributes.items() if key != "gen_ai.tool.call.id"
+        }
+        if parallel:
+            start = first.spans[0].started_at
+            is_result = attributes.get("gen_ai.operation.name") == "execute_tool"
+            offset = 2 if is_result else 0
+            span = span.model_copy(
+                update={
+                    "started_at": start + timedelta(seconds=offset),
+                    "ended_at": start + timedelta(seconds=offset + 1),
+                }
+            )
+        spans.append(span.model_copy(update={"attributes": attributes}))
+    trace = first.model_copy(update={"spans": tuple(spans)})
+    bindings = (
+        RAGLineageBinding(trace_id=trace.trace_id, lineage_id="lineage-a", partition="fit"),
+    )
+    if parallel:
+        with pytest.raises(ValueError, match="ambiguous"):
+            extract_fit_transitions((trace,), bindings)
+    else:
+        transitions = extract_fit_transitions((trace,), bindings)
+        assert len(transitions) == 2
+        assert {(row.action_span_id, row.observation_span_id) for row in transitions} == {
+            (first.spans[0].span_id, first.spans[1].span_id),
+            (second.spans[0].span_id, second.spans[1].span_id),
+        }
+
+
+def test_idless_call_does_not_steal_an_explicit_pair() -> None:
+    """A later explicit call can finish first without making the remaining result ambiguous."""
+    first = _tool_trace(with_result=True, index=1)
+    second = _tool_trace(with_result=True, index=2)
+    call, result = (
+        span.model_copy(
+            update={
+                "attributes": {
+                    k: v for k, v in span.attributes.items() if k != "gen_ai.tool.call.id"
+                }
+            }
+        )
+        for span in first.spans
+    )
+    result = result.model_copy(
+        update={"started_at": second.spans[1].ended_at, "ended_at": second.spans[1].ended_at}
+    )
+    trace = first.model_copy(update={"spans": (call, result, *second.spans)})
+    transitions = extract_fit_transitions(
+        (trace,),
+        (RAGLineageBinding(trace_id=trace.trace_id, lineage_id="lineage-a", partition="fit"),),
+    )
+    assert {(row.action_span_id, row.observation_span_id) for row in transitions} == {
+        (call.span_id, result.span_id),
+        (second.spans[0].span_id, second.spans[1].span_id),
+    }
 
 
 def _constant_binding(

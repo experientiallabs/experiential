@@ -19,6 +19,7 @@ from exp.runtime.gateway.contracts import (
 )
 from exp.runtime.models.providers.base import GatewayWireProfile
 from exp.runtime.models.providers.capability_policy import (
+    EFFORT_DROP_DISCLOSURE,
     coerce_capability,
     coerce_generation_parameters,
     coerce_structured_text_schema,
@@ -93,15 +94,87 @@ def test_efforts_order_by_nearness_and_prefer_the_lower_level_on_ties() -> None:
     assert efforts_by_nearness("bogus", ("high",)) == ()
 
 
-@pytest.mark.parametrize("effort", ("none", "minimal", "low", "medium"))
-def test_explicit_effort_cannot_be_upsold(effort: ReasoningEffort) -> None:
-    """A high-only rung cannot replace an explicit lower requested effort."""
-    assert (
-        coerce_generation_parameters(
-            (_reasoning_profile("gpt-5-pro"),), _request(reasoning_effort=effort)
-        )
-        is None
+@pytest.mark.parametrize("effort", ("low", "medium"))
+def test_an_effort_below_every_tier_rises_to_the_nearest_one(effort: ReasoningEffort) -> None:
+    """A high-only route serves an explicit lower effort at ``high``, disclosed.
+
+    A lane whose ladder is only ``high`` refused ``medium`` by name
+    (gemini-3.8-flash under a high-only ladder, production 2026-10-17).
+    Raising happens only when no tier at or below the request serves, so it
+    never replaces a lower tier that would.
+    """
+    coercion = coerce_generation_parameters(
+        (_reasoning_profile("gpt-5-pro"),), _request(reasoning_effort=effort)
     )
+    assert coercion is not None
+    assert coercion.request.reasoning_effort == "high"
+    assert coercion.disclosures == ("reasoning_effort->high(nearest_supported)",)
+    gemini = GatewayWireProfile(
+        dialect="gemini_generate_content",
+        url="https://gemini.test",
+        model_id="gemini-3.8-flash",
+        supports_reasoning=True,
+        reasoning_wire_format="gemini_thinking",
+        supported_reasoning_efforts=("high",),
+    )
+    request = _request(reasoning_effort=effort).model_copy(
+        update={"provider_output_config": {"effort": effort}}
+    )
+    coercion = coerce_generation_parameters((gemini,), request)
+    assert coercion is not None
+    assert coercion.request.reasoning_effort == "high"
+    # The Messages surface's verbatim channel carries the same tier.
+    assert coercion.request.provider_output_config == {"effort": "high"}
+
+
+def test_a_lower_tier_still_wins_over_raising_and_a_non_reasoning_route_drops() -> None:
+    """Snapping down stays first; a route that cannot reason keeps the drop."""
+    ladder = GatewayWireProfile(
+        dialect="openai_compatible",
+        url="https://ladder.test",
+        model_id="ladder-model",
+        supports_reasoning=True,
+        reasoning_wire_format="reasoning_effort",
+        supported_reasoning_efforts=("low", "xhigh"),
+    )
+    coercion = coerce_generation_parameters((ladder,), _request(reasoning_effort="high"))
+    assert coercion is not None
+    assert coercion.request.reasoning_effort == "low"
+    assert coercion.disclosures == ("reasoning_effort->low",)
+    plain = GatewayWireProfile(
+        dialect="openai_compatible", url="https://plain.test", model_id="plain-model"
+    )
+    dropped = coerce_generation_parameters((plain,), _request(reasoning_effort="medium"))
+    assert dropped is not None
+    assert dropped.request.reasoning_effort is None
+    assert dropped.disclosures == (EFFORT_DROP_DISCLOSURE,)
+
+
+@pytest.mark.parametrize("effort", ("none", "minimal"))
+def test_an_effort_below_the_whole_ladder_takes_the_lowest_tier(effort: ReasoningEffort) -> None:
+    """``none``/``minimal`` on a route that cannot reason that little takes its shallowest tier.
+
+    Pinned clients send ``none`` to every model; the gateway refused 925 such
+    requests a day on ladders like ``low, high, max``. The route cannot turn
+    reasoning off, so the lowest tier it serves is the nearest reading.
+    """
+    coercion = coerce_generation_parameters(
+        (_reasoning_profile("gpt-5-pro"),), _request(reasoning_effort=effort)
+    )
+    assert coercion is not None
+    assert coercion.request.reasoning_effort == "high"
+    assert coercion.disclosures == ("reasoning_effort->high(lowest_supported)",)
+    ladder = GatewayWireProfile(
+        dialect="openai_compatible",
+        url="https://glm.test",
+        model_id="glm-5.3-flash",
+        supports_reasoning=True,
+        reasoning_wire_format="reasoning_effort",
+        supported_reasoning_efforts=("low", "high", "max"),
+    )
+    coercion = coerce_generation_parameters((ladder,), _request(reasoning_effort=effort))
+    assert coercion is not None
+    assert coercion.request.reasoning_effort == "low"
 
 
 def test_effort_snap_updates_the_native_output_config() -> None:
@@ -518,7 +591,13 @@ def test_disabled_thinking_is_preserved_or_refused_without_a_drop() -> None:
     assert compatible_generation_parameter_profile_indexes((budgeted, shim), request) == (0,)
     assert compatible_generation_parameter_profile_indexes((adaptive_only, shim), request) == (0,)
     assert coerce_generation_parameters((budgeted, shim), request) is None
-    assert coerce_generation_parameters((shim,), request) is None
+    # A route with no reasoning rung already serves the off switch: the config
+    # drops with disclosure instead of being refused (claude-sonnet-5 behind
+    # its non-reasoning lanes refused Claude Code side calls, 2026-10-18).
+    already_off = coerce_generation_parameters((shim,), request)
+    assert already_off is not None
+    assert already_off.request.provider_thinking_config is None
+    assert already_off.disclosures == ("thinking->dropped(no_reasoning_on_route)",)
     # An adaptive config on the same mixed route is not a ``disabled`` drop;
     # it takes the effort translation path instead.
     adaptive_mixed = coerce_generation_parameters(
@@ -551,6 +630,49 @@ def test_adaptive_thinking_translates_to_a_budget_on_a_budgeted_route() -> None:
         "budget_tokens": 4_000,
     }
     assert coercion.disclosures == ("thinking.type->enabled",)
+
+
+def test_adaptive_thinking_beside_an_effort_serves_as_the_budget_on_a_budgeted_route() -> None:
+    """Claude Code's shape for a model it does not know reaches Haiku 4.5 as one budget.
+
+    Haiku 4.5 rejects both ``adaptive`` and ``output_config.effort`` by name, so
+    the translated budget is the only depth on the wire and the effort drops,
+    disclosed under the caller's field. An off effort is not translated on, and
+    an effort the decoder does not recognize keeps the provider's refusal.
+    """
+    profile = _budgeted_haiku_profile()
+    request = decode_messages(
+        {
+            "model": "claude-haiku-4.5",
+            "max_tokens": 32_000,
+            "messages": [{"role": "user", "content": "hi"}],
+            "thinking": {"type": "adaptive", "display": "omitted"},
+            "output_config": {"effort": "high"},
+        }
+    ).request
+    coercion = coerce_generation_parameters((profile,), request)
+    assert coercion is not None
+    assert coercion.disclosures == (
+        "thinking.type->enabled",
+        "output_config.effort->dropped(superseded_by_thinking_budget)",
+    )
+    _public, provider = route_generation_parameter_requests((profile,), coercion.request)
+    payload = dialect_stream_payload(profile, provider)
+    assert payload["thinking"] == {"type": "enabled", "budget_tokens": 16_000, "display": "omitted"}
+    assert "output_config" not in payload
+
+    off = _messages_request(
+        provider_thinking_config={"type": "adaptive"},
+        reasoning_effort="none",
+        maximum_output_tokens=8_000,
+    )
+    assert coerce_generation_parameters((profile,), off) is None
+    unknown = _messages_request(
+        provider_thinking_config={"type": "adaptive"},
+        provider_output_config={"effort": "hyperdrive"},
+        maximum_output_tokens=8_000,
+    )
+    assert coerce_generation_parameters((profile,), unknown) is None
 
 
 def test_adaptive_thinking_with_a_legal_caller_budget_keeps_that_budget() -> None:
@@ -757,6 +879,74 @@ def test_top_level_user_images_keep_the_fail_closed_contract() -> None:
     )
 
 
+def _tool_document_request(*, user_document: bool = False) -> GatewayRequest:
+    """Decode a Claude Code turn whose Read tool returned a PDF beside a screenshot."""
+    pdf: JsonObject = {
+        "type": "document",
+        "source": {"type": "base64", "media_type": "application/pdf", "data": "JVBERi0xLjQK"},
+        "title": "r.pdf",
+    }
+    user: list[JsonObject] = [{"type": "text", "text": "go"}]
+    if user_document:
+        user.append(pdf)
+    image: JsonObject = {
+        "type": "image",
+        "source": {"type": "base64", "media_type": "image/png", "data": "aGk="},
+    }
+    return decode_messages(
+        {
+            "model": "m",
+            "max_tokens": 64,
+            "messages": [
+                {"role": "user", "content": user},
+                {
+                    "role": "assistant",
+                    "content": [{"type": "tool_use", "id": "call-1", "name": "Read", "input": {}}],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "call-1",
+                            "content": [{"type": "text", "text": "read:"}, pdf, image],
+                        }
+                    ],
+                },
+            ],
+        }
+    ).request
+
+
+@pytest.mark.parametrize("capability", ["pdf_input", "pdf_url_input"])
+def test_tool_result_documents_degrade_with_placeholder_on_a_pdf_incapable_route(
+    capability: str,
+) -> None:
+    """A tool-returned PDF is baked into history like a screenshot: a route with
+    no PDF input serves it as a disclosed placeholder instead of refusing the
+    request (which would wedge the session), and the screenshot beside it stays."""
+    from exp.runtime.models.providers.dialect_dispatch import (
+        TOOL_RESULT_DOCUMENT_DROP_DISCLOSURE,
+    )
+
+    request = _tool_document_request()
+    assert request.documents
+    coercion = coerce_capability(capability, request)
+    assert coercion is not None
+    assert coercion.disclosures == (TOOL_RESULT_DOCUMENT_DROP_DISCLOSURE,)
+    assert coercion.request.documents == ()
+    tool_message = next(m for m in coercion.request.messages if m.role == "tool")
+    assert [part.kind for part in tool_message.content_parts] == ["text", "text", "image"]
+    assert tool_message.content == (
+        "read:[document 'r.pdf' omitted: this model route cannot carry documents]"
+    )
+
+
+def test_top_level_user_documents_keep_the_fail_closed_contract() -> None:
+    """A user document the caller can re-send never degrades silently."""
+    assert coerce_capability("pdf_input", _tool_document_request(user_document=True)) is None
+
+
 def _openai_reasoning_profile(
     efforts: tuple[ReasoningEffort, ...] = ("none", "low", "medium", "high"),
 ) -> GatewayWireProfile:
@@ -773,11 +963,16 @@ def _openai_reasoning_profile(
 
 @pytest.mark.parametrize("extension", (False, True))
 @pytest.mark.parametrize("effort", (None, "high"))
-def test_public_messages_numeric_budget_never_becomes_advisory_effort(
+def test_public_messages_numeric_budget_snaps_onto_the_effort_ladder_disclosed(
     extension: bool,
     effort: ReasoningEffort | None,
 ) -> None:
-    """A public 1024-token budget cannot become high or a default-on request."""
+    """A budget no rung carries verbatim serves at the nearest route tier.
+
+    Owner decision 2026-10-19 (qwen3.8-flash-next-uncensored refused 27 budgets
+    in two hours): the 1024-token budget asks for ``low``, the route serves only
+    ``high``, so it serves at ``high`` and says so, instead of refusing.
+    """
     body: JsonObject = {
         "model": "reasoner",
         "messages": [{"role": "user", "content": "Solve this."}],
@@ -794,7 +989,17 @@ def test_public_messages_numeric_budget_never_becomes_advisory_effort(
     profile = _openai_reasoning_profile(efforts=("high",))
     with pytest.raises(ProviderParameterError):
         route_generation_parameter_requests((profile,), request)
-    assert coerce_generation_parameters((profile,), request) is None
+    coercion = coerce_generation_parameters((profile,), request)
+    if request.reasoning_effort is not None or (request.provider_output_config or {}).get("effort"):
+        # Two depth controls at once stay the caller's contradiction to resolve.
+        assert coercion is None
+        return
+    assert coercion is not None
+    assert coercion.request.reasoning_effort == "high"
+    assert coercion.request.provider_thinking_config is None
+    assert coercion.disclosures == (
+        "thinking.budget_tokens->reasoning_effort:high(route_effort_ladder)",
+    )
 
 
 def test_a_thinking_config_translates_to_an_effort_on_an_openai_route() -> None:
@@ -929,13 +1134,19 @@ def test_the_thinking_translation_tries_farther_tiers_when_the_nearest_cannot_se
     assert coercion.request.reasoning_effort == "high"
 
 
-def test_a_disabled_thinking_config_never_snaps_to_an_active_effort() -> None:
-    """A disabled config needs an exact off tier or a typed admission refusal."""
+def test_a_disabled_thinking_config_takes_the_off_tier_else_the_lowest() -> None:
+    """A disabled config takes an exact off tier; a route that cannot turn
+    reasoning off serves it at its lowest tier, exactly like an explicit
+    ``none`` effort, and says so (glm-5.3-flash-uncensored refused Claude Code's
+    off switch on every side call, 2026-10-18)."""
     coercion = coerce_generation_parameters(
         (_openai_reasoning_profile(efforts=("low", "medium", "high")),),
         _messages_request(provider_thinking_config={"type": "disabled"}),
     )
-    assert coercion is None
+    assert coercion is not None
+    assert coercion.disclosures == ("thinking->reasoning_effort:low(no_off_tier)",)
+    assert coercion.request.reasoning_effort == "low"
+    assert coercion.request.provider_thinking_config is None
 
     exact = coerce_generation_parameters(
         (_openai_reasoning_profile(),),
@@ -950,13 +1161,20 @@ def test_a_disabled_thinking_config_never_snaps_to_an_active_effort() -> None:
 def test_disabled_config_cannot_be_erased_by_another_effort_channel(
     effort: ReasoningEffort | None,
 ) -> None:
-    """Neither an effort nor an empty ladder can turn an explicit off switch on."""
-    for ladder in ((), ("low", "medium", "high")):
-        request = _messages_request(
-            provider_thinking_config={"type": "disabled"}, reasoning_effort=effort
-        )
-        profile = replace(_openai_reasoning_profile(efforts=ladder), model_id="custom-reasoner")
-        assert coerce_generation_parameters((profile,), request) is None
+    """An effort beside the off switch never turns it on: on an off tier the
+    off switch wins and the effort yields with disclosure, and an empty ladder
+    (an always-reasoning rung of unknown depth) keeps the refusal."""
+    request = _messages_request(
+        provider_thinking_config={"type": "disabled"}, reasoning_effort=effort
+    )
+    unknown = replace(_openai_reasoning_profile(efforts=()), model_id="custom-reasoner")
+    assert coerce_generation_parameters((unknown,), request) is None
+    off_tier = replace(_openai_reasoning_profile(), model_id="custom-reasoner")
+    coercion = coerce_generation_parameters((off_tier,), request)
+    assert coercion is not None
+    assert coercion.request.reasoning_effort == "none"
+    yielded = ("output_config.effort->ignored(thinking_disabled)",) if effort == "high" else ()
+    assert coercion.disclosures == (*yielded, "thinking->reasoning_effort:none(disabled)")
 
 
 def test_a_mixed_route_whose_anthropic_rung_declined_translates_onto_the_foreign_ladder() -> None:
@@ -1340,3 +1558,39 @@ def test_temperature_forwards_beside_a_translated_thinking_config_on_an_effort_r
     assert payload["temperature"] == 0.3
     assert payload["reasoning_effort"] == "high"
     assert not any("temperature" in item for item in public.ignored_parameters)
+
+
+@pytest.mark.parametrize(("effort", "snapped"), (("medium", "low"), ("xhigh", "high")))
+def test_an_effort_beside_thinking_snaps_onto_the_ladder(
+    effort: ReasoningEffort, snapped: ReasoningEffort
+) -> None:
+    """Claude Code sends adaptive thinking beside ``output_config.effort``; the
+    effort wins, and on a ladder that skips it (glm-5.3: low, high, max) it now
+    snaps like a bare effort instead of refusing (16 refusals, 2026-10-18)."""
+    profile = _openai_reasoning_profile(efforts=("low", "high", "max"))
+    request = _messages_request(
+        provider_thinking_config={"type": "adaptive"},
+        reasoning_effort=effort,
+        provider_output_config={"effort": effort},
+    )
+    coercion = coerce_generation_parameters((profile,), request, admits=lambda _candidate: True)
+    assert coercion is not None
+    assert coercion.request.reasoning_effort == snapped
+    assert coercion.request.provider_thinking_config is None
+    assert coercion.disclosures == (
+        "thinking->dropped(superseded_by_effort)",
+        f"reasoning_effort->{snapped}",
+    )
+
+
+def test_an_active_effort_never_snaps_down_to_off() -> None:
+    """glm-5.1's zai rung offers only none and high: "medium" used to snap down to
+    ``none`` and serve with no reasoning at all. It now rises to the nearest active
+    tier, disclosed."""
+    profile = _openai_reasoning_profile(efforts=("none", "high"))
+    coercion = coerce_generation_parameters(
+        (profile,), _request(reasoning_effort="medium"), admits=lambda _candidate: True
+    )
+    assert coercion is not None
+    assert coercion.request.reasoning_effort == "high"
+    assert coercion.disclosures == ("reasoning_effort->high(nearest_supported)",)

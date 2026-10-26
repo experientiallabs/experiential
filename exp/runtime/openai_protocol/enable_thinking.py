@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from exp.common.core.artifacts import JsonObject
 from exp.common.models.model import ReasoningEffort
+from exp.runtime.openai_protocol.client_field_repairs import chat_output_cap
 from exp.runtime.openai_protocol.errors import invalid_field, unsupported_field
 from exp.runtime.openai_protocol.wire_models import _ChatRequest
 
@@ -23,6 +24,15 @@ from exp.runtime.openai_protocol.wire_models import _ChatRequest
 _TRANSLATED = "{path}->translated(reasoning_effort)"
 _IGNORED = "{path}->ignored(explicit_reasoning_effort)"
 _EXCLUDE_DROPPED = "reasoning.exclude->dropped(not_carried)"
+
+CHAT_TEMPLATE_PRESERVE_THINKING_IGNORED = (
+    "chat_template_kwargs.preserve_thinking->ignored(not_forwarded)"
+)
+"""Disclosure recorded when Qwen's ``preserve_thinking`` template switch is accepted unused.
+
+No wire receives ``chat_template_kwargs`` verbatim (``enable_thinking`` is
+translated to the canonical reasoning control), so the switch cannot reach a
+chat template; it is named rather than refused."""
 
 
 class _EnableThinkingResult:
@@ -231,7 +241,9 @@ def _budgeted_thinking(request: _ChatRequest) -> _EnableThinkingResult:
         raise invalid_field(
             param, "thinking.budget_tokens requires thinking enabled. Remove the off control."
         )
-    maximum = request.max_completion_tokens or request.max_tokens or request.max_output_tokens
+    maximum, _, _ = chat_output_cap(
+        request.max_completion_tokens, request.max_tokens, request.max_output_tokens
+    )
     if maximum is not None and budget >= maximum:
         raise invalid_field(
             param,

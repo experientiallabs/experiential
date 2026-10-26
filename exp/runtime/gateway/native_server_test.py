@@ -11,7 +11,11 @@ import pytest
 
 from exp.runtime.gateway import native_server
 from exp.runtime.gateway.native_server import (
+    PRE_FIRST_BYTE_MAX_ENV,
+    PRE_FIRST_BYTE_RESERVE_ENV,
     NativeGatewayServerError,
+    pre_first_byte_max_seconds,
+    pre_first_byte_reserve_seconds,
     serve_native_gateway,
 )
 
@@ -41,6 +45,8 @@ def test_host_passes_the_serve_configuration(
 
     native = SimpleNamespace(serve=serve)
     monkeypatch.setattr(native_server.importlib, "import_module", lambda _name: native)
+    monkeypatch.setenv(PRE_FIRST_BYTE_RESERVE_ENV, "20")
+    monkeypatch.setenv(PRE_FIRST_BYTE_MAX_ENV, "480")
     control = SimpleNamespace(guardrail_detectors={}, request_timeout_seconds=37.0)
 
     serve_native_gateway(
@@ -53,6 +59,7 @@ def test_host_passes_the_serve_configuration(
         public_upstreams_only=public_only,
         time_to_first_byte_seconds=12.0,
         native_usage_enabled=False,
+        maximum_retained_output_bytes=512 * 1024 * 1024,
     )
 
     assert captured["control_plane"] is control
@@ -67,6 +74,9 @@ def test_host_passes_the_serve_configuration(
     assert config["public_upstreams_only"] is public_only
     assert config["time_to_first_byte_seconds"] == 12.0
     assert config["native_usage_enabled"] is False
+    assert config["maximum_retained_output_bytes"] == 512 * 1024 * 1024
+    assert config["pre_first_byte_reserve_seconds"] == 20.0
+    assert config["pre_first_byte_max_seconds"] == 480.0
     assert captured["guardrail_detectors"] == {}
     assert captured["capture"] is None
 
@@ -144,3 +154,19 @@ def test_host_requires_the_extension(monkeypatch: pytest.MonkeyPatch) -> None:
             host="127.0.0.1",
             port=8080,
         )
+
+
+def test_the_reserve_override_is_optional_and_validated() -> None:
+    """Unset keeps the data plane's default; a negative value fails loudly."""
+    assert pre_first_byte_reserve_seconds({}) is None
+    assert pre_first_byte_reserve_seconds({PRE_FIRST_BYTE_RESERVE_ENV: "7.5"}) == 7.5
+    with pytest.raises(ValueError):
+        pre_first_byte_reserve_seconds({PRE_FIRST_BYTE_RESERVE_ENV: "-1"})
+
+
+def test_the_budget_ceiling_override_is_optional_and_validated() -> None:
+    """Unset keeps the data plane's 600 s default; a negative value fails loudly."""
+    assert pre_first_byte_max_seconds({}) is None
+    assert pre_first_byte_max_seconds({PRE_FIRST_BYTE_MAX_ENV: "900"}) == 900.0
+    with pytest.raises(ValueError):
+        pre_first_byte_max_seconds({PRE_FIRST_BYTE_MAX_ENV: "-5"})

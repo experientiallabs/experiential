@@ -32,9 +32,18 @@ def chat_structured_text(value: _ChatResponseFormat | None) -> StructuredTextFor
     )
 
 
+def responses_json_object_output(value: _ResponseText | None) -> bool:
+    """Return whether the Responses text format selects schema-free JSON mode."""
+    return value is not None and value.format is not None and value.format.type == "json_object"
+
+
 def responses_structured_text(value: _ResponseText | None) -> StructuredTextFormat | None:
-    """Convert the Responses JSON Schema text format when requested."""
-    if value is None or value.format is None or value.format.type == "text":
+    """Convert the Responses JSON Schema text format when requested.
+
+    ``json_object`` rides ``json_object_output`` like the Chat spelling (see
+    :func:`responses_json_object_output`) and yields no structured text.
+    """
+    if value is None or value.format is None or value.format.type in {"text", "json_object"}:
         return None
     schema = value.format.schema_
     name = value.format.name

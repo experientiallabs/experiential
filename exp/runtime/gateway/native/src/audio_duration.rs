@@ -22,6 +22,12 @@
 //! Any other codec (Vorbis, for one, whose packet sizes need its setup
 //! header), a container that fails to demux, or a stream with no audio has no
 //! trustworthy duration and is refused rather than reserved on a guess.
+//!
+//! A streamed WAV (what OpenAI's and this gateway's `/v1/audio/speech` emit)
+//! is written before its length is known, so its RIFF and `data` chunk sizes
+//! hold the placeholder `0xFFFFFFFF` (some writers use 0). Those sizes are
+//! settled to the bytes actually present before measuring, so the demuxer, the
+//! upload digest and the provider all see one self-consistent file.
 
 use std::io::Cursor;
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -45,6 +51,10 @@ const OPUS_SAMPLE_RATE: u64 = 48_000;
 /// metadata, so every frame is counted at the larger size: the reservation may
 /// cover up to twice an AAC-LC file's length, but never less than any profile.
 const AAC_SAMPLES_PER_FRAME: u64 = 2_048;
+
+/// The size a streaming WAV writer leaves in a chunk header it cannot seek
+/// back to; 0 is the other placeholder in use.
+const STREAMED_CHUNK_SIZE: u32 = u32::MAX;
 
 /// How one codec's packet durations are derived.
 enum Meter {
@@ -151,6 +161,63 @@ fn measure(bytes: Vec<u8>, extension: &str) -> Option<u64> {
         .filter(|milli| *milli > 0)
 }
 
+/// Settle a streamed WAV's placeholder sizes to the bytes present, in place.
+///
+/// A RIFF/WAVE file whose RIFF size or `data` chunk size is `0xFFFFFFFF` or 0
+/// was written as a stream: as ffmpeg does, the RIFF chunk is read as running
+/// to the end of the file and the `data` chunk as running from its header to
+/// the end of the file, and both fields are rewritten to those lengths. Only
+/// those two header fields change; any other file, including a well-formed
+/// WAV or one with a malformed chunk walk, is left byte-for-byte as it was.
+/// The audio's duration is then bounded by the sample bytes actually uploaded,
+/// never by a header a caller wrote.
+pub(crate) fn settle_streamed_wav_sizes(bytes: &mut [u8]) {
+    if bytes.len() < 12 || &bytes[..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
+        return;
+    }
+    let Ok(riff_size) = u32::try_from(bytes.len() - 8) else {
+        return;
+    };
+    if is_streamed_size(read_u32_le(bytes, 4)) {
+        bytes[4..8].copy_from_slice(&riff_size.to_le_bytes());
+    }
+    let mut offset = 12usize;
+    while offset + 8 <= bytes.len() {
+        let size = read_u32_le(bytes, offset + 4);
+        let body = offset + 8;
+        if &bytes[offset..offset + 4] == b"data" {
+            if is_streamed_size(size) {
+                // `bytes.len() - body` fits: the whole file's length did above.
+                let present = (bytes.len() - body) as u32;
+                bytes[offset + 4..body].copy_from_slice(&present.to_le_bytes());
+            }
+            return;
+        }
+        // Chunks are word-aligned: an odd-sized chunk carries one pad byte.
+        let size = size as usize;
+        offset = match body
+            .checked_add(size)
+            .and_then(|end| end.checked_add(size & 1))
+        {
+            Some(next) if next <= bytes.len() => next,
+            _ => return,
+        };
+    }
+}
+
+fn is_streamed_size(size: u32) -> bool {
+    size == STREAMED_CHUNK_SIZE || size == 0
+}
+
+fn read_u32_le(bytes: &[u8], offset: usize) -> u32 {
+    u32::from_le_bytes([
+        bytes[offset],
+        bytes[offset + 1],
+        bytes[offset + 2],
+        bytes[offset + 3],
+    ])
+}
+
 /// Samples (at 48 kHz) one Opus packet decodes to, from its TOC byte.
 ///
 /// The frame size follows from the configuration number (RFC 6716 table 2)
@@ -199,6 +266,81 @@ mod tests {
     #[test]
     fn measures_a_wav_from_its_samples() {
         assert_eq!(duration_milli(wav(2), "wav"), Some(2_000));
+    }
+
+    /// `wav(seconds)` as a streaming writer leaves it: both sizes unknown.
+    fn streamed_wav(seconds: u32, placeholder: u32) -> Vec<u8> {
+        let mut bytes = wav(seconds);
+        bytes[4..8].copy_from_slice(&placeholder.to_le_bytes());
+        bytes[40..44].copy_from_slice(&placeholder.to_le_bytes());
+        bytes
+    }
+
+    #[test]
+    fn a_streamed_wav_is_settled_to_its_present_bytes_and_measured() {
+        for placeholder in [u32::MAX, 0] {
+            let mut bytes = streamed_wav(2, placeholder);
+            assert_eq!(
+                duration_milli(bytes.clone(), "wav"),
+                None,
+                "{placeholder:#x}"
+            );
+            settle_streamed_wav_sizes(&mut bytes);
+            assert_eq!(bytes, wav(2), "{placeholder:#x}");
+            assert_eq!(
+                duration_milli(bytes, "wav"),
+                Some(2_000),
+                "{placeholder:#x}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_streamed_wav_with_a_list_chunk_before_data_is_settled() {
+        // ffmpeg writes a LIST/INFO chunk between fmt and data when it streams.
+        let plain = wav(1);
+        let list: &[u8] = b"LIST\x12\0\0\0INFOISFT\x05\0\0\0Lavf\0\0";
+        let mut bytes = [&plain[..36], list, &plain[36..]].concat();
+        bytes[4..8].copy_from_slice(&u32::MAX.to_le_bytes());
+        let data = 36 + list.len();
+        bytes[data + 4..data + 8].copy_from_slice(&u32::MAX.to_le_bytes());
+        settle_streamed_wav_sizes(&mut bytes);
+        let riff = u32::try_from(bytes.len() - 8).unwrap();
+        assert_eq!(bytes[4..8], riff.to_le_bytes());
+        assert_eq!(bytes[data + 4..data + 8], 32_000u32.to_le_bytes());
+        assert_eq!(duration_milli(bytes, "wav"), Some(1_000));
+    }
+
+    #[test]
+    fn a_settled_size_counts_only_the_bytes_uploaded() {
+        // A streamed header cannot claim more audio than was sent: half the
+        // samples measure as half the duration.
+        let mut bytes = streamed_wav(2, u32::MAX);
+        bytes.truncate(44 + 32_000);
+        settle_streamed_wav_sizes(&mut bytes);
+        assert_eq!(duration_milli(bytes, "wav"), Some(1_000));
+    }
+
+    #[test]
+    fn settling_leaves_well_formed_and_foreign_files_untouched() {
+        let mut plain = wav(1);
+        settle_streamed_wav_sizes(&mut plain);
+        assert_eq!(plain, wav(1));
+        for foreign in [
+            b"not audio at all".to_vec(),
+            Vec::new(),
+            b"RIFF\xff\xff\xff\xffWEBPVP8 ".to_vec(),
+        ] {
+            let mut bytes = foreign.clone();
+            settle_streamed_wav_sizes(&mut bytes);
+            assert_eq!(bytes, foreign);
+        }
+        // A chunk walk that runs off the end stops without touching data.
+        let mut broken = streamed_wav(1, u32::MAX);
+        broken[16..20].copy_from_slice(&u32::MAX.to_le_bytes());
+        let before = broken.clone();
+        settle_streamed_wav_sizes(&mut broken);
+        assert_eq!(broken[16..], before[16..]);
     }
 
     #[test]

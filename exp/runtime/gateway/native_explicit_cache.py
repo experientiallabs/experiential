@@ -130,10 +130,16 @@ def bind_explicit_cache(
     """Retain pure plans without reserving or contacting any provider at admission.
 
     Only marked, representable native Google text prefixes on non-ZDR requests
-    qualify. The actual selected attempt rechecks tenant allowance and credential
+    qualify, and nothing qualifies for an organization with prompt caching off.
+    The actual selected attempt rechecks tenant allowance and credential
     generation through the injected host before any cache operation.
     """
-    if host is None or authorization.zdr_requested or provider_request.tool_search is not None:
+    if (
+        host is None
+        or authorization.zdr_requested
+        or authorization.prompt_caching_disabled
+        or provider_request.tool_search is not None
+    ):
         return None, public_request
     bindings: list[NativeCacheBinding | None] = []
     for deployment, (profile, _client), wire in zip(

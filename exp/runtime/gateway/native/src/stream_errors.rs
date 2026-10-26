@@ -354,6 +354,11 @@ pub(crate) fn classify_stream_error_with_raw_message(
     let code_ref = code_lower.as_deref().unwrap_or("");
     let message_ref = message_lower.as_deref().unwrap_or("");
 
+    if message.is_some_and(crate::rejection_shapes::names_account_policy_block)
+        || raw_message.is_some_and(crate::rejection_shapes::names_account_policy_block)
+    {
+        return StreamErrorKind::ProviderAuthentication;
+    }
     if is_refusal_code(Some(code_ref)) {
         return StreamErrorKind::Refusal(refusal_reason(code, message));
     }

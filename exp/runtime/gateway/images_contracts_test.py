@@ -5,11 +5,14 @@ from __future__ import annotations
 import pytest
 from pydantic import ValidationError
 
+from exp.common.models import BilledUnitKind, GatewayTokenPrices, GatewayUnitPrices
 from exp.runtime.gateway.contracts import GatewayApiSurface
 from exp.runtime.gateway.images_contracts import (
     MAXIMUM_IMAGE_OUTPUT_TOKENS,
     ImagesRequest,
+    image_variant,
     images_ceiling_nano_usd,
+    per_image_rate,
 )
 from exp.runtime.gateway.ledger_valuation import NanoUsdOverflowError
 
@@ -53,3 +56,40 @@ def test_reservation_ceiling_prices_prompt_tokens_and_maximum_image_tokens() -> 
     # or read as "unpriced".
     with pytest.raises(NanoUsdOverflowError):
         images_ceiling_nano_usd(request, input_tokens=10**16, input_rate=10**12, output_rate=1)
+
+
+def test_the_image_variant_is_quality_then_size() -> None:
+    """Omitted parts drop out, so a bare request prices at the flat rate."""
+    assert image_variant(ImagesRequest(prompt="p", quality="hd", size="1024x1792")) == (
+        "hd/1024x1792"
+    )
+    assert image_variant(ImagesRequest(prompt="p", size="1024x1024")) == "1024x1024"
+    assert image_variant(ImagesRequest(prompt="p")) == ""
+
+
+def test_a_per_image_card_prices_its_variant_or_flat_rate() -> None:
+    """Variants price exactly; others fall back to the flat rate when one exists."""
+    card = GatewayTokenPrices(
+        units=GatewayUnitPrices(kind=BilledUnitKind.IMAGE, rates={"": 20, "hd/1024x1024": 80})
+    )
+    assert per_image_rate(card, ImagesRequest(prompt="p", quality="hd", size="1024x1024")) == 80
+    assert per_image_rate(card, ImagesRequest(prompt="p", size="256x256")) == 20
+    strict = GatewayTokenPrices(
+        units=GatewayUnitPrices(kind=BilledUnitKind.IMAGE, rates={"hd/1024x1024": 80})
+    )
+    assert per_image_rate(strict, ImagesRequest(prompt="p")) is None
+    seconds = GatewayTokenPrices(
+        units=GatewayUnitPrices(kind=BilledUnitKind.VIDEO_SECOND, rates={"": 1})
+    )
+    assert per_image_rate(seconds, ImagesRequest(prompt="p")) is None
+
+
+def test_a_per_image_ceiling_is_n_images() -> None:
+    """The unit reservation is n times the rate, regardless of token rates."""
+    request = ImagesRequest(prompt="p", n=3)
+    assert (
+        images_ceiling_nano_usd(
+            request, input_tokens=10, input_rate=None, output_rate=None, image_rate=20_000_000
+        )
+        == 60_000_000
+    )

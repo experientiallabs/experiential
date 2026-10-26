@@ -27,12 +27,12 @@ from exp.runtime.gateway.budgets_test import (
     _unknown_attempt,
 )
 from exp.runtime.gateway.contracts import (
-    ExecutionSnapshot,
     GatewayEvent,
     GatewayEventKind,
     GatewayServiceTierAdmission,
     GatewayUsage,
 )
+from exp.runtime.gateway.execution_snapshot import ExecutionSnapshot
 from exp.runtime.gateway.model_plan import model_execution_snapshot
 from exp.runtime.gateway.model_plan_test import catalog as model_catalog
 from exp.runtime.gateway.native_accounting import NativeAttemptAccounting, NativeBridgeError
@@ -451,7 +451,10 @@ def test_later_child_denial_keeps_root_failure_terminal(tmp_path: Path) -> None:
         _request("chain-budget"),
         time.monotonic() + 30,
         total_attempts=1,
-        attempt_counts=[0, 1, 0],
+        # The dial that failed was depth 0 (``current_depth`` below); the
+        # ledger row at depth 1 above only spends the root allowance, so the
+        # child at depth 1 is still this request's untried successor.
+        attempt_counts=[1, 0, 0],
     )
     accounting.register(entry)
     with pytest.raises(NativeBridgeError) as caught:

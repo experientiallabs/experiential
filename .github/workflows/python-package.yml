@@ -1,320 +1,305 @@
-name: python package
+name: python-package
 
 on:
   pull_request:
-    paths:
-      - ".github/workflows/python-package.yml"
-      - "pyproject.toml"
-      - "uv.lock"
-      - "README.md"
-      - "exp/**"
   push:
     branches: [main]
-    paths:
-      - ".github/workflows/python-package.yml"
-      - "pyproject.toml"
-      - "uv.lock"
-      - "README.md"
-      - "exp/**"
-  release:
-    types: [published]
+    tags: ['v*']
   workflow_dispatch:
     inputs:
       source:
-        description: Source to build for a release replay or an exact-ref verification
-        required: true
+        description: Build the selected ref or replay the latest GitHub release
         type: choice
-        default: latest-release
-        options:
-          - latest-release
-          - selected-ref
+        options: [selected-ref, latest-release]
+        default: selected-ref
       publish:
-        description: "Publish the built distribution to PyPI"
-        required: true
+        description: Publish a latest-release replay from protected main
         type: boolean
         default: false
 
 permissions:
   contents: read
 
-# A newer push to the same pull request supersedes the running build; main
-# pushes, releases, and replays each keep their own run.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
-  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}-${{ inputs.source }}-${{ inputs.publish }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  UV_VERSION: '0.12.18'
+  MATURIN_VERSION: '1.14.1'
+  RUST_TOOLCHAIN: '1.99.1'
 
 jobs:
-  native-targets:
-    # The four cross-platform wheels only change when the crate does, and
-    # macOS bills 10x and Windows 2x the Linux rate. Pull requests and main
-    # pushes that leave the crate alone build only the linux-x86_64 wheel that
-    # `build` smokes. Releases and replays always build every target.
+  source:
     runs-on: ubuntu-latest
     outputs:
-      matrix: ${{ steps.targets.outputs.matrix }}
+      revision: ${{ steps.source.outputs.revision }}
+      publish: ${{ steps.source.outputs.publish }}
     steps:
-      - name: Detect native crate changes
-        id: native
-        if: github.event_name == 'pull_request' || github.event_name == 'push'
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Resolve and validate the immutable source
+        id: source
         env:
           GH_TOKEN: ${{ github.token }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          BEFORE: ${{ github.event.before }}
+          SOURCE: ${{ inputs.source }}
+          PUBLISH: ${{ inputs.publish }}
+          REF_PROTECTED: ${{ github.ref_protected }}
         run: |
-          # Any lookup failure builds every target (fail closed).
-          if [ "${GITHUB_EVENT_NAME}" = pull_request ]; then
-            files="$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/files" \
-              --paginate -q '.[] | .filename, (.previous_filename // empty)')" || { echo "changed=true" >> "$GITHUB_OUTPUT"; exit 0; }
-          else
-            # Compare lists at most 300 files; a list that long builds everything.
-            files="$(gh api "repos/${GITHUB_REPOSITORY}/compare/${BEFORE}...${GITHUB_SHA}" \
-              -q '.files[] | .filename, (.previous_filename // empty)')" || { echo "changed=true" >> "$GITHUB_OUTPUT"; exit 0; }
-            if [ "$(printf '%s\n' "${files}" | grep -c .)" -ge 300 ]; then
-              echo "changed=true" >> "$GITHUB_OUTPUT"; exit 0
-            fi
-          fi
-          if printf '%s\n' "${files}" \
-            | grep -qE '^(exp/runtime/gateway/native/|\.github/workflows/python-package\.yml$)'; then
-            echo "changed=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "changed=false" >> "$GITHUB_OUTPUT"
-          fi
-      - name: Select wheel targets
-        id: targets
-        env:
-          NATIVE_CHANGED: ${{ steps.native.outputs.changed || 'true' }}
-        run: |
-          # macos-x86_64 is cross-compiled from the arm runner; macos-13 (the
-          # last intel runner) is being retired and queues for hours.
-          all='[
-            {"runner": "ubuntu-latest", "target": "linux-x86_64"},
-            {"runner": "ubuntu-24.04-arm", "target": "linux-aarch64"},
-            {"runner": "macos-14", "target": "macos-x86_64", "cargo-target": "x86_64-apple-darwin"},
-            {"runner": "macos-14", "target": "macos-arm64"},
-            {"runner": "windows-latest", "target": "windows-x86_64"}
-          ]'
-          if [ "${NATIVE_CHANGED}" = true ]; then
-            targets="${all}"
-          else
-            targets="$(printf '%s' "${all}" | jq -c 'map(select(.target == "linux-x86_64"))')"
-          fi
-          echo "matrix=$(printf '%s' "${targets}" | jq -c '{include: .}')" >> "$GITHUB_OUTPUT"
+          python3 - <<'PY'
+          import json
+          import os
+          import re
+          import subprocess
+          import tomllib
+          from pathlib import Path
 
-  native-wheels:
-    needs: native-targets
+          event = os.environ['GITHUB_EVENT_NAME']
+          ref = os.environ['GITHUB_REF']
+          tag = ref.removeprefix('refs/tags/') if ref.startswith('refs/tags/') else ''
+          replay = event == 'workflow_dispatch' and os.environ['SOURCE'] == 'latest-release'
+          publish = (event == 'push' and bool(tag)) or os.environ['PUBLISH'] == 'true'
+          if replay:
+              release = json.loads(subprocess.check_output(
+                  ['gh', 'api', f"repos/{os.environ['GITHUB_REPOSITORY']}/releases/latest"],
+                  text=True,
+              ))
+              assert not release['draft'] and not release['prerelease']
+              tag = release['tag_name']
+          if tag:
+              assert re.fullmatch(r'v\d+\.\d+\.\d+(rc\d+)?', tag), tag
+              subprocess.run(['git', 'checkout', '--detach', f'refs/tags/{tag}'], check=True)
+          if publish:
+              assert os.environ['GITHUB_REPOSITORY'] == 'experientiallabs/experiential'
+              assert os.environ['REF_PROTECTED'] == 'true', 'publishing requires a protected ref'
+              assert event == 'push' and ref.startswith('refs/tags/v') or (
+                  replay and ref == 'refs/heads/main'
+              ), 'manual publication requires latest-release on main'
+              subprocess.run(['git', 'merge-base', '--is-ancestor', 'HEAD', 'origin/main'], check=True)
+              assert not Path('.github/deferred-native-release.toml').exists()
+              project = tomllib.loads(Path('pyproject.toml').read_text())['project']
+              assert project['name'] == 'experiential'
+              assert tag == 'v' + project['version'], 'tag must match the flagship version'
+              native = tomllib.loads(Path('exp/runtime/gateway/native/pyproject.toml').read_text())['project']
+              cargo = tomllib.loads(Path('exp/runtime/gateway/native/Cargo.toml').read_text())['package']
+              assert native['name'] == 'exp-gateway-native' and native['version'] == cargo['version']
+          revision = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write(f'revision={revision}\npublish={str(publish).lower()}\n')
+          PY
+
+  native-linux:
+    needs: source
     strategy:
       fail-fast: false
-      matrix: ${{ fromJSON(needs.native-targets.outputs.matrix) }}
+      matrix:
+        include:
+          - name: linux-x86_64
+            runner: ubuntu-latest
+            sdist: 'true'
+            image: quay.io/pypa/manylinux2014_x86_64:2026.09.23-1@sha256:2fa5f99f660f115f547d96b4edcadfc19f77a6de8807734bf0fc4924f81be01a
+          - name: linux-aarch64
+            runner: ubuntu-24.04-arm
+            sdist: 'false'
+            image: quay.io/pypa/manylinux2014_aarch64:2026.09.23-1@sha256:47940daeb8e0fdcc7deefad334bfda3d8d12b447ba1ebd5411f9f106318eafdb
     runs-on: ${{ matrix.runner }}
     steps:
-      - name: Resolve the latest published release
-        id: release
-        if: github.event_name == 'workflow_dispatch' && inputs.source == 'latest-release'
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.source.outputs.revision }}
+          persist-credentials: false
+      - name: Build and import the manylinux2014 wheel
         env:
-          GH_TOKEN: ${{ github.token }}
-        shell: bash
+          IMAGE: ${{ matrix.image }}
+          SDIST: ${{ matrix.sdist }}
         run: |
-          published_tag="$(
-            gh release view --repo "$GITHUB_REPOSITORY" \
-              --json isDraft,publishedAt,tagName \
-              --jq 'select(.isDraft == false and .publishedAt != null) | .tagName'
-          )"
-          test -n "$published_tag"
-          echo "tag=$published_tag" >> "$GITHUB_OUTPUT"
-      - uses: actions/checkout@v4
+          mkdir -p "$RUNNER_TEMP/native-dist"
+          docker run --rm -v "$GITHUB_WORKSPACE:/io" -v "$RUNNER_TEMP/native-dist:/dist" -w /io \
+            -e UV_VERSION -e MATURIN_VERSION -e RUST_TOOLCHAIN -e SDIST "$IMAGE" bash -euc '
+              export PATH="/opt/python/cp312-cp312/bin:$HOME/.cargo/bin:$PATH"
+              python -m pip install --quiet --no-cache-dir "uv==$UV_VERSION" "maturin==$MATURIN_VERSION"
+              curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y \
+                --no-modify-path --profile minimal --default-toolchain "$RUST_TOOLCHAIN"
+              maturin build --release --locked --compatibility manylinux2014 \
+                --manifest-path exp/runtime/gateway/native/Cargo.toml --out /dist
+              if [ "$SDIST" = true ]; then
+                maturin sdist --manifest-path exp/runtime/gateway/native/Cargo.toml --out /dist
+              fi
+              uv venv --python /opt/python/cp312-cp312/bin/python /tmp/native-smoke
+              uv pip install --python /tmp/native-smoke/bin/python /dist/*.whl
+              cd /tmp
+              /tmp/native-smoke/bin/python -c "import exp_gateway_native as n; assert n.__version__; assert callable(n.serve)"
+            '
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.source == 'latest-release' && format('refs/tags/{0}', steps.release.outputs.tag) || github.ref }}
-      - name: Build the abi3 extension wheel
-        uses: PyO3/maturin-action@423a6347767a8b16e65c2a7a7042e4a921528da8  # v1.51.0
-        with:
-          command: build
-          args: --release --manifest-path exp/runtime/gateway/native/Cargo.toml --out native-dist
-          manylinux: auto
-          target: ${{ matrix.cargo-target || '' }}
-      - name: Build the extension sdist
-        if: matrix.target == 'linux-x86_64'
-        uses: PyO3/maturin-action@423a6347767a8b16e65c2a7a7042e4a921528da8  # v1.51.0
-        with:
-          command: sdist
-          args: --manifest-path exp/runtime/gateway/native/Cargo.toml --out native-dist
-      - uses: astral-sh/setup-uv@v6
-      - name: Smoke test the wheel on its own platform
-        # The cross-compiled intel-mac wheel cannot import on the arm runner.
-        if: matrix.cargo-target == null
-        shell: bash
-        run: |
-          uv venv --python 3.12 native-smoke
-          venv_python="native-smoke/bin/python"
-          [ -x "$venv_python" ] || venv_python="native-smoke/Scripts/python.exe"
-          uv pip install --python "$venv_python" native-dist/*.whl
-          "$venv_python" -c "import exp_gateway_native as n; assert n.__version__; assert callable(n.serve)"
-      - uses: actions/upload-artifact@v4
-        with:
-          name: native-dist-${{ matrix.target }}
-          path: native-dist/
+          name: native-${{ matrix.name }}
+          path: ${{ runner.temp }}/native-dist/*
+          if-no-files-found: error
 
-  build:
-    needs: native-wheels
+  native-desktop:
+    needs: source
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macos-arm64
+            runner: macos-latest
+            target: aarch64-apple-darwin
+            uv-checksum: cf40e0c6a202190ccd9e0406dcfdd5b2d6668a9a5c779b17948963df32aafe5b
+          - name: macos-x86_64
+            runner: macos-15-intel
+            target: x86_64-apple-darwin
+            uv-checksum: 2e4108f5395397c8bc5d43bf83d3bdbb2d0e92b90d0efa607756be704905fa33
+          - name: windows-x86_64
+            runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            uv-checksum: cae6a3bc25239f83dffb467a4b180508d9da23986c04639ebfa44e43e6a84bff
+    runs-on: ${{ matrix.runner }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.source.outputs.revision }}
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
+        with:
+          version: ${{ env.UV_VERSION }}
+          checksum: ${{ matrix.uv-checksum }}
+          python-version: '3.12'
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          workspaces: exp/runtime/gateway/native
+          key: package-${{ matrix.target }}
+      - name: Build the native wheel
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          uvx --from "maturin==$MATURIN_VERSION" maturin build --release --locked \
+            --target "$TARGET" --interpreter "$(uv python find 3.12)" \
+            --manifest-path exp/runtime/gateway/native/Cargo.toml --out "$RUNNER_TEMP/native-dist"
+      - name: Import the wheel outside the checkout
+        run: |
+          uv venv --python 3.12 "$RUNNER_TEMP/native-smoke"
+          smoke_python="$RUNNER_TEMP/native-smoke/bin/python"
+          if [ "$RUNNER_OS" = Windows ]; then smoke_python="$RUNNER_TEMP/native-smoke/Scripts/python.exe"; fi
+          uv pip install --python "$smoke_python" "$RUNNER_TEMP"/native-dist/*.whl
+          cd "$RUNNER_TEMP"
+          "$smoke_python" -c 'import exp_gateway_native as n; assert n.__version__; assert callable(n.serve)'
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: native-${{ matrix.name }}
+          path: ${{ runner.temp }}/native-dist/*
+          if-no-files-found: error
+
+  package:
+    needs: [source, native-linux, native-desktop]
     runs-on: ubuntu-latest
     steps:
-      - name: Resolve the latest published release
-        id: release
-        if: github.event_name == 'workflow_dispatch' && inputs.source == 'latest-release'
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.source.outputs.revision }}
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
+        with:
+          version: ${{ env.UV_VERSION }}
+          checksum: 89eadd7c76fc063887959510d5ba0ab1264dfd5f1143b925ddb73021a40acf16
+          python-version: '3.12'
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: native-linux-x86_64
+          path: ${{ runner.temp }}/native-dist
+      - name: Build the flagship distributions
+        run: uv build --package experiential --no-sources --out-dir "$RUNNER_TEMP/dist"
+      - name: Verify the installed SDK and no-spend release evidence
         env:
-          GH_TOKEN: ${{ github.token }}
+          EXP_RELEASE_REVISION: ${{ needs.source.outputs.revision }}
         run: |
-          published_tag="$(
-            gh release view --repo "$GITHUB_REPOSITORY" \
-              --json isDraft,publishedAt,tagName \
-              --jq 'select(.isDraft == false and .publishedAt != null) | .tagName'
-          )"
-          test -n "$published_tag"
-          echo "tag=$published_tag" >> "$GITHUB_OUTPUT"
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.source == 'latest-release' && format('refs/tags/{0}', steps.release.outputs.tag) || github.ref }}
-      - name: Resolve the checked-out revision
-        id: source_revision
-        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
-      - uses: astral-sh/setup-uv@v6
-      - name: Build the EXP distribution
-        run: uv build --package experiential --no-sources
-      - uses: actions/download-artifact@v4
-        with:
-          name: native-dist-linux-x86_64
-          path: native-dist
-      - name: Smoke test the wheel
-        run: |
-          uv venv --python 3.12 /tmp/exp-wheel-smoke
-          uv pip install --python /tmp/exp-wheel-smoke/bin/python dist/*.whl native-dist/*.whl "openai==3.0.0"
-          cd /tmp
-          /tmp/exp-wheel-smoke/bin/python - <<'PY'
+          uv venv --python 3.12 "$RUNNER_TEMP/exp-wheel-smoke"
+          uv pip install --python "$RUNNER_TEMP/exp-wheel-smoke/bin/python" \
+            "$RUNNER_TEMP"/dist/*.whl "$RUNNER_TEMP"/native-dist/*.whl 'openai==3.0.0'
+          cp exp/tests/release_test.py "$RUNNER_TEMP/exp-wheel-smoke/installed_release_evidence.py"
+          export EXP_SOURCE_CHECKOUT="$GITHUB_WORKSPACE"
+          cd "$RUNNER_TEMP/exp-wheel-smoke"
+          ./bin/python - <<'PY'
           import exp
-          import exp.common.models
-          import exp.runtime.models
+          import exp_gateway_native
           from exp.runtime.environments import LocalProcessEnvironmentRuntime
           from exp.runtime.openai_protocol import completed_body, decode_chat
           from exp.runtime.router import RouterRuntime
-          from exp.simulation import compare_text_and_sandbox
+          from exp.simulation import SimulationSpec, compare_text_and_sandbox
           from exp.simulation.engines import SandboxSimulator
           from exp.optimize.router import RouterCompositionResult
-          from exp.simulation import SimulationSpec
 
-          assert callable(exp.compose_router)
-          assert callable(exp.load_project_router)
-          assert callable(exp.load_router)
-          assert callable(decode_chat)
-          assert callable(completed_body)
-          assert exp.RouterRuntime is RouterRuntime
-          assert exp.RouterCompositionResult is RouterCompositionResult
-          assert "create_project_router_app" not in exp.__all__
+          assert callable(exp.compose_router) and callable(exp.load_project_router) and callable(exp.load_router)
+          assert callable(decode_chat) and callable(completed_body)
+          assert exp.RouterRuntime is RouterRuntime and exp.RouterCompositionResult is RouterCompositionResult
+          assert 'create_project_router_app' not in exp.__all__
           assert callable(compare_text_and_sandbox)
-          assert SimulationSpec.__module__ == "exp.simulation.specs.simulation"
-          assert SandboxSimulator.__module__ == "exp.simulation.engines.sandbox"
-          assert LocalProcessEnvironmentRuntime.__module__ == "exp.runtime.environments.local"
-
-          import exp_gateway_native
-
-          assert exp_gateway_native.__version__
-          assert callable(exp_gateway_native.serve)
+          assert SimulationSpec.__module__ == 'exp.simulation.specs.simulation'
+          assert SandboxSimulator.__module__ == 'exp.simulation.engines.sandbox'
+          assert LocalProcessEnvironmentRuntime.__module__ == 'exp.runtime.environments.local'
+          assert exp_gateway_native.__version__ and callable(exp_gateway_native.serve)
           PY
-          /tmp/exp-wheel-smoke/bin/exp --help
-      - name: Block publishing unreleased native changes
-        if: github.event_name == 'release' || inputs.publish == true
-        run: test ! -e .github/deferred-native-release.toml
-      - name: Installed-wheel no-spend release evidence
-        env:
-          PYTHONNOUSERSITE: "1"
-          TERM: xterm-256color
-          EXP_INSTALLED_RELEASE_EVIDENCE: "1"
-          EXP_RELEASE_REVISION: ${{ steps.source_revision.outputs.sha }}
-          EXP_SOURCE_CHECKOUT: ${{ github.workspace }}
-          EXP_TELEMETRY: "0"
+          ./bin/exp --help
+          env -u GITHUB_SHA PYTHONNOUSERSITE=1 TERM=xterm-256color \
+            EXP_INSTALLED_RELEASE_EVIDENCE=1 EXP_TELEMETRY=0 ./bin/python installed_release_evidence.py
+      - name: Verify published Capture dependencies on Python 3.13
         run: |
-          cp exp/tests/release_test.py /tmp/exp-wheel-smoke/installed_release_evidence.py
-          cd /tmp/exp-wheel-smoke
-          ./bin/python installed_release_evidence.py
-      - uses: actions/upload-artifact@v4
+          uv venv --python 3.13 "$RUNNER_TEMP/exp-capture-smoke"
+          uv pip install --python "$RUNNER_TEMP/exp-capture-smoke/bin/python" \
+            "$RUNNER_TEMP"/dist/*.whl "$RUNNER_TEMP"/native-dist/*.whl 'openai==3.0.0'
+          cd "$RUNNER_TEMP"
+          ./exp-capture-smoke/bin/python -c 'import mitmproxy, mitmproxy_rs, exp_gateway_native'
+          ./exp-capture-smoke/bin/exp capture --help
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: python-dist
-          path: dist/
+          name: experiential-distributions
+          path: ${{ runner.temp }}/dist/*
+          if-no-files-found: error
 
-  capture-release-smoke:
-    if: github.event_name == 'release' || inputs.publish == true
-    needs: build
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    steps:
-      - uses: astral-sh/setup-uv@d0d8abe699bfb85fec6de9f7adb5ae17292296ff # v6
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          name: python-dist
-          path: dist
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          name: native-dist-linux-x86_64
-          path: native-dist
-      - name: Require published Capture dependencies before release
-        # Test a downloaded copy after the publish artifact has been finalized.
-        # This job cannot replace that artifact and has no publishing credentials.
-        run: |
-          uv venv --python 3.13 /tmp/exp-capture-release-smoke
-          uv pip install --python /tmp/exp-capture-release-smoke/bin/python dist/*.whl native-dist/*.whl "openai==3.0.0"
-          /tmp/exp-capture-release-smoke/bin/python -c "import mitmproxy, mitmproxy_rs"
-
-  publish:
-    if: >-
-      github.event_name == 'release' ||
-      (github.event_name == 'workflow_dispatch' &&
-      github.ref == 'refs/heads/main' &&
-      inputs.source == 'latest-release' &&
-      inputs.publish)
-    needs: [build, capture-release-smoke]
+  publish-native:
+    if: needs.source.outputs.publish == 'true'
+    needs: [source, native-linux, native-desktop, package]
     runs-on: ubuntu-latest
     environment: pypi
     permissions:
       contents: read
       id-token: write
     steps:
-      - uses: astral-sh/setup-uv@v6
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          name: python-dist
-          path: dist
-      - uses: actions/download-artifact@v4
-        with:
-          pattern: native-dist-*
-          path: dist
+          pattern: native-*
           merge-multiple: true
-      - name: Drop files whose exact filename is already on PyPI
-        # A release can carry a native package whose version did not change
-        # (for example an experiential-only bump). The native build is not
-        # byte-reproducible, so a rebuilt wheel with an already-published
-        # filename would fail uv publish's hash check. PyPI treats filenames
-        # as immutable, so the published copy is authoritative; drop the
-        # local duplicate and let --check-url verify everything that remains.
-        shell: bash
-        run: |
-          for file in dist/*; do
-            name="$(basename "$file")"
-            project="$(echo "$name" | sed -E 's/-[0-9].*//' | tr '_' '-')"
-            code="$(curl -sSL --retry 3 -o /tmp/pypi-index.html -w '%{http_code}' \
-              "https://pypi.org/simple/$project/")"
-            if [ "$code" = "200" ] && grep -qF "$name" /tmp/pypi-index.html; then
-              echo "Dropping $name: already published to $project"
-              rm "$file"
-            elif [ "$code" != "200" ] && [ "$code" != "404" ]; then
-              echo "PyPI index lookup for $project failed with HTTP $code" >&2
-              exit 1
-            fi
-          done
-          ls dist/
-      - name: Publish to PyPI with trusted publishing
-        shell: bash
-        run: |
-          if [ -z "$(ls -A dist)" ]; then
-            echo "Nothing to publish: every built file is already on PyPI"
-            exit 0
-          fi
-          uv publish --trusted-publishing always --check-url https://pypi.org/simple/ dist/*
+          path: native-dist
+      - name: Publish the native dependency first
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1
+        with:
+          packages-dir: native-dist/
+          skip-existing: true
+
+  publish:
+    if: needs.source.outputs.publish == 'true'
+    needs: [source, publish-native]
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: experiential-distributions
+          path: dist
+      - name: Publish the flagship package
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1
+        with:
+          skip-existing: true

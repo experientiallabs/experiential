@@ -84,6 +84,17 @@ def test_nested_budget_leaves_room_below_any_output_limit(limit_field: str, limi
     assert error.value.detail.param == "thinking.budget_tokens"
 
 
+def test_nested_budget_leaves_room_below_the_smallest_of_several_output_limits() -> None:
+    """With two output-limit spellings the budget must fit under the smaller one."""
+    with pytest.raises(OpenAIProtocolError) as error:
+        _decode(
+            thinking={"type": "enabled", "budget_tokens": 4096},
+            max_tokens=4096,
+            max_completion_tokens=8192,
+        )
+    assert error.value.detail.param == "thinking.budget_tokens"
+
+
 @pytest.mark.parametrize(
     "controls",
     [

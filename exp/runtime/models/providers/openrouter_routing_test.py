@@ -1,12 +1,16 @@
-"""Tests for the OpenRouter zero-data-retention routing constraint."""
+"""Tests for the OpenRouter routing constraints: zero data retention and reasoning off."""
 
 from __future__ import annotations
 
 import json
 
-from exp.common.core.artifacts import JsonObject
+import pytest
+
+from exp.common.core.artifacts import JsonObject, JsonValue
 from exp.runtime.models.providers.openrouter_routing import (
     OPENROUTER_METADATA_HEADER,
+    OPENROUTER_REASONING_OFF_IGNORED,
+    constrain_openrouter_reasoning_off,
     constrain_openrouter_zero_data_retention,
     openrouter_cache_writes_within_reads,
     openrouter_chat_wire,
@@ -88,3 +92,39 @@ def test_only_openrouter_chat_rungs_are_openrouter_chat_wires() -> None:
     assert openrouter_chat_wire("openrouter", "openai_compatible")
     assert not openrouter_chat_wire("openrouter", "openai_responses")
     assert not openrouter_chat_wire("openai", "openai_compatible")
+
+
+def test_reasoning_off_routes_away_from_upstreams_that_ignore_it() -> None:
+    """Effort none adds the observed non-compliant upstreams to provider.ignore."""
+    payload: JsonObject = {**_payload(), "reasoning": {"effort": "none"}}
+    narrowed = constrain_openrouter_reasoning_off(payload)
+
+    assert narrowed["provider"] == {"ignore": list(OPENROUTER_REASONING_OFF_IGNORED)}
+    assert "provider" not in payload
+
+
+def test_reasoning_off_keeps_existing_preferences_and_ignore_names() -> None:
+    """An existing provider object keeps its keys; the ignore list is extended once."""
+    payload: JsonObject = {
+        **_payload(),
+        "reasoning": {"effort": "none"},
+        "provider": {"zdr": True, "ignore": ["deepinfra", "atlas-cloud"]},
+    }
+    narrowed = constrain_openrouter_reasoning_off(payload)
+
+    assert narrowed["provider"] == {"zdr": True, "ignore": ["deepinfra", "atlas-cloud"]}
+    then_zdr = constrain_openrouter_zero_data_retention(narrowed)
+    assert then_zdr["provider"] == {
+        "zdr": True,
+        "data_collection": "deny",
+        "ignore": ["deepinfra", "atlas-cloud"],
+    }
+
+
+@pytest.mark.parametrize("reasoning", [None, {"effort": "high"}, {"effort": "low"}, "none"])
+def test_reasoning_on_or_absent_leaves_the_payload_untouched(reasoning: JsonValue | None) -> None:
+    """Only an explicit effort none narrows the upstreams."""
+    payload: JsonObject = _payload()
+    if reasoning is not None:
+        payload["reasoning"] = reasoning
+    assert constrain_openrouter_reasoning_off(payload) is payload

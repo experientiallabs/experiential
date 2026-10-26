@@ -17,7 +17,11 @@ from exp.common.models.gateway_chains import (
     ModelExecutionStage,
     expand_model_chain,
 )
-from exp.runtime.gateway.contracts import AuthorizationSnapshot, DirectTarget, ExecutionSnapshot
+from exp.runtime.gateway.contracts import (
+    AuthorizationSnapshot,
+    DirectTarget,
+)
+from exp.runtime.gateway.execution_snapshot import ExecutionSnapshot
 
 
 def model_execution_snapshot(

@@ -19,7 +19,6 @@ from exp.common.models import (
     ModelCapabilities,
     ModelCatalog,
     ModelClient,
-    ModelFinishReason,
     ModelMessage,
     ModelRecord,
     ModelRequest,
@@ -39,13 +38,10 @@ from exp.runtime.models.providers.bedrock import (
     BedrockRegionError,
     BedrockRuntime,
     BoundedBedrockClient,
-    converse_response,
     create_bedrock_runtime_client,
     resolve_bedrock_region,
 )
 from exp.runtime.models.providers.errors import (
-    ProviderRefusalError,
-    ProviderRefusalSignal,
     ProviderResponseError,
 )
 from exp.runtime.models.providers.transport import ProviderTransportError, ScriptedJsonTransport
@@ -931,104 +927,6 @@ def test_real_bearer_request_emits_only_the_pinned_authorization_token() -> None
     assert captured == {"authorization": "Bearer bedrock-bearer"}
 
 
-def test_converse_response_normalizes_cache_legs_without_double_counting() -> None:
-    """Converse inputTokens exclude cache legs, so read and write are added once."""
-    response = converse_response(
-        {
-            "output": {
-                "message": {
-                    "role": "assistant",
-                    "content": [
-                        {"text": "done"},
-                        {
-                            "toolUse": {
-                                "toolUseId": "call-new",
-                                "name": "create_ticket",
-                                "input": {"priority": "urgent"},
-                            }
-                        },
-                    ],
-                }
-            },
-            "stopReason": "tool_use",
-            "usage": {
-                "inputTokens": 10,
-                "outputTokens": 4,
-                "cacheReadInputTokens": 6,
-                "cacheWriteInputTokens": 2,
-            },
-        },
-        configured_model=_snapshot(),
-        latency_seconds=0.5,
-    )
-
-    assert response.finish_reason == ModelFinishReason.COMPLETED
-    assert response.output.content == "done"
-    assert response.output.tool_calls[0].call_id == "call-new"
-    assert response.economics.usage is not None
-    assert response.economics.usage.input_tokens == 18
-    assert response.economics.usage.cached_input_tokens == 6
-    assert response.economics.usage.cache_write_input_tokens == 2
-
-
-def test_converse_response_reads_past_a_reasoning_block() -> None:
-    """A reasoning model's thinking leads its turn and never fails the response."""
-    response = converse_response(
-        {
-            "output": {
-                "message": {
-                    "role": "assistant",
-                    "content": [
-                        {"reasoningContent": {"reasoningText": {"text": "a circle"}}},
-                        {"text": "Circle"},
-                    ],
-                }
-            },
-            "stopReason": "end_turn",
-            "usage": {"inputTokens": 9, "outputTokens": 2},
-        },
-        configured_model=_snapshot(),
-        latency_seconds=0.2,
-    )
-
-    assert response.output.content == "Circle"
-    assert response.finish_reason == ModelFinishReason.COMPLETED
-
-
-def test_converse_response_maps_length_and_rejects_unsupported_blocks() -> None:
-    """max_tokens becomes length, and unknown content blocks fail closed."""
-    length = converse_response(
-        {
-            "output": {"message": {"content": [{"text": "partial"}]}},
-            "stopReason": "max_tokens",
-            "usage": {"inputTokens": 3, "outputTokens": 2},
-        },
-        configured_model=_snapshot(),
-        latency_seconds=0.1,
-    )
-    assert length.finish_reason == ModelFinishReason.LENGTH
-    with pytest.raises(ProviderResponseError, match="unsupported block"):
-        converse_response(
-            {
-                "output": {"message": {"content": [{"image": {"format": "png"}}]}},
-                "stopReason": "end_turn",
-            },
-            configured_model=_snapshot(),
-            latency_seconds=0.1,
-        )
-    with pytest.raises(ProviderRefusalError) as refusal_error:
-        converse_response(
-            {
-                "output": {"message": {"content": [{"text": "blocked"}]}},
-                "stopReason": "content_filtered",
-            },
-            configured_model=_snapshot(),
-            latency_seconds=0.1,
-        )
-    assert refusal_error.value.signal is ProviderRefusalSignal.GUARDRAIL
-    assert "blocked" not in str(refusal_error.value)
-
-
 def _signing_client(monkeypatch: pytest.MonkeyPatch, *, token: str | None = None) -> BedrockClient:
     """Build one region-bound client over deterministic environment credentials."""
     monkeypatch.setenv("AWS_ACCESS_KEY_ID", "AKIDEXAMPLE")
@@ -1372,3 +1270,60 @@ def test_bounded_client_wire_profile_marks_the_body_for_signing() -> None:
     assert profile.model_id == "us.anthropic.claude-sonnet-4-5"
     assert profile.timeout_seconds == 600.0
     assert profile.url.endswith("/model/us.anthropic.claude-sonnet-4-5/converse-stream")
+
+
+@pytest.mark.parametrize(
+    "model_id",
+    [
+        "us.anthropic.claude-opus-4-8",
+        "us.anthropic.claude-opus-4-7",
+        "us.anthropic.claude-opus-5",
+        "us.anthropic.claude-sonnet-5",
+        "us.anthropic.claude-fable-5-1",
+    ],
+)
+def test_bounded_profile_declares_adaptive_reasoning_for_claude_when_the_catalog_does(
+    model_id: str,
+) -> None:
+    """A reasoning-declared Bedrock Claude rung carries the Anthropic effort contract."""
+    client = BedrockClient(
+        model=_snapshot(model_id),
+        region="us-east-1",
+        environment={},
+        runtime_factory=None,
+        supports_reasoning=True,
+        reasoning_effort="high",
+    )
+    profile = BoundedBedrockClient(client).gateway_wire_profile()
+    assert profile.supports_reasoning is True
+    assert profile.reasoning_wire_format == "anthropic_adaptive"
+    assert profile.reasoning_effort == "high"
+
+
+@pytest.mark.parametrize(
+    ("model_id", "declared"),
+    [
+        # The catalog has not declared reasoning: today's contract stands.
+        ("us.anthropic.claude-opus-4-8", False),
+        # Budgeted-thinking Claude and non-Claude models carry no control here.
+        ("us.anthropic.claude-sonnet-4-5", True),
+        ("us.deepseek.r1-v1:0", True),
+        ("moonshot.kimi-k2-thinking", True),
+    ],
+)
+def test_bounded_profile_keeps_reasoning_off_outside_adaptive_claude(
+    model_id: str, declared: bool
+) -> None:
+    """Only a declared adaptive-generation Claude rung gains the reasoning control."""
+    client = BedrockClient(
+        model=_snapshot(model_id),
+        region="us-east-1",
+        environment={},
+        runtime_factory=None,
+        supports_reasoning=declared,
+        reasoning_effort="high" if declared else None,
+    )
+    profile = BoundedBedrockClient(client).gateway_wire_profile()
+    assert profile.supports_reasoning is False
+    assert profile.reasoning_wire_format == "none"
+    assert profile.reasoning_effort is None

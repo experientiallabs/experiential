@@ -10,6 +10,7 @@ from urllib.parse import urlsplit
 from pydantic import AwareDatetime, Field, model_validator
 
 from exp.common.core.artifacts import ArtifactId, ContractModel, Sha256
+from exp.common.models.azure_endpoints import AzureApiSurface
 from exp.common.models.catalog import BillingSource, SubscriptionKind
 from exp.common.models.gateway_catalog import (
     DeploymentId,
@@ -20,7 +21,6 @@ from exp.common.models.gateway_catalog import (
 from exp.common.models.gateway_pools import GatewayEquivalenceCertification
 from exp.runtime.gateway.contracts import (
     AttemptId,
-    ExecutionSnapshot,
     GatewayEvent,
     GatewayEventKind,
     GatewayFailure,
@@ -31,6 +31,7 @@ from exp.runtime.gateway.contracts import (
     OrganizationId,
     VirtualKeyId,
 )
+from exp.runtime.gateway.execution_snapshot import ExecutionSnapshot
 
 ConnectionId = ArtifactId
 ProviderConnectionRevisionId = ArtifactId
@@ -144,7 +145,7 @@ class ProviderConnectionRevision(ContractModel):
     provider: str = Field(min_length=1, max_length=128)
     base_url: str | None = Field(default=None, max_length=2_048)
     api_version: str | None = Field(default=None, max_length=256)
-    azure_api_surface: Literal["openai_deployments", "model_inference"] | None = None
+    azure_api_surface: AzureApiSurface | None = None
     region: str | None = Field(default=None, max_length=256)
     secret_reference: OpaqueSecretReference | None = None
     access_key_id_reference: OpaqueSecretReference | None = None
@@ -590,7 +591,7 @@ class UpsertProviderConnectionCommand(ContractModel):
     provider: str = Field(min_length=1, max_length=128)
     base_url: str | None = Field(default=None, max_length=2_048)
     api_version: str | None = Field(default=None, max_length=256)
-    azure_api_surface: Literal["openai_deployments", "model_inference"] | None = None
+    azure_api_surface: AzureApiSurface | None = None
     region: str | None = Field(default=None, max_length=256)
     secret_reference: OpaqueSecretReference | None = None
     access_key_id_reference: OpaqueSecretReference | None = None

@@ -15,6 +15,7 @@ from pathlib import Path
 
 from rich.console import Console
 from rich.panel import Panel
+from rich.text import Text
 
 from exp.cli.build.providers import (
     configure_build_providers as _configure_build_providers,
@@ -23,6 +24,7 @@ from exp.cli.build.providers import (
     require_replay_role_overrides as _require_replay_role_overrides,
 )
 from exp.cli.build.source import project_for_build
+from exp.cli.build.summary import learning_lines
 from exp.cli.build.traces import load_build_traces
 from exp.cli.build.wizard_screens import (
     WizardBuildPlan,
@@ -100,8 +102,9 @@ def run_build_wizard(
     maximum_router_cost_usd: float | None,
     providers: tuple[str, ...],
     console: Console,
+    retry_incomplete: bool = False,
 ) -> None:
-    """Run one resumable interactive project build through router completion.
+    """Run one resumable interactive project build, learning and router completion.
 
     Args:
         project: Safe local project identifier.
@@ -115,6 +118,7 @@ def run_build_wizard(
         maximum_router_cost_usd: Optional router budget requiring confirmation when exceeded.
         providers: Repeatable provider names that skip the opening provider list.
         console: Interactive terminal for prompts and progress.
+        retry_incomplete: Replace an interrupted learning trace, buying it again.
 
     Raises:
         ValueError: Existing state or a selected wizard input is invalid.
@@ -210,7 +214,7 @@ def run_build_wizard(
         return
 
     run_judge = selection.router or selection.judge_rubric or selection.judge_calibration
-    total_stages = 1 + (1 if run_judge else 0) + (2 if selection.router else 0)
+    total_stages = 2 + (1 if run_judge else 0) + (2 if selection.router else 0)
     if not plan.build_reused:
         console.print(f"[bold]1/{total_stages} Simulation and RAG indexes[/bold]")
         from exp.cli.build.app import _complete_grounded_build, _validated_role_snapshots
@@ -242,8 +246,17 @@ def run_build_wizard(
         )
 
     store = ProjectStore(root, project)
+    console.print(f"[bold]2/{total_stages} Learning from traces[/bold]")
+    _learn_from_traces(
+        store,
+        project=project,
+        root=root,
+        code_revision=code_revision,
+        retry_incomplete=retry_incomplete,
+        console=console,
+    )
     if run_judge:
-        console.print(f"[bold]2/{total_stages} Judge syllabus[/bold]")
+        console.print(f"[bold]3/{total_stages} Judge syllabus[/bold]")
         _ensure_judge_calibration(
             store,
             catalog,
@@ -276,7 +289,7 @@ def run_build_wizard(
         maximum_judgments=cost_plan.maximum_judgments,
     )
 
-    console.print(f"[bold]3/{total_stages} Router plan[/bold]")
+    console.print(f"[bold]{total_stages - 1}/{total_stages} Router plan[/bold]")
     catalog = load_model_catalog(root / "models.toml")
     candidate_plan = _candidate_plan(root, catalog)
     preflight = preflight_automatic_router(
@@ -289,8 +302,8 @@ def run_build_wizard(
         raise ValueError(
             "automatic router cost plan changed after the grounded build; rerun exp build"
         )
-    console.print(f"[bold]4/{total_stages} Router optimization[/bold]")
-    with progress_display(console, single_line=True) as progress:
+    console.print(f"[bold]{total_stages}/{total_stages} Router optimization[/bold]")
+    with progress_display(console) as progress:
         optimize_project_router(
             store,
             candidate_plan,
@@ -302,6 +315,45 @@ def run_build_wizard(
             progress=progress,
         )
     console.print("[green]Complete[/green]")
+
+
+def _learn_from_traces(
+    store: ProjectStore,
+    *,
+    project: str,
+    root: Path,
+    code_revision: str,
+    retry_incomplete: bool,
+    console: Console,
+) -> None:
+    """Run the build's default learning stage and print its result lines, as ``-t`` builds do.
+
+    Args:
+        store: Project with the completed grounded build.
+        project: Project name, for the command a refusal names.
+        root: Local EXP root holding the consent settings.
+        code_revision: Exact producer revision for new learning evidence.
+        retry_incomplete: Replace an interrupted learning trace, buying it again.
+        console: Interactive terminal for the spend question and results.
+    """
+    # Deferred: learning loads the fidelity lifecycle (startup-isolation gate).
+    from exp.cli.build.learning import learn_with_report
+
+    learning, report = learn_with_report(
+        console,
+        store,
+        project=project,
+        root=root,
+        yes=False,
+        non_interactive=False,
+        code_revision=code_revision,
+        retry_incomplete=retry_incomplete,
+        command=f"exp build {project}",
+    )
+    for line in learning_lines(learning):
+        console.print(line)
+    if report is not None:
+        console.print(Text(f"Report: {report}"))
 
 
 def _ensure_judge_calibration(

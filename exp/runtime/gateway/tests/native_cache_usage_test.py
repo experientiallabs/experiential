@@ -304,3 +304,58 @@ def test_native_and_python_cache_ttl_presence_matches(
         # additive marker keeps their actual observability explicit.
         parsed = ResponseUsage.model_validate(completed["usage"])
         assert parsed.input_tokens_details.cache_write_tokens == (0 if unreported else 100)
+
+
+@pytest.mark.parametrize("half_day", [None, 0, 2000])
+@pytest.mark.parametrize("surface", ["chat", "responses"])
+def test_native_and_python_twelve_hour_split_matches(half_day: int | None, surface: str) -> None:
+    """OpenAI's ``cache_write_tokens_details`` renders identically on both encoders."""
+    native = pytest.importorskip("exp_gateway_native")
+    usage = GatewayUsage(
+        input_tokens=3250,
+        output_tokens=5,
+        cached_input_tokens=0,
+        cache_creation_input_tokens=3247,
+        cache_creation_12h_input_tokens=half_day,
+        reasoning_tokens=0,
+    )
+    events = (
+        GatewayEvent(kind=GatewayEventKind.TEXT_DELTA, sequence_number=0, text_delta="ok"),
+        GatewayEvent(kind=GatewayEventKind.USAGE, sequence_number=1, usage=usage),
+        GatewayEvent(kind=GatewayEventKind.COMPLETED, sequence_number=2),
+    )
+    fixture = json.dumps(
+        [
+            {"kind": "text_delta", "text": "ok"},
+            {"kind": "usage", **usage.model_dump(mode="json")},
+            {"kind": "completed"},
+        ]
+    )
+    if surface == "chat":
+        encoder = ChatSseEncoder(
+            request_id="cache-request", model="model", created_at=123, include_usage=True
+        )
+        expected = encode_events(encoder, events)
+        actual = native.encode_chat_fixture("cache-request", "model", 123, True, fixture)
+    else:
+        request = GatewayRequest(
+            surface=GatewayApiSurface.RESPONSES,
+            messages=(GatewayMessage(role="user", content="hello"),),
+            stream=True,
+        )
+        responses = ResponsesSseEncoder(
+            request_id="cache-request", model="model", created_at=123, request=request
+        )
+        expected = encode_events(responses, events)
+        actual = native.encode_responses_fixture(
+            "cache-request",
+            "model",
+            123,
+            json.dumps(responses_envelope(request)),
+            fixture,
+        )
+    assert list(actual) == list(expected)
+    terminal = "".join(actual)
+    assert ('"cache_write_tokens_details"' in terminal) == (half_day is not None)
+    if half_day is not None:
+        assert f'"ttl_30m_tokens":{3247 - half_day},"ttl_12h_tokens":{half_day}' in terminal

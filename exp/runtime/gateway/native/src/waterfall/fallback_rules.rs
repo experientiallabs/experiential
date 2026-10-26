@@ -94,24 +94,37 @@ pub(crate) fn rung_eligibility(wire: &DeploymentWire, failure: &Failure) -> Rung
     }
 }
 
-/// Whether some rung after `depth` may take `failure`: an unrestricted rung
-/// when `unrestricted_advance` (the route policy's own verdict on the
-/// failure) holds, or any rung whose set names the failure. A route with no
-/// sets reduces to `depth + 1 < route.len() && unrestricted_advance`.
+/// Whether route index `index` is still untried in this request: not the
+/// failing `depth` and never dispatched (`dispatched` counts physical
+/// dispatches per route index; an index past its end counts as untried).
+pub(crate) fn untried(dispatched: &[u32], depth: usize, index: usize) -> bool {
+    index != depth && dispatched.get(index).is_none_or(|count| *count == 0)
+}
+
+/// Whether some untried rung may take `failure`: an unrestricted rung when
+/// `unrestricted_advance` (the route policy's own verdict on the failure)
+/// holds, or any rung whose set names the failure. Untried includes a rung
+/// EARLIER than `depth` that this request skipped (shed at admission, or
+/// passed over by affinity order): the control plane revisits it in route
+/// order (`native_fallback_rules.untried_depths`), so a dead lane at depth 1
+/// still reaches the full lane it was skipped for at depth 0. A route with
+/// no sets and nothing skipped reduces to `depth + 1 < route.len() &&
+/// unrestricted_advance`.
 pub(crate) fn successor_available(
     route: &[DeploymentWire],
     depth: usize,
+    dispatched: &[u32],
     failure: &Failure,
     unrestricted_advance: bool,
 ) -> bool {
-    route
-        .iter()
-        .skip(depth + 1)
-        .any(|wire| match rung_eligibility(wire, failure) {
-            RungEligibility::Unrestricted => unrestricted_advance,
-            RungEligibility::Matched => true,
-            RungEligibility::Excluded => false,
-        })
+    route.iter().enumerate().any(|(index, wire)| {
+        untried(dispatched, depth, index)
+            && match rung_eligibility(wire, failure) {
+                RungEligibility::Unrestricted => unrestricted_advance,
+                RungEligibility::Matched => true,
+                RungEligibility::Excluded => false,
+            }
+    })
 }
 
 /// Whether the rung at `depth` should withhold refusal DELTAS for a rule rung
@@ -120,9 +133,14 @@ pub(crate) fn successor_available(
 /// that accepts an unnamed refusal (`refusal` or `refusal:unspecified`) can
 /// ever take it; a rung restricted to `refusal:cyber_policy` leaves the
 /// stream's refusal text flowing to the caller exactly as today.
+/// Only rungs after `depth` are considered: an earlier skipped rung could
+/// take the refusal too, but withholding is decided before the dial and a
+/// stream that is not withheld simply commits, so judging by later rungs
+/// alone never strands a refusal.
 pub(crate) fn refusal_deltas_withheld_for(route: &[DeploymentWire], depth: usize) -> bool {
     let unnamed = Failure::new(FailureClass::Refusal, "provider refused the request");
-    successor_available(route, depth, &unnamed, false)
+    let earlier = vec![1; depth + 1];
+    successor_available(route, depth, &earlier, &unnamed, false)
 }
 
 /// Whether the depth the control plane reserved honors the rules: a first
@@ -164,6 +182,7 @@ mod tests {
             headers: HashMap::new(),
             model_id: String::new(),
             billing_customer_managed: tokens.is_some(),
+            tenant_origin: false,
             explicit_cache: false,
             automatic_cache: false,
             automatic_cache_written_tokens: None,
@@ -300,21 +319,62 @@ mod tests {
             rung(None),
         ];
         // A refusal the policy would not advance still reaches the rule rung.
-        assert!(successor_available(&route, 0, &cyber(), false));
+        assert!(successor_available(&route, 0, &[1], &cyber(), false));
         // A throttle skips the rule rung but the policy admits the plain rung.
-        assert!(successor_available(&route, 0, &throttled(), true));
+        assert!(successor_available(&route, 0, &[1], &throttled(), true));
         // With nothing unrestricted left and no match, the ladder is over.
         let tail = [rung(None), rung(Some(&["refusal:cyber_policy"]))];
-        assert!(!successor_available(&tail, 0, &throttled(), true));
-        assert!(successor_available(&tail, 0, &cyber(), false));
+        assert!(!successor_available(&tail, 0, &[1], &throttled(), true));
+        assert!(successor_available(&tail, 0, &[1], &cyber(), false));
         // An unrestricted route reduces to the historical bound.
         let plain = [rung(None), rung(None)];
-        assert!(successor_available(&plain, 0, &throttled(), true));
-        assert!(!successor_available(&plain, 0, &throttled(), false));
-        assert!(!successor_available(&plain, 1, &throttled(), true));
+        assert!(successor_available(&plain, 0, &[1], &throttled(), true));
+        assert!(!successor_available(&plain, 0, &[1], &throttled(), false));
+        assert!(!successor_available(&plain, 1, &[1, 1], &throttled(), true));
         // Every rung restricted: nothing after depth 0 takes a throttle.
         let all = [rung(Some(&["refusal"])), rung(Some(&["refusal"]))];
-        assert!(!successor_available(&all, 0, &throttled(), true));
+        assert!(!successor_available(&all, 0, &[1], &throttled(), true));
+    }
+
+    #[test]
+    fn a_skipped_earlier_rung_is_a_successor_and_a_dispatched_one_is_not() {
+        let plain = [rung(None), rung(None), rung(None)];
+        // Depth 0 was skipped (never dispatched); depth 1 failed: depth 0 and
+        // depth 2 are both untried.
+        assert!(successor_available(
+            &plain[..2],
+            1,
+            &[0, 1],
+            &throttled(),
+            true
+        ));
+        assert!(!successor_available(
+            &plain[..2],
+            1,
+            &[1, 1],
+            &throttled(),
+            true
+        ));
+        // Every other index dispatched: nothing left, whatever the policy.
+        assert!(!successor_available(
+            &plain,
+            1,
+            &[1, 1, 1],
+            &throttled(),
+            true
+        ));
+        assert!(successor_available(
+            &plain,
+            2,
+            &[0, 1, 1],
+            &throttled(),
+            true
+        ));
+        // A skipped earlier rule rung still follows its own set.
+        let rule = [rung(Some(&["refusal:cyber_policy"])), rung(None)];
+        assert!(!successor_available(&rule, 1, &[0, 1], &throttled(), true));
+        assert!(successor_available(&rule, 1, &[0, 1], &cyber(), false));
+        assert!(untried(&[0, 1], 1, 0) && !untried(&[0, 1], 1, 1) && untried(&[0, 1], 1, 5));
     }
 
     #[test]

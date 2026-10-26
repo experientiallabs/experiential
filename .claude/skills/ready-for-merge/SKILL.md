@@ -100,7 +100,7 @@ rule. In particular verify:
 - No `Any`, bare `dict`/`object`, or untyped `**kwargs` where a concrete type is practical.
 - NO new top-level directory or file, of any name, unless the PR description records that a
   human granted permission for that exact name (AGENTS.md rule 5). The tracked top level is
-  closed: `exp/`, `docs/`, `.claude/`, `.github/`. Reusable code goes in `exp/`
+  closed: `exp/`, `docs/`, `assets/`, `.claude/`, `.github/`, `.gitlab/`. Reusable code goes in `exp/`
   (shared contracts in `exp/common/` and runtime adapters in `exp/runtime/`), finished reports in
   `docs/`, and scratch work outside the repo entirely. Benchmark data is a dependency, never a
   directory.

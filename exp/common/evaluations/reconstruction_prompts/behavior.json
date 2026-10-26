@@ -1,0 +1,151 @@
+{
+  "name": "Reconstruction behavioral fidelity v1",
+  "syllabus": "Assess observable reconstruction only. Mechanical truth stays separate. A correct native refusal can score highly even if the requested task cannot finish. Missing evidence requires unassessable, not invented credit. Calibration is provisional.",
+  "dimensions": [
+    {
+      "dimension_id": "response",
+      "name": "Observable response correctness",
+      "description": "Reply information and declared external representation",
+      "min_score": 1,
+      "max_score": 5,
+      "anchors": [
+        {
+          "score": 1,
+          "description": "Observable response correctness: Fundamentally contradicted behavior."
+        },
+        {
+          "score": 2,
+          "description": "Observable response correctness: Major errors likely to mislead subsequent actions."
+        },
+        {
+          "score": 3,
+          "description": "Observable response correctness: Mixed behavior with a substantive gap or error."
+        },
+        {
+          "score": 4,
+          "description": "Observable response correctness: Core behavior correct with a minor nonmaterial defect."
+        },
+        {
+          "score": 5,
+          "description": "Observable response correctness: Fully meets the criterion over assessable evidence; no detected contradiction."
+        }
+      ]
+    },
+    {
+      "dimension_id": "state",
+      "name": "State and causal continuity",
+      "description": "Correct identities, mutations, preservation and later readbacks",
+      "min_score": 1,
+      "max_score": 5,
+      "anchors": [
+        {
+          "score": 1,
+          "description": "State and causal continuity: Fundamentally contradicted behavior."
+        },
+        {
+          "score": 2,
+          "description": "State and causal continuity: Major errors likely to mislead subsequent actions."
+        },
+        {
+          "score": 3,
+          "description": "State and causal continuity: Mixed behavior with a substantive gap or error."
+        },
+        {
+          "score": 4,
+          "description": "State and causal continuity: Core behavior correct with a minor nonmaterial defect."
+        },
+        {
+          "score": 5,
+          "description": "State and causal continuity: Fully meets the criterion over assessable evidence; no detected contradiction."
+        }
+      ]
+    },
+    {
+      "dimension_id": "policy",
+      "name": "Success, error and policy fidelity",
+      "description": "Correct refusals, errors, no-ops and policy boundaries",
+      "min_score": 1,
+      "max_score": 5,
+      "anchors": [
+        {
+          "score": 1,
+          "description": "Success, error and policy fidelity: Fundamentally contradicted behavior."
+        },
+        {
+          "score": 2,
+          "description": "Success, error and policy fidelity: Major errors likely to mislead subsequent actions."
+        },
+        {
+          "score": 3,
+          "description": "Success, error and policy fidelity: Mixed behavior with a substantive gap or error."
+        },
+        {
+          "score": 4,
+          "description": "Success, error and policy fidelity: Core behavior correct with a minor nonmaterial defect."
+        },
+        {
+          "score": 5,
+          "description": "Success, error and policy fidelity: Fully meets the criterion over assessable evidence; no detected contradiction."
+        }
+      ]
+    },
+    {
+      "dimension_id": "grounding",
+      "name": "Evidence grounding and uncertainty",
+      "description": "Supported claims, current versus historical values and acknowledged unknowns",
+      "min_score": 1,
+      "max_score": 5,
+      "anchors": [
+        {
+          "score": 1,
+          "description": "Evidence grounding and uncertainty: Fundamentally contradicted behavior."
+        },
+        {
+          "score": 2,
+          "description": "Evidence grounding and uncertainty: Major errors likely to mislead subsequent actions."
+        },
+        {
+          "score": 3,
+          "description": "Evidence grounding and uncertainty: Mixed behavior with a substantive gap or error."
+        },
+        {
+          "score": 4,
+          "description": "Evidence grounding and uncertainty: Core behavior correct with a minor nonmaterial defect."
+        },
+        {
+          "score": 5,
+          "description": "Evidence grounding and uncertainty: Fully meets the criterion over assessable evidence; no detected contradiction."
+        }
+      ]
+    },
+    {
+      "dimension_id": "actor",
+      "name": "Actor-facing fidelity",
+      "description": "Consequences support appropriate decisions without false completion claims",
+      "min_score": 1,
+      "max_score": 5,
+      "anchors": [
+        {
+          "score": 1,
+          "description": "Actor-facing fidelity: Fundamentally contradicted behavior."
+        },
+        {
+          "score": 2,
+          "description": "Actor-facing fidelity: Major errors likely to mislead subsequent actions."
+        },
+        {
+          "score": 3,
+          "description": "Actor-facing fidelity: Mixed behavior with a substantive gap or error."
+        },
+        {
+          "score": 4,
+          "description": "Actor-facing fidelity: Core behavior correct with a minor nonmaterial defect."
+        },
+        {
+          "score": 5,
+          "description": "Actor-facing fidelity: Fully meets the criterion over assessable evidence; no detected contradiction."
+        }
+      ]
+    }
+  ]
+}

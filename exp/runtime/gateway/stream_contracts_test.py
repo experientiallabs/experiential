@@ -231,3 +231,32 @@ def test_responses_probability_boundary_rejects_invalid_shape(change: JsonObject
                 **change,
             }
         )
+
+
+def test_image_output_tokens_are_an_output_subset() -> None:
+    """Generated-image tokens live inside the output total, never beside it."""
+    usage = GatewayUsage(input_tokens=17, output_tokens=1126, image_output_tokens=1120)
+    assert usage.image_output_tokens == 1120
+    for output in (None, 1000):
+        with pytest.raises(ValidationError):
+            GatewayUsage(input_tokens=17, output_tokens=output, image_output_tokens=1120)
+
+
+def test_twelve_hour_writes_are_a_write_subset_disjoint_from_one_hour_writes() -> None:
+    """OpenAI's 12-hour writes live inside the write total, beside any one-hour part."""
+    usage = GatewayUsage(
+        input_tokens=3250,
+        output_tokens=5,
+        cache_creation_input_tokens=3247,
+        cache_creation_12h_input_tokens=3247,
+    )
+    assert usage.cache_creation_12h_input_tokens == 3247
+    for writes, hour in ((None, None), (3000, None), (3247, 1)):
+        with pytest.raises(ValidationError):
+            GatewayUsage(
+                input_tokens=3250,
+                output_tokens=5,
+                cache_creation_input_tokens=writes,
+                cache_creation_1h_input_tokens=hour,
+                cache_creation_12h_input_tokens=3247,
+            )
