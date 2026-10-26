@@ -218,7 +218,10 @@ def test_project_option_launches_the_native_gateway_on_loopback(
         """
         assert root == Path("/tmp/local-exp")
         assert port == 8123
-        yield
+        try:
+            yield
+        finally:
+            resource_closes.append(("lock released", 0.0))
 
     def serve(value: object, *, host: str, port: int, **kwargs: object) -> None:
         """Capture the control plane and loopback bind without serving.
@@ -274,7 +277,9 @@ def test_project_option_launches_the_native_gateway_on_loopback(
     assert loaded == [(Path("/tmp/local-exp"), frozenset({"project-a"}))]
     assert served == ([] if check else [(control_planes[0], "127.0.0.1", 8123)])
     assert closed == [0.25]
-    assert resource_closes == [("control", 0.25), ("components", 0.25)]
+    # Teardown finishes before the instance lock is released, so no second gateway on the
+    # root can reconcile while these workers may still write.
+    assert resource_closes == [("control", 0.25), ("components", 0.25), ("lock released", 0.0)]
     receipt = json.loads(result.stdout)
     assert receipt["launch_mode"] == "project_alias"
     assert receipt["base_url"] == "http://127.0.0.1:8123/v1"
