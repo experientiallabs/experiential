@@ -10,6 +10,7 @@ import threading
 from collections.abc import Callable, Collection, Iterator, Mapping
 from contextlib import AbstractContextManager, contextmanager
 from datetime import UTC, datetime
+from functools import partial
 from multiprocessing.synchronize import Event
 from pathlib import Path
 
@@ -20,7 +21,7 @@ from exp.common.core.artifacts import JsonObject
 from exp.common.models import load_model_catalog, write_model_catalog
 from exp.common.project import ProjectStore
 from exp.optimize.evaluation import fidelity, held_out_audit, trace_replay
-from exp.optimize.evaluation.fidelity import execute_fidelity_evaluation
+from exp.optimize.evaluation.fidelity import execute_fidelity_evaluation, saved_fidelity_report
 from exp.optimize.evaluation.held_out_audit import (
     HeldOutAudit,
     ReservationInactiveError,
@@ -43,6 +44,7 @@ from exp.optimize.evaluation.held_out_receipts import (
     QUALIFIED,
     RECEIPT_TYPE,
     audit_receipts,
+    dispatch_owner,
     receipt_view,
     record_report,
 )
@@ -88,7 +90,7 @@ def run(store: ProjectStore, opened: HeldOutAudit, *, resume: bool = False) -> N
         execute_fidelity_evaluation(
             store,
             prepared,
-            dispatch_guard=opened.guard,
+            dispatch_guard=partial(opened.guard, prepared),
             resume_until=clock() + DEADLINE if resume else None,
         )
 
@@ -290,6 +292,40 @@ def test_a_claimed_slot_makes_the_reservation_permanent_after_a_crash(
     assert len(audit_receipts(store)) == 2
 
 
+def test_the_receipt_that_dispatched_a_shared_run_alone_completes_it(
+    built: tuple[ProjectStore, FailingOnce],
+) -> None:
+    """Dispatch ownership is recorded, never inferred from which receipt reserved first."""
+    store, provider = built
+    with audit(store) as first:
+        receipt = first.receipt
+        shared = first.panel.prepared[0]
+        # A later development re-audit over the same case dispatches the shared run first.
+        with audit(store, 2, include_inspected=True) as other:
+            assert shared in other.panel.prepared
+            provider.armed = True
+            with pytest.raises(KeyboardInterrupt):
+                run(store, other)
+        dispatcher = other.receipt
+        assert dispatch_owner(store, shared.spec.run_id) == dispatcher.receipt_id
+        # The owner's lease is held, yet its claim for the other receipt's run is refused.
+        with pytest.raises(
+            ReservationInactiveError, match=f"under receipt {dispatcher.receipt_id}"
+        ):
+            first.guard(shared)
+    with (
+        pytest.raises(ValueError, match=f"under receipt {dispatcher.receipt_id}.*only that"),
+        audit(store),
+    ):
+        pass
+    with audit(store, 2, include_inspected=True) as resumed:
+        assert resumed.receipt == dispatcher
+        run(store, resumed, resume=True)
+        assert [item.receipt for item in resumed.view.reattempts] == [dispatcher.receipt_id]
+    with audit(store) as replayed:
+        assert replayed.receipt == receipt and saved_fidelity_report(store, shared) is not None
+
+
 def test_a_reregistration_before_dispatch_does_not_qualify_the_headline(
     built: tuple[ProjectStore, FailingOnce],
 ) -> None:
@@ -361,7 +397,7 @@ def test_release_and_resume_never_leave_a_released_reservation_with_claims(
         release_held_out_audit(store, receipt, clock=clock)
     assert reservation_state(store, receipt) == "dispatched"
     with pytest.raises(ReservationInactiveError):
-        opened.guard()
+        opened.guard(opened.panel.prepared[0])
 
     # The converse order: an unused reservation is released first, so it cannot be resumed.
     with audit(store, 2) as fresh:

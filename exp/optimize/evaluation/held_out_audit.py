@@ -12,9 +12,9 @@ dispatch ledger's ``BEGIN IMMEDIATE``. No earlier lock is taken while a later on
   its reservation committed against that snapshot.
 - Resuming: an invocation with the same request continues the latest receipt that still holds
   its reservation, when the selected cases, panel identity and code revision all match its
-  frozen configuration. Replaced registrations become that receipt's children. A run that an
-  earlier receipt still holding its reservation dispatched and never finished is completed only
-  by that receipt; any later receipt over it refuses to open.
+  frozen configuration. Replaced registrations become that receipt's children. A run another
+  receipt dispatched first and never finished is completed only by that receipt: any other
+  receipt over it refuses to open, and its slot claims for that run are refused.
 - Configuration change: with zero claimed slots the old reservation is released under its
   lease and a new receipt is minted; with any claimed slot the old reservation is permanent and
   the new receipt over those cases is a development re-audit.
@@ -35,7 +35,7 @@ from filelock import FileLock
 
 from exp.common.core.artifacts import stable_id
 from exp.common.project import ProjectStore
-from exp.optimize.evaluation.fidelity import saved_fidelity_report
+from exp.optimize.evaluation.fidelity import PreparedFidelity, saved_fidelity_report
 from exp.optimize.evaluation.held_out_exposure import (
     HeldOutExposure,
     LineageExposure,
@@ -52,7 +52,6 @@ from exp.optimize.evaluation.held_out_fidelity import (
     panel_slots,
     plan_held_out_panel,
     register_planned_panel,
-    run_slots,
 )
 from exp.optimize.evaluation.held_out_receipts import (
     AuditCase,
@@ -62,8 +61,10 @@ from exp.optimize.evaluation.held_out_receipts import (
     ReceiptView,
     audit_receipts,
     current_registration,
+    dispatch_owner,
     receipt_view,
     record_attempts,
+    record_dispatch,
     record_notice,
     record_redispatches,
     save_receipt,
@@ -146,19 +147,30 @@ class HeldOutAudit:
             return False
         return _notice(self.project, self.receipt, blocked, snapshot.identity, clock)
 
-    def guard(self) -> None:
-        """Refuse a slot claim unless this process still holds the lease.
+    def guard(self, prepared: PreparedFidelity) -> None:
+        """Refuse a slot claim for one run unless this receipt may dispatch it.
 
         The reservation was confirmed active inside the ledger transaction after the lease was
         taken, and only a lease holder can release it, so it stays active while the lease is
-        held.
+        held. The run's first claim records this receipt as its dispatcher; a run another
+        receipt dispatched first is refused, so only that receipt ever completes it.
+
+        Args:
+            prepared: Registration of the run about to claim a slot.
 
         Raises:
-            ReservationInactiveError: The lease is no longer held.
+            ReservationInactiveError: The lease is no longer held, or another receipt
+                dispatched the run.
         """
         if not self._lease.is_locked:
             raise ReservationInactiveError(
                 f"panel {self.receipt.panel} lease is not held; refusing to claim a slot"
+            )
+        run = prepared.spec.run_id
+        owner = record_dispatch(self.project, self.receipt, run, clock=self._clock)
+        if owner != self.receipt.receipt_id:
+            raise ReservationInactiveError(
+                f"run {run} was dispatched under receipt {owner}; refusing to claim a slot"
             )
 
 
@@ -215,7 +227,7 @@ def open_held_out_audit(
                         current = transaction.snapshot()
                         if not current.active(owner.receipt_id):
                             continue
-                        _require_unclaimed(project, current, owner.base_runs, owner.sequence)
+                        _require_unclaimed(project, owner.base_runs, owner.receipt_id)
                         blocked = late_exposure(project, ledger, current, owner)
                         dispatched = bool(blocked) and bool(panel_slots(project, owner.base_runs))
                         if blocked and not dispatched:
@@ -468,11 +480,10 @@ def _reserve(
         touched = tuple(lineage for lineage in planned.lineages if lineage in exposure.lineages)
         if not request.include_inspected and set(touched) - allowed:
             return None
-        sequence = len(audit_receipts(project)) + 1
-        _require_unclaimed(project, snapshot, planned.base_runs, sequence)
+        _require_unclaimed(project, planned.base_runs, None)
         saved = _any_saved(project, planned.base_runs)
         receipt = AuditReceipt(
-            sequence=sequence,
+            sequence=len(audit_receipts(project)) + 1,
             opened_at=clock(),
             project=project.paths.project_id,
             request=request,
@@ -523,35 +534,30 @@ def _reserve(
 
 
 def _require_unclaimed(
-    project: ProjectStore, snapshot: LedgerSnapshot, base_runs: tuple[str, ...], sequence: int
+    project: ProjectStore, base_runs: tuple[str, ...], receipt: str | None
 ) -> None:
-    """Refuse a run an earlier active receipt dispatched and has not finished.
+    """Refuse a run another receipt dispatched and has not finished.
 
     A run's ID never names a receipt, so a development re-audit over the same cases registers
-    the very runs an interrupted receipt claimed slots for. Only the receipt that reserved the
-    run first may resume it; otherwise its lost requests would be re-dispatched, and its result
-    reported, under another receipt.
+    the very runs an interrupted receipt claimed slots for. Only the receipt recorded as the
+    run's dispatcher may resume it; otherwise its lost requests would be re-dispatched, and its
+    result reported, under another receipt. A run that claimed slots is never replaced, so an
+    unfinished dispatched run is always the case's current registration.
 
     Raises:
-        ValueError: An earlier receipt still holding its reservation owns an unfinished run.
+        ValueError: Another receipt dispatched an unfinished run of the panel.
     """
-    for other in audit_receipts(project):
-        if other.sequence >= sequence:
-            return
-        if not snapshot.active(other.receipt_id):
+    for base in base_runs:
+        current = current_registration(project, base)
+        if current is None or saved_fidelity_report(project, current) is not None:
             continue
-        for base in frozenset(base_runs).intersection(other.base_runs):
-            current = current_registration(project, base)
-            if (
-                current is not None
-                and run_slots(project, current.spec.run_id)
-                and saved_fidelity_report(project, current) is None
-            ):
-                raise ValueError(
-                    f"run {current.spec.run_id} was dispatched under receipt "
-                    f"{other.receipt_id} and has no saved result; only that receipt can "
-                    "complete it: repeat the request that opened it with --retry-incomplete"
-                )
+        owner = dispatch_owner(project, current.spec.run_id)
+        if owner is not None and owner != receipt:
+            raise ValueError(
+                f"run {current.spec.run_id} was dispatched under receipt {owner} and has no "
+                "saved result; only that receipt can complete it: repeat the request that "
+                "opened it with --retry-incomplete"
+            )
 
 
 def _any_saved(project: ProjectStore, base_runs: tuple[str, ...]) -> bool:

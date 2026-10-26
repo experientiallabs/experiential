@@ -5,6 +5,7 @@ from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import AbstractContextManager, nullcontext
 from datetime import UTC, datetime
+from functools import partial
 from pathlib import Path
 from threading import Event
 from time import monotonic
@@ -454,7 +455,7 @@ def execute_runs(
     registrations: tuple[PreparedFidelity, ...],
     progress: ProgressHook | None = None,
     *,
-    guard: Callable[[], None] | None = None,
+    guard: Callable[[PreparedFidelity], None] | None = None,
     resume: bool = False,
 ) -> None:
     """Run the registered traces concurrently through the fidelity owner.
@@ -496,7 +497,7 @@ def execute_runs(
                         store,
                         prepared,
                         progress=qualified(hook, f"trace {index}/{total}"),
-                        dispatch_guard=guard,
+                        dispatch_guard=None if guard is None else partial(guard, prepared),
                         resume_until=window,
                     )
                 except BaseException:
