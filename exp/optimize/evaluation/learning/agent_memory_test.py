@@ -386,3 +386,15 @@ def test_costs_price_every_request_at_the_spend_ceilings_whole_generation_bound(
     assert merge.attempts == 2 * agent_memory.MERGE_ROUNDS
     assert screen.attempts == 4
     assert consolidation_cost(store, prepared, candidates())[0].attempts == 0
+    large = tuple(
+        Lesson(
+            kind="procedure",
+            statement="s" * 4_000,
+            applies_when="w",
+            evidence=("e",),
+            traces=("t",),
+        )
+        for _ in range(10)
+    )
+    merge, _ = consolidation_cost(store, prepared, candidates(*large))
+    assert merge.attempts == 5 * agent_memory.MERGE_ROUNDS

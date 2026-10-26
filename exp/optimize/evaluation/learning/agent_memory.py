@@ -274,12 +274,12 @@ def consolidation_cost(
     merge: list[int] = []
     screen: list[int] = []
     for kind in KINDS:
-        shown = [
-            _json_bytes(_shown_candidate(row)) for row in candidates.candidates if row.kind == kind
-        ]
+        rows = [row for row in candidates.candidates if row.kind == kind]
+        shown = [_json_bytes(_shown_candidate(row)) for row in rows]
+        # The same packer as execution, so each chunk is one merge request of the first round.
         merge.extend(
-            sum(chunk) + REQUEST_MARGIN_BYTES
-            for chunk in _chunks(shown, limit, lambda size: size)
+            sum(_json_bytes(_shown_candidate(row)) for row in chunk) + REQUEST_MARGIN_BYTES
+            for chunk in _chunks(rows, limit, _shown_candidate)
             if len(chunk) > 1
         )
         accepted = min(sum(shown), limit)
