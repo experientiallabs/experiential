@@ -9,13 +9,13 @@ from typing import TYPE_CHECKING, Literal, cast
 
 from exp.common.core.artifacts import stable_id
 from exp.common.models.gateway_catalog import read_pinned_normalized_snapshot
-from exp.common.sqlite.connection import connect_database
+from exp.common.sqlite.connection import connect_database, persistent_connection
 from exp.runtime.gateway.budgets import (
     BudgetScope,
     BudgetScopeKind,
     SQLiteBudgetStore,
 )
-from exp.runtime.gateway.contracts import GatewayFailureClass, ProjectTarget
+from exp.runtime.gateway.contracts import ProjectTarget
 from exp.runtime.gateway.ledger import SQLiteAttemptLedger
 from exp.runtime.gateway.management import require_gateway_servable_provider
 from exp.runtime.gateway.model_chain_authority import (
@@ -31,7 +31,6 @@ from exp.runtime.gateway.platform import (
     AttemptSettlementRecord,
     AttemptSettlementRequest,
     AttemptTerminalState,
-    AttemptUsageSource,
     BillingSourceUsageAttribution,
     CreateIdentityCommand,
     DisableAliasCommand,
@@ -71,19 +70,10 @@ from exp.runtime.gateway.sqlite.platform_records import (
     key_record as _key_record,
 )
 from exp.runtime.gateway.sqlite.platform_records import (
-    optional_datetime as _optional_datetime,
-)
-from exp.runtime.gateway.sqlite.platform_records import (
-    optional_int as _optional_int,
-)
-from exp.runtime.gateway.sqlite.platform_records import (
     provider_binding as _provider_binding,
 )
 from exp.runtime.gateway.sqlite.platform_records import (
     require_reservation_replay as _require_reservation_replay,
-)
-from exp.runtime.gateway.sqlite.platform_records import (
-    require_settlement_replay as _require_settlement_replay,
 )
 from exp.runtime.gateway.sqlite.platform_records import (
     required_datetime as _datetime,
@@ -92,7 +82,7 @@ from exp.runtime.gateway.sqlite.platform_records import (
     reservation_record as _reservation_record,
 )
 from exp.runtime.gateway.sqlite.platform_records import (
-    usage_record as _usage_record,
+    settle_attempt_in_transaction as _settle_attempt_in_transaction,
 )
 from exp.runtime.gateway.sqlite.provider_commands import sqlite_connection_config
 from exp.runtime.gateway.sqlite.store import SQLiteGatewayStore
@@ -636,43 +626,18 @@ class SQLiteGatewayPlatform:
         Raises:
             ValueError: Tenant ownership or replay evidence differs from the row.
         """
-        self._reservation(
-            organization_id=request.organization_id,
-            attempt_id=request.attempt_id,
-        )
-        self.attempts.finish_attempt(
-            attempt_id=request.attempt_id,
-            terminal_event=request.terminal_event,
-            failure=request.failure,
-            finalize_request=request.finalize_request,
-            first_token_at=request.first_token_at,
-        )
-        row = self._attempt_row(
-            organization_id=request.organization_id,
-            attempt_id=request.attempt_id,
-        )
-        if request.finalize_request and str(row["request_terminal_state"]) != str(row["state"]):
-            raise ValueError(
-                "attempt settlement replay cannot finalize its non-terminal parent request"
-            )
-        usage = _usage_record(row)
-        settlement = AttemptSettlementRecord(
-            reservation=_reservation_record(row, organization_id=request.organization_id),
-            state=AttemptTerminalState(str(row["state"])),
-            terminal_at=_datetime(row["terminal_at"]),
-            failure_class=(
-                None
-                if row["failure_class"] is None
-                else GatewayFailureClass(str(row["failure_class"]))
-            ),
-            usage=usage,
-            usage_source=AttemptUsageSource(str(row["usage_source"] or "unknown")),
-            estimated_cost_nano_usd=_optional_int(row["estimated_cost_nano_usd"]),
-            settled_nano_usd=_optional_int(row["budget_settled_nano_usd"]),
-            first_token_at=_optional_datetime(row["first_token_at"]),
-        )
-        _require_settlement_replay(settlement, request=request)
-        return settlement
+        with persistent_connection(
+            self.database_path, busy_timeout_ms=self._busy_timeout_ms
+        ) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                settlement = _settle_attempt_in_transaction(connection, self.attempts, request)
+            except BaseException:
+                connection.execute("ROLLBACK")
+                raise
+            else:
+                connection.execute("COMMIT")
+                return settlement
 
     def usage_attribution(
         self,

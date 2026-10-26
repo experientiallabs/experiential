@@ -40,6 +40,22 @@ _UNIT_FIELDS = (
     "billed_quantity_milli",
     "billed_unit_rate",
 )
+_REPLAY_CONFLICT = (
+    "attempt settlement replay differs from durable accounting evidence (durable usage or cost)"
+)
+
+
+def record_recovery(
+    connection: sqlite3.Connection, attempt_id: str, terminal: GatewayEvent | None
+) -> None:
+    """Persist trusted provisional provenance alongside the initial terminal transaction."""
+    if terminal is not None and terminal.accounting_recovery:
+        if terminal.usage is not None or terminal.failure is None:
+            raise GatewayLedgerError("accounting recovery requires an unmetered failure")
+        connection.execute(
+            "UPDATE gateway_attempts SET accounting_recovery = 1 WHERE attempt_id = ?",
+            (attempt_id,),
+        )
 
 
 def reconcile_terminal_attempt(
@@ -54,12 +70,13 @@ def reconcile_terminal_attempt(
     """Upgrade provisional billing atomically while preserving the first delivery outcome.
 
     The caller owns the SQLite write transaction. Complete observed usage can
-    replace an explicitly estimated meter or unknown usage from failure,
-    cancellation or crash recovery. A provider's completed/incomplete terminal
-    without usage remains immutable; another estimate or partial observation
-    cannot replace any terminal meter. The original delivery state, failure and
-    timestamps remain intact. An identical observed meter is replayable even
-    when its outcome differs from the earlier cancellation or crash outcome.
+    replace an explicitly estimated meter or unknown usage with persisted
+    recovery provenance, including cancellation/crash states. A provider's
+    final terminal without usage remains immutable; another estimate or partial
+    observation cannot replace any terminal meter. The original delivery state,
+    failure and timestamps remain
+    intact. An identical observed meter is replayable even when its outcome
+    differs from the earlier cancellation or crash outcome.
     """
     row = connection.execute(
         "SELECT a.*, r.api_surface FROM gateway_attempts AS a "
@@ -82,12 +99,12 @@ def reconcile_terminal_attempt(
     )
     if complete and row["usage_source"] in {"unknown", "estimated"}:
         assert terminal is not None and usage is not None
-        if row["usage_source"] == "unknown" and row["state"] not in {
-            "cancelled",
-            "failed",
-            "unknown_after_crash",
-        }:
-            raise GatewayLedgerError("attempt settlement replay differs from the durable usage")
+        if (
+            row["usage_source"] == "unknown"
+            and not row["accounting_recovery"]
+            and row["state"] not in {"cancelled", "unknown_after_crash"}
+        ):
+            raise GatewayLedgerError(_REPLAY_CONFLICT)
         _upgrade_observed(connection, row, attempt_id, terminal, failure, usage, receipt)
         return
     if complete and row["usage_source"] == "observed":
@@ -99,19 +116,13 @@ def reconcile_terminal_attempt(
         if prior is not None and prior.resolution == "confirmed":
             if receipt not in (None, prior):
                 raise GatewayLedgerError("service-tier receipt differs from the settled tier")
-            same = same and row["estimated_cost_nano_usd"] == tier_usage_cost(
-                prior, usage, terminal
-            )
+            same = same and _replay_cost_matches(row, tier_usage_cost(prior, usage, terminal))
         elif row["service_tier_admission"] is None:
             if receipt is not None:
                 raise GatewayLedgerError("service-tier receipt has no admitted schedules")
-            same = same and row["estimated_cost_nano_usd"] == observed_usage_cost(
-                row, usage, terminal
-            )
+            same = same and _replay_cost_matches(row, observed_usage_cost(row, usage, terminal))
         if not same:
-            raise GatewayLedgerError(
-                "attempt settlement replay differs from the durable usage or cost"
-            )
+            raise GatewayLedgerError(_REPLAY_CONFLICT)
         if prior is not None and prior.resolution != "confirmed" and receipt is not None:
             # The exact meter may predate its tier receipt. Validate the schedule
             # and resolve its hold without overwriting an explicit refund.
@@ -123,7 +134,17 @@ def reconcile_terminal_attempt(
     raise GatewayLedgerError("attempt is already settled with another terminal state")
 
 
+def _replay_cost_matches(row: sqlite3.Row, cost: int | None) -> bool:
+    """Keep durable unknown pricing unchanged when exact public replay omits private markers."""
+    # Public event JSON omits the trusted disconnect marker. Its exact observed
+    # meter can therefore look priceable on replay, but the durable unknown cost
+    # and conservative charge must remain untouched. Never promote that replay
+    # into a billing correction; only known costs owe exact recomputation here.
+    return row["estimated_cost_nano_usd"] is None or row["estimated_cost_nano_usd"] == cost
+
+
 def _prior_tier(row: sqlite3.Row) -> GatewayServiceTierSettlement | None:
+    """Decode the immutable tier evidence retained by the original terminal write."""
     previous = row["service_tier_settlement"]
     return None if previous is None else GatewayServiceTierSettlement.model_validate_json(previous)
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sqlite3
 from datetime import datetime
+from typing import TYPE_CHECKING
 
 from exp.common.models import BillingSource
 from exp.common.models.catalog_prices import BilledUnitKind
@@ -28,6 +29,71 @@ from exp.runtime.gateway.platform import (
 )
 from exp.runtime.gateway.sqlite.provider_authority import ProviderConnectionBinding
 from exp.runtime.gateway.stream_contracts import BilledUnits
+
+if TYPE_CHECKING:
+    from exp.runtime.gateway.ledger import SQLiteAttemptLedger
+
+
+def settle_attempt_in_transaction(
+    connection: sqlite3.Connection,
+    attempts: SQLiteAttemptLedger,
+    request: AttemptSettlementRequest,
+) -> AttemptSettlementRecord:
+    """Apply and verify public settlement under the caller's immediate write transaction.
+
+    Public terminal replays are exact comparisons, never an entry point to the
+    internal recovery ledger's late-meter reconciliation. Validation also runs
+    before an initial write commits, so a rejected public settlement changes
+    neither the attempt nor its budget allocations.
+    """
+    row = _settlement_row(connection, request)
+    if request.terminal_event is not None and request.terminal_event.accounting_recovery:
+        raise ValueError("public settlement cannot declare internal accounting recovery")
+    if row["state"] == "dispatched":
+        attempts.apply_finish_attempt(
+            connection,
+            attempt_id=request.attempt_id,
+            terminal_event=request.terminal_event,
+            failure=request.failure,
+            finalize_request=request.finalize_request,
+            first_token_at=request.first_token_at,
+        )
+        row = _settlement_row(connection, request)
+    if request.finalize_request and str(row["request_terminal_state"]) != str(row["state"]):
+        raise ValueError(
+            "attempt settlement replay cannot finalize its non-terminal parent request"
+        )
+    settlement = AttemptSettlementRecord(
+        reservation=reservation_record(row, organization_id=request.organization_id),
+        state=AttemptTerminalState(str(row["state"])),
+        terminal_at=required_datetime(row["terminal_at"]),
+        failure_class=(
+            None if row["failure_class"] is None else GatewayFailureClass(str(row["failure_class"]))
+        ),
+        usage=usage_record(row),
+        usage_source=AttemptUsageSource(str(row["usage_source"] or "unknown")),
+        estimated_cost_nano_usd=optional_int(row["estimated_cost_nano_usd"]),
+        settled_nano_usd=optional_int(row["budget_settled_nano_usd"]),
+        first_token_at=optional_datetime(row["first_token_at"]),
+    )
+    require_settlement_replay(settlement, request=request)
+    return settlement
+
+
+def _settlement_row(
+    connection: sqlite3.Connection, request: AttemptSettlementRequest
+) -> sqlite3.Row:
+    """Read the exact tenant-owned attempt and parent within the settlement transaction."""
+    row = connection.execute(
+        "SELECT a.*, r.identity_id, r.alias_id, r.alias_revision_id, "
+        "r.terminal_state AS request_terminal_state FROM gateway_attempts AS a "
+        "JOIN gateway_requests AS r ON r.organization_id = a.organization_id "
+        "AND r.request_id = a.request_id WHERE a.organization_id = ? AND a.attempt_id = ?",
+        (request.organization_id, request.attempt_id),
+    ).fetchone()
+    if row is None:
+        raise ValueError("attempt does not belong to the requested organization")
+    return row
 
 
 def key_record(

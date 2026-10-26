@@ -23,7 +23,6 @@ from exp.runtime.gateway.class_throttles import (
 from exp.runtime.gateway.contracts import (
     AuthorizationSnapshot,
     GatewayEvent,
-    GatewayEventKind,
     GatewayFailure,
     GatewayFailureClass,
 )
@@ -867,11 +866,7 @@ class NativeAttemptAccounting:
                     )
                     self._finish_attempt(
                         attempt_id=entry.active_attempt_id,
-                        terminal_event=GatewayEvent(
-                            kind=GatewayEventKind.FAILED,
-                            sequence_number=0,
-                            failure=failure,
-                        ),
+                        terminal_event=GatewayEvent.for_accounting_recovery(failure=failure),
                         failure=failure,
                         finalize_request=True,
                         **web_search_requests_kwarg(

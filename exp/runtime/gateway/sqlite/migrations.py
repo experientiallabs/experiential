@@ -16,7 +16,7 @@ from exp.runtime.gateway.sqlite.nano_usd_migration import (
     migrate_money_to_nano_usd,
 )
 
-SCHEMA_VERSION = 31
+SCHEMA_VERSION = 32
 
 
 class GatewaySchemaError(RuntimeError):
@@ -799,6 +799,10 @@ _MIGRATIONS: dict[int, tuple[MigrationStep, ...]] = {
         "PRAGMA writable_schema = RESET",
         "CREATE TABLE gateway_schema_refresh_v31 (noop INTEGER) STRICT",
         "DROP TABLE gateway_schema_refresh_v31",
+    ),
+    32: (  # trusted local cleanup, distinct from an immutable provider failure
+        "ALTER TABLE gateway_attempts ADD COLUMN accounting_recovery INTEGER NOT NULL "
+        "DEFAULT 0 CHECK (accounting_recovery IN (0, 1))",
     ),
     24: (  # plan sign-in kind: part of the connection identity digest, so it rides the revision
         "ALTER TABLE provider_connection_revisions ADD COLUMN subscription TEXT "

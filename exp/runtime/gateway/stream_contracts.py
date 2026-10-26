@@ -9,7 +9,7 @@ from __future__ import annotations
 from enum import StrEnum
 from typing import Annotated, Literal
 
-from pydantic import Field, TypeAdapter, model_validator
+from pydantic import Field, PrivateAttr, TypeAdapter, model_validator
 
 from exp.common.core.artifacts import ContractModel, JsonObject
 from exp.common.models.catalog_prices import MAXIMUM_UNIT_VARIANT_CHARACTERS, BilledUnitKind
@@ -238,6 +238,7 @@ class GatewayEvent(ContractModel):
 
     kind: GatewayEventKind
     sequence_number: int = Field(ge=0)
+    _accounting_recovery: bool = PrivateAttr(default=False)
     text_delta: str | None = None
     reasoning_summary_output_index: int | None = Field(default=None, ge=0)
     reasoning_summary_index: int | None = Field(default=None, ge=0)
@@ -300,6 +301,23 @@ class GatewayEvent(ContractModel):
         Literal["delta", "text_done", "content_part_done", "item_done", "terminal"] | None
     ) = Field(default=None, alias="phase")
     responses_logprobs_records: tuple[JsonObject, ...] | None = Field(default=None, alias="records")
+
+    @property
+    def accounting_recovery(self) -> bool:
+        """Whether trusted local cleanup created this provisional, unmetered terminal."""
+        return self._accounting_recovery
+
+    @classmethod
+    def for_accounting_recovery(cls, *, failure: GatewayFailure) -> GatewayEvent:
+        """Mark an internal unknown-liability write without accepting provenance from JSON.
+
+        The private attribute is absent from both the serialized event and its
+        input fields. Only recovery callers use this constructor; ordinary
+        provider terminal observations never acquire this capability.
+        """
+        event = cls(kind=GatewayEventKind.FAILED, sequence_number=0, failure=failure)
+        event._accounting_recovery = True
+        return event
 
     @model_validator(mode="after")
     def _require_event_payload(self) -> GatewayEvent:

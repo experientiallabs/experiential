@@ -42,7 +42,7 @@ from exp.runtime.gateway.ledger_errors import (
 from exp.runtime.gateway.ledger_errors import (
     IdempotencyReplayUnavailableError as IdempotencyReplayUnavailableError,
 )
-from exp.runtime.gateway.ledger_reconciliation import reconcile_terminal_attempt
+from exp.runtime.gateway.ledger_reconciliation import reconcile_terminal_attempt, record_recovery
 from exp.runtime.gateway.ledger_requests import finish_request
 from exp.runtime.gateway.ledger_service_tiers import (
     long_context_values,
@@ -713,6 +713,7 @@ class SQLiteAttemptLedger(LocalSnapshotMemoOwner):
                 attempt_id,
             ),
         )
+        record_recovery(connection, attempt_id, terminal_event)
         settle_attempt_budgets(
             connection,
             attempt_id=attempt_id,

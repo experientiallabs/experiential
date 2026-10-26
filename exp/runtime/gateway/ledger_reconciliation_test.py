@@ -2,12 +2,17 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
+import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
 from pathlib import Path
+from unittest.mock import DEFAULT, Mock
 
 import pytest
+from pydantic import ValidationError
 
 from exp.common.models.catalog import GatewayDeploymentMetadata, GatewayTokenPrices
 from exp.common.models.catalog_prices import BilledUnitKind, GatewayUnitPrices
@@ -30,7 +35,14 @@ from exp.runtime.gateway.ledger_test import (
     _execution,
     _request,
 )
+from exp.runtime.gateway.native_accounting import NativeAttemptAccounting
+from exp.runtime.gateway.native_execution import InflightRequest
+from exp.runtime.gateway.native_recovery_test import RecoveryHostFake
+from exp.runtime.gateway.platform import AttemptSettlementRequest
+from exp.runtime.gateway.routing import GatewayRoute
 from exp.runtime.gateway.service_tiers import GatewayServiceTierAdmission
+from exp.runtime.gateway.sqlite import migrations
+from exp.runtime.gateway.sqlite.platform import SQLiteGatewayPlatform
 from exp.runtime.gateway.sqlite.store import SQLiteGatewayStore
 from exp.runtime.gateway.stream_contracts import BilledUnits
 
@@ -50,6 +62,7 @@ def _started(
     deployment: ExactModelDeployment | None = None,
     tier: GatewayServiceTierAdmission | None = None,
 ) -> tuple[FakeLedgerClock, SQLiteGatewayStore, SQLiteAttemptLedger, SQLiteBudgetStore, str]:
+    """Reserve one priced attempt against its original team and identity allocations."""
     clock = FakeLedgerClock()
     store, ledger, key = _authority_fixture(tmp_path, clock)
     budgets = SQLiteBudgetStore(store.database_path, clock=clock)
@@ -77,6 +90,7 @@ def _started(
 
 
 def _cancelled(*, estimated: bool = False, usage: GatewayUsage | None = None) -> GatewayEvent:
+    """Build the trusted incomplete-disconnect observation used by recovery."""
     return GatewayEvent(
         kind=GatewayEventKind.FAILED,
         sequence_number=0,
@@ -88,6 +102,7 @@ def _cancelled(*, estimated: bool = False, usage: GatewayUsage | None = None) ->
 
 
 def _observed(*, input_tokens: int = 10, output_tokens: int = 5) -> GatewayEvent:
+    """Build a complete provider meter without recovery-only flags."""
     return GatewayEvent(
         kind=GatewayEventKind.COMPLETED,
         sequence_number=1,
@@ -96,6 +111,7 @@ def _observed(*, input_tokens: int = 10, output_tokens: int = 5) -> GatewayEvent
 
 
 def _assert_allocations(budgets: SQLiteBudgetStore, *, settled: int, reserved: int = 0) -> None:
+    """Check both original allocations while proving the next month remains untouched."""
     original = budgets.remaining(organization_id="org-one", period="2026-08")
     assert len(original) == 2
     for allocation in original:
@@ -515,3 +531,373 @@ def test_recovered_usage_waits_for_missing_tier_receipt(tmp_path: Path) -> None:
             service_tier=receipt,
         )
     _assert_allocations(budgets, settled=40)
+
+
+@pytest.mark.parametrize("output_tokens", [0, 7])
+@pytest.mark.parametrize("tiered", [False, True])
+def test_serialized_disconnect_replay_preserves_durable_unknown_billing(
+    tmp_path: Path,
+    output_tokens: int,
+    tiered: bool,
+) -> None:
+    """Losing the private disconnect marker on an exact replay cannot reprice its meter."""
+    tier = (
+        GatewayServiceTierAdmission(
+            requested="priority",
+            standard_prices=GatewayTokenPrices(),
+            requested_prices=GatewayTokenPrices(
+                input_nano_usd_per_million_tokens=2_000_000,
+                output_nano_usd_per_million_tokens=4_000_000,
+            ),
+        )
+        if tiered
+        else None
+    )
+    _, _, ledger, budgets, attempt = _started(tmp_path, tier=tier)
+    receipt = None if tier is None else tier.settlement(served="priority", resolution="confirmed")
+    terminal = _cancelled(usage=GatewayUsage(input_tokens=19, output_tokens=output_tokens))
+    ledger.finish_attempt(
+        attempt_id=attempt,
+        terminal_event=terminal,
+        failure=_CANCELLED,
+        service_tier=receipt,
+    )
+    before = dict(_attempt_row(tmp_path, attempt))
+    public_replay = GatewayEvent.model_validate_json(terminal.model_dump_json())
+    assert public_replay.usage_incomplete_due_to_disconnect is False
+    assert public_replay.usage == terminal.usage
+    for supplied in (receipt, None):
+        ledger.finish_attempt(
+            attempt_id=attempt,
+            terminal_event=public_replay,
+            failure=_CANCELLED,
+            service_tier=supplied,
+        )
+        with pytest.raises(GatewayLedgerError, match="differs from durable accounting evidence"):
+            ledger.finish_attempt(
+                attempt_id=attempt,
+                terminal_event=public_replay.model_copy(
+                    update={
+                        "usage": GatewayUsage(input_tokens=20, output_tokens=output_tokens),
+                    }
+                ),
+                failure=_CANCELLED,
+                service_tier=supplied,
+            )
+    assert dict(_attempt_row(tmp_path, attempt)) == before
+    assert before["usage_source"] == "observed"
+    assert before["estimated_cost_nano_usd"] is None
+    _assert_allocations(budgets, settled=0 if tiered else 300, reserved=300 if tiered else 0)
+
+
+@pytest.mark.parametrize(
+    "failure_class",
+    [
+        None,
+        GatewayFailureClass.PROVIDER_INTERNAL,
+        GatewayFailureClass.TRANSPORT,
+        GatewayFailureClass.INTERNAL,
+    ],
+)
+def test_failed_provider_observation_does_not_prove_recovery(
+    tmp_path: Path,
+    failure_class: GatewayFailureClass | None,
+) -> None:
+    """A provider's unmetered failure is immutable even if its class resembles cleanup."""
+    _, _, ledger, budgets, attempt = _started(tmp_path)
+    failure = (
+        None
+        if failure_class is None
+        else GatewayFailure(
+            failure_class=failure_class,
+            safe_message="provider failure",
+        )
+    )
+    terminal = GatewayEvent(kind=GatewayEventKind.FAILED, sequence_number=0, failure=failure)
+    ledger.finish_attempt(attempt_id=attempt, terminal_event=terminal, failure=failure)
+    before = dict(_attempt_row(tmp_path, attempt))
+    assert before["accounting_recovery"] == 0
+    for _ in range(2):
+        with pytest.raises(GatewayLedgerError, match="differs from durable accounting evidence"):
+            ledger.finish_attempt(attempt_id=attempt, terminal_event=_observed(), failure=None)
+    assert dict(_attempt_row(tmp_path, attempt)) == before
+    _assert_allocations(budgets, settled=300)
+
+
+@pytest.mark.parametrize("estimated", [False, True])
+@pytest.mark.parametrize("same_outcome", [False, True])
+def test_public_replay_refuses_internal_recovery_without_mutating_accounting(
+    tmp_path: Path,
+    estimated: bool,
+    same_outcome: bool,
+) -> None:
+    """A rejected public replay cannot apply the internal ledger's otherwise valid upgrade."""
+    _, store, ledger, budgets, attempt = _started(tmp_path)
+    platform = SQLiteGatewayPlatform(store.database_path, attempts=ledger, budgets=budgets)
+    initial = _cancelled(
+        estimated=estimated,
+        usage=GatewayUsage(input_tokens=19, output_tokens=7) if estimated else None,
+    )
+    request = AttemptSettlementRequest(
+        organization_id="org-one",
+        attempt_id=attempt,
+        terminal_event=initial,
+    )
+    settlement = platform.settle_attempt(request)
+    before = dict(_attempt_row(tmp_path, attempt))
+    terminal = _observed()
+    if same_outcome:
+        terminal = terminal.model_copy(
+            update={"kind": GatewayEventKind.FAILED, "failure": _CANCELLED}
+        )
+    with pytest.raises(ValueError, match="differs from durable accounting evidence"):
+        platform.settle_attempt(request.model_copy(update={"terminal_event": terminal}))
+    if estimated:
+        # Public JSON cannot promote the private estimate provenance to observed.
+        with pytest.raises(ValueError, match="differs from durable accounting evidence"):
+            platform.settle_attempt(
+                AttemptSettlementRequest.model_validate_json(request.model_dump_json())
+            )
+    assert platform.settle_attempt(request) == settlement
+    assert dict(_attempt_row(tmp_path, attempt)) == before
+    _assert_allocations(budgets, settled=66 if estimated else 300)
+    ledger.finish_attempt(attempt_id=attempt, terminal_event=_observed(), failure=None)
+    assert _attempt_row(tmp_path, attempt)["usage_source"] == "observed"
+    _assert_allocations(budgets, settled=40)
+
+
+def test_public_initial_settlement_validation_rolls_back_the_write(tmp_path: Path) -> None:
+    """A public field the durable record cannot reproduce must fail before accounting commits."""
+    _, store, ledger, budgets, attempt = _started(tmp_path)
+    platform = SQLiteGatewayPlatform(store.database_path, attempts=ledger, budgets=budgets)
+    before = dict(_attempt_row(tmp_path, attempt))
+    request = AttemptSettlementRequest(
+        organization_id="org-one",
+        attempt_id=attempt,
+        terminal_event=GatewayEvent(
+            kind=GatewayEventKind.COMPLETED,
+            sequence_number=0,
+            usage=GatewayUsage(input_tokens=10, output_tokens=5, tool_names=("tool",)),
+        ),
+    )
+    with pytest.raises(ValueError, match="differs from durable accounting evidence"):
+        platform.settle_attempt(request)
+    assert dict(_attempt_row(tmp_path, attempt)) == before
+    _assert_allocations(budgets, settled=0, reserved=300)
+    with sqlite3.connect(store.database_path) as connection:
+        assert connection.execute(
+            "SELECT terminal_state, terminal_at FROM gateway_requests WHERE request_id = ?",
+            (before["request_id"],),
+        ).fetchone() == (None, None)
+
+
+def test_real_sqlite_native_abandonment_retains_then_commits_the_late_meter(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The actual native race upgrades a committed cancellation in the real SQLite owner."""
+    monkeypatch.setattr(NativeAttemptAccounting, "_sweep_loop", lambda self: None)
+    clock = FakeLedgerClock()
+    store, ledger, key = _authority_fixture(tmp_path, clock)
+    budgets = SQLiteBudgetStore(store.database_path, clock=clock)
+    budgets.set_limit(
+        organization_id="org-one",
+        period="2026-08",
+        scope=_SCOPES[0],
+        limit_nano_usd=1_000,
+    )
+    request = _request("native late meter")
+    authorization = store.authorize_request(
+        raw_key=key,
+        alias="coding",
+        request=request,
+        deadline_monotonic=clock.monotonic() + 30,
+    )
+    snapshot, deployment = _execution(authorization), _deployment()
+    ledger.accept_request(authorization=authorization)
+    attempt = ledger.start_attempt(
+        snapshot=snapshot,
+        deployment=deployment,
+        attempt_ordinal=0,
+        route_depth=0,
+        maximum_cost_nano_usd=300,
+    )
+    accounting = NativeAttemptAccounting(ledger, recovery_host=RecoveryHostFake())
+    entry = InflightRequest(
+        authorization=authorization,
+        route=GatewayRoute(snapshot=snapshot, deployment=deployment, route_reason="direct"),
+        request=request,
+        deadline_monotonic=time.monotonic() + 30,
+        total_attempts=1,
+        attempt_depths={attempt: 0},
+        active_attempt_id=attempt,
+    )
+    accounting.register(entry)
+    entered, release, waiting = threading.Event(), threading.Event(), threading.Event()
+    gate = entry.execution_lock
+
+    class ObservedGate:
+        """Signal that the exact callback retained its meter before waiting behind cleanup."""
+
+        def __enter__(self) -> None:
+            """Wait until the already-running abandonment releases the request gate."""
+            waiting.set()
+            gate.acquire()
+
+        def __exit__(self, *_exception: object) -> None:
+            """Release the same request gate after the observed write."""
+            gate.release()
+
+        def acquire(self, *, blocking: bool) -> bool:
+            """Preserve abandonment's nonblocking gate acquisition."""
+            return gate.acquire(blocking=blocking)
+
+        def release(self) -> None:
+            """Release abandonment's ownership of the gate."""
+            gate.release()
+
+    def delay_unknown(**fields: object) -> object:
+        """Pause the actual unknown SQLite write until the exact meter is retained."""
+        terminal = fields["terminal_event"]
+        assert isinstance(terminal, GatewayEvent)
+        if terminal.usage is None:
+            entered.set()
+            assert release.wait(5)
+        return DEFAULT
+
+    monkeypatch.setattr(entry, "execution_lock", ObservedGate())
+    finish = Mock(wraps=ledger.finish_attempt, side_effect=delay_unknown)
+    monkeypatch.setattr(accounting, "_finish_attempt", finish)
+    payload = json.dumps(
+        {
+            "request_id": authorization.request_id,
+            "attempt_id": attempt,
+            "outcome": "completed",
+            "usage": {"input_tokens": 10, "output_tokens": 5},
+            "finalize": True,
+            "opened": True,
+        }
+    )
+    errors: list[BaseException] = []
+    abandoned: list[object] = []
+
+    def abandon() -> None:
+        """Commit the cancellation before the provider's exact write can start."""
+        try:
+            abandoned.append(
+                json.loads(accounting.abandon(json.dumps({"request_id": authorization.request_id})))
+            )
+        except BaseException as error:  # noqa: BLE001 - report thread failures to the test.
+            errors.append(error)
+
+    def observe() -> None:
+        """Send the provider callback through the real native accounting path."""
+        try:
+            accounting.settle(payload)
+        except BaseException as error:  # noqa: BLE001 - report thread failures to the test.
+            errors.append(error)
+
+    cleanup, observed = threading.Thread(target=abandon), threading.Thread(target=observe)
+    cleanup.start()
+    try:
+        assert entered.wait(5)
+        observed.start()
+        assert waiting.wait(5)
+        assert entry.pending_settlement is not None
+    finally:
+        release.set()
+        cleanup.join(5)
+        if observed.ident is not None:
+            observed.join(5)
+    assert not cleanup.is_alive()
+    assert not observed.is_alive()
+    assert not errors
+    assert abandoned == [{"terminalized": False}]
+    assert finish.call_count == 2
+    assert accounting.entry(authorization.request_id) is None
+    assert accounting.close(5)
+    row = _attempt_row(tmp_path, attempt)
+    assert row["state"] == "cancelled"
+    assert row["accounting_recovery"] == 1
+    assert row["usage_source"] == "observed"
+    assert (row["input_tokens"], row["output_tokens"], row["estimated_cost_nano_usd"]) == (
+        10,
+        5,
+        40,
+    )
+    allocation = budgets.remaining(organization_id="org-one", period="2026-08")[0]
+    assert allocation.settled_nano_usd == 40
+    assert allocation.reserved_nano_usd == 0
+    assert allocation.unknown_cost_attempts == 0
+
+
+@pytest.mark.parametrize("field", ["accounting_recovery", "_accounting_recovery"])
+def test_recovery_provenance_is_internal_and_cannot_be_invented_by_public_payloads(
+    tmp_path: Path,
+    field: str,
+) -> None:
+    """Only the trusted constructor can create a recovery-capable failed terminal."""
+    _, store, ledger, budgets, attempt = _started(tmp_path)
+    failure = GatewayFailure(
+        failure_class=GatewayFailureClass.INTERNAL,
+        safe_message="local recovery",
+    )
+    recovery = GatewayEvent.for_accounting_recovery(failure=failure)
+    assert recovery.accounting_recovery
+    assert not GatewayEvent.model_validate_json(recovery.model_dump_json()).accounting_recovery
+    request = AttemptSettlementRequest(
+        organization_id="org-one",
+        attempt_id=attempt,
+        terminal_event=recovery,
+    )
+    payload = json.loads(request.model_dump_json())
+    payload["terminal_event"][field] = True
+    with pytest.raises(ValidationError, match="extra_forbidden"):
+        AttemptSettlementRequest.model_validate_json(json.dumps(payload))
+    platform = SQLiteGatewayPlatform(store.database_path, attempts=ledger, budgets=budgets)
+    before = dict(_attempt_row(tmp_path, attempt))
+    with pytest.raises(ValueError, match="cannot declare internal accounting recovery"):
+        platform.settle_attempt(request)
+    assert dict(_attempt_row(tmp_path, attempt)) == before
+    _assert_allocations(budgets, settled=0, reserved=300)
+    ledger.finish_attempt(attempt_id=attempt, terminal_event=recovery, failure=failure)
+    assert _attempt_row(tmp_path, attempt)["accounting_recovery"] == 1
+    for _ in range(2):
+        ledger.finish_attempt(attempt_id=attempt, terminal_event=_observed(), failure=None)
+    row = _attempt_row(tmp_path, attempt)
+    assert row["state"] == "failed"
+    assert row["failure_class"] == "internal"
+    assert row["usage_source"] == "observed"
+    assert row["estimated_cost_nano_usd"] == 40
+    _assert_allocations(budgets, settled=40)
+
+
+def test_schema32_preserves_legacy_failure_without_inventing_recovery(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The additive migration defaults old terminal rows to immutable and preserves money."""
+    with monkeypatch.context() as prior:
+        prior.setattr(migrations, "SCHEMA_VERSION", 31)
+        _, store, ledger, budgets, attempt = _started(tmp_path)
+        failure = GatewayFailure(
+            failure_class=GatewayFailureClass.INTERNAL,
+            safe_message="previous failure",
+        )
+        terminal = GatewayEvent(kind=GatewayEventKind.FAILED, sequence_number=0, failure=failure)
+        ledger.finish_attempt(attempt_id=attempt, terminal_event=terminal, failure=failure)
+        before = dict(_attempt_row(tmp_path, attempt))
+    assert "accounting_recovery" not in before
+    backup = migrations.initialize_database(store.database_path)
+    assert backup is not None
+    with sqlite3.connect(backup) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone() == (31,)
+        assert "accounting_recovery" not in {
+            row[1] for row in connection.execute("PRAGMA table_info(gateway_attempts)")
+        }
+    after = dict(_attempt_row(tmp_path, attempt))
+    assert after.pop("accounting_recovery") == 0
+    assert after == before
+    with pytest.raises(GatewayLedgerError, match="differs from durable accounting evidence"):
+        ledger.finish_attempt(attempt_id=attempt, terminal_event=_observed(), failure=None)
+    _assert_allocations(budgets, settled=300)

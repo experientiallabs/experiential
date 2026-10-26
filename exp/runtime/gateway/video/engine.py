@@ -415,7 +415,13 @@ class VideoEngine:
 
     def _settle_unknown(self, job: VideoJob, failure: GatewayFailure) -> None:
         """Retain a submit the provider may have accepted without inventing zero usage."""
-        self._settle_created(job, None, failure, finalize=True, settled_milli=None)
+        self._settle_created(
+            job,
+            GatewayEvent.for_accounting_recovery(failure=failure),
+            failure,
+            finalize=True,
+            settled_milli=None,
+        )
 
     def _settle_created(
         self,
@@ -741,11 +747,15 @@ class VideoEngine:
                     safe_message=snapshot.error_message or "the video could not be generated",
                 )
             billed = 0 if observed_zero else None
-            event = GatewayEvent(
-                kind=GatewayEventKind.FAILED,
-                sequence_number=0,
-                failure=failure,
-                usage=zero_units(job.variant) if observed_zero else None,
+            event = (
+                GatewayEvent.for_accounting_recovery(failure=failure)
+                if snapshot is None and not observed_zero
+                else GatewayEvent(
+                    kind=GatewayEventKind.FAILED,
+                    sequence_number=0,
+                    failure=failure,
+                    usage=zero_units(job.variant) if observed_zero else None,
+                )
             )
         if completed:
             assert snapshot is not None

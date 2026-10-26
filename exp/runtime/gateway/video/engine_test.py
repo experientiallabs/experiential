@@ -32,6 +32,7 @@ from exp.common.models import (
     ModelCapabilities,
     NormalizedGatewayCatalog,
 )
+from exp.runtime.gateway.budgets import BudgetScope, BudgetScopeKind, SQLiteBudgetStore
 from exp.runtime.gateway.catalog_authority import upsert_connection, upsert_singleton_deployment
 from exp.runtime.gateway.lifecycle import LocalGatewayComponents, load_gateway_components
 from exp.runtime.gateway.management import GatewayManagement
@@ -604,6 +605,71 @@ def test_another_engine_settlement_winner_releases_the_losing_retry_owner(
     assert attempt["state"] == "completed"
     assert attempt["billed_quantity_milli"] == 5_000
     assert attempt["budget_settled_nano_usd"] == 5 * _XAI_RATE
+
+
+def test_late_provider_acceptance_recovers_after_another_owner_commits_unknown(
+    setup: _Setup,
+) -> None:
+    """An interrupted job publication cannot strand the late provider's exact video units."""
+    jobs = setup.components.video_jobs
+    assert jobs is not None
+    other = _stored_engine(setup, InMemoryVideoOutputStore())
+    budgets = SQLiteBudgetStore(setup.database)
+    period = datetime.now(UTC).strftime("%Y-%m")
+    budgets.set_limit(
+        organization_id=setup.components.organization_id,
+        period=period,
+        scope=BudgetScope(kind=BudgetScopeKind.TEAM),
+        limit_nano_usd=2_000_000_000,
+    )
+    handle = setup.provider.handle
+
+    def accept_after_unknown_cleanup(request: httpx.Request) -> httpx.Response:
+        """Let the other owner commit unknown usage before this submit returns its ID."""
+        if request.method == "POST":
+            (open_job,) = jobs.open_jobs(limit=2)
+            assert open_job.provider_job_id is None
+            setup.clock.now += timedelta(seconds=DISPATCH_GRACE_SECONDS + 1)
+            with patch.object(jobs, "save_open", side_effect=RuntimeError("job write unavailable")):
+                assert not other.refresh(open_job).settled
+            (attempt,) = _attempts(setup)
+            assert attempt["state"] == "failed"
+            assert attempt["failure_class"] == "internal"
+            assert attempt["usage_source"] == "unknown"
+            assert attempt["accounting_recovery"] == 1
+            assert attempt["budget_settled_nano_usd"] == 6 * _XAI_RATE
+        return handle(request)
+
+    try:
+        with patch.object(setup.provider, "handle", side_effect=accept_after_unknown_cleanup):
+            accepted = _create(setup, alias="grok-video", seconds=6)
+        assert accepted.provider_job_id is not None
+        current = jobs.load_any(video_id=accepted.video_id)
+        assert current is not None and not current.settled
+        assert current.provider_job_id == accepted.provider_job_id
+        completed = setup.engine.refresh(current)
+        assert completed.settled
+        assert completed.status is VideoStatus.COMPLETED
+        assert completed.billed_seconds_milli == 5_000
+        assert setup.engine.refresh(completed) == completed
+        assert other.close(5)
+        assert len(setup.provider.posts) == 1
+        (attempt,) = _attempts(setup)
+        assert attempt["state"] == "failed"  # Original cleanup delivery evidence survives.
+        assert attempt["accounting_recovery"] == 1
+        assert attempt["usage_source"] == "observed"
+        assert attempt["billed_quantity_milli"] == 5_000
+        assert attempt["estimated_cost_nano_usd"] == 5 * _XAI_RATE
+        assert attempt["budget_settled_nano_usd"] == 5 * _XAI_RATE
+        allocation = budgets.remaining(
+            organization_id=setup.components.organization_id,
+            period=period,
+        )[0]
+        assert allocation.reserved_nano_usd == 0
+        assert allocation.settled_nano_usd == 5 * _XAI_RATE
+        assert allocation.unknown_cost_attempts == 0
+    finally:
+        assert other.close(5)
 
 
 def test_stale_waiter_observes_the_settled_winner_after_deadline(setup: _Setup) -> None:
