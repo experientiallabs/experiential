@@ -215,6 +215,37 @@ def test_dispatched_simulator_failure_is_an_unknown_outcome(
     assert session.state == initial and session.transitions == ()
 
 
+def test_unknown_reask_is_not_masked_by_an_earlier_rejected_proposal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A saved refused proposal does not decide the outcome of the re-ask that timed out."""
+    session, project, _, _ = setup(tmp_path)
+    replies: list[object] = [{"observations": [], "effect": "not-an-object"}]
+
+    def refused_then_timeout(body: object, identity: object) -> object:
+        """Return one refused proposal, then fail the re-ask after dispatch."""
+        if replies:
+            return replies.pop()
+        raise TimeoutError("simulator read timed out")
+
+    monkeypatch.setattr(session, "_complete", refused_then_timeout)
+    monkeypatch.setattr(
+        session, "_policy", session._policy.model_copy(update={"maximum_reasks": 1})
+    )
+    result = run_actor_workflow(
+        session,
+        _task(),
+        agent=_Actor((ToolCall(call_id="valid", name="append", arguments={"item": "a"}),)),
+        model=_UnusedModel(),
+        artifacts=project.artifacts,
+        clock=lambda: NOW,
+        code_revision="fixture",
+    )
+    assert session.has_recorded_proposal("actor-step-0")
+    assert result.evidence.stop_reason == "simulator_outcome_unknown"
+    assert result.error_type == "TimeoutError"
+
+
 def test_actor_provider_failure_is_not_a_simulator_failure(tmp_path: Path) -> None:
     """A failed actor call reaches no simulator operation and stays actor-attributed."""
     session, project, _, _ = setup(tmp_path)
