@@ -5,9 +5,11 @@ environment it builds from scratch (only a fixed hash seed and locale), no site 
 script-directory import path and a private working directory. The worker refuses to start with
 randomized hashing, so set and dict iteration order is reproducible across runs. Before it reads any
 program the worker imports the allowlisted modules, then installs kernel resource limits on
-itself: CPU time per request, address space, no file creation and no free file-descriptor slot,
-so a program can open no file, socket or pipe even if it escaped the language subset. It then
-speaks one JSON line per request on standard input and output.
+itself: CPU time per request, address space, no file creation and no free file-descriptor slot.
+The language subset is the containment; these limits are only a backstop. The descriptor limit
+stops new files, sockets and pipes only while every held descriptor stays open: code that escaped
+the subset could close one and reuse its slot, and the worker has no filesystem or network
+isolation of its own. It then speaks one JSON line per request on standard input and output.
 
 A program is one Python module that defines ``transition(state, args, facts)``. ``state`` maps
 the call's visible state domains to JSON values and is edited in place; ``args`` are the call's
@@ -536,8 +538,7 @@ def _install_limits(memory_bytes: int, cpu_seconds: int) -> None:
     if not memory_limited:
         raise SystemExit(71)
     # The listing itself holds one descriptor that it closes again, so keep only the descriptors
-    # still open afterwards. They must be exactly 0..n-1: a free slot below the limit would let
-    # an escaped program open a file.
+    # still open afterwards. They must be exactly 0..n-1, so no slot below the limit starts free.
     listed = sorted(int(name) for name in os.listdir("/dev/fd") if name.isdigit())
     held = [descriptor for descriptor in listed if _is_open(descriptor)]
     if held != list(range(len(held))):

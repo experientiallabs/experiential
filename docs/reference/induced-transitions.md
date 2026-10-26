@@ -137,8 +137,10 @@ The worker runs under these conditions:
 - It runs in a private temporary directory, with an environment built from scratch and a fixed
   hash seed.
 - Before it reads any program it sets its own limits on CPU time, address space and file size,
-  and its descriptor limit leaves no free slot. Even an escaped program can open no file, socket
-  or pipe.
+  and its descriptor limit leaves no free slot. These limits are a backstop, not a sandbox: the
+  descriptor limit stops new files, sockets and pipes only while every held descriptor stays
+  open, so code that escaped the language subset could close one and reuse its slot. The worker
+  has no filesystem or network isolation of its own; the language subset is the containment.
 - The CPU limit is re-armed before every request, so each request gets the full budget whatever
   earlier requests used.
 - Only compiled programs are cached. Each request runs the program's top level in fresh globals

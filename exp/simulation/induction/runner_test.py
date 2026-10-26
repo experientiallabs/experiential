@@ -186,18 +186,15 @@ def test_module_views_expose_exactly_the_listed_names() -> None:
         assert sorted(vars(runner._module_view(name))) == sorted(exported)
 
 
-def test_installed_limits_leave_no_free_descriptor_slot() -> None:
-    """Even the real ``open`` fails once limits are installed: every slot below the cap is held."""
+def _under_limits(probe: str) -> str:
+    """Run one probe after the real worker limits are installed and return its output."""
     script = (
-        "import errno, importlib.util, sys\n"
+        "import errno, importlib.util, os, sys\n"
         "spec = importlib.util.spec_from_file_location('runner', sys.argv[1])\n"
         "module = importlib.util.module_from_spec(spec)\n"
         "spec.loader.exec_module(module)\n"
         "module._install_limits(512 * 1024 * 1024, 10)\n"
-        "try:\n"
-        "    open('/etc/hostname')\n"
-        "except OSError as error:\n"
-        "    print(error.errno == errno.EMFILE)\n"
+        f"{probe}"
     )
     result = subprocess.run(  # noqa: S603 - fixed interpreter and test script
         (sys.executable, "-S", "-c", script, str(Path(runner.__file__))),
@@ -206,7 +203,32 @@ def test_installed_limits_leave_no_free_descriptor_slot() -> None:
         check=True,
         timeout=30,
     )
-    assert result.stdout.strip() == "True"
+    return result.stdout.strip()
+
+
+def test_installed_limits_leave_no_free_descriptor_slot() -> None:
+    """Even the real ``open`` fails once limits are installed: every slot below the cap is held."""
+    probe = (
+        "try:\n"
+        "    open('/etc/hostname')\n"
+        "except OSError as error:\n"
+        "    print(error.errno == errno.EMFILE)\n"
+    )
+    assert _under_limits(probe) == "True"
+
+
+def test_the_descriptor_limit_is_documented_as_a_backstop_only() -> None:
+    """Closing a held descriptor frees a slot, so the docs promise no escaped-code containment.
+
+    Code that escaped the subset with ``os.close`` could open a file in the freed slot; the
+    module documentation therefore names the language subset as the containment.
+    """
+    assert _under_limits("os.close(0)\nopen('/etc/hostname').close()\nprint('opened')") == (
+        "opened"
+    )
+    documentation = " ".join(str(runner.__doc__).split())
+    assert "code that escaped the subset could close one and reuse its slot" in documentation
+    assert "even if it escaped" not in documentation
 
 
 COUNTER = """
