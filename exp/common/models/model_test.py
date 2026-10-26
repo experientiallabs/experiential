@@ -287,6 +287,30 @@ def test_tool_call_preserves_optional_raw_arguments_without_changing_legacy_payl
         )
 
 
+def test_a_treated_tool_call_keeps_raw_text_beside_its_object_stand_in() -> None:
+    """A replayed call whose text names no object keeps both; artifacts see only the object."""
+    treated = ToolCall(
+        call_id="call-1",
+        name="lookup",
+        arguments={"_unparsed_arguments": "not json"},
+        raw_arguments="not json",
+        arguments_treatment="invalid_json",
+    )
+    assert treated.arguments_json() == "not json"
+    assert treated.arguments_json(sort_keys=True) == '{"_unparsed_arguments": "not json"}'
+    assert treated.model_dump(mode="json") == {
+        "call_id": "call-1",
+        "name": "lookup",
+        "arguments": {"_unparsed_arguments": "not json"},
+    }
+    with pytest.raises(ValidationError, match="requires the raw text"):
+        ToolCall(
+            call_id="call-1", name="lookup", arguments={}, arguments_treatment="truncated_json"
+        )
+    with pytest.raises(ValidationError, match="must encode one JSON object"):
+        ToolCall(call_id="call-1", name="lookup", arguments={}, raw_arguments="not json")
+
+
 def test_combine_economics_reports_partial_totals_only_when_asked() -> None:
     """Aggregation never presents a partial usage, cost, or provenance as complete."""
     priced = OperationEconomics(

@@ -20,7 +20,7 @@ from uuid import uuid4
 import pytest
 
 import exp.runtime.gateway.native_bridge as native_bridge_module
-from exp.common.core.artifacts import JsonObject
+from exp.common.core.artifacts import JsonObject, JsonValue
 from exp.common.models import (
     GatewayDeploymentCapabilities,
     GatewayTokenPrices,
@@ -457,6 +457,191 @@ def test_openrouter_sampling_extras_forward_or_drop_per_rung_never_refuse(
     for name in ("repetition_penalty", "min_p", "top_a"):
         assert f"{name}->dropped(unsupported_by_provider)" in ignored
     assert "attempt_id" in _start_first(control, admission)
+
+
+_CUT_OFF_ARGUMENTS = '{"path": "src/ma'
+"""A replayed call the model emitted cut off at ``max_tokens`` (a valid object prefix)."""
+
+
+def _history_with_malformed_call(surface: str, arguments: str) -> str:
+    """A tool-declaring body whose history replays one call carrying ``arguments``."""
+    tool: JsonObject = {
+        "name": "read",
+        "description": "Read one file.",
+        "parameters": {"type": "object", "properties": {"path": {"type": "string"}}},
+    }
+    if surface == "responses":
+        return json.dumps(
+            {
+                "model": "coding",
+                "tools": [{"type": "function", **tool}],
+                "input": [
+                    {"role": "user", "content": "go"},
+                    {
+                        "type": "function_call",
+                        "call_id": "c1",
+                        "name": "read",
+                        "arguments": arguments,
+                    },
+                    {"type": "function_call_output", "call_id": "c1", "output": "done"},
+                    {"role": "user", "content": "next"},
+                ],
+            }
+        )
+    return json.dumps(
+        {
+            "model": "coding",
+            "tools": [{"type": "function", "function": tool}],
+            "messages": [
+                {"role": "user", "content": "go"},
+                {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {
+                            "id": "c1",
+                            "type": "function",
+                            "function": {"name": "read", "arguments": arguments},
+                        }
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "c1", "content": "done"},
+                {"role": "user", "content": "next"},
+            ],
+        }
+    )
+
+
+def _replayed_upstream_arguments(payload: JsonObject) -> list[JsonValue]:
+    """Every replayed call's arguments as the rung's upstream payload carries them."""
+    found: list[JsonValue] = []
+    for item in cast("list[JsonObject]", payload.get("input") or []):
+        if item.get("type") == "function_call":
+            found.append(item["arguments"])
+    for message in cast("list[JsonObject]", payload.get("messages") or []):
+        for call in cast("list[JsonObject]", message.get("tool_calls") or []):
+            found.append(cast("JsonObject", call["function"])["arguments"])
+        content = message.get("content")
+        for block in cast("list[JsonObject]", content if isinstance(content, list) else []):
+            if block.get("type") == "tool_use":
+                found.append(block["input"])
+    return found
+
+
+_CHAT_ARGUMENTS = "messages.tool_calls.function.arguments"
+
+
+@pytest.mark.parametrize(
+    ("provider", "surface", "arguments", "expected", "disclosure"),
+    (
+        (
+            "openai-compatible",
+            "chat",
+            _CUT_OFF_ARGUMENTS,
+            {"path": "src/ma"},
+            f"{_CHAT_ARGUMENTS}->repaired(truncated_json)",
+        ),
+        (
+            "openai-compatible",
+            "chat",
+            "not json",
+            {"_unparsed_arguments": "not json"},
+            f"{_CHAT_ARGUMENTS}->wrapped(invalid_json)",
+        ),
+        (
+            "openai-compatible",
+            "responses",
+            _CUT_OFF_ARGUMENTS,
+            {"path": "src/ma"},
+            "input.arguments->repaired(truncated_json)",
+        ),
+        (
+            "anthropic",
+            "chat",
+            _CUT_OFF_ARGUMENTS,
+            {"path": "src/ma"},
+            f"{_CHAT_ARGUMENTS}->repaired(truncated_json)",
+        ),
+        (
+            "anthropic",
+            "responses",
+            "[1, 2]",
+            {"_unparsed_arguments": "[1, 2]"},
+            "input.arguments->wrapped(non_object_json)",
+        ),
+    ),
+)
+def test_history_with_a_malformed_call_serves_its_disclosed_stand_in(
+    tmp_path: Path,
+    provider: str,
+    surface: str,
+    arguments: str,
+    expected: JsonObject,
+    disclosure: str,
+) -> None:
+    """A history replaying a malformed or cut-off call no longer 400s, so the session lives.
+
+    A generic OpenAI-compatible server decodes history arguments (vLLM
+    ``json.loads`` them) and Anthropic's ``tool_use.input`` must be an object,
+    so both rungs receive the object stand-in and the admission discloses it.
+    """
+    _manager, key = _configured_gateway(
+        tmp_path,
+        provider=provider,
+        capabilities=ModelCapabilities(maximum_output_tokens=2_048, supports_tools=True),
+    )
+    control = NativeControlPlane(
+        load_gateway_components(tmp_path, environment={"TEST_PROVIDER_KEY": "local-test-key"})
+    )
+    admission = _admit(
+        control,
+        key,
+        _history_with_malformed_call(surface, arguments),
+        surface="responses" if surface == "responses" else None,
+    )
+    route = cast("list[JsonObject]", admission["route"])
+    sent = _replayed_upstream_arguments(cast("JsonObject", route[0]["upstream_payload"]))
+    if provider == "anthropic":
+        assert sent == [expected]
+    else:
+        assert [json.loads(cast("str", value)) for value in sent] == [expected]
+    assert disclosure in cast("list[str]", admission["ignored_parameters"])
+    assert "attempt_id" in _start_first(control, admission)
+
+
+@pytest.mark.parametrize("surface", ("chat", "responses"))
+def test_openai_rung_replays_malformed_history_arguments_byte_exact(
+    tmp_path: Path, surface: str
+) -> None:
+    """OpenAI's own API treats ``arguments`` as opaque: the text passes untouched, undisclosed."""
+    capabilities = ModelCapabilities(maximum_output_tokens=2_048, supports_tools=True)
+    streaming_tools = GatewayDeploymentCapabilities(
+        supports_streaming=True, supports_streaming_tool_arguments=True
+    )
+    _manager, key = _configured_pool_gateway(
+        tmp_path,
+        gateway_capabilities=(streaming_tools, streaming_tools),
+        api_key_envs=("TEST_ALPHA_KEY", "TEST_BETA_KEY"),
+        provider="openai",
+        provider_models=("gpt-5.6-sol", "gpt-5.6-sol"),
+        model_capabilities=(capabilities, capabilities),
+    )
+    control = NativeControlPlane(
+        load_gateway_components(
+            tmp_path, environment={"TEST_ALPHA_KEY": "alpha", "TEST_BETA_KEY": "beta"}
+        )
+    )
+    for arguments in (_CUT_OFF_ARGUMENTS, "not json", "[1, 2]"):
+        admission = _admit(
+            control,
+            key,
+            _history_with_malformed_call(surface, arguments),
+            surface="responses" if surface == "responses" else None,
+        )
+        route = cast("list[JsonObject]", admission["route"])
+        payload = cast("JsonObject", route[0]["upstream_payload"])
+        assert _replayed_upstream_arguments(payload) == [arguments]
+        ignored = cast("list[str]", admission.get("ignored_parameters") or [])
+        assert not [entry for entry in ignored if "arguments->" in entry]
 
 
 @pytest.mark.parametrize(
@@ -5982,7 +6167,9 @@ def test_capability_rejection_names_the_public_request_field(
     assert recorded, "the rejection records a durable failure"
     ledger = recorded[-1]
     assert ledger.failure_class == GatewayFailureClass.UNSUPPORTED_CAPABILITY
-    assert ledger.safe_message.endswith("(field: input.0.role)")
+    assert ledger.safe_message.endswith(
+        "(field: input.0.role; this model route does not support developer role messages)"
+    )
     assert "developer_messages" not in ledger.safe_message
     assert "canary" not in ledger.safe_message
 
@@ -7697,6 +7884,116 @@ def test_workbuddy_message_bookkeeping_is_dropped_before_dispatch(tmp_path: Path
     assert tagged_scope == plain_scope
 
 
+def test_legacy_function_calling_history_dispatches_as_tools_on_a_chat_rung(
+    tmp_path: Path,
+) -> None:
+    """A deprecated ``functions`` conversation admits, rewritten to tools and disclosed.
+
+    Production 2026-10-24: an AsyncOpenAI 1.109.1 client replaying a history
+    with an assistant ``function_call`` turn was refused ``Invalid value for
+    'messages.44.function_call'`` on every turn, though OpenAI still serves the
+    deprecated shapes. The chat rung receives the ``tool_calls`` / ``tool``
+    spelling, never the legacy keys, and the keyed replay scope equals that of
+    the same history written with tools.
+    """
+    root = tmp_path / "gateway"
+    root.mkdir()
+    _manager, raw_key = _configured_gateway(
+        root,
+        capabilities=ModelCapabilities(supports_tools=True, maximum_output_tokens=128_000),
+    )
+    control = NativeControlPlane(
+        load_gateway_components(root, environment={"TEST_PROVIDER_KEY": "provider-secret-canary"}),
+        request_timeout_seconds=120.0,
+    )
+    function = {
+        "name": "lookup",
+        "parameters": {"type": "object", "properties": {"q": {"type": "string"}}},
+    }
+    legacy = json.dumps(
+        {
+            "model": "coding",
+            "functions": [function],
+            "function_call": "auto",
+            "messages": [
+                {"role": "user", "content": "find it"},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "function_call": {"name": "lookup", "arguments": '{"q":"it"}'},
+                },
+                {"role": "function", "name": "lookup", "content": "found"},
+                {"role": "user", "content": "thanks"},
+            ],
+        }
+    )
+    modern = json.dumps(
+        {
+            "model": "coding",
+            "tools": [{"type": "function", "function": function}],
+            "tool_choice": "auto",
+            "messages": [
+                {"role": "user", "content": "find it"},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "call_legacy_function_1",
+                            "type": "function",
+                            "function": {"name": "lookup", "arguments": '{"q":"it"}'},
+                        }
+                    ],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "call_legacy_function_1",
+                    "name": "lookup",
+                    "content": "found",
+                },
+                {"role": "user", "content": "thanks"},
+            ],
+        }
+    )
+    admission = _flatten_started(control, _admit(control, raw_key, legacy))
+    assert admission["ignored_parameters"] == [
+        "messages.function_call->translated(tool_calls)",
+        "messages.role->translated(function_as_tool)",
+        "functions->translated(tools)",
+        "function_call->translated(tool_choice)",
+    ]
+    upstream = admission["upstream_payload"]
+    assert isinstance(upstream, dict)
+    assert "functions" not in upstream and "function_call" not in upstream
+    assert upstream["tool_choice"] == "auto"
+    tools = cast("list[JsonObject]", upstream["tools"])
+    assert [cast("JsonObject", tool["function"])["name"] for tool in tools] == ["lookup"]
+    messages = cast("list[JsonObject]", upstream["messages"])
+    assert [message["role"] for message in messages] == ["user", "assistant", "tool", "user"]
+    assert all("function_call" not in message for message in messages)
+    calls = cast("list[JsonObject]", messages[1]["tool_calls"])
+    assert [call["id"] for call in calls] == ["call_legacy_function_1"]
+    assert messages[2]["tool_call_id"] == "call_legacy_function_1"
+    legacy_scope = _claim_scope(control, raw_key, legacy, idempotency_key="legacy-op")
+    modern_scope = _claim_scope(control, raw_key, modern, idempotency_key="legacy-op")
+    assert legacy_scope == modern_scope
+    unpaired = json.dumps(
+        {
+            "model": "coding",
+            "messages": [
+                {"role": "user", "content": "find it"},
+                {"role": "function", "name": "lookup", "content": "found"},
+            ],
+        }
+    )
+    with pytest.raises(NativeBridgeError) as refused:
+        control.admit(json.dumps({"raw_key": raw_key, "body": unpaired}))
+    error = json.loads(refused.value.public_error_json)
+    assert error["status_code"] == 400
+    assert error["code"] == "invalid_parameter"
+    assert error["param"] == "messages.1.name"
+
+
 def test_claude_code_turn_output_config_serves_on_the_messages_lane(tmp_path: Path) -> None:
     """Claude Code's ``messages[1].output_config`` admits, disclosed, never forwarded.
 
@@ -7802,3 +8099,152 @@ def test_responses_instructions_reach_a_chat_wire_lane_as_system(tmp_path: Path)
     assert isinstance(messages, list)
     assert messages[0] == {"role": "system", "content": "Answer in French."}
     assert admission["ignored_parameters"] == [DEVELOPER_ROLE_REWRITE_DISCLOSURE]
+
+
+def _tool_change_body(*, count_only: bool = False) -> str:
+    """A Claude Code late-tool-additions turn on the Messages lane.
+
+    One deferred MCP tool is added by reference, one tool is defined by
+    value, and one is withdrawn, all in the mid-conversation system turn
+    Claude Code appends after a user turn.
+    """
+    schema: JsonObject = {"type": "object", "properties": {"q": {"type": "string"}}}
+    payload: JsonObject = {
+        "model": "coding",
+        "tools": [
+            {"name": "Bash", "input_schema": schema},
+            {"name": "mcp__github__create_issue", "input_schema": schema, "defer_loading": True},
+            {"name": "mcp__slack__post_message", "input_schema": schema, "defer_loading": True},
+        ],
+        "messages": [
+            {"role": "user", "content": "open an issue"},
+            {
+                "role": "system",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": "<system-reminder>MCP tools changed.</system-reminder>",
+                    },
+                    {
+                        "type": "tool_removal",
+                        "tool": {"type": "tool_reference", "name": "mcp__slack__post_message"},
+                    },
+                    {
+                        "type": "tool_addition",
+                        "tool": {"type": "tool_reference", "name": "mcp__github__create_issue"},
+                    },
+                    {
+                        "type": "tool_addition",
+                        "tool": {
+                            "type": "tool_definition",
+                            "definition": {"name": "mcp__linear__create", "input_schema": schema},
+                        },
+                        "cache_control": {"type": "ephemeral"},
+                    },
+                ],
+            },
+        ],
+    }
+    if not count_only:
+        payload["max_tokens"] = 64
+    return json.dumps(payload)
+
+
+_TOOL_CHANGE_DISCLOSURES = (
+    "messages.content.tool_removal->text",
+    "messages.content.tool_addition->tools",
+)
+
+
+def test_claude_code_tool_changes_serve_on_an_anthropic_messages_rung(tmp_path: Path) -> None:
+    """``tool_addition`` / ``tool_removal`` admit on the Messages lane, applied and stated.
+
+    Production 2026-10-18 onward: claude-cli 2.1.293 through 2.1.310 sent
+    tool changes in a mid-conversation system turn, and every such
+    ``/v1/messages`` call was a 400 ``unsupported content block type
+    'tool_addition'`` though Anthropic serves the same body. On a native
+    Anthropic rung the added tool dispatches without ``defer_loading``, the
+    defined tool joins ``tools``, the withdrawn tool stays declared and
+    deferred, and the system turn's changes ride as text after the reminder,
+    the block's cache marker on its line.
+    """
+    root = tmp_path / "anthropic-root"
+    root.mkdir()
+    _manager, raw_key = _configured_gateway(
+        root,
+        provider="anthropic",
+        capabilities=ModelCapabilities(supports_tools=True, maximum_output_tokens=128_000),
+    )
+    control = NativeControlPlane(
+        load_gateway_components(root, environment={"TEST_PROVIDER_KEY": "provider-secret-canary"}),
+        request_timeout_seconds=120.0,
+    )
+
+    admission = _flatten_started(
+        control, _admit(control, raw_key, _tool_change_body(), surface="messages")
+    )
+
+    ignored = cast("list[str]", admission["ignored_parameters"])
+    assert all(disclosure in ignored for disclosure in _TOOL_CHANGE_DISCLOSURES)
+    upstream = admission["upstream_payload"]
+    assert isinstance(upstream, dict)
+    tools = cast("list[JsonObject]", upstream["tools"])
+    assert [(tool["name"], tool.get("defer_loading")) for tool in tools] == [
+        ("Bash", None),
+        ("mcp__github__create_issue", None),
+        ("mcp__slack__post_message", True),
+        ("mcp__linear__create", None),
+    ]
+    messages = cast("list[JsonObject]", upstream["messages"])
+    assert [message["role"] for message in messages] == ["user"]
+    blocks = cast("list[JsonObject]", messages[0]["content"])
+    text = "".join(str(block.get("text", "")) for block in blocks)
+    assert "Tool removed: mcp__slack__post_message." in text
+    assert "Tool added: mcp__github__create_issue." in text
+    assert "Tool added: mcp__linear__create." in text
+    assert blocks[-1]["cache_control"] == {"type": "ephemeral"}
+    assert "tool_addition" not in json.dumps(upstream)
+
+
+def test_claude_code_tool_changes_serve_on_a_chat_wire_rung(tmp_path: Path) -> None:
+    """A Chat-wire rung receives every tool loaded and the changes as instruction text."""
+    _manager, raw_key = _configured_gateway(
+        tmp_path,
+        capabilities=ModelCapabilities(supports_tools=True, maximum_output_tokens=128_000),
+    )
+    control = NativeControlPlane(
+        load_gateway_components(tmp_path, environment={"TEST_PROVIDER_KEY": "local-test-key"})
+    )
+
+    admission = _admit(control, raw_key, _tool_change_body(), surface="messages")
+
+    ignored = cast("list[str]", admission["ignored_parameters"])
+    assert all(disclosure in ignored for disclosure in _TOOL_CHANGE_DISCLOSURES)
+    route = admission["route"]
+    assert isinstance(route, list) and isinstance(route[0], dict)
+    payload = route[0]["upstream_payload"]
+    assert isinstance(payload, dict)
+    tools = cast("list[JsonObject]", payload["tools"])
+    assert [cast("JsonObject", tool["function"])["name"] for tool in tools] == [
+        "Bash",
+        "mcp__github__create_issue",
+        "mcp__slack__post_message",
+        "mcp__linear__create",
+    ]
+    assert "defer_loading" not in json.dumps(payload)
+    wire_text = json.dumps(_payload_messages(admission))
+    assert "Tool removed: mcp__slack__post_message." in wire_text
+    assert "Tool added: mcp__linear__create." in wire_text
+    assert "tool_addition" not in json.dumps(payload)
+
+
+def test_count_tokens_counts_a_tool_change_turn(tmp_path: Path) -> None:
+    """``count_tokens`` accepts the same turn (production refused it too) and counts it."""
+    control, raw_key = _control_plane(tmp_path)
+    counted = json.loads(
+        control.count_tokens(
+            json.dumps({"raw_key": raw_key, "body": _tool_change_body(count_only=True)})
+        )
+    )
+    assert isinstance(counted["input_tokens"], int)
+    assert counted["input_tokens"] > 0

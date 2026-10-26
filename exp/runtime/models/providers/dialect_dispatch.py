@@ -29,6 +29,7 @@ from exp.runtime.models.providers.errors import ProviderCapabilityError
 from exp.runtime.models.providers.fireworks import (
     require_responses_continuation_channel,
 )
+from exp.runtime.models.providers.history_tool_arguments import history_tool_arguments_for_wire
 from exp.runtime.models.providers.messages_payloads import (
     anthropic_messages_stream_payload,
     bedrock_converse_stream_payload,
@@ -521,6 +522,9 @@ def dialect_stream_payload(
         ProviderCapabilityError: The request uses a capability this dialect
             cannot preserve.
     """
+    # Replayed calls whose text encodes no object: OpenAI's own wires take the
+    # raw text, every other wire its disclosed object stand-in.
+    provider_request = history_tool_arguments_for_wire(profile, provider_request)
     if profile.dialect != NATIVE_TOOL_REFERENCE_DIALECT:
         # Only Anthropic expands tool_reference blocks and honors
         # defer_loading without a tool-search tool; every other wire gets the

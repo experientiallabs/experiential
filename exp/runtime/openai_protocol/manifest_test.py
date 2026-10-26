@@ -47,6 +47,10 @@ def test_manifests_classify_explicit_exclusions() -> None:
     chat = disposition_map(CHAT_MANIFEST)
     responses = disposition_map(RESPONSES_MANIFEST)
     assert chat["audio"] == CompatibilityDisposition.UNSUPPORTED
+    # OpenAI's deprecated tools spellings are rewritten to tools/tool_choice
+    # with disclosure (legacy_functions), never refused.
+    for legacy in ("functions", "function_call"):
+        assert chat[legacy] == CompatibilityDisposition.CONDITIONALLY_SUPPORTED
     # Value-constrained acceptances: the wire models admit only the no-op
     # values Copilot hardcodes (n:1, truncation:"disabled").
     assert chat["n"] == CompatibilityDisposition.SUPPORTED

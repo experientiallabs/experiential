@@ -80,3 +80,43 @@ across turns so provider prompt caching holds; the cost is the deferred definiti
 A request that does declare a tool-search tool takes the planner above instead: an all-native
 route keeps the provider's search and its markers, and any other route runs the gateway search,
 which partitions the tools and clears the markers itself. Only the reference text applies to it.
+
+## Mid-conversation tool changes (`tool_addition` / `tool_removal`)
+
+Anthropic lets a `role: "system"` turn inside `messages` change which tools the model is offered
+from that point on, without editing `tools`
+([Mid-conversation system messages and tool changes](https://platform.claude.com/docs/en/build-with-claude/mid-conversation-system-messages)).
+The blocks sit in the system turn's `content`, beside `text` blocks:
+
+| Block | Shape | Meaning |
+|---|---|---|
+| `tool_addition` by reference | `{"type": "tool_addition", "tool": {"type": "tool_reference", "name": "<name>"}}` | offer a tool declared in `tools` (usually `defer_loading: true`), or re-offer a removed one |
+| `tool_addition` by value | `{"type": "tool_addition", "tool": {"type": "tool_definition", "definition": {<custom tool>}}}` | define a tool (beta `inline-tools-2026-09-15`); a later definition under the same name replaces it |
+| `tool_removal` | `{"type": "tool_removal", "tool": {"type": "tool_reference", "name": "<name>"}}` | withdraw a tool from that point on |
+
+Claude Code sends them when MCP tools arrive late or deferred tools load: the system turn's
+reminder text, then one removal per withdrawn tool, then one addition per added tool, the cache
+marker on the last block. The decoder admits them in system turns only (any other role is a named
+400). No dispatch wire carries them as sent: the gateway re-emits every mid-conversation system
+turn as instruction text (user text on Anthropic rungs), and no other dialect has a positional
+tool list. So every rung, Anthropic's included, receives one translation
+(`exp/runtime/anthropic_protocol/tool_changes.py`):
+
+| Change | Applied to `tools` | Stated in the system turn | Disclosure |
+|---|---|---|---|
+| addition by reference | the named tool loses `defer_loading` and is offered immediately | `Tool added: <name>. ...` | `messages.content.tool_addition->tools` |
+| addition by value | the custom tool joins `tools`, replacing a same-named declaration in place | `Tool added: <name>. ...` (`Tool declared: ...` for a deferred definition) | `messages.content.tool_addition->tools` |
+| removal | none: the tool stays declared, because earlier history may call it | `Tool removed: <name>. ...` | `messages.content.tool_removal->text` |
+
+An added tool is therefore offered from the start of the request rather than only from its system
+turn, a superset that keeps every tool the caller made available callable. Each change after the
+first edits `tools`, so a rung's provider prompt cache for the tool prefix misses once per change,
+where Anthropic's positional changes keep it. A cache marker on a block (or inside its
+definition, never both) stays on that block's text line, the same prompt boundary.
+`count_tokens` decodes the same way, so the count includes the added definitions.
+
+A reference to a name that neither `tools` nor an earlier by-value definition declares is a named
+400 on `messages.N.content.M.tool.name`, as on Anthropic (`tool_reference_unresolved`); a
+definition reusing a declared server tool's name is a 400 on its `definition.name`. MCP references
+(`mcp_tool_reference`, `mcp_toolset_reference`) and non-custom definitions (server tools,
+`mcp_toolset`) are named 400s: declare the tool in `tools` and add it by reference.

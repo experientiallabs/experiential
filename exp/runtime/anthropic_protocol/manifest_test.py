@@ -84,9 +84,9 @@ def test_every_official_sdk_tool_definition_field_is_consciously_classified() ->
 
     # The accepted table is executable, not aspirational: the strict wire
     # model must accept exactly the accepted fields.
-    from exp.runtime.anthropic_protocol import requests as anthropic_requests
+    from exp.runtime.anthropic_protocol.tool_changes import CustomTool
 
-    wire_fields = set(anthropic_requests._Tool.model_fields)
+    wire_fields = set(CustomTool.model_fields)
     assert wire_fields == set(MESSAGES_TOOL_FIELDS_ACCEPTED)
 
 

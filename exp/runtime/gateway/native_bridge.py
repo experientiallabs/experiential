@@ -668,15 +668,19 @@ class NativeControlPlane(
                     public_tools=bool(public_request.tools),
                     developer_messages_param=decoded.developer_messages_param,
                 )
-                # The ledger keeps the capability-free generic sentence, but a
-                # bare "cannot preserve a requested capability" is untriageable
-                # from an alert. Append the PUBLIC field the caller was told
-                # about (never the internal literal), so operators read
-                # "(field: stop)" without opening the request.
+                # The ledger keeps the generic sentence, but a bare "cannot
+                # preserve a requested capability" is untriageable from an
+                # alert, and the field alone is ambiguous (every attachment
+                # kind is "messages"). Append the PUBLIC field and the refused
+                # capability in plain words (never the internal literal), so
+                # operators read "(field: messages; this model route does not
+                # support image input)" without opening the request.
                 failure = failure.model_copy(
                     update={
                         "safe_message": ledger_capability_message(
-                            failure.safe_message, public_error.detail.param
+                            failure.safe_message,
+                            public_error.detail.param,
+                            exc.capability,
                         )
                     }
                 )
