@@ -289,3 +289,16 @@ def test_donors_and_labels_never_cross_worlds_that_share_a_visible_state() -> No
     assert row.delegated == 2 and row.affected_trajectories == 1
     assert row.verified_correct == 1
     assert row.success["unit_differences"] == {"a": 0.0, "b": 0.0}
+
+
+def test_unknown_donors_and_main_outcomes_stay_bounds_against_the_cascade() -> None:
+    """One passing donor among unknown ones does not score as a certain pass."""
+    donors = [branch("world-x", "a", index, "close", "unassessable") for index in range(3)]
+    passing = branch("world-x", "a", 3, "close", "pass")
+    changed = branch("world-x", "a", 4, "open", "fail")
+    unknown_main = branch("world-x", "a", 5, "open", "unassessable")
+    row = offline([*donors, passing, changed, unknown_main], ("a",))
+    # Donors: three unknown (counted failed) and one pass give 0.25 to each changed trajectory.
+    # The changed failure gains 0.25; the unknown main outcome, bounded at 1, loses 0.75. The
+    # unchanged pass is paired with itself; unchanged unknowns carry no paired evidence.
+    assert row.success["estimate"] == pytest.approx((0.25 + 0.25 + 1.0) / 3 - (0.0 + 1.0 + 1.0) / 3)

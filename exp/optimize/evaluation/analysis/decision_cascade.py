@@ -15,7 +15,9 @@ The procedure is registered before any decider answer is read:
    state the cascade follows the decider, so the trajectories that took the decider's decision
    from the same state of the same checkpoint (continuation branches reach shared states) stand
    in for what would have followed. Without such an observed continuation the trajectory counts
-   as a task failure and a policy violation, because what would have followed is not observed.
+   as a task failure and a policy violation, because what would have followed is not observed;
+   an unknown donor outcome counts the same way, and an unknown main outcome of a trajectory the
+   cascade changes counts as a main success.
 5. Select by the registered objective: the largest delegated share whose task success and
    policy compliance stay within their margins of the main model alone, compared per lineage.
    Ties go to the higher threshold. The selected threshold becomes a deployable
@@ -75,7 +77,7 @@ from exp.runtime.sessions.dispatch_ledger import DispatchLedger
 
 # Identity of the estimator and selection rule below, in place of their source text. Bump it
 # when either changes; exp/tests/code_protocols_test.py records the covered source.
-CASCADE_FIT_PROTOCOL = "decision-cascade-fit-v2"
+CASCADE_FIT_PROTOCOL = "decision-cascade-fit-v3"
 FIT_SCOPE = (
     "development fit on the main model's own trajectories; offline estimate splicing observed "
     "continuations at accepted disagreements and failing a trajectory without one; states the "
@@ -271,7 +273,9 @@ def estimate_threshold(
     state; the trajectories that took the same decision (or, for a draft, the same complete
     action) from the same state of the same checkpoint are its observed continuations, and their
     estimated outcomes are averaged in its place. Without any such continuation it counts as a
-    task failure and a policy violation. Splicing always moves to a later disagreement, so the
+    task failure and a policy violation. Unknown outcomes stay bounds adverse to the cascade: an
+    unknown donor counts as a failure, and an unknown main outcome of a trajectory the cascade
+    would change counts as a main success. Splicing always moves to a later disagreement, so the
     recursion ends.
     """
     decision_labels = points.labels(by="decision")
@@ -308,17 +312,20 @@ def estimate_threshold(
         (row.study.artifact_id, row.branch): {"success": row.outcome, "compliance": row.policy}
         for row in points.trajectories
     }
-    memo: dict[tuple[Trajectory, str], float | None] = {}
+    memo: dict[tuple[Trajectory, str], float] = {}
 
-    def spliced(trajectory: Trajectory, name: str) -> float | None:
-        """Return the cascade estimate of one trajectory, None when it is unknown."""
+    def spliced(trajectory: Trajectory, name: str) -> float:
+        """Return the cascade estimate of one trajectory, an unknown outcome counted as failed.
+
+        Counting an unknown donor as a failure is the bound adverse to the cascade.
+        """
         if (trajectory, name) not in memo:
             if trajectory not in diverges:
-                memo[trajectory, name] = _known(verdicts[trajectory][name])
+                observed = _known(verdicts[trajectory][name])
+                memo[trajectory, name] = 0.0 if observed is None else observed
             else:
                 donors = [spliced(row, name) for row in takes.get(diverges[trajectory], [])]
-                known = [value for value in donors if value is not None]
-                memo[trajectory, name] = sum(known) / len(known) if known else 0.0
+                memo[trajectory, name] = sum(donors) / len(donors) if donors else 0.0
         return memo[trajectory, name]
 
     main: dict[str, dict[str, list[float]]] = {"success": {}, "compliance": {}}
@@ -329,10 +336,15 @@ def estimate_threshold(
             observed = _known(verdicts[trajectory][name])
             main[name].setdefault(row.lineage, [])
             cascade[name].setdefault(row.lineage, [])
-            estimate = spliced(trajectory, name)
-            if observed is not None and estimate is not None:
+            if trajectory in diverges:
+                # An unknown main outcome is bounded against the cascade, as in confirmation.
+                main[name][row.lineage].append(1.0 if observed is None else observed)
+                cascade[name][row.lineage].append(spliced(trajectory, name))
+            elif observed is not None:
+                # Without a delegated disagreement both arms share the observed outcome; an
+                # unknown one carries no paired evidence and is left out of both.
                 main[name][row.lineage].append(observed)
-                cascade[name][row.lineage].append(estimate)
+                cascade[name][row.lineage].append(observed)
     success = unit_difference_summary(cascade["success"], main["success"])
     compliance = unit_difference_summary(cascade["compliance"], main["compliance"])
     count = len(points.points)
