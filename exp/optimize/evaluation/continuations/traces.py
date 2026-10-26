@@ -7,13 +7,15 @@ It reads only saved artifacts: no runtime code, world or provider is opened.
 
 Authority. Each executed step carries the world receipt of the backend that answered it, and
 only a reply whose receipt names a ``native`` owner is source evidence. A branch whose own steps
-include at least one native reply is exported as ``generated-native``: its simulated replies, and
-any reply without proven native authority (an unverifiable prefix, a backend without receipts),
-are excluded from the trace and marked ``excluded`` in its step ledger, so the call stays visible
-with no recorded reply and learning skips it. A branch with no native reply but a simulated one
-is exported as ``generated-simulated`` with every reply retained for inspection; its traces carry
-``simulation`` provenance, and the build refuses them as learning source. A branch that executed
-no step with known authority carries no world evidence and is skipped.
+include at least one native reply and whose conversation, inherited prefix included, holds no
+simulated reply is exported as ``generated-native``: any reply without proven native authority
+(an unverifiable prefix, a backend without receipts) is excluded from the trace and marked
+``excluded`` in its step ledger, so the call stays visible with no recorded reply and learning
+skips it. A branch with any simulated reply is exported as ``generated-simulated`` with every
+reply retained for inspection, because its later actions and its verifier grade over the final
+world both depend on simulated execution; its traces carry ``simulation`` provenance, and the
+build refuses them as learning source. A branch that executed no step with known authority
+carries no world evidence and is skipped.
 
 Lineage. Every fork and continuation of one captured task declares the source task's lineage
 group as its conversation and as its declared task identity (``task_lineage``), under one
@@ -130,7 +132,7 @@ class TrajectoryTraceSummary(ContractModel):
         studies: Continuation-study results the generators reached.
         branches: Saved branches considered.
         native: Native traces, including mixed ones.
-        mixed: Native traces with at least one excluded reply.
+        mixed: Native traces with at least one excluded reply of unproven authority.
         simulated: Traces labelled ``generated-simulated``.
         duplicates: Branches collapsed into an identical trajectory's trace.
         skipped: Branches that produced no trace.
@@ -332,15 +334,13 @@ def _trajectory(
     owners = {
         entry.reply.owner for entry in reconstructed if entry.phase == "branch" and entry.reply
     }
-    if "native" in owners:
-        authority: Authority = "generated-native"
-    elif "simulated" in owners:
-        authority = "generated-simulated"
-    else:
+    if not owners & {"native", "simulated"}:
         return skip(
             "the branch executed no step with native or simulated authority evidence, so it "
             "carries no world evidence"
         )
+    simulated = any(entry.reply and entry.reply.owner == "simulated" for entry in reconstructed)
+    authority: Authority = "generated-simulated" if simulated else "generated-native"
     rendered = _conversation(project, study, branch, checkpoint, reconstructed, authority)
     if isinstance(rendered, str):
         return skip(rendered)

@@ -424,10 +424,10 @@ def mixed_task() -> TaskCase:
     )
 
 
-def test_mixed_episodes_keep_only_native_replies_including_through_fork_lineage(
+def test_mixed_episodes_with_a_simulated_reply_are_simulated_including_through_fork_lineage(
     tmp_path: Path,
 ) -> None:
-    """Simulated replies are excluded and marked, also when inherited from a parent branch."""
+    """A simulated refund decides the mixed grade, so the trace is simulated, also as a prefix."""
     project = ProjectStore(tmp_path, PROJECT)
     store = project.artifacts
     events: list[MixedEvent] = []
@@ -446,18 +446,24 @@ def test_mixed_episodes_keep_only_native_replies_including_through_fork_lineage(
         ],
     )
     summary = export_trajectory_traces(project, TrajectoryTraceExport(generators=(parent,)))
-    assert (summary.native, summary.mixed, summary.simulated) == (1, 1, 0)
-    (trace,) = imported(tmp_path, summary, "generated-native")
+    assert (summary.native, summary.mixed, summary.simulated) == (0, 0, 1)
+    (trace,) = imported(tmp_path, summary, "generated-simulated")
+    assert trace.source.identity.kind == "simulation"
     assert [(row["tool"], row["owner"], row["reply"]) for row in steps(trace)] == [
-        ("refund", "simulated", "excluded"),
+        ("refund", "simulated", "recorded"),
         ("place_order", "native", "recorded"),
     ]
-    assert [exchange.name for exchange in recorded_exchanges(trace, "lineage")] == ["place_order"]
-    assert '"refund": 1' not in trace.model_dump_json()  # the simulated reply never appears
     world_identity = metadata(trace)["world"]
     assert isinstance(world_identity, dict) and world_identity["kind"] == "mixed"
+    with pytest.raises(ValueError, match="carry simulation provenance"):
+        build_task_set(
+            TraceNormalizationResult(traces=(trace,), issues=()),
+            ProjectStore(tmp_path, "learner").artifacts,
+            created_at=datetime.now(UTC),
+            code_revision=REVISION,
+        )
 
-    # A fork resumed after the simulated refund inherits it as prefix, still excluded.
+    # A fork resumed after the simulated refund inherits it as prefix and stays simulated.
     (branch,) = load_study(store, parent).branches
     fork_point = branch.checkpoints[0]
     child = study(
@@ -467,12 +473,12 @@ def test_mixed_episodes_keep_only_native_replies_including_through_fork_lineage(
         [(AssistantAction(tool_calls=(_order("o2", "desk"),)), AssistantAction(content="done"))],
     )
     summary = export_trajectory_traces(project, TrajectoryTraceExport(generators=(child,)))
-    (forked,) = imported(tmp_path, summary, "generated-native")
+    assert (summary.native, summary.simulated) == (0, 1)
+    (forked,) = imported(tmp_path, summary, "generated-simulated")
     assert [(row["phase"], row["owner"], row["reply"]) for row in steps(forked)] == [
-        ("prefix", "simulated", "excluded"),
+        ("prefix", "simulated", "recorded"),
         ("branch", "native", "recorded"),
     ]
-    assert forked.initial_context["replay_from"] == 0
     occurrences = metadata(forked)["occurrences"]
     assert isinstance(occurrences, list)
     (occurrence,) = occurrences
