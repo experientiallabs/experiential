@@ -72,7 +72,7 @@ pub(crate) async fn acquire_batch_permit(
     );
     match tokio::time::timeout(state.request_timeout, acquire).await {
         Ok(Ok(permit)) => Ok(permit),
-        Ok(Err(_)) => Err(PublicError::draining()),
+        Ok(Err(error)) => Err(error),
         Err(_) => Err(PublicError::new(
             429,
             "unavailable_route",
