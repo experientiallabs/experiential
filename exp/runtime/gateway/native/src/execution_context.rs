@@ -189,7 +189,9 @@ mod tests {
                 assert!(enforce(&states[0], "block", "alpha").is_err());
                 assert_eq!(enforce(&states[1], "block", "alpha").unwrap(), "alpha");
                 assert!(matches!(
-                    enforce(&states[2], "block", "process").unwrap_err().class,
+                    enforce(&states[2], "block", "process")
+                        .unwrap_err()
+                        .failure_class,
                     crate::errors::FailureClass::Unavailable
                 ));
                 // Independent control planes can reuse every caller/store-local replay ID.
