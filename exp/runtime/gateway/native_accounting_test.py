@@ -954,6 +954,36 @@ def test_predispatch_and_provider_terminal_settlements_do_not_invent_disconnect_
     assert terminal.usage_incomplete_due_to_disconnect is False
 
 
+@pytest.mark.parametrize("opened", [None, False, True])
+@pytest.mark.parametrize("paid_prework", [False, True])
+def test_settlement_preserves_private_execution_observation(
+    opened: bool | None, paid_prework: bool
+) -> None:
+    """The write seam receives witnessed facts without a meter or customer waiver."""
+    registry, ledger, entry = _registry(background_recovery=False)
+    entry.no_paid_prework = not paid_prework
+    started = _start(registry, ordinal=0)
+    payload: JsonObject = {
+        "request_id": entry.authorization.request_id,
+        "attempt_id": started["attempt_id"],
+        "outcome": "failed",
+        "usage": None,
+        "failure": {"failure_class": "transport", "safe_message": "transport failed"},
+        "finalize": True,
+    }
+    if opened is not None:
+        payload["opened"] = opened
+    registry.settle(json.dumps(payload))
+    terminal = ledger.terminal_events[-1]
+    assert terminal is not None
+    assert terminal.attempt_stream_opened is opened
+    assert terminal.attempt_paid_prework is (None if opened is None else paid_prework)
+    assert terminal.usage is None
+    assert not terminal.accounting_release_reservation
+    assert not terminal.decision_provider_rejected
+    registry.close()
+
+
 def _start(
     registry: NativeAttemptAccounting,
     *,

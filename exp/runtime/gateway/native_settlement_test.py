@@ -43,6 +43,13 @@ from exp.runtime.gateway.native_settlement import (
 )
 
 
+@pytest.mark.parametrize("opened", [0, 1, "false", "true", {}, []])
+def test_response_phase_rejects_coerced_provenance(opened: JsonValue) -> None:
+    """Only a native boolean can describe whether the provider response opened."""
+    with pytest.raises(ValueError):
+        NativeSettlementPayload.model_validate({"opened": opened})
+
+
 def test_graceful_retirement_keeps_unknown_usage_and_no_rejection_certificate() -> None:
     """A health-only connection hint cannot release an unresolved provider attempt."""
     data: JsonObject = {

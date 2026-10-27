@@ -14,6 +14,31 @@ from exp.runtime.gateway.stream_contracts import (
 )
 
 
+def test_attempt_observation_is_private_and_does_not_authorize_billing() -> None:
+    """Execution facts survive local copying, but public JSON cannot recreate them."""
+    event = GatewayEvent(
+        kind=GatewayEventKind.FAILED,
+        sequence_number=0,
+        failure=GatewayFailure(
+            failure_class=GatewayFailureClass.TRANSPORT, safe_message="transport failed"
+        ),
+    )
+    observed = event.with_attempt_observation(stream_opened=False, paid_prework=False)
+    assert event.attempt_stream_opened is None
+    assert observed.attempt_stream_opened is False
+    assert observed.attempt_paid_prework is False
+    assert observed.model_copy().attempt_stream_opened is False
+    assert observed.model_dump_json() == event.model_dump_json()
+    assert (
+        GatewayEvent.model_validate_json(observed.model_dump_json()).attempt_stream_opened is None
+    )
+    assert not observed.accounting_release_reservation
+    assert not observed.decision_provider_rejected
+    assert observed.usage is None
+    with pytest.raises(ValidationError):
+        GatewayEvent.model_validate({**event.model_dump(), "_attempt_stream_opened": False})
+
+
 def test_gateway_failure_carries_an_optional_bounded_refusal_reason() -> None:
     """The refusal reason is an optional typed field that round-trips through
     the contract's JSON serialization and defaults to absent."""

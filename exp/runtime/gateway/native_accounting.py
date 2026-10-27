@@ -769,6 +769,13 @@ class NativeAttemptAccounting:
         parsed = terminal_from_settlement(data, surface=entry.authorization.surface)
         retain_recovery_observation_time(self.recovery, entry, attempt_id)
         terminal, failure = settled_terminal(data, entry, parsed=parsed, loads=self._loads)
+        # Missing response provenance stays unknown. A timeout sweep or a
+        # provider-shaped event cannot manufacture a native phase observation.
+        if isinstance(data.get("opened"), bool):
+            terminal = terminal.with_attempt_observation(
+                stream_opened=data["opened"] is True,
+                paid_prework=not entry.no_paid_prework,
+            )
         try:
             self._finish_attempt(
                 attempt_id=attempt_id,

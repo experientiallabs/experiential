@@ -240,6 +240,8 @@ class GatewayEvent(ContractModel):
     sequence_number: int = Field(ge=0)
     _accounting_recovery: bool = PrivateAttr(default=False)
     _accounting_release_reservation: bool = PrivateAttr(default=False)
+    _attempt_stream_opened: bool | None = PrivateAttr(default=None)
+    _attempt_paid_prework: bool | None = PrivateAttr(default=None)
     text_delta: str | None = None
     reasoning_summary_output_index: int | None = Field(default=None, ge=0)
     reasoning_summary_index: int | None = Field(default=None, ge=0)
@@ -302,6 +304,25 @@ class GatewayEvent(ContractModel):
         Literal["delta", "text_done", "content_part_done", "item_done", "terminal"] | None
     ) = Field(default=None, alias="phase")
     responses_logprobs_records: tuple[JsonObject, ...] | None = Field(default=None, alias="records")
+
+    @property
+    def attempt_stream_opened(self) -> bool | None:
+        """Whether a provider stream opened; this does not classify HTTP error responses."""
+        return self._attempt_stream_opened
+
+    @property
+    def attempt_paid_prework(self) -> bool | None:
+        """Whether the admitted request may have paid prework, independent of its meter."""
+        return self._attempt_paid_prework
+
+    def with_attempt_observation(
+        self, *, stream_opened: bool, paid_prework: bool
+    ) -> GatewayEvent:
+        """Attach execution facts privately without deciding a host's billing policy."""
+        event = self.model_copy()
+        event._attempt_stream_opened = stream_opened
+        event._attempt_paid_prework = paid_prework
+        return event
 
     @property
     def accounting_recovery(self) -> bool:

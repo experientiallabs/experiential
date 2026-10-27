@@ -222,6 +222,7 @@ class NativeSettlementPayload(BaseModel):
 
     model_config = ConfigDict(extra="ignore")
     graceful_transport_retirement: bool = Field(default=False, strict=True)
+    opened: bool | None = Field(default=None, strict=True)
     dispatched: bool = Field(default=False, strict=True)
     finalize: bool = Field(default=True, strict=True)
     usage_incomplete_due_to_disconnect: bool = Field(default=False, strict=True)
