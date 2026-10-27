@@ -17,11 +17,16 @@ use axum::response::Response;
 use base64::Engine as _;
 use serde_json::{json, Map, Value};
 
+use crate::admission::pre_admission_permit;
 use crate::encode::compact_json;
 use crate::errors::PublicError;
 use crate::respond::{bearer_key, error_response};
 use crate::route_images::serve_images;
 use crate::server::AppState;
+
+#[cfg(test)]
+#[path = "route_image_edits_tests.rs"]
+mod tests;
 
 /// Largest decoded image part accepted (`MAXIMUM_EDIT_IMAGE_BYTES`).
 pub(crate) const MAXIMUM_EDIT_IMAGE_BYTES: usize = 20 * 1024 * 1024;
@@ -74,10 +79,21 @@ pub(crate) async fn image_edits(
             Some("image"),
         ));
     }
-    let (fields, files) = match parse_edit_upload(&state, request).await {
-        Ok(parsed) => parsed,
+    // Bound buffered uploads and their lifetime before parsing any body bytes.
+    // The shared ladder retains this same permit through terminal accounting.
+    let permit = match pre_admission_permit(&state, deadline).await {
+        Ok(permit) => permit,
         Err(error) => return error_response(&error),
     };
+    let read = tokio::time::timeout_at(deadline.into(), parse_edit_upload(&state, request)).await;
+    let (fields, files) = match read {
+        Ok(Ok(parsed)) => parsed,
+        Ok(Err(error)) => return error_response(&error),
+        Err(_) => return error_response(&upload_deadline_error()),
+    };
+    if Instant::now() >= deadline {
+        return error_response(&upload_deadline_error());
+    }
     let admit_value = json!({
         "raw_key": raw_key,
         "upload": {"fields": fields, "files": files},
@@ -90,8 +106,18 @@ pub(crate) async fn image_edits(
         &raw_key,
         "admit_image_edits",
         admit_value,
+        Some(permit),
     )
     .await
+}
+
+fn upload_deadline_error() -> PublicError {
+    PublicError::new(
+        408,
+        "request_timeout",
+        "The image upload did not arrive before the request deadline.",
+        "invalid_request_error",
+    )
 }
 
 /// Parse one edit upload into its text fields and base64 image parts.

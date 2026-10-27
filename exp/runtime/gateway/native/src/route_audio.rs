@@ -35,7 +35,7 @@ use base64::Engine as _;
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
 
-use crate::admission::{new_guard, wire_drift_response};
+use crate::admission::{new_guard, pre_admission_permit, wire_drift_response};
 use crate::audio_upload::{measure_upload, read_upload, AudioUpload};
 use crate::dialects::{Dialect, MAXIMUM_RETAINED_OUTPUT_BYTES, OUTPUT_OVERFLOW_MESSAGE};
 use crate::encode::compact_json;
@@ -128,7 +128,7 @@ pub(crate) async fn speech(
     // Like transcription, the body is read only under a permit and the
     // request deadline, so the concurrency limit bounds every buffered body.
     let deadline = started + state.request_timeout;
-    let permit = match pre_admission_permit(&state, deadline, &raw_key).await {
+    let permit = match pre_admission_permit(&state, deadline).await {
         Ok(permit) => permit,
         Err(error) => return error_response(&error),
     };
@@ -174,7 +174,7 @@ pub(crate) async fn transcriptions(
     // under a concurrency permit and the request deadline, so the configured
     // request limit bounds this route's buffered memory like every other route.
     let deadline = started + state.request_timeout;
-    let permit = match pre_admission_permit(&state, deadline, &raw_key).await {
+    let permit = match pre_admission_permit(&state, deadline).await {
         Ok(permit) => permit,
         Err(error) => return error_response(&error),
     };
@@ -207,30 +207,6 @@ pub(crate) async fn transcriptions(
 /// `instructions`, 4,096 characters each) fully `\uXXXX`-escaped, plus room
 /// for the short fields, so an oversized body never reaches the bridge.
 const MAXIMUM_SPEECH_BODY_BYTES: usize = 128 * 1024;
-
-/// Take one data-plane permit before the body is read (no admission or attempt
-/// guard exists yet), under the same request deadline.
-async fn pre_admission_permit(
-    state: &AppState,
-    deadline: Instant,
-    _raw_key: &str,
-) -> Result<DispatchPermit, PublicError> {
-    let acquire = state.dispatch_capacity.acquire(
-        state.bridge.execution.as_ref(),
-        &state.permits,
-        &state.permit_queue,
-        None,
-    );
-    match tokio::time::timeout_at(deadline.into(), acquire).await {
-        Ok(Ok(permit)) => Ok(permit),
-        Ok(Err(error)) => Err(error),
-        Err(_) => Err(Failure::new(
-            FailureClass::Timeout,
-            "gateway execution queue deadline exceeded",
-        )
-        .public_error()),
-    }
-}
 
 fn upload_deadline_error() -> PublicError {
     PublicError::new(

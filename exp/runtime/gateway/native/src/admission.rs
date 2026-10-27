@@ -10,6 +10,7 @@ use axum::response::Response;
 use serde::Deserialize;
 use serde_json::Value;
 
+use crate::dispatch_capacity::DispatchPermit;
 use crate::encode_responses::ResponsesEnvelope;
 use crate::errors::empty_completion_headers;
 use crate::errors::{Failure, FailureClass, PublicError};
@@ -352,6 +353,29 @@ pub(crate) async fn wire_drift_response(
             .await;
     }
     error_response(&PublicError::internal())
+}
+
+/// Take one data-plane permit before the body is read (no admission or attempt
+/// guard exists yet), under the same request deadline.
+pub(crate) async fn pre_admission_permit(
+    state: &AppState,
+    deadline: Instant,
+) -> Result<DispatchPermit, PublicError> {
+    let acquire = state.dispatch_capacity.acquire(
+        state.bridge.execution.as_ref(),
+        &state.permits,
+        &state.permit_queue,
+        None,
+    );
+    match tokio::time::timeout_at(deadline.into(), acquire).await {
+        Ok(Ok(permit)) => Ok(permit),
+        Ok(Err(error)) => Err(error),
+        Err(_) => Err(Failure::new(
+            FailureClass::Timeout,
+            "gateway execution queue deadline exceeded",
+        )
+        .public_error()),
+    }
 }
 
 /// Wait for one bounded active-dispatch permit after admission, like the

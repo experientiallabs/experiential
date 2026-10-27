@@ -32,6 +32,7 @@ use serde_json::{json, Map, Value};
 use crate::admission::{acquire_permit, new_guard, wire_drift_response};
 use crate::bridge::Bridge;
 use crate::dialects::{Dialect, MAXIMUM_RETAINED_OUTPUT_BYTES, OUTPUT_OVERFLOW_MESSAGE};
+use crate::dispatch_capacity::DispatchPermit;
 use crate::encode::compact_json;
 use crate::errors::{Failure, FailureClass, PublicError};
 use crate::events::{BilledUnits, Usage};
@@ -147,12 +148,14 @@ pub(crate) async fn images(
         &raw_key,
         "admit_images",
         admit_value,
+        None,
     )
     .await
 }
 
 /// Admit one parsed image request through `admit_method`, then walk its
 /// ladder and answer: shared by the generations and edits routes.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn serve_images(
     state: &AppState,
     headers: &axum::http::HeaderMap,
@@ -161,6 +164,7 @@ pub(crate) async fn serve_images(
     raw_key: &str,
     admit_method: &'static str,
     mut admit_value: Value,
+    upload_permit: Option<DispatchPermit>,
 ) -> Response {
     let client_request_id = latin1_header(headers, "x-client-request-id");
     with_app_identity(&mut admit_value, headers);
@@ -182,9 +186,15 @@ pub(crate) async fn serve_images(
         Err(_) => return wire_drift_response(state, &admission_value, started).await,
     };
     let mut guard = new_guard(state, admission.request_id.clone(), started);
-    let permit = match acquire_permit(state, &mut guard, deadline, None).await {
-        Ok(permit) => permit,
-        Err(response) => return *response,
+    let permit = match upload_permit {
+        Some(permit) => {
+            guard.hold_dispatch(permit.clone());
+            permit
+        }
+        None => match acquire_permit(state, &mut guard, deadline, None).await {
+            Ok(permit) => permit,
+            Err(response) => return *response,
+        },
     };
     let _permit = permit;
 
