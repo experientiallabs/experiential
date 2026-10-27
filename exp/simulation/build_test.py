@@ -28,8 +28,14 @@ from exp.common.project import (
 )
 from exp.common.project.paths import ProjectPaths
 from exp.common.project.testing import RawArtifact
+from exp.common.tasks import load_task_set
 from exp.common.traces import Trace, TraceSource, TraceSpan
 from exp.common.traces.ingest.otlp import TraceNormalizationIssue, TraceNormalizationResult
+from exp.optimize.evaluation.audit.exposure import held_out_exposure
+from exp.optimize.evaluation.audit.lifecycle_test import audit, clock, run
+from exp.optimize.evaluation.audit.panel_test import SimulatedProvider, episode
+from exp.optimize.evaluation.audit.panel_test import build_project as exp_build
+from exp.optimize.evaluation.audit.receipts import record_report
 from exp.simulation.build import (
     SupersededBuildReviewError,
     build_project,
@@ -37,6 +43,9 @@ from exp.simulation.build import (
     parse_build_review,
     select_build_review,
 )
+from exp.simulation.development_scope import development_tasks
+from exp.simulation.mining.bindings import load_task_set_lineage_bindings
+from exp.simulation.mining.deduplicate import LeakageGroup, freeze_task_partition
 from exp.simulation.mining.service import MiningSpec
 
 _PROVIDER_FREE_REVISION = "a" * 40
@@ -645,3 +654,50 @@ def test_a_provider_free_stage_mined_under_another_version_is_not_relabeled(
 
     with pytest.raises(SupersededBuildReviewError, match="hashing-descriptor-v3.*new project"):
         build_module.provider_free_build_review(store)
+
+
+def test_a_rebuild_never_moves_audited_held_out_content_to_fit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Content a held-out audit showed stays held out, whatever rank a later build gives it.
+
+    The split is a rank among the lineages one build sees, so rebuilding the audited user with
+    two new ones ranks it into fit two times in three; each try checks the unsealed rank.
+    """
+    episodes = [episode(index) for index in range(14)]
+    provider = SimulatedProvider(episodes)
+    _, project, _ = exp_build(tmp_path, monkeypatch, provider, episodes=episodes[:2])
+
+    def partitions() -> dict[str, str]:
+        """Each lineage of the project's current build, with its partition."""
+        build = project.load_project().build
+        assert build is not None
+        bindings = load_task_set_lineage_bindings(project.artifacts, build.task_set.artifact_id)
+        return {row.lineage_id: row.partition for row in bindings.bindings}
+
+    with audit(project) as opened:
+        run(project, opened)
+        record_report(
+            project, opened.receipt, opened.panel, kind="evaluation", detail_shown=True, clock=clock
+        )
+        (shown,) = opened.receipt.lineages
+    build = project.load_project().build
+    assert build is not None
+    tasks = load_task_set(project.artifacts, build.task_set.artifact_id).tasks
+    (task,) = (case for case in tasks if case.lineage_group_id == shown)
+    user = int(task.instruction.split("user_")[1][:2])
+    for first in range(2, 14, 2):
+        later = [episodes[user], episodes[first], episodes[first + 1]]
+        project = exp_build(tmp_path, monkeypatch, provider, episodes=later)[1]
+        rebuilt = partitions()
+        unsealed = freeze_task_partition(
+            [LeakageGroup(lineage, (lineage,), (lineage,), 1) for lineage in rebuilt]
+        )
+        if unsealed.partition_for(shown) == "fit":
+            break
+    else:
+        pytest.fail("no rebuild ranked the audited lineage into fit")
+    assert rebuilt[shown] == "held_out"
+    assert "fit" in rebuilt.values(), "every other lineage keeps its ranked partition"
+    assert shown not in {case.lineage_group_id for case in development_tasks(project)}
+    assert shown in held_out_exposure(project).lineages

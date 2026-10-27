@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 from collections import defaultdict
-from collections.abc import Iterable, Sequence
+from collections.abc import Collection, Iterable, Sequence
 from dataclasses import dataclass
 from typing import Literal
 
@@ -218,13 +218,19 @@ def freeze_task_partition(
     *,
     fit_lineage_target: int = DEFAULT_FIT_LINEAGE_TARGET,
     held_out_lineage_target: int = DEFAULT_HELD_OUT_LINEAGE_TARGET,
+    sealed: Collection[str] = (),
 ) -> FrozenTaskPartition:
     """Freeze a deterministic partition over connected source lineages.
+
+    Sealed groups take their ranked place like any other, so every other group keeps the
+    partition it would have had, and are then held out wherever they ranked.
 
     Args:
         groups: Connected leakage groups output by ``analyze_duplicates``.
         fit_lineage_target: Desired fit lineage count before representative selection.
         held_out_lineage_target: Desired held-out lineage count before representative selection.
+        sealed: Group IDs that must be held out, such as groups holding content an earlier
+            held-out audit exposed or reserved.
 
     Returns:
         A partition that never splits a connected lineage or duplicate component.
@@ -252,16 +258,6 @@ def freeze_task_partition(
             "representative capacity; every lineage remains in the deterministic split"
         )
     )
-    if len(groups) == 1:
-        group = groups[0]
-        return FrozenTaskPartition(
-            fit_lineage_group_ids=(group.lineage_group_id,),
-            held_out_lineage_group_ids=(),
-            fit_workload_mass=group.workload_mass,
-            held_out_workload_mass=0,
-            underfilled_reason=underfilled_reason,
-        )
-
     by_id = {group.lineage_group_id: group for group in groups}
     ranked = sorted(
         by_id,
@@ -270,15 +266,15 @@ def freeze_task_partition(
             group_id,
         ),
     )
-    if held_out_lineage_target == 0:
+    if held_out_lineage_target == 0 or len(ranked) == 1:
         fit_count = len(ranked)
     elif fit_lineage_target == 0:
         fit_count = 0
     else:
         fit_count = len(ranked) * fit_lineage_target // target_count
         fit_count = min(max(fit_count, 1), len(ranked) - 1)
-    fit_ids = ranked[:fit_count]
-    held_out_ids = ranked[fit_count:]
+    fit_ids = [group_id for group_id in ranked[:fit_count] if group_id not in sealed]
+    held_out_ids = sorted(set(ranked) - set(fit_ids))
     return FrozenTaskPartition(
         fit_lineage_group_ids=tuple(sorted(fit_ids)),
         held_out_lineage_group_ids=tuple(sorted(held_out_ids)),

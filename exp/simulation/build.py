@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -34,7 +34,7 @@ from exp.common.project.database import project_connection
 from exp.common.project.project import require_durable_source_id
 from exp.common.release_revision import installed_release_revision
 from exp.common.tasks import TaskSet
-from exp.common.traces import load_trace_dataset
+from exp.common.traces import Trace, load_trace_dataset
 from exp.common.traces.ingest.dataset import (
     PersistedTraceDataset,
     persist_trace_dataset,
@@ -51,7 +51,12 @@ from exp.simulation.mining.descriptors import (
     DescriptorEmbedding,
     HashingDescriptorEmbedder,
 )
-from exp.simulation.mining.exposure_ledger import ExposureLedger
+from exp.simulation.mining.exposure_ledger import (
+    ExposureLedger,
+    SourceRecord,
+    node_vertex,
+    record_sha256,
+)
 from exp.simulation.mining.service import MiningSpec, TaskMiningResult, mine_tasks, persist_task_set
 
 _BUILD_SCOPED_REVIEW_KEYS = (
@@ -408,14 +413,15 @@ def build_task_set(
         created_at=created_at,
         code_revision=code_revision,
     )
+    dataset_input = artifact_input(trace_dataset.manifest)
     mining = mine_tasks(
         trace_dataset.traces,
         mining_spec,
         embedder=embedder or HashingDescriptorEmbedder(),
         input_trace_count=len(trace_dataset.traces) + trace_dataset.dataset.invalid_trace_count,
         invalid_trace_count=trace_dataset.dataset.invalid_trace_count,
+        sealed_trace_ids=_sealed_traces(store, dataset_input, trace_dataset.traces),
     )
-    dataset_input = artifact_input(trace_dataset.manifest)
     task_set = persist_task_set(
         mining,
         store,
@@ -425,6 +431,30 @@ def build_task_set(
         inputs=(dataset_input,),
     )
     return TaskSetBuild(trace_dataset=trace_dataset, mining=mining, task_set=task_set)
+
+
+def _sealed_traces(
+    store: ArtifactStore, dataset: ArtifactInput, traces: Sequence[Trace]
+) -> frozenset[str]:
+    """Traces linked in the root ledger to content a held-out audit exposed or reserved.
+
+    The partition is a rank among the lineages one build sees, so a rebuild could otherwise move
+    such content from held out to fit, where every fitting path would learn or retrieve it.
+    """
+    ledger = ExposureLedger(store.paths.root)
+    snapshot = ledger.snapshot()
+    sealed: set[str] = set()
+    for trace in traces:
+        source = SourceRecord(
+            project=store.paths.project_id,
+            dataset=dataset,
+            trace_id=trace.trace_id,
+            record_sha256=record_sha256(trace),
+        )
+        vertices = [node_vertex(*item, source) for item in ledger.vertices(trace).items()]
+        if snapshot.exposure(vertices) is not None or snapshot.taken(vertices, None) is not None:
+            sealed.add(trace.trace_id)
+    return frozenset(sealed)
 
 
 def build_project(

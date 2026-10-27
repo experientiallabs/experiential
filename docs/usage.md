@@ -586,6 +586,10 @@ and unchanged); the refusal reports their count and scheme, and development re-a
 Every table is append-only. Independence is only relative to the ledger a decision used;
 `ExposureLedger.export()` and `merge()` share one between machines. A build made before the
 ledger existed is refused until `exp build` is rerun on the same import to record its grouping.
+The fit and held-out split is a rank among the lineages one build sees, so a rebuild can move a
+lineage across it. A lineage whose content the ledger links to exposed or reserved content is
+always held out, wherever it ranks, so a rebuild never hands audited content to fitting; every
+other lineage keeps the partition its rank gives it.
 
 Grouping links recorded after a reservation are reassessed whenever its receipt is resumed or
 reports. If they reveal exposure that predates the receipt, an undispatched reservation is
