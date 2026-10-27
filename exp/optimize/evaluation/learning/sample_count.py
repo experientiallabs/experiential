@@ -14,8 +14,9 @@ the search. This module makes the question a registered procedure over the exist
    development measurement meets the criterion.
 4. Freeze the selected memory checkpoint, the simulator and serving configuration, retrieval
    and recall, role budgets, judge and code revision.
-5. Confirm on untouched lineages: an independent audit receipt of the frozen checkpoint, opened
-   after selection, over lineages never used for development.
+5. Confirm on untouched lineages: the first independent audit receipt of the frozen checkpoint
+   opened after selection, over lineages never used for development. Later audits cannot
+   replace it, so confirmation is never chosen by its score.
 6. Report the consumed trajectory count, the exact-reply metric, its uncertainty at the
    lineage count, coverage and every failure.
 
@@ -34,7 +35,6 @@ shows it was minted first, is refused, and one minted after the selection is acc
 its clock claims.
 """
 
-import json
 from collections.abc import Sequence
 from datetime import datetime
 from typing import Annotated, Literal, Self
@@ -57,6 +57,7 @@ from exp.optimize.evaluation.audit.panel import PlannedPanel, saved_held_out_res
 from exp.optimize.evaluation.audit.receipts import (
     Basis,
     ReceiptView,
+    audit_receipts,
     find_receipt,
     receipt_panel,
     receipt_reference,
@@ -69,7 +70,7 @@ from exp.optimize.evaluation.learning.traces import fit_cases, learning_plan
 # Identity of the code that decides this artifact's behavior, in place of its source text.
 # Bump it when behavior changes. exp/tests/code_protocols_test.py fails when the covered
 # source changes until it is bumped or, for a pure refactor, its digest is updated.
-SAMPLE_COUNT_PROTOCOL = "sample-count-v3"
+SAMPLE_COUNT_PROTOCOL = "sample-count-v4"
 REGISTRATION_TYPE = "sample-count-registration"
 SELECTION_TYPE = "sample-count-selection"
 CONFIRMATION_TYPE = "sample-count-confirmation"
@@ -816,8 +817,10 @@ def record_sample_count_confirmation(
 ) -> tuple[JsonObject, ArtifactInput | None]:
     """Confirm a saved selection on one independent audit and save the report.
 
-    A selection is confirmed on one receipt only: trying further confirmation audits until
-    one passes would be another search.
+    A selection is confirmed on one receipt only, fixed before any score is read: the first
+    independent audit receipt of the frozen checkpoint minted after the saved selection.
+    Trying further confirmation audits, or previewing several with dry runs, until one passes
+    would be another search.
 
     Args:
         project: Project holding the selection and the confirmation receipt.
@@ -831,8 +834,8 @@ def record_sample_count_confirmation(
 
     Raises:
         ValueError: The selection is not saved, the audit receipt was minted before the saved
-            selection (by receipt sequence, whatever its clock claims), or the selection was
-            already confirmed on another receipt.
+            selection (by receipt sequence, whatever its clock claims), or another independent
+            audit of the frozen checkpoint was minted after the selection and before it.
     """
     selection = SampleCountSelection.model_validate_json(
         _load(project, request.selection, SELECTION_TYPE, "selection.json")
@@ -847,16 +850,28 @@ def record_sample_count_confirmation(
     registration = SampleCountRegistration.model_validate_json(
         _load(project, registration_ref, REGISTRATION_TYPE, "registration.json")
     )
-    for saved_id in project.artifacts.list_ids(artifact_type=CONFIRMATION_TYPE):
-        saved = project.artifacts.read(saved_id).manifest
-        receipt = json.loads(project.artifacts.read_bytes(saved_id, "confirmation.json"))
-        if request.selection in saved.inputs and receipt["confirmation"]["receipt"] != (
-            request.confirmation
-        ):
-            raise ValueError(
-                f"selection {request.selection.artifact_id} was confirmed on another audit "
-                f"({saved_id}); a selection is confirmed once"
-            )
+    if selection.receipts_before is None:
+        raise ValueError("confirm a saved selection; record the selection first")
+    # Bound by receipt order before any score is computed, so neither a dry run nor a further
+    # audit can pick a passing confirmation among several.
+    first = next(
+        (
+            row.receipt_id
+            for row in audit_receipts(project)
+            if row.sequence > selection.receipts_before
+            and row.basis == "independent"
+            and row.checkpoint is not None
+            and row.checkpoint.lineage == registration.memory_lineage
+            and row.checkpoint.version == selection.memory_version
+        ),
+        None,
+    )
+    if first is not None and first != request.confirmation:
+        raise ValueError(
+            f"selection {request.selection.artifact_id} is confirmed only on the first "
+            f"independent audit of its frozen checkpoint opened after it ({first}); a selection "
+            "is confirmed once, so register a new procedure instead of auditing again"
+        )
     measurement = receipt_measurement(project, request.confirmation)
     receipt = receipt_reference(project, request.confirmation)
     report = confirm_sample_count(registration, selection, measurement)

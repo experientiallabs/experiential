@@ -109,9 +109,9 @@ PROTOCOLS = (
     ),
     Protocol(
         "exp.optimize.evaluation.learning.sample_count:SAMPLE_COUNT_PROTOCOL",
-        "sample-count-v3",
+        "sample-count-v4",
         ("exp.optimize.evaluation.learning.sample_count",),
-        "3953e3ea2eb4d20464ae73eef613b6f36ea90de64c87d288bf5195acf46f0d9d",
+        "1ada99fdb976a5f5c9bc1bc54c119b6f5f8453b87c0c3cd2f4b81aca30bd33c0",
     ),
     Protocol(
         "exp.optimize.evaluation.learning.screening:SCREENING_PROTOCOL",

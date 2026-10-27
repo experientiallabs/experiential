@@ -21,7 +21,7 @@ from exp.optimize.evaluation.audit.panel_test import (
     episode,
     learn_fit,
 )
-from exp.optimize.evaluation.audit.receipts import receipt_reference, record_report
+from exp.optimize.evaluation.audit.receipts import AuditReceipt, receipt_reference, record_report
 from exp.optimize.evaluation.learning.sample_count import (
     CheckpointMeasurement,
     LineageMeasurement,
@@ -417,3 +417,78 @@ def test_the_procedure_runs_on_held_out_audits_of_the_learned_memory(
         )
     with pytest.raises(ValueError, match="cannot be reported|independent audit"):
         confirm_sample_count(registered, selection, again)
+
+
+def test_only_the_first_audit_after_the_selection_can_confirm_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A second confirmation audit can be neither previewed nor saved in place of the first.
+
+    Otherwise an operator could open several independent audits of the frozen checkpoint, read
+    each score through a dry run, and save only a passing one: a search on the outcome.
+    """
+    provider = SimulatedProvider([episode(i) for i in range(USERS)], learnable=True)
+    root, store, _ = build_project(tmp_path, monkeypatch, provider)
+    learn_fit(root, store)
+    development = plan_held_out_panel(
+        store, 1, profile="memory", code_revision="fixture", clock=clock
+    ).lineages
+    _, registration_ref = register_sample_count_study(
+        store,
+        grid=(len(fit_cases(store)),),
+        threshold=0.75,
+        criterion="point_estimate",
+        development_lineages=development,
+        registered_at=clock(),
+        code_revision=REVISION,
+    )
+
+    def audited() -> AuditReceipt:
+        """Open, run and show one independent one-trace audit of the final memory."""
+        with open_held_out_audit(
+            store, 1, profile="memory", code_revision=REVISION, clock=clock
+        ) as opened:
+            run(store, opened)
+            record_report(
+                store,
+                opened.receipt,
+                opened.panel,
+                kind="evaluation",
+                detail_shown=True,
+                clock=clock,
+            )
+        return opened.receipt
+
+    _, selection_ref = sample_count.record_sample_count_selection(
+        store,
+        sample_count.SampleCountSelect(
+            resolution="select", registration=registration_ref, development=(audited().receipt_id,)
+        ),
+        created_at=clock(),
+        code_revision=REVISION,
+    )
+    assert selection_ref is not None
+    first, second = audited(), audited()
+    assert first.basis == second.basis == "independent"
+    for dry_run in (True, False):
+        with pytest.raises(ValueError, match=f"first independent audit .*\\({first.receipt_id}\\)"):
+            sample_count.record_sample_count_confirmation(
+                store,
+                sample_count.SampleCountConfirm(
+                    resolution="confirm", selection=selection_ref, confirmation=second.receipt_id
+                ),
+                created_at=clock(),
+                code_revision=REVISION,
+                dry_run=dry_run,
+            )
+    _, confirmed = sample_count.record_sample_count_confirmation(
+        store,
+        sample_count.SampleCountConfirm(
+            resolution="confirm", selection=selection_ref, confirmation=first.receipt_id
+        ),
+        created_at=clock(),
+        code_revision=REVISION,
+    )
+    assert confirmed is not None
+    cited = store.artifacts.read(confirmed.artifact_id).manifest.inputs
+    assert receipt_reference(store, first.receipt_id) in cited
