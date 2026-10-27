@@ -9,7 +9,9 @@ output items with a lifecycle ``status`` or ``phase`` but without the item
 ``internal_chat_message_metadata_passthrough``, the OpenAI SDK sends
 Responses ``stream_options``, OpenCode sends Anthropic's ``output_config`` on
 Chat, agents attach determinism and cache-retention hints (``seed``,
-``prompt_cache_retention``) no route forwards, and image clients send
+``prompt_cache_retention``) no route forwards, clients with OpenAI-style
+extra body fields send Chat's ``stream_options`` on Anthropic Messages calls,
+and image clients send
 OpenRouter's Chat ``modalities`` of text and image, which the route's own
 declared output modalities already decide. OpenRouter's deprecated
 ``include_reasoning`` boolean is rewritten to the ``reasoning.exclude`` it
@@ -68,12 +70,18 @@ OUTPUT_PHASE_DROPPED = "input.phase->dropped(no_item_id)"
 """Disclosure recorded when an id-less message item loses its ``phase``."""
 
 STREAM_OPTIONS_NOT_STREAMING = "stream_options->ignored(stream_false)"
-"""Disclosure recorded when ``stream_options`` arrive on a non-streaming call (either surface)."""
+"""Disclosure recorded when ``stream_options`` arrive on a non-streaming call (any surface)."""
 
 STREAM_OBFUSCATION_IGNORED = "stream_options.include_obfuscation->ignored(not_emitted)"
 """Disclosure recorded when stream obfuscation padding is requested but never emitted."""
 
 _STREAM_OPTION_FIELDS = frozenset({"include_obfuscation", "reasoning_summary_delivery"})
+
+MESSAGES_STREAM_USAGE_ALWAYS_INCLUDED = "stream_options.include_usage->ignored(always_included)"
+"""Disclosure recorded when a Messages stream asks for ``include_usage: false``.
+
+The Anthropic stream always reports usage on ``message_start`` and
+``message_delta``, so the request to leave it out cannot be honored."""
 
 THINKING_DISPLAY_DROPPED = "thinking.display->dropped(not_carried)"
 """Disclosure recorded when a Chat ``thinking.display`` preference is removed.
@@ -479,6 +487,61 @@ def drop_chat_stream_options_without_stream(
     options = payload["stream_options"]
     remaining = {key: value for key, value in payload.items() if key != "stream_options"}
     return remaining, () if options is None else (STREAM_OPTIONS_NOT_STREAMING,)
+
+
+def accept_messages_stream_options(payload: JsonObject) -> tuple[JsonObject, tuple[str, ...]]:
+    """Consume Chat's ``stream_options`` when a client sends it on Anthropic Messages.
+
+    Anthropic defines no such field, but clients configured with OpenAI-style
+    extra body fields (for example an opencode request-body overlay, which
+    only adds keys to an otherwise valid Anthropic body) attach Chat's
+    ``{"include_usage": true}`` to Messages calls. The Anthropic stream always
+    carries usage, so ``include_usage: true`` (or an empty object) is already
+    satisfied and is removed silently; ``false`` cannot be honored and is
+    disclosed. Chat's other key, ``include_obfuscation``, asks for padding the
+    gateway never emits and is disclosed when true, as on Responses. Any
+    object on a call that does not stream is disclosed as ignored. Any other
+    key, or a non-boolean value, keeps a named rejection.
+
+    Args:
+        payload: Parsed Anthropic Messages (or ``count_tokens``) body.
+
+    Returns:
+        The payload without ``stream_options`` and any disclosures.
+
+    Raises:
+        OpenAIProtocolError: The object is malformed or names a key other
+            than ``include_usage``.
+    """
+    if "stream_options" not in payload:
+        return payload, ()
+    options = payload["stream_options"]
+    remaining = {key: value for key, value in payload.items() if key != "stream_options"}
+    if options is None:
+        return remaining, ()
+    if not isinstance(options, dict):
+        raise invalid_field("stream_options", "'stream_options' must be an object.")
+    unknown = sorted(set(options) - {"include_usage", "include_obfuscation"})
+    if unknown:
+        raise invalid_field(
+            f"stream_options.{unknown[0]}",
+            f"Unknown parameter: 'stream_options.{unknown[0]}'. "
+            "Messages stream_options accepts only include_usage and include_obfuscation.",
+        )
+    for key in ("include_usage", "include_obfuscation"):
+        value = options.get(key)
+        if value is not None and not isinstance(value, bool):
+            raise invalid_field(
+                f"stream_options.{key}", f"'stream_options.{key}' must be a boolean."
+            )
+    if payload.get("stream") is not True:
+        return remaining, (STREAM_OPTIONS_NOT_STREAMING,)
+    disclosures: list[str] = []
+    if options.get("include_usage") is False:
+        disclosures.append(MESSAGES_STREAM_USAGE_ALWAYS_INCLUDED)
+    if options.get("include_obfuscation") is True:
+        disclosures.append(STREAM_OBFUSCATION_IGNORED)
+    return remaining, tuple(disclosures)
 
 
 def drop_chat_thinking_display(payload: JsonObject) -> tuple[JsonObject, tuple[str, ...]]:

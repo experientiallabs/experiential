@@ -375,6 +375,51 @@ def test_unsupported_and_unknown_top_level_fields_are_rejected(
     assert excinfo.value.detail.param == param_fragment
 
 
+def test_openai_stream_options_on_a_messages_stream_are_accepted() -> None:
+    """Chat's ``stream_options`` on /v1/messages serves instead of a 400.
+
+    The Anthropic stream always carries usage, so ``include_usage: true`` is
+    already satisfied: the field is removed before the closed manifest reads
+    the body, and nothing about the canonical request changes.
+    """
+    decoded = decode_messages(_body(stream=True, stream_options={"include_usage": True}))
+    assert decoded.request.stream is True
+    assert decoded.request.include_usage is True
+    assert decoded.request.ignored_parameters == ()
+
+
+def test_messages_stream_options_disclose_what_cannot_be_honored() -> None:
+    """``include_usage: false`` and a non-streaming call are served and disclosed."""
+    opted_out = decode_messages(_body(stream=True, stream_options={"include_usage": False}))
+    assert opted_out.request.ignored_parameters == (
+        "stream_options.include_usage->ignored(always_included)",
+    )
+    not_streaming = decode_messages(_body(stream_options={"include_usage": True}))
+    assert not_streaming.request.stream is False
+    assert not_streaming.request.ignored_parameters == ("stream_options->ignored(stream_false)",)
+    count_payload = _body(stream_options={"include_usage": True})
+    del count_payload["max_tokens"]
+    counted = decode_messages_count_tokens(count_payload)
+    assert counted.request.ignored_parameters == ("stream_options->ignored(stream_false)",)
+
+
+@pytest.mark.parametrize(
+    ("options", "param"),
+    [
+        ("include_usage", "stream_options"),
+        ({"include_usage": "yes"}, "stream_options.include_usage"),
+        ({"include_obfuscation": "no"}, "stream_options.include_obfuscation"),
+        ({"chunk_size": 4}, "stream_options.chunk_size"),
+    ],
+)
+def test_malformed_messages_stream_options_are_a_named_400(options: JsonValue, param: str) -> None:
+    """Only an object of Chat's optional boolean stream options is accepted."""
+    with pytest.raises(OpenAIProtocolError) as excinfo:
+        decode_messages(_body(stream=True, stream_options=options))
+    assert excinfo.value.status_code == 400
+    assert excinfo.value.detail.param == param
+
+
 def test_top_k_is_preserved_for_route_specific_validation() -> None:
     """The official Messages top-k field reaches the shared route contract."""
     decoded = decode_messages(_body(top_k=5))

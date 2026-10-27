@@ -97,6 +97,7 @@ from exp.runtime.models.providers.cache_policy import (
 )
 from exp.runtime.models.providers.errors import ProviderParameterError
 from exp.runtime.models.providers.openrouter_routing import ProviderRoutingPreferences
+from exp.runtime.openai_protocol.client_field_repairs import accept_messages_stream_options
 from exp.runtime.openai_protocol.errors import invalid_field, unsupported_field
 from exp.runtime.openai_protocol.history_documents import trim_history_documents
 from exp.runtime.openai_protocol.manifest import validate_manifest
@@ -435,6 +436,9 @@ def _decode(
     # Media the gateway cannot forward fails every replay of a history that
     # carries it, so history copies degrade to disclosed placeholders.
     payload, media_disclosures = degrade_history_media(payload)
+    # Clients with OpenAI-style extra body fields attach Chat's stream_options;
+    # usage always streams on this surface.
+    payload, stream_disclosures = accept_messages_stream_options(payload)
     validate_manifest(payload, MESSAGES_MANIFEST)
     request = validate_wire(payload, wire)
     require_served_server_tool_types(request.tools)
@@ -541,6 +545,7 @@ def _decode(
                 *media_disclosures,
                 *document_disclosures,
                 *prefill_disclosures,
+                *stream_disclosures,
                 *dropped_beta_disclosures,
                 *tool_change_disclosures,
                 *channels.disclosures,
