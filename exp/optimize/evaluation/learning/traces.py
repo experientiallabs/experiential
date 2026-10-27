@@ -90,6 +90,7 @@ from exp.optimize.evaluation.learning.retirement import (
     retired_traces,
     retirement_of,
     settle_refusal,
+    trace_lock,
 )
 from exp.simulation.evaluation.workflow import INFRASTRUCTURE_STOPS
 from exp.simulation.retrieval.build_inputs import load_completed_build_rag_lineage_bindings
@@ -691,6 +692,7 @@ def learn_from_traces(
     Raises:
         Exception: One of ``INFRASTRUCTURE_STOPS`` stopped a trace; a deterministic refusal
             propagates only below the retirement bound without ``retry_incomplete``.
+        Timeout: Another process is learning or retiring the same trace.
     """
     plan = learning_plan(
         project,
@@ -707,82 +709,83 @@ def learn_from_traces(
     earlier: set[str] = set()  # trajectories of the traces before this one in the pass
     for index, case in enumerate(cases):
         report(progress, "Learning from traces", completed=index, total=len(cases))
-        if retirement_of(project, plan.lineage, case.trace_id) is not None:
-            retired += 1
-            continue
-        attempted: set[str] = set()
-        retiring = False
-        while True:
-            now = clock()
-            spec = learning_spec(project, plan, case, deadline=now + DEADLINE)
-            prepared, _ = register_replay(
-                project,
-                spec,
-                label=LABEL,
-                trace=case.trace_id,
-                code_revision=code_revision,
-                now=now,
-            )
-            if prepared.id in attempted:
-                break  # attempts exhausted: the latest one stays the trace's result
-            attempted.add(prepared.id)
-            saved = saved_fidelity_report(project, prepared)
-            if saved is None or dream_pending(project, prepared):
-                if saved is None:
-                    require_unlearned(project, plan.lineage, spec, earlier)
-                if used + spec.maximum_physical_attempts > maximum_attempts:
-                    stopped = (
-                        f"attempt budget reached after {learned} of {len(cases)} traces; "
-                        "run again with a larger budget to continue"
-                    )
-                    break
-                before = attempts_used(project, prepared)
-                try:
-                    execute_fidelity_evaluation(
-                        project,
-                        prepared,
-                        clock=clock,
-                        resume_until=now + DEADLINE if retry_incomplete else None,
-                        progress=_inside(progress, index, cases),
-                    )
-                except INFRASTRUCTURE_STOPS as error:
-                    settled = settle_refusal(
-                        project,
-                        plan.lineage,
-                        case.trace_id,
-                        prepared,
-                        error,
-                        traces=len(cases),
-                        now=clock(),
-                        code_revision=code_revision,
-                        retry_incomplete=retry_incomplete,
-                    )
-                    if settled is None:
-                        raise
-                    if settled:
-                        retiring = True
+        with trace_lock(project, plan.lineage, case.trace_id):
+            if retirement_of(project, plan.lineage, case.trace_id) is not None:
+                retired += 1
+                continue
+            attempted: set[str] = set()
+            retiring = False
+            while True:
+                now = clock()
+                spec = learning_spec(project, plan, case, deadline=now + DEADLINE)
+                prepared, _ = register_replay(
+                    project,
+                    spec,
+                    label=LABEL,
+                    trace=case.trace_id,
+                    code_revision=code_revision,
+                    now=now,
+                )
+                if prepared.id in attempted:
+                    break  # attempts exhausted: the latest one stays the trace's result
+                attempted.add(prepared.id)
+                saved = saved_fidelity_report(project, prepared)
+                if saved is None or dream_pending(project, prepared):
+                    if saved is None:
+                        require_unlearned(project, plan.lineage, spec, earlier)
+                    if used + spec.maximum_physical_attempts > maximum_attempts:
+                        stopped = (
+                            f"attempt budget reached after {learned} of {len(cases)} traces; "
+                            "run again with a larger budget to continue"
+                        )
                         break
-                    attempted.discard(prepared.id)  # resend the identical request in place
-                    continue
-                finally:
-                    used += attempts_used(project, prepared) - before
-            else:
-                # Replay completes any interrupted publication without provider calls.
-                execute_fidelity_evaluation(project, prepared, clock=clock)
-            receipt = saved_memory_receipt(project, prepared)
-            if receipt is None or receipt.get("reason") != INCOMPLETE:
+                    before = attempts_used(project, prepared)
+                    try:
+                        execute_fidelity_evaluation(
+                            project,
+                            prepared,
+                            clock=clock,
+                            resume_until=now + DEADLINE if retry_incomplete else None,
+                            progress=_inside(progress, index, cases),
+                        )
+                    except INFRASTRUCTURE_STOPS as error:
+                        settled = settle_refusal(
+                            project,
+                            plan.lineage,
+                            case.trace_id,
+                            prepared,
+                            error,
+                            traces=len(cases),
+                            now=clock(),
+                            code_revision=code_revision,
+                            retry_incomplete=retry_incomplete,
+                        )
+                        if settled is None:
+                            raise
+                        if settled:
+                            retiring = True
+                            break
+                        attempted.discard(prepared.id)  # resend the identical request in place
+                        continue
+                    finally:
+                        used += attempts_used(project, prepared) - before
+                else:
+                    # Replay completes any interrupted publication without provider calls.
+                    execute_fidelity_evaluation(project, prepared, clock=clock)
+                receipt = saved_memory_receipt(project, prepared)
+                if receipt is None or receipt.get("reason") != INCOMPLETE:
+                    break
+            if stopped is not None:
                 break
-        if stopped is not None:
-            break
-        earlier.add(consumed_trajectory_digest(trajectory_record(spec)))
-        if retiring:
-            retired += 1
-            continue
-        receipt = saved_memory_receipt(project, prepared)
-        if receipt is not None and receipt.get("reason") in ("consumed", DUPLICATE):
-            learned += 1
-        else:
-            incomplete += 1
+            earlier.add(consumed_trajectory_digest(trajectory_record(spec)))
+            if retiring:
+                retired += 1
+                continue
+            receipt = saved_memory_receipt(project, prepared)
+            if receipt is not None and receipt.get("reason") in ("consumed", DUPLICATE):
+                learned += 1
+            else:
+                incomplete += 1
     if stopped is None:
         report(progress, "Learning from traces", completed=len(cases), total=len(cases))
     head = memory_head(project.artifacts, plan.lineage)

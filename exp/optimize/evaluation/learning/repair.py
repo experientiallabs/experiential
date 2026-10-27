@@ -40,6 +40,7 @@ from exp.optimize.evaluation.learning.retirement import (
     TraceRetirement,
     retire,
     retirement_of,
+    trace_lock,
     trace_refusals,
 )
 from exp.optimize.evaluation.learning.traces import (
@@ -140,45 +141,50 @@ def retire_trace(
     saved = retirement_of(project, plan.lineage, case.trace_id)
     if saved is not None and saved.cause == "operator" and saved.reason == request.reason:
         return _retired(saved, replayed=True)
-    head = memory_head(project.artifacts, plan.lineage)
-    spec = learning_spec(project, plan, case, deadline=datetime.now(UTC) + DEADLINE)
-    digest = consumed_trajectory_digest(trajectory_record(spec))
-    if head is not None and digest in head.consumed:
-        raise ValueError(f"trace {case.trace_id} is already learned into memory {plan.lineage}")
-    attempts = registered_attempts(project, plan, case)
-    if any(saved_fidelity_report(project, prepared) is not None for prepared in attempts):
-        raise ValueError(
-            f"trace {case.trace_id} already has a saved learning measurement; it is counted as "
-            "learned or not learned already and cannot be retired"
-        )
-    for prepared in attempts:
-        lock = CoordinationLock(project.artifacts.project_directory / (prepared.id + ".lock"))
-        try:
-            lock.acquire(timeout=0)
-        except Timeout as error:
+    busy = f"trace {case.trace_id} is being learned by another process; retry once it stops"
+    try:
+        held = trace_lock(project, plan.lineage, case.trace_id).acquire()
+    except Timeout as error:
+        raise ValueError(busy) from error
+    # Held through the record, so no learning pass starts the trace between check and commit.
+    with held:
+        head = memory_head(project.artifacts, plan.lineage)
+        spec = learning_spec(project, plan, case, deadline=datetime.now(UTC) + DEADLINE)
+        digest = consumed_trajectory_digest(trajectory_record(spec))
+        if head is not None and digest in head.consumed:
+            raise ValueError(f"trace {case.trace_id} is already learned into memory {plan.lineage}")
+        attempts = registered_attempts(project, plan, case)
+        if any(saved_fidelity_report(project, prepared) is not None for prepared in attempts):
             raise ValueError(
-                f"trace {case.trace_id} is being learned by another process; retry once it stops"
-            ) from error
-        lock.release()
-    refusals = trace_refusals(project, plan.lineage, case.trace_id)
-    retirement = TraceRetirement(
-        lineage=plan.lineage,
-        trace_id=case.trace_id,
-        cause="operator",
-        reason=request.reason,
-        run=attempts[-1].id if attempts else None,
-        refusals=refusals,
-        head_version=0 if head is None else head.version,
-    )
-    if dry_run:
-        return {"validated": True, **_retired(retirement, replayed=False)}
-    retire(
-        project,
-        retirement,
-        now=datetime.now(UTC),
-        code_revision=code_revision,
-        unconsumed=digest,
-    )
+                f"trace {case.trace_id} already has a saved learning measurement; it is counted as "
+                "learned or not learned already and cannot be retired"
+            )
+        for prepared in attempts:
+            lock = CoordinationLock(project.artifacts.project_directory / (prepared.id + ".lock"))
+            try:
+                lock.acquire(timeout=0)
+            except Timeout as error:
+                raise ValueError(busy) from error
+            lock.release()
+        refusals = trace_refusals(project, plan.lineage, case.trace_id)
+        retirement = TraceRetirement(
+            lineage=plan.lineage,
+            trace_id=case.trace_id,
+            cause="operator",
+            reason=request.reason,
+            run=attempts[-1].id if attempts else None,
+            refusals=refusals,
+            head_version=0 if head is None else head.version,
+        )
+        if dry_run:
+            return {"validated": True, **_retired(retirement, replayed=False)}
+        retire(
+            project,
+            retirement,
+            now=datetime.now(UTC),
+            code_revision=code_revision,
+            unconsumed=digest,
+        )
     return _retired(retirement, replayed=False)
 
 

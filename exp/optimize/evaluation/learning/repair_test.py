@@ -23,8 +23,9 @@ from exp.optimize.evaluation.fidelity.memory import (
     saved_memory_receipt,
     trajectory_record,
 )
-from exp.optimize.evaluation.fidelity.runner import PreparedFidelity
+from exp.optimize.evaluation.fidelity.runner import FidelitySpec, PreparedFidelity
 from exp.optimize.evaluation.learning import repair as learning_repair
+from exp.optimize.evaluation.learning import traces
 from exp.optimize.evaluation.learning.repair import LearningRepairSpec, repair_learning
 from exp.optimize.evaluation.learning.retirement import retirement_of
 from exp.optimize.evaluation.learning.retirement_test import OUTAGE, learn, refusing_project
@@ -389,3 +390,41 @@ def test_an_operator_retires_a_stuck_trace_and_learning_continues(
     (row,) = planned.checkpoint.retired
     assert (row.trace_id, row.cause) == (trace_id, "operator")
     assert planned.checkpoint.fit_traces_learned == len(cases) - 1
+
+
+def test_an_operator_cannot_retire_a_trace_a_learning_pass_has_started(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A retirement arriving after the pass checked retirement, before it ran, is refused.
+
+    Otherwise the retirement is recorded and the pass then learns the trace anyway: the trace
+    ends up both learned and retired, and every learning report drops its score.
+    """
+    store, provider, trace_id = refusing_project(tmp_path, monkeypatch, OUTAGE)
+    with pytest.raises(ProviderTransportError):
+        learn(store)
+    provider.task_id = None  # the outage ends: the next pass learns the trace
+    refusals: list[str] = []
+    checked = traces.require_unlearned
+
+    def operator_retires(
+        project: ProjectStore, lineage: str, spec: FidelitySpec, earlier: set[str]
+    ) -> None:
+        """The pass's unlearned check of the resumed trace, then a racing operator retirement."""
+        checked(project, lineage, spec, earlier)
+        if refusals:
+            return  # later traces of the pass
+        request = learning_repair.TraceRetirementRequest(
+            resolution="retire-trace", trace_id=trace_id, reason="racing operator"
+        )
+        with pytest.raises(ValueError, match="being learned by another process") as refused:
+            learning_repair.retire_trace(project, request, code_revision=REVISION)
+        refusals.append(str(refused.value))
+
+    monkeypatch.setattr(traces, "require_unlearned", operator_retires)
+    outcome = learn(store, retry_incomplete=True)
+
+    assert len(refusals) == 1 and outcome.retired == 0
+    assert outcome.learned == len(learning_cases(store, "fit"))
+    lineage = learning_plan(store, scope="fit").lineage
+    assert retirement_of(store, lineage, trace_id) is None

@@ -29,6 +29,7 @@ from exp.common.core.artifacts import (
     Sha256,
     stable_id,
 )
+from exp.common.core.locks import CoordinationLock
 from exp.common.models.unknown_outcome import MAXIMUM_REDISPATCHES
 from exp.common.project import ProjectStore, artifact_input
 from exp.optimize.evaluation.fidelity.runner import PreparedFidelity, saved_fidelity_report
@@ -363,6 +364,19 @@ def settle_refusal(
 def retirement_id(lineage: str, trace_id: str) -> str:
     """Identity of a trace's retirement record in one memory lineage."""
     return stable_id(RETIREMENT_TYPE, {"lineage": lineage, "trace": trace_id})
+
+
+def trace_lock(project: ProjectStore, lineage: str, trace_id: str) -> CoordinationLock:
+    """Held while a trace is learned or retired, so a retirement never interleaves with learning.
+
+    A learning pass holds it from its retirement check until the trace's last attempt is saved
+    and published; an operator retirement holds it from its checks until its record is written.
+    Neither waits for the other: whichever comes second is refused and can be retried.
+    """
+    return CoordinationLock(
+        project.artifacts.project_directory / (retirement_id(lineage, trace_id) + ".lock"),
+        timeout=0,
+    )
 
 
 def retirement_of(project: ProjectStore, lineage: str, trace_id: str) -> TraceRetirement | None:
