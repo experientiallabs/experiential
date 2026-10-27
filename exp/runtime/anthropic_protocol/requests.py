@@ -98,6 +98,7 @@ from exp.runtime.models.providers.cache_policy import (
 )
 from exp.runtime.models.providers.errors import ProviderParameterError
 from exp.runtime.models.providers.openrouter_routing import ProviderRoutingPreferences
+from exp.runtime.openai_protocol.client_field_repairs import accept_messages_stream_options
 from exp.runtime.openai_protocol.errors import invalid_field, unsupported_field
 from exp.runtime.openai_protocol.manifest import validate_manifest
 from exp.runtime.openai_protocol.requests import DecodedGatewayRequest
@@ -389,6 +390,9 @@ def _decode(
     # turn defines is removed with disclosure rather than failing the whole
     # conversation. Content blocks and top-level fields stay strict.
     payload, unknown_disclosures = drop_unknown_message_keys(payload, _MESSAGE_KEYS)
+    # Clients with OpenAI-style extra body fields attach Chat's stream_options;
+    # usage always streams on this surface.
+    payload, stream_disclosures = accept_messages_stream_options(payload)
     validate_manifest(payload, MESSAGES_MANIFEST)
     request = validate_wire(payload, wire)
     require_served_server_tool_types(request.tools)
@@ -479,6 +483,7 @@ def _decode(
             provider_beta_tokens=forwarded_betas,
             ignored_parameters=(
                 *unknown_disclosures,
+                *stream_disclosures,
                 *dropped_beta_disclosures,
                 *tool_change_disclosures,
                 *channels.disclosures,
