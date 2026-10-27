@@ -47,8 +47,9 @@ def _strict_enum(
 
 
 # Draft 2020-12 accepts 1.0 as an integer and compares 1 equal to 1.0. Verifiers distinguish
-# booleans, integers and floats the way strict_equal does, so this pass runs after the
-# standard check passes and refuses any value that matched only through numeric coercion.
+# booleans, integers and floats the way strict_equal does, so every verifier schema is checked
+# by this validator alone: a standard pass in front of it would reject values that strict
+# semantics accept under `not`, `oneOf` or `if`.
 _StrictTypes = validators.extend(
     Draft202012Validator,
     type_checker=Draft202012Validator.TYPE_CHECKER.redefine_many(
@@ -581,9 +582,7 @@ def _grade_goal(verifier: TaskVerifier, value: JsonObject) -> Assessment:
         except ValueError:
             return Assessment(status="unassessable", reason=f"missing observation {pointer}")
     schema = expand_local_references(verifier.outcome_schema)
-    error = next(Draft202012Validator(schema).iter_errors(value), None)
-    if error is None:
-        error = next(_StrictTypes(schema).iter_errors(value), None)
+    error = next(_StrictTypes(schema).iter_errors(value), None)
     if error is not None:
         return Assessment(status="fail", reason=error.message)
     for rule in verifier.rules:
@@ -633,9 +632,7 @@ def _grade_policy(verifier: TaskVerifier, value: JsonObject, *, complete: bool) 
                         missing.append(f"argument observation unavailable: {name}")
                     else:
                         expanded = expand_local_references(schema)
-                        error = next(Draft202012Validator(expanded).iter_errors(arguments), None)
-                        if error is None:
-                            error = next(_StrictTypes(expanded).iter_errors(arguments), None)
+                        error = next(_StrictTypes(expanded).iter_errors(arguments), None)
                         if error is not None:
                             violations.append(f"operation violates argument schema: {name}")
                 for rule in verifier.argument_rules.get(name, ()):

@@ -447,6 +447,9 @@ def test_rules_preserve_boolean_number_distinctions_and_unknown_observations() -
         ({"const": 1}, (1,), (1.0, True)),
         ({"const": 1.0}, (1.0,), (1, True)),
         ({"enum": [0, "x"]}, (0, "x"), (0.0, False)),
+        ({"not": {"type": "integer"}}, (1.0, True), (1,)),
+        ({"oneOf": [{"const": 1}, {"const": 1.0}]}, (1, 1.0), (True,)),
+        ({"if": {"type": "integer"}, "then": {"minimum": 5}}, (5, 1.0, True), (1,)),
         ({"properties": {"rows": {"anyOf": [{"type": "integer"}, {"type": "null"}]}}}, (), ()),
     ],
 )
@@ -467,6 +470,27 @@ def test_schema_checks_keep_booleans_integers_and_floats_distinct(
         assert grade(nested, {"rows": 6, "final_answer": "done"}).status == "pass"
         assert grade(nested, {"rows": None, "final_answer": "done"}).status == "pass"
         assert grade(nested, {"rows": 6.0, "final_answer": "done"}).status == "fail"
+
+
+@pytest.mark.parametrize(
+    ("arguments", "status"),
+    [({"count": 1.0}, "pass"), ({"count": True}, "pass"), ({"count": 1}, "fail")],
+)
+def test_argument_schema_negation_uses_strict_numeric_types(
+    arguments: JsonObject, status: str
+) -> None:
+    """An argument policy refusing integers admits 1.0 and true, which are not integers."""
+    check = TaskVerifier(
+        description="The count is never an integer.",
+        outcome_schema={},
+        argument_schemas={"tally": {"properties": {"count": {"not": {"type": "integer"}}}}},
+    )
+    value: JsonObject = {
+        "steps": [{"action": {"name": "tally", "arguments": arguments}, "status": "valid"}],
+        "stop_reason": "completed",
+        "final_answer": "done",
+    }
+    assert grade(check, value).policy.status == status
 
 
 def test_observed_policy_violation_survives_later_missing_evidence() -> None:
