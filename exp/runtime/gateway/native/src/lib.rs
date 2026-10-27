@@ -719,6 +719,23 @@ mod module_tests {
     use super::*;
 
     #[test]
+    fn pinned_digest_buffer_keeps_cursor_valid_after_compression_panic() {
+        use sha2::digest::{block_buffer::EagerBuffer, consts::U4};
+        use std::panic::{catch_unwind, AssertUnwindSafe};
+
+        // GHSA-qwgh-2vcv-g2f7 requires an inline position byte. Our pinned
+        // implementation keeps its position separate from the input buffer.
+        let mut buffer = EagerBuffer::<U4>::new(&[1, 2]);
+        let failure = catch_unwind(AssertUnwindSafe(|| {
+            buffer.digest_blocks(&[3, 0xff], |_| panic!("compression failure"));
+        }));
+        assert!(failure.is_err());
+        assert_eq!(buffer.get_pos(), 2);
+        buffer.digest_blocks(&[4, 5], |_| {});
+        assert_eq!(buffer.get_pos(), 0);
+    }
+
+    #[test]
     fn exports_compiled_model_stage_contract() {
         Python::initialize();
         Python::attach(|py| {

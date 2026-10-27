@@ -3698,3 +3698,19 @@ def test_documentation_index_commands_and_release_scope_are_current() -> None:
 
 if __name__ == "__main__" and os.environ.get("EXP_INSTALLED_RELEASE_EVIDENCE") == "1":
     _installed_release_driver()
+
+
+def test_buffer_advisory_exception_is_bound_to_the_reviewed_source() -> None:
+    """Changing the dependency invalidates the narrow false-positive exception."""
+    root = Path(__file__).resolve().parents[2]
+    policy = tomllib.loads((root / ".gitlab/ci/osv-scanner.toml").read_text())
+    if not any(item["id"] == "GHSA-qwgh-2vcv-g2f7" for item in policy["IgnoredVulns"]):
+        return
+    lock = tomllib.loads((root / "exp/runtime/gateway/native/Cargo.lock").read_text())
+    buffers = [item for item in lock["package"] if item["name"] == "block-buffer"]
+    assert len(buffers) == 1
+    assert buffers[0]["version"] == "0.10.4"
+    assert buffers[0]["source"] == "registry+https://github.com/rust-lang/crates.io-index"
+    assert (
+        buffers[0]["checksum"] == "3078c7629b62d3f0439517fa394996acacc5cbc91c5a20d8c658e77abd503a71"
+    )

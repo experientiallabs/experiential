@@ -5,6 +5,11 @@
 # once its date passes.
 
 [[IgnoredVulns]]
+id = "GHSA-qwgh-2vcv-g2f7"
+ignoreUntil = 2026-11-02
+reason = "Source-confirmed false positive for block-buffer 0.10.4: its cursor is a separate pos:u8, not the input-overwritten inline cursor in the advisory; ReadBuffer is absent. release_test pins the exact version/checksum while this exception exists, and the native caught-compression-panic regression proves pos stays 2. Upstream source: https://github.com/RustCrypto/utils/blob/block-buffer-v0.10.4/block-buffer/src/lib.rs. Remove or re-review on any version/source change."
+
+[[IgnoredVulns]]
 id = "GHSA-xrqw-3rrv-vx5w"
 ignoreUntil = 2026-11-21
 reason = "transformers 5.5.4, sft extra only. The pinned tinker-cookbook 0.4.3 caps transformers at 5.5.4, so the fix (5.10.0+) waits on the tinker-cookbook 0.5 upgrade."
