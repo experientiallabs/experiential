@@ -108,6 +108,17 @@ impl Bridge {
         }
     }
 
+    /// Keep learned input repairs with their execution owner, including the process owner.
+    pub(crate) fn replay_repair_scope(&self, caller: Option<&str>) -> Option<String> {
+        caller.map(|caller| {
+            let namespace = self
+                .execution
+                .as_ref()
+                .map_or(0, |execution| execution.resources.replay_namespace);
+            format!("{namespace}:{caller}")
+        })
+    }
+
     /// Call one control-plane method with a JSON-string argument.
     pub async fn call(
         &self,

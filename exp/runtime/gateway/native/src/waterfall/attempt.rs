@@ -127,7 +127,8 @@ pub(super) async fn run_attempt(
     // What is already known repairs the first dial: the payload this request
     // stripped on an earlier dial of the rung, else the payloads this worker
     // remembers the caller's provider refusing.
-    let mut repair = AttemptRepair::begin(wire, ctx.caller_scope, repaired, ctx.request_id);
+    let caller_scope = ctx.bridge.replay_repair_scope(ctx.caller_scope);
+    let mut repair = AttemptRepair::begin(wire, caller_scope.as_deref(), repaired, ctx.request_id);
     if reactive_repair {
         repair.mark_reactive_successor();
     }

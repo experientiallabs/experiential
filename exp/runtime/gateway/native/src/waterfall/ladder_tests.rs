@@ -105,7 +105,7 @@ class Plane:
         return "{}"
 "#;
 
-fn plane() -> Py<PyAny> {
+pub(super) fn plane() -> Py<PyAny> {
     Python::initialize();
     Python::attach(|py| {
         pyo3::types::PyModule::from_code(py, PLANE_SOURCE, c"ladder_plane.py", c"ladder_plane")
@@ -405,8 +405,8 @@ const THROTTLE_FRAME: &str = "{\"error\":{\"code\":\"rate_limit_exceeded\",\
 
 /// Everything one ladder run needs, kept alive together.
 pub(super) struct Harness {
-    bridge: Arc<Bridge>,
-    http: crate::upstream::UpstreamClient,
+    pub(super) bridge: Arc<Bridge>,
+    pub(super) http: crate::upstream::UpstreamClient,
 }
 
 impl Harness {

@@ -5,15 +5,117 @@
 //! through a new reservation; the per-request and per-caller memories spare the
 //! refused dial afterwards; unrelated failures keep their verdict.
 
+use std::sync::Arc;
 use std::time::Duration;
 
+use pyo3::prelude::*;
+use pyo3::types::PyDict;
 use serde_json::{json, Value};
 
 use super::ladder_tests::{
-    block_on, finish, responses_wire, spawn_rung, Answer, Harness, INVALID_ENCRYPTED_CONTENT_BODY,
-    RESPONSES_FAILED_ENCRYPTED_FRAME, RESPONSES_FAILED_OTHER_FRAME, RESPONSES_TEXT_FRAME, SCHEDULE,
+    block_on, finish, plane, responses_wire, spawn_rung, Answer, Harness,
+    INVALID_ENCRYPTED_CONTENT_BODY, RESPONSES_FAILED_ENCRYPTED_FRAME, RESPONSES_FAILED_OTHER_FRAME,
+    RESPONSES_TEXT_FRAME, SCHEDULE,
 };
 use super::*;
+use crate::execution_binding::{ExecutionBindings, ExecutionHandle};
+
+fn bound_harness(process: &Harness, handle: &ExecutionHandle) -> Harness {
+    let bindings = ExecutionBindings::new(1).unwrap();
+    let token = "bound-repair-test-relay-token-0001";
+    bindings.register(token.into(), handle).unwrap();
+    Harness {
+        bridge: Arc::new(process.bridge.bind(bindings.claim(token).unwrap())),
+        http: crate::upstream::build_client(Duration::from_secs(2), false).unwrap(),
+    }
+}
+
+#[test]
+fn learned_repair_cannot_cross_execution_handles_or_reach_the_process_owner() {
+    block_on(async {
+        let process = Harness::new();
+        let handles: Vec<_> = (0..2)
+            .map(|_| {
+                let target = plane();
+                Python::attach(|py| {
+                    ExecutionHandle::new(target, 8, 2, 2, &PyDict::new(py), None).unwrap()
+                })
+            })
+            .collect();
+        let caller = Some("local:default-bound-repair");
+        let foreign = "rsn_bound_execution_refused_payload_hA==";
+        let local = "gAAA_bound_execution_valid_payload==";
+        let first = bound_harness(&process, &handles[0]);
+        let rejected = spawn_rung(vec![
+            Answer::Rejected(INVALID_ENCRYPTED_CONTENT_BODY),
+            Answer::ResponsesStream(&[RESPONSES_TEXT_FRAME]),
+        ])
+        .await;
+        let route = [responses_wire("a", &rejected.url, &[foreign, local])];
+        let (won, guard) = first
+            .run_as("first-relay", caller, &route, None, Duration::from_secs(60))
+            .await;
+        let Won::Committed(committed) = finish(guard, won).await else {
+            panic!("the first execution must learn the provider's refusal");
+        };
+        assert!(committed.encrypted_reasoning_stripped);
+        drop(committed);
+        assert_eq!(rejected.bodies.lock().unwrap().len(), 2);
+        let story = first.story().await;
+        assert_eq!(story["starts"].as_array().unwrap().len(), 2);
+        assert_eq!(story["settles"].as_array().unwrap().len(), 2);
+        drop(first);
+
+        // Fresh relay leases retain memory only for the same explicit handle.
+        // Independent handles and direct process execution keep the input intact.
+        for (handle, scope, stripped) in [
+            (Some(&handles[0]), caller, true),
+            (Some(&handles[1]), caller, false),
+            (None, caller, false),
+            (Some(&handles[0]), None, false),
+        ] {
+            let bound = handle.map(|handle| bound_harness(&process, handle));
+            let harness = bound.as_ref().unwrap_or(&process);
+            let before = harness.story().await;
+            let rung = spawn_rung(vec![Answer::ResponsesStream(&[RESPONSES_TEXT_FRAME])]).await;
+            let route = [responses_wire("a", &rung.url, &[foreign, local])];
+            let (won, guard) = harness
+                .run_as("fresh-relay", scope, &route, None, Duration::from_secs(60))
+                .await;
+            let Won::Committed(committed) = finish(guard, won).await else {
+                panic!("the replay must reach its selected provider");
+            };
+            assert_eq!(committed.encrypted_reasoning_stripped, stripped);
+            drop(committed);
+            let after = harness.story().await;
+            for events in ["starts", "settles"] {
+                assert_eq!(
+                    after[events].as_array().unwrap().len(),
+                    before[events].as_array().unwrap().len() + 1
+                );
+            }
+            let bodies = rung.bodies.lock().unwrap();
+            assert_eq!(bodies.len(), 1);
+            let sent: Value = serde_json::from_str(&bodies[0]).unwrap();
+            let payloads: Vec<_> = sent["input"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|item| item.get("encrypted_content").and_then(Value::as_str))
+                .collect();
+            assert_eq!(
+                payloads,
+                if stripped {
+                    vec![local]
+                } else {
+                    vec![foreign, local]
+                }
+            );
+        }
+        drop(process);
+        assert!(handles.iter().all(|handle| !handle.in_use()));
+    });
+}
 
 #[test]
 fn explicit_one_blocks_every_repair_and_operator_throttle_redial() {
