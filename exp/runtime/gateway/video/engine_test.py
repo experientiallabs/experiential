@@ -77,17 +77,23 @@ class _Provider:
         submits: Submit outcomes consumed in order; an int is an HTTP status,
             an exception class is raised, and ``None`` accepts.
         done: Whether operation polls report completion.
+        failed: Whether xAI reports an authoritative failed render.
         poll_status: HTTP status for polls.
+        poll_payload: Optional replacement xAI poll body for malformed/expired responses.
         xai_duration: The rendered duration xAI reports, in seconds.
         posts: Every submit URL received.
+        polls: Every provider read URL received.
         bodies: Every submit body received, decoded.
     """
 
     submits: list[int | type[Exception] | None] = field(default_factory=list)
     done: bool = True
+    failed: bool = False
     poll_status: int = 200
+    poll_payload: dict[str, object] | None = None
     xai_duration: int = 5
     posts: list[str] = field(default_factory=list)
+    polls: list[str] = field(default_factory=list)
     bodies: list[dict[str, object]] = field(default_factory=list)
 
     def handle(self, request: httpx.Request) -> httpx.Response:
@@ -106,11 +112,16 @@ class _Provider:
             return httpx.Response(
                 200, json={"name": f"models/{model}/operations/op-{len(self.posts)}"}
             )
+        self.polls.append(str(request.url))
         if self.poll_status != 200:
             return httpx.Response(self.poll_status, json={"error": {"message": "busy"}})
         if request.url.host == "api.x.ai":
+            if self.poll_payload is not None:
+                return httpx.Response(200, json=self.poll_payload)
             if not self.done:
                 return httpx.Response(200, json={"status": "pending"})
+            if self.failed:
+                return httpx.Response(200, json={"status": "failed", "error": "render failed"})
             video = {"url": "https://vidgen.x.ai/v.mp4", "duration": self.xai_duration}
             return httpx.Response(200, json={"status": "done", "video": video})
         if not self.done:
@@ -458,6 +469,200 @@ def test_failed_terminal_write_keeps_the_original_meter_through_shutdown(setup: 
     assert current.completed_at == observed_at
     assert current.billed_seconds_milli == 5_000
     assert _attempts(setup)[0]["budget_settled_nano_usd"] == 5 * _XAI_RATE
+
+
+def _unpublished_terminal(setup: _Setup, *, failed: bool = False) -> VideoJob:
+    """Lose process-local ownership after real accounting commits but before job publication."""
+    job = _create(setup, alias="grok-video", seconds=6)
+    setup.provider.failed = failed
+    jobs = setup.components.video_jobs
+    assert jobs is not None
+    with patch.object(jobs, "save_open", side_effect=RuntimeError("job write unavailable")):
+        assert not setup.engine.refresh(job).settled
+    # A process crash loses this in-memory receipt. The fresh owner below gets
+    # only the durable open job and the independently committed ledger terminal.
+    lost = setup.engine._pending.pop(job.video_id)
+    assert lost.ledger_written
+    assert jobs.load_any(video_id=job.video_id) == job
+    setup.clock.now += timedelta(seconds=VIDEO_JOB_SETTLEMENT_SECONDS + 1)
+    return job
+
+
+@pytest.mark.parametrize("failed", [False, True])
+def test_fresh_owner_recovers_terminal_publication_after_accounting_commit(
+    setup: _Setup, failed: bool
+) -> None:
+    """Replay of the same provider job closes the expired crash window without a waiver."""
+    job = _unpublished_terminal(setup, failed=failed)
+    before = dict(_attempts(setup)[0])
+    other = _stored_engine(setup, InMemoryVideoOutputStore())
+    finish = setup.components.ledger.finish_attempt
+    with patch.object(setup.components.ledger, "finish_attempt", wraps=finish) as replayed:
+        recovered = other.refresh(job)
+    assert replayed.call_count == 2
+    assert replayed.call_args_list[0].kwargs["terminal_event"].accounting_release_reservation
+    assert not replayed.call_args_list[1].kwargs["terminal_event"].accounting_recovery
+    assert recovered.settled
+    assert recovered.status is (VideoStatus.FAILED if failed else VideoStatus.COMPLETED)
+    assert recovered.billed_seconds_milli == (0 if failed else 5_000)
+    assert dict(_attempts(setup)[0]) == before
+    assert before["budget_settled_nano_usd"] == (0 if failed else 5 * _XAI_RATE)
+    assert before["accounting_recovery"] == 0
+    assert other.refresh(job) == recovered
+    assert len(setup.provider.polls) == 2
+    assert setup.provider.polls[0] == setup.provider.polls[1]
+    assert setup.provider.polls[0].endswith(f"/videos/{job.provider_job_id}")
+    assert len(setup.provider.posts) == 1
+    assert other.close(5)
+
+
+@pytest.mark.parametrize(
+    "unavailable", ["503", "404", "410", "pending", "identity", "missing", "unknown", "expired"]
+)
+def test_recovery_waits_for_same_job_terminal_and_bounds_provider_reads(
+    setup: _Setup, unavailable: str
+) -> None:
+    """Unknown, vanished or foreign observations cannot publish even an already-zero terminal."""
+    job = _unpublished_terminal(setup, failed=True)
+    before = dict(_attempts(setup)[0])
+    other = _stored_engine(setup, InMemoryVideoOutputStore(), poll_interval_seconds=5)
+    jobs = setup.components.video_jobs
+    assert jobs is not None
+    if unavailable == "identity":
+        with patch.object(
+            setup.components.ledger, "finish_attempt", side_effect=RuntimeError("offline")
+        ):
+            assert not other.refresh(job).settled
+        assert jobs.save_open(job=job.model_copy(update={"provider_job_id": "another-job"}))
+    elif unavailable == "pending":
+        setup.provider.done = False
+    elif unavailable in {"missing", "unknown", "expired"}:
+        setup.provider.poll_payload = {"terminal_replayable": True}
+        if unavailable != "missing":
+            setup.provider.poll_payload["status"] = unavailable
+    else:
+        setup.provider.poll_status = int(unavailable)
+    assert not other.refresh(job).settled
+    pending = other._pending[job.video_id]
+    assert pending.event is not None and pending.event.accounting_release_reservation
+    polls = len(setup.provider.polls)
+    assert polls == (1 if unavailable == "identity" else 2)
+    other._retry_settlements()
+    assert len(setup.provider.polls) == polls
+    setup.clock.now += timedelta(seconds=5)
+    other._poll_stop.set()
+    other._retry_settlements()
+    assert len(setup.provider.polls) == polls
+    assert other._pending[job.video_id] is pending
+    assert dict(_attempts(setup)[0]) == before
+    # Restore availability before shutdown: drain must not start provider I/O.
+    other._poll_stop.clear()
+    setup.provider.poll_status = 200
+    setup.provider.poll_payload = None
+    setup.provider.done = True
+    assert jobs.save_open(job=job)
+    assert other.refresh(job).settled
+    assert dict(_attempts(setup)[0]) == before
+    assert len(setup.provider.posts) == 1
+    assert other.close(5)
+
+
+def test_recovered_terminal_is_retained_before_retrying_its_exact_ledger_write(
+    setup: _Setup,
+) -> None:
+    """A lost replay acknowledgment retries the retained receipt without another provider poll."""
+    job = _unpublished_terminal(setup)
+    before = dict(_attempts(setup)[0])
+    other = _stored_engine(setup, InMemoryVideoOutputStore())
+    finish = setup.components.ledger.finish_attempt
+
+    def lose_exact_ack(
+        *,
+        attempt_id: str,
+        terminal_event: GatewayEvent | None,
+        failure: GatewayFailure | None,
+        finalize_request: bool,
+    ) -> None:
+        """Commit exact replay before losing its acknowledgment; let typed supersession through."""
+        finish(
+            attempt_id=attempt_id,
+            terminal_event=terminal_event,
+            failure=failure,
+            finalize_request=finalize_request,
+        )
+        raise RuntimeError("exact replay acknowledgment lost")
+
+    with patch.object(setup.components.ledger, "finish_attempt", side_effect=lose_exact_ack):
+        assert not other.refresh(job).settled
+    retained = other._pending[job.video_id]
+    assert retained.require_ledger_replay
+    assert not retained.ledger_written
+    assert retained.closed.billed_seconds_milli == 5_000
+    setup.provider.poll_status = 503
+    assert other.close(5)
+    assert len(setup.provider.polls) == 2
+    assert len(setup.provider.posts) == 1
+    assert dict(_attempts(setup)[0]) == before
+
+
+def test_conflicting_recovered_meter_keeps_ownership_without_repolling(setup: _Setup) -> None:
+    """A different meter cannot rewrite the original terminal or publish a job."""
+    job = _unpublished_terminal(setup)
+    before = dict(_attempts(setup)[0])
+    other = _stored_engine(setup, InMemoryVideoOutputStore())
+    setup.provider.xai_duration = 6
+    assert not other.refresh(job).settled
+    retained = other._pending[job.video_id]
+    assert retained.closed.billed_seconds_milli == 6_000
+    assert retained.require_ledger_replay
+    setup.provider.xai_duration = 5
+    other._retry_settlements()
+    assert other._pending[job.video_id] is retained
+    assert not retained.ledger_written
+    assert dict(_attempts(setup)[0]) == before
+    assert len(setup.provider.polls) == 2
+    assert len(setup.provider.posts) == 1
+    assert other._poller is None  # This unresolved owner has not started a background thread.
+
+
+@pytest.mark.parametrize("meter", ["unknown", "partial", "estimated"])
+def test_ordinary_unresolved_terminal_does_not_authorize_provider_recovery(
+    setup: _Setup, meter: str
+) -> None:
+    """A generic waiver rejection retains ownership and never polls or changes uncertain money."""
+    job = _create(setup, alias="grok-video", seconds=6)
+    failure = GatewayFailure(
+        failure_class=GatewayFailureClass.PROVIDER_INTERNAL, safe_message="provider failed"
+    )
+    estimated = meter == "estimated"
+    event = GatewayEvent(
+        kind=GatewayEventKind.INCOMPLETE if estimated else GatewayEventKind.FAILED,
+        sequence_number=0,
+        failure=None if estimated else failure,
+        usage=None
+        if meter == "unknown"
+        else GatewayUsage(input_tokens=19, output_tokens=7 if estimated else None),
+        usage_estimated=estimated,
+        usage_unreported_truncation=estimated,
+    )
+    setup.components.ledger.finish_attempt(
+        attempt_id=job.attempt_id,
+        terminal_event=event,
+        failure=failure,
+    )
+    before = dict(_attempts(setup)[0])
+    other = _stored_engine(setup, InMemoryVideoOutputStore())
+    setup.clock.now += timedelta(seconds=VIDEO_JOB_SETTLEMENT_SECONDS + 1)
+    assert not other.refresh(job).settled
+    retained = other._pending[job.video_id]
+    assert retained.event is not None and retained.event.accounting_release_reservation
+    other._retry_settlements()
+    assert other._pending[job.video_id] is retained
+    assert not retained.ledger_written
+    assert dict(_attempts(setup)[0]) == before
+    assert not setup.provider.polls
+    assert len(setup.provider.posts) == 1
+    assert other._poller is None
 
 
 def test_another_owner_timeout_cannot_discard_a_retained_exact_completion(setup: _Setup) -> None:
@@ -1207,7 +1412,9 @@ class _BrokenOutputs(InMemoryVideoOutputStore):
         raise RuntimeError("bucket unavailable")
 
 
-def _stored_engine(setup: _Setup, outputs: InMemoryVideoOutputStore) -> VideoEngine:
+def _stored_engine(
+    setup: _Setup, outputs: InMemoryVideoOutputStore, *, poll_interval_seconds: float = 0
+) -> VideoEngine:
     """A second engine over the same seams with host output storage installed."""
 
     def http() -> httpx.Client:
@@ -1221,7 +1428,7 @@ def _stored_engine(setup: _Setup, outputs: InMemoryVideoOutputStore) -> VideoEng
         jobs=setup.components.video_jobs,
         clients={"veo": VeoVideoClient(http=http), "xai_videos": XaiVideoClient(http=http)},
         clock=setup.clock,
-        poll_interval_seconds=0,
+        poll_interval_seconds=poll_interval_seconds,
         outputs=outputs,
     )
 

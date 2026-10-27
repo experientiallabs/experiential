@@ -78,6 +78,8 @@ class VideoProviderSnapshot(ContractModel):
         error_code: Public failure code for a failed job.
         error_message: Bounded provider explanation for a failed job.
         asset_lifetime_seconds: How long the provider keeps the asset, if known.
+        terminal_replayable: Whether explicit provider evidence can authorize terminal replay.
+            Derived by the client, never copied from the provider's JSON fields.
     """
 
     status: VideoStatus
@@ -87,6 +89,7 @@ class VideoProviderSnapshot(ContractModel):
     error_code: str | None = None
     error_message: str | None = None
     asset_lifetime_seconds: int | None = None
+    terminal_replayable: bool = False
 
 
 @dataclass(frozen=True)
@@ -425,6 +428,7 @@ class VeoVideoClient:
                 status=VideoStatus.FAILED,
                 error_code="video_generation_failed",
                 error_message=_bounded(error.get("message")),
+                terminal_replayable=_bounded(error.get("message")) is not None,
             )
         result = operation.get("response")
         generated = result.get("generateVideoResponse") if isinstance(result, dict) else None
@@ -437,6 +441,7 @@ class VeoVideoClient:
                 progress=100,
                 content_url=uri,
                 asset_lifetime_seconds=VEO_ASSET_LIFETIME_SECONDS,
+                terminal_replayable=True,
             )
         reasons = generated.get("raiMediaFilteredReasons") if isinstance(generated, dict) else None
         return VideoProviderSnapshot(
@@ -446,6 +451,9 @@ class VeoVideoClient:
                 _bounded(reasons[0])
                 if isinstance(reasons, list) and reasons
                 else "the provider returned no video for this request"
+            ),
+            terminal_replayable=(
+                isinstance(reasons, list) and bool(reasons) and _bounded(reasons[0]) is not None
             ),
         )
 
@@ -550,6 +558,7 @@ class XaiVideoClient:
                 status=VideoStatus.FAILED,
                 error_code="video_generation_failed",
                 error_message=_bounded(body.get("error")) or f"the provider reported {status}",
+                terminal_replayable=status == "failed",
             )
         video = body.get("video")
         video_url = video.get("url") if isinstance(video, dict) else None
@@ -557,7 +566,10 @@ class XaiVideoClient:
         duration_milli = _duration_milli(duration)
         if output_stored:
             return VideoProviderSnapshot(
-                status=VideoStatus.COMPLETED, progress=100, duration_milli=duration_milli
+                status=VideoStatus.COMPLETED,
+                progress=100,
+                duration_milli=duration_milli,
+                terminal_replayable=True,
             )
         if not _asset_url(video_url):
             return VideoProviderSnapshot(
@@ -570,6 +582,7 @@ class XaiVideoClient:
             progress=100,
             content_url=video_url,
             duration_milli=duration_milli,
+            terminal_replayable=True,
         )
 
     def content(self, profile: GatewayWireProfile, content_url: str) -> VideoContentFetch:

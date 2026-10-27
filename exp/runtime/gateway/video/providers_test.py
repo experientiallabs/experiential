@@ -185,12 +185,14 @@ def test_veo_polls_normalize_every_terminal_shape() -> None:
         snapshot = VeoVideoClient(http=_http(handler)).poll(_VEO, "models/veo/operations/op-1")
         assert seen == [f"{root}/models/veo/operations/op-1"]
         assert (snapshot.status, snapshot.error_code) == (expected, code)
+        assert snapshot.terminal_replayable is (status == 200 and expected is VideoStatus.FAILED)
     sample = {"video": {"uri": f"{root}/files/abc:download?alt=media"}}
     done = {"done": True, "response": {"generateVideoResponse": {"generatedSamples": [sample]}}}
     snapshot = VeoVideoClient(http=_http(_answer(200, done))).poll(
         _VEO, "models/veo/operations/op-1"
     )
     assert snapshot.status is VideoStatus.COMPLETED
+    assert snapshot.terminal_replayable
     assert snapshot.content_url == sample["video"]["uri"]
     assert snapshot.asset_lifetime_seconds == VEO_ASSET_LIFETIME_SECONDS
 
@@ -279,6 +281,21 @@ def test_xai_poll_shapes(payload: object, status: VideoStatus, code: str | None)
     """Pending, failed, expired, and URL-less generations normalize."""
     snapshot = XaiVideoClient(http=_http(_answer(200, payload))).poll(_XAI, "req")
     assert (snapshot.status, snapshot.error_code) == (status, code)
+    assert snapshot.terminal_replayable is (
+        isinstance(payload, dict) and payload.get("status") == "failed"
+    )
+
+
+@pytest.mark.parametrize("payload", [{}, {"status": "unknown"}, {"status": "expired"}])
+def test_xai_missing_or_expired_status_cannot_assert_terminal_replay(
+    payload: dict[str, object],
+) -> None:
+    """Only the client parser can establish terminal evidence; a JSON flag has no authority."""
+    snapshot = XaiVideoClient(
+        http=_http(_answer(200, {**payload, "terminal_replayable": True}))
+    ).poll(_XAI, "req")
+    assert snapshot.status is VideoStatus.FAILED  # Ordinary failure normalization is unchanged.
+    assert not snapshot.terminal_replayable
 
 
 def test_veo_sends_duration_seconds_as_a_json_number() -> None:

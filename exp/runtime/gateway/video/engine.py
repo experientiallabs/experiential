@@ -26,7 +26,6 @@ from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 
-from exp.common.models.catalog_prices import BilledUnitKind
 from exp.common.models.gateway_catalog import ExactModelDeployment
 from exp.runtime.gateway.client_apps import with_client_identity
 from exp.runtime.gateway.contracts import AuthorizationSnapshot, DirectTarget
@@ -45,12 +44,10 @@ from exp.runtime.gateway.native_execution import (
 from exp.runtime.gateway.native_request_settlement import RequestSettlements
 from exp.runtime.gateway.native_settlement import gateway_updating_failure
 from exp.runtime.gateway.stream_contracts import (
-    BilledUnits,
     GatewayEvent,
     GatewayEventKind,
     GatewayFailure,
     GatewayFailureClass,
-    GatewayUsage,
 )
 from exp.runtime.gateway.video.contracts import (
     VIDEO_JOB_SETTLEMENT_SECONDS,
@@ -71,7 +68,14 @@ from exp.runtime.gateway.video.providers import (
     default_video_clients,
     video_dialect,
 )
-from exp.runtime.gateway.video.settlement import JobGate, PendingSettlement, closed_job, zero_units
+from exp.runtime.gateway.video.settlement import (
+    JobGate,
+    PendingSettlement,
+    closed_job,
+    require_same_job,
+    terminal_settlement,
+    zero_units,
+)
 from exp.runtime.gateway.video.store import ListOrder, VideoJobStore
 from exp.runtime.models.providers.base import GatewayWireProfile
 from exp.runtime.openai_protocol.errors import OpenAIProtocolError, public_failure_error
@@ -666,12 +670,8 @@ class VideoEngine:
         resolved = self._resolve(job)
         if resolved is None:
             return job
-        profile, client = resolved
-        assert job.provider_job_id is not None
         try:
-            snapshot = client.poll(profile, job.provider_job_id, output_stored=job.output_stored)
-            if snapshot.status is VideoStatus.COMPLETED and job.output_stored:
-                snapshot = self._confirm_stored(job, snapshot)
+            snapshot = self._poll_snapshot(job, resolved)
         except Exception:  # noqa: BLE001 - transient; the next poll retries.
             _LOGGER.warning("video %s poll unavailable; will retry", job.video_id)
             return self._save(job.model_copy(update={"last_polled_at": now}))
@@ -686,6 +686,17 @@ class VideoEngine:
                 }
             )
         )
+
+    def _poll_snapshot(
+        self, job: VideoJob, resolved: tuple[GatewayWireProfile, VideoProviderClient]
+    ) -> VideoProviderSnapshot:
+        """Read the same frozen provider job with the client's bounded transport."""
+        profile, client = resolved
+        assert job.provider_job_id is not None
+        snapshot = client.poll(profile, job.provider_job_id, output_stored=job.output_stored)
+        if snapshot.status is VideoStatus.COMPLETED and job.output_stored:
+            snapshot = self._confirm_stored(job, snapshot)
+        return snapshot
 
     def _confirm_stored(
         self, job: VideoJob, snapshot: VideoProviderSnapshot
@@ -723,71 +734,17 @@ class VideoEngine:
         observed_zero: bool,
         release_reservation: bool = False,
     ) -> VideoJob:
-        """Settle one job's attempt exactly once and persist its terminal state.
-
-        A completed snapshot bills ``min(rendered, requested)`` seconds; any
-        provider failure bills zero observed seconds. Local recovery has unknown
-        provider usage; a timeout explicitly releases the customer reservation
-        without claiming zero provider units or cost.
-        """
-        now = self._clock()
-        completed = snapshot is not None and snapshot.status is VideoStatus.COMPLETED
-        if completed:
-            assert snapshot is not None
-            requested = job.seconds * 1000
-            billed = min(snapshot.duration_milli or requested, requested)
-            usage = GatewayUsage(
-                billed_units=BilledUnits(
-                    kind=BilledUnitKind.VIDEO_SECOND, variant=job.variant, quantity_milli=billed
-                )
-            )
-            event = GatewayEvent(kind=GatewayEventKind.COMPLETED, sequence_number=0, usage=usage)
-            failure = None
-        else:
-            if failure is None:
-                assert snapshot is not None
-                failure = GatewayFailure(
-                    failure_class=GatewayFailureClass.REFUSAL
-                    if snapshot.error_code == "content_filtered"
-                    else GatewayFailureClass.PROVIDER_INTERNAL,
-                    safe_message=snapshot.error_message or "the video could not be generated",
-                )
-            billed = 0 if observed_zero else None
-            event = (
-                GatewayEvent.for_accounting_recovery(
-                    failure=failure, release_reservation=release_reservation
-                )
-                if snapshot is None and not observed_zero
-                else GatewayEvent(
-                    kind=GatewayEventKind.FAILED,
-                    sequence_number=0,
-                    failure=failure,
-                    usage=zero_units(job.variant) if observed_zero else None,
-                )
-            )
-        if completed:
-            assert snapshot is not None
-            lifetime = snapshot.asset_lifetime_seconds
-            closed = job.model_copy(
-                update={
-                    "status": VideoStatus.COMPLETED,
-                    "progress": 100,
-                    "content_url": snapshot.content_url,
-                    "billed_seconds_milli": billed,
-                    "completed_at": now,
-                    "expires_at": None if lifetime is None else now + timedelta(seconds=lifetime),
-                    "last_polled_at": now,
-                    "settled": True,
-                }
-            )
-        else:
-            assert failure is not None
-            code = None if snapshot is None else snapshot.error_code
-            closed = closed_job(job, failure, settled_milli=billed, now=now, code=code)
+        """Retain one terminal receipt until accounting and job publication both acknowledge it."""
+        candidate = terminal_settlement(
+            job,
+            snapshot,
+            failure=failure,
+            observed_zero=observed_zero,
+            release_reservation=release_reservation,
+            now=self._clock(),
+        )
         with self._pending_lock:
-            pending = self._pending.setdefault(
-                job.video_id, PendingSettlement(job, closed, event, failure)
-            )
+            pending = self._pending.setdefault(job.video_id, candidate)
         return self._deliver_settlement(pending)
 
     def _deliver_settlement(self, pending: PendingSettlement) -> VideoJob:
@@ -815,6 +772,8 @@ class VideoEngine:
                     pending,
                     recovery_superseded=isinstance(error, AccountingRecoverySupersededError),
                 )
+                if saved is None and isinstance(error, AccountingRecoverySupersededError):
+                    return self._recover_superseded(pending)
             except Exception:  # noqa: BLE001 - a failed reread never releases ownership.
                 saved = None
             if saved is None:
@@ -825,6 +784,48 @@ class VideoEngine:
                 del self._pending[pending.job.video_id]
         return saved
 
+    def _recover_superseded(self, pending: PendingSettlement) -> VideoJob:
+        """Recover lost job publication only from a terminal read and exact ledger replay."""
+        now = self._clock()
+        if (
+            self._poll_stop.is_set()
+            or pending.job.provider_job_id is None
+            or pending.event is None
+            or not pending.event.accounting_release_reservation
+            or (
+                pending.recovery_polled_at is not None
+                and now - pending.recovery_polled_at < self._poll_interval
+            )
+        ):
+            return pending.job
+        pending.recovery_polled_at = now
+        current = self._jobs.load_any(video_id=pending.job.video_id)
+        if current is None:
+            return pending.job
+        require_same_job(current, pending.job, frozen=True)
+        resolved = self._resolve(pending.job)
+        if resolved is None:
+            return pending.job
+        snapshot = self._poll_snapshot(pending.job, resolved)
+        if not snapshot.terminal_replayable or snapshot.status not in {
+            VideoStatus.COMPLETED,
+            VideoStatus.FAILED,
+        }:
+            return pending.job
+        recovered = terminal_settlement(
+            pending.job,
+            snapshot,
+            failure=None,
+            observed_zero=True,
+            now=now,
+        )
+        recovered.require_ledger_replay = True
+        with self._pending_lock:
+            if self._pending.get(pending.job.video_id) is not pending:
+                return pending.job
+            self._pending[pending.job.video_id] = recovered
+        return self._deliver_settlement(recovered)
+
     def _settled_job_winner(
         self, pending: PendingSettlement, *, recovery_superseded: bool = False
     ) -> VideoJob | None:
@@ -832,20 +833,10 @@ class VideoEngine:
         current = self._jobs.load_any(video_id=pending.job.video_id)
         if current is None or not current.settled:
             return None
-        if (
-            current.video_id,
-            current.organization_id,
-            current.request_id,
-            current.attempt_id,
-        ) != (
-            pending.job.video_id,
-            pending.job.organization_id,
-            pending.job.request_id,
-            pending.job.attempt_id,
-        ):
-            raise RuntimeError("video settlement winner changed request or attempt identity")
+        require_same_job(current, pending.job)
         if not pending.ledger_written and (
-            (
+            pending.require_ledger_replay
+            or (
                 current.billed_seconds_milli is None
                 and pending.closed.billed_seconds_milli is not None
             )
@@ -861,7 +852,7 @@ class VideoEngine:
         return current
 
     def _retry_settlements(self) -> None:
-        """Give each organization a bounded turn without polling providers again."""
+        """Give each organization a bounded turn for delivery and superseded-job recovery."""
         self._request_settlements.retry(_POLLER_BATCH)
         with self._pending_lock:
             selected = self._recovery.select(list(self._pending.values()), _POLLER_BATCH)
