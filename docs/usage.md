@@ -598,9 +598,10 @@ notice is appended instead and the headline becomes "independent, invalidated: p
 exposure". The receipt and its snapshot are never rewritten, and exposure that
 happens only after the receipt was minted never invalidates it. "Before" and "after" are
 causal, never exposure times: the receipt lists every exposure in the snapshot it was minted
-against, and later exposure counts as after only when a report of a receipt saved under this
-root recorded it. Exposure merged from another ledger cannot be ordered against the receipt, so
-it counts as predating, whatever its recorded time.
+against, and later exposure counts as after only when this root's ledger recorded it from a
+report run here (the ledger notes the rows it wrote itself; a merge never imports that note).
+Exposure merged from another ledger cannot be ordered against the receipt, so it counts as
+predating, whatever its recorded time, even when its receipt was copied into this root.
 
 An audit runs in a fixed order: reserve, register, claim a dispatch slot, call. Selection reads
 the ledger, then the panel's exclusive lease (an OS file lock, `panel in use` for any second

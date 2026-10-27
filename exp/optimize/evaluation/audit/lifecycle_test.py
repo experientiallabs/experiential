@@ -597,19 +597,26 @@ def test_locks_are_always_taken_in_one_order(
 OUTSIDE = f"{TRACE_CONTENT.identity.key}:{'e' * 64}"
 
 
-def expose_outside(store: ProjectStore, *, at: datetime | None = None) -> None:
-    """Expose content no held-out lineage is linked to yet, as a merge from another ledger."""
-    ExposureLedger(store.paths.root).record_exposure(
+def expose_outside(
+    store: ProjectStore,
+    *,
+    at: datetime | None = None,
+    receipt: str = "held-out-audit-receipt-elsewhere",
+) -> None:
+    """Expose content no held-out lineage is linked to yet, merged from another root's ledger."""
+    elsewhere = ExposureLedger(store.paths.root.parent / "elsewhere")
+    elsewhere.record_exposure(
         LedgerExposure(
             vertices=(OUTSIDE,),
             how="inspected",
             panel="held-out-panel-elsewhere",
-            receipt="held-out-audit-receipt-elsewhere",
+            receipt=receipt,
             report="exp eval --audit --verbose",
-            project="elsewhere",
+            project=PROJECT,
             at=at or clock(),
         )
     )
+    ExposureLedger(store.paths.root).merge(elsewhere.export())
 
 
 def link_late(store: ProjectStore, lineage: str, target: str = OUTSIDE) -> None:
@@ -742,6 +749,21 @@ def test_merged_exposure_without_causal_order_counts_even_when_its_clock_claims_
     with audit(store) as opened:
         run(store, opened)
         expose_outside(store, at=opened.receipt.opened_at + timedelta(days=1))
+        link_late(store, opened.receipt.lineages[0])
+        assert opened.reassess(clock)
+        [notice] = opened.view.notices
+        assert notice.exposed[0].path is not None
+        assert notice.exposed[0].path.exposed_node == OUTSIDE
+
+
+def test_merged_exposure_counts_even_when_its_receipt_was_copied_here(
+    built: tuple[ProjectStore, FailingOnce],
+) -> None:
+    """A receipt saved here, as in a copied root, never proves this root recorded its exposure."""
+    store, _ = built
+    with audit(store) as opened:
+        run(store, opened)
+        expose_outside(store, receipt=opened.receipt.receipt_id)
         link_late(store, opened.receipt.lineages[0])
         assert opened.reassess(clock)
         [notice] = opened.view.notices

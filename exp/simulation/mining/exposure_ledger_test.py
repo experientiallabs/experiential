@@ -344,18 +344,20 @@ def test_unfingerprintable_traces_are_unresolved_nodes_still_linked_by_grouping(
 
 
 def test_ledger_rows_are_append_only_and_exports_merge(tmp_path: Path) -> None:
-    """Rows are never edited or deleted; a merged export reproduces the snapshot."""
+    """Rows are never edited or deleted; a merged export reproduces the snapshot, not provenance."""
     ledger = ExposureLedger(tmp_path / "here")
     build(ledger, "one", trace(1, lineage="x"), trace(2, lineage="x"))
     first = ledger.snapshot().identity
     build(ledger, "one", trace(1, lineage="x"), trace(2, lineage="x"))
     assert ledger.snapshot().identity == first, "recording the same build again adds nothing"
-    expose(ledger, vertex(ledger, trace(1)))
+    exposure = expose(ledger, vertex(ledger, trace(1)))
     exported = ledger.export()
+    assert exported.recorded_here == (exposure.record_id,)
     elsewhere = ExposureLedger(tmp_path / "elsewhere")
     assert elsewhere.snapshot().exposure((vertex(ledger, trace(2)),)) is None
     assert elsewhere.merge(exported) == ()
     assert elsewhere.snapshot().identity == exported.identity
+    assert elsewhere.export().recorded_here == (), "a merge never claims it recorded a row"
     with pytest.raises(Exception, match="append-only"):
         with ledger.transaction() as transaction:
             transaction._connection.execute("DELETE FROM records")  # noqa: SLF001
