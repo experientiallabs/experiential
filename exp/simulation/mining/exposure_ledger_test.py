@@ -12,6 +12,7 @@ from pydantic import ValidationError
 from exp.common.core.artifacts import ArtifactInput, JsonValue, sha256_json
 from exp.common.traces import Trace
 from exp.simulation.mining.exposure_ledger import (
+    DECLARED_PREFIX,
     ExposureLedger,
     LedgerEdge,
     LedgerExposure,
@@ -160,9 +161,11 @@ def test_declared_task_edges_stay_within_one_source_and_customer(tmp_path: Path)
     build(ledger, "one", a, b, other_customer, other_source)
 
     edges = ledger.export().edges
-    assert [(edge.left, edge.right, edge.task_lineage) for edge in edges] == [
-        (*sorted((vertex(ledger, a), vertex(ledger, b))), "ticket-1")
-    ]
+    identities = {edge.left for edge in edges if edge.left.startswith(DECLARED_PREFIX)}
+    assert len(identities) == 3, "each source and customer scope has its own identity vertex"
+    assert [
+        (edge.left, edge.right, edge.task_lineage) for edge in edges if edge.left not in identities
+    ] == [(*sorted((vertex(ledger, a), vertex(ledger, b))), "ticket-1")]
     expose(ledger, vertex(ledger, a))
     snapshot = ledger.snapshot()
     found = snapshot.exposure((vertex(ledger, b),))
@@ -180,6 +183,28 @@ def test_declared_task_edges_stay_within_one_source_and_customer(tmp_path: Path)
             near_duplicates=(),
         )
     assert ledger.snapshot().identity == snapshot.identity
+
+
+def test_a_declared_task_identity_links_traces_across_builds(tmp_path: Path) -> None:
+    """A task seen in one build stays exposed when a later import holds only new content of it."""
+    ledger = ExposureLedger(tmp_path)
+    seen = customer(trace(1, lineage="user_17"), "c1")
+    fresh = customer(trace(2, lineage="user_17"), "c1")
+    other_customer = customer(trace(3, lineage="user_17"), "c2")
+    other_source = customer(trace(4, lineage="user_17"), "c1", source_id="other-export")
+    build(ledger, "one", seen)
+    build(ledger, "two", fresh, other_customer, other_source)
+    exposure = expose(ledger, vertex(ledger, seen))
+    snapshot = ledger.snapshot()
+    found = snapshot.exposure((vertex(ledger, fresh),))
+    assert found is not None and found.by == (exposure.record_id,)
+    assert found.component_size == 2, "the task identity itself is not counted as content"
+    assert [(edge.task_lineage, edge.build) for edge in found.path] == [
+        ("user_17", "task-set-two"),
+        ("user_17", "task-set-one"),
+    ]
+    assert snapshot.exposure((vertex(ledger, other_customer),)) is None
+    assert snapshot.exposure((vertex(ledger, other_source),)) is None
 
 
 def test_matching_runs_under_every_computable_scheme_with_equivalence_links(

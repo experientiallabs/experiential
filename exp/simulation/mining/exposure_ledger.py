@@ -12,7 +12,9 @@ SQLite file, and keys everything on content (:mod:`exp.simulation.mining.fingerp
 - Edges are grouping relationships recorded for every build, whether or not anything is exposed:
   two traces that declare the same task identity within one source and customer, exactly as the
   build's own partition scopes declarations (:mod:`exp.simulation.mining.lineage`), or the
-  build's near-duplicate union with its similarity. Each edge names the project and build that
+  build's near-duplicate union with its similarity. Each build also links its declaring traces
+  to a vertex for the scoped identity itself, so one task joins its traces across builds even
+  when a later import holds only new content of it. Each edge names the project and build that
   produced it. Nothing weaker (a shared customer, conversation or time bucket, or a declared
   name reused by another source or customer) is an edge.
 - Equivalence links join the nodes of one verified source under every scheme that fingerprinted
@@ -62,6 +64,7 @@ LEDGER_DIRECTORY = "exposure-ledger"
 LEDGER_FILE = "ledger.sqlite"
 SCHEMA_VERSION: Final = 1
 TASK_LINEAGE_KEY = "task_lineage"
+DECLARED_PREFIX = "declared:"
 SAME_HOST_LIMIT = (
     "Reservations and panel leases are atomic only for runs sharing one ledger file on one host; "
     "SQLite and file locks over network filesystems are unreliable."
@@ -336,7 +339,8 @@ class LedgerSnapshot:
             *(vertex for item in export.exposures for vertex in item.vertices),
             *self._reserved,
         }:
-            self._sizes[self._union.find(vertex)] += 1
+            if not vertex.startswith(DECLARED_PREFIX):
+                self._sizes[self._union.find(vertex)] += 1
 
     def _link(self, left: Vertex, right: Vertex, edge: LedgerEdge | None) -> None:
         """Join two vertices by a grouping edge or an equivalence link (``None``)."""
@@ -601,7 +605,8 @@ class ExposureLedger:
         Every trace is fingerprinted under every computable scheme; edges use the newest. A
         declared-task-identity edge joins traces that declare one task identity within one
         source and customer, the scope the build's own partition gives declarations, so a
-        task name reused by an unrelated source or customer never links their content.
+        task name reused by an unrelated source or customer never links their content. One
+        more such edge links them to the scoped identity's own vertex, shared by every build.
 
         Args:
             project: Project that built.
@@ -629,20 +634,19 @@ class ExposureLedger:
         nodes = _nodes(self, project, build, dataset, traces)
         by_trace = {node.source.trace_id: node for node in nodes if node.scheme == primary}
         edges: list[LedgerEdge] = []
-        for (_, _, task_lineage), members in sorted(
-            _declared_partitions(traces, lineages, by_trace).items()
-        ):
+        for scope, members in sorted(_declared_partitions(traces, lineages, by_trace).items()):
             chain = sorted(members)
+            declared = DECLARED_PREFIX + sha256_json(list(scope))
             edges.extend(
                 LedgerEdge(
-                    left=left,
-                    right=right,
+                    left=min(left, right),
+                    right=max(left, right),
                     reason="declared-task-identity",
-                    task_lineage=task_lineage,
+                    task_lineage=scope[2],
                     project=project,
                     build=build,
                 )
-                for left, right in zip(chain, chain[1:], strict=False)
+                for left, right in (*zip(chain, chain[1:], strict=False), (chain[0], declared))
             )
         for duplicate in near_duplicates:
             ends = sorted(

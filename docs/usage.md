@@ -550,9 +550,11 @@ reimports, rebuilds and regrouping:
 - Edges are grouping relationships that every `exp build` records, exposed or not: traces that
   declare the same task identity within one source and customer (the scope the build's own
   partition gives declarations), and the build's own exact or semantic near-duplicate unions
-  with their similarity. Each names the project and build that produced it. Nothing weaker (a
-  shared customer, conversation or time bucket, or a declared name reused by another source or
-  customer) is an edge.
+  with their similarity. Each names the project and build that produced it. Declaring traces
+  also link to the scoped task identity itself, so a task stays joined across builds even when
+  a later import carries only new content of it. Nothing weaker (a shared customer,
+  conversation or time bucket, or a declared name reused by another source or customer) is an
+  edge.
 - Equivalence links join one source's nodes under every scheme that fingerprinted it, for
   unexposed traces too.
 - Exposures mark content a person saw, with the panel, receipt and report that showed it.
