@@ -315,9 +315,7 @@ class GatewayEvent(ContractModel):
         """Whether the admitted request may have paid prework, independent of its meter."""
         return self._attempt_paid_prework
 
-    def with_attempt_observation(
-        self, *, stream_opened: bool, paid_prework: bool
-    ) -> GatewayEvent:
+    def with_attempt_observation(self, *, stream_opened: bool, paid_prework: bool) -> GatewayEvent:
         """Attach execution facts privately without deciding a host's billing policy."""
         event = self.model_copy()
         event._attempt_stream_opened = stream_opened
