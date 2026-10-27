@@ -140,6 +140,35 @@ def test_a_bounded_collection_resumes_from_its_durable_cursor(tmp_path: Path) ->
     assert store.read_session("s").state == _world(5)
 
 
+def test_a_half_reclaimed_revision_cannot_be_pinned_and_collection_continues(
+    tmp_path: Path,
+) -> None:
+    """A bounded sweep that stopped between a revision's child and its root leaves it unpinnable.
+
+    Genesis stores its children before its root, so a one-row batch sweep reaches the point
+    where the old rows subtree is gone and the genesis root row is still present.
+    """
+    store = _history(tmp_path)
+    old = store.ref_at("s", 0)
+    root = bytes.fromhex(old.root_sha256)
+    for _ in range(_node_count(tmp_path / "s.sqlite")):
+        store.collect_garbage(batch_size=1, maximum_batches=1)
+        with sqlite3.connect(tmp_path / "s.sqlite") as raw:
+            remaining = raw.execute(
+                "SELECT COUNT(*) FROM state_nodes WHERE digest = ?", (root,)
+            ).fetchone()[0]
+        try:
+            store.read_state(old)
+        except StateUnavailableError:
+            break
+    assert remaining == 1, "the sweep must stop after a child of genesis and before its root"
+    with pytest.raises(StateUnavailableError, match="partly reclaimed"):
+        store.pin_revisions("late", "s", 0, 1)
+    assert not store.release_pin("late", "s")
+    assert store.collect_garbage().complete
+    assert store.read_session("s").state == _world(5)
+
+
 def test_a_commit_between_batches_that_reuses_a_candidate_keeps_it_alive(
     tmp_path: Path,
 ) -> None:

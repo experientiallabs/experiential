@@ -71,6 +71,11 @@ class CollectionReport(ContractModel):
 def pin_revisions(connection: sqlite3.Connection, pin: RetentionPin) -> RetentionPin:
     """Register a pin after checking that every revision in its range is still materialized.
 
+    A bounded or interrupted collection can delete an unowned revision's shared child and stop
+    before its root, so the check walks every node each revision reaches, not only its root.
+    Pinning a half-reclaimed revision would expose unreadable state and make every later
+    collection refuse to mark.
+
     Args:
         connection: Connection inside a write transaction.
         pin: Requested owner and range.
@@ -82,7 +87,7 @@ def pin_revisions(connection: sqlite3.Connection, pin: RetentionPin) -> Retentio
         SessionNotFoundError: If the session does not exist.
         RetentionConflictError: If the owner already pins another range of the session, or
             the range extends past the session head.
-        StateUnavailableError: If a revision in the range was already reclaimed.
+        StateUnavailableError: If a node of a revision in the range was already reclaimed.
     """
     head = connection.execute(
         "SELECT version FROM sessions WHERE session_id = ?", (pin.session_id,)
@@ -108,14 +113,20 @@ def pin_revisions(connection: sqlite3.Connection, pin: RetentionPin) -> Retentio
                 "release it first"
             )
         return pin
-    for row in connection.execute(
-        "SELECT e.revision FROM state_events e LEFT JOIN state_nodes n ON n.digest = e.root"
-        " WHERE e.session_id = ? AND e.revision >= ? AND e.revision < ? AND n.digest IS NULL",
-        (pin.session_id, pin.start_revision, pin.end_revision),
-    ):
-        raise StateUnavailableError(
-            f"revision {row['revision']} of {pin.session_id!r} was reclaimed; it cannot be pinned"
+    roots = {
+        bytes(row[0])
+        for row in connection.execute(
+            "SELECT root FROM state_events WHERE session_id = ? AND revision >= ? AND revision < ?",
+            (pin.session_id, pin.start_revision, pin.end_revision),
         )
+    }
+    try:
+        _reachable(connection, roots)
+    except StateUnavailableError as error:
+        raise StateUnavailableError(
+            f"revisions [{pin.start_revision}, {pin.end_revision}) of {pin.session_id!r} were"
+            " partly reclaimed; they cannot be pinned"
+        ) from error
     connection.execute(
         "INSERT INTO state_pins (owner_id, session_id, start_revision, end_revision)"
         " VALUES (?, ?, ?, ?)",
