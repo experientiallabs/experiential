@@ -11,6 +11,7 @@ from exp.common.core.artifacts import (
     sha256_json,
     stable_id,
 )
+from exp.common.evaluations.actor_rubric import actor_judge
 from exp.common.models import load_model_catalog
 from exp.common.progress import ProgressHook, report
 from exp.common.project import ProjectStore, artifact_input
@@ -110,7 +111,7 @@ def prepare_built_council(
     identity = stable_id(
         "built-council",
         {
-            "profile": "built-council-json-judge-v2",
+            "profile": "built-council-actor-judge-v3",
             "build": build.model_dump(mode="json"),
             "models": list(models),
             "catalog_sha256": sha256_json(catalog),
@@ -223,7 +224,10 @@ def prepare_built_council(
         actors=tuple(CouncilActor(alias=alias, tier="operator-selected") for alias in models),
         analysts=(calibration_spec.judge_alias,),
         judge_alias=calibration_spec.judge_alias,
-        judge=calibration_spec.judge,
+        # Actors are judged on task behavior, not on the calibration's reconstruction fidelity.
+        judge=actor_judge(
+            calibration_spec.judge.model_identity, per_turn=calibration_spec.judge.per_turn
+        ),
         retrieval=retrieval,
         memory=None,
         analyst_fidelity_plans=(artifact_input(project.artifacts.read(calibration.id).manifest),),

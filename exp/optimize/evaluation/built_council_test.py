@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from exp.common.core.artifacts import JsonObject
+from exp.common.evaluations.actor_rubric import ACTOR_JUDGE_PROMPT, actor_judge
 from exp.common.models import load_model_catalog, write_model_catalog
 from exp.optimize.evaluation import built_council, fidelity, trace_council
 from exp.optimize.evaluation.built_council import DEFAULT_ACTOR_MODELS, prepare_built_council
@@ -43,6 +44,10 @@ def test_fresh_build_prepares_disjoint_calibration_and_actor_tasks(
     assert len(prepared.council.actors) == 5
     assert prepared.calibration.spec.judge_output_protocol == "json"
     assert prepared.council.judge_output_protocol == "json"
+    actor_rubric = actor_judge(prepared.calibration.spec.judge.model_identity)
+    assert prepared.council.judge.definition == actor_rubric.definition
+    assert prepared.council.judge.prompt == ACTOR_JUDGE_PROMPT
+    assert prepared.calibration.spec.judge.definition != actor_rubric.definition
     assert prepared.calibration.spec.maximum_physical_attempts >= 3 * (
         5 * len(prepared.calibration.spec.workload.actions) + 1
     )
