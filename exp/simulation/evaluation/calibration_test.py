@@ -780,16 +780,33 @@ def test_rejected_judge_outputs_are_failures_not_abstentions() -> None:
     assert representative["false_acceptances"] == 0 and representative["false_rejections"] == 0
 
 
-@pytest.mark.parametrize("disagreement", ["none", "threshold", "critical"])
+@pytest.mark.parametrize("disagreement", ["none", "threshold", "second-threshold", "critical"])
 def test_judge_only_qualification_needs_matching_threshold_decisions(disagreement: str) -> None:
-    """Scores within tolerance still disqualify a judge whose pass/fail decision flips."""
+    """Scores within tolerance still disqualify a judge whose pass/fail decision flips.
+
+    Two required criteria carry different minimums; a crossing on either one disqualifies.
+    """
     bound = bound_pack(variants=2)
-    judgments = task_judgments(bound)
+    required = {"outcome": 5, "evidence": 4}
+    judgments = tuple(
+        judgment.model_copy(
+            update={
+                "axes": tuple(
+                    axis.model_copy(update={"status": "assessed", "score": 4})
+                    if axis.dimension_id == "evidence"
+                    else axis
+                    for axis in judgment.axes
+                )
+            }
+        )
+        for judgment in task_judgments(bound)
+    )
     labeled = CalibrationPack.model_validate(
         {
             **bound.model_dump(),
             "score_tolerance": 1,
-            "minimum_scores": {"outcome": 5},
+            "required_dimensions": tuple(required),
+            "minimum_scores": required,
             "cases": tuple(
                 {
                     **case.model_dump(),
@@ -799,24 +816,27 @@ def test_judge_only_qualification_needs_matching_threshold_decisions(disagreemen
                         "authority": "human",
                         "expected": case.expected_task,
                     },
-                    "expert_scores": {"outcome": 5 if case.expected_task == "pass" else 1},
+                    "expert_scores": {
+                        "outcome": 5 if case.expected_task == "pass" else 1,
+                        "evidence": 4,
+                    },
                 }
                 for case in bound.cases
             ),
         }
     )
     position = next(i for i, case in enumerate(labeled.cases) if case.challenge.expected == "pass")
-    if disagreement != "none":
+    changes = {
+        "threshold": ("outcome", {"score": 4}),
+        "second-threshold": ("evidence", {"score": 3}),
+        "critical": ("outcome", {"critical_flags": ("unsupported_claim",)}),
+    }
+    if disagreement in changes:
+        criterion, update = changes[disagreement]
         changed = judgments[position].model_copy(
             update={
                 "axes": tuple(
-                    axis.model_copy(
-                        update={"score": 4}
-                        if disagreement == "threshold"
-                        else {"critical_flags": ("unsupported_claim",)}
-                    )
-                    if axis.dimension_id == "outcome"
-                    else axis
+                    axis.model_copy(update=update) if axis.dimension_id == criterion else axis
                     for axis in judgments[position].axes
                 )
             }
