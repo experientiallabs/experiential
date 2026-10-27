@@ -26,6 +26,8 @@ impl FromRef<ServerState> for AppState {
         let mut state = server.base.clone();
         if server.bindings_enabled {
             if let Ok(execution) = EXECUTION.try_with(Arc::clone) {
+                state.guardrail_detectors = execution.resources.guardrail_detectors.clone();
+                state.replays = Arc::new(state.replays.bound(execution.resources.replay_namespace));
                 state.bridge = Arc::new(state.bridge.bind(execution));
             }
         }
@@ -70,6 +72,191 @@ mod tests {
     use axum::routing::post;
     use axum::Router;
     use pyo3::prelude::*;
+    use pyo3::types::PyDict;
+    use std::sync::atomic::AtomicUsize;
+    use std::time::{Duration, Instant};
+    use tokio::sync::Semaphore;
+
+    fn handle(pattern: &str, replacement: &str) -> ExecutionHandle {
+        Python::initialize();
+        Python::attach(|py| {
+            let mapping = PyDict::new(py);
+            let detector = crate::RegexDetector::new(
+                &serde_json::json!({"patterns": [pattern], "replacement": replacement}).to_string(),
+            )
+            .unwrap();
+            mapping
+                .set_item("same-adapter", Py::new(py, detector).unwrap())
+                .unwrap();
+            let handle = ExecutionHandle::new(py.None(), 2, 2, 1, &mapping).unwrap();
+            // The handle owns a snapshot, not the caller's mutable Python dictionary.
+            mapping.clear();
+            handle
+        })
+    }
+
+    fn server_state(process: &ExecutionHandle) -> ServerState {
+        let bridge = crate::bridge::Bridge::new(Python::attach(|py| py.None()), 1).unwrap();
+        ServerState {
+            base: AppState {
+                bridge: Arc::new(bridge),
+                http: crate::upstream::build_client(Duration::from_secs(1), false).unwrap(),
+                permits: Arc::new(Semaphore::new(4)),
+                dispatch_capacity: Arc::new(crate::dispatch_capacity::DispatchCapacity::new()),
+                permit_queue: Arc::new(crate::permit_queue::PermitQueue::new(None)),
+                request_timeout: Duration::from_secs(30),
+                time_to_first_byte: Duration::from_secs(1),
+                time_to_first_byte_slope_seconds_per_million_input_tokens: 0.0,
+                time_to_first_token: Duration::from_secs(1),
+                pre_first_byte_budget: None,
+                pre_first_byte_reserve: Duration::ZERO,
+                pre_first_byte_max: None,
+                pending_settlements: Arc::new(AtomicUsize::new(0)),
+                handled_requests: Arc::new(AtomicUsize::new(0)),
+                replays: Arc::new(crate::replay::ReplayStore::new()),
+                capture: None,
+                guardrail_detectors: process.inner.guardrail_detectors.clone(),
+            },
+            bindings_enabled: true,
+        }
+    }
+
+    fn enforce(
+        state: &AppState,
+        action: &str,
+        text: &str,
+    ) -> Result<String, crate::errors::Failure> {
+        use crate::guardrails::plan::{OutputPlan, PlanCheck};
+
+        let plan = OutputPlan {
+            protected: true,
+            max_response_bytes: 1024,
+            policy_id: "rule".into(),
+            organization_id: String::new(),
+            identity_id: String::new(),
+            checks: vec![PlanCheck {
+                action: action.into(),
+                adapter_id: "same-adapter".into(),
+                check_id: "output".into(),
+                capability: "regex".into(),
+                timeout_ms: 5000,
+            }],
+        };
+        let events = crate::guardrails::plan::enforce(
+            &plan,
+            &state.guardrail_detectors,
+            vec![crate::events::Event::TextDelta(text.into())],
+            Instant::now() + Duration::from_secs(30),
+        )?;
+        Ok(crate::guardrails::projection(&events).text)
+    }
+
+    #[test]
+    fn bound_targets_keep_their_own_detectors_after_extraction() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let process = handle("process", "[process]");
+                let first = handle("alpha", "[first]");
+                let second = handle("beta", "[second]");
+                let empty = Python::attach(|py| {
+                    ExecutionHandle::new(py.None(), 2, 2, 1, &PyDict::new(py)).unwrap()
+                });
+                let server = server_state(&process);
+                let bindings = ExecutionBindings::new(3).unwrap();
+                let mut states = Vec::new();
+                for (index, target) in [&first, &second, &empty].into_iter().enumerate() {
+                    let token = format!("{index:032}");
+                    bindings.register(token.clone(), target).unwrap();
+                    let lease = bindings.claim(&token).unwrap();
+                    let state = EXECUTION
+                        .scope(lease, async { AppState::from_ref(&server) })
+                        .await;
+                    states.push(state);
+                }
+                // The task-local binding has ended; the extracted stream state still owns it.
+                assert!(first.in_use() && second.in_use() && empty.in_use());
+                assert_eq!(
+                    enforce(&states[0], "modify", "alpha beta").unwrap(),
+                    "[first] beta"
+                );
+                assert_eq!(
+                    enforce(&states[1], "modify", "alpha beta").unwrap(),
+                    "alpha [second]"
+                );
+                assert!(enforce(&states[0], "block", "alpha").is_err());
+                assert_eq!(enforce(&states[1], "block", "alpha").unwrap(), "alpha");
+                assert!(matches!(
+                    enforce(&states[2], "block", "process").unwrap_err().class,
+                    crate::errors::FailureClass::Unavailable
+                ));
+                // Independent control planes can reuse every caller/store-local replay ID.
+                let key: crate::replay::ReplayKey = serde_json::from_value(serde_json::json!({
+                    "organization_id": "local", "identity_id": "key", "alias_revision_id": "rev",
+                    "surface": "chat_completions", "caller_operation_sha256": "same-op",
+                    "canonical_request_sha256": "same-body"
+                }))
+                .unwrap();
+                let crate::replay::Claim::Owner(mut first_owner) =
+                    states[0].replays.claim(key.clone()).await.unwrap()
+                else {
+                    panic!("first target must own its request");
+                };
+                let crate::replay::Claim::Owner(mut second_owner) =
+                    states[1].replays.claim(key.clone()).await.unwrap()
+                else {
+                    panic!("another target must not join the first target");
+                };
+                let crate::replay::Claim::Join(first_joiner) =
+                    states[0].replays.claim(key.clone()).await.unwrap()
+                else {
+                    panic!("same-target duplicates must still join");
+                };
+                for (owner, body) in [(&mut first_owner, "first"), (&mut second_owner, "second")] {
+                    owner
+                        .complete(crate::replay::CachedResponse {
+                            status_code: 200,
+                            media_type: "text/plain".into(),
+                            headers: vec![],
+                            body: body.as_bytes().to_vec(),
+                        })
+                        .await
+                        .unwrap();
+                }
+                assert_eq!(first_joiner.result().await.unwrap().body, b"first");
+                for (state, expected) in states
+                    .iter()
+                    .zip([b"first".as_slice(), b"second".as_slice()])
+                {
+                    let crate::replay::Claim::Replay(cached) =
+                        state.replays.claim(key.clone()).await.unwrap()
+                    else {
+                        panic!("each target must replay only its own response");
+                    };
+                    assert_eq!(cached.body, expected);
+                }
+                // Individual execution keeps its own map, even inside a host binding's scope.
+                let individual = ServerState {
+                    bindings_enabled: false,
+                    ..server.clone()
+                };
+                let token = "individual-check".repeat(3);
+                bindings.register(token.clone(), &first).unwrap();
+                let individual_state = EXECUTION
+                    .scope(bindings.claim(&token).unwrap(), async {
+                        AppState::from_ref(&individual)
+                    })
+                    .await;
+                assert_eq!(
+                    enforce(&individual_state, "modify", "process alpha").unwrap(),
+                    "[process] alpha"
+                );
+                drop(states);
+                assert!(!first.in_use() && !second.in_use() && !empty.in_use());
+            });
+    }
 
     #[test]
     fn missing_and_consumed_bindings_preserve_each_wire_error_envelope() {
@@ -79,7 +266,10 @@ mod tests {
             .unwrap()
             .block_on(async {
                 Python::initialize();
-                let handle = ExecutionHandle::new(Python::attach(|py| py.None()), 2, 2, 1).unwrap();
+                let handle = Python::attach(|py| {
+                    ExecutionHandle::new(py.None(), 2, 2, 1, &pyo3::types::PyDict::new(py))
+                })
+                .unwrap();
                 let bindings = ExecutionBindings::new(4).unwrap();
                 let app = Router::new()
                     .route("/v1/messages", post(|| async { "ok" }))

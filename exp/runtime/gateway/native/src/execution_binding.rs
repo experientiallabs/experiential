@@ -1,14 +1,19 @@
 //! Explicit host-selected callback targets and execution resources.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
+use pyo3::types::PyDict;
 use tokio::sync::Semaphore;
 
 use crate::errors::PublicError;
+use crate::guardrails::plan::DetectorMap;
+
+// Zero belongs to individual process execution; handle identities are never reused.
+static NEXT_REPLAY_NAMESPACE: AtomicU64 = AtomicU64::new(1);
 
 /// Resources shared only by requests the host explicitly assigns to this handle.
 pub(crate) struct ExecutionResources {
@@ -16,10 +21,12 @@ pub(crate) struct ExecutionResources {
     pub(crate) active: Arc<Semaphore>,
     pub(crate) serving: Arc<Semaphore>,
     pub(crate) settlement: Arc<Semaphore>,
+    pub(crate) guardrail_detectors: Arc<DetectorMap>,
+    pub(crate) replay_namespace: u64,
     owners: AtomicUsize,
 }
 
-/// A callback target with explicit capacity, independent of caller identity.
+/// A callback target with explicit capacity and detector rules, independent of caller identity.
 #[pyclass]
 pub struct ExecutionHandle {
     pub(crate) inner: Arc<ExecutionResources>,
@@ -28,12 +35,13 @@ pub struct ExecutionHandle {
 #[pymethods]
 impl ExecutionHandle {
     #[new]
-    #[pyo3(signature = (control_plane, *, max_active_requests, callback_permits, settlement_permits))]
+    #[pyo3(signature = (control_plane, *, max_active_requests, callback_permits, settlement_permits, guardrail_detectors))]
     pub(crate) fn new(
         control_plane: Py<PyAny>,
         max_active_requests: usize,
         callback_permits: usize,
         settlement_permits: usize,
+        guardrail_detectors: &Bound<'_, PyDict>,
     ) -> PyResult<Self> {
         if !(1..=65_536).contains(&max_active_requests)
             || !(1..=256).contains(&callback_permits)
@@ -43,12 +51,19 @@ impl ExecutionHandle {
                 "execution limits must be positive: active at most 65536, callbacks at most 256",
             ));
         }
+        let replay_namespace = NEXT_REPLAY_NAMESPACE
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                value.checked_add(1)
+            })
+            .map_err(|_| PyRuntimeError::new_err("execution identity capacity exhausted"))?;
         Ok(Self {
             inner: Arc::new(ExecutionResources {
                 target: control_plane,
                 active: Arc::new(Semaphore::new(max_active_requests)),
                 serving: Arc::new(Semaphore::new(callback_permits)),
                 settlement: Arc::new(Semaphore::new(settlement_permits)),
+                guardrail_detectors: Arc::new(crate::collect_detectors(Some(guardrail_detectors))?),
+                replay_namespace,
                 owners: AtomicUsize::new(0),
             }),
         })
@@ -153,13 +168,15 @@ pub(crate) mod tests {
 
     fn handle() -> ExecutionHandle {
         Python::initialize();
-        ExecutionHandle::new(Python::attach(|py| py.None()), 128, 32, 8).unwrap()
+        Python::attach(|py| ExecutionHandle::new(py.None(), 128, 32, 8, &PyDict::new(py))).unwrap()
     }
 
     pub(crate) fn lease(active: usize, serving: usize, cleanup: usize) -> Arc<ExecutionLease> {
         Python::initialize();
-        let handle =
-            ExecutionHandle::new(Python::attach(|py| py.None()), active, serving, cleanup).unwrap();
+        let handle = Python::attach(|py| {
+            ExecutionHandle::new(py.None(), active, serving, cleanup, &PyDict::new(py))
+        })
+        .unwrap();
         ExecutionLease::new(handle.inner)
     }
 

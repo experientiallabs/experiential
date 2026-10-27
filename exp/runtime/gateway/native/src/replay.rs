@@ -84,15 +84,23 @@ struct Entry {
 }
 
 struct Inner {
-    entries: HashMap<ReplayKey, Entry>,
+    entries: HashMap<CacheKey, Entry>,
     response_bytes: usize,
     order_counter: u64,
     epoch_counter: u64,
 }
 
+/// An execution owner's private namespace never comes from a request or callback.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct CacheKey {
+    namespace: u64,
+    request: ReplayKey,
+}
+
 /// Single-process duplicate joining and exact completed-response replay.
 pub struct ReplayStore {
-    inner: Mutex<Inner>,
+    inner: Arc<Mutex<Inner>>,
+    namespace: u64,
     capacity: usize,
     byte_cap: usize,
     ttl: Duration,
@@ -113,7 +121,7 @@ pub enum Claim {
 /// waiting forever, mirroring the python engine's abandon-on-error paths.
 pub struct OwnerLease {
     store: Arc<ReplayStore>,
-    key: ReplayKey,
+    key: CacheKey,
     epoch: u64,
     settled: bool,
 }
@@ -181,28 +189,42 @@ impl ReplayStore {
 
     pub fn with_bounds(capacity: usize, byte_cap: usize, ttl: Duration) -> Self {
         Self {
-            inner: Mutex::new(Inner {
+            inner: Arc::new(Mutex::new(Inner {
                 entries: HashMap::new(),
                 response_bytes: 0,
                 order_counter: 0,
                 epoch_counter: 0,
-            }),
+            })),
+            namespace: 0,
             capacity: capacity.max(1),
             byte_cap: byte_cap.max(1),
             ttl,
         }
     }
 
+    /// Isolate one execution authority while retaining the process-wide count and byte bounds.
+    pub(crate) fn bound(&self, namespace: u64) -> Self {
+        Self {
+            inner: self.inner.clone(),
+            namespace,
+            capacity: self.capacity,
+            byte_cap: self.byte_cap,
+            ttl: self.ttl,
+        }
+    }
+
     /// Claim original work, join an in-flight duplicate, or replay completion.
     pub async fn claim(self: &Arc<Self>, key: ReplayKey) -> Result<Claim, PublicError> {
+        let key = CacheKey {
+            namespace: self.namespace,
+            request: key,
+        };
         let mut inner = self.inner.lock().await;
         let now = Instant::now();
         Self::expire(&mut inner, now);
-        if inner
-            .entries
-            .keys()
-            .any(|existing| existing.conflicts_with(&key))
-        {
+        if inner.entries.keys().any(|existing| {
+            existing.namespace == key.namespace && existing.request.conflicts_with(&key.request)
+        }) {
             return Err(conflict_error());
         }
         if inner.entries.contains_key(&key) {
@@ -248,7 +270,7 @@ impl ReplayStore {
 
     async fn complete_entry(
         &self,
-        key: &ReplayKey,
+        key: &CacheKey,
         epoch: u64,
         response: CachedResponse,
     ) -> Result<(), PublicError> {
@@ -287,7 +309,7 @@ impl ReplayStore {
         Ok(())
     }
 
-    async fn abandon_entry(&self, key: &ReplayKey, epoch: u64) {
+    async fn abandon_entry(&self, key: &CacheKey, epoch: u64) {
         let mut inner = self.inner.lock().await;
         let matches = inner
             .entries
@@ -301,7 +323,7 @@ impl ReplayStore {
     }
 
     fn expire(inner: &mut Inner, now: Instant) {
-        let expired: Vec<ReplayKey> = inner
+        let expired: Vec<CacheKey> = inner
             .entries
             .iter()
             .filter(|(_, entry)| entry.response.is_some() && entry.expires_at <= now)
@@ -339,7 +361,7 @@ impl ReplayStore {
         Ok(())
     }
 
-    fn oldest_completed(inner: &Inner) -> Option<ReplayKey> {
+    fn oldest_completed(inner: &Inner) -> Option<CacheKey> {
         inner
             .entries
             .iter()
@@ -352,12 +374,12 @@ impl ReplayStore {
 impl OwnerLease {
     /// The alias revision this replay claim was scoped to.
     pub fn alias_revision_id(&self) -> &str {
-        &self.key.alias_revision_id
+        &self.key.request.alias_revision_id
     }
 
     /// The frozen inspection configuration the owner must also use at admission.
     pub fn guardrail_revision(&self) -> Option<&str> {
-        self.key.guardrail_revision.as_deref()
+        self.key.request.guardrail_revision.as_deref()
     }
 
     /// Publish one exact successful response from the unique owner.
@@ -438,6 +460,45 @@ mod tests {
             headers: vec![],
             body: vec![b'x'; size],
         }
+    }
+
+    #[tokio::test]
+    async fn bound_replay_views_isolate_conflicts_and_share_capacity() {
+        let process = Arc::new(ReplayStore::with_bounds(2, 4096, Duration::from_secs(60)));
+        let first = Arc::new(process.bound(1));
+        let second = Arc::new(process.bound(2));
+        let _first = first.claim(key("same", "one")).await.unwrap();
+        let _second = second.claim(key("same", "two")).await.unwrap();
+        let Err(conflict) = first.claim(key("same", "two")).await else {
+            panic!("same-authority conflicting bodies must still conflict");
+        };
+        assert_eq!(conflict.code, "idempotency_conflict");
+        let Err(overloaded) = process.claim(key("other", "body")).await else {
+            panic!("bound views must share the process count limit");
+        };
+        assert_eq!(overloaded.code, "gateway_overloaded");
+    }
+
+    #[tokio::test]
+    async fn bound_replay_views_share_the_byte_limit() {
+        let process = Arc::new(ReplayStore::with_bounds(4, 100, Duration::from_secs(60)));
+        let first = Arc::new(process.bound(1));
+        let second = Arc::new(process.bound(2));
+        for store in [&first, &second] {
+            let Claim::Owner(mut owner) = store.claim(key("same", "body")).await.unwrap() else {
+                panic!("independent authority must own its request");
+            };
+            owner.complete(response(40)).await.unwrap();
+        }
+        assert!(matches!(
+            second.claim(key("same", "body")).await.unwrap(),
+            Claim::Replay(_)
+        ));
+        assert!(matches!(
+            first.claim(key("same", "body")).await.unwrap(),
+            Claim::Owner(_)
+        ));
+        assert!(process.inner.lock().await.response_bytes <= 100);
     }
 
     #[tokio::test]

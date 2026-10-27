@@ -479,7 +479,10 @@ class Plane:
         let process_observer = Python::attach(|py| process.clone_ref(py));
         let target = plane();
         let observer = Python::attach(|py| target.clone_ref(py));
-        let handle = ExecutionHandle::new(target, 128, 1, 1).unwrap();
+        let handle = Python::attach(|py| {
+            ExecutionHandle::new(target, 128, 1, 1, &pyo3::types::PyDict::new(py))
+        })
+        .unwrap();
         let bindings = ExecutionBindings::new(1).unwrap();
         let token = "x".repeat(32);
         bindings.register(token.clone(), &handle).unwrap();
@@ -592,7 +595,10 @@ class DatabasePlane:
                     .unbind()
             });
             let observer = Python::attach(|py| target.clone_ref(py));
-            let handle = ExecutionHandle::new(target, 128, 1, 1).unwrap();
+            let handle = Python::attach(|py| {
+                ExecutionHandle::new(target, 128, 1, 1, &pyo3::types::PyDict::new(py))
+            })
+            .unwrap();
             let token = format!("{index:032}");
             bindings.register(token.clone(), &handle).unwrap();
             let bound = bridge.bind(bindings.claim(&token).unwrap());
@@ -635,7 +641,10 @@ class DatabasePlane:
         let target = plane();
         Python::attach(|py| target.bind(py).setattr("fail_close", true).unwrap());
         let observer = Python::attach(|py| target.clone_ref(py));
-        let handle = ExecutionHandle::new(target, 128, 1, 1).unwrap();
+        let handle = Python::attach(|py| {
+            ExecutionHandle::new(target, 128, 1, 1, &pyo3::types::PyDict::new(py))
+        })
+        .unwrap();
         let bindings = ExecutionBindings::new(1).unwrap();
         let token = "c".repeat(32);
         bindings.register(token.clone(), &handle).unwrap();

@@ -167,7 +167,7 @@ impl RegexDetector {
     }
 }
 
-/// Collect the adapter-keyed detectors handed to `serve`.
+/// Snapshot the adapter-keyed detectors supplied by one execution owner.
 fn collect_detectors(detectors: Option<&Bound<'_, PyDict>>) -> PyResult<DetectorMap> {
     let mut compiled: DetectorMap = HashMap::new();
     let Some(mapping) = detectors else {
