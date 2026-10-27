@@ -218,6 +218,7 @@ def prepare_project_traces(
     stage = ProjectProviderFreeStage(
         trace_dataset=trace_dataset,
         task_set=task_set,
+        descriptor_embedder=DESCRIPTOR_EMBEDDING,
     )
     store.bind_provider_free_stage(stage)
     return stage
@@ -260,6 +261,8 @@ def provider_free_build_review(store: ProjectStore) -> BuildReviewReadiness:
         Manifest-bound readiness record accepted by completed-build selection.
 
     Raises:
+        SupersededBuildReviewError: The stage was mined under another descriptor grouping
+            version, or before its version was recorded.
         ValueError: Preparation settings, source evidence, or selected pointers are inconsistent.
     """
     config = store.load_project()
@@ -267,6 +270,13 @@ def provider_free_build_review(store: ProjectStore) -> BuildReviewReadiness:
     settings = config.trace_preparation
     if stage is None or settings is None:
         raise ValueError("hosted build requires selected provider-free trace evidence")
+    if stage.descriptor_embedder != DESCRIPTOR_EMBEDDING:
+        raise SupersededBuildReviewError(
+            f"this project's provider-free tasks were grouped into lineages under "
+            f"{stage.descriptor_embedder or 'an unrecorded descriptor version'}, and this version "
+            f"of exp groups them under {DESCRIPTOR_EMBEDDING}, so it will not relabel that "
+            "fit/held-out split; prepare the traces again in a new project"
+        )
     trace_stored = store.artifacts.read(stage.trace_dataset.artifact_id)
     task_stored = store.artifacts.read(stage.task_set.artifact_id)
     if artifact_input(trace_stored.manifest) != stage.trace_dataset:

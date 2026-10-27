@@ -24,6 +24,7 @@ from exp.common.project import (
     ProjectStoreError,
     ProjectTracePreparationSettings,
     artifact_input,
+    write_project_config,
 )
 from exp.common.project.paths import ProjectPaths
 from exp.common.project.testing import RawArtifact
@@ -182,7 +183,13 @@ def test_package_root_prepares_and_reopens_exact_provider_free_project_stage(
     config = store.load_project()
     trace_manifest = store.artifacts.read(first.trace_dataset.artifact_id).manifest
     task_manifest = store.artifacts.read(first.task_set.artifact_id).manifest
-    assert set(first.model_dump()) == {"schema_version", "trace_dataset", "task_set"}
+    assert set(first.model_dump()) == {
+        "schema_version",
+        "trace_dataset",
+        "task_set",
+        "descriptor_embedder",
+    }
+    assert first.descriptor_embedder == "hashing-descriptor-v3"
     assert trace_manifest.source is not None
     assert trace_manifest.source.source_id == "platform-trace-source:source-123"
     assert trace_manifest.code_revision == _PROVIDER_FREE_REVISION
@@ -611,3 +618,30 @@ def test_stored_review_requires_an_explicit_descriptor_grouping_version(
         SupersededBuildReviewError, match="no valid descriptor grouping.*run exp build"
     ):
         parse_build_review(binding)
+
+
+@pytest.mark.parametrize("version", [None, "hashing-descriptor-v2"])
+def test_a_provider_free_stage_mined_under_another_version_is_not_relabeled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, version: str | None
+) -> None:
+    """A hosted review of an older stage is refused, never stamped with the current version."""
+    _fix_provider_free_revision(monkeypatch)
+    root = tmp_path / ".exp"
+    stage = exp.prepare_project_traces(
+        "support-project",
+        _chat_export(tmp_path / "upload.json"),
+        root=root,
+        source_id="platform-trace-source:source-123",
+        settings=_provider_free_settings(),
+    )
+    store = ProjectStore(root, "support-project")
+    assert build_module.provider_free_build_review(store).descriptor_embedder == (
+        "hashing-descriptor-v3"
+    )
+    older = stage.model_copy(update={"descriptor_embedder": version})
+    write_project_config(
+        store.paths, store.load_project().model_copy(update={"provider_free_stage": older})
+    )
+
+    with pytest.raises(SupersededBuildReviewError, match="hashing-descriptor-v3.*new project"):
+        build_module.provider_free_build_review(store)
