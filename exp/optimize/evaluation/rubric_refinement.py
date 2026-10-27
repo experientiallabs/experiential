@@ -39,7 +39,7 @@ def refine_rubric(
     judge: Callable[[JudgeConfig, JsonObject, str], CalibrationJudgment],
     maximum_revisions: int,
 ) -> JsonObject:
-    """Keep revisions only when independent development errors improve without regressions.
+    """Keep revisions that improve development errors without regressing selection errors.
 
     Args:
         pack: Frozen expert labels, partitions and initial judge binding.
@@ -157,9 +157,6 @@ def refine_rubric(
             and set(candidate_selection_errors) == set(selection_errors)
             and all(
                 candidate_selection_errors[key] <= error for key, error in selection_errors.items()
-            )
-            and any(
-                candidate_selection_errors[key] < error for key, error in selection_errors.items()
             )
         )
         history.append(

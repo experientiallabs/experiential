@@ -18,12 +18,17 @@ from exp.simulation.evaluation_calibration_test import pack
 
 
 @pytest.mark.parametrize("task_labels", [False, True])
-@pytest.mark.parametrize("selection_overfit", [False, True])
+@pytest.mark.parametrize("selection", ["repaired", "regressed", "already-perfect"])
 def test_blinded_revision_improves_without_opening_confirmation_during_selection(
     task_labels: bool,
-    selection_overfit: bool,
+    selection: str,
 ) -> None:
-    """Use explicit software-fixture human labels, never claim real expert calibration."""
+    """Use explicit software-fixture human labels, never claim real expert calibration.
+
+    The selection partition is either repaired with development, regressed by the overfit
+    revision, or already judged perfectly so it can only stay unchanged.
+    """
+    selection_overfit = selection == "regressed"
     original = pack()
     config = actor_judge("fixture-judge")
     cases = tuple(
@@ -92,8 +97,10 @@ def test_blinded_revision_improves_without_opening_confirmation_during_selection
         assert "expected" not in visible and "authority" not in visible
         answer, observed = value["final_answer"], value["observed"]
         score = (5 if answer == observed else 1) if current.prompt == "fixture-corrected" else 5
-        if selection_overfit and value.get("source_instance") == "selection":
-            score = 5
+        if value.get("source_instance") == "selection" and selection != "repaired":
+            score = 5 if answer == observed else 1
+            if selection_overfit and current.prompt != config.prompt:
+                score = 6 - score
         return CalibrationJudgment(
             case_id=str(visible["case_id"]),
             outcome_sha256=sha256_json(value),
@@ -134,7 +141,7 @@ def test_blinded_revision_improves_without_opening_confirmation_during_selection
     assert len(proposals) == 1
     assert len(calls) == (8 if selection_overfit else 10)
     assert result["development_targets_met"] is not selection_overfit
-    assert result["selection_targets_met"] is not selection_overfit
+    assert result["selection_targets_met"] is True
     history = result["history"]
     assert isinstance(history, list) and len(history) == 1
     assert history[0]["selected"] is not selection_overfit
