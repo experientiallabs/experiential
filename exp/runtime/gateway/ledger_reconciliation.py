@@ -95,15 +95,19 @@ def reconcile_terminal_attempt(
         and terminal.accounting_release_reservation
         and not row["accounting_recovery"]
         and row["state"] not in {"cancelled", "unknown_after_crash"}
-        and row["usage_source"] == "observed"
-        and (
+    ):
+        if row["usage_source"] == "observed" and (
             row["billed_quantity_milli"] is not None
             or (row["input_tokens"] is not None and row["output_tokens"] is not None)
-        )
-    ):
-        raise AccountingRecoverySupersededError(
-            "accounting recovery was superseded by an immutable provider terminal"
-        )
+        ):
+            raise AccountingRecoverySupersededError(
+                "accounting recovery was superseded by an immutable provider terminal"
+            )
+        # Same-state replay can acknowledge an ordinary unmetered failure, but
+        # it cannot acknowledge a customer waiver without applying that waiver.
+        # Incomplete evidence proves neither recovery authority nor a complete
+        # immutable winner, so retain ownership instead of reporting success.
+        raise GatewayLedgerError("customer waiver requires durable accounting recovery")
     if (
         terminal is not None
         and terminal.accounting_release_reservation

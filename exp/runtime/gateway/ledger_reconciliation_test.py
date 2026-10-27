@@ -990,6 +990,81 @@ def test_customer_waiver_does_not_replace_an_ordinary_exact_provider_terminal(
     _assert_allocations(budgets, settled=40)
 
 
+@pytest.mark.parametrize("meter", ["unknown", "partial", "estimated"])
+@pytest.mark.parametrize("tiered", [False, True])
+def test_customer_waiver_cannot_acknowledge_an_ordinary_unresolved_provider_terminal(
+    tmp_path: Path, meter: str, tiered: bool
+) -> None:
+    """Same-state replay must not falsely acknowledge a waiver while retaining liability."""
+    prices = _deployment().gateway.prices
+    tier = (
+        GatewayServiceTierAdmission(
+            requested="priority", standard_prices=prices, requested_prices=prices
+        )
+        if tiered
+        else None
+    )
+    clock, store, ledger, budgets, attempt = _started(tmp_path, tier=tier)
+    failure = GatewayFailure(
+        failure_class=GatewayFailureClass.PROVIDER_INTERNAL, safe_message="provider failed"
+    )
+    estimated = meter == "estimated"
+    usage = (
+        None
+        if meter == "unknown"
+        else GatewayUsage(input_tokens=19, output_tokens=7 if estimated else None)
+    )
+    # An explicit failure can accompany a valid estimated truncation. It does
+    # not grant the separate private customer-waiver recovery capability.
+    event = GatewayEvent(
+        kind=GatewayEventKind.INCOMPLETE if estimated else GatewayEventKind.FAILED,
+        sequence_number=0,
+        failure=None if estimated else failure,
+        usage=usage,
+        usage_estimated=estimated,
+        usage_unreported_truncation=estimated,
+    )
+    ledger.finish_attempt(attempt_id=attempt, terminal_event=event, failure=failure)
+    before = dict(_attempt_row(tmp_path, attempt))
+    assert before["state"] == "failed"
+    assert before["accounting_recovery"] == 0
+    assert before["usage_source"] == ("observed" if meter == "partial" else meter)
+    _assert_allocations(
+        budgets,
+        settled=0 if tiered else (66 if estimated else 300),
+        reserved=300 if tiered else 0,
+    )
+    allocations = budgets.remaining(organization_id="org-one", period="2026-08")
+    timeout = GatewayFailure(
+        failure_class=GatewayFailureClass.TIMEOUT, safe_message="settlement deadline reached"
+    )
+    waiver = GatewayEvent.for_accounting_recovery(failure=timeout, release_reservation=True)
+    reopened = SQLiteAttemptLedger(store.database_path, clock=clock)
+    receipts = (
+        (None,)
+        if tier is None
+        else (
+            None,
+            tier.settlement(served=None, resolution="missing"),
+            tier.settlement(served="priority", resolution="confirmed"),
+        )
+    )
+    for _ in range(2):
+        for receipt in receipts:
+            with pytest.raises(
+                GatewayLedgerError, match="requires durable accounting recovery"
+            ) as exc:
+                reopened.finish_attempt(
+                    attempt_id=attempt,
+                    terminal_event=waiver,
+                    failure=timeout,
+                    service_tier=receipt,
+                )
+            assert not isinstance(exc.value, AccountingRecoverySupersededError)
+            assert dict(_attempt_row(tmp_path, attempt)) == before
+            assert budgets.remaining(organization_id="org-one", period="2026-08") == allocations
+
+
 def test_schema32_preserves_legacy_failure_without_inventing_recovery(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
