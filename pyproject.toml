@@ -1,6 +1,6 @@
 [project]
 name = "experiential"
-version = "0.7.221"
+version = "0.7.222"
 description = "Build simulations and optimize model routing from agent traces."
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -9,7 +9,7 @@ dependencies = [
     # Every requirement here and in the extras is an exact pin, except `openai`: callers'
     # own code imports that SDK next to this package, so it stays a certified range. A
     # version moves only by a reviewed edit, and [tool.uv] keeps it 7 days old.
-    "exp-gateway-native==0.3.171",  # compiled gateway data plane; checkouts build it via [tool.uv.sources]
+    "exp-gateway-native==0.3.172",  # compiled gateway data plane; checkouts build it via [tool.uv.sources]
     # Cross-platform advisory locking for durable registries edited in place. Declared directly
     # because `exp.common.core.locks` imports it and Unix-only `fcntl` is not a portable boundary.
     "filelock==4.2.1",

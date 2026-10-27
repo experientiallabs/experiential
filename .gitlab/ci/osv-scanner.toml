@@ -28,8 +28,3 @@ reason = "brotli 1.2.0, capture on Python 3.13+. exp-mitmproxy 12.2.3.post2 caps
 id = "PYSEC-2026-4322"
 ignoreUntil = 2026-11-07
 reason = "Same brotli 1.2.0 advisory as GHSA-9v8h-qqgm-4m35, published separately by PyPA."
-
-[[IgnoredVulns]]
-id = "GHSA-qwgh-2vcv-g2f7"
-ignoreUntil = 2026-11-26
-reason = "block-buffer 0.10.4 in the native gateway, pulled by digest 0.10 (sha1, sha2). The corruption needs a compress callback that panics and is caught; neither hash's compression panics and the gateway never catches one around it. The fix is block-buffer 0.12.1, which needs the digest 0.11 line; move once sha1/sha2 release on it."
