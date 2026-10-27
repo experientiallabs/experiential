@@ -358,6 +358,8 @@ def test_ledger_rows_are_append_only_and_exports_merge(tmp_path: Path) -> None:
     assert elsewhere.merge(exported) == ()
     assert elsewhere.snapshot().identity == exported.identity
     assert elsewhere.export().recorded_here == (), "a merge never claims it recorded a row"
+    elsewhere.record_exposure(exposure)
+    assert elsewhere.export().recorded_here == (), "replaying a merged row keeps it foreign"
     with pytest.raises(Exception, match="append-only"):
         with ledger.transaction() as transaction:
             transaction._connection.execute("DELETE FROM records")  # noqa: SLF001

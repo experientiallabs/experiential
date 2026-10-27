@@ -498,11 +498,14 @@ class LedgerTransaction:
         """Every row as of now, inside this transaction."""
         return LedgerSnapshot(_export(self._connection))
 
-    def record(self, kind: RecordKind, record: BaseModel) -> None:
-        """Add one content-addressed record unless it is already present."""
-        self._connection.execute(
-            "INSERT OR IGNORE INTO records (kind, record_id, body) VALUES (?, ?, ?)",
-            (kind, _record_id(record), _body(record)),
+    def record(self, kind: RecordKind, record: BaseModel) -> bool:
+        """Add one content-addressed record unless it is already present; True when added."""
+        return (
+            self._connection.execute(
+                "INSERT OR IGNORE INTO records (kind, record_id, body) VALUES (?, ?, ?)",
+                (kind, _record_id(record), _body(record)),
+            ).rowcount
+            == 1
         )
 
     def record_scheme(self, scheme: SchemeIdentity) -> None:
@@ -745,12 +748,15 @@ class ExposureLedger:
     def record_exposure(self, exposure: LedgerExposure) -> None:
         """Mark content exposed, and note that this ledger recorded it; both rows are permanent.
 
+        A row already present, for example from a merge, keeps its provenance: replaying it here
+        proves nothing about when it was first recorded.
+
         Args:
             exposure: What was shown, and how.
         """
         with self.transaction() as transaction:
-            transaction.record("exposure", exposure)
-            transaction.record_here(exposure)
+            if transaction.record("exposure", exposure):
+                transaction.record_here(exposure)
 
     def snapshot(self) -> LedgerSnapshot:
         """Every row now in the ledger, as one queryable snapshot."""
