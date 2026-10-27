@@ -598,8 +598,9 @@ notice is appended instead and the headline becomes "independent, invalidated: p
 exposure". The receipt and its snapshot are never rewritten, and exposure that
 happens only after the receipt was minted never invalidates it. "Before" and "after" are
 causal, never exposure times: the receipt lists every exposure in the snapshot it was minted
-against, and later exposure counts as after only when this root's ledger recorded it from a
-report run here (the ledger notes the rows it wrote itself; a merge never imports that note).
+against, and later exposure counts as after only when this root's ledger recorded both it,
+from a report run here, and the receipt's reservation (the ledger notes the rows it wrote
+itself; a merge never imports that note, so a moved project's receipt orders nothing here).
 Exposure merged from another ledger cannot be ordered against the receipt, so it counts as
 predating, whatever its recorded time, even when its receipt was copied into this root.
 

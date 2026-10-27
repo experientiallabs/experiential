@@ -389,10 +389,11 @@ def late_exposure(
 
     Order is causal, never read from exposure times. An exposure predates the receipt when it
     was in the ledger snapshot the receipt was minted against (``prior_exposures``). One that
-    was not counts as later only when this root's ledger recorded it itself, from a report run
-    here, which the ledger's transaction serialized after the reservation. An exposure merged
-    from another ledger, whose order against this receipt nothing proves, still counts, even
-    when its receipt was copied here too, so skew between hosts can never clear an audit.
+    was not counts as later only when this root's ledger recorded both the receipt's
+    reservation and the exposure itself, from a report run here, which the ledger's transaction
+    serialized after the reservation. An exposure merged from another ledger, or any exposure
+    against a reservation merged with a moved project's receipt, has no proven order against
+    the receipt and still counts, so skew between hosts can never clear an audit.
 
     Args:
         project: Project of the receipt.
@@ -407,10 +408,11 @@ def late_exposure(
         return ()
     prior = frozenset(receipt.prior_exposures)
     here = frozenset(snapshot.records.recorded_here)
+    shared = receipt.receipt_id in here
 
     def predates(item: LedgerExposure) -> bool:
         """Whether this exposure is not provably recorded here after the receipt."""
-        return item.record_id in prior or item.record_id not in here
+        return item.record_id in prior or not shared or item.record_id not in here
 
     exposure = held_out_exposure(
         project, snapshot, receipt.receipt_id, ledger=ledger, counts=predates

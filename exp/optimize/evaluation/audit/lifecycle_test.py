@@ -6,6 +6,7 @@ source-RAG profile so no learning pass is needed.
 
 import multiprocessing
 import os
+import shutil
 import threading
 from collections.abc import Callable, Collection, Iterator, Mapping
 from contextlib import AbstractContextManager, contextmanager
@@ -25,6 +26,7 @@ from exp.optimize.evaluation.audit.exposure import held_out_members
 from exp.optimize.evaluation.audit.lifecycle import (
     HeldOutAudit,
     ReservationInactiveError,
+    late_exposure,
     open_held_out_audit,
     outcome_unknown,
     release_held_out_audit,
@@ -619,6 +621,21 @@ def expose_outside(
     ExposureLedger(store.paths.root).merge(elsewhere.export())
 
 
+def expose_here(store: ProjectStore) -> None:
+    """Expose content no held-out lineage is linked to yet, recorded by this root's ledger."""
+    ExposureLedger(store.paths.root).record_exposure(
+        LedgerExposure(
+            vertices=(OUTSIDE,),
+            how="inspected",
+            panel="held-out-panel-here",
+            receipt="held-out-audit-receipt-here",
+            report="exp eval --audit --verbose",
+            project=PROJECT,
+            at=clock(),
+        )
+    )
+
+
 def link_late(store: ProjectStore, lineage: str, target: str = OUTSIDE) -> None:
     """A later build records a grouping link from the lineage to the exposed content."""
     member = held_out_members(store)[lineage].vertices[0]
@@ -769,6 +786,32 @@ def test_merged_exposure_counts_even_when_its_receipt_was_copied_here(
         [notice] = opened.view.notices
         assert notice.exposed[0].path is not None
         assert notice.exposed[0].path.exposed_node == OUTSIDE
+
+
+def test_local_exposure_never_follows_a_receipt_reserved_in_another_ledger(
+    built: tuple[ProjectStore, FailingOnce],
+) -> None:
+    """A moved project's receipt and a merged reservation give local exposure no order.
+
+    The exposure here was recorded before the receipt was minted elsewhere, yet it is missing
+    from that receipt's snapshot, so only shared history could order the two.
+    """
+    store, _ = built
+    root = store.paths.root
+    moved = root.parent / "moved" / root.name
+    shutil.copytree(root, moved)
+    expose_here(store)
+    elsewhere = ProjectStore(moved, PROJECT)
+    with audit(elsewhere) as opened:
+        run(elsewhere, opened)
+        receipt = opened.receipt
+    shutil.rmtree(root / "projects")
+    shutil.copytree(moved / "projects", root / "projects")
+    ExposureLedger(root).merge(ExposureLedger(moved).export())
+    link_late(store, receipt.lineages[0])
+    ledger = ExposureLedger(root)
+    [blocked] = late_exposure(store, ledger, ledger.snapshot(), receipt)
+    assert blocked.path is not None and blocked.path.exposed_node == OUTSIDE
 
 
 def _resume_and_hold(root: str, holding: Event, done: Event) -> None:

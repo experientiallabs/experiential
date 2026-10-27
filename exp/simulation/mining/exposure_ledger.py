@@ -294,7 +294,8 @@ class LedgerExport(ContractModel):
         exposures: Exposure records.
         reservations: Content claimed by audit receipts.
         releases: Reservations their owners released.
-        recorded_here: Exposure record IDs this ledger wrote itself, never merged ones; local
+        recorded_here: Exposure record IDs and reserving receipts this ledger wrote itself, never
+            merged ones; local
             provenance, so it is outside the identity and a merge never imports it.
     """
 
@@ -500,13 +501,11 @@ class LedgerTransaction:
 
     def record(self, kind: RecordKind, record: BaseModel) -> bool:
         """Add one content-addressed record unless it is already present; True when added."""
-        return (
-            self._connection.execute(
-                "INSERT OR IGNORE INTO records (kind, record_id, body) VALUES (?, ?, ?)",
-                (kind, _record_id(record), _body(record)),
-            ).rowcount
-            == 1
+        cursor = self._connection.execute(
+            "INSERT OR IGNORE INTO records (kind, record_id, body) VALUES (?, ?, ?)",
+            (kind, _record_id(record), _body(record)),
         )
+        return cursor.rowcount == 1
 
     def record_scheme(self, scheme: SchemeIdentity) -> None:
         """Record a scheme this code computes under, refusing a changed spec without a bump.
@@ -531,12 +530,16 @@ class LedgerTransaction:
             "INSERT OR IGNORE INTO recorded_here (record_id) VALUES (?)", (exposure.record_id,)
         )
 
-    def reserve(self, reservation: LedgerReservation) -> None:
-        """Claim content for one receipt; a receipt reserves at most once."""
+    def reserve(self, reservation: LedgerReservation, *, here: bool = True) -> None:
+        """Claim content for one receipt, at most once; ``here`` is False when merged."""
         self._connection.execute(
             "INSERT INTO reservations (receipt, body) VALUES (?, ?)",
             (reservation.receipt, _body(reservation)),
         )
+        if here:
+            self._connection.execute(
+                "INSERT INTO recorded_here (record_id) VALUES (?)", (reservation.receipt,)
+            )
 
     def release(self, release: LedgerRelease) -> None:
         """Free a reservation; its owner must have checked that no slot was claimed."""
@@ -748,8 +751,7 @@ class ExposureLedger:
     def record_exposure(self, exposure: LedgerExposure) -> None:
         """Mark content exposed, and note that this ledger recorded it; both rows are permanent.
 
-        A row already present, for example from a merge, keeps its provenance: replaying it here
-        proves nothing about when it was first recorded.
+        A row already present, for example from a merge, keeps its provenance.
 
         Args:
             exposure: What was shown, and how.
@@ -802,7 +804,7 @@ class ExposureLedger:
                     transaction.record(kind, record)
             for reservation in export.reservations:
                 if reservation.receipt not in snapshot.reservations:
-                    transaction.reserve(reservation)
+                    transaction.reserve(reservation, here=False)
             for release in export.releases:
                 if release.receipt not in snapshot.released:
                     transaction.release(release)
