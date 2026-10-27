@@ -469,6 +469,7 @@ def build_project(
     episodes: list[JsonObject] | None = None,
     learn: bool = False,
     project: str = PROJECT,
+    relative_traces: bool = False,
 ) -> tuple[Path, ProjectStore, str]:
     """Run ``exp build`` on the package through the routed fake and return its output.
 
@@ -476,6 +477,10 @@ def build_project(
     retests its misses. Without it the build stops at the bare simulator; the recall alias is
     added afterwards so a test can drive learning itself. Every project shares one ``.exp`` root
     under ``tmp_path``, as projects on one machine do.
+
+    The package's source identity, and so every lineage ID derived from it, embeds the path
+    ``exp build`` was given. With ``relative_traces`` the build runs from ``tmp_path`` and names
+    the package relatively, so lineage IDs and their split ranks are the same on every run.
     """
     root = tmp_path / ".exp"
     root.mkdir(exist_ok=True)
@@ -491,13 +496,15 @@ def build_project(
     )
     monkeypatch.setattr("exp.cli.build.app.capture_build_completed", lambda **_kwargs: None)
     monkeypatch.setattr(fidelity, "HttpxJsonTransport", lambda: provider)
+    if relative_traces:
+        monkeypatch.chdir(tmp_path)
     result = CliRunner().invoke(
         app,
         [
             "build",
             project,
             "--traces",
-            str(package),
+            package.name if relative_traces else str(package),
             "--source",
             "otel-genai",
             "--root",

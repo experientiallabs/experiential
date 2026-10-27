@@ -636,7 +636,7 @@ class ExposureLedger:
         edges: list[LedgerEdge] = []
         for scope, members in sorted(_declared_partitions(traces, lineages, by_trace).items()):
             chain = sorted(members)
-            declared = DECLARED_PREFIX + sha256_json(list(scope))
+            declared = declared_vertex(*scope)
             edges.extend(
                 LedgerEdge(
                     left=min(left, right),
@@ -791,6 +791,11 @@ def node_vertex(scheme: SchemeIdentity, fingerprint: str | None, source: SourceR
     if fingerprint is None:
         return f"unresolved:{scheme.key}:{source.record_sha256}"
     return f"{scheme.key}:{fingerprint}"
+
+
+def declared_vertex(source_id: str, customer_id: str, task_lineage: str) -> Vertex:
+    """Graph vertex of one task identity declared within one source and customer."""
+    return DECLARED_PREFIX + sha256_json([source_id, customer_id, task_lineage])
 
 
 def record_sha256(trace: Trace) -> str:

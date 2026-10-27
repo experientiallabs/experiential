@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import threading
+from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -14,7 +16,7 @@ from pydantic import JsonValue
 import exp
 import exp.runtime.models.registry as runtime_model_registry
 import exp.simulation.build as build_module
-from exp.common.core.artifacts import SourceIdentity
+from exp.common.core.artifacts import JsonObject, SourceIdentity
 from exp.common.project import (
     ArtifactCorruptionError,
     ArtifactStore,
@@ -28,7 +30,6 @@ from exp.common.project import (
 )
 from exp.common.project.paths import ProjectPaths
 from exp.common.project.testing import RawArtifact
-from exp.common.tasks import load_task_set
 from exp.common.traces import Trace, TraceSource, TraceSpan
 from exp.common.traces.ingest.otlp import TraceNormalizationIssue, TraceNormalizationResult
 from exp.optimize.evaluation.audit.exposure import held_out_exposure
@@ -656,48 +657,101 @@ def test_a_provider_free_stage_mined_under_another_version_is_not_relabeled(
         build_module.provider_free_build_review(store)
 
 
-def test_a_rebuild_never_moves_audited_held_out_content_to_fit(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Content a held-out audit showed stays held out, whatever rank a later build gives it.
+def _trace_partitions(project: ProjectStore) -> dict[str, tuple[str, str]]:
+    """Each trace of the project's current build, with its lineage and partition."""
+    build = project.load_project().build
+    assert build is not None
+    bindings = load_task_set_lineage_bindings(project.artifacts, build.task_set.artifact_id)
+    return {row.trace_id: (row.lineage_id, row.partition) for row in bindings.bindings}
 
-    The split is a rank among the lineages one build sees, so rebuilding the audited user with
-    two new ones ranks it into fit two times in three; each try checks the unsealed rank.
-    """
-    episodes = [episode(index) for index in range(14)]
-    provider = SimulatedProvider(episodes)
-    _, project, _ = exp_build(tmp_path, monkeypatch, provider, episodes=episodes[:2])
 
-    def partitions() -> dict[str, str]:
-        """Each lineage of the project's current build, with its partition."""
-        build = project.load_project().build
-        assert build is not None
-        bindings = load_task_set_lineage_bindings(project.artifacts, build.task_set.artifact_id)
-        return {row.lineage_id: row.partition for row in bindings.bindings}
+def _package_trace_id(item: JsonObject) -> str:
+    """The trace ID the package encoding gives one episode."""
+    return hashlib.sha256(str(item["user"]).encode()).hexdigest()[:32]
 
+
+_EPISODES = [episode(index) for index in range(14)]
+
+
+def _audit_in_detail(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, provider: SimulatedProvider
+) -> tuple[str, int]:
+    """Build two users, audit the held-out one with per-trace detail; its lineage and user."""
+    _, project, _ = exp_build(
+        tmp_path, monkeypatch, provider, episodes=_EPISODES[:2], relative_traces=True
+    )
     with audit(project) as opened:
         run(project, opened)
         record_report(
             project, opened.receipt, opened.panel, kind="evaluation", detail_shown=True, clock=clock
         )
         (shown,) = opened.receipt.lineages
-    build = project.load_project().build
-    assert build is not None
-    tasks = load_task_set(project.artifacts, build.task_set.artifact_id).tasks
-    (task,) = (case for case in tasks if case.lineage_group_id == shown)
-    user = int(task.instruction.split("user_")[1][:2])
-    for first in range(2, 14, 2):
-        later = [episodes[user], episodes[first], episodes[first + 1]]
-        project = exp_build(tmp_path, monkeypatch, provider, episodes=later)[1]
-        rebuilt = partitions()
-        unsealed = freeze_task_partition(
-            [LeakageGroup(lineage, (lineage,), (lineage,), 1) for lineage in rebuilt]
+    (user,) = (
+        index
+        for index, item in enumerate(_EPISODES[:2])
+        if _trace_partitions(project)[_package_trace_id(item)][0] == shown
+    )
+    return shown, user
+
+
+def _rebuild_until_ranked_fit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    provider: SimulatedProvider,
+    watched: Sequence[JsonObject],
+) -> tuple[ProjectStore, str, str]:
+    """Rebuild each watched episode with two new users until the plain rank makes it fit.
+
+    Three lineages put two in fit, so each try ranks the watched one there about two times in
+    three. Every other lineage must keep exactly its plain-rank partition. The package is named
+    relatively, so lineage IDs, and so which try ranks fit, are the same on every run.
+
+    Returns:
+        The rebuilt project, the watched lineage and its partition.
+    """
+    for first, item in zip(range(2, 14, 2), watched, strict=True):
+        later = [item, _EPISODES[first], _EPISODES[first + 1]]
+        _, project, _ = exp_build(
+            tmp_path, monkeypatch, provider, episodes=later, relative_traces=True
         )
-        if unsealed.partition_for(shown) == "fit":
-            break
-    else:
-        pytest.fail("no rebuild ranked the audited lineage into fit")
-    assert rebuilt[shown] == "held_out"
-    assert "fit" in rebuilt.values(), "every other lineage keeps its ranked partition"
+        traces = _trace_partitions(project)
+        partitions = dict(traces.values())
+        lineage = traces[_package_trace_id(item)][0]
+        plain = freeze_task_partition(
+            [LeakageGroup(group, (group,), (group,), 1) for group in partitions]
+        )
+        if plain.partition_for(lineage) == "fit":
+            assert {
+                group: partition for group, partition in partitions.items() if group != lineage
+            } == {group: plain.partition_for(group) for group in partitions if group != lineage}
+            return project, lineage, partitions[lineage]
+    pytest.fail("no rebuild ranked the watched lineage into fit")
+
+
+def test_a_rebuild_never_moves_audited_held_out_content_to_fit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Content a held-out audit showed stays held out, whatever rank a later build gives it."""
+    provider = SimulatedProvider(_EPISODES)
+    shown, user = _audit_in_detail(tmp_path, monkeypatch, provider)
+    project, lineage, partition = _rebuild_until_ranked_fit(
+        tmp_path, monkeypatch, provider, [_EPISODES[user]] * 6
+    )
+    assert (lineage, partition) == (shown, "held_out")
     assert shown not in {case.lineage_group_id for case in development_tasks(project)}
     assert shown in held_out_exposure(project).lineages
+
+
+def test_fresh_content_of_an_audited_task_identity_stays_held_out(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """New content declaring an audited task, without the shown trace, is held out too."""
+    fresh = [episode(index) for index in range(20, 26)]
+    provider = SimulatedProvider([*_EPISODES, *fresh])
+    _, user = _audit_in_detail(tmp_path, monkeypatch, provider)
+    declaring = [{**item, "lineage": _EPISODES[user]["user"]} for item in fresh]
+    project, lineage, partition = _rebuild_until_ranked_fit(
+        tmp_path, monkeypatch, provider, declaring
+    )
+    assert partition == "held_out"
+    assert lineage not in {case.lineage_group_id for case in development_tasks(project)}

@@ -54,9 +54,11 @@ from exp.simulation.mining.descriptors import (
 from exp.simulation.mining.exposure_ledger import (
     ExposureLedger,
     SourceRecord,
+    declared_vertex,
     node_vertex,
     record_sha256,
 )
+from exp.simulation.mining.lineage import assign_source_lineages
 from exp.simulation.mining.service import MiningSpec, TaskMiningResult, mine_tasks, persist_task_set
 
 _BUILD_SCOPED_REVIEW_KEYS = (
@@ -439,12 +441,14 @@ def _sealed_traces(
     """Traces linked in the root ledger to content a held-out audit exposed or reserved.
 
     The partition is a rank among the lineages one build sees, so a rebuild could otherwise move
-    such content from held out to fit, where every fitting path would learn or retrieve it.
+    such content from held out to fit, where every fitting path would learn or retrieve it. A
+    trace is linked through its own content or through the task identity it declares within
+    its source and customer, which earlier builds joined to their own declaring traces.
     """
     ledger = ExposureLedger(store.paths.root)
     snapshot = ledger.snapshot()
     sealed: set[str] = set()
-    for trace in traces:
+    for trace, assignment in zip(traces, assign_source_lineages(traces), strict=True):
         source = SourceRecord(
             project=store.paths.project_id,
             dataset=dataset,
@@ -452,6 +456,14 @@ def _sealed_traces(
             record_sha256=record_sha256(trace),
         )
         vertices = [node_vertex(*item, source) for item in ledger.vertices(trace).items()]
+        if assignment.task_lineage is not None:
+            vertices.append(
+                declared_vertex(
+                    trace.source.identity.source_id,
+                    assignment.customer_id,
+                    assignment.task_lineage,
+                )
+            )
         if snapshot.exposure(vertices) is not None or snapshot.taken(vertices, None) is not None:
             sealed.add(trace.trace_id)
     return frozenset(sealed)
