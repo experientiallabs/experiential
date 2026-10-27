@@ -28,6 +28,7 @@ from exp.runtime.gateway.ledger_valuation import (
     observed_usage_cost,
     optional_int,
 )
+from exp.runtime.gateway.service_tiers import GatewayServiceTierAdmission
 
 _TOKEN_FIELDS = (
     "input_tokens",
@@ -79,7 +80,9 @@ def reconcile_terminal_attempt(
     observation cannot replace any terminal meter. The original delivery state,
     failure and timestamps remain
     intact. An identical observed meter is replayable even when its outcome
-    differs from the earlier cancellation or crash outcome.
+    differs from the earlier cancellation or crash outcome. An unmetered failure
+    following trusted recovery acknowledges the durable outcome without changing
+    its usage or customer charge.
     """
     row = connection.execute(
         "SELECT a.*, r.api_surface FROM gateway_attempts AS a "
@@ -158,15 +161,60 @@ def reconcile_terminal_attempt(
             same = same and _replay_cost_matches(row, observed_usage_cost(row, usage, terminal))
         if not same:
             raise GatewayLedgerError(_REPLAY_CONFLICT)
-        if prior is not None and prior.resolution != "confirmed" and receipt is not None:
+        recovered_tier_without_cost = (
+            row["accounting_recovery"] or row["state"] == "unknown_after_crash"
+        ) and row["estimated_cost_nano_usd"] is None
+        if prior is not None and (
+            (prior.resolution != "confirmed" and receipt is not None)
+            or (prior.resolution == "confirmed" and recovered_tier_without_cost)
+        ):
             # The exact meter may predate its tier receipt. Validate the schedule
-            # and resolve its hold without overwriting an explicit refund.
+            # and resolve its hold without overwriting an explicit refund. Only
+            # proven recovery rows can have acquired their observed meter solely
+            # through a complete, non-disconnect upgrade. Ordinary serialized
+            # disconnects must retain their unknown billing on replay.
             _upgrade_observed(connection, row, attempt_id, terminal, failure, usage, receipt)
+        return
+    if (
+        usage is None
+        and state in {"failed", "cancelled"}
+        and (failure is not None or (terminal is not None and terminal.failure is not None))
+        and (row["accounting_recovery"] or row["state"] == "unknown_after_crash")
+    ):
+        # Cleanup can commit while a weaker provider failure waits for the same
+        # execution gate. Acknowledge delivery without inventing usage, clearing
+        # liability, or replacing an exact meter that arrived in the meantime.
+        _retain_unmetered_tier_receipt(connection, row, attempt_id, receipt)
         return
     if row["state"] == state or (row["state"] == "unknown_after_crash" and receipt is not None):
         reconcile_tier_receipt(connection, attempt_id, receipt, terminal, usage)
         return
     raise GatewayLedgerError("attempt is already settled with another terminal state")
+
+
+def _retain_unmetered_tier_receipt(
+    connection: sqlite3.Connection,
+    row: sqlite3.Row,
+    attempt_id: str,
+    receipt: GatewayServiceTierSettlement | None,
+) -> None:
+    """Retain validated tier evidence without pricing an unmetered recovery failure."""
+    if receipt is None:
+        return
+    if row["service_tier_admission"] is None:
+        raise GatewayLedgerError("service-tier receipt has no admitted schedules")
+    admission = GatewayServiceTierAdmission.model_validate_json(row["service_tier_admission"])
+    if receipt != admission.settlement(served=receipt.served, resolution=receipt.resolution):
+        raise GatewayLedgerError("service-tier receipt differs from the admitted schedules")
+    prior = _prior_tier(row)
+    if prior is not None and prior.resolution == "confirmed":
+        if receipt.resolution == "confirmed" and receipt != prior:
+            raise GatewayLedgerError("service-tier receipt differs from the settled tier")
+        return
+    if receipt.resolution == "confirmed":
+        # Rates and receipt can be known while the provider's meter is still
+        # unknown. Preserve the existing budget disposition until usage arrives.
+        settle_tier(connection, attempt_id, receipt)
 
 
 def _replay_cost_matches(row: sqlite3.Row, cost: int | None) -> bool:

@@ -693,11 +693,15 @@ def test_public_initial_settlement_validation_rolls_back_the_write(tmp_path: Pat
         ).fetchone() == (None, None)
 
 
-def test_real_sqlite_native_abandonment_retains_then_commits_the_late_meter(
+@pytest.mark.parametrize(
+    "late_result", ["meter", "unmetered", "unmetered_tier", "unmetered_self_served"]
+)
+def test_real_sqlite_native_abandonment_acknowledges_the_late_outcome(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    late_result: str,
 ) -> None:
-    """The actual native race upgrades a committed cancellation in the real SQLite owner."""
+    """A late meter upgrades recovery; a weaker failure drains without changing liability."""
     monkeypatch.setattr(NativeAttemptAccounting, "_sweep_loop", lambda self: None)
     clock = FakeLedgerClock()
     store, ledger, key = _authority_fixture(tmp_path, clock)
@@ -716,6 +720,17 @@ def test_real_sqlite_native_abandonment_retains_then_commits_the_late_meter(
         deadline_monotonic=clock.monotonic() + 30,
     )
     snapshot, deployment = _execution(authorization), _deployment()
+    tier = (
+        GatewayServiceTierAdmission(
+            requested="priority",
+            standard_prices=deployment.gateway.prices,
+            requested_prices=deployment.gateway.prices,
+        )
+        if late_result in {"unmetered_tier", "unmetered_self_served"}
+        else None
+    )
+    if late_result == "unmetered_self_served":
+        monkeypatch.setattr("exp.runtime.gateway.class_throttles.fast_on_rung", lambda *_: True)
     ledger.accept_request(authorization=authorization)
     attempt = ledger.start_attempt(
         snapshot=snapshot,
@@ -723,6 +738,7 @@ def test_real_sqlite_native_abandonment_retains_then_commits_the_late_meter(
         attempt_ordinal=0,
         route_depth=0,
         maximum_cost_nano_usd=300,
+        service_tier=tier,
     )
     accounting = NativeAttemptAccounting(ledger, recovery_host=RecoveryHostFake())
     entry = InflightRequest(
@@ -733,6 +749,7 @@ def test_real_sqlite_native_abandonment_retains_then_commits_the_late_meter(
         total_attempts=1,
         attempt_depths={attempt: 0},
         active_attempt_id=attempt,
+        attempt_service_tiers={} if tier is None else {attempt: tier},
     )
     accounting.register(entry)
     entered, release, waiting = threading.Event(), threading.Event(), threading.Event()
@@ -762,7 +779,7 @@ def test_real_sqlite_native_abandonment_retains_then_commits_the_late_meter(
         """Pause the actual unknown SQLite write until the exact meter is retained."""
         terminal = fields["terminal_event"]
         assert isinstance(terminal, GatewayEvent)
-        if terminal.usage is None:
+        if terminal.accounting_recovery:
             entered.set()
             assert release.wait(5)
         return DEFAULT
@@ -774,10 +791,14 @@ def test_real_sqlite_native_abandonment_retains_then_commits_the_late_meter(
         {
             "request_id": authorization.request_id,
             "attempt_id": attempt,
-            "outcome": "completed",
-            "usage": {"input_tokens": 10, "output_tokens": 5},
+            "outcome": "completed" if late_result == "meter" else "failed",
+            **(
+                {"usage": {"input_tokens": 10, "output_tokens": 5}}
+                if late_result == "meter"
+                else {"failure": {"failure_class": "transport", "safe_message": "open failed"}}
+            ),
             "finalize": True,
-            "opened": True,
+            "opened": late_result == "meter",
         }
     )
     errors: list[BaseException] = []
@@ -821,15 +842,19 @@ def test_real_sqlite_native_abandonment_retains_then_commits_the_late_meter(
     row = _attempt_row(tmp_path, attempt)
     assert row["state"] == "cancelled"
     assert row["accounting_recovery"] == 1
-    assert row["usage_source"] == "observed"
+    assert row["usage_source"] == ("observed" if late_result == "meter" else "unknown")
     assert (row["input_tokens"], row["output_tokens"], row["estimated_cost_nano_usd"]) == (
-        10,
-        5,
-        40,
+        (10, 5, 40) if late_result == "meter" else (None, None, None)
     )
+    if tier is not None:
+        assert json.loads(row["service_tier_settlement"])["resolution"] == (
+            "confirmed" if late_result == "unmetered_self_served" else "missing"
+        )
     allocation = budgets.remaining(organization_id="org-one", period="2026-08")[0]
-    assert allocation.settled_nano_usd == 40
-    assert allocation.reserved_nano_usd == 0
+    assert allocation.settled_nano_usd == (
+        40 if late_result == "meter" else 0 if tier is not None else 300
+    )
+    assert allocation.reserved_nano_usd == (300 if tier is not None else 0)
     assert allocation.unknown_cost_attempts == 0
 
 
@@ -994,3 +1019,202 @@ def test_schema32_preserves_legacy_failure_without_inventing_recovery(
     with pytest.raises(GatewayLedgerError, match="differs from durable accounting evidence"):
         ledger.finish_attempt(attempt_id=attempt, terminal_event=_observed(), failure=None)
     _assert_allocations(budgets, settled=300)
+
+
+@pytest.mark.parametrize("crashed", [False, True])
+@pytest.mark.parametrize("observed_first", [False, True])
+@pytest.mark.parametrize("tiered", [False, True])
+def test_unmetered_recovery_failure_replay_preserves_durable_evidence(
+    tmp_path: Path, crashed: bool, observed_first: bool, tiered: bool
+) -> None:
+    """Weaker late failures survive reopen without changing meters, charges or delivery."""
+    prices = _deployment().gateway.prices
+    tier = (
+        GatewayServiceTierAdmission(
+            requested="priority", standard_prices=prices, requested_prices=prices
+        )
+        if tiered
+        else None
+    )
+    clock, store, ledger, budgets, attempt = _started(tmp_path, tier=tier)
+    receipt = None if tier is None else tier.settlement(served="priority", resolution="confirmed")
+    if crashed:
+        clock.advance(60)
+        assert ledger.reconcile_crashed_requests(cleanup_grace=timedelta()) == (0, 1)
+    else:
+        ledger.finish_attempt(
+            attempt_id=attempt,
+            terminal_event=GatewayEvent.for_accounting_recovery(failure=_CANCELLED),
+            failure=_CANCELLED,
+        )
+    if observed_first:
+        ledger.finish_attempt(
+            attempt_id=attempt, terminal_event=_observed(), failure=None, service_tier=receipt
+        )
+    before = dict(_attempt_row(tmp_path, attempt))
+    allocations = budgets.remaining(organization_id="org-one", period="2026-08")
+    failure = GatewayFailure(
+        failure_class=GatewayFailureClass.TRANSPORT, safe_message="late open failure"
+    )
+    event = GatewayEvent(kind=GatewayEventKind.FAILED, sequence_number=2, failure=failure)
+    reopened = SQLiteAttemptLedger(store.database_path, clock=clock)
+    missing = None if tier is None else tier.settlement(served=None, resolution="missing")
+    for supplied in (None, missing, receipt, missing, receipt):
+        reopened.finish_attempt(
+            attempt_id=attempt, terminal_event=event, failure=None, service_tier=supplied
+        )
+    after = dict(_attempt_row(tmp_path, attempt))
+    if receipt is not None:
+        assert after["service_tier_settlement"] == receipt.model_dump_json()
+        before.pop("service_tier_settlement")
+        after.pop("service_tier_settlement")
+    assert after == before
+    assert budgets.remaining(organization_id="org-one", period="2026-08") == allocations
+
+
+@pytest.mark.parametrize("incoming", ["partial", "estimated", "completed_without_usage"])
+def test_recovery_acknowledgment_does_not_absorb_other_terminal_evidence(
+    tmp_path: Path, incoming: str
+) -> None:
+    """Only an actual unmetered failure is weaker than the trusted recovery outcome."""
+    _, _, ledger, budgets, attempt = _started(tmp_path)
+    ledger.finish_attempt(
+        attempt_id=attempt,
+        terminal_event=GatewayEvent.for_accounting_recovery(failure=_CANCELLED),
+        failure=_CANCELLED,
+    )
+    before = dict(_attempt_row(tmp_path, attempt))
+    failure = GatewayFailure(
+        failure_class=GatewayFailureClass.TRANSPORT, safe_message="late open failure"
+    )
+    event = (
+        GatewayEvent(kind=GatewayEventKind.COMPLETED, sequence_number=1)
+        if incoming == "completed_without_usage"
+        else GatewayEvent(
+            kind=GatewayEventKind.FAILED,
+            sequence_number=1,
+            failure=failure,
+            usage=GatewayUsage(
+                input_tokens=10, output_tokens=5 if incoming == "estimated" else None
+            ),
+            usage_estimated=incoming == "estimated",
+        )
+    )
+    with pytest.raises(GatewayLedgerError, match="another terminal state"):
+        ledger.finish_attempt(attempt_id=attempt, terminal_event=event, failure=event.failure)
+    assert dict(_attempt_row(tmp_path, attempt)) == before
+    _assert_allocations(budgets, settled=300)
+
+
+def test_unmetered_failure_cannot_replace_an_ordinary_completed_provider_terminal(
+    tmp_path: Path,
+) -> None:
+    """The recovery acknowledgment does not relax immutable ordinary provider outcomes."""
+    _, _, ledger, budgets, attempt = _started(tmp_path)
+    ledger.finish_attempt(attempt_id=attempt, terminal_event=_observed(), failure=None)
+    before = dict(_attempt_row(tmp_path, attempt))
+    failure = GatewayFailure(
+        failure_class=GatewayFailureClass.TRANSPORT, safe_message="late open failure"
+    )
+    with pytest.raises(GatewayLedgerError, match="another terminal state"):
+        ledger.finish_attempt(attempt_id=attempt, terminal_event=None, failure=failure)
+    assert dict(_attempt_row(tmp_path, attempt)) == before
+    _assert_allocations(budgets, settled=40)
+
+
+@pytest.mark.parametrize("crashed", [False, True])
+@pytest.mark.parametrize("waived", [False, True])
+def test_complete_meter_after_unmetered_tier_confirmation_resolves_only_known_liability(
+    tmp_path: Path, crashed: bool, waived: bool
+) -> None:
+    """Confirmed metadata remains usable after reopen and never reverses a customer waiver."""
+    prices = _deployment().gateway.prices
+    tier = GatewayServiceTierAdmission(
+        requested="priority", standard_prices=prices, requested_prices=prices
+    )
+    clock, store, ledger, budgets, attempt = _started(tmp_path, tier=tier)
+    if crashed:
+        clock.advance(60)
+        assert ledger.reconcile_crashed_requests(cleanup_grace=timedelta()) == (0, 1)
+    else:
+        ledger.finish_attempt(
+            attempt_id=attempt,
+            terminal_event=GatewayEvent.for_accounting_recovery(failure=_CANCELLED),
+            failure=_CANCELLED,
+        )
+    if waived:
+        ledger.finish_attempt(
+            attempt_id=attempt,
+            terminal_event=GatewayEvent.for_accounting_recovery(
+                failure=_CANCELLED, release_reservation=True
+            ),
+            failure=_CANCELLED,
+        )
+    ledger.finish_attempt(attempt_id=attempt, terminal_event=_observed(), failure=None)
+    before = dict(_attempt_row(tmp_path, attempt))
+    assert before["usage_source"] == "observed"
+    assert before["estimated_cost_nano_usd"] is None
+    failure = GatewayFailure(
+        failure_class=GatewayFailureClass.TRANSPORT, safe_message="late open failure"
+    )
+    receipt = tier.settlement(served="priority", resolution="confirmed")
+    ledger.finish_attempt(
+        attempt_id=attempt, terminal_event=None, failure=failure, service_tier=receipt
+    )
+    confirmed = _attempt_row(tmp_path, attempt)
+    assert confirmed["estimated_cost_nano_usd"] is None
+    assert confirmed["budget_settled_nano_usd"] == (0 if waived else None)
+    _assert_allocations(budgets, settled=0, reserved=0 if waived else 300)
+    reopened = SQLiteAttemptLedger(store.database_path, clock=clock)
+    for _ in range(2):
+        reopened.finish_attempt(attempt_id=attempt, terminal_event=_observed(), failure=None)
+    after = _attempt_row(tmp_path, attempt)
+    for field in ("state", "terminal_at", "failure_class", "input_tokens", "output_tokens"):
+        assert after[field] == before[field]
+    assert after["estimated_cost_nano_usd"] == 40
+    assert after["budget_settled_nano_usd"] == (0 if waived else 40)
+    _assert_allocations(budgets, settled=0 if waived else 40)
+
+
+@pytest.mark.parametrize("invalid", ["unadmitted", "forged_rates", "conflicting_confirmation"])
+def test_unmetered_recovery_failure_still_rejects_invalid_tier_evidence(
+    tmp_path: Path, invalid: str
+) -> None:
+    """Weaker failures cannot invent schedules or replace a confirmed served tier."""
+    prices = _deployment().gateway.prices
+    tier = GatewayServiceTierAdmission(
+        requested="priority", standard_prices=prices, requested_prices=prices
+    )
+    _, _, ledger, budgets, attempt = _started(
+        tmp_path, tier=None if invalid == "unadmitted" else tier
+    )
+    ledger.finish_attempt(
+        attempt_id=attempt,
+        terminal_event=GatewayEvent.for_accounting_recovery(failure=_CANCELLED),
+        failure=_CANCELLED,
+    )
+    failure = GatewayFailure(
+        failure_class=GatewayFailureClass.TRANSPORT, safe_message="late open failure"
+    )
+    event = GatewayEvent(kind=GatewayEventKind.FAILED, sequence_number=1, failure=failure)
+    receipt = tier.settlement(served="priority", resolution="confirmed")
+    if invalid == "conflicting_confirmation":
+        ledger.finish_attempt(
+            attempt_id=attempt, terminal_event=event, failure=failure, service_tier=receipt
+        )
+        receipt = tier.settlement(served="default", resolution="confirmed")
+    elif invalid == "forged_rates":
+        receipt = receipt.model_copy(
+            update={"prices": prices.model_copy(update={"input_nano_usd_per_million_tokens": 999})}
+        )
+    before = dict(_attempt_row(tmp_path, attempt))
+    with pytest.raises(GatewayLedgerError, match="service-tier receipt"):
+        ledger.finish_attempt(
+            attempt_id=attempt, terminal_event=event, failure=failure, service_tier=receipt
+        )
+    assert dict(_attempt_row(tmp_path, attempt)) == before
+    _assert_allocations(
+        budgets,
+        settled=300 if invalid == "unadmitted" else 0,
+        reserved=0 if invalid == "unadmitted" else 300,
+    )

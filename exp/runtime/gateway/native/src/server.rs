@@ -4,6 +4,10 @@
 //! The chat, Responses, and Messages surfaces live in their `route_*`
 //! modules; unknown routes answer the native 404 in the OpenAI envelope.
 
+#[cfg(test)]
+#[path = "server_usage_tests.rs"]
+mod usage_tests;
+
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};

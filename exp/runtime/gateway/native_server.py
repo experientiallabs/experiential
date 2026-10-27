@@ -186,7 +186,8 @@ def serve_native_gateway(
             opaque callback targets and explicit execution resources. None uses the
             supplied control plane directly without additional scheduling. With
             bindings enabled, the original control plane owns process diagnostics
-            and closes all per-thread resources at worker shutdown.
+            (including enabled usage routes) and closes all per-thread resources
+            at worker shutdown.
         shutdown: Optional embedder-owned stop handle from
             ``exp_gateway_native.shutdown_handle()``. A host serving on a
             background thread calls ``request_shutdown()`` to stop the plane

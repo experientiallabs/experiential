@@ -45,7 +45,7 @@ pub(crate) async fn bind_execution(
     // Diagnostics use the process owner and never claim a caller's resources.
     if matches!(
         path,
-        "/health/live" | "/health/ready" | "/metrics" | "/metrics.json"
+        "/health/live" | "/health/ready" | "/metrics" | "/metrics.json" | "/usage" | "/usage.json"
     ) {
         return next.run(request).await;
     }
