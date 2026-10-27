@@ -20,6 +20,7 @@ from unittest.mock import patch
 
 import httpx
 import pytest
+from exp_gateway_native import ExecutionBindings, ExecutionHandle
 
 from exp.common.core.artifacts import sha256_json
 from exp.common.models import (
@@ -39,6 +40,7 @@ from exp.runtime.gateway.ledger_test import FakeLedgerClock
 from exp.runtime.gateway.lifecycle import LocalGatewayComponents, load_gateway_components
 from exp.runtime.gateway.management import GatewayManagement
 from exp.runtime.gateway.native_accounting_errors import NativeBridgeError
+from exp.runtime.gateway.native_bridge import NativeControlPlane
 from exp.runtime.gateway.stream_contracts import (
     BilledUnits,
     GatewayEvent,
@@ -299,6 +301,94 @@ def _create(setup: _Setup, alias: str = "veo", seconds: int = 8) -> VideoJob:
         reference_image=None,
         client_headers={},
     )
+
+
+def _video_control(setup: _Setup) -> NativeControlPlane:
+    """Use the real control-plane lifecycle with the fixture's real ledger and provider client."""
+
+    def bind(control: NativeControlPlane, *, start_poller: bool = True) -> None:
+        """Install the fixture engine; the constructor owns starting its poller."""
+        del start_poller
+        control._videos = setup.engine
+
+    with patch.object(NativeControlPlane, "_bind_videos", bind):
+        return NativeControlPlane(setup.components, background_recovery=False)
+
+
+def test_open_video_keeps_its_control_plane_nonidle_after_the_execution_lease_ends(
+    setup: _Setup,
+) -> None:
+    """A returned video response releases request capacity, not its asynchronous job owner."""
+    setup.provider.done = False
+    control = _video_control(setup)
+    bindings = ExecutionBindings(capacity=1)
+    handle = ExecutionHandle(
+        control,
+        max_active_requests=1,
+        callback_permits=1,
+        settlement_permits=1,
+        guardrail_detectors=control.guardrail_detectors,
+        capture=control.capture_collector,
+    )
+    token = "video-lifetime-fixture-token" * 2
+    try:
+        assert control.accounting_drained
+        bindings.register(token, handle)
+        assert handle.in_use
+        response = json.loads(
+            control.video_create(
+                json.dumps(
+                    {
+                        "bearer_key": setup.raw_key,
+                        "fields": {
+                            "model": "grok-video",
+                            "prompt": "a test clip",
+                            "seconds": "6",
+                            "size": "1280x720",
+                        },
+                    }
+                )
+            )
+        )
+        bindings.remove(token)
+        assert not handle.in_use
+        assert not control.accounting_drained
+        jobs = setup.components.video_jobs
+        assert jobs is not None
+        job = jobs.load_any(video_id=response["id"])
+        assert job is not None and not job.settled
+        setup.provider.done = True
+        assert setup.engine.refresh(job).settled
+        assert control.accounting_drained
+        assert len(setup.provider.posts) == 1
+    finally:
+        bindings.remove(token)
+        assert control.close(5)
+
+
+def test_process_close_preserves_open_video_for_a_fresh_polling_owner(setup: _Setup) -> None:
+    """Idle retirement is fenced, but explicit bounded shutdown can preserve durable work."""
+    setup.provider.done = False
+    control = _video_control(setup)
+    job = _create(setup, alias="grok-video", seconds=6)
+    before = dict(_attempts(setup)[0])
+    assert not control.accounting_drained
+    assert control.close(5)
+    assert dict(_attempts(setup)[0]) == before
+    jobs = setup.components.video_jobs
+    assert jobs is not None
+    current = jobs.load_any(video_id=job.video_id)
+    assert current is not None and not current.settled
+    other = _stored_engine(setup, InMemoryVideoOutputStore())
+    try:
+        assert not other.idle
+        setup.provider.done = True
+        assert other.refresh(current).settled
+        assert other.idle
+        assert len(setup.provider.posts) == 1
+        assert _attempts(setup)[0]["budget_settled_nano_usd"] == 5 * _XAI_RATE
+    finally:
+        assert other.close(5)
 
 
 def _attempts(setup: _Setup) -> list[sqlite3.Row]:
@@ -665,6 +755,63 @@ def test_ordinary_unresolved_terminal_does_not_authorize_provider_recovery(
     assert other._poller is None
 
 
+@pytest.mark.parametrize("partial", [False, True])
+def test_published_unresolved_winner_retires_only_the_obsolete_waiver(
+    setup: _Setup, partial: bool
+) -> None:
+    """A settled job supersedes the local waiver while durable unknown liability stays intact."""
+    job = _create(setup, alias="grok-video", seconds=6)
+    other = _stored_engine(setup, InMemoryVideoOutputStore())
+    setup.clock.now += timedelta(seconds=VIDEO_JOB_SETTLEMENT_SECONDS + 1)
+    with patch.object(
+        setup.components.ledger, "finish_attempt", side_effect=RuntimeError("offline")
+    ):
+        assert not setup.engine.refresh(job).settled
+    pending = setup.engine._pending[job.video_id]
+    failure = GatewayFailure(
+        failure_class=GatewayFailureClass.PROVIDER_INTERNAL, safe_message="provider failed"
+    )
+    # A competing owner can publish an ordinary provider terminal without the
+    # local recovery capability, including records from an older writer.
+    event = GatewayEvent(
+        kind=GatewayEventKind.FAILED,
+        sequence_number=0,
+        failure=failure,
+        usage=GatewayUsage(input_tokens=19) if partial else None,
+    )
+    other._settle_created(job, event, failure, finalize=True, settled_milli=None)
+    jobs = setup.components.video_jobs
+    assert jobs is not None
+    winner = jobs.load_any(video_id=job.video_id)
+    assert winner is not None and winner.settled
+    assert winner.billed_seconds_milli is None
+    before = dict(_attempts(setup)[0])
+    assert before["accounting_recovery"] == 0
+    assert before["estimated_cost_nano_usd"] is None
+    assert before["budget_settled_nano_usd"] == job.reserved_nano_usd
+    # A generic write failure still proves nothing, even with a published job.
+    with patch.object(
+        setup.components.ledger, "finish_attempt", side_effect=RuntimeError("offline")
+    ):
+        setup.engine._retry_settlements()
+    assert setup.engine._pending[job.video_id] is pending
+    assert not setup.engine.idle
+    # Nor may the typed rejection accept a job belonging to another attempt.
+    with patch.object(
+        jobs, "load_any", return_value=winner.model_copy(update={"attempt_id": "other"})
+    ):
+        setup.engine._retry_settlements()
+    assert setup.engine._pending[job.video_id] is pending
+    assert setup.engine.refresh(job) == winner
+    assert job.video_id not in setup.engine._pending
+    assert setup.engine.idle
+    assert dict(_attempts(setup)[0]) == before
+    assert not setup.provider.polls
+    assert len(setup.provider.posts) == 1
+    assert other.close(5)
+    assert setup.engine.close(5)
+
+
 def test_another_owner_timeout_cannot_discard_a_retained_exact_completion(setup: _Setup) -> None:
     """A durable local timeout preserves the exact receipt another owner still must commit."""
     jobs = setup.components.video_jobs
@@ -920,10 +1067,12 @@ def test_failed_create_request_finish_is_owned_by_shutdown(setup: _Setup) -> Non
     ) as failed:
         with pytest.raises(NativeBridgeError):
             _create(setup, alias="grok-video", seconds=16)
+        assert not setup.engine.idle
         assert not setup.engine.close(0.01)
     original = failed.call_args.kwargs
     with patch.object(setup.components.ledger, "finish_request", wraps=finish) as recovered:
         assert setup.engine.close(5)
+    assert setup.engine.idle
     assert recovered.call_args.kwargs == original
     assert original["certify_no_effects"] is True
     assert not _attempts(setup) and not setup.provider.posts
@@ -1006,7 +1155,7 @@ def test_job_store_retry_does_not_repeat_acknowledged_accounting(setup: _Setup) 
 def test_another_engine_settlement_winner_releases_the_losing_retry_owner(
     setup: _Setup, delay_winner_job: bool
 ) -> None:
-    """A conflicting timeout drains only after the completed winner is durably published."""
+    """Without a fresh provider receipt, timeout recovery waits for the durable job winner."""
     job = _create(setup, alias="grok-video", seconds=6)
     other = _stored_engine(setup, InMemoryVideoOutputStore())
     jobs = setup.components.video_jobs
@@ -1031,6 +1180,9 @@ def test_another_engine_settlement_winner_releases_the_losing_retry_owner(
             if delay_winner_job:
                 with patch.object(jobs, "save_open", side_effect=RuntimeError("offline")):
                     assert not other.refresh(job).settled
+                # Preserve the pending-winner scenario: fresh provider evidence
+                # cannot reconstruct its job before the original owner publishes.
+                setup.provider.poll_status = 503
             else:
                 assert other.refresh(job).settled
         finish(

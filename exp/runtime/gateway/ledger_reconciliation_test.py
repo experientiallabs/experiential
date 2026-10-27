@@ -27,7 +27,10 @@ from exp.runtime.gateway.contracts import (
 )
 from exp.runtime.gateway.group_commit import GroupCommitAttemptLedger, SyncGroupCommitLedger
 from exp.runtime.gateway.ledger import GatewayLedgerError, SQLiteAttemptLedger
-from exp.runtime.gateway.ledger_errors import AccountingRecoverySupersededError
+from exp.runtime.gateway.ledger_errors import (
+    AccountingRecoverySupersededError,
+    AccountingRecoveryUnresolvedTerminalError,
+)
 from exp.runtime.gateway.ledger_test import (
     FakeLedgerClock,
     _attempt_row,
@@ -1052,7 +1055,8 @@ def test_customer_waiver_cannot_acknowledge_an_ordinary_unresolved_provider_term
     for _ in range(2):
         for receipt in receipts:
             with pytest.raises(
-                GatewayLedgerError, match="requires durable accounting recovery"
+                AccountingRecoveryUnresolvedTerminalError,
+                match="requires durable accounting recovery",
             ) as exc:
                 reopened.finish_attempt(
                     attempt_id=attempt,

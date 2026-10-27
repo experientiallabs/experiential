@@ -15,6 +15,15 @@ class AccountingRecoverySupersededError(GatewayLedgerError):
     """
 
 
+class AccountingRecoveryUnresolvedTerminalError(GatewayLedgerError):
+    """An ordinary terminal rejects recovery while its financial liability remains unresolved.
+
+    No waiver or meter was applied. Only an independently verified matching
+    settled job can retire the obsolete recovery owner; this outcome never
+    authorizes provider reconstruction or infers a complete terminal meter.
+    """
+
+
 class AttemptRejectedError(GatewayLedgerError):
     """A typed pre-dispatch rejection during authorization, acceptance or reservation.
 

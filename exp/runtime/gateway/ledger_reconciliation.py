@@ -14,6 +14,7 @@ from exp.runtime.gateway.contracts import (
 )
 from exp.runtime.gateway.ledger_errors import (
     AccountingRecoverySupersededError,
+    AccountingRecoveryUnresolvedTerminalError,
     GatewayLedgerError,
 )
 from exp.runtime.gateway.ledger_service_tiers import (
@@ -107,7 +108,9 @@ def reconcile_terminal_attempt(
         # it cannot acknowledge a customer waiver without applying that waiver.
         # Incomplete evidence proves neither recovery authority nor a complete
         # immutable winner, so retain ownership instead of reporting success.
-        raise GatewayLedgerError("customer waiver requires durable accounting recovery")
+        raise AccountingRecoveryUnresolvedTerminalError(
+            "customer waiver requires durable accounting recovery"
+        )
     if (
         terminal is not None
         and terminal.accounting_release_reservation

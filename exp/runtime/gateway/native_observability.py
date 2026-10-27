@@ -267,8 +267,10 @@ class NativeObservabilityMixin:
         A host must also stop new execution before closing an idle instance. A
         durable acknowledgment can finish this lifetime while its ledger retains
         an unresolved financial hold for a later authoritative usage receipt.
+        Durable open video jobs still need this instance's poller. Explicit
+        process close may preserve them for restart instead of waiting for renders.
         """
-        return recovery_drained(self._accounting)
+        return recovery_drained(self._accounting) and (self._videos is None or self._videos.idle)
 
     def recover_accounting(self) -> None:
         """Run one bounded recovery pass when the host explicitly owns its scheduling.

@@ -31,7 +31,10 @@ from exp.runtime.gateway.client_apps import with_client_identity
 from exp.runtime.gateway.contracts import AuthorizationSnapshot, DirectTarget
 from exp.runtime.gateway.guardrails.enforcement import GuardrailEngine
 from exp.runtime.gateway.guardrails.native import require_unguarded_surface
-from exp.runtime.gateway.ledger_errors import AccountingRecoverySupersededError
+from exp.runtime.gateway.ledger_errors import (
+    AccountingRecoverySupersededError,
+    AccountingRecoveryUnresolvedTerminalError,
+)
 from exp.runtime.gateway.model_chain_authority import authorize_serving_model_chains
 from exp.runtime.gateway.native_accounting_errors import NativeBridgeError, authority_error
 from exp.runtime.gateway.native_accounting_recovery import RecoveryRotation
@@ -770,7 +773,13 @@ class VideoEngine:
             try:
                 saved = self._settled_job_winner(
                     pending,
-                    recovery_superseded=isinstance(error, AccountingRecoverySupersededError),
+                    recovery_superseded=isinstance(
+                        error,
+                        (
+                            AccountingRecoverySupersededError,
+                            AccountingRecoveryUnresolvedTerminalError,
+                        ),
+                    ),
                 )
                 if saved is None and isinstance(error, AccountingRecoverySupersededError):
                     return self._recover_superseded(pending)
@@ -943,6 +952,15 @@ class VideoEngine:
         with self._pending_lock:
             active = self._active_creates or self._pending or self._job_gates
         return not active and not self._request_settlements.outstanding
+
+    @property
+    def idle(self) -> bool:
+        """Permit idle retirement only after local owners and durable open jobs finish.
+
+        Explicit process shutdown may stop polling and leave durable jobs for
+        restart. Idle host eviction must keep their poller alive instead.
+        """
+        return self._recovery_drained() and not self._jobs.open_jobs(limit=1)
 
 
 def _unsupported_failure() -> GatewayFailure:
