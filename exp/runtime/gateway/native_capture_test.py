@@ -676,15 +676,17 @@ def test_accepted_routing_failure_keeps_effective_prompt_without_inventing_model
         "hosted-late",
         "hosted-byok",
         "hosted-checkpoint-failed",
+        "absent",
         "off",
         "broken",
         "full",
     ],
 )
+@pytest.mark.parametrize("bound", [False, True])
 def test_real_http_surfaces_capture_or_fail_before_provider_dispatch(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, policy: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, policy: str, bound: bool
 ) -> None:
-    """Collect Chat, Responses and Messages JSON/SSE through native HTTP, not a fixture tap."""
+    """Real HTTP keeps capture and required checkpoints with the selected execution owner."""
     destination = policy
     if policy.startswith("hosted-batched"):
         policy = "hosted"
@@ -741,12 +743,50 @@ def test_real_http_surfaces_capture_or_fail_before_provider_dispatch(
     port = _unused_port()
     shutdown = native.shutdown_handle()
     failures: list[BaseException] = []
-    control = NativeControlPlane(components, capture=capture)
+    control = NativeControlPlane(components, capture=None if policy == "absent" else capture)
     admit = control.admit
+    process_records: list[str] = []
+    process_request_ids: list[str] = []
+    process_collector = (
+        native.CaptureCollector(
+            CaptureConfiguration(settlement_required=False).model_dump_json(),
+            process_records.append,
+        )
+        if bound
+        else None
+    )
+    process = (
+        NativeControlPlane(
+            components,
+            capture=CaptureController(process_collector, application_for=lambda _auth: "process"),
+        )
+        if process_collector is not None
+        else control
+    )
+    bindings = native.ExecutionBindings() if bound else None
+    handle = (
+        native.ExecutionHandle(
+            control,
+            max_active_requests=8,
+            callback_permits=4,
+            settlement_permits=2,
+            guardrail_detectors=control.guardrail_detectors,
+            capture=control.capture_collector,
+        )
+        if bound
+        else None
+    )
 
     def funding_admit(argument: str) -> str:
         """Model a hosted-funded test lane; local provider fixtures otherwise use BYOK."""
         result = json.loads(admit(argument))
+        if process_collector is not None:
+            # Independent owners can reuse request IDs. A bound request, even
+            # one without capture, must never attach to this process-owned prompt.
+            document = json.loads(_request_json())
+            document["request_id"] = result["request_id"]
+            assert process_collector.begin(json.dumps(document))
+            process_request_ids.append(result["request_id"])
         if policy in {"hosted", "hosted-late", "hosted-checkpoint-failed"}:
             for wire in result["route"]:
                 wire["billing_customer_managed"] = False
@@ -771,10 +811,11 @@ def test_real_http_surfaces_capture_or_fail_before_provider_dispatch(
         """Serve the real data plane and preserve startup failures for assertions."""
         try:
             serve_native_gateway(
-                control,
+                process,
                 host="127.0.0.1",
                 port=port,
-                capture=collector,
+                capture=process_collector if bound else collector,
+                execution_bindings=bindings,
                 shutdown=shutdown,
             )
         except BaseException as error:  # noqa: BLE001 - surfaced after bounded shutdown.
@@ -795,6 +836,9 @@ def test_real_http_surfaces_capture_or_fail_before_provider_dispatch(
                     payload["messages"] = [{"role": "user", "content": prompt}]
                 if surface == "messages":
                     payload["max_tokens"] = 128
+                if bindings is not None:
+                    assert handle is not None
+                    bindings.register(raw_key, handle)
                 response = httpx.post(
                     f"http://127.0.0.1:{port}/v1/{surface}",
                     headers={
@@ -844,15 +888,26 @@ def test_real_http_surfaces_capture_or_fail_before_provider_dispatch(
     finally:
         shutdown.request_shutdown()
         worker.join(timeout=10)
+        assert control.close(2)
+        if process is not control:
+            assert process.close(2)
+        if process_collector is not None:
+            for request_id in process_request_ids:
+                process_collector.settle(request_id, False, False)
+            assert process_collector.close(2)
+            assert process_collector.counts()[0] == 0
         components.write_ledger.close()
         provider.shutdown()
         provider.server_close()
         provider_thread.join(timeout=5)
     assert not failures
     assert not worker.is_alive()
+    assert process_records == [], "bound output reached the process collector"
+    assert handle is None or not handle.in_use
     assert collector.close(1)
+    assert collector.counts()[0] == 0
     assert _LoopbackProvider.calls == (0 if policy in {"broken", "full"} else 6)
-    if policy in {"off", "broken", "full", "hosted-byok", "hosted-checkpoint-failed"}:
+    if policy in {"absent", "off", "broken", "full", "hosted-byok", "hosted-checkpoint-failed"}:
         assert records == []
         return
     if destination in {"hosted-batched-references", "hosted-batched-bytes-references"}:

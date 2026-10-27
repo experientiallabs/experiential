@@ -35,7 +35,10 @@ from exp.runtime.gateway.native_metrics_text import render_metrics_text
 from exp.runtime.gateway.usage import GatewayUsageReport, read_usage_report, usage_html
 
 if TYPE_CHECKING:
+    from exp_gateway_native import CaptureCollector
+
     from exp.runtime.gateway.guardrails.enforcement import GuardrailEngine
+    from exp.runtime.gateway.native_capture import CaptureController
     from exp.runtime.gateway.video.engine import VideoEngine
 
 
@@ -50,6 +53,28 @@ class NativeObservabilityMixin:
     _guardrails: GuardrailEngine | None
     _background_recovery: bool
     _videos: VideoEngine | None
+    _request_timeout_seconds: float
+    _capture: CaptureController | None
+
+    @property
+    def capture_collector(self) -> CaptureCollector | None:
+        """Return this instance's collector for its native execution binding."""
+        return None if self._capture is None else self._capture.native
+
+    @property
+    def request_timeout_seconds(self) -> float:
+        """Return the per-request budget shared with the data plane."""
+        return self._request_timeout_seconds
+
+    @property
+    def reconciled_expired_requests(self) -> int:
+        """Return crashed requests reconciled at startup."""
+        return self._components.reconciled_expired_requests
+
+    @property
+    def reconciled_unknown_attempts(self) -> int:
+        """Return crashed attempts reconciled at startup."""
+        return self._components.reconciled_unknown_attempts
 
     def models(self, argument: str) -> str:
         """Return the granted model list body for one authenticated key."""

@@ -9,6 +9,7 @@ use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use tokio::sync::Semaphore;
 
+use crate::capture::{collector::Collector, python::CaptureCollector};
 use crate::errors::PublicError;
 use crate::guardrails::plan::DetectorMap;
 
@@ -22,11 +23,12 @@ pub(crate) struct ExecutionResources {
     pub(crate) serving: Arc<Semaphore>,
     pub(crate) settlement: Arc<Semaphore>,
     pub(crate) guardrail_detectors: Arc<DetectorMap>,
+    pub(crate) capture: Option<Arc<Collector>>,
     pub(crate) replay_namespace: u64,
     owners: AtomicUsize,
 }
 
-/// A callback target with explicit capacity and detector rules, independent of caller identity.
+/// A callback target with explicit resources and content ownership, independent of caller identity.
 #[pyclass]
 pub struct ExecutionHandle {
     pub(crate) inner: Arc<ExecutionResources>,
@@ -35,13 +37,14 @@ pub struct ExecutionHandle {
 #[pymethods]
 impl ExecutionHandle {
     #[new]
-    #[pyo3(signature = (control_plane, *, max_active_requests, callback_permits, settlement_permits, guardrail_detectors))]
+    #[pyo3(signature = (control_plane, *, max_active_requests, callback_permits, settlement_permits, guardrail_detectors, capture))]
     pub(crate) fn new(
         control_plane: Py<PyAny>,
         max_active_requests: usize,
         callback_permits: usize,
         settlement_permits: usize,
         guardrail_detectors: &Bound<'_, PyDict>,
+        capture: Option<&CaptureCollector>,
     ) -> PyResult<Self> {
         if !(1..=65_536).contains(&max_active_requests)
             || !(1..=256).contains(&callback_permits)
@@ -68,6 +71,7 @@ impl ExecutionHandle {
                 serving: Arc::new(Semaphore::new(callback_permits)),
                 settlement: Arc::new(Semaphore::new(settlement_permits)),
                 guardrail_detectors: Arc::new(crate::collect_detectors(Some(guardrail_detectors))?),
+                capture: capture.map(|collector| collector.inner.clone()),
                 replay_namespace,
                 owners: AtomicUsize::new(0),
             }),
@@ -173,13 +177,14 @@ pub(crate) mod tests {
 
     fn handle() -> ExecutionHandle {
         Python::initialize();
-        Python::attach(|py| ExecutionHandle::new(py.None(), 128, 32, 8, &PyDict::new(py))).unwrap()
+        Python::attach(|py| ExecutionHandle::new(py.None(), 128, 32, 8, &PyDict::new(py), None))
+            .unwrap()
     }
 
     pub(crate) fn lease(active: usize, serving: usize, cleanup: usize) -> Arc<ExecutionLease> {
         Python::initialize();
         let handle = Python::attach(|py| {
-            ExecutionHandle::new(py.None(), active, serving, cleanup, &PyDict::new(py))
+            ExecutionHandle::new(py.None(), active, serving, cleanup, &PyDict::new(py), None)
         })
         .unwrap();
         ExecutionLease::new(handle.inner)

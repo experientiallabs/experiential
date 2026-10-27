@@ -27,6 +27,7 @@ impl FromRef<ServerState> for AppState {
         if server.bindings_enabled {
             if let Ok(execution) = EXECUTION.try_with(Arc::clone) {
                 state.guardrail_detectors = execution.resources.guardrail_detectors.clone();
+                state.capture = execution.resources.capture.clone();
                 state.replays = Arc::new(state.replays.bound(execution.resources.replay_namespace));
                 state.bridge = Arc::new(state.bridge.bind(execution));
             }
@@ -88,7 +89,7 @@ mod tests {
             mapping
                 .set_item("same-adapter", Py::new(py, detector).unwrap())
                 .unwrap();
-            let handle = ExecutionHandle::new(py.None(), 2, 2, 1, &mapping).unwrap();
+            let handle = ExecutionHandle::new(py.None(), 2, 2, 1, &mapping, None).unwrap();
             // The handle owns a snapshot, not the caller's mutable Python dictionary.
             mapping.clear();
             handle
@@ -162,7 +163,7 @@ mod tests {
                 let first = handle("alpha", "[first]");
                 let second = handle("beta", "[second]");
                 let empty = Python::attach(|py| {
-                    ExecutionHandle::new(py.None(), 2, 2, 1, &PyDict::new(py)).unwrap()
+                    ExecutionHandle::new(py.None(), 2, 2, 1, &PyDict::new(py), None).unwrap()
                 });
                 let server = server_state(&process);
                 let bindings = ExecutionBindings::new(3).unwrap();
@@ -269,7 +270,7 @@ mod tests {
             .block_on(async {
                 Python::initialize();
                 let handle = Python::attach(|py| {
-                    ExecutionHandle::new(py.None(), 2, 2, 1, &pyo3::types::PyDict::new(py))
+                    ExecutionHandle::new(py.None(), 2, 2, 1, &pyo3::types::PyDict::new(py), None)
                 })
                 .unwrap();
                 let bindings = ExecutionBindings::new(4).unwrap();

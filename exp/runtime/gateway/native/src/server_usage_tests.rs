@@ -69,7 +69,7 @@ fn usage_uses_process_owner_and_preserves_one_use_binding() {
         .block_on(async {
             let target = plane("bound");
             let handle =
-                Python::attach(|py| ExecutionHandle::new(target, 2, 2, 1, &PyDict::new(py)))
+                Python::attach(|py| ExecutionHandle::new(target, 2, 2, 1, &PyDict::new(py), None))
                     .unwrap();
             let bindings = ExecutionBindings::new(1).unwrap();
             let token = "registered-relay-token".repeat(2);

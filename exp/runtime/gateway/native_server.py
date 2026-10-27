@@ -181,7 +181,8 @@ def serve_native_gateway(
             leaves the budget off, which is the behavior before this
             setting existed; 1 GiB (a quarter of a 4 GiB worker) is the
             suggested value when enabling it.
-        capture: The collector shared with the admission controller; None retains no content.
+        capture: The process collector shared with its admission controller. Bound
+            requests use their execution handle's collector, including explicit None.
         execution_bindings: Optional one-use bindings from host relay tokens to
             opaque callback targets and explicit execution resources. None uses the
             supplied control plane directly without additional scheduling. With

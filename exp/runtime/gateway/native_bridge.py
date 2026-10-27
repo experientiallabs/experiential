@@ -261,6 +261,9 @@ class NativeControlPlane(
         self._guardrail_detectors = deterministic.compile_native_detectors(
             {} if guardrails is None else guardrails.deterministic_specifications
         )
+        # Finish fallible initialization before background workers can retain the ledger.
+        reservation_encoder()
+        self._bind_videos(start_poller=False)
         # Shared accounting owns reservations, health, recovery and deadline cleanup.
         self._accounting = NativeAttemptAccounting(
             self._write_ledger,
@@ -270,29 +273,18 @@ class NativeControlPlane(
             default_lane_bound=default_lane_bound,
             background_recovery=background_recovery,
         )
-        self._bind_videos()  # the optional /v1/videos engine and its settlement poller
-        # Build BPE once at bind time; a corrupt table must fail startup.
-        reservation_encoder()
+        try:
+            if self._videos is not None:
+                self._videos.start_poller()
+        except BaseException:
+            # No request can yet enter, so this registry has no retained writes.
+            self._accounting.close()
+            raise
 
     @property
     def guardrail_detectors(self) -> dict[str, deterministic.NativeDetector]:
         """Return the compiled deterministic rules the data plane enforces."""
         return dict(self._guardrail_detectors)
-
-    @property
-    def request_timeout_seconds(self) -> float:
-        """Return the per-request budget shared with the data plane."""
-        return self._request_timeout_seconds
-
-    @property
-    def reconciled_expired_requests(self) -> int:
-        """Return crashed requests reconciled at startup."""
-        return self._components.reconciled_expired_requests
-
-    @property
-    def reconciled_unknown_attempts(self) -> int:
-        """Return crashed attempts reconciled at startup."""
-        return self._components.reconciled_unknown_attempts
 
     def admit(self, argument: str) -> str:
         """Decode, authorize, inspect, route, and durably accept one request.

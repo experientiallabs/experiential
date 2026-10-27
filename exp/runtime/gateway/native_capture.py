@@ -337,7 +337,7 @@ class CaptureController:
         """Bind the collector to a host-owned authenticated capture-policy decision.
 
         Args:
-            native: Shared collector also passed to the native server.
+            native: Collector also supplied to this instance's native server or execution handle.
             application_for: Return a configured application or None to decline capture.
         """
         self.native = native

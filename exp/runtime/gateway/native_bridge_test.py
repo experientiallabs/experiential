@@ -363,6 +363,57 @@ def _chat_body(*, model: str = "coding", stream: bool = False) -> str:
     return json.dumps(payload)
 
 
+@pytest.mark.parametrize("background_recovery", [False, True])
+@pytest.mark.parametrize("failure_point", ["tokenizer", "videos", "video_poller"])
+def test_failed_control_plane_initialization_leaves_no_background_owner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    background_recovery: bool,
+    failure_point: str,
+) -> None:
+    """Repeated constructor failures leave no unreachable recovery or video thread."""
+    _configured_gateway(tmp_path)
+    components = load_gateway_components(
+        tmp_path, environment={"TEST_PROVIDER_KEY": "provider-secret-canary"}
+    )
+    started: list[threading.Thread] = []
+    original_start = threading.Thread.start
+
+    def track_start(thread: threading.Thread) -> None:
+        """Observe real owned workers and inject a video thread creation failure."""
+        if thread.name in {"exp-native-settlement-sweep", "gateway-video-poller"}:
+            started.append(thread)
+            if failure_point == "video_poller" and thread.name == "gateway-video-poller":
+                raise RuntimeError("startup fault")
+        original_start(thread)
+
+    monkeypatch.setattr(threading.Thread, "start", track_start)
+    if failure_point == "tokenizer":
+        monkeypatch.setattr(
+            native_bridge_module,
+            "reservation_encoder",
+            mock.Mock(side_effect=RuntimeError("startup fault")),
+        )
+    elif failure_point == "videos":
+        monkeypatch.setattr(
+            NativeControlPlane, "_bind_videos", mock.Mock(side_effect=RuntimeError("startup fault"))
+        )
+    try:
+        for _ in range(2):
+            with pytest.raises(RuntimeError, match="startup fault"):
+                NativeControlPlane(components, background_recovery=background_recovery)
+            assert not any(thread.is_alive() for thread in started)
+        if failure_point == "video_poller":
+            assert sum(thread.name == "exp-native-settlement-sweep" for thread in started) == (
+                2 if background_recovery else 0
+            )
+        else:
+            assert not started
+    finally:
+        components.write_ledger.close()
+        components.ledger.close()
+
+
 def _admit(
     control: NativeControlPlane,
     raw_key: str,

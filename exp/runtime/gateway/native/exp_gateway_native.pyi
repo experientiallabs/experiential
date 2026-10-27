@@ -96,7 +96,7 @@ class CaptureCollector:
     def maintenance_failures(self) -> int: ...
 
 class ExecutionHandle:
-    """Callback target with explicit capacity, detector snapshot and private replay identity."""
+    """Callback target with explicit capacity, capture, detectors and private replay identity."""
 
     def __init__(
         self,
@@ -106,6 +106,7 @@ class ExecutionHandle:
         callback_permits: int,
         settlement_permits: int,
         guardrail_detectors: Mapping[str, _DeterministicDetector],
+        capture: CaptureCollector | None,
     ) -> None: ...
     @property
     def in_use(self) -> bool: ...

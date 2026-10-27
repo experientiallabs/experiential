@@ -1091,13 +1091,16 @@ def test_recovery_acknowledgment_does_not_absorb_other_terminal_evidence(
         GatewayEvent(kind=GatewayEventKind.COMPLETED, sequence_number=1)
         if incoming == "completed_without_usage"
         else GatewayEvent(
-            kind=GatewayEventKind.FAILED,
+            kind=(
+                GatewayEventKind.INCOMPLETE if incoming == "estimated" else GatewayEventKind.FAILED
+            ),
             sequence_number=1,
-            failure=failure,
+            failure=None if incoming == "estimated" else failure,
             usage=GatewayUsage(
                 input_tokens=10, output_tokens=5 if incoming == "estimated" else None
             ),
             usage_estimated=incoming == "estimated",
+            usage_unreported_truncation=incoming == "estimated",
         )
     )
     with pytest.raises(GatewayLedgerError, match="another terminal state"):
