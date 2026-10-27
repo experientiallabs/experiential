@@ -22,7 +22,9 @@ group as its conversation and as its declared task identity (``task_lineage``), 
 customer boundary per source project. A build therefore keeps all of them in one leakage group,
 fit or held out together, and the root exposure ledger joins them by declared task identity, so
 a reservation or exposure of one fork covers the rest. Studies only run from fit tasks of the
-source build (the study owner refuses reserved ones), so no export carries held-out evidence.
+source build (the study owner refuses reserved ones), and the export checks each study's task
+again against the current build, because a rebuild can move a fit lineage to held out; so no
+export carries held-out evidence.
 
 Admission. Every export applies one registered admission policy, which every study it judges
 must cite by pinning it as ``admission_policy`` before running. Each branch's per-dimension
@@ -86,6 +88,7 @@ from exp.optimize.evaluation.equivalence.verdicts import (
 )
 from exp.runtime.environments import Observation
 from exp.simulation.continuations import ContinuationCheckpoint, load_continuation_checkpoint
+from exp.simulation.development_scope import require_development_task
 from exp.simulation.mining.exposure_ledger import TASK_LINEAGE_KEY
 
 TRAJECTORY_TRACE_PROTOCOL = "generated-trajectory-v2"
@@ -255,7 +258,8 @@ def export_trajectory_traces(
 
     Raises:
         ValueError: A generator differs from its saved artifact or reaches no study, the
-            policy is not the one a study pinned, or a calibration is not under the policy.
+            policy is not the one a study pinned, a calibration is not under the policy, or
+            a study's task is no longer development data under the project's current build.
     """
     destination = validate_local_id(spec.project or project.paths.project_id, label="project ID")
     store = project.artifacts
@@ -277,6 +281,9 @@ def export_trajectory_traces(
         reference, generators = studies[study_id]
         study = load_study(store, reference)
         require_pinned_policy(store, reference, study, spec.policy)
+        require_development_task(
+            store, load_continuation_checkpoint(store, study.spec.checkpoint).task
+        )
         for branch in study.branches:
             branches += 1
             converted = _trajectory(project, study, branch, reference, generators, admission)

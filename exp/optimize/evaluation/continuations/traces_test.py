@@ -22,12 +22,18 @@ from exp.common.core.artifacts import (
 )
 from exp.common.models import AssistantAction, ModelMessage, ToolCall
 from exp.common.project import ArtifactStore, ProjectStore, artifact_input
-from exp.common.tasks import TaskCase, ToolSchema
+from exp.common.tasks import TaskCase, ToolSchema, load_task_set
 from exp.common.traces import Trace
 from exp.common.traces.ingest.otlp import TraceNormalizationResult
 from exp.common.traces.ingest.persistence import read_ingested_traces
 from exp.common.traces.sqlite import SQLiteTraceStore
 from exp.common.traces.sqlite_schema import trace_database_path
+from exp.optimize.evaluation.audit.panel_test import (
+    USERS,
+    SimulatedProvider,
+    build_project,
+    episode,
+)
 from exp.optimize.evaluation.continuations.records import load_study
 from exp.optimize.evaluation.continuations.study import (
     ContinuationStudySpec,
@@ -615,3 +621,45 @@ def test_authored_prefix_replies_are_never_proven_native(tmp_path: Path) -> None
     # Exported call IDs stay unique even though the actor reused call-1 across turns.
     call_ids = [row["call_id"] for row in steps(trace)]
     assert call_ids == ["a1", "call-1", "call-1~1"]
+
+
+def test_export_refuses_a_study_whose_lineage_a_rebuild_reserved(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A lineage fit when its study ran but held out by a later build is never exported.
+
+    A build of one lineage keeps it fit; a build of two holds out whichever ranks second, so a
+    rebuild with one more user can move the studied lineage to held out.
+    """
+
+    def partitions(project: ProjectStore) -> dict[str, str]:
+        """Each task lineage of the project's current build, with its partition."""
+        build = project.load_project().build
+        assert build is not None
+        tasks = load_task_set(project.artifacts, build.task_set.artifact_id).tasks
+        return {task.lineage_group_id: task.partition for task in tasks}
+
+    first = [episode(0)]
+    _, project, _ = build_project(
+        tmp_path, monkeypatch, SimulatedProvider(first), episodes=first, relative_traces=True
+    )
+    store = project.artifacts
+    policy = registered_policy(store)
+    ((lineage, partition),) = partitions(project).items()
+    assert partition == "fit"
+    task = ticket_task(0).model_copy(update={"lineage_group_id": lineage})
+    reference, _ = capture(store, ticket_case().runtime, task)
+    result = study(store, reference, ticket_case().runtime, [ticket_fork(0, 0)], policy=policy)
+    spec = TrajectoryTraceExport(policy=policy, generators=(result,))
+    assert export_trajectory_traces(project, spec, dry_run=True).native == 1
+    for user in range(1, USERS):
+        later = [episode(0), episode(user)]
+        project = build_project(
+            tmp_path, monkeypatch, SimulatedProvider(later), episodes=later, relative_traces=True
+        )[1]
+        if partitions(project)[lineage] == "held_out":
+            break
+    else:
+        pytest.fail("no second user ranked before the studied lineage")
+    with pytest.raises(ValueError, match="lineage is reserved by the frozen build"):
+        export_trajectory_traces(project, spec)
