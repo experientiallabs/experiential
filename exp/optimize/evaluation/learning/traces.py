@@ -90,7 +90,7 @@ from exp.optimize.evaluation.learning.retirement import (
     retired_traces,
     retirement_of,
     settle_refusal,
-    trace_lock,
+    trace_held,
 )
 from exp.simulation.evaluation.workflow import INFRASTRUCTURE_STOPS
 from exp.simulation.retrieval.build_inputs import load_completed_build_rag_lineage_bindings
@@ -692,7 +692,7 @@ def learn_from_traces(
     Raises:
         Exception: One of ``INFRASTRUCTURE_STOPS`` stopped a trace; a deterministic refusal
             propagates only below the retirement bound without ``retry_incomplete``.
-        Timeout: Another process is learning or retiring the same trace.
+        ValueError: Another process is learning or retiring the same trace.
     """
     plan = learning_plan(
         project,
@@ -709,7 +709,7 @@ def learn_from_traces(
     earlier: set[str] = set()  # trajectories of the traces before this one in the pass
     for index, case in enumerate(cases):
         report(progress, "Learning from traces", completed=index, total=len(cases))
-        with trace_lock(project, plan.lineage, case.trace_id):
+        with trace_held(project, plan.lineage, case.trace_id):
             if retirement_of(project, plan.lineage, case.trace_id) is not None:
                 retired += 1
                 continue

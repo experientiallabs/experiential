@@ -17,9 +17,12 @@ stay unchanged. A retired trace is never scored and never silently dropped: ever
 report and audit checkpoint counts it as not learned and names it.
 """
 
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import datetime
 from typing import Literal
 
+from filelock import Timeout
 from pydantic import Field
 
 from exp.common.core.artifacts import (
@@ -366,17 +369,30 @@ def retirement_id(lineage: str, trace_id: str) -> str:
     return stable_id(RETIREMENT_TYPE, {"lineage": lineage, "trace": trace_id})
 
 
-def trace_lock(project: ProjectStore, lineage: str, trace_id: str) -> CoordinationLock:
-    """Held while a trace is learned or retired, so a retirement never interleaves with learning.
+@contextmanager
+def trace_held(project: ProjectStore, lineage: str, trace_id: str) -> Iterator[None]:
+    """Hold a trace while it is learned or retired, so a retirement never interleaves with learning.
 
     A learning pass holds it from its retirement check until the trace's last attempt is saved
     and published; an operator retirement holds it from its checks until its record is written.
     Neither waits for the other: whichever comes second is refused and can be retried.
+
+    Raises:
+        ValueError: Another process is learning or retiring the trace.
     """
-    return CoordinationLock(
+    lock = CoordinationLock(
         project.artifacts.project_directory / (retirement_id(lineage, trace_id) + ".lock"),
         timeout=0,
     )
+    try:
+        held = lock.acquire()
+    except Timeout as error:
+        raise ValueError(
+            f"trace {trace_id} is being learned or retired by another process in memory "
+            f"{lineage}; run the command again once it stops"
+        ) from error
+    with held:
+        yield
 
 
 def retirement_of(project: ProjectStore, lineage: str, trace_id: str) -> TraceRetirement | None:

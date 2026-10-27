@@ -40,7 +40,7 @@ from exp.optimize.evaluation.learning.retirement import (
     TraceRetirement,
     retire,
     retirement_of,
-    trace_lock,
+    trace_held,
     trace_refusals,
 )
 from exp.optimize.evaluation.learning.traces import (
@@ -141,13 +141,8 @@ def retire_trace(
     saved = retirement_of(project, plan.lineage, case.trace_id)
     if saved is not None and saved.cause == "operator" and saved.reason == request.reason:
         return _retired(saved, replayed=True)
-    busy = f"trace {case.trace_id} is being learned by another process; retry once it stops"
-    try:
-        held = trace_lock(project, plan.lineage, case.trace_id).acquire()
-    except Timeout as error:
-        raise ValueError(busy) from error
     # Held through the record, so no learning pass starts the trace between check and commit.
-    with held:
+    with trace_held(project, plan.lineage, case.trace_id):
         head = memory_head(project.artifacts, plan.lineage)
         spec = learning_spec(project, plan, case, deadline=datetime.now(UTC) + DEADLINE)
         digest = consumed_trajectory_digest(trajectory_record(spec))
@@ -164,7 +159,10 @@ def retire_trace(
             try:
                 lock.acquire(timeout=0)
             except Timeout as error:
-                raise ValueError(busy) from error
+                raise ValueError(
+                    f"trace {case.trace_id} is being learned by another process; retry once "
+                    "it stops"
+                ) from error
             lock.release()
         refusals = trace_refusals(project, plan.lineage, case.trace_id)
         retirement = TraceRetirement(

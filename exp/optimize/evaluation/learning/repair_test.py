@@ -25,7 +25,7 @@ from exp.optimize.evaluation.fidelity.memory import (
 )
 from exp.optimize.evaluation.fidelity.runner import FidelitySpec, PreparedFidelity
 from exp.optimize.evaluation.learning import repair as learning_repair
-from exp.optimize.evaluation.learning import traces
+from exp.optimize.evaluation.learning import retirement, traces
 from exp.optimize.evaluation.learning.repair import LearningRepairSpec, repair_learning
 from exp.optimize.evaluation.learning.retirement import retirement_of
 from exp.optimize.evaluation.learning.retirement_test import OUTAGE, learn, refusing_project
@@ -417,7 +417,9 @@ def test_an_operator_cannot_retire_a_trace_a_learning_pass_has_started(
         request = learning_repair.TraceRetirementRequest(
             resolution="retire-trace", trace_id=trace_id, reason="racing operator"
         )
-        with pytest.raises(ValueError, match="being learned by another process") as refused:
+        with pytest.raises(
+            ValueError, match="being learned or retired by another process"
+        ) as refused:
             learning_repair.retire_trace(project, request, code_revision=REVISION)
         refusals.append(str(refused.value))
 
@@ -428,3 +430,20 @@ def test_an_operator_cannot_retire_a_trace_a_learning_pass_has_started(
     assert outcome.learned == len(learning_cases(store, "fit"))
     lineage = learning_plan(store, scope="fit").lineage
     assert retirement_of(store, lineage, trace_id) is None
+
+
+def test_a_pass_meeting_a_held_trace_stops_with_an_operator_message(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Contention is a refusal naming the trace, not a raw lock timeout taken as an outage."""
+    store, provider, trace_id = refusing_project(tmp_path, monkeypatch, OUTAGE)
+    with pytest.raises(ProviderTransportError):
+        learn(store)
+    provider.task_id = None
+    lineage = learning_plan(store, scope="fit").lineage
+
+    with (
+        retirement.trace_held(store, lineage, trace_id),
+        pytest.raises(ValueError, match=f"trace {trace_id} is being learned or retired"),
+    ):
+        learn(store, retry_incomplete=True)
