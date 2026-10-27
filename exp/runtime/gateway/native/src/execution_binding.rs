@@ -1,7 +1,7 @@
 //! Explicit host-selected callback targets and execution resources.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
@@ -13,7 +13,7 @@ use crate::errors::PublicError;
 use crate::guardrails::plan::DetectorMap;
 
 // Zero belongs to individual process execution; handle identities are never reused.
-static NEXT_REPLAY_NAMESPACE: AtomicU64 = AtomicU64::new(1);
+static NEXT_REPLAY_NAMESPACE: Mutex<u64> = Mutex::new(1);
 
 /// Resources shared only by requests the host explicitly assigns to this handle.
 pub(crate) struct ExecutionResources {
@@ -51,11 +51,16 @@ impl ExecutionHandle {
                 "execution limits must be positive: active at most 65536, callbacks at most 256",
             ));
         }
-        let replay_namespace = NEXT_REPLAY_NAMESPACE
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
-                value.checked_add(1)
-            })
-            .map_err(|_| PyRuntimeError::new_err("execution identity capacity exhausted"))?;
+        let replay_namespace = {
+            let mut next = NEXT_REPLAY_NAMESPACE
+                .lock()
+                .map_err(|_| PyRuntimeError::new_err("execution identities unavailable"))?;
+            let current = *next;
+            *next = current
+                .checked_add(1)
+                .ok_or_else(|| PyRuntimeError::new_err("execution identity capacity exhausted"))?;
+            current
+        };
         Ok(Self {
             inner: Arc::new(ExecutionResources {
                 target: control_plane,
