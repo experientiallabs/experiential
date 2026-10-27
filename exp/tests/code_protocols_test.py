@@ -57,7 +57,7 @@ PROTOCOLS = (
     ),
     Protocol(
         "exp.optimize.evaluation.tasks.calibration:CALIBRATION_PROTOCOL",
-        "task-calibration-v10",
+        "task-calibration-v11",
         (
             "exp.optimize.evaluation.tasks.calibration",
             "exp.optimize.evaluation.tasks.admission",
@@ -65,7 +65,7 @@ PROTOCOLS = (
             "exp.simulation.evaluation.tasks",
             "exp.simulation.evaluation.admission",
         ),
-        "8cc16410f284caf35e9c321c62c04b75cc7c8869f0f379e56383daabe2d1ba89",
+        "c297a9c3fb433511bba5b1742c79eebd29bc6a7ed266a7b93b466c92070db604",
     ),
     Protocol(
         "exp.optimize.evaluation.tasks.challenges:CHALLENGE_PROTOCOL",

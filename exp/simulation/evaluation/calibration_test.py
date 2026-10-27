@@ -778,3 +778,52 @@ def test_rejected_judge_outputs_are_failures_not_abstentions() -> None:
     assert representative["judge_failures"] == 1
     assert representative["unnecessary_abstentions"] == 0
     assert representative["false_acceptances"] == 0 and representative["false_rejections"] == 0
+
+
+@pytest.mark.parametrize("disagreement", ["none", "threshold", "critical"])
+def test_judge_only_qualification_needs_matching_threshold_decisions(disagreement: str) -> None:
+    """Scores within tolerance still disqualify a judge whose pass/fail decision flips."""
+    bound = bound_pack(variants=2)
+    judgments = task_judgments(bound)
+    labeled = CalibrationPack.model_validate(
+        {
+            **bound.model_dump(),
+            "score_tolerance": 1,
+            "minimum_scores": {"outcome": 5},
+            "cases": tuple(
+                {
+                    **case.model_dump(),
+                    "expected_task": None,
+                    "challenge": {
+                        **case.challenge.model_dump(),
+                        "authority": "human",
+                        "expected": case.expected_task,
+                    },
+                    "expert_scores": {"outcome": 5 if case.expected_task == "pass" else 1},
+                }
+                for case in bound.cases
+            ),
+        }
+    )
+    position = next(i for i, case in enumerate(labeled.cases) if case.challenge.expected == "pass")
+    if disagreement != "none":
+        changed = judgments[position].model_copy(
+            update={
+                "axes": tuple(
+                    axis.model_copy(
+                        update={"score": 4}
+                        if disagreement == "threshold"
+                        else {"critical_flags": ("unsupported_claim",)}
+                    )
+                    if axis.dimension_id == "outcome"
+                    else axis
+                    for axis in judgments[position].axes
+                )
+            }
+        )
+        judgments = judgments[:position] + (changed,) + judgments[position + 1 :]
+    report = calibrate(labeled, judgments, admission=EvidenceAdmission())
+    assert report["rubric_status"] == "supported_on_labeled_cases"
+    assert report["qualification"] == (
+        "qualified_in_scope" if disagreement == "none" else "diagnostic_only"
+    )
