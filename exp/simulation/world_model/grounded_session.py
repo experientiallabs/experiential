@@ -662,6 +662,8 @@ def open_grounded_session(
                         "task": task.model_dump(mode="json", exclude={"task_id"}),
                         "checkpoint": None if checkpoint is None else checkpoint.artifact_id,
                         "output_protocol": output_protocol,
+                        "json_object_output": json_object_output,
+                        "served_model_id": served_model_id,
                         "output_tokens": maximum_output_tokens,
                         "selection": None
                         if runtime.evidence_selector is None

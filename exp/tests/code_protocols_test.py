@@ -80,7 +80,7 @@ PROTOCOLS = (
     ),
     Protocol(
         "exp.optimize.evaluation.council.runner:COUNCIL_HARNESS_PROTOCOL",
-        "council-harness-v5",
+        "council-harness-v6",
         (
             "exp.runtime.agents.chat:ChatAgentRuntime",
             "exp.runtime.agents.pi:PiAgentRuntime",
@@ -88,7 +88,7 @@ PROTOCOLS = (
             "exp.simulation.actor:run_actor_workflow",
             "exp.simulation.world_model.grounded_session:open_grounded_session",
         ),
-        "b603ad527f8e08fdbda0a891de4226abda96ab7aa3f92608f2d14e784063ccea",
+        "fe55f4aca8ba262638d1c8f3d5c3e56a85529185877fb21483ae095655efc94e",
     ),
     Protocol(
         "exp.optimize.evaluation.tasks.refinement:REFINEMENT_REQUEST_PROTOCOL",
