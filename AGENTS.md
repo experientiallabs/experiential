@@ -4,6 +4,19 @@ Experiential builds immutable task evidence from agent traces, composes and fits
 runs those routers on loopback, and executes bounded SFT from persisted datasets. All importable
 code lives under `exp/`; benchmark data arrives as a dependency (see rule 6).
 
+## Product and repository boundaries
+
+Make open-source Experiential excellent for individual users. Keep enterprise operations,
+organization management, billing, and deployment orchestration in other repos. Enterprise
+builders can build that layer themselves, but this boundary must never compromise our
+gateway's performance, security, or maintainability.
+
+Public code, documentation, commit messages, PR descriptions, and comments must describe the
+standalone open-source behavior. Keep private repository links, internal deployment details,
+customer information, and private operational or experiment evidence in private repos or local
+records. Limit disclosure cleanup to sensitive cases; preserve legitimate public interfaces
+and ordinary technical terminology. Keep shared interfaces small, performant, and reliable.
+
 ## Toolchain
 
 Managed with `uv`; lint/format with `ruff`; type-check with `ty`.

@@ -900,7 +900,7 @@ class NativeAttemptAccounting:
                 raise authority_error(exc) from exc
             with self._lock:
                 # A meter may arrive while the unknown cancellation is writing.
-                # MemoryDB can upgrade pending usage; a conflicting terminal
+                # A ledger can upgrade pending usage; a conflicting terminal
                 # owner must retain the evidence instead of reporting a drain.
                 if entry.pending_settlement is not None:
                     return '{"terminalized":false}'
