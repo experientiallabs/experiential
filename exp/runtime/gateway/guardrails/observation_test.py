@@ -10,7 +10,7 @@ import time
 import weakref
 from collections.abc import Callable, Coroutine
 from concurrent.futures import Future
-from typing import Never
+from typing import Literal, Never
 
 import pytest
 
@@ -481,7 +481,12 @@ def test_subject_budget_outlives_cancel_ignoring_isolated_work(limit: str, inter
 
 
 @pytest.mark.parametrize("failed", [False, True])
-def test_idle_worker_cannot_retain_a_released_observation_subject(failed: bool) -> None:
+@pytest.mark.parametrize("completion", ["normal", "blocked", "closing"])
+def test_idle_worker_cannot_retain_a_released_observation_subject(
+    failed: bool,
+    completion: Literal["normal", "blocked", "closing"],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """A completed result or exception traceback leaves no uncharged subject in an idle worker."""
 
     class Subject:
@@ -491,6 +496,19 @@ def test_idle_worker_cannot_retain_a_released_observation_subject(failed: bool) 
     inspects = BoundedInspect(max_inflight=1)
     subject = Subject()
     retained = weakref.ref(subject)
+    callback_entered = threading.Event()
+    callback_release = threading.Event()
+    workers: tuple[bounded._IsolationWorker, ...] = ()
+    original_return = bounded._IsolationWorker._return_after_callback
+
+    def block_completion(self: bounded._IsolationWorker, returned: Future[None]) -> None:
+        """Hold the outcome callback while the caller finishes and shutdown may begin."""
+        original_return(self, returned)
+        if completion != "normal" and self in inspects._pool._workers:
+            callback_entered.set()
+            assert callback_release.wait(10)
+
+    monkeypatch.setattr(bounded._IsolationWorker, "_return_after_callback", block_completion)
 
     def factory(payload: Subject) -> Callable[[ObservationLease], Coroutine[object, object, None]]:
         """Create the same subject ownership chain as the engine's classifier closure."""
@@ -517,9 +535,34 @@ def test_idle_worker_cannot_retain_a_released_observation_subject(failed: bool) 
             is ObservationAdmission.ACCEPTED
         )
         del subject
+        if completion != "normal":
+            assert callback_entered.wait(2)
+            with owner._lock:
+                outer_jobs = list(owner._jobs.values())
+            assert len(outer_jobs) == 1
+            outer = outer_jobs[0]
+            assert outer is not None
+            outer.result(timeout=2)
+            outer_drained = threading.Event()
+            bounded._NATIVE_RUNNER.loop().call_soon_threadsafe(outer_drained.set)
+            assert outer_drained.wait(2)
+            assert not owner._idle.is_set()
+            assert owner._bytes == 10
+            with inspects._pool._lock:
+                assert not inspects._pool._idle
+                workers = tuple(inspects._pool._workers)
+            assert len(workers) == 1
+            if completion == "closing":
+                inspects.close(timeout_seconds=0)
+                assert workers[0]._thread.is_alive()
+            callback_release.set()
         assert owner._idle.wait(2)
         gc.collect()
         assert retained() is None
         assert owner._bytes == 0
     finally:
+        callback_release.set()
         owner.close(timeout_seconds=2)
+        inspects.close(timeout_seconds=2)
+    if completion == "closing":
+        assert not workers[0]._thread.is_alive()

@@ -65,37 +65,40 @@ class _IsolationWorker:
         )
         self._thread.start()
 
-    def submit[T](self, fn: Callable[[], Coroutine[object, object, T]]) -> tuple[Future[T], int]:
-        """Schedule ``fn`` on this worker and return its future plus generation.
+    def submit[T](
+        self, fn: Callable[[], Coroutine[object, object, T]]
+    ) -> tuple[Future[T], Future[None], int]:
+        """Schedule ``fn`` and expose separate outcome and worker-return boundaries.
 
         Args:
             fn: Zero-argument coroutine factory for one inspect.
 
         Returns:
-            A future that completes when the isolated inspect exits, and the
-            generation that ``request_cancel`` must name.
+            The inspect outcome, a subject-free future completed after the outcome
+            callback releases its task references, and the cancellation generation.
         """
         loop = self._loop
         if loop is None:
             raise RuntimeError("classifier isolation loop is not running")
         result: Future[T] = Future()
+        returned: Future[None] = Future()
 
         def start() -> None:
             """Create the inspect task on the worker loop."""
+            self._active_generation = generation
             if result.cancelled():
                 self._pending_cancels.discard(generation)
-                self._busy = False
-                self._stop_if_idle()
+                self._return_after_callback(returned)
                 return
             try:
                 task = loop.create_task(fn())
             except Exception as exc:  # noqa: BLE001 - factory errors must complete the waiter
-                self._busy = False
-                result.set_exception(exc)
-                self._stop_if_idle()
+                try:
+                    result.set_exception(exc)
+                finally:
+                    self._return_after_callback(returned)
                 return
             self._task = task
-            self._active_generation = generation
             if generation in self._pending_cancels:
                 self._pending_cancels.discard(generation)
                 task.cancel()
@@ -104,7 +107,6 @@ class _IsolationWorker:
                 """Copy the inspect outcome onto the cross-thread future."""
                 if self._task is done and self._active_generation == generation:
                     self._task = None
-                    self._busy = False
                 try:
                     if result.done():
                         return
@@ -117,7 +119,7 @@ class _IsolationWorker:
                         return
                     result.set_result(done.result())
                 finally:
-                    self._stop_if_idle()
+                    self._return_after_callback(returned)
 
             task.add_done_callback(finish)
 
@@ -132,7 +134,22 @@ class _IsolationWorker:
             except RuntimeError:
                 self._busy = False
                 raise
-        return result, generation
+        return result, returned, generation
+
+    def _return_after_callback(self, returned: Future[None]) -> None:
+        """Keep the worker busy until the current callback and its task references unwind."""
+        loop = self._loop
+        assert loop is not None  # A busy worker cannot shut down its loop.
+        loop.call_soon(self._return, returned)
+
+    def _return(self, returned: Future[None]) -> None:
+        """Publish availability without retaining a task, outcome, factory, or traceback."""
+        with self._state_lock:
+            self._busy = False
+        try:
+            returned.set_result(None)
+        finally:
+            self._stop_if_idle()
 
     def stop_when_idle(self) -> None:
         """Reject submission and stop this loop only after its actual inspect finishes."""
@@ -617,6 +634,8 @@ class BoundedInspect:
     def _track_abandoned(self, adapter_id: str, task: Future[object]) -> None:
         """Remember one abandoned inspect until it actually exits."""
         with self._lock:
+            if task.done():
+                return
             self._abandoned.setdefault(adapter_id, set()).add(task)
         _logger.info("guardrail adapter quarantined adapter_id=%s", adapter_id)
 
@@ -726,15 +745,16 @@ class BoundedInspect:
         if retention is not None:
             retention.retain()
         try:
-            pending, generation = worker.submit(isolated)
+            pending, returned, generation = worker.submit(isolated)
         except BaseException:
             if retention is not None:
                 retention.release()
             self._pool.release(worker)
             raise
         pending.add_done_callback(
-            lambda done: self._reclaim(adapter_id, worker, cast(Future[object], done), retention)
+            lambda done: self._finish_detached(adapter_id, cast(Future[object], done))
         )
+        returned.add_done_callback(lambda _done: self._reclaim(worker, retention))
         try:
             return await self._await_isolated(pending, remaining)
         except ClassifierTimeoutError:
@@ -748,16 +768,12 @@ class BoundedInspect:
 
     def _reclaim(
         self,
-        adapter_id: str,
         worker: _IsolationWorker,
-        task: Future[object],
         retention: InspectionRetention | None,
     ) -> None:
-        """Return the worker after the isolated inspect actually exits."""
+        """Release capacity only after the worker's outcome callback has unwound."""
         try:
             self._pool.release(worker)
-            if task.done():
-                self._finish_detached(adapter_id, task)
         finally:
             if retention is not None:
                 retention.release()

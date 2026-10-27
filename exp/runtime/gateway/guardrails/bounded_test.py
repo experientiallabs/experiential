@@ -6,7 +6,8 @@ import asyncio
 import socket
 import threading
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Coroutine, Iterator
+from concurrent.futures import Future
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -101,6 +102,98 @@ def test_bounded_inspect_returns_the_inspect_result() -> None:
         assert await bound.run(inspect, 0.5, adapter_id="healthy") == 7
 
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("cancel_before_start", [False, True])
+def test_worker_returns_after_factory_failure_or_prestart_cancellation(
+    cancel_before_start: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Closing cannot skip the return boundary when no inspect task was created."""
+    worker = _IsolationWorker()
+    start_entered = threading.Event()
+    start_release = threading.Event()
+    callback_entered = threading.Event()
+    callback_release = threading.Event()
+    original_return = _IsolationWorker._return_after_callback
+    factory_calls: list[str] = []
+
+    def block_loop() -> None:
+        """Let cancellation and close happen before the queued submission starts."""
+        start_entered.set()
+        assert start_release.wait(10)
+
+    def factory() -> Coroutine[object, object, int]:
+        """Fail synchronously before returning a coroutine."""
+        factory_calls.append("called")
+        raise RuntimeError("synthetic factory failure")
+
+    def block_return(self: _IsolationWorker, returned: Future[None]) -> None:
+        """Hold the source callback after queuing its subject-free return signal."""
+        original_return(self, returned)
+        if self is worker:
+            callback_entered.set()
+            assert callback_release.wait(10)
+
+    monkeypatch.setattr(_IsolationWorker, "_return_after_callback", block_return)
+    try:
+        assert worker._ready.wait(2)
+        worker.assert_running()
+        loop = worker._loop
+        assert loop is not None
+        loop.call_soon_threadsafe(block_loop)
+        assert start_entered.wait(2)
+        outcome, returned, _generation = worker.submit(factory)
+        if cancel_before_start:
+            assert outcome.cancel()
+        worker.stop_when_idle()
+        start_release.set()
+        assert callback_entered.wait(2)
+        assert not returned.done()
+        assert worker._busy
+        assert worker._thread.is_alive()
+        if cancel_before_start:
+            assert outcome.cancelled()
+            assert not factory_calls
+        else:
+            with pytest.raises(RuntimeError, match="synthetic factory failure"):
+                outcome.result(timeout=2)
+            assert factory_calls == ["called"]
+        callback_release.set()
+        assert returned.result(timeout=2) is None
+    finally:
+        start_release.set()
+        callback_release.set()
+        worker.stop_when_idle()
+        worker.wait_stopped(2)
+    assert not worker._thread.is_alive()
+
+
+def test_completion_before_quarantine_insertion_does_not_retain_the_outcome(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A timeout racing completion cannot leave a completed subject in the quarantine map."""
+    bound = BoundedInspect(max_inflight=1)
+    worker = _IsolationWorker()
+    pending: Future[object] = Future()
+    original_track = bound._track_abandoned
+    pending.add_done_callback(lambda done: bound._finish_detached("racing", done))
+
+    def finish_then_track(adapter_id: str, task: Future[object]) -> None:
+        """Complete after abandon's first done check and before quarantine insertion."""
+        task.set_exception(RuntimeError("synthetic detector failure"))
+        original_track(adapter_id, task)
+
+    monkeypatch.setattr(bound, "_track_abandoned", finish_then_track)
+    try:
+        assert worker._ready.wait(2)
+        bound._abandon("racing", worker, pending, 0)
+        assert not bound._abandoned
+        assert bound.detached_inspect_count() == 0
+        assert not bound.quarantined_adapter_ids()
+    finally:
+        worker.stop_when_idle()
+        worker.wait_stopped(2)
+        bound.close(timeout_seconds=2)
 
 
 def test_isolation_workers_are_daemon_threads() -> None:
