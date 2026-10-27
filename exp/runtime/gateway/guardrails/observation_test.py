@@ -498,7 +498,7 @@ def test_idle_worker_cannot_retain_a_released_observation_subject(
     retained = weakref.ref(subject)
     callback_entered = threading.Event()
     callback_release = threading.Event()
-    workers: tuple[bounded._IsolationWorker, ...] = ()
+    workers: list[bounded._IsolationWorker] = []
     original_return = bounded._IsolationWorker._return_after_callback
 
     def block_completion(self: bounded._IsolationWorker, returned: Future[None]) -> None:
@@ -550,7 +550,7 @@ def test_idle_worker_cannot_retain_a_released_observation_subject(
             assert owner._bytes == 10
             with inspects._pool._lock:
                 assert not inspects._pool._idle
-                workers = tuple(inspects._pool._workers)
+                workers = list(inspects._pool._workers)
             assert len(workers) == 1
             if completion == "closing":
                 inspects.close(timeout_seconds=0)
@@ -565,4 +565,5 @@ def test_idle_worker_cannot_retain_a_released_observation_subject(
         owner.close(timeout_seconds=2)
         inspects.close(timeout_seconds=2)
     if completion == "closing":
+        assert len(workers) == 1
         assert not workers[0]._thread.is_alive()
