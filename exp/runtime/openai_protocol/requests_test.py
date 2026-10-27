@@ -43,12 +43,12 @@ from exp.runtime.models.providers.streaming_requests import (
     dialect_stream_payload,
     openai_responses_stream_payload,
 )
+from exp.runtime.openai_protocol.embeddings_requests import decode_embeddings
 from exp.runtime.openai_protocol.errors import OpenAIProtocolError
 from exp.runtime.openai_protocol.model_adapter import model_request
 from exp.runtime.openai_protocol.requests import (
     DecodedGatewayRequest,
     decode_chat,
-    decode_embeddings,
     decode_responses,
 )
 

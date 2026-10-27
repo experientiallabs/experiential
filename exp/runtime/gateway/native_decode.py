@@ -12,13 +12,15 @@ from exp.runtime.openai_protocol.audio_requests import (
     decode_speech,
     decode_transcription,
 )
+from exp.runtime.openai_protocol.embeddings_requests import (
+    DecodedEmbeddingsRequest,
+    decode_embeddings,
+)
 from exp.runtime.openai_protocol.errors import OpenAIProtocolError
 from exp.runtime.openai_protocol.images_requests import DecodedImagesRequest, decode_images
 from exp.runtime.openai_protocol.requests import (
-    DecodedEmbeddingsRequest,
     DecodedGatewayRequest,
     decode_chat,
-    decode_embeddings,
     decode_responses,
 )
 

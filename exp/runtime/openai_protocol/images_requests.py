@@ -1,7 +1,7 @@
 """Decode the OpenAI Images generation body into the canonical images surface.
 
 Lives beside :mod:`exp.runtime.openai_protocol.requests` (which owns the
-line-budgeted chat, Responses, and embeddings decoders) and reuses its
+line-budgeted chat and Responses decoders) and reuses its
 validation helpers, so every public surface decodes through one manifest,
 one official-SDK shape check, and one closed wire model.
 """
