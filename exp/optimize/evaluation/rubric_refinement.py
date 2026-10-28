@@ -14,6 +14,8 @@ from exp.simulation.evaluation_calibration import (
     blinded_case,
     calibrate,
 )
+from exp.simulation.evaluation_tasks import label_admitted
+from exp.simulation.evidence_admission import EvidenceAdmission, require_admitted
 
 
 class RubricEdit(ContractModel):
@@ -38,6 +40,7 @@ def refine_rubric(
     propose: Callable[[JsonObject, str], RubricEdit],
     judge: Callable[[JudgeConfig, JsonObject, str], CalibrationJudgment],
     maximum_revisions: int,
+    admission: EvidenceAdmission | None = None,
 ) -> JsonObject:
     """Keep revisions that improve development errors without regressing selection errors.
 
@@ -46,6 +49,8 @@ def refine_rubric(
         propose: Existing metered structured-completion owner, receiving development only.
         judge: Existing evaluator owner, receiving blinded outcomes without expected scores.
         maximum_revisions: Registered finite proposal allowance, separate from provider caps.
+        admission: Store-verified evidence admission; any refusal stops before a callback.
+            Without it, witnessed labels stay unadmitted.
 
     Returns:
         Every proposed version, selection evidence and final confirmation assessment.
@@ -55,17 +60,24 @@ def refine_rubric(
         raise ValueError("a nonnegative revision allowance is required")
     if pack.judge is None:
         raise ValueError("rubric development requires an exact initial judge")
+    if admission is not None:
+        require_admitted(admission)
+    verified = (
+        frozenset()
+        if admission is None
+        else admission.verified_ids(case.challenge for case in pack.cases)
+    )
     development = tuple(case for case in pack.cases if case.partition == "development")
     selection = tuple(case for case in pack.cases if case.partition == "selection")
     if (
         not development
         or not pack.required_dimensions
-        or any(not _labeled(pack, case) for case in development)
+        or any(not _labeled(pack, case, verified) for case in development)
     ):
         raise ValueError(
             "development needs admitted task labels or required expert criterion labels"
         )
-    if not selection or any(not _labeled(pack, case) for case in selection):
+    if not selection or any(not _labeled(pack, case, verified) for case in selection):
         raise ValueError("rubric selection requires a separate independently labeled partition")
     allowed = {case.challenge.id for case in development}
     run = sha256_json(pack)
@@ -91,7 +103,9 @@ def refine_rubric(
     selected = pack.judge
     selected_judgments = assess(selected, development) + assess(selected, selection)
     report = calibrate(
-        pack.model_copy(update={"cases": development + selection}), selected_judgments
+        pack.model_copy(update={"cases": development + selection}),
+        selected_judgments,
+        admission=admission,
     )
     errors = _errors(report, "development")
     selection_errors = _errors(report, "selection")
@@ -135,7 +149,9 @@ def refine_rubric(
         )
         candidate_judgments = assess(candidate, development)
         candidate_report = calibrate(
-            pack.model_copy(update={"cases": development, "judge": candidate}), candidate_judgments
+            pack.model_copy(update={"cases": development, "judge": candidate}),
+            candidate_judgments,
+            admission=admission,
         )
         candidate_errors = _errors(candidate_report, "development")
         authoring_improved = (
@@ -150,6 +166,7 @@ def refine_rubric(
             candidate_report = calibrate(
                 pack.model_copy(update={"cases": development + selection, "judge": candidate}),
                 candidate_judgments,
+                admission=admission,
             )
             candidate_selection_errors = _errors(candidate_report, "selection")
         improved = (
@@ -188,13 +205,14 @@ def refine_rubric(
         targets_met
         and selection_met
         and bool(confirmation)
-        and all(_labeled(pack, case) for case in confirmation)
+        and all(_labeled(pack, case, verified) for case in confirmation)
     )
     confirmation_judgments = assess(selected, confirmation) if confirmation_ready else ()
     final = calibrate(
         pack.model_copy(update={"judge": selected}),
         selected_judgments + confirmation_judgments,
         allow_confirmation=confirmation_ready,
+        admission=admission,
     )
     if not targets_met or not selection_met:
         final["confirmation_status"] = "not_run"
@@ -250,9 +268,9 @@ def _errors(report: JsonObject, partition: str) -> dict[str, int]:
     return errors
 
 
-def _labeled(pack: CalibrationPack, case: CalibrationCase) -> bool:
+def _labeled(pack: CalibrationPack, case: CalibrationCase, verified: frozenset[str]) -> bool:
     """Accept scoped task judgments without inventing ordinal expert labels."""
-    return case.challenge.approved and (
+    return label_admitted(case.challenge, verified) and (
         (case.expected_task in {"pass", "fail"} and case.task_label_scope == "task_correctness")
         or set(pack.required_dimensions)
         <= (set(case.expert_scores) | set(case.expected_unassessable))

@@ -5,12 +5,13 @@ from pathlib import Path
 
 import pytest
 
-from exp.common.core.artifacts import ArtifactEnvelope, ArtifactInput, JsonObject
+from exp.common.core.artifacts import ArtifactInput, JsonObject
 from exp.common.evaluations.reconstruction import WorkflowEvidence, WorkflowStep
-from exp.common.project import ProjectStore, artifact_input
+from exp.common.project import ProjectStore
 from exp.common.tasks import TaskCase
 from exp.simulation.evaluation_tasks import (
     EvaluationTask,
+    OutcomeRule,
     TaskRevisionProposal,
     TaskVerifier,
     VerifierChallenge,
@@ -19,6 +20,12 @@ from exp.simulation.evaluation_tasks import (
     load_evaluation_task,
     persist_evaluation_task,
     qualify_verifier,
+)
+from exp.simulation.evidence_admission import (
+    EvaluationSpecification,
+    persist_specification,
+    record_label_witness,
+    verify_label_witness,
 )
 
 
@@ -57,33 +64,52 @@ def outcome(status: str) -> JsonObject:
     }
 
 
-def witness(project: ProjectStore) -> ArtifactInput:
-    """Persist an explicit independently approved synthetic task specification."""
-    manifest = project.artifacts.write_json(
-        artifact_id="labels",
-        artifact_type="task-label-witness",
-        envelope=ArtifactEnvelope(
-            schema_version=1, created_at=datetime.now(UTC), inputs=(), code_revision="test"
+def specification(project: ProjectStore) -> ArtifactInput:
+    """Persist an independent task specification, distinct from every compared predicate."""
+    return persist_specification(
+        project.artifacts,
+        EvaluationSpecification(
+            description="Reference: an order is complete only when its final status is done.",
+            predicate=TaskVerifier(
+                description="Reference completion specification.",
+                outcome_schema={"type": "object"},
+                rules=(OutcomeRule(path="/final_state/status", operator="equals", value="done"),),
+            ),
+            subject="outcome",
         ),
-        files={"labels.json": {"done": "pass", "pending": "fail"}},
+        created_at=datetime.now(UTC),
+        code_revision="test",
     )
-    return artifact_input(manifest)
 
 
 def challenges(project: ProjectStore) -> tuple[VerifierChallenge, ...]:
-    """Bind positive and negative labels to a separate immutable specification."""
-    reference = witness(project)
+    """Bind positive and negative labels to saved checks of a separate specification."""
+    reference = specification(project)
     return tuple(
         VerifierChallenge(
             id=status,
             outcome=outcome(status),
             expected=expected,
             authority="synthetic_specification",
-            approved=True,
             rationale="Declared independent task specification.",
-            source_refs=(reference,),
+            witness=record_label_witness(
+                project.artifacts,
+                specification=reference,
+                outcome=outcome(status),
+                created_at=datetime.now(UTC),
+                code_revision="test",
+            ),
         )
         for status, expected in (("done", "pass"), ("pending", "fail"))
+    )
+
+
+def reverified(project: ProjectStore, cases: tuple[VerifierChallenge, ...]) -> frozenset[str]:
+    """IDs whose saved witness re-derives from the store, as admission computes them."""
+    return frozenset(
+        case.id
+        for case in cases
+        if verify_label_witness(project.artifacts, case, label=case.expected, compared=()) is None
     )
 
 
@@ -136,20 +162,38 @@ def test_qualification_requires_independent_labels_and_preserves_regressions(
     """A blanket accepting verifier loses the protected negative and is refused."""
     project = ProjectStore(tmp_path, "task-test")
     cases = challenges(project)
-    result = qualify_verifier(verifier(None), verifier("done"), cases)
+    verified = reverified(project, cases)
+    assert verified == {"done", "pending"}
+    result = qualify_verifier(verifier(None), verifier("done"), cases, verified=verified)
     assert result.disposition == "accepted_development"
     assert result.gains == ("pending",)
     assert result.losses == ()
-    bad = qualify_verifier(verifier("done"), verifier(None), cases)
+    bad = qualify_verifier(verifier("done"), verifier(None), cases, verified=verified)
     assert bad.disposition == "rejected"
     assert bad.losses == ("pending",)
-    assert qualify_verifier(verifier("done"), verifier("done"), cases).disposition == "rejected"
-    assert qualify_verifier(verifier(None), verifier("done"), cases[:1]).disposition == "incomplete"
+    assert (
+        qualify_verifier(verifier("done"), verifier("done"), cases, verified=verified).disposition
+        == "rejected"
+    )
+    assert (
+        qualify_verifier(verifier(None), verifier("done"), cases[:1], verified=verified).disposition
+        == "incomplete"
+    )
+    # A witness that was not re-verified admits nothing, whatever it claims.
+    assert qualify_verifier(verifier(None), verifier("done"), cases).disposition == "incomplete"
     generated = tuple(
-        case.model_copy(update={"authority": "generated_hypothesis", "approved": False})
+        VerifierChallenge.model_validate(
+            {
+                **case.model_dump(exclude={"witness"}),
+                "authority": "generated_hypothesis",
+            }
+        )
         for case in cases
     )
-    assert qualify_verifier(verifier(None), verifier("done"), generated).disposition == "incomplete"
+    assert (
+        qualify_verifier(verifier(None), verifier("done"), generated, verified=verified).disposition
+        == "incomplete"
+    )
 
 
 def test_generated_challenge_cannot_claim_independent_approval() -> None:
@@ -169,7 +213,8 @@ def test_persisted_task_revision_retains_parent_and_rejects_changed_world(tmp_pa
     """Prompt/verifier children preserve intent, world and independently labeled cases."""
     project = ProjectStore(tmp_path, "task-test")
     cases = challenges(project)
-    ref = cases[0].source_refs[0]
+    ref = cases[0].witness
+    assert ref is not None
     task = EvaluationTask(
         intent="Complete the order",
         task=TaskCase(

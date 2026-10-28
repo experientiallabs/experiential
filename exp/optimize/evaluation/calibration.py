@@ -16,8 +16,9 @@ from exp.common.core.artifacts import (
 )
 from exp.common.evaluations.reconstruction import DualReport, WorkflowEvidence
 from exp.common.project import ProjectStore, artifact_input
+from exp.optimize.evaluation.evidence_admission import admit_calibration_evidence
 from exp.optimize.evaluation.harbor_export import export_harbor_task, verify_harbor_export
-from exp.simulation import evaluation_calibration, evaluation_tasks
+from exp.simulation import evaluation_calibration, evaluation_tasks, evidence_admission
 from exp.simulation.evaluation_calibration import CalibrationJudgment, CalibrationPack, calibrate
 from exp.simulation.evaluation_tasks import load_evaluation_task, normalized_outcome
 
@@ -91,6 +92,8 @@ def execute_calibration(
     references = {spec.pack.task}
     for case in spec.pack.cases:
         references.update(case.challenge.source_refs)
+        if case.challenge.witness is not None:
+            references.add(case.challenge.witness)
     references.update(row.report for row in spec.judgments)
     for reference in references:
         if artifact_input(project.artifacts.read(reference.artifact_id).manifest) != reference:
@@ -139,13 +142,20 @@ def execute_calibration(
                 axes=report.axes,
             )
         )
-    result = calibrate(spec.pack, tuple(judgments))
+    admission = admit_calibration_evidence(project, spec.pack)
+    result = calibrate(spec.pack, tuple(judgments), admission=admission)
     if (
         spec.harbor is not None
         and not spec.harbor.diagnostic
         and result["qualification"] != "qualified_in_scope"
     ):
-        raise ValueError("unqualified task requires an explicit diagnostic Harbor export")
+        raise ValueError(
+            "unqualified task requires an explicit diagnostic Harbor export"
+            + "".join(
+                f"; [{row['reason']}] {row['subject']}: {row['detail']}"
+                for row in admission.model_dump(mode="json")["refusals"]
+            )
+        )
     if dry_run:
         return None
     implementation = sha256_json(
@@ -153,6 +163,7 @@ def execute_calibration(
             "application": Path(__file__).read_text(),
             "calibration": Path(evaluation_calibration.__file__).read_text(),
             "predicates": Path(evaluation_tasks.__file__).read_text(),
+            "admission": Path(evidence_admission.__file__).read_text(),
         }
     )
     result["implementation_sha256"] = implementation
@@ -166,6 +177,13 @@ def execute_calibration(
     )
     if project.artifacts.exists(identity):
         reference = artifact_input(project.artifacts.read(identity).manifest)
+        saved = json.loads(project.artifacts.read_bytes(identity, "report.json"))
+        if sha256_json(saved) != sha256_json(result):
+            raise ValueError(
+                f"calibration run {spec.run_id} was saved as {saved.get('qualification')}, but "
+                f"the current evidence gives {result['qualification']}; the project's exposure "
+                "ledger or generated proposals changed since, so re-run under a fresh run ID"
+            )
         project.select_evaluation_task(reference)
         _deliver(project, spec, reference)
         return reference

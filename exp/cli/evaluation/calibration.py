@@ -59,6 +59,12 @@ def run_calibration(project: str, spec_path: Path, *, root: Path, dry_run: bool)
         console.print(
             f"Label sources: {result['label_authorities']} · groups: {result['lineage_groups']}"
         )
+        console.print(f"Witnessed labels verified: {result['witnessed_verified']}")
+        for refusal in result["qualification_refusals"]:
+            console.print(
+                f"Not qualified [{refusal['reason']}] {refusal['subject']}: {refusal['detail']}",
+                markup=False,
+            )
         if spec.harbor is not None:
             console.print(f"Harbor package: {spec.harbor.destination}")
             console.print("Package export is separate from a completed Harbor execution trial.")

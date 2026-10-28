@@ -8,9 +8,10 @@ import pytest
 from typer.testing import CliRunner
 
 from exp.cli.app import app
-from exp.common.core.artifacts import ArtifactEnvelope, ArtifactInput
-from exp.common.project import artifact_input
+from exp.common.core.artifacts import ArtifactEnvelope, ArtifactInput, JsonObject
+from exp.common.project import ProjectStore, artifact_input
 from exp.optimize.evaluation import task_refinement, trace_council
+from exp.optimize.evaluation.fidelity import FidelitySpec
 from exp.optimize.evaluation.tests.fidelity_memory_test import structured_reply
 from exp.optimize.evaluation.trace_council_test import sequence, spec_project
 from exp.runtime.models.providers.transport import ScriptedJsonTransport
@@ -21,6 +22,30 @@ from exp.simulation.evaluation_tasks import (
     VerifierChallenge,
     load_evaluation_task,
 )
+from exp.simulation.evidence_admission import (
+    EvaluationSpecification,
+    EvidenceAdmissionError,
+    persist_specification,
+    record_label_witness,
+)
+
+
+def specification(project: ProjectStore) -> ArtifactInput:
+    """Save the independent specification that labels every refinement challenge."""
+    return persist_specification(
+        project.artifacts,
+        EvaluationSpecification(
+            description="Reference: the last value read must be the current one.",
+            predicate=TaskVerifier(
+                description="Reference specification for the current value.",
+                outcome_schema={"type": "object"},
+                rules=(OutcomeRule(path="/final_state/last", operator="equals", value="current"),),
+            ),
+            subject="outcome",
+        ),
+        created_at=datetime.fromisoformat("2026-10-17T00:00:00Z"),
+        code_revision="fixture-revision",
+    )
 
 
 def verifier(*, strict: bool) -> TaskVerifier:
@@ -47,6 +72,15 @@ def verifier(*, strict: bool) -> TaskVerifier:
     )
 
 
+def fit_council_project(
+    tmp_path: Path,
+) -> tuple[ProjectStore, trace_council.TraceCouncilSpec, FidelitySpec]:
+    """Council over the fixture task as a fit task: refinement never sees held-out labels."""
+    project, council, fidelity = spec_project(tmp_path)
+    task = council.tasks[0].model_copy(update={"partition": "fit"})
+    return project, council.model_copy(update={"tasks": (task,)}), fidelity
+
+
 @pytest.mark.parametrize(
     "change_prompt,failed_judge,bad_verifier,hacker_succeeds",
     [
@@ -66,7 +100,7 @@ def test_refinement_keeps_confirmation_private_and_replays_without_calls(
     hacker_succeeds: bool,
 ) -> None:
     """Exercise source capture, proposing roles, child actors, grading and zero-call replay."""
-    project, council, fidelity = spec_project(tmp_path)
+    project, council, fidelity = fit_council_project(tmp_path)
     source_wire = ScriptedJsonTransport(sequence(fidelity))
     monkeypatch.setattr(trace_council, "HttpxJsonTransport", lambda: source_wire)
     monkeypatch.setenv("FIDELITY_TEST_KEY", "fixture-only")
@@ -74,29 +108,24 @@ def test_refinement_keeps_confirmation_private_and_replays_without_calls(
         project, council, code_revision="fixture-revision"
     )
     trace_council.execute_trace_council(project, prepared_source)
-    witness = project.artifacts.write_json(
-        artifact_id="label-witness",
-        artifact_type="synthetic-specification",
-        envelope=ArtifactEnvelope(
-            schema_version=1,
-            created_at=fidelity.deadline,
-            inputs=(),
-            code_revision="fixture-revision",
-        ),
-        files={"labels.json": {"rule": "last must be current"}},
-    )
-    witness_ref = artifact_input(witness)
+    reference = specification(project)
 
     def challenge(identity: str, value: str) -> VerifierChallenge:
-        """Declare independent synthetic labels rather than generated model truth."""
+        """Label with saved checks of an independent specification, not generated truth."""
+        outcome: JsonObject = {"final_state": {"last": value}, "partition_marker": identity}
         return VerifierChallenge(
             id=identity,
-            outcome={"final_state": {"last": value}, "partition_marker": identity},
+            outcome=outcome,
             expected="pass" if value == "current" else "fail",
             authority="synthetic_specification",
-            approved=True,
             rationale="Declared synthetic specification",
-            source_refs=(witness_ref,),
+            witness=record_label_witness(
+                project.artifacts,
+                specification=reference,
+                outcome=outcome,
+                created_at=fidelity.deadline,
+                code_revision="fixture-revision",
+            ),
         )
 
     spec = task_refinement.TaskRefinementSpec(
@@ -106,11 +135,15 @@ def test_refinement_keeps_confirmation_private_and_replays_without_calls(
         verifier=verifier(strict=False),
         development_challenges=(
             challenge("dev-positive", "current"),
+            challenge("dev-positive-2", "current"),
             challenge("dev-negative", "wrong"),
+            challenge("dev-negative-2", "wrong"),
         ),
         confirmation_challenges=(
             challenge("SECRET_CONFIRM_POS", "current"),
+            challenge("SECRET_CONFIRM_POS_2", "current"),
             challenge("SECRET_CONFIRM_NEG", "wrong"),
+            challenge("SECRET_CONFIRM_NEG_2", "wrong"),
         ),
         author_alias="model",
         verifier_alias="model",
@@ -119,6 +152,9 @@ def test_refinement_keeps_confirmation_private_and_replays_without_calls(
         maximum_physical_attempts=3,
         child_maximum_physical_attempts=12,
     )
+    witness_ref = spec.development_challenges[2].witness
+    assert witness_ref is not None
+    negative_witness = witness_ref.artifact_id
     before = len(source_wire.requests)
     prepared = task_refinement.prepare_task_refinement(
         project, spec, code_revision="fixture-revision"
@@ -144,7 +180,7 @@ def test_refinement_keeps_confirmation_private_and_replays_without_calls(
                         ),
                     ),
                 ).model_dump(mode="json"),
-                "evidence_refs": ["verifier", "challenge:dev-negative", "label-witness"],
+                "evidence_refs": ["verifier", "challenge:dev-negative", negative_witness],
                 "reason": "Reject the independently labeled wrong value.",
             }
         ),
@@ -214,7 +250,7 @@ def test_refinement_keeps_confirmation_private_and_replays_without_calls(
     assert result["confirmation_status"] == (
         "not_run" if failed_judge or bad_verifier or hacker_succeeds else "passed"
     )
-    assert result["gains"] == ([] if bad_verifier else ["dev-negative"])
+    assert result["gains"] == ([] if bad_verifier else ["dev-negative", "dev-negative-2"])
     assert result["losses"] == []
     assert result["role_physical_attempts"] == 3
     assert result["physical_attempts"] == (3 if bad_verifier else 12)
@@ -226,7 +262,8 @@ def test_refinement_keeps_confirmation_private_and_replays_without_calls(
         request = json.dumps(child_wire.requests[index].payload)
         assert "SECRET_CONFIRM" not in request
         assert "challenge:dev-negative" not in request
-        assert "synthetic-specification" not in request
+        assert "label-witness" not in request
+        assert "evaluation-specification" not in request
     child_ref = artifact_input(project.artifacts.read(str(result["child_artifact_id"])).manifest)
     assert any(
         ref.artifact_id == prepared.id + "-report"
@@ -313,3 +350,85 @@ def test_refinement_rejects_partition_overlap_before_dispatch() -> None:
             hacker_alias="model",
             deadline=datetime.fromisoformat("2099-01-01T00:00:00Z"),
         )
+
+
+@pytest.mark.parametrize("defect", ["self_approval", "inadequate_evidence"])
+def test_refinement_refuses_unqualifiable_labels_before_any_paid_call(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, defect: str
+) -> None:
+    """A generated-label chain or too few witnessed labels stop before registration or spend."""
+    project, council, fidelity = fit_council_project(tmp_path)
+    source_wire = ScriptedJsonTransport(sequence(fidelity))
+    monkeypatch.setattr(trace_council, "HttpxJsonTransport", lambda: source_wire)
+    monkeypatch.setenv("FIDELITY_TEST_KEY", "fixture-only")
+    prepared_source = trace_council.prepare_trace_council(
+        project, council, code_revision="fixture-revision"
+    )
+    trace_council.execute_trace_council(project, prepared_source)
+    reference = specification(project)
+    if defect == "self_approval":
+        proposal = artifact_input(
+            project.artifacts.write_json(
+                artifact_id="earlier-role-proposal",
+                artifact_type="task-refinement-proposal",
+                envelope=ArtifactEnvelope(
+                    schema_version=1, created_at=fidelity.deadline, code_revision="fixture"
+                ),
+                files={"proposal.json": {"verifier": None}},
+            )
+        )
+        stored = json.loads(
+            project.artifacts.read_bytes(reference.artifact_id, "specification.json")
+        )
+        reference = persist_specification(
+            project.artifacts,
+            EvaluationSpecification.model_validate(stored),
+            sources=(proposal,),
+            created_at=fidelity.deadline,
+            code_revision="fixture-revision",
+        )
+
+    def challenge(identity: str, value: str) -> VerifierChallenge:
+        """One specification-witnessed label."""
+        outcome: JsonObject = {"final_state": {"last": value}, "partition_marker": identity}
+        return VerifierChallenge(
+            id=identity,
+            outcome=outcome,
+            expected="pass" if value == "current" else "fail",
+            authority="synthetic_specification",
+            rationale="Declared synthetic specification",
+            witness=record_label_witness(
+                project.artifacts,
+                specification=reference,
+                outcome=outcome,
+                created_at=fidelity.deadline,
+                code_revision="fixture-revision",
+            ),
+        )
+
+    copies = 1 if defect == "inadequate_evidence" else 2
+    spec = task_refinement.TaskRefinementSpec(
+        run_id="refused",
+        source_council=artifact_input(project.artifacts.read(prepared_source.id).manifest),
+        intent="Read the current value accurately",
+        verifier=verifier(strict=False),
+        development_challenges=tuple(
+            challenge(f"dev-{value}-{n}", value)
+            for value in ("current", "wrong")
+            for n in range(copies)
+        ),
+        confirmation_challenges=tuple(
+            challenge(f"confirm-{value}-{n}", value)
+            for value in ("current", "wrong")
+            for n in (0, 1)
+        ),
+        author_alias="model",
+        verifier_alias="model",
+        hacker_alias="model",
+        deadline=fidelity.deadline,
+    )
+    before = len(source_wire.requests)
+    with pytest.raises(EvidenceAdmissionError, match=rf"\[{defect}\]"):
+        task_refinement.prepare_task_refinement(project, spec, code_revision="fixture-revision")
+    assert len(source_wire.requests) == before
+    assert not project.artifacts.list_ids(artifact_type="task-refinement-plan")
