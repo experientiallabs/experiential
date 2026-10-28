@@ -16,6 +16,10 @@ REFINE_TASK_OPTION = typer.Option(
     None, "--refine-task", help="Refine a simulator task against protected verifier challenges."
 )
 
+MATERIALIZE_OPTION = typer.Option(
+    None, "--materialize", help="Materialize declared native edits from a frozen checkpoint."
+)
+
 CALIBRATION_OPTION = typer.Option(
     None, "--calibrate", help="Calibrate a frozen task from independently labeled saved evidence."
 )
@@ -84,6 +88,7 @@ def evaluate(
     trace_analysis: Path | None = TRACE_ANALYSIS_OPTION,
     refine_task: Path | None = REFINE_TASK_OPTION,
     calibration: Path | None = CALIBRATION_OPTION,
+    materialize: Path | None = MATERIALIZE_OPTION,
 ) -> None:
     """Evaluate models against a project's simulated scenarios and configured judge.
 
@@ -108,7 +113,40 @@ def evaluate(
         trace_analysis: Simulator-only actor council and read-only evaluation refinement.
         refine_task: Bounded task refinement with independent qualification checks.
         calibration: Saved-evidence verifier and rubric calibration without new inference.
+        materialize: Frozen native artifact handoff, without provider calls.
     """
+    if materialize is not None:
+        if (
+            project is None
+            or any(
+                value is not None
+                for value in (
+                    calibration,
+                    fidelity,
+                    audit,
+                    trace_analysis,
+                    refine_task,
+                    resume,
+                    report,
+                    models,
+                    repeats,
+                    concurrency,
+                    maximum_steps,
+                    maximum_output_tokens,
+                )
+            )
+            or verbose
+            or retry_incomplete
+            or include_inspected
+        ):
+            raise typer.BadParameter(
+                "--materialize requires PROJECT and cannot combine with other modes "
+                "or rollout overrides"
+            )
+        from exp.cli.evaluation.native_artifacts import run_materialization
+
+        run_materialization(project, materialize, root=root, dry_run=dry_run)
+        return
     if calibration is not None:
         if (
             project is None

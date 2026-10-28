@@ -9,6 +9,7 @@ from pathlib import Path
 
 from exp.common.core.artifacts import ArtifactInput, JsonObject
 from exp.common.project import ProjectStore, artifact_input
+from exp.runtime.environments.artifact_edits import NativeArtifactBinding
 from exp.simulation.evaluation_tasks import load_evaluation_task
 from exp.simulation.world_model.checkpoints import load_world_checkpoint
 
@@ -46,6 +47,12 @@ def export_harbor_task(
         raise ValueError("Harbor destination exists; select a new immutable package directory")
     task = load_evaluation_task(project.artifacts, task_ref)
     checkpoint = load_world_checkpoint(project.artifacts, task.checkpoint)
+    declared_native = task.task.initial_context.get("native_artifact_binding")
+    native_binding = (
+        NativeArtifactBinding.model_validate(declared_native)
+        if declared_native is not None
+        else None
+    )
     qualified = False
     if calibration is not None:
         stored = project.artifacts.read(calibration.artifact_id).manifest
@@ -55,6 +62,8 @@ def export_harbor_task(
         if report.get("task") != task_ref.model_dump(mode="json"):
             raise ValueError("calibration belongs to another task")
         qualified = report.get("qualification") == "qualified_in_scope"
+    if native_binding is not None:
+        qualified = False
     if not qualified and not diagnostic:
         raise ValueError("task is not calibrated; only an explicit diagnostic export is permitted")
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -100,6 +109,12 @@ def export_harbor_task(
                 "uncertainty or escalation instructions.\n"
             )
         )
+        if native_binding is not None:
+            instruction += (
+                "After submitting, retrieve the declared native files with "
+                "python /app/tools.py outputs --directory /app/outputs. "
+                "A contradiction between predicted and native artifact facts refuses delivery.\n"
+            )
         (staging / "instruction.md").write_text(instruction)
         configuration = (
             'schema_version = "1.4"\n\n[task]\n'
@@ -120,6 +135,20 @@ def export_harbor_task(
             'EXP_HARBOR_VERIFIER_TOKEN = "${EXP_HARBOR_VERIFIER_TOKEN}"\n'
             "[verifier.environment]\ncpus = 1\nmemory_mb = 512\n"
         )
+        if native_binding is not None:
+            artifacts = ", ".join(
+                "{source = "
+                + json.dumps("/app/outputs/" + path)
+                + ", destination = "
+                + json.dumps(path)
+                + "}"
+                for path in native_binding.output_paths
+            )
+            configuration = configuration.replace(
+                'schema_version = "1.4"\n',
+                'schema_version = "1.4"\nartifacts = [' + artifacts + "]\n",
+                1,
+            )
         (staging / "task.toml").write_text(configuration)
         binding: JsonObject = {
             "task": task_ref.model_dump(mode="json"),

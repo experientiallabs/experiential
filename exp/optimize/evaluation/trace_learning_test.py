@@ -282,7 +282,11 @@ def test_a_protocol_change_learns_a_fresh_memory_trace_by_trace(
     provider = SimulatedProvider([episode(i) for i in range(USERS)], learnable=True)
     _, store, _ = build_project(tmp_path, monkeypatch, provider, learn=True)
     before = learning_plan(store, scope="all").lineage
-    changed = lambda: "changed-prompts"  # noqa: E731 - one stand-in for an edited prompt
+
+    def changed(*, native_artifacts: bool = False) -> str:
+        """Stand in for a protocol edit, with or without the native-artifact guidance."""
+        return "changed-prompts"
+
     monkeypatch.setattr(trace_learning, "protocol_prompts_sha256", changed)
     monkeypatch.setattr(trace_replay, "protocol_prompts_sha256", changed)
     _relearn(store)

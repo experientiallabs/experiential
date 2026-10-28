@@ -59,7 +59,7 @@ def serve_harbor_trial(
 
         def do_POST(self) -> None:
             """Dispatch fixed typed operations, without actor-selected paths or code."""
-            if self.path not in ("/call", "/submit", "/grade"):
+            if self.path not in ("/call", "/submit", "/grade", "/outputs"):
                 self.reply(404, {"error": "unknown endpoint"})
                 return
             if not self.authorized(verifier_token if self.path == "/grade" else actor_token):
@@ -75,6 +75,10 @@ def serve_harbor_trial(
                     result = trial.call(ToolCall.model_validate(value))
                 elif self.path == "/submit":
                     result = trial.submit(value)
+                elif self.path == "/outputs":
+                    if value:
+                        raise ValueError("output retrieval takes no actor-provided evidence")
+                    result = trial.output_files()
                 elif value:
                     raise ValueError("grading takes no actor-provided evidence")
                 else:

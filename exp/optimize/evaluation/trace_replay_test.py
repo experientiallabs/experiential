@@ -7,6 +7,7 @@ import pytest
 
 from exp.common.core.artifacts import JsonObject, JsonValue, SourceIdentity
 from exp.common.traces import Trace, TraceSource, TraceSpan
+from exp.optimize.evaluation import trace_replay
 from exp.optimize.evaluation.fidelity_test import source_project
 from exp.optimize.evaluation.trace_replay import content_run_id, recorded_exchanges, replay_boundary
 
@@ -85,3 +86,22 @@ def test_recorded_exchange_inventory_preserves_empty_results_and_prefix_offsets(
     assert type(exchanges[0].reply) is type(reply)
     assert exchanges[0].reply == reply
     assert replay_boundary(source, len(exchanges)) == 1
+
+
+def test_native_prompt_change_addresses_a_new_native_run_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Changing native guidance cannot silently replay results from an older prompt."""
+    _, spec = source_project(tmp_path)
+    native = spec.model_copy(
+        update={
+            "task": spec.task.model_copy(
+                update={"initial_context": {"native_artifact_binding": {"fixture": True}}}
+            )
+        }
+    )
+    before = content_run_id(native, "native", "t")
+    plain = content_run_id(spec, "plain", "t")
+    monkeypatch.setattr(trace_replay, "NATIVE_ARTIFACT_PLAN_GUIDANCE", "different behavior")
+    assert content_run_id(native, "native", "t") != before
+    assert content_run_id(spec, "plain", "t") == plain

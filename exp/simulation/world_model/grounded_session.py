@@ -23,6 +23,7 @@ from exp.common.tasks.facts import InstanceFacts
 from exp.runtime.environments import Observation
 from exp.runtime.sessions.store import SessionBinding, SessionStore
 from exp.simulation.engines.text.prompt import (
+    NATIVE_ARTIFACT_PLAN_GUIDANCE,
     MemoryContext,
     parse_world_model_transition,
     validate_transition_action,
@@ -169,6 +170,12 @@ class GroundedTransitionEngine:
                         "facts": self.facts.model_dump(mode="json"),
                         "facts_version": self.facts_version,
                     }
+                ),
+                # Recorded only for native-artifact tasks, so other identities stay unchanged.
+                **(
+                    {"native_artifact_guidance_sha256": sha256_json(NATIVE_ARTIFACT_PLAN_GUIDANCE)}
+                    if self.task.initial_context.get("native_artifact_binding") is not None
+                    else {}
                 ),
             }
         )
