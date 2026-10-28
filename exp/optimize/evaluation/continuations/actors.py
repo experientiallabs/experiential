@@ -17,9 +17,11 @@ from exp.common.core.artifacts import (
     sha256_json,
     stable_id,
 )
+from exp.common.evaluations.uncertainty import missing_outcome_bounds
 from exp.common.models import ModelSnapshot, load_model_catalog
 from exp.common.project import ProjectStore, artifact_input
 from exp.optimize.evaluation.continuations.job import (
+    MAXIMUM_PHYSICAL_ATTEMPTS,
     ContinuationJob,
     continuation_result_reference,
     execute_continuation_job,
@@ -70,8 +72,11 @@ class ActorPanelSpec(ContractModel):
             {sha256_json(actor.model) for actor in self.actors}
         ) != len(self.actors):
             raise ValueError("actor panel requires distinct aliases and frozen models")
-        if sum(job.maximum_physical_attempts for job in self.cases) * len(self.actors) > 100_000:
-            raise ValueError("actor panel exceeds the 100000 physical-attempt ceiling")
+        attempts = sum(job.maximum_physical_attempts for job in self.cases) * len(self.actors)
+        if attempts > MAXIMUM_PHYSICAL_ATTEMPTS:
+            raise ValueError(
+                f"actor panel exceeds the {MAXIMUM_PHYSICAL_ATTEMPTS} physical-attempt ceiling"
+            )
         if any(job.study.training_specification is not None for job in self.cases):
             raise ValueError(
                 "actor panels measure behavior; training admission is a separate study"
@@ -203,8 +208,11 @@ def panel_metrics(
             unknown += missing
             violations += sum(grade.policy.status == "fail" for grade in grades)
             goal_pass += sum(grade.goal.status == "pass" for grade in grades)
-            lower.append(passed / count)
-            upper.append((passed + missing) / count)
+            bounds = missing_outcome_bounds(passed, missing, count)
+            if bounds is None:
+                raise ValueError("actor panel case has no planned repeats")
+            lower.append(bounds[0])
+            upper.append(bounds[1])
         low, high = sum(lower) / len(spec.cases), sum(upper) / len(spec.cases)
         ranges.append((low, high))
         actors.append(

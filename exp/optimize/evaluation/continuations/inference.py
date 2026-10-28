@@ -29,7 +29,7 @@ from exp.common.project import ProjectStore
 from exp.optimize.evaluation.continuations.campaign import ContinuationCampaign
 from exp.optimize.evaluation.continuations.experiment import CheckpointExperiment
 from exp.optimize.evaluation.continuations.records import load_study
-from exp.optimize.evaluation.continuations.study import ContinuationStudy
+from exp.optimize.evaluation.continuations.study import known_outcomes
 from exp.simulation.continuations import load_continuation_checkpoint
 
 
@@ -102,7 +102,9 @@ def experiment_cells(
                 checkpoint=cell.job.study.checkpoint.artifact_id,
                 lineage=checkpoint.task.lineage_group_id,
                 planned=cell.job.study.repeats,
-                outcomes=() if study is None else _known(study),
+                outcomes=()
+                if study is None
+                else known_outcomes(row.assessment for row in study.branches),
                 forecast=cell.job.study.predicted_success
                 if study is None
                 else study.spec.predicted_success,
@@ -196,7 +198,7 @@ def campaign_inference(project: ProjectStore, report: ContinuationCampaign) -> J
         experiment's inference, and the number of independent task lineages behind all of it.
     """
     source = load_study(project.artifacts, report.source)
-    known = _known(source)
+    known = known_outcomes(row.assessment for row in source.branches)
     planned = len(source.branches)
     lineage = load_continuation_checkpoint(
         project.artifacts, source.spec.checkpoint
@@ -283,15 +285,6 @@ def campaign_summary(project: ProjectStore, report: ContinuationCampaign) -> Jso
         **report.metrics,
         "inference": campaign_inference(project, report),
     }
-
-
-def _known(study: ContinuationStudy) -> tuple[int, ...]:
-    """Known binary outcomes, matching the saved study's own metric convention."""
-    return tuple(
-        int(row.assessment.status == "pass")
-        for row in study.branches
-        if row.assessment is not None and row.assessment.status != "unassessable"
-    )
 
 
 def _critic(group: Sequence[CellOutcomes], base_rate: BaseRate | None) -> JsonObject:

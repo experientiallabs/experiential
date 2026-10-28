@@ -83,7 +83,7 @@ def mixed_fixture(
     probe_sha = sha256_json({"native": "row-count-from-real-workbook"})
     native_file = tmp_path / "reviewed_native.py"
     native_file.write_text("""from exp.common.core.artifacts import ArtifactInput
-from exp.optimize.evaluation.continuations.job import ContinuationRuntime
+from exp.optimize.evaluation.executable.loader import ContinuationRuntime
 from exp.optimize.evaluation.continuations.study_test import probe
 from exp.runtime.environments.artifact_world import ArtifactWorldFactory
 from exp.runtime.environments.workbook_edits import WorkbookEditAdapter
@@ -263,3 +263,57 @@ def test_refused_native_read_reaches_actor_without_poisoning_or_predicting(
         session.execute(workbook_case().first.model_copy(update={"call_id": "again"}))
         final = session.checkpoint()
         assert isinstance(final, MixedCheckpoint) and final.sequence == after.sequence + 1
+
+
+def test_declared_workbook_facts_reach_the_simulated_side_beside_native_receipts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only declared facts and receipts enter the request; native state is never derived."""
+    from exp.optimize.evaluation.executable.grounded_test import (
+        assert_wire_facts,
+        wire_messages,
+        with_facts,
+    )
+    from exp.simulation.world_model.executable_test import workbook_facts
+
+    project, spec, image, transport = mixed_fixture(tmp_path, monkeypatch)
+    facts = workbook_facts()
+    configuration = {
+        **spec.model_dump(mode="json"),
+        "simulated": with_facts(spec.simulated, facts),
+    }
+    bound = MixedRuntimeDefinition.model_validate(configuration)
+    assert bound.simulated.facts is not None and spec.simulated.facts is None
+    assert "facts" not in json.dumps(spec.model_dump(mode="json")["simulated"])
+    runtime_file = Path(mixed_runtime.__file__)
+    captures = []
+    for definition in (spec.model_dump(mode="json"), configuration):
+        capture = CaptureDefinition(
+            task=spec.simulated.task,
+            sources=(spec.simulated.world_model, image),
+            runtime_file=runtime_file,
+            runtime_sha256=sha256_bytes(runtime_file.read_bytes()),
+            configuration=definition,
+            probe_sha256=spec.probe_sha256,
+        )
+        captures.append(capture_initial_world(project, capture, code_revision="test"))
+    assert captures[0] != captures[1] and not transport.requests
+    point = load_continuation_checkpoint(project.artifacts, captures[1])
+    runtime = continuation_runtime(project, configuration)
+    with restore_continuation_world(runtime.world, point.world_task, point.world) as world:
+        world.execute(workbook_case().first)
+        result = world.execute(
+            ToolCall(name="inspect", call_id="read", arguments={"key": "output.xlsx"})
+        )
+        saved = world.checkpoint()
+        assert result.content == "predicted reply"
+        assert runtime.probe(saved)["simulated"] == {"status": "pending"}
+    assert len(transport.requests) == 1
+    expected = facts.conditioning(0)
+    assert expected is not None
+    payload = transport.requests[0].payload
+    assert_wire_facts(payload, expected)
+    channel = json.loads(wire_messages(payload)[1])
+    rows = channel["instance_facts"]["facts"]
+    assert len(rows) == len(facts.facts) + 1 and rows[-1]["key"].startswith("native-read/")
+    assert set(channel["environment_state"]["domains"]) == {"records"}

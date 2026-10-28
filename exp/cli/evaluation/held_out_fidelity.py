@@ -29,7 +29,11 @@ from exp.optimize.evaluation.audit.lifecycle import (
     outcome_unknown,
     require_held_out_selection,
 )
-from exp.optimize.evaluation.audit.panel import AuditCheckpoint, saved_held_out_results
+from exp.optimize.evaluation.audit.panel import (
+    AuditCheckpoint,
+    MemoryProfile,
+    saved_held_out_results,
+)
 from exp.optimize.evaluation.audit.receipts import (
     AuditReceipt,
     AuditReport,
@@ -77,6 +81,7 @@ def run_held_out_fidelity(
     verbose: bool = False,
     retry_incomplete: bool = False,
     include_inspected: bool = False,
+    memory_profile: MemoryProfile = "learned",
     details: Console | None = None,
     terminal: Console | None = None,
     progress: ProgressHook | None = None,
@@ -103,6 +108,7 @@ def run_held_out_fidelity(
         retry_incomplete: Resume interrupted runs in place: saved work replays, and a request
             lost in flight is sent again and reported as an unknown-outcome retry.
         include_inspected: Also re-run exposed or reserved lineages, as a development re-audit.
+        memory_profile: What the held-out replays read: all learned memory, none, or lessons.
         details: Where the panel's description and notes are written; defaults to the terminal.
         terminal: The user's terminal, for results, warnings, the spend question and errors.
         progress: The calling command's single progress line; without it, the panel owns one.
@@ -121,6 +127,7 @@ def run_held_out_fidelity(
             code_revision=installed_execution_revision(),
             clock=clock,
             include_inspected=include_inspected,
+            memory_profile=memory_profile,
         ) as audit:
             _run_audit(
                 screen,
@@ -369,10 +376,20 @@ def checkpoint_lines(checkpoint: AuditCheckpoint, simulator: str) -> tuple[str, 
     return (
         f"Audited checkpoint: memory {checkpoint.lineage} v{checkpoint.version}, "
         f"scope {checkpoint.scope}, {checkpoint.fit_traces_learned} fit traces learned, "
-        f"simulator {simulator} (held-out lineages reserved before learning)",
+        f"simulator {simulator} (held-out lineages reserved before learning)"
+        + _memory_note(checkpoint),
         "The build's all-traces memory is a different checkpoint "
         "and was not independently evaluated.",
     )
+
+
+def _memory_note(checkpoint: AuditCheckpoint) -> str:
+    """How much of the checkpoint the replays read, when not all of it."""
+    if checkpoint.memory == "none":
+        return "; replays read no memory"
+    if checkpoint.lessons is not None:
+        return f"; replays read only lesson set {checkpoint.lessons.artifact_id}"
+    return ""
 
 
 def render_exposure(
@@ -387,6 +404,9 @@ def render_exposure(
     if receipt.checkpoint is not None:
         for line in checkpoint_lines(receipt.checkpoint, receipt.world_model.artifact_id):
             console.print(Text(line, style="dim"))
+        if receipt.checkpoint.memory != "learned" and screen is not console:
+            note = _memory_note(receipt.checkpoint).removeprefix("; ")
+            screen.print(Text(f"Memory profile {receipt.checkpoint.memory}: {note}", style="dim"))
     console.print(Text(receipt_line(view), style="dim"))
     exposed = receipt.exposed
     console.print(
@@ -450,6 +470,7 @@ def run_audit(
     verbose: bool = False,
     retry_incomplete: bool = False,
     include_inspected: bool = False,
+    memory_profile: MemoryProfile = "learned",
 ) -> None:
     """Independently audit the simulator on traces it never learned.
 
@@ -467,6 +488,7 @@ def run_audit(
         verbose: Also print every trace, every turn, and every criterion.
         retry_incomplete: Resume interrupted runs in place.
         include_inspected: Also re-run exposed or reserved lineages, as a development re-audit.
+        memory_profile: What the held-out replays read: all learned memory, none, or lessons.
     """
     started = monotonic()
     console = Console(theme=EXP_THEME)
@@ -489,6 +511,7 @@ def run_audit(
             verbose=verbose,
             retry_incomplete=retry_incomplete,
             include_inspected=include_inspected,
+            memory_profile=memory_profile,
         )
         return
     with usage_error(OSError, ValueError):
@@ -499,7 +522,9 @@ def run_audit(
                 "recall it (for example cloudflare/clef-flash); add one to the model catalog"
             )
         # An exhausted panel refuses here, before fit learning asks to spend anything.
-        require_held_out_selection(store, count, include_inspected=include_inspected)
+        require_held_out_selection(
+            store, count, include_inspected=include_inspected, memory_profile=memory_profile
+        )
     heading(console, project, "Held-out simulation fidelity")
     buffer = io.StringIO()
     details = Console(file=buffer, width=110, theme=EXP_THEME, no_color=True)
@@ -524,6 +549,9 @@ def run_audit(
         if outcome is None or not recorded_plan(store, "fit"):
             return
         pipeline.complete("learning")
+        report_key = outcome.plan.lineage + (
+            "" if memory_profile == "learned" else "-" + memory_profile
+        )
         learned = LearningSummary(recall, outcome, learning_curve(store, "fit"))
         for line in learning_lines(learned, "fit traces"):
             console.print(line)
@@ -537,14 +565,13 @@ def run_audit(
             verbose=verbose,
             retry_incomplete=retry_incomplete,
             include_inspected=include_inspected,
+            memory_profile=memory_profile,
             details=details,
             terminal=console,
             progress=pipeline.phase("panel"),
             pause=pipeline.paused,
         )
-    console.print(
-        Text(f"Report: {save_details(store, 'audits', outcome.plan.lineage, buffer.getvalue())}")
-    )
+    console.print(Text(f"Report: {save_details(store, 'audits', report_key, buffer.getvalue())}"))
     console.print(
         f"[green]Complete[/green] [dim]in {duration_text(monotonic() - started)} total wall time "
         "(fit learning, the spend question and the held-out replay; per-trace replay time is "

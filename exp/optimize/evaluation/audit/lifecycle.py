@@ -46,6 +46,7 @@ from exp.optimize.evaluation.audit.exposure import (
 )
 from exp.optimize.evaluation.audit.panel import (
     HeldOutPanel,
+    MemoryProfile,
     PlannedPanel,
     Profile,
     held_out_cases,
@@ -194,6 +195,7 @@ def open_held_out_audit(
     code_revision: str,
     clock: Callable[[], datetime],
     include_inspected: bool = False,
+    memory_profile: MemoryProfile = "learned",
 ) -> Iterator[HeldOutAudit]:
     """Reserve and register a held-out audit, or resume the request's receipt, under its lease.
 
@@ -204,6 +206,7 @@ def open_held_out_audit(
         code_revision: Exact running implementation.
         clock: Aware clock.
         include_inspected: Also select exposed or reserved lineages, as a development re-audit.
+        memory_profile: Memory audit only: all learned memory, none, or screened lessons.
 
     Yields:
         The open audit; the lease is held until the context exits.
@@ -213,7 +216,9 @@ def open_held_out_audit(
         ValueError: Nothing can be selected, or selection kept changing under other audits.
     """
     ledger = ExposureLedger(project.paths.root)
-    request = AuditRequest(profile=profile, count=count, include_inspected=include_inspected)
+    request = AuditRequest(
+        profile=profile, count=count, include_inspected=include_inspected, memory=memory_profile
+    )
     refresh_ledger(project, ledger)
     for _ in range(SELECTION_ROUNDS):
         snapshot = ledger.snapshot()
@@ -225,6 +230,7 @@ def open_held_out_audit(
             code_revision=code_revision,
             clock=clock,
             excluded=excluded,
+            memory_profile=memory_profile,
         )
         if owner is not None and planned.lineages != owner.lineages:
             # Selection no longer lands on the owner's cases: a new receipt, around its hold.
@@ -238,6 +244,7 @@ def open_held_out_audit(
                 code_revision=code_revision,
                 clock=clock,
                 excluded=excluded,
+                memory_profile=memory_profile,
             )
         follows: tuple[AuditReceipt, Literal["released-unused", "dispatched"]] | None = None
         if owner is not None:
@@ -295,6 +302,7 @@ def require_held_out_selection(
     count: int,
     *,
     include_inspected: bool = False,
+    memory_profile: MemoryProfile = "learned",
 ) -> None:
     """Refuse a memory audit that could select nothing, before it learns or calls anything.
 
@@ -307,13 +315,19 @@ def require_held_out_selection(
         project: Project with a completed build.
         count: Maximum held-out traces.
         include_inspected: Also select exposed or reserved lineages, as a development re-audit.
+        memory_profile: What the replays will read.
 
     Raises:
         ValueError: Unknown fingerprint schemes block an independent audit, or no held-out
             lineage is left to select.
     """
     ledger = ExposureLedger(project.paths.root)
-    request = AuditRequest(profile="memory", count=count, include_inspected=include_inspected)
+    request = AuditRequest(
+        profile="memory",
+        count=count,
+        include_inspected=include_inspected,
+        memory=memory_profile,
+    )
     refresh_ledger(project, ledger)
     _, _, excluded = _selection(project, request, ledger.snapshot())
     held_out_cases(project, count, fit_calls(project), excluded=excluded)

@@ -1,4 +1,13 @@
-"""Standalone actor/verifier transport copied into isolated Harbor environments."""
+"""Standalone actor/verifier transport copied into isolated Harbor environments.
+
+Harbor requires every verified trial to leave ``reward.json`` or ``reward.txt`` in its verifier
+log directory. The verifier therefore writes ``reward.json`` for every verdict the trusted backend
+returns: a scored verdict carries ``{"reward": 0 or 1, "scored": 1}``, while a diagnostic,
+unsubmitted, failed or unknown-outcome verdict carries only ``{"scored": 0}``, never a reward
+value the backend did not grant. The complete verdict is retained in ``experiential.json``.
+Only a grading failure, where no verdict exists, leaves no reward file, so Harbor records that
+trial as an infrastructure exception instead of an actor outcome.
+"""
 
 import argparse
 import base64
@@ -9,8 +18,11 @@ import shutil
 import sys
 import tempfile
 from pathlib import Path, PurePosixPath, PureWindowsPath
+from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
+
+VERIFIER_FILES = ("reward.json", "reward.txt", "experiential.json")
 
 
 def main() -> int:
@@ -20,15 +32,20 @@ def main() -> int:
     parser.add_argument(
         "--body", default="{}", help="JSON call or final answer, as declared by tools"
     )
-    parser.add_argument("--directory", type=Path, help="New directory for declared native outputs")
+    parser.add_argument(
+        "--directory",
+        type=Path,
+        help="New directory for declared native outputs, or the verifier log directory "
+        "(default /logs/verifier)",
+    )
     args = parser.parse_args()
     if args.operation == "outputs" and args.directory is None:
         parser.error("outputs requires --directory")
     if args.operation == "verify":
-        directory = Path("/logs/verifier")
+        directory = args.directory or Path("/logs/verifier")
         directory.mkdir(parents=True, exist_ok=True)
-        (directory / "reward.txt").unlink(missing_ok=True)
-        (directory / "experiential.json").unlink(missing_ok=True)
+        for name in VERIFIER_FILES:
+            (directory / name).unlink(missing_ok=True)
     endpoint = os.environ["EXP_HARBOR_ENDPOINT"].rstrip("/")
     parsed = urlsplit(endpoint)
     if (
@@ -48,26 +65,79 @@ def main() -> int:
         headers={"Authorization": "Bearer " + credential, "Content-Type": "application/json"},
         method="GET" if args.operation == "tools" else "POST",
     )
+    if args.operation == "verify":
+        return verify(request, directory)
     with urlopen(request, timeout=120) as response:
         raw = response.read()
     if args.operation == "outputs":
         write_outputs(json.loads(raw), args.directory)
         return 0
-    if args.operation != "verify":
-        sys.stdout.buffer.write(raw + b"\n")
-        return 0
-    result = json.loads(raw)
-    (directory / "experiential.json").write_bytes(raw)
-    reward = result.get("reward") if isinstance(result, dict) else None
-    if (
-        not isinstance(result, dict)
-        or result.get("status") != "completed"
-        or type(reward) is not int
-        or reward not in (0, 1)
-    ):
-        return 2
-    (directory / "reward.txt").write_text(str(reward) + "\n")
+    sys.stdout.buffer.write(raw + b"\n")
     return 0
+
+
+def verify(request: Request, directory: Path) -> int:
+    """Retain the backend verdict and publish the Harbor reward file it supports.
+
+    Args:
+        request: Authorized private grading request.
+        directory: Verifier log directory, already cleared of earlier attempts.
+
+    Returns:
+        Zero when a verdict was recorded, two when grading failed and no reward exists.
+    """
+    try:
+        with urlopen(request, timeout=120) as response:
+            raw = response.read()
+    except HTTPError as error:
+        body = error.read().decode(errors="replace")
+        return grading_failed(directory, {"http_status": error.code, "response": body})
+    except URLError as error:
+        return grading_failed(directory, {"error": type(error).__name__, "reason": str(error)})
+    (directory / "experiential.json").write_bytes(raw)
+    try:
+        result = json.loads(raw)
+    except ValueError:
+        return grading_failed(directory, None, "grading response is not JSON")
+    if not isinstance(result, dict):
+        return grading_failed(directory, None, "grading response is not a JSON object")
+    reward = result.get("reward")
+    scored = result.get("status") == "completed" and type(reward) is int and reward in (0, 1)
+    rewards = {"reward": reward, "scored": 1} if scored else {"scored": 0}
+    (directory / "reward.json").write_text(json.dumps(rewards) + "\n")
+    if not scored:
+        sys.stderr.write(
+            "Experiential verdict is unscored ("
+            + str(result.get("status"))
+            + ", "
+            + str(result.get("qualification"))
+            + "); see experiential.json for the retained outcome.\n"
+        )
+    return 0
+
+
+def grading_failed(directory: Path, detail: dict[str, int | str] | None, reason: str = "") -> int:
+    """Retain a grading failure without any reward file, so Harbor reports an exception.
+
+    Args:
+        directory: Verifier log directory.
+        detail: Transport failure to retain, or None to keep an already saved raw response.
+        reason: Human-readable failure summary.
+
+    Returns:
+        The verifier failure exit status.
+    """
+    if detail is not None:
+        record = {"status": "grading_failed", **detail}
+        (directory / "experiential.json").write_text(json.dumps(record) + "\n")
+        reason = reason or json.dumps(detail)
+    sys.stderr.write(
+        "Experiential grading failed: "
+        + reason
+        + ". No reward was written; confirm the trusted trial backend is still serving, "
+        "then verify again.\n"
+    )
+    return 2
 
 
 def write_outputs(result: dict[str, list[dict[str, str]]], directory: Path) -> None:

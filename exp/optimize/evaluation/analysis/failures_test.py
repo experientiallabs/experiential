@@ -14,8 +14,8 @@ from exp.optimize.evaluation.continuations.study import (
     ContinuationStudySpec,
     run_continuation_study,
 )
-from exp.optimize.evaluation.continuations.study_test import probe, workbook_runtime
-from exp.runtime.agents.chat_test import _Model, _response
+from exp.optimize.evaluation.continuations.study_test import OutageModel, probe, workbook_runtime
+from exp.runtime.agents.chat_test import _response
 from exp.runtime.environments.tests.world_conformance_test import workbook_case
 from exp.simulation.continuations import (
     load_continuation_checkpoint,
@@ -56,7 +56,7 @@ def failed_study(
         store,
         spec,
         actor=actor,
-        model=_Model(tuple(_response(action) for action in actions)),
+        model=OutageModel(tuple(_response(action) for action in actions)),
         world=workbook_runtime(point.world),
         probe=probe,
         probe_sha256=spec.probe_sha256,

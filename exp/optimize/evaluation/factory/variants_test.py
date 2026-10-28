@@ -11,9 +11,9 @@ from exp.optimize.evaluation.continuations.intervention import (
     capture_action_intervention,
 )
 from exp.optimize.evaluation.continuations.job_test import job_fixture
+from exp.optimize.evaluation.executable.package import export_executable_harbor
 from exp.optimize.evaluation.executable.task import (
     ExecutableTask,
-    export_executable_harbor,
     load_executable_task,
     persist_executable_task,
 )

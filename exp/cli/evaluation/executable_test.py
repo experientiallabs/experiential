@@ -82,9 +82,9 @@ def test_cli_serves_expired_frozen_simulator_under_one_explicit_trial_allowance(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The public CLI can reuse an old world without rebuying calls when a trial is resumed."""
+    from exp.optimize.evaluation.executable.package import export_executable_harbor
     from exp.optimize.evaluation.executable.provider_grant import ProviderLimits
     from exp.optimize.evaluation.executable.provider_grant_test import expired_task
-    from exp.optimize.evaluation.executable.task import export_executable_harbor
 
     project, task, _, transport = expired_task(tmp_path, monkeypatch)
     monkeypatch.setattr(
@@ -263,7 +263,7 @@ def test_serve_preflight_does_not_execute_witnesses_without_consent(
     from rich.console import Console
 
     from exp.cli.evaluation.executable import run_executable_command
-    from exp.optimize.evaluation.executable.task import export_executable_harbor
+    from exp.optimize.evaluation.executable.package import export_executable_harbor
 
     project, task, spec = qualified_fixture(tmp_path, monkeypatch)
     qualification = qualify_executable_task(
@@ -476,7 +476,7 @@ def test_serve_spend_prompt_names_the_spec_file_the_user_passed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Consent identifies the exact `--continuations` file, not an invented spec name."""
-    from exp.optimize.evaluation.executable.task import export_executable_harbor
+    from exp.optimize.evaluation.executable.package import export_executable_harbor
 
     monkeypatch.setattr(
         "exp.cli.evaluation.continuations.installed_execution_revision", lambda: "test"

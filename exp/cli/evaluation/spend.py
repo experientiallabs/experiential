@@ -5,12 +5,16 @@ import math
 from rich.console import Console
 from rich.text import Text
 
-from exp.common.core.artifacts import ContractModel
 from exp.common.project import ProjectStore
-from exp.optimize.evaluation.executable.costs import CostComponent, evaluation_costs, total_cost
+from exp.optimize.evaluation.executable.costs import (
+    CostComponent,
+    CostedSpec,
+    evaluation_costs,
+    total_cost,
+)
 
 
-def review_cost(console: Console, project: ProjectStore, spec: ContractModel) -> float | None:
+def review_cost(console: Console, project: ProjectStore, spec: CostedSpec) -> float | None:
     """Show known components and unresolved dependencies before requesting authorization."""
     return review_components(console, evaluation_costs(project, spec))
 

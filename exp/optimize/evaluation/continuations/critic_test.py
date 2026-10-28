@@ -262,3 +262,19 @@ def test_critic_failure_names_the_saved_defect_or_the_lost_dispatch(
         )
         == "ValueError"
     )
+
+
+def test_missing_critic_credential_refuses_before_intent_and_stays_retryable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A credential refusal dispatched nothing, so it is not saved as an unknown-outcome draw."""
+    project, _, spec, transport = critic_fixture(tmp_path, monkeypatch)
+    monkeypatch.delenv("HELD_OUT_TEST_KEY")
+    with pytest.raises(ValueError):
+        predict_success(project, spec, code_revision="test")
+    assert not transport.requests
+    assert not project.artifacts.exists(spec.identity("test") + "-intent")
+    monkeypatch.setenv("HELD_OUT_TEST_KEY", "fixture-only")
+    reference = predict_success(project, spec, code_revision="test")
+    assert load_critic_prediction(project.artifacts, reference).estimate.probability == 0.75
+    assert len(transport.requests) == 1

@@ -123,9 +123,16 @@ class StructuredFailure(ContractModel):
 
 
 class SourceIdentity(ContractModel):
-    """Identifies immutable source evidence without storing its raw payload."""
+    """Identifies immutable source evidence without storing its raw payload.
 
-    kind: Literal["file", "otlp", "production", "simulation", "manual", "generated"]
+    Attributes:
+        kind: Provenance class. ``native-world`` marks replies executed by a native-owned
+            executable world backend; ``simulation`` marks replies a simulated owner produced.
+        source_id: Durable source label.
+        sha256: Digest of the exact source content, when known.
+    """
+
+    kind: Literal["file", "otlp", "production", "native-world", "simulation", "manual", "generated"]
     source_id: str = Field(min_length=1, max_length=512)
     sha256: Sha256 | None = None
 

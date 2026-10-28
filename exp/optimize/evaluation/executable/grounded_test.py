@@ -7,17 +7,23 @@ from pathlib import Path
 
 import pytest
 
-from exp.common.core.artifacts import sha256_json
+from exp.common.core.artifacts import JsonObject, sha256_json
 from exp.common.models import ToolCall, load_model_catalog
+from exp.common.project import ProjectStore
+from exp.common.tasks.facts import ConditioningFacts, InstanceFacts
 from exp.optimize.evaluation.executable import grounded as grounded_runtime
 from exp.optimize.evaluation.executable.grounded import (
     GroundedRuntimeDefinition,
     continuation_runtime,
 )
+from exp.optimize.evaluation.fidelity.instance_facts import ReplayFacts
+from exp.optimize.evaluation.fidelity.runner import FidelitySpec
 from exp.optimize.evaluation.fidelity.runner_test import source_project
 from exp.runtime.environments.world_contracts import StateDomain, ToolEffectPolicy, WorldManifest
+from exp.runtime.environments.worlds import ExecutableWorldRuntime
 from exp.runtime.models.providers.transport import JsonHttpResponse, ScriptedJsonTransport
 from exp.runtime.sessions.dispatch_ledger import DispatchCapExhaustedError
+from exp.simulation.engines.text.prompt import INSTANCE_FACTS_GUIDANCE
 from exp.simulation.world_model.prediction_reading import PredictionReading
 
 
@@ -277,3 +283,212 @@ def test_build_learned_memory_uses_admitted_native_decisions_in_executable_world
         project.artifacts.project_directory / (identity + "-world.sqlite"), allowance, identity
     )
     assert ledger.used() == len(requests)
+
+
+def _prediction(call_id: str) -> JsonHttpResponse:
+    """Return one scripted provider reply proposing an unchanged-state text observation."""
+    proposal = {
+        "observations": [{"call_id": call_id, "reply": "pending", "encoding": "text"}],
+        "effect": {"kind": "edits", "edits": []},
+    }
+    return JsonHttpResponse(
+        status_code=200,
+        body={
+            "id": "prediction-" + call_id,
+            "model": "fixture-v1",
+            "choices": [
+                {
+                    "index": 0,
+                    "finish_reason": "tool_calls",
+                    "message": {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [
+                            {
+                                "id": "proposal",
+                                "type": "function",
+                                "function": {
+                                    "name": "submit_transition",
+                                    "arguments": json.dumps(proposal),
+                                },
+                            }
+                        ],
+                    },
+                }
+            ],
+        },
+    )
+
+
+def wire_messages(payload: JsonObject) -> tuple[str, str]:
+    """Return the system and user message text of one physical provider request body."""
+    messages = payload["messages"]
+    assert isinstance(messages, list)
+    text = {}
+    for row in messages:
+        assert isinstance(row, dict)
+        content = row["content"]
+        if isinstance(content, list):
+            content = "".join(
+                str(part["text"]) for part in content if isinstance(part, dict) and "text" in part
+            )
+        text[str(row["role"])] = str(content)
+    return text["system"], text["user"]
+
+
+def assert_wire_facts(payload: JsonObject, expected: ConditioningFacts) -> None:
+    """The physical request carries each registered fact's exact canonical rendering."""
+    system, user = wire_messages(payload)
+    assert INSTANCE_FACTS_GUIDANCE in system
+    for fact in expected.facts:
+        rendered = json.dumps(
+            fact.rendered(), ensure_ascii=False, separators=(",", ":"), sort_keys=True
+        )
+        assert rendered in user
+    channel = json.loads(user)["instance_facts"]
+    assert channel["state_version"] == expected.state_version
+    assert channel["facts"][: len(expected.facts)] == [row.rendered() for row in expected.facts]
+
+
+def _record_spec(project: ProjectStore, fidelity: FidelitySpec) -> GroundedRuntimeDefinition:
+    """Return a fact-free records world over the fixture's built simulator."""
+    return GroundedRuntimeDefinition(
+        task=fidelity.task.model_copy(
+            update={"origin": "authored", "source_trace_ids": (), "partition": "fit"}
+        ),
+        world_model=fidelity.world_model,
+        catalog_sha256=sha256_json(
+            load_model_catalog(project.model_catalog_path).model_dump(mode="json")
+        ),
+        manifest=WorldManifest(
+            domains=(StateDomain(name="records", owner="simulated"),),
+            tools=(ToolEffectPolicy(name="inspect", reads=("records",), writes=()),),
+        ),
+        initial_state={"records": {"status": "pending"}},
+        probe_paths={"status": "/records/status"},
+        maximum_physical_attempts=2,
+        deadline=datetime.now(UTC) + timedelta(minutes=5),
+    )
+
+
+def with_facts(spec: GroundedRuntimeDefinition, facts: InstanceFacts) -> JsonObject:
+    """Return the configuration JSON of ``spec`` with explicitly declared facts."""
+    return {
+        **spec.model_dump(mode="json"),
+        "facts": ReplayFacts(facts=facts).model_dump(mode="json"),
+    }
+
+
+def test_declared_record_facts_reach_the_wire_and_survive_continuation_restore(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Facts condition every physical prediction and re-key only the definition binding them."""
+    from exp.common.release_revision import installed_execution_revision
+    from exp.optimize.evaluation.continuations.study import restore_continuation_world
+    from exp.simulation.world_model.executable_test import record_facts
+
+    project, fidelity = source_project(tmp_path)
+    monkeypatch.setenv("FIDELITY_TEST_KEY", "fixture-only")
+    spec = _record_spec(project, fidelity)
+    facts = record_facts()
+    configuration = with_facts(spec, facts)
+    plain = spec.model_dump(mode="json")
+    assert "facts" not in plain and GroundedRuntimeDefinition.model_validate(plain) == spec
+    transport = ScriptedJsonTransport((_prediction("first"), _prediction("second")))
+    monkeypatch.setattr(grounded_runtime, "HttpxJsonTransport", lambda: transport)
+    runtime = continuation_runtime(project, configuration)
+    task = spec.task
+    with runtime.world.open(task) as world:
+        world.execute(ToolCall(name="inspect", call_id="first", arguments={"key": "current"}))
+        saved = world.checkpoint()
+        assert runtime.probe(saved) == {"status": "pending"}
+    restarted = continuation_runtime(project, configuration)
+    with restore_continuation_world(restarted.world, task, saved) as world:
+        world.execute(ToolCall(name="inspect", call_id="second", arguments={"key": "current"}))
+    assert len(transport.requests) == 2
+    for version, request in enumerate(transport.requests):
+        expected = facts.conditioning(version)
+        assert expected is not None and len(expected.facts) == 4
+        assert_wire_facts(request.payload, expected)
+        assert "private-answer-7731" not in json.dumps(request.payload)
+    unbound = continuation_runtime(project, plain)
+    assert isinstance(unbound.world, ExecutableWorldRuntime)
+    assert isinstance(runtime.world, ExecutableWorldRuntime)
+    assert unbound.world.backend_sha256 != runtime.world.backend_sha256
+    with pytest.raises(ValueError, match="another backend definition"):
+        with restore_continuation_world(unbound.world, task, saved):
+            pass
+    revision = installed_execution_revision()
+    for definition in (plain, configuration):
+        identity = sha256_json({"definition": definition, "code": revision})
+        assert (project.artifacts.project_directory / (identity + "-world.sqlite")).exists()
+
+
+@pytest.mark.parametrize(
+    "change,reason",
+    [
+        ({"status": "unvalidated", "method": None}, "not validated"),
+        ({"state_version": 1}, "starting version 0"),
+        ({"key": "native-read/" + "a" * 64}, "reserved native-read/"),
+    ],
+)
+def test_definition_refuses_facts_an_executable_episode_cannot_honor(
+    change: JsonObject, reason: str
+) -> None:
+    """Unvalidated, later-state and receipt-shadowing facts refuse before any composition."""
+    from exp.simulation.world_model.executable_test import record_facts
+
+    fact = record_facts().facts[0].model_dump(mode="json")
+    provenance = fact["provenance"]
+    assert isinstance(provenance, dict)
+    if "status" in change:
+        provenance["validation"] = change
+    elif "state_version" in change:
+        provenance["state_version"] = change["state_version"]
+    else:
+        fact.update(change)
+    from exp.common.core.artifacts import ArtifactInput
+    from exp.runtime.environments.tests.world_conformance_test import _task
+
+    spec = GroundedRuntimeDefinition(
+        task=_task("inspect"),
+        world_model=ArtifactInput(artifact_id="world-model", sha256="0" * 64),
+        catalog_sha256="0" * 64,
+        manifest=WorldManifest(
+            domains=(StateDomain(name="records", owner="simulated"),),
+            tools=(ToolEffectPolicy(name="inspect", reads=("records",)),),
+        ),
+        initial_state={"records": {}},
+        probe_paths={"state": "/records"},
+        maximum_physical_attempts=1,
+        deadline=datetime.now(UTC) + timedelta(minutes=5),
+    )
+    with pytest.raises(ValueError, match=reason):
+        GroundedRuntimeDefinition.model_validate(
+            {**spec.model_dump(mode="json"), "facts": {"facts": {"facts": [fact]}}}
+        )
+
+
+def test_facts_derived_from_a_foreign_trace_refuse_before_any_call(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The fidelity reservation rule applies: facts cannot launder another trace's state."""
+    from exp.common.tasks.facts import InstanceFactsError
+    from exp.simulation.world_model.executable_test import record_facts
+
+    project, fidelity = source_project(tmp_path)
+    monkeypatch.setenv("FIDELITY_TEST_KEY", "fixture-only")
+    spec = _record_spec(project, fidelity)
+    fact = record_facts().facts[0]
+    foreign = fact.model_copy(
+        update={
+            "provenance": fact.provenance.model_copy(
+                update={"derived_from_traces": ("someone-else",)}
+            )
+        }
+    )
+    transport = ScriptedJsonTransport(())
+    monkeypatch.setattr(grounded_runtime, "HttpxJsonTransport", lambda: transport)
+    with pytest.raises(InstanceFactsError, match="someone-else"):
+        continuation_runtime(project, with_facts(spec, InstanceFacts(facts=(foreign,))))
+    assert not transport.requests

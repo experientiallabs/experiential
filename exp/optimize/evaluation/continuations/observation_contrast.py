@@ -14,6 +14,7 @@ from exp.common.core.artifacts import (
     sha256_json,
     stable_id,
 )
+from exp.common.evaluations.uncertainty import missing_outcome_bounds
 from exp.common.project import ProjectStore, artifact_input
 from exp.optimize.evaluation.continuations.action_contrast import grade_intervention_outcome
 from exp.optimize.evaluation.continuations.intervention import (
@@ -21,6 +22,7 @@ from exp.optimize.evaluation.continuations.intervention import (
     saved_intervention,
 )
 from exp.optimize.evaluation.continuations.job import (
+    MAXIMUM_PHYSICAL_ATTEMPTS,
     ContinuationJob,
     continuation_result_reference,
     execute_continuation_job,
@@ -28,6 +30,7 @@ from exp.optimize.evaluation.continuations.job import (
     saved_continuation_job,
 )
 from exp.optimize.evaluation.continuations.records import load_study
+from exp.optimize.evaluation.continuations.study import known_outcomes
 from exp.optimize.evaluation.executable.deferral import (
     deferred_execution,
     record_execution_deferral,
@@ -105,27 +108,25 @@ class ObservationContrast(ContractModel):
         result: JsonObject = {}
         for arm in ("recorded", "alternative"):
             rows = [cell for cell in self.cells if cell.arm == arm]
-            known = [
-                row.assessment.status == "pass"
-                for row in rows
-                if row.assessment is not None and row.assessment.status != "unassessable"
-            ]
+            known = known_outcomes(row.assessment for row in rows)
             unknown = len(rows) - len(known)
+            bounds = missing_outcome_bounds(sum(known), unknown, len(rows))
+            if bounds is None:
+                raise ValueError("observation contrast metrics need every planned cell")
             result[arm] = {
                 "planned": len(rows),
                 "assessable": len(known),
                 "successes": sum(known),
                 "unknown": unknown,
-                "success_bounds": [sum(known) / len(rows), (sum(known) + unknown) / len(rows)],
+                "success_bounds": bounds,
             }
         pairs = []
         for pair in range(self.spec.pairs):
             values = {
-                cell.arm: int(cell.assessment.status == "pass")
+                cell.arm: label
                 for cell in self.cells
                 if cell.pair == pair
-                and cell.assessment is not None
-                and cell.assessment.status != "unassessable"
+                for label in known_outcomes((cell.assessment,))
             }
             pairs.append(
                 {
@@ -159,7 +160,7 @@ def _source(project: ProjectStore, spec: ObservationContrastSpec) -> ActionInter
         raise ValueError("observation source differs from its executed action")
     if spec.alternative == effect.observation.content:
         raise ValueError("observation arms must contain different replies")
-    if effect.spec.base.maximum_physical_attempts * spec.pairs * 2 > 100_000:
+    if effect.spec.base.maximum_physical_attempts * spec.pairs * 2 > MAXIMUM_PHYSICAL_ATTEMPTS:
         raise ValueError("observation comparison exceeds its combined actor attempt ceiling")
     for ref in spec.evidence:
         if artifact_input(store.read(ref.artifact_id).manifest) != ref:
@@ -239,7 +240,8 @@ def _assess(
     project: ProjectStore, effect: ActionIntervention, cell: ObservationCell
 ) -> VerifierGrade:
     """Recompute the complete grade from original effects and saved suffix observations."""
-    assert cell.result is not None
+    if cell.result is None:
+        raise ValueError("observation cell has no saved continuation to assess")
     study = load_study(project.artifacts, cell.result)
     if study.spec != cell.job.study or len(study.branches) != 1:
         raise ValueError("observation comparison changed its continuation population")
@@ -416,5 +418,6 @@ def run_observation_contrast(
             files={"report.json": report},
         )
         verified = saved_observation_contrast(project, spec, code_revision=code_revision)
-        assert verified is not None
+        if verified is None:
+            raise RuntimeError("observation contrast report was not saved")
         return verified

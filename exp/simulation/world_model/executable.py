@@ -3,6 +3,11 @@
 The world kernel owns time, scheduling, ownership and rollback. This adapter proposes one tool
 reply and state edit, retains the raw response, and never executes a native tool or learns from
 an evaluator. Restoring a checkpoint restores state and predictor history, not a future model draw.
+
+Instance facts are bound by the engine, not stored as state: every prediction receives the
+engine's conditioning facts for its state version in the separate ``instance_facts`` channel,
+exactly as fidelity replay delivers them. They are never a writable domain, never part of a
+checkpoint image, and they change the frozen definition only when present.
 """
 
 import json
@@ -32,6 +37,7 @@ from exp.runtime.environments.world_responses import (
 from exp.runtime.environments.worlds import WorldContext
 from exp.simulation.engines.reasks import reask_proposal
 from exp.simulation.engines.state_policy import StateEditPolicy
+from exp.simulation.engines.text.prompt import INSTANCE_FACTS_GUIDANCE
 from exp.simulation.engines.transition import Completion
 from exp.simulation.world_model.frozen_memory import TaskView
 from exp.simulation.world_model.grounded_session import GroundedTransitionEngine
@@ -55,7 +61,8 @@ class GroundedWorldFactory:
     """Existing grounded model adapted to simulated domains of one frozen world manifest.
 
     Attributes:
-        engine: Frozen predictor, artifact, task, retrieval policy and output protocol.
+        engine: Frozen predictor, artifact, task, retrieval policy and output protocol. Its
+            optional instance facts condition every prediction; they are not state domains.
         manifest: Shared world ownership/effect policy. State keys name simulated domains.
         initial_state: Exact starting values for every simulated domain.
         complete: Existing admitted completion owner, responsible for physical attempt budgets.
@@ -87,6 +94,7 @@ class GroundedWorldFactory:
         self.maximum_reasks = maximum_reasks
         self._identity = engine.identity
         self._memory_identity = None if memory is None else memory.identity
+        self._facts_bound = engine.facts is not None
         self._domains = {row.name for row in manifest.domains if row.owner == "simulated"}
         self._check_state(initial_state)
         self._definition_identity = sha256_json(self.definition)
@@ -101,6 +109,13 @@ class GroundedWorldFactory:
             "manifest": self.manifest.model_dump(mode="json"),
             "initial_state": deepcopy(self.initial_state),
             "maximum_reasks": self.maximum_reasks,
+            # Bound only when the engine delivers facts, so fact-free definitions are unchanged.
+            # The engine identity already binds the facts; this binds the guidance framing them.
+            **(
+                {"facts_prompt_sha256": sha256_json(INSTANCE_FACTS_GUIDANCE)}
+                if self._facts_bound
+                else {}
+            ),
         }
 
     def _check_state(self, state: JsonObject) -> None:

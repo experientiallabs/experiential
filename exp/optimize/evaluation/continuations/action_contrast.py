@@ -14,6 +14,7 @@ from exp.common.core.artifacts import (
     sha256_json,
     stable_id,
 )
+from exp.common.evaluations.uncertainty import missing_outcome_bounds
 from exp.common.models import ToolCall
 from exp.common.project import ProjectStore, artifact_input
 from exp.optimize.evaluation.continuations.intervention import (
@@ -24,12 +25,14 @@ from exp.optimize.evaluation.continuations.intervention import (
     saved_intervention,
 )
 from exp.optimize.evaluation.continuations.job import (
+    MAXIMUM_PHYSICAL_ATTEMPTS,
     ContinuationJob,
     continuation_result_reference,
     execute_continuation_job,
     saved_continuation_job,
 )
 from exp.optimize.evaluation.continuations.records import load_study
+from exp.optimize.evaluation.continuations.study import known_outcomes
 from exp.optimize.evaluation.executable.deferral import (
     deferred_execution,
     record_execution_deferral,
@@ -62,7 +65,8 @@ class ActionContrastSpec(ContractModel):
             self.alternative.arguments,
         ):
             raise ValueError("action contrast requires two different decisions")
-        if self.base.maximum_physical_attempts * self.base.study.repeats * 2 > 100_000:
+        attempts = self.base.maximum_physical_attempts * self.base.study.repeats * 2
+        if attempts > MAXIMUM_PHYSICAL_ATTEMPTS:
             raise ValueError("action contrast exceeds its combined actor attempt ceiling")
         return self
 
@@ -208,13 +212,12 @@ def _metrics(cells: tuple[ContrastCell, ...]) -> JsonObject:
     bounds: dict[str, tuple[float, float]] = {}
     for arm in ("baseline", "alternative"):
         group = [cell for cell in cells if cell.arm == arm]
-        labels = [
-            int(cell.assessment.status == "pass")
-            for cell in group
-            if cell.assessment is not None and cell.assessment.status != "unassessable"
-        ]
+        labels = known_outcomes(cell.assessment for cell in group)
         total, known, passed = len(group), len(labels), sum(labels)
-        bounds[arm] = (passed / total, (passed + total - known) / total)
+        arm_bounds = missing_outcome_bounds(passed, total - known, total)
+        if arm_bounds is None:
+            raise ValueError("action contrast metrics need every planned cell of both arms")
+        bounds[arm] = (arm_bounds[0], arm_bounds[1])
         result[arm] = {
             "planned": total,
             "assessable": known,
@@ -242,17 +245,15 @@ def _metrics(cells: tuple[ContrastCell, ...]) -> JsonObject:
     pairs = []
     for pair in sorted({cell.pair for cell in cells}):
         matched = {cell.arm: cell for cell in cells if cell.pair == pair}
-        labels = {
-            arm: int(cell.assessment.status == "pass")
+        known = {
+            arm: label
             for arm, cell in matched.items()
-            if cell.assessment is not None and cell.assessment.status != "unassessable"
+            for label in known_outcomes((cell.assessment,))
         }
         pairs.append(
             {
                 "pair": pair,
-                "difference": labels["alternative"] - labels["baseline"]
-                if len(labels) == 2
-                else None,
+                "difference": known["alternative"] - known["baseline"] if len(known) == 2 else None,
             }
         )
     result["pairs"] = pairs

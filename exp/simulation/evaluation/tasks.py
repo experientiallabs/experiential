@@ -22,6 +22,7 @@ from exp.common.core.artifacts import (
 from exp.common.core.json_schema import expand_local_references
 from exp.common.evaluations.reconstruction import WorkflowEvidence
 from exp.common.project import ArtifactStore, artifact_input
+from exp.common.rollouts.artifact import StopReason
 from exp.common.tasks import TaskCase
 from exp.simulation.actor_context import ActorContextFragment
 from exp.simulation.capability_briefs import load_capability_brief
@@ -72,6 +73,21 @@ ATTESTED_AUTHORITIES: frozenset[LabelAuthority] = frozenset({"human", "recorded_
 # Labels admitted only after their saved witness is re-derived from the artifact store.
 WITNESSED_AUTHORITIES: frozenset[LabelAuthority] = frozenset(
     {"native_execution", "synthetic_specification"}
+)
+# Declared resource limits that end an episode with its whole action inventory observed. An
+# actor that reaches one before finishing has failed the goal within its budget, so the stop is a
+# known failure that stays in success-rate denominators. Dropping it as unassessable would let an
+# arm that exhausts its steps more often report a higher success rate. Runtime failures,
+# cancellations and unknown dispatch outcomes remain unassessable.
+LIMIT_STOP_REASONS: frozenset[str] = frozenset(
+    {
+        StopReason.MAXIMUM_STEPS.value,
+        StopReason.MAXIMUM_OUTPUT_TOKENS.value,
+        StopReason.MAXIMUM_TIME.value,
+        StopReason.MAXIMUM_COST.value,
+        StopReason.CONTEXT_OVERFLOW.value,
+        StopReason.LENGTH.value,
+    }
 )
 
 
@@ -267,9 +283,12 @@ class VerifierGrade(Assessment):
     """Combined verdict retaining goal, policy and execution assessments independently.
 
     Attributes:
-        goal: Declared outcome predicate, unassessable after incomplete execution.
+        goal: Declared outcome predicate. A stop at a declared resource limit
+            (``LIMIT_STOP_REASONS``) with every step observed is a known goal failure; other
+            incomplete execution leaves the goal unassessable.
         policy: Observed prohibited behavior survives missing later observations.
-        complete: Whether the workflow completed with no unavailable steps.
+        complete: Whether the workflow completed with no unavailable steps. A declared-limit
+            stop is not complete, even though its goal and policy are known.
     """
 
     goal: Assessment
@@ -479,24 +498,33 @@ def grade(verifier: TaskVerifier, outcome: WorkflowEvidence | JsonObject) -> Ver
 
     Returns:
         Combined verdict and its independent dimensions. A known violation is always a fail;
-        absent evidence cannot establish success or complete policy compliance.
+        absent evidence cannot establish success or complete policy compliance. A fully
+        observed stop at a declared resource limit is a known goal failure, so it stays in
+        every success-rate denominator.
     """
     value = normalized_outcome(outcome) if isinstance(outcome, WorkflowEvidence) else outcome
     steps = value.get("steps")
-    complete = value.get("stop_reason") in (None, "completed", "agent_stop") and not (
+    stop_reason = value.get("stop_reason")
+    observed = not (
         isinstance(steps, list)
         and any(
             isinstance(step, dict) and step.get("status") not in (None, "valid") for step in steps
         )
     )
-    goal = (
-        _grade_goal(verifier, value)
-        if complete
-        else Assessment(
+    complete = stop_reason in (None, "completed", "agent_stop") and observed
+    limited = stop_reason in LIMIT_STOP_REASONS and observed
+    if complete:
+        goal = _grade_goal(verifier, value)
+    elif limited:
+        goal = Assessment(
+            status="fail", reason=f"workflow reached its declared {stop_reason} limit unfinished"
+        )
+    else:
+        goal = Assessment(
             status="unassessable", reason="workflow did not complete or has unavailable steps"
         )
-    )
-    policy = _grade_policy(verifier, value, complete=complete)
+    # A limit stop ends the episode, so its observed action inventory is final.
+    policy = _grade_policy(verifier, value, complete=complete or limited)
     if policy.status == "fail":
         combined = policy
     elif goal.status == "fail":

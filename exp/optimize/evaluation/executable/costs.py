@@ -9,7 +9,7 @@ import math
 from dataclasses import dataclass
 from pathlib import Path
 
-from exp.common.core.artifacts import ContractModel, JsonObject, Sha256, sha256_bytes
+from exp.common.core.artifacts import JsonObject, Sha256, sha256_bytes
 from exp.common.models import load_model_catalog
 from exp.common.models.pricing import completion_cost_reservation
 from exp.common.models.token_cost import schedule_maximum_cost_nano_usd
@@ -70,6 +70,28 @@ class CostComponent:
         return CostComponent(
             self.name, self.attempts * count, None if self.usd is None else self.usd * count
         )
+
+
+# Every paid payload with a declared cost inventory; evaluation_costs refuses anything else.
+CostedSpec = (
+    ContinuationJob
+    | AuthorSettings
+    | CriticSpec
+    | MemoryAnalystSpec
+    | CheckpointProposalSpec
+    | ActorDecisionSpec
+    | CaptureDefinition
+    | ActionInterventionSpec
+    | FramingStudySpec
+    | ActionContrastSpec
+    | ObservationContrastSpec
+    | ActorPanelSpec
+    | CheckpointExperimentSpec
+    | ContinuationCampaignSpec
+    | EquivalenceSpec
+    | CandidateBatchSpec
+    | TaskFactorySpec
+)
 
 
 def model_cost(
@@ -191,7 +213,7 @@ def job_costs(project: ProjectStore, job: ContinuationJob) -> tuple[CostComponen
     )
 
 
-def evaluation_costs(project: ProjectStore, spec: ContractModel) -> tuple[CostComponent, ...]:
+def evaluation_costs(project: ProjectStore, spec: CostedSpec) -> tuple[CostComponent, ...]:
     """Expand maintained command contracts into complete bounded role inventories."""
     if isinstance(spec, ContinuationJob):
         return job_costs(project, spec)

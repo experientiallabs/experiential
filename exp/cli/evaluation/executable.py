@@ -18,6 +18,10 @@ from exp.common.project import ProjectStore
 from exp.optimize.evaluation.continuations.capture import preflight_capture
 from exp.optimize.evaluation.continuations.evidence import qualified_training_job
 from exp.optimize.evaluation.executable.costs import runtime_costs
+from exp.optimize.evaluation.executable.package import (
+    export_executable_harbor,
+    verify_executable_package,
+)
 from exp.optimize.evaluation.executable.provider_grant import ProviderLimits
 from exp.optimize.evaluation.executable.qualification import (
     ExecutableQualificationSpec,
@@ -35,11 +39,9 @@ from exp.optimize.evaluation.executable.scenarios import (
 )
 from exp.optimize.evaluation.executable.task import (
     ExecutableTask,
-    export_executable_harbor,
     load_executable_task,
     persist_executable_task,
     preflight_executable_task,
-    verify_executable_package,
 )
 from exp.optimize.evaluation.executable.trial import open_executable_harbor_trial
 from exp.optimize.evaluation.factory.worlds import (

@@ -367,6 +367,7 @@ uv run pytest -q
     | --- | --- | --- |
     | Progress of a long-running command | `exp/cli/shared/progress.py` | `progress_display` for one phase, `progress_phases` for several; services report through `exp/common/progress.py` `report` |
     | Executable evaluation cost inventory | `exp/optimize/evaluation/executable/costs.py` | Credential-free estimates for actors, simulator dependencies and review stages; unknown components remain explicit |
+    | Trusted runtime-file loading | `exp/optimize/evaluation/executable/loader.py` | `load_runtime_definition` returns a `ContinuationRuntime`; only operator-selected source at its reviewed digest executes, and a provider grant selects the trial_runtime factory |
     | Deferred evaluation child execution | `exp/optimize/evaluation/executable/deferral.py` | Retain known lease contention separately from unknown dispatch; retry the same durable child only |
     | Native gateway composition lifetime | `exp/runtime/gateway/native_lifecycle.py`, `exp/runtime/gateway/lifecycle.py`, `exp/runtime/gateway/instance_lock.py` | Close control-plane pollers before caller-owned local components; bounded worker drain and startup rollback release thread-owned SQLite caches; no daemon thread substitutes for explicit ownership; the root's owner lock is released only after a recorded finished teardown and is otherwise kept until exit |
     | Latency subprocess output lifetime | `exp/runtime/gateway/latency_measure.py` | `GatewayProcess`: keep one stdout reader; stop and wait for the process, join its reader, then close the pipe; startup failures use the same bounded owner |
@@ -376,6 +377,7 @@ uv run pytest -q
     | Interactive choices | `exp/cli/shared/picker.py` | `choose_one` |
     | Terminal styling | `exp/cli/shared/theme.py` | `EXP_THEME` |
     | Trajectory-count selection and confirmation | `exp/optimize/evaluation/learning/sample_count.py` | Register the grid, order, metric and criterion first; select on development audits; confirm the frozen checkpoint only on an independent audit of untouched lineages |
+    | Learning-miss screening and lesson-library edits | `exp/optimize/evaluation/learning/screening.py`, `exp/optimize/evaluation/learning/lessons.py`, `exp/optimize/evaluation/learning/lesson_evolution.py` | `screen_lessons` (one typed decision per miss; `fit_threshold` over a registered grid on the fit split) and `evolve_lessons` (one edit through `evolve_library` in `exp/optimize/simulation/evolution.py`), from the `repair-learning` continuation |
     | Unknown recall recovery | `exp/optimize/evaluation/learning/profile.py` | Exact original intent plus an explicit single-attempt permit; preserve ambiguity and refuse a second unknown replacement |
     | Diagnostic source admission | `exp/optimize/evaluation/analysis/source_access.py` | Exact operator classifications over the complete dependency graph; unknown and protected sources refuse |
     | Recorded-reply kinds in exact-reply breakdowns | `exp/optimize/evaluation/fidelity/replay.py` | `reply_kind`: trivial (empty or under 60 characters), text, structured |
@@ -388,6 +390,7 @@ uv run pytest -q
     | Provider calls and retries | `exp/runtime/models/registry.py`, `exp/runtime/models/providers/transport.py` | `RuntimeModelCatalog`, `RetryPolicy` |
     | Infrastructure failures in scored workflows | `exp/simulation/evaluation/workflow.py` | `INFRASTRUCTURE_STOPS` are raised, never scored; the run stays incomplete and resumes in place |
     | Producer revision | `exp/common/release_revision.py` | `installed_release_revision` |
+    | Generated trajectories as trace evidence | `exp/optimize/evaluation/continuations/traces.py` | `export_trajectory_traces` over saved continuation studies; only native-owned replies become learning evidence, and the build refuses simulation provenance |
 
     Keep this table current. A change that introduces an owner for a new concern adds its row in
     the same commit.

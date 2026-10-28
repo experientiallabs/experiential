@@ -25,6 +25,7 @@ from exp.optimize.evaluation.continuations.experiment import (
     saved_checkpoint_experiment,
 )
 from exp.optimize.evaluation.continuations.job import (
+    MAXIMUM_PHYSICAL_ATTEMPTS,
     ContinuationJob,
     continuation_result_reference,
     execute_continuation_job,
@@ -66,7 +67,8 @@ class ContinuationCampaignSpec(ContractModel):
     """An evaluation schedule, with no weight update, promotion or protected-audit authority.
 
     Attributes:
-        initial: Complete source attempt job; set study.repeats=16 for the proposed schedule.
+        initial: Complete source attempt job; its study repeats are the source attempts
+            every selector inspects and the critics' base rate is measured on.
         selectors: Registered retrospective selector models, all retained without winner picking.
         critics: Prospective critic templates; every selector is evaluated with each critic.
         points: Maximum selected points per selector, default four.
@@ -116,8 +118,11 @@ class ContinuationCampaignSpec(ContractModel):
                 or critic.deadline != job.deadline
             ):
                 raise ValueError("campaign critic must match the frozen actor/verifier/deadline")
-        if self.attempt_bound() > 100000:
-            raise ValueError("campaign exceeds the 100000 actor/selector/critic attempt ceiling")
+        if self.attempt_bound() > MAXIMUM_PHYSICAL_ATTEMPTS:
+            raise ValueError(
+                f"campaign exceeds the {MAXIMUM_PHYSICAL_ATTEMPTS} actor/selector/critic "
+                "attempt ceiling"
+            )
         return self
 
     def attempt_bound(self) -> int:
@@ -182,8 +187,8 @@ class ContinuationCampaign(ContractModel):
     metrics: JsonObject
     scope: str = (
         "development evaluation schedule; retrospective selectors, prospective critics; "
-        "correlated source attempts and model errors; no GRPO, training warm-up, "
-        "weight updates, independent task correctness or promotion"
+        "correlated source attempts and model errors; no weight updates, "
+        "independent task correctness or promotion"
     )
 
 
@@ -292,7 +297,8 @@ def _metrics(
         ):
             raise ValueError("campaign selector differs from its frozen draw")
         proposals = propose_checkpoints(project, selector_spec, code_revision=revision)
-        assert proposals is not None
+        if proposals is None:
+            raise RuntimeError("checkpoint proposals returned no report outside a dry run")
         if cell.experiment is None:
             if cell.failure is None:
                 raise ValueError("campaign cell lost its unfinished or abstained experiment")
@@ -466,7 +472,10 @@ def run_continuation_campaign(
                         proposals = propose_checkpoints(
                             project, selector_spec, code_revision=code_revision
                         )
-                        assert proposals is not None
+                        if proposals is None:
+                            raise RuntimeError(
+                                "checkpoint proposals returned no report outside a dry run"
+                            )
                         proposals_ref = artifact_input(
                             store.read(selector_spec.identity(code_revision)).manifest
                         )

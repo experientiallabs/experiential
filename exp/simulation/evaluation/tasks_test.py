@@ -17,6 +17,7 @@ from exp.simulation.evaluation.admission import (
     verify_label_witness,
 )
 from exp.simulation.evaluation.tasks import (
+    LIMIT_STOP_REASONS,
     EvaluationTask,
     FieldRelation,
     OutcomeRule,
@@ -278,7 +279,7 @@ def test_revision_proposal_forbids_code_and_world_changes() -> None:
 
 
 @pytest.mark.parametrize(
-    "stop_reason", ["actor_failure", "simulator_failure", "failure", "maximum_steps", "unknown"]
+    "stop_reason", ["actor_failure", "simulator_failure", "failure", "cancelled", "unknown"]
 )
 def test_unavailable_or_empty_workflow_cannot_satisfy_a_weak_verifier(stop_reason: str) -> None:
     """A matching initial value cannot turn a stopped or nonexistent execution into success."""
@@ -299,6 +300,26 @@ def test_unavailable_or_empty_workflow_cannot_satisfy_a_weak_verifier(stop_reaso
         grade(verifier(None), evidence.model_copy(update={"stop_reason": "completed"})).status
         == "unassessable"
     )
+
+
+@pytest.mark.parametrize("stop_reason", sorted(LIMIT_STOP_REASONS))
+def test_declared_limit_stop_is_a_known_goal_failure(stop_reason: str) -> None:
+    """Running out of budget fails the goal and stays known, even over a satisfying state."""
+    limited = {**outcome("done"), "stop_reason": stop_reason}
+    graded = grade(verifier("done"), limited)
+    assert (graded.status, graded.goal.status, graded.policy.status) == ("fail", "fail", "pass")
+    assert not graded.complete
+    assert stop_reason in graded.reason
+    violating = TaskVerifier(
+        description="Only reads are allowed.",
+        outcome_schema={},
+        required_paths=("/final_state/status",),
+        allowed_tools=("read",),
+    )
+    step = {"action": {"name": "write", "arguments": {}}, "status": "valid", "after": {}}
+    assert grade(violating, {**limited, "steps": [step]}).policy.status == "fail"
+    unobserved = {**limited, "steps": [{**step, "status": "failure"}]}
+    assert grade(verifier("done"), unobserved).status == "unassessable"
 
 
 def test_answer_only_completed_workflow_remains_assessable() -> None:

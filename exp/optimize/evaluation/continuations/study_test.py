@@ -5,11 +5,14 @@ from pathlib import Path
 
 import pytest
 
-from exp.common.core.artifacts import JsonObject, sha256_json
+from exp.common.core.artifacts import ArtifactInput, JsonObject, sha256_json
 from exp.common.models import AssistantAction, ModelRequest, ModelResponse, ToolCall
 from exp.common.project import ArtifactStore, ProjectPaths
 from exp.optimize.evaluation.continuations.study import (
+    ContinuationBranch,
+    ContinuationStudy,
     ContinuationStudySpec,
+    known_outcomes,
     run_continuation_study,
 )
 from exp.runtime.agents.chat import ChatAgentRuntime
@@ -20,13 +23,14 @@ from exp.runtime.environments.workbook_edits import WorkbookEditAdapter, read_su
 from exp.runtime.environments.world_contracts import ExecutableCheckpoint
 from exp.runtime.environments.worlds import ExecutableWorldRuntime
 from exp.runtime.models.call_evidence import current_call_intent, current_consumer
+from exp.runtime.models.providers.transport import ProviderTransportError
 from exp.simulation.continuations import (
     ContinuationCheckpoint,
     WorldCheckpoint,
     persist_continuation_checkpoint,
 )
 from exp.simulation.continuations_test import capsule
-from exp.simulation.evaluation.tasks import OutcomeRule, TaskVerifier
+from exp.simulation.evaluation.tasks import OutcomeRule, TaskVerifier, grade
 from exp.simulation.reconstruction.models import resolve
 
 
@@ -130,6 +134,21 @@ def test_native_workbook_branches_restore_same_world_and_replay_without_calls(
     assert result.metrics()["training_admitted"] is False
 
 
+class OutageModel(_Model):
+    """Scripted actor model whose provider is unreachable once its responses run out.
+
+    A provider failure is retained as an outcome-unknown branch; the base double's exhaustion
+    error would instead propagate as a programming error.
+    """
+
+    def complete(self, request: ModelRequest) -> ModelResponse:
+        """Return the next scripted response, or fail like an unreachable provider."""
+        try:
+            return super().complete(request)
+        except StopIteration:
+            raise ProviderTransportError("provider unavailable") from None
+
+
 def test_failed_branches_stay_in_denominator_and_are_not_redrawn(tmp_path: Path) -> None:
     """An unavailable actor result is unknown, never a failed skill label or a fresh retry."""
     store = ArtifactStore(ProjectPaths(tmp_path, "case"))
@@ -150,7 +169,7 @@ def test_failed_branches_stay_in_denominator_and_are_not_redrawn(tmp_path: Path)
         store,
         spec,
         actor=actor,
-        model=_Model(()),
+        model=OutageModel(()),
         world=workbook_runtime(checkpoint.world),
         probe=probe,
         probe_sha256=spec.probe_sha256,
@@ -160,7 +179,7 @@ def test_failed_branches_stay_in_denominator_and_are_not_redrawn(tmp_path: Path)
     assert result.metrics()["assessable"] == 0
     assert result.metrics()["brier"] is None
     assert all(row.status == "outcome_unknown" for row in result.branches)
-    assert all(row.failure == "StopIteration" for row in result.branches)
+    assert all(row.failure == "ProviderTransportError" for row in result.branches)
     with pytest.raises(ValueError, match="changed"):
         run_continuation_study(
             store,
@@ -594,3 +613,112 @@ def test_actor_request_is_durable_before_interruption_and_unknown_is_not_redrawn
     assert result.branches[0].status == "outcome_unknown"
     assert result.branches[0].failure_detail is not None
     assert result.branches[0].failure_detail.details["phase"] == "interrupted_branch"
+
+
+def test_step_limit_stops_stay_in_the_resumed_success_denominator() -> None:
+    """An arm that runs out of steps more often cannot report a higher success rate."""
+    verifier = TaskVerifier(
+        description="Answer done.",
+        outcome_schema={"properties": {"final_answer": {"const": "done"}}},
+        required_paths=("/final_answer",),
+    )
+    spec = ContinuationStudySpec(
+        checkpoint=ArtifactInput(artifact_id="checkpoint", sha256="0" * 64),
+        actor_model=_response(AssistantAction(content="done")).model,
+        verifier=verifier,
+        probe_sha256=sha256_json({"probe": "none"}),
+        repeats=4,
+        selector="denominator scenario",
+    )
+
+    def study(*stops: tuple[str, str | None]) -> ContinuationStudy:
+        """Grade completed branches with the given actor stop reason and final answer."""
+        branches = []
+        for index, (stop_reason, answer) in enumerate(stops):
+            outcome: JsonObject = {"steps": [], "final_answer": answer, "stop_reason": stop_reason}
+            branches.append(
+                ContinuationBranch(
+                    index=index,
+                    status="completed",
+                    outcome=outcome,
+                    assessment=grade(verifier, outcome),
+                )
+            )
+        return ContinuationStudy(spec=spec, branches=tuple(branches))
+
+    exhausted = study(
+        ("completed", "done"),
+        ("maximum_steps", None),
+        ("maximum_steps", None),
+        ("length", "do"),
+    ).metrics()
+    finishing = study(
+        ("completed", "done"),
+        ("completed", "done"),
+        ("completed", "wrong"),
+        ("completed", "wrong"),
+    ).metrics()
+    assert (exhausted["assessable"], exhausted["unassessable"]) == (4, 0)
+    assert exhausted["resumed_success_rate"] == 0.25
+    assert finishing["resumed_success_rate"] == 0.5
+
+
+def test_known_outcomes_label_passes_and_failures_and_skip_unknowns() -> None:
+    """Only assessed grades become labels; missing and unassessable grades stay unknown."""
+    verifier = TaskVerifier(
+        description="Answer done.",
+        outcome_schema={"properties": {"final_answer": {"const": "done"}}},
+        required_paths=("/final_answer",),
+    )
+    passed = grade(verifier, {"steps": [], "final_answer": "done", "stop_reason": "completed"})
+    failed = grade(verifier, {"steps": [], "final_answer": "no", "stop_reason": "completed"})
+    unknown = grade(verifier, {"steps": [], "final_answer": "done", "stop_reason": "failure"})
+    assert known_outcomes((passed, None, failed, unknown, passed)) == (1, 0, 1)
+
+
+def test_programming_error_propagates_and_leaves_the_branch_unknown(tmp_path: Path) -> None:
+    """A defect is not recorded as a measurement; its saved intent keeps the branch unknown."""
+    store = ArtifactStore(ProjectPaths(tmp_path, "case"))
+    checkpoint, actor = capsule(store)
+    ref = persist_continuation_checkpoint(
+        store, checkpoint, created_at=datetime.now(UTC), code_revision="test"
+    )
+    spec = ContinuationStudySpec(
+        checkpoint=ref,
+        actor_model=_response(AssistantAction(content="done")).model,
+        verifier=TaskVerifier(description="Declared test.", outcome_schema={}),
+        probe_sha256="a" * 64,
+        repeats=1,
+        selector="fixture",
+    )
+
+    def broken(world: WorldCheckpoint) -> JsonObject:
+        """Fail like a probe with a coding defect."""
+        raise TypeError("probe defect")
+
+    world = workbook_runtime(checkpoint.world)
+    with pytest.raises(TypeError, match="probe defect"):
+        run_continuation_study(
+            store,
+            spec,
+            actor=actor,
+            model=_Model(()),
+            world=world,
+            probe=broken,
+            probe_sha256=spec.probe_sha256,
+            code_revision="test",
+        )
+    model = _Model((_response(AssistantAction(content="done")),))
+    result = run_continuation_study(
+        store,
+        spec,
+        actor=actor,
+        model=model,
+        world=world,
+        probe=probe,
+        probe_sha256=spec.probe_sha256,
+        code_revision="test",
+    )
+    assert result.branches[0].status == "outcome_unknown"
+    assert result.branches[0].failure == "UnfinishedDispatchIntent"
+    assert not model.requests

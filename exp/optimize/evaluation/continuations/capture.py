@@ -18,7 +18,7 @@ from exp.common.core.artifacts import (
 )
 from exp.common.project import ProjectStore, artifact_input
 from exp.common.tasks import TaskCase
-from exp.optimize.evaluation.continuations.job import load_runtime_definition
+from exp.optimize.evaluation.executable.loader import load_runtime_definition
 from exp.runtime.agents.chat import ChatAgentRuntime
 from exp.simulation.continuations import (
     ContinuationCheckpoint,

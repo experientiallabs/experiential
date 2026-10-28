@@ -39,6 +39,7 @@ from exp.optimize.evaluation.continuations.records import load_study
 from exp.optimize.evaluation.continuations.selection import (
     CheckpointProposal,
     CheckpointSelectionSpec,
+    checkpoint_content_digest,
     load_selection_plan,
     match_checkpoints,
     persist_selection_plan,
@@ -350,15 +351,7 @@ def _render(
         if point.task != base.task or point.world_task != base.world_task:
             raise ValueError("selector studies must share the exact task and world task")
         remaining = actor.remaining_calls(point.actor)
-        world = point.world.model_dump(mode="json")
-        world.pop("episode_id", None)
-        digest = sha256_json(
-            {
-                "task": point.task.model_dump(mode="json"),
-                "actor": point.actor.model_dump(mode="json"),
-                "world": world,
-            }
-        )
+        digest = checkpoint_content_digest(point)
         reason = "terminal" if remaining <= 0 else "duplicate_content" if digest in seen else None
         if reason is not None:
             excluded.append({"checkpoint": point_ref.model_dump(mode="json"), "reason": reason})
@@ -539,6 +532,25 @@ def propose_checkpoints(
                 return None
             if datetime.now(UTC) >= spec.deadline:
                 raise ValueError("selector deadline expired; register a new study before inference")
+            transport = AdmittedJsonTransport(
+                HttpxJsonTransport(),
+                artifacts=store,
+                code_revision=code_revision,
+                deadline=spec.deadline,
+                ledger=DispatchLedger(
+                    store.project_directory / (identity + ".sqlite"), 1, sha256_json(spec)
+                ),
+            )
+            catalog = load_model_catalog(project.model_catalog_path)
+            if sha256_json(catalog.model_dump(mode="json")) != spec.catalog_sha256:
+                raise ValueError("selector catalog changed; restore its frozen configuration")
+            # Resolve credentials before the intent: a refusal here dispatched nothing, so it
+            # must stay retryable rather than become an unknown-outcome draw.
+            model = RuntimeModelCatalog(catalog, transport_factory=lambda: transport).resolve(
+                spec.selector_alias
+            )
+            if model.snapshot != spec.selector_model:
+                raise ValueError("selector model differs from its frozen snapshot")
             store.write_json(
                 artifact_id=intent_id,
                 artifact_type="checkpoint-selector-intent",
@@ -551,23 +563,6 @@ def propose_checkpoints(
                 files={"spec.json": spec, "request.json": request},
             )
             intent = artifact_input(store.read(intent_id).manifest)
-            transport = AdmittedJsonTransport(
-                HttpxJsonTransport(),
-                artifacts=store,
-                code_revision=code_revision,
-                deadline=spec.deadline,
-                ledger=DispatchLedger(
-                    store.project_directory / (identity + ".sqlite"), 1, sha256_json(spec)
-                ),
-            )
-            catalog = load_model_catalog(project.model_catalog_path)
-            if sha256_json(catalog.model_dump(mode="json")) != spec.catalog_sha256:
-                raise ValueError("selector catalog changed before dispatch; intent retained")
-            model = RuntimeModelCatalog(catalog, transport_factory=lambda: transport).resolve(
-                spec.selector_alias
-            )
-            if model.snapshot != spec.selector_model:
-                raise ValueError("selector model differs before dispatch")
             with canonical_call(intent):
                 response = model.client.complete(request)
             store.write_json(

@@ -12,15 +12,36 @@ from exp.common.project import ProjectStore
 from exp.optimize.evaluation.audit.panel_test import write_catalog
 from exp.optimize.evaluation.continuations.admission import ContinuationAdmission
 from exp.optimize.evaluation.continuations.admission_test import admitted_workbook_study
+from exp.optimize.evaluation.continuations.framing import FramingStudySpec
 from exp.optimize.evaluation.continuations.job import (
+    MAXIMUM_PHYSICAL_ATTEMPTS,
     ContinuationJob,
     execute_continuation_job,
     preflight_continuation_job,
 )
 from exp.optimize.evaluation.continuations.records import load_study
 from exp.runtime.environments.tests.world_conformance_test import workbook_case
-from exp.runtime.models.providers.transport import JsonHttpResponse, ScriptedJsonTransport
+from exp.runtime.models.providers.transport import (
+    JsonHttpResponse,
+    ProviderTransportError,
+    ScriptedJsonTransport,
+)
 from exp.runtime.models.registry import RuntimeModelCatalog
+
+
+class OutageTransport(ScriptedJsonTransport):
+    """Scripted provider that is unreachable once its replies run out.
+
+    Continuation runners retain provider failures as outcome-unknown measurements, while a
+    programming error (such as the base double's unexpected-request assertion) propagates. Fixtures
+    that model an unavailable provider therefore end in a transport failure, not an assertion.
+    """
+
+    def _answer(self) -> JsonHttpResponse:
+        """Serve the next scripted reply, or fail like an unreachable provider."""
+        if not self._responses:
+            raise ProviderTransportError("scripted provider has no further replies")
+        return super()._answer()
 
 
 def job_fixture(
@@ -38,7 +59,7 @@ def job_fixture(
     catalog = load_model_catalog(project.model_catalog_path)
     model = RuntimeModelCatalog(catalog).resolve("world")
     runtime = tmp_path / "selected_runtime.py"
-    runtime.write_text("""from exp.optimize.evaluation.continuations.job import ContinuationRuntime
+    runtime.write_text("""from exp.optimize.evaluation.executable.loader import ContinuationRuntime
 from exp.optimize.evaluation.continuations.study_test import probe, workbook_runtime
 from exp.simulation.continuations import load_continuation_checkpoint
 from exp.common.core.artifacts import ArtifactInput
@@ -78,7 +99,7 @@ def continuation_runtime(project, configuration):
         {"role": "assistant", "content": "done"},
         {"role": "assistant", "content": "unsupported completion"},
     ]
-    transport = ScriptedJsonTransport(
+    transport = OutageTransport(
         tuple(
             JsonHttpResponse(
                 status_code=200,
@@ -141,3 +162,22 @@ def test_runtime_drift_refuses_before_code_or_provider_calls(
     with pytest.raises(ValueError, match="runtime source changed"):
         execute_continuation_job(project, job, code_revision="test")
     assert not transport.requests
+
+
+def test_one_physical_attempt_ceiling_bounds_jobs_and_composed_panels(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A job and a panel composed from jobs share the same named attempt ceiling."""
+    _, job, _ = job_fixture(tmp_path, monkeypatch)
+    with pytest.raises(ValueError, match="less than or equal"):
+        job.model_validate(
+            {**job.model_dump(), "maximum_physical_attempts": MAXIMUM_PHYSICAL_ATTEMPTS + 1}
+        )
+    largest = job.model_copy(
+        update={
+            "maximum_physical_attempts": MAXIMUM_PHYSICAL_ATTEMPTS,
+            "study": job.study.model_copy(update={"training_specification": None}),
+        }
+    )
+    with pytest.raises(ValueError, match="physical-attempt ceiling"):
+        FramingStudySpec(base=largest, intervention="Evaluation", equivalence_rationale="cue")

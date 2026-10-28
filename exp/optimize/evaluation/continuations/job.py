@@ -1,11 +1,12 @@
-"""CLI composition of trusted executable runtimes and bounded continuation actors."""
+"""Frozen continuation jobs: preflight, admitted execution and saved-result lookup.
 
-import importlib.util
-from collections.abc import Callable
-from dataclasses import dataclass
+A job binds one continuation study to an operator-selected trusted runtime file, an actor catalog
+alias and finite provider allowances. Execution meters every actor HTTP attempt through the
+admitted transport; saved results are read back without loading runtime code or credentials.
+"""
+
 from datetime import UTC, datetime
 from pathlib import Path
-from types import ModuleType
 
 from pydantic import AwareDatetime, Field
 
@@ -16,7 +17,6 @@ from exp.common.core.artifacts import (
     Sha256,
     sha256_bytes,
     sha256_json,
-    stable_id,
 )
 from exp.common.models import load_model_catalog
 from exp.common.project import ProjectStore, artifact_input
@@ -24,10 +24,13 @@ from exp.optimize.evaluation.continuations.records import load_study
 from exp.optimize.evaluation.continuations.study import (
     ContinuationStudy,
     ContinuationStudySpec,
-    WorldRuntime,
     run_continuation_study,
+    study_identity,
 )
-from exp.optimize.evaluation.executable.provider_grant import ProviderGrant
+from exp.optimize.evaluation.executable.loader import (
+    ContinuationRuntime,
+    load_runtime_definition,
+)
 from exp.runtime.agents.chat import ChatAgentRuntime
 from exp.runtime.models.providers.admitted_transport import (
     AdmittedJsonTransport,
@@ -36,23 +39,12 @@ from exp.runtime.models.providers.admitted_transport import (
 from exp.runtime.models.providers.transport import HttpxJsonTransport
 from exp.runtime.models.registry import RuntimeModelCatalog
 from exp.runtime.sessions.dispatch_ledger import DispatchLedger
-from exp.simulation.continuations import WorldCheckpoint, load_continuation_checkpoint
+from exp.simulation.continuations import load_continuation_checkpoint
 from exp.simulation.development_scope import require_development_task
 
-
-@dataclass(frozen=True)
-class ContinuationRuntime:
-    """Trusted environment implementation selected explicitly by the operator.
-
-    Attributes:
-        world: Existing executable or mixed runtime with exact restore semantics.
-        probe: Evaluator-only state projection, never passed to the actor.
-        probe_sha256: Digest of the projection definition checked against registration.
-    """
-
-    world: WorldRuntime
-    probe: Callable[[WorldCheckpoint], JsonObject]
-    probe_sha256: Sha256
+# Shared ceiling on durable provider attempts registered by one continuation job and by every
+# panel, experiment, contrast or campaign composed from jobs, counted before any dispatch.
+MAXIMUM_PHYSICAL_ATTEMPTS = 100_000
 
 
 class ContinuationJob(ContractModel):
@@ -80,7 +72,7 @@ class ContinuationJob(ContractModel):
     catalog_sha256: Sha256
     maximum_model_calls: int = Field(gt=0, le=1000)
     system_prompt: str | None = None
-    maximum_physical_attempts: int = Field(gt=0, le=100_000)
+    maximum_physical_attempts: int = Field(gt=0, le=MAXIMUM_PHYSICAL_ATTEMPTS)
     deadline: AwareDatetime
 
     def implementation(self, code_revision: str) -> Sha256:
@@ -131,13 +123,7 @@ def saved_continuation_job(
     project: ProjectStore, job: ContinuationJob, *, code_revision: str
 ) -> ContinuationStudy | None:
     """Read the complete saved study without loading environment code or provider credentials."""
-    identity = (
-        stable_id(
-            "continuation-study",
-            {"spec": sha256_json(job.study), "code": job.implementation(code_revision)},
-        )
-        + "-result"
-    )
+    identity = study_identity(job.study, job.implementation(code_revision)) + "-result"
     if not project.artifacts.exists(identity):
         return None
     return load_study(project.artifacts, artifact_input(project.artifacts.read(identity).manifest))
@@ -218,64 +204,11 @@ def load_continuation_runtime(project: ProjectStore, job: ContinuationJob) -> Co
     )
 
 
-def load_runtime_definition(
-    project: ProjectStore,
-    *,
-    runtime_file: Path,
-    runtime_sha256: Sha256,
-    configuration: JsonObject,
-    probe_sha256: Sha256,
-    provider_grant: ProviderGrant | None = None,
-) -> ContinuationRuntime:
-    """Execute verified factory bytes for initial capture or exact checkpoint restoration."""
-    if provider_grant is not None:
-        provider_grant.require_configuration(project, configuration, runtime_sha256=runtime_sha256)
-    module = load_runtime_module(runtime_file, runtime_sha256)
-    entrypoint = "continuation_runtime" if provider_grant is None else "trial_runtime"
-    factory = getattr(module, entrypoint, None)
-    if not callable(factory):
-        raise ValueError(f"runtime must export {entrypoint} for this execution authority")
-    runtime = (
-        factory(project, configuration)
-        if provider_grant is None
-        else factory(project, configuration, provider_grant)
-    )
-    if not isinstance(runtime, ContinuationRuntime):
-        raise ValueError("runtime factory must return ContinuationRuntime")
-    if runtime.probe_sha256 != probe_sha256:
-        raise ValueError("runtime probe differs from the frozen definition")
-    return runtime
-
-
-def load_runtime_module(runtime_file: Path, runtime_sha256: Sha256) -> ModuleType:
-    """Import only the explicitly selected source bytes, never model-generated executable code."""
-    module_spec = importlib.util.spec_from_file_location(
-        "exp_continuation_runtime_" + runtime_sha256, runtime_file
-    )
-    if module_spec is None or module_spec.loader is None:
-        raise ValueError("runtime file cannot be loaded as a Python module")
-    module = importlib.util.module_from_spec(module_spec)
-    source = runtime_file.read_bytes()
-    if sha256_bytes(source) != runtime_sha256:
-        raise ValueError("runtime source changed after preflight")
-    exec(compile(source, str(runtime_file), "exec"), module.__dict__)
-    return module
-
-
 def continuation_result_reference(
     project: ProjectStore, job: ContinuationJob, *, code_revision: str
 ) -> ArtifactInput:
     """Return the verified immutable result reference for CLI handoffs and downstream evidence."""
     if saved_continuation_job(project, job, code_revision=code_revision) is None:
         raise ValueError("continuation job has no complete saved result")
-    identity = (
-        stable_id(
-            "continuation-study",
-            {
-                "spec": sha256_json(job.study),
-                "code": job.implementation(code_revision),
-            },
-        )
-        + "-result"
-    )
+    identity = study_identity(job.study, job.implementation(code_revision)) + "-result"
     return artifact_input(project.artifacts.read(identity).manifest)

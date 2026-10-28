@@ -15,10 +15,10 @@ from exp.common.core.artifacts import (
 )
 from exp.common.project import ProjectStore
 from exp.common.release_revision import installed_execution_revision
-from exp.optimize.evaluation.continuations.job import ContinuationRuntime, load_runtime_definition
 from exp.optimize.evaluation.executable.grounded import GroundedRuntimeDefinition
 from exp.optimize.evaluation.executable.grounded import continuation_runtime as grounded_runtime
 from exp.optimize.evaluation.executable.grounded import trial_runtime as granted_grounded_runtime
+from exp.optimize.evaluation.executable.loader import ContinuationRuntime, load_runtime_definition
 from exp.optimize.evaluation.executable.provider_grant import ProviderGrant
 from exp.runtime.environments.mixed import (
     MixedCheckpoint,

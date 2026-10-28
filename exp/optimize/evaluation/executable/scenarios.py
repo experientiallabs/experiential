@@ -23,7 +23,7 @@ from exp.common.models import ToolCall
 from exp.common.project import ProjectStore, artifact_input
 from exp.common.tasks import TaskCase, ToolSchema
 from exp.optimize.evaluation.continuations.capture import CaptureDefinition, preflight_capture
-from exp.optimize.evaluation.continuations.job import load_runtime_definition
+from exp.optimize.evaluation.executable.loader import load_runtime_definition
 from exp.runtime.agents.chat import ChatAgentRuntime
 from exp.runtime.environments.world_artifacts import load_world_image
 from exp.runtime.environments.world_contracts import ExecutableCheckpoint

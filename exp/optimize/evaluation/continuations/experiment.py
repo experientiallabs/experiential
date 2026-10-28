@@ -14,6 +14,7 @@ from exp.common.core.artifacts import (
     sha256_json,
     stable_id,
 )
+from exp.common.evaluations.uncertainty import missing_outcome_bounds
 from exp.common.project import ProjectStore, artifact_input
 from exp.optimize.evaluation.continuations.critic import (
     CriticSpec,
@@ -23,6 +24,7 @@ from exp.optimize.evaluation.continuations.critic import (
     preflight_critic,
 )
 from exp.optimize.evaluation.continuations.job import (
+    MAXIMUM_PHYSICAL_ATTEMPTS,
     ContinuationJob,
     continuation_result_reference,
     execute_continuation_job,
@@ -31,6 +33,7 @@ from exp.optimize.evaluation.continuations.job import (
 )
 from exp.optimize.evaluation.continuations.records import load_study
 from exp.optimize.evaluation.continuations.selection import load_selection_plan, selection_jobs
+from exp.optimize.evaluation.continuations.study import known_outcomes
 from exp.optimize.evaluation.executable.deferral import (
     deferred_execution,
     record_execution_deferral,
@@ -131,7 +134,7 @@ def preflight_checkpoint_experiment(project: ProjectStore, spec: CheckpointExper
         if spec.critic is not None:
             preflight_critic(project, _critic(spec.critic, job))
             attempts += spec.critic.maximum_physical_attempts
-    if attempts > 100_000:
+    if attempts > MAXIMUM_PHYSICAL_ATTEMPTS:
         raise ValueError("checkpoint experiment exceeds its combined actor/critic attempt ceiling")
 
 
@@ -147,11 +150,7 @@ def _metrics(project: ProjectStore, cells: tuple[ExperimentCell, ...]) -> JsonOb
             if cell.result is None:
                 continue
             result = load_study(project.artifacts, cell.result)
-            labels = [
-                int(row.assessment.status == "pass")
-                for row in result.branches
-                if row.assessment is not None and row.assessment.status != "unassessable"
-            ]
+            labels = known_outcomes(row.assessment for row in result.branches)
             passed += sum(labels)
             known += len(labels)
             mixed += bool(labels and 0 < sum(labels) < len(labels))
@@ -173,9 +172,7 @@ def _metrics(project: ProjectStore, cells: tuple[ExperimentCell, ...]) -> JsonOb
             "successes": passed,
             "assessable": known,
             "unknown": planned - known,
-            "success_bounds": None
-            if not planned
-            else [passed / planned, (passed + planned - known) / planned],
+            "success_bounds": missing_outcome_bounds(passed, planned - known, planned),
             "checkpoints_with_both_success_and_failure": mixed,
             "critic_assessable_checkpoints": len(briers),
             "critic_failures": sum(critic_failures.values()),

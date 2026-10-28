@@ -50,7 +50,7 @@ PROTOCOLS = (
             "exp.simulation.evaluation.tasks",
             "exp.simulation.evaluation.admission",
         ),
-        "04713c2d37d0f5512507a26caa1ba2ea63cd18ec26eeb806f9df923773317328",
+        "098aea4090b56992b1a19ad02b1b44e1b64249322d58b7d09b786ecf53c6ab1b",
     ),
     Protocol(
         "exp.optimize.evaluation.tasks.challenges:CHALLENGE_PROTOCOL",
@@ -89,13 +89,32 @@ PROTOCOLS = (
             "exp.optimize.evaluation.continuations.proposals:_packet",
             "exp.optimize.evaluation.continuations.proposals:_render",
         ),
-        "cb2ad6e8c7435817a17943b6a440dc68ee15aa83cf73b02513c1707c296c43e9",
+        "9a6f924c6f413f3da8911eeb078b3d45b92a89b9838766fbd14eaff378a54135",
     ),
     Protocol(
         "exp.optimize.evaluation.learning.sample_count:SAMPLE_COUNT_PROTOCOL",
         "sample-count-v1",
         ("exp.optimize.evaluation.learning.sample_count",),
         "0d6a436e42eb2fafe530930865ad937351745c78d81aa83495007a1c753daef8",
+    ),
+    Protocol(
+        "exp.optimize.evaluation.learning.screening:SCREENING_PROTOCOL",
+        "learning-miss-screening-v1",
+        (
+            "exp.optimize.evaluation.learning.screening:screening_request",
+            "exp.optimize.evaluation.learning.screening:_bounded",
+            "exp.optimize.evaluation.learning.screening:_probabilities",
+        ),
+        "de36bab2fa626f87e9673bb8bfd220fa6e2051631cb443c15eb519016a353485",
+    ),
+    Protocol(
+        "exp.optimize.evaluation.learning.lesson_evolution:EVOLUTION_PROTOCOL",
+        "lesson-evolution-v3",
+        (
+            "exp.optimize.evaluation.learning.lesson_evolution:_attempt",
+            "exp.optimize.evaluation.learning.lesson_evolution:evolve_lessons",
+        ),
+        "89ba387276193e7a3435a0e5617821c0b37db5ad2654aff1509f2a00051f0a74",
     ),
     Protocol(
         "exp.runtime.models.providers.attempt_timeouts:ATTEMPT_TIMEOUT_PROTOCOL",
@@ -119,7 +138,7 @@ PROTOCOLS = (
         "exp.optimize.evaluation.executable.workbook:PRIVATE_VIEWS_PROTOCOL",
         "private-workbook-views-v2",
         ("exp.optimize.evaluation.executable.workbook",),
-        "19b915db0979a376e0071f9a64cd26f4554f116044b83de063c85b9f3a0fb428",
+        "e14d471c25cadda4e5cc1750bf8784a8f3576d87b37589c8d70a4561a0ed8881",
     ),
     Protocol(
         "exp.runtime.environments.record_world:RECORD_WORLD_PROTOCOL",

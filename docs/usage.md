@@ -520,6 +520,24 @@ judge, not a score), and the learning curve. The report
 names the audited checkpoint (memory lineage, version and `fit` scope). The build's all-traces
 memory is a different checkpoint, which this audit does not evaluate independently.
 
+Screened lessons. Learning records a miss on every inexact step; most describe one instance's
+data, not how the environment behaves. To compare memory profiles on any project:
+
+1. `exp eval PROJECT --audit N --audit-memory learned` learns the fit-only memory and audits it.
+2. Screen its misses with `--continuations` and `{"action": "repair-learning", "learning_repair":
+   {"resolution": "screen-lessons"}}` (`--dry-run` first: misses, new decisions, estimate). One
+   native decision per miss (recall alias) gives three probabilities: reusable behaviour, already
+   covered, supported by the recorded reply. The threshold is fitted on the fit split from saved
+   same-tool deliveries and saved; unknown decisions are never redrawn. Screened-in misses become
+   `unresolved` rule entries `derived_from` their trajectory; the rest stay source evidence.
+3. `--audit N --include-inspected --audit-memory none`, then the same with `lessons` (only
+   screened-in records and their overview lines, no raw observations): the same cases and specs
+   except memory, reported as development re-audits of step 1's lineages.
+4. Optionally `"resolution": "evolve-lessons"`, `lessons` set to the printed `lesson_set` and a
+   fresh `run_id`: one proposed rule edit, replayed on held-out and protected fit lineages without
+   memory, `accepted` only on a strict exact-reply gain without regressions; every attempt stays
+   `research`. Pass the returned `library` to build on an accepted edit.
+
 A held-out lineage stays independent only while nobody has read its per-trace results, or the
 results of anything grouped with it. That fact is kept in one exposure ledger at the `.exp` root
 (`<root>/exposure-ledger/ledger.sqlite`), shared by every project on the machine, so it survives
@@ -907,85 +925,22 @@ optional exact `EvaluationMemory`, task, manifest, initial domain state, private
 deadline and cumulative physical-attempt ceiling. Its predictor, query embeddings and memory
 readers share admission. Provider SDKs bypassing that transport are refused. Projections from
 this factory have simulated authority; they do not establish native truth. Missing memory means
-no learned memory is delivered. `workbook_runtime.py` binds immutable XLSX inputs and private worksheet
+no learned memory is delivered. Optional `facts` (`ReplayFacts`: the same validated, provenance-bearing
+`InstanceFacts` and held-out reservation rules as fidelity replay, with `first_version` the start's state
+version) condition every simulated prediction in the separate `instance_facts` channel with the same
+guidance, beside native read receipts. Facts are not state: they are never a writable domain or part of
+a checkpoint image, and nothing is derived from native state. Only starting-state facts are accepted, and
+the `native-read/` key prefix is reserved. Facts re-key the definition, ledger and backend digest, so a
+checkpoint restores only under the same facts; definitions without facts keep their identities. Declare
+them under `simulated` in the mixed definition, or in any continuation or `compare-environments` job. `workbook_runtime.py` binds immutable XLSX inputs and private worksheet
 digest views. `mixed_runtime.py` combines a native factory with this simulator and real/simulated routes under one
 manifest; private projections stay under separate `native` and `simulated` keys. Execution receipts
 bind release plus installed EXP source/resource digest; code changes require fresh qualification. Third-party dependencies remain host-owned. Owned executable-world shadow routes refuse at setup until an independent mirror contract exists; cross-owner writes remain unsupported.
 
 ### Continuation, Harbor and training CLI
 
-All continuation operations use the existing command:
-```bash
-exp eval PROJECT --root ROOT --continuations operation.json --dry-run
-exp eval PROJECT --root ROOT --continuations operation.json --yes --non-interactive
-```
-
-Paid operations display actor and maintained simulator dependency estimates before consent. Unknown prices or custom-runtime allowances remain explicit; known subtotals are not total budgets. Actor and simulator physical-attempt ceilings are separate durable limits, not a shared dollar cap.
-
-`operation.json` uses `ContinuationCommand`; `register-brief` saves a source-linked `CapabilityBrief`. `compare-environments` takes `equivalence: EquivalenceSpec`: native/reference, repeated-reference and candidate actors, material checks and council reviews. Review attempts are divided equally across planned judgments and analysts so early retries cannot spend later reviewers' allowance; the budget must cover at least one attempt each. For multi-family qualification and delivery, use `--pipeline pipeline.json` with `TaskFactorySpec`; see the [development factory scope](release-scope.md#development-task-factory).
-
-- `action: "capture"`, `capture: CaptureDefinition`: pin sources/runtime SHA-256 and save the initial world and zero-call actor context. Saved replay imports no runtime; unknown startup refuses retry.
-- `action: "prepare-scenario"`, `scenario: RecordScenarioSpec`: replay native setup twice, retain full kernel checkpoints, and publish a continuation seed with only explicit `public_fields`. `setup_tools` are separate from actor tools. `action: "search-scenarios"`, `scenario_search: ScenarioSearchSpec` tests two or more supplied native constructions against independent control witnesses, then publishes discriminating scenario variants. Positive controls also receive up to 256 synthetic final-state perturbations each; candidate false passes against the independent specification block publication and remain in `verifier_probes`. These probes are not native witnesses or training labels; the report states truncated coverage. Optional `target: ScenarioResearchTarget` retains cited research and a named hypothesis, with source quotes checked before execution; see [scope](release-scope.md#development-task-factory). Neither operation grants qualification. `TaskVerifier.table_relations` checks complete observed rows (identity or global first/last per key), with explicit headers, order and null semantics; workbook views expose typed rows only with `include_rows: true`, privately to the evaluator. A view of an output the actor has not written is unavailable evidence; only a preservation view sets `baseline_until_written: true` to read its input until the output exists. Declare the requirement independently of generated answer files.
-- `action: "witness-record"`, `record_witness: RecordWitnessSpec`: execute native actions from a seed and re-derive an independent state/effect specification. Verification requires the explicitly selected native runtime. `ExecutableQualificationSpec.replay_native_records` opts into that replay during qualification and reload; it does not certify production fidelity or actor prose.
-- `action: "run"`, `job: ContinuationJob`: supply the returned checkpoint reference, frozen
-  actor/catalog, verifier, probe and sampling settings. Each branch restores the same capsule.
-  Results retain tool-turn checkpoints and final actor requests before dispatch, linked to physical request-body receipts where the admitted transport is used. Blocked invisible-tool attempts remain policy evidence; operator failures name their phase. Saved inputs survive interruption, without replaying unknown effects.
-- `action: "analyse-failures"`, `analysis: ArtifactInput`: re-grade every saved branch and locate
-  symptoms at exact pre-response checkpoints. Batched tools share a boundary; no causal blame.
-- `action: "compare-framing"`, `framing: FramingStudySpec`: preregister two authored cues and
-  alternate AB/BA order. World, prefix, tools and budget stay fixed. All cells remain counted;
-  unknown outcomes are not redrawn. Cue equivalence is an assumption, not an awareness diagnosis.
-- `action: "predict-success"`, `critic: CriticSpec`: record an estimate from actor-visible
-  context only, without the private world, verifier or future outcomes. Supply its artifact as
-  the subsequent study's `critic_prediction`, with the returned `predicted_success`. Actor,
-  checkpoint, horizon, sampling, verifier and probe identities must match. Fresh continuations
-  measure Brier score; unknown outcomes remain explicitly unassessable. This does not train a critic.
-- `action: "propose-tasks"`, `proposals: TaskProposalSpec`: retain two to four prompt candidates
-  from public context and a capability brief. Fixed intent/world/verifier; fresh qualification required.
-- `action: "evaluate-candidates"`, `batch: CandidateBatchSpec`: measure every saved prototype, check independent controls, then compare actors. Harbor export requires observable qualification; tier separation is a selection signal, not a correctness gate. Rejected/unknown candidates remain counted.
-- `action: "propose-checkpoints"`, `checkpoint_proposals: CheckpointProposalSpec`: select up to four informative checkpoints from complete saved development attempts, retaining the response and matched-random controls. Selection sees outcomes; prospective critics do not. Unknown draws never silently retry.
-- `action: "run-continuation-campaign"`, `campaign: ContinuationCampaignSpec`: register source attempts (for example 16), selectors, critics and equal-budget continuations in one command. Retain failed cells, unknown bounds and per-arm results; saved work replays without calls. The printed `inference` separates each checkpoint's repeated-attempt Wilson interval from the interval across independent task lineages (repeats averaged first), and compares critic Brier scores with the source attempts' base rate on the same outcomes. Publication-only recovery needs no runtime or credentials. No training or independent correctness claim.
-- `action: "make-variant"`, `variant: TaskVariantSpec`: publish a drill, rephrasing or executed
-  state variation. Keep source lineage and the original environment restore binding. Actor
-  wording may change; prior approvals do not carry over. Fresh qualification precedes rewards.
-- `action: "intervene"`, `intervention: ActionInterventionSpec`: impose one permitted call on an
-  exact capsule and save its actual reply/state. Unknown effects never retry. `compare-actions`
-  takes `contrast: ActionContrastSpec`: paired actions, equal budgets, AB/BA, prefix policy grading.
-  Saved children replay; unknowns remain counted. Recovery differences do not establish blame.
-- `action: "compare-observations"`, `observations: ObservationContrastSpec`: compare a saved action
-  reply with authored alternative text at the identical world and actor allowance. Both arms retain prefix policy effects and unknowns. Alternative correctness, causal blame and training are unapproved.
-- `action: "probe-actor-decisions"`, `actor_decisions: ActorDecisionSpec`: recorded/repeated-recorded/simulated reply probes at caller-admitted public prefixes. No workbook or tool execution. Saved next decisions and missing-outcome bounds measure development sensitivity, not semantic equivalence or episode success. Recovery finalizes saved draws after expiry without inference; unstarted slots are deadline-stopped and failure counts include repair guidance.
-- `action: "admit-actor-prefix"`, `prefix: ActorPrefixSpec`: extract complete retained model input from a build dataset and bind the saved simulator action/reference reply. Writes `case.json` for actor probes; source-export limitations remain explicit. No initial workbook required.
-- `action: "check-failure-research"`, `research: FailureResearchSpec`: check cited outcomes against declared task predicates with positive, negative and unknown controls. Saves provisional research; unresolved requirements block assessment. Authored witnesses are not original program execution, protected calibration or predictor-memory approval.
-- `action: "match-checkpoints"`, `selection: CheckpointSelectionSpec`: freeze proposed points,
-  explanations and a candidate pool; draw unused random controls at the nearest allowed horizon. Unmatched proposals remain explicit; content aliases cannot inflate the control pool.
-- `action: "run-selection"`, `experiment: CheckpointExperimentSpec`: execute both matched arms,
-  optionally recording a public-context critic first. Retain unknowns and report success bounds
-  and Brier coverage separately; `inference` adds per-checkpoint and per-lineage Wilson intervals
-  and proposed-minus-random effects per lineage. Recoverability does not establish action-level blame.
-- `action: "compare-actors"`, `actors: ActorPanelSpec`: compare two to ten frozen model
-  snapshots on the same case checkpoints, rotating dispatch order across cases. Unknown branches
-  contribute explicit failure/success bounds. Reported separation applies only to the fixed
-  development panel; tier labels are declarations and these bounds are not confidence intervals.
-- `action: "export"`, `export: ContinuationExport`: independently re-grade complete studies
-  against their preregistered acceptance evidence. Export only admitted post-checkpoint assistant
-  tool-only targets; prose, earlier mistakes and replies stay context. Mechanical acceptance cannot approve prose. Source-bound lineages stay grouped; oversized training inputs refuse context truncation.
-  Prefix observations must reconstruct exactly from saved executed ancestors; authored conversation interventions cannot supply positive supervision. Targets retain their qualification reference and scope. Missing qualification produces a `diagnostic` dataset, which the training loader refuses; inspection remains available. Empty or root-shape-only acceptance predicates refuse; nonempty checks still require independent controls.
-- `action: "harbor"`, `harbor: ExecutableCommand`: `propose-worlds` accepts `world_proposals: WorldProposalSpec`: one bounded author draw from cited research produces 2–4 data plans, candidate predicates and control scripts. The pinned runtime supplies `bind_construction(project, configuration, assets)` returning `ConstructionBinding`; it may change initial assets only. Independent acceptance stays fixed and hidden. All proposals and failures are saved; at least two distinct materialized worlds are required for native challenges. Unknown author/binding outcomes never silently rerun. This supplies development candidates, not actor equivalence or training admission. `construct-assets` accepts a `construction` (explicit tables with values, sequences and keyed lookups) and publishes unqualified generated JSON/XLSX assets for the existing runtime; `register`, `qualify`, `export`, then `serve`. `prepare-training` takes a `qualification` reference and returns a runnable continuation operation (`operation_file` saves a new JSON file); optional `comparison` plus `comparison_case` retain paired measurements for that exact candidate. Admission rechecks the pinned evidence without provider calls; qualification does not imply simulator fidelity.
-  Mechanical qualification requires feasible execution plus independent positive, goal-failure,
-  prohibited-effect and unknown-evidence controls. Its scope is a development observable contract,
-  not independent audit, model-tier separation, native fidelity or host containment. Unqualified
-  export needs `diagnostic: true` and cannot reward. Cosmetic verifier edits cannot supply independent evidence; distinct syntax alone does not prove independence.
-
-Harbor `--dry-run` checks sources and paths without runtime imports; it does not execute qualification witnesses.
-`serve` takes private actor/verifier connection paths in existing directories outside the package and a finite
-trial lease. Committed calls replay; unknown outcomes never re-dispatch. Optional `provider_limits`
-supplies a deadline and attempt cap for supported `trial_runtime` factories, bounded by the frozen
-simulator ceiling. Resumes keep the same grant and counter for predictor, embedding and memory calls.
-Submission requires every declared output file; missing files leave the trial open for correction.
-Configure a reachable private endpoint for containers. Packages use Harbor 0.24.0 schema 1.4 with a separate verifier environment.
-Local HTTP and package schemas are tested; container launch needs Docker/Harbor. Runtime factories execute in the trusted operator environment. Pi uses a minimal child environment and private HOME/TMPDIR, with provider credentials kept by the coordinator; this does not establish filesystem or network confinement.
-`exp optimize model PROJECT --root ROOT --training-job training.json` accepts a `TrainingJob` from `exp.cli.optimize.training_job`. Use `action: "score-initial"` to save frozen-model losses on the accepted training partition, then `action: "train"` with `spec.tail_sft.reference` pointing to that artifact. TailSFT drops the configured fraction of the smallest current-minus-initial loss margins per batch, retaining context but weighting only target tokens. Initial/model/dataset and exact rendered target identities must match. Unknown scoring or update intents refuse implicit
-repetition. The static fraction and single-batch implementation do not claim published distributed
-schedule results. Training produces a candidate checkpoint; this path does not promote a model
-or alter active routing. Dry-run and shared spend consent apply before client construction.
+`exp eval PROJECT --continuations SPEC.json` runs one action from a JSON spec: continuation
+studies and campaigns, witnessed SFT export, trajectory trace export, learning repair (lesson
+screening and library evolution), saved-evidence analysis, environment comparison, task-factory
+authoring and executable Harbor tasks. Every action, its payload and the Harbor reward contract
+are documented in [docs/reference/continuations-and-harbor.md](reference/continuations-and-harbor.md).

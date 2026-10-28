@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 from filelock import FileLock, Timeout
 
-from exp.common.core.artifacts import sha256_json, stable_id
+from exp.common.core.artifacts import sha256_json
 from exp.common.models import load_model_catalog, write_model_catalog
 from exp.common.project import ProjectStore
 from exp.optimize.evaluation.continuations.actors import (
@@ -16,6 +16,7 @@ from exp.optimize.evaluation.continuations.actors import (
     run_actor_panel,
 )
 from exp.optimize.evaluation.continuations.job_test import job_fixture
+from exp.optimize.evaluation.continuations.study import study_identity
 from exp.runtime.models.providers.transport import ScriptedJsonTransport
 from exp.runtime.models.registry import RuntimeModelCatalog
 
@@ -46,10 +47,7 @@ def test_busy_child_can_resume_without_a_terminal_panel_failure(
     project, spec, transport = panel_fixture(tmp_path, monkeypatch)
     identity = spec.identity("test")
     cell = panel_jobs(spec, "test")[0]
-    child = stable_id(
-        "continuation-study",
-        {"spec": sha256_json(cell.job.study), "code": cell.job.implementation("test")},
-    )
+    child = study_identity(cell.job.study, cell.job.implementation("test"))
     with FileLock(project.artifacts.project_directory / (child + ".lock"), timeout=0):
         with pytest.raises(Timeout):
             run_actor_panel(project, spec, code_revision="test")

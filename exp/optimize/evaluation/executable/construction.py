@@ -3,7 +3,7 @@
 from exp.common.core.artifacts import ArtifactInput, ContractModel, JsonObject, Sha256
 from exp.common.project import ProjectStore
 from exp.optimize.evaluation.continuations.capture import CaptureDefinition
-from exp.optimize.evaluation.continuations.job import load_runtime_module
+from exp.optimize.evaluation.executable.loader import load_runtime_module
 from exp.simulation.world_construction import load_construction
 
 

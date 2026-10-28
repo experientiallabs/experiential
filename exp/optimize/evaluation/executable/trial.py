@@ -20,11 +20,11 @@ from exp.common.core.artifacts import (
 )
 from exp.common.models import ToolCall
 from exp.common.project import ProjectStore, artifact_input
-from exp.optimize.evaluation.continuations.job import ContinuationRuntime, load_runtime_definition
 from exp.optimize.evaluation.continuations.study import (
     CheckpointSession,
     restore_continuation_world,
 )
+from exp.optimize.evaluation.executable.loader import ContinuationRuntime, load_runtime_definition
 from exp.optimize.evaluation.executable.provider_grant import ProviderGrant, ProviderLimits
 from exp.optimize.evaluation.executable.qualification import load_executable_qualification
 from exp.optimize.evaluation.executable.task import ExecutableTask, load_executable_task

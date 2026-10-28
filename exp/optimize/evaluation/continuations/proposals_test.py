@@ -190,16 +190,32 @@ def test_unknown_selector_intent_never_rebuys(
     """An interrupted selector cannot silently draw a more convenient proposal."""
     project, spec, transport = selector_fixture(tmp_path, monkeypatch)
 
-    def interrupted() -> ScriptedJsonTransport:
+    def interrupted(intent: object) -> None:
         """Interrupt after durable intent, before any provider call."""
         raise KeyboardInterrupt
 
-    monkeypatch.setattr(owner, "HttpxJsonTransport", interrupted)
+    monkeypatch.setattr(owner, "canonical_call", interrupted)
     with pytest.raises(KeyboardInterrupt):
         propose_checkpoints(project, spec, code_revision="test")
     with pytest.raises(ValueError, match="unknown outcome"):
         propose_checkpoints(project, spec, code_revision="test")
     assert not transport.requests
+
+
+def test_missing_selector_credential_refuses_before_intent_and_stays_retryable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A credential refusal dispatched nothing, so it is not saved as an unknown-outcome draw."""
+    project, spec, transport = selector_fixture(tmp_path, monkeypatch)
+    monkeypatch.delenv("HELD_OUT_TEST_KEY")
+    with pytest.raises(ValueError):
+        propose_checkpoints(project, spec, code_revision="test")
+    assert not transport.requests
+    assert not project.artifacts.exists(spec.identity("test") + "-intent")
+    monkeypatch.setenv("HELD_OUT_TEST_KEY", "fixture-only")
+    report = propose_checkpoints(project, spec, code_revision="test")
+    assert report is not None and report.selection is not None
+    assert len(transport.requests) == 1
 
 
 def test_cli_selection_and_replay(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

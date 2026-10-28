@@ -20,11 +20,15 @@ from exp.common.core.artifacts import (
     stable_id,
 )
 from exp.common.project import ArtifactStore, ProjectStore, artifact_input
-from exp.optimize.evaluation.continuations.job import ContinuationJob, preflight_continuation_job
+from exp.optimize.evaluation.continuations.job import (
+    MAXIMUM_PHYSICAL_ATTEMPTS,
+    ContinuationJob,
+    preflight_continuation_job,
+)
 from exp.runtime.agents.chat import ChatAgentRuntime
 from exp.runtime.environments.mixed import MixedCheckpoint
 from exp.runtime.environments.world_contracts import ExecutableCheckpoint
-from exp.simulation.continuations import load_continuation_checkpoint
+from exp.simulation.continuations import ContinuationCheckpoint, load_continuation_checkpoint
 from exp.simulation.development_scope import require_development_task
 
 if TYPE_CHECKING:
@@ -76,8 +80,13 @@ class CheckpointSelectionSpec(ContractModel):
             raise ValueError("checkpoint pool and proposed identities must be unique")
         if not set(refs) <= set(self.pool):
             raise ValueError("every proposed checkpoint must belong to the registered pool")
-        if len(self.proposed) * 2 * self.base.maximum_physical_attempts > 100_000:
-            raise ValueError("checkpoint comparison exceeds the 100000 actor-attempt ceiling")
+        if len(self.proposed) * 2 * self.base.maximum_physical_attempts > (
+            MAXIMUM_PHYSICAL_ATTEMPTS
+        ):
+            raise ValueError(
+                f"checkpoint comparison exceeds the {MAXIMUM_PHYSICAL_ATTEMPTS} "
+                "actor-attempt ceiling"
+            )
         return self
 
     def identity(self, code_revision: str) -> str:
@@ -120,6 +129,23 @@ class CheckpointSelectionPlan(ContractModel):
     matches: tuple[CheckpointMatch, ...]
     scope: str = (
         "development; one source task; proposed versus horizon-matched random, not causal blame"
+    )
+
+
+def checkpoint_content_digest(point: ContinuationCheckpoint) -> Sha256:
+    """Identify a checkpoint's task, actor context and world state, ignoring its episode label.
+
+    Two checkpoints with the same digest are the same starting point, so neither adds a distinct
+    control or pool entry.
+    """
+    world = point.world.model_dump(mode="json")
+    world.pop("episode_id", None)
+    return sha256_json(
+        {
+            "task": point.task.model_dump(mode="json"),
+            "actor": point.actor.model_dump(mode="json"),
+            "world": world,
+        }
     )
 
 
@@ -177,15 +203,7 @@ def _match(project: ProjectStore, spec: CheckpointSelectionSpec) -> CheckpointSe
                 "checkpoint controls must share the exact source task and world policy"
             )
         remaining = actor.remaining_calls(point.actor)
-        world = point.world.model_dump(mode="json")
-        world.pop("episode_id", None)
-        digest = sha256_json(
-            {
-                "task": point.task.model_dump(mode="json"),
-                "actor": point.actor.model_dump(mode="json"),
-                "world": world,
-            }
-        )
+        digest = checkpoint_content_digest(point)
         if digest in seen_points:
             raise ValueError("duplicate checkpoint content does not add a random control")
         seen_points.add(digest)
@@ -264,25 +282,18 @@ def persist_selection_plan(
         spec.base.study.checkpoint,
         *(reference for proposal in spec.proposed for reference in proposal.evidence),
     }
-    if project.artifacts.exists(identity):
-        saved = CheckpointSelectionPlan.model_validate_json(
-            project.artifacts.read_bytes(identity, "plan.json")
-        )
-        if saved != plan:
-            raise ValueError("saved checkpoint selection does not reproduce")
-    else:
-        project.artifacts.write_json(
-            artifact_id=identity,
-            artifact_type="checkpoint-selection",
-            envelope=ArtifactEnvelope(
-                schema_version=1,
-                created_at=created_at,
-                code_revision=code_revision,
-                inputs=tuple(sorted(inputs, key=lambda row: row.artifact_id)),
-            ),
-            files={"plan.json": plan},
-        )
-    return artifact_input(project.artifacts.read(identity).manifest)
+    manifest = project.artifacts.write_json(
+        artifact_id=identity,
+        artifact_type="checkpoint-selection",
+        envelope=ArtifactEnvelope(
+            schema_version=1,
+            created_at=created_at,
+            code_revision=code_revision,
+            inputs=tuple(sorted(inputs, key=lambda row: row.artifact_id)),
+        ),
+        files={"plan.json": plan},
+    )
+    return artifact_input(manifest)
 
 
 def selection_jobs(

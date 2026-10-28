@@ -10,10 +10,11 @@ from exp.common.core.artifacts import ArtifactInput, sha256_bytes
 from exp.common.models import AssistantAction, ToolCall
 from exp.common.project import ProjectStore
 from exp.optimize.evaluation.continuations.capture import CaptureDefinition, capture_initial_world
-from exp.optimize.evaluation.continuations.job import ContinuationJob, load_runtime_definition
+from exp.optimize.evaluation.continuations.job import ContinuationJob
 from exp.optimize.evaluation.continuations.study import ContinuationStudySpec
 from exp.optimize.evaluation.executable import grounded as grounded_runtime
 from exp.optimize.evaluation.executable import mixed as mixed_runtime
+from exp.optimize.evaluation.executable.loader import load_runtime_definition
 from exp.optimize.evaluation.executable.mixed_test import mixed_fixture
 from exp.optimize.evaluation.executable.provider_grant import ProviderGrant, ProviderLimits
 from exp.optimize.evaluation.executable.task import ExecutableTask, persist_executable_task
