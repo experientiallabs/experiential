@@ -72,6 +72,7 @@ def _probe_facts(
         "host_environment_readable": False,
         "procfs_private": True,
         "host_signalable": False,
+        "process_limit_enforced": True,
     }
     observed.update(command or {})
     complete: dict[str, JsonValue] = {
@@ -97,6 +98,16 @@ def test_full_probe_enforces_every_guarantee_with_its_mechanisms() -> None:
         backend.report.mechanisms
     )
     assert backend.deny_network and backend.landlock_abi == 6
+
+
+def test_unenforced_process_limit_withholds_the_process_count_guarantee() -> None:
+    """A probe that forked past RLIMIT_NPROC, as real root does, never claims the limit."""
+    backend = linux_containment_from_probe(_probe_facts(command={"process_limit_enforced": False}))
+
+    reasons = {item.guarantee: item.reason for item in backend.report.unavailable}
+    assert backend.report.refusal is None
+    assert ContainmentGuarantee.PROCESS_COUNT_LIMIT not in backend.report.level.guarantees
+    assert "RLIMIT_NPROC" in reasons[ContainmentGuarantee.PROCESS_COUNT_LIMIT]
 
 
 def test_namespace_refusal_reports_no_guarantees_and_how_to_fix_it() -> None:
@@ -229,7 +240,7 @@ def test_file_size_limit_stops_an_oversized_write(tmp_path: Path) -> None:
     assert observation.metadata["size"] == 1024**2
 
 
-@_CONTAINED
+@_requires(ContainmentGuarantee.PROCESS_COUNT_LIMIT)
 def test_process_count_limit_bounds_the_whole_session(tmp_path: Path) -> None:
     """The command plus its descendants never exceed the configured process count."""
     runtime = _runtime(tmp_path, resources=ResourceLimits(process_count=8))
@@ -240,7 +251,7 @@ def test_process_count_limit_bounds_the_whole_session(tmp_path: Path) -> None:
     assert observation.metadata["children"] == 7
 
 
-@_CONTAINED
+@_requires(ContainmentGuarantee.PROCESS_COUNT_LIMIT)
 def test_fork_bomb_is_bounded_and_fully_cleaned(tmp_path: Path) -> None:
     """An exponential fork bomb is held to the process limit and leaves nothing behind."""
     marker = _marker()

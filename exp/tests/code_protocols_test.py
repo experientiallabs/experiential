@@ -153,12 +153,12 @@ PROTOCOLS = (
     ),
     Protocol(
         "exp.runtime.environments.containment.linux:LINUX_CONTAINMENT_PROTOCOL",
-        "linux-namespaces-v2",
+        "linux-namespaces-v3",
         (
             "exp.runtime.environments.containment.linux",
             "exp.runtime.environments.containment.linux_gate",
         ),
-        "e012412f1ce9ae0a15454cdafcfda11438e87cc78fac39197d7dc6fd223fa44d",
+        "f84fdea9abeb821d9203c4593d215a0f853e6757d7ac117f7ad23966ff930776",
     ),
     Protocol(
         "exp.runtime.environments.containment.darwin:DARWIN_CONTAINMENT_PROTOCOL",

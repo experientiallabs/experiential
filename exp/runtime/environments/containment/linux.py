@@ -34,7 +34,7 @@ from exp.runtime.environments.containment.contract import (
 )
 from exp.runtime.environments.containment.linux_gate import MINIMUM_LANDLOCK_ABI
 
-LINUX_CONTAINMENT_PROTOCOL = "linux-namespaces-v2"
+LINUX_CONTAINMENT_PROTOCOL = "linux-namespaces-v3"
 _GATE_PROGRAM = Path(__file__).with_name("linux_gate.py")
 _GATE_ARGV = (sys.executable, "-I", "-S", str(_GATE_PROGRAM))
 _PROBE_TIMEOUT_SECONDS = 15.0
@@ -54,7 +54,6 @@ _ALWAYS_ENFORCED = frozenset(
         ContainmentGuarantee.CPU_TIME_LIMIT,
         ContainmentGuarantee.MEMORY_LIMIT,
         ContainmentGuarantee.FILE_SIZE_LIMIT,
-        ContainmentGuarantee.PROCESS_COUNT_LIMIT,
         ContainmentGuarantee.NO_NEW_PRIVILEGES,
     }
 )
@@ -147,6 +146,13 @@ def linux_containment_from_probe(facts: JsonObject) -> LinuxContainment:
     else:
         reasons[ContainmentGuarantee.FILESYSTEM_WRITE_CONFINEMENT] = (
             landlock_reason if not landlock_abi else "the probe could write outside its workspace"
+        )
+    if observed.get("process_limit_enforced") is True:
+        enforced.add(ContainmentGuarantee.PROCESS_COUNT_LIMIT)
+    else:
+        reasons[ContainmentGuarantee.PROCESS_COUNT_LIMIT] = (
+            "the probe forked past RLIMIT_NPROC; the kernel exempts real root from it, so run "
+            "the environment as an unprivileged user or through a remote EnvironmentRuntime"
         )
     private_procfs = observed.get("procfs_private") is True
     if private_procfs:

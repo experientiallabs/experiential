@@ -439,6 +439,7 @@ def _probe() -> int:
             observed["writes_confined"] = _writes_confined(workspace, outside)
             observed["host_environment_readable"] = _readable(f"/proc/{supervisor_pid}/environ")
             observed["host_signalable"] = _signalable(supervisor_pid)
+            observed["process_limit_enforced"] = _process_limit_enforced()
             os.write(report_write, json.dumps(observed).encode())
             os._exit(0)
 
@@ -509,6 +510,19 @@ def _signalable(pid: int) -> bool:
     finally:
         os.close(directory)
     return True
+
+
+def _process_limit_enforced() -> bool:
+    """Return whether RLIMIT_NPROC refuses a fork here; the kernel exempts real root from it."""
+    resource.setrlimit(resource.RLIMIT_NPROC, (1, 1))
+    try:
+        child = os.fork()
+    except BlockingIOError:
+        return True
+    if child == 0:
+        os._exit(0)
+    os.waitpid(child, 0)
+    return False
 
 
 def _report(facts: dict[str, object]) -> int:

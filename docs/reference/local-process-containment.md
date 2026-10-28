@@ -73,9 +73,14 @@ a private mount namespace and a procfs mount for the session's PID namespace. Th
 that `/proc/self` matches the command's PID and that procfs lists only session processes.
 A denied or ineffective mount leaves `host_process_isolation` unavailable; the other proven
 guarantees remain available. A run requiring host-process isolation is refused before dispatch.
+The process-count limit is `RLIMIT_NPROC`, which the kernel does not apply to real root, and
+the session's user namespace keeps the invoking user. The probe therefore lowers the limit and
+tries a fork; if the fork succeeds, as it does for root (for example in a CI container),
+`process_count_limit` is reported unavailable and the session total is no longer bounded by
+`process_count × memory_bytes`. Run as an unprivileged user to keep it.
 
 On the current qualification host, private procfs mounts are denied by host policy. Its
-`linux-namespaces-v2` report therefore enforces 12 guarantees and explicitly withholds
+`linux-namespaces-v3` report therefore enforces 12 guarantees and explicitly withholds
 `host_process_isolation`; it must not be presented as full host-process isolation.
 
 Each session runs three processes:
@@ -128,7 +133,7 @@ SandboxSettings(
 
 `SandboxSimulator` reads the level from the environment runtime and raises
 `SandboxSimulationError` naming the missing guarantees before opening any session. The runtime's
-`ContainmentLevel` (protocol `linux-namespaces-v2` or `darwin-kqueue-v1` plus the sorted
+`ContainmentLevel` (protocol `linux-namespaces-v3` or `darwin-kqueue-v1` plus the sorted
 guarantees) is recorded in every `SandboxSimulationCellBinding` as `environment_containment`.
 It is part of the rollout identity, so a resumed or replayed run never mixes containment levels.
 A runtime that reports no containment records none and cannot satisfy any requirement.
