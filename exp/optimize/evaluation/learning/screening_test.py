@@ -14,6 +14,7 @@ from exp.optimize.evaluation.learning.screening import (
     _probabilities,
     fit_threshold,
     screening_request,
+    screening_score,
 )
 
 
@@ -100,3 +101,9 @@ def test_the_threshold_grid_must_increase_inside_the_unit_interval() -> None:
         LessonScreeningSpec(resolution="screen-lessons", thresholds=(0.5, 0.2))
     with pytest.raises(ValueError, match="increase strictly"):
         LessonScreeningSpec(resolution="screen-lessons", thresholds=(1.0,))
+
+
+def test_the_score_is_reusable_times_supported_times_uncovered() -> None:
+    """One formula scores both learning misses and agent lessons."""
+    assert screening_score(0.5, 0.0, 0.8) == pytest.approx(0.4)
+    assert screening_score(1.0, 1.0, 1.0) == 0.0

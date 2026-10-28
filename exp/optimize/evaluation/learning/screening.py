@@ -175,7 +175,21 @@ class MissScreening(ContractModel):
         """Reusable, uncovered and supported: the product of the three probabilities."""
         if self.behavioural is None or self.covered is None or self.supported is None:
             return None
-        return self.behavioural * self.supported * (1 - self.covered)
+        return screening_score(self.behavioural, self.covered, self.supported)
+
+
+def screening_score(reusable: float, covered: float, supported: float) -> float:
+    """Screening score of one candidate lesson: reusable, uncovered and supported.
+
+    Args:
+        reusable: Probability the lesson holds beyond the instance it came from.
+        covered: Probability accepted lessons already state it.
+        supported: Probability its evidence supports it.
+
+    Returns:
+        ``reusable * supported * (1 - covered)``, compared against a registered threshold.
+    """
+    return reusable * supported * (1 - covered)
 
 
 class ThresholdFit(ContractModel):

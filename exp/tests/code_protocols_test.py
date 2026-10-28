@@ -114,6 +114,23 @@ PROTOCOLS = (
         "1ada99fdb976a5f5c9bc1bc54c119b6f5f8453b87c0c3cd2f4b81aca30bd33c0",
     ),
     Protocol(
+        "exp.optimize.evaluation.learning.agent_memory:AGENT_MEMORY_PROTOCOL",
+        "agent-memory-v2",
+        (
+            "exp.optimize.evaluation.learning.agent_memory_requests",
+            "exp.optimize.evaluation.learning.agent_memory:extract_candidates",
+            "exp.optimize.evaluation.learning.agent_memory:consolidate",
+            "exp.optimize.evaluation.learning.agent_memory:_merge_kind",
+            "exp.optimize.evaluation.learning.agent_memory:_merge_chunk",
+            "exp.optimize.evaluation.learning.agent_memory:_screen",
+            "exp.optimize.evaluation.learning.agent_memory:_shown_candidate",
+            "exp.optimize.evaluation.learning.agent_memory:_shown_lesson",
+            "exp.optimize.evaluation.learning.agent_memory:_accepted_shown",
+            "exp.optimize.evaluation.learning.screening:screening_score",
+        ),
+        "311e91099d43a0dc9c681881446cd988b8dc571e30a8c026117fbad10f6bb7e9",
+    ),
+    Protocol(
         "exp.optimize.evaluation.learning.screening:SCREENING_PROTOCOL",
         "learning-miss-screening-v1",
         (
