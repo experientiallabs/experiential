@@ -14,9 +14,11 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
+from rich.console import Console
 from typer.testing import CliRunner
 
 from exp.cli.app import app
+from exp.cli.shared.theme import EXP_THEME
 from exp.common.core.artifacts import JsonObject, JsonValue
 from exp.common.evaluations.reconstruction import default_judge
 from exp.common.models import (
@@ -105,7 +107,9 @@ def package_rows(episodes: list[JsonObject]) -> list[JsonObject]:
 
     Each trace has a ``chat`` span with the customer request and the request context
     ``{"task_lineage": USER, "replay_from": N}``, then one call and one result span per
-    recorded tool exchange, paired by ``gen_ai.tool.call.id``.
+    recorded tool exchange, paired by ``gen_ai.tool.call.id``. An episode may override its
+    declared task identity (``lineage``) and conversation (``conversation``), omit call IDs
+    (``no_call_ids``), or supply instance facts in the request context (``facts``).
     """
     rows: list[JsonObject] = []
     start = datetime(2026, 10, 15, tzinfo=UTC)
@@ -114,7 +118,9 @@ def package_rows(episodes: list[JsonObject]) -> list[JsonObject]:
         # A repeat of the same task (same user) is a different trace with its own identity.
         key = user + str(item.get("repeat", ""))
         trace_id = hashlib.sha256(key.encode()).hexdigest()[:32]
-        context = {"task_lineage": user, "replay_from": item["prefix"]}
+        context = {"task_lineage": item.get("lineage", user), "replay_from": item["prefix"]}
+        if "facts" in item:
+            context["instance_facts"] = item["facts"]
         rows.append(
             {
                 "trace_id": trace_id,
@@ -127,7 +133,7 @@ def package_rows(episodes: list[JsonObject]) -> list[JsonObject]:
                     "gen_ai.provider.name": "recording",
                     "gen_ai.request.model": "recorded-agent",
                     "gen_ai.prompt": item["instruction"],
-                    "exp.conversation.id": user,
+                    "exp.conversation.id": item.get("conversation", user),
                     "exp.request.context": json.dumps(context),
                 },
             }
@@ -157,6 +163,7 @@ def package_rows(episodes: list[JsonObject]) -> list[JsonObject]:
                     },
                 ),
             ):
+                identity = {} if item.get("no_call_ids") else {"gen_ai.tool.call.id": call_id}
                 rows.append(
                     {
                         "trace_id": trace_id,
@@ -164,11 +171,7 @@ def package_rows(episodes: list[JsonObject]) -> list[JsonObject]:
                         "name": kind,
                         "start_time": (at + offset).isoformat(),
                         "end_time": (at + offset).isoformat(),
-                        "attributes": {
-                            **attributes,
-                            "gen_ai.tool.name": name,
-                            "gen_ai.tool.call.id": call_id,
-                        },
+                        "attributes": {**attributes, "gen_ai.tool.name": name, **identity},
                     }
                 )
     return rows
@@ -464,18 +467,20 @@ def build_project(
     *flags: str,
     episodes: list[JsonObject] | None = None,
     learn: bool = False,
+    project: str = PROJECT,
 ) -> tuple[Path, ProjectStore, str]:
     """Run ``exp build`` on the package through the routed fake and return its output.
 
     With ``learn`` the catalog has a memory-recall model, so the build learns every trace and
     retests its misses. Without it the build stops at the bare simulator; the recall alias is
-    added afterwards so a test can drive learning itself.
+    added afterwards so a test can drive learning itself. Every project shares one ``.exp`` root
+    under ``tmp_path``, as projects on one machine do.
     """
     root = tmp_path / ".exp"
-    root.mkdir()
+    root.mkdir(exist_ok=True)
     write_catalog(root, recall=learn)
     episodes = episodes or [episode(i) for i in range(USERS)]
-    package = tmp_path / "package.jsonl"
+    package = tmp_path / f"{project}.jsonl"
     package.write_text("".join(json.dumps(row) + "\n" for row in package_rows(episodes)))
     monkeypatch.setenv("HELD_OUT_TEST_KEY", "fixture-only")
     monkeypatch.setenv("EXP_RELEASE_REVISION", REVISION)
@@ -489,7 +494,7 @@ def build_project(
         app,
         [
             "build",
-            PROJECT,
+            project,
             "--traces",
             str(package),
             "--source",
@@ -504,7 +509,7 @@ def build_project(
     assert result.exit_code == 0, result.output
     if not learn:
         write_catalog(root)
-    return root, ProjectStore(root, PROJECT), " ".join(result.output.split())
+    return root, ProjectStore(root, project), " ".join(result.output.split())
 
 
 def build_report(store: ProjectStore) -> str:
@@ -521,14 +526,36 @@ def audit_report(store: ProjectStore) -> str:
     return " ".join(report.read_text(encoding="utf-8").split())
 
 
-def held_out_command(root: Path, count: int, *flags: str) -> str:
+def learn_fit(root: Path, store: ProjectStore) -> None:
+    """Learn the audit's fit-only memory, so a test can drive the panel itself.
+
+    ``exp eval --audit`` runs this same learning first; once it is saved, the audit's own learning
+    step replays without provider calls.
+    """
+    from exp.cli.build.learning import run_learning
+
+    run_learning(
+        Console(theme=EXP_THEME),
+        store,
+        project=PROJECT,
+        root=root,
+        recall_alias="jev",
+        maximum_attempts=None,
+        yes=True,
+        non_interactive=True,
+        code_revision=REVISION,
+        hold_out=True,
+    )
+
+
+def held_out_command(root: Path, count: int, *flags: str, exit_code: int = 0) -> str:
     """Invoke ``exp eval PROJECT --audit N`` and return its output."""
     result = CliRunner().invoke(
         app,
         ["eval", PROJECT, "--root", str(root), "--audit", str(count)]
         + ["--yes", "--non-interactive", *flags],
     )
-    assert result.exit_code == 0, result.output
+    assert result.exit_code == exit_code, result.output
     return " ".join(result.output.split())
 
 
@@ -737,7 +764,8 @@ def test_run_ids_follow_content_and_retire_attempts_that_cannot_finish(
     with pytest.raises(KeyboardInterrupt):
         execute_fidelity_evaluation(store, expired.prepared[0])
     resumed = register(later)
-    assert resumed.retired == (run_id, run_id + "-r2")
+    # Generation one was already replaced; only the newly retired attempt is reported.
+    assert resumed.retired == (run_id + "-r2",)
     assert resumed.prepared[0].spec.run_id == run_id + "-r3"
 
     # Changed inputs (here the judge's output allowance) address a new run, never a refusal.

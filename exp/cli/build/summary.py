@@ -12,6 +12,7 @@ from exp.cli.shared.progress import duration_text
 from exp.common.core.files import write_text_atomic
 from exp.common.project import ProjectStore
 from exp.common.project.paths import validate_local_id
+from exp.optimize.evaluation.fidelity_recovery import QUALIFICATION
 from exp.simulation.build import ProjectBuild
 
 if TYPE_CHECKING:  # learning loads the fidelity lifecycle; keep `exp --help` free of it
@@ -81,6 +82,8 @@ def learning_lines(learning: BuildLearning, noun: str = "traces") -> tuple[str, 
         if curve.quarters:
             last = curve.quarters[-1]
             learned += f", last {last.last - last.first + 1} traces {last.share}"
+        if curve.qualification is not None:
+            learned += f" · {QUALIFICATION}"
     lines = [learned]
     if outcome.incomplete:
         lines.append(
@@ -98,6 +101,7 @@ def learning_lines(learning: BuildLearning, noun: str = "traces") -> tuple[str, 
             f"{_percent(total.exact, total.steps)} replies exact ({total.exact}/{total.steps}) · "
             f"fixed {changes.fixed} of {changes.missed} missed turns · "
             f"{changes.regressed} regressed"
+            + ("" if retest.qualification is None else f" · {QUALIFICATION}")
         )
     return tuple(lines)
 

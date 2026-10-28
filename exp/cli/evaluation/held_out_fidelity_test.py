@@ -43,6 +43,8 @@ def test_a_failed_trace_starts_none_of_the_queued_panel_traces(
         raise ProviderTransportError("unauthorized", status_code=401)
 
     monkeypatch.setattr(held_out_fidelity, "execute_fidelity_evaluation", execute)
+    # No trace was interrupted before, so nothing needs resuming in place.
+    monkeypatch.setattr(held_out_fidelity, "interrupted", lambda _store, _prepared: False)
     traces = tuple(range(PANEL_CONCURRENCY * 25))
     with pytest.raises(typer.Exit):
         execute_runs(

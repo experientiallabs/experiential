@@ -13,6 +13,7 @@ from exp.cli.evaluation.held_out_fidelity import (
     aggregate_line,
     execute_runs,
     render_traces,
+    require_resumable,
     share,
 )
 from exp.cli.evaluation.view import heading
@@ -23,6 +24,7 @@ from exp.common.progress import ProgressHook
 from exp.common.project import ProjectStore
 from exp.common.release_revision import installed_release_revision
 from exp.optimize.evaluation.fidelity import execute_fidelity_evaluation, saved_fidelity_report
+from exp.optimize.evaluation.fidelity_recovery import QUALIFICATION, Qualification, qualify
 from exp.optimize.evaluation.miss_retest import (
     TurnChanges,
     register_miss_retest,
@@ -41,11 +43,13 @@ class RetestOutcome:
         total: Sums over the retested traces.
         planned: Traces in the retest panel.
         changes: Turns fixed and regressed against their first measurement.
+        qualification: Present when any retested trace resumed with unknown-outcome retries.
     """
 
     total: ReplayAggregate
     planned: int
     changes: TurnChanges
+    qualification: Qualification | None = None
 
 
 def run_miss_retest(
@@ -74,7 +78,8 @@ def run_miss_retest(
         non_interactive: Disable terminal questions.
         dry_run: Register the runs and stop before credentials or provider calls.
         verbose: Also print every trace, every turn, and every criterion.
-        retry_incomplete: Replace interrupted runs, buying their calls again.
+        retry_incomplete: Resume interrupted runs in place: saved work replays, and a request
+            lost in flight is sent again and reported as an unknown-outcome retry.
         details: Where the full retest output is written; defaults to the terminal.
         terminal: The user's terminal, for the spend question and errors.
         progress: The calling command's single progress line; without it, the retest owns one.
@@ -93,7 +98,6 @@ def run_miss_retest(
             count,
             code_revision=installed_release_revision(),
             clock=lambda: datetime.now(UTC),
-            retry_incomplete=retry_incomplete,
         )
         heading(console, project, "Miss retest")
         judge = panel.prepared[0].spec.judge_alias
@@ -127,6 +131,7 @@ def run_miss_retest(
             for prepared in panel.prepared:
                 execute_fidelity_evaluation(store, prepared)
         else:
+            require_resumable(store, panel.prepared, resume=retry_incomplete)
             interactive = not non_interactive and can_prompt(screen)
             with pause() if pause is not None else nullcontext():
                 consented = require_spend_consent(
@@ -140,13 +145,17 @@ def run_miss_retest(
                 )
             if not consented:
                 return None
-            execute_runs(screen, store, panel.prepared, progress)
+            execute_runs(screen, store, panel.prepared, progress, resume=retry_incomplete)
         results = saved_retest_results(store, panel)
         if verbose:
             render_traces(console, store, panel.prepared, results, "Retested trace")
         console.print()
         total, changes = aggregate(results), turn_changes(panel, results)
-        console.print(Text(aggregate_line(total, len(panel.cases), "Miss retest")))
+        qualification = qualify([(row.unknown_outcomes, row.exact, row.steps) for row in results])
+        label = "Miss retest" if qualification is None else f"Miss retest ({QUALIFICATION})"
+        console.print(Text(aggregate_line(total, len(panel.cases), label)))
+        for line in qualification.lines() if qualification is not None else ():
+            console.print(Text(line))
         console.print(Text(changes_line(changes)))
         curve = learning_curve(store, "all")
         if curve is not None:
@@ -158,7 +167,9 @@ def run_miss_retest(
                 style="dim",
             )
         )
-    return RetestOutcome(total=total, planned=len(panel.cases), changes=changes)
+    return RetestOutcome(
+        total=total, planned=len(panel.cases), changes=changes, qualification=qualification
+    )
 
 
 def changes_line(changes: TurnChanges) -> str:
