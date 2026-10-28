@@ -20,8 +20,21 @@ This module makes that assumption explicit and enforced instead of silent:
 - `current_host` names this machine and boot for lease records, so a lease is only ever taken
   over on the machine that wrote it (see `require_same_host`).
 
+The machine identity is, in order: ``EXP_MACHINE_ID`` when set and non-empty, read as the raw
+machine identifier on any platform; the platform's own identifier (``/etc/machine-id`` or
+``/var/lib/dbus/machine-id`` on Linux, ``IOPlatformUUID`` on macOS, ``MachineGuid`` on
+Windows); otherwise, on a Linux host without a machine-id such as a minimal container image, an
+EXP-generated random identifier created once, exclusively, at ``~/.local/state/exp/machine-id``
+and never rewritten. That home is the effective user's account home, never ``HOME`` or an XDG
+variable, so an environment-selected profile is still the same machine. The generated
+identifier is per account and lives in the container's own filesystem, so a recreated container
+gets a new one and is refused by the markers the old one wrote; a container whose project
+directory outlives it, two accounts sharing one such project, or any host whose identity must
+be pinned, set ``EXP_MACHINE_ID`` to one fixed value for every run.
+
 Machine and boot identifiers are hashed under an EXP-specific prefix before they are written:
-systemd documents ``/etc/machine-id`` as confidential, and EXP only needs equality.
+systemd documents ``/etc/machine-id`` as confidential, and EXP only needs equality. A generated
+identifier is hashed under its own kind, so it never equals a platform identifier's hash.
 """
 
 from __future__ import annotations
@@ -36,14 +49,19 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
 if sys.platform == "win32":
     import winreg
+else:
+    import pwd
 
 MARKER_NAME = ".exp-host"
 SINGLE_WRITER_ENV = "EXP_SINGLE_WRITER"
+MACHINE_ID_ENV = "EXP_MACHINE_ID"
+GENERATED_MACHINE_ID_NAME = "machine-id"
 _PROTOCOL = "exp-host-scope-v1"
 _LINUX_MACHINE_ID_PATHS = (Path("/etc/machine-id"), Path("/var/lib/dbus/machine-id"))
 _LINUX_BOOT_ID_PATH = Path("/proc/sys/kernel/random/boot_id")
@@ -127,14 +145,15 @@ def _darwin_value(command: tuple[str, ...], key: str | None) -> str:
     raise HostScopeError(f"cannot read {key} from {' '.join(command)}")
 
 
-def _raw_identity() -> tuple[str, str | None]:
+def _raw_identity() -> tuple[str | None, str | None]:
     """Read this platform's raw machine and boot identifiers.
 
     Returns:
-        The stable machine identifier and the boot identifier, if the platform has one.
+        The stable machine identifier, or ``None`` on a Linux host without a machine-id, and the
+        boot identifier, if the platform has one.
 
     Raises:
-        HostScopeError: The platform's stable machine identifier is unavailable.
+        HostScopeError: A macOS system tool reported no identifier.
     """
     if sys.platform == "win32":
         with winreg.OpenKey(
@@ -148,15 +167,88 @@ def _raw_identity() -> tuple[str, str | None]:
     if sys.platform == "darwin":
         machine = _darwin_value(("ioreg", "-rd1", "-c", "IOPlatformExpertDevice"), "IOPlatformUUID")
         return machine, _darwin_value(("sysctl", "-n", "kern.bootsessionuuid"), None)
-    machine = _read_first(_LINUX_MACHINE_ID_PATHS)
-    if machine is None:
+    return _read_first(_LINUX_MACHINE_ID_PATHS), _read_first((_LINUX_BOOT_ID_PATH,))
+
+
+def _create_once(path: Path, payload: bytes, mode: int) -> bytes:
+    """Create ``path`` exclusively with ``payload``, or read what another process created first.
+
+    The payload is written in one call right after the exclusive creation, so a reader can only
+    observe the file empty during that instant; the bounded re-read covers exactly that window.
+
+    Returns:
+        The file's contents, empty only if its creator never finished writing.
+    """
+    try:
+        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+    except FileExistsError:
+        pass
+    else:
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+    deadline = time.monotonic() + _CREATION_WINDOW_S
+    content = path.read_bytes()
+    while not content and time.monotonic() < deadline:
+        time.sleep(0.01)
+        content = path.read_bytes()
+    return content
+
+
+def _account_home() -> Path:
+    """Return the effective user's home from the account database, ignoring ``HOME``.
+
+    Raises:
+        HostScopeError: The effective user has no account entry with an absolute home.
+    """
+    try:
+        home = Path(pwd.getpwuid(os.geteuid()).pw_dir)
+    except KeyError as exc:
         raise HostScopeError(
-            "cannot identify this machine: /etc/machine-id is missing or empty, and EXP needs a "
-            "stable machine identity to keep project locks on one host. Create it with "
-            "`systemd-machine-id-setup` (or `dbus-uuidgen > /etc/machine-id`); in a container, "
-            "generate one in the image or mount the host's file read-only."
+            f"this machine has no /etc/machine-id and user {os.geteuid()} has no account home "
+            f"for EXP's own machine identity. Set {MACHINE_ID_ENV} to a fixed identifier for "
+            "this machine, so EXP can keep project locks on one host."
+        ) from exc
+    if not home.is_absolute():
+        raise HostScopeError(
+            f"this machine has no /etc/machine-id and the account home {home} is not absolute. "
+            f"Set {MACHINE_ID_ENV} to a fixed identifier for this machine, so EXP can keep "
+            "project locks on one host."
         )
-    return machine, _read_first((_LINUX_BOOT_ID_PATH,))
+    return home
+
+
+def generated_machine_id_path() -> Path:
+    """Return where EXP keeps the identity it generates for a host without a machine-id."""
+    return _account_home() / ".local" / "state" / "exp" / GENERATED_MACHINE_ID_NAME
+
+
+def _generated_machine_id() -> str:
+    """Return this user's EXP-generated machine identifier, creating it on first use.
+
+    Raises:
+        HostScopeError: The identifier file cannot be created or read, or is empty.
+    """
+    path = generated_machine_id_path()
+    remedy = (
+        f"Set {MACHINE_ID_ENV} to a fixed identifier for this machine, or make {path} "
+        "creatable, so EXP can keep project locks on one host."
+    )
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        value = _create_once(path, uuid.uuid4().hex.encode("ascii"), 0o600).decode("ascii")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise HostScopeError(
+            f"this machine has no /etc/machine-id, and EXP's own machine identity {path} cannot "
+            f"be created or read ({exc}). {remedy}"
+        ) from exc
+    if not value.strip():
+        raise HostScopeError(
+            f"this machine has no /etc/machine-id, and EXP's own machine identity {path} is "
+            f"empty; delete it to generate a new one. {remedy}"
+        )
+    return value
 
 
 @functools.cache
@@ -167,14 +259,22 @@ def current_host() -> HostIdentity:
         The hashed machine and boot identity with a diagnostic hostname.
 
     Raises:
-        HostScopeError: The platform's stable machine identifier is unavailable.
+        HostScopeError: The platform's identifiers are unreadable, or no machine identity can be
+            read or generated.
     """
     try:
         machine, boot = _raw_identity()
     except (OSError, subprocess.CalledProcessError) as exc:
         raise HostScopeError(f"cannot identify this machine for project locking: {exc}") from exc
+    override = os.environ.get(MACHINE_ID_ENV, "")
+    if override.strip():
+        machine_digest = _digest("machine", override)
+    elif machine is not None:
+        machine_digest = _digest("machine", machine)
+    else:
+        machine_digest = _digest("generated-machine", _generated_machine_id())
     return HostIdentity(
-        machine=_digest("machine", machine),
+        machine=machine_digest,
         boot=None if boot is None else _digest("boot", boot),
         hostname=socket.gethostname(),
     )
@@ -247,25 +347,8 @@ def _marker_payload(host: HostIdentity) -> bytes:
 
 
 def _claim_or_read(marker: Path, host: HostIdentity) -> dict[str, str]:
-    """Create the marker exclusively, or read the one another process created first.
-
-    The marker is written in one call right after its exclusive creation, so a reader can only
-    observe it empty during that instant; the bounded re-read covers exactly that window.
-    """
-    try:
-        descriptor = os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
-    except FileExistsError:
-        pass
-    else:
-        with os.fdopen(descriptor, "wb") as handle:
-            handle.write(_marker_payload(host))
-            handle.flush()
-            os.fsync(handle.fileno())
-    deadline = time.monotonic() + _CREATION_WINDOW_S
-    payload = marker.read_bytes()
-    while not payload and time.monotonic() < deadline:
-        time.sleep(0.01)
-        payload = marker.read_bytes()
+    """Create the marker exclusively, or read the one another process created first."""
+    payload = _create_once(marker, _marker_payload(host), 0o644)
     try:
         record = json.loads(payload)
     except (OSError, ValueError) as exc:
@@ -322,6 +405,9 @@ def require_host_scope(directory: Path) -> None:
                 f" and this machine ({host.hostname}) cannot share its locks: two hosts on one "
                 f"project would silently break mutual exclusion. {_REMEDY} If the project was "
                 f"moved here and the other machine no longer uses it, delete {key / MARKER_NAME}."
+                f" If this is the same machine under a new identity (a container recreated "
+                f"without /etc/machine-id), set {MACHINE_ID_ENV} to one fixed value for every "
+                "run."
             )
         _verified.add(key)
 
