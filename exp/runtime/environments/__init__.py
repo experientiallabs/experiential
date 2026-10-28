@@ -25,6 +25,14 @@ from exp.runtime.environments.local import (
     LocalProcessLimits,
     LocalProcessProtocolError,
 )
+from exp.runtime.environments.mixed import (
+    MixedRealityEnvironmentRuntime,
+    MixedRealityPolicy,
+    StepIntent,
+    StepPrediction,
+    StepResult,
+    ToolRoute,
+)
 
 __all__ = [
     "BOUNDED_CLEANUP_CONTRACT",
@@ -46,4 +54,10 @@ __all__ = [
     "LocalProcessLimits",
     "LocalProcessProtocolError",
     "Observation",
+    "MixedRealityEnvironmentRuntime",
+    "MixedRealityPolicy",
+    "StepIntent",
+    "StepPrediction",
+    "StepResult",
+    "ToolRoute",
 ]
