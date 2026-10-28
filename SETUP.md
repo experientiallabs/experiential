@@ -5,9 +5,11 @@ Copy-paste prompts for getting started with the hosted Experiential Labs gateway
 prompt you want into your coding agent (Claude Code, Cursor, Codex, Aider, or
 Conductor) and it runs the setup for you. Your account is created instantly from
 the email you give the agent. Free has no signup or monthly general credits.
-GPT-6 Luna, DeepSeek V4.1 Flash and Clef (Jev for existing accounts) share 10 RPM, 250K TPM and 1M input/output
-tokens per UTC day. Unlock free and promotional models with a one-time $1 card
-verification charge, credited to your balance. Paid calls need funded credits. This file mirrors the machine-readable contract at
+On Free, GPT-6 Luna, DeepSeek V4.1 Flash and Clef, plus Jev for existing Free
+accounts, share 10 RPM, 250K TPM and 1M input/output tokens per UTC day.
+Unlock free and promotional models with a temporary $1 card verification charge.
+The charge is refunded and is not added to your credit balance.
+Paid calls need funded credits. This file mirrors the machine-readable contract at
 https://platform.experientiallabs.ai/llms.txt.
 
 Each block below is one self-contained prompt. The prompt text is the product's
@@ -147,8 +149,9 @@ from Experiential Labs and click the verification link (or enter the code at
 https://platform.experientiallabs.ai/signin) to confirm my email. My traces are already live.
 Follow the activation steps at the returned overview_url first. If manual review
 is required, wait for approval; payment does not bypass review.
-To use free models after approval, ask me to complete the one-time $1 card verification at
-https://platform.experientiallabs.ai/credits; the charge is credited to my balance.
+To use free models after approval, ask me to complete card verification at
+https://platform.experientiallabs.ai/credits. The temporary $1 charge is refunded
+and is not added to my credit balance.
 Paid calls need funded credits. BYOK calls use my own provider keys.
 
 ## 2. Connect your inference provider keys (BYOK)
@@ -259,8 +262,8 @@ enter the code at https://platform.experientiallabs.ai/signin) to confirm my ema
 Email verification does not grant credits. Follow the returned overview_url's
 activation steps first; if manual review is required, wait for approval.
 Payment does not bypass review. After approval, ask me to complete card verification at
-https://platform.experientiallabs.ai/credits to unlock free models (a one-time
-$1 charge credited to my balance), or add credits for paid calls.
+https://platform.experientiallabs.ai/credits to unlock free models (a temporary
+$1 charge that is refunded and is not added to my credit balance), or add credits for paid calls.
 BYOK does not draw platform credits, but still requires review approval.
 
 ## 3. Start calling models on the gateway
@@ -496,6 +499,6 @@ enter the code at https://platform.experientiallabs.ai/signin) to confirm my ema
 Email verification does not grant credits. Follow the returned overview_url's
 activation steps first; if manual review is required, wait for approval.
 Payment does not bypass review. After approval, ask me to complete card verification at
-https://platform.experientiallabs.ai/credits to unlock free models (a one-time
-$1 charge credited to my balance), or add credits for paid calls.
+https://platform.experientiallabs.ai/credits to unlock free models (a temporary
+$1 charge that is refunded and is not added to my credit balance), or add credits for paid calls.
 BYOK does not draw platform credits, but still requires review approval.
