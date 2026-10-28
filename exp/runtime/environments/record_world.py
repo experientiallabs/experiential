@@ -14,13 +14,17 @@ import json
 import sqlite3
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from pathlib import Path
 
 from exp.common.core.artifacts import JsonObject, JsonValue, Sha256, sha256_json
 from exp.common.models import ToolCall
 from exp.common.tasks import TaskCase
 from exp.runtime.environments.interface import Observation
 from exp.runtime.environments.worlds import NativeImage, WorldAccess, WorldContext, digest_bytes
+
+# Identity of the code that decides this artifact's behavior, in place of its source text.
+# Bump it when behavior changes. exp/tests/code_protocols_test.py fails when the covered
+# source changes until it is bumped or, for a pure refactor, its digest is updated.
+RECORD_WORLD_PROTOCOL = "sqlite-record-world-v1"
 
 _DATABASE_PART = "database"
 
@@ -63,8 +67,7 @@ class RecordWorldFactory:
         self._schema = schema
         self._tools = dict(tools)
         self._definition: JsonObject = {
-            "name": "sqlite-record-world-v1",
-            "source_sha256": digest_bytes(Path(__file__).read_bytes()),
+            "name": RECORD_WORLD_PROTOCOL,
             "sqlite": sqlite3.sqlite_version,
             "service": service,
             "schema_sha256": digest_bytes(schema.encode()),
@@ -123,6 +126,7 @@ class RecordWorld:
             reply = tool.run(self._connection, action.arguments, context)
         except RecordToolError as exc:
             self._connection.rollback()
+            context.discard()
             return Observation(content=str(exc), is_error=True)
         except BaseException:
             self._connection.rollback()
@@ -153,6 +157,33 @@ class RecordWorld:
             parts={_DATABASE_PART: _canonical_image(self._connection.serialize())},
             domains=self.domain_digests(),
         )
+
+    def projection(self) -> JsonObject:
+        """Return evaluator-only table contents in a deterministic, lossless JSON shape.
+
+        This reads actual SQLite values, independently of tool replies. Callers must select
+        explicit public fields before exposing any of this private projection to an actor.
+        """
+        tables: JsonObject = {}
+        names = self._connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' "
+            "ORDER BY name"
+        ).fetchall()
+        for (name,) in names:
+            quoted = '"' + str(name).replace('"', '""') + '"'
+            cursor = self._connection.execute(f"SELECT * FROM {quoted}")  # noqa: S608
+            rows = [[_cell(value) for value in row] for row in cursor.fetchall()]
+            tables[str(name)] = {
+                "columns": [column[0] for column in cursor.description],
+                "rows": sorted(rows, key=lambda row: json.dumps(row, sort_keys=True)),
+            }
+        return {"tables": tables}
+
+    def state_projection(self) -> JsonObject:
+        """Expose table-keyed private state for declared reply consistency checks."""
+        tables = self.projection()["tables"]
+        assert isinstance(tables, dict)
+        return tables
 
     def close(self) -> None:
         """Close the connection."""

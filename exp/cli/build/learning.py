@@ -17,12 +17,8 @@ from exp.cli.shared.progress import ProgressDisplay
 from exp.cli.shared.theme import EXP_THEME
 from exp.common.models import ModelCatalog, load_model_catalog
 from exp.common.project import ProjectStore
-from exp.optimize.evaluation.learning.traces import (
-    learned_runs,
-    learning_curve,
-    learning_plan,
-    resolve_memory_recall,
-)
+from exp.optimize.evaluation.learning.recall import resolve_memory_recall
+from exp.optimize.evaluation.learning.traces import learned_runs, learning_curve, learning_plan
 from exp.runtime.models import RuntimeModelCatalog
 from exp.simulation.world_model.runtime import load_grounded_world_model_artifact
 
@@ -40,6 +36,8 @@ def learn_and_retest(
     details: Console | None = None,
     pipeline: ProgressDisplay | None = None,
     command: str | None = None,
+    evidence_reading: bool | None = None,
+    dream_every: int | None = None,
 ) -> LearningSummary:
     """The build's default pipeline: learn from every trace, then retest the misses.
 
@@ -55,6 +53,8 @@ def learn_and_retest(
         details: Where the full learning and retest output is written; defaults to ``console``.
         pipeline: The build's single progress line, with ``learning`` and ``retest`` phases.
         command: The exact build command a refusal tells the operator to run again.
+        evidence_reading: Enable bounded readers, or follow the recorded learning plan.
+        dream_every: Consolidation interval, or follow the recorded learning plan.
 
     Returns:
         What ran, for the build's summary.
@@ -63,6 +63,11 @@ def learn_and_retest(
     catalog = load_model_catalog(store.model_catalog_path)
     recall = resolve_memory_recall(catalog)
     if recall is None:
+        if evidence_reading or dream_every is not None:
+            raise ValueError(
+                "evidence reading and dreaming require a native decision model for memory recall; "
+                "add one to the model catalog and run the build again"
+            )
         console.print(
             "[yellow]note[/yellow] the simulator was built without learning: learning needs a "
             "native decision model to recall memory (for example cloudflare/clef-flash on the "
@@ -92,6 +97,8 @@ def learn_and_retest(
         progress=None if pipeline is None else pipeline.phase("learning"),
         pause=None if pipeline is None else pipeline.paused,
         command=command,
+        evidence_reading=evidence_reading,
+        dream_every=dream_every,
     )
     if outcome is None:
         return LearningSummary(recall=recall)
@@ -132,6 +139,8 @@ def learn_with_report(
     retry_incomplete: bool = False,
     pipeline: ProgressDisplay | None = None,
     command: str | None = None,
+    evidence_reading: bool | None = None,
+    dream_every: int | None = None,
 ) -> tuple[LearningSummary, Path | None]:
     """Run the build's learning stage and save its full output as the learning report.
 
@@ -146,6 +155,8 @@ def learn_with_report(
         retry_incomplete: Replace an interrupted trace, buying its calls again.
         pipeline: The build's single progress line, with ``learning`` and ``retest`` phases.
         command: The exact build command a refusal tells the operator to run again.
+        evidence_reading: Enable bounded readers, or follow the recorded learning plan.
+        dream_every: Consolidation interval, or follow the recorded learning plan.
 
     Returns:
         What ran, and ``runtime/learning/<lineage>/report.txt`` when learning ran.
@@ -164,6 +175,8 @@ def learn_with_report(
         details=details,
         pipeline=pipeline,
         command=command,
+        evidence_reading=evidence_reading,
+        dream_every=dream_every,
     )
     if learning.outcome is None:
         return learning, None

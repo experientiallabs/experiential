@@ -14,7 +14,7 @@ from exp.common.models import (
     ModelRecord,
 )
 from exp.common.models.catalog_roles import ModelRoles
-from exp.optimize.evaluation.learning.traces import resolve_memory_recall
+from exp.optimize.evaluation.learning.recall import resolve_memory_recall
 
 
 @pytest.mark.parametrize(

@@ -8,7 +8,7 @@ import functools
 import json
 from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from threading import Event
 
@@ -19,12 +19,13 @@ from exp.cli.app import app
 from exp.common.core.artifacts import JsonObject, JsonValue, canonical_json_bytes
 from exp.common.models import (
     BillingSource,
+    ConnectionConfig,
     ModelCapabilities,
     ModelRecord,
     load_model_catalog,
     write_model_catalog,
 )
-from exp.common.project import ProjectStore
+from exp.common.project import ProjectStore, artifact_input
 from exp.common.tasks.store import load_task_set
 from exp.optimize.evaluation.audit import panel_test as held_out_fidelity_test
 from exp.optimize.evaluation.audit.panel_test import (
@@ -41,8 +42,15 @@ from exp.optimize.evaluation.audit.panel_test import (
 )
 from exp.optimize.evaluation.contracts import EvaluationBudget
 from exp.optimize.evaluation.fidelity.runner import FidelityRetrieval
+from exp.optimize.evaluation.fidelity.runner_test import source_project
 from exp.optimize.evaluation.learning import profile as learned_memory
-from exp.optimize.evaluation.learning.profile import NO_MEMORY_NOTE, EvaluationMemory
+from exp.optimize.evaluation.learning.profile import (
+    NO_MEMORY_NOTE,
+    EvaluationMemory,
+    RecallRecovery,
+    _recorded_decisions,
+    recover_recall_decision,
+)
 from exp.optimize.evaluation.learning.traces import learning_plan
 from exp.optimize.evaluation.prepare import ModelEvaluationOptions
 from exp.optimize.evaluation.runs import (
@@ -57,7 +65,7 @@ from exp.optimize.evaluation.runs import (
 from exp.optimize.evaluation.runtime import run_prepared_model_evaluation
 from exp.optimize.evaluation.tests.fidelity_memory_test import memory_project
 from exp.optimize.router.automatic.provisional import prepare_hosted_provisional_judge
-from exp.runtime.gateway.decisions_contracts import DecisionRequest
+from exp.runtime.gateway.decisions_contracts import DecisionRequest, NoulQuestion
 from exp.runtime.models import RuntimeModelCatalog
 from exp.runtime.models.providers.transport import JsonHttpResponse, ScriptedJsonTransport
 from exp.simulation.retrieval.jev import JEVPolicy
@@ -321,6 +329,30 @@ def test_actor_evaluation_reads_learned_memory_without_its_own_lineage(
     assert report["memory"]["version"] == head.version
     assert report["simulator_memory"].startswith(f"Simulator memory: v{head.version}")
 
+    # Even a bounded selection with zero dispatches leaves durable coverage evidence.
+    pinned = learned_memory.learned_evaluation_memory(
+        store, load_model_catalog(root / "models.toml")
+    )
+    assert pinned is not None
+    bounded = pinned.model_copy(
+        update={"recall": pinned.recall.model_copy(update={"memory_input_bytes": 24000})}
+    )
+    record = learned_memory._selection_recorder(store, bounded, REVISION)
+    coverage: JsonObject = {
+        "packed_ids": [],
+        "omitted_ids": ["too-large"],
+        "stop_reason": "no-original-fits",
+    }
+    record(coverage)
+    record(coverage)
+    identities = store.artifacts.list_ids(artifact_type="evaluation-recall-selection")
+    recorded = [json.loads(store.artifacts.read_bytes(key, "selection.json")) for key in identities]
+    matches = [row for row in recorded if row["selection"] == coverage]
+    assert len(matches) == 1
+    saved_coverage = matches[0]
+    assert saved_coverage["selection"] == coverage
+    assert saved_coverage["memory"]["recall"]["memory_input_bytes"] == 24000
+
 
 def test_memory_version_is_part_of_the_plan_identity(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -572,3 +604,129 @@ def test_concurrent_recall_waits_for_one_saved_answer(
             release.set()
         assert first.result(timeout=5) == second.result(timeout=5) == {"answer": "shared"}
     assert len(wire.requests) == 1
+
+
+@pytest.mark.parametrize("replacement_unknown", [False, True])
+def test_explicit_recall_recovery_preserves_original_and_never_redraws_twice(
+    tmp_path: Path, replacement_unknown: bool
+) -> None:
+    """A single exact permit recovers a read-only decision or retains its second ambiguity."""
+    project, spec = source_project(tmp_path)
+    config = load_model_catalog(project.model_catalog_path)
+    config = config.model_copy(
+        update={
+            "connections": {
+                "http": ConnectionConfig(
+                    provider="typesafe",
+                    base_url="https://fixture.invalid/v1",
+                    api_key_env="FIDELITY_TEST_KEY",
+                    trusted_custom_origin=True,
+                )
+            }
+        }
+    )
+    catalog = RuntimeModelCatalog(config, environment={"FIDELITY_TEST_KEY": "fixture-only"})
+    model, _ = catalog.snapshot("model")
+    memory = EvaluationMemory(
+        lineage="fixture-memory",
+        version=1,
+        world_model=spec.world_model,
+        recall=FidelityRetrieval(jev_alias="model", jev=JEVPolicy()),
+        recall_model=model,
+    )
+    request = DecisionRequest(
+        state={"record": "permitted"},
+        questions={"relevant": NoulQuestion(instructions="Is this record relevant?")},
+    )
+
+    class InterruptedTransport(ScriptedJsonTransport):
+        """Record a physical dispatch, then simulate process loss before response retention."""
+
+        def post(
+            self,
+            url: str,
+            *,
+            headers: Mapping[str, str],
+            payload: JsonObject,
+            timeout_seconds: float,
+        ) -> JsonHttpResponse:
+            """Consume the scripted wire result before losing the owner's process."""
+            super().post(url, headers=headers, payload=payload, timeout_seconds=timeout_seconds)
+            raise KeyboardInterrupt
+
+    lost = InterruptedTransport([JsonHttpResponse(status_code=200, body={})])
+    with pytest.raises(KeyboardInterrupt):
+        _recorded_decisions(project, memory, catalog, "fixture", lost)(request)
+    [intent] = project.artifacts.list_ids(artifact_type="evaluation-recall-intent")
+    original_bytes = project.artifacts.read_bytes(intent, "request.json")
+    with pytest.raises(ValueError, match="unknown outcome"):
+        _recorded_decisions(project, memory, catalog, "fixture", lost)(request)
+    assert len(lost.requests) == 1
+    recovery = RecallRecovery(
+        intent=artifact_input(project.artifacts.read(intent).manifest),
+        deadline=datetime.now(UTC) + timedelta(minutes=5),
+        rationale="Explicit development retry; duplicate billing and selection bias accepted",
+    )
+    refused_transport = ScriptedJsonTransport()
+    for invalid_permit in (
+        recovery.model_copy(update={"intent": spec.world_model}),
+        recovery.model_copy(update={"deadline": datetime.now(UTC) - timedelta(seconds=1)}),
+    ):
+        with pytest.raises(ValueError, match="exact unknown|deadline expired"):
+            recover_recall_decision(
+                project,
+                memory,
+                request,
+                recovery=invalid_permit,
+                catalog=catalog,
+                code_revision="fixture",
+                transport=refused_transport,
+            )
+    assert not refused_transport.requests
+    replacement = (
+        InterruptedTransport([JsonHttpResponse(status_code=200, body={})])
+        if replacement_unknown
+        else ScriptedJsonTransport(
+            [JsonHttpResponse(status_code=200, body={"answers": {"relevant": 0.9}})]
+        )
+    )
+    if replacement_unknown:
+        with pytest.raises(KeyboardInterrupt):
+            recover_recall_decision(
+                project,
+                memory,
+                request,
+                recovery=recovery,
+                catalog=catalog,
+                code_revision="fixture",
+                transport=replacement,
+            )
+        with pytest.raises(ValueError, match="no second replacement"):
+            recover_recall_decision(
+                project,
+                memory,
+                request,
+                recovery=recovery,
+                catalog=catalog,
+                code_revision="fixture",
+                transport=replacement,
+            )
+    else:
+        result = recover_recall_decision(
+            project,
+            memory,
+            request,
+            recovery=recovery,
+            catalog=catalog,
+            code_revision="fixture",
+            transport=replacement,
+        )
+        assert result == {"answers": {"relevant": 0.9}}
+        assert (
+            _recorded_decisions(project, memory, catalog, "fixture", replacement)(request) == result
+        )
+        [decision] = project.artifacts.list_ids(artifact_type="evaluation-recall-decision")
+        assert recovery.intent in project.artifacts.read(decision).manifest.inputs
+    assert len(replacement.requests) == 1
+    assert project.artifacts.read_bytes(intent, "request.json") == original_bytes
+    assert len(project.artifacts.list_ids(artifact_type="evaluation-recall-recovery")) == 1

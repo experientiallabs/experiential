@@ -25,10 +25,22 @@ from uuid import uuid4
 
 from pydantic import Field, model_validator
 
-from exp.common.core.artifacts import ContractModel, Sha256, sha256_json
+from exp.common.core.artifacts import (
+    ContractModel,
+    FailureCode,
+    Sha256,
+    StructuredFailure,
+    sha256_json,
+)
 from exp.common.models import NumericMeasurement, OperationEconomics, ToolCall, combine_economics
 from exp.common.tasks import TaskCase
 from exp.runtime.environments.interface import EnvironmentRuntime, EnvironmentSession, Observation
+from exp.runtime.environments.world_grounding import NativeReadReceipt
+from exp.runtime.environments.world_outcomes import (
+    ExecutionEvidence,
+    WorldExecutionReceipt,
+    execute_with_recovery,
+)
 from exp.runtime.environments.worlds import (
     CheckpointableSession,
     ExecutableCheckpoint,
@@ -80,7 +92,7 @@ class MixedRealityPolicy(ContractModel):
         """Reject ambiguous tool names, absent identities, and unowned state mixing."""
         if len({route.name for route in self.routes}) != len(self.routes):
             raise ValueError("tool routes must have unique names")
-        native = any(route.mode != "simulated" for route in self.routes)
+        native = self.requires_native
         candidate = any(route.mode != "real" for route in self.routes)
         if native and self.native_identity is None:
             raise ValueError("native routes require a frozen native identity")
@@ -111,7 +123,19 @@ class MixedRealityPolicy(ContractModel):
                         f"route {route.name!r} declares effect {route.effect!r} but its world "
                         "policy disagrees"
                     )
+            routes = {route.name: route.mode for route in self.routes}
+            if any(
+                routes.get(bridge.target_tool) != "simulated" for bridge in self.world.native_reads
+            ):
+                raise ValueError("native read bridge targets must have simulated routes")
         return self
+
+    @property
+    def requires_native(self) -> bool:
+        """Include private read dependencies even when every actor tool is simulated."""
+        return any(route.mode != "simulated" for route in self.routes) or bool(
+            self.world is not None and self.world.native_reads
+        )
 
 
 class StepIntent(ContractModel):
@@ -152,6 +176,20 @@ class StepPrediction(ContractModel):
     status: Literal["predicted", "failed", "halted"]
 
 
+class StepGrounding(ContractModel):
+    """Private native facts durably recorded before a simulated call is dispatched.
+
+    Attributes:
+        kind: Discriminator for original native read evidence.
+        operation_id: Identity of the previously retained dispatch intent.
+        reads: Exact checkpoint-bound original observations required by this action.
+    """
+
+    kind: Literal["grounding"] = "grounding"
+    operation_id: str
+    reads: tuple[NativeReadReceipt, ...]
+
+
 class StepResult(ContractModel):
     """Operator-only evidence of a completed or interrupted backend dispatch.
 
@@ -168,6 +206,8 @@ class StepResult(ContractModel):
         exact_observation: Exact content and error-flag equality, not a state comparison.
         economics: Combined reported charges with missing totals retained as unknown.
         accounting_failure: Invalid backend accounting, retained before stopping execution.
+        failures: Operator-only stage reasons tied to the original operation, never actor messages.
+        execution: Exact authoritative tool-effect evidence when its backend supplies it.
     """
 
     kind: Literal["result"] = "result"
@@ -184,6 +224,8 @@ class StepResult(ContractModel):
     exact_observation: bool | None
     economics: OperationEconomics
     accounting_failure: str | None
+    failures: tuple[StructuredFailure, ...] = ()
+    execution: WorldExecutionReceipt | None = None
 
 
 class MixedCheckpoint(ContractModel):
@@ -210,6 +252,9 @@ class MixedCheckpoint(ContractModel):
     shadow_halted: bool
 
 
+type MixedEvent = StepIntent | StepPrediction | StepGrounding | StepResult
+
+
 class MixedRealityEnvironmentRuntime:
     """Compose existing environment owners with required pre/post dispatch evidence.
 
@@ -227,14 +272,26 @@ class MixedRealityEnvironmentRuntime:
         policy: MixedRealityPolicy,
         native: EnvironmentRuntime | None,
         candidate: EnvironmentRuntime | None,
-        record: Callable[[StepIntent | StepPrediction | StepResult], None],
+        record: Callable[[MixedEvent], None],
     ) -> None:
         """Bind exact runtimes without importing simulation or provider implementations."""
-        if any(route.mode != "simulated" for route in policy.routes) and native is None:
+        if policy.requires_native and native is None:
             raise ValueError("native routes require an executable native runtime")
         if any(route.mode != "real" for route in policy.routes) and candidate is None:
             raise ValueError("candidate routes require an executable candidate runtime")
         if policy.world is not None:
+            if isinstance(candidate, ExecutableWorldRuntime) and any(
+                route.mode == "shadow" for route in policy.routes
+            ):
+                raise ValueError(
+                    "owned-world shadow routes require an independent mirror contract; "
+                    "the simulated owner cannot execute native-owned tools"
+                )
+            if policy.world.native_reads and not (
+                isinstance(native, ExecutableWorldRuntime)
+                and isinstance(candidate, ExecutableWorldRuntime)
+            ):
+                raise ValueError("native read bridges require paired executable worlds")
             for runtime, owner in ((native, "native"), (candidate, "simulated")):
                 if isinstance(runtime, ExecutableWorldRuntime) and (
                     runtime.manifest != policy.world or runtime.owner != owner
@@ -281,10 +338,14 @@ class MixedRealityEnvironmentRuntime:
                 f"task tools are not routed: {sorted(unavailable)!r}; complete the policy first"
             )
         public_task = task.model_copy(update={"reference_answer": None}, deep=True)
+        if self.policy.world is not None and {tool.name for tool in task.tools} & {
+            bridge.probe_tool for bridge in self.policy.world.native_reads
+        }:
+            raise ValueError("native grounding probes are private, not actor tools")
         with ExitStack() as stack:
             native = None
             candidate = None
-            if any(route.mode != "simulated" for route in self.policy.routes):
+            if self.policy.requires_native:
                 if self._native is None:
                     raise RuntimeError("native runtime binding is missing")
                 native = stack.enter_context(_open(self._native, public_task, checkpoint, "native"))
@@ -312,7 +373,7 @@ class _MixedSession:
         task: TaskCase,
         native: EnvironmentSession | None,
         candidate: EnvironmentSession | None,
-        record: Callable[[StepIntent | StepPrediction | StepResult], None],
+        record: Callable[[MixedEvent], None],
     ) -> None:
         """Allocate a fresh episode; replay is exclusively the enclosing simulator's job."""
         self._policy = policy
@@ -329,10 +390,12 @@ class _MixedSession:
         self._shadow_halted = False
         self._scope: ComparisonScope = "initial_correspondence_unverified"
         self._lock = threading.Lock()
+        self.last_execution: WorldExecutionReceipt | None = None
 
     def execute(self, action: ToolCall) -> Observation:
         """Execute once, refusing unknown routes and use after an ambiguous outcome."""
         with self._lock:
+            self.last_execution = None
             if self._stopped:
                 raise RuntimeError(
                     "environment session stopped; retain receipts and open a new episode"
@@ -393,7 +456,7 @@ class _MixedSession:
         with self._lock:
             self._stopped = True
 
-    def _retain(self, event: StepIntent | StepPrediction | StepResult) -> None:
+    def _retain(self, event: MixedEvent) -> None:
         """Stop the episode on failed evidence persistence, including after dispatch."""
         try:
             self._record(event)
@@ -406,6 +469,7 @@ class _MixedSession:
         started = time.monotonic()
         candidate_observation = None
         candidate_failure = None
+        grounding_refused = False
         shadow_status: Literal["not_requested", "predicted", "failed", "halted"] = "not_requested"
         if intent.route.mode == "shadow":
             if self._shadow_halted:
@@ -433,7 +497,43 @@ class _MixedSession:
         failure = None
         try:
             backend = self._candidate if authority == "simulated" else self._native
-            observation = self._call(backend, intent.action)
+            bridges = (
+                ()
+                if self._policy.world is None
+                else tuple(
+                    row
+                    for row in self._policy.world.native_reads
+                    if row.target_tool == intent.action.name
+                )
+            )
+            if bridges:
+                if not isinstance(self._native, ExecutableWorld) or not isinstance(
+                    backend, ExecutableWorld
+                ):
+                    raise RuntimeError("native grounding requires paired executable sessions")
+                self._native.advance(0)
+                backend.advance(0)
+                if self._native.clock != backend.clock:
+                    raise RuntimeError("native and simulated clocks differ before grounding")
+                reads = tuple(self._native.observe_native(row, intent.action) for row in bridges)
+                self._retain(StepGrounding(operation_id=intent.operation_id, reads=reads))
+                refused = [row.observation for row in reads if row.observation.is_error]
+                if refused:
+                    grounding_refused = True
+                    # An isolated read has a known negative outcome; no prediction was sent.
+                    authority = "native"
+                    observation = Observation(
+                        content="Native grounding unavailable: "
+                        + "; ".join(row.content for row in refused),
+                        is_error=True,
+                        metadata={"grounding_refused": True},
+                    )
+                else:
+                    observation = backend.execute_grounded(
+                        intent.action.model_copy(deep=True), reads
+                    )
+            else:
+                observation = self._call(backend, intent.action)
         except BaseException as exc:  # noqa: BLE001 - retain ambiguous dispatch evidence
             failure = exc
             self._stopped = True
@@ -459,9 +559,15 @@ class _MixedSession:
                 ),
             }
         )
+        authoritative = self._native if authority == "native" else self._candidate
+        if isinstance(authoritative, ExecutionEvidence):
+            receipt = authoritative.last_execution
+            if receipt is not None and receipt.action_sha256 == sha256_json(intent.action):
+                self.last_execution = receipt.model_copy(update={"public_refusal": None})
         result = StepResult(
             operation_id=intent.operation_id,
             authority=authority,
+            execution=self.last_execution,
             authoritative_observation=observation,
             authoritative_failure=type(failure).__name__ if failure is not None else None,
             candidate_observation=candidate_observation,
@@ -473,13 +579,55 @@ class _MixedSession:
             accounting_failure=(
                 type(accounting_failure).__name__ if accounting_failure is not None else None
             ),
+            failures=tuple(
+                StructuredFailure(
+                    code=FailureCode.TIMEOUT
+                    if error_type == "TimeoutError"
+                    else FailureCode.INTERNAL,
+                    message=(
+                        "Mixed execution failed at the recorded stage; inspect the matching "
+                        "operation intent and retained observations before reconciliation. "
+                        "No implicit redispatch."
+                    ),
+                    exception_type=error_type,
+                    details={
+                        "phase": phase,
+                        "operation_id": intent.operation_id,
+                        "authority": authority,
+                        "route": intent.route.mode,
+                    },
+                )
+                for phase, error_type in (
+                    (
+                        "authoritative_execution",
+                        type(failure).__name__ if failure is not None else None,
+                    ),
+                    ("shadow_prediction", candidate_failure),
+                    (
+                        "economics_validation",
+                        type(accounting_failure).__name__
+                        if accounting_failure is not None
+                        else None,
+                    ),
+                )
+                if error_type is not None
+            ),
         )
         self._retain(result)
         if exact is False:
             self._scope = "divergent_prefix"
         if intent.route.mode == "real" and intent.route.effect == "write":
             self._scope = "unpaired_prefix"
-        if failure is None:
+        receipt = self.last_execution
+        refused = (
+            receipt is not None
+            and receipt.error_type is not None
+            and receipt.effects == "not_started"
+            and not receipt.dispatched
+            and receipt.before_sha256 is not None
+            and receipt.before_sha256 == receipt.after_sha256
+        )
+        if failure is None and not grounding_refused and not refused:
             self._align_clocks(intent, authority)
         if failure is not None:
             _raise_backend_failure("execution", failure)
@@ -490,7 +638,11 @@ class _MixedSession:
         return Observation(
             content=observation.content,
             is_error=observation.is_error,
-            metadata={"economics": economics.model_dump(mode="json"), "authority": authority},
+            metadata={
+                "economics": economics.model_dump(mode="json"),
+                "authority": authority,
+                **({"grounding_refused": True} if grounding_refused else {}),
+            },
         )
 
     def _align_clocks(self, intent: StepIntent, authority: Literal["native", "simulated"]) -> None:
@@ -506,7 +658,7 @@ class _MixedSession:
         """Give a backend its own public action copy, without mutating the other's request."""
         if backend is None:
             raise RuntimeError("selected environment backend is not bound")
-        return backend.execute(action.model_copy(deep=True))
+        return execute_with_recovery(backend, action.model_copy(deep=True))
 
 
 def _open(

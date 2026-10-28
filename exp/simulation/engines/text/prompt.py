@@ -85,7 +85,9 @@ json, or an exact native text string with encoding text. Do not serialize a JSON
 a string. effect is kind edits: only the changes this call makes to environment_state, as
 ordered ops. set {"op":"set","path":[...],"value":...} creates or replaces an object key
 (missing parent objects are created) or an existing list index; delete removes a key or index;
-append adds to an existing list; remove_value removes the first equal list element. Paths are
+append adds to an existing list; remove_value removes the first equal list element.
+copy {"op":"copy","from":[...],"path":[...]} deep-copies an existing source to a set-compatible
+destination, preserving its values and types exactly. Later edits can change that copy. Paths are
 lists of object keys and list indexes. Use an empty edits list when the state does not change;
 never restate unchanged state. terminal is false.
 The external observation is serialized by code; you decide every reply value and state effect.

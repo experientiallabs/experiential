@@ -156,6 +156,8 @@ class _RuntimeCatalog:
 @pytest.fixture(name="pinned_traces")
 def _pinned_traces(request: pytest.FixtureRequest) -> Path:
     """Return the cached pinned public export, skipping when it cannot be fetched."""
+    if getattr(request.config, "cache", None) is None:
+        pytest.skip("the pinned public export needs pytest's cacheprovider plugin")
     cache = Path(str(request.config.cache.mkdir("exp-public-fixtures")))
     path = cache / "terminal-tasks-traces.otel.jsonl"
     if not path.is_file() or _sha256(path) != TRACES_SHA256:

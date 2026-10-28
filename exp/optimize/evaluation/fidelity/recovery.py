@@ -35,7 +35,8 @@ class UnknownOutcome(ContractModel):
 
     Attributes:
         stage: Prediction, judge, investigation, or retrieval (an interrupted preparation).
-        step: Measured step index from 0, or None for the run's judge. Disclosure lines count
+        step: Measured step index from 0, or None for a run-level judge or consolidation.
+            Disclosure lines count
             steps from 1, like the per-turn report.
         attempts: Dispatches of this step at this stage: the lost one plus each re-dispatch.
     """
@@ -46,7 +47,11 @@ class UnknownOutcome(ContractModel):
 
     def line(self) -> str:
         """One per-step disclosure line, naming the stage and attempt count."""
-        where = "judge" if self.step is None else f"step {self.step + 1}"
+        where = (
+            ("memory consolidation" if self.stage == "investigation" else self.stage)
+            if self.step is None
+            else f"step {self.step + 1}"
+        )
         return (
             f"{where} re-dispatched after an unknown outcome ({self.stage}, "
             f"{self.attempts} attempts)"
@@ -248,7 +253,9 @@ def recorded_outcomes(
         UnknownOutcome.model_validate(
             {
                 "stage": stage,
-                "step": None if operation == JUDGE_OPERATION else steps[operation],
+                "step": None
+                if operation == JUDGE_OPERATION or operation.startswith("dream:")
+                else steps[operation],
                 "attempts": count + 1,
             }
         )

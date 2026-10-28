@@ -27,7 +27,8 @@ from exp.common.models.model import ReasoningEffort
 from exp.common.progress import ProgressHook, report
 from exp.common.project import ProjectStore, artifact_input
 from exp.common.tasks import TaskCase
-from exp.optimize.evaluation.fidelity.decision_access import decision_caller
+from exp.optimize.evaluation.fidelity.decision_access import decision_caller, receipt_recorder
+from exp.optimize.evaluation.fidelity.dreaming import dream_pending, run_dream
 from exp.optimize.evaluation.fidelity.instance_facts import ReplayFacts, require_fact_scope
 from exp.optimize.evaluation.fidelity.knowledge_exposure import require_unexposed_task
 from exp.optimize.evaluation.fidelity.memory import (
@@ -36,6 +37,8 @@ from exp.optimize.evaluation.fidelity.memory import (
     maintain_memory,
     trajectory_record,
 )
+from exp.optimize.evaluation.fidelity.memory_outcomes import record_memory_outcomes
+from exp.optimize.evaluation.fidelity.memory_policy import FidelityMemory
 from exp.optimize.evaluation.fidelity.recovery import (
     JUDGE_OPERATION,
     RecoveryLog,
@@ -61,7 +64,8 @@ from exp.runtime.models.structured_completion import (
 )
 from exp.runtime.sessions.dispatch_ledger import DispatchLedger
 from exp.runtime.sessions.store import SessionStore
-from exp.simulation.evaluation import FixedWorkflow, evaluate_workflow
+from exp.simulation.evaluation.workflow import FixedWorkflow, evaluate_workflow
+from exp.simulation.retrieval.evidence_reading import EvidenceReader
 from exp.simulation.retrieval.jev import JEVCueSelector, JEVPolicy, JEVSelector
 from exp.simulation.retrieval.selection import EvidencePolicy
 from exp.simulation.world_model.artifact import GroundedWorldModelArtifact
@@ -102,11 +106,15 @@ class FidelityRetrieval(ContractModel):
         jev_alias: Catalog alias served by the native decision wire.
         jev: Frozen rubric; it must equal any reranker bound in the simulator artifact.
         memory_top_k: Maximum research records delivered to one prediction.
+        memory_input_bytes: Optional complete recall request limit, including framing reserve.
     """
 
     jev_alias: str = Field(min_length=1)
     jev: JEVPolicy
     memory_top_k: int = Field(default=4, gt=0, strict=True)
+    memory_input_bytes: int | None = Field(
+        default=None, ge=4096, le=24000, strict=True, exclude_if=lambda value: value is None
+    )
 
 
 class RoleBudget(ContractModel):
@@ -134,49 +142,6 @@ class RoleBudgets(ContractModel):
     prediction: RoleBudget
     investigation: RoleBudget
     judging: RoleBudget
-
-
-class FidelityMemory(ContractModel):
-    """Cross-trajectory memory: learn from this trajectory, or evaluate a frozen checkpoint.
-
-    Attributes:
-        lineage: Project-local versioned memory sequence.
-        mode: ``learn`` pins the current head and publishes the next version after a
-            completed trajectory; ``frozen`` reads an exact checkpoint and never publishes.
-        checkpoint: Exact frozen version; absent in learning mode.
-        reserved: Frozen evaluation that declares this task lineage reserved: it is refused if
-            the lineage already consumed the task lineage, and later learning of it is refused.
-            Without it a frozen run is a diagnostic and relies on same-trajectory withholding.
-        hide_task_lineage: Learning only: memory from earlier trajectories of this task lineage
-            is hidden from the run, so every prediction is made on a task memory has not seen
-            (test-then-train), the same exclusion recorded-evidence retrieval applies.
-        withhold_own: False only for an unreserved frozen retest that reads what memory learned
-            from this very trajectory: a retention check, never a generalization measure.
-        overview_lines: Line budget of the memory overview delivered with every prediction.
-        maximum_compressions: Compression calls a learning run may buy after publication.
-    """
-
-    lineage: str = Field(pattern=r"^[a-z][a-z0-9-]{0,63}$")
-    mode: Literal["learn", "frozen"]
-    checkpoint: int | None = Field(default=None, ge=1, strict=True)
-    reserved: bool = Field(default=False, strict=True, exclude_if=lambda value: not value)
-    hide_task_lineage: bool = Field(default=False, strict=True, exclude_if=lambda value: not value)
-    withhold_own: bool = Field(default=True, strict=True, exclude_if=lambda value: value)
-    overview_lines: int = Field(default=32, ge=1, strict=True)
-    maximum_compressions: int = Field(default=16, ge=0, strict=True)
-
-    @model_validator(mode="after")
-    def checkpoint_mode(self) -> "FidelityMemory":
-        """Reserved evaluation names its checkpoint; learning always follows the head."""
-        if (self.mode == "frozen") != (self.checkpoint is not None):
-            raise ValueError("frozen memory requires a checkpoint; learning uses the head")
-        if self.reserved and self.mode != "frozen":
-            raise ValueError("only frozen evaluation can declare a reserved task lineage")
-        if self.hide_task_lineage and self.mode != "learn":
-            raise ValueError("hiding the task lineage applies only while learning")
-        if not self.withhold_own and (self.mode != "frozen" or self.reserved):
-            raise ValueError("only an unreserved frozen retest may read its own trajectory")
-        return self
 
 
 class FidelitySpec(ContractModel):
@@ -260,6 +225,12 @@ class FidelitySpec(ContractModel):
             or any(not row.reply_available for row in self.references.steps)
         ):
             raise ValueError("online research requires explicitly disclosed post-step replies")
+        if (
+            self.online_research is not None
+            and self.online_research.reading is not None
+            and self.retrieval is None
+        ):
+            raise ValueError("evidence reading requires a registered decision-model alias")
         if self.memory is not None and self.retrieval is None:
             raise ValueError("memory delivery requires a registered JEV retrieval policy")
         if self.memory is not None and (self.memory.mode == "learn") != (
@@ -288,6 +259,7 @@ class FidelitySpec(ContractModel):
         return JEVCueSelector(
             policy=self.retrieval.jev,
             top_k=self.retrieval.memory_top_k,
+            maximum_input_bytes=self.retrieval.memory_input_bytes,
             decide=_never,
             record=_discard,
         ).identity
@@ -514,8 +486,14 @@ def execute_fidelity_evaluation(
     with FileLock(directory / (prepared.id + ".lock"), timeout=0):
         previous = saved_fidelity_report(project, prepared)
         intent = prepared.id + "-execution"
-        if previous is not None:
+        if previous is not None and not dream_pending(project, prepared):
             report(progress, "Saved fidelity result")
+            record_memory_outcomes(
+                project.artifacts,
+                prepared.id,
+                created_at=now(),
+                code_revision=prepared.code_revision,
+            )
             consume_trajectory(project, prepared, now())
             return previous
         resuming = project.artifacts.exists(intent)
@@ -582,6 +560,7 @@ def execute_fidelity_evaluation(
         predictor = role_model(registry, catalog, artifact.model_alias, spec, "prediction")
         budget = RequestBudget(project, identity=identity, maximum_cost_usd=None)
         originals: JEVSelector | None = None
+        reader: EvidenceReader | None = None
         prior: MemoryVersion | None = None
         prior_identity: JsonObject | None = None
         prior_records: dict[str, JsonObject] = {}
@@ -594,13 +573,16 @@ def execute_fidelity_evaluation(
             decide = decision_caller(
                 registry.resolve(spec.retrieval.jev_alias), transport, window, now
             )
-            record = _receipt_recorder(project, prepared, now)
+            record = receipt_recorder(project, prepared.id, prepared.code_revision, now)
+            if spec.online_research is not None and spec.online_research.reading is not None:
+                reader = EvidenceReader(spec.online_research.reading, decide, record)
             if artifact.selection_policy_sha256 is not None:
                 originals = JEVSelector(policy=spec.retrieval.jev, decide=decide, record=record)
             if spec.memory is not None or spec.online_research is not None:
                 research_selection = JEVCueSelector(
                     policy=spec.retrieval.jev,
                     top_k=spec.retrieval.memory_top_k,
+                    maximum_input_bytes=spec.retrieval.memory_input_bytes,
                     decide=decide,
                     record=record,
                 )
@@ -804,6 +786,7 @@ def execute_fidelity_evaluation(
             served_model_id=predictor.served_model_id,
             research_policy=spec.online_research,
             research_selection=research_selection,
+            research_reader=reader,
             research_complete=completion(investigating, structured=True, role="investigation")
             if spec.online_research is not None
             else None,
@@ -833,27 +816,47 @@ def execute_fidelity_evaluation(
             lambda: report(progress, "Judging"),
         )
 
-        result = evaluate_workflow(
-            session,
-            spec.workload,
-            references=spec.references,
-            judge=spec.judge,
-            judge_complete=resumable_judge if spec.judged else skipped_judge,
-            artifacts=project.artifacts,
-            clock=now,
-            code_revision=prepared.code_revision,
-            evaluation_id=prepared.id + "-report",
-            reply_feedback_source=spec.online_research.feedback_source
-            if spec.online_research is not None
-            else None,
-            progress=progress,
-            feedback_after_predictions=spec.online_research is not None
-            and not spec.online_research.notes_reach_predictions,
-            resume=resumption is not None,
+        result = (
+            previous
+            if previous is not None
+            else evaluate_workflow(
+                session,
+                spec.workload,
+                references=spec.references,
+                judge=spec.judge,
+                judge_complete=resumable_judge if spec.judged else skipped_judge,
+                artifacts=project.artifacts,
+                clock=now,
+                code_revision=prepared.code_revision,
+                evaluation_id=prepared.id + "-report",
+                reply_feedback_source=spec.online_research.feedback_source
+                if spec.online_research is not None
+                else None,
+                progress=progress,
+                feedback_after_predictions=spec.online_research is not None
+                and not spec.online_research.notes_reach_predictions,
+                resume=resumption is not None,
+            )
         )
         learning = spec.memory is not None and spec.memory.mode == "learn"
         if learning:
             report(progress, "Publishing memory")
+        if dream_pending(project, prepared):
+            assert spec.retrieval is not None
+            report(progress, "Checking cited memory claims")
+            run_dream(
+                project,
+                prepared,
+                complete=completion(investigating, structured=True, role="investigation"),
+                decide=decision_caller(
+                    registry.resolve(spec.retrieval.jev_alias), transport, window, now
+                ),
+                clock=now,
+                resumption=resumption,
+            )
+        record_memory_outcomes(
+            project.artifacts, prepared.id, created_at=now(), code_revision=prepared.code_revision
+        )
         consume_trajectory(project, prepared, now())
         if learning:
             report(progress, "Compressing memory")
@@ -965,24 +968,3 @@ def _check_budget(role: str, budget: RoleBudget, caps: ModelCapabilities) -> Non
         caps.supports_reasoning is not True or caps.reasoning_effort is None
     ):
         raise ValueError(f"{role} model does not accept a configured reasoning effort")
-
-
-def _receipt_recorder(
-    project: ProjectStore, prepared: PreparedFidelity, clock: Callable[[], datetime]
-) -> Callable[[JsonObject], None]:
-    """Retain exact JEV requests, raw answers and selected IDs as immutable receipts."""
-
-    def record(receipt: JsonObject) -> None:
-        """Persist one content-addressed receipt beside the run's other artifacts."""
-        identity = stable_id("jev-receipt", {"run": prepared.id, "receipt": receipt})
-        if not project.artifacts.exists(identity):
-            project.artifacts.write_json(
-                artifact_id=identity,
-                artifact_type="jev-receipt",
-                envelope=ArtifactEnvelope(
-                    schema_version=1, created_at=clock(), code_revision=prepared.code_revision
-                ),
-                files={"receipt.json": {"run": prepared.id, **receipt}},
-            )
-
-    return record

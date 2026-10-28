@@ -52,3 +52,14 @@ def test_qualification_counts_stages_and_shows_both_sensitivity_figures() -> Non
     )
     assert unaffected == "  Unaffected traces only  5/6 replies exact (83%) · 2/2 traces"
     assert affected == "  Re-attempted traces only  1/3 replies exact (33%) · 1/1 traces"
+
+
+def test_consolidation_retry_has_no_invented_prediction_step(tmp_path: Path) -> None:
+    """Run-level learning retries remain visible without inventing a measured tool step."""
+    store = ProjectStore(tmp_path, "demo")
+    log = RecoveryLog(store, "run", code_revision="r", clock=lambda: datetime.now(UTC))
+    log.record("investigation", "dream:reader-a", "reader-retry-1")
+    log.record("investigation", "dream:reader-b", "reader-retry-2")
+    rows = recorded_outcomes(store, "run", ())
+    assert rows == (UnknownOutcome(stage="investigation", step=None, attempts=2),) * 2
+    assert rows[0].line().startswith("memory consolidation re-dispatched")

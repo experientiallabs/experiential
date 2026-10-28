@@ -6,7 +6,7 @@ import copy
 
 from exp.common.core.artifacts import JsonObject, JsonValue
 
-DELTA_OPS: tuple[str, ...] = ("set", "delete", "append", "remove_value")
+DELTA_OPS: tuple[str, ...] = ("set", "delete", "append", "remove_value", "copy")
 
 
 class DeltaError(ValueError):
@@ -61,6 +61,8 @@ def apply_delta(state: JsonObject, delta: JsonValue) -> JsonObject:
     an existing key or index, ``append`` adds to an existing list, ``remove_value`` removes the
     first JSON-equal element of an existing list. Booleans remain distinct from numbers,
     while numeric equality admits equivalent integer and floating-point values.
+    ``copy`` deep-copies an existing ``from`` path to a set-compatible destination. Sources
+    resolve against the working state, so later operations observe earlier edits.
     Any other op or shape is refused.
 
     Args:
@@ -79,6 +81,16 @@ def apply_delta(state: JsonObject, delta: JsonValue) -> JsonObject:
     for op in delta:
         if not isinstance(op, dict) or op.get("op") not in DELTA_OPS:
             raise DeltaError("undeclared op")
+        if op["op"] == "copy":
+            source = op.get("from")
+            if (
+                set(op) != {"op", "path", "from"}
+                or not isinstance(source, list)
+                or not source
+                or not all(type(part) in (str, int) for part in source)
+            ):
+                raise DeltaError("copy requires an exact nonempty source path")
+            op = {"op": "set", "path": op["path"], "value": copy.deepcopy(_resolve(new, source))}
         if set(op) - {"op", "path", "value"}:
             raise DeltaError("op carries undeclared fields")
         path = op.get("path")
@@ -93,6 +105,7 @@ def apply_delta(state: JsonObject, delta: JsonValue) -> JsonObject:
         )
         key = path[-1]
         kind = op["op"]
+        assert isinstance(kind, str)
         if kind == "set":
             if "value" not in op:
                 raise DeltaError("set requires value")

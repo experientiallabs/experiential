@@ -3,7 +3,8 @@
 from collections.abc import Callable
 from datetime import datetime
 
-from exp.common.core.artifacts import JsonObject
+from exp.common.core.artifacts import ArtifactEnvelope, JsonObject, stable_id
+from exp.common.project import ProjectStore
 from exp.runtime.gateway.decisions_contracts import DecisionRequest
 from exp.runtime.models.providers.admitted_transport import AdmittedJsonTransport
 from exp.runtime.models.providers.transport import ProviderTransportError
@@ -41,3 +42,24 @@ def decision_caller(
         return response.body
 
     return decide
+
+
+def receipt_recorder(
+    project: ProjectStore, run_id: str, code_revision: str, clock: Callable[[], datetime]
+) -> Callable[[JsonObject], None]:
+    """Retain exact JEV requests, raw answers and selected IDs as immutable receipts."""
+
+    def record(receipt: JsonObject) -> None:
+        """Persist one content-addressed receipt beside the run's other artifacts."""
+        identity = stable_id("jev-receipt", {"run": run_id, "receipt": receipt})
+        if not project.artifacts.exists(identity):
+            project.artifacts.write_json(
+                artifact_id=identity,
+                artifact_type="jev-receipt",
+                envelope=ArtifactEnvelope(
+                    schema_version=1, created_at=clock(), code_revision=code_revision
+                ),
+                files={"receipt.json": {"run": run_id, **receipt}},
+            )
+
+    return record

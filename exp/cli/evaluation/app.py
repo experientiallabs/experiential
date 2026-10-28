@@ -57,6 +57,14 @@ VERBOSE_OPTION = typer.Option(
 )
 
 
+CONTINUATIONS_OPTION = typer.Option(
+    None, "--continuations", help="Run frozen continuations or export witnessed SFT targets."
+)
+PIPELINE_OPTION = typer.Option(
+    None, "--pipeline", help="Qualify and deliver a frozen multi-family task-factory manifest."
+)
+
+
 def evaluate(
     project: str | None = typer.Argument(None, metavar="PROJECT"),
     models: str | None = typer.Option(
@@ -89,6 +97,8 @@ def evaluate(
     refine_task: Path | None = REFINE_TASK_OPTION,
     calibration: Path | None = CALIBRATION_OPTION,
     materialize: Path | None = MATERIALIZE_OPTION,
+    continuations: Path | None = CONTINUATIONS_OPTION,
+    pipeline: Path | None = PIPELINE_OPTION,
 ) -> None:
     """Evaluate models against a project's simulated scenarios and configured judge.
 
@@ -114,7 +124,89 @@ def evaluate(
         refine_task: Bounded task refinement with independent qualification checks.
         calibration: Saved-evidence verifier and rubric calibration without new inference.
         materialize: Frozen native artifact handoff, without provider calls.
+        continuations: Explicit runtime study or saved-evidence training export specification.
+        pipeline: Bounded multi-family development qualification and verified package delivery.
     """
+    if pipeline is not None:
+        if (
+            project is None
+            or any(
+                value is not None
+                for value in (
+                    continuations,
+                    materialize,
+                    calibration,
+                    fidelity,
+                    audit,
+                    trace_analysis,
+                    refine_task,
+                    resume,
+                    report,
+                    models,
+                    repeats,
+                    concurrency,
+                    maximum_steps,
+                    maximum_output_tokens,
+                )
+            )
+            or verbose
+            or retry_incomplete
+            or include_inspected
+        ):
+            raise typer.BadParameter(
+                "--pipeline requires PROJECT and cannot combine with other evaluation modes "
+                "or rollout overrides"
+            )
+        from exp.cli.evaluation.pipeline import run_pipeline
+
+        run_pipeline(
+            project,
+            pipeline,
+            root=root,
+            yes=yes,
+            non_interactive=non_interactive,
+            dry_run=dry_run,
+        )
+        return
+    if continuations is not None:
+        if (
+            project is None
+            or any(
+                value is not None
+                for value in (
+                    materialize,
+                    calibration,
+                    fidelity,
+                    audit,
+                    trace_analysis,
+                    refine_task,
+                    resume,
+                    report,
+                    models,
+                    repeats,
+                    concurrency,
+                    maximum_steps,
+                    maximum_output_tokens,
+                )
+            )
+            or verbose
+            or retry_incomplete
+            or include_inspected
+        ):
+            raise typer.BadParameter(
+                "--continuations requires PROJECT and cannot combine with other evaluation modes"
+            )
+        from exp.cli.evaluation.continuations import run_continuations
+
+        run_continuations(
+            project,
+            continuations,
+            root=root,
+            yes=yes,
+            non_interactive=non_interactive,
+            dry_run=dry_run,
+        )
+        return
     if materialize is not None:
         if (
             project is None

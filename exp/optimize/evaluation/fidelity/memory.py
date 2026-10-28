@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING
 from exp.common.core.artifacts import ArtifactEnvelope, JsonObject
 from exp.common.project import ProjectStore, artifact_input
 from exp.runtime.sessions.store import SessionStore
+from exp.simulation.world_model.dreaming import DreamResult
 from exp.simulation.world_model.experience_memory import (
     ReservedTaskError,
     consumed_task_lineages,
@@ -30,6 +31,7 @@ from exp.simulation.world_model.memory_tree import (
     ambiguous_blocks,
     build_pending,
     fit_line,
+    fit_rule_line,
     refused_blocks,
 )
 
@@ -43,7 +45,8 @@ DUPLICATE = "duplicate trajectory already consumed"
 
 def saved_memory_receipt(project: ProjectStore, prepared: PreparedFidelity) -> JsonObject | None:
     """Read the memory version a completed learning trajectory produced, if any."""
-    identity = prepared.id + "-memory"
+    repair = prepared.id + "-learning-repair-result"
+    identity = repair if project.artifacts.exists(repair) else prepared.id + "-memory"
     if not project.artifacts.exists(identity):
         return None
     return json.loads(project.artifacts.read_bytes(identity, "memory.json"))
@@ -95,6 +98,23 @@ def consume_trajectory(project: ProjectStore, prepared: PreparedFidelity, now: d
             else None
         )
         try:
+            lines = memory_lines(spec, receipts)
+            if spec.memory.dreaming is not None:
+                dream = DreamResult.model_validate_json(
+                    project.artifacts.read_bytes(prepared.id + "-dream", "record.json")
+                )
+                research.extend(dream.records)
+                lines.extend(
+                    (
+                        "hypothesis",
+                        fit_rule_line("checked hypothesis", row.proposal.cue, row.proposal.claim),
+                        row.record,
+                    )
+                    for row in dream.decisions
+                    if row.record is not None
+                    and row.proposal.transferable
+                    and not row.proposal.retire
+                )
             version, consumed = publish_trajectory(
                 project.artifacts,
                 lineage=spec.memory.lineage,
@@ -103,7 +123,7 @@ def consume_trajectory(project: ProjectStore, prepared: PreparedFidelity, now: d
                 selection_policy_sha256=str(spec.memory_selection_identity),
                 trajectory=trajectory_record(spec),
                 research=research,
-                lines=memory_lines(spec, receipts),
+                lines=lines,
                 created_at=now,
                 code_revision=prepared.code_revision,
                 publisher=prepared.id,
@@ -156,13 +176,14 @@ def memory_lines(spec: FidelitySpec, receipts: list[JsonObject]) -> list[tuple[L
         if investigation.get("transferable") is not True:
             continue
         superseded = investigation.get("supersedes") or []
-        text = (
-            f"[unresolved rule] when {investigation.get('observable_cue')}: "
-            f"{investigation.get('hypothesis')}"
+        detail = f"(supersedes {', '.join(str(item) for item in superseded)})" if superseded else ""
+        text = fit_rule_line(
+            "unresolved rule",
+            str(investigation.get("observable_cue")),
+            str(investigation.get("hypothesis")),
+            detail,
         )
-        if superseded:
-            text += f" (supersedes {', '.join(str(item) for item in superseded)})"
-        lines.append(("hypothesis", fit_line(text), str(row["id"])))
+        lines.append(("hypothesis", text, str(row["id"])))
     return lines
 
 

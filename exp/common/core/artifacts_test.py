@@ -36,6 +36,14 @@ _DIGEST_A = "a" * 64
 _DIGEST_B = "b" * 64
 
 
+@pytest.mark.parametrize("prefix", ["Bearer", "bearer", "BEARER", "bEaReR"])
+def test_secret_scan_keeps_case_insensitive_matching_and_minimum_length(prefix: str) -> None:
+    """Moving fixed regex flags out of the scan cannot change token admission."""
+    assert_secret_free({"text": f"{prefix} " + "a" * 11})
+    with pytest.raises(SecretBoundaryError):
+        assert_secret_free({"text": f"{prefix} " + "a" * 12})
+
+
 def test_deterministic_json_hash_and_stable_id_ignore_mapping_order() -> None:
     """Canonical JSON makes equivalent mappings hash and identify identically."""
     first = {"nested": {"b": 2, "a": 1}, "items": ["x", "y"]}

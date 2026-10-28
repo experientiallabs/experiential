@@ -788,21 +788,10 @@ def _publish(
     if (head.version if head else 0) != (parent.version if parent else 0):
         raise ValueError("memory advanced after this trajectory was pinned")
     number = 1 if parent is None else parent.version + 1
-    source_id = stable_id("consumed-trajectory", {"digest": digest})
-    payload: JsonObject = {
-        "trajectory": trajectory,
-        "authority": "Disclosed native replies after prediction; not a behavioral rule",
-    }
-    if not store.exists(source_id):
-        store.write_json(
-            artifact_id=source_id,
-            artifact_type="consumed-trajectory",
-            envelope=ArtifactEnvelope(
-                schema_version=1, created_at=created_at, code_revision=code_revision
-            ),
-            files={"trajectory.json": payload},
-        )
-    source_ref = artifact_input(store.read(source_id).manifest)
+    source_ref = persist_trajectory_source(
+        store, trajectory, created_at=created_at, code_revision=code_revision
+    )
+    source_id = source_ref.artifact_id
     entries: list[LibraryEntry] = [
         _entry(
             store, source_id, "trajectory.json", kind="trajectory", cue=digest, source=source_ref
@@ -884,6 +873,29 @@ def _publish(
     )
     _materialize(store, persisted)
     return persisted, True
+
+
+def persist_trajectory_source(
+    store: ArtifactStore, trajectory: JsonObject, *, created_at: datetime, code_revision: str
+) -> ArtifactInput:
+    """Persist disclosed source observations without publishing a memory version."""
+    _require_admissible(trajectory)
+    digest = consumed_trajectory_digest(trajectory)
+    source_id = stable_id("consumed-trajectory", {"digest": digest})
+    payload: JsonObject = {
+        "trajectory": trajectory,
+        "authority": "Disclosed native replies after prediction; not a behavioral rule",
+    }
+    if not store.exists(source_id):
+        store.write_json(
+            artifact_id=source_id,
+            artifact_type="consumed-trajectory",
+            envelope=ArtifactEnvelope(
+                schema_version=1, created_at=created_at, code_revision=code_revision
+            ),
+            files={"trajectory.json": payload},
+        )
+    return artifact_input(store.read(source_id).manifest)
 
 
 def _entry(

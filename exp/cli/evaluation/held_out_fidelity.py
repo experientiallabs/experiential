@@ -47,13 +47,13 @@ from exp.optimize.evaluation.fidelity.runner import (
     execute_fidelity_evaluation,
     saved_fidelity_report,
 )
+from exp.optimize.evaluation.learning.recall import resolve_memory_recall
 from exp.optimize.evaluation.learning.traces import (
     fit_cases,
     learned_runs,
     learning_curve,
     learning_plan,
     recorded_plan,
-    resolve_memory_recall,
 )
 from exp.simulation.mining.exposure_ledger import PanelInUseError
 

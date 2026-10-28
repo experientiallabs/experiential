@@ -54,6 +54,7 @@ _BUILD_SCOPED_REVIEW_KEYS = (
     "rubric_review",
     "human_score_history",
     "human_score_submissions",
+    "human_review_submissions",
 )
 _MINIMUM_PROVIDER_FREE_TRACE_COUNT = 100
 _MAXIMUM_PROVIDER_FREE_TRACE_COUNT = 1000

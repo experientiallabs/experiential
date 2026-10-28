@@ -30,6 +30,19 @@ from exp.runtime.models.providers.async_transport import (
     run_then_close_pooled_client,
     run_with_retry_async,
 )
+from exp.runtime.models.providers.attempt_timeouts import (
+    COMPLETION_SECONDS_PER_OUTPUT_TOKEN as COMPLETION_SECONDS_PER_OUTPUT_TOKEN,
+)
+from exp.runtime.models.providers.attempt_timeouts import (
+    MAXIMUM_COMPLETION_TIMEOUT_SECONDS as MAXIMUM_COMPLETION_TIMEOUT_SECONDS,
+)
+from exp.runtime.models.providers.attempt_timeouts import (
+    completion_deadline_seconds,
+    request_timeout_seconds,
+)
+from exp.runtime.models.providers.attempt_timeouts import (
+    completion_timeout_seconds as completion_timeout_seconds,
+)
 from exp.runtime.models.providers.errors import (
     ProviderCapabilityError,
     ProviderRetryableResponseError,
@@ -61,32 +74,6 @@ ReasoningWireFormat = Literal[
     "gemini_thinking",
 ]
 """Provider-wire representation for one normalized reasoning-effort control."""
-
-COMPLETION_SECONDS_PER_OUTPUT_TOKEN = 0.03
-"""Per-token completion allowance, a conservative approximately 33 tokens per second."""
-
-MAXIMUM_COMPLETION_TIMEOUT_SECONDS = 600.0
-"""Hard ceiling for a derived completion-attempt timeout."""
-
-
-def completion_timeout_seconds(
-    configured_timeout_seconds: float,
-    maximum_output_tokens: int | None,
-) -> float:
-    """Derive one bounded completion timeout from the requested output budget.
-
-    Args:
-        configured_timeout_seconds: Positive per-attempt floor configured on the client.
-        maximum_output_tokens: Requested output ceiling, or ``None`` for the provider default.
-
-    Returns:
-        A finite timeout between the configured floor and scaled ceiling.
-    """
-    if maximum_output_tokens is None:
-        return configured_timeout_seconds
-    scaled = maximum_output_tokens * COMPLETION_SECONDS_PER_OUTPUT_TOKEN
-    return max(configured_timeout_seconds, min(scaled, MAXIMUM_COMPLETION_TIMEOUT_SECONDS))
-
 
 SERVICE_TIER_DIALECTS = frozenset({"openai_responses", "openai_compatible"})
 """Wire dialects with a request field that preserves the caller's service tier.
@@ -547,6 +534,8 @@ class ProviderHttpClient(abc.ABC):
     """One explicit provider connection sharing validation, headers, and the completion flow."""
 
     default_headers: ClassVar[Mapping[str, str]] = {}
+    _reasoning_effort: str | None = None
+    """Catalog-pinned reasoning effort, sent when a request names none; clients may set it."""
 
     def __init__(
         self,
@@ -586,8 +575,8 @@ class ProviderHttpClient(abc.ABC):
         A completed response that decodes to no usable output, such as a reasoning model
         spending its whole output budget without visible text, is dispatched again under the
         client's bounded retry policy before the last error surfaces to the caller. The request's
-        output budget scales both the default request deadline and each transport-attempt ceiling,
-        while an injected request-wide deadline remains authoritative.
+        size, output budget and reasoning effort scale each transport-attempt ceiling, and the
+        default request deadline leaves every allowed attempt that whole ceiling.
 
         Args:
             request: Visible messages, tool schemas, and sampling controls to send.
@@ -595,11 +584,13 @@ class ProviderHttpClient(abc.ABC):
         Returns:
             The typed non-streaming model response with observed request economics.
         """
-        completion_timeout = completion_timeout_seconds(
-            self._timeout_seconds,
-            request.maximum_output_tokens,
+        deadline_seconds = completion_deadline_seconds(
+            request_timeout_seconds(
+                self._timeout_seconds, request, default_reasoning_effort=self._reasoning_effort
+            ),
+            self._retry_policy,
         )
-        return _run_sync(self.complete_async(request), timeout_seconds=completion_timeout)
+        return _run_sync(self.complete_async(request), timeout_seconds=deadline_seconds)
 
     async def complete_async(
         self,
@@ -612,6 +603,8 @@ class ProviderHttpClient(abc.ABC):
 
         Transport failures and completed empty-output responses share one retry policy instead of
         multiplying nested retry counts. The same idempotency identity is sent on every safe retry.
+        Without an injected deadline, every attempt the retry policy allows gets its whole
+        request-derived timeout instead of the remainder of a single attempt's allowance.
 
         Args:
             request: Visible messages, tool schemas, and sampling controls to send.
@@ -621,11 +614,12 @@ class ProviderHttpClient(abc.ABC):
         Returns:
             The typed completed response with observed request economics.
         """
-        completion_timeout = completion_timeout_seconds(
-            self._timeout_seconds,
-            request.maximum_output_tokens,
+        completion_timeout = request_timeout_seconds(
+            self._timeout_seconds, request, default_reasoning_effort=self._reasoning_effort
         )
-        request_deadline = deadline or RequestDeadline.after(completion_timeout)
+        request_deadline = deadline or RequestDeadline.after(
+            completion_deadline_seconds(completion_timeout, self._retry_policy)
+        )
         payload = self._build_request(request)
         path = self._request_path(self._completion_path())
         url = f"{self._base_url}/{path}"

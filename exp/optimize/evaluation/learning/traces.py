@@ -1,15 +1,17 @@
 """Sequential learning pass: the hybrid simulator learns trace by trace from the build's traces.
 
 By default every trace is learned (scope ``all``): the simulator should learn from every
-success and failure it is given. The traces are replayed one at a time in their export (JSONL)
+success and failure it is given. The traces are replayed one at a time in canonical dataset
 order on the hybrid simulator: learned memory supplies behavioral rules and the build's index
 supplies recorded facts, never from the trace's own lineage. Each trace runs through the
 existing learn-mode lifecycle of :func:`execute_fidelity_evaluation`: every step is predicted
 from the task, the visible history and the current memory, the recorded reply is disclosed only
 after the prediction commits, mismatches are investigated, the completed trajectory is
 published as one memory version, and maintenance compresses the memory log. No second runner
-exists. A rerun replays completed traces without provider calls and continues where it stopped;
-a trace interrupted mid-run resumes in place with ``retry_incomplete``, so its first saved
+exists. A trace whose package supplies instance facts (its starting world) delivers them to
+each of its predictions, as a held-out replay does; they key each run and the memory lineage.
+A rerun replays completed traces without provider calls and continues where it stopped; a
+trace interrupted mid-run resumes in place with ``retry_incomplete``, so its first saved
 measurement is still the one scored.
 
 Measurement is test-then-train: each trace is predicted whole on the memory pinned before it,
@@ -25,26 +27,28 @@ first trace is registered, can never be learned, and remain for an independent h
 """
 
 from collections.abc import Callable, Sequence
+from contextlib import nullcontext
 from dataclasses import replace
 from datetime import datetime
 from typing import Literal
 
-from pydantic import Field, JsonValue
+from pydantic import Field, JsonValue, model_validator
 
 from exp.common.core.artifacts import (
     ArtifactEnvelope,
     ArtifactInput,
     ContractModel,
     JsonObject,
+    Sha256,
     sha256_json,
     stable_id,
 )
 from exp.common.evaluations.reconstruction import DualReport
-from exp.common.models import ModelCatalog
 from exp.common.progress import ProgressHook, report
-from exp.common.project import ProjectBuildArtifacts, ProjectStore
+from exp.common.project import ProjectBuildArtifacts, ProjectStore, artifact_input
 from exp.common.tasks import TaskCase
 from exp.common.traces.store import load_trace_dataset
+from exp.optimize.evaluation.fidelity.dreaming import dream_pending
 from exp.optimize.evaluation.fidelity.memory import (
     DUPLICATE,
     INCOMPLETE,
@@ -77,21 +81,25 @@ from exp.optimize.evaluation.fidelity.runner import (
     execute_fidelity_evaluation,
     saved_fidelity_report,
 )
+from exp.optimize.evaluation.learning.repeats import require_unlearned
 from exp.runtime.models.providers.transport import RetryPolicy
+from exp.simulation.engines.text.prompt import INSTANCE_FACTS_GUIDANCE
 from exp.simulation.retrieval.build_inputs import load_completed_build_rag_lineage_bindings
+from exp.simulation.retrieval.evidence_reading import ReadingPolicy
 from exp.simulation.retrieval.jev import JEVCueSelector, JEVPolicy
+from exp.simulation.world_model.dreaming import DreamPolicy
 from exp.simulation.world_model.experience_memory import (
     consumed_trajectory_digest,
+    knowledge_identity,
     memory_head,
+    memory_lock,
     reserve_task_lineage,
 )
-from exp.simulation.world_model.runtime import persist_fit_only_world_model
+from exp.simulation.world_model.runtime import (
+    load_grounded_world_model_artifact,
+    persist_fit_only_world_model,
+)
 from exp.simulation.world_model.session_research import OnlineResearchPolicy
-
-# Preferred native decision models for memory recall, best first.
-RECALL_PREFERENCE = ("clef-flash", "clef", "jev")
-DECISION_PROVIDER = "typesafe"
-
 
 LABEL = "learn"
 FEEDBACK_SOURCE = "recorded-trace-reply"
@@ -107,14 +115,32 @@ class LearningPlan(ContractModel):
         scope: ``all`` learns every trace; ``fit`` learns fit traces and reserves held-out ones.
         world_model: Hybrid simulator: the build's world model over its serving index (``all``)
             or its fit-only index (``fit``).
-        lineage: Memory lineage, one per learning simulator and scope.
+        lineage: Memory lineage, one per knowledge identity and scope, independent of serving.
+        bank_protocol: Required knowledge-based bank contract; earlier plans need fresh setup.
         recall: Native decision recall over memory records (not recorded-evidence retrieval).
+        reading: Optional objective-driven reading during discrepancy investigations.
+        dreaming: Optional cited consolidation policy, applied only after completed traces.
+        dream_protocol: Exact consolidation prompts, schema and limits, required with dreaming.
+        dream_trace_ids: Frozen scheduled trace IDs, including the final trace.
     """
 
     scope: Scope
     world_model: ArtifactInput
     lineage: str = Field(pattern=r"^[a-z][a-z0-9-]{0,63}$")
+    bank_protocol: Literal["knowledge-v2"]
     recall: FidelityRetrieval
+    reading: ReadingPolicy | None = Field(default=None, exclude_if=lambda value: value is None)
+    dreaming: DreamPolicy | None = Field(default=None, exclude_if=lambda value: value is None)
+    dream_protocol: Sha256 | None = Field(default=None, exclude_if=lambda value: value is None)
+    dream_trace_ids: tuple[str, ...] = Field(default=(), exclude_if=lambda value: not value)
+
+    @model_validator(mode="after")
+    def frozen_dream_protocol(self) -> "LearningPlan":
+        """Refuse changed or unpinned consolidation semantics before resuming a memory lineage."""
+        expected = self.dreaming.identity if self.dreaming is not None else None
+        if self.dream_protocol != expected:
+            raise ValueError("saved dream protocol is missing or changed; use a new project")
+        return self
 
     @property
     def selector_identity(self) -> str:
@@ -122,6 +148,7 @@ class LearningPlan(ContractModel):
         return JEVCueSelector(
             policy=self.recall.jev,
             top_k=self.recall.memory_top_k,
+            maximum_input_bytes=self.recall.memory_input_bytes,
             decide=lambda request: {},
             record=lambda receipt: None,
         ).identity
@@ -177,7 +204,7 @@ class LearningCurve(ContractModel):
     Attributes:
         points: Each trace's first saved measurement, in trace order. Learning retries never
             replace an existing measurement, whether or not they publish memory.
-        quarters: Four windows of scored traces in export order.
+        quarters: Four windows of scored traces in canonical dataset order.
         halves: First and second half of scored traces, independent of learning success.
         incomplete: Traces not learned into memory (scored when their predictions completed).
         qualification: Present when any scored trace resumed with unknown-outcome retries.
@@ -241,6 +268,8 @@ def learning_plan(
     scope: Scope | None = None,
     *,
     record: bool = False,
+    evidence_reading: bool | None = None,
+    dream_every: int | None = None,
 ) -> LearningPlan:
     """Derive the project's learning plan; only learning itself records it.
 
@@ -254,6 +283,8 @@ def learning_plan(
         scope: Traces to learn. None reads the recorded plan whose memory learned most
             recently (``all`` when neither has learned anything yet).
         record: Record a new plan; set only when learning starts.
+        evidence_reading: Enable bounded investigation readers; None follows a saved plan.
+        dream_every: Consolidate every N traces and at completion; None follows the saved plan.
 
     Returns:
         The plan for the build's current world model.
@@ -262,69 +293,177 @@ def learning_plan(
         ValueError: No completed build, no recorded plan and no alias, or a different alias.
     """
     if scope is None:
-        return learning_plan(project, recall_alias, _active_scope(project), record=record)
-    world_model, identity = _plan_identity(project, scope)
-    if project.artifacts.exists(identity):
-        saved = LearningPlan.model_validate_json(
-            project.artifacts.read_bytes(identity, "plan.json")
+        return learning_plan(
+            project,
+            recall_alias,
+            _active_scope(project),
+            record=record,
+            evidence_reading=evidence_reading,
+            dream_every=dream_every,
         )
+    world_model, identity, lineage = _plan_identity(project, scope)
+    with memory_lock(project.artifacts, lineage) if record else nullcontext():
+        return _bind_learning_plan(
+            project,
+            scope,
+            world_model,
+            identity,
+            lineage,
+            recall_alias,
+            record=record,
+            evidence_reading=evidence_reading,
+            dream_every=dream_every,
+        )
+
+
+def _bind_learning_plan(
+    project: ProjectStore,
+    scope: Scope,
+    world_model: ArtifactInput,
+    identity: str,
+    lineage: str,
+    recall_alias: str | None,
+    *,
+    record: bool,
+    evidence_reading: bool | None,
+    dream_every: int | None,
+) -> LearningPlan:
+    """Reuse a bank's founding policy while pinning each exact serving plan separately.
+
+    The immutable bank pointer names its first plan, the single policy authority. Writers
+    hold the bank lock through both publications, so concurrent starts cannot choose different
+    policies. Preflight only reads; an orphan exact plan is not a discoverable bank.
+    """
+    bank_id = stable_id("trace-learning-bank", {"lineage": lineage})
+    if not project.artifacts.exists(bank_id):
+        _require_plan_contract(project)
+    if project.artifacts.exists(bank_id):
+        founding = ArtifactInput.model_validate_json(
+            project.artifacts.read_bytes(bank_id, "plan.json")
+        )
+        if artifact_input(project.artifacts.read(founding.artifact_id).manifest) != founding:
+            raise ValueError("learning bank's founding plan changed; rebuild in a new project")
+        saved = LearningPlan.model_validate_json(
+            project.artifacts.read_bytes(founding.artifact_id, "plan.json")
+        )
+        if saved.lineage != lineage or saved.scope != scope:
+            raise ValueError("learning bank's founding plan belongs to different knowledge")
         if recall_alias is not None and saved.recall.jev_alias != recall_alias:
             raise ValueError(
                 f"memory {saved.lineage} learns with recall alias {saved.recall.jev_alias!r}; "
                 "keep that alias, or rebuild to start a new memory"
             )
-        return saved
-    if recall_alias is None:
+        if evidence_reading is not None and (saved.reading is not None) != evidence_reading:
+            raise ValueError("evidence-reading policy differs from saved memory; use a new project")
+        if dream_every is not None and (
+            saved.dreaming is None or saved.dreaming.interval != dream_every
+        ):
+            raise ValueError("dreaming policy differs from saved memory; use a new project")
+        plan = saved.model_copy(update={"world_model": world_model})
+    elif recall_alias is None:
         command = "exp eval PROJECT --audit N" if scope == "fit" else "exp build PROJECT"
         raise ValueError(
             f"no learned memory for this build; run {command} with a native decision model "
             "for memory recall in the catalog"
         )
-    plan = LearningPlan(
-        scope=scope,
-        world_model=world_model,
-        lineage=_lineage(world_model, scope),
-        recall=FidelityRetrieval(jev_alias=recall_alias, jev=JEVPolicy()),
-    )
+    else:
+        dreaming = DreamPolicy(interval=dream_every) if dream_every is not None else None
+        plan = LearningPlan(
+            scope=scope,
+            world_model=world_model,
+            lineage=lineage,
+            bank_protocol="knowledge-v2",
+            recall=FidelityRetrieval(
+                jev_alias=recall_alias,
+                jev=JEVPolicy(),
+                memory_input_bytes=24000 if evidence_reading else None,
+            ),
+            reading=ReadingPolicy() if evidence_reading else None,
+            dreaming=dreaming,
+            dream_protocol=dreaming.identity if dreaming is not None else None,
+            dream_trace_ids=_dream_schedule(project, scope, dream_every),
+        )
+    if project.artifacts.exists(identity):
+        exact = LearningPlan.model_validate_json(
+            project.artifacts.read_bytes(identity, "plan.json")
+        )
+        if exact != plan:
+            raise ValueError("saved execution plan conflicts with learning bank; use a new project")
     if not record:
         return plan
-    project.artifacts.write_json(
-        artifact_id=identity,
-        artifact_type=_PLAN_TYPE,
-        envelope=ArtifactEnvelope(
-            schema_version=1,
-            created_at=project.artifacts.read(world_model.artifact_id).manifest.created_at,
-            code_revision="trace-learning",
-            inputs=(world_model,),
-        ),
-        files={"plan.json": plan.model_dump(mode="json")},
+    envelope = ArtifactEnvelope(
+        schema_version=1,
+        created_at=project.artifacts.read(world_model.artifact_id).manifest.created_at,
+        code_revision="trace-learning",
+        inputs=(world_model, artifact_input(project.artifacts.read(bank_id).manifest))
+        if project.artifacts.exists(bank_id)
+        else (world_model,),
     )
+    if not project.artifacts.exists(identity):
+        project.artifacts.write_json(
+            artifact_id=identity,
+            artifact_type=_PLAN_TYPE,
+            envelope=envelope,
+            files={"plan.json": plan.model_dump(mode="json")},
+        )
+    if not project.artifacts.exists(bank_id):
+        reference = artifact_input(project.artifacts.read(identity).manifest)
+        project.artifacts.write_json(
+            artifact_id=bank_id,
+            artifact_type="trace-learning-bank",
+            envelope=envelope.model_copy(update={"inputs": (reference,)}),
+            files={"plan.json": reference.model_dump(mode="json")},
+        )
     return plan
 
 
 def _active_scope(project: ProjectStore) -> Scope:
     """The scope whose memory published most recently; ``all`` before anything is learned."""
     published: list[tuple[datetime, int, Scope]] = []
+    recorded: list[Scope] = []
     for rank, scope in enumerate(SCOPES):
-        if not recorded_plan(project, scope):
+        lineage = _plan_identity(project, scope)[2]
+        if not _recorded(project, lineage):
             continue
-        world_model = _plan_identity(project, scope)[0]
-        head = memory_head(project.artifacts, _lineage(world_model, scope))
+        recorded.append(scope)
+        head = memory_head(project.artifacts, lineage)
         if head is not None:
             published.append((head.created_at, -rank, scope))
     if published:
         return max(published)[2]
-    recorded = [scope for scope in SCOPES if recorded_plan(project, scope)]
     return recorded[0] if recorded else "all"
 
 
 def recorded_plan(project: ProjectStore, scope: Scope) -> bool:
-    """Whether this build has a recorded learning plan in ``scope``."""
-    return project.artifacts.exists(_plan_identity(project, scope)[1])
+    """Whether this build's knowledge has a recorded learning policy in ``scope``."""
+    return _recorded(project, _plan_identity(project, scope)[2])
 
 
-def _plan_identity(project: ProjectStore, scope: Scope) -> tuple[ArtifactInput, str]:
-    """The scope's hybrid simulator and the identity its recorded plan occupies."""
+def _recorded(project: ProjectStore, lineage: str) -> bool:
+    """Whether a learning policy is recorded for ``lineage``."""
+    exists = project.artifacts.exists(stable_id("trace-learning-bank", {"lineage": lineage}))
+    if not exists:
+        _require_plan_contract(project)
+    return exists
+
+
+def _require_plan_contract(project: ProjectStore) -> None:
+    """Refuse obsolete plan formats instead of silently treating learned memory as absent."""
+    for identity in project.artifacts.list_ids():
+        if identity.startswith(_PLAN_TYPE + "-"):
+            try:
+                LearningPlan.model_validate_json(
+                    project.artifacts.read_bytes(identity, "plan.json")
+                )
+            except ValueError as error:
+                raise ValueError(
+                    f"learning plan {identity} has an incompatible bank contract; "
+                    "use a fresh project (no automatic memory migration)"
+                ) from error
+
+
+def _plan_identity(project: ProjectStore, scope: Scope) -> tuple[ArtifactInput, str, str]:
+    """The scope's hybrid simulator, its recorded plan's identity, and its (costly) lineage."""
     build = _build(project)
     # Hybrid: learned memory supplies behavioral rules; the build's index supplies recorded
     # facts. Each task's own lineage is excluded from retrieval, so a trace never retrieves its
@@ -335,26 +474,68 @@ def _plan_identity(project: ProjectStore, scope: Scope) -> tuple[ArtifactInput, 
         if scope == "all"
         else persist_fit_only_world_model(project.artifacts, build.world_model, build.fit_rag)
     )
-    lineage = _lineage(world_model, scope)
-    return world_model, stable_id(_PLAN_TYPE, {"lineage": lineage})
+    lineage = _lineage(project, world_model, scope)
+    plan = {"lineage": lineage, "world_model": world_model.model_dump(mode="json")}
+    return world_model, stable_id(_PLAN_TYPE, plan), lineage
 
 
-def _lineage(world_model: ArtifactInput, scope: Scope) -> str:
+def _lineage(project: ProjectStore, world_model: ArtifactInput, scope: Scope) -> str:
     """Memory lineage of one learning simulator under the test-then-train protocol.
 
-    The lineage covers everything that decides a learning run besides its trace, simulator
-    and memory, so changing any of it (a prompt, an allowance) starts a fresh memory that is
-    learned trace by trace again, instead of predicting already-learned traces on a memory
-    that has seen every later trace.
+    The lineage is a knowledge-compatible bank, separate from exact serving and execution
+    identity: a serving change (such as retrieval top-k) keeps the learned memory. It also
+    covers every learning run input besides the trace, simulator and memory, so changing any
+    of them (a prompt, an allowance, the instance facts delivered to predictions) starts a
+    fresh memory that is learned trace by trace again, instead of predicting already-learned
+    traces on a memory that has seen every later trace.
     """
-    key = {"world_model": world_model.model_dump(mode="json"), "scope": scope}
-    return "learn-" + sha256_json({**key, "protocol": "test-then-train", **_protocol()})[:16]
+    artifact = load_grounded_world_model_artifact(project.artifacts, world_model)
+    key = {"knowledge": knowledge_identity(artifact), "scope": scope}
+    delivered = _delivered_facts(learning_cases(project, scope))
+    # Only a pass that delivers facts keys on them; fact-free lineages keep their identity.
+    facts: JsonObject = {} if delivered is None else {"instance_facts": delivered}
+    return (
+        "learn-" + sha256_json({**key, "protocol": "test-then-train", **_protocol(), **facts})[:16]
+    )
+
+
+def _delivered_facts(cases: Sequence[ReplayCase]) -> Sha256 | None:
+    """Identity of the instance facts a learning pass delivers to its predictions.
+
+    Facts condition every prediction of their trace, so they shape what each trace teaches:
+    adding, changing or removing any trace's conditioning facts starts a fresh memory, as a
+    prompt edit does. Verifier-private facts never reach a simulator request and are left out.
+
+    Args:
+        cases: The pass's replay cases in learning order.
+
+    Returns:
+        A digest over each trace's conditioning facts, or None when no trace delivers any.
+    """
+    delivered = {
+        case.trace_id: [
+            fact.model_dump(mode="json")
+            for fact in case.facts.facts
+            if fact.visibility == "conditioning"
+        ]
+        for case in cases
+        if case.facts is not None
+    }
+    delivered = {trace: facts for trace, facts in delivered.items() if facts}
+    return sha256_json(delivered) if delivered else None
 
 
 def _protocol() -> JsonObject:
-    """The learning run inputs shared by every trace of a lineage."""
+    """The learning run inputs shared by every trace of a lineage.
+
+    The prompts include the native-artifact, instance-facts and evidence-reading protocols even
+    though only some traces use them: a lineage spans every trace, so editing any of them starts
+    a fresh memory.
+    """
     return {
-        "prompts": protocol_prompts_sha256(),
+        "prompts": protocol_prompts_sha256(native_artifacts=True),
+        "facts_prompt": INSTANCE_FACTS_GUIDANCE,
+        "reading_protocol": ReadingPolicy().identity,
         "proposal_reasks": PROPOSAL_REASKS,
         "output_tokens": {"prediction": PREDICTION_TOKENS, "investigation": INVESTIGATION_TOKENS},
         "attempts_per_request": RetryPolicy().maximum_attempts,
@@ -364,7 +545,7 @@ def _protocol() -> JsonObject:
 
 
 def learning_cases(project: ProjectStore, scope: Scope) -> tuple[ReplayCase, ...]:
-    """Every trace in scope with something to replay, in the build's trace (JSONL) order.
+    """Every trace in scope with something to replay, in canonical dataset order.
 
     Each case's public task is the trace's own request: its task text, request context, public
     prefix, and published tools, or signatures observed in learned traces when it declares none.
@@ -411,8 +592,21 @@ def learning_cases(project: ProjectStore, scope: Scope) -> tuple[ReplayCase, ...
 
 
 def fit_cases(project: ProjectStore) -> tuple[ReplayCase, ...]:
-    """Every fit trace with something to replay, in the build's trace (JSONL) order."""
+    """Every fit trace with something to replay, in canonical dataset order."""
     return learning_cases(project, "fit")
+
+
+def _dream_schedule(project: ProjectStore, scope: Scope, interval: int | None) -> tuple[str, ...]:
+    """Pin periodic and final consolidation boundaries to the imported trace order."""
+    if interval is None:
+        return ()
+    policy = DreamPolicy(interval=interval)
+    cases = learning_cases(project, scope)
+    return tuple(
+        case.trace_id
+        for index, case in enumerate(cases, 1)
+        if index % policy.interval == 0 or index == len(cases)
+    )
 
 
 def fit_calls(project: ProjectStore) -> list[tuple[str, JsonValue]]:
@@ -497,12 +691,18 @@ def learning_spec(
         case,
         deadline=deadline,
         label=LABEL,
-        memory=FidelityMemory(lineage=plan.lineage, mode="learn", hide_task_lineage=True),
+        memory=FidelityMemory(
+            lineage=plan.lineage,
+            mode="learn",
+            hide_task_lineage=True,
+            dreaming=plan.dreaming if case.trace_id in plan.dream_trace_ids else None,
+        ),
         retrieval=plan.recall,
         online_research=OnlineResearchPolicy(
             feedback_source=FEEDBACK_SOURCE,
             selection_policy_sha256=plan.selector_identity,
             notes_reach_predictions=False,
+            reading=plan.reading,
         ),
         per_turn=False,
         judged=False,
@@ -519,6 +719,8 @@ def learn_from_traces(
     clock: Callable[[], datetime],
     progress: ProgressHook | None = None,
     retry_incomplete: bool = False,
+    evidence_reading: bool | None = None,
+    dream_every: int | None = None,
 ) -> LearningOutcome:
     """Learn from every trace in scope, in order, within an explicit physical-attempt budget.
 
@@ -536,11 +738,20 @@ def learn_from_traces(
         progress: Shared progress display; reports ``Learning from traces k/n``.
         retry_incomplete: Resume a trace that was interrupted mid-run: saved work replays,
             and a request lost in flight is sent again and reported.
+        evidence_reading: Enable bounded readers, or follow the recorded learning plan.
+        dream_every: Consolidation interval, or follow the recorded learning plan.
 
     Returns:
         The outcome; ``stopped`` explains an early stop.
     """
-    plan = learning_plan(project, recall_alias, scope, record=True)
+    plan = learning_plan(
+        project,
+        recall_alias,
+        scope,
+        record=True,
+        evidence_reading=evidence_reading,
+        dream_every=dream_every,
+    )
     if scope == "fit":
         reserve_held_out(project, plan, code_revision=code_revision)
     cases = learning_cases(project, scope)
@@ -563,8 +774,10 @@ def learn_from_traces(
             if prepared.id in attempted:
                 break  # attempts exhausted: the latest one stays the trace's result
             attempted.add(prepared.id)
-            if saved_fidelity_report(project, prepared) is None:
-                _require_unlearned(project, plan, spec, earlier)
+            saved = saved_fidelity_report(project, prepared)
+            if saved is None or dream_pending(project, prepared):
+                if saved is None:
+                    require_unlearned(project, plan.lineage, spec, earlier)
                 if used + spec.maximum_physical_attempts > maximum_attempts:
                     stopped = (
                         f"attempt budget reached after {learned} of {len(cases)} traces; "
@@ -634,7 +847,7 @@ def learning_curve(project: ProjectStore, scope: Scope | None = None) -> Learnin
 def learned_runs(
     project: ProjectStore, plan: LearningPlan
 ) -> list[tuple[ReplayCase, PreparedFidelity, ReplayResult]]:
-    """Learned traces in export order, each with its first saved measurement.
+    """Learned traces in canonical dataset order, each with its first saved measurement.
 
     Args:
         project: Project with a recorded learning plan.
@@ -651,7 +864,7 @@ def learned_runs(
 def learning_progress(
     project: ProjectStore, plan: LearningPlan
 ) -> tuple[list[tuple[ReplayCase, PreparedFidelity, ReplayResult, bool]], list[ReplayCase]]:
-    """Every scored trace in export order, read from saved attempts without calls.
+    """Every scored trace in canonical dataset order, read from saved attempts without calls.
 
     Each trace is predicted whole before any of its feedback is used, so every attempt with
     a saved report scores the whole trace, including unanswered slots as misses. The first
@@ -768,70 +981,3 @@ def _inside(
         return None
     detail = f"trace {index + 1}/{len(cases)}"
     return lambda event: progress(replace(event, detail=event.detail or detail))
-
-
-def _require_unlearned(
-    project: ProjectStore, plan: LearningPlan, spec: FidelitySpec, earlier: set[str]
-) -> None:
-    """Refuse to predict a trace this memory already learned, on memory that has seen later traces.
-
-    A trajectory that an earlier trace of the pass consumed belongs to an identical repeat, which
-    is predicted like any trace and then publishes nothing.
-
-    Args:
-        project: Project holding the memory lineage.
-        plan: The learning plan being run.
-        spec: This trace's learning run.
-        earlier: Trajectory digests of the traces before this one in the pass.
-
-    Raises:
-        ValueError: The trace is already in the lineage under different run inputs.
-    """
-    head = memory_head(project.artifacts, plan.lineage)
-    digest = consumed_trajectory_digest(trajectory_record(spec))
-    if head is not None and digest in head.consumed and digest not in earlier:
-        raise ValueError(
-            f"trace {spec.task.task_id} is already learned into memory {plan.lineage} "
-            f"v{head.version}, but its learning run inputs changed; predicting it again would "
-            "read memory that has seen every later trace. This is a learning-identity defect: "
-            "report it with the project's runtime/learning report"
-        )
-
-
-def resolve_memory_recall(catalog: ModelCatalog) -> str | None:
-    """Choose the decision alias that recalls simulator memory, without a flag.
-
-    The ``memory_recall`` role wins when set. Otherwise the catalog's SystemOne decision models
-    are ranked by ``RECALL_PREFERENCE`` (Clef Flash first), then by alias.
-
-    Args:
-        catalog: The project's model catalog.
-
-    Returns:
-        The alias, or None when the catalog has no native decision model.
-
-    Raises:
-        ValueError: The ``memory_recall`` role names an alias that is not a decision model.
-    """
-
-    def decision(alias: str) -> bool:
-        record = catalog.models.get(alias)
-        connection = None if record is None else catalog.connections.get(record.connection)
-        return connection is not None and connection.provider == DECISION_PROVIDER
-
-    chosen = catalog.roles.memory_recall
-    if chosen is not None:
-        if not decision(chosen):
-            raise ValueError(
-                f"memory_recall role {chosen!r} is not a native decision model "
-                f"({DECISION_PROVIDER} connection)"
-            )
-        return chosen
-
-    def rank(alias: str) -> tuple[int, str]:
-        model = catalog.models[alias].model.casefold()
-        hits = [i for i, name in enumerate(RECALL_PREFERENCE) if name in model]
-        return (min(hits) if hits else len(RECALL_PREFERENCE), alias)
-
-    candidates = sorted((a for a in catalog.models if decision(a)), key=rank)
-    return candidates[0] if candidates else None

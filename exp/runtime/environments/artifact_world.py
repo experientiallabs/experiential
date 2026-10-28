@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping
-from pathlib import Path
 from typing import Protocol, runtime_checkable
 
 from exp.common.core.artifacts import JsonObject, Sha256, sha256_json, validate_artifact_file_path
@@ -19,6 +18,11 @@ from exp.common.tasks import TaskCase
 from exp.runtime.environments.artifact_edits import ArtifactEditAdapter
 from exp.runtime.environments.interface import Observation
 from exp.runtime.environments.worlds import NativeImage, WorldAccess, WorldContext, digest_bytes
+
+# Identity of the code that decides this artifact's behavior, in place of its source text.
+# Bump it when behavior changes. exp/tests/code_protocols_test.py fails when the covered
+# source changes until it is bumped or, for a pure refactor, its digest is updated.
+ARTIFACT_WORLD_PROTOCOL = "artifact-world-v2"
 
 _ABSENT = sha256_json({"absent": True})
 
@@ -56,8 +60,7 @@ class ArtifactWorldFactory:
         self._outputs = tuple(outputs)
         self._domains = tuple(sorted({*files, *outputs}))
         self._definition: JsonObject = {
-            "name": "artifact-world-v1",
-            "source_sha256": digest_bytes(Path(__file__).read_bytes()),
+            "name": ARTIFACT_WORLD_PROTOCOL,
             "adapter": adapter.definition,
             "files": {path: digest_bytes(payload) for path, payload in sorted(files.items())},
             "outputs": list(self._outputs),
@@ -113,9 +116,12 @@ class ArtifactWorld:
             path: {"sha256": digest_bytes(payload), "bytes": len(payload)}
             for path, payload in sorted(output.files.items())
         }
+        receipt: JsonObject = {"written": written}
+        if not output.files:
+            receipt["projection"] = output.projection
         return Observation(
             content=json.dumps(
-                {"written": written, "projection": output.projection},
+                receipt,
                 sort_keys=True,
                 separators=(",", ":"),
             )
@@ -131,6 +137,13 @@ class ArtifactWorld:
     def capture(self) -> NativeImage:
         """Return the exact bytes of every existing file and the per-file digests."""
         return NativeImage(parts=dict(self._files), domains=self.domain_digests())
+
+    def state_projection(self) -> JsonObject:
+        """Expose file existence and byte identity, without claiming semantic file coverage."""
+        return {
+            path: {"sha256": digest_bytes(payload), "bytes": len(payload)}
+            for path, payload in sorted(self._files.items())
+        }
 
     def close(self) -> None:
         """Drop the private file mapping."""

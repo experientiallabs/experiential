@@ -20,6 +20,7 @@ from exp.cli.app import app
 from exp.common.core.artifacts import JsonObject
 from exp.common.models import ToolCall
 from exp.common.project import ProjectStore
+from exp.optimize.evaluation.audit.lifecycle import open_held_out_audit
 from exp.optimize.evaluation.audit.panel import (
     HeldOutPanel,
     register_held_out_fidelity,
@@ -379,6 +380,24 @@ def test_the_cli_resumes_only_with_retry_incomplete_and_qualifies_its_headline(
     killed = CliRunner().invoke(app, command)
     assert killed.exit_code != 0 and provider.kill is None, "the process was killed mid-panel"
     sent = len(provider.requests)
+    with open_held_out_audit(
+        store, 3, profile="memory", code_revision=REVISION, clock=now
+    ) as audit:
+        registrations = audit.panel.prepared
+        committed = {
+            prepared.id: SessionStore(
+                store.artifacts.project_directory / (prepared.id + "-sessions.sqlite")
+            )
+            .read_session(prepared.id)
+            .state["transitions"]
+            for prepared in registrations
+        }
+    assert all(isinstance(rows, list) for rows in committed.values())
+    missing_predictions = sum(
+        len(prepared.spec.workload.actions) - len(committed[prepared.id])
+        for prepared in registrations
+        if isinstance(committed[prepared.id], list)
+    )
     refused = CliRunner().invoke(app, command)
     assert refused.exit_code != 0 and "--retry-incomplete" in " ".join(refused.output.split())
     assert "cost of this command" not in refused.output, "refused before any spend consent"
@@ -387,7 +406,18 @@ def test_the_cli_resumes_only_with_retry_incomplete_and_qualifies_its_headline(
     assert resumed.exit_code == 0, resumed.output
     output = " ".join(resumed.output.split()) + " " + audit_report(store)
     assert "1 interrupted trace(s) resume in place" in output
-    assert provider.sent("prediction", sent) == 2, "only the lost step and the one after it"
+    assert provider.sent("prediction", sent) == missing_predictions, (
+        "only uncommitted steps may dispatch; concurrent traces can stop at different boundaries"
+    )
+    for prepared in registrations:
+        before = committed[prepared.id]
+        after = (
+            SessionStore(store.artifacts.project_directory / (prepared.id + "-sessions.sqlite"))
+            .read_session(prepared.id)
+            .state["transitions"]
+        )
+        assert isinstance(before, list) and isinstance(after, list)
+        assert after[: len(before)] == before, "recovery changed a committed transition"
     # A11 by stage: the receipt's qualified headline over every trace, the re-dispatches by
     # stage, then the unaffected-only and affected-only scores with their denominators.
     assert "Held-out fidelity (independent, qualified: trace re-attempts) 9/9 replies" in output
@@ -399,11 +429,16 @@ def test_the_cli_resumes_only_with_retry_incomplete_and_qualifies_its_headline(
     assert "Unaffected traces only 6/6 replies exact (100%)" in output
     assert "Re-attempted traces only 3/3 replies exact (100%)" in output
     assert "· 2/2 traces" in output and "· 1/1 traces" in output
-    assert "independent, qualified: trace re-attempts · this run: evaluation" in output
+    assert "Report:" in output
+    assert "independent, qualified: trace re-attempts · this run: evaluation" in audit_report(store)
     # The receipt's attempt tree holds the in-place re-attempt; the detail names the step.
-    shown = " ".join(CliRunner().invoke(app, [*command, "--verbose"]).output.split())
-    shown += " " + audit_report(store)
-    assert "Saved results. No provider calls." in shown
-    assert "resumed in place" in shown
-    assert "re-dispatched after an unknown outcome (prediction, 2 attempts)" in shown
+    purchased_before_replay = len(provider.requests)
+    replayed = CliRunner().invoke(app, [*command, "--verbose"])
+    assert replayed.exit_code == 0, replayed.output
+    shown = " ".join(replayed.output.split())
+    assert "Report:" in shown and len(provider.requests) == purchased_before_replay
+    details = audit_report(store)
+    assert "Saved results. No provider calls." in details
+    assert "resumed in place" in details
+    assert "re-dispatched after an unknown outcome (prediction, 2 attempts)" in details
     assert "Held-out fidelity (independent, qualified: trace re-attempts) 9/9 replies" in shown

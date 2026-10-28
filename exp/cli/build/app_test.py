@@ -55,6 +55,13 @@ _RUNNER = CliRunner()
 _RESOLVE_CALLS: list[str] = []
 
 
+def test_evidence_reading_cannot_be_silently_ignored_by_router_wizard(tmp_path: Path) -> None:
+    result = _RUNNER.invoke(app, ["build", "reader", "--root", str(tmp_path), "--evidence-reading"])
+    assert result.exit_code == 2
+    assert "requires --traces PATH or --import-id ID" in result.output
+    assert not list(tmp_path.iterdir())
+
+
 def test_malformed_release_revision_fails_before_build_state(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

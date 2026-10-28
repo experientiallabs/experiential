@@ -16,8 +16,8 @@ from exp.common.core.artifacts import (
     canonical_json_bytes,
     sha256_json,
     stable_id,
+    strict_equal,
 )
-from exp.common.evaluations.reconstruction import strict_equal
 from exp.common.project import ArtifactStore, artifact_input
 from exp.runtime.environments.artifact_edits import (
     MAX_ARTIFACT_BYTES,

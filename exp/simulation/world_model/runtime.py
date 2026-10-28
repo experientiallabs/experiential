@@ -673,6 +673,7 @@ def persist_fit_only_world_model(
         top_k=artifact.top_k,
         knowledge=artifact.knowledge,
         selection_policy_sha256=artifact.selection_policy_sha256,
+        original_evidence=artifact.original_evidence,
     )
     return artifact_input(persisted.manifest)
 
@@ -706,7 +707,6 @@ def _require_fit_subset(
         or serving.index.embedding_chunk_bytes != fit.embedding_chunk_bytes
         or serving.index.fit_lineage_ids != fit.fit_lineage_ids
         or serving.index.default_top_k != fit.default_top_k
-        or artifact.top_k != fit.default_top_k
     ):
         raise ValueError("fit RAG identity differs from the grounded world-model build graph")
     fit_lineages = set(fit.fit_lineage_ids)

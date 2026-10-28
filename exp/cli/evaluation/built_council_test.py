@@ -15,7 +15,7 @@ from exp.optimize.evaluation.audit.panel_test import (
     build_project,
     episode,
 )
-from exp.optimize.evaluation.built_council import BuiltCouncil
+from exp.optimize.evaluation.council.built import BuiltCouncil
 from exp.simulation.world_model.runtime import load_grounded_world_model_artifact
 
 

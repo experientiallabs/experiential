@@ -146,7 +146,10 @@ class SFTModelOptimizationConfig(ArtifactEnvelope):
     @model_validator(mode="after")
     def _require_exact_bindings(self) -> SFTModelOptimizationConfig:
         """Require content-addressed intent and exactly one frozen W12 input."""
-        if self.inputs != (self.dataset,):
+        expected_inputs = (self.dataset,) + (
+            (self.training.tail_sft.reference,) if self.training.tail_sft else ()
+        )
+        if self.inputs != expected_inputs:
             raise ValueError("SFT model optimization configs must name exactly their W12 dataset")
         if self.training.base_model != self.base_model.model_id:
             raise ValueError("SFT training base_model must match the frozen base model snapshot")
@@ -281,7 +284,7 @@ def create_sft_model_optimization_config(
         return SFTModelOptimizationConfig(
             schema_version=1,
             created_at=created_at,
-            inputs=(dataset_input,),
+            inputs=(dataset_input,) + ((training.tail_sft.reference,) if training.tail_sft else ()),
             code_revision=code_revision,
             config_id=config_id,
             dataset=dataset_input,

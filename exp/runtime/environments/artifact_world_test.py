@@ -1,6 +1,7 @@
 """Artifact worlds: exact file images, adapter refusals and declared paths."""
 
 import io
+import json
 
 import pytest
 from openpyxl import Workbook, load_workbook
@@ -59,9 +60,13 @@ def _delete(start: int) -> ToolCall:
 
 def test_image_holds_exact_bytes_and_marks_unwritten_outputs() -> None:
     """Captured parts are the native files; an output exists only after it is written."""
-    world = _factory().create(_task())
+    source = _workbook()
+    factory = ArtifactWorldFactory(
+        WorkbookEditAdapter(), files={"in.xlsx": source}, outputs=("out.xlsx",)
+    )
+    world = factory.create(_task())
     image = world.capture()
-    assert image.parts == {"in.xlsx": _workbook()}
+    assert image.parts == {"in.xlsx": source}
     absent = image.domains["out.xlsx"]
     reply = world.execute(_delete(2), WorldContext.__new__(WorldContext))
     assert not reply.is_error
@@ -91,3 +96,27 @@ def test_paths_and_images_stay_within_declared_files() -> None:
     image = NativeImage(parts={"other.xlsx": b""}, domains={})
     with pytest.raises(ValueError, match="undeclared files"):
         _factory().restore(image)
+
+
+def test_write_acknowledgement_excludes_full_projection_but_keeps_actual_bytes() -> None:
+    """An edit acknowledges committed output; cells are available through explicit reads."""
+    world = _factory().create(_task())
+    reply = world.execute(_delete(1), WorldContext.__new__(WorldContext))
+    value = json.loads(reply.content)
+    assert set(value) == {"written"}
+    assert value["written"]["out.xlsx"]["sha256"] == world.capture().domains["out.xlsx"]
+    assert len(reply.content) < 200
+    read = world.execute(
+        ToolCall(
+            call_id="read",
+            name="inspect_workbook",
+            arguments={
+                "source": "out.xlsx",
+                "sheet": "Data",
+                "row_count": 1,
+                "column_count": 2,
+            },
+        ),
+        WorldContext.__new__(WorldContext),
+    )
+    assert json.loads(read.content)["projection"]["out.xlsx"]["rows"][0][1]["value"] == 2.5

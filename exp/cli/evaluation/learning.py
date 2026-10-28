@@ -29,6 +29,7 @@ from exp.optimize.evaluation.learning.traces import (
     learning_progress,
     learning_spec,
 )
+from exp.runtime.models.providers.async_transport import ProviderDeadlineExceeded
 from exp.runtime.models.providers.transport import ProviderTransportError
 from exp.runtime.models.structured_completion import CompletionNotDispatched
 
@@ -50,6 +51,8 @@ def run_learning(
     progress: ProgressHook | None = None,
     pause: Callable[[], AbstractContextManager[None]] | None = None,
     command: str | None = None,
+    evidence_reading: bool | None = None,
+    dream_every: int | None = None,
 ) -> LearningOutcome | None:
     """Write the learning preflight, ask for spend consent, then learn from every trace.
 
@@ -72,6 +75,8 @@ def run_learning(
         progress: The command's single progress line; without it, learning owns a display.
         pause: Releases that progress line while the spend question is asked.
         command: Exact command a refusal names; defaults to the bare command.
+        evidence_reading: Enable bounded readers, or follow the recorded learning plan.
+        dream_every: Consolidation interval, or follow the recorded learning plan.
 
     Returns:
         The outcome, or None when the user declined the spend.
@@ -81,7 +86,9 @@ def run_learning(
     """
     screen = terminal or console
     scope: Scope = "fit" if hold_out else "all"
-    plan = learning_plan(store, recall_alias, scope)
+    plan = learning_plan(
+        store, recall_alias, scope, evidence_reading=evidence_reading, dream_every=dream_every
+    )
     cases = learning_cases(store, scope)
     now = datetime.now(UTC)
     ceiling = sum(
@@ -91,13 +98,23 @@ def run_learning(
     budget = ceiling if maximum_attempts is None else maximum_attempts
     console.print("Learning preflight")
     kept = "fit traces; held-out traces kept out" if hold_out else "traces, every trace"
-    console.print(f"  [dim]traces[/dim]       {len(cases)} {kept}, in export order")
+    console.print(f"  [dim]traces[/dim]       {len(cases)} {kept}, in canonical dataset order")
     console.print(
         "  [dim]measured[/dim]     test-then-train: whole trace predicted on memory pinned "
         "before it"
     )
     console.print(f"  [dim]simulator[/dim]    hybrid {plan.world_model.artifact_id}")
     console.print(f"  [dim]memory[/dim]       {plan.lineage} · recall {plan.recall.jev_alias}")
+    if plan.reading is not None:
+        console.print(
+            f"  [dim]evidence[/dim]     objective-driven investigations, at most "
+            f"{plan.reading.additional_calls} extra calls per discrepancy"
+        )
+    if plan.dreaming is not None:
+        console.print(
+            f"  [dim]dreaming[/dim]     every {plan.dreaming.interval} traces and at completion, "
+            f"at most {plan.dreaming.calls} extra logical calls per pass"
+        )
     console.print(
         f"  [dim]attempts[/dim]     at most {budget:,} physical attempts, retries included "
         f"(all traces need at most {ceiling:,})"
@@ -136,8 +153,10 @@ def run_learning(
                 clock=lambda: datetime.now(UTC),
                 progress=hook,
                 retry_incomplete=retry_incomplete,
+                evidence_reading=evidence_reading,
+                dream_every=dream_every,
             )
-    except (ProviderTransportError, CompletionNotDispatched) as exc:
+    except (ProviderTransportError, ProviderDeadlineExceeded, CompletionNotDispatched) as exc:
         screen.print(f"[red]error[/red] a provider request failed: {exc}")
         screen.print(
             "Learned traces are saved. The stopped trace is never bought again silently: "
@@ -151,8 +170,9 @@ def run_learning(
     )
     if outcome.incomplete:
         console.print(
-            f"[yellow]warning[/yellow] {outcome.incomplete} trace(s) stopped before completing "
-            "on every allowed attempt and were not learned"
+            f"[yellow]warning[/yellow] {outcome.incomplete} trace(s) have incomplete saved "
+            "results and were not learned. Saved predictions are never re-purchased. "
+            "--retry-incomplete resumes interrupted runs, not finalized reports."
         )
     if outcome.stopped is not None:
         console.print(f"[yellow]warning[/yellow] {outcome.stopped}")

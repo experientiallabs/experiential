@@ -12,14 +12,15 @@ from exp.common.models import NumericMeasurement, OperationEconomics, ToolCall
 from exp.common.tasks import TaskCase, ToolSchema
 from exp.runtime.environments.interface import Observation
 from exp.runtime.environments.mixed import (
+    MixedEvent,
     MixedRealityEnvironmentRuntime,
     MixedRealityPolicy,
     StepIntent,
-    StepPrediction,
     StepResult,
     ToolRoute,
 )
 from exp.runtime.environments.record_world import RecordTool, RecordWorldFactory
+from exp.runtime.environments.world_outcomes import execute_with_recovery
 from exp.runtime.environments.worlds import (
     ExecutableWorldRuntime,
     RestoreError,
@@ -100,7 +101,7 @@ def _observation(content: str, cost: float = 0) -> Observation:
 
 def test_shadow_returns_native_reply_and_records_both_costs() -> None:
     """A wrong candidate never replaces native truth or hides its generation charge."""
-    events: list[StepIntent | StepPrediction | StepResult] = []
+    events: list[MixedEvent] = []
     native = _Runtime([_observation("pending", 0)])
     candidate = _Runtime([_observation("delivered", 0.03)])
     runtime = MixedRealityEnvironmentRuntime(
@@ -129,7 +130,7 @@ def test_shadow_returns_native_reply_and_records_both_costs() -> None:
 
 def test_shadow_failure_preserves_native_success_and_halts_shadow_track() -> None:
     """A provider failure does not force native tool reexecution or erase the receipt."""
-    events: list[StepIntent | StepPrediction | StepResult] = []
+    events: list[MixedEvent] = []
     native = _Runtime([_observation("a"), _observation("b")])
     candidate = _Runtime([TimeoutError("private provider information")])
     runtime = MixedRealityEnvironmentRuntime(
@@ -151,7 +152,7 @@ def test_shadow_failure_preserves_native_success_and_halts_shadow_track() -> Non
 
 def test_native_transport_failure_is_never_retried_or_simulated() -> None:
     """An ambiguous native write poisons the session and retains the attempted result."""
-    events: list[StepIntent | StepPrediction | StepResult] = []
+    events: list[MixedEvent] = []
     native = _Runtime([TimeoutError("native unknown")])
     candidate = _Runtime([_observation("model guess")])
     runtime = MixedRealityEnvironmentRuntime(
@@ -168,11 +169,13 @@ def test_native_transport_failure_is_never_retried_or_simulated() -> None:
     assert len(native.actions) == len(candidate.actions) == 1
     assert isinstance(events[-1], StepResult)
     assert events[-1].authoritative_failure == "TimeoutError"
+    assert events[-1].failures[0].details["phase"] == "authoritative_execution"
+    assert events[-1].failures[0].details["operation_id"] == events[-1].operation_id
 
 
 def test_tool_error_is_an_observation_and_divergent_prefix_stays_visible() -> None:
     """A declared native tool error continues, while earlier divergence stays qualified."""
-    events: list[StepIntent | StepPrediction | StepResult] = []
+    events: list[MixedEvent] = []
     native = _Runtime([Observation(content="missing", is_error=True), Observation(content="ok")])
     candidate = _Runtime([Observation(content="different"), Observation(content="ok")])
     runtime = MixedRealityEnvironmentRuntime(
@@ -191,7 +194,7 @@ def test_tool_error_is_an_observation_and_divergent_prefix_stays_visible() -> No
 
 def test_real_write_breaks_candidate_correspondence_without_rescuing_it() -> None:
     """Unshadowed mutation is explicitly unpaired, never silently mirrored into the twin."""
-    events: list[StepIntent | StepPrediction | StepResult] = []
+    events: list[MixedEvent] = []
     native = _Runtime([Observation(content="changed"), Observation(content="value")])
     candidate = _Runtime([Observation(content="value")])
     runtime = MixedRealityEnvironmentRuntime(
@@ -216,7 +219,7 @@ def test_recording_failure_stops_before_purchase() -> None:
     native = _Runtime([Observation(content="never")])
     candidate = _Runtime([Observation(content="never")])
 
-    def refuse(event: StepIntent | StepPrediction | StepResult) -> None:
+    def refuse(event: MixedEvent) -> None:
         """Model a failed durable evidence sink."""
         raise OSError("disk unavailable")
 
@@ -237,7 +240,7 @@ def test_recording_failure_stops_before_purchase() -> None:
 def test_unknown_tools_are_rejected_before_dispatch() -> None:
     """A policy cannot be widened by an actor's invented tool name."""
     native = _Runtime([])
-    events: list[StepIntent | StepPrediction | StepResult] = []
+    events: list[MixedEvent] = []
     runtime = MixedRealityEnvironmentRuntime(
         policy=_policy(ToolRoute(name="read", mode="real", effect="read")),
         native=native,
@@ -252,7 +255,7 @@ def test_unknown_tools_are_rejected_before_dispatch() -> None:
 
 def test_simulated_mode_uses_only_candidate_backend() -> None:
     """An all-simulated policy has explicit candidate authority and no native dispatch."""
-    events: list[StepIntent | StepPrediction | StepResult] = []
+    events: list[MixedEvent] = []
     candidate = _Runtime([Observation(content="simulated")])
     runtime = MixedRealityEnvironmentRuntime(
         policy=_policy(ToolRoute(name="write", mode="simulated", effect="write")),
@@ -299,7 +302,7 @@ def test_exited_session_cannot_dispatch_again() -> None:
 def test_invalid_charge_preserves_raw_result_and_stops_session() -> None:
     """A malformed cost receipt cannot permit another ambiguous native mutation."""
     native = _Runtime([Observation(content="changed", metadata={"economics": {"cost_usd": "bad"}})])
-    events: list[StepIntent | StepPrediction | StepResult] = []
+    events: list[MixedEvent] = []
     runtime = MixedRealityEnvironmentRuntime(
         policy=_policy(ToolRoute(name="write", mode="real", effect="write")),
         native=native,
@@ -321,7 +324,7 @@ def test_invalid_charge_preserves_raw_result_and_stops_session() -> None:
 def test_world_policy_does_not_expand_actor_tool_permissions() -> None:
     """A broad world policy never gives an actor tools outside its public task."""
     native = _Runtime([])
-    events: list[StepIntent | StepPrediction | StepResult] = []
+    events: list[MixedEvent] = []
     runtime = MixedRealityEnvironmentRuntime(
         policy=_policy(
             ToolRoute(name="read", mode="real", effect="read"),
@@ -354,10 +357,10 @@ def test_missing_task_routes_fail_before_backends_open() -> None:
 
 def test_failed_result_persistence_cannot_reexecute_native_write() -> None:
     """A write that succeeded before a disk failure is retained as an unresolved intent."""
-    events: list[StepIntent | StepPrediction | StepResult] = []
+    events: list[MixedEvent] = []
     native = _Runtime([Observation(content="committed")])
 
-    def fail_after_intent(event: StepIntent | StepPrediction | StepResult) -> None:
+    def fail_after_intent(event: MixedEvent) -> None:
         """Persist intent but model a result-store outage."""
         if isinstance(event, StepResult):
             raise OSError("disk full")
@@ -380,7 +383,7 @@ def test_failed_result_persistence_cannot_reexecute_native_write() -> None:
 def test_backend_exception_payload_is_not_actor_visible() -> None:
     """A backend's raw error message cannot leak credentials through the actor bridge."""
     native = _Runtime([ValueError("secret-native-value")])
-    events: list[StepIntent | StepPrediction | StepResult] = []
+    events: list[MixedEvent] = []
     runtime = MixedRealityEnvironmentRuntime(
         policy=_policy(ToolRoute(name="read", mode="real", effect="read")),
         native=native,
@@ -393,6 +396,8 @@ def test_backend_exception_payload_is_not_actor_visible() -> None:
     assert "secret-native-value" not in str(failed.value)
     assert isinstance(events[-1], StepResult)
     assert events[-1].authoritative_failure == "ValueError"
+    assert events[-1].failures[0].details["phase"] == "authoritative_execution"
+    assert "secret-native-value" not in events[-1].model_dump_json()
 
 
 def test_shadow_predicts_before_native_dispatch_and_cannot_edit_its_action() -> None:
@@ -418,7 +423,7 @@ def test_shadow_predicts_before_native_dispatch_and_cannot_edit_its_action() -> 
             order.append("native")
             return super().execute(action)
 
-    events: list[StepIntent | StepPrediction | StepResult] = []
+    events: list[MixedEvent] = []
     native = Native([Observation(content="native")])
     candidate = Candidate([Observation(content="guess")])
     runtime = MixedRealityEnvironmentRuntime(
@@ -439,7 +444,7 @@ def test_bad_shadow_accounting_keeps_valid_native_charge_in_operator_evidence() 
     """An unknown aggregate must not erase the separately observed native charge."""
     native = _Runtime([_observation("committed", 0.5)])
     candidate = _Runtime([Observation(content="guess", metadata={"economics": {"invalid": 1}})])
-    events: list[StepIntent | StepPrediction | StepResult] = []
+    events: list[MixedEvent] = []
     runtime = MixedRealityEnvironmentRuntime(
         policy=_policy(ToolRoute(name="write", mode="shadow", effect="write")),
         native=native,
@@ -461,7 +466,7 @@ def test_bad_shadow_accounting_keeps_valid_native_charge_in_operator_evidence() 
 
 def test_shadow_prediction_is_retained_before_native_dispatch() -> None:
     """Native work starts only after operator evidence contains the sealed prediction."""
-    events: list[StepIntent | StepPrediction | StepResult] = []
+    events: list[MixedEvent] = []
 
     class Native(_Runtime):
         """Inspect the durable evidence boundary when native execution begins."""
@@ -487,7 +492,7 @@ def test_failed_prediction_persistence_prevents_native_dispatch() -> None:
     native = _Runtime([Observation(content="changed")])
     candidate = _Runtime([Observation(content="guess")])
 
-    def retain(event: StepIntent | StepPrediction | StepResult) -> None:
+    def retain(event: MixedEvent) -> None:
         """Model storage failing between prediction and native dispatch."""
         if event.kind == "prediction":
             raise OSError("prediction receipt unavailable")
@@ -569,7 +574,7 @@ def _world_policy(world: WorldManifest | None = WORLD, **modes: str) -> MixedRea
 
 
 def _world_runtime(
-    events: list[StepIntent | StepPrediction | StepResult],
+    events: list[MixedEvent], *, shadow: bool = False
 ) -> MixedRealityEnvironmentRuntime:
     """Bind a native SQLite orders world and a simulated SQLite refunds world."""
     native = ExecutableWorldRuntime(
@@ -590,7 +595,10 @@ def _world_runtime(
         owner="simulated",
     )
     return MixedRealityEnvironmentRuntime(
-        policy=_world_policy(), native=native, candidate=candidate, record=events.append
+        policy=_world_policy(place_order="shadow") if shadow else _world_policy(),
+        native=native,
+        candidate=candidate,
+        record=events.append,
     )
 
 
@@ -640,7 +648,7 @@ def test_world_manifest_admits_disjoint_mixed_routes_and_refuses_overlap() -> No
 
 def test_mixed_episode_checkpoints_and_forks_across_native_and_simulated_domains() -> None:
     """A fork's native and simulated effects never reach the parent or a sibling."""
-    events: list[StepIntent | StepPrediction | StepResult] = []
+    events: list[MixedEvent] = []
     runtime = _world_runtime(events)
     task = _task("place_order", "refund")
     with runtime.open(task) as parent:
@@ -671,7 +679,7 @@ def test_mixed_episode_checkpoints_and_forks_across_native_and_simulated_domains
 
 def test_mixed_restore_refuses_foreign_checkpoints_and_unrestorable_backends() -> None:
     """Checkpoints bind policy and task; backends outside the contract cannot checkpoint."""
-    events: list[StepIntent | StepPrediction | StepResult] = []
+    events: list[MixedEvent] = []
     runtime = _world_runtime(events)
     task = _task("place_order", "refund")
     with runtime.open(task) as session:
@@ -697,7 +705,7 @@ def test_mixed_restore_refuses_foreign_checkpoints_and_unrestorable_backends() -
 
 def test_candidate_world_failure_stops_the_mixed_episode() -> None:
     """A failed candidate-world call is rolled back there and the episode stops, unretried."""
-    events: list[StepIntent | StepPrediction | StepResult] = []
+    events: list[MixedEvent] = []
     runtime = _world_runtime(events)
     with runtime.open(_task("place_order", "refund")) as session:
         session.execute(_refund("r1"))
@@ -705,3 +713,62 @@ def test_candidate_world_failure_stops_the_mixed_episode() -> None:
             session.execute(ToolCall(call_id="bad", name="refund", arguments={}))
         with pytest.raises(RuntimeError, match="cannot be checkpointed"):
             session.checkpoint()
+
+
+def test_owned_shadow_route_refuses_before_opening_an_unavailable_mirror() -> None:
+    """An owned simulator cannot shadow native domains without a separate mirror contract."""
+    events: list[MixedEvent] = []
+    with pytest.raises(ValueError, match="shadow.*mirror"):
+        _world_runtime(events, shadow=True)
+    assert not events
+
+
+def test_mixed_pre_dispatch_refusal_preserves_both_clocks_and_allows_correction() -> None:
+    """A proven rejected access is an actor observation, not an irrecoverable simulator outage."""
+    read_world = WORLD.model_copy(
+        update={
+            "tools": (
+                WORLD.tools[0].model_copy(update={"writes": ()}),
+                WORLD.tools[1],
+            )
+        }
+    )
+    policy = MixedRealityPolicy(
+        native_identity=sha256_json({"n": 1}),
+        candidate_identity=sha256_json({"c": 1}),
+        world=read_world,
+        routes=(
+            ToolRoute(name="place_order", mode="real", effect="read"),
+            ToolRoute(name="refund", mode="simulated", effect="write"),
+        ),
+    )
+    native = ExecutableWorldRuntime(
+        read_world,
+        RecordWorldFactory(
+            service={"name": "orders"},
+            schema=ORDERS_SCHEMA,
+            tools={"place_order": RecordTool(access=_orders, run=place_order)},
+        ),
+    )
+    candidate = ExecutableWorldRuntime(
+        read_world,
+        RecordWorldFactory(
+            service={"name": "refunds"},
+            schema=REFUNDS_SCHEMA,
+            tools={"refund": RecordTool(access=_refunds, run=refund)},
+        ),
+        owner="simulated",
+    )
+    runtime = MixedRealityEnvironmentRuntime(
+        policy=policy, native=native, candidate=candidate, record=lambda event: None
+    )
+    with runtime.open(_task("place_order", "refund")) as session:
+        before = session.checkpoint()
+        reply = execute_with_recovery(session, _order("refused"))
+        assert reply.is_error
+        after = session.checkpoint()
+        assert after.native == before.native and after.candidate == before.candidate
+        assert session.execute(_refund("allowed")).is_error is False
+        done = session.checkpoint()
+        assert done.native is not None and done.candidate is not None
+        assert done.native.clock == done.candidate.clock == 2

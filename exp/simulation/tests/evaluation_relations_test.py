@@ -4,7 +4,7 @@ import pytest
 from pydantic import ValidationError
 
 from exp.common.core.artifacts import JsonObject
-from exp.simulation.evaluation_tasks import FieldRelation, TaskVerifier, grade
+from exp.simulation.evaluation.tasks import FieldRelation, TaskVerifier, grade
 
 
 def outcome() -> JsonObject:
@@ -14,7 +14,14 @@ def outcome() -> JsonObject:
         "final_state": {"order": {"status": "pending"}},
         "final_answer": {"status": "pending"},
         "stop_reason": "completed",
-        "steps": [{"action": {"name": "inspect"}, "reply": {"status": "pending"}}],
+        "steps": [
+            {
+                "action": {"name": "inspect"},
+                "reply": {"status": "pending"},
+                "status": "valid",
+                "after": {"order": {"status": "pending"}},
+            }
+        ],
     }
 
 
@@ -78,3 +85,14 @@ def test_relations_reject_non_pointer_paths() -> None:
     """A comparison cannot execute a generated expression."""
     with pytest.raises(ValidationError):
         FieldRelation(left="eval(answer)", right="/reply")
+
+
+def test_matching_endpoints_do_not_prove_unobserved_intermediate_preservation() -> None:
+    """A reverted side effect could hide between equal endpoints when step state is missing."""
+    value = outcome()
+    steps = value["steps"]
+    assert isinstance(steps, list) and isinstance(steps[0], dict)
+    del steps[0]["after"]
+    result = grade(verifier(), value)
+    assert result.goal.status == "pass" and result.policy.status == "unassessable"
+    assert result.status == "unassessable"

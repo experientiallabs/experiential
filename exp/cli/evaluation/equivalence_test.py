@@ -1,0 +1,50 @@
+"""The public CLI executes and replays paired measurements and trace-council analysis."""
+
+from pathlib import Path
+
+import pytest
+from typer.testing import CliRunner
+
+from exp.cli.app import app
+from exp.cli.evaluation.continuations import ContinuationCommand
+from exp.optimize.evaluation.equivalence.runner_test import equivalence_fixture
+
+
+def test_public_cli_compares_environments_and_runs_its_council(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Dry-run is inert, execution saves complete evidence, and replay needs no provider setup."""
+    project, spec, actors, reviews = equivalence_fixture(tmp_path, monkeypatch)
+    request = tmp_path / "equivalence.json"
+    request.write_text(
+        ContinuationCommand(action="compare-environments", equivalence=spec).model_dump_json()
+    )
+    command = [
+        "eval",
+        "case",
+        "--root",
+        str(tmp_path),
+        "--continuations",
+        str(request),
+        "--yes",
+        "--non-interactive",
+    ]
+    runner = CliRunner()
+    dry = runner.invoke(app, [*command, "--dry-run"])
+    assert dry.exit_code == 0, dry.output
+    assert not actors.requests and not reviews.requests
+    assert not project.artifacts.list_ids(artifact_type="actor-equivalence-registration")
+    result = runner.invoke(app, command)
+    assert result.exit_code == 0, result.output
+    assert '"material_matches": 1' in result.output and '"reference_control"' in result.output
+    assert '"analyses"' in result.output and "No training or promotion" in " ".join(
+        result.output.split()
+    )
+    assert len(actors.requests) == 6 and len(reviews.requests) == 3
+    spec.cases[0].reference.runtime_file.unlink()
+    project.model_catalog_path.unlink()
+    monkeypatch.delenv("HELD_OUT_TEST_KEY")
+    replay = runner.invoke(app, command)
+    assert replay.exit_code == 0, replay.output
+    assert replay.output[replay.output.index("{") :] == result.output[result.output.index("{") :]
+    assert len(actors.requests) == 6 and len(reviews.requests) == 3
