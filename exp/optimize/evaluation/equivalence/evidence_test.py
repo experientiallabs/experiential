@@ -9,13 +9,24 @@ from exp.common.project import ProjectStore
 from exp.optimize.evaluation.continuations.admission import ContinuationAdmission
 from exp.optimize.evaluation.continuations.admission_test import admitted_workbook_study
 from exp.optimize.evaluation.continuations.records import load_study
-from exp.optimize.evaluation.equivalence.evidence import equivalence_metrics, measure_pair
+from exp.optimize.evaluation.equivalence.evidence import (
+    PairMeasurement,
+    equivalence_metrics,
+    measure_pair,
+)
 from exp.simulation.continuations import load_continuation_checkpoint
 
 
 @pytest.mark.parametrize(
     "fault",
-    ["missing_state", "changed_initial", "changed_request", "matching_failure", "interrupted"],
+    [
+        "missing_state",
+        "changed_initial",
+        "changed_request",
+        "matching_failure",
+        "interrupted",
+        "candidate_failed",
+    ],
 )
 def test_material_evidence_cannot_be_inferred_from_matching_final_prose(
     tmp_path: Path, fault: str
@@ -42,6 +53,9 @@ def test_material_evidence_cannot_be_inferred_from_matching_final_prose(
     candidate = reference.model_copy(update={"outcome": outcome})
     if fault == "interrupted":
         candidate = candidate.model_copy(update={"status": "outcome_unknown"})
+    if fault == "candidate_failed":
+        crashed = {"steps": [], "stop_reason": "failed"}
+        candidate = candidate.model_copy(update={"status": "failed", "outcome": crashed})
     measured = measure_pair(
         reference,
         candidate,
@@ -71,9 +85,74 @@ def test_material_evidence_cannot_be_inferred_from_matching_final_prose(
         assert isinstance(cases, dict)
         assert cases["0"]["candidate"]["agreement_bounds"] == [1, 1]
         assert cases["1"]["candidate"]["agreement_bounds"] == [0, 0]
+        headline = pooled["candidate"]
+        assert isinstance(headline, dict) and headline["agreement_bounds"] == [0.5, 0.5]
+        assert headline["agreement"]["estimate"] == 0.5
+    elif fault == "candidate_failed":
+        assert measured.material_agreement == "different"
+        assert "different:completed_execution" in measured.differences
+        metrics = equivalence_metrics((measured,))["candidate"]
+        assert isinstance(metrics, dict)
+        assert metrics["material_differences"] == 1 and metrics["unassessable"] == 0
+        assert metrics["agreement_bounds"] == [0, 0]
     else:
         assert measured.material_agreement == "unassessable"
         assert measured.differences
     if fault == "interrupted":
         assert measured.comparison.candidate_assessment.task_result == "unassessable"
         assert measured.comparison.candidate.stop_reason == "outcome_unknown"
+
+
+def _pair(case: int, repeat: int, condition: str, agreement: str) -> PairMeasurement:
+    """Build a measurement row with only the fields the aggregate reads."""
+    return PairMeasurement.model_construct(
+        case=case,
+        repeat=repeat,
+        condition=condition,
+        material_agreement=agreement,
+        comparison=_COMPARISON,
+        differences=(),
+    )
+
+
+class _Assessment:
+    """Task result stub for the pair matrix."""
+
+    task_result = "pass"
+
+
+class _Comparison:
+    """Comparison stub carrying both assessments."""
+
+    reference_assessment = _Assessment()
+    candidate_assessment = _Assessment()
+
+
+_COMPARISON = _Comparison()
+
+
+def test_cases_weigh_equally_and_control_agreement_is_subtracted() -> None:
+    """Many repeats of one case cannot outvote another case, and control noise is removed."""
+    rows = (
+        *(_pair(0, repeat, "candidate", "match") for repeat in range(8)),
+        _pair(1, 0, "candidate", "different"),
+        _pair(1, 1, "candidate", "unassessable"),
+        *(_pair(0, repeat, "reference_control", "match") for repeat in range(8)),
+        _pair(1, 0, "reference_control", "match"),
+        _pair(1, 1, "reference_control", "different"),
+    )
+    metrics = equivalence_metrics(rows)
+    candidate = metrics["candidate"]
+    assert isinstance(candidate, dict)
+    assert candidate["planned_pairs"] == 10
+    assert candidate["agreement"]["estimate"] == 0.5
+    assert candidate["agreement"]["independent_units"] == 2
+    assert candidate["agreement_bounds"] == [0.5, 0.75]
+    difference = metrics["candidate_minus_control"]
+    assert isinstance(difference, dict)
+    assert difference["unit_differences"] == {"0": 0.0, "1": -0.5}
+    assert difference["estimate"] == -0.25 and difference["independent_units"] == 2
+    low, high = difference["wilson_95"]
+    assert -1 <= low < -0.25 < high <= 1
+    cases = metrics["by_case"]
+    assert isinstance(cases, dict) and cases["1"]["candidate_minus_control"] == -0.5

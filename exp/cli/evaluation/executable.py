@@ -1,4 +1,4 @@
-"""Harbor publication and bounded local serving of frozen executable task profiles."""
+"""Continuation actions owned by executable tasks: Harbor packages, scenarios and witnesses."""
 
 import json
 import os
@@ -10,10 +10,12 @@ from typing import Literal
 from pydantic import Field, model_validator
 from rich.console import Console
 
+from exp.cli.evaluation.continuation_context import ContinuationContext
 from exp.cli.evaluation.spend import review_components, review_cost
 from exp.cli.shared.consent import require_spend_consent
 from exp.common.core.artifacts import ArtifactInput, ContractModel
 from exp.common.project import ProjectStore
+from exp.optimize.evaluation.continuations.capture import preflight_capture
 from exp.optimize.evaluation.continuations.evidence import qualified_training_job
 from exp.optimize.evaluation.executable.costs import runtime_costs
 from exp.optimize.evaluation.executable.provider_grant import ProviderLimits
@@ -23,6 +25,13 @@ from exp.optimize.evaluation.executable.qualification import (
     preflight_executable_qualification,
     preflight_qualification_reference,
     qualify_executable_task,
+)
+from exp.optimize.evaluation.executable.scenarios import (
+    RecordScenarioSpec,
+    RecordWitnessSpec,
+    prepare_record_scenario,
+    prepare_record_witness,
+    saved_record_scenario,
 )
 from exp.optimize.evaluation.executable.task import (
     ExecutableTask,
@@ -106,7 +115,14 @@ class ExecutableCommand(ContractModel):
 
     @model_validator(mode="after")
     def operation_fields(self) -> "ExecutableCommand":
-        """Reject conflicting or ignored payloads before publication, consent or runtime imports."""
+        """Reject conflicting or ignored payloads before publication, consent or runtime imports.
+
+        Returns:
+            This command, unchanged, once only its action's fields are set.
+
+        Raises:
+            ValueError: A field outside the action is set or a required field is missing.
+        """
         allowed = {
             "propose-worlds": {"world_proposals"},
             "construct-assets": {"construction"},
@@ -152,7 +168,17 @@ class ExecutableCommand(ContractModel):
 
 
 def _connection_file(path: Path, endpoint: str, token: str, *, verifier: bool) -> None:
-    """Create an exclusive owner-readable capability file without logging its contents."""
+    """Create an exclusive owner-readable capability file without logging its contents.
+
+    Args:
+        path: New private file path; an existing file is never overwritten.
+        endpoint: Loopback URL of the served trial.
+        token: Capability token for the actor or the verifier.
+        verifier: Whether the token is the verifier's rather than the actor's.
+
+    Returns:
+        None. The file is created with owner-only permissions.
+    """
     descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     with os.fdopen(descriptor, "w") as stream:
         json.dump(
@@ -173,9 +199,28 @@ def run_executable_command(
     yes: bool,
     non_interactive: bool,
     code_revision: str,
+    spec_path: Path | None = None,
 ) -> None:
-    """Publish immutable artifacts or explicitly serve a bounded trusted environment runtime."""
+    """Publish immutable artifacts or explicitly serve a bounded trusted environment runtime.
+
+    Args:
+        project: Project store that owns every task, qualification and package artifact.
+        command: One validated executable operation.
+        console: Command-owned output console.
+        dry_run: Check sources and destinations without publication, execution or serving.
+        yes: Explicit authorization of the displayed estimate.
+        non_interactive: Fail rather than prompt when paid work lacks authorization.
+        code_revision: Installed execution revision recorded in published artifacts.
+        spec_path: The ``--continuations`` spec file named in spend prompts. Python callers
+            without a spec file leave it unset, and prompts then name no file.
+
+    Returns:
+        None. Results are printed to ``console``.
+    """
     now = datetime.now(UTC)
+    consent_command = f"exp eval {project.paths.project_id} --continuations"
+    if spec_path is not None:
+        consent_command = f"{consent_command} {spec_path}"
     if command.action == "propose-worlds":
         spec = command.world_proposals
         if spec is None:
@@ -199,7 +244,7 @@ def run_executable_command(
             estimated_cost_usd=review_cost(console, project, spec),
             cost_is_upper_bound=False,
             non_interactive=non_interactive,
-            command=f"exp eval {project.paths.project_id} --continuations propose-worlds.json",
+            command=consent_command,
         ):
             return
         console.print_json(
@@ -375,7 +420,7 @@ def run_executable_command(
         ),
         cost_is_upper_bound=False,
         non_interactive=non_interactive,
-        command=f"exp eval {project.paths.project_id} --continuations executable-serve.json",
+        command=consent_command,
     ):
         return
     task = verify_executable_package(project, command.directory)
@@ -405,3 +450,69 @@ def run_executable_command(
     finally:
         for path in created:
             path.unlink(missing_ok=True)
+
+
+def handle_harbor(context: ContinuationContext, command: ExecutableCommand) -> None:
+    """Run one executable task operation from the ``harbor`` continuation action.
+
+    Args:
+        context: Validated ``--continuations`` invocation.
+        command: Executable task registration, qualification, export or serving operation.
+
+    Returns:
+        None. The operation result is printed to the console.
+    """
+    run_executable_command(
+        context.store,
+        command,
+        console=context.console,
+        dry_run=context.dry_run,
+        yes=context.yes,
+        non_interactive=context.non_interactive,
+        code_revision=context.revision,
+        spec_path=context.spec_path,
+    )
+
+
+def handle_prepare_scenario(context: ContinuationContext, scenario: RecordScenarioSpec) -> None:
+    """Prepare a native scenario's setup and public initialization, or replay the saved one.
+
+    Args:
+        context: Validated ``--continuations`` invocation.
+        scenario: Native setup and public initialization.
+
+    Returns:
+        None. The prepared scenario is printed to the console.
+    """
+    store, revision = context.store, context.revision
+    saved_scenario = saved_record_scenario(store, scenario, code_revision=revision)
+    if saved_scenario is None:
+        preflight_capture(store, scenario.capture)
+    if context.dry_run:
+        context.console.print(
+            "Native scenario parsed and source pins checked; no runtime imported."
+        )
+        return
+    result = saved_scenario or prepare_record_scenario(store, scenario, code_revision=revision)
+    context.console.print_json(data=result.model_dump(mode="json"))
+
+
+def handle_witness_record(context: ContinuationContext, witness: RecordWitnessSpec) -> None:
+    """Execute an explicit native script and check it against an independent predicate.
+
+    Args:
+        context: Validated ``--continuations`` invocation.
+        witness: Explicit native script and its independent predicate.
+
+    Returns:
+        None. The witness record is printed to the console.
+    """
+    preflight_capture(context.store, witness.capture)
+    if context.dry_run:
+        context.console.print(
+            "Record witness inputs parsed; no runtime imported or script executed."
+        )
+        return
+    context.console.print_json(
+        data=prepare_record_witness(context.store, witness, code_revision=context.revision)
+    )

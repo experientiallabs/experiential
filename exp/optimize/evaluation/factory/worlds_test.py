@@ -56,6 +56,7 @@ def world_fixture(
         template=template,
         acceptance=search.candidates[0].acceptance,
         asset_requirements=(
+            "XLSX sheets have no implicit header. "
             "original.xlsx contains Data (id,key with one header) and Protected. "
             "Keep Protected intact. Public tools inspect input.xlsx/output.xlsx. "
             "Private projection: /final_state/views/main/sha256 hashes the Data sheet, "
@@ -308,3 +309,14 @@ def test_citation_and_runtime_drift_refuse_before_author_spend(
     with pytest.raises(ValueError, match="runtime source changed"):
         propose_worlds(project, spec, code_revision="test")
     assert not transport.requests
+
+
+def test_the_generic_author_prompt_takes_layout_facts_from_the_spec(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Runtime-specific layout reaches the author only through the declared requirements."""
+    project, spec, _ = world_fixture(tmp_path, monkeypatch)
+    request = world_proposal_request(project, spec)
+    system, user = request.messages
+    assert "xlsx" not in str(system.content).lower()
+    assert json.loads(str(user.content))["asset_requirements"] == spec.asset_requirements

@@ -21,8 +21,14 @@ from exp.common.models import (
     ModelRequest,
     ModelResponse,
     ModelSnapshot,
+    ReasoningEffort,
+)
+from exp.runtime.models.providers.attempt_timeouts import (
+    completion_deadline_seconds,
+    request_timeout_seconds,
 )
 from exp.runtime.models.providers.base import (
+    DEFAULT_RETRY_POLICY,
     DEFAULT_TIMEOUT_SECONDS,
     MAXIMUM_COMPLETION_TIMEOUT_SECONDS,
     GatewayWireProfile,
@@ -115,7 +121,10 @@ def _snapshot() -> ModelSnapshot:
 
 
 def _client(
-    transport: JsonHttpTransport, *, base_url: str = "https://echo.test/v1/"
+    transport: JsonHttpTransport,
+    *,
+    base_url: str = "https://echo.test/v1/",
+    reasoning_effort: ReasoningEffort | None = None,
 ) -> _EchoClient:
     """Build the client under test against a deterministic transport."""
     return _EchoClient(
@@ -123,6 +132,7 @@ def _client(
         api_key="secret-key",
         base_url=base_url,
         transport=transport,
+        reasoning_effort=reasoning_effort,
     )
 
 
@@ -381,18 +391,23 @@ def test_a_catalog_pinned_reasoning_effort_lengthens_the_attempt() -> None:
     transport = _TimeoutRecordingTransport(
         [JsonHttpResponse(status_code=200, body={"answer": "ok"})]
     )
-    client = _client(transport)
-    client._reasoning_effort = "high"
-
-    client.complete(
-        ModelRequest(
-            messages=(ModelMessage(role="user", content="hi"),), maximum_output_tokens=2_048
-        )
+    client = _client(transport, reasoning_effort="high")
+    request = ModelRequest(
+        messages=(ModelMessage(role="user", content="hi"),), maximum_output_tokens=2_048
     )
+
+    client.complete(request)
 
     # 102.4 s for 2,048 output tokens plus the registered 120 s for high effort.
     assert len(transport.timeouts) == 1
     assert 221.0 < transport.timeouts[0] <= 223.0
+    # The request deadline gives each allowed attempt that same whole allowance.
+    attempt = request_timeout_seconds(
+        DEFAULT_TIMEOUT_SECONDS, request, default_reasoning_effort="high"
+    )
+    assert client._completion_deadline_seconds(request) == completion_deadline_seconds(
+        attempt, DEFAULT_RETRY_POLICY
+    )
 
 
 def test_a_retry_after_a_slow_failed_attempt_gets_its_whole_attempt_timeout() -> None:

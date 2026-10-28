@@ -9,6 +9,9 @@ from exp.common.project import ArtifactStore
 from exp.simulation.engines.text.prompt import MemoryContext
 from exp.simulation.world_model.memory_tree import AUTHORITY, MemoryLine, read_line
 
+RESEARCH_HISTORY_ABLATION = "off-current-delivery-v1"
+"""Identity mark for a world model whose current delivery withholds research history."""
+
 
 def observation_overview(
     store: ArtifactStore,

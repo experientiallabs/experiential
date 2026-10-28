@@ -46,6 +46,7 @@ from exp.optimize.evaluation.executable.deferral import (
 )
 from exp.simulation.continuations import load_continuation_checkpoint
 from exp.simulation.evaluation.analysis import TraceAnalysis, analyze_traces
+from exp.simulation.reconstruction.models import path_parts
 
 
 class EquivalenceCase(ContractModel):
@@ -96,10 +97,7 @@ class EquivalenceCase(ContractModel):
             if len(paths) != len(set(paths)):
                 raise ValueError("equivalence state paths must be unique")
             for path in paths:
-                if path and not path.startswith("/"):
-                    raise ValueError("equivalence state paths must be JSON pointers")
-                if "~" in path.replace("~0", "").replace("~1", ""):
-                    raise ValueError("equivalence state pointer has an invalid escape")
+                path_parts(path)
         return self
 
 
@@ -383,7 +381,15 @@ def _assemble(
                     condition=condition,
                     identity=key,
                 )
-                if measured.material_agreement != "unassessable":
+                # A known candidate failure is already a material difference with no trace
+                # for a semantic judge to rate, so only two completed executions are judged.
+                if measured.material_agreement != "unassessable" and all(
+                    side.execution == "completed"
+                    for side in (
+                        measured.comparison.reference_assessment,
+                        measured.comparison.candidate_assessment,
+                    )
+                ):
                     if not allow_dispatch and not project.artifacts.exists(key + "-intent"):
                         raise ValueError("equivalence report lost a planned judge request")
                     report(

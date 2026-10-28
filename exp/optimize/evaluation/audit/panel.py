@@ -23,9 +23,9 @@ status live in :mod:`exp.optimize.evaluation.audit.receipts`.
 
 from collections.abc import Callable, Collection, Sequence
 from datetime import datetime
-from typing import Literal
+from typing import Literal, Self
 
-from pydantic import Field, JsonValue
+from pydantic import Field, JsonValue, model_validator
 
 from exp.common.core.artifacts import ArtifactInput, ContractModel, stable_id
 from exp.common.project import ProjectBuildArtifacts, ProjectStore
@@ -87,6 +87,7 @@ class PlannedPanel(ContractModel):
         checkpoint: Frozen memory checkpoint read, for the memory profile.
         cases: Selected held-out traces in selection order.
         specs: One derived fidelity spec per case, in the same order.
+        code_revision: Implementation that produces every run; part of each run ID.
     """
 
     profile: Profile
@@ -94,12 +95,13 @@ class PlannedPanel(ContractModel):
     checkpoint: AuditCheckpoint | None = None
     cases: tuple[ReplayCase, ...] = Field(min_length=1)
     specs: tuple[FidelitySpec, ...] = Field(min_length=1)
+    code_revision: str = Field(min_length=1)
 
     @property
     def base_runs(self) -> tuple[str, ...]:
         """First-generation content-addressed run ID of every case, in panel order."""
         return tuple(
-            content_run_id(spec, LABEL, case.trace_id)
+            content_run_id(spec, LABEL, case.trace_id, code_revision=self.code_revision)
             for case, spec in zip(self.cases, self.specs, strict=True)
         )
 
@@ -108,9 +110,9 @@ class PlannedPanel(ContractModel):
         """Panel identity: the sorted selected case IDs with each one's content-addressed run.
 
         Run IDs already cover the simulator, memory checkpoint and recall policy, every prompt
-        sent, and the judge configuration. Replacement attempts share their first-generation
-        run ID, so they keep the panel identity. The code revision is deliberately not part of
-        run IDs and is compared beside this identity.
+        sent, the judge configuration and the producing code revision, so a panel run by other
+        code is another panel. Replacement attempts share their first-generation run ID, so they
+        keep the panel identity.
         """
         pairs = sorted(
             [case.task.task_id, run] for case, run in zip(self.cases, self.base_runs, strict=True)
@@ -119,8 +121,15 @@ class PlannedPanel(ContractModel):
 
     @property
     def lineages(self) -> tuple[str, ...]:
-        """Audited task lineages, in panel order."""
+        """Audited task lineages, in panel order; one case per lineage."""
         return tuple(case.task.lineage_group_id for case in self.cases)
+
+    @model_validator(mode="after")
+    def one_case_per_lineage(self) -> Self:
+        """Refuse two cases of one lineage: they would count as two independent units."""
+        if len(set(self.lineages)) != len(self.cases):
+            raise ValueError("a held-out panel measures one case per task lineage")
+        return self
 
 
 class Retirement(ContractModel):
@@ -164,10 +173,12 @@ def held_out_cases(
     *,
     excluded: Collection[str] = frozenset(),
 ) -> tuple[ReplayCase, ...]:
-    """Select held-out traces deterministically, skipping excluded lineages.
+    """Select held-out traces deterministically, one per lineage, skipping excluded lineages.
 
     Held-out tasks are taken in task-ID order; each replays its first source trace. Traces with
-    nothing to measure after their public prefix are skipped.
+    nothing to measure after their public prefix are skipped. A lineage is the independent unit,
+    so only its first measurable task is selected: tasks sharing a lineage are related variants,
+    not separate evidence, and the whole lineage is reserved with that one case.
 
     Args:
         project: Project with a completed build.
@@ -176,7 +187,7 @@ def held_out_cases(
         excluded: Lineages never selected (the exposed ones, by default).
 
     Returns:
-        Up to ``count`` cases.
+        Up to ``count`` cases, each from a distinct lineage.
 
     Raises:
         ValueError: No held-out trace has recorded tool calls to replay, or every one that
@@ -188,10 +199,13 @@ def held_out_cases(
         for trace in load_trace_dataset(project.artifacts, build.trace_dataset.artifact_id).traces
     }
     cases: list[ReplayCase] = []
+    selected: set[str] = set()
     exhausted = False
     for task in _held_out_tasks(project):
         if len(cases) == count:
             break
+        if task.lineage_group_id in selected:
+            continue
         case = replay_case(task, traces[min(task.source_trace_ids)], visible_calls)
         if case is None:
             continue
@@ -199,6 +213,7 @@ def held_out_cases(
             exhausted = True
         else:
             cases.append(case)
+            selected.add(task.lineage_group_id)
     if not cases and exhausted:
         raise ValueError(
             "every held-out lineage of this build is exposed or reserved in the exposure ledger "
@@ -258,6 +273,7 @@ def plan_held_out_panel(
     count: int,
     *,
     profile: Profile,
+    code_revision: str,
     clock: Callable[[], datetime],
     excluded: Collection[str] = frozenset(),
 ) -> PlannedPanel:
@@ -268,6 +284,7 @@ def plan_held_out_panel(
         count: Maximum number of held-out traces.
         profile: ``memory`` reads the final learned checkpoint with held-out lineages
             reserved; ``source-rag`` retrieves from the fit-only index.
+        code_revision: Implementation that will produce every run.
         clock: Aware clock for deadlines.
         excluded: Lineages never selected.
 
@@ -324,7 +341,12 @@ def plan_held_out_panel(
         for case in cases
     )
     return PlannedPanel(
-        profile=profile, world_model=world_model, checkpoint=checkpoint, cases=cases, specs=specs
+        profile=profile,
+        world_model=world_model,
+        checkpoint=checkpoint,
+        cases=cases,
+        specs=specs,
+        code_revision=code_revision,
     )
 
 
@@ -332,10 +354,9 @@ def register_planned_panel(
     project: ProjectStore,
     planned: PlannedPanel,
     *,
-    code_revision: str,
     clock: Callable[[], datetime],
 ) -> HeldOutPanel:
-    """Register a planned panel's runs without provider calls or credentials.
+    """Register a planned panel's runs at its code revision, without provider calls.
 
     A run interrupted after it claimed slots is never replaced here; execution resumes it in
     place with ``--retry-incomplete``. Only attempts that claimed no slot are re-registered.
@@ -343,7 +364,6 @@ def register_planned_panel(
     Args:
         project: Project owning the registrations.
         planned: Planned panel.
-        code_revision: Exact producing implementation identity.
         clock: Aware clock for attempt retirement.
 
     Returns:
@@ -358,7 +378,7 @@ def register_planned_panel(
             spec,
             label=LABEL,
             trace=case.trace_id,
-            code_revision=code_revision,
+            code_revision=planned.code_revision,
             now=now,
         )
         prepared.append(registration)
@@ -402,8 +422,15 @@ def register_held_out_fidelity(
     Returns:
         The registered panel.
     """
-    planned = plan_held_out_panel(project, count, profile=profile, clock=clock, excluded=excluded)
-    return register_planned_panel(project, planned, code_revision=code_revision, clock=clock)
+    planned = plan_held_out_panel(
+        project,
+        count,
+        profile=profile,
+        code_revision=code_revision,
+        clock=clock,
+        excluded=excluded,
+    )
+    return register_planned_panel(project, planned, clock=clock)
 
 
 def run_slots(project: ProjectStore, run_id: str) -> int:

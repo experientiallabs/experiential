@@ -125,7 +125,7 @@ def test_a_simulated_artifact_cannot_back_a_recorded_observation(tmp_path: Path)
 
 
 def test_recorded_observations_need_a_wholly_recorded_provenance_closure(tmp_path: Path) -> None:
-    """Recorded ancestry is accepted; a recorded-type source with generated ancestry is refused."""
+    """Recorded ancestry is accepted; generated ancestry and unclassified types are refused."""
     project = ProjectStore(tmp_path, "case")
     now = datetime.now(UTC)
 
@@ -152,10 +152,12 @@ def test_recorded_observations_need_a_wholly_recorded_provenance_closure(tmp_pat
     traces = saved("recorded-traces", "trace-dataset")
     persist_capability_brief(project.artifacts, observed(traces), created_at=now, code_revision="t")
     laundered = saved("laundered", "trace-dataset", saved("predicted", "world-checkpoint"))
-    with pytest.raises(ValueError, match="not recorded evidence"):
-        persist_capability_brief(
-            project.artifacts, observed(laundered), created_at=now, code_revision="t"
-        )
+    unclassified = saved("unclassified", "operator-notes")
+    for source in (laundered, unclassified):
+        with pytest.raises(ValueError, match="not recorded evidence"):
+            persist_capability_brief(
+                project.artifacts, observed(source), created_at=now, code_revision="t"
+            )
     # A brief saved without publication checks is refused again when loaded.
     stored = project.artifacts.write_json(
         artifact_id="unchecked-brief",

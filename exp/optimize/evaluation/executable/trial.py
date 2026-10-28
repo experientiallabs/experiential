@@ -30,13 +30,13 @@ from exp.optimize.evaluation.executable.qualification import load_executable_qua
 from exp.optimize.evaluation.executable.task import ExecutableTask, load_executable_task
 from exp.runtime.environments.interface import Observation
 from exp.runtime.environments.world_artifacts import load_world_image, persist_world_image
+from exp.runtime.environments.world_contracts import ExecutableCheckpoint
 from exp.runtime.environments.world_outcomes import (
     WorldExecutionReceipt,
     execute_with_recovery,
     execution_receipt,
     known_failed_effects,
 )
-from exp.runtime.environments.worlds import ExecutableCheckpoint
 from exp.simulation.continuations import WorldCheckpoint, load_continuation_checkpoint
 from exp.simulation.evaluation.tasks import grade
 

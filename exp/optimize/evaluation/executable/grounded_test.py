@@ -15,7 +15,7 @@ from exp.optimize.evaluation.executable.grounded import (
     continuation_runtime,
 )
 from exp.optimize.evaluation.fidelity.runner_test import source_project
-from exp.runtime.environments.worlds import StateDomain, ToolEffectPolicy, WorldManifest
+from exp.runtime.environments.world_contracts import StateDomain, ToolEffectPolicy, WorldManifest
 from exp.runtime.models.providers.transport import JsonHttpResponse, ScriptedJsonTransport
 from exp.runtime.sessions.dispatch_ledger import DispatchCapExhaustedError
 from exp.simulation.world_model.prediction_reading import PredictionReading
@@ -180,6 +180,7 @@ def test_build_learned_memory_uses_admitted_native_decisions_in_executable_world
     def post(
         url: str, *, headers: Mapping[str, str], payload: JsonObject, timeout_seconds: float
     ) -> JsonHttpResponse:
+        """Script decision answers and one read-more proposal; forward the rest to the fixture."""
         questions = payload.get("questions", {})
         if isinstance(questions, dict) and set(questions) == {"support", "contradiction"}:
             provider.requests.append(RecordedRequest(url, dict(headers), payload))

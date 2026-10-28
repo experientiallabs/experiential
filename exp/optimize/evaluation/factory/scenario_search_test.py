@@ -37,8 +37,8 @@ from exp.simulation.capability_briefs import persist_capability_brief
 from exp.simulation.capability_briefs_test import brief
 from exp.simulation.continuations import load_continuation_checkpoint
 from exp.simulation.evaluation.admission import EvaluationSpecification, persist_specification
+from exp.simulation.evaluation.record_execution_test import acceptance, source
 from exp.simulation.evaluation.tasks import OutcomeRule
-from exp.simulation.record_execution_test import acceptance, source
 
 
 def search_fixture(
@@ -280,9 +280,9 @@ def workbook_search_fixture(
         WorkbookReadArguments,
         workbook_projection,
     )
-    from exp.runtime.environments.worlds import ToolEffectPolicy
+    from exp.runtime.environments.world_contracts import ToolEffectPolicy
+    from exp.simulation.evaluation.table_relations import TableRelation
     from exp.simulation.evaluation.tasks import TaskVerifier
-    from exp.simulation.table_relations import TableRelation
     from exp.simulation.world_construction import (
         ConstructionSpec,
         TablePlan,
@@ -361,7 +361,7 @@ def workbook_search_fixture(
                 outcome_schema={},
                 table_relations=(
                     TableRelation(
-                        source="/initial_state/views/main/sheets/0/rows",
+                        source="/initial_state/views/source/sheets/0/rows",
                         target="/final_state/views/main/sheets/0/rows",
                         operation="last_per_key",
                         key_columns=(1,),
@@ -447,6 +447,9 @@ def workbook_search_fixture(
                         output_file="output.xlsx",
                         sheets=("Data",),
                         include_rows=generated,
+                    ),
+                    "source": WorkbookStateView(
+                        input_file="input.xlsx", sheets=("Data",), include_rows=generated
                     ),
                     "protected": definition.views["protected"],
                 },

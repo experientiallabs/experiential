@@ -18,30 +18,29 @@ from exp.common.models import ToolCall
 from exp.common.project import ProjectStore, artifact_input
 from exp.common.tasks import TaskCase, ToolSchema
 from exp.runtime.environments.record_world import RecordTool, RecordToolError, RecordWorldFactory
-from exp.runtime.environments.worlds import (
+from exp.runtime.environments.world_contracts import (
     ExecutableCheckpoint,
-    ExecutableWorldRuntime,
     StateDomain,
     ToolEffectPolicy,
     WorldAccess,
-    WorldContext,
     WorldEvent,
     WorldManifest,
 )
+from exp.runtime.environments.worlds import ExecutableWorldRuntime, WorldContext
 from exp.simulation.evaluation.admission import (
     EvaluationSpecification,
     persist_specification,
     record_label_witness,
     verify_label_witness,
 )
-from exp.simulation.evaluation.tasks import OutcomeRule, TaskVerifier, VerifierChallenge, grade
-from exp.simulation.record_execution import (
+from exp.simulation.evaluation.record_execution import (
     RecordReplayRuntime,
     execute_record_script,
     load_record_execution,
     record_state,
     verify_record_execution,
 )
+from exp.simulation.evaluation.tasks import OutcomeRule, TaskVerifier, VerifierChallenge, grade
 
 NOW = datetime(2026, 10, 18, tzinfo=UTC)
 SCHEMA = """

@@ -20,6 +20,7 @@ from exp.cli.app import app
 from exp.common.core.artifacts import JsonObject
 from exp.common.models import ToolCall
 from exp.common.project import ProjectStore
+from exp.common.release_revision import installed_execution_revision
 from exp.optimize.evaluation.audit.lifecycle import open_held_out_audit
 from exp.optimize.evaluation.audit.panel import (
     HeldOutPanel,
@@ -380,8 +381,9 @@ def test_the_cli_resumes_only_with_retry_incomplete_and_qualifies_its_headline(
     killed = CliRunner().invoke(app, command)
     assert killed.exit_code != 0 and provider.kill is None, "the process was killed mid-panel"
     sent = len(provider.requests)
+    # The audit command binds its runs to the installed source.
     with open_held_out_audit(
-        store, 3, profile="memory", code_revision=REVISION, clock=now
+        store, 3, profile="memory", code_revision=installed_execution_revision(), clock=now
     ) as audit:
         registrations = audit.panel.prepared
         committed = {
@@ -421,7 +423,8 @@ def test_the_cli_resumes_only_with_retry_incomplete_and_qualifies_its_headline(
     # A11 by stage: the receipt's qualified headline over every trace, the re-dispatches by
     # stage, then the unaffected-only and affected-only scores with their denominators.
     assert "Held-out fidelity (independent, qualified: trace re-attempts) 9/9 replies" in output
-    assert "· judge 4.0/5 · 3/3 traces" in output
+    assert "· judge 4.0/5 (3/3 traces judged, 0 judge failures) · 3/3 traces" in output
+    assert "per-lineage mean exact 100% (95% interval" in output and "3 lineages" in output
     assert (
         "re-dispatched after an unknown outcome prediction 1 · judge 0 · investigation 0 · "
         "1 of 3 traces affected"

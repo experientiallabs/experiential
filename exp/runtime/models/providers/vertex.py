@@ -22,7 +22,13 @@ from typing import Literal, Protocol
 from urllib.parse import urlsplit
 
 from exp.common.core.artifacts import JsonObject
-from exp.common.models import ChatMaxTokensField, ModelRequest, ModelResponse, ModelSnapshot
+from exp.common.models import (
+    ChatMaxTokensField,
+    ModelRequest,
+    ModelResponse,
+    ModelSnapshot,
+    ReasoningEffort,
+)
 from exp.runtime.models.providers.anthropic import (
     anthropic_messages_request,
     anthropic_messages_response,
@@ -31,10 +37,6 @@ from exp.runtime.models.providers.async_transport import (
     AsyncJsonHttpTransport,
     ProviderDeadlineExceeded,
     RequestDeadline,
-)
-from exp.runtime.models.providers.attempt_timeouts import (
-    completion_deadline_seconds,
-    request_timeout_seconds,
 )
 from exp.runtime.models.providers.base import (
     DEFAULT_RETRY_POLICY,
@@ -267,7 +269,7 @@ class VertexClient(ProviderHttpClient):
         supports_frequency_penalty: bool = False,
         supports_presence_penalty: bool = False,
         supports_reasoning: bool = False,
-        reasoning_effort: str | None = None,
+        reasoning_effort: ReasoningEffort | None = None,
     ) -> None:
         """Create a client with explicit generation gates for one Vertex endpoint root.
 
@@ -297,6 +299,7 @@ class VertexClient(ProviderHttpClient):
             transport=transport,
             retry_policy=retry_policy,
             timeout_seconds=timeout_seconds,
+            reasoning_effort=reasoning_effort,
         )
         self._token_provider = token_provider or ServiceAccountTokenProvider(api_key)
         self._supports_temperature = supports_temperature
@@ -306,7 +309,6 @@ class VertexClient(ProviderHttpClient):
         self._supports_frequency_penalty = supports_frequency_penalty
         self._supports_presence_penalty = supports_presence_penalty
         self._supports_reasoning = supports_reasoning
-        self._reasoning_effort = reasoning_effort
 
     async def complete_async(
         self,
@@ -326,12 +328,7 @@ class VertexClient(ProviderHttpClient):
             The typed completed response with observed request economics.
         """
         request_deadline = deadline or RequestDeadline.after(
-            completion_deadline_seconds(
-                request_timeout_seconds(
-                    self._timeout_seconds, request, default_reasoning_effort=self._reasoning_effort
-                ),
-                self._retry_policy,
-            )
+            self._completion_deadline_seconds(request)
         )
         await _warm_vertex_bearer_token(
             self._token_provider, request_deadline, self._timeout_seconds
@@ -431,7 +428,7 @@ class VertexOpenAIClient(OpenAICompatibleClient):
         supports_frequency_penalty: bool = False,
         supports_presence_penalty: bool = False,
         supports_reasoning: bool = False,
-        reasoning_effort: str | None = None,
+        reasoning_effort: ReasoningEffort | None = None,
         chat_max_tokens_field: ChatMaxTokensField | None = None,
         sampling_requires_reasoning_none: bool = False,
     ) -> None:
@@ -500,12 +497,7 @@ class VertexOpenAIClient(OpenAICompatibleClient):
             The typed completed response with observed request economics.
         """
         request_deadline = deadline or RequestDeadline.after(
-            completion_deadline_seconds(
-                request_timeout_seconds(
-                    self._timeout_seconds, request, default_reasoning_effort=self._reasoning_effort
-                ),
-                self._retry_policy,
-            )
+            self._completion_deadline_seconds(request)
         )
         await _warm_vertex_bearer_token(
             self._token_provider, request_deadline, self._timeout_seconds
@@ -630,7 +622,7 @@ class VertexAnthropicClient(ProviderHttpClient):
         supports_top_p: bool = True,
         supports_top_k: bool = False,
         supports_reasoning: bool = False,
-        reasoning_effort: str | None = None,
+        reasoning_effort: ReasoningEffort | None = None,
     ) -> None:
         """Create a Vertex Anthropic client for one project-and-location endpoint root.
 
@@ -658,13 +650,13 @@ class VertexAnthropicClient(ProviderHttpClient):
             transport=transport,
             retry_policy=retry_policy,
             timeout_seconds=timeout_seconds,
+            reasoning_effort=reasoning_effort,
         )
         self._token_provider = token_provider or ServiceAccountTokenProvider(api_key)
         self._supports_temperature = supports_temperature
         self._supports_top_p = supports_top_p
         self._supports_top_k = supports_top_k
         self._supports_reasoning = supports_reasoning
-        self._reasoning_effort = reasoning_effort
 
     async def complete_async(
         self,
@@ -675,12 +667,7 @@ class VertexAnthropicClient(ProviderHttpClient):
     ) -> ModelResponse:
         """Warm the bearer token off the event loop, then run the shared completion flow."""
         request_deadline = deadline or RequestDeadline.after(
-            completion_deadline_seconds(
-                request_timeout_seconds(
-                    self._timeout_seconds, request, default_reasoning_effort=self._reasoning_effort
-                ),
-                self._retry_policy,
-            )
+            self._completion_deadline_seconds(request)
         )
         await _warm_vertex_bearer_token(
             self._token_provider, request_deadline, self._timeout_seconds

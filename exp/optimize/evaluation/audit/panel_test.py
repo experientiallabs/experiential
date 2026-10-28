@@ -33,6 +33,7 @@ from exp.common.models import (
 from exp.common.models.catalog_roles import ModelRoles
 from exp.common.project import ProjectStore
 from exp.common.tasks.store import load_task_set
+from exp.optimize.evaluation.audit import panel as held_out_panel
 from exp.optimize.evaluation.audit.panel import (
     held_out_council_inputs,
     register_held_out_fidelity,
@@ -596,7 +597,10 @@ def test_audit_learns_fit_traces_then_measures_held_out_on_final_memory(
     report = audit_report(store)
     assert "Learning curve exact replies by trace order:" in report
     assert "Report:" in output and "report.txt" in output
-    assert re.search(r"Complete in (under 1s|\d+(s|m\d\ds|h\d\dm))", output), "time taken"
+    assert re.search(r"Complete in (under 1s|\d+(s|m\d\ds|h\d\dm)) total wall time", output), (
+        "the command's time is labelled as wall time spanning learning and the spend question"
+    )
+    assert "replay time per trace" in audit_report(store), "per-trace time from execution start"
     # Held-out lineages were reserved before learning and never consumed.
     held = held_out_lineages(store)
     assert all(is_reserved(store.artifacts, plan.lineage, lineage) for lineage in held)
@@ -668,6 +672,13 @@ def test_source_rag_profile_measures_held_out_and_feeds_the_council_offline(
     total = aggregate(saved_held_out_results(store, panel))
     # Three traces, each replaying 3 calls after a 1-call public prefix; one tool is wrong.
     assert (total.exact, total.steps, total.judge_mean) == (6, 9, 4.0)
+    assert (total.judged_traces, total.judge_failures, total.lineages) == (3, 0, 3)
+    assert total.lineage_exact == pytest.approx(2 / 3)
+    assert total.lineage_interval is not None
+    assert total.lineage_interval[0] < 2 / 3 < total.lineage_interval[1]
+    assert sum(row.steps for row in total.kinds) == 9
+    assert sum(row.exact for row in total.kinds) == 6
+    assert len(total.replay_seconds) == 3 and min(total.replay_seconds) >= 0
     # The fixture judge scores every turn 4, so it disagrees on the three wrong turns.
     assert (total.judge_agreements, total.judge_turns) == (6, 9)
     fidelity_requests = provider.requests[built:]
@@ -787,6 +798,63 @@ def test_run_ids_follow_content_and_retire_attempts_that_cannot_finish(
     changed = register(later)
     assert not changed.retired
     assert changed.prepared[0].spec.run_id.split("-")[-1] != run_id.split("-")[-1]
+
+
+def test_tasks_sharing_a_lineage_are_one_panel_unit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Selection takes one case per task lineage, so related tasks never count twice."""
+    provider = SimulatedProvider([episode(i) for i in range(USERS)])
+    _, store, _ = build_project(tmp_path, monkeypatch, provider)
+    tasks = held_out_panel._held_out_tasks(store)
+    assert len(tasks) >= 3
+    related = tasks[1].model_copy(update={"lineage_group_id": tasks[0].lineage_group_id})
+    shared = (tasks[0], related, *tasks[2:])
+    monkeypatch.setattr(held_out_panel, "_held_out_tasks", lambda project: shared)
+    _, cases = source_rag_inputs(store, len(shared))
+    assert [case.task.task_id for case in cases] == [
+        task.task_id for task in shared if task is not related
+    ]
+    assert len({case.task.lineage_group_id for case in cases}) == len(cases)
+
+
+def test_a_saved_result_never_replays_under_other_code(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A run measured by one code revision is registered and measured again by another."""
+    provider = SimulatedProvider([episode(i) for i in range(USERS)])
+    _, store, _ = build_project(tmp_path, monkeypatch, provider)
+
+    def register(revision: str):  # noqa: ANN202 - local shorthand
+        """Register one source-RAG held-out run at a code revision."""
+        return register_held_out_fidelity(
+            store, 1, profile="source-rag", code_revision=revision, clock=lambda: datetime.now(UTC)
+        )
+
+    measured = register(REVISION)
+    execute_fidelity_evaluation(store, measured.prepared[0])
+    assert register(REVISION).prepared == measured.prepared
+    other = register("d" * 40)
+    assert not other.retired
+    assert other.identity != measured.identity
+    assert other.prepared[0].spec.run_id != measured.prepared[0].spec.run_id
+    assert other.prepared[0].code_revision == "d" * 40
+    assert fidelity.saved_fidelity_report(store, other.prepared[0]) is None
+
+
+def test_replay_time_runs_from_execution_start_to_the_saved_report(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Waiting between registration and execution never counts as replay time."""
+    provider = SimulatedProvider([episode(i) for i in range(USERS)])
+    _, store, _ = build_project(tmp_path, monkeypatch, provider)
+    panel = register_held_out_fidelity(
+        store, 1, profile="source-rag", code_revision=REVISION, clock=lambda: datetime.now(UTC)
+    )
+    later = datetime.now(UTC) + timedelta(hours=1)
+    execute_fidelity_evaluation(store, panel.prepared[0], clock=lambda: later)
+    (result,) = saved_held_out_results(store, panel)
+    assert result.replay_seconds == 0, "the frozen execution clock never advanced"
 
 
 class Outage(SimulatedProvider):

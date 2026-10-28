@@ -515,6 +515,99 @@ def test_an_unauthorized_effect_can_be_added_to_an_existing_object() -> None:
         )
 
 
+@pytest.mark.parametrize(
+    ("pointer", "operation", "accepted"),
+    [
+        ("/actions/1/value", "replace", True),
+        ("/actions/01/value", "replace", False),
+        ("/actions/+1/value", "replace", False),
+        ("/observed/a~1b", "add", True),
+        ("/observed/a~2b", "add", False),
+    ],
+)
+def test_perturbation_pointers_follow_the_shared_json_pointer_owner(
+    pointer: str, operation: Literal["replace", "add"], accepted: bool
+) -> None:
+    """Noncanonical indexes and invalid escapes cannot name a saved value."""
+    base = study()
+    edit = Perturbation(
+        perturbation_id="case-a-pointer",
+        base_case_id="case-a",
+        factor="unauthorized_write" if operation == "add" else "wrong_cell",
+        edits=(OutputEdit(pointer=pointer, value=41, operation=operation),),
+        description="One exact edit.",
+    )
+
+    def registered() -> JudgeChallengeStudy:
+        """Register the base study with the one extra perturbation."""
+        return JudgeChallengeStudy.model_validate(
+            {**base.model_dump(), "perturbations": (*base.perturbations, edit)}
+        )
+
+    if not accepted:
+        with pytest.raises(ValueError, match="pointer"):
+            study_items(registered())
+        return
+    item = next(row for row in study_items(registered()) if row.item_id == "case-a-pointer")
+    assert isinstance(item.outcome, dict)
+    if operation == "add":
+        assert item.outcome["observed"] == {"value": 42, "a/b": 41}
+    else:
+        actions = item.outcome["actions"]
+        assert isinstance(actions, list) and actions[1] == {"cell": "B2", "value": 41}
+
+
+def test_an_optional_criterion_failure_is_not_a_judge_failure() -> None:
+    """Only required criteria can block a decision, so abstentions never go negative."""
+    registered = study()
+
+    def optional_failure(judge: JudgeConfig, blinded: JsonObject, key: str) -> CalibrationJudgment:
+        """Fail every optional criterion while the required one is still assessed."""
+        saved = scripted_judge(judge, blinded, key)
+        axes = tuple(
+            axis
+            if axis.dimension_id == "outcome"
+            else axis.model_copy(update={"status": "judge_failure"})
+            for axis in saved.axes
+        )
+        return saved.model_copy(update={"axes": axes})
+
+    report = assess_challenge_study(registered, run_challenge_study(registered, optional_failure))
+    for arm in ("careful", "credulous", "length"):
+        measured = section(report, "arms", arm)
+        assert measured["base_judge_failures"] == 0
+        sensitivity = measured["sensitivity"]
+        assert isinstance(sensitivity, dict)
+        for row in sensitivity.values():
+            assert isinstance(row, dict)
+            assert row["judge_failed"] == 0 and row["judge_abstained"] == 0
+
+
+def test_failed_repeats_are_counted_apart_from_repeat_consistency() -> None:
+    """A repeat with no judgment is neither agreement nor disagreement."""
+    registered = study(repeats=2)
+
+    def second_repeat_fails(
+        judge: JudgeConfig, blinded: JsonObject, key: str
+    ) -> CalibrationJudgment:
+        """Reject the credulous judge's second repeat on one stable output."""
+        saved = scripted_judge(judge, blinded, key)
+        if not key.endswith(":1:case-a-identity") or judge.model_identity != "credulous":
+            return saved
+        axes = tuple(axis.model_copy(update={"status": "judge_failure"}) for axis in saved.axes)
+        return saved.model_copy(update={"axes": axes})
+
+    judgments = run_challenge_study(registered, second_repeat_fails)
+    consistency = section(assess_challenge_study(registered, judgments), "arms", "credulous")[
+        "repeat_consistency"
+    ]
+    assert isinstance(consistency, dict)
+    assert consistency["trials"] == 17 and consistency["successes"] == 16
+    assert consistency["failed_repeats"] == 1 and consistency["missing_repeats"] == 0
+    assert consistency["items_without_two_judged_repeats"] == 1
+    assert consistency["planned_bounds"] == [16 / 18, 17 / 18]
+
+
 def test_agreeing_judged_repeats_with_an_unavailable_one_leave_consistency_unknown() -> None:
     """Two agreeing judgments of three planned repeats do not establish consistency."""
     registered = study(repeats=3)

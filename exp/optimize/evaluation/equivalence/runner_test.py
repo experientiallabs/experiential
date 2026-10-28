@@ -90,13 +90,13 @@ def simulated_workbook(project: ProjectStore, configuration: JsonObject) -> Cont
         OperationEconomics,
         ToolCall,
     )
-    from exp.runtime.environments.worlds import (
+    from exp.runtime.environments.world_contracts import (
         ExecutableCheckpoint,
-        ExecutableWorldRuntime,
         StateDomain,
         ToolEffectPolicy,
         WorldManifest,
     )
+    from exp.runtime.environments.worlds import ExecutableWorldRuntime
     from exp.simulation.world_model.executable import GroundedWorldFactory, PredictorEvent
     from exp.simulation.world_model.grounded_session import GroundedTransitionEngine
     from exp.simulation.world_model.runtime_test import _runtime
@@ -171,7 +171,7 @@ def simulated_workbook(project: ProjectStore, configuration: JsonObject) -> Cont
 def test_native_reference_and_grounded_candidate_use_actual_world_owners(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, illegal_clock: bool
 ) -> None:
-    """Compare real XLSX effects to simulated commits, keeping simulator failures unavailable."""
+    """Compare real XLSX effects to simulated commits; a simulator failure is a difference."""
     project, spec, _, reviews = equivalence_fixture(tmp_path, monkeypatch)
     reference = spec.cases[0].reference
     configuration: JsonObject = {
@@ -206,7 +206,8 @@ def test_native_reference_and_grounded_candidate_use_actual_world_owners(
     result = run_equivalence(project, spec, code_revision="test")
     measured = result.measurements[0]
     if illegal_clock:
-        assert measured.material_agreement == "unassessable"
+        assert measured.material_agreement == "different"
+        assert "different:completed_execution" in measured.differences
         assert measured.judgment is None
         assert measured.comparison.candidate_assessment.execution != "completed"
     else:
@@ -225,7 +226,7 @@ def test_native_reference_and_grounded_candidate_use_actual_world_owners(
         cell = next(row for row in result.cells if row.condition == "candidate")
         assert cell.result is not None
         from exp.optimize.evaluation.continuations.records import load_study
-        from exp.runtime.environments.worlds import ExecutableCheckpoint
+        from exp.runtime.environments.world_contracts import ExecutableCheckpoint
 
         study = load_study(project.artifacts, cell.result)
         end = load_continuation_checkpoint(project.artifacts, study.branches[0].checkpoints[-1])
@@ -405,6 +406,19 @@ def test_changed_actor_policy_refuses_before_calls(
             }
         )
     assert not actors.requests and not reviews.requests
+
+
+@pytest.mark.parametrize("path", ["rows", "/rows~2", "/rows/~"])
+def test_state_paths_use_the_shared_pointer_rules(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, path: str
+) -> None:
+    """Relative pointers and invalid escapes refuse before any execution is registered."""
+    _, spec, actors, _ = equivalence_fixture(tmp_path, monkeypatch)
+    with pytest.raises(ValueError, match="pointer"):
+        EquivalenceCase.model_validate(
+            {**spec.cases[0].model_dump(mode="json"), "final_state_paths": [path]}
+        )
+    assert not actors.requests
 
 
 def test_failed_candidate_stays_in_denominator_and_is_not_judged(

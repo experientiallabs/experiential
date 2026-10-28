@@ -36,6 +36,7 @@ from exp.optimize.evaluation.continuations.proposals import (
     SourceBranchPolicy,
     propose_checkpoints,
 )
+from exp.runtime.models.providers.admitted_transport import require_admitted_transport
 from exp.runtime.models.registry import RuntimeModelCatalog
 
 
@@ -240,16 +241,7 @@ def preflight_continuation_campaign(project: ProjectStore, spec: ContinuationCam
             and selector.output_tokens > capability.maximum_output_tokens
         ):
             raise ValueError("campaign selector output allowance exceeds model capacity")
-        provider = catalog.connections[catalog.models[selector.alias].connection].provider
-        if provider not in {
-            "openai",
-            "openai-compatible",
-            "openrouter",
-            "anthropic",
-            "gemini",
-            "azure",
-        }:
-            raise ValueError("campaign selectors require the admitted HTTP transport")
+        require_admitted_transport(catalog, selector.alias, consumer="campaign selector")
     for critic in spec.critics:
         preflight_critic(project, critic)
     return spec.attempt_bound()

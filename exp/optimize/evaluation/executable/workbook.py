@@ -7,7 +7,6 @@ to the verifier. Task authors must still define the intended behavior and qualif
 """
 
 from operator import not_
-from pathlib import Path
 from typing import Self
 
 from pydantic import Field, model_validator
@@ -30,14 +29,15 @@ from exp.runtime.environments.workbook_edits import (
     read_supported_workbook,
     workbook_projection,
 )
-from exp.runtime.environments.worlds import (
-    ExecutableCheckpoint,
-    ExecutableWorldRuntime,
-    WorldEvent,
-    WorldManifest,
-)
+from exp.runtime.environments.world_contracts import ExecutableCheckpoint, WorldEvent, WorldManifest
+from exp.runtime.environments.worlds import ExecutableWorldRuntime
 from exp.simulation.continuations import WorldCheckpoint
 from exp.simulation.world_construction import load_construction
+
+# Saved probes and the task profiles that contain them bind to this protocol, not to this
+# file's bytes. Bump it whenever projection semantics change; exp/tests/code_protocols_test.py
+# records the covered source so the choice between a bump and a refactor stays explicit.
+PRIVATE_VIEWS_PROTOCOL = "private-workbook-views-v2"
 
 
 class WorkbookStateView(ContractModel):
@@ -45,17 +45,24 @@ class WorkbookStateView(ContractModel):
 
     Attributes:
         input_file: Initial workbook supplying the baseline.
-        output_file: Use this output once present; absent means inspect input_file only.
+        output_file: Inspect this output; None means inspect input_file. Unless
+            baseline_until_written is set, an output the actor has not created is unavailable
+            evidence, never the unchanged input.
         sheets: Exact ordered sheet names to hash, or None for all sheets in workbook order.
             Missing names produce unavailable evidence, never an empty successful digest.
         include_rows: Opt in to complete typed sheet rows in the private evaluator projection.
             Actor tool observations remain unchanged; explicit public_fields can disclose them.
+        baseline_until_written: Project input_file while output_file is absent, so a preserved
+            path compares the input baseline with the written output across every state. Use
+            it only for preservation views: a goal over such a view would see the unchanged
+            input when the actor never writes. Requires output_file.
     """
 
     include_rows: bool = Field(default=False, strict=True, exclude_if=not_)
     input_file: str
     output_file: str | None = None
     sheets: tuple[str, ...] | None = Field(default=None, min_length=1, max_length=128)
+    baseline_until_written: bool = Field(default=False, strict=True, exclude_if=not_)
 
     @model_validator(mode="after")
     def unique_sheets(self) -> Self:
@@ -64,6 +71,8 @@ class WorkbookStateView(ContractModel):
             len(set(self.sheets)) != len(self.sheets) or any(not name for name in self.sheets)
         ):
             raise ValueError("worksheet view names must be nonempty and unique")
+        if self.baseline_until_written and self.output_file is None:
+            raise ValueError("a baseline until written needs an output_file to wait for")
         return self
 
 
@@ -120,12 +129,11 @@ class WorkbookRuntimeDefinition(ContractModel):
 
     @property
     def probe_sha256(self) -> Sha256:
-        """Bind projections to this implementation, adapter dependencies and exact configuration."""
+        """Bind projections to the view protocol, adapter dependencies and exact configuration."""
         return sha256_json(
             {
-                "protocol": "private-workbook-views-v1",
+                "protocol": PRIVATE_VIEWS_PROTOCOL,
                 "definition": self.model_dump(mode="json"),
-                "implementation": sha256_bytes(Path(__file__).read_bytes()),
                 "adapter": WorkbookEditAdapter().definition,
             }
         )
@@ -162,7 +170,10 @@ def continuation_runtime(project: ProjectStore, configuration: JsonObject) -> Co
         views: JsonObject = {}
         for name, view in spec.views.items():
             selected = (
-                view.output_file if view.output_file in checkpoint.image.parts else view.input_file
+                view.input_file
+                if view.output_file is None
+                or (view.baseline_until_written and view.output_file not in checkpoint.image.parts)
+                else view.output_file
             )
             if selected not in checkpoint.image.parts:
                 views[name] = {"source": None, "unavailable": "registered file is absent"}
@@ -172,7 +183,8 @@ def continuation_runtime(project: ProjectStore, configuration: JsonObject) -> Co
                     read_supported_workbook(checkpoint.image.parts[selected])
                 )
             sheets = decoded[selected]["sheets"]
-            assert isinstance(sheets, list)
+            if not isinstance(sheets, list):
+                raise ValueError("workbook projection has a malformed sheet inventory")
             named = {
                 row["name"]: row
                 for row in sheets

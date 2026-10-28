@@ -2,6 +2,7 @@
 
 from collections.abc import Callable
 from contextlib import nullcontext
+from statistics import median
 
 import typer
 from rich.console import Console
@@ -10,15 +11,21 @@ from rich.text import Text
 
 from exp.cli.evaluation.fidelity import render_fidelity
 from exp.cli.evaluation.fidelity_turns import render_turns, turn_marks
-from exp.cli.shared.progress import progress_display
+from exp.cli.shared.progress import duration_text, progress_display
+from exp.common.models.client import RequestAdmissionRefused
+from exp.common.models.unknown_outcome import DispatchOutcomeUnknown
 from exp.common.progress import ProgressHook
 from exp.common.project import ProjectStore
 from exp.optimize.evaluation.fidelity.panel import execute_panel, require_resumable
-from exp.optimize.evaluation.fidelity.replay import ReplayAggregate, ReplayResult
+from exp.optimize.evaluation.fidelity.replay import (
+    TRIVIAL_REPLY_CHARACTERS,
+    ReplayAggregate,
+    ReplayResult,
+)
 from exp.optimize.evaluation.fidelity.runner import PreparedFidelity
-from exp.runtime.models.providers.async_transport import ProviderDeadlineExceeded
-from exp.runtime.models.providers.transport import ProviderTransportError
 from exp.runtime.models.structured_completion import CompletionNotDispatched
+from exp.runtime.sessions.dispatch_ledger import DispatchCapExhaustedError
+from exp.simulation.evaluation.workflow import INFRASTRUCTURE_STOPS
 
 
 def run_panel(
@@ -30,14 +37,15 @@ def run_panel(
     guard: Callable[[PreparedFidelity], None] | None = None,
     resume: bool = False,
 ) -> None:
-    """Run a registered panel, explaining a provider failure.
+    """Run a registered panel, explaining an infrastructure stop.
 
     ``progress`` is the calling command's single progress line; without it, the panel owns a
     display with one row per trace.
 
     Raises:
         ValueError: A trace was interrupted and ``resume`` was not given; nothing is sent.
-        typer.Exit: A provider request failed; completed traces stay saved.
+        typer.Exit: The execution machinery stopped a trace (see ``INFRASTRUCTURE_STOPS``);
+            completed traces stay saved and the stopped one is never scored.
     """
     stopped = require_resumable(store, registrations, resume=resume)
     if stopped:
@@ -51,8 +59,8 @@ def run_panel(
     try:
         with nullcontext(progress) if progress is not None else progress_display(console) as hook:
             execute_panel(store, registrations, progress=hook, guard=guard, resume=resume)
-    except (ProviderTransportError, ProviderDeadlineExceeded, CompletionNotDispatched) as exc:
-        console.print(f"[red]error[/red] a provider request failed: {exc}")
+    except INFRASTRUCTURE_STOPS as exc:
+        console.print(f"[red]error[/red] {stop_reason(exc)}")
         console.print(
             "Completed traces are saved. The stopped trace is never bought again silently: "
             "run the same command with --retry-incomplete to resume it."
@@ -60,8 +68,30 @@ def run_panel(
         raise typer.Exit(code=1) from exc
 
 
+def stop_reason(error: BaseException) -> str:
+    """What stopped a replay or learning run, for its error line.
+
+    Args:
+        error: One of ``INFRASTRUCTURE_STOPS``.
+
+    Returns:
+        A plain reason naming the failed part of the execution machinery.
+    """
+    if isinstance(error, DispatchCapExhaustedError):
+        return f"the run spent its physical-attempt ceiling: {error}"
+    if isinstance(error, DispatchOutcomeUnknown):
+        return f"a provider request has an unknown outcome: {error}"
+    if isinstance(error, (CompletionNotDispatched, RequestAdmissionRefused)):
+        return f"a provider request was refused before dispatch: {error}"
+    return f"a provider request failed: {error}"
+
+
 def aggregate_line(total: ReplayAggregate, planned: int, title: str = "Held-out fidelity") -> str:
-    """One line: replies exact, reply-field agreement, and the judge mean.
+    """The pooled headline, then the per-lineage rate, the reply-kind split, and replay time.
+
+    The headline pools every turn of every trace; the per-lineage mean weighs each independent
+    lineage equally and carries its 95 percent interval at the lineage count. The judge mean
+    states how many traces it covers and how many judge calls failed.
 
     Args:
         total: Sums over completed traces.
@@ -76,14 +106,50 @@ def aggregate_line(total: ReplayAggregate, planned: int, title: str = "Held-out 
         f"{share(total.fields_matched, total.fields_total)} reply fields match "
         f"({total.fields_matched}/{total.fields_total})"
     )
-    judge = "judge -" if total.judge_mean is None else f"judge {total.judge_mean:.1f}/5"
-    line = f"{title}  {exact} · {fields} · {judge} · {total.traces}/{planned} traces"
+    line = f"{title}  {exact} · {fields} · {judge_summary(total)} · {total.traces}/{planned} traces"
+    if total.lineage_exact is not None and total.lineage_interval is not None:
+        low, high = total.lineage_interval
+        line += (
+            f"\n  per-lineage mean exact {total.lineage_exact:.0%} (95% interval {low:.0%} to "
+            f"{high:.0%}, {total.lineages} {'lineage' if total.lineages == 1 else 'lineages'})"
+        )
+    kinds = [row for row in total.kinds if row.steps]
+    if kinds:
+        line += (
+            "\n  exact by recorded reply: "
+            + " · ".join(
+                f"{row.kind} {row.exact}/{row.steps} ({share(row.exact, row.steps)})"
+                for row in kinds
+            )
+            + f" (trivial: empty or under {TRIVIAL_REPLY_CHARACTERS} characters)"
+        )
+    if total.replay_seconds:
+        line += (
+            f"\n  replay time per trace {duration_text(median(total.replay_seconds))} median, "
+            f"{duration_text(max(total.replay_seconds))} longest (execution start to saved report)"
+        )
     if total.judge_turns:
         line += (
             f"\n  judge agrees with exact replies on {total.judge_agreements}/{total.judge_turns} "
             f"turns ({share(total.judge_agreements, total.judge_turns)})"
         )
     return line
+
+
+def judge_summary(total: ReplayAggregate) -> str:
+    """The judge mean with the traces it covers and the judge failures, for the headline.
+
+    Args:
+        total: Sums over completed traces.
+
+    Returns:
+        ``judge M/5 (J/T traces judged, F judge failures)``, with ``-`` for no assessed score.
+    """
+    mean = "-" if total.judge_mean is None else f"{total.judge_mean:.1f}/5"
+    failures = (
+        f"{total.judge_failures} judge {'failure' if total.judge_failures == 1 else 'failures'}"
+    )
+    return f"judge {mean} ({total.judged_traces}/{total.traces} traces judged, {failures})"
 
 
 def render_traces(
@@ -95,7 +161,7 @@ def render_traces(
 ) -> None:
     """Per-trace rows, then every turn and criterion of each trace."""
     table = Table(box=None, padding=(0, 2))
-    for column in (label, "Replies exact", "Field match", "Judge", "Turns"):
+    for column in (label, "Replies exact", "Field match", "Judge", "Replay time", "Turns"):
         table.add_column(column)
     for result in results:
         table.add_row(
@@ -103,6 +169,7 @@ def render_traces(
             f"{result.exact}/{result.steps}",
             share(result.fields_matched, result.fields_total),
             _judge(result),
+            "-" if result.replay_seconds is None else duration_text(result.replay_seconds),
             turn_marks(result.turns),
         )
     console.print()

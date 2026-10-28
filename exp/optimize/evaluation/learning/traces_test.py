@@ -37,6 +37,7 @@ from exp.optimize.evaluation.audit.panel_test import (
 )
 from exp.optimize.evaluation.fidelity import replay
 from exp.optimize.evaluation.fidelity.runner import FidelityMemory, FidelitySpec
+from exp.optimize.evaluation.learning import lineage as plan_lineage
 from exp.optimize.evaluation.learning import traces
 from exp.optimize.evaluation.learning.profile import learned_evaluation_memory
 from exp.optimize.evaluation.learning.traces import (
@@ -122,7 +123,10 @@ def test_serving_change_reuses_bank_but_pins_new_execution(
     deadline = datetime.now(UTC) + timedelta(hours=1)
     old_run = learning_spec(store, original, case, deadline=deadline)
     new_run = learning_spec(store, updated, case, deadline=deadline)
-    assert old_run.run_id != new_run.run_id and old_run.world_model != new_run.world_model
+    assert replay.content_run_id(
+        old_run, "learn", case.trace_id, code_revision=None
+    ) != replay.content_run_id(new_run, "learn", case.trace_id, code_revision=None)
+    assert old_run.world_model != new_run.world_model
     saved = learning_plan(store, scope="all", record=True)
     assert saved == updated
     assert len(set(store.artifacts.list_ids()) - set(before)) == 1
@@ -276,7 +280,9 @@ def test_cli_evidence_reading_is_pinned_metered_and_replayed(
     assert spec.memory_selection_identity == plan.selector_identity
     assert spec.retrieval is not None and spec.retrieval.memory_input_bytes == 24000
     assert spec.maximum_physical_attempts > control.maximum_physical_attempts
-    assert spec.run_id != control.run_id
+    assert replay.content_run_id(
+        spec, "learn", case.trace_id, code_revision=None
+    ) != replay.content_run_id(control, "learn", case.trace_id, code_revision=None)
     assert memory_head(store.artifacts, plan.lineage) is not None
     before = len(provider.requests)
     outcome = learn_from_traces(
@@ -563,7 +569,7 @@ def test_a_protocol_change_learns_a_fresh_memory_trace_by_trace(
         """Stand in for a protocol edit across both supported request projections."""
         return "changed-prompts"
 
-    monkeypatch.setattr(traces, "protocol_prompts_sha256", changed)
+    monkeypatch.setattr(plan_lineage, "protocol_prompts_sha256", changed)
     monkeypatch.setattr(replay, "protocol_prompts_sha256", changed)
     _relearn(store)
     plan = learning_plan(store, scope="all")
@@ -606,7 +612,7 @@ def test_facts_delivery_keys_the_learning_lineage(
             return learning_plan(store, "jev", scope).lineage
 
     artifact = load_grounded_world_model_artifact(store.artifacts, delivered.world_model)
-    protocol = {"protocol": "test-then-train", **traces._protocol()}  # noqa: SLF001
+    protocol = {"protocol": "test-then-train", **plan_lineage.learning_protocol()}
     key = {"knowledge": knowledge_identity(artifact), "scope": scope, **protocol}
     fact_free = "learn-" + sha256_json(key)[:16]
     assert lineage() == fact_free, "a fact-free pass keeps the identity of earlier memories"
@@ -648,7 +654,7 @@ def test_editing_the_workbook_or_facts_prompt_starts_a_fresh_memory(
     _, store, _ = build_project(tmp_path, monkeypatch, provider, learn=True)
     learned = learning_plan(store, scope="all")
     before, recall = learned.lineage, learned.recall.jev_alias
-    monkeypatch.setattr(traces, "INSTANCE_FACTS_GUIDANCE", "edited facts guidance")
+    monkeypatch.setattr(plan_lineage, "INSTANCE_FACTS_GUIDANCE", "edited facts guidance")
     facts_edited = learning_plan(store, recall, scope="all").lineage
     monkeypatch.setattr(replay, "NATIVE_ARTIFACT_PLAN_GUIDANCE", "edited workbook guidance")
     workbook_edited = learning_plan(store, recall, scope="all").lineage
@@ -664,9 +670,18 @@ def test_learning_refuses_to_predict_a_learned_trace_on_later_memory(
     purchased = len(provider.requests)
     content_run_id = replay.content_run_id
 
-    def drifted(spec: FidelitySpec, label: str, trace: str, generation: int = 1) -> str:
+    def drifted(
+        spec: FidelitySpec,
+        label: str,
+        trace: str,
+        generation: int = 1,
+        *,
+        code_revision: str | None,
+    ) -> str:
         """Every run ID changes while the lineage stays the same."""
-        return content_run_id(spec, label, trace + "-drift", generation)
+        return content_run_id(
+            spec, label, trace + "-drift", generation, code_revision=code_revision
+        )
 
     monkeypatch.setattr(replay, "content_run_id", drifted)
     with pytest.raises(ValueError, match="already learned into memory"):

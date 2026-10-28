@@ -6,7 +6,8 @@ import pytest
 from typer.testing import CliRunner
 
 from exp.cli.app import app
-from exp.cli.evaluation.continuations import ContinuationCommand, ContinuationExport
+from exp.cli.evaluation.continuation_studies import ContinuationExport
+from exp.cli.evaluation.continuations import ContinuationCommand
 from exp.common.project import artifact_input
 from exp.optimize.evaluation.continuations.job_test import job_fixture
 from exp.optimize.evaluation.continuations.observation_contrast_test import observation_fixture
@@ -643,3 +644,19 @@ def test_missing_continuation_artifact_is_a_readable_usage_error(
     assert result.exit_code == 2
     assert "missing-study" in result.output and "missing" in result.output
     assert "Traceback" not in result.output
+
+
+def test_registry_is_the_one_list_of_actions_and_payloads() -> None:
+    """Each action has exactly one payload field, and every payload field has one action."""
+    from typing import get_args
+
+    from exp.cli.evaluation.continuations import CONTINUATION_ACTIONS
+
+    names = [action.name for action in CONTINUATION_ACTIONS]
+    payloads = [action.payload for action in CONTINUATION_ACTIONS]
+    assert len(set(names)) == len(names) == 30
+    assert len(set(payloads)) == len(payloads)
+    assert set(payloads) == set(ContinuationCommand.model_fields) - {"action"}
+    assert get_args(ContinuationCommand.model_fields["action"].annotation) == tuple(names)
+    with pytest.raises(ValueError, match="harbor requires only its harbor payload"):
+        ContinuationCommand.model_validate({"action": "harbor"})

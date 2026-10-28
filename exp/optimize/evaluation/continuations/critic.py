@@ -27,7 +27,10 @@ from exp.common.models import (
 from exp.common.project import ArtifactStore, ProjectStore, artifact_input
 from exp.common.tasks import ToolSchema
 from exp.runtime.agents.chat import ChatAgentRuntime
-from exp.runtime.models.providers.admitted_transport import AdmittedJsonTransport
+from exp.runtime.models.providers.admitted_transport import (
+    AdmittedJsonTransport,
+    require_admitted_transport,
+)
 from exp.runtime.models.providers.transport import HttpxJsonTransport
 from exp.runtime.models.registry import RuntimeModelCatalog
 from exp.runtime.sessions.dispatch_ledger import DispatchLedger
@@ -190,16 +193,7 @@ def preflight_critic(project: ProjectStore, spec: CriticSpec) -> ModelCatalog:
         and required + spec.critic_output_tokens > capabilities.context_window_tokens
     ):
         raise ValueError("critic complete input and output exceed model context capacity")
-    provider = catalog.connections[catalog.models[spec.critic_alias].connection].provider
-    if provider not in {
-        "openai",
-        "openai-compatible",
-        "openrouter",
-        "anthropic",
-        "gemini",
-        "azure",
-    }:
-        raise ValueError("critic requires a provider using the admitted HTTP transport")
+    require_admitted_transport(catalog, spec.critic_alias, consumer="critic")
     return catalog
 
 

@@ -13,7 +13,9 @@ from exp.optimize.evaluation.fidelity.replay import (
     protocol_prompts_sha256,
     recorded_exchanges,
     replay_boundary,
+    reply_kind,
 )
+from exp.optimize.evaluation.fidelity.runner import FidelityMemory
 from exp.optimize.evaluation.fidelity.runner_test import source_project
 from exp.simulation.retrieval import evidence_reading
 
@@ -60,10 +62,30 @@ def test_run_id_addresses_content_but_not_deadline(tmp_path: Path) -> None:
     _, spec = source_project(tmp_path)
     later = spec.model_copy(update={"deadline": spec.deadline + timedelta(hours=1)})
     changed = spec.model_copy(update={"maximum_output_tokens": 2048})
-    assert content_run_id(spec, "held-out", "T 1") == content_run_id(later, "held-out", "T 1")
-    assert content_run_id(spec, "held-out", "T 1") != content_run_id(changed, "held-out", "T 1")
-    assert content_run_id(spec, "learn", "T 1", 3).startswith("learn-t-1-")
-    assert content_run_id(spec, "learn", "T 1", 3).endswith("-r3")
+    code = "fixture"
+    assert content_run_id(spec, "held-out", "T 1", code_revision=code) == content_run_id(
+        later, "held-out", "T 1", code_revision=code
+    )
+    assert content_run_id(spec, "held-out", "T 1", code_revision=code) != content_run_id(
+        changed, "held-out", "T 1", code_revision=code
+    )
+    assert content_run_id(spec, "learn", "T 1", 3, code_revision=code).startswith("learn-t-1-")
+    assert content_run_id(spec, "learn", "T 1", 3, code_revision=code).endswith("-r3")
+
+
+def test_a_measured_run_is_keyed_on_code_and_a_learning_run_is_not(tmp_path: Path) -> None:
+    """Other code addresses another measured run; learning runs stay with their memory lineage."""
+    _, spec = source_project(tmp_path)
+    first = content_run_id(spec, "held-out", "t", code_revision="a" * 40)
+    assert content_run_id(spec, "held-out", "t", code_revision="a" * 40) == first
+    assert content_run_id(spec, "held-out", "t", code_revision="b" * 40) != first
+    with pytest.raises(ValueError, match="code revision"):
+        content_run_id(spec, "held-out", "t", code_revision=None)
+    learning = spec.model_copy(
+        update={"memory": FidelityMemory(lineage="learn-fixture", mode="learn")}
+    )
+    learned = content_run_id(learning, "learn", "t", code_revision=None)
+    assert content_run_id(learning, "learn", "t", code_revision="b" * 40) == learned
 
 
 @pytest.mark.parametrize("reply", ["", " \n", "  visible\n", None, False, 0])
@@ -118,8 +140,34 @@ def test_native_prompt_change_addresses_a_new_native_run_only(
             )
         }
     )
-    before = content_run_id(native, "native", "t")
-    plain = content_run_id(spec, "plain", "t")
+    before = content_run_id(native, "native", "t", code_revision="fixture")
+    plain = content_run_id(spec, "plain", "t", code_revision="fixture")
     monkeypatch.setattr(trace_replay, "NATIVE_ARTIFACT_PLAN_GUIDANCE", "different behavior")
-    assert content_run_id(native, "native", "t") != before
-    assert content_run_id(spec, "plain", "t") == plain
+    assert content_run_id(native, "native", "t", code_revision="fixture") != before
+    assert content_run_id(spec, "plain", "t", code_revision="fixture") == plain
+
+
+@pytest.mark.parametrize(
+    ("reply", "kind"),
+    [
+        ("", "trivial"),
+        (None, "trivial"),
+        ({}, "trivial"),
+        ("  ok\n", "trivial"),
+        ({"status": "cancelled"}, "trivial"),
+        (0, "trivial"),
+        ("x" * 59, "trivial"),
+        ("x" * 60, "text"),
+        ("The order was cancelled and a refund of $42.10 was issued to the card.", "text"),
+        (
+            {"order_id": "#W1001", "items": [{"name": "lamp", "price": 42.1}]},
+            "structured",
+        ),
+        (["a" * 30, "b" * 30], "structured"),
+    ],
+)
+def test_reply_kinds_separate_short_fixed_outputs_from_text_and_structured_replies(
+    reply: JsonValue, kind: str
+) -> None:
+    """Short or empty replies are trivial; longer strings are text; longer JSON is structured."""
+    assert reply_kind(reply) == kind

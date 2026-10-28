@@ -29,7 +29,10 @@ from exp.optimize.evaluation.continuations.study import (
 )
 from exp.optimize.evaluation.executable.provider_grant import ProviderGrant
 from exp.runtime.agents.chat import ChatAgentRuntime
-from exp.runtime.models.providers.admitted_transport import AdmittedJsonTransport
+from exp.runtime.models.providers.admitted_transport import (
+    AdmittedJsonTransport,
+    require_admitted_transport,
+)
 from exp.runtime.models.providers.transport import HttpxJsonTransport
 from exp.runtime.models.registry import RuntimeModelCatalog
 from exp.runtime.sessions.dispatch_ledger import DispatchLedger
@@ -109,16 +112,7 @@ def preflight_continuation_job(project: ProjectStore, job: ContinuationJob) -> N
     snapshot, capabilities = registry.snapshot(job.actor_alias)
     if snapshot != job.study.actor_model:
         raise ValueError("actor alias differs from the registered model snapshot")
-    provider = catalog.connections[catalog.models[job.actor_alias].connection].provider
-    if provider not in {
-        "openai",
-        "openai-compatible",
-        "openrouter",
-        "anthropic",
-        "gemini",
-        "azure",
-    }:
-        raise ValueError("continuation actor requires a provider using the admitted HTTP transport")
+    require_admitted_transport(catalog, job.actor_alias, consumer="continuation actor")
     if (
         capabilities.maximum_output_tokens is not None
         and job.study.maximum_output_tokens > capabilities.maximum_output_tokens

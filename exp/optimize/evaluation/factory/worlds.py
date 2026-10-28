@@ -64,8 +64,11 @@ class WorldProposalSpec(AuthorSettings):
         target: Cited research and selected hypothesis, still a proposal rather than causal proof.
         template: Trusted scenario setup, runtime, configuration and explicit public fields.
         acceptance: Independent native-observation specification, hidden from the author.
-        asset_requirements: Public data layout and obtainable-fact requirements for the binder.
-            Do not put secrets, checker code, protected examples or expected answers here.
+        asset_requirements: Public data layout and obtainable-fact requirements for the binder,
+            including the runtime's format conventions and state path names (for a workbook
+            runtime, header semantics and paths such as /files/input.xlsx); the author prompt
+            itself stays runtime-neutral. Do not put secrets, checker code, protected examples
+            or expected answers here.
     """
 
     base: ArtifactInput
@@ -205,11 +208,12 @@ def world_proposal_request(project: ProjectStore, spec: WorldProposalSpec) -> Mo
                     "invented facts and "
                     "distribution assumptions. Use only the construction operators "
                     "and supplied tools. "
-                    "Columns render in lexical order; XLSX sheets have no implicit header. Propose "
+                    "Columns render in lexical order. The asset requirements describe the "
+                    "runtime's data layout and state paths; follow them. Propose "
                     "a candidate verifier over initial_state/final_state, and "
                     "use workflow-rooted JSON pointers for required_paths, rules and table "
-                    "relations (for example /final_state/files/input.xlsx). Only preserved_paths "
-                    "are state-relative (for example /files/input.xlsx). Verify complete typed "
+                    "relations (for example /final_state/<state path>). Only preserved_paths "
+                    "are state-relative (for example /<state path>). Verify complete typed "
                     "rows, headers, preserved data and unwanted extra effects, not just selected "
                     "cell values. Proposed verifiers face synthetic specification counterexamples. "
                     "controls for solution, "

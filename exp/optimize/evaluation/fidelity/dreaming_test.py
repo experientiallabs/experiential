@@ -18,6 +18,7 @@ from exp.optimize.evaluation.audit.panel_test import (
     build_project,
     episode,
 )
+from exp.optimize.evaluation.fidelity.replay import content_run_id
 from exp.optimize.evaluation.learning.traces import (
     learn_from_traces,
     learning_cases,
@@ -108,7 +109,10 @@ def test_build_consolidation_is_budgeted_pinned_hidden_and_replayed(
         project, plan.model_copy(update={"dreaming": None}), cases[0], deadline=spec.deadline
     )
     assert spec.maximum_physical_attempts > ordinary.maximum_physical_attempts
-    assert spec.run_id != ordinary.run_id
+    trace = cases[0].trace_id
+    assert content_run_id(spec, "learn", trace, code_revision=None) != content_run_id(
+        ordinary, "learn", trace, code_revision=None
+    )
     head = memory_head(project.artifacts, plan.lineage)
     assert head is not None and head.version == len(head.consumed) == 2
     first = read_memory_version(project.artifacts, plan.lineage, 1)

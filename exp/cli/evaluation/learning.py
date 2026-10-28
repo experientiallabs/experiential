@@ -14,6 +14,7 @@ import typer
 from rich.console import Console
 from rich.text import Text
 
+from exp.cli.evaluation.replay_view import stop_reason
 from exp.cli.shared.consent import can_prompt, require_spend_consent
 from exp.cli.shared.progress import progress_display
 from exp.common.progress import ProgressHook
@@ -29,9 +30,7 @@ from exp.optimize.evaluation.learning.traces import (
     learning_progress,
     learning_spec,
 )
-from exp.runtime.models.providers.async_transport import ProviderDeadlineExceeded
-from exp.runtime.models.providers.transport import ProviderTransportError
-from exp.runtime.models.structured_completion import CompletionNotDispatched
+from exp.simulation.evaluation.workflow import INFRASTRUCTURE_STOPS
 
 
 def run_learning(
@@ -156,8 +155,8 @@ def run_learning(
                 evidence_reading=evidence_reading,
                 dream_every=dream_every,
             )
-    except (ProviderTransportError, ProviderDeadlineExceeded, CompletionNotDispatched) as exc:
-        screen.print(f"[red]error[/red] a provider request failed: {exc}")
+    except INFRASTRUCTURE_STOPS as exc:
+        screen.print(f"[red]error[/red] {stop_reason(exc)}")
         screen.print(
             "Learned traces are saved. The stopped trace is never bought again silently: "
             "run the same command with --retry-incomplete to resume it."

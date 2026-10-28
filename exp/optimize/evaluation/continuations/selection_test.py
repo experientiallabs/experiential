@@ -20,7 +20,7 @@ from exp.optimize.evaluation.continuations.study_test import workbook_runtime
 from exp.runtime.agents.chat import ChatAgentRuntime, ChatCheckpoint
 from exp.runtime.agents.chat_test import _Model, _response
 from exp.runtime.environments.tests.world_conformance_test import workbook_case
-from exp.runtime.environments.worlds import ExecutableCheckpoint
+from exp.runtime.environments.world_contracts import ExecutableCheckpoint
 from exp.simulation.continuations import (
     ContinuationCheckpoint,
     load_continuation_checkpoint,

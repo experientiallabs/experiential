@@ -489,7 +489,7 @@ def _category_validation(
         if case.expected_task is not None:
             if judgment is None:
                 task_not_judged += 1
-            elif _judge_failed(judgment, pack.minimum_scores):
+            elif required_judge_failed(judgment.axes, pack.minimum_scores):
                 # A rejected or undispatched judge output is an operational failure, not a
                 # judge abstention; it stays out of both error directions.
                 task_judge_failures += 1
@@ -734,11 +734,20 @@ def _bound_axes(
     return judgment.axes
 
 
-def _judge_failed(judgment: CalibrationJudgment, minimum_scores: dict[str, int]) -> bool:
-    """Whether the evaluator obtained no judgment of a required criterion."""
+def required_judge_failed(axes: tuple[AxisOutcome, ...], minimum_scores: dict[str, int]) -> bool:
+    """Whether the evaluator obtained no judgment of a required criterion.
+
+    Args:
+        axes: Criterion outcomes of one judgment.
+        minimum_scores: Registered thresholds; their keys are the required criteria.
+
+    Returns:
+        True when a required criterion failed, was unknown or was not run. An optional
+        criterion's failure cannot block the decision, so it is not an operational failure.
+    """
     return any(
         axis.status in ("judge_failure", "judge_unknown", "not_run")
-        for axis in judgment.axes
+        for axis in axes
         if axis.dimension_id in minimum_scores
     )
 

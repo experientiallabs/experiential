@@ -52,8 +52,8 @@ from exp.simulation.evaluation.admission import (
     record_label_witness,
 )
 from exp.simulation.evaluation.calibration import CalibrationCase
+from exp.simulation.evaluation.record_execution_test import acceptance, source
 from exp.simulation.evaluation.tasks import TaskVerifier, VerifierChallenge
-from exp.simulation.record_execution_test import acceptance, source
 from exp.simulation.task_distribution import CoverageStratum, TaskDistribution
 
 

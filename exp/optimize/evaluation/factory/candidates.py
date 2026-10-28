@@ -192,7 +192,8 @@ def _package(
     existing_only: bool = False,
 ) -> Path:
     """Publish or verify the same exact qualified package, never overwrite changed output."""
-    assert spec.destination is not None and cell.qualification is not None
+    if spec.destination is None or cell.qualification is None:
+        raise ValueError("candidate packaging needs a destination and a qualified candidate")
     path = spec.destination / cell.task.artifact_id
     name = f"{spec.namespace}/candidate-{index}"
     if path.exists():

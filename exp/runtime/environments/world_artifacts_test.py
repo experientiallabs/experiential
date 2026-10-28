@@ -6,12 +6,12 @@ from pathlib import Path
 
 import pytest
 
-from exp.common.core.artifacts import SecretBoundaryError, assert_secret_free
+from exp.common.core.artifacts import SecretBoundaryError, assert_secret_free, sha256_bytes
 from exp.common.project import ArtifactStore, ProjectPaths
 from exp.common.project.errors import ArtifactStoreError
 from exp.runtime.environments.tests.world_conformance_test import workbook_case
 from exp.runtime.environments.world_artifacts import load_world_image, persist_world_image
-from exp.runtime.environments.worlds import NativeImage, digest_bytes
+from exp.runtime.environments.world_contracts import NativeImage
 
 
 def test_binary_snapshot_does_not_scan_base64_as_text_but_preserves_actual_secret_checks(
@@ -27,7 +27,7 @@ def test_binary_snapshot_does_not_scan_base64_as_text_but_preserves_actual_secre
         assert_secret_free({"encoded": encoded})
     payload = base64.b64decode(encoded)
     image = NativeImage(
-        parts={"opaque.bin": payload}, domains={"opaque.bin": digest_bytes(payload)}
+        parts={"opaque.bin": payload}, domains={"opaque.bin": sha256_bytes(payload)}
     )
     checkpoint = checkpoint.model_copy(update={"image": image})
     ref = persist_world_image(store, checkpoint, created_at=datetime.now(UTC), code_revision="test")
@@ -37,7 +37,7 @@ def test_binary_snapshot_does_not_scan_base64_as_text_but_preserves_actual_secre
     bad = checkpoint.model_copy(
         update={
             "image": NativeImage(
-                parts={"opaque.bin": actual_text}, domains={"opaque.bin": digest_bytes(actual_text)}
+                parts={"opaque.bin": actual_text}, domains={"opaque.bin": sha256_bytes(actual_text)}
             )
         }
     )

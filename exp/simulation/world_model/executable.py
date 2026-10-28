@@ -23,12 +23,13 @@ from exp.common.models import AssistantAction, ModelMessage, ToolCall
 from exp.common.tasks import TaskCase
 from exp.common.tasks.facts import ConditioningFacts, FactProvenance, FactValidation, InstanceFact
 from exp.runtime.environments.interface import Observation
+from exp.runtime.environments.world_contracts import NativeImage, WorldAccess, WorldManifest
 from exp.runtime.environments.world_responses import (
     validate_reply,
     validate_reply_state,
     validate_state_projection,
 )
-from exp.runtime.environments.worlds import NativeImage, WorldAccess, WorldContext, WorldManifest
+from exp.runtime.environments.worlds import WorldContext
 from exp.simulation.engines.reasks import reask_proposal
 from exp.simulation.engines.state_policy import StateEditPolicy
 from exp.simulation.engines.transition import Completion

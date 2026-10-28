@@ -26,7 +26,8 @@ from exp.optimize.evaluation.continuations.capture import CaptureDefinition, pre
 from exp.optimize.evaluation.continuations.job import load_runtime_definition
 from exp.runtime.agents.chat import ChatAgentRuntime
 from exp.runtime.environments.world_artifacts import load_world_image
-from exp.runtime.environments.worlds import ExecutableCheckpoint, ExecutableWorldRuntime
+from exp.runtime.environments.world_contracts import ExecutableCheckpoint
+from exp.runtime.environments.worlds import ExecutableWorldRuntime
 from exp.simulation.continuations import (
     ContinuationCheckpoint,
     load_continuation_checkpoint,
@@ -34,13 +35,13 @@ from exp.simulation.continuations import (
 )
 from exp.simulation.development_scope import require_development_task
 from exp.simulation.evaluation.admission import record_label_witness
-from exp.simulation.reconstruction.models import path_parts, resolve
-from exp.simulation.record_execution import (
+from exp.simulation.evaluation.record_execution import (
     RecordReplayRuntime,
     execute_record_script,
     load_record_execution,
     require_record_runtime,
 )
+from exp.simulation.reconstruction.models import path_parts, resolve
 
 
 class RecordScenarioSpec(ContractModel):

@@ -27,7 +27,10 @@ from exp.common.core.json_schema import expand_local_references
 from exp.common.models import ModelRequest, ModelResponse, ModelSnapshot, load_model_catalog
 from exp.common.project import ProjectStore, artifact_input
 from exp.runtime.models.call_evidence import call_consumer, canonical_call
-from exp.runtime.models.providers.admitted_transport import AdmittedJsonTransport
+from exp.runtime.models.providers.admitted_transport import (
+    AdmittedJsonTransport,
+    require_admitted_transport,
+)
 from exp.runtime.models.providers.transport import HttpxJsonTransport
 from exp.runtime.models.registry import RuntimeModelCatalog
 from exp.runtime.sessions.dispatch_ledger import DispatchLedger
@@ -330,16 +333,7 @@ def preflight_actor_decisions(project: ProjectStore, spec: ActorDecisionSpec) ->
     model, capability = RuntimeModelCatalog(catalog, environment={}).snapshot(spec.actor_alias)
     if model != spec.actor_model:
         raise ValueError("actor probe model differs from its frozen snapshot")
-    provider = catalog.connections[catalog.models[spec.actor_alias].connection].provider
-    if provider not in {
-        "openai",
-        "openai-compatible",
-        "openrouter",
-        "anthropic",
-        "gemini",
-        "azure",
-    }:
-        raise ValueError("actor probes require the admitted HTTP transport")
+    require_admitted_transport(catalog, spec.actor_alias, consumer="actor probe")
     for case in spec.cases:
         for tool in case.request.tools:
             try:

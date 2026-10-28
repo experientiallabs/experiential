@@ -1,10 +1,10 @@
 """Protocol versions stand in for source text in saved-result identities; this guards them.
 
-Calibration, the actor council, task refinement and the restorable environment backends bind
-their saved results to a protocol constant instead of hashing their own source. Saved results then
-survive moves, formatting and unrelated edits, and re-key only when the protocol is bumped.
-Provider attempt timeouts follow the same rule: each admitted physical attempt records the
-protocol of the derivation that bounded it.
+Calibration, the actor council, task refinement, private workbook views and the restorable
+environment backends bind their saved results to a protocol constant instead of hashing their own
+source. Saved results then survive moves, formatting and unrelated edits, and re-key only when the
+protocol is bumped. Provider attempt timeouts follow the same rule: each admitted physical attempt
+records the protocol of the derivation that bounded it.
 
 This test keeps that honest. Each protocol lists the source that decides its behavior, with that
 source's digest at the protocol's current value. When the covered source changes, the test fails
@@ -42,7 +42,7 @@ class Protocol:
 PROTOCOLS = (
     Protocol(
         "exp.optimize.evaluation.tasks.calibration:CALIBRATION_PROTOCOL",
-        "task-calibration-v6",
+        "task-calibration-v7",
         (
             "exp.optimize.evaluation.tasks.calibration",
             "exp.optimize.evaluation.tasks.admission",
@@ -50,17 +50,17 @@ PROTOCOLS = (
             "exp.simulation.evaluation.tasks",
             "exp.simulation.evaluation.admission",
         ),
-        "b050c28a545628c3baf96e1768cfa24d98cab0852a7d538ce350ef05004c1630",
+        "04713c2d37d0f5512507a26caa1ba2ea63cd18ec26eeb806f9df923773317328",
     ),
     Protocol(
         "exp.optimize.evaluation.tasks.challenges:CHALLENGE_PROTOCOL",
-        "judge-challenge-v5",
+        "judge-challenge-v6",
         (
             "exp.optimize.evaluation.tasks.challenges",
             "exp.simulation.evaluation.calibration:task_decision",
             "exp.simulation.evaluation.calibration:blinded_case",
         ),
-        "4a503a8fc8bf754d115bb4a2a7eccd9b709378fbf6ad0bb02842a11eba368e18",
+        "cfb50e4ac7dea292a349fd1b25dd4800be6206be76e07a6672d08ef071a041bf",
     ),
     Protocol(
         "exp.optimize.evaluation.council.runner:COUNCIL_HARNESS_PROTOCOL",
@@ -101,25 +101,31 @@ PROTOCOLS = (
         "exp.runtime.models.providers.attempt_timeouts:ATTEMPT_TIMEOUT_PROTOCOL",
         "provider-attempt-timeout-v2",
         ("exp.runtime.models.providers.attempt_timeouts",),
-        "792a67af91f4a19d1935306f560b12af0c3785395709032940de85322e7c68a3",
+        "ce424e2025444d35f339df9c23da581a49102d27efd35a0a58ec6fccfa841fe2",
     ),
     Protocol(
         "exp.runtime.environments.workbook_edits:XLSX_ROW_EDITS_PROTOCOL",
         "xlsx-row-edits-v3",
         ("exp.runtime.environments.workbook_edits",),
-        "b1423d44f246df1382ea532deaadd773c31f8891eb65cf55d71b691017032d64",
+        "977a23f451e187c67db9052c5eaa226a49b433727821a904d3708ea648ff6242",
     ),
     Protocol(
         "exp.runtime.environments.artifact_world:ARTIFACT_WORLD_PROTOCOL",
         "artifact-world-v2",
         ("exp.runtime.environments.artifact_world",),
-        "b57a74dbfb1482e69a5f11e2e70a60a0c24bbc2bcf8d1beac229fe0d754b0710",
+        "46a47face27b447433d024c989da577496bbbed3e66eda502812a08698b5c495",
+    ),
+    Protocol(
+        "exp.optimize.evaluation.executable.workbook:PRIVATE_VIEWS_PROTOCOL",
+        "private-workbook-views-v2",
+        ("exp.optimize.evaluation.executable.workbook",),
+        "19b915db0979a376e0071f9a64cd26f4554f116044b83de063c85b9f3a0fb428",
     ),
     Protocol(
         "exp.runtime.environments.record_world:RECORD_WORLD_PROTOCOL",
         "sqlite-record-world-v1",
         ("exp.runtime.environments.record_world",),
-        "7a97535d9a1e939a0b9b1d812e1ff326b06cd89866618df8325e97f417add01f",
+        "8fb247418212f90d8963088e1323a0b4581dbaf937fc8cda590d784a31867b99",
     ),
 )
 

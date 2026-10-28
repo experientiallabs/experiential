@@ -38,9 +38,7 @@ from exp.common.core.artifacts import (
     ArtifactEnvelope,
     ArtifactInput,
     ContractModel,
-    JsonObject,
     Sha256,
-    sha256_json,
     stable_id,
 )
 from exp.common.evaluations.reconstruction import DualReport
@@ -58,15 +56,10 @@ from exp.optimize.evaluation.fidelity.memory import (
 from exp.optimize.evaluation.fidelity.recovery import QUALIFICATION, Qualification, qualify
 from exp.optimize.evaluation.fidelity.replay import (
     DEADLINE,
-    INVESTIGATION_TOKENS,
-    PREDICTION_TOKENS,
-    PROPOSAL_REASKS,
-    REQUEST_RESERVATION_USD,
     ReplayCase,
     ReplayResult,
     attempts_used,
     content_run_id,
-    protocol_prompts_sha256,
     recorded_exchanges,
     register_replay,
     replay_case,
@@ -81,29 +74,28 @@ from exp.optimize.evaluation.fidelity.runner import (
     execute_fidelity_evaluation,
     saved_fidelity_report,
 )
+from exp.optimize.evaluation.learning.lineage import (
+    FEEDBACK_SOURCE,
+    PLAN_TYPE,
+    dream_schedule,
+    memory_lineage,
+    plan_identity,
+    plan_world_model,
+)
 from exp.optimize.evaluation.learning.repeats import require_unlearned
-from exp.runtime.models.providers.transport import RetryPolicy
-from exp.simulation.engines.text.prompt import INSTANCE_FACTS_GUIDANCE
 from exp.simulation.retrieval.build_inputs import load_completed_build_rag_lineage_bindings
 from exp.simulation.retrieval.evidence_reading import ReadingPolicy
 from exp.simulation.retrieval.jev import JEVCueSelector, JEVPolicy
 from exp.simulation.world_model.dreaming import DreamPolicy
 from exp.simulation.world_model.experience_memory import (
     consumed_trajectory_digest,
-    knowledge_identity,
     memory_head,
     memory_lock,
     reserve_task_lineage,
 )
-from exp.simulation.world_model.runtime import (
-    load_grounded_world_model_artifact,
-    persist_fit_only_world_model,
-)
 from exp.simulation.world_model.session_research import OnlineResearchPolicy
 
 LABEL = "learn"
-FEEDBACK_SOURCE = "recorded-trace-reply"
-_PLAN_TYPE = "trace-learning-plan"
 Scope = Literal["all", "fit"]
 SCOPES: tuple[Scope, ...] = ("all", "fit")
 
@@ -381,7 +373,9 @@ def _bind_learning_plan(
             reading=ReadingPolicy() if evidence_reading else None,
             dreaming=dreaming,
             dream_protocol=dreaming.identity if dreaming is not None else None,
-            dream_trace_ids=_dream_schedule(project, scope, dream_every),
+            dream_trace_ids=()
+            if dream_every is None
+            else dream_schedule(learning_cases(project, scope), dream_every),
         )
     if project.artifacts.exists(identity):
         exact = LearningPlan.model_validate_json(
@@ -402,7 +396,7 @@ def _bind_learning_plan(
     if not project.artifacts.exists(identity):
         project.artifacts.write_json(
             artifact_id=identity,
-            artifact_type=_PLAN_TYPE,
+            artifact_type=PLAN_TYPE,
             envelope=envelope,
             files={"plan.json": plan.model_dump(mode="json")},
         )
@@ -450,7 +444,7 @@ def _recorded(project: ProjectStore, lineage: str) -> bool:
 def _require_plan_contract(project: ProjectStore) -> None:
     """Refuse obsolete plan formats instead of silently treating learned memory as absent."""
     for identity in project.artifacts.list_ids():
-        if identity.startswith(_PLAN_TYPE + "-"):
+        if identity.startswith(PLAN_TYPE + "-"):
             try:
                 LearningPlan.model_validate_json(
                     project.artifacts.read_bytes(identity, "plan.json")
@@ -464,84 +458,14 @@ def _require_plan_contract(project: ProjectStore) -> None:
 
 def _plan_identity(project: ProjectStore, scope: Scope) -> tuple[ArtifactInput, str, str]:
     """The scope's hybrid simulator, its recorded plan's identity, and its (costly) lineage."""
-    build = _build(project)
-    # Hybrid: learned memory supplies behavioral rules; the build's index supplies recorded
-    # facts. Each task's own lineage is excluded from retrieval, so a trace never retrieves its
-    # own recorded replies while it is learned. Scope ``fit`` uses the fit-only index, so
-    # held-out traces stay out of retrieval as well as out of memory.
-    world_model = (
-        build.world_model
-        if scope == "all"
-        else persist_fit_only_world_model(project.artifacts, build.world_model, build.fit_rag)
-    )
+    world_model = plan_world_model(project.artifacts, _build(project), scope)
     lineage = _lineage(project, world_model, scope)
-    plan = {"lineage": lineage, "world_model": world_model.model_dump(mode="json")}
-    return world_model, stable_id(_PLAN_TYPE, plan), lineage
+    return world_model, plan_identity(world_model, lineage), lineage
 
 
 def _lineage(project: ProjectStore, world_model: ArtifactInput, scope: Scope) -> str:
-    """Memory lineage of one learning simulator under the test-then-train protocol.
-
-    The lineage is a knowledge-compatible bank, separate from exact serving and execution
-    identity: a serving change (such as retrieval top-k) keeps the learned memory. It also
-    covers every learning run input besides the trace, simulator and memory, so changing any
-    of them (a prompt, an allowance, the instance facts delivered to predictions) starts a
-    fresh memory that is learned trace by trace again, instead of predicting already-learned
-    traces on a memory that has seen every later trace.
-    """
-    artifact = load_grounded_world_model_artifact(project.artifacts, world_model)
-    key = {"knowledge": knowledge_identity(artifact), "scope": scope}
-    delivered = _delivered_facts(learning_cases(project, scope))
-    # Only a pass that delivers facts keys on them; fact-free lineages keep their identity.
-    facts: JsonObject = {} if delivered is None else {"instance_facts": delivered}
-    return (
-        "learn-" + sha256_json({**key, "protocol": "test-then-train", **_protocol(), **facts})[:16]
-    )
-
-
-def _delivered_facts(cases: Sequence[ReplayCase]) -> Sha256 | None:
-    """Identity of the instance facts a learning pass delivers to its predictions.
-
-    Facts condition every prediction of their trace, so they shape what each trace teaches:
-    adding, changing or removing any trace's conditioning facts starts a fresh memory, as a
-    prompt edit does. Verifier-private facts never reach a simulator request and are left out.
-
-    Args:
-        cases: The pass's replay cases in learning order.
-
-    Returns:
-        A digest over each trace's conditioning facts, or None when no trace delivers any.
-    """
-    delivered = {
-        case.trace_id: [
-            fact.model_dump(mode="json")
-            for fact in case.facts.facts
-            if fact.visibility == "conditioning"
-        ]
-        for case in cases
-        if case.facts is not None
-    }
-    delivered = {trace: facts for trace, facts in delivered.items() if facts}
-    return sha256_json(delivered) if delivered else None
-
-
-def _protocol() -> JsonObject:
-    """The learning run inputs shared by every trace of a lineage.
-
-    The prompts include the native-artifact, instance-facts and evidence-reading protocols even
-    though only some traces use them: a lineage spans every trace, so editing any of them starts
-    a fresh memory.
-    """
-    return {
-        "prompts": protocol_prompts_sha256(native_artifacts=True),
-        "facts_prompt": INSTANCE_FACTS_GUIDANCE,
-        "reading_protocol": ReadingPolicy().identity,
-        "proposal_reasks": PROPOSAL_REASKS,
-        "output_tokens": {"prediction": PREDICTION_TOKENS, "investigation": INVESTIGATION_TOKENS},
-        "attempts_per_request": RetryPolicy().maximum_attempts,
-        "request_reservation_usd": REQUEST_RESERVATION_USD,
-        "feedback_source": FEEDBACK_SOURCE,
-    }
+    """Memory lineage of one learning simulator over the scope's replay cases."""
+    return memory_lineage(project.artifacts, world_model, scope, learning_cases(project, scope))
 
 
 def learning_cases(project: ProjectStore, scope: Scope) -> tuple[ReplayCase, ...]:
@@ -594,19 +518,6 @@ def learning_cases(project: ProjectStore, scope: Scope) -> tuple[ReplayCase, ...
 def fit_cases(project: ProjectStore) -> tuple[ReplayCase, ...]:
     """Every fit trace with something to replay, in canonical dataset order."""
     return learning_cases(project, "fit")
-
-
-def _dream_schedule(project: ProjectStore, scope: Scope, interval: int | None) -> tuple[str, ...]:
-    """Pin periodic and final consolidation boundaries to the imported trace order."""
-    if interval is None:
-        return ()
-    policy = DreamPolicy(interval=interval)
-    cases = learning_cases(project, scope)
-    return tuple(
-        case.trace_id
-        for index, case in enumerate(cases, 1)
-        if index % policy.interval == 0 or index == len(cases)
-    )
 
 
 def fit_calls(project: ProjectStore) -> list[tuple[str, JsonValue]]:
@@ -905,7 +816,8 @@ def learning_progress(
 def _registered(project: ProjectStore, plan: LearningPlan, case: ReplayCase) -> bool:
     """Whether any attempt of one case was registered and stopped without a saved report."""
     spec = learning_spec(project, plan, case, deadline=datetime.now().astimezone())
-    plan_id = stable_id("fidelity", {"run_id": content_run_id(spec, LABEL, case.trace_id, 1)})
+    run_id = content_run_id(spec, LABEL, case.trace_id, code_revision=None)  # learn: unkeyed
+    plan_id = stable_id("fidelity", {"run_id": run_id})
     return project.artifacts.exists(plan_id) and project.artifacts.exists(
         _intent_of(project, plan_id)
     )
@@ -927,7 +839,7 @@ def _saved_attempts(
     attempts: list[tuple[PreparedFidelity, DualReport]] = []
     generation = 1
     while True:
-        run_id = content_run_id(spec, LABEL, case.trace_id, generation)
+        run_id = content_run_id(spec, LABEL, case.trace_id, generation, code_revision=None)
         plan_id = stable_id("fidelity", {"run_id": run_id})
         if not project.artifacts.exists(plan_id):
             return attempts

@@ -18,19 +18,22 @@ their own request channel, and they are part of the spec and therefore of the ru
 environment adapter can supply them instead through ``replay_case(..., facts=provider)``.
 
 Run identities are content-addressed: the run ID is derived from the complete spec except its
-deadline, so changed inputs (a rebuilt simulator, another judge, a new tool inventory, a new
-memory checkpoint) register a new run automatically, and an unchanged run replays its saved
-result without provider calls. An earlier attempt that never bought a call and can never
-complete (its deadline passed, or its execution stopped with no process holding it) is retired
-and the next attempt gets a fresh generation suffix. An interrupted attempt that bought calls
-is never replaced: it stops visibly, and ``--retry-incomplete`` resumes it in place (see
-:mod:`exp.optimize.evaluation.fidelity.recovery`).
+deadline, plus the producing code revision of every measured run, so changed inputs (a rebuilt
+simulator, another judge, a new tool inventory, a new memory checkpoint, changed code) register a
+new run automatically, and an unchanged run replays its saved result without provider calls. A
+learn-mode run is not keyed on the code revision: it produces memory, and its reuse is governed
+by the memory lineage (see :func:`content_run_id`). An earlier attempt that never bought a call
+and can never complete (its deadline passed, or its execution stopped with no process holding
+it) is retired and the next attempt gets a fresh generation suffix. An interrupted attempt
+that bought calls is never replaced: it stops visibly, and ``--retry-incomplete`` resumes it in
+place (see :mod:`exp.optimize.evaluation.fidelity.recovery`).
 """
 
 import json
 import re
 from collections.abc import Sequence
 from datetime import datetime, timedelta
+from typing import Literal
 
 from filelock import FileLock, Timeout
 from pydantic import Field, JsonValue
@@ -50,6 +53,7 @@ from exp.common.evaluations.reconstruction import (
     default_judge,
     saved_turn_outcomes,
 )
+from exp.common.evaluations.uncertainty import unit_mean_summary
 from exp.common.models import ModelCapabilities, ReasoningEffort, ToolCall, load_model_catalog
 from exp.common.project import ProjectStore
 from exp.common.tasks import TaskCase
@@ -94,6 +98,9 @@ REQUEST_RESERVATION_USD = 1.0
 PREDICTION_TOKENS = 12_288
 INVESTIGATION_TOKENS = 4_096
 JUDGING_TOKENS = 32_768
+TRIVIAL_REPLY_CHARACTERS = 60  # shorter recorded replies are fixed outputs, not world modelling
+ReplyKind = Literal["trivial", "text", "structured"]
+REPLY_KINDS: tuple[ReplyKind, ...] = ("trivial", "text", "structured")
 
 
 class RecordedExchange(ContractModel):
@@ -133,14 +140,30 @@ class ReplayCase(ContractModel):
 PROPOSAL_REASKS = 2
 
 
+class ReplyKindCount(ContractModel):
+    """Exact replies among the measured turns whose recorded reply is of one kind.
+
+    Attributes:
+        kind: Recorded-reply kind, as :func:`reply_kind` classifies it.
+        exact: Turns of this kind reproduced exactly.
+        steps: Measured turns of this kind.
+    """
+
+    kind: ReplyKind
+    exact: int = Field(ge=0)
+    steps: int = Field(ge=0)
+
+
 class ReplayResult(ContractModel):
     """Measurements of one replayed trace, read from its saved report.
 
     Attributes:
         trace_id: Recorded trace.
+        lineage: Task lineage of the trace, the independent unit of panel uncertainty.
         run_id: Content-addressed fidelity run.
         steps: Planned measured turns.
         exact: Turns whose simulated reply equals the recorded reply exactly.
+        kinds: ``exact`` and ``steps`` split by recorded-reply kind, one row per kind.
         fields_matched: Recorded reply leaf fields reproduced, over every turn with a recorded
             reply; a turn the simulator never answered reproduces none of its fields.
         fields_total: Recorded reply leaf fields compared, over the same turns.
@@ -150,12 +173,17 @@ class ReplayResult(ContractModel):
         report: The saved dual report.
         unknown_outcomes: Steps re-dispatched after an unknown outcome when the run resumed;
             empty for a run that never resent a lost request.
+        replay_seconds: Wall time from execution start to the saved report, from the two
+            artifacts' creation times; a resumed run includes its interruption. None when the
+            run has no execution record.
     """
 
     trace_id: str
+    lineage: str
     run_id: str
     steps: int
     exact: int
+    kinds: tuple[ReplyKindCount, ...]
     fields_matched: int
     fields_total: int
     judge_scores: tuple[int, ...]
@@ -163,6 +191,7 @@ class ReplayResult(ContractModel):
     turns: tuple[TurnOutcome, ...]
     report: DualReport
     unknown_outcomes: tuple[UnknownOutcome, ...] = ()
+    replay_seconds: float | None = None
 
     def recovery_lines(self) -> tuple[str, ...]:
         """Per-step disclosure of every unknown-outcome retry, for trace detail views."""
@@ -174,14 +203,23 @@ class ReplayAggregate(ContractModel):
 
     Attributes:
         traces: Completed traces.
-        exact: Exactly reproduced replies.
-        steps: Measured turns.
+        exact: Exactly reproduced replies, pooled over every turn of every trace.
+        steps: Measured turns, pooled the same way.
         fields_matched: Matching reply leaf fields.
         fields_total: Compared reply leaf fields.
         judge_mean: Mean assessed criterion score, or None when nothing was assessed.
+        judged_traces: Completed traces with at least one assessed criterion score.
+        judge_failures: Completed traces whose judge failed or has an unknown outcome.
         judge_turns: Turns with a per-turn response score and a recorded reply.
         judge_agreements: Of those, turns where the judge's verdict (response score 4 or 5)
             agrees with exact reproduction; a calibration check on the judge, not a score.
+        kinds: Exact replies split by recorded-reply kind (see :func:`reply_kind`).
+        lineages: Independent task lineages behind the completed traces.
+        lineage_exact: Equal-weight mean over lineages of each lineage's mean per-trace
+            exact rate, or None without a completed trace.
+        lineage_interval: Two-sided 95 percent Wilson interval of ``lineage_exact`` at the
+            lineage count, from the uncertainty owner.
+        replay_seconds: Per-trace replay wall time of every completed trace that has one.
     """
 
     traces: int
@@ -190,8 +228,41 @@ class ReplayAggregate(ContractModel):
     fields_matched: int
     fields_total: int
     judge_mean: float | None
+    judged_traces: int = 0
+    judge_failures: int = 0
     judge_turns: int = 0
     judge_agreements: int = 0
+    kinds: tuple[ReplyKindCount, ...] = ()
+    lineages: int = 0
+    lineage_exact: float | None = None
+    lineage_interval: tuple[float, float] | None = None
+    replay_seconds: tuple[float, ...] = ()
+
+
+def reply_kind(reply: JsonValue) -> ReplyKind:
+    """Classify one recorded reply for the exact-reply breakdown; the single owner of the rule.
+
+    A reply is ``trivial`` when it is empty or short: its text (the string itself, or compact
+    JSON for any other value), stripped of surrounding whitespace, has fewer than
+    ``TRIVIAL_REPLY_CHARACTERS`` (60) characters. An acknowledgement, a status word, a number
+    or an empty result is reproduced without modelling the environment, so pooling it with
+    real replies inflates the exact rate. Otherwise a string is ``text`` and any other value (a
+    JSON object or array, decoded from JSON text when recorded) is ``structured``.
+
+    Args:
+        reply: Recorded reply, decoded from JSON when it is JSON text.
+
+    Returns:
+        The reply's kind.
+    """
+    text = (
+        reply
+        if isinstance(reply, str)
+        else json.dumps(reply, ensure_ascii=False, separators=(",", ":"))
+    )
+    if len(text.strip()) < TRIVIAL_REPLY_CHARACTERS:
+        return "trivial"
+    return "text" if isinstance(reply, str) else "structured"
 
 
 def replay_boundary(trace: Trace, exchanges: int) -> int:
@@ -356,7 +427,8 @@ def replay_spec(
         judge_effort: Judge reasoning effort, applied when the judge model pins one.
 
     Returns:
-        Complete spec; its run ID is a generation-one content address.
+        Complete spec. Its run ID is the placeholder ``pending``: :func:`register_replay`
+        addresses the registered run by content, producer revision and generation.
 
     Raises:
         ValueError: The project configures no judge, or the world model lacks tool support.
@@ -398,7 +470,7 @@ def replay_spec(
     if memory is not None and memory.dreaming is not None:
         tail += memory.dreaming.calls
     prediction = _allowance(PREDICTION_TOKENS, predictor)
-    spec = FidelitySpec(
+    return FidelitySpec(
         run_id="pending",
         world_model=world_model,
         task=task,
@@ -446,7 +518,6 @@ def replay_spec(
             ),
         ),
     )
-    return spec.model_copy(update={"run_id": content_run_id(spec, label, case.trace_id)})
 
 
 def protocol_prompts_sha256(
@@ -466,7 +537,14 @@ def protocol_prompts_sha256(
     )
 
 
-def content_run_id(spec: FidelitySpec, label: str, trace: str, generation: int = 1) -> str:
+def content_run_id(
+    spec: FidelitySpec,
+    label: str,
+    trace: str,
+    generation: int = 1,
+    *,
+    code_revision: str | None,
+) -> str:
     """Address a fidelity run by its complete inputs except the run ID and deadline.
 
     The inputs include every system prompt the run can send (``protocol_prompts_sha256``, plus
@@ -474,15 +552,29 @@ def content_run_id(spec: FidelitySpec, label: str, trace: str, generation: int =
     new run instead of replaying a result it never produced. Facts are part of the spec, so
     changing any fact addresses a new run.
 
+    A measured run (held-out, retest, frozen memory or none) is also keyed on the code revision
+    that produces it, as continuation studies are, so changed code never replays a measurement
+    it did not make. A learn-mode run is not: it produces memory, each trace is learned into a
+    lineage once, and the lineage already keys every learning input, so re-keying it by code
+    would refuse every already-learned trace instead of measuring it again.
+
     Args:
         spec: Complete spec; its current run ID and deadline are ignored.
         label: Purpose prefix, such as ``held-out`` or ``learn``.
         trace: Replayed trace ID, kept readable in the run ID.
         generation: Attempt number for unchanged inputs; 1 has no suffix.
+        code_revision: Producing implementation identity; required for a measured run and
+            ignored for a learn-mode run, which may pass None.
 
     Returns:
         A valid run ID: ``<label>-<trace>-<digest>[-r<generation>]``.
+
+    Raises:
+        ValueError: A measured run was addressed without its code revision.
     """
+    learning = spec.memory is not None and spec.memory.mode == "learn"
+    if not learning and code_revision is None:
+        raise ValueError("a measured replay run is addressed by its producing code revision")
     # An unjudged run (learning) never calls the judge, so the judge is not one of its inputs:
     # configuring another judge must not re-address it.
     unjudged: dict[str, object] = (
@@ -505,6 +597,7 @@ def content_run_id(spec: FidelitySpec, label: str, trace: str, generation: int =
             ),
             # Only runs that deliver facts send the facts guidance; fact-free IDs are unchanged.
             **({} if spec.facts is None else {"facts_prompt": INSTANCE_FACTS_GUIDANCE}),
+            **({} if learning else {"code": code_revision}),
         }
     )[:12]
     slug = re.sub(r"[^a-z0-9]+", "-", trace.casefold()).strip("-")[:40] or "trace"
@@ -537,11 +630,12 @@ def register_replay(
 
     Returns:
         The registration (an existing one when unchanged and usable) and retired run IDs.
+        A measured run registered by other code is never returned: the revision addresses it.
     """
     retired: list[str] = []
     generation = 1
     while True:
-        run_id = content_run_id(spec, label, trace, generation)
+        run_id = content_run_id(spec, label, trace, generation, code_revision=code_revision)
         plan_id = stable_id("fidelity", {"run_id": run_id})
         if not project.artifacts.exists(plan_id):
             attempt = spec.model_copy(update={"run_id": run_id})
@@ -550,7 +644,7 @@ def register_replay(
         saved = PreparedFidelity.model_validate_json(
             project.artifacts.read_bytes(plan_id, "plan.json")
         )
-        successor = content_run_id(spec, label, trace, generation + 1)
+        successor = content_run_id(spec, label, trace, generation + 1, code_revision=code_revision)
         if project.artifacts.exists(stable_id("fidelity", {"run_id": successor})):
             generation += 1  # replaced by an earlier registration; follow the chain
             continue
@@ -572,19 +666,31 @@ def replay_result(
         report: Its saved dual report.
 
     Returns:
-        Exact replies, reply-field agreement, and assessed judge scores.
+        Exact replies, overall and by recorded-reply kind, reply-field agreement, assessed
+        judge scores and the replay's wall time.
     """
     rows = report.mechanical.get("steps")
-    exact = sum(
-        isinstance(row, dict) and row.get("trajectory_reply_exact") is True
+    reproduced = {
+        row.get("step")
         for row in (rows if isinstance(rows, list) else [])
-    )
+        if isinstance(row, dict) and row.get("trajectory_reply_exact") is True
+    }
+    kinds = [reply_kind(step.reply) for step in case.steps]
     turns = saved_turn_outcomes(project.artifacts, prepared.id + "-report", report) or ()
     return ReplayResult(
         trace_id=case.trace_id,
+        lineage=case.task.lineage_group_id,
         run_id=prepared.spec.run_id,
         steps=report.planned_steps,
-        exact=exact,
+        exact=len(reproduced),
+        kinds=tuple(
+            ReplyKindCount(
+                kind=kind,
+                exact=sum(step in reproduced for step, row in enumerate(kinds) if row == kind),
+                steps=kinds.count(kind),
+            )
+            for kind in REPLY_KINDS
+        ),
         fields_matched=sum(turn.fields_matched or 0 for turn in turns),
         fields_total=sum(turn.fields_total or 0 for turn in turns),
         turns=turns,
@@ -592,7 +698,28 @@ def replay_result(
         judge_status=report.judge_status,
         report=report,
         unknown_outcomes=unknown_outcomes(project, prepared),
+        replay_seconds=replay_seconds(project, prepared),
     )
+
+
+def replay_seconds(project: ProjectStore, prepared: PreparedFidelity) -> float | None:
+    """Wall time of one run from execution start to its saved report, without provider calls.
+
+    Measured from the creation times of the run's execution record and its report, so neither
+    registration nor any wait before execution counts; a resumed run includes its interruption.
+
+    Args:
+        project: Project holding the run.
+        prepared: Exact registration.
+
+    Returns:
+        Seconds, or None unless both the execution record and the report are saved.
+    """
+    started, finished = prepared.id + "-execution", prepared.id + "-report"
+    if not (project.artifacts.exists(started) and project.artifacts.exists(finished)):
+        return None
+    begun = project.artifacts.read(started).manifest.created_at
+    return (project.artifacts.read(finished).manifest.created_at - begun).total_seconds()
 
 
 def saved_results(
@@ -625,9 +752,19 @@ def aggregate(results: Sequence[ReplayResult]) -> ReplayAggregate:
         results: Completed traces.
 
     Returns:
-        Totals; the judge mean pools every assessed criterion score.
+        Pooled totals with their recorded-reply-kind split, and the per-lineage mean exact rate
+        with its interval at the lineage count; the judge mean pools every assessed criterion
+        score of the judged traces.
     """
     scores = [score for result in results for score in result.judge_scores]
+    by_lineage: dict[str, list[float]] = {}
+    rows = [row for result in results for row in result.kinds]
+    for result in results:
+        by_lineage.setdefault(result.lineage, []).append(
+            result.exact / result.steps if result.steps else 0.0
+        )
+    summary = unit_mean_summary(by_lineage)
+    estimate, interval = summary["estimate"], summary["wilson_95"]
     judged = [
         (score >= 4, turn.divergence == 0)
         for result in results
@@ -641,9 +778,34 @@ def aggregate(results: Sequence[ReplayResult]) -> ReplayAggregate:
         fields_matched=sum(result.fields_matched for result in results),
         fields_total=sum(result.fields_total for result in results),
         judge_mean=sum(scores) / len(scores) if scores else None,
+        judged_traces=sum(bool(result.judge_scores) for result in results),
+        judge_failures=sum(result.judge_status in ("failed", "unknown") for result in results),
         judge_turns=len(judged),
         judge_agreements=sum(verdict == exact for verdict, exact in judged),
+        kinds=tuple(
+            ReplyKindCount(
+                kind=kind,
+                exact=sum(row.exact for row in rows if row.kind == kind),
+                steps=sum(row.steps for row in rows if row.kind == kind),
+            )
+            for kind in REPLY_KINDS
+        ),
+        lineages=len(by_lineage),
+        lineage_exact=float(estimate) if isinstance(estimate, (int, float)) else None,
+        lineage_interval=_interval(interval),
+        replay_seconds=tuple(
+            result.replay_seconds for result in results if result.replay_seconds is not None
+        ),
     )
+
+
+def _interval(value: JsonValue) -> tuple[float, float] | None:
+    """The uncertainty owner's ``[low, high]`` interval as a pair, or None when absent."""
+    if isinstance(value, list) and len(value) == 2:
+        low, high = value
+        if isinstance(low, (int, float)) and isinstance(high, (int, float)):
+            return float(low), float(high)
+    return None
 
 
 def interrupted(project: ProjectStore, prepared: PreparedFidelity) -> bool:

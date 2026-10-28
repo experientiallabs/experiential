@@ -12,6 +12,7 @@ from exp.common.models import (
     ModelRequest,
     ModelResponse,
     ModelSnapshot,
+    ReasoningEffort,
     ToolCall,
     ToolChoice,
     Usage,
@@ -244,7 +245,7 @@ class AnthropicClient(ProviderHttpClient):
         supports_frequency_penalty: bool = False,
         supports_presence_penalty: bool = False,
         supports_reasoning: bool = False,
-        reasoning_effort: str | None = None,
+        reasoning_effort: ReasoningEffort | None = None,
         authorization_bearer: bool = False,
         inference_geo: Literal["us"] | None = None,
     ) -> None:
@@ -263,6 +264,7 @@ class AnthropicClient(ProviderHttpClient):
             transport=transport,
             retry_policy=retry_policy,
             timeout_seconds=timeout_seconds,
+            reasoning_effort=reasoning_effort,
         )
         self._supports_temperature = supports_temperature
         self._supports_top_p = supports_top_p
@@ -271,7 +273,6 @@ class AnthropicClient(ProviderHttpClient):
         self._supports_frequency_penalty = supports_frequency_penalty
         self._supports_presence_penalty = supports_presence_penalty
         self._supports_reasoning = supports_reasoning
-        self._reasoning_effort = reasoning_effort
         self._authorization_bearer = authorization_bearer
         self._inference_geo = inference_geo
 

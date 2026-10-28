@@ -7,21 +7,19 @@ from pathlib import Path
 import pytest
 from openpyxl import Workbook, load_workbook
 
-from exp.common.core.artifacts import ArtifactEnvelope, JsonObject
+from exp.common.core.artifacts import ArtifactEnvelope, JsonObject, sha256_json
 from exp.common.models import ToolCall
 from exp.common.project import ProjectStore, artifact_input
 from exp.common.tasks import TaskCase, ToolSchema
 from exp.optimize.evaluation.executable.workbook import (
+    PRIVATE_VIEWS_PROTOCOL,
     WorkbookRuntimeDefinition,
     WorkbookStateView,
     continuation_runtime,
 )
-from exp.runtime.environments.worlds import (
-    ExecutableWorldRuntime,
-    StateDomain,
-    ToolEffectPolicy,
-    WorldManifest,
-)
+from exp.runtime.environments.workbook_edits import WorkbookEditAdapter
+from exp.runtime.environments.world_contracts import StateDomain, ToolEffectPolicy, WorldManifest
+from exp.runtime.environments.worlds import ExecutableWorldRuntime
 from exp.simulation.evaluation.tasks import OutcomeRule, TaskVerifier, grade
 
 
@@ -64,7 +62,10 @@ def workbook_definition(tmp_path: Path) -> tuple[ProjectStore, WorkbookRuntimeDe
         ),
         views={
             "protected": WorkbookStateView(
-                input_file="input.xlsx", output_file="output.xlsx", sheets=("Protected",)
+                input_file="input.xlsx",
+                output_file="output.xlsx",
+                sheets=("Protected",),
+                baseline_until_written=True,
             )
         },
     )
@@ -88,7 +89,7 @@ def workbook_definition(tmp_path: Path) -> tuple[ProjectStore, WorkbookRuntimeDe
 
 def test_constructed_assets_enter_existing_runtime_and_restore(tmp_path: Path) -> None:
     """Construction outputs feed the maintained state machine without a special adapter."""
-    from exp.runtime.environments.worlds import ExecutableCheckpoint
+    from exp.runtime.environments.world_contracts import ExecutableCheckpoint
     from exp.simulation.world_construction import (
         ConstructionSpec,
         SequenceColumn,
@@ -293,11 +294,9 @@ def test_private_row_projection_is_opt_in_and_does_not_change_actor_observations
         runtime = continuation_runtime(project, spec.model_dump(mode="json"))
         with runtime.world.open(task) as world:
             before = runtime.probe(world.checkpoint())
-            if spec == rich:
-                assert resolve(before, "/views/main/sheets/0/rows/1/0/value") == 1
-            else:
-                with pytest.raises(ValueError):
-                    resolve(before, "/views/main/sheets")
+            assert resolve(before, "/views/main/source") is None
+            with pytest.raises(ValueError):
+                resolve(before, "/views/main/sheets")
             reply = world.execute(
                 ToolCall(
                     name="edit_workbook",
@@ -315,3 +314,61 @@ def test_private_row_projection_is_opt_in_and_does_not_change_actor_observations
                 assert resolve(after, "/views/main/source") == "output.xlsx"
                 assert resolve(after, "/views/main/sheets/0/rows/0/0/value") == 1
     assert replies[0] == replies[1]
+
+
+def test_an_unwritten_output_is_unavailable_rather_than_the_unchanged_input(
+    tmp_path: Path,
+) -> None:
+    """A goal over the output cannot pass on input content the actor never transformed."""
+    project, definition, task = workbook_definition(tmp_path)
+    spec = definition.model_copy(
+        update={
+            "views": {
+                **definition.views,
+                "main": WorkbookStateView(
+                    input_file="input.xlsx", output_file="output.xlsx", sheets=("Protected",)
+                ),
+            }
+        }
+    )
+    runtime = continuation_runtime(project, spec.model_dump(mode="json"))
+    with runtime.world.open(task) as world:
+        state = runtime.probe(world.checkpoint())
+    views = state["views"]
+    assert isinstance(views, dict)
+    assert views["main"] == {"source": None, "unavailable": "registered file is absent"}
+    baseline = views["protected"]
+    assert isinstance(baseline, dict) and baseline["source"] == "input.xlsx"
+    # The unchanged input would satisfy this rule; the absent output must not.
+    predicate = TaskVerifier(
+        description="Protected content is carried into the output.",
+        outcome_schema={},
+        required_paths=("/final_state/views/main/sha256",),
+        rules=(
+            OutcomeRule(
+                path="/final_state/views/main/sha256", operator="equals", value=baseline["sha256"]
+            ),
+        ),
+    )
+    outcome: JsonObject = {
+        "initial_state": state,
+        "final_state": state,
+        "final_answer": "done",
+        "stop_reason": "completed",
+        "steps": [],
+    }
+    assert grade(predicate, outcome).goal.status == "unassessable"
+    with pytest.raises(ValueError, match="output_file"):
+        WorkbookStateView(input_file="input.xlsx", baseline_until_written=True)
+
+
+def test_probe_identity_binds_the_view_protocol_not_this_source_file(tmp_path: Path) -> None:
+    """Reformatting the adapter module cannot re-key every saved task profile."""
+    _, spec, _ = workbook_definition(tmp_path)
+    assert spec.probe_sha256 == sha256_json(
+        {
+            "protocol": PRIVATE_VIEWS_PROTOCOL,
+            "definition": spec.model_dump(mode="json"),
+            "adapter": WorkbookEditAdapter().definition,
+        }
+    )

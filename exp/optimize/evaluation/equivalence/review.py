@@ -28,7 +28,10 @@ from exp.common.models import (
 from exp.common.project import ProjectStore, artifact_input
 from exp.common.tasks import ToolSchema
 from exp.runtime.models.call_evidence import call_consumer, canonical_call
-from exp.runtime.models.providers.admitted_transport import AdmittedJsonTransport
+from exp.runtime.models.providers.admitted_transport import (
+    AdmittedJsonTransport,
+    require_admitted_transport,
+)
 from exp.runtime.models.providers.transport import HttpxJsonTransport
 from exp.runtime.models.registry import RuntimeModelCatalog
 from exp.runtime.sessions.dispatch_ledger import DispatchCapExhaustedError, DispatchLedger
@@ -62,16 +65,7 @@ def preflight_reviewer(
     snapshot, caps = RuntimeModelCatalog(catalog, environment={}).snapshot(reviewer.alias)
     if snapshot != reviewer.model or caps.supports_tools is not True:
         raise ValueError("equivalence reviewer requires its pinned tool-capable model")
-    provider = catalog.connections[catalog.models[reviewer.alias].connection].provider
-    if provider not in {
-        "openai",
-        "openai-compatible",
-        "openrouter",
-        "anthropic",
-        "gemini",
-        "azure",
-    }:
-        raise ValueError("equivalence reviewer requires admitted HTTP transport")
+    require_admitted_transport(catalog, reviewer.alias, consumer="equivalence reviewer")
     if caps.context_window_tokens is None or (
         caps.maximum_output_tokens is not None
         and reviewer.output_tokens > caps.maximum_output_tokens

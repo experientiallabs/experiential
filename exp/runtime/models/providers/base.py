@@ -531,11 +531,14 @@ class GatewayWireProfile:
 
 
 class ProviderHttpClient(abc.ABC):
-    """One explicit provider connection sharing validation, headers, and the completion flow."""
+    """One explicit provider connection sharing validation, headers, and the completion flow.
+
+    The client's catalog-pinned reasoning effort, passed as ``reasoning_effort``, is the effort
+    a request sends when it names none. The same effective effort scales each completion
+    attempt's timeout, so a subclass never derives timeouts from a separately kept effort.
+    """
 
     default_headers: ClassVar[Mapping[str, str]] = {}
-    _reasoning_effort: str | None = None
-    """Catalog-pinned reasoning effort, sent when a request names none; clients may set it."""
 
     def __init__(
         self,
@@ -546,6 +549,7 @@ class ProviderHttpClient(abc.ABC):
         transport: AsyncJsonHttpTransport | JsonHttpTransport | None = None,
         retry_policy: RetryPolicy = DEFAULT_RETRY_POLICY,
         timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
+        reasoning_effort: ReasoningEffort | None = None,
     ) -> None:
         """Create a client with a single explicit endpoint and credential.
 
@@ -556,7 +560,10 @@ class ProviderHttpClient(abc.ABC):
             transport: Optional deterministic transport used by tests.
             retry_policy: Bounded same-endpoint retry policy.
             timeout_seconds: Per-attempt timeout floor. Completion calls scale above it from the
-                requested maximum output tokens, while non-completion routes use it exactly.
+                request's size, output budget and reasoning effort, while non-completion routes
+                use it exactly.
+            reasoning_effort: Catalog-pinned effort sent when a request names none, or ``None``
+                to leave the provider default.
         """
         if not api_key:
             raise ValueError(f"{type(self).__name__} requires a non-empty API key")
@@ -568,6 +575,26 @@ class ProviderHttpClient(abc.ABC):
         self._transport = as_async_transport(transport)
         self._retry_policy = retry_policy
         self._timeout_seconds = timeout_seconds
+        self._reasoning_effort = reasoning_effort
+
+    def _completion_timeout_seconds(self, request: ModelRequest) -> float:
+        """Per-attempt completion timeout for ``request`` under this client's effective effort."""
+        return request_timeout_seconds(
+            self._timeout_seconds, request, default_reasoning_effort=self._reasoning_effort
+        )
+
+    def _completion_deadline_seconds(self, request: ModelRequest) -> float:
+        """Request-wide deadline that leaves every allowed attempt its whole completion timeout.
+
+        Args:
+            request: The complete typed request whose size, output budget and effort apply.
+
+        Returns:
+            The bounded deadline in seconds, retries and their waits included.
+        """
+        return completion_deadline_seconds(
+            self._completion_timeout_seconds(request), self._retry_policy
+        )
 
     def complete(self, request: ModelRequest) -> ModelResponse:
         """Complete one non-streaming request through the provider's completion route.
@@ -584,13 +611,10 @@ class ProviderHttpClient(abc.ABC):
         Returns:
             The typed non-streaming model response with observed request economics.
         """
-        deadline_seconds = completion_deadline_seconds(
-            request_timeout_seconds(
-                self._timeout_seconds, request, default_reasoning_effort=self._reasoning_effort
-            ),
-            self._retry_policy,
+        return _run_sync(
+            self.complete_async(request),
+            timeout_seconds=self._completion_deadline_seconds(request),
         )
-        return _run_sync(self.complete_async(request), timeout_seconds=deadline_seconds)
 
     async def complete_async(
         self,
@@ -614,9 +638,7 @@ class ProviderHttpClient(abc.ABC):
         Returns:
             The typed completed response with observed request economics.
         """
-        completion_timeout = request_timeout_seconds(
-            self._timeout_seconds, request, default_reasoning_effort=self._reasoning_effort
-        )
+        completion_timeout = self._completion_timeout_seconds(request)
         request_deadline = deadline or RequestDeadline.after(
             completion_deadline_seconds(completion_timeout, self._retry_policy)
         )

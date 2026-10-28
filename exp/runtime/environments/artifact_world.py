@@ -12,12 +12,19 @@ import json
 from collections.abc import Mapping
 from typing import Protocol, runtime_checkable
 
-from exp.common.core.artifacts import JsonObject, Sha256, sha256_json, validate_artifact_file_path
+from exp.common.core.artifacts import (
+    JsonObject,
+    Sha256,
+    sha256_bytes,
+    sha256_json,
+    validate_artifact_file_path,
+)
 from exp.common.models import ToolCall
 from exp.common.tasks import TaskCase
 from exp.runtime.environments.artifact_edits import ArtifactEditAdapter
 from exp.runtime.environments.interface import Observation
-from exp.runtime.environments.worlds import NativeImage, WorldAccess, WorldContext, digest_bytes
+from exp.runtime.environments.world_contracts import NativeImage, WorldAccess
+from exp.runtime.environments.worlds import WorldContext
 
 # Identity of the code that decides this artifact's behavior, in place of its source text.
 # Bump it when behavior changes. exp/tests/code_protocols_test.py fails when the covered
@@ -62,7 +69,7 @@ class ArtifactWorldFactory:
         self._definition: JsonObject = {
             "name": ARTIFACT_WORLD_PROTOCOL,
             "adapter": adapter.definition,
-            "files": {path: digest_bytes(payload) for path, payload in sorted(files.items())},
+            "files": {path: sha256_bytes(payload) for path, payload in sorted(files.items())},
             "outputs": list(self._outputs),
         }
 
@@ -113,7 +120,7 @@ class ArtifactWorld:
             return Observation(content=str(exc), is_error=True)
         self._files.update(output.files)
         written = {
-            path: {"sha256": digest_bytes(payload), "bytes": len(payload)}
+            path: {"sha256": sha256_bytes(payload), "bytes": len(payload)}
             for path, payload in sorted(output.files.items())
         }
         receipt: JsonObject = {"written": written}
@@ -130,7 +137,7 @@ class ArtifactWorld:
     def domain_digests(self) -> dict[str, Sha256]:
         """Digest every declared file, marking files that do not exist yet."""
         return {
-            path: digest_bytes(self._files[path]) if path in self._files else _ABSENT
+            path: sha256_bytes(self._files[path]) if path in self._files else _ABSENT
             for path in self._domains
         }
 
@@ -141,7 +148,7 @@ class ArtifactWorld:
     def state_projection(self) -> JsonObject:
         """Expose file existence and byte identity, without claiming semantic file coverage."""
         return {
-            path: {"sha256": digest_bytes(payload), "bytes": len(payload)}
+            path: {"sha256": sha256_bytes(payload), "bytes": len(payload)}
             for path, payload in sorted(self._files.items())
         }
 

@@ -5,7 +5,7 @@ from itertools import product
 import pytest
 
 from exp.common.core.artifacts import JsonObject
-from exp.simulation.table_relations import TableRelation, assess_table_relation
+from exp.simulation.evaluation.table_relations import TableRelation, assess_table_relation
 
 
 def test_global_last_occurrence_rejects_adjacency_and_preserves_payloads() -> None:

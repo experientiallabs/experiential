@@ -14,7 +14,10 @@ from exp.common.core.artifacts import (
 )
 from exp.common.models import ModelRequest, ModelResponse, ModelSnapshot, load_model_catalog
 from exp.common.project import ProjectStore, artifact_input
-from exp.runtime.models.providers.admitted_transport import AdmittedJsonTransport
+from exp.runtime.models.providers.admitted_transport import (
+    AdmittedJsonTransport,
+    require_admitted_transport,
+)
 from exp.runtime.models.providers.transport import HttpxJsonTransport
 from exp.runtime.models.registry import RuntimeModelCatalog
 from exp.runtime.sessions.dispatch_ledger import DispatchLedger
@@ -65,16 +68,7 @@ def preflight_author(project: ProjectStore, spec: AuthorSettings, request: Model
         and size + spec.output_tokens > capability.context_window_tokens
     ):
         raise ValueError("author complete input and output exceed model capacity")
-    provider = catalog.connections[catalog.models[spec.model_alias].connection].provider
-    if provider not in {
-        "openai",
-        "openai-compatible",
-        "openrouter",
-        "anthropic",
-        "gemini",
-        "azure",
-    }:
-        raise ValueError("author requires the admitted HTTP transport")
+    require_admitted_transport(catalog, spec.model_alias, consumer="author")
 
 
 def author_response(

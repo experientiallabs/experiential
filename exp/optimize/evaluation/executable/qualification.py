@@ -26,8 +26,9 @@ from exp.runtime.environments.worlds import ExecutableWorldRuntime
 from exp.simulation.capability_briefs import load_capability_brief
 from exp.simulation.evaluation.admission import verify_label_witness
 from exp.simulation.evaluation.calibration import CalibrationCase, CalibrationPack
-from exp.simulation.evaluation.tasks import grade, normalized_outcome
-from exp.simulation.record_execution import RecordReplayRuntime, require_record_runtime
+from exp.simulation.evaluation.record_execution import RecordReplayRuntime, require_record_runtime
+from exp.simulation.evaluation.tasks import TaskVerifier, grade, normalized_outcome
+from exp.simulation.reconstruction.models import path_parts
 
 
 class ExecutableQualificationSpec(ContractModel):
@@ -110,11 +111,13 @@ def assess_executable_qualification(
     # Reuse the established identity, duplicate and grouped-partition checks.
     CalibrationPack(task=spec.task, parent=predicate, candidate=predicate, cases=spec.cases)
     refusals = []
+    # Argument rules constrain only the calls they name, so an unrequested write elsewhere
+    # needs a check over observed state: preservation or a pin on the complete output.
     if predicate.allowed_tools is None or not (
-        predicate.preserved_paths or predicate.preserve_state or predicate.argument_rules
+        predicate.preserved_paths or predicate.preserve_state or _pins_full_output(predicate)
     ):
         refusals.append(
-            "explicit permitted tools and a state/effect preservation policy are required"
+            "explicit permitted tools and a state-preservation or full-output check are required"
         )
     feasible = load_study(project.artifacts, spec.feasibility)
     task_revision = project.artifacts.read(spec.task.artifact_id).manifest.code_revision
@@ -179,6 +182,25 @@ def assess_executable_qualification(
         qualified=not refusals,
         refusals=tuple(refusals),
     )
+
+
+def _pins_full_output(predicate: TaskVerifier) -> bool:
+    """Whether an equality rule fixes the whole final state or one whole observed file.
+
+    Args:
+        predicate: The task verifier under qualification.
+
+    Returns:
+        True when a rule requires the whole outcome, ``/final_state`` or one complete
+        ``/final_state/files/<name>`` entry to equal an authored value, which covers every
+        effect on that output.
+    """
+    for rule in predicate.rules:
+        parts = path_parts(rule.path)
+        whole_file = len(parts) == 3 and parts[:2] == ("final_state", "files")
+        if rule.operator == "equals" and (parts in ((), ("final_state",)) or whole_file):
+            return True
+    return False
 
 
 def qualify_executable_task(

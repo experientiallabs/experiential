@@ -1,11 +1,12 @@
 """Immutable evaluation tasks and independently qualified data-only verifiers."""
 
-from collections.abc import Collection, Sequence
+from collections.abc import Collection, Iterator, Sequence
 from datetime import datetime
 from operator import not_
 from typing import Literal, Self
 
-from jsonschema import Draft202012Validator, SchemaError
+from jsonschema import Draft202012Validator, SchemaError, ValidationError, validators
+from jsonschema.protocols import Validator
 from pydantic import Field, model_validator
 
 from exp.common.core.artifacts import (
@@ -24,8 +25,39 @@ from exp.common.project import ArtifactStore, artifact_input
 from exp.common.tasks import TaskCase
 from exp.simulation.actor_context import ActorContextFragment
 from exp.simulation.capability_briefs import load_capability_brief
+from exp.simulation.evaluation.table_relations import TableRelation, assess_table_relation
 from exp.simulation.reconstruction.models import check_schema, path_parts, resolve
-from exp.simulation.table_relations import TableRelation, assess_table_relation
+
+
+def _strict_const(
+    validator: Validator, const: JsonValue, instance: JsonValue, schema: JsonObject
+) -> Iterator[ValidationError]:
+    """Require the exact JSON type of a constant, so 1.0 and true never equal 1."""
+    if not strict_equal(instance, const):
+        yield ValidationError(f"{instance!r} is not strictly {const!r}")
+
+
+def _strict_enum(
+    validator: Validator, enum: list[JsonValue], instance: JsonValue, schema: JsonObject
+) -> Iterator[ValidationError]:
+    """Require one enumerated member with its exact JSON type."""
+    if not any(strict_equal(instance, member) for member in enum):
+        yield ValidationError(f"{instance!r} is not strictly one of {enum!r}")
+
+
+# Draft 2020-12 accepts 1.0 as an integer and compares 1 equal to 1.0. Verifiers distinguish
+# booleans, integers and floats the way strict_equal does, so this pass runs after the
+# standard check passes and refuses any value that matched only through numeric coercion.
+_StrictTypes = validators.extend(
+    Draft202012Validator,
+    type_checker=Draft202012Validator.TYPE_CHECKER.redefine_many(
+        {
+            "integer": lambda _, value: type(value) is int,
+            "number": lambda _, value: type(value) in (int, float),
+        }
+    ),
+    validators={"const": _strict_const, "enum": _strict_enum},
+)
 
 Verdict = Literal["pass", "fail", "unassessable"]
 LabelAuthority = Literal[
@@ -494,6 +526,8 @@ def _grade_goal(verifier: TaskVerifier, value: JsonObject) -> Assessment:
             return Assessment(status="unassessable", reason=f"missing observation {pointer}")
     schema = expand_local_references(verifier.outcome_schema)
     error = next(Draft202012Validator(schema).iter_errors(value), None)
+    if error is None:
+        error = next(_StrictTypes(schema).iter_errors(value), None)
     if error is not None:
         return Assessment(status="fail", reason=error.message)
     for rule in verifier.rules:

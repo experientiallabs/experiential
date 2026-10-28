@@ -145,13 +145,12 @@ def test_content_is_reserved_before_any_run_is_registered(
         project: ProjectStore,
         planned: PlannedPanel,
         *,
-        code_revision: str,
         clock: Callable[[], datetime],
     ) -> HeldOutPanel:
         """Record whether the newest receipt's reservation was committed before registering."""
         receipts = audit_receipts(store)
         seen.append(bool(receipts) and ledger.snapshot().active(receipts[-1].receipt_id))
-        return register(project, planned, code_revision=code_revision, clock=clock)
+        return register(project, planned, clock=clock)
 
     monkeypatch.setattr(held_out_audit, "register_planned_panel", checked)
     with audit(store) as opened:
@@ -207,11 +206,19 @@ def test_a_reservation_committed_between_selection_and_commit_is_respected(
         count: int,
         *,
         profile: Profile,
+        code_revision: str,
         clock: Callable[[], datetime],
         excluded: Collection[str] = frozenset(),
     ) -> PlannedPanel:
         """Plan, then let another receipt reserve the planned lineage before the commit."""
-        planned = plan(project, count, profile=profile, clock=clock, excluded=excluded)
+        planned = plan(
+            project,
+            count,
+            profile=profile,
+            code_revision=code_revision,
+            clock=clock,
+            excluded=excluded,
+        )
         if not stolen:
             lineage = planned.lineages[0]
             stolen.append(lineage)
@@ -313,11 +320,10 @@ def test_the_receipt_that_dispatched_a_shared_run_alone_completes_it(
                 run(store, other)
         dispatcher = other.receipt
         assert dispatch_owner(store, shared.spec.run_id) == dispatcher.receipt_id
-        # The owner's lease is held, yet its claim for the other receipt's run is refused.
         with pytest.raises(
             ReservationInactiveError, match=f"under receipt {dispatcher.receipt_id}"
         ):
-            first.guard(shared)
+            run(store, first, resume=True)
     with (
         pytest.raises(ValueError, match=f"under receipt {dispatcher.receipt_id}.*only that"),
         audit(store),
@@ -370,18 +376,18 @@ def test_a_receipt_stopped_before_its_first_claim_owns_nothing(
             first.guard(shared)
             raise ReservationInactiveError("stopped before the claim")
 
-        # Stop between the guard and the claim: the dispatch record has no slot behind it.
         with pytest.raises(ReservationInactiveError, match="before the claim"):
-            stop_after_guard()
+            execute_fidelity_evaluation(store, shared, dispatch_guard=stop_after_guard)
     assert dispatch_owner(store, shared.spec.run_id) is None
     release_held_out_audit(store, first.receipt, clock=clock)
     with audit(store, include_inspected=True) as other:
         [current] = other.panel.prepared
-        # The re-audit reuses the unclaimed run: it does not block the other receipt, which
-        # then dispatches and owns it.
-        assert current.spec.run_id == shared.spec.run_id
+        # The re-audit draws the case's next generation; the unclaimed run neither blocks it
+        # nor gains an owner.
+        assert current.spec.run_id == shared.spec.run_id + "-r2"
         run(store, other, resume=True)
         assert dispatch_owner(store, current.spec.run_id) == other.receipt.receipt_id
+    assert dispatch_owner(store, shared.spec.run_id) is None
     assert saved_fidelity_report(store, current) is not None
 
 
@@ -429,17 +435,39 @@ def test_a_configuration_change_with_zero_slots_releases_and_mints_a_new_receipt
 def test_a_configuration_change_after_dispatch_is_a_development_reaudit(
     built: tuple[ProjectStore, FailingOnce],
 ) -> None:
-    """A code-revision mismatch is detected; the dispatched reservation stays permanent."""
+    """A code-revision mismatch is detected; the dispatched reservation stays permanent.
+
+    The new receipt measures again: saved results of other code never stand in for its runs.
+    """
     store, _ = built
     with audit(store) as opened:
         original = opened.receipt
         run(store, opened)
+        measured = {prepared.spec.run_id for prepared in opened.panel.prepared}
     with audit(store, revision="d" * 40) as changed:
         assert changed.receipt.follow_reason == "dispatched"
         assert changed.receipt.basis == "development-re-audit"
         assert changed.receipt.reaudited == original.lineages
+        assert changed.receipt.panel != original.panel
+        assert measured.isdisjoint(prepared.spec.run_id for prepared in changed.panel.prepared)
+        assert all(prepared.code_revision == "d" * 40 for prepared in changed.panel.prepared)
+        assert all(saved_fidelity_report(store, p) is None for p in changed.panel.prepared)
     assert reservation_state(store, original) == "dispatched"
     assert receipt_view(store, original).headline == "independent"
+
+
+def test_a_refused_dispatch_stops_the_trace_without_a_score(
+    built: tuple[ProjectStore, FailingOnce],
+) -> None:
+    """A slot claim refused by the audit's guard stops the run; no turn is scored as a miss."""
+    store, provider = built
+    with audit(store) as opened:
+        prepared = opened.panel.prepared[0]
+    sent = len(provider.requests)
+    with pytest.raises(ReservationInactiveError):
+        execute_fidelity_evaluation(store, prepared, dispatch_guard=partial(opened.guard, prepared))
+    assert len(provider.requests) == sent
+    assert saved_fidelity_report(store, prepared) is None
 
 
 def test_release_and_resume_never_leave_a_released_reservation_with_claims(

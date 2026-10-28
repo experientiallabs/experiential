@@ -21,7 +21,7 @@ from exp.cli.shared.theme import EXP_THEME
 from exp.common.models import load_model_catalog
 from exp.common.progress import ProgressHook
 from exp.common.project import ProjectStore
-from exp.common.release_revision import installed_release_revision
+from exp.common.release_revision import installed_execution_revision, installed_release_revision
 from exp.optimize.evaluation.audit.exposure import LIMITS, LineageExposure
 from exp.optimize.evaluation.audit.lifecycle import (
     HeldOutAudit,
@@ -88,7 +88,9 @@ def run_held_out_fidelity(
     with every held-out lineage reserved, plus recorded facts from the fit-only index. The
     panel's content is reserved for its audit receipt before any run is registered, and every
     invocation appends a report to that receipt before showing anything; ``--verbose`` shows
-    per-trace detail, which exposes the audited lineages so later audits skip them.
+    per-trace detail, which exposes the audited lineages so later audits skip them. Every run is
+    keyed on the installed source revision: saved results replay only for the exact code that
+    produced them, and edited code opens a new receipt that measures again.
 
     Args:
         project: Existing project with a completed build.
@@ -115,7 +117,8 @@ def run_held_out_fidelity(
             store,
             count,
             profile="memory",
-            code_revision=installed_release_revision(),
+            # Measurements bind the installed source, so edited code measures again.
+            code_revision=installed_execution_revision(),
             clock=clock,
             include_inspected=include_inspected,
         ) as audit:
@@ -542,4 +545,8 @@ def run_audit(
     console.print(
         Text(f"Report: {save_details(store, 'audits', outcome.plan.lineage, buffer.getvalue())}")
     )
-    console.print(f"[green]Complete[/green] [dim]in {duration_text(monotonic() - started)}[/dim]")
+    console.print(
+        f"[green]Complete[/green] [dim]in {duration_text(monotonic() - started)} total wall time "
+        "(fit learning, the spend question and the held-out replay; per-trace replay time is "
+        "in the report)[/dim]"
+    )

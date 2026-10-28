@@ -5,6 +5,7 @@ They establish internal consistency, not held-out fidelity or general spreadshee
 """
 
 from exp.common.core.artifacts import JsonObject
+from exp.runtime.environments.world_contracts import WorldManifest
 from exp.runtime.environments.world_responses import ReplyStateBinding
 from exp.runtime.environments.world_state_paths import (
     ArgumentKey,
@@ -16,7 +17,6 @@ from exp.runtime.environments.world_state_paths import (
     SelectItem,
     SliceItems,
 )
-from exp.runtime.environments.worlds import WorldManifest
 
 
 def workbook_state_schema() -> JsonObject:

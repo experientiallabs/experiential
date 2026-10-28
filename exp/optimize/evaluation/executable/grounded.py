@@ -27,14 +27,14 @@ from exp.optimize.evaluation.executable.provider_grant import ProviderGrant
 from exp.optimize.evaluation.fidelity.decision_access import decision_caller, receipt_recorder
 from exp.optimize.evaluation.fidelity.retrieval_binding import index_embedder_alias
 from exp.optimize.evaluation.learning.profile import EvaluationMemory, bind_evaluation_memory
-from exp.runtime.environments.worlds import (
-    ExecutableCheckpoint,
-    ExecutableWorldRuntime,
-    WorldManifest,
-)
+from exp.runtime.environments.world_contracts import ExecutableCheckpoint, WorldManifest
+from exp.runtime.environments.worlds import ExecutableWorldRuntime
 from exp.runtime.models.budget import RequestBudget
 from exp.runtime.models.call_evidence import call_consumer
-from exp.runtime.models.providers.admitted_transport import AdmittedJsonTransport
+from exp.runtime.models.providers.admitted_transport import (
+    AdmittedJsonTransport,
+    require_admitted_transport,
+)
 from exp.runtime.models.providers.transport import HttpxJsonTransport
 from exp.runtime.models.registry import RuntimeModelCatalog
 from exp.runtime.models.structured_completion import CompletionPlan, StructuredCompletion
@@ -140,18 +140,7 @@ def _runtime(
     if embedder_alias is not None:
         aliases.append(embedder_alias)
     for alias in aliases:
-        provider = catalog.connections[catalog.models[alias].connection].provider
-        if provider not in {
-            "openai",
-            "openai-compatible",
-            "openrouter",
-            "anthropic",
-            "gemini",
-            "azure",
-        }:
-            raise ValueError(
-                "executable simulator requires a provider using the admitted HTTP transport"
-            )
+        require_admitted_transport(catalog, alias, consumer="executable simulator")
     if spec.memory is not None:
         recall = catalog.models[spec.memory.recall.jev_alias]
         if catalog.connections[recall.connection].provider != "typesafe":

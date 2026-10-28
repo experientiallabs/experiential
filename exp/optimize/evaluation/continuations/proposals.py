@@ -46,7 +46,10 @@ from exp.optimize.evaluation.continuations.selection import (
 from exp.optimize.evaluation.continuations.study import ContinuationStudy
 from exp.runtime.agents.chat import ChatAgentRuntime
 from exp.runtime.models.call_evidence import canonical_call
-from exp.runtime.models.providers.admitted_transport import AdmittedJsonTransport
+from exp.runtime.models.providers.admitted_transport import (
+    AdmittedJsonTransport,
+    require_admitted_transport,
+)
 from exp.runtime.models.providers.transport import HttpxJsonTransport
 from exp.runtime.models.registry import RuntimeModelCatalog
 from exp.runtime.sessions.dispatch_ledger import DispatchLedger
@@ -478,16 +481,7 @@ def preflight_checkpoint_proposals(project: ProjectStore, spec: CheckpointPropos
         and size + spec.output_tokens > capability.context_window_tokens
     ):
         raise ValueError("selector complete request exceeds model capacity")
-    provider = catalog.connections[catalog.models[spec.selector_alias].connection].provider
-    if provider not in {
-        "openai",
-        "openai-compatible",
-        "openrouter",
-        "anthropic",
-        "gemini",
-        "azure",
-    }:
-        raise ValueError("checkpoint proposals require the admitted HTTP transport")
+    require_admitted_transport(catalog, spec.selector_alias, consumer="checkpoint selector")
 
 
 def _parse(response: ModelResponse, spec: CheckpointProposalSpec, size: int) -> PointChoices:

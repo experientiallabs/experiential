@@ -20,18 +20,17 @@ from exp.common.tasks import TaskCase, ToolSchema
 from exp.runtime.environments.artifact_world import ArtifactWorldFactory
 from exp.runtime.environments.record_world import RecordTool, RecordToolError, RecordWorldFactory
 from exp.runtime.environments.workbook_edits import WorkbookEditAdapter
-from exp.runtime.environments.worlds import (
+from exp.runtime.environments.world_contracts import (
     AuthorityError,
-    ExecutableWorldRuntime,
     RestoreError,
     StateDomain,
     ToolEffectPolicy,
     UndeclaredEffectError,
     WorldAccess,
-    WorldContext,
     WorldEvent,
     WorldManifest,
 )
+from exp.runtime.environments.worlds import ExecutableWorldRuntime, WorldContext
 
 
 @dataclass(frozen=True)

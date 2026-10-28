@@ -15,7 +15,7 @@ Every refusal carries one named reason, so qualification and paid work stop with
 the caller can act on:
 
 - ``self_approval``: a generated label approves itself, directly or because its specification
-  is, copies, or derives from generated artifacts;
+  is, copies, or derives from generated or unclassified artifacts;
 - ``unverifiable_witness``: a witness is missing, differs from its digest, or re-derives a
   different observation or verdict;
 - ``contaminated_lineage``: an exposed, reserved or unresolved lineage, or a task whose own
@@ -53,6 +53,11 @@ from exp.runtime.environments.artifact_edits import (
     NativeArtifactBinding,
     NativeArtifactPlan,
 )
+from exp.simulation.evaluation.record_execution import (
+    RECORD_RECEIPT_TYPE,
+    RecordReplayRuntime,
+    verify_record_execution,
+)
 from exp.simulation.evaluation.tasks import (
     WITNESSED_AUTHORITIES,
     EvaluationTask,
@@ -63,11 +68,6 @@ from exp.simulation.evaluation.tasks import (
     grade,
     load_evaluation_task,
     normalized_outcome,
-)
-from exp.simulation.record_execution import (
-    RECORD_RECEIPT_TYPE,
-    RecordReplayRuntime,
-    verify_record_execution,
 )
 
 AdmissionReason = Literal[
@@ -85,99 +85,24 @@ WitnessKind = Literal["specification_check", "native_execution"]
 # rates and their uncertainty are reported separately by calibration.
 MINIMUM_ADMITTED_PER_VERDICT = 2
 
-# Generated proposal and construction types. Label evidence derived from any of them is a
-# generated label, whatever authority it later claims. Deterministic rendering adds no authority.
-GENERATED_ARTIFACT_TYPES = frozenset(
-    {
-        "actor-workflow",
-        "world-construction",
-        "author-intent",
-        "author-response",
-        "world-binding-intent",
-        "world-proposal-cell",
-        "world-proposals",
-        "task-variant",
-        "task-variant-proposal",
-        "memory-prediction-outcomes",
-        "failure-analysis",
-        "action-intervention",
-        "action-intervention-intent",
-        "action-contrast-registration",
-        "action-contrast-intent",
-        "action-contrast-cell",
-        "action-contrast",
-        "observation-contrast-registration",
-        "observation-contrast-intent",
-        "observation-contrast-cell",
-        "observation-contrast",
-        "task-proposal-intent",
-        "task-proposal-response",
-        "task-proposals",
-        "candidate-batch-registration",
-        "candidate-batch-intent",
-        "candidate-measurement",
-        "candidate-batch",
-        "task-factory-registration",
-        "task-factory-cell",
-        "task-factory-result",
-        "scenario-search-registration",
-        "scenario-search-intent",
-        "scenario-search-cell",
-        "scenario-search-result",
-        "mixed-executable-event",
-        "checkpoint-selection",
-        "checkpoint-experiment",
-        "checkpoint-experiment-registration",
-        "checkpoint-experiment-intent",
-        "checkpoint-experiment-cell",
-        "actor-critic-prediction",
-        "actor-critic-response",
-        "actor-critic-intent",
-        "actor-panel-registration",
-        "actor-panel-report",
-        "actor-panel-cell",
-        "grounded-world-prediction",
-        "behavioral-library-edit",
-        "continuation-checkpoint",
-        "continuation-turn",
-        "continuation-study",
-        "executable-world-image",
-        "executable-task",
-        "executable-trial",
-        "executable-qualification",
-        "reachable-record-scenario",
-        "native-record-execution",
-        "framing-registration",
-        "framing-cell",
-        "framing-report",
-        "continuation-admission",
-        "experience-library",
-        "fidelity-report",
-        "investigation-evidence",
-        "judgment",
-        "library-edit-intent",
-        "memory-compression",
-        "memory-dream",
-        "memory-line",
-        "memory-summary",
-        "provider-response",
-        "reconstruction",
-        "reconstruction-development",
-        "reconstruction-response",
-        "rollout",
-        "rubric-proposal-evidence",
-        "session-research",
-        "task-refinement-proposal",
-        "task-refinement-report",
-        "workflow-dual-evaluation",
-        "workflow-judge-response",
-        "world-checkpoint",
-        "world-operation",
-    }
-)
 NATIVE_RECEIPT_TYPE = "native-artifact-materialization"
 SPECIFICATION_TYPE = "evaluation-specification"
 WITNESS_TYPE = "label-witness"
+# Recorded and human-authored evidence types that may ground a specification. Every artifact in
+# a specification's provenance closure must have one of these types; any other type, including
+# every model-generated proposal or construction type and any type added later, makes each label
+# the specification witnesses a generated label. Deterministic rendering adds no authority.
+RECORDED_EVIDENCE_TYPES = frozenset(
+    {
+        "authored-intent",
+        "authored-requirement",
+        "authored-task",
+        "evaluation-task",
+        "human-label-set",
+        SPECIFICATION_TYPE,
+        "trace-dataset",
+    }
+)
 _WITNESS_KIND: dict[str, WitnessKind] = {
     "synthetic_specification": "specification_check",
     "native_execution": "native_execution",
@@ -306,8 +231,8 @@ def persist_specification(
     Args:
         store: Project artifact owner.
         specification: Predicate and subject.
-        sources: Artifacts the specification was derived from; generated sources make every
-            label it witnesses a generated label.
+        sources: Artifacts the specification was derived from; a source closure outside
+            ``RECORDED_EVIDENCE_TYPES`` makes every label it witnesses a generated label.
         created_at: Publication time.
         code_revision: Producing source identity.
 
@@ -436,8 +361,9 @@ def verify_label_witness(
     if generated is not None:
         return refuse(
             "self_approval",
-            f"the witness specification derives from generated artifact {generated}; "
-            "author the specification from recorded or native evidence",
+            f"the witness specification derives from {generated}, which is not recorded "
+            "evidence; author the specification from artifacts of the recorded evidence "
+            f"types ({', '.join(sorted(RECORDED_EVIDENCE_TYPES))})",
         )
     predicate = _predicate_fingerprint(specification.predicate)
     if any(_predicate_fingerprint(row) == predicate for row in compared):
@@ -674,7 +600,9 @@ def _specification(store: ArtifactStore, reference: ArtifactInput) -> Evaluation
 
 
 def generated_ancestor(store: ArtifactStore, reference: ArtifactInput) -> str | None:
-    """The first model-generated artifact in a provenance closure, if any.
+    """The first artifact in a provenance closure that is not recorded evidence.
+
+    Unclassified types are refused like generated ones, so a new generated type fails closed.
 
     Raises:
         ValueError: An artifact in the closure differs from its declared digest.
@@ -688,7 +616,7 @@ def generated_ancestor(store: ArtifactStore, reference: ArtifactInput) -> str | 
         manifest = store.read(current.artifact_id).manifest
         if artifact_input(manifest) != current:
             raise ValueError("specification provenance differs from its declared digest")
-        if manifest.artifact_type in GENERATED_ARTIFACT_TYPES or (
+        if manifest.artifact_type not in RECORDED_EVIDENCE_TYPES or (
             manifest.artifact_type == "evaluation-task"
             and EvaluationTask.model_validate_json(
                 store.read_bytes(current.artifact_id, "task.json")

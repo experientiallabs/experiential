@@ -23,7 +23,7 @@ from exp.optimize.evaluation.executable.task import (
 )
 from exp.simulation.evaluation.admission import record_label_witness
 from exp.simulation.evaluation.calibration import CalibrationCase
-from exp.simulation.evaluation.tasks import VerifierChallenge
+from exp.simulation.evaluation.tasks import OutcomeRule, VerifierChallenge
 
 
 def qualified_fixture(
@@ -155,6 +155,41 @@ def test_feasibility_from_another_runtime_cannot_qualify_the_same_study(
     )
     assert not report.qualified
     assert any("runtime" in reason for reason in report.refusals)
+
+
+@pytest.mark.parametrize("check", ["arguments_only", "full_output"])
+def test_argument_rules_alone_cannot_stand_in_for_a_state_check(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, check: str
+) -> None:
+    """Rules over named call arguments leave unrequested writes unobserved."""
+    project, reference, spec = qualified_fixture(tmp_path, monkeypatch)
+    task = load_executable_task(project, reference)
+    verifier = task.job.study.verifier
+    pinned = OutcomeRule(path="/final_state/files/output.xlsx", operator="equals", value="0" * 64)
+    weakened = verifier.model_copy(
+        update={
+            "preserved_paths": (),
+            "argument_rules": {
+                "edit_workbook": (
+                    OutcomeRule(path="/destination", operator="equals", value="output.xlsx"),
+                )
+            },
+            "rules": (*verifier.rules, pinned) if check == "full_output" else verifier.rules,
+        }
+    )
+    job = task.job.model_copy(
+        update={"study": task.job.study.model_copy(update={"verifier": weakened})}
+    )
+    changed = persist_executable_task(
+        project,
+        task.model_copy(update={"job": job}),
+        created_at=datetime.now(UTC),
+        code_revision="test",
+    )
+    report = assess_executable_qualification(project, spec.model_copy(update={"task": changed}))
+    assert not report.qualified
+    refused = any("state-preservation or full-output" in reason for reason in report.refusals)
+    assert refused == (check == "arguments_only")
 
 
 def test_removing_collateral_damage_control_blocks_reward(

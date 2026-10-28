@@ -9,7 +9,8 @@ import pytest
 from typer.testing import CliRunner
 
 from exp.cli.app import app
-from exp.cli.evaluation.continuations import ContinuationCommand, ContinuationExport
+from exp.cli.evaluation.continuation_studies import ContinuationExport
+from exp.cli.evaluation.continuations import ContinuationCommand
 from exp.cli.evaluation.executable import ExecutableCommand
 from exp.optimize.evaluation.continuations.admission import (
     ContinuationAdmission,
@@ -469,3 +470,65 @@ def test_cli_authors_worlds_with_consent_then_replays_without_provider_or_runtim
     assert replayed.exit_code == 0, replayed.output
     assert WorldProposals.model_validate_json(replayed.output) == report
     assert len(transport.requests) == 1
+
+
+def test_serve_spend_prompt_names_the_spec_file_the_user_passed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Consent identifies the exact `--continuations` file, not an invented spec name."""
+    from exp.optimize.evaluation.executable.task import export_executable_harbor
+
+    monkeypatch.setattr(
+        "exp.cli.evaluation.continuations.installed_execution_revision", lambda: "test"
+    )
+    project, task, spec = qualified_fixture(tmp_path, monkeypatch)
+    qualification = qualify_executable_task(
+        project, spec, created_at=datetime.now(UTC), code_revision="test"
+    )
+    package = export_executable_harbor(
+        project, task, tmp_path / "package", name="test/consent", qualification=qualification
+    )
+    commands: list[str] = []
+
+    def decline(*args: object, command: str, **kwargs: object) -> bool:
+        """Record the command shown to the operator and decline the spend.
+
+        Args:
+            *args: Positional consent arguments, ignored.
+            command: Command identity shown in the spend prompt.
+            **kwargs: Remaining consent arguments, ignored.
+
+        Returns:
+            False, so serving never starts.
+        """
+        commands.append(command)
+        return False
+
+    monkeypatch.setattr("exp.cli.evaluation.executable.require_spend_consent", decline)
+    path = tmp_path / "my-serve-request.json"
+    path.write_text(
+        ContinuationCommand(
+            action="harbor",
+            harbor=ExecutableCommand(
+                action="serve",
+                directory=package,
+                actor_connection_file=tmp_path / "actor.json",
+                verifier_connection_file=tmp_path / "verifier.json",
+            ),
+        ).model_dump_json()
+    )
+    result = CliRunner().invoke(
+        app,
+        [
+            "eval",
+            project.paths.project_id,
+            "--root",
+            str(project.paths.root),
+            "--continuations",
+            str(path),
+            "--non-interactive",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert commands == [f"exp eval {project.paths.project_id} --continuations {path}"]
+    assert not (tmp_path / "actor.json").exists()

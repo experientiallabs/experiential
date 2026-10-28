@@ -34,6 +34,7 @@ from typing import Literal
 from filelock import FileLock
 
 from exp.common.core.artifacts import stable_id
+from exp.common.models.client import RequestAdmissionRefused
 from exp.common.project import ProjectStore
 from exp.optimize.evaluation.audit.exposure import (
     HeldOutExposure,
@@ -82,8 +83,12 @@ SELECTION_ROUNDS = 5  # concurrent audits that keep taking the chosen content
 ReservationState = Literal["active", "dispatched", "released"]
 
 
-class ReservationInactiveError(RuntimeError):
-    """Dispatch was refused: the lease is not held or the reservation is not active."""
+class ReservationInactiveError(RequestAdmissionRefused):
+    """Dispatch was refused: the lease is not held or the reservation is not active.
+
+    A local stop before dispatch, so it bypasses step-failure handling: the trace stops
+    unscored instead of counting its remaining turns as misses.
+    """
 
 
 class HeldOutAudit:
@@ -214,7 +219,12 @@ def open_held_out_audit(
         snapshot = ledger.snapshot()
         owner, exposure, excluded = _selection(project, request, snapshot)
         planned = plan_held_out_panel(
-            project, count, profile=profile, clock=clock, excluded=excluded
+            project,
+            count,
+            profile=profile,
+            code_revision=code_revision,
+            clock=clock,
+            excluded=excluded,
         )
         if owner is not None and planned.lineages != owner.lineages:
             # Selection no longer lands on the owner's cases: a new receipt, around its hold.
@@ -222,7 +232,12 @@ def open_held_out_audit(
             exposure = held_out_exposure(project, snapshot)
             excluded = frozenset() if include_inspected else exposure.lineages
             planned = plan_held_out_panel(
-                project, count, profile=profile, clock=clock, excluded=excluded
+                project,
+                count,
+                profile=profile,
+                code_revision=code_revision,
+                clock=clock,
+                excluded=excluded,
             )
         follows: tuple[AuditReceipt, Literal["released-unused", "dispatched"]] | None = None
         if owner is not None:
@@ -242,12 +257,7 @@ def open_held_out_audit(
                         raise ValueError(_blocked(owner, blocked))
                     if blocked:
                         _notice(project, owner, blocked, current.identity, clock)
-                    panel = register_planned_panel(
-                        project,
-                        planned,
-                        code_revision=code_revision,
-                        clock=clock,
-                    )
+                    panel = register_planned_panel(project, planned, clock=clock)
                     record_attempts(project, owner, panel, clock=clock)
                     yield HeldOutAudit(
                         project, owner, panel, exposure, lease, excluded=len(excluded), clock=clock
@@ -269,12 +279,7 @@ def open_held_out_audit(
             )
             if receipt is None:
                 continue
-            panel = register_planned_panel(
-                project,
-                planned,
-                code_revision=code_revision,
-                clock=clock,
-            )
+            panel = register_planned_panel(project, planned, clock=clock)
             record_attempts(project, receipt, panel, clock=clock)
             yield HeldOutAudit(
                 project, receipt, panel, exposure, lease, excluded=len(excluded), clock=clock

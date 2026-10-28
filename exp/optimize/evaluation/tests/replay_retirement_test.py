@@ -313,9 +313,9 @@ def test_editing_a_sent_prompt_addresses_a_new_run(
 ) -> None:
     """Saved results never replay under a system prompt they were not produced with."""
     _, base = memory_project(tmp_path)
-    before = trace_replay.content_run_id(base, "held-out", "trace")
+    before = trace_replay.content_run_id(base, "held-out", "trace", code_revision=REVISION)
     monkeypatch.setattr(trace_replay, prompt, getattr(trace_replay, prompt) + " Edited.")
-    assert trace_replay.content_run_id(base, "held-out", "trace") != before
+    assert trace_replay.content_run_id(base, "held-out", "trace", code_revision=REVISION) != before
 
 
 def test_both_profiles_derive_tool_schemas_from_the_same_fit_calls(
