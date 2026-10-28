@@ -13,6 +13,10 @@ Message mapping follows the roles the conversation already declares:
 - a ``tool`` message becomes the tool result paired with the earlier call,
 - ``system`` and ``developer`` messages are retained as initial instructions.
 
+A model call's input is every message before it. The conversation's messages are declared once,
+on the first observation, and stored once on the trace; each model span names how many of them
+form its input. Import size and time therefore grow linearly with transcript length.
+
 Chat JSON carries no source timing. When a message declares no timestamp, EXP assigns ordinal
 timestamps that preserve message order only, and every resulting span records
 ``exp.source.time.synthetic`` so downstream consumers can never mistake assigned order for measured
@@ -24,6 +28,7 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Mapping, Sequence
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 
 from pydantic import JsonValue
@@ -143,7 +148,6 @@ def _conversation_observations(
     if request_text is None:
         raise VendorTraceFormatError("chat JSON conversation has no user message")
     observations: list[VendorObservation] = []
-    input_messages: list[JsonValue] = []
     for index, message in enumerate(messages):
         role = message_role(message)
         timestamp, synthetic = _message_timestamp(message, index)
@@ -156,15 +160,13 @@ def _conversation_observations(
             synthetic=synthetic,
             source_trace_id=source_trace_id,
             request_text=request_text if not observations else None,
-            input_messages=tuple(input_messages),
             model=model,
             extensions=extensions,
         )
         observations.extend(emitted)
-        input_messages.append(message)
     if not observations:
         raise VendorTraceFormatError("chat JSON conversation has no assistant or tool message")
-    return tuple(observations)
+    return (replace(observations[0], message_history=tuple(messages)), *observations[1:])
 
 
 def _message_observations(
@@ -177,7 +179,6 @@ def _message_observations(
     synthetic: bool,
     source_trace_id: str,
     request_text: str | None,
-    input_messages: tuple[JsonValue, ...],
     model: VendorModelIdentity | None,
     extensions: JsonObject,
 ) -> tuple[VendorObservation, ...]:
@@ -192,7 +193,6 @@ def _message_observations(
         synthetic: Whether the timestamp is EXP-assigned.
         source_trace_id: Vendor conversation key.
         request_text: Trace request text, supplied only on the first emitted observation.
-        input_messages: Messages preceding this one, retained as canonical input evidence.
         model: Declared conversation model identity.
         extensions: Approved EXP extension attributes for the conversation.
 
@@ -238,7 +238,7 @@ def _message_observations(
             ended_at=timestamp,
             kind="model",
             request_text=request_text,
-            input_messages=list(input_messages),
+            input_history_prefix=index,
             completion_text=completion or None,
             tool_calls=declared_tool_calls(message),
             model=model,

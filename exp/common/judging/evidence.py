@@ -30,6 +30,7 @@ _HIDDEN_EVIDENCE_KEYS: Final[frozenset[str]] = frozenset(
     {
         "request",
         "gen_ai.input.messages",
+        "exp.input.history_prefix",
         "reasoning",
         "reasoning_content",
         "redacted_thinking",
@@ -42,7 +43,8 @@ _HIDDEN_EVIDENCE_KEYS: Final[frozenset[str]] = frozenset(
 ``request`` carries the complete provider request for one model-call span, including the whole
 prior message history, so a ten-turn rollout would repeat its transcript quadratically.
 ``gen_ai.input.messages`` is the equivalent per-turn input history on normalized production
-trace spans. The remaining keys name provider reasoning containers that must never be shown to
+trace spans, and ``exp.input.history_prefix`` is its stored form when the history is shared
+on the trace. The remaining keys name provider reasoning containers that must never be shown to
 a judge scoring externally visible behavior.
 """
 

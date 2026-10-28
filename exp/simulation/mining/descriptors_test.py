@@ -5,7 +5,13 @@ from __future__ import annotations
 from collections.abc import Sequence
 
 from exp.common.tasks import ToolSchema
-from exp.simulation.mining.descriptors import RoutingDescriptor, normalized_vectors
+from exp.common.traces.ingest.chat_json_test import _inline_history, _two_request_trace
+from exp.simulation.mining.descriptors import (
+    RoutingDescriptor,
+    coverage_descriptor,
+    normalized_vectors,
+    routing_descriptor,
+)
 
 
 def _descriptor(*tools: str) -> RoutingDescriptor:
@@ -62,3 +68,12 @@ def test_mining_vectors_embed_the_similarity_text() -> None:
     normalized_vectors(embedder, (descriptor,))
 
     assert embedder.texts == [descriptor.similarity_text()]
+
+
+def test_descriptors_match_for_shared_and_inline_history() -> None:
+    """Storing chat history once leaves routing and coverage descriptors unchanged."""
+    trace = _two_request_trace()
+    inline = _inline_history(trace)
+
+    assert routing_descriptor(trace) == routing_descriptor(inline)
+    assert coverage_descriptor(trace) == coverage_descriptor(inline)

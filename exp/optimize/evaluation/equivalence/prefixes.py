@@ -147,7 +147,7 @@ def admit_actor_prefix(store: ArtifactStore, spec: ActorPrefixSpec) -> ActorDeci
     span = next((row for row in trace.spans if row.span_id == spec.model_span_id), None)
     if span is None:
         raise ValueError("actor prefix span absent; select the recorded next-decision model span")
-    messages = _messages(span.attributes.get("gen_ai.input.messages"))
+    messages = _messages(trace.input_messages(span))
     indexes = [
         i
         for i, row in enumerate(messages)
