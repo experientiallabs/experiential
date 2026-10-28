@@ -24,6 +24,14 @@ fit or held out together, and the root exposure ledger joins them by declared ta
 a reservation or exposure of one fork covers the rest. Studies only run from fit tasks of the
 source build (the study owner refuses reserved ones), so no export carries held-out evidence.
 
+Admission. Every export applies one registered admission policy, which must predate every
+study it judges. Each branch's per-dimension verdicts and overall verdict are recorded in its
+occurrence under ``exp.trace.metadata.occurrences[].admission`` and counted per branch in the
+summary; ``calibrations`` names saved comparisons under the same policy that may admit simulated
+observations. Admission is provenance for later consumers: refused and unassessable branches
+are still exported, so the evidence denominator stays complete, and verdict wording never
+changes a trace's content identity.
+
 Identity. Identical trajectories collapse into one trace whose provenance lists every
 occurrence. Trace IDs derive from content, and each authority is persisted as one immutable,
 content-addressed import, so an unchanged export replays its existing import.
@@ -63,15 +71,24 @@ from exp.common.traces.ingest.vendor_records import VendorTraceFormatError
 from exp.optimize.evaluation.continuations.prefix import _executed_parent
 from exp.optimize.evaluation.continuations.records import load_study
 from exp.optimize.evaluation.continuations.study import ContinuationBranch, ContinuationStudy
+from exp.optimize.evaluation.equivalence.dimensions import StepOwner, step_owner, world_identity
+from exp.optimize.evaluation.equivalence.policy import (
+    AdmissionPolicy,
+    Verdict,
+    load_admission_policy,
+    require_policy_precedes,
+)
+from exp.optimize.evaluation.equivalence.verdicts import (
+    CalibrationEvidence,
+    admit_trajectory,
+    policy_calibrations,
+)
 from exp.runtime.environments import Observation
-from exp.runtime.environments.mixed import MixedCheckpoint
-from exp.runtime.environments.world_outcomes import WorldExecutionReceipt
 from exp.simulation.continuations import ContinuationCheckpoint, load_continuation_checkpoint
 from exp.simulation.mining.exposure_ledger import TASK_LINEAGE_KEY
 
-TRAJECTORY_TRACE_PROTOCOL = "generated-trajectory-v1"
+TRAJECTORY_TRACE_PROTOCOL = "generated-trajectory-v2"
 Authority = Literal["generated-native", "generated-simulated"]
-StepOwner = Literal["native", "simulated", "unknown"]
 _KIND: dict[Authority, Literal["native-world", "simulation"]] = {
     "generated-native": "native-world",
     "generated-simulated": "simulation",
@@ -86,11 +103,17 @@ class TrajectoryTraceExport(ContractModel):
         generators: Exact saved results: a continuation study, campaign, checkpoint
             experiment, actor panel, environment comparison or any report whose cells bind
             continuation-study results.
+        policy: Registered admission policy applied to every trajectory; it must be
+            registered before every study the generators reach.
+        calibrations: Saved ``compare-environments`` reports registered under the same policy;
+            only their calibration can admit a simulated observation.
         project: Project receiving the imports, so ``exp build PROJECT --import-id`` accepts
             them. Defaults to the project holding the generators.
     """
 
     generators: tuple[ArtifactInput, ...] = Field(min_length=1)
+    policy: ArtifactInput
+    calibrations: tuple[ArtifactInput, ...] = ()
     project: str | None = None
 
 
@@ -137,6 +160,8 @@ class TrajectoryTraceSummary(ContractModel):
         duplicates: Branches collapsed into an identical trajectory's trace.
         skipped: Branches that produced no trace.
         imports: One entry per authority with at least one trace.
+        policy: Admission policy applied.
+        admission: Exported branches per overall admission verdict.
     """
 
     project: str
@@ -148,6 +173,23 @@ class TrajectoryTraceSummary(ContractModel):
     duplicates: int
     skipped: tuple[TrajectorySkip, ...] = ()
     imports: tuple[TrajectoryImport, ...] = ()
+    policy: ArtifactInput
+    admission: dict[Verdict, int]
+
+
+@dataclass(frozen=True)
+class _Admission:
+    """The registered policy and calibrations one export applies.
+
+    Attributes:
+        reference: Registered policy reference.
+        policy: The registered policy.
+        calibrations: Supplied calibrations under the policy.
+    """
+
+    reference: ArtifactInput
+    policy: AdmissionPolicy
+    calibrations: tuple[CalibrationEvidence, ...]
 
 
 @dataclass(frozen=True)
@@ -186,12 +228,14 @@ class _Trajectory:
         authority: Export authority.
         conversation: Chat conversation with provenance extensions, minus occurrences.
         mixed: Whether a reply was excluded.
-        occurrences: Per-branch provenance of identical trajectories.
+        occurrences: Per-branch provenance of identical trajectories, each with its verdict.
+        verdicts: Overall admission verdict of each occurrence, in the same order.
     """
 
     authority: Authority
     conversation: JsonObject
     mixed: bool
+    verdicts: list[Verdict] = field(default_factory=list)
     occurrences: list[JsonObject] = field(default_factory=list)
 
 
@@ -209,10 +253,16 @@ def export_trajectory_traces(
         Counts by authority, skipped branches and the import of each authority.
 
     Raises:
-        ValueError: A generator differs from its saved artifact or reaches no study.
+        ValueError: A generator differs from its saved artifact or reaches no study, the
+            policy was registered after a study, or a calibration is not under the policy.
     """
     destination = validate_local_id(spec.project or project.paths.project_id, label="project ID")
     store = project.artifacts
+    admission = _Admission(
+        spec.policy,
+        load_admission_policy(store, spec.policy),
+        policy_calibrations(project, spec.calibrations, spec.policy),
+    )
     studies: dict[str, tuple[ArtifactInput, list[str]]] = {}
     for generator in spec.generators:
         for reference in trajectory_studies(store, generator):
@@ -225,9 +275,12 @@ def export_trajectory_traces(
     for study_id in sorted(studies):
         reference, generators = studies[study_id]
         study = load_study(store, reference)
+        require_policy_precedes(
+            store, spec.policy, study_id.removesuffix("-result"), subject="continuation study"
+        )
         for branch in study.branches:
             branches += 1
-            converted = _trajectory(project, study, branch, reference, generators)
+            converted = _trajectory(project, study, branch, reference, generators, admission)
             if isinstance(converted, TrajectorySkip):
                 skipped.append(converted)
                 continue
@@ -235,6 +288,7 @@ def export_trajectory_traces(
             if trace_id in trajectories:
                 duplicates += 1
                 trajectories[trace_id].occurrences.extend(converted.occurrences)
+                trajectories[trace_id].verdicts.extend(converted.verdicts)
             else:
                 trajectories[trace_id] = converted
     imports = tuple(
@@ -252,6 +306,11 @@ def export_trajectory_traces(
         duplicates=duplicates,
         skipped=tuple(skipped),
         imports=imports,
+        policy=spec.policy,
+        admission={
+            verdict: sum(row.verdicts.count(verdict) for row in trajectories.values())
+            for verdict in ("admitted", "refused", "unassessable")
+        },
     )
 
 
@@ -306,6 +365,7 @@ def _trajectory(
     branch: ContinuationBranch,
     reference: ArtifactInput,
     generators: Sequence[str],
+    admission: _Admission,
 ) -> _Trajectory | TrajectorySkip:
     """Reconstruct one branch's actor-visible conversation and classify its authority.
 
@@ -315,6 +375,7 @@ def _trajectory(
         branch: Saved branch, including interrupted ones.
         reference: Study result reference.
         generators: Every requested generator artifact ID that reached the study.
+        admission: Policy and calibrations applied to the branch.
 
     Returns:
         The exportable trajectory, or why the branch produced none.
@@ -341,6 +402,15 @@ def _trajectory(
         )
     simulated = any(entry.reply and entry.reply.owner == "simulated" for entry in reconstructed)
     authority: Authority = "generated-simulated" if simulated else "generated-native"
+    verdict = admit_trajectory(
+        admission.reference,
+        admission.policy,
+        branch,
+        checkpoint=checkpoint,
+        verifier=study.spec.verifier,
+        actor_model=study.spec.actor_model,
+        calibrations=admission.calibrations,
+    )
     rendered = _conversation(project, study, branch, checkpoint, reconstructed, authority)
     if isinstance(rendered, str):
         return skip(rendered)
@@ -355,8 +425,9 @@ def _trajectory(
         "fork_lineage": list(lineage),
         "prefix": "executed" if executed else "unverified",
         "code_revision": manifest.code_revision,
+        "admission": verdict.model_dump(mode="json"),
     }
-    return _Trajectory(authority, conversation, mixed, [occurrence])
+    return _Trajectory(authority, conversation, mixed, [verdict.status], [occurrence])
 
 
 def _prefix_replies(
@@ -469,14 +540,7 @@ def _step_reply(step: JsonValue) -> _Reply:
     """
     assert isinstance(step, dict)
     reply = step.get("reply")
-    is_error = isinstance(reply, dict) and reply.get("is_error") is True
-    raw = step.get("execution")
-    if not isinstance(raw, dict):
-        return _Reply("unknown", is_error)
-    receipt = WorldExecutionReceipt.model_validate(raw)
-    if receipt.action_sha256 != sha256_json(ToolCall.model_validate(step.get("action"))):
-        return _Reply("unknown", is_error)
-    return _Reply(receipt.owner, is_error)
+    return _Reply(step_owner(step), isinstance(reply, dict) and reply.get("is_error") is True)
 
 
 def _conversation(
@@ -568,7 +632,7 @@ def _conversation(
             "origin": task.origin,
             "source_trace_ids": list(task.source_trace_ids),
         },
-        "world": _world(checkpoint),
+        "world": world_identity(checkpoint),
         "actor_model": model.model_dump(mode="json"),
         "verifier": None
         if branch.assessment is None
@@ -612,38 +676,6 @@ def _unique(call_id: str, used: set[str]) -> str:
         candidate, index = f"{call_id}~{index}", index + 1
     used.add(candidate)
     return candidate
-
-
-def _world(checkpoint: ContinuationCheckpoint) -> JsonObject:
-    """Identify the world the branch ran in by manifest, backend and policy digests.
-
-    Args:
-        checkpoint: Resumed checkpoint.
-
-    Returns:
-        Secret-free world identity.
-    """
-    world = checkpoint.world
-    if isinstance(world, MixedCheckpoint):
-        worlds = {"native": world.native, "simulated": world.candidate}
-        return {
-            "kind": "mixed",
-            "policy_sha256": world.policy_sha256,
-            "backends": {
-                owner: {
-                    "manifest_sha256": point.manifest_sha256,
-                    "backend_sha256": point.backend_sha256,
-                }
-                for owner, point in worlds.items()
-                if point is not None
-            },
-        }
-    return {
-        "kind": "executable",
-        "manifest_sha256": world.manifest_sha256,
-        "backend_sha256": world.backend_sha256,
-        "owner": world.owner,
-    }
 
 
 def _outcome(branch: ContinuationBranch) -> JsonObject:

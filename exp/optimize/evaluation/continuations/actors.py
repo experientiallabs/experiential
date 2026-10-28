@@ -29,6 +29,7 @@ from exp.optimize.evaluation.continuations.job import (
     saved_continuation_job,
 )
 from exp.optimize.evaluation.continuations.records import load_study
+from exp.optimize.evaluation.continuations.study import actor_budget_exhausted
 from exp.optimize.evaluation.executable.deferral import (
     deferred_execution,
     record_execution_deferral,
@@ -296,19 +297,17 @@ def panel_metrics(
     for index, actor in enumerate(spec.actors):
         rows = [row for row in cells if row.actor == index]
         lower, upper = [], []
-        planned = successes = violations = goal_pass = unknown = 0
+        planned = successes = violations = goal_pass = unknown = exhausted = 0
         for row in rows:
             count = row.job.study.repeats
             planned += count
-            grades = (
-                ()
-                if row.result is None
-                else tuple(
-                    branch.assessment
-                    for branch in load_study(project.artifacts, row.result).branches
-                    if branch.assessment is not None
-                )
+            branches = (
+                () if row.result is None else load_study(project.artifacts, row.result).branches
             )
+            grades = tuple(
+                branch.assessment for branch in branches if branch.assessment is not None
+            )
+            exhausted += actor_budget_exhausted(branches)
             passed = sum(grade.status == "pass" for grade in grades)
             missing = count - sum(grade.status != "unassessable" for grade in grades)
             successes += passed
@@ -331,6 +330,8 @@ def panel_metrics(
                 "goal_pass": goal_pass,
                 "policy_violations": violations,
                 "unknown": unknown,
+                "actor_budget_exhausted": exhausted,
+                "actor_budget_exhausted_share": exhausted / planned if planned else None,
                 "case_weighted_pass_bounds": [low, high],
             }
         )

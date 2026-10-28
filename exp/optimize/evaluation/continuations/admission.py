@@ -1,4 +1,9 @@
-"""Independent, pre-registered acceptance of saved development continuations for SFT."""
+"""Independent, pre-registered acceptance of saved development continuations for SFT.
+
+Every branch is judged twice: against the independent training specification frozen before
+sampling, and dimension by dimension under a registered admission policy that predates the
+study. A branch is admitted only when both pass; its per-dimension verdicts stay in the report.
+"""
 
 from datetime import datetime
 
@@ -11,12 +16,22 @@ from exp.common.core.artifacts import (
     sha256_json,
     stable_id,
 )
-from exp.common.project import ArtifactStore, artifact_input
+from exp.common.project import ArtifactStore, ProjectStore, artifact_input
 from exp.optimize.evaluation.continuations.evidence import (
     TrainingEvidenceAssessment,
     verify_training_evidence,
 )
 from exp.optimize.evaluation.continuations.records import load_study
+from exp.optimize.evaluation.equivalence.policy import (
+    load_admission_policy,
+    require_policy_precedes,
+)
+from exp.optimize.evaluation.equivalence.runner import load_equivalence_report
+from exp.optimize.evaluation.equivalence.verdicts import (
+    CalibrationEvidence,
+    TrajectoryAdmission,
+    admit_trajectory,
+)
 from exp.simulation.continuations import load_continuation_checkpoint
 from exp.simulation.development_scope import require_development_task
 from exp.simulation.evaluation.admission import (
@@ -36,11 +51,13 @@ class BranchAdmission(ContractModel):
         admitted: Whether the saved execution passed both independent and study criteria.
         reason: Concrete refusal or scope of acceptance.
         witness: Re-derived specification witness, when available.
+        policy: Per-dimension verdicts under the registered admission policy.
     """
 
     index: int = Field(ge=0)
     admitted: bool
     reason: str
+    policy: TrajectoryAdmission
     witness: ArtifactInput | None = None
 
 
@@ -49,6 +66,7 @@ class ContinuationAdmission(ContractModel):
 
     Attributes:
         study: Exact saved study result, including all failures.
+        policy: Registered admission policy, fixed before the study was registered.
         branches: Decisions in the original registration order.
         scope: Checked success under the declared observation and policy contract only.
         evidence: Re-derived task qualification and comparison scope, absent for outcome-only
@@ -56,6 +74,7 @@ class ContinuationAdmission(ContractModel):
     """
 
     study: ArtifactInput
+    policy: ArtifactInput
     branches: tuple[BranchAdmission, ...]
     scope: str = "development; independently specified observed outcome, not native fidelity"
     evidence: TrainingEvidenceAssessment | None = None
@@ -65,6 +84,7 @@ def admit_continuations(
     store: ArtifactStore,
     study_ref: ArtifactInput,
     *,
+    policy: ArtifactInput,
     created_at: datetime,
     code_revision: str,
 ) -> ArtifactInput:
@@ -73,13 +93,21 @@ def admit_continuations(
     Args:
         store: Trusted artifact owner; no caller-supplied outcomes are accepted.
         study_ref: Complete saved development study.
+        policy: Registered admission policy, registered before the study.
         created_at: Decision publication time.
         code_revision: Producing implementation identity.
 
     Returns:
         Immutable report including rejected and unknown branches. No calls are dispatched.
+
+    Raises:
+        ValueError: The policy is not registered or was registered after the study.
     """
     study = load_study(store, study_ref)
+    rules = load_admission_policy(store, policy)
+    require_policy_precedes(
+        store, policy, study_ref.artifact_id.removesuffix("-result"), subject="continuation study"
+    )
     evidence = verify_training_evidence(
         store,
         study.spec,
@@ -101,10 +129,20 @@ def admit_continuations(
         predicate = EvaluationSpecification.model_validate_json(
             store.read_bytes(specification.artifact_id, "specification.json")
         )
+    calibrations = _calibrations(store, evidence, policy)
     decisions = []
     for branch in study.branches:
         reason = None
         witness = None
+        verdicts = admit_trajectory(
+            policy,
+            rules,
+            branch,
+            checkpoint=checkpoint,
+            verifier=study.spec.verifier,
+            actor_model=study.spec.actor_model,
+            calibrations=calibrations,
+        )
         assessment = grade(study.spec.verifier, branch.grading_outcome())
         if branch.status != "completed" or not assessment.complete:
             reason = "execution incomplete or outcome unknown"
@@ -141,21 +179,32 @@ def admit_continuations(
             )
             if refusal is not None:
                 reason = f"{refusal.reason}: {refusal.detail}"
+        if reason is None and verdicts.status != "admitted":
+            reason = f"admission policy {verdicts.status}: " + "; ".join(verdicts.reasons)
         decisions.append(
             BranchAdmission(
                 index=branch.index,
                 admitted=reason is None,
-                reason=reason or "goal, policy and independent pre-registered specification passed",
+                reason=reason
+                or "goal, policy, independent pre-registered specification and every gating "
+                "admission dimension passed",
+                policy=verdicts,
                 witness=witness,
             )
         )
-    result = ContinuationAdmission(study=study_ref, branches=tuple(decisions), evidence=evidence)
+    result = ContinuationAdmission(
+        study=study_ref, policy=policy, branches=tuple(decisions), evidence=evidence
+    )
     identity = stable_id(
         "continuation-admission", {"result": sha256_json(result), "code": code_revision}
     )
     if store.exists(identity):
         return artifact_input(store.read(identity).manifest)
-    inputs = {study_ref, *(row.witness for row in decisions if row.witness is not None)}
+    inputs = {
+        study_ref,
+        policy,
+        *(row.witness for row in decisions if row.witness is not None),
+    }
     if study.spec.training_evidence is not None:
         inputs.update(study.spec.training_evidence.sources())
     manifest = store.write_json(
@@ -170,3 +219,26 @@ def admit_continuations(
         files={"admission.json": result},
     )
     return artifact_input(manifest)
+
+
+def _calibrations(
+    store: ArtifactStore, evidence: TrainingEvidenceAssessment | None, policy: ArtifactInput
+) -> tuple[CalibrationEvidence, ...]:
+    """Use the comparison pinned before generation, when it was calibrated under this policy.
+
+    Args:
+        store: Project artifact store.
+        evidence: Re-derived training evidence, possibly with a pinned comparison.
+        policy: Applied admission policy.
+
+    Returns:
+        The pinned comparison's calibration, or nothing; simulated observations then stay
+        unassessable rather than borrowing another policy's margins.
+    """
+    if evidence is None or evidence.comparison is None:
+        return ()
+    project = ProjectStore(store.paths.root, store.paths.project_id)
+    report = load_equivalence_report(project, evidence.comparison)
+    if report.calibration is None or report.calibration.policy != policy:
+        return ()
+    return (CalibrationEvidence(report=evidence.comparison, calibration=report.calibration),)

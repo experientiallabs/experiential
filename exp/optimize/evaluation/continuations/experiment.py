@@ -33,7 +33,7 @@ from exp.optimize.evaluation.continuations.job import (
 )
 from exp.optimize.evaluation.continuations.records import load_study
 from exp.optimize.evaluation.continuations.selection import load_selection_plan, selection_jobs
-from exp.optimize.evaluation.continuations.study import known_outcomes
+from exp.optimize.evaluation.continuations.study import actor_budget_exhausted, known_outcomes
 from exp.optimize.evaluation.executable.deferral import (
     deferred_execution,
     record_execution_deferral,
@@ -116,6 +116,7 @@ def _critic(template: CriticSpec, job: ContinuationJob) -> CriticSpec:
         or spec.maximum_model_calls != job.maximum_model_calls
         or spec.system_prompt != job.system_prompt
         or spec.actor_output_tokens != job.study.maximum_output_tokens
+        or spec.actor_reasoning_effort != job.study.reasoning_effort
         or spec.temperature != job.study.temperature
         or spec.verifier_sha256 != sha256_json(job.study.verifier)
         or spec.probe_sha256 != job.study.probe_sha256
@@ -144,7 +145,7 @@ def _metrics(project: ProjectStore, cells: tuple[ExperimentCell, ...]) -> JsonOb
     for arm in ("proposed", "random"):
         group = [cell for cell in cells if cell.arm == arm]
         planned = sum(cell.job.study.repeats for cell in group)
-        passed = known = mixed = actor_requests = 0
+        passed = known = mixed = actor_requests = exhausted = 0
         briers = []
         for cell in group:
             if cell.result is None:
@@ -153,6 +154,7 @@ def _metrics(project: ProjectStore, cells: tuple[ExperimentCell, ...]) -> JsonOb
             labels = known_outcomes(row.assessment for row in result.branches)
             passed += sum(labels)
             known += len(labels)
+            exhausted += actor_budget_exhausted(result.branches)
             mixed += bool(labels and 0 < sum(labels) < len(labels))
             for branch in result.branches:
                 calls = branch.outcome.get("model_calls", [])
@@ -172,6 +174,8 @@ def _metrics(project: ProjectStore, cells: tuple[ExperimentCell, ...]) -> JsonOb
             "successes": passed,
             "assessable": known,
             "unknown": planned - known,
+            "actor_budget_exhausted": exhausted,
+            "actor_budget_exhausted_share": exhausted / planned if planned else None,
             "success_bounds": missing_outcome_bounds(passed, planned - known, planned),
             "checkpoints_with_both_success_and_failure": mixed,
             "critic_assessable_checkpoints": len(briers),

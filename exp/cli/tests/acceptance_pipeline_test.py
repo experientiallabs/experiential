@@ -7,14 +7,16 @@ only, so a break between two stages fails here even when every stage's own tests
    and learns from every trace.
 2. ``exp eval --audit`` measures the simulator on held-out traces with frozen fit-only memory,
    then replays the saved audit without a provider call.
-3. ``development-tasks`` chooses a fit task of the build, ``ground-runtime`` grounds the built
+3. ``register-admission-policy`` fixes the per-dimension admission policy before any result;
+   ``development-tasks`` chooses a fit task of the build, ``ground-runtime`` grounds the built
    simulator with its learned memory and the trace's instance facts, and
    ``compare-environments`` runs the native world and that simulator on the captured task under
-   one actor policy.
+   one actor policy and that policy's margins.
 4. ``register-specification`` saves an independent acceptance specification, and ``capture``
    and ``run`` fork native branches from the captured checkpoint.
-5. ``export-traces`` turns those trajectories into imports: native ones are learned by
-   ``exp build --import-id``; simulated ones are refused.
+5. ``export-traces`` turns those trajectories into imports under the policy: native ones are
+   admitted and learned by ``exp build --import-id``; simulated ones stay unassessable without
+   an applicable calibration and are refused as learning source.
 6. ``repair-learning`` screens learning misses into lessons, and the audit compares the three
    memory profiles.
 7. ``harbor`` registers the native task, witnesses its controls, qualifies it, exports and
@@ -52,7 +54,7 @@ from exp.common.core.artifacts import (
     sha256_json,
 )
 from exp.common.models import ToolCall, load_model_catalog
-from exp.common.project import ProjectStore
+from exp.common.project import ProjectStore, artifact_input
 from exp.common.tasks import TaskCase, ToolSchema
 from exp.common.tasks.facts import FactProvenance, FactValidation, InstanceFact, InstanceFacts
 from exp.common.tasks.store import load_task_set
@@ -69,6 +71,8 @@ from exp.optimize.evaluation.audit.panel_test import (
 from exp.optimize.evaluation.continuations.capture import CaptureDefinition
 from exp.optimize.evaluation.continuations.job import ContinuationJob
 from exp.optimize.evaluation.continuations.study import ContinuationStudySpec
+from exp.optimize.evaluation.equivalence.policy import policy_identity
+from exp.optimize.evaluation.equivalence.policy_test import fixture_policy
 from exp.optimize.evaluation.equivalence.review import ReviewModel
 from exp.optimize.evaluation.equivalence.runner import EquivalenceCase, EquivalenceSpec
 from exp.optimize.evaluation.executable import workbook as workbook_runtime
@@ -1330,8 +1334,22 @@ def job(
     )
 
 
+def register_policy(pipeline: Pipeline) -> ArtifactInput:
+    """Stage 3a: register the admission policy before any comparison or trajectory exists."""
+    policy = fixture_policy()
+    operation = {
+        "action": "register-admission-policy",
+        "admission_policy": policy.model_dump(mode="json"),
+    }
+    assert "Dry run: not registered" in pipeline.operation("policy", operation, "--dry-run")
+    output = pipeline.operation("policy", operation)
+    reference = artifact_input(pipeline.project.artifacts.read(policy_identity(policy)).manifest)
+    assert reference.artifact_id in output, output
+    return reference
+
+
 def compare_environments(
-    pipeline: Pipeline, monkeypatch: pytest.MonkeyPatch
+    pipeline: Pipeline, monkeypatch: pytest.MonkeyPatch, policy: ArtifactInput
 ) -> tuple[Development, ArtifactInput]:
     """Stage 3: pair the native world with the built simulator on one captured fit task."""
     world, project = pipeline.world, pipeline.project
@@ -1463,6 +1481,7 @@ def compare_environments(
         analysts=(reviewer,),
         maximum_review_attempts=3,
         deadline=DEADLINE,
+        policy=policy,
     )
     actor = ScriptedActor(terms.plans[:1])
     reviews = ScriptedReviewer()
@@ -1488,6 +1507,11 @@ def compare_environments(
     assert _obj(control["agreement"])["wilson_95"]
     assert _obj(metrics["candidate_minus_control"])["estimate"] == 0.0
     assert set(_obj(report["analyses"])) == {"case-0:judge"}
+    # One task family is too few independent units for any equivalence verdict.
+    calibration = _obj(report["calibration"])
+    assert calibration["policy"] == policy.artifact_id
+    goal = _obj(_obj(calibration["dimensions"])["goal_success"])
+    assert goal["status"] == "unassessable" and "underpowered: 1" in str(goal["reason"]), goal
     predictions = [
         _user_content(row.payload)
         for row in pipeline.provider.requests
@@ -1574,7 +1598,10 @@ def fork_native_branches(
 
 
 def export_and_learn(
-    pipeline: Pipeline, development: Development, generators: Sequence[ArtifactInput]
+    pipeline: Pipeline,
+    development: Development,
+    generators: Sequence[ArtifactInput],
+    policy: ArtifactInput,
 ) -> None:
     """Stage 5: export the generated trajectories; only native ones become learning evidence."""
     learner = f"{pipeline.world.kind}-learner"
@@ -1582,6 +1609,8 @@ def export_and_learn(
         "action": "export-traces",
         "traces": {
             "generators": [row.model_dump(mode="json") for row in generators],
+            "policy": policy.model_dump(mode="json"),
+            "calibrations": [generators[0].model_dump(mode="json")],
             "project": learner,
         },
     }
@@ -1595,6 +1624,11 @@ def export_and_learn(
     assert counts is not None and "Dry run: nothing imported." in dry, dry
     exported = pipeline.operation("export-traces", operation)
     assert counts.group(0) in exported, exported
+    admission = re.search(
+        rf"Admission policy {policy.artifact_id}: (\d+) admitted, 0 refused, 1 unassessable",
+        exported,
+    )
+    assert admission is not None and int(admission.group(1)) >= int(counts.group(1)), exported
     assert len(pipeline.provider.requests) == calls, "the export opens no runtime or provider"
     native = re.search(rf"exp build {learner} --import-id (import-[0-9a-f]+)", exported)
     simulated = re.search(r"generated-simulated: (import-[0-9a-f]+)", exported)
@@ -1605,10 +1639,18 @@ def export_and_learn(
     for trace in traces:
         assert trace.source.identity.kind == "native-world"
         assert trace.conversation_id == lineage, "every fork keeps its source task's lineage"
-        steps = _arr(_obj(trace.spans[0].attributes["exp.trace.metadata"])["steps"])
-        assert {_obj(row)["owner"] for row in steps} == {"native"}
+        provenance = _obj(trace.spans[0].attributes["exp.trace.metadata"])
+        assert {_obj(row)["owner"] for row in _arr(provenance["steps"])} == {"native"}
+        for occurrence in _arr(provenance["occurrences"]):
+            verdict = _obj(_obj(occurrence)["admission"])
+            assert (verdict["status"], verdict["simulated"]) == ("admitted", False)
+            assert _obj(verdict["policy"])["artifact_id"] == policy.artifact_id
     (labelled,) = read_ingested_traces(pipeline.root, simulated.group(1)).traces
     assert labelled.source.identity.kind == "simulation"
+    (occurrence,) = _arr(_obj(labelled.spans[0].attributes["exp.trace.metadata"])["occurrences"])
+    withheld = _obj(_obj(occurrence)["admission"])
+    assert (withheld["status"], withheld["simulated"]) == ("unassessable", True)
+    assert any("underpowered" in str(reason) for reason in _arr(withheld["reasons"])), withheld
 
     root = str(pipeline.root)
     built = exp(
@@ -1822,7 +1864,9 @@ def package_and_trial(
     assert not list(scratch.iterdir()), "every trial removed its temporary files"
 
 
-def relearn_in_place(pipeline: Pipeline, generators: Sequence[ArtifactInput]) -> None:
+def relearn_in_place(
+    pipeline: Pipeline, generators: Sequence[ArtifactInput], policy: ArtifactInput
+) -> None:
     """Export to the default destination, the source project, and rebuild it from the import.
 
     The command the export prints must run as printed, although the project was first built
@@ -1831,7 +1875,10 @@ def relearn_in_place(pipeline: Pipeline, generators: Sequence[ArtifactInput]) ->
     project = pipeline.project.paths.project_id
     operation: JsonObject = {
         "action": "export-traces",
-        "traces": {"generators": [row.model_dump(mode="json") for row in generators]},
+        "traces": {
+            "generators": [row.model_dump(mode="json") for row in generators],
+            "policy": policy.model_dump(mode="json"),
+        },
     }
     exported = pipeline.operation("export-in-place", operation)
     printed = re.search(
@@ -1854,9 +1901,10 @@ def test_pipeline_connects_every_stage_through_the_cli(
     """Build, audit, compare, fork, export, learn, screen and package one world end to end."""
     pipeline, traces = offline_pipeline(WORLDS[kind], tmp_path, monkeypatch)
     build_and_audit(pipeline, traces)
-    development, comparison = compare_environments(pipeline, monkeypatch)
+    policy = register_policy(pipeline)
+    development, comparison = compare_environments(pipeline, monkeypatch, policy)
     forked, feasibility, studies = fork_native_branches(pipeline, development, monkeypatch)
-    export_and_learn(pipeline, development, (comparison, *studies))
+    export_and_learn(pipeline, development, (comparison, *studies), policy)
     screen_lessons(pipeline)
     package_and_trial(pipeline, development, forked, feasibility, monkeypatch)
-    relearn_in_place(pipeline, studies)
+    relearn_in_place(pipeline, studies, policy)

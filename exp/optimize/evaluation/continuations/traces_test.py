@@ -41,6 +41,7 @@ from exp.optimize.evaluation.continuations.traces import (
     export_trajectory_traces,
     trajectory_studies,
 )
+from exp.optimize.evaluation.equivalence.policy_test import registered_policy
 from exp.optimize.evaluation.fidelity.replay import recorded_exchanges
 from exp.runtime.agents.chat import ChatAgentRuntime
 from exp.runtime.agents.chat_test import _Model, _response
@@ -291,6 +292,7 @@ def test_native_workbook_branches_export_with_provenance_and_collapse_identical_
 ) -> None:
     """Two identical native XLSX branches become one native trace listing both occurrences."""
     project = ProjectStore(tmp_path, PROJECT)
+    policy = registered_policy(project.artifacts)
     checkpoint, actor = capsule(project.artifacts)
     reference = persist_continuation_checkpoint(
         project.artifacts, checkpoint, created_at=datetime.now(UTC), code_revision=REVISION
@@ -311,7 +313,7 @@ def test_native_workbook_branches_export_with_provenance_and_collapse_identical_
         study_probe=probe,
         probe_sha256=sha256_json({"probe": "xlsx-row-count-v1"}),
     )
-    spec = TrajectoryTraceExport(generators=(result,))
+    spec = TrajectoryTraceExport(policy=policy, generators=(result,))
     dry = export_trajectory_traces(project, spec, dry_run=True)
     assert (dry.branches, dry.native, dry.mixed, dry.simulated, dry.duplicates) == (2, 1, 0, 0, 1)
     assert [row.import_id for row in dry.imports] == [None]
@@ -339,6 +341,17 @@ def test_native_workbook_branches_export_with_provenance_and_collapse_identical_
     assert isinstance(verifier, dict) and verifier["status"] == "pass"
     occurrences = provenance["occurrences"]
     assert isinstance(occurrences, list) and len(occurrences) == 2
+    # Each branch carries its own verdict under the policy, outside the trace identity.
+    occurrences = [dict(row) for row in occurrences if isinstance(row, dict)]
+    verdicts = [row.pop("admission") for row in occurrences]
+    assert all(
+        isinstance(row, dict)
+        and row["status"] == "admitted"
+        and row["policy"] == policy.model_dump(mode="json")
+        for row in verdicts
+    )
+    assert "admission" not in provenance
+    assert summary.admission == {"admitted": 2, "refused": 0, "unassessable": 0}
     assert {json.dumps(row, sort_keys=True) for row in occurrences} == {
         json.dumps(
             {
@@ -375,6 +388,7 @@ def test_record_world_authority_splits_native_from_simulated_and_build_refuses_s
 ) -> None:
     """A simulated owner's trajectories are labelled and refused as learning source."""
     project = ProjectStore(tmp_path, PROJECT)
+    policy = registered_policy(project.artifacts)
     store = project.artifacts
     native = ticket_studies(store, tasks=1)
     reference, _ = capture(store, simulated_tickets(), ticket_task(9))
@@ -384,7 +398,7 @@ def test_record_world_authority_splits_native_from_simulated_and_build_refuses_s
         sorted((*native, simulated), key=lambda row: row.artifact_id)
     )
     summary = export_trajectory_traces(
-        project, TrajectoryTraceExport(generators=(generator,), project="learner")
+        project, TrajectoryTraceExport(policy=policy, generators=(generator,), project="learner")
     )
     assert (summary.project, summary.native, summary.simulated, summary.mixed) == (
         "learner",
@@ -429,6 +443,7 @@ def test_mixed_episodes_with_a_simulated_reply_are_simulated_including_through_f
 ) -> None:
     """A simulated refund decides the mixed grade, so the trace is simulated, also as a prefix."""
     project = ProjectStore(tmp_path, PROJECT)
+    policy = registered_policy(project.artifacts)
     store = project.artifacts
     events: list[MixedEvent] = []
     world = _world_runtime(events)
@@ -445,7 +460,9 @@ def test_mixed_episodes_with_a_simulated_reply_are_simulated_including_through_f
             )
         ],
     )
-    summary = export_trajectory_traces(project, TrajectoryTraceExport(generators=(parent,)))
+    summary = export_trajectory_traces(
+        project, TrajectoryTraceExport(policy=policy, generators=(parent,))
+    )
     assert (summary.native, summary.mixed, summary.simulated) == (0, 0, 1)
     (trace,) = imported(tmp_path, summary, "generated-simulated")
     assert trace.source.identity.kind == "simulation"
@@ -472,7 +489,9 @@ def test_mixed_episodes_with_a_simulated_reply_are_simulated_including_through_f
         world,
         [(AssistantAction(tool_calls=(_order("o2", "desk"),)), AssistantAction(content="done"))],
     )
-    summary = export_trajectory_traces(project, TrajectoryTraceExport(generators=(child,)))
+    summary = export_trajectory_traces(
+        project, TrajectoryTraceExport(policy=policy, generators=(child,))
+    )
     assert (summary.native, summary.simulated) == (0, 1)
     (forked,) = imported(tmp_path, summary, "generated-simulated")
     assert [(row["phase"], row["owner"], row["reply"]) for row in steps(forked)] == [
@@ -493,10 +512,13 @@ def test_branches_without_world_evidence_are_skipped_and_generators_must_reach_s
 ) -> None:
     """An answer-only branch has no reply to learn from; a foreign artifact is refused."""
     project = ProjectStore(tmp_path, PROJECT)
+    policy = registered_policy(project.artifacts)
     store = project.artifacts
     reference, _ = capture(store, ticket_case().runtime, ticket_task(0))
     result = study(store, reference, ticket_case().runtime, [(AssistantAction(content="done"),)])
-    summary = export_trajectory_traces(project, TrajectoryTraceExport(generators=(result,)))
+    summary = export_trajectory_traces(
+        project, TrajectoryTraceExport(policy=policy, generators=(result,))
+    )
     assert summary.imports == () and summary.native == summary.simulated == 0
     (skip,) = summary.skipped
     assert skip.branch == 0 and "no world evidence" in skip.reason
@@ -532,6 +554,7 @@ def authored_prefix(
 def test_authored_prefix_replies_are_never_proven_native(tmp_path: Path) -> None:
     """Context no world executed is excluded as unknown; an unpaired reply skips the branch."""
     project = ProjectStore(tmp_path, PROJECT)
+    policy = registered_policy(project.artifacts)
     store = project.artifacts
     _, point = capture(store, ticket_case().runtime, ticket_task(0))
     claimed = ToolCall(
@@ -551,7 +574,8 @@ def test_authored_prefix_replies_are_never_proven_native(tmp_path: Path) -> None
         for reference in (authored, orphan)
     ]
     summary = export_trajectory_traces(
-        project, TrajectoryTraceExport(generators=(panel(store, "authored", results),))
+        project,
+        TrajectoryTraceExport(policy=policy, generators=(panel(store, "authored", results),)),
     )
     assert (summary.native, summary.mixed) == (1, 1)
     (skip,) = summary.skipped

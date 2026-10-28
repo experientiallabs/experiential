@@ -8,7 +8,8 @@ import pytest
 
 from exp.common.core.artifacts import ArtifactInput, JsonObject, JsonValue
 from exp.common.project import ArtifactStore, ProjectPaths
-from exp.runtime.sessions.store import SessionBinding, SessionNotFoundError, SessionStore
+from exp.runtime.sessions.errors import SessionNotFoundError
+from exp.runtime.sessions.store import SessionBinding, SessionStore
 from exp.simulation.engines.text.generic_delta import apply_delta
 from exp.simulation.engines.transition import Completion
 from exp.simulation.retrieval.selection import AllOriginals

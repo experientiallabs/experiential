@@ -128,14 +128,16 @@ def capture_stored_world_checkpoint(
         code_revision: Producing source identity.
 
     Returns:
-        Persisted, source-verified candidate checkpoint.
+        Persisted, source-verified candidate checkpoint. The source store retains the
+        checkpointed revisions under the checkpoint's artifact identity until
+        ``SessionStore.release_pin`` releases them.
     """
 
     def proposals(operation_id: str) -> JsonObject | None:
         """Read one operation's authoritative saved proposal."""
         return session_store.proposal(session_id, operation_id)
 
-    return _capture_record(
+    checkpoint = _capture_record(
         session_store.read_session(session_id),
         proposals,
         world_model,
@@ -147,6 +149,10 @@ def capture_stored_world_checkpoint(
         created_at=created_at,
         code_revision=code_revision,
     )
+    session_store.pin_revisions(
+        checkpoint.artifact_id, session_id, 0, checkpoint.prefix_position + 1
+    )
+    return checkpoint
 
 
 def _capture_record(
@@ -303,7 +309,7 @@ def capture_world_checkpoint(
     context = session.evaluation_context.get("task_context", {})
     if not isinstance(context, dict):
         raise ValueError("checkpoint session has no public initialization context")
-    return _capture_record(
+    checkpoint = _capture_record(
         session.committed_record(),
         session.recorded_proposal,
         world_model,
@@ -315,6 +321,8 @@ def capture_world_checkpoint(
         created_at=created_at,
         code_revision=code_revision,
     )
+    session.retain_history(checkpoint.artifact_id, checkpoint.prefix_position + 1)
+    return checkpoint
 
 
 def load_world_checkpoint(artifacts: ArtifactStore, reference: ArtifactInput) -> WorldCheckpoint:

@@ -12,6 +12,7 @@ from pydantic import ValidationError
 from exp.common.core.artifacts import ArtifactInput, JsonValue, sha256_json
 from exp.common.traces import Trace
 from exp.simulation.mining.exposure_ledger import (
+    DECLARED_PREFIX,
     ExposureLedger,
     LedgerEdge,
     LedgerExposure,
@@ -29,6 +30,7 @@ from exp.simulation.mining.fingerprint import (
     trace_content_fingerprint,
     vector_trace,
 )
+from exp.simulation.mining.lineage import assign_source_lineages
 
 AT = datetime(2026, 10, 16, tzinfo=UTC)
 DATASET = ArtifactInput(artifact_id="trace-dataset-fixture", sha256="a" * 64)
@@ -48,6 +50,19 @@ def trace(index: int, *, lineage: str | None = None) -> Trace:
 def declaring(item: Trace, lineage: str) -> Trace:
     """The same content declaring another task identity (not part of the fingerprint)."""
     return item.model_copy(update={"initial_context": {"task_lineage": lineage}})
+
+
+def customer(item: Trace, customer_id: str, *, source_id: str | None = None) -> Trace:
+    """The same trace captured for one customer, optionally from another source."""
+    spans = tuple(
+        span.model_copy(update={"attributes": {**span.attributes, "exp.customer.id": customer_id}})
+        for span in item.spans
+    )
+    source = item.source
+    if source_id is not None:
+        identity = source.identity.model_copy(update={"source_id": source_id})
+        source = source.model_copy(update={"identity": identity})
+    return item.model_copy(update={"spans": spans, "source": source})
 
 
 def ordered_fingerprint(item: Trace) -> str | None:
@@ -74,12 +89,13 @@ EDITED = Scheme(
 
 
 def build(ledger: ExposureLedger, project: str, *traces: Trace) -> None:
-    """Record one build of ``traces`` with no near-duplicate unions."""
+    """Record one build of ``traces`` with its partition's declarations, no near-duplicates."""
     ledger.record_build(
         project=project,
         build=f"task-set-{project}",
         dataset=DATASET,
         traces=traces,
+        lineages=assign_source_lineages(traces),
         near_duplicates=(),
     )
 
@@ -133,6 +149,62 @@ def test_exposure_flows_transitively_and_backward_through_recorded_grouping(
     assert snapshot.exposure((vertex(ledger, d),)) is None
     # Late-link reassessment counts only exposure recorded before a cutoff.
     assert snapshot.exposure((vertex(ledger, c),), before=AT) is None
+
+
+def test_declared_task_edges_stay_within_one_source_and_customer(tmp_path: Path) -> None:
+    """A declared name links one customer's traces; another customer or source reusing it is not."""
+    ledger = ExposureLedger(tmp_path)
+    a = customer(trace(1, lineage="ticket-1"), "c1")
+    b = customer(trace(2, lineage="ticket-1"), "c1")
+    other_customer = customer(trace(3, lineage="ticket-1"), "c2")
+    other_source = customer(trace(4, lineage="ticket-1"), "c1", source_id="other-export")
+    build(ledger, "one", a, b, other_customer, other_source)
+
+    edges = ledger.export().edges
+    identities = {edge.left for edge in edges if edge.left.startswith(DECLARED_PREFIX)}
+    assert len(identities) == 3, "each source and customer scope has its own identity vertex"
+    assert [
+        (edge.left, edge.right, edge.task_lineage) for edge in edges if edge.left not in identities
+    ] == [(*sorted((vertex(ledger, a), vertex(ledger, b))), "ticket-1")]
+    expose(ledger, vertex(ledger, a))
+    snapshot = ledger.snapshot()
+    found = snapshot.exposure((vertex(ledger, b),))
+    assert found is not None and found.exposed_node == vertex(ledger, a)
+    assert snapshot.exposure((vertex(ledger, other_customer),)) is None
+    assert snapshot.exposure((vertex(ledger, other_source),)) is None
+    # The scope comes from the build's own partition: a trace without its assignment is refused.
+    with pytest.raises(ValueError, match="trace-1 has no source lineage assignment"):
+        ledger.record_build(
+            project="two",
+            build="task-set-two",
+            dataset=DATASET,
+            traces=(a,),
+            lineages=(),
+            near_duplicates=(),
+        )
+    assert ledger.snapshot().identity == snapshot.identity
+
+
+def test_a_declared_task_identity_links_traces_across_builds(tmp_path: Path) -> None:
+    """A task seen in one build stays exposed when a later import holds only new content of it."""
+    ledger = ExposureLedger(tmp_path)
+    seen = customer(trace(1, lineage="user_17"), "c1")
+    fresh = customer(trace(2, lineage="user_17"), "c1")
+    other_customer = customer(trace(3, lineage="user_17"), "c2")
+    other_source = customer(trace(4, lineage="user_17"), "c1", source_id="other-export")
+    build(ledger, "one", seen)
+    build(ledger, "two", fresh, other_customer, other_source)
+    exposure = expose(ledger, vertex(ledger, seen))
+    snapshot = ledger.snapshot()
+    found = snapshot.exposure((vertex(ledger, fresh),))
+    assert found is not None and found.by == (exposure.record_id,)
+    assert found.component_size == 2, "the task identity itself is not counted as content"
+    assert [(edge.task_lineage, edge.build) for edge in found.path] == [
+        ("user_17", "task-set-two"),
+        ("user_17", "task-set-one"),
+    ]
+    assert snapshot.exposure((vertex(ledger, other_customer),)) is None
+    assert snapshot.exposure((vertex(ledger, other_source),)) is None
 
 
 def test_matching_runs_under_every_computable_scheme_with_equivalence_links(

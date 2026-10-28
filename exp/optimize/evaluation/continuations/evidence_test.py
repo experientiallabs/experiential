@@ -22,6 +22,7 @@ from exp.optimize.evaluation.continuations.job import (
 )
 from exp.optimize.evaluation.continuations.job_test import job_fixture
 from exp.optimize.evaluation.equivalence.evidence import equivalence_metrics
+from exp.optimize.evaluation.equivalence.policy_test import registered_policy
 from exp.optimize.evaluation.equivalence.review import ReviewModel
 from exp.optimize.evaluation.equivalence.runner import (
     EquivalenceCase,
@@ -122,11 +123,16 @@ def test_qualified_run_and_export_retain_evidence_without_fidelity_claim(
     job = qualified_training_job(project, qualification=qualification)
     # Obtain a fresh admitted transport with the same scripted responses, in another project.
     _, _, transport = job_fixture(tmp_path / "transport", monkeypatch)
+    policy = registered_policy(project.artifacts)
     execute_continuation_job(project, job, code_revision="test")
     result = continuation_result_reference(project, job, code_revision="test")
     assert len(transport.requests) == 3
     reference = admit_continuations(
-        project.artifacts, result, created_at=datetime.now(UTC), code_revision="test"
+        project.artifacts,
+        result,
+        policy=policy,
+        created_at=datetime.now(UTC),
+        code_revision="test",
     )
     admission = ContinuationAdmission.model_validate_json(
         project.artifacts.read_bytes(reference.artifact_id, "admission.json")

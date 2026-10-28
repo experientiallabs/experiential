@@ -57,7 +57,17 @@ class ProviderRetryableResponseError(ProviderResponseError):
     Reasoning models can consume an entire output budget on hidden reasoning and return
     neither visible text nor a tool call. The response is well formed on the wire, so the
     request is safe to dispatch again under the client's bounded retry policy.
+
+    Attributes:
+        hit_length_limit: Whether the provider reported that the response stopped at the
+            output-token allowance, so the empty output means the allowance was spent (for
+            example on reasoning) rather than that the model chose to say nothing.
     """
+
+    def __init__(self, message: str, *, hit_length_limit: bool = False) -> None:
+        """Retain the sanitized failure and the provider's length-termination signal."""
+        super().__init__(message)
+        self.hit_length_limit = hit_length_limit
 
 
 class ProviderRefusalSignal(StrEnum):

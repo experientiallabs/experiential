@@ -6,7 +6,13 @@ from pathlib import Path
 import pytest
 
 from exp.common.core.artifacts import ArtifactInput, JsonObject, sha256_json
-from exp.common.models import AssistantAction, ModelRequest, ModelResponse, ToolCall
+from exp.common.models import (
+    AssistantAction,
+    ModelFinishReason,
+    ModelRequest,
+    ModelResponse,
+    ToolCall,
+)
 from exp.common.project import ArtifactStore, ProjectPaths
 from exp.optimize.evaluation.continuations.study import (
     ContinuationBranch,
@@ -14,6 +20,7 @@ from exp.optimize.evaluation.continuations.study import (
     ContinuationStudySpec,
     known_outcomes,
     run_continuation_study,
+    study_identity,
 )
 from exp.runtime.agents.chat import ChatAgentRuntime
 from exp.runtime.agents.chat_test import _Model, _response
@@ -23,6 +30,10 @@ from exp.runtime.environments.workbook_edits import WorkbookEditAdapter, read_su
 from exp.runtime.environments.world_contracts import ExecutableCheckpoint
 from exp.runtime.environments.worlds import ExecutableWorldRuntime
 from exp.runtime.models.call_evidence import current_call_intent, current_consumer
+from exp.runtime.models.providers.errors import (
+    ProviderRetryableResponseError,
+    ProviderTruncatedResponseError,
+)
 from exp.runtime.models.providers.transport import ProviderTransportError
 from exp.simulation.continuations import (
     ContinuationCheckpoint,
@@ -783,3 +794,104 @@ def test_cascade_branches_record_who_decided_each_step(tmp_path: Path) -> None:
     receipts = sorted(store.list_ids(artifact_type="cascade-decision"))
     assert [row.rsplit("-", 2)[-2:] for row in receipts] == [["decision", "0"], ["decision", "1"]]
     assert "cascade" not in spec.model_copy(update={"cascade": None}).model_dump(mode="json")
+
+
+def test_actor_reasoning_effort_reaches_every_request_and_keys_the_study(tmp_path: Path) -> None:
+    """A registered effort is sent on each actor call; unset, the request and identity stay."""
+    store = ArtifactStore(ProjectPaths(tmp_path, "case"))
+    spec, actor, point = _diagnostic_study(store)
+    assert "reasoning_effort" not in spec.model_dump(mode="json")
+    low = spec.model_copy(update={"reasoning_effort": "low"})
+    assert study_identity(low, "test") != study_identity(spec, "test")
+    for registered, expected in ((spec, None), (low, "low")):
+        model = _Model((_response(AssistantAction(content="done")),))
+        result = run_continuation_study(
+            store,
+            registered,
+            actor=actor,
+            model=model,
+            world=workbook_runtime(point.world),
+            probe=probe,
+            probe_sha256=registered.probe_sha256,
+            code_revision="test",
+        )
+        assert [request.reasoning_effort for request in model.requests] == [expected]
+        saved = ModelRequest.model_validate_json(
+            store.read_bytes(result.branches[0].actor_calls[0].artifact_id, "request.json")
+        )
+        assert saved.reasoning_effort == expected
+
+
+class _BudgetModel:
+    """Script one actor call per branch: a response to return or a provider error to raise."""
+
+    def __init__(self, script: tuple[ModelResponse | Exception, ...]) -> None:
+        """Keep the per-call script in dispatch order."""
+        self._script = iter(script)
+
+    def complete(self, request: ModelRequest) -> ModelResponse:
+        """Return or raise the next scripted outcome."""
+        step = next(self._script)
+        if isinstance(step, Exception):
+            raise step
+        return step
+
+
+def test_actor_budget_exhaustion_is_counted_apart_from_other_unknowns(tmp_path: Path) -> None:
+    """Spending the allowance without a tool call is its own counted stop beside grading.
+
+    A refused dispatch stays outcome-unknown and unassessable; a returned length stop keeps the
+    verifier's grade, a known failure at a declared limit.
+    """
+    store = ArtifactStore(ProjectPaths(tmp_path, "case"))
+    spec, actor, point = _diagnostic_study(store)
+    spec = spec.model_copy(update={"repeats": 5})
+    model = _BudgetModel(
+        (
+            ProviderRetryableResponseError("empty", hit_length_limit=True),
+            _response(AssistantAction(content="partial"), finish_reason=ModelFinishReason.LENGTH),
+            ProviderTruncatedResponseError("tool JSON ended early"),
+            ProviderRetryableResponseError("empty", hit_length_limit=False),
+            ProviderTransportError("provider unavailable"),
+        )
+    )
+    result = run_continuation_study(
+        store,
+        spec,
+        actor=actor,
+        model=model,
+        world=workbook_runtime(point.world),
+        probe=probe,
+        probe_sha256=spec.probe_sha256,
+        code_revision="test",
+    )
+    assert [row.actor_stop for row in result.branches] == [
+        "actor_budget_exhausted",
+        "actor_budget_exhausted",
+        "actor_budget_exhausted",
+        None,
+        None,
+    ]
+    assert [row.status for row in result.branches] == [
+        "outcome_unknown",
+        "completed",
+        "outcome_unknown",
+        "outcome_unknown",
+        "outcome_unknown",
+    ]
+    assert [
+        None if row.assessment is None else row.assessment.status for row in result.branches
+    ] == [
+        "unassessable",
+        "fail",
+        "unassessable",
+        "unassessable",
+        "unassessable",
+    ]
+    assert result.branches[0].failure_detail is not None
+    assert result.branches[0].failure_detail.details["phase"] == "actor_model_dispatch"
+    assert "actor_stop" not in result.branches[3].model_dump(mode="json")
+    metrics = result.metrics()
+    assert (metrics["planned"], metrics["assessable"], metrics["unassessable"]) == (5, 1, 4)
+    assert metrics["actor_budget_exhausted"] == 3
+    assert metrics["actor_budget_exhausted_share"] == 0.6

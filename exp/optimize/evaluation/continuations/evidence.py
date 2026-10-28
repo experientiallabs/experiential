@@ -5,11 +5,11 @@ against its selected reference. Neither establishes population fidelity or train
 """
 
 from exp.common.core.artifacts import ArtifactInput, ContractModel, JsonObject
-from exp.common.project import ArtifactStore, ProjectStore, artifact_input
+from exp.common.project import ArtifactStore, ProjectStore
 from exp.optimize.evaluation.continuations.job import ContinuationJob
 from exp.optimize.evaluation.continuations.study import ContinuationStudySpec, TrainingEvidence
 from exp.optimize.evaluation.equivalence.evidence import equivalence_metrics
-from exp.optimize.evaluation.equivalence.runner import EquivalenceReport, saved_equivalence
+from exp.optimize.evaluation.equivalence.runner import load_equivalence_report
 from exp.optimize.evaluation.executable.qualification import load_executable_qualification
 from exp.optimize.evaluation.executable.task import load_executable_task
 
@@ -99,7 +99,7 @@ def verify_training_evidence(
         )
     comparison = None
     if evidence.comparison is not None:
-        comparison = _comparison(project, evidence.comparison)
+        comparison = load_equivalence_report(project, evidence.comparison)
         index = evidence.comparison_case
         if index is None or index >= len(comparison.spec.cases):
             raise ValueError("comparison_case is outside the saved paired report")
@@ -126,26 +126,6 @@ def verify_training_evidence(
             tuple(row for row in comparison.measurements if row.case == evidence.comparison_case)
         ),
     )
-
-
-def _comparison(project: ProjectStore, reference: ArtifactInput) -> EquivalenceReport:
-    """Reconstruct a report from saved executions and reviews without fresh inference."""
-    store = project.artifacts
-    manifest = store.read(reference.artifact_id).manifest
-    if (
-        artifact_input(manifest) != reference
-        or manifest.artifact_type != "actor-equivalence-report"
-    ):
-        raise ValueError("comparison reference differs from the saved paired report")
-    report = EquivalenceReport.model_validate_json(
-        store.read_bytes(reference.artifact_id, "report.json")
-    )
-    if reference.artifact_id != report.spec.identity(manifest.code_revision) + "-result":
-        raise ValueError("comparison report lost its frozen identity")
-    rebuilt = saved_equivalence(project, report.spec, code_revision=manifest.code_revision)
-    if rebuilt != report:
-        raise ValueError("comparison report no longer reproduces from saved evidence")
-    return report
 
 
 def _comparison_execution(job: ContinuationJob) -> JsonObject:

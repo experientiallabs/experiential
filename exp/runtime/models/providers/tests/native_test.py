@@ -609,9 +609,10 @@ def test_openai_reasoning_only_output_surfaces_a_retryable_error_after_exhaustio
         retry_policy=RetryPolicy(maximum_attempts=2, initial_delay_seconds=0.0),
     )
 
-    with pytest.raises(ProviderRetryableResponseError, match="no text or tool call"):
+    with pytest.raises(ProviderRetryableResponseError, match="no text or tool call") as raised:
         client.complete(_request())
 
+    assert raised.value.hit_length_limit is True
     assert len(transport.requests) == 2
 
 

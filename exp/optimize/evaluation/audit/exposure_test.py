@@ -21,6 +21,7 @@ from exp.optimize.evaluation.audit.receipts_test import _dataset
 from exp.simulation.mining.exposure_ledger import ExposureLedger
 from exp.simulation.mining.exposure_ledger_test import DATASET, EDITED, trace
 from exp.simulation.mining.fingerprint import TRACE_CONTENT
+from exp.simulation.mining.lineage import assign_source_lineages
 
 
 def test_exposure_is_decided_only_with_a_ledger_that_recorded_the_build(
@@ -94,6 +95,7 @@ def test_unknown_scheme_nodes_without_equivalence_refuse_independent_audits(
         build="task-set-far",
         dataset=DATASET,
         traces=(trace(1), trace(2)),
+        lineages=assign_source_lineages((trace(1), trace(2))),
         near_duplicates=(),
     )
     assert ExposureLedger(store.paths.root).merge(elsewhere.export()) == (EDITED.identity,)

@@ -18,6 +18,7 @@ from exp.optimize.evaluation.continuations.admission import (
 )
 from exp.optimize.evaluation.continuations.job import continuation_result_reference
 from exp.optimize.evaluation.continuations.job_test import job_fixture
+from exp.optimize.evaluation.equivalence.policy_test import registered_policy
 from exp.optimize.evaluation.executable.qualification import qualify_executable_task
 from exp.optimize.evaluation.executable.qualification_test import qualified_fixture
 from exp.optimize.evaluation.executable.trial_test import _post
@@ -487,12 +488,17 @@ def test_cli_prepares_and_executes_qualified_training_job(
     assert runner.invoke(app, args).exit_code != 0
     assert ContinuationCommand.model_validate_json(operation_file.read_text()) == operation
     args[args.index(str(path))] = str(operation_file)
+    policy = registered_policy(project.artifacts)
     execution = runner.invoke(app, args)
     assert execution.exit_code == 0, execution.output
     assert len(transport.requests) == 3
     reference = continuation_result_reference(project, operation.job, code_revision="test")
     admitted = admit_continuations(
-        project.artifacts, reference, created_at=datetime.now(UTC), code_revision="test"
+        project.artifacts,
+        reference,
+        policy=policy,
+        created_at=datetime.now(UTC),
+        code_revision="test",
     )
     report = ContinuationAdmission.model_validate_json(
         project.artifacts.read_bytes(admitted.artifact_id, "admission.json")
@@ -503,13 +509,14 @@ def test_cli_prepares_and_executes_qualified_training_job(
         ContinuationCommand(
             action="export",
             export=ContinuationExport(
-                studies=(reference,), dataset=SFTBuildSpec(held_out_fraction=0)
+                studies=(reference,), policy=policy, dataset=SFTBuildSpec(held_out_fraction=0)
             ),
         ).model_dump_json()
     )
     exported = runner.invoke(app, args)
     assert exported.exit_code == 0, exported.output
     assert "1/2 branches" in exported.output and "Assistant targets: 1" in exported.output
+    assert f"Admission policy {policy.artifact_id}: 1 admitted, 1 refused" in exported.output
     assert report.evidence.qualification_scope[:45] in exported.output
     dataset_id = project.artifacts.list_ids(artifact_type="sft-dataset")[0]
     dataset = load_verified_sft_dataset(project, dataset_id)

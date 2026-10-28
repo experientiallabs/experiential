@@ -548,9 +548,13 @@ reimports, rebuilds and regrouping:
   trace ID and any declared task identity (`task_lineage`). Project-local lineage IDs are not
   used, because they change on reimport and regrouping.
 - Edges are grouping relationships that every `exp build` records, exposed or not: traces that
-  declare the same task identity, and the build's own exact or semantic near-duplicate unions
-  with their similarity. Each names the project and build that produced it. Nothing weaker (a
-  shared customer, conversation or time bucket) is an edge.
+  declare the same task identity within one source and customer (the scope the build's own
+  partition gives declarations), and the build's own exact or semantic near-duplicate unions
+  with their similarity. Each names the project and build that produced it. Declaring traces
+  also link to the scoped task identity itself, so a task stays joined across builds even when
+  a later import carries only new content of it. Nothing weaker (a shared customer,
+  conversation or time bucket, or a declared name reused by another source or customer) is an
+  edge.
 - Equivalence links join one source's nodes under every scheme that fingerprinted it, for
   unexposed traces too.
 - Exposures mark content a person saw, with the panel, receipt and report that showed it.
@@ -582,6 +586,10 @@ and unchanged); the refusal reports their count and scheme, and development re-a
 Every table is append-only. Independence is only relative to the ledger a decision used;
 `ExposureLedger.export()` and `merge()` share one between machines. A build made before the
 ledger existed is refused until `exp build` is rerun on the same import to record its grouping.
+The fit and held-out split is a rank among the lineages one build sees, so a rebuild can move a
+lineage across it. A lineage whose content the ledger links to exposed or reserved content is
+always held out, wherever it ranks, so a rebuild never hands audited content to fitting; every
+other lineage keeps the partition its rank gives it.
 
 Grouping links recorded after a reservation are reassessed whenever its receipt is resumed or
 reports. If they reveal exposure that predates the receipt, an undispatched reservation is

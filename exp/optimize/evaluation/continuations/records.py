@@ -45,6 +45,7 @@ def load_study(store: ArtifactStore, reference: ArtifactInput) -> ContinuationSt
             actor_model=study.spec.actor_model,
             temperature=study.spec.temperature,
             output_tokens=study.spec.maximum_output_tokens,
+            reasoning_effort=study.spec.reasoning_effort,
             probability=study.spec.predicted_success,
             verifier_sha256=sha256_json(study.spec.verifier),
             probe_sha256=study.spec.probe_sha256,

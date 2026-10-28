@@ -13,6 +13,7 @@ results, and plans do not live here.
 | `reference/task-hardening.md` | Task-validity checks (leakage, closed-book, controls) and bounded hardening of saturated factory worlds: specs, rules, bands and limits. |
 | `reference/instance-facts.md` | Backend-derived instance facts from task input files: the `derive-facts` action, the typed lossless workbook encoding, validation, refusals, bounds and views. |
 | `reference/decision-cascade.md` | Cheap next-action decisions with the main model as fallback: labels on reached states, threshold fit by a registered objective, held-out closed-loop confirmation and the versioned runtime policy. |
+| `reference/admission-policy.md` | Per-dimension trajectory admission policies: applicability, predeclared margins, family-clustered calibration and the export consumers. |
 | `reference/evidence-reading.md` | Bounded objective-driven evidence reading during learning investigations: budgets, pinned policy, replay and limits. |
 | `reference/providers.md` | Catalog providers, first-build `--provider` flags, environment variables, Azure endpoint and deployment rules, the Bedrock credential chain, and OpenAI-compatible listing metadata plus identity-only operator declaration. |
 | `reference/gateway-architecture.md` | Operational local gateway contracts, certified exact-model routing, ownership boundaries, and compatibility locks. |
@@ -31,6 +32,7 @@ results, and plans do not live here.
 | `reference/gateway-latency.md` | Routine CI gateway-latency report against a local mock: schedule, artifact schema, and numeric latency badge. |
 | `reference/openai-compatible-recipes.md` | Verified Fireworks, Modal, and Experiential Cloud connection recipes through the openai-compatible provider family. |
 | `reference/ingest.md` | Current declared local trace source contract for every supported source. |
+| `reference/incremental-session-state.md` | Incremental session state: content-addressed nodes, immutable event log, structural edits, retention pins, collection, measured effect and the schema 4 cutover. |
 | `reference/immutable-real-trace-rag.md` | Immutable real-trace retrieval provenance, leakage, persistence, and historical restoration contract. |
 | `reference/induced-transitions.md` | Exact per-tool transition programs induced from fit traces: induce and validate actions, validation rules, sandboxed execution, serving with the grounded simulator and paired replay measurement. |
 | `reference/router_optimization_config.md` | Exact completed-evidence configuration recipe for router optimization. |

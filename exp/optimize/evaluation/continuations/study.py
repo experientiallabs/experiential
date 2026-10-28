@@ -27,8 +27,16 @@ from exp.common.core.artifacts import (
     sha256_json,
     stable_id,
 )
-from exp.common.models import ModelClient, ModelRequest, ModelResponse, ModelSnapshot, ToolCall
+from exp.common.models import (
+    ModelClient,
+    ModelRequest,
+    ModelResponse,
+    ModelSnapshot,
+    ReasoningEffort,
+    ToolCall,
+)
 from exp.common.project import ArtifactStore, artifact_input
+from exp.common.rollouts import StopReason
 from exp.common.tasks import TaskCase
 from exp.optimize.evaluation.continuations.critic import require_prediction_binding
 from exp.optimize.evaluation.continuations.deciders import RecordedDecider
@@ -50,6 +58,10 @@ from exp.runtime.environments.world_outcomes import (
 )
 from exp.runtime.environments.worlds import ExecutableWorldRuntime
 from exp.runtime.models.call_evidence import call_consumer, canonical_call
+from exp.runtime.models.providers.errors import (
+    ProviderRetryableResponseError,
+    ProviderTruncatedResponseError,
+)
 from exp.simulation.continuations import (
     ContinuationCheckpoint,
     WorldCheckpoint,
@@ -60,6 +72,12 @@ from exp.simulation.development_scope import require_development_task
 from exp.simulation.evaluation.tasks import TaskVerifier, VerifierGrade, grade
 
 WorldRuntime = ExecutableWorldRuntime | MixedRealityEnvironmentRuntime
+
+# An actor call that stopped at its output-token allowance with no complete tool call: the
+# allowance was spent (typically on reasoning) before the actor acted. Grading is unchanged (a
+# refused call stays unassessable; a returned length stop fails at a declared limit), and reports
+# count these branches on their own instead of leaving them as unexplained unknowns.
+ActorStop = Literal["actor_budget_exhausted"]
 
 
 class TrainingEvidence(ContractModel):
@@ -102,6 +120,10 @@ class ContinuationStudySpec(ContractModel):
         selector: Identity and rationale of the checkpoint-selection policy.
         temperature: Explicit actor sampling temperature for every continuation call.
         maximum_output_tokens: Hard per-call output allowance, separate from remaining calls.
+        reasoning_effort: Requested actor reasoning effort for every continuation call, or None
+            for the model's catalog default; it must be one the actor deployment declares it
+            can preserve. A lower effort leaves the output allowance for the tool call instead
+            of spending it on reasoning.
         training_specification: Optional independent acceptance specification frozen before
             outcomes. Its absence keeps every branch ineligible for supervised export.
         training_evidence: Optional qualified-task and paired measurement handoff. Without it,
@@ -121,6 +143,9 @@ class ContinuationStudySpec(ContractModel):
     selector: str = Field(min_length=1, max_length=2000)
     temperature: float = Field(default=1.0, ge=0, le=2, allow_inf_nan=False)
     maximum_output_tokens: int = Field(default=1024, gt=0, strict=True)
+    reasoning_effort: ReasoningEffort | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
     training_specification: ArtifactInput | None = None
     training_evidence: TrainingEvidence | None = None
     cascade: CascadePolicy | None = Field(default=None, exclude_if=lambda value: value is None)
@@ -146,6 +171,14 @@ def study_identity(spec: ContinuationStudySpec, code_revision: str) -> str:
         The registration identity; branches and the result extend it with suffixes.
     """
     return stable_id("continuation-study", {"spec": sha256_json(spec), "code": code_revision})
+
+
+def actor_budget_exhausted(branches: Iterable["ContinuationBranch"]) -> int:
+    """Count branches whose actor spent its output allowance without acting.
+
+    The count is reported beside, not instead of, the assessed and unassessable counts.
+    """
+    return sum(branch.actor_stop == "actor_budget_exhausted" for branch in branches)
 
 
 def known_outcomes(grades: Iterable[VerifierGrade | None]) -> tuple[int, ...]:
@@ -176,6 +209,11 @@ class ContinuationBranch(ContractModel):
         actor_calls: Durable final actor inputs and returned responses, including interrupted calls.
         cascade_decisions: With a cascade, which model decided each actor step and the decider's
             confidence, in step order. Empty without a cascade.
+        actor_stop: ``actor_budget_exhausted`` when the actor's last call stopped at its output
+            allowance with no complete tool call, whether the provider returned that response or
+            refused it as empty after its bounded retries; None otherwise. It names the cause
+            and never changes the assessment: a refused dispatch stays outcome-unknown and
+            unassessable, and a returned response is graded by the verifier as before.
     """
 
     index: int
@@ -188,6 +226,7 @@ class ContinuationBranch(ContractModel):
     checkpoints: tuple[ArtifactInput, ...] = ()
     actor_calls: tuple[ArtifactInput, ...] = ()
     cascade_decisions: tuple[CascadeDecisionRecord, ...] = Field(default=(), exclude_if=not_)
+    actor_stop: ActorStop | None = Field(default=None, exclude_if=lambda value: value is None)
 
     def grading_outcome(self) -> JsonObject:
         """Keep saved execution status authoritative over a promising partial observation."""
@@ -214,10 +253,15 @@ class ContinuationStudy(ContractModel):
         """Report known outcomes separately from all planned branches and critic coverage."""
         labels = known_outcomes(row.assessment for row in self.branches)
         probability = self.spec.predicted_success
+        exhausted = actor_budget_exhausted(self.branches)
         return {
             "planned": len(self.branches),
             "assessable": len(labels),
             "unassessable": len(self.branches) - len(labels),
+            "actor_budget_exhausted": exhausted,
+            "actor_budget_exhausted_share": exhausted / len(self.branches)
+            if self.branches
+            else None,
             "successes": sum(labels),
             "resumed_success_rate": sum(labels) / len(labels) if labels else None,
             "brier": (
@@ -293,6 +337,7 @@ class _PinnedModel:
             update={
                 "temperature": self._spec.temperature,
                 "maximum_output_tokens": self._spec.maximum_output_tokens,
+                "reasoning_effort": self._spec.reasoning_effort,
             }
         )
         receipt: JsonObject = {"request": request.model_dump(mode="json")}
@@ -415,6 +460,7 @@ def run_continuation_study(
             actor_model=spec.actor_model,
             temperature=spec.temperature,
             output_tokens=spec.maximum_output_tokens,
+            reasoning_effort=spec.reasoning_effort,
             probability=spec.predicted_success,
             verifier_sha256=sha256_json(spec.verifier),
             probe_sha256=spec.probe_sha256,
@@ -633,6 +679,10 @@ def _run_branch(
             checkpoints=tuple(points),
             actor_calls=saved_actor_call_evidence(store, branch_id),
             cascade_decisions=tuple(decisions),
+            actor_stop="actor_budget_exhausted"
+            if episode.stop_reason == StopReason.LENGTH
+            and (episode.final_action is None or not episode.final_action.tool_calls)
+            else None,
         )
     except (ValueError, OSError, RuntimeError) as error:
         # Runtime, environment and provider failures become retained branch outcomes. Any other
@@ -663,6 +713,13 @@ def _run_branch(
             checkpoints=tuple(points),
             actor_calls=saved_actor_call_evidence(store, branch_id),
             cascade_decisions=tuple(decisions),
+            actor_stop="actor_budget_exhausted"
+            if outcome["execution_phase"] == "actor_model_dispatch"
+            and (
+                isinstance(error, ProviderTruncatedResponseError)
+                or (isinstance(error, ProviderRetryableResponseError) and error.hit_length_limit)
+            )
+            else None,
             failure=type(error).__name__,
             failure_detail=StructuredFailure(
                 code=FailureCode.TIMEOUT
@@ -710,6 +767,7 @@ def saved_actor_call_evidence(store: ArtifactStore, branch_id: str) -> tuple[Art
         if (
             request.temperature != spec.temperature
             or request.maximum_output_tokens != spec.maximum_output_tokens
+            or request.reasoning_effort != spec.reasoning_effort
         ):
             raise ValueError("actor request differs from the frozen sampling policy")
         reference = artifact_input(intent)
