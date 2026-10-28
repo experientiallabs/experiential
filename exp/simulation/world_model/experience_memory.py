@@ -27,6 +27,7 @@ from exp.common.core.artifacts import (
     sha256_json,
     stable_id,
 )
+from exp.common.core.locks import CoordinationLock
 from exp.common.project import ArtifactStore, artifact_input
 from exp.simulation.reconstruction.library import (
     LibraryEntry,
@@ -341,7 +342,7 @@ def require_memory_scope(
 
 def memory_lock(store: ArtifactStore, lineage: str) -> FileLock:
     """Serialize publication and reservation decisions for one lineage."""
-    return FileLock(store.project_directory / f"memory-{lineage}.lock", timeout=60)
+    return CoordinationLock(store.project_directory / f"memory-{lineage}.lock", timeout=60)
 
 
 def materialize_log(store: ArtifactStore, version: MemoryVersion | None) -> None:

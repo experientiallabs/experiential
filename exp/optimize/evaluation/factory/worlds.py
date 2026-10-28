@@ -7,7 +7,7 @@ code, permissions, independent acceptance, lineage, or model budgets. Every prop
 import json
 from datetime import UTC, datetime
 
-from filelock import FileLock, Timeout
+from filelock import Timeout
 from pydantic import Field
 
 from exp.common.core.artifacts import (
@@ -20,6 +20,7 @@ from exp.common.core.artifacts import (
     sha256_json,
     stable_id,
 )
+from exp.common.core.locks import CoordinationLock
 from exp.common.models import ModelMessage, ModelRequest, ModelResponse, ToolChoice
 from exp.common.project import ProjectStore, artifact_input
 from exp.common.tasks import ToolSchema
@@ -412,7 +413,7 @@ def propose_worlds(
     """Draw once, freeze every proposal, bind assets and run existing native challenge owners."""
     spec = WorldProposalSpec.model_validate_json(spec.model_dump_json())
     store, identity = project.artifacts, spec.identity(code_revision)
-    with FileLock(store.project_directory / (identity + ".lock"), timeout=0):
+    with CoordinationLock(store.project_directory / (identity + ".lock"), timeout=0):
         request = world_proposal_request(project, spec)
         if not store.exists(identity + "-response"):
             if store.exists(identity + "-intent"):

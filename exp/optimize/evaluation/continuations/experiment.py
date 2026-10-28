@@ -3,7 +3,7 @@
 import json
 from datetime import UTC, datetime
 
-from filelock import FileLock, Timeout
+from filelock import Timeout
 from pydantic import Field
 
 from exp.common.core.artifacts import (
@@ -14,6 +14,7 @@ from exp.common.core.artifacts import (
     sha256_json,
     stable_id,
 )
+from exp.common.core.locks import CoordinationLock
 from exp.common.evaluations.uncertainty import missing_outcome_bounds
 from exp.common.project import ProjectStore, artifact_input
 from exp.optimize.evaluation.continuations.critic import (
@@ -412,7 +413,7 @@ def run_checkpoint_experiment(
     """
     store = project.artifacts
     identity = spec.identity(code_revision)
-    with FileLock(store.project_directory / (identity + ".lock"), timeout=0):
+    with CoordinationLock(store.project_directory / (identity + ".lock"), timeout=0):
         saved = saved_checkpoint_experiment(project, spec, code_revision=code_revision)
         if saved is not None:
             return saved

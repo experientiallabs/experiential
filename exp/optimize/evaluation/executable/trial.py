@@ -8,8 +8,6 @@ from copy import deepcopy
 from datetime import UTC, datetime
 from threading import RLock
 
-from filelock import FileLock
-
 from exp.common.core.artifacts import (
     ArtifactEnvelope,
     ArtifactInput,
@@ -18,6 +16,7 @@ from exp.common.core.artifacts import (
     sha256_json,
     stable_id,
 )
+from exp.common.core.locks import CoordinationLock
 from exp.common.models import ToolCall
 from exp.common.project import ProjectStore, artifact_input
 from exp.optimize.evaluation.continuations.study import (
@@ -346,7 +345,7 @@ def open_executable_harbor_trial(
         },
     )
     store = project.artifacts
-    with FileLock(store.project_directory / (identity + ".lock"), timeout=0):
+    with CoordinationLock(store.project_directory / (identity + ".lock"), timeout=0):
         start: JsonObject = {
             "task": task_ref.model_dump(mode="json"),
             "provider_limits": None
@@ -384,20 +383,22 @@ def open_executable_harbor_trial(
             record = json.loads(store.read_bytes(key, "record.json"))
             reference = ArtifactInput.model_validate(record["world"])
             restored = load_world_image(store, reference)
-        runtime = load_runtime_definition(
-            project,
-            runtime_file=task.job.runtime_file,
-            runtime_sha256=task.job.runtime_sha256,
-            configuration=task.job.configuration,
-            probe_sha256=task.job.study.probe_sha256,
-            provider_grant=None
-            if provider_limits is None
-            else ProviderGrant(
-                registration=registration,
-                limits=provider_limits,
-            ),
-        )
-        with restore_continuation_world(runtime.world, checkpoint.world_task, restored) as session:
+        with (
+            load_runtime_definition(
+                project,
+                runtime_file=task.job.runtime_file,
+                runtime_sha256=task.job.runtime_sha256,
+                configuration=task.job.configuration,
+                probe_sha256=task.job.study.probe_sha256,
+                provider_grant=None
+                if provider_limits is None
+                else ProviderGrant(
+                    registration=registration,
+                    limits=provider_limits,
+                ),
+            ) as runtime,
+            restore_continuation_world(runtime.world, checkpoint.world_task, restored) as session,
+        ):
             yield ExecutableHarborTrial(
                 project,
                 task_ref,

@@ -21,7 +21,11 @@ from exp.common.evaluations.reconstruction import WorkflowEvidence
 from exp.common.project import ProjectStore, artifact_input
 from exp.optimize.evaluation.continuations.job import load_continuation_runtime
 from exp.optimize.evaluation.continuations.records import load_study
-from exp.optimize.evaluation.executable.task import load_executable_task, preflight_executable_task
+from exp.optimize.evaluation.executable.task import (
+    ExecutableTask,
+    load_executable_task,
+    preflight_executable_task,
+)
 from exp.runtime.environments.worlds import ExecutableWorldRuntime
 from exp.simulation.capability_briefs import load_capability_brief
 from exp.simulation.evaluation.admission import verify_label_witness
@@ -100,13 +104,27 @@ def assess_executable_qualification(
     """Re-derive every label and the feasible run from trusted immutable records."""
     preflight_executable_qualification(project, spec)
     task = load_executable_task(project, spec.task)
-    record_runtime = None
-    if spec.replay_native_records:
-        runtime = load_continuation_runtime(project, task.job)
+    if not spec.replay_native_records:
+        return _assess(project, spec, task, None)
+    with load_continuation_runtime(project, task.job) as runtime:
         if not isinstance(runtime.world, ExecutableWorldRuntime):
             raise ValueError("native record qualification requires a wholly native task runtime")
         require_record_runtime(runtime.world)
-        record_runtime = RecordReplayRuntime(runtime.world, runtime.probe, runtime.probe_sha256)
+        return _assess(
+            project,
+            spec,
+            task,
+            RecordReplayRuntime(runtime.world, runtime.probe, runtime.probe_sha256),
+        )
+
+
+def _assess(
+    project: ProjectStore,
+    spec: ExecutableQualificationSpec,
+    task: ExecutableTask,
+    record_runtime: RecordReplayRuntime | None,
+) -> ExecutableQualification:
+    """Judge every case, with native record replay when the open task runtime is supplied."""
     predicate = task.job.study.verifier
     # Reuse the established identity, duplicate and grouped-partition checks.
     CalibrationPack(task=spec.task, parent=predicate, candidate=predicate, cases=spec.cases)

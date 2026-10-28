@@ -6,8 +6,6 @@ import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
 
-from filelock import FileLock
-
 from exp.common.core.artifacts import (
     ArtifactEnvelope,
     ArtifactInput,
@@ -18,6 +16,7 @@ from exp.common.core.artifacts import (
     stable_id,
     strict_equal,
 )
+from exp.common.core.locks import CoordinationLock
 from exp.common.project import ArtifactStore, artifact_input
 from exp.runtime.environments.artifact_edits import (
     MAX_ARTIFACT_BYTES,
@@ -92,7 +91,7 @@ def materialize_native_artifacts(
     )
     if dry_run:
         return None
-    with FileLock(artifacts.project_directory / (identity + ".lock"), timeout=0):
+    with CoordinationLock(artifacts.project_directory / (identity + ".lock"), timeout=0):
         if artifacts.exists(identity):
             reference = artifact_input(artifacts.read(identity).manifest)
         else:

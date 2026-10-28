@@ -32,7 +32,6 @@ from datetime import datetime
 from pathlib import Path
 from typing import Literal
 
-from filelock import FileLock
 from pydantic import Field, model_validator
 
 from exp.common.core.artifacts import (
@@ -45,6 +44,7 @@ from exp.common.core.artifacts import (
     sha256_json,
     stable_id,
 )
+from exp.common.core.locks import CoordinationLock
 from exp.common.models import ModelSnapshot, load_model_catalog
 from exp.common.project import ProjectStore, artifact_input
 from exp.optimize.evaluation.fidelity.decision_access import decision_caller
@@ -408,7 +408,7 @@ def screen_misses(
         if request is None or identity is None:
             outcomes.append(MissScreening(miss=miss, status="no-hypothesis"))
             continue
-        with FileLock(store.project_directory / (identity + ".lock"), timeout=0):
+        with CoordinationLock(store.project_directory / (identity + ".lock"), timeout=0):
             if not store.exists(identity):
                 envelope = ArtifactEnvelope(
                     schema_version=1, created_at=clock(), code_revision=code_revision

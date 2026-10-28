@@ -571,11 +571,11 @@ def test_locks_are_always_taken_in_one_order(
         with tracked("dispatch"):
             return claim(self, claimed_at)
 
-    fidelity_lock = fidelity.FileLock
+    fidelity_lock = fidelity.CoordinationLock
     monkeypatch.setattr(ExposureLedger, "lease", tracked_lease)
     monkeypatch.setattr(ExposureLedger, "transaction", tracked_transaction)
-    monkeypatch.setattr(fidelity, "FileLock", TrackedFileLock)
-    monkeypatch.setattr(trace_replay, "FileLock", TrackedFileLock)
+    monkeypatch.setattr(fidelity, "CoordinationLock", TrackedFileLock)
+    monkeypatch.setattr(trace_replay, "CoordinationLock", TrackedFileLock)
     monkeypatch.setattr(DispatchLedger, "claim", tracked_claim)
 
     with audit(store) as opened:

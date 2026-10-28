@@ -13,7 +13,6 @@ evidence; a normalized JSON outcome has no evaluator path and is refused before 
 from datetime import UTC, datetime
 from typing import Self
 
-from filelock import FileLock
 from pydantic import AwareDatetime, Field, model_validator
 
 from exp.common.core.artifacts import (
@@ -25,6 +24,7 @@ from exp.common.core.artifacts import (
     sha256_json,
     stable_id,
 )
+from exp.common.core.locks import CoordinationLock
 from exp.common.evaluations.reconstruction import (
     EvaluationReferences,
     JudgeConfig,
@@ -209,7 +209,7 @@ def run_challenge(
         return saved
     preflight_challenge_run(project, spec)
     store, identity = project.artifacts, spec.identity
-    with FileLock(store.project_directory / (identity + ".lock"), timeout=0):
+    with CoordinationLock(store.project_directory / (identity + ".lock"), timeout=0):
         registration = _saved_run_registration(project, spec)
         if registration is None:
             registration = artifact_input(

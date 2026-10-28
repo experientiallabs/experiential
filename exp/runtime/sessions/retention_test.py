@@ -237,3 +237,44 @@ def test_a_commit_inside_one_sweep_that_reuses_candidates_keeps_them_alive(
     later = store.collect_garbage()
     assert later.complete and later.reclaimed_nodes > 0
     assert store.read_session("s").state == expected
+
+
+def test_a_preview_reports_what_collection_reclaims_and_what_each_pin_holds(
+    tmp_path: Path,
+) -> None:
+    """The preview writes nothing; its counts equal the collection that follows a release."""
+    store = _history(tmp_path)
+    store.pin_revisions("checkpoint-a", "s", 0, 3)
+    store.pin_revisions("fork-b", "s", 2, 5)
+    before = _node_count(tmp_path / "s.sqlite")
+    preview = store.preview_collection()
+    assert _node_count(tmp_path / "s.sqlite") == before
+    assert preview.reclaimable_nodes == 0 and preview.retained_nodes == before
+    holdings = {row.pin.owner_id: row for row in preview.pins}
+    assert (holdings["checkpoint-a"].exclusive_nodes, holdings["fork-b"].exclusive_nodes) == (
+        4,
+        4,
+    )
+    assert store.read_state(store.ref_at("s", 1)) == _world(1)
+    assert store.release_pin("checkpoint-a", "s")
+    released = store.preview_collection()
+    assert released.reclaimable_nodes == holdings["checkpoint-a"].exclusive_nodes
+    assert released.reclaimable_bytes == holdings["checkpoint-a"].exclusive_bytes
+    assert [row.pin.owner_id for row in released.pins] == ["fork-b"]
+    report = store.collect_garbage()
+    assert (report.reclaimed_nodes, report.reclaimed_bytes) == (
+        released.reclaimable_nodes,
+        released.reclaimable_bytes,
+    )
+    assert store.preview_collection().reclaimable_nodes == 0
+
+
+def test_a_vacuum_after_collection_returns_freed_pages_and_keeps_every_revision(
+    tmp_path: Path,
+) -> None:
+    """The file shrinks; heads read the same and the event log still replays every revision."""
+    store = _history(tmp_path, revisions=40)
+    store.collect_garbage()
+    assert store.vacuum() > 0
+    assert store.read_session("s").state == _world(40)
+    assert len(store.verify_history("s")) == 41

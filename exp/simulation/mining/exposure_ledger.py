@@ -36,8 +36,9 @@ recording under it is refused. On import, such a scheme is refused and its nodes
 unknown-scheme nodes, which block independence wherever no verified equivalence resolves them.
 
 Atomicity holds for processes that share this one ledger file on one host; SQLite and OS file
-locks over network filesystems are unreliable. A panel lease is an exclusive OS file lock, so it
-dies with its process and a crash leaves no stale lease.
+locks over network filesystems are unreliable, so the ledger's connection and panel leases refuse
+another machine or an undeclared network filesystem (`exp.common.core.host_scope`). A panel
+lease is an exclusive OS file lock, so it dies with its process and a crash leaves no stale lease.
 """
 
 import json
@@ -53,6 +54,7 @@ from filelock import FileLock, Timeout
 from pydantic import AwareDatetime, BaseModel, Field, model_validator
 
 from exp.common.core.artifacts import ArtifactInput, ContractModel, Sha256, sha256_json
+from exp.common.core.locks import CoordinationLock
 from exp.common.core.union_find import UnionFind
 from exp.common.sqlite.connection import connect_database
 from exp.common.traces import Trace
@@ -574,7 +576,7 @@ class ExposureLedger:
         """
         directory = self.directory / "leases"
         directory.mkdir(parents=True, exist_ok=True)
-        lock = FileLock(directory / f"panel-{panel}.lock", timeout=0, thread_local=False)
+        lock = CoordinationLock(directory / f"panel-{panel}.lock", timeout=0, thread_local=False)
         try:
             lock.acquire()
         except Timeout:

@@ -13,7 +13,6 @@ from datetime import UTC, datetime
 from operator import not_
 from typing import Literal, Protocol
 
-from filelock import FileLock
 from pydantic import Field, model_validator
 
 from exp.common.core.artifacts import (
@@ -27,6 +26,7 @@ from exp.common.core.artifacts import (
     sha256_json,
     stable_id,
 )
+from exp.common.core.locks import CoordinationLock
 from exp.common.models import (
     ModelClient,
     ModelRequest,
@@ -487,7 +487,7 @@ def run_continuation_study(
     if not actor.remaining_calls(checkpoint.actor):
         raise ValueError("continuation has no remaining actor calls; select an earlier turn")
     identity = study_identity(spec, code_revision)
-    with FileLock(store.project_directory / (identity + ".lock"), timeout=0):
+    with CoordinationLock(store.project_directory / (identity + ".lock"), timeout=0):
         result_id = identity + "-result"
         if store.exists(result_id):
             return ContinuationStudy.model_validate_json(store.read_bytes(result_id, "record.json"))

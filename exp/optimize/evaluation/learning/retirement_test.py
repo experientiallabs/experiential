@@ -41,6 +41,7 @@ from exp.optimize.evaluation.learning.traces import (
     learning_plan,
     learning_spec,
 )
+from exp.runtime.models.providers.backpressure import ProviderAdmissionRefused
 from exp.runtime.models.providers.transport import (
     JsonHttpResponse,
     ProviderTransportError,
@@ -182,13 +183,19 @@ def test_a_deterministic_refusal_retires_the_trace_and_the_pass_completes(
 def test_a_transport_outage_is_never_retired(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """An overloaded gateway stays resumable however often the identical request fails."""
+    """An overloaded gateway stays resumable however often the identical request fails.
+
+    Repeated overload opens the host's provider breaker, so later passes are refused before
+    dispatch rather than resent; either stop is resumable and none of them is a refusal.
+    """
     store, _, trace_id = refusing_project(tmp_path, monkeypatch, OUTAGE)
     lineage = learning_plan(store, "jev", "fit").lineage
-    with pytest.raises(ProviderTransportError):
+    with pytest.raises((ProviderTransportError, ProviderAdmissionRefused)):
         learn(store)
     for _ in range(RETIREMENT_FAILURES + 1):
-        with pytest.raises((ProviderTransportError, DispatchOutcomeUnknown)):
+        with pytest.raises(
+            (ProviderTransportError, DispatchOutcomeUnknown, ProviderAdmissionRefused)
+        ):
             learn(store, retry_incomplete=True)
     assert retirement_of(store, lineage, trace_id) is None
     assert not store.artifacts.list_ids(artifact_type=REFUSAL_TYPE)

@@ -11,7 +11,12 @@ import pytest
 
 from exp.common.sqlite.connection import connect_database
 from exp.runtime.sessions.errors import SessionStoreError
-from exp.runtime.sessions.schema import SCHEMA_VERSION, STATE_CODEC, open_schema
+from exp.runtime.sessions.schema import (
+    SCHEMA_VERSION,
+    STATE_CODEC,
+    is_session_database,
+    open_schema,
+)
 from exp.runtime.sessions.store import SessionStore
 
 FULL_STATE_SCHEMA = (
@@ -104,3 +109,22 @@ def test_concurrent_first_opens_create_one_schema(tmp_path: Path) -> None:
     for thread in threads:
         thread.join()
     assert len(set(identities)) == 1 and len(identities) == 4
+
+
+def test_session_databases_are_recognized_read_only_among_other_files(tmp_path: Path) -> None:
+    """Ledgers, other schemas and non-SQLite files are not stores, and nothing is created."""
+    store = tmp_path / "store.sqlite"
+    SessionStore(store)
+    ledger = tmp_path / "ledger.sqlite"
+    with sqlite3.connect(ledger) as raw:
+        raw.execute("CREATE TABLE slots (n INTEGER)")
+        raw.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+    other = tmp_path / "notes.sqlite"
+    other.write_text("not a database")
+    assert is_session_database(store)
+    assert not is_session_database(ledger)
+    assert not is_session_database(other)
+    empty = tmp_path / "empty.sqlite"
+    sqlite3.connect(empty).close()
+    assert not is_session_database(empty)
+    assert empty.stat().st_size == 0

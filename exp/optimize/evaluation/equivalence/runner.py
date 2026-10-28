@@ -4,7 +4,7 @@ from datetime import UTC, datetime
 from functools import partial
 from typing import Literal
 
-from filelock import FileLock, Timeout
+from filelock import Timeout
 from pydantic import AwareDatetime, Field, model_validator
 
 from exp.common.core.artifacts import (
@@ -16,6 +16,7 @@ from exp.common.core.artifacts import (
     sha256_json,
     stable_id,
 )
+from exp.common.core.locks import CoordinationLock
 from exp.common.evaluations.actor_equivalence import evaluate_actor_equivalence
 from exp.common.progress import ProgressHook, report
 from exp.common.project import ProjectStore, artifact_input
@@ -701,7 +702,7 @@ def run_equivalence(
 ) -> EquivalenceReport:
     """Register, execute, compare and analyze under one panel lease; never silently redraw cells."""
     store, identity = project.artifacts, spec.identity(code_revision)
-    with FileLock(store.project_directory / (identity + ".lock"), timeout=0):
+    with CoordinationLock(store.project_directory / (identity + ".lock"), timeout=0):
         saved = saved_equivalence(project, spec, code_revision=code_revision)
         if saved is not None:
             return saved

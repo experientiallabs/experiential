@@ -3,7 +3,7 @@
 from datetime import UTC, datetime
 from typing import Literal, Self
 
-from filelock import FileLock, Timeout
+from filelock import Timeout
 from pydantic import Field, model_validator
 
 from exp.common.core.artifacts import (
@@ -14,6 +14,7 @@ from exp.common.core.artifacts import (
     sha256_json,
     stable_id,
 )
+from exp.common.core.locks import CoordinationLock
 from exp.common.evaluations.uncertainty import missing_outcome_bounds
 from exp.common.models import ToolCall
 from exp.common.project import ProjectStore, artifact_input
@@ -364,7 +365,7 @@ def run_action_contrast(
     """Execute all preregistered cells once under a lease, preserving failures and child work."""
     spec = ActionContrastSpec.model_validate_json(spec.model_dump_json())
     store, identity = project.artifacts, spec.identity(code_revision)
-    with FileLock(store.project_directory / (identity + ".lock"), timeout=0):
+    with CoordinationLock(store.project_directory / (identity + ".lock"), timeout=0):
         saved = saved_action_contrast(project, spec, code_revision=code_revision)
         if saved is not None:
             return saved

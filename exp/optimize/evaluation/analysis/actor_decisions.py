@@ -9,7 +9,6 @@ from collections import Counter
 from datetime import UTC, datetime
 from typing import Literal, Self
 
-from filelock import FileLock
 from jsonschema import Draft202012Validator
 from jsonschema.exceptions import SchemaError
 from pydantic import AwareDatetime, Field, model_validator
@@ -24,6 +23,7 @@ from exp.common.core.artifacts import (
     stable_id,
 )
 from exp.common.core.json_schema import expand_local_references
+from exp.common.core.locks import CoordinationLock
 from exp.common.models import ModelRequest, ModelResponse, ModelSnapshot, load_model_catalog
 from exp.common.project import ProjectStore, artifact_input
 from exp.runtime.models.call_evidence import call_consumer, canonical_call
@@ -453,7 +453,7 @@ def run_actor_decisions(
         raise ValueError("actor probes require text-only canonical prefixes; media refused")
     spec = ActorDecisionSpec.model_validate_json(spec.model_dump_json())
     store, identity = project.artifacts, spec.identity(code_revision)
-    with FileLock(store.project_directory / (identity + ".lock"), timeout=0):
+    with CoordinationLock(store.project_directory / (identity + ".lock"), timeout=0):
         saved = saved_actor_decisions(project, spec, code_revision=code_revision)
         if saved is not None:
             return saved

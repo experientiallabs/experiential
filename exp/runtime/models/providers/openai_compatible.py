@@ -31,9 +31,7 @@ from exp.common.models.usage_observability import (
 )
 from exp.common.traces.ingest.json_strict import reject_duplicate_json_keys
 from exp.runtime.gateway.images_contracts import ImagesRequest
-from exp.runtime.models.providers.async_transport import (
-    AsyncJsonHttpTransport,
-)
+from exp.runtime.models.providers.async_transport import AsyncJsonHttpTransport
 from exp.runtime.models.providers.base import (
     DEFAULT_RETRY_POLICY,
     DEFAULT_TIMEOUT_SECONDS,
@@ -453,6 +451,8 @@ def openai_embedding_response_raw(payload: JsonObject, *, expected_count: int) -
 
 class OpenAIEmbeddingMixin(ProviderHttpClient):
     """Adds the shared OpenAI-wire embeddings endpoint to one HTTP provider client."""
+
+    supports_idempotency_key: ClassVar[bool] = True
 
     def _embedding_model_id(self) -> str:
         """Return the model id placed on the embeddings wire.

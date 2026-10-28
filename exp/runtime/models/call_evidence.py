@@ -5,7 +5,7 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from typing import Literal
 
-from exp.common.core.artifacts import ArtifactInput
+from exp.common.core.artifacts import ArtifactInput, JsonObject, sha256_json
 
 _INTENT: ContextVar[ArtifactInput | None] = ContextVar("canonical_call_intent", default=None)
 Consumer = Literal["simulator", "actor", "selector", "investigator", "analyst", "unknown"]
@@ -40,3 +40,32 @@ def canonical_call(reference: ArtifactInput) -> Iterator[None]:
         yield
     finally:
         _INTENT.reset(token)
+
+
+def intent_idempotency_key(url: str, payload: JsonObject) -> str | None:
+    """Derive a stable ``Idempotency-Key`` for one physical request of the current intent.
+
+    The key depends only on the canonical intent's identity, the endpoint and the exact request
+    body, so a resend of the same intent after an ambiguous failure, in this process or a
+    resumed one, carries the same key and an endpoint that honours it cannot execute twice.
+    Different requests made under one intent get different keys. Credentials never enter it:
+    the URL is hashed and headers are not read.
+
+    Args:
+        url: Absolute provider endpoint URL.
+        payload: Exact JSON request body.
+
+    Returns:
+        ``exp-intent-`` plus 48 hex digits, or None outside a recorded canonical intent.
+    """
+    intent = _INTENT.get()
+    if intent is None:
+        return None
+    digest = sha256_json(
+        {
+            "intent": intent.artifact_id,
+            "endpoint_sha256": sha256_json({"url": url}),
+            "request_sha256": sha256_json(payload),
+        }
+    )
+    return "exp-intent-" + digest[:48]

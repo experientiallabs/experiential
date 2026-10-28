@@ -8,7 +8,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal, Self
 
-from filelock import FileLock, Timeout
+from filelock import Timeout
 from pydantic import AwareDatetime, Field, model_validator
 
 from exp.common.core.artifacts import (
@@ -19,6 +19,7 @@ from exp.common.core.artifacts import (
     sha256_json,
     stable_id,
 )
+from exp.common.core.locks import CoordinationLock
 from exp.common.progress import ProgressHook, report
 from exp.common.project import ProjectStore, artifact_input
 from exp.optimize.evaluation.continuations.actors import (
@@ -420,7 +421,7 @@ def run_task_factory(
     """Run the frozen finite population; saved and unknown outcomes are never silently redrawn."""
     spec = TaskFactorySpec.model_validate_json(spec.model_dump_json())
     store, identity = project.artifacts, spec.identity(code_revision)
-    with FileLock(store.project_directory / (identity + ".lock"), timeout=0):
+    with CoordinationLock(store.project_directory / (identity + ".lock"), timeout=0):
         previous = saved_task_factory(project, spec, code_revision=code_revision)
         if previous is not None:
             return previous

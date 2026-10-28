@@ -20,6 +20,7 @@ from exp.common.core.artifacts import (
     stable_id,
     strict_equal,
 )
+from exp.common.core.locks import CoordinationLock
 from exp.common.evaluations.reconstruction import DualReport, WorkflowEvidence, WorkflowStep
 from exp.common.models import ToolCall
 from exp.common.project import ArtifactStore, artifact_input
@@ -118,7 +119,7 @@ class HarborTrial:
             "harbor-trial",
             {"task": self.task_ref.model_dump(mode="json"), "session": record.session_id},
         )
-        self._lease = FileLock(
+        self._lease = CoordinationLock(
             self.artifacts.project_directory / (self._identity + ".lock"), timeout=0
         )
         binding: JsonObject = {

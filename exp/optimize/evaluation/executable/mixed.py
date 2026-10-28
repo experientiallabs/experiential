@@ -1,5 +1,6 @@
 """Configuration-driven composition of a reviewed native runtime and a frozen learned simulator."""
 
+from contextlib import ExitStack
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Self
@@ -116,33 +117,37 @@ def _runtime(
     simulated_configuration = configuration["simulated"]
     if not isinstance(simulated_configuration, dict):
         raise ValueError("simulated runtime configuration must be a JSON object")
-    native = load_runtime_definition(
-        project,
-        runtime_file=spec.native.runtime_file,
-        runtime_sha256=spec.native.runtime_sha256,
-        configuration=spec.native.configuration,
-        probe_sha256=spec.native.probe_sha256,
-    )
-    if not isinstance(native.world, ExecutableWorldRuntime) or native.world.owner != "native":
-        raise ValueError("mixed composition requires a native executable-world runtime")
-    if native.world.manifest != spec.simulated.manifest:
-        raise ValueError("native runtime manifest differs from the frozen mixed definition")
-    candidate = (
-        grounded_runtime(project, simulated_configuration)
-        if provider_grant is None
-        else granted_grounded_runtime(project, simulated_configuration, provider_grant)
-    )
-    if (
-        not isinstance(candidate.world, ExecutableWorldRuntime)
-        or candidate.world.owner != "simulated"
-    ):
-        raise ValueError("mixed composition requires an executable learned simulator")
-    policy = MixedRealityPolicy(
-        native_identity=native.world.backend_sha256,
-        candidate_identity=candidate.world.backend_sha256,
-        routes=spec.routes,
-        world=spec.simulated.manifest,
-    )
+    with ExitStack() as owned:
+        native = owned.enter_context(
+            load_runtime_definition(
+                project,
+                runtime_file=spec.native.runtime_file,
+                runtime_sha256=spec.native.runtime_sha256,
+                configuration=spec.native.configuration,
+                probe_sha256=spec.native.probe_sha256,
+            )
+        )
+        if not isinstance(native.world, ExecutableWorldRuntime) or native.world.owner != "native":
+            raise ValueError("mixed composition requires a native executable-world runtime")
+        if native.world.manifest != spec.simulated.manifest:
+            raise ValueError("native runtime manifest differs from the frozen mixed definition")
+        candidate = owned.enter_context(
+            grounded_runtime(project, simulated_configuration)
+            if provider_grant is None
+            else granted_grounded_runtime(project, simulated_configuration, provider_grant)
+        )
+        if (
+            not isinstance(candidate.world, ExecutableWorldRuntime)
+            or candidate.world.owner != "simulated"
+        ):
+            raise ValueError("mixed composition requires an executable learned simulator")
+        policy = MixedRealityPolicy(
+            native_identity=native.world.backend_sha256,
+            candidate_identity=candidate.world.backend_sha256,
+            routes=spec.routes,
+            world=spec.simulated.manifest,
+        )
+        release = owned.pop_all().close
     revision = installed_execution_revision()
     definition_sha = sha256_json(spec)
 
@@ -192,4 +197,5 @@ def _runtime(
         ),
         probe,
         spec.probe_sha256,
+        release,
     )

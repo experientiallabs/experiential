@@ -1,5 +1,6 @@
 """The built-in induced runtime: exact programs over the built grounded simulator."""
 
+import os
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -9,6 +10,7 @@ from exp.common.core.artifacts import ArtifactEnvelope, ArtifactInput, sha256_js
 from exp.common.models import BillingSource, ModelSnapshot, ToolCall
 from exp.common.project import ProjectStore, artifact_input
 from exp.optimize.evaluation.executable import grounded as grounded_runtime
+from exp.optimize.evaluation.executable import induced as induced_runtime
 from exp.optimize.evaluation.executable.grounded_test import _record_spec
 from exp.optimize.evaluation.executable.induced import continuation_runtime
 from exp.optimize.evaluation.fidelity.runner_test import source_project
@@ -19,9 +21,11 @@ from exp.simulation.induction.contracts import (
     InducedCoverage,
     ProgramDomain,
     ProgramProposal,
+    SandboxLimits,
     TransitionProgram,
     ValidationReport,
 )
+from exp.simulation.induction.sandbox import ProgramSandbox
 
 REVISION = "c" * 40
 PROGRAM = TransitionProgram(
@@ -130,3 +134,53 @@ def test_coverage_under_another_manifest_is_refused(
                 "coverage": coverage.model_dump(mode="json"),
             },
         )
+
+
+class _Interrupted(KeyboardInterrupt):
+    """An operator interrupt raised inside the runtime block."""
+
+
+@pytest.mark.parametrize("ending", ["normal", "exception", "interrupt"])
+def test_closing_the_runtime_stops_the_program_worker_on_every_exit_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, ending: str
+) -> None:
+    """The runtime owns its worker: leaving the block reaps it and removes its directory."""
+    project, fidelity = source_project(tmp_path)
+    monkeypatch.setenv("FIDELITY_TEST_KEY", "fixture-only")
+    monkeypatch.setattr(grounded_runtime, "HttpxJsonTransport", ScriptedJsonTransport)
+    opened: list[ProgramSandbox] = []
+
+    class RecordedSandbox(ProgramSandbox):
+        """The production sandbox, remembered so the test can find its worker."""
+
+        def __init__(self, limits: SandboxLimits | None = None) -> None:
+            super().__init__(limits)
+            opened.append(self)
+
+    monkeypatch.setattr(induced_runtime, "ProgramSandbox", RecordedSandbox)
+    spec = _record_spec(project, fidelity)
+    coverage = _saved_induction(project, spec.manifest)
+    configuration = {
+        "grounded": spec.model_dump(mode="json"),
+        "coverage": coverage.model_dump(mode="json"),
+    }
+    worker = None
+    directory = None
+    failure = {"exception": ValueError, "interrupt": _Interrupted}.get(ending)
+    try:
+        with continuation_runtime(project, configuration) as runtime:
+            with runtime.world.open(spec.task) as world:
+                world.execute(ToolCall(name="inspect", call_id="read", arguments={"key": "now"}))
+            (sandbox,) = opened
+            assert sandbox._process is not None and sandbox._directory is not None
+            worker, directory = sandbox._process.pid, sandbox._directory
+            if failure is not None:
+                raise failure("stop inside the runtime")
+    except (ValueError, KeyboardInterrupt) as error:
+        assert type(error) is failure
+    assert worker is not None and directory is not None
+    with pytest.raises(ProcessLookupError):
+        os.kill(worker, 0)
+    assert not directory.exists()
+    with pytest.raises(RuntimeError, match="sandbox is closed"):
+        opened[0].run(PROGRAM, {"records": {"status": "x"}}, {"key": "now"}, {})

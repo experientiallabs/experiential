@@ -34,7 +34,6 @@ from collections.abc import Collection, Mapping
 from datetime import UTC, datetime
 from typing import Literal, Self
 
-from filelock import FileLock
 from pydantic import AwareDatetime, Field, model_validator
 
 from exp.common.core.artifacts import (
@@ -46,6 +45,7 @@ from exp.common.core.artifacts import (
     sha256_json,
     stable_id,
 )
+from exp.common.core.locks import CoordinationLock
 from exp.common.evaluations.uncertainty import unit_difference_summary, unit_mean_summary
 from exp.common.models import ModelRequest, ModelSnapshot, load_model_catalog
 from exp.common.project import ArtifactStore, ProjectStore, artifact_input
@@ -563,7 +563,7 @@ def run_cascade_fit(
     """
     spec = CascadeFitSpec.model_validate_json(spec.model_dump_json())
     store, identity = project.artifacts, spec.identity(code_revision)
-    with FileLock(store.project_directory / (identity + ".lock"), timeout=0):
+    with CoordinationLock(store.project_directory / (identity + ".lock"), timeout=0):
         saved = saved_cascade_fit(project, spec, code_revision=code_revision)
         if saved is not None:
             return saved

@@ -55,6 +55,37 @@ of the block and of every complete ancestor; the next maintenance rebuilds them 
 lines, still excluding retired hypotheses. Memory lines, source evidence and retrieval are
 untouched, and audit receipts keep reading their pinned versions. No provider call is made.
 
+## Retiring checkpoints and reclaiming session state: `retire-checkpoint`, `collect-garbage`
+
+Capturing a world checkpoint pins the source session's revisions under the checkpoint's
+artifact ID, so that history stays in the session database. A pin is released only when the
+operator retires the checkpoint:
+
+```json
+{"action": "retire-checkpoint",
+ "retirement": {"checkpoint": {"artifact_id": "CHECKPOINT", "sha256": "MANIFEST_SHA256"},
+                "reason": "why the checkpoint is no longer needed"}}
+```
+
+Retirement is refused while any saved artifact (a study, campaign, task, package, fork or other
+result) names the checkpoint in its inputs or its data; the refusal lists the referrers. The
+retirement record is saved first and then every pin the checkpoint owns is released, so an
+interrupted retirement completes when run again. The checkpoint artifact itself stays loadable.
+
+```json
+{"action": "collect-garbage", "collection": {"batch_size": 500, "vacuum": false}}
+```
+
+`collect-garbage` reclaims, in every session database of the project, the state nodes no
+session head and no pin reaches, and saves the inventory as a report. With `--dry-run` it
+writes nothing and prints what would be reclaimed and every pin: its owner, session and
+revision range, the nodes only it keeps, and whether its owner is `referenced`, `retirable`,
+`retired` (run the retirement again to release a pin registered after it) or
+`not_a_checkpoint` (never released by these actions). Event logs are never reclaimed, so every
+revision stays replayable. Freed pages are reused by later writes; `vacuum: true` also rewrites
+each database that reclaimed nodes so its file shrinks (the rewrite waits for, then excludes,
+concurrent writers).
+
 ## Judge challenge studies: `challenge-judges`
 
 `challenge: ChallengeRunSpec` holds a registered `JudgeChallengeStudy` over a calibration pack

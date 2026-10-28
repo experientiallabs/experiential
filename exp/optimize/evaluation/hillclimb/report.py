@@ -15,10 +15,10 @@ reverted. The report lists every round, kept and reverted.
 from datetime import UTC, datetime
 from typing import Literal
 
-from filelock import FileLock
 from pydantic import AwareDatetime, Field
 
 from exp.common.core.artifacts import ArtifactEnvelope, ArtifactInput, ContractModel, stable_id
+from exp.common.core.locks import CoordinationLock
 from exp.common.project import ArtifactStore, ProjectStore, artifact_input
 from exp.optimize.evaluation.continuations.job import ContinuationJob
 from exp.optimize.evaluation.hillclimb.design import ClimbSpec, climb_split
@@ -250,7 +250,7 @@ def run_climb_report(
     """
     climb = spec.climb.identity()
     store = project.artifacts
-    with FileLock(store.project_directory / f"{climb}.lock", timeout=0):
+    with CoordinationLock(store.project_directory / f"{climb}.lock", timeout=0):
         saved = saved_climb_report(project, spec)
         if saved is not None:
             return saved

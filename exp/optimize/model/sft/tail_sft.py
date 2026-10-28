@@ -9,7 +9,6 @@ from collections.abc import Sequence
 from datetime import datetime
 from typing import Protocol, runtime_checkable
 
-from filelock import FileLock
 from pydantic import Field
 
 from exp.common.core.artifacts import (
@@ -19,6 +18,7 @@ from exp.common.core.artifacts import (
     Sha256,
     stable_id,
 )
+from exp.common.core.locks import CoordinationLock
 from exp.common.project import ArtifactStore, artifact_input
 
 
@@ -212,7 +212,7 @@ def record_initial_losses(
     envelope = ArtifactEnvelope(
         schema_version=1, created_at=created_at, code_revision=code_revision, inputs=(dataset,)
     )
-    with FileLock(store.project_directory / (identity + ".lock"), timeout=0):
+    with CoordinationLock(store.project_directory / (identity + ".lock"), timeout=0):
         if store.exists(identity):
             return artifact_input(store.read(identity).manifest)
         losses = []

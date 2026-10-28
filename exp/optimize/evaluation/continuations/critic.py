@@ -3,7 +3,6 @@
 import json
 from datetime import UTC, datetime
 
-from filelock import FileLock
 from pydantic import AwareDatetime, Field
 
 from exp.common.core.artifacts import (
@@ -15,6 +14,7 @@ from exp.common.core.artifacts import (
     sha256_json,
     stable_id,
 )
+from exp.common.core.locks import CoordinationLock
 from exp.common.models import (
     ModelCatalog,
     ModelMessage,
@@ -298,7 +298,7 @@ def predict_success(
     """Save one prospective prediction; replay raw results and refuse unknown-outcome redraws."""
     store = project.artifacts
     identity = spec.identity(code_revision)
-    with FileLock(store.project_directory / (identity + ".lock"), timeout=0):
+    with CoordinationLock(store.project_directory / (identity + ".lock"), timeout=0):
         if store.exists(identity):
             reference = artifact_input(store.read(identity).manifest)
             load_critic_prediction(store, reference)

@@ -8,7 +8,6 @@ from functools import partial
 from operator import not_
 from pathlib import Path
 
-from filelock import FileLock
 from pydantic import AwareDatetime, Field
 
 from exp.common.core.artifacts import (
@@ -21,6 +20,7 @@ from exp.common.core.artifacts import (
     sha256_json,
     stable_id,
 )
+from exp.common.core.locks import CoordinationLock
 from exp.common.models import ToolCall
 from exp.common.models.client import StructuredRequestPreflight
 from exp.common.models.unknown_outcome import resume_unknown
@@ -126,7 +126,7 @@ class DurableWorldModelSession:
         self._engine_identity = engine.identity
         self._binding, self._policy, self._complete = binding, policy, complete
         self._validate, self._clock = validate, clock or _utc_now
-        self._lock = FileLock(lock_path, timeout=0)
+        self._lock = CoordinationLock(lock_path, timeout=0)
         self.session_id = session_id
         self.initial_state = copy.deepcopy(initial_state)
         validate(initial_state)

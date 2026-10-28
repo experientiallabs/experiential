@@ -17,7 +17,6 @@ import time
 from collections.abc import Callable
 from datetime import UTC, datetime
 
-from filelock import FileLock
 from pydantic import AwareDatetime, Field
 
 from exp.common.core.artifacts import (
@@ -28,6 +27,7 @@ from exp.common.core.artifacts import (
     sha256_json,
     stable_id,
 )
+from exp.common.core.locks import CoordinationLock
 from exp.common.models import ModelCatalog, ModelSnapshot
 from exp.common.project import ArtifactAlreadyExistsError, ProjectStore, artifact_input
 from exp.common.tasks import TaskCase
@@ -290,7 +290,7 @@ def _recorded_decisions(
             {"memory": sha256_json(memory), "request": request_sha256, "code": code_revision},
         )
         store = project.artifacts
-        with FileLock(store.project_directory / (identity + ".lock"), timeout=lock_timeout):
+        with CoordinationLock(store.project_directory / (identity + ".lock"), timeout=lock_timeout):
             if not store.exists(identity):
                 intent = identity + "-intent"
                 recovering = store.exists(intent)

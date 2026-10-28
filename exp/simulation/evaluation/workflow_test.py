@@ -19,10 +19,17 @@ from exp.common.models.client import RequestAdmissionRefused
 from exp.common.models.unknown_outcome import DispatchOutcomeUnknown
 from exp.common.project import ProjectConfig, ProjectStore
 from exp.runtime.models.providers.async_transport import ProviderDeadlineExceeded
+from exp.runtime.models.providers.backpressure import (
+    REQUEST_REFUSAL_CODES,
+    ProviderAdmissionRefused,
+    is_overload,
+)
 from exp.runtime.models.providers.transport import ProviderTransportError
 from exp.runtime.models.structured_completion import CompletionNotDispatched
 from exp.runtime.sessions.dispatch_ledger import DispatchCapExhaustedError
 from exp.simulation.evaluation.workflow import (
+    DETERMINISTIC_REFUSALS,
+    INFRASTRUCTURE_STOPS,
     FixedWorkflow,
     deterministic_refusal,
     evaluate_workflow,
@@ -151,3 +158,16 @@ def test_only_an_identified_registered_refusal_is_deterministic() -> None:
         DispatchOutcomeUnknown("earlier dispatch saved no response"),
     ):
         assert deterministic_refusal(error) is None
+
+
+def test_deterministic_refusals_never_open_a_provider_breaker() -> None:
+    """A retirable per-request 503 is definite, so it is never counted as provider overload."""
+    assert DETERMINISTIC_REFUSALS <= REQUEST_REFUSAL_CODES
+    assert all(not is_overload(503, code) for code in DETERMINISTIC_REFUSALS)
+    assert is_overload(503, "gateway_overloaded") and is_overload(429)
+
+
+def test_a_host_admission_refusal_is_an_infrastructure_stop() -> None:
+    """An open breaker or a slot wait stops the run resumably instead of scoring a miss."""
+    refusal = ProviderAdmissionRefused("open", provider="openrouter", reason="circuit_open")
+    assert isinstance(refusal, INFRASTRUCTURE_STOPS)

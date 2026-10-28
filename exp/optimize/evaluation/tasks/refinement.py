@@ -4,7 +4,6 @@ import json
 from collections.abc import Callable
 from datetime import UTC, datetime
 
-from filelock import FileLock
 from pydantic import AwareDatetime, Field, model_validator
 
 from exp.common.core.artifacts import (
@@ -15,6 +14,7 @@ from exp.common.core.artifacts import (
     sha256_json,
     stable_id,
 )
+from exp.common.core.locks import CoordinationLock
 from exp.common.models import load_model_catalog
 from exp.common.progress import ProgressHook, report
 from exp.common.project import ProjectStore, artifact_input
@@ -495,7 +495,7 @@ def execute_task_refinement(
     )
     if stored != prepared or prepared.protocol_sha256 != _protocol():
         raise ValueError("refinement differs from its saved registration or role protocol")
-    with FileLock(project.artifacts.project_directory / (prepared.id + ".lock"), timeout=0):
+    with CoordinationLock(project.artifacts.project_directory / (prepared.id + ".lock"), timeout=0):
         saved = saved_task_refinement(project, prepared)
         if saved is not None:
             project.select_evaluation_task(

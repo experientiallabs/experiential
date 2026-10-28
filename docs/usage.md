@@ -958,5 +958,6 @@ studies and campaigns, witnessed SFT export, trajectory trace export, learning r
 screening and library evolution), saved-evidence analysis, environment comparison, task-factory
 authoring and executable Harbor tasks. Every action, its payload and the Harbor reward contract
 are documented in [docs/reference/continuations-and-harbor.md](reference/continuations-and-harbor.md).
-Trajectory-count selection (`sample-count`), summary forgetting (`forget-summary`) and judge
-challenge studies (`challenge-judges`) are in [evaluation-procedures.md](reference/evaluation-procedures.md).
+Trajectory-count selection (`sample-count`), summary forgetting (`forget-summary`), judge
+challenge studies (`challenge-judges`), checkpoint retirement (`retire-checkpoint`) and
+session-state collection (`collect-garbage`) are in [evaluation-procedures.md](reference/evaluation-procedures.md).

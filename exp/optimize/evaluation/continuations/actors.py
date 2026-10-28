@@ -6,7 +6,7 @@ Unknown outcomes produce explicit worst/best-case bounds, never disappear from d
 
 from datetime import UTC, datetime
 
-from filelock import FileLock, Timeout
+from filelock import Timeout
 from pydantic import Field, model_validator
 
 from exp.common.core.artifacts import (
@@ -17,6 +17,7 @@ from exp.common.core.artifacts import (
     sha256_json,
     stable_id,
 )
+from exp.common.core.locks import CoordinationLock
 from exp.common.evaluations.uncertainty import missing_outcome_bounds
 from exp.common.models import ModelSnapshot, load_model_catalog
 from exp.common.project import ProjectStore, artifact_input
@@ -420,7 +421,7 @@ def run_actor_panel(
     """Register every comparison before dispatch; save results or unknown outcomes once per cell."""
     identity = spec.identity(code_revision)
     store = project.artifacts
-    with FileLock(store.project_directory / (identity + ".lock"), timeout=0):
+    with CoordinationLock(store.project_directory / (identity + ".lock"), timeout=0):
         saved = saved_actor_panel(project, spec, code_revision=code_revision)
         if saved is not None:
             return saved

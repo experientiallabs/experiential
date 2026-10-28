@@ -1,6 +1,7 @@
 """CLI runtime composition restores a real workbook and meters scripted actor HTTP calls."""
 
 import json
+import os
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -248,3 +249,53 @@ def test_actor_spending_its_allowance_is_sent_its_effort_and_counted_as_exhauste
     metrics = result.metrics()
     assert (metrics["assessable"], metrics["actor_budget_exhausted"]) == (0, 2)
     assert metrics["actor_budget_exhausted_share"] == 1.0
+
+
+_WORKER_RUNTIME = """from exp.optimize.evaluation.executable.loader import ContinuationRuntime
+from exp.optimize.evaluation.continuations.study_test import probe, workbook_runtime
+from exp.simulation.continuations import load_continuation_checkpoint
+from exp.simulation.induction.contracts import TransitionProgram
+from exp.simulation.induction.sandbox import ProgramSandbox
+from exp.common.core.artifacts import ArtifactInput
+def continuation_runtime(project, configuration):
+    reference = ArtifactInput.model_validate(configuration["checkpoint"])
+    checkpoint = load_continuation_checkpoint(project.artifacts, reference)
+    sandbox = ProgramSandbox()
+    source = "def transition(state, args, facts):\\n    return 1\\n"
+    program = TransitionProgram(tool="t", source=source)
+    assert sandbox.run(program, {}, {}, {}).status == "reply"
+    (project.artifacts.project_directory / "worker.pid").write_text(str(sandbox._process.pid))
+    world = workbook_runtime(checkpoint.world)
+    return ContinuationRuntime(world, probe, configuration["probe"], sandbox.close)
+"""
+
+
+class _Interrupted(KeyboardInterrupt):
+    """An operator interrupt during the continuation study."""
+
+
+@pytest.mark.parametrize("interrupted", [False, True])
+def test_a_job_closes_its_runtime_and_leaves_no_worker_process(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, interrupted: bool
+) -> None:
+    """Studies, panels and campaigns all execute here, so every exit path reaps the worker."""
+    project, job, _ = job_fixture(tmp_path, monkeypatch)
+    job.runtime_file.write_text(_WORKER_RUNTIME)
+    job = job.model_copy(update={"runtime_sha256": sha256_bytes(job.runtime_file.read_bytes())})
+    if interrupted:
+
+        def interrupt(*args: object, **kwargs: object) -> None:
+            """Stop where the actor would start."""
+            del args, kwargs
+            raise _Interrupted
+
+        monkeypatch.setattr(
+            "exp.optimize.evaluation.continuations.job.run_continuation_study", interrupt
+        )
+        with pytest.raises(_Interrupted):
+            execute_continuation_job(project, job, code_revision="test")
+    else:
+        assert execute_continuation_job(project, job, code_revision="test").metrics()["planned"]
+    worker = int((project.artifacts.project_directory / "worker.pid").read_text())
+    with pytest.raises(ProcessLookupError):
+        os.kill(worker, 0)

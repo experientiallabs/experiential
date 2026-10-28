@@ -6,8 +6,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 
-from filelock import FileLock, Timeout
-
+from exp.common.core.locks import CoordinationLock, Timeout
 from exp.runtime.gateway.lifecycle_fields import GatewayLifecycleError
 
 
@@ -15,7 +14,7 @@ class GatewayTeardownIncomplete(GatewayLifecycleError):
     """Serving workers may still be running after a failed or timed-out drain."""
 
 
-_RETAINED_OWNER_LOCKS: list[FileLock] = []
+_RETAINED_OWNER_LOCKS: list[CoordinationLock] = []
 """Owner locks kept until process exit because their workers may still write."""
 
 
@@ -56,7 +55,7 @@ def gateway_instance_lock(root: Path, *, port: int) -> Iterator[GatewayOwnership
     """
     state_dir = root / "gateway"
     state_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-    lock = FileLock(state_dir / "run.lock", timeout=0, mode=0o600)
+    lock = CoordinationLock(state_dir / "run.lock", timeout=0, mode=0o600)
     try:
         lock.acquire()
     except Timeout:

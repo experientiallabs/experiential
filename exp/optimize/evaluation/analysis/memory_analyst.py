@@ -3,7 +3,6 @@
 import json
 from datetime import UTC, datetime
 
-from filelock import FileLock
 from pydantic import AwareDatetime, Field
 
 from exp.common.core.artifacts import (
@@ -15,6 +14,7 @@ from exp.common.core.artifacts import (
     sha256_json,
     stable_id,
 )
+from exp.common.core.locks import CoordinationLock
 from exp.common.models import ModelSnapshot, load_model_catalog
 from exp.common.project import ProjectStore, artifact_input
 from exp.optimize.evaluation.analysis.memory_evidence import (
@@ -223,7 +223,7 @@ def run_memory_analysis(
     Admission and dispatch linearize before any later protection declaration. The lease
     prevents concurrent classification changes while approved content is being disclosed.
     """
-    with FileLock(project.artifacts.project_directory / "source-access.lock", timeout=0):
+    with CoordinationLock(project.artifacts.project_directory / "source-access.lock", timeout=0):
         return _run_admitted_memory_analysis(project, spec, code_revision=code_revision)
 
 
@@ -237,7 +237,7 @@ def _run_admitted_memory_analysis(
     definition = preflight_memory_analyst(project, spec)
     identity = spec.identity(code_revision)
     directory = project.artifacts.project_directory
-    with FileLock(directory / (identity + ".lock"), timeout=0):
+    with CoordinationLock(directory / (identity + ".lock"), timeout=0):
         saved = saved_memory_analysis(project, spec, code_revision=code_revision)
         if saved is not None:
             return saved

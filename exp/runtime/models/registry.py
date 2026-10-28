@@ -33,6 +33,7 @@ from exp.runtime.models.credentials import (
     read_connection_credential,
 )
 from exp.runtime.models.preflight import CapabilityRequirement, preflight_capabilities
+from exp.runtime.models.providers.admitted_transport import AdmittedJsonTransport
 from exp.runtime.models.providers.anthropic import ANTHROPIC_BASE_URL, AnthropicClient
 from exp.runtime.models.providers.anthropic_subscription import (
     AnthropicOAuthApp,
@@ -52,6 +53,7 @@ from exp.runtime.models.providers.azure import (
     bind_azure_api_key,
     resolve_azure_api_surface,
 )
+from exp.runtime.models.providers.backpressure import ProviderRoute
 from exp.runtime.models.providers.base import DEFAULT_TIMEOUT_SECONDS
 from exp.runtime.models.providers.bedrock import (
     BedrockClient,
@@ -442,7 +444,7 @@ class RuntimeModelCatalog:
                     model=snapshot,
                     api_key=api_key,
                     base_url=connection.base_url,
-                    transport=self._transport_factory(),
+                    transport=self._bound_transport(connection.provider, alias),
                     timeout_seconds=self._http_timeout_seconds,
                     token_provider=token_provider,
                     supports_temperature=capabilities.supports_temperature,
@@ -472,7 +474,7 @@ class RuntimeModelCatalog:
                 model=snapshot,
                 api_key=api_key,
                 base_url=connection.base_url,
-                transport=self._transport_factory(),
+                transport=self._bound_transport(connection.provider, alias),
                 timeout_seconds=self._http_timeout_seconds,
                 token_provider=token_provider,
                 supports_temperature=capabilities.supports_temperature,
@@ -500,7 +502,7 @@ class RuntimeModelCatalog:
                 model=snapshot,
                 api_key=api_key,
                 base_url=connection.base_url or OPENAI_BASE_URL,
-                transport=self._transport_factory(),
+                transport=self._bound_transport(connection.provider, alias),
                 timeout_seconds=self._http_timeout_seconds,
                 supports_temperature=capabilities.supports_temperature,
                 supports_top_p=_supports_top_p(capabilities),
@@ -557,7 +559,7 @@ class RuntimeModelCatalog:
                     api_key=api_key,
                     base_url=azure_anthropic_base_url(connection.base_url),
                     authorization_bearer=True,
-                    transport=self._transport_factory(),
+                    transport=self._bound_transport(connection.provider, alias),
                     timeout_seconds=self._http_timeout_seconds,
                     supports_temperature=capabilities.supports_temperature,
                     supports_top_p=_supports_top_p(capabilities),
@@ -614,7 +616,7 @@ class RuntimeModelCatalog:
                 api_key=api_key,
                 api_version=api_version,
                 api_surface=api_surface,
-                transport=self._transport_factory(),
+                transport=self._bound_transport(connection.provider, alias),
                 timeout_seconds=self._http_timeout_seconds,
                 supports_temperature=capabilities.supports_temperature,
                 supports_top_p=_supports_top_p(capabilities),
@@ -666,7 +668,7 @@ class RuntimeModelCatalog:
             raise ModelConnectionError(
                 f"OpenAI-compatible alias {alias!r} needs connection.base_url"
             )
-        transport = self._transport_factory()
+        transport = self._bound_transport(provider, alias)
         endpoint = urlsplit(base_url)
         if (
             self._transport_factory is HttpxAsyncJsonTransport
@@ -747,6 +749,18 @@ class RuntimeModelCatalog:
             credential_receipt=credential.receipt,
         )
 
+    def _bound_transport(self, provider: str, alias: str) -> ProviderTransport:
+        """Build one client's transport, scoping an admitted transport to its provider and alias.
+
+        Host-wide admission limits and circuit breakers are keyed by these scopes, so every
+        client the registry builds on an :class:`AdmittedJsonTransport` paces under its own
+        provider's breaker and its alias's in-flight limit.
+        """
+        transport = self._transport_factory()
+        if isinstance(transport, AdmittedJsonTransport):
+            return transport.for_route(ProviderRoute(provider=provider, alias=alias))
+        return transport
+
     def _anthropic_app(self) -> AnthropicOAuthApp:
         """Return the operator's Anthropic OAuth app.
 
@@ -803,7 +817,7 @@ class RuntimeModelCatalog:
                 client = ChatGptSubscriptionClient(
                     model=snapshot,
                     tokens=tokens,
-                    transport=self._transport_factory(),
+                    transport=self._bound_transport(connection.provider, alias),
                     timeout_seconds=self._http_timeout_seconds,
                     supports_temperature=capabilities.supports_temperature,
                     supports_top_p=_supports_top_p(capabilities),
@@ -816,7 +830,7 @@ class RuntimeModelCatalog:
                     model=snapshot,
                     tokens=tokens,
                     app=self._anthropic_app(),
-                    transport=self._transport_factory(),
+                    transport=self._bound_transport(connection.provider, alias),
                     timeout_seconds=self._http_timeout_seconds,
                     supports_temperature=capabilities.supports_temperature,
                     supports_top_p=_supports_top_p(capabilities),

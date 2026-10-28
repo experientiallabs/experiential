@@ -7,11 +7,12 @@ the grounded predictor, which holds the one simulated state and the full call hi
 world stays the simulated owner: no reply this runtime produces is native evidence.
 
 Only ``continuation_runtime`` is provided; per-trial provider grants bind the grounded
-definition's own configuration and are not composed here.
+definition's own configuration and are not composed here. The returned runtime owns the
+program worker; closing it stops the worker and removes its directory.
 """
 
 import json
-import weakref
+from contextlib import ExitStack
 
 from exp.common.core.artifacts import ArtifactInput, ContractModel, JsonObject, Sha256, sha256_json
 from exp.common.project import ProjectStore
@@ -60,21 +61,23 @@ def continuation_runtime(project: ProjectStore, configuration: JsonObject) -> Co
             "induced coverage was validated under another world manifest; re-run "
             "validate-transitions with this runtime's manifest"
         )
-    base = grounded.continuation_runtime(project, spec.grounded.model_dump(mode="json"))
-    world = base.world
-    if not isinstance(world, ExecutableWorldRuntime):
-        raise ValueError("induced programs compose only with the executable grounded world")
-    sandbox = ProgramSandbox(coverage.limits)
-    facts = spec.grounded.facts
-    starting = None if facts is None else facts.facts.conditioning(facts.first_version)
-    factory = InducedWorldFactory(
-        coverage,
-        world.factory,
-        sandbox,
-        facts={} if starting is None else {fact.key: fact.value for fact in starting.facts},
-    )
-    # The runtime has no close hook; the worker stops when the factory is collected or at exit.
-    weakref.finalize(factory, sandbox.close)
+    with ExitStack() as owned:
+        base = owned.enter_context(
+            grounded.continuation_runtime(project, spec.grounded.model_dump(mode="json"))
+        )
+        world = base.world
+        if not isinstance(world, ExecutableWorldRuntime):
+            raise ValueError("induced programs compose only with the executable grounded world")
+        sandbox = owned.enter_context(ProgramSandbox(coverage.limits))
+        facts = spec.grounded.facts
+        starting = None if facts is None else facts.facts.conditioning(facts.first_version)
+        factory = InducedWorldFactory(
+            coverage,
+            world.factory,
+            sandbox,
+            facts={} if starting is None else {fact.key: fact.value for fact in starting.facts},
+        )
+        release = owned.pop_all().close
 
     def probe(checkpoint: WorldCheckpoint) -> JsonObject:
         """Read only registered simulated state; unresolved fields refuse assessment."""
@@ -93,4 +96,5 @@ def continuation_runtime(project: ProjectStore, configuration: JsonObject) -> Co
         ),
         probe,
         spec.probe_sha256,
+        release,
     )

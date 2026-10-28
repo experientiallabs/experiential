@@ -4,7 +4,6 @@ import json
 from datetime import UTC, datetime
 from typing import Literal, Self
 
-from filelock import FileLock
 from pydantic import Field, model_validator
 
 from exp.common.core.artifacts import (
@@ -14,6 +13,7 @@ from exp.common.core.artifacts import (
     sha256_json,
     stable_id,
 )
+from exp.common.core.locks import CoordinationLock
 from exp.common.models import (
     ModelMessage,
     ModelRequest,
@@ -256,7 +256,7 @@ def propose_tasks(
     """Draw once, retain raw output and publish all candidates for separate qualification."""
     spec = TaskProposalSpec.model_validate_json(spec.model_dump_json())
     store, identity = project.artifacts, spec.identity(code_revision)
-    with FileLock(store.project_directory / (identity + ".lock"), timeout=0):
+    with CoordinationLock(store.project_directory / (identity + ".lock"), timeout=0):
         saved = saved_task_proposals(project, spec, code_revision=code_revision)
         if saved is not None:
             return saved
