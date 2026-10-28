@@ -237,6 +237,10 @@ class _RuntimeCatalog:
         self._embedding = _EmbeddingClient()
         self._completion = _CompletionClient()
 
+    def with_transport_wrapper(self, _wrapper: object) -> _RuntimeCatalog:
+        """No HTTP exists in these injected clients; retain their deterministic semantics."""
+        return self
+
     def snapshot(self, alias: str) -> tuple[ModelSnapshot, ModelCapabilities]:
         """Return the fixture alias identity without constructing a provider client.
 

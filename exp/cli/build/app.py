@@ -819,19 +819,33 @@ def _complete_grounded_build(
                 f"grounded build requires ${estimate:.6f}, above the configured "
                 f"${maximum_build_cost_usd:.6f} ceiling"
             )
-        resolved_embedder = runtime_catalog.preflight(
-            selected.embedder,
-            CapabilityRequirement(requires_embeddings=True),
-        )
-        built = _build_grounded_artifacts(
+        from exp.cli.build.embedding_admission import admitted_embeddings
+
+        with admitted_embeddings(
             store,
             completed,
-            world_alias=selected.world_model,
-            world_snapshot=world_snapshot,
-            resolved_embedder=resolved_embedder,
-            top_k=top_k,
-            progress=progress,
-        )
+            runtime_catalog,
+            alias=selected.embedder,
+            snapshot=embedder_snapshot,
+            maximum_input_tokens=runtime_catalog.snapshot(selected.embedder)[
+                1
+            ].context_window_tokens,
+            estimate=estimate,
+            provider_spend_authorized=provider_spend_authorized,
+        ) as admitted_catalog:
+            resolved_embedder = admitted_catalog.preflight(
+                selected.embedder,
+                CapabilityRequirement(requires_embeddings=True),
+            )
+            built = _build_grounded_artifacts(
+                store,
+                completed,
+                world_alias=selected.world_model,
+                world_snapshot=world_snapshot,
+                resolved_embedder=resolved_embedder,
+                top_k=top_k,
+                progress=progress,
+            )
     save_grounded_checkpoint(store, built)
     report(progress, "finalization")
     select_completed_build(

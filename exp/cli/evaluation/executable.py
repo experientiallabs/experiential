@@ -16,8 +16,9 @@ from exp.cli.evaluation.continuation_context import (
     require_new_operation_file,
 )
 from exp.cli.evaluation.spend import review_components, review_cost
+from exp.cli.evaluation.spend_ceiling import inventory_terms
 from exp.cli.shared.consent import require_spend_consent
-from exp.common.core.artifacts import ArtifactInput, ContractModel, JsonObject
+from exp.common.core.artifacts import ArtifactInput, ContractModel, JsonObject, sha256_json
 from exp.common.project import ProjectStore
 from exp.optimize.evaluation.continuations.capture import preflight_capture
 from exp.optimize.evaluation.continuations.evidence import qualified_training_job
@@ -224,6 +225,7 @@ def run_executable_command(
     non_interactive: bool,
     code_revision: str,
     spec_path: Path | None = None,
+    context: ContinuationContext | None = None,
 ) -> None:
     """Publish immutable artifacts or explicitly serve a bounded trusted environment runtime.
 
@@ -237,6 +239,9 @@ def run_executable_command(
         code_revision: Installed execution revision recorded in published artifacts.
         spec_path: The ``--continuations`` spec file named in spend prompts. Python callers
             without a spec file leave it unset, and prompts then name no file.
+        context: The ``--continuations`` invocation, whose consent enforces the operation's
+            spend ceiling over every paid role; Python callers without one ask the shared
+            consent only.
 
     Returns:
         None. Results are printed to ``console``.
@@ -261,14 +266,18 @@ def run_executable_command(
                 "Author context and sources checked; no calls, binding or native execution."
             )
             return
-        if not saved and not require_spend_consent(
-            console,
-            root=project.paths.root,
-            yes=yes,
-            estimated_cost_usd=review_cost(console, project, spec),
-            cost_is_upper_bound=False,
-            non_interactive=non_interactive,
-            command=consent_command,
+        if not saved and not (
+            context.consent(spec)
+            if context is not None
+            else require_spend_consent(
+                console,
+                root=project.paths.root,
+                yes=yes,
+                estimated_cost_usd=review_cost(console, project, spec),
+                cost_is_upper_bound=False,
+                non_interactive=non_interactive,
+                command=consent_command,
+            )
         ):
             return
         console.print_json(
@@ -464,18 +473,26 @@ def run_executable_command(
             f"attempts until {command.provider_limits.deadline.isoformat()}; "
             "resumes share this trial's counter."
         )
-    if not require_spend_consent(
-        console,
-        root=project.paths.root,
-        yes=yes,
-        estimated_cost_usd=review_components(
+    components = runtime_costs(project, definition.job.runtime_sha256, definition.job.configuration)
+    if context is not None:
+        review_components(console, components)
+        known, _ = inventory_terms(components)
+        consented = context.consent_ceiling(
+            stage=sha256_json(command.model_dump(mode="json")),
+            known_usd=known,
+            unpriced=tuple(row for row in components if row.usd is None),
+        )
+    else:
+        consented = require_spend_consent(
             console,
-            runtime_costs(project, definition.job.runtime_sha256, definition.job.configuration),
-        ),
-        cost_is_upper_bound=False,
-        non_interactive=non_interactive,
-        command=consent_command,
-    ):
+            root=project.paths.root,
+            yes=yes,
+            estimated_cost_usd=review_components(console, components),
+            cost_is_upper_bound=False,
+            non_interactive=non_interactive,
+            command=consent_command,
+        )
+    if not consented:
         return
     task = verify_executable_package(project, command.directory)
     created = []
@@ -525,6 +542,7 @@ def handle_harbor(context: ContinuationContext, command: ExecutableCommand) -> N
         non_interactive=context.non_interactive,
         code_revision=context.revision,
         spec_path=context.spec_path,
+        context=context,
     )
 
 

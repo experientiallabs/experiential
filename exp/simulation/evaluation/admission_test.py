@@ -432,3 +432,33 @@ def test_reordered_table_relations_cannot_certify_themselves(tmp_path: Path) -> 
         project.artifacts, challenge, label="pass", compared=(candidate,)
     )
     assert refusal is not None and refusal.reason == "self_approval"
+
+
+def test_argument_schema_fingerprint_is_canonical_and_opt_in() -> None:
+    """Annotations and local refs cannot manufacture a different policy oracle."""
+    from exp.simulation.evaluation.admission import _predicate_fingerprint
+
+    legacy = TaskVerifier(description="Legacy predicate.", outcome_schema={"type": "object"})
+    assert (
+        _predicate_fingerprint(legacy)
+        == "cad1acfee27b1afa4886fcba759ae364621ffa2a601cfdd32ec54b2685504a39"
+    )
+    first = legacy.model_copy(
+        update={"argument_schemas": {"edit": {"properties": {"updates": {"maxItems": 0}}}}}
+    )
+    equivalent = legacy.model_copy(
+        update={
+            "argument_schemas": {
+                "edit": {
+                    "$defs": {"empty": {"maxItems": 0, "description": "annotation"}},
+                    "properties": {"updates": {"$ref": "#/$defs/empty"}},
+                }
+            }
+        }
+    )
+    different = legacy.model_copy(
+        update={"argument_schemas": {"edit": {"properties": {"updates": {"maxItems": 1}}}}}
+    )
+    assert _predicate_fingerprint(first) == _predicate_fingerprint(equivalent)
+    assert _predicate_fingerprint(first) != _predicate_fingerprint(different)
+    assert _predicate_fingerprint(first) != _predicate_fingerprint(legacy)

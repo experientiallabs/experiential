@@ -15,8 +15,11 @@ from exp.common.evaluations.reconstruction import (
     mechanical_checks,
 )
 from exp.common.project import ProjectStore, artifact_input
+from exp.optimize.evaluation.analysis.source_access import exclude_source_from_qualification
+from exp.optimize.evaluation.analysis.source_access_test import _source
 from exp.optimize.evaluation.council.fidelity import load_tool_fidelity
 from exp.optimize.evaluation.fidelity import runner as fidelity
+from exp.optimize.evaluation.fidelity.memory_test import _exclude, _published
 from exp.optimize.evaluation.fidelity.runner import (
     FidelitySpec,
     execute_fidelity_evaluation,
@@ -30,13 +33,20 @@ from exp.optimize.evaluation.tests.fidelity_memory_test import (
     trajectory,
 )
 from exp.runtime.models.providers.transport import ScriptedJsonTransport
+from exp.simulation.world_model.experience_memory import read_memory_version
 
 
 def saved_measurement(
-    root: Path, *, corrupt_counts: bool = False
+    root: Path, *, corrupt_counts: bool = False, frozen_memory: bool = False
 ) -> tuple[ProjectStore, FidelitySpec, ArtifactInput]:
     """Save a held-out measured chronology with one failed planned transition."""
-    project, spec = source_project(root)
+    project, spec = memory_project(root) if frozen_memory else source_project(root)
+    if frozen_memory:
+        learning = trajectory(spec, "seed", "seed", "learn")
+        _published(project, learning, None)
+        spec = trajectory(spec, "measured", "current", "frozen", checkpoint=1)
+        assert spec.memory is not None
+        spec = spec.model_copy(update={"memory": spec.memory.model_copy(update={"reserved": True})})
     prepared = prepare_fidelity_evaluation(project, spec, code_revision="fixture")
     action: JsonObject = {"name": "inspect", "arguments": {"key": "current"}}
     evidence = WorkflowEvidence(
@@ -182,3 +192,37 @@ def test_duplicate_measurements_cannot_inflate_tool_support(tmp_path: Path) -> N
     project, spec, plan = saved_measurement(tmp_path)
     with pytest.raises(ValueError, match="duplicate"):
         load_tool_fidelity(project, (plan, plan), spec.world_model, ())
+
+
+@pytest.mark.parametrize("excluded_kind", ["plan", "report", "intent"])
+def test_tool_qualification_refuses_excluded_measurement(
+    tmp_path: Path, excluded_kind: str
+) -> None:
+    """A completed report cannot qualify a tool through an excluded root or ancestor."""
+    project, spec, plan = saved_measurement(tmp_path)
+    identity = plan.artifact_id
+    if excluded_kind == "report":
+        identity += "-report"
+    elif excluded_kind == "intent":
+        identity += "-report-intent"
+    source = artifact_input(project.artifacts.read(identity).manifest)
+    exclude_source_from_qualification(
+        project.artifacts,
+        source,
+        audit=_source(project.artifacts, "exclusion-audit"),
+        rationale="Proven unsafe response lineage",
+        code_revision="fixture",
+    )
+    with pytest.raises(ValueError, match="excluded from qualification"):
+        load_tool_fidelity(project, (plan,), spec.world_model, ("actor-lineage",))
+
+
+def test_completed_tool_report_cannot_launder_excluded_spec_memory(tmp_path: Path) -> None:
+    """Memory referenced inside a plan's JSON is fenced even without a manifest edge."""
+    project, spec, plan = saved_measurement(tmp_path, frozen_memory=True)
+    assert load_tool_fidelity(project, (plan,), spec.world_model, ())["profiles"]
+    assert spec.memory is not None
+    version = read_memory_version(project.artifacts, spec.memory.lineage, 1)
+    _exclude(project, version)
+    with pytest.raises(ValueError, match="excluded from qualification"):
+        load_tool_fidelity(project, (plan,), spec.world_model, ())

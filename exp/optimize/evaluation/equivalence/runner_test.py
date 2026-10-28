@@ -1,6 +1,7 @@
 """Paired execution through real XLSX worlds, admitted HTTP and saved trace-council reviews."""
 
 import json
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -8,6 +9,11 @@ import pytest
 from filelock import Timeout
 
 from exp.common.core.artifacts import ArtifactInput, JsonObject, sha256_bytes, sha256_json
+from exp.common.evaluations.actor_equivalence import (
+    ActorComparison,
+    ActorEquivalenceReport,
+    EquivalenceRubric,
+)
 from exp.common.models import load_model_catalog, write_model_catalog
 from exp.common.project import ProjectStore, artifact_input
 from exp.optimize.evaluation.continuations.job import ContinuationJob
@@ -17,6 +23,7 @@ from exp.optimize.evaluation.equivalence import runner as owner
 from exp.optimize.evaluation.equivalence.evidence import PairMeasurement
 from exp.optimize.evaluation.equivalence.policy_test import fixture_policy, registered_policy
 from exp.optimize.evaluation.equivalence.review import ReviewModel
+from exp.optimize.evaluation.equivalence.rubric_test import frozen_rubric
 from exp.optimize.evaluation.equivalence.runner import (
     EquivalenceCase,
     EquivalenceSpec,
@@ -259,6 +266,7 @@ def equivalence_fixture(
     ).snapshot("judge")[0]
     reviewer = ReviewModel(alias="judge", model=model, output_tokens=1024)
     spec = EquivalenceSpec(
+        rubric=frozen_rubric(project, reviewer),
         cases=(
             EquivalenceCase(
                 reference=base,
@@ -535,6 +543,48 @@ def test_same_panel_lease_excludes_another_process_owner(
         with pytest.raises(Timeout):
             run_equivalence(project, spec, code_revision="test")
     assert not actors.requests and not reviews.requests
+
+
+def test_busy_source_access_defers_the_judge_and_a_later_run_completes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Contention for the disclosure boundary sends nothing and never records a failed judgment."""
+    from filelock import FileLock
+
+    project, spec, actors, reviews = equivalence_fixture(tmp_path, monkeypatch)
+    judge = owner.evaluate_actor_equivalence
+
+    def contended(
+        pair: ActorComparison,
+        *,
+        model_identity: str,
+        complete: Callable[[JsonObject, str], JsonObject],
+        rubric: EquivalenceRubric,
+    ) -> ActorEquivalenceReport:
+        """Judge while another process holds the source-access lock."""
+        with FileLock(project.artifacts.project_directory / "source-access.lock", timeout=0):
+            return judge(pair, model_identity=model_identity, complete=complete, rubric=rubric)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(owner, "evaluate_actor_equivalence", contended)
+        with pytest.raises(Timeout):
+            run_equivalence(project, spec, code_revision="test")
+    assert len(actors.requests) == 6 and not reviews.requests
+    assert saved_equivalence(project, spec, code_revision="test") is None
+
+    def unlocked() -> ScriptedJsonTransport:
+        """Prove no provider transport is built while the disclosure boundary is held."""
+        with FileLock(project.artifacts.project_directory / "source-access.lock", timeout=0):
+            return reviews
+
+    monkeypatch.setattr("exp.optimize.evaluation.equivalence.review.HttpxJsonTransport", unlocked)
+    result = run_equivalence(project, spec, code_revision="test")
+    assert all(
+        row.judgment is not None and row.judgment.status == "completed"
+        for row in result.measurements
+    )
+    assert len(actors.requests) == 6 and len(reviews.requests) == 3
+    assert saved_equivalence(project, spec, code_revision="test") == result
 
 
 def test_five_actor_panel_preserves_one_source_family_and_scopes_each_analyst(

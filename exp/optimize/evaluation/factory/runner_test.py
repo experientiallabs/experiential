@@ -14,7 +14,7 @@ from typer.testing import CliRunner
 from exp.cli.app import app
 from exp.common.core.artifacts import ArtifactEnvelope, JsonObject
 from exp.common.models import ToolCall
-from exp.common.project import ProjectStore
+from exp.common.project import ProjectStore, artifact_input
 from exp.common.project.manifests import ArtifactManifest
 from exp.optimize.evaluation.continuations.study import ContinuationStudySpec
 from exp.optimize.evaluation.executable.package import verify_executable_package
@@ -25,7 +25,11 @@ from exp.optimize.evaluation.executable.task import (
     load_executable_task,
     persist_executable_task,
 )
-from exp.optimize.evaluation.factory.candidates_test import _reply, batch_fixture
+from exp.optimize.evaluation.factory.candidates_test import (
+    _reply,
+    batch_fixture,
+    fixture_quality_reviews,
+)
 from exp.optimize.evaluation.factory.proposals import (
     TaskProposalSpec,
     load_task_proposals,
@@ -71,6 +75,7 @@ def factory_fixture(
                 strata=("workbook",),
                 information="available",
                 horizon="single_decision",
+                quality_reviews=batch.quality_reviews,
             ),
         ),
         actors=batch.actors,
@@ -428,6 +433,11 @@ def record_family(
     return FactoryFamily(
         proposal=proposal,
         controls=tuple(cases),
+        quality_reviews=fixture_quality_reviews(
+            project,
+            artifact_input(project.artifacts.read(proposal.identity("test")).manifest),
+            (brief_ref, authority),
+        ),
         strata=("retail",),
         information="available",
         horizon="single_decision",
@@ -530,3 +540,35 @@ def test_busy_child_remains_pending_and_completes_after_release(
     result = run_task_factory(project, spec, code_revision="test")
     assert result.status == "development_qualified"
     assert all(cell.error_type is None for cell in result.cells)
+
+
+def test_native_record_permission_is_strict_opt_in_through_factory_batch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Legacy identities stay unchanged; explicit replay reaches the normal child owner."""
+    from pydantic import ValidationError
+
+    from exp.optimize.evaluation.factory.candidates import CandidateBatchSpec
+    from exp.optimize.evaluation.factory.runner import _batch
+
+    project, spec, _ = factory_fixture(tmp_path, monkeypatch)
+    family = spec.families[0]
+    legacy_family = family.model_dump(mode="json")
+    assert "replay_native_records" not in legacy_family
+    batch = _batch(project, spec, family, "test")
+    assert "replay_native_records" not in batch.model_dump(mode="json")
+    assert (
+        family.model_copy(update={"replay_native_records": False}).model_dump(mode="json")
+        == legacy_family
+    )
+    opted = family.model_copy(update={"replay_native_records": True})
+    forwarded = _batch(project, spec, opted, "test")
+    assert forwarded.replay_native_records is True
+    assert forwarded.identity("test") != batch.identity("test")
+    for invalid in ("yes", 1, None):
+        with pytest.raises(ValidationError):
+            FactoryFamily.model_validate({**legacy_family, "replay_native_records": invalid})
+        with pytest.raises(ValidationError):
+            CandidateBatchSpec.model_validate(
+                {**batch.model_dump(mode="json"), "replay_native_records": invalid}
+            )

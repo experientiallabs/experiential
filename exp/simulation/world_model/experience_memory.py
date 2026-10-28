@@ -63,6 +63,9 @@ class MemoryVersion(ArtifactEnvelope):
         lineage: Caller-named memory sequence within one project.
         version: Number of consumed distinct trajectories; 0 is never persisted.
         world_model: Serving simulator whose predictions produced this version's research.
+        knowledge_scope: Null-only annotation emitted by existing same-scheme writers. It
+            grants no scope: the bound source/world graph remains the authority. Accepting
+            explicit null preserves immutable paid checkpoints; new records omit the field.
         knowledge_identity: What the simulator knows (knowledge and serving corpus). This is
             the only compatibility gate: any model, top-k, reranker, prompt, prediction
             guidance or memory selector may read or extend the lineage, so serving
@@ -92,6 +95,7 @@ class MemoryVersion(ArtifactEnvelope):
     library: ArtifactInput
     consumed: tuple[Sha256, ...]
     publisher: str
+    knowledge_scope: None = Field(default=None, exclude_if=lambda value: value is None)
     knowledge_identity: Sha256
     knowledge_identity_scheme: Literal[2]
     serving_policy: JsonObject
@@ -705,6 +709,7 @@ def publish_trajectory(
     created_at: datetime,
     code_revision: str,
     publisher: str,
+    evidence: tuple[ArtifactInput, ...] = (),
 ) -> tuple[MemoryVersion, bool]:
     """Consume one completed trajectory into the next lineage version.
 
@@ -722,6 +727,8 @@ def publish_trajectory(
         created_at: Aware publication time.
         code_revision: Publishing implementation identity.
         publisher: Stable run identity; a restart of the same run recovers its own version.
+        evidence: Saved artifacts the trajectory was recorded in, cited by the new version so
+            ancestry checks on memory reach them. A recovered own version must cite them too.
 
     Returns:
         The new (or recovered own) version and True, or the existing head and False when
@@ -729,8 +736,9 @@ def publish_trajectory(
 
     Raises:
         ReservedTaskError: The trajectory's task lineage is reserved for evaluation.
-        ValueError: The trajectory lacks a task lineage, or its actions and replies are
-            malformed or unequal in number.
+        ValueError: The trajectory lacks a task lineage, its actions and replies are
+            malformed or unequal in number, or this publisher's earlier version lacks the
+            evidence citations.
     """
     require_consumed_trajectory(trajectory)
     artifact = load_grounded_world_model_artifact(store, world_model)
@@ -748,6 +756,7 @@ def publish_trajectory(
             created_at=created_at,
             code_revision=code_revision,
             publisher=publisher,
+            evidence=evidence,
         )
 
 
@@ -769,6 +778,7 @@ def _publish(
     created_at: datetime,
     code_revision: str,
     publisher: str,
+    evidence: tuple[ArtifactInput, ...],
 ) -> tuple[MemoryVersion, bool]:
     """Publication body; the caller holds the lineage lock."""
     if parent is not None and (
@@ -792,6 +802,13 @@ def _publish(
         index = head.consumed.index(digest)
         own = read_memory_version(store, lineage, index + 1)
         if own.publisher == publisher and index == (parent.version if parent else 0):
+            missing = sorted(ref.artifact_id for ref in set(evidence) - set(own.inputs))
+            if missing:
+                raise ValueError(
+                    f"memory version {own.version} of {lineage!r} was published without citing "
+                    f"{', '.join(missing)}, so its provenance cannot be recovered; exclude that "
+                    "version from qualification or learn into a fresh memory lineage"
+                )
             _materialize(store, own)
             return own, True
         return head, False
@@ -851,7 +868,7 @@ def _publish(
         created_at=created_at,
         inputs=tuple(
             sorted(
-                [artifact_input(store.read(snapshot.library_id).manifest)]
+                [artifact_input(store.read(snapshot.library_id).manifest), *evidence]
                 + ([] if parent is None else [_input(store, lineage, parent.version)]),
                 key=lambda row: row.artifact_id,
             )

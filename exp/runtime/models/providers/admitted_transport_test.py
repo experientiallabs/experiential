@@ -243,6 +243,72 @@ def test_credential_bearing_request_refuses_before_claim_and_io(tmp_path: Path) 
     assert not project.artifacts.list_ids()
 
 
+@pytest.mark.parametrize(
+    ("url", "payload", "texts"),
+    [
+        (
+            "https://fixture.invalid/v1/embeddings",
+            {"model": "embed", "input": ["Authorization: token ${GITHUB_TOKEN}", "ls -la"]},
+            ["Authorization: token ${GITHUB_TOKEN}", "ls -la"],
+        ),
+        (
+            "https://fixture.invalid/v1beta/models/e:batchEmbedContents",
+            {"requests": [{"content": {"parts": [{"text": "'password': u.password"}]}}]},
+            ["'password': u.password"],
+        ),
+    ],
+)
+def test_embedding_text_is_retained_by_digest_so_quoted_credentials_still_dispatch(
+    tmp_path: Path, url: str, payload: JsonObject, texts: list[str]
+) -> None:
+    """Embedding inputs quote trace evidence; the receipt cites them, the wire gets them whole."""
+    from exp.common.core.artifacts import sha256_bytes, sha256_json
+
+    project = ProjectStore(tmp_path, "attempt")
+    inner = ScriptedJsonTransport([JsonHttpResponse(status_code=200, body={})])
+    transport = AdmittedJsonTransport(
+        inner,
+        ledger=DispatchLedger(tmp_path / "calls.sqlite", 1, "b" * 64),
+        artifacts=project.artifacts,
+        code_revision="test",
+        deadline=datetime.now(UTC) + timedelta(minutes=1),
+    )
+    transport.post(url, headers={}, payload=payload, timeout_seconds=5)
+    assert inner.requests[0].payload == payload
+    identity = next(x for x in project.artifacts.list_ids() if x.endswith("-intent"))
+    encoded = project.artifacts.read_bytes(identity, "receipt.json")
+    saved = json.loads(encoded)
+    assert saved["request_sha256"] == sha256_json(payload)
+    assert all(text.encode() not in encoded for text in texts)
+    cited = json.dumps(saved["request_body"])
+    for text in texts:
+        assert sha256_bytes(text.encode("utf-8")) in cited
+
+
+def test_embedding_route_still_refuses_credentials_outside_its_text_fields(
+    tmp_path: Path,
+) -> None:
+    """Only embedded text is cited; a credential in any other embedding field still refuses."""
+    project = ProjectStore(tmp_path, "attempt")
+    inner = ScriptedJsonTransport([JsonHttpResponse(status_code=200, body={})])
+    ledger = DispatchLedger(tmp_path / "calls.sqlite", 1, "b" * 64)
+    transport = AdmittedJsonTransport(
+        inner,
+        ledger=ledger,
+        artifacts=project.artifacts,
+        code_revision="test",
+        deadline=datetime.now(UTC) + timedelta(minutes=1),
+    )
+    with pytest.raises(ArtifactStoreError, match="request"):
+        transport.post(
+            "https://fixture.invalid/v1/embeddings",
+            headers={},
+            payload={"input": ["ls"], "user": '{"api_key": "inert-body-secret"}'},
+            timeout_seconds=5,
+        )
+    assert not inner.requests and ledger.used() == 0
+
+
 def test_late_paid_response_is_retained_but_cannot_authorize_an_action(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

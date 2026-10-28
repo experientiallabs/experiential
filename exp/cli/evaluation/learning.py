@@ -15,10 +15,13 @@ from rich.console import Console
 from rich.text import Text
 
 from exp.cli.evaluation.replay_view import stop_reason
+from exp.cli.evaluation.spend_ceiling import ceiling_line, enforced_ceiling, inventory_terms
 from exp.cli.shared.consent import can_prompt, require_spend_consent
 from exp.cli.shared.progress import progress_display
+from exp.common.core.artifacts import stable_id
 from exp.common.progress import ProgressHook
 from exp.common.project import ProjectStore
+from exp.optimize.evaluation.executable.model_costs import fidelity_costs
 from exp.optimize.evaluation.fidelity.replay import DEADLINE
 from exp.optimize.evaluation.learning.retirement import (
     RETIREMENT_FAILURES,
@@ -95,10 +98,8 @@ def run_learning(
     )
     cases = learning_cases(store, scope)
     now = datetime.now(UTC)
-    ceiling = sum(
-        learning_spec(store, plan, case, deadline=now + DEADLINE).maximum_physical_attempts
-        for case in cases
-    )
+    specs = tuple(learning_spec(store, plan, case, deadline=now + DEADLINE) for case in cases)
+    ceiling = sum(spec.maximum_physical_attempts for spec in specs)
     budget = ceiling if maximum_attempts is None else maximum_attempts
     console.print("Learning preflight")
     kept = "fit traces; held-out traces kept out" if hold_out else "traces, every trace"
@@ -123,6 +124,16 @@ def run_learning(
         f"  [dim]attempts[/dim]     at most {budget:,} physical attempts, retries included "
         f"(all traces need at most {ceiling:,})"
     )
+    # One ceiling over every trace of the plan: priced roles in dollars, unpriced ones within
+    # their displayed attempts, which only an explicit confirmation authorizes.
+    known, unpriced = inventory_terms(
+        tuple(row for spec in specs for row in fidelity_costs(store, spec))
+    )
+    unpriced = min(unpriced, budget)  # the physical-attempt budget bounds every role
+    operation = stable_id("learning", {"lineage": plan.lineage, "scope": scope})
+    shown = command or (f"exp eval {project} --audit N" if hold_out else f"exp build {project}")
+    # A pass over saved results asks nothing, so it authorizes no further spend.
+    asked = False
     scored, _ = learning_progress(store, plan)
     retired = retired_traces(store, plan.lineage, tuple(case.trace_id for case in cases))
     if len(scored) + len(retired) == len(cases) and all(learned for *_, learned in scored):
@@ -135,20 +146,31 @@ def run_learning(
                     f"Learning {len(cases)} {'fit traces' if hold_out else 'traces'} with "
                     f"memory recall {plan.recall.jev_alias}: at most {budget:,} model attempts"
                 )
+            screen.print(Text(ceiling_line(known, unpriced), style="dim"))
+            asked = True
             consented = require_spend_consent(
                 screen,
                 root=root,
                 yes=yes,
-                estimated_cost_usd=None,
-                cost_is_upper_bound=False,
-                command=command
-                or (f"exp eval {project} --audit N" if hold_out else f"exp build {project}"),
+                estimated_cost_usd=None if unpriced else known,
+                cost_is_upper_bound=not unpriced,
+                command=shown,
                 non_interactive=non_interactive or not can_prompt(screen),
             )
         if not consented:
             return None
     try:
-        with nullcontext(progress) if progress is not None else progress_display(console) as hook:
+        with (
+            enforced_ceiling(
+                store,
+                operation,
+                stage=operation,
+                ceiling_usd=known if asked else None,
+                unpriced_attempts=unpriced,
+                command=shown,
+            ),
+            nullcontext(progress) if progress is not None else progress_display(console) as hook,
+        ):
             outcome = learn_from_traces(
                 store,
                 recall_alias=recall_alias,

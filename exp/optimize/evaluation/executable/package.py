@@ -73,6 +73,7 @@ def export_executable_harbor(
         },
         qualified=qualified,
         output_paths=task.output_paths,
+        transport=task.harbor_transport,
         notice="Tools run in the declared executable or mixed world from a frozen checkpoint.",
     )
 

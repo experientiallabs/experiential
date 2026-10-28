@@ -6,6 +6,7 @@ import pytest
 from typer.testing import CliRunner
 
 from exp.cli.app import app
+from exp.cli.evaluation.continuation_context_test import UNPRICED_SPEND
 from exp.cli.evaluation.continuation_studies import ContinuationExport
 from exp.cli.evaluation.continuations import ContinuationCommand
 from exp.common.project import artifact_input
@@ -28,7 +29,9 @@ def test_cli_compares_saved_observations_and_replays_without_runtime(
     project, spec, transport = observation_fixture(tmp_path, monkeypatch)
     request = tmp_path / "observations.json"
     request.write_text(
-        ContinuationCommand(action="compare-observations", observations=spec).model_dump_json()
+        ContinuationCommand(
+            spend=UNPRICED_SPEND, action="compare-observations", observations=spec
+        ).model_dump_json()
     )
     command = [
         "eval",
@@ -72,6 +75,7 @@ def test_cli_captures_builtin_workbook_without_custom_factory_or_credentials(
     request = tmp_path / "capture-native.json"
     request.write_text(
         ContinuationCommand(
+            spend=UNPRICED_SPEND,
             action="capture",
             capture=CaptureDefinition(
                 task=task,
@@ -115,7 +119,9 @@ def test_cli_localizes_saved_failures_without_runtime_or_provider(
     project.model_catalog_path.unlink()
     request = tmp_path / "analysis.json"
     request.write_text(
-        ContinuationCommand(action="analyse-failures", analysis=reference).model_dump_json()
+        ContinuationCommand(
+            spend=UNPRICED_SPEND, action="analyse-failures", analysis=reference
+        ).model_dump_json()
     )
     command = [
         "eval",
@@ -158,7 +164,11 @@ def test_cli_captures_configured_native_and_learned_world_without_model_calls(
         probe_sha256=spec.probe_sha256,
     )
     request = tmp_path / "mixed-capture.json"
-    request.write_text(ContinuationCommand(action="capture", capture=capture).model_dump_json())
+    request.write_text(
+        ContinuationCommand(
+            spend=UNPRICED_SPEND, action="capture", capture=capture
+        ).model_dump_json()
+    )
     command = [
         "eval",
         project.paths.project_id,
@@ -187,7 +197,9 @@ def test_cli_registers_a_brief_without_hiding_unresolved_assumptions(tmp_path: P
     project = ProjectStore(tmp_path, "case")
     request = tmp_path / "brief.json"
     request.write_text(
-        ContinuationCommand(action="register-brief", brief=brief()).model_dump_json()
+        ContinuationCommand(
+            spend=UNPRICED_SPEND, action="register-brief", brief=brief()
+        ).model_dump_json()
     )
     command = [
         "eval",
@@ -222,7 +234,9 @@ def test_cli_evaluates_and_packages_every_saved_candidate(
     )
     request = tmp_path / "batch.json"
     request.write_text(
-        ContinuationCommand(action="evaluate-candidates", batch=spec).model_dump_json()
+        ContinuationCommand(
+            spend=UNPRICED_SPEND, action="evaluate-candidates", batch=spec
+        ).model_dump_json()
     )
     command = [
         "eval",
@@ -255,7 +269,9 @@ def test_cli_proposes_multiple_tasks_without_inheriting_qualification(
     project, spec, transport = proposal_fixture(tmp_path, monkeypatch)
     request = tmp_path / "proposals.json"
     request.write_text(
-        ContinuationCommand(action="propose-tasks", proposals=spec).model_dump_json()
+        ContinuationCommand(
+            spend=UNPRICED_SPEND, action="propose-tasks", proposals=spec
+        ).model_dump_json()
     )
     command = [
         "eval",
@@ -290,7 +306,9 @@ def test_cli_compares_actions_then_replays_without_runtime(
     project, spec, transport = contrast_fixture(tmp_path, monkeypatch)
     request = tmp_path / "contrast.json"
     request.write_text(
-        ContinuationCommand(action="compare-actions", contrast=spec).model_dump_json()
+        ContinuationCommand(
+            spend=UNPRICED_SPEND, action="compare-actions", contrast=spec
+        ).model_dump_json()
     )
     command = [
         "eval",
@@ -324,7 +342,9 @@ def test_cli_run_and_export_with_private_native_state(
     project, job, transport = job_fixture(tmp_path, monkeypatch)
     monkeypatch.setenv("EXP_RELEASE_REVISION", "c" * 40)
     request = tmp_path / "continuations.json"
-    request.write_text(ContinuationCommand(action="run", job=job).model_dump_json())
+    request.write_text(
+        ContinuationCommand(spend=UNPRICED_SPEND, action="run", job=job).model_dump_json()
+    )
     command = [
         "eval",
         "case",
@@ -340,7 +360,7 @@ def test_cli_run_and_export_with_private_native_state(
     policy = fixture_policy(margin=0.6)
     request.write_text(
         ContinuationCommand(
-            action="register-admission-policy", admission_policy=policy
+            spend=UNPRICED_SPEND, action="register-admission-policy", admission_policy=policy
         ).model_dump_json()
     )
     preview = runner.invoke(app, [*command, "--dry-run"])
@@ -354,7 +374,9 @@ def test_cli_run_and_export_with_private_native_state(
     job = job.model_copy(
         update={"study": job.study.model_copy(update={"admission_policy": policy_ref})}
     )
-    request.write_text(ContinuationCommand(action="run", job=job).model_dump_json())
+    request.write_text(
+        ContinuationCommand(spend=UNPRICED_SPEND, action="run", job=job).model_dump_json()
+    )
     dry = runner.invoke(app, [*command, "--dry-run"])
     assert dry.exit_code == 0, dry.output
     assert not transport.requests
@@ -374,6 +396,7 @@ def test_cli_run_and_export_with_private_native_state(
     )
     request.write_text(
         ContinuationCommand(
+            spend=UNPRICED_SPEND,
             action="export",
             export=ContinuationExport(
                 studies=(artifact_input(project.artifacts.read(study).manifest),),
@@ -407,7 +430,11 @@ def test_cli_captures_initial_world_without_actor_calls(
 
     project, definition, transport = capture_fixture(tmp_path, monkeypatch)
     request = tmp_path / "capture.json"
-    request.write_text(ContinuationCommand(action="capture", capture=definition).model_dump_json())
+    request.write_text(
+        ContinuationCommand(
+            spend=UNPRICED_SPEND, action="capture", capture=definition
+        ).model_dump_json()
+    )
     command = [
         "eval",
         "case",
@@ -440,7 +467,11 @@ def test_cli_compares_actor_snapshots_without_hiding_unavailable_outcomes(
 
     _, spec, transport = panel_fixture(tmp_path, monkeypatch)
     request = tmp_path / "actors.json"
-    request.write_text(ContinuationCommand(action="compare-actors", actors=spec).model_dump_json())
+    request.write_text(
+        ContinuationCommand(
+            spend=UNPRICED_SPEND, action="compare-actors", actors=spec
+        ).model_dump_json()
+    )
     command = [
         "eval",
         "case",
@@ -469,7 +500,11 @@ def test_cli_records_a_prospective_critic_without_exposing_private_state(
 
     _, _, spec, transport = critic_fixture(tmp_path, monkeypatch)
     request = tmp_path / "critic.json"
-    request.write_text(ContinuationCommand(action="predict-success", critic=spec).model_dump_json())
+    request.write_text(
+        ContinuationCommand(
+            spend=UNPRICED_SPEND, action="predict-success", critic=spec
+        ).model_dump_json()
+    )
     command = [
         "eval",
         "case",
@@ -506,7 +541,9 @@ def test_cli_matches_checkpoints_then_runs_and_replays_registered_experiment(
     _, selection = selection_fixture(tmp_path, monkeypatch)
     request = tmp_path / "selection.json"
     request.write_text(
-        ContinuationCommand(action="match-checkpoints", selection=selection).model_dump_json()
+        ContinuationCommand(
+            spend=UNPRICED_SPEND, action="match-checkpoints", selection=selection
+        ).model_dump_json()
     )
     command = [
         "eval",
@@ -524,7 +561,9 @@ def test_cli_matches_checkpoints_then_runs_and_replays_registered_experiment(
     reference = ArtifactInput.model_validate(json.loads(result.output)["reference"])
     request.write_text(
         ContinuationCommand(
-            action="run-selection", experiment=CheckpointExperimentSpec(selection=reference)
+            spend=UNPRICED_SPEND,
+            action="run-selection",
+            experiment=CheckpointExperimentSpec(selection=reference),
         ).model_dump_json()
     )
     dry = runner.invoke(app, [*command, "--dry-run"])
@@ -536,11 +575,15 @@ def test_cli_matches_checkpoints_then_runs_and_replays_registered_experiment(
     replay = runner.invoke(app, command)
     assert replay.exit_code == 0, replay.output
     request.write_text(
-        ContinuationCommand(action="match-checkpoints", selection=selection).model_dump_json()
+        ContinuationCommand(
+            spend=UNPRICED_SPEND, action="match-checkpoints", selection=selection
+        ).model_dump_json()
     )
     assert runner.invoke(app, command).exit_code == 0
     with pytest.raises(ValueError, match="requires only"):
-        ContinuationCommand(action="run", job=selection.base, selection=selection)
+        ContinuationCommand(
+            spend=UNPRICED_SPEND, action="run", job=selection.base, selection=selection
+        )
 
 
 def test_cli_action_intervention_changes_native_state_without_actor_inference(
@@ -555,7 +598,11 @@ def test_cli_action_intervention_changes_native_state_without_actor_inference(
         base=job, action=workbook_case().first, rationale="One-row contrast."
     )
     request = tmp_path / "intervention.json"
-    request.write_text(ContinuationCommand(action="intervene", intervention=spec).model_dump_json())
+    request.write_text(
+        ContinuationCommand(
+            spend=UNPRICED_SPEND, action="intervene", intervention=spec
+        ).model_dump_json()
+    )
     command = [
         "eval",
         "case",
@@ -590,7 +637,11 @@ def test_cli_publishes_a_variant_without_promoting_it(
 
     project, spec = variant_fixture(tmp_path, monkeypatch)
     request = tmp_path / "variant.json"
-    request.write_text(ContinuationCommand(action="make-variant", variant=spec).model_dump_json())
+    request.write_text(
+        ContinuationCommand(
+            spend=UNPRICED_SPEND, action="make-variant", variant=spec
+        ).model_dump_json()
+    )
     command = [
         "eval",
         "case",
@@ -621,7 +672,9 @@ def test_cli_measures_saved_decisions_without_provider_setup(tmp_path: Path) -> 
     before = store.list_ids()
     request = tmp_path / "decisions.json"
     request.write_text(
-        ContinuationCommand(action="measure-decisions", decisions=spec).model_dump_json()
+        ContinuationCommand(
+            spend=UNPRICED_SPEND, action="measure-decisions", decisions=spec
+        ).model_dump_json()
     )
     result = CliRunner().invoke(
         app,
@@ -670,16 +723,19 @@ def test_missing_continuation_artifact_is_a_readable_usage_error(
 
 
 def test_registry_is_the_one_list_of_actions_and_payloads() -> None:
-    """Each action has exactly one payload field, and every payload field has one action."""
+    """Each action has exactly one payload field, and every payload field has one action.
+
+    ``spend`` is the one shared non-payload field: the operation's spend-ceiling choices.
+    """
     from typing import get_args
 
     from exp.cli.evaluation.continuations import CONTINUATION_ACTIONS
 
     names = [action.name for action in CONTINUATION_ACTIONS]
     payloads = [action.payload for action in CONTINUATION_ACTIONS]
-    assert len(set(names)) == len(names) == 50
+    assert len(set(names)) == len(names) == 56
     assert len(set(payloads)) == len(payloads)
-    assert set(payloads) == set(ContinuationCommand.model_fields) - {"action"}
+    assert set(payloads) == set(ContinuationCommand.model_fields) - {"action", "spend"}
     assert get_args(ContinuationCommand.model_fields["action"].annotation) == tuple(names)
     with pytest.raises(ValueError, match="harbor requires only its harbor payload"):
         ContinuationCommand.model_validate({"action": "harbor"})

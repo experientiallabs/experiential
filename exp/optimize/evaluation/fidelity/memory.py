@@ -8,11 +8,12 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
-from exp.common.core.artifacts import ArtifactEnvelope, JsonObject
+from exp.common.core.artifacts import ArtifactEnvelope, ArtifactInput, JsonObject
 from exp.common.project import ProjectStore, artifact_input
+from exp.optimize.evaluation.analysis.source_access import refuse_known_ineligible_sources
 from exp.runtime.sessions.store import SessionStore
 from exp.simulation.world_model.dreaming import DreamResult
 from exp.simulation.world_model.experience_memory import (
@@ -21,8 +22,11 @@ from exp.simulation.world_model.experience_memory import (
     is_reserved,
     materialize_log,
     memory_head,
+    memory_version_id,
     publish_trajectory,
     read_memory_version,
+    require_memory_scope,
+    reserve_task_lineage,
     retired_lines,
     summary_generations,
 )
@@ -37,10 +41,33 @@ from exp.simulation.world_model.memory_tree import (
 
 if TYPE_CHECKING:
     from exp.optimize.evaluation.fidelity.runner import FidelitySpec, PreparedFidelity
+    from exp.simulation.world_model.artifact import GroundedWorldModelArtifact
 
 
 INCOMPLETE = "incomplete trajectory is not consumed"
 DUPLICATE = "duplicate trajectory already consumed"
+
+
+def refuse_ineligible_memory(
+    project: ProjectStore, lineage: str, *, checkpoint: int | None = None
+) -> None:
+    """Check known exclusions before loading a pinned checkpoint or a contiguous head.
+
+    Verified snapshots may read payload bytes before semantic memory decoding.
+    A head read also checks every version it would parse;
+    a pinned checkpoint checks its declared ancestry without following newer versions.
+    This is not source admission or a replacement for knowledge and partition validation.
+    """
+    sources: list[ArtifactInput] = []
+    version = checkpoint if checkpoint is not None else 1
+    while project.artifacts.exists(identity := memory_version_id(lineage, version)):
+        if len(sources) >= 100_000:
+            raise ValueError("memory qualification exceeds the contiguous version bound")
+        sources.append(artifact_input(project.artifacts.read(identity).manifest))
+        if checkpoint is not None:
+            break
+        version += 1
+    refuse_known_ineligible_sources(project.artifacts, tuple(sources), maximum_artifacts=100_000)
 
 
 def saved_memory_receipt(project: ProjectStore, prepared: PreparedFidelity) -> JsonObject | None:
@@ -57,7 +84,8 @@ def consume_trajectory(project: ProjectStore, prepared: PreparedFidelity, now: d
 
     Deterministic code decides admission: only a learning spec whose every planned step
     was predicted and disclosed is consumed. Model-authored investigations enter as
-    unresolved research, never as accepted rules.
+    unresolved research, never as accepted rules. A plan or report excluded from
+    qualification refuses publication, including on replay of a saved report.
     """
     spec = prepared.spec
     receipt_id = prepared.id + "-memory"
@@ -68,6 +96,11 @@ def consume_trajectory(project: ProjectStore, prepared: PreparedFidelity, now: d
         or project.artifacts.exists(receipt_id)
     ):
         return
+    # A saved report may have been excluded after it was written; its evidence then never
+    # enters memory, and the version cites the plan and report so later checks reach them.
+    plan = artifact_input(project.artifacts.read(prepared.id).manifest)
+    report = artifact_input(project.artifacts.read(prepared.id + "-report").manifest)
+    refuse_known_ineligible_sources(project.artifacts, (plan, report), maximum_artifacts=100_000)
     pinned = json.loads(project.artifacts.read_bytes(prepared.id + "-execution", "execution.json"))
     memory = pinned.get("memory")
     if not isinstance(memory, dict) or memory.get("lineage") != spec.memory.lineage:
@@ -127,6 +160,7 @@ def consume_trajectory(project: ProjectStore, prepared: PreparedFidelity, now: d
                 created_at=now,
                 code_revision=prepared.code_revision,
                 publisher=prepared.id,
+                evidence=(plan, report),
             )
         except ReservedTaskError as error:
             outcome |= {"published": False, "reason": str(error)}
@@ -146,7 +180,7 @@ def consume_trajectory(project: ProjectStore, prepared: PreparedFidelity, now: d
             schema_version=1,
             created_at=now,
             code_revision=prepared.code_revision,
-            inputs=(artifact_input(project.artifacts.read(prepared.id + "-report").manifest),),
+            inputs=(report,),
         ),
         files={"memory.json": outcome},
     )
@@ -244,6 +278,40 @@ def maintain_memory(
             schema_version=1, created_at=now, code_revision=prepared.code_revision
         ),
         files={"maintenance.json": outcome},
+    )
+
+
+def validate_memory(
+    project: ProjectStore, spec: FidelitySpec, artifact: GroundedWorldModelArtifact
+) -> None:
+    """Check partition, checkpoint and knowledge before anything is written."""
+    if spec.memory is None:
+        return
+    refuse_ineligible_memory(project, spec.memory.lineage, checkpoint=spec.memory.checkpoint)
+    check_partition(project, spec)
+    pinned = (
+        memory_head(project.artifacts, spec.memory.lineage)
+        if spec.memory.checkpoint is None
+        else read_memory_version(project.artifacts, spec.memory.lineage, spec.memory.checkpoint)
+    )
+    require_memory_scope(
+        pinned,
+        world_model=spec.world_model,
+        artifact=artifact,
+        selection_policy_sha256=str(spec.memory_selection_identity),
+    )
+
+
+def establish_reservation(project: ProjectStore, spec: FidelitySpec, code_revision: str) -> None:
+    """Register a declared held-out panel only after validation, under the lineage lock."""
+    if spec.memory is None or not spec.memory.reserved:
+        return
+    reserve_task_lineage(
+        project.artifacts,
+        spec.memory.lineage,
+        spec.task.lineage_group_id,
+        created_at=datetime.now(UTC),
+        code_revision=code_revision,
     )
 
 

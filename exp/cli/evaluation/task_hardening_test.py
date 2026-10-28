@@ -7,6 +7,7 @@ import pytest
 from typer.testing import CliRunner
 
 from exp.cli.app import app
+from exp.cli.evaluation.continuation_context_test import UNPRICED_SPEND
 from exp.cli.evaluation.continuations import ContinuationCommand
 from exp.common.release_revision import installed_execution_revision
 from exp.optimize.evaluation.factory.hardening_test import record_hardening
@@ -24,7 +25,9 @@ def test_check_task_validity_runs_with_consent_and_saves_its_report(
     transport = script(monkeypatch, judge(), closed())
     path = tmp_path / "validity.json"
     path.write_text(
-        ContinuationCommand(action="check-task-validity", task_validity=spec).model_dump_json()
+        ContinuationCommand(
+            spend=UNPRICED_SPEND, action="check-task-validity", task_validity=spec
+        ).model_dump_json()
     )
     args = ["eval", "records", "--root", str(tmp_path), "--continuations", str(path)]
     runner = CliRunner()
@@ -50,7 +53,11 @@ def test_harden_tasks_runs_with_consent_and_replays_without_calls(
     """A saturated record world is hardened once; a rerun replays the saved report."""
     project, spec, author, actor = record_hardening(tmp_path, monkeypatch)
     path = tmp_path / "hardening.json"
-    path.write_text(ContinuationCommand(action="harden-tasks", hardening=spec).model_dump_json())
+    path.write_text(
+        ContinuationCommand(
+            spend=UNPRICED_SPEND, action="harden-tasks", hardening=spec
+        ).model_dump_json()
+    )
     args = ["eval", "records", "--root", str(tmp_path), "--continuations", str(path)]
     runner = CliRunner()
     seeded = len(author.requests)

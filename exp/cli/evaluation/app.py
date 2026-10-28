@@ -51,14 +51,24 @@ INCLUDE_INSPECTED_OPTION = typer.Option(
     "reported as a development re-audit, never independent.",
 )
 
-AuditMemory = Literal["learned", "none", "lessons"]
-AUDIT_MEMORIES: tuple[AuditMemory, ...] = ("learned", "none", "lessons")
+AuditMemory = Literal["learned", "none", "lessons", "bare", "guidance"]
+AUDIT_MEMORIES: tuple[AuditMemory, ...] = ("learned", "none", "lessons", "bare", "guidance")
 AUDIT_MEMORY_OPTION = typer.Option(
     None,
     "--audit-memory",
-    metavar="learned|none|lessons",
+    metavar="learned|none|lessons|bare|guidance",
     help="With --audit, the memory the held-out replays read: all learned memory (default), "
-    "none, or only the checkpoint's screened lessons. Every other spec field is identical.",
+    "none (recorded originals only), only the checkpoint's screened lessons, bare (no "
+    "originals and no memory), or guidance (originals plus temporary session-scoped notes "
+    "that are never persisted). Every other spec field is identical.",
+)
+AUDIT_CHECKPOINT_OPTION = typer.Option(
+    None,
+    "--audit-checkpoint",
+    min=1,
+    metavar="K",
+    help="With --audit, read the frozen memory version that had consumed exactly K fit "
+    "trajectories instead of the final one (for sample-count grids).",
 )
 
 VERBOSE_OPTION = typer.Option(
@@ -136,6 +146,7 @@ def evaluate(
     retry_incomplete: bool = RETRY_INCOMPLETE_OPTION,
     include_inspected: bool = INCLUDE_INSPECTED_OPTION,
     audit_memory: str | None = AUDIT_MEMORY_OPTION,
+    audit_checkpoint: int | None = AUDIT_CHECKPOINT_OPTION,
     verbose: bool = VERBOSE_OPTION,
     trace_analysis: Path | None = TRACE_ANALYSIS_OPTION,
     refine_task: Path | None = REFINE_TASK_OPTION,
@@ -164,6 +175,7 @@ def evaluate(
         retry_incomplete: Resume interrupted audit runs in place.
         include_inspected: Re-run held-out lineages an earlier audit showed in detail.
         audit_memory: Memory profile the audit's held-out replays read.
+        audit_checkpoint: Earlier frozen memory version the audit reads, by consumed traces.
         verbose: Plain per-turn fidelity detail, for agents and logs.
         trace_analysis: Simulator-only actor council and read-only evaluation refinement.
         refine_task: Bounded task refinement with independent qualification checks.
@@ -180,8 +192,11 @@ def evaluate(
     """
     if audit_memory is not None and (audit is None or audit_memory not in AUDIT_MEMORIES):
         raise typer.BadParameter(
-            "--audit-memory applies only with --audit and is one of learned, none or lessons"
+            "--audit-memory applies only with --audit and is one of learned, none, lessons, "
+            "bare or guidance"
         )
+    if audit_checkpoint is not None and audit is None:
+        raise typer.BadParameter("--audit-checkpoint applies only with --audit")
     rollout = (models, repeats, concurrency, maximum_steps, maximum_output_tokens)
     audit_flags = (verbose, retry_incomplete, include_inspected)
     if pipeline is not None:
@@ -368,6 +383,7 @@ def evaluate(
             retry_incomplete=retry_incomplete,
             include_inspected=include_inspected,
             memory_profile=next(m for m in AUDIT_MEMORIES if m == (audit_memory or "learned")),
+            checkpoint=audit_checkpoint,
         )
         return
     if fidelity is not None:

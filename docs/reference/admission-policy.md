@@ -80,7 +80,10 @@ registered again.
 
 ## Consumers
 
-- `compare-environments`: set `equivalence.policy` to the reference. The policy is pinned in the
+- `compare-environments`: set `equivalence.policy` to the reference. The comparison's semantic
+  judge rates under a separately frozen
+  [trajectory-derived rubric](trajectory-derived-equivalence.md); those ratings stay diagnostic
+  and never enter calibration. The policy is pinned in the
   comparison registration, and the saved report gains `calibration`, one entry per dimension
   with the candidate's unit-mean disagreement, the repeated-reference control, the
   candidate-minus-control difference and the false-pass rate, each with Wilson intervals at the

@@ -25,6 +25,7 @@ from exp.optimize.evaluation.continuations.job_test import job_fixture
 from exp.optimize.evaluation.equivalence.evidence import equivalence_metrics
 from exp.optimize.evaluation.equivalence.policy_test import fixture_policy, registered_policy
 from exp.optimize.evaluation.equivalence.review import ReviewModel
+from exp.optimize.evaluation.equivalence.rubric_test import frozen_rubric
 from exp.optimize.evaluation.equivalence.runner import (
     EquivalenceCase,
     EquivalenceSpec,
@@ -205,6 +206,7 @@ def test_saved_comparison_only_attaches_to_its_exact_candidate(
     # The comparison is registered under its own policy, which the study then reaches by citation.
     comparison_policy = registered_policy(project.artifacts, fixture_policy(margin=0.4))
     spec = EquivalenceSpec(
+        rubric=frozen_rubric(project, judge),
         cases=(
             EquivalenceCase(
                 reference=compared,

@@ -5,7 +5,9 @@ independently witnessed positive, negative and unknown controls, and preservatio
 It does not qualify rubric judgments, model-tier separation, native fidelity or containment.
 """
 
+import re
 from datetime import datetime
+from pathlib import Path
 
 from pydantic import Field
 
@@ -14,6 +16,7 @@ from exp.common.core.artifacts import (
     ArtifactInput,
     ContractModel,
     JsonObject,
+    sha256_bytes,
     sha256_json,
     stable_id,
 )
@@ -131,9 +134,11 @@ def _assess(
     refusals = []
     # Argument rules constrain only the calls they name, so an unrequested write elsewhere
     # needs a check over observed state: preservation or a pin on the complete output.
-    if predicate.allowed_tools is None or not (
+    generic_retention = bool(
         predicate.preserved_paths or predicate.preserve_state or _pins_full_output(predicate)
-    ):
+    )
+    workbook_outputs = not generic_retention and _pins_native_workbook_outputs(task)
+    if predicate.allowed_tools is None or not (generic_retention or workbook_outputs):
         refusals.append(
             "explicit permitted tools and a state-preservation or full-output check are required"
         )
@@ -193,13 +198,81 @@ def _assess(
             refusals.append(f"{partition}: missing goal-achieved-with-prohibited-effect control")
         if not any(row.status == "unassessable" for row in admitted):
             refusals.append(f"{partition}: missing unavailable-evidence control")
-    return ExecutableQualification(
+    result = ExecutableQualification(
         task=spec.task,
         spec=spec,
         profile_sha256=task.profile(),
         qualified=not refusals,
         refusals=tuple(refusals),
     )
+    if workbook_outputs:
+        result = result.model_copy(
+            update={
+                "scope": result.scope
+                + "; complete native workbook output means ordered sheet names and rectangular "
+                "cell values, types and number formats, including observed row/column extent; "
+                "not fonts, fills, column widths or binary workbook metadata"
+            }
+        )
+    return result
+
+
+def _pins_native_workbook_outputs(task: ExecutableTask) -> bool:
+    """Recognize complete observable outputs only for the maintained native XLSX owner.
+
+    A caller-named view is insufficient: its runtime bytes, private probe, native binding,
+    all-sheet coverage and non-fallback output mapping must reproduce the built-in contract.
+    This does not certify binary file equality or effects outside the observed workbook.
+    """
+    if not task.output_paths:
+        return False
+    try:
+        maintained = sha256_bytes(Path(__file__).with_name("workbook.py").read_bytes())
+        if task.job.runtime_sha256 != maintained:
+            return False
+        if sha256_bytes(task.job.runtime_file.read_bytes()) != maintained:
+            return False
+    except OSError:
+        return False
+    # Generic CLI/qualification paths must not import optional workbook dependencies.
+    # Only a selected maintained owner with both source hashes verified needs its typed model.
+    from exp.optimize.evaluation.executable.workbook import WorkbookRuntimeDefinition
+
+    try:
+        definition = WorkbookRuntimeDefinition.model_validate(task.job.configuration)
+    except ValueError:
+        return False
+    outputs = set(definition.output_paths)
+    writable = {name for tool in definition.manifest.tools for name in tool.writes}
+    if (
+        not outputs <= writable
+        or definition.probe_sha256 != task.job.study.probe_sha256
+        or any(domain.owner != "native" for domain in definition.manifest.domains)
+        or any(set(tool.writes) - outputs for tool in definition.manifest.tools)
+    ):
+        return False
+    covered: set[str] = set()
+    for rule in task.job.study.verifier.rules:
+        parts = path_parts(rule.path)
+        if (
+            rule.operator != "equals"
+            or len(parts) != 4
+            or parts[:2] != ("final_state", "views")
+            or parts[3] != "sha256"
+            or not isinstance(rule.value, str)
+            or re.fullmatch(r"[0-9a-f]{64}", rule.value) is None
+        ):
+            continue
+        view = definition.views.get(parts[2])
+        if (
+            view is not None
+            and view.output_file in outputs
+            and view.sheets is None
+            and not view.baseline_until_written
+        ):
+            assert view.output_file is not None
+            covered.add(view.output_file)
+    return bool(outputs) and (outputs | set(task.output_paths)) <= covered
 
 
 def _pins_full_output(predicate: TaskVerifier) -> bool:

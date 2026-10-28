@@ -9,9 +9,11 @@ only, so a break between two stages fails here even when every stage's own tests
    then replays the saved audit without a provider call.
 3. ``register-admission-policy`` fixes the per-dimension admission policy before any result;
    ``development-tasks`` chooses a fit task of the build, ``ground-runtime`` grounds the built
-   simulator with its learned memory and the trace's instance facts, and
-   ``compare-environments`` runs the native world and that simulator on the captured task under
-   one actor policy and that policy's margins.
+   simulator with its learned memory and the trace's instance facts,
+   ``derive-equivalence-rubric`` and ``freeze-equivalence-rubric`` fix the judge's rubric from an
+   admitted development trajectory of another family, and ``compare-environments`` runs the
+   native world and that simulator on the captured task under one actor policy, that policy's
+   margins and the frozen rubric.
 4. ``register-specification`` saves an independent acceptance specification, and ``capture``
    and ``run`` fork native branches from the captured checkpoint.
 5. ``export-traces`` turns those trajectories into imports under the policy: native ones are
@@ -53,12 +55,15 @@ from exp.common.core.artifacts import (
     sha256_bytes,
     sha256_json,
 )
+from exp.common.evaluations.actor_equivalence import RUBRIC_DIMENSIONS
+from exp.common.evaluations.reconstruction import WorkflowEvidence, WorkflowStep
 from exp.common.models import ToolCall, load_model_catalog
 from exp.common.project import ProjectStore, artifact_input
 from exp.common.tasks import TaskCase, ToolSchema
 from exp.common.tasks.facts import FactProvenance, FactValidation, InstanceFact, InstanceFacts
 from exp.common.tasks.store import load_task_set
 from exp.common.traces.ingest.persistence import read_ingested_traces
+from exp.optimize.evaluation.analysis.source_access import declare_source_access
 from exp.optimize.evaluation.audit.panel import MemoryProfile, plan_held_out_panel
 from exp.optimize.evaluation.audit.panel_test import (
     SimulatedProvider,
@@ -74,6 +79,11 @@ from exp.optimize.evaluation.continuations.study import ContinuationStudySpec
 from exp.optimize.evaluation.equivalence.policy import policy_identity
 from exp.optimize.evaluation.equivalence.policy_test import fixture_policy
 from exp.optimize.evaluation.equivalence.review import ReviewModel
+from exp.optimize.evaluation.equivalence.rubric import (
+    RubricDerivationSpec,
+    RubricTrajectory,
+    register_rubric_trajectory,
+)
 from exp.optimize.evaluation.equivalence.runner import EquivalenceCase, EquivalenceSpec
 from exp.optimize.evaluation.executable import workbook as workbook_runtime
 from exp.optimize.evaluation.executable.loader import ContinuationRuntime
@@ -734,6 +744,10 @@ def exp(*arguments: str) -> str:
     return flat(result.output)
 
 
+UNPRICED_SPEND: JsonObject = {"unpriced_attempts": 10_000}
+"""Explicit unpriced-attempt ceiling for the fixture's unpriced simulator and decision wire."""
+
+
 def refused(*arguments: str) -> str:
     """Run one ``exp`` command that must fail and return its flattened output."""
     result = CliRunner().invoke(app, list(arguments))
@@ -764,15 +778,24 @@ class Pipeline:
         return exp("eval", self.project.paths.project_id, "--root", str(self.root), *flags)
 
     def operation(self, name: str, operation: JsonObject, *flags: str) -> str:
-        """Run one ``exp eval --continuations`` operation saved as ``name``.json."""
+        """Run one ``exp eval --continuations`` operation saved as ``name``.json.
+
+        The fixture catalog prices the embedder but not the simulator or decision wire, so
+        every operation explicitly authorizes unpriced attempts beside its dollar ceiling.
+        """
         path = self.tmp / f"{name}.json"
-        path.write_text(json.dumps(operation))
+        path.write_text(json.dumps({"spend": UNPRICED_SPEND, **operation}))
+        return self.eval("--continuations", str(path), "--non-interactive", *flags)
+
+    def emitted(self, path: Path, *flags: str) -> str:
+        """Run an operation file another stage emitted, after authorizing its unpriced roles."""
+        path.write_text(json.dumps({"spend": UNPRICED_SPEND, **json.loads(path.read_text())}))
         return self.eval("--continuations", str(path), "--non-interactive", *flags)
 
     def refused(self, name: str, operation: JsonObject) -> str:
         """Run one ``exp eval --continuations`` operation that must fail; return its output."""
         path = self.tmp / f"{name}.json"
-        path.write_text(json.dumps(operation))
+        path.write_text(json.dumps({"spend": UNPRICED_SPEND, **operation}))
         project, root = self.project.paths.project_id, str(self.root)
         return refused(
             "eval", project, "--root", root, "--continuations", str(path), "--non-interactive"
@@ -1245,7 +1268,9 @@ class ScriptedReviewer(ScriptedJsonTransport):
             "findings": [],
             "limitations": ["Scripted reviewer; no live-model equivalence measured."],
         }
-        if "summary" not in properties:
+        if "grounding" in properties:
+            proposal = _rubric_proposal(_user_content(payload))
+        elif "summary" not in properties:
             proposal = {}
             for name in properties:
                 proposal[name] = {
@@ -1259,6 +1284,48 @@ class ScriptedReviewer(ScriptedJsonTransport):
         return _tool_reply(
             "judge-v1", str(_at(payload, "tool_choice", "function", "name")), proposal
         )
+
+
+def _rubric_proposal(request: JsonObject) -> JsonObject:
+    """Propose a rubric that cites an exact excerpt of the first supplied public field."""
+    allowed = _obj(request["allowed_evidence_refs"])
+    reference, text = next((key, str(value)) for key, value in allowed.items() if value)
+    dimensions = RUBRIC_DIMENSIONS
+    return {
+        "rubric": {
+            "definition": {
+                "name": "Order handling",
+                "syllabus": "Compare how both executions read state and commit the request.",
+                "dimensions": [
+                    {
+                        "dimension_id": name,
+                        "name": name,
+                        "description": f"Paired {name} relationships observed in development.",
+                        "min_score": 1,
+                        "max_score": 5,
+                        "anchors": [
+                            {"score": score, "description": f"Paired {name} level {score}"}
+                            for score in range(1, 6)
+                        ],
+                    }
+                    for name in dimensions
+                ],
+            },
+            "state_coverage": request["state_coverage"],
+            "criteria": [
+                {
+                    "dimension_id": name,
+                    "valid_variations": ["Instance identifiers may differ."],
+                    "unassessable_when": "The relevant effect is not observed.",
+                }
+                for name in dimensions
+            ],
+        },
+        "grounding": [
+            {"dimension_id": name, "citations": [{"reference": reference, "quote": text[:40]}]}
+            for name in dimensions
+        ],
+    }
 
 
 def json_tail(output: str) -> JsonObject:
@@ -1356,6 +1423,83 @@ def register_policy(pipeline: Pipeline) -> ArtifactInput:
     return reference
 
 
+def freeze_rubric(pipeline: Pipeline, reviewer: ReviewModel, catalog_sha256: str) -> ArtifactInput:
+    """Stage 3b: derive the judge's rubric from a development trajectory, review and freeze it.
+
+    Registering the trajectory and classifying it are operator Python calls; derivation and the
+    explicit review run through the CLI, and the frozen draft replays without a model call.
+    """
+    project = pipeline.project
+    task = TaskCase(
+        task_id="rubric-development",
+        lineage_group_id="rubric-development-family",
+        partition="fit",
+        workload_weight=1.0,
+        origin="authored",
+        instruction="Look up the order and report its status",
+    )
+    source = register_rubric_trajectory(
+        project,
+        RubricTrajectory(
+            task=task,
+            trajectory=WorkflowEvidence(
+                workflow_id="rubric-development",
+                task=task.instruction,
+                initial_state={},
+                steps=(
+                    WorkflowStep(
+                        step=0,
+                        action={"name": "get_order_details", "arguments": {"order_id": "#W1"}},
+                        status="valid",
+                        reply="order #W1 is pending",
+                    ),
+                ),
+                final_answer="Order #W1 is pending",
+                stop_reason="completed",
+            ),
+        ),
+        inputs=(),
+        code_revision=REVISION,
+    )
+    declare_source_access(
+        project.artifacts,
+        source,
+        scope="development",
+        rationale="Authored development trajectory outside the evaluated family",
+        code_revision=REVISION,
+    )
+    derivation = RubricDerivationSpec(
+        sources=(source,),
+        proposer=reviewer,
+        catalog_sha256=catalog_sha256,
+        state_coverage="partial",
+        deadline=DEADLINE,
+    )
+    operation: JsonObject = {
+        "action": "derive-equivalence-rubric",
+        "rubric_derivation": derivation.model_dump(mode="json"),
+    }
+    assert "no calls or publication" in pipeline.operation("rubric", operation, "--dry-run")
+    draft = ArtifactInput.model_validate(
+        json_tail(pipeline.operation("rubric", operation, "--yes"))["draft"]
+    )
+    assert json_tail(pipeline.operation("rubric", operation))["draft"] == draft.model_dump(
+        mode="json"
+    ), "a saved draft replays without consent or a model call"
+    review: JsonObject = {
+        "action": "freeze-equivalence-rubric",
+        "rubric_review": {
+            "draft": draft.model_dump(mode="json"),
+            "reviewer": "acceptance author",
+            "rationale": "Citations and paired anchors reviewed; calibration remains pending.",
+        },
+    }
+    assert "no publication" in pipeline.operation("rubric-review", review, "--dry-run")
+    return ArtifactInput.model_validate(
+        json_tail(pipeline.operation("rubric-review", review))["rubric"]
+    )
+
+
 def compare_environments(
     pipeline: Pipeline, monkeypatch: pytest.MonkeyPatch, policy: ArtifactInput
 ) -> tuple[Development, ArtifactInput]:
@@ -1415,14 +1559,7 @@ def compare_environments(
     expected_fact = starting_fact(world, index)
     assert _at(configuration, "facts", "facts", "facts", 0, "key") == expected_fact.key
     candidate_checkpoint = ArtifactInput.model_validate(
-        json_tail(
-            pipeline.eval(
-                "--continuations",
-                str(pipeline.tmp / "capture-simulated.json"),
-                "--non-interactive",
-                "--yes",
-            )
-        )
+        json_tail(pipeline.emitted(pipeline.tmp / "capture-simulated.json", "--yes"))
     )
     assert len(pipeline.provider.requests) == calls, "capture makes no model call"
     if world.kind == "records":
@@ -1476,7 +1613,14 @@ def compare_environments(
     )
     model = RuntimeModelCatalog(catalog, environment={}).snapshot("judge")[0]
     reviewer = ReviewModel(alias="judge", model=model, output_tokens=1024)
+    reviews = ScriptedReviewer()
+    monkeypatch.setattr(
+        "exp.optimize.evaluation.equivalence.review.HttpxJsonTransport", lambda: reviews
+    )
+    rubric = freeze_rubric(pipeline, reviewer, development.catalog_sha256)
+    assert len(reviews.requests) == 1, "one proposal; the replay and the freeze make no call"
     spec = EquivalenceSpec(
+        rubric=rubric,
         cases=(
             EquivalenceCase(
                 reference=reference,
@@ -1492,18 +1636,27 @@ def compare_environments(
         policy=policy,
     )
     actor = ScriptedActor(terms.plans[:1])
-    reviews = ScriptedReviewer()
     monkeypatch.setattr(
         "exp.optimize.evaluation.continuations.job.HttpxJsonTransport", lambda: actor
-    )
-    monkeypatch.setattr(
-        "exp.optimize.evaluation.equivalence.review.HttpxJsonTransport", lambda: reviews
     )
     # The operator's runtime file executes as a fresh module, so it imports this transport anew.
     monkeypatch.setattr(transport, "HttpxJsonTransport", lambda: pipeline.provider)
     operation = {"action": "compare-environments", "equivalence": spec.model_dump(mode="json")}
     output = pipeline.operation("equivalence", operation, "--yes")
     report = json_tail(output)
+    # Every paid role reserved against the one operation ceiling: priced embeddings settled
+    # in dollars, the unpriced simulator and decision wire against the explicit attempt cap.
+    receipts = [
+        json.loads(path.read_text())
+        for path in (project.paths.runtime_directory / "spend").glob("*/receipt.json")
+    ]
+    spend = next(row for row in receipts if str(row["command"]).endswith("equivalence.json"))
+    assert spend["accounted_usd"] <= spend["ceiling_usd"] and spend["in_flight_usd"] == 0
+    assert spend["unpriced_attempts"] > 0 and spend["unknown_usd"] == 0, spend
+    roles = {row["role"]: row for row in spend["roles"]}
+    assert set(roles) == {"embed", "jev", "judge", "world"}, spend
+    assert 0 < roles["embed"]["settled_usd"] <= spend["ceiling_usd"], spend
+    assert all(roles[role]["unpriced_attempts"] for role in ("jev", "judge", "world")), spend
     metrics = _obj(report["metrics"])
     # Paired evidence: the simulator, conditioned on the instance facts and frozen memory,
     # commits the same material consequence as the native world.
@@ -1515,6 +1668,11 @@ def compare_environments(
     assert _obj(control["agreement"])["wilson_95"]
     assert _obj(metrics["candidate_minus_control"])["estimate"] == 0.0
     assert set(_obj(report["analyses"])) == {"case-0:judge"}
+    # The judge rated under the frozen rubric; its ratings stay separate from admission.
+    assert metrics["rubric"] == rubric.model_dump(mode="json")
+    assert metrics["rubric_calibration"] == "provisional"
+    goal_ratings = _obj(_obj(candidate["rubric_dimensions"])["goal"])
+    assert (goal_ratings["assessed"], goal_ratings["not_judged"]) == (1, 0), goal_ratings
     # One task family is too few independent units for any equivalence verdict.
     calibration = _obj(report["calibration"])
     assert calibration["policy"] == policy.artifact_id
@@ -1821,11 +1979,7 @@ def package_and_trial(
     assert "the witness establishes fail, but the label declares pass" in wrong, wrong
     witnessed = json_tail(pipeline.operation("controls", witness))
     assert json.loads((pipeline.tmp / "qualify.json").read_text()) == witnessed
-    qualified = json_tail(
-        pipeline.eval(
-            "--continuations", str(pipeline.tmp / "qualify.json"), "--non-interactive", "--yes"
-        )
-    )
+    qualified = json_tail(pipeline.emitted(pipeline.tmp / "qualify.json", "--yes"))
     assert qualified["qualified"] is True, qualified["refusals"]
     package = pipeline.tmp / "packages" / pipeline.world.kind
     exported = harbor(

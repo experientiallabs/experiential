@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 import os
 from collections.abc import Callable, Mapping
+from copy import copy
 from dataclasses import dataclass, field, replace
 from functools import cached_property
 from threading import TIMEOUT_MAX
@@ -891,6 +892,14 @@ class RuntimeModelCatalog:
         if role == "candidate":
             return roles.candidate_reasoning_efforts.get(alias)
         return None
+
+    def with_transport_wrapper(
+        self, wrapper: Callable[[ProviderTransport], ProviderTransport]
+    ) -> RuntimeModelCatalog:
+        """Wrap fresh transports without changing credentials, catalog or client factories."""
+        result = copy(self)
+        result._transport_factory = lambda: wrapper(self._transport_factory())
+        return result
 
     def with_catalog(self, catalog: ModelCatalog) -> RuntimeModelCatalog:
         """Return an equivalent resolver over updated local catalog metadata.

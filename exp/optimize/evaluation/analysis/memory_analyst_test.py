@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 from filelock import FileLock, Timeout
 
+from exp.cli.evaluation.continuation_context_test import UNPRICED_SPEND
 from exp.common.core.artifacts import ArtifactEnvelope, JsonObject, sha256_json
 from exp.common.models import ModelMessage, ModelRequest, load_model_catalog
 from exp.common.project import artifact_input
@@ -126,7 +127,9 @@ def test_analyst_replay_uses_saved_call_and_never_changes_memory(
 
     command = tmp_path / "analyse-memory.json"
     command.write_text(
-        ContinuationCommand(action="analyse-memory", memory_analyst=spec).model_dump_json()
+        ContinuationCommand(
+            spend=UNPRICED_SPEND, action="analyse-memory", memory_analyst=spec
+        ).model_dump_json()
     )
     args = [
         "eval",

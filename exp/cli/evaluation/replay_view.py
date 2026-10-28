@@ -1,6 +1,6 @@
 """Terminal presentation shared by replay panels: the held-out audit and the miss retest."""
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from contextlib import nullcontext
 from statistics import median
 
@@ -134,6 +134,28 @@ def aggregate_line(total: ReplayAggregate, planned: int, title: str = "Held-out 
             f"turns ({share(total.judge_agreements, total.judge_turns)})"
         )
     return line
+
+
+def facts_line(registrations: Sequence[PreparedFidelity]) -> str:
+    """How many replayed traces had their predictions conditioned on supplied instance facts.
+
+    Exactness on a trace given its starting-world facts measures fidelity given those facts,
+    so a panel states how many of its traces were measured that way.
+
+    Args:
+        registrations: Every registered trace of the panel.
+
+    Returns:
+        ``Instance facts: ...`` with the supplied count over the planned traces.
+    """
+    supplied = [row.spec.facts for row in registrations if row.spec.facts is not None]
+    if not supplied:
+        return "  instance facts: none supplied; predictions read only the task and its history"
+    facts = sum(len(row.facts.facts) for row in supplied)
+    return (
+        f"  instance facts: supplied to {len(supplied)}/{len(registrations)} traces "
+        f"({facts} validated facts); exactness there is measured given those facts"
+    )
 
 
 def judge_summary(total: ReplayAggregate) -> str:

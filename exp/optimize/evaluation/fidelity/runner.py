@@ -34,8 +34,11 @@ from exp.optimize.evaluation.fidelity.knowledge_exposure import require_unexpose
 from exp.optimize.evaluation.fidelity.memory import (
     check_partition,
     consume_trajectory,
+    establish_reservation,
     maintain_memory,
+    refuse_ineligible_memory,
     trajectory_record,
+    validate_memory,
 )
 from exp.optimize.evaluation.fidelity.memory_outcomes import record_memory_outcomes
 from exp.optimize.evaluation.fidelity.memory_policy import (
@@ -100,6 +103,7 @@ from exp.simulation.world_model.runtime import (
     load_grounded_world_model,
     load_grounded_world_model_artifact,
 )
+from exp.simulation.world_model.session_guidance import SessionGuidance, SessionGuidancePolicy
 from exp.simulation.world_model.session_research import OnlineResearchPolicy
 
 
@@ -175,6 +179,7 @@ class FidelitySpec(ContractModel):
             reason, within the same turn; refused output is never repaired.
         judged: False skips the judge; the report records it as not run. Learning uses it:
             its score is exact replies, so a judge call per trace would buy nothing.
+        guidance: Optional temporary session guidance from retrieved originals, never persisted.
         facts: Validated instance facts of the replayed instance, delivered to predictions in
             their own channel by state version; part of the run identity.
     """
@@ -206,6 +211,7 @@ class FidelitySpec(ContractModel):
     proposal_reasks: int = Field(default=0, ge=0, le=3, strict=True, exclude_if=lambda v: not v)
     judged: bool = Field(default=True, strict=True, exclude_if=lambda value: value)
     facts: ReplayFacts | None = Field(default=None, exclude_if=lambda value: value is None)
+    guidance: SessionGuidancePolicy | None = Field(default=None, exclude_if=lambda v: v is None)
 
     @model_validator(mode="after")
     def separate_references(self) -> "FidelitySpec":
@@ -237,6 +243,8 @@ class FidelitySpec(ContractModel):
             raise ValueError("evidence reading requires a registered decision-model alias")
         if self.memory is not None and self.retrieval is None:
             raise ValueError("memory delivery requires a registered JEV retrieval policy")
+        if self.guidance is not None and (self.online_research or self.memory_learns):
+            raise ValueError("session guidance is temporary: frozen or memory-free replays only")
         if self.memory is not None and (self.memory.mode == "learn") != (
             self.online_research is not None
         ):
@@ -248,6 +256,11 @@ class FidelitySpec(ContractModel):
         ):
             raise ValueError("online research must register the spec's JEV memory selector")
         return self
+
+    @property
+    def memory_learns(self) -> bool:
+        """Whether this run publishes memory."""
+        return self.memory is not None and self.memory.mode == "learn"
 
     def budget(self, role: Literal["prediction", "investigation", "judging"]) -> RoleBudget:
         """The registered budget for one role, or the shared legacy allowance."""
@@ -321,9 +334,13 @@ def prepare_fidelity_evaluation(
         artifact = load_grounded_world_model_artifact(project.artifacts, spec.world_model)
         # A registration may predate a guard: recheck what the predictor could see.
         _require_unexposed(project, artifact, spec)
+        if spec.memory is not None:
+            refuse_ineligible_memory(
+                project, spec.memory.lineage, checkpoint=spec.memory.checkpoint
+            )
         if spec.memory is not None and spec.memory.reserved:
-            _validate_memory(project, spec, artifact)
-            _establish_reservation(project, spec, code_revision)
+            validate_memory(project, spec, artifact)
+            establish_reservation(project, spec, code_revision)
         return saved
     manifest = project.artifacts.read(spec.world_model.artifact_id).manifest
     if artifact_input(manifest) != spec.world_model:
@@ -356,7 +373,7 @@ def prepare_fidelity_evaluation(
         record = catalog.models.get(spec.retrieval.jev_alias)
         if record is None or catalog.connections[record.connection].provider != "typesafe":
             raise ValueError("JEV retrieval requires a configured native decision-model alias")
-    _validate_memory(project, spec, artifact)
+    validate_memory(project, spec, artifact)
     _require_unexposed(project, artifact, spec)
     prepared = PreparedFidelity(
         id=plan_id,
@@ -376,41 +393,8 @@ def prepare_fidelity_evaluation(
         ),
         files={"plan.json": prepared.model_dump(mode="json")},
     )
-    _establish_reservation(project, spec, code_revision)
+    establish_reservation(project, spec, code_revision)
     return prepared
-
-
-def _validate_memory(
-    project: ProjectStore, spec: FidelitySpec, artifact: GroundedWorldModelArtifact
-) -> None:
-    """Check partition, checkpoint and knowledge before anything is written."""
-    if spec.memory is None:
-        return
-    check_partition(project, spec)
-    pinned = (
-        memory_head(project.artifacts, spec.memory.lineage)
-        if spec.memory.checkpoint is None
-        else read_memory_version(project.artifacts, spec.memory.lineage, spec.memory.checkpoint)
-    )
-    require_memory_scope(
-        pinned,
-        world_model=spec.world_model,
-        artifact=artifact,
-        selection_policy_sha256=str(spec.memory_selection_identity),
-    )
-
-
-def _establish_reservation(project: ProjectStore, spec: FidelitySpec, code_revision: str) -> None:
-    """Register a declared held-out panel only after validation, under the lineage lock."""
-    if spec.memory is None or not spec.memory.reserved:
-        return
-    reserve_task_lineage(
-        project.artifacts,
-        spec.memory.lineage,
-        spec.task.lineage_group_id,
-        created_at=datetime.now(UTC),
-        code_revision=code_revision,
-    )
 
 
 INTERRUPTED = (
@@ -486,6 +470,10 @@ def execute_fidelity_evaluation(
         raise ValueError("execution differs from the saved fidelity registration")
     # Execute from the saved bytes, so a resumed run rebuilds byte-identical requests.
     prepared = saved
+    if prepared.spec.memory is not None:
+        refuse_ineligible_memory(
+            project, prepared.spec.memory.lineage, checkpoint=prepared.spec.memory.checkpoint
+        )
     directory = project.artifacts.project_directory
     with CoordinationLock(directory / (prepared.id + ".lock"), timeout=0):
         previous = saved_fidelity_report(project, prepared)
@@ -777,6 +765,13 @@ def execute_fidelity_evaluation(
             )
         else:
             _record_resumption(project, prepared, intent, window, now())
+        guide = completion(investigating, structured=True, role="investigation")  # guidance only
+        guidance = None if spec.guidance is None else SessionGuidance(
+            spec.guidance, guide, project.artifacts, session_id=prepared.id,
+            operations=tuple(action.call_id for action in spec.workload.actions),
+            code_revision=prepared.code_revision, clock=now,
+            profile_sha256=guide.completion_profile_sha256, resumption=resumption,
+        )  # fmt: skip
         report(progress, "Loading simulator and memory")
         session = open_grounded_session(
             runtime=runtime,
@@ -816,6 +811,7 @@ def execute_fidelity_evaluation(
             or spec.retrieval is not None,
             facts=None if spec.facts is None else spec.facts.facts,
             facts_version=0 if spec.facts is None else spec.facts.first_version,
+            prediction_reader=guidance,
         )
 
         def skipped_judge(body: JsonObject, logical_id: str) -> JsonObject:

@@ -10,9 +10,11 @@ from exp.common.project import ProjectStore
 from exp.optimize.evaluation.audit.panel_test import write_catalog
 from exp.optimize.evaluation.executable import workbook as workbook_runtime
 from exp.optimize.evaluation.executable.costs import (
+    runtime_costs,
+)
+from exp.optimize.evaluation.executable.model_costs import (
     decision_cost,
     model_cost,
-    runtime_costs,
     total_cost,
 )
 from exp.optimize.evaluation.executable.workbook_test import workbook_definition
@@ -48,7 +50,8 @@ def test_known_rates_price_every_attempt_without_credentials(
     )
     actor = model_cost(project, "world", 2, 4096)
     assert actor.usd is not None
-    assert actor.attempts == 2 and actor.usd == pytest.approx(0.416384)
+    # Two attempts reserve the complete 200K input and generation windows, including thought.
+    assert actor.attempts == 2 and actor.usd == pytest.approx(1.2)
     reader = decision_cost(project, "world", 2)
     assert reader.usd is not None and reader.usd > actor.usd
     assert decision_cost(project, "judge", 1).usd is None

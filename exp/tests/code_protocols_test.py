@@ -57,7 +57,7 @@ PROTOCOLS = (
     ),
     Protocol(
         "exp.optimize.evaluation.tasks.calibration:CALIBRATION_PROTOCOL",
-        "task-calibration-v7",
+        "task-calibration-v12",
         (
             "exp.optimize.evaluation.tasks.calibration",
             "exp.optimize.evaluation.tasks.admission",
@@ -65,7 +65,7 @@ PROTOCOLS = (
             "exp.simulation.evaluation.tasks",
             "exp.simulation.evaluation.admission",
         ),
-        "098aea4090b56992b1a19ad02b1b44e1b64249322d58b7d09b786ecf53c6ab1b",
+        "f15a5289e76ffa42f8363e0d85d7ed660873740886bf4a149c7ca832e433740d",
     ),
     Protocol(
         "exp.optimize.evaluation.tasks.challenges:CHALLENGE_PROTOCOL",
@@ -80,7 +80,7 @@ PROTOCOLS = (
     ),
     Protocol(
         "exp.optimize.evaluation.council.runner:COUNCIL_HARNESS_PROTOCOL",
-        "council-harness-v4",
+        "council-harness-v6",
         (
             "exp.runtime.agents.chat:ChatAgentRuntime",
             "exp.runtime.agents.pi:PiAgentRuntime",
@@ -88,7 +88,7 @@ PROTOCOLS = (
             "exp.simulation.actor:run_actor_workflow",
             "exp.simulation.world_model.grounded_session:open_grounded_session",
         ),
-        "c3cc35dd94e6cc7583b095211d7370ffc29672575d3cf39d2beb0f34977f5259",
+        "fe55f4aca8ba262638d1c8f3d5c3e56a85529185877fb21483ae095655efc94e",
     ),
     Protocol(
         "exp.optimize.evaluation.tasks.refinement:REFINEMENT_REQUEST_PROTOCOL",

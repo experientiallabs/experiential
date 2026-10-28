@@ -10,7 +10,10 @@ from exp.cli.evaluation import replay_view
 from exp.common.models.client import RequestAdmissionRefused
 from exp.common.models.unknown_outcome import DispatchOutcomeUnknown
 from exp.common.project import ProjectStore
+from exp.common.tasks.facts import FactProvenance, FactValidation, InstanceFact, InstanceFacts
+from exp.optimize.evaluation.fidelity.instance_facts import ReplayFacts
 from exp.optimize.evaluation.fidelity.replay import ReplayAggregate, ReplyKindCount
+from exp.optimize.evaluation.fidelity.runner import FidelitySpec, PreparedFidelity
 from exp.runtime.models.providers.async_transport import ProviderDeadlineExceeded
 from exp.runtime.models.providers.transport import ProviderTransportError
 from exp.runtime.sessions.dispatch_ledger import DispatchCapExhaustedError
@@ -109,3 +112,25 @@ def test_an_unjudged_panel_says_how_many_traces_the_judge_covered() -> None:
         traces=2, exact=0, steps=2, fields_matched=0, fields_total=0, judge_mean=None
     )
     assert "judge - (0/2 traces judged, 0 judge failures)" in replay_view.aggregate_line(total, 2)
+
+
+def test_a_panel_states_which_traces_were_measured_given_supplied_facts() -> None:
+    """Exactness given supplied instance facts is labelled, and its absence is said too."""
+    fact = InstanceFact(
+        key="orders/#W1/status",
+        value="pending",
+        visibility="conditioning",
+        provenance=FactProvenance(
+            adapter="fixture",
+            source="order service",
+            validation=FactValidation(status="validated", method="read"),
+            state_version=0,
+        ),
+    )
+    facts = ReplayFacts(facts=InstanceFacts(facts=(fact,)))
+    with_facts = PreparedFidelity.model_construct(spec=FidelitySpec.model_construct(facts=facts))
+    bare = PreparedFidelity.model_construct(spec=FidelitySpec.model_construct(facts=None))
+    line = replay_view.facts_line((with_facts, bare))
+    assert "supplied to 1/2 traces (1 validated facts)" in line
+    assert "measured given those facts" in line
+    assert "none supplied" in replay_view.facts_line((bare,))

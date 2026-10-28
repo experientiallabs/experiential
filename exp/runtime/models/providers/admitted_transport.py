@@ -9,7 +9,14 @@ from copy import copy, deepcopy
 from datetime import UTC, datetime
 from urllib.parse import urlsplit
 
-from exp.common.core.artifacts import ArtifactEnvelope, ArtifactInput, JsonObject, sha256_json
+from exp.common.core.artifacts import (
+    ArtifactEnvelope,
+    ArtifactInput,
+    JsonObject,
+    JsonValue,
+    sha256_bytes,
+    sha256_json,
+)
 from exp.common.models import ModelCatalog
 from exp.common.project import ArtifactStore, ArtifactStoreError, artifact_input
 from exp.common.project.request_budget import validate_provider_response
@@ -26,6 +33,12 @@ from exp.runtime.models.providers.transport import (
     ProviderTransportError,
     public_error_code,
 )
+from exp.runtime.models.spend_ceiling import (
+    OperationSpendCeiling,
+    Reservation,
+    current_spend_ceiling,
+    is_embedding_endpoint,
+)
 from exp.runtime.sessions.dispatch_ledger import DispatchLedger
 
 ADMITTED_TRANSPORT_PROVIDERS = frozenset(
@@ -39,6 +52,41 @@ registry providers fall outside it: ``bedrock`` and ``tinker`` dispatch through 
 runtimes, ``typesafe`` and ``elevenlabs`` serve no completion (the native gateway owns their
 wire), and ``vertex`` mints its OAuth bearer token over Google's own HTTP client.
 """
+
+_EMBEDDED_TEXT_KEYS = frozenset({"input", "text"})
+"""Embedding request fields that carry text: OpenAI-wire ``input`` and Gemini part ``text``."""
+
+
+def _retained_request(url: str, payload: JsonObject | None) -> JsonObject | None:
+    """Return the request body an intent receipt keeps for one physical request.
+
+    Embedding inputs are chunks of the caller's own stored evidence, so the receipt cites each
+    text by its digest and length instead of copying it. Agent traces routinely quote placeholder
+    credentials such as ``Authorization: token ${GITHUB_TOKEN}``, which the credential boundary
+    would otherwise refuse to retain. Every other field, and every non-embedding body, is kept
+    whole and still passes the boundary unchanged.
+
+    Args:
+        url: Absolute provider endpoint, which distinguishes embedding requests.
+        payload: Exact JSON request body, or None for a bodiless request.
+
+    Returns:
+        The body to retain; ``request_sha256`` still digests the exact sent body.
+    """
+    if payload is None or not is_embedding_endpoint(url):
+        return payload
+    return {name: _cite_texts(value, name) for name, value in payload.items()}
+
+
+def _cite_texts(value: JsonValue, key: str | None) -> JsonValue:
+    """Replace embedded text under :data:`_EMBEDDED_TEXT_KEYS` with its digest and length."""
+    if isinstance(value, str) and key in _EMBEDDED_TEXT_KEYS:
+        return {"text_sha256": sha256_bytes(value.encode("utf-8")), "characters": len(value)}
+    if isinstance(value, list):
+        return [_cite_texts(item, key) for item in value]
+    if isinstance(value, dict):
+        return {name: _cite_texts(item, name) for name, item in value.items()}
+    return value
 
 
 def require_admitted_transport(catalog: ModelCatalog, alias: str, *, consumer: str) -> None:
@@ -68,6 +116,11 @@ class AdmittedJsonTransport(JsonHttpTransport):
     (:mod:`exp.runtime.models.providers.backpressure`): the provider's circuit breaker must
     admit it and an in-flight slot of its provider and alias must be free. The slot is held
     only while the request is in flight, and every definite status updates the breaker.
+
+    Under an operation spend ceiling every POST reserves its worst-case cost, priced as its
+    route's alias (or the alias named by :meth:`priced_as`), before the ledger claim and the
+    intent receipt; the response settles it, an unknown outcome keeps it, and a request that
+    provably never left releases it.
     """
 
     def __init__(
@@ -82,6 +135,7 @@ class AdmittedJsonTransport(JsonHttpTransport):
         before_claim: Callable[[], None] | None = None,
         admission: HostProviderAdmission | None = None,
         route: ProviderRoute | None = None,
+        spend_ceiling: OperationSpendCeiling | None = None,
     ) -> None:
         """Bind physical capacity, immutable receipts and an aware global deadline.
 
@@ -89,7 +143,8 @@ class AdmittedJsonTransport(JsonHttpTransport):
         recheck that it is still allowed to dispatch; nothing is claimed or sent after a refusal.
         ``admission`` defaults to the host-wide database and registered limits. ``route`` names
         the provider and alias scopes; the registry binds it per client with :meth:`for_route`,
-        and an unbound transport is scoped by its endpoint host.
+        and an unbound transport is scoped by its endpoint host. ``spend_ceiling`` defaults to
+        the ceiling installed in the current operation scope when the transport is built.
         """
         if deadline.tzinfo is None:
             raise ValueError("transport deadline must be timezone-aware")
@@ -99,6 +154,23 @@ class AdmittedJsonTransport(JsonHttpTransport):
         self._before_claim = before_claim
         self._artifacts, self._revision = artifacts, code_revision
         self._clock = clock or _utc_now
+        self._ceiling = spend_ceiling or current_spend_ceiling()
+        self._priced_alias: str | None = None
+
+    @property
+    def spend_ceiling(self) -> OperationSpendCeiling | None:
+        """Return the operation ceiling this transport reserves against, if any."""
+        return self._ceiling
+
+    def priced_as(self, alias: str) -> AdmittedJsonTransport:
+        """Return a view whose requests are priced as ``alias`` without changing admission.
+
+        A wire posted outside the registry's clients, such as the native decision wire, names
+        the catalog alias whose prices bound it; pacing keeps the transport's own route.
+        """
+        view = copy(self)
+        view._priced_alias = alias
+        return view
 
     def for_route(self, route: ProviderRoute) -> AdmittedJsonTransport:
         """Return a view sharing this ledger, deadline and admission, scoped to ``route``."""
@@ -145,8 +217,9 @@ class AdmittedJsonTransport(JsonHttpTransport):
         """
         if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
             raise ValueError("physical request timeout must be finite and positive")
+        retained = _retained_request(url, payload)
         try:
-            validate_provider_response(json.dumps(payload, ensure_ascii=False, allow_nan=False))
+            validate_provider_response(json.dumps(retained, ensure_ascii=False, allow_nan=False))
         except ArtifactStoreError as error:
             raise ArtifactStoreError(
                 "provider request cannot be retained at the credential boundary; "
@@ -161,7 +234,7 @@ class AdmittedJsonTransport(JsonHttpTransport):
         route = self._route_for(url)
         with self._admission.admit(route, wait_seconds=min(remaining, timeout_seconds)) as slot:
             return self._dispatch(
-                method, url, payload, timeout_seconds, send, slot, idempotency_key
+                method, url, payload, retained, timeout_seconds, send, slot, idempotency_key
             )
 
     def _dispatch(
@@ -169,51 +242,77 @@ class AdmittedJsonTransport(JsonHttpTransport):
         method: str,
         url: str,
         payload: JsonObject | None,
+        retained: JsonObject | None,
         timeout_seconds: float,
         send: Callable[[float], JsonHttpResponse],
         slot: AdmissionSlot,
         idempotency_key: str | None,
     ) -> JsonHttpResponse:
-        """Claim a ledger slot, record intent, send once and report the outcome to the slot."""
+        """Reserve spend, claim a ledger slot, record intent, send once and settle the outcome.
+
+        A reservation is released only while the request provably has not left: before the
+        dispatch mark commits, nothing has been sent. The intent keeps ``retained``, the
+        receipt form of the body, beside the digest of the exact ``payload`` that is sent.
+        """
         timeout_seconds -= slot.waited_seconds
         now = self._clock()
         remaining = (self._deadline - now).total_seconds()
         if remaining <= 0 or timeout_seconds <= 0:
             raise TimeoutError("transport deadline reached before physical dispatch")
-        sequence, attempt = self._ledger.claim(now.isoformat())
-        base = "provider-attempt-" + attempt
-        canonical = current_call_intent()
-        intent = self._record(
-            base + "-intent",
-            {
-                "sequence": sequence,
-                "method": method,
-                "endpoint_sha256": sha256_json({"url": url}),
-                "request_sha256": sha256_json(payload),
-                "request_body": payload,
-                "consumer": current_consumer(),
-                "timeout_seconds": min(remaining, timeout_seconds),
-                "timeout_protocol": ATTEMPT_TIMEOUT_PROTOCOL,
-                **({"idempotency_key": idempotency_key} if idempotency_key else {}),
-                **({"canonical_request": canonical.model_dump(mode="json")} if canonical else {}),
-            },
-            () if canonical is None else (canonical,),
-        )
-        remaining = (self._deadline - self._clock()).total_seconds()
-        if remaining <= 0:
-            self._record(
-                base + "-not-dispatched",
+        ceiling = self._ceiling
+        reservation: Reservation | None = None
+        if ceiling is not None and payload is not None:
+            alias = self._priced_alias or (None if self._route is None else self._route.alias)
+            reservation = ceiling.reserve(alias=alias, url=url, payload=payload)
+        try:
+            sequence, attempt = self._ledger.claim(now.isoformat())
+            base = "provider-attempt-" + attempt
+            canonical = current_call_intent()
+            intent = self._record(
+                base + "-intent",
                 {
                     "sequence": sequence,
-                    "outcome": "deadline_before_io",
-                    "dispatch": "not_started",
+                    "method": method,
+                    "endpoint_sha256": sha256_json({"url": url}),
+                    "request_sha256": sha256_json(payload),
+                    "request_body": retained,
+                    "consumer": current_consumer(),
+                    "timeout_seconds": min(remaining, timeout_seconds),
+                    "timeout_protocol": ATTEMPT_TIMEOUT_PROTOCOL,
+                    **({"idempotency_key": idempotency_key} if idempotency_key else {}),
+                    **(
+                        {"canonical_request": canonical.model_dump(mode="json")}
+                        if canonical
+                        else {}
+                    ),
                 },
-                (intent,),
+                () if canonical is None else (canonical,),
             )
-            raise TimeoutError("transport deadline reached while persisting intent")
+            remaining = (self._deadline - self._clock()).total_seconds()
+            if remaining <= 0:
+                self._record(
+                    base + "-not-dispatched",
+                    {
+                        "sequence": sequence,
+                        "outcome": "deadline_before_io",
+                        "dispatch": "not_started",
+                    },
+                    (intent,),
+                )
+                raise TimeoutError("transport deadline reached while persisting intent")
+            if reservation is not None and ceiling is not None:
+                ceiling.mark_dispatched(reservation, attempt)
+        except BaseException:
+            if reservation is not None and ceiling is not None:
+                ceiling.release(reservation)
+            raise
         try:
             response = send(min(remaining, timeout_seconds))
-        except Exception as error:  # noqa: BLE001 - preserve ambiguity without retrying.
+        except BaseException as error:
+            if reservation is not None and ceiling is not None:
+                ceiling.retain_unknown(reservation)
+            if not isinstance(error, Exception):
+                raise
             failure = error if isinstance(error, ProviderTransportError) else None
             slot.record(
                 status_code=None if failure is None else failure.status_code,
@@ -231,6 +330,8 @@ class AdmittedJsonTransport(JsonHttpTransport):
                 (intent,),
             )
             raise
+        if reservation is not None and ceiling is not None:
+            ceiling.settle(reservation, response)
         slot.record(
             status_code=response.status_code,
             retry_after_seconds=response.retry_after_seconds,

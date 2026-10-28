@@ -388,7 +388,8 @@ def test_learning_reuse_restart_duplicate_and_frozen_checkpoint(
         + ["--non-interactive", "--verbose"],
     )
     assert shown.exit_code == 0, shown.output
-    assert "frozen run read v1" in shown.output and "Whole trajectory exact: no" in shown.output
+    assert "frozen run read v1" in shown.output
+    assert "Whole trajectory replies exact: no" in shown.output
     assert "read v1, unchanged" in shown.output
 
 

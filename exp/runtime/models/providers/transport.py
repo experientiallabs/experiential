@@ -580,6 +580,8 @@ def classify_retry(exception: Exception) -> RetryClassification:
         A stable retry decision and concise reason.
     """
     if isinstance(exception, ProviderTransportError):
+        if exception.error_code == "idempotency_replay_unavailable":
+            return RetryClassification(retryable=False, reason="outcome_unknown")
         if exception.status_code is None:
             return RetryClassification(retryable=True, reason="transport")
         if exception.status_code in _RETRYABLE_STATUS_CODES:
@@ -590,6 +592,25 @@ def classify_retry(exception: Exception) -> RetryClassification:
     if isinstance(exception, OSError):
         return RetryClassification(retryable=True, reason="os_error")
     return RetryClassification(retryable=False, reason="non_transport_error")
+
+
+def classify_unrepeatable_retry(exception: Exception) -> RetryClassification:
+    """Classify one error for a wire that cannot deduplicate a resend of the same request.
+
+    A timeout, transport failure or retryable HTTP answer does not prove that a request
+    was never executed. Without deduplication, only a trusted certified non-dispatch refusal
+    may retry. A lost completed keyed result remains unknown under either wire policy.
+
+    Args:
+        exception: Error raised by one request attempt.
+
+    Returns:
+        A stable retry decision and concise reason.
+    """
+    classification = classify_retry(exception)
+    if classification.retryable and not is_unbilled_attempt(exception):
+        return RetryClassification(retryable=False, reason="outcome_unknown")
+    return classification
 
 
 def run_with_retry[ResultT](

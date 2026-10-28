@@ -55,6 +55,7 @@ from exp.runtime.models.providers.transport import (
     RetryClassification,
     RetryPolicy,
     classify_retry,
+    classify_unrepeatable_retry,
     is_unbilled_attempt,
     propagate_request_attempt_evidence,
     public_error_code,
@@ -684,16 +685,6 @@ class ProviderHttpClient(abc.ABC):
                 raise
             if not 200 <= response.status_code < 300:
                 unbilled_attempts += int(response.known_unbilled)
-                error = response.body.get("error")
-                if (
-                    idempotency_key is None
-                    and response.status_code == 409
-                    and isinstance(error, dict)
-                    and error.get("code") == "idempotency_replay_unavailable"
-                ):
-                    # The gateway confirms this completed operation cannot be replayed. A new
-                    # client-owned attempt gets a new key and remains inside the retry allowance.
-                    request_headers["Idempotency-Key"] = f"exp-{uuid4().hex}"
                 raise ProviderTransportError(
                     f"provider returned HTTP {response.status_code}",
                     status_code=response.status_code,
@@ -713,8 +704,12 @@ class ProviderHttpClient(abc.ABC):
                 raise ProviderTruncatedResponseError(
                     str(error), response_body=deepcopy(response.body)
                 ) from error
-            except ProviderRetryableResponseError:
-                if idempotency_key is None:
+            except ProviderRetryableResponseError as error:
+                if error.hit_length_limit:
+                    # A definite allowance stop is one returned model outcome, not QoS.
+                    # Keep its body for durable rejection without inventing an assistant action.
+                    error.response_body = deepcopy(response.body)
+                elif idempotency_key is None:
                     # Replaying a cached, completed empty response cannot produce usable output.
                     request_headers["Idempotency-Key"] = f"exp-{uuid4().hex}"
                 raise
@@ -724,7 +719,9 @@ class ProviderHttpClient(abc.ABC):
             policy=self._retry_policy,
             deadline=request_deadline,
             attempt_timeout_seconds=completion_timeout,
-            classify=_classify_complete_retry,
+            classify=_classify_complete_retry
+            if self.supports_idempotency_key
+            else _classify_unrepeatable_complete_retry,
         )
         return result.model_copy(
             update={
@@ -795,6 +792,9 @@ class ProviderHttpClient(abc.ABC):
             retry_policy=self._retry_policy,
             idempotency_key=idempotency_key or self._intent_idempotency_key(url, payload),
             attempt_timeout_seconds=self._timeout_seconds,
+            classify=classify_retry
+            if self.supports_idempotency_key
+            else classify_unrepeatable_retry,
         )
 
     def _request_path(self, path: str) -> str:
@@ -831,8 +831,30 @@ def _classify_complete_retry(exception: Exception) -> RetryClassification:
         A stable retry decision and concise reason.
     """
     if isinstance(exception, ProviderRetryableResponseError):
+        if exception.hit_length_limit:
+            return RetryClassification(retryable=False, reason="output_budget_exhausted")
         return RetryClassification(retryable=True, reason="empty_completed_output")
     return classify_retry(exception)
+
+
+def _classify_unrepeatable_complete_retry(exception: Exception) -> RetryClassification:
+    """Classify failures on a wire without an idempotency contract.
+
+    An empty output without a length stop may be retried. A known output-allowance stop is
+    terminal; any unproven transport or HTTP failure may have executed and is never resent
+    (see `classify_unrepeatable_retry`).
+
+    Args:
+        exception: Error raised by one post-and-parse attempt.
+
+    Returns:
+        A stable retry decision and concise reason.
+    """
+    if isinstance(exception, ProviderRetryableResponseError):
+        if exception.hit_length_limit:
+            return RetryClassification(retryable=False, reason="output_budget_exhausted")
+        return RetryClassification(retryable=True, reason="empty_completed_output")
+    return classify_unrepeatable_retry(exception)
 
 
 def _run_sync[ResultT](

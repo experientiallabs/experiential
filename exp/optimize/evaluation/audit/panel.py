@@ -11,10 +11,16 @@ reproduces held-out traces, in one of two explicit profiles:
 - ``source-rag``: the same world model retrieving from the build's fit-only index; the serving
   index also holds held-out traces and is never used here.
 
-The memory profile reads its checkpoint in one of three memory settings, every other spec field
-identical, so one panel's cases compare them: ``learned`` (all learned memory, the default),
-``none`` (no experience memory), and ``lessons`` (only the checkpoint's screened lessons, see
-:mod:`exp.optimize.evaluation.learning.lessons`).
+The memory profile reads its checkpoint in one of five memory settings, every other spec field
+identical apart from what the setting names, so one panel's cases compare them: ``learned`` (all
+learned memory, the default), ``none`` (no experience memory; recorded originals are still
+retrieved from the fit-only index), ``lessons`` (only the checkpoint's screened lessons, see
+:mod:`exp.optimize.evaluation.learning.lessons`), ``bare`` (the memory-first variant of the same
+simulator, which retrieves no recorded original, and no memory) and ``guidance`` (``none`` plus
+temporary session-scoped guidance synthesized from the retrieved originals, see
+:mod:`exp.simulation.world_model.session_guidance`). A panel may read an earlier frozen
+checkpoint, the version that had consumed exactly ``checkpoint`` fit trajectories, instead of the
+final one.
 
 Held-out traces are selected deterministically and replayed through the shared trace-replay
 path and the existing fidelity owner; see :mod:`exp.optimize.evaluation.fidelity.replay` for the
@@ -60,14 +66,19 @@ from exp.optimize.evaluation.learning.traces import (
     recorded_plan,
 )
 from exp.simulation.retrieval import load_rag_index
-from exp.simulation.world_model.experience_memory import memory_head
+from exp.simulation.world_model.experience_memory import memory_head, read_memory_version
 from exp.simulation.world_model.observed_tools import observed_calls
-from exp.simulation.world_model.runtime import persist_fit_only_world_model
+from exp.simulation.world_model.runtime import (
+    persist_fit_only_world_model,
+    persist_memory_first_world_model,
+)
+from exp.simulation.world_model.session_guidance import SessionGuidancePolicy
 
 LABEL = "held-out"
 PANEL_JUDGE_EFFORT = "low"  # panels report the judge alongside exact replies; low suffices
 Profile = Literal["memory", "source-rag"]
-MemoryProfile = Literal["learned", "none", "lessons"]
+MemoryProfile = Literal["learned", "none", "lessons", "bare", "guidance"]
+MEMORYLESS: frozenset[str] = frozenset({"none", "bare", "guidance"})
 
 
 class AuditCheckpoint(ContractModel):
@@ -293,6 +304,7 @@ def plan_held_out_panel(
     clock: Callable[[], datetime],
     excluded: Collection[str] = frozenset(),
     memory_profile: MemoryProfile = "learned",
+    checkpoint: int | None = None,
 ) -> PlannedPanel:
     """Select up to ``count`` held-out cases and derive their specs, registering nothing.
 
@@ -304,8 +316,11 @@ def plan_held_out_panel(
         code_revision: Implementation that will produce every run.
         clock: Aware clock for deadlines.
         excluded: Lineages never selected.
-        memory_profile: Memory profile only: read all learned memory, none, or only the
-            checkpoint's latest screened lesson set.
+        memory_profile: Memory profile only: read all learned memory, none, only the
+            checkpoint's latest screened lesson set, the memory-first simulator with no memory
+            (``bare``), or no memory plus session-scoped guidance (``guidance``).
+        checkpoint: Memory profile only: read the frozen version that had consumed exactly this
+            many fit trajectories instead of the final one.
 
     Returns:
         The planned panel.
@@ -314,7 +329,6 @@ def plan_held_out_panel(
         ValueError: No learned memory for the memory profile, or no selectable lineage.
     """
     memory: FidelityMemory | None = None
-    checkpoint: AuditCheckpoint | None = None
     if profile == "memory":
         if not recorded_plan(project, "fit"):
             raise ValueError(
@@ -331,38 +345,58 @@ def plan_held_out_panel(
                 "PROJECT --audit N to learn it"
             )
         world_model = plan.world_model
+        if memory_profile == "bare":
+            world_model = persist_memory_first_world_model(project.artifacts, world_model)
+        version = head
+        learned = len(learned_runs(project, plan))
+        order = tuple(case.trace_id for case in fit_cases(project))
+        retired = retired_traces(project, plan.lineage, order)
+        if checkpoint is not None:
+            if checkpoint > head.version:
+                raise ValueError(
+                    f"memory has consumed {head.version} fit trajectories; checkpoint "
+                    f"{checkpoint} does not exist yet"
+                )
+            version = read_memory_version(project.artifacts, plan.lineage, checkpoint)
+            if version is None:
+                raise ValueError(f"memory version {checkpoint} was never published")
+            learned = checkpoint
+            # Traces retired before the checkpoint's last consumed trace, in learning order.
+            runs = learned_runs(project, plan)
+            last = order.index(runs[checkpoint - 1][0].trace_id)
+            retired = tuple(row for row in retired if order.index(row.trace_id) < last)
         lessons = (
-            latest_lesson_set(project, plan.lineage, head.version)
+            latest_lesson_set(project, plan.lineage, version.version)
             if memory_profile == "lessons"
             else None
         )
-        checkpoint = AuditCheckpoint(
+        frozen = AuditCheckpoint(
             lineage=plan.lineage,
-            version=head.version,
+            version=version.version,
             scope=plan.scope,
-            fit_traces_learned=len(learned_runs(project, plan)),
-            retired=retired_traces(
-                project, plan.lineage, tuple(case.trace_id for case in fit_cases(project))
-            ),
+            fit_traces_learned=learned,
+            retired=retired,
             memory=memory_profile,
             lessons=lessons,
         )
         cases = held_out_cases(project, count, fit_calls(project), excluded=excluded)
         memory = (
             None
-            if memory_profile == "none"
+            if memory_profile in MEMORYLESS
             else FidelityMemory(
                 lineage=plan.lineage,
                 mode="frozen",
-                checkpoint=head.version,
+                checkpoint=version.version,
                 reserved=True,
                 lessons=lessons,
             )
         )
         retrieval = plan.recall
+        checkpoint_row: AuditCheckpoint | None = frozen
     else:
-        if memory_profile != "learned":
+        if memory_profile != "learned" or checkpoint is not None:
             raise ValueError("a memory profile applies only to the memory audit profile")
+        checkpoint_row = None
         world_model, cases = source_rag_inputs(project, count, excluded=excluded)
         retrieval = None
     deadline = clock() + DEADLINE
@@ -376,13 +410,16 @@ def plan_held_out_panel(
             memory=memory,
             retrieval=retrieval,
             judge_effort=PANEL_JUDGE_EFFORT,
+            guidance=SessionGuidancePolicy()
+            if profile == "memory" and memory_profile == "guidance"
+            else None,
         )
         for case in cases
     )
     return PlannedPanel(
         profile=profile,
         world_model=world_model,
-        checkpoint=checkpoint,
+        checkpoint=checkpoint_row,
         cases=cases,
         specs=specs,
         code_revision=code_revision,

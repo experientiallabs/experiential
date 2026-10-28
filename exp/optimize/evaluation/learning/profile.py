@@ -31,8 +31,9 @@ from exp.common.core.locks import CoordinationLock
 from exp.common.models import ModelCatalog, ModelSnapshot
 from exp.common.project import ArtifactAlreadyExistsError, ProjectStore, artifact_input
 from exp.common.tasks import TaskCase
+from exp.optimize.evaluation.fidelity.memory import refuse_ineligible_memory
 from exp.optimize.evaluation.fidelity.runner import FidelityRetrieval
-from exp.optimize.evaluation.learning.traces import learning_plan, recorded_plan
+from exp.optimize.evaluation.learning.traces import Scope, learning_plan, recorded_plan
 from exp.optimize.router.evaluation.build import completed_project_build
 from exp.runtime.gateway.decisions_contracts import DecisionRequest
 from exp.runtime.models import RuntimeModelCatalog
@@ -43,6 +44,7 @@ from exp.runtime.models.providers.transport import (
     JsonHttpTransport,
     ProviderTransportError,
     RetryPolicy,
+    classify_unrepeatable_retry,
     run_with_retry,
 )
 from exp.runtime.sessions.dispatch_ledger import DispatchLedger
@@ -94,13 +96,16 @@ class EvaluationMemory(ContractModel):
 
 
 def learned_evaluation_memory(
-    project: ProjectStore, catalog: ModelCatalog
+    project: ProjectStore, catalog: ModelCatalog, scope: Scope = "all"
 ) -> EvaluationMemory | None:
     """Pin the build's learned memory at its latest version, or None when nothing was learned.
 
     Args:
         project: Project with a completed build.
         catalog: Credential-free catalog naming the recall model.
+        scope: ``all`` pins the memory ``exp build`` learned from every trace; ``fit`` pins
+            the fit-only memory ``exp eval --audit`` learned, which never consumed a held-out
+            lineage and is read over the fit-only index.
 
     Returns:
         The memory every simulated turn reads, or None without learned memory.
@@ -108,9 +113,10 @@ def learned_evaluation_memory(
     Raises:
         ValueError: The memory's recall alias is no longer configured.
     """
-    if not recorded_plan(project, "all"):
+    if not recorded_plan(project, scope):
         return None
-    plan = learning_plan(project, None, "all")
+    plan = learning_plan(project, None, scope)
+    refuse_ineligible_memory(project, plan.lineage)
     head = memory_head(project.artifacts, plan.lineage)
     if head is None:
         return None
@@ -160,6 +166,7 @@ def bind_evaluation_memory(
     """
     if memory.world_model != world_model:
         raise ValueError("evaluation memory belongs to a different simulator; prepare again")
+    refuse_ineligible_memory(project, memory.lineage, checkpoint=memory.version)
     version = read_memory_version(project.artifacts, memory.lineage, memory.version)
     selector = JEVCueSelector(
         policy=memory.recall.jev,
@@ -266,9 +273,15 @@ def _recorded_decisions(
     lock_timeout = retry_policy.maximum_attempts * (
         request_timeout + retry_policy.maximum_delay_seconds
     )
+    if isinstance(transport, AdmittedJsonTransport):
+        transport = transport.priced_as(memory.recall.jev_alias)
 
     def post(request: DecisionRequest, active_transport: JsonHttpTransport) -> JsonObject:
-        """One decision attempt; transport failures are retried, refusals are not."""
+        """One decision attempt over a wire that defines no idempotency key.
+
+        Only a trusted certified non-dispatch refusal may retry; an HTTP status alone
+        does not prove non-execution. Unknown outcomes are never resent.
+        """
         response = active_transport.post(
             url,
             headers=profile.headers,
@@ -279,6 +292,7 @@ def _recorded_decisions(
             raise ProviderTransportError(
                 f"recall decision returned HTTP {response.status_code}",
                 status_code=response.status_code,
+                known_unbilled=response.known_unbilled,
             )
         return response.body
 
@@ -342,7 +356,11 @@ def _recorded_decisions(
                 started = time.monotonic()
                 dependencies = (artifact_input(store.read(intent).manifest),)
                 if recovery is None:
-                    body = run_with_retry(lambda: post(request, transport), policy=retry_policy)
+                    body = run_with_retry(
+                        lambda: post(request, transport),
+                        policy=retry_policy,
+                        classify=classify_unrepeatable_retry,
+                    )
                 else:
                     recovery_manifest = store.write_json(
                         artifact_id=identity + "-recovery",
@@ -369,7 +387,7 @@ def _recorded_decisions(
                         artifacts=store,
                         code_revision=code_revision,
                         deadline=recovery.deadline,
-                    )
+                    ).priced_as(memory.recall.jev_alias)
                     with canonical_call(recovery_ref):
                         body = post(request, admitted)
                     dependencies += (recovery_ref,)

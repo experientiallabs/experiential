@@ -290,7 +290,11 @@ def _goal(verifier: TaskVerifier, goal: Assessment) -> DimensionObservation:
 
 def _policy(verifier: TaskVerifier, outcome: JsonObject) -> DimensionObservation:
     """Observe the declared tool and argument policy, separately from protected state."""
-    if verifier.allowed_tools is None and not verifier.argument_rules:
+    if (
+        verifier.allowed_tools is None
+        and not verifier.argument_rules
+        and not verifier.argument_schemas
+    ):
         return _observation(
             "policy_compliance",
             None,
@@ -308,7 +312,9 @@ def _effects(verifier: TaskVerifier, outcome: JsonObject) -> DimensionObservatio
             None,
             "not applicable: the verifier declares no protected state",
         )
-    state_only = verifier.model_copy(update={"allowed_tools": None, "argument_rules": {}})
+    state_only = verifier.model_copy(
+        update={"allowed_tools": None, "argument_rules": {}, "argument_schemas": {}}
+    )
     return _observation("forbidden_effects", grade(state_only, outcome).policy)
 
 

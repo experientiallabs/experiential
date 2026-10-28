@@ -19,6 +19,7 @@ from exp.optimize.evaluation.audit.panel_test import (
     episode,
 )
 from exp.optimize.evaluation.continuations.capture import CaptureDefinition
+from exp.optimize.evaluation.learning.lineage import plan_world_model
 from exp.runtime.environments.world_contracts import StateDomain, ToolEffectPolicy, WorldManifest
 
 TOOL = ToolSchema(
@@ -106,6 +107,9 @@ def test_cli_lists_development_tasks_and_grounds_a_simulated_capture(
     saved = json.loads(capture_file.read_text())
     assert saved == json.loads(output) and saved["action"] == "capture"
     capture = CaptureDefinition.model_validate(saved["capture"])
-    assert capture.sources == (build.world_model,) and capture.task.tools == (TOOL,)
+    # A development world retrieves from the fit-only index, never the serving index.
+    fit_index = plan_world_model(project.artifacts, build, "fit")
+    assert fit_index != build.world_model
+    assert capture.sources == (fit_index,) and capture.task.tools == (TOOL,)
     code, output = run(project, path, operation)
     assert code != 0 and "operation_file needs a new file" in output, output

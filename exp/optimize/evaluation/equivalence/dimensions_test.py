@@ -230,3 +230,23 @@ def test_state_fidelity_pairs_need_an_executed_tool_and_a_native_reference() -> 
             reference, other, verifier=GOAL, tools=TOOLS, material_agreement="match"
         )
         assert {row.dimension: row.agreement for row in rows}["state_fidelity"] == expected
+
+
+def test_argument_schema_policy_is_applicable_and_separate_from_state() -> None:
+    """A constrained argument cannot be ignored or contaminate protected-state scoring."""
+    schema_only = GOAL.model_copy(
+        update={
+            "argument_schemas": {"edit": {"properties": {"rows": {"maxItems": 0}}}},
+            "preserved_paths": ("/input",),
+        }
+    )
+    changed = step("edit")
+    assert isinstance(changed["action"], dict)
+    changed["action"]["arguments"] = {"rows": [1]}
+    # Updating arguments also changes the truthful receipt's action identity.
+    assert isinstance(changed["execution"], dict)
+    changed["execution"]["action_sha256"] = sha256_json(ToolCall.model_validate(changed["action"]))
+    values = observed(branch(changed), schema_only)
+    assert values["policy_compliance"] == "refused"
+    assert values["forbidden_effects"] == "admitted"
+    assert values["goal_success"] == "admitted"

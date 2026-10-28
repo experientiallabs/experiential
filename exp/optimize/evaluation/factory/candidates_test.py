@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 from filelock import Timeout
 
-from exp.common.core.artifacts import JsonObject
+from exp.common.core.artifacts import ArtifactInput, JsonObject
 from exp.common.models import load_model_catalog
 from exp.common.project import ProjectStore, artifact_input
 from exp.optimize.evaluation.continuations.actors import PanelActor
@@ -17,7 +17,13 @@ from exp.optimize.evaluation.executable.package import verify_executable_package
 from exp.optimize.evaluation.executable.qualification_test import qualified_fixture
 from exp.optimize.evaluation.executable.task import load_executable_task, persist_executable_task
 from exp.optimize.evaluation.factory.candidates import CandidateBatchSpec, run_candidate_batch
-from exp.optimize.evaluation.factory.proposals import TaskProposalSpec, propose_tasks
+from exp.optimize.evaluation.factory.proposals import (
+    TaskProposalSpec,
+    load_task_proposals,
+    propose_tasks,
+)
+from exp.optimize.evaluation.factory.quality import QUALITY_AXES, QualityFinding, TaskQualityReview
+from exp.optimize.evaluation.factory.variants import load_task_variant
 from exp.runtime.environments.tests.world_conformance_test import workbook_case
 from exp.runtime.models.providers.transport import JsonHttpResponse, ScriptedJsonTransport
 from exp.runtime.models.registry import RuntimeModelCatalog
@@ -38,6 +44,31 @@ def _reply(model: str, message: JsonObject, finish: str = "stop") -> JsonHttpRes
             "model": model,
             "choices": [{"index": 0, "finish_reason": finish, "message": message}],
         },
+    )
+
+
+def fixture_quality_reviews(
+    project: ProjectStore, proposals: ArtifactInput, sources: tuple[ArtifactInput, ...]
+) -> tuple[TaskQualityReview, ...]:
+    """Supply software stand-ins for review plumbing, never real expert labels."""
+    return tuple(
+        TaskQualityReview(
+            task=load_task_variant(project, variant).task,
+            proposals=proposals,
+            reviewer="software-fixture-human-stand-in",
+            authority="human",
+            approved=True,
+            findings=tuple(
+                QualityFinding(
+                    axis=axis,
+                    verdict="pass",
+                    rationale="Software fixture only; not actual independent expert calibration.",
+                    sources=sources,
+                )
+                for axis in QUALITY_AXES
+            ),
+        )
+        for variant in load_task_proposals(project, proposals).variants
     )
 
 
@@ -146,6 +177,9 @@ def batch_fixture(
             PanelActor(alias="judge", model=catalog.snapshot("judge")[0], label="declared strong"),
         ),
         destination=tmp_path / "packages",
+        quality_reviews=fixture_quality_reviews(
+            project, proposals, (brief_ref, original_acceptance)
+        ),
     )
     replies = []
     for _ in range(2):
@@ -350,3 +384,220 @@ def test_busy_feasibility_child_remains_retryable(
     report = run_candidate_batch(project, spec, code_revision="test")
     assert report.candidates[0].feasibility is not None
     assert run_candidate_batch(project, spec, code_revision="test") == report
+
+
+def test_native_record_controls_require_opt_in_and_cached_reader_keeps_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Real SQLite witnesses require permission and cached reads buy no new inference."""
+    from contextlib import AbstractContextManager
+
+    from exp.common.models import ToolCall
+    from exp.common.tasks import ToolSchema
+    from exp.optimize.evaluation.continuations.job import load_continuation_runtime
+    from exp.optimize.evaluation.executable import qualification as qualification_owner
+    from exp.optimize.evaluation.executable.loader import ContinuationRuntime
+    from exp.optimize.evaluation.factory.candidates import saved_candidate_batch
+    from exp.optimize.evaluation.factory.runner_test import factory_fixture, record_family
+    from exp.runtime.environments.world_artifacts import load_world_image
+    from exp.runtime.environments.world_contracts import ExecutableCheckpoint
+    from exp.runtime.environments.worlds import ExecutableWorldRuntime
+    from exp.simulation.continuations import load_continuation_checkpoint
+    from exp.simulation.evaluation.admission import (
+        EvaluationSpecification,
+        LabelWitness,
+        persist_specification,
+        record_label_witness,
+    )
+    from exp.simulation.evaluation.record_execution import (
+        RecordReplayRuntime,
+        execute_record_script,
+        load_record_execution,
+    )
+    from exp.simulation.evaluation.tasks import OutcomeRule
+
+    project, factory, _ = factory_fixture(tmp_path, monkeypatch)
+    family = record_family(project, factory, tmp_path, monkeypatch)
+    task = load_executable_task(project, family.proposal.base)
+    checkpoint = load_continuation_checkpoint(project.artifacts, task.job.study.checkpoint)
+    assert isinstance(checkpoint.world, ExecutableCheckpoint)
+    cases = []
+    with load_continuation_runtime(project, task.job) as runtime:
+        assert isinstance(runtime.world, ExecutableWorldRuntime)
+        replay = RecordReplayRuntime(runtime.world, runtime.probe, runtime.probe_sha256)
+        baselines = {}
+        for partition in ("development", "confirmation"):
+            operator = checkpoint.world_task.model_copy(
+                update={
+                    "tools": (
+                        *checkpoint.world_task.tools,
+                        ToolSchema(
+                            name="setup",
+                            description="Operator setup only.",
+                            input_schema={"type": "object"},
+                        ),
+                    )
+                }
+            )
+            setup = execute_record_script(
+                project.artifacts,
+                replay,
+                task=operator,
+                baseline=checkpoint.world,
+                actions=(
+                    ToolCall(
+                        call_id=f"setup-{partition}",
+                        name="setup",
+                        arguments={"id": "b", "address": partition},
+                    ),
+                ),
+                finish_tick=checkpoint.world.clock + 1,
+                sources=(family.proposal.base,),
+                created_at=datetime.now(UTC),
+                code_revision="test",
+            )
+            baseline = load_world_image(
+                project.artifacts, load_record_execution(project.artifacts, setup).final
+            )
+            assert isinstance(baseline, ExecutableCheckpoint)
+            baselines[partition] = (baseline, setup)
+        for index, case in enumerate(family.controls):
+            if case.challenge.expected == "unassessable":
+                cases.append(case)
+                continue
+            old_witness = case.challenge.witness
+            assert old_witness is not None
+            source = LabelWitness.model_validate_json(
+                project.artifacts.read_bytes(old_witness.artifact_id, "witness.json")
+            )
+            arguments: JsonObject = {
+                "address": "wrong" if "goal-miss" in case.challenge.id else "new"
+            }
+            if "valid-two" in case.challenge.id:
+                arguments["id"] = "a"
+            if "side-effect" in case.challenge.id:
+                arguments["email"] = True
+            baseline, setup = baselines[case.partition]
+            receipt = execute_record_script(
+                project.artifacts,
+                replay,
+                task=checkpoint.world_task,
+                baseline=baseline,
+                actions=(ToolCall(call_id=f"native-{index}", name="change", arguments=arguments),),
+                finish_tick=baseline.clock + 1,
+                sources=(setup,),
+                created_at=datetime.now(UTC),
+                code_revision="test",
+            )
+            native = load_record_execution(project.artifacts, receipt)
+            authored = EvaluationSpecification.model_validate_json(
+                project.artifacts.read_bytes(source.specification.artifact_id, "specification.json")
+            )
+            native_spec = persist_specification(
+                project.artifacts,
+                authored.model_copy(
+                    update={
+                        "subject": "native_observation",
+                        "predicate": authored.predicate.model_copy(
+                            update={
+                                "rules": (
+                                    OutcomeRule(
+                                        path="/final_state/tables/orders/rows/0/1",
+                                        operator="equals",
+                                        value="new",
+                                    ),
+                                )
+                            }
+                        ),
+                    }
+                ),
+                sources=(source.specification,),
+                created_at=datetime.now(UTC),
+                code_revision="test",
+            )
+            witness = record_label_witness(
+                project.artifacts,
+                specification=native_spec,
+                outcome=native.outcome,
+                receipt=receipt,
+                record_runtime=replay,
+                created_at=datetime.now(UTC),
+                code_revision="test",
+            )
+            challenge = case.challenge.model_copy(
+                update={
+                    "outcome": native.outcome,
+                    "authority": "native_execution",
+                    "witness": witness,
+                }
+            )
+            cases.append(case.model_copy(update={"challenge": challenge}))
+    proposals = artifact_input(project.artifacts.read(family.proposal.identity("test")).manifest)
+    spec = CandidateBatchSpec(
+        proposals=proposals,
+        controls=tuple(cases),
+        actors=factory.actors,
+        quality_reviews=family.quality_reviews,
+    )
+
+    def responses(models: tuple[str, ...]) -> tuple[JsonHttpResponse, ...]:
+        """Use ordinary provider-native scripted parsing/admission; never live calls."""
+        result = []
+        for model in models:
+            result.extend(
+                (
+                    _reply(
+                        model,
+                        {
+                            "role": "assistant",
+                            "content": None,
+                            "tool_calls": [
+                                {
+                                    "id": "change",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "change",
+                                        "arguments": '{"address":"new"}',
+                                    },
+                                }
+                            ],
+                        },
+                        "tool_calls",
+                    ),
+                    _reply(model, {"role": "assistant", "content": "done"}),
+                )
+            )
+        return tuple(result)
+
+    false_wire = ScriptedJsonTransport(responses(("world-v1", "world-v1")))
+    monkeypatch.setattr(
+        "exp.optimize.evaluation.continuations.job.HttpxJsonTransport", lambda: false_wire
+    )
+    calls = []
+    original = qualification_owner.load_continuation_runtime
+
+    def tracked(
+        project: ProjectStore, job: ContinuationJob
+    ) -> AbstractContextManager[ContinuationRuntime]:
+        """Observe permission-bound real runtime loading, without replacing native execution."""
+        calls.append(job.runtime_sha256)
+        return original(project, job)
+
+    monkeypatch.setattr(qualification_owner, "load_continuation_runtime", tracked)
+    declined = run_candidate_batch(project, spec, code_revision="test")
+    assert declined.counts["unqualified"] == 2 and not calls and len(false_wire.requests) == 4
+    opted = spec.model_copy(update={"replay_native_records": True})
+    assert opted.identity("test") != spec.identity("test")
+    true_wire = ScriptedJsonTransport(responses(("world-v1", "judge-v1", "world-v1", "judge-v1")))
+    monkeypatch.setattr(
+        "exp.optimize.evaluation.continuations.job.HttpxJsonTransport", lambda: true_wire
+    )
+    measured = run_candidate_batch(project, opted, code_revision="test")
+    assert measured.counts["qualified_candidate"] == 2, measured.model_dump_json()
+    assert len(true_wire.requests) == 8 and calls
+    before = len(calls)
+    assert saved_candidate_batch(project, opted, code_revision="test") == measured
+    assert len(calls) > before and len(true_wire.requests) == 8
+    before = len(calls)
+    assert saved_candidate_batch(project, spec, code_revision="test") == declined
+    assert len(calls) == before

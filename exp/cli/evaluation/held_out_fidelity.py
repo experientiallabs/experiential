@@ -12,12 +12,14 @@ from rich.text import Text
 
 from exp.cli.evaluation.learning import run_learning
 from exp.cli.evaluation.learning_summary import LearningSummary, learning_lines, save_details
-from exp.cli.evaluation.replay_view import aggregate_line, render_traces, run_panel
+from exp.cli.evaluation.replay_view import aggregate_line, facts_line, render_traces, run_panel
+from exp.cli.evaluation.spend_ceiling import ceiling_line, enforced_ceiling, inventory_terms
 from exp.cli.evaluation.view import heading
 from exp.cli.shared.consent import can_prompt, one_cost_warning, require_spend_consent
 from exp.cli.shared.options import usage_error
 from exp.cli.shared.progress import Phase, duration_text, progress_phases
 from exp.cli.shared.theme import EXP_THEME
+from exp.common.core.artifacts import stable_id
 from exp.common.models import load_model_catalog
 from exp.common.progress import ProgressHook
 from exp.common.project import ProjectStore
@@ -41,6 +43,7 @@ from exp.optimize.evaluation.audit.receipts import (
     ReportKind,
     record_report,
 )
+from exp.optimize.evaluation.executable.model_costs import fidelity_costs
 from exp.optimize.evaluation.fidelity.panel import PANEL_STAGE, require_resumable
 from exp.optimize.evaluation.fidelity.recovery import stage_line
 from exp.optimize.evaluation.fidelity.replay import (
@@ -82,6 +85,7 @@ def run_held_out_fidelity(
     retry_incomplete: bool = False,
     include_inspected: bool = False,
     memory_profile: MemoryProfile = "learned",
+    checkpoint: int | None = None,
     details: Console | None = None,
     terminal: Console | None = None,
     progress: ProgressHook | None = None,
@@ -128,6 +132,7 @@ def run_held_out_fidelity(
             clock=clock,
             include_inspected=include_inspected,
             memory_profile=memory_profile,
+            checkpoint=checkpoint,
         ) as audit:
             _run_audit(
                 screen,
@@ -237,13 +242,23 @@ def _run_audit(
             record("stopped")
             raise
         interactive = not non_interactive and can_prompt(screen)
+        # One ceiling over every trace of the receipt: priced roles in dollars, unpriced ones
+        # within their displayed attempts, which only an explicit confirmation authorizes.
+        known, unpriced = inventory_terms(
+            tuple(row for item in panel.prepared for row in fidelity_costs(store, item.spec))
+        )
+        # The traces' physical-attempt ceilings bound every role together.
+        unpriced = min(
+            unpriced, sum(item.spec.maximum_physical_attempts for item in panel.prepared)
+        )
         with pause() if pause is not None else nullcontext():
+            screen.print(Text(ceiling_line(known, unpriced), style="dim"))
             consented = require_spend_consent(
                 screen,
                 root=root,
                 yes=yes,
-                estimated_cost_usd=None,
-                cost_is_upper_bound=False,
+                estimated_cost_usd=None if unpriced else known,
+                cost_is_upper_bound=not unpriced,
                 command=command,
                 non_interactive=not interactive,
             )
@@ -251,7 +266,15 @@ def _run_audit(
             record("stopped")
             return
         try:
-            run_panel(screen, store, panel.prepared, progress, guard=audit.guard, resume=resume)
+            with enforced_ceiling(
+                store,
+                stable_id("audit", receipt.receipt_id),
+                stage=receipt.receipt_id,
+                ceiling_usd=known,
+                unpriced_attempts=unpriced,
+                command=command,
+            ):
+                run_panel(screen, store, panel.prepared, progress, guard=audit.guard, resume=resume)
         except BaseException:
             record("stopped")
             raise
@@ -262,7 +285,10 @@ def _run_audit(
     view = audit.view
     if verbose:
         render_traces(screen, store, panel.prepared, results, "Held-out trace")
-    lines = [aggregate_line(aggregate(results), len(panel.cases), title(audit, view))]
+    lines = [
+        aggregate_line(aggregate(results), len(panel.cases), title(audit, view)),
+        facts_line(panel.prepared),
+    ]
     if any(view.redispatched.values()):
         lines.append(stage_line(view.redispatched, len(view.affected_traces), len(panel.cases)))
     lines.extend(sensitivity_lines(view, results))
@@ -393,6 +419,13 @@ def _memory_note(checkpoint: AuditCheckpoint) -> str:
     """How much of the checkpoint the replays read, when not all of it."""
     if checkpoint.memory == "none":
         return "; replays read no memory"
+    if checkpoint.memory == "bare":
+        return "; replays read no memory and retrieve no recorded originals (memory-first)"
+    if checkpoint.memory == "guidance":
+        return (
+            "; replays read no memory, plus temporary session guidance from retrieved "
+            "originals that is never persisted"
+        )
     if checkpoint.lessons is not None:
         return f"; replays read only lesson set {checkpoint.lessons.artifact_id}"
     return ""
@@ -477,6 +510,7 @@ def run_audit(
     retry_incomplete: bool = False,
     include_inspected: bool = False,
     memory_profile: MemoryProfile = "learned",
+    checkpoint: int | None = None,
 ) -> None:
     """Independently audit the simulator on traces it never learned.
 
@@ -494,7 +528,9 @@ def run_audit(
         verbose: Also print every trace, every turn, and every criterion.
         retry_incomplete: Resume interrupted runs in place.
         include_inspected: Also re-run exposed or reserved lineages, as a development re-audit.
-        memory_profile: What the held-out replays read: all learned memory, none, or lessons.
+        memory_profile: What the held-out replays read: all learned memory, none, lessons,
+            bare or guidance.
+        checkpoint: Earlier frozen memory version to read, by consumed fit trajectories.
     """
     started = monotonic()
     console = Console(theme=EXP_THEME)
@@ -518,6 +554,7 @@ def run_audit(
             retry_incomplete=retry_incomplete,
             include_inspected=include_inspected,
             memory_profile=memory_profile,
+            checkpoint=checkpoint,
         )
         return
     with usage_error(OSError, ValueError):
@@ -529,7 +566,11 @@ def run_audit(
             )
         # An exhausted panel refuses here, before fit learning asks to spend anything.
         require_held_out_selection(
-            store, count, include_inspected=include_inspected, memory_profile=memory_profile
+            store,
+            count,
+            include_inspected=include_inspected,
+            memory_profile=memory_profile,
+            checkpoint=checkpoint,
         )
     heading(console, project, "Held-out simulation fidelity")
     buffer = io.StringIO()
@@ -555,8 +596,10 @@ def run_audit(
         if outcome is None or not recorded_plan(store, "fit"):
             return
         pipeline.complete("learning")
-        report_key = outcome.plan.lineage + (
-            "" if memory_profile == "learned" else "-" + memory_profile
+        report_key = (
+            outcome.plan.lineage
+            + ("" if memory_profile == "learned" else "-" + memory_profile)
+            + ("" if checkpoint is None else f"-v{checkpoint}")
         )
         learned = LearningSummary(recall, outcome, learning_curve(store, "fit"))
         for line in learning_lines(learned, "fit traces"):
@@ -572,6 +615,7 @@ def run_audit(
             retry_incomplete=retry_incomplete,
             include_inspected=include_inspected,
             memory_profile=memory_profile,
+            checkpoint=checkpoint,
             details=details,
             terminal=console,
             progress=pipeline.phase("panel"),

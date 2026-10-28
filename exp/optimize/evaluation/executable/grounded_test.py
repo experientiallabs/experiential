@@ -8,13 +8,19 @@ from pathlib import Path
 import pytest
 
 from exp.common.core.artifacts import JsonObject, sha256_json
-from exp.common.models import ToolCall, load_model_catalog
+from exp.common.models import (
+    ReasoningEffort,
+    ToolCall,
+    load_model_catalog,
+    write_model_catalog,
+)
 from exp.common.project import ProjectStore
 from exp.common.tasks.facts import ConditioningFacts, InstanceFacts
 from exp.optimize.evaluation.executable import grounded as grounded_runtime
 from exp.optimize.evaluation.executable.grounded import (
     GroundedRuntimeDefinition,
     continuation_runtime,
+    preflight_grounded_runtime,
 )
 from exp.optimize.evaluation.fidelity.instance_facts import ReplayFacts
 from exp.optimize.evaluation.fidelity.runner import FidelitySpec
@@ -22,13 +28,15 @@ from exp.optimize.evaluation.fidelity.runner_test import source_project
 from exp.runtime.environments.world_contracts import StateDomain, ToolEffectPolicy, WorldManifest
 from exp.runtime.environments.worlds import ExecutableWorldRuntime
 from exp.runtime.models.providers.transport import JsonHttpResponse, ScriptedJsonTransport
+from exp.runtime.models.registry import RuntimeModelCatalog
 from exp.runtime.sessions.dispatch_ledger import DispatchCapExhaustedError
 from exp.simulation.engines.text.prompt import INSTANCE_FACTS_GUIDANCE
 from exp.simulation.world_model.prediction_reading import PredictionReading
 
 
+@pytest.mark.parametrize("projection", ["present", "missing", "null"])
 def test_built_world_runs_restores_and_exhausts_one_shared_attempt_budget(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, projection: str
 ) -> None:
     """A frozen trace-built model makes a real provider-protocol call, not a second simulator."""
     project, fidelity = source_project(tmp_path)
@@ -44,7 +52,7 @@ def test_built_world_runs_restores_and_exhausts_one_shared_attempt_budget(
         ),
         manifest=WorldManifest(
             domains=(StateDomain(name="records", owner="simulated"),),
-            tools=(ToolEffectPolicy(name="inspect", reads=("records",), writes=()),),
+            tools=(ToolEffectPolicy(name="inspect", reads=("records",), writes=("records",)),),
         ),
         initial_state={"records": {"status": "pending"}},
         probe_paths={"status": "/records/status"},
@@ -55,6 +63,14 @@ def test_built_world_runs_restores_and_exhausts_one_shared_attempt_budget(
         "observations": [{"call_id": "read", "reply": "pending", "encoding": "text"}],
         "effect": {"kind": "edits", "edits": []},
     }
+    if projection != "present":
+        proposal["effect"]["edits"] = [
+            {
+                "op": "set",
+                "path": ["domains", "records"],
+                "value": {} if projection == "missing" else {"status": None},
+            }
+        ]
     transport = ScriptedJsonTransport(
         (
             JsonHttpResponse(
@@ -91,11 +107,19 @@ def test_built_world_runs_restores_and_exhausts_one_shared_attempt_budget(
     with runtime.world.open(task) as world:
         saved = world.checkpoint()
         assert runtime.probe(saved) == {"status": "pending"}
+        with pytest.raises(ValueError, match="frozen simulator"):
+            runtime.probe(saved.model_copy(update={"backend_sha256": "0" * 64}))
         result = world.execute(
             ToolCall(name="inspect", call_id="read", arguments={"key": "current"})
         )
         assert result.content == "pending"
         assert result.metadata["authority"] == "simulated"
+        expected = (
+            {}
+            if projection == "missing"
+            else {"status": None if projection == "null" else "pending"}
+        )
+        assert runtime.probe(world.checkpoint()) == expected
     # A restored fork shares the same dispatch ledger. It cannot obtain a fresh budget.
     restarted = continuation_runtime(project, spec.model_dump(mode="json"))
     from exp.optimize.evaluation.continuations.study import restore_continuation_world
@@ -492,3 +516,86 @@ def test_facts_derived_from_a_foreign_trace_refuse_before_any_call(
     with pytest.raises(InstanceFactsError, match="someone-else"):
         continuation_runtime(project, with_facts(spec, InstanceFacts(facts=(foreign,))))
     assert not transport.requests
+
+
+def _reasoning_spec(project: ProjectStore, fidelity: FidelitySpec) -> GroundedRuntimeDefinition:
+    """Declare a high-default fixture before freezing a definition, retaining model identity."""
+    catalog = load_model_catalog(project.model_catalog_path)
+    record = catalog.models["model"]
+    assert record.capabilities is not None
+    configured = record.model_copy(
+        update={
+            "capabilities": record.capabilities.model_copy(
+                update={"supports_reasoning": True, "reasoning_effort": "high"}
+            ),
+            "supported_reasoning_efforts": ("none", "low", "high"),
+        }
+    )
+    expected = RuntimeModelCatalog(catalog, environment={}).snapshot("model")[0]
+    prepared = catalog.model_copy(update={"models": {"model": configured, "untouched": configured}})
+    assert RuntimeModelCatalog(prepared, environment={}).snapshot("model")[0] == expected
+    write_model_catalog(project.model_catalog_path, prepared)
+    return _record_spec(project, fidelity)
+
+
+@pytest.mark.parametrize("effort", [None, "none", "low"])
+def test_predictor_reasoning_override_reaches_wire_and_receipts_without_catalog_mutation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, effort: ReasoningEffort | None
+) -> None:
+    """One local predictor policy preserves model identity and other catalog aliases."""
+    project, fidelity = source_project(tmp_path)
+    baseline = _reasoning_spec(project, fidelity)
+    spec = baseline.model_copy(update={"reasoning_effort": effort})
+    catalog_bytes = project.model_catalog_path.read_bytes()
+    catalog = load_model_catalog(project.model_catalog_path)
+    snapshot = RuntimeModelCatalog(catalog, environment={}).snapshot("model")[0]
+    if effort is None:
+        assert "reasoning_effort" not in spec.model_dump(mode="json")
+        assert spec.model_dump(mode="json") == baseline.model_dump(mode="json")
+    else:
+        assert spec.model_dump(mode="json")["reasoning_effort"] == effort
+        assert sha256_json(spec) != sha256_json(baseline)
+    transport = ScriptedJsonTransport((_prediction("read"),))
+    monkeypatch.setenv("FIDELITY_TEST_KEY", "fixture-only")
+    monkeypatch.setattr(grounded_runtime, "HttpxJsonTransport", lambda: transport)
+    runtime = continuation_runtime(project, spec.model_dump(mode="json"))
+    with runtime.world.open(spec.task) as world:
+        assert (
+            world.execute(
+                ToolCall(name="inspect", call_id="read", arguments={"key": "current"})
+            ).content
+            == "pending"
+        )
+    assert len(transport.requests) == 1
+    assert transport.requests[0].payload["reasoning_effort"] == (effort or "high")
+    assert project.model_catalog_path.read_bytes() == catalog_bytes
+    assert RuntimeModelCatalog(catalog, environment={}).snapshot("model")[0] == snapshot
+    assert catalog.models["untouched"].capabilities is not None
+    assert catalog.models["untouched"].capabilities.reasoning_effort == "high"
+    intents = project.artifacts.list_ids(artifact_type="structured-call-intent")
+    assert len(intents) == 1
+    receipt = json.loads(project.artifacts.read_bytes(intents[0], "request.json"))
+    assert receipt["plan"]["model"] == snapshot.model_dump(mode="json")
+    assert receipt["plan"]["capabilities"]["reasoning_effort"] == (effort or "high")
+    assert receipt["request"].get("reasoning_effort") == effort
+
+
+def test_unsupported_predictor_reasoning_is_refused_before_runtime_or_provider_creation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An unsupported explicit setting cannot publish a capture or buy a simulator call."""
+    project, fidelity = source_project(tmp_path)
+    baseline = _reasoning_spec(project, fidelity)
+    bad = baseline.model_copy(update={"reasoning_effort": "max"})
+    before = project.artifacts.list_ids()
+
+    def forbidden() -> ScriptedJsonTransport:
+        """Fail if runtime validation reaches transport construction."""
+        raise AssertionError("unsupported reasoning must fail before any transport exists")
+
+    monkeypatch.setattr(grounded_runtime, "HttpxJsonTransport", forbidden)
+    with pytest.raises(ValueError, match="reasoning effort"):
+        preflight_grounded_runtime(project, bad)
+    with pytest.raises(ValueError, match="reasoning effort"):
+        continuation_runtime(project, bad.model_dump(mode="json"))
+    assert project.artifacts.list_ids() == before

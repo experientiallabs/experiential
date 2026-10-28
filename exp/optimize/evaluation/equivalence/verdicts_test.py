@@ -114,7 +114,8 @@ def calibration_of(
                 )
             )
     return CalibrationEvidence(
-        report=REPORT, calibration=calibrate(policy_ref, policy, measurements, scopes)
+        report=REPORT,
+        calibration=calibrate(policy_ref, policy, measurements, scopes, state_coverage="full"),
     )
 
 

@@ -47,8 +47,9 @@ def _strict_enum(
 
 
 # Draft 2020-12 accepts 1.0 as an integer and compares 1 equal to 1.0. Verifiers distinguish
-# booleans, integers and floats the way strict_equal does, so this pass runs after the
-# standard check passes and refuses any value that matched only through numeric coercion.
+# booleans, integers and floats the way strict_equal does, so every verifier schema is checked
+# by this validator alone: a standard pass in front of it would reject values that strict
+# semantics accept under `not`, `oneOf` or `if`.
 _StrictTypes = validators.extend(
     Draft202012Validator,
     type_checker=Draft202012Validator.TYPE_CHECKER.redefine_many(
@@ -162,6 +163,7 @@ class TaskVerifier(ContractModel):
         preserved_paths: State-relative pointers, such as /files/input.xlsx, that must stay
             unchanged through the workflow. Do not prepend /initial_state or /final_state.
         argument_rules: Per-tool predicates over every observed call's arguments.
+        argument_schemas: Optional bounded JSON Schemas over each named tool's arguments.
     """
 
     description: str = Field(min_length=1)
@@ -176,6 +178,9 @@ class TaskVerifier(ContractModel):
     argument_rules: dict[str, tuple[OutcomeRule, ...]] = Field(
         default_factory=dict, exclude_if=not_
     )
+    argument_schemas: dict[str, JsonObject] = Field(
+        default_factory=dict, max_length=32, exclude_if=not_
+    )
 
     @model_validator(mode="after")
     def supported_schema(self) -> Self:
@@ -185,6 +190,7 @@ class TaskVerifier(ContractModel):
         except SchemaError as error:
             raise ValueError("invalid verifier JSON Schema") from error
         _bounded_predicate(expand_local_references(self.outcome_schema))
+        _check_argument_schemas(self.argument_schemas)
         for pointer in (*self.required_paths, *self.preserved_paths):
             path_parts(pointer)
         return self
@@ -203,6 +209,7 @@ class RuleVerifierDraft(ContractModel):
         preserve_state: Whether complete observed state must remain unchanged.
         preserved_paths: State subtrees protected across observations.
         argument_rules: Per-tool predicates over observed arguments.
+        argument_schemas: Optional bounded JSON Schemas over named tools' arguments.
     """
 
     description: str = Field(min_length=1)
@@ -216,9 +223,18 @@ class RuleVerifierDraft(ContractModel):
     argument_rules: dict[str, tuple[OutcomeRule, ...]] = Field(
         default_factory=dict, exclude_if=not_
     )
+    argument_schemas: dict[str, JsonObject] = Field(
+        default_factory=dict, max_length=32, exclude_if=not_
+    )
+
+    @model_validator(mode="after")
+    def supported_argument_schemas(self) -> Self:
+        """Refuse unsupported policy schemas before a model-authored draft is accepted."""
+        _check_argument_schemas(self.argument_schemas)
+        return self
 
     def compile(self) -> TaskVerifier:
-        """Construct a data verifier without model-authored JSON Schema syntax."""
+        """Compile typed rules and bounded argument schemas into one data verifier."""
         return TaskVerifier(
             description=self.description,
             outcome_schema={"type": "object"},
@@ -230,7 +246,20 @@ class RuleVerifierDraft(ContractModel):
             preserve_state=self.preserve_state,
             preserved_paths=self.preserved_paths,
             argument_rules=self.argument_rules,
+            argument_schemas=self.argument_schemas,
         )
+
+
+def _check_argument_schemas(schemas: dict[str, JsonObject]) -> None:
+    """Apply the existing finite verifier schema rules to every declared argument policy."""
+    for name, schema in schemas.items():
+        if not name.strip():
+            raise ValueError("argument schema requires a nonempty tool name")
+        try:
+            check_schema(schema)
+        except SchemaError as error:
+            raise ValueError("invalid argument policy JSON Schema") from error
+        _bounded_predicate(expand_local_references(schema))
 
 
 def _bounded_predicate(schema: JsonValue) -> None:
@@ -553,9 +582,7 @@ def _grade_goal(verifier: TaskVerifier, value: JsonObject) -> Assessment:
         except ValueError:
             return Assessment(status="unassessable", reason=f"missing observation {pointer}")
     schema = expand_local_references(verifier.outcome_schema)
-    error = next(Draft202012Validator(schema).iter_errors(value), None)
-    if error is None:
-        error = next(_StrictTypes(schema).iter_errors(value), None)
+    error = next(_StrictTypes(schema).iter_errors(value), None)
     if error is not None:
         return Assessment(status="fail", reason=error.message)
     for rule in verifier.rules:
@@ -587,7 +614,7 @@ def _grade_policy(verifier: TaskVerifier, value: JsonObject, *, complete: bool) 
     missing: list[str] = []
     violations: list[str] = []
     steps = value.get("steps")
-    if verifier.allowed_tools is not None or verifier.argument_rules:
+    if verifier.allowed_tools is not None or verifier.argument_rules or verifier.argument_schemas:
         if not isinstance(steps, list):
             missing.append("action inventory unavailable")
         else:
@@ -599,6 +626,15 @@ def _grade_policy(verifier: TaskVerifier, value: JsonObject, *, complete: bool) 
                 name = action["name"]
                 if verifier.allowed_tools is not None and name not in verifier.allowed_tools:
                     violations.append("operation violates allowed tool policy")
+                if (schema := verifier.argument_schemas.get(name)) is not None:
+                    arguments = action.get("arguments")
+                    if not isinstance(arguments, dict):
+                        missing.append(f"argument observation unavailable: {name}")
+                    else:
+                        expanded = expand_local_references(schema)
+                        error = next(_StrictTypes(expanded).iter_errors(arguments), None)
+                        if error is not None:
+                            violations.append(f"operation violates argument schema: {name}")
                 for rule in verifier.argument_rules.get(name, ()):
                     try:
                         argument = resolve(action.get("arguments"), rule.path)

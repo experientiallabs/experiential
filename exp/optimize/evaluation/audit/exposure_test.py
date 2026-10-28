@@ -1,6 +1,7 @@
 """The held-out exposure decision needs the build's grouping in the ledger it decides with."""
 
 import hashlib
+from functools import partial
 from pathlib import Path
 
 import pytest
@@ -18,10 +19,12 @@ from exp.optimize.evaluation.audit.panel_test import (
     held_out_lineages,
 )
 from exp.optimize.evaluation.audit.receipts_test import _dataset
+from exp.simulation.build import build_project as build_artifacts
 from exp.simulation.mining.exposure_ledger import ExposureLedger
 from exp.simulation.mining.exposure_ledger_test import DATASET, EDITED, trace
 from exp.simulation.mining.fingerprint import TRACE_CONTENT
 from exp.simulation.mining.lineage import assign_source_lineages
+from exp.simulation.mining.service import MiningSpec
 
 
 def test_exposure_is_decided_only_with_a_ledger_that_recorded_the_build(
@@ -40,11 +43,24 @@ def test_exposure_is_decided_only_with_a_ledger_that_recorded_the_build(
         held_out_exposure(store, ExposureLedger(tmp_path / "elsewhere").snapshot())
 
 
+@pytest.mark.parametrize("source_project", ["retail", "alternate-source"])
 def test_a_group_with_an_unresolved_member_is_ineligible(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, source_project: str
 ) -> None:
     """A5: one unfingerprintable member makes its whole lineage ineligible for independence."""
     originals = [episode(i) for i in range(USERS)]
+    # More than half the lineages are held out, so every source-path-dependent split must
+    # include both classes: only six customers have an unresolved sibling, and six do not.
+    held_out_target = USERS // 2 + 2
+    monkeypatch.setattr(
+        "exp.cli.build.app.build_project",
+        partial(
+            build_artifacts,
+            mining_spec=MiningSpec(
+                fit_task_budget=USERS - held_out_target, held_out_task_budget=held_out_target
+            ),
+        ),
+    )
     # Even customers also have a repeat in the same conversation recorded without call IDs,
     # whose trace ID sorts after the original's, so the selected trace is the fingerprintable one.
     follow_ups: list[JsonObject] = [
@@ -52,8 +68,11 @@ def test_a_group_with_an_unresolved_member_is_ineligible(
         for i in range(0, USERS, 2)
     ]
     provider = SimulatedProvider(originals)
-    _, store, _ = build_project(tmp_path, monkeypatch, provider, episodes=originals + follow_ups)
+    _, store, _ = build_project(
+        tmp_path, monkeypatch, provider, episodes=originals + follow_ups, project=source_project
+    )
     members = held_out_members(store)
+    assert len(members) == held_out_target
     unresolved = {lineage for lineage, item in members.items() if item.unresolved}
     assert unresolved and unresolved != set(members)
     decision = held_out_exposure(store)

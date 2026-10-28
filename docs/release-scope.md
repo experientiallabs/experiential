@@ -145,12 +145,47 @@ denominator-preserving evidence.
 
 ## Development task factory
 
+Factory packaging requires task-quality assessment in addition to observable-contract
+qualification. By default a separate LLM rubric proxy uses the last pinned panel model; set
+`CandidateBatchSpec.quality_proxy` or `FactoryFamily.quality_proxy` to override its frozen model,
+rubrics, deadline and physical-attempt allowance. It judges all six protected axes with cited
+findings: prompt/verifier alignment, verifier/intent alignment, production prompt distribution,
+world sufficiency and causality, failure attribution, and meaningful difficulty. All axes must
+pass to package. Repairable defects or insufficient evidence remain `needs_review`, meaning
+revision or another explicitly registered experiment, not mandatory human approval. A drop is
+`rejected_quality`. An optional operator-attested human decision can replace the proxy.
+
+Proxy requests contain public task/intent, the capability brief, the verifier, saved execution
+outcomes and development controls; confirmation labels are withheld. The complete input and
+output schema, model snapshot, rubric revisions, response and dispatch receipts are retained.
+The host derives acceptance; the model cannot set an approval flag or claim label authority.
+Catalog/attempt/deadline/capacity checks and shared spend consent apply. Missing or uncertain
+responses are not silently redrawn; completed judgments replay without new provider calls.
+Proxy approval is provisional model judgment, not independently calibrated expert agreement.
+It permits automatic factory operation without requiring human review. Direct mechanical
+qualification remains explicitly narrower.
+
+This review is the semantic gate of the packaging path (`evaluate-candidates` and the
+`--pipeline` factory). Task validity (`check-task-validity`: re-derived controls, literal and
+judged answer leakage, closed-book draws) and hardening (`harden-tasks`) remain the mechanical
+screens of scenario-search variants, documented in
+[task hardening](reference/task-hardening.md). A proxy pass does not replace a validity
+rejection, and hardening keeps variants without packaging them.
+
+World history can be materialized through `RecordScenarioSpec.setup_actions` and `finish_tick`:
+the existing kernel executes setup actions and scheduled events, replays native setup, and saves
+the reached checkpoint and execution receipts. Causal consistency follows only from the declared
+transition rules and checked invariants. Randomness must be seeded and its distributions justified;
+a consistent synthetic history does not independently establish realistic production behavior.
+
 `exp eval PROJECT --root ROOT --pipeline pipeline.json --dry-run` validates a
 `exp.optimize.evaluation.factory.runner.TaskFactorySpec`. Repeat with `--yes --non-interactive`
 to authorize the displayed finite author/actor allowance when prices are unknown. The manifest
 binds seed tasks, capability briefs, independent control witnesses, the shared actor panel,
 coverage strata, deadline and export destination. Runtime inference keeps its separately declared
-allowance; this command does not claim an aggregate dollar ceiling.
+allowance. Consent sets one spend ceiling over every author and actor request, the known-rate
+subtotal. Unpriced roles may use only their displayed physical attempts, and only after an
+explicit confirmation.
 
 Each seed uses the existing two-to-four-candidate author, native feasibility, observable-contract
 qualification, actor panel and Harbor exporter. Related source lineages, traces or equal workflow
@@ -199,9 +234,13 @@ without judge dispatch. Equivalent observed actor mistakes may support fidelity,
 actor competence. Rubric normalization remains distinct from mechanical accuracy.
 
 `exp eval PROJECT --root ROOT --continuations SPEC.json` accepts
-`{"action":"compare-environments","equivalence":...}`. Each `EquivalenceSpec` case binds a
-reference and candidate `ContinuationJob`, identical public actor checkpoints and policies,
-and explicit initial-state and material final-state probe paths. The candidate may use the
+`{"action":"compare-environments","equivalence":...}`. Each `EquivalenceSpec` names a frozen
+trajectory-derived judge rubric (`rubric`), and each case binds a reference and candidate
+`ContinuationJob`, identical public actor checkpoints and policies, and the declared
+initial-state and material final-state probe paths (both required under a full-state rubric).
+The rubric comes from admitted development trajectories of other families through
+`derive-equivalence-rubric` and an explicit `freeze-equivalence-rubric` author review; it is
+provisional, not an independently calibrated judge. The candidate may use the
 frozen grounded simulator or mixed runtime. Separate reference, candidate and repeated-reference
 executions retain every planned branch, including unavailable ones. The reference repeat exposes
 actor variability; it does not establish a confidence interval or population equivalence.
@@ -210,7 +249,8 @@ runtime code or credentials. New dispatch needs the normal spend consent.
 
 The report separates mechanical outcome/effect agreement, task competence, unavailable-pair
 bounds and semantic rubric ratings. Missing initial evidence, changed initial actor requests or
-incomplete execution make the comparison unassessable. Matching failures do not become successful
+incomplete execution make the comparison unassessable. Missing final-state evidence leaves the
+material outcome unknown while the paired behavior is still judged. Matching failures do not become successful
 training examples. No judge score overrides mechanical disagreement. Private evaluator probes
 and council findings never enter the actor requests.
 Blinded A/B judge packets exclude backend observation metadata and execution-owner receipts;

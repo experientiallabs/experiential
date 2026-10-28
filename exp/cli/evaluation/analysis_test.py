@@ -9,6 +9,7 @@ import pytest
 from typer.testing import CliRunner
 
 from exp.cli.app import app
+from exp.cli.evaluation.continuation_context_test import UNPRICED_SPEND
 from exp.cli.evaluation.continuations import ContinuationCommand
 from exp.optimize.evaluation.analysis import decision_cascade
 from exp.optimize.evaluation.analysis.decision_cascade_test import (
@@ -34,6 +35,7 @@ def test_cli_fits_a_decision_cascade_after_a_free_dry_run(
     request = tmp_path / "fit.json"
     request.write_text(
         ContinuationCommand(
+            spend=UNPRICED_SPEND,
             action="fit-decision-cascade",
             cascade_fit=fit_spec(project, studies, systemone(project)),
         ).model_dump_json()

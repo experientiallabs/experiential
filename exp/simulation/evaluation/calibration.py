@@ -319,6 +319,9 @@ def calibrate(
     all_required_judged = bool(pack.required_dimensions) and all(
         set(pack.required_dimensions) <= set(case.expert_scores) for case in pack.cases
     )
+    judge_decisions_agree = all(
+        _threshold_agreement(pack, case, index.get(case.challenge.id)) for case in pack.cases
+    )
     task_cases = [
         row for row, case in zip(rows, pack.cases, strict=True) if case.expected_task is not None
     ]
@@ -393,7 +396,10 @@ def calibrate(
         and pack.judge_completion_sha256 is not None
         and profile_bound
         and bool(pack.minimum_scores)
-        and ((judge_ready and all_required_judged) or (task_agreement and task_coverage))
+        and (
+            (judge_ready and all_required_judged and judge_decisions_agree)
+            or (task_agreement and task_coverage)
+        )
         and not refusals
         and all(case.task_label_scope == "task_correctness" for case in pack.cases)
         else "diagnostic_only",
@@ -707,6 +713,27 @@ def _judge_comparison(
         "assessment_errors": assessment_errors,
         "report": judgment.report.model_dump(mode="json"),
     }
+
+
+def _threshold_agreement(
+    pack: CalibrationPack, case: CalibrationCase, judgment: CalibrationJudgment | None
+) -> bool:
+    """Whether the judge reaches the task decision the expert scores imply.
+
+    Scores within tolerance can still fall on opposite sides of a registered minimum, and a
+    critical flag fails a task the expert scores pass; either flips the issued decision.
+    """
+    axes = {axis.dimension_id: axis for axis in _bound_axes(pack, case, judgment)}
+    for key, minimum in pack.minimum_scores.items():
+        axis, expected = axes.get(key), case.expert_scores.get(key)
+        if axis is None or expected is None or axis.status != "assessed" or axis.score is None:
+            return False
+        if (axis.score >= minimum) != (expected >= minimum):
+            return False
+    expert_passes = all(
+        case.expert_scores[key] >= minimum for key, minimum in pack.minimum_scores.items()
+    )
+    return not (expert_passes and any(axis.critical_flags for axis in axes.values()))
 
 
 def _bound_axes(

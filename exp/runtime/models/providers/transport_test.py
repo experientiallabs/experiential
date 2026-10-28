@@ -17,6 +17,7 @@ from exp.runtime.models.providers.transport import (
     RetryPolicy,
     ScriptedJsonTransport,
     classify_retry,
+    classify_unrepeatable_retry,
     get_json,
     is_known_unbilled_failure,
     parse_retry_after,
@@ -161,6 +162,32 @@ def test_get_json_reports_a_rejected_credential_status_without_retrying() -> Non
 def test_retry_classification_is_transport_specific(exception: Exception, retryable: bool) -> None:
     """Only transport-shaped errors retry, with no semantic failover branch."""
     assert classify_retry(exception).retryable is retryable
+
+
+@pytest.mark.parametrize(
+    ("exception", "retryable"),
+    [
+        (ProviderTransportError("unavailable", status_code=503), False),
+        (ProviderTransportError("rate limited", status_code=429), False),
+        (ProviderTransportError("certified refusal", status_code=429, known_unbilled=True), True),
+        (
+            ProviderTransportError(
+                "lost keyed result", status_code=409, error_code="idempotency_replay_unavailable"
+            ),
+            False,
+        ),
+        (ProviderTransportError("bad request", status_code=400), False),
+        (ProviderTransportError("network"), False),
+        (TimeoutError("slow"), False),
+        (ConnectionResetError("reset"), False),
+        (ValueError("invalid request"), False),
+    ],
+)
+def test_an_unrepeatable_wire_never_resends_an_unknown_outcome(
+    exception: Exception, retryable: bool
+) -> None:
+    """Without deduplication, an HTTP error alone cannot establish a safe resend."""
+    assert classify_unrepeatable_retry(exception).retryable is retryable
 
 
 def test_retry_runs_a_bounded_same_operation() -> None:

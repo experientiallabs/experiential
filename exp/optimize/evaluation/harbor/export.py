@@ -6,9 +6,11 @@ import shutil
 import tempfile
 from hashlib import sha256
 from pathlib import Path
+from typing import Literal
 
 from exp.common.core.artifacts import ArtifactInput, JsonObject
 from exp.common.project import ProjectStore, artifact_input
+from exp.optimize.evaluation.analysis.source_access import refuse_known_ineligible_sources
 from exp.runtime.environments.artifact_edits import NativeArtifactBinding
 from exp.simulation.capability_briefs import load_capability_brief
 from exp.simulation.evaluation.tasks import load_evaluation_task
@@ -43,6 +45,10 @@ def export_harbor_task(
         Task directory. A trusted runner must separately launch its frozen backend.
     """
     preflight_harbor_destination(destination, name=name)
+    if calibration is not None:
+        refuse_known_ineligible_sources(
+            project.artifacts, (calibration,), maximum_artifacts=100_000
+        )
     task = load_evaluation_task(project.artifacts, task_ref)
     checkpoint = load_world_checkpoint(project.artifacts, task.checkpoint)
     declared_native = task.task.initial_context.get("native_artifact_binding")
@@ -112,6 +118,7 @@ def write_harbor_package(
     qualified: bool,
     notice: str,
     output_paths: tuple[str, ...] = (),
+    transport: Literal["http", "unix-no-network"] = "http",
 ) -> Path:
     """Write the shared Harbor client and isolated verifier package for one frozen backend.
 
@@ -124,10 +131,13 @@ def write_harbor_package(
         qualified: Whether the specific runtime and grading profile has qualified evidence.
         notice: Accurate execution-authority disclosure for the selected backend.
         output_paths: Declared native output files, when supported by the backend.
+        transport: Explicit Unix/no-network package policy, or the unchanged HTTP default.
 
     Returns:
         Published package with the complete digest-bound file inventory.
     """
+    if transport not in ("http", "unix-no-network"):
+        raise ValueError("unsupported Harbor transport")
     preflight_harbor_destination(destination, name=name)
     destination.parent.mkdir(parents=True, exist_ok=True)
     staging = Path(tempfile.mkdtemp(prefix=".harbor-export-", dir=destination.parent))
@@ -207,6 +217,54 @@ def write_harbor_package(
                 'schema_version = "1.4"\nartifacts = [' + artifacts + "]\n",
                 1,
             )
+        if transport == "unix-no-network":
+            dockerfile = environment / "Dockerfile"
+            dockerfile.write_text(
+                dockerfile.read_text() + "RUN chown 65534:65534 /app\nUSER 65534:65534\n"
+            )
+            configuration = configuration.replace(
+                'EXP_HARBOR_ENDPOINT = "${EXP_HARBOR_ENDPOINT}"',
+                'EXP_HARBOR_SOCKET = "/run/experiential/backend.sock"',
+            )
+            for section in ("agent", "environment", "verifier", "verifier.environment"):
+                configuration = configuration.replace(
+                    f"[{section}]\n", f'[{section}]\nnetwork_mode = "no-network"\n'
+                )
+            compose = {
+                "services": {
+                    "main": {
+                        "network_mode": "none",
+                        "cap_drop": ["ALL"],
+                        "security_opt": ["no-new-privileges:true"],
+                        "environment": {
+                            key: ""
+                            for key in (
+                                "HTTP_PROXY",
+                                "HTTPS_PROXY",
+                                "ALL_PROXY",
+                                "NO_PROXY",
+                                "http_proxy",
+                                "https_proxy",
+                                "all_proxy",
+                                "no_proxy",
+                            )
+                        },
+                        "volumes": [
+                            {
+                                "type": "bind",
+                                "source": (
+                                    "${EXP_HARBOR_SOCKET_DIR:?trial socket directory required}"
+                                ),
+                                "target": "/run/experiential",
+                                "read_only": True,
+                                "bind": {"create_host_path": False},
+                            }
+                        ],
+                    }
+                }
+            }
+            for directory in (environment, tests):
+                (directory / "docker-compose.yaml").write_text(json.dumps(compose, indent=2) + "\n")
         (staging / "task.toml").write_text(configuration)
         binding["files"] = {
             str(path.relative_to(staging)): sha256(path.read_bytes()).hexdigest()

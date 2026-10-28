@@ -15,8 +15,13 @@ import hashlib
 import json
 import os
 import shutil
+import socket
 import sys
 import tempfile
+from collections.abc import Iterator
+from contextlib import contextmanager
+from http.client import HTTPConnection, HTTPResponse
+from io import BytesIO
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
@@ -46,7 +51,11 @@ def main() -> int:
         directory.mkdir(parents=True, exist_ok=True)
         for name in VERIFIER_FILES:
             (directory / name).unlink(missing_ok=True)
-    endpoint = os.environ["EXP_HARBOR_ENDPOINT"].rstrip("/")
+    endpoint = (
+        "http://localhost"
+        if "EXP_HARBOR_SOCKET" in os.environ
+        else os.environ["EXP_HARBOR_ENDPOINT"].rstrip("/")
+    )
     parsed = urlsplit(endpoint)
     if (
         parsed.scheme not in ("http", "https")
@@ -67,13 +76,64 @@ def main() -> int:
     )
     if args.operation == "verify":
         return verify(request, directory)
-    with urlopen(request, timeout=120) as response:
+    with open_request(request) as response:
         raw = response.read()
     if args.operation == "outputs":
         write_outputs(json.loads(raw), args.directory)
         return 0
     sys.stdout.buffer.write(raw + b"\n")
     return 0
+
+
+class UnixHTTPConnection(HTTPConnection):
+    """HTTP framing over only the explicitly selected local Unix socket."""
+
+    def __init__(self, path: str) -> None:
+        if not Path(path).is_absolute():
+            raise ValueError("an absolute Unix backend socket path is required")
+        super().__init__("localhost", timeout=120)
+        self.socket_path = path
+
+    def connect(self) -> None:
+        """Never resolve a host, consult a proxy or fall back to TCP."""
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            self.sock.settimeout(self.timeout)
+            self.sock.connect(self.socket_path)
+        except BaseException:
+            self.sock.close()
+            raise
+
+
+@contextmanager
+def open_request(request: Request) -> Iterator[HTTPResponse]:
+    """Use the selected explicit transport, retaining the same HTTP failure semantics."""
+    if "EXP_HARBOR_SOCKET" not in os.environ:
+        with urlopen(request, timeout=120) as response:
+            yield response
+        return
+    connection = UnixHTTPConnection(os.environ["EXP_HARBOR_SOCKET"])
+    try:
+        connection.request(
+            request.get_method(), request.selector, request.data, dict(request.header_items())
+        )
+        response = connection.getresponse()
+        if response.status >= 400:
+            raise HTTPError(
+                request.full_url,
+                response.status,
+                response.reason,
+                response.headers,
+                BytesIO(response.read()),
+            )
+        with response:
+            yield response
+    except OSError as error:
+        if isinstance(error, HTTPError):
+            raise
+        raise URLError(error) from error
+    finally:
+        connection.close()
 
 
 def verify(request: Request, directory: Path) -> int:
@@ -87,7 +147,7 @@ def verify(request: Request, directory: Path) -> int:
         Zero when a verdict was recorded, two when grading failed and no reward exists.
     """
     try:
-        with urlopen(request, timeout=120) as response:
+        with open_request(request) as response:
             raw = response.read()
     except HTTPError as error:
         body = error.read().decode(errors="replace")

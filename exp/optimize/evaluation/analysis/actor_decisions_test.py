@@ -9,6 +9,7 @@ from pydantic import BaseModel, JsonValue, ValidationError
 from typer.testing import CliRunner
 
 from exp.cli.app import app
+from exp.cli.evaluation.continuation_context_test import UNPRICED_SPEND
 from exp.cli.evaluation.continuations import ContinuationCommand
 from exp.common.core.artifacts import ArtifactEnvelope, sha256_json
 from exp.common.models import (
@@ -246,7 +247,9 @@ def test_cli_dry_run_execute_and_saved_replay(
     )
     path = tmp_path / "probe.json"
     path.write_text(
-        ContinuationCommand(action="probe-actor-decisions", actor_decisions=spec).model_dump_json()
+        ContinuationCommand(
+            spend=UNPRICED_SPEND, action="probe-actor-decisions", actor_decisions=spec
+        ).model_dump_json()
     )
     args = ["eval", "case", "--root", str(tmp_path), "--continuations", str(path)]
     runner = CliRunner()
@@ -412,7 +415,9 @@ def test_expired_recovery_finalizes_without_catalog_or_new_calls(
     )
     path = tmp_path / "recover.json"
     path.write_text(
-        ContinuationCommand(action="probe-actor-decisions", actor_decisions=spec).model_dump_json()
+        ContinuationCommand(
+            spend=UNPRICED_SPEND, action="probe-actor-decisions", actor_decisions=spec
+        ).model_dump_json()
     )
     recovered = CliRunner().invoke(
         app, ["eval", "case", "--root", str(tmp_path), "--continuations", str(path)]

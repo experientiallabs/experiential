@@ -1,6 +1,7 @@
 """Frozen executable task contracts shared by continuation studies and Harbor delivery."""
 
 from datetime import datetime
+from typing import Literal
 
 from pydantic import Field, field_validator
 
@@ -31,6 +32,7 @@ class ExecutableTask(ContractModel):
         maximum_tool_calls: Finite tool-attempt ceiling per trial, frozen before execution.
         capability_brief: Optional private intent; unresolved assumptions prevent qualification.
         known_limits: Public qualifications that survive export.
+        harbor_transport: Opt-in Unix IPC with no actor or verifier container networking.
     """
 
     intent: str = Field(min_length=1)
@@ -38,6 +40,9 @@ class ExecutableTask(ContractModel):
     output_paths: tuple[str, ...] = ()
     maximum_tool_calls: int = Field(default=50, ge=1, le=1000)
     capability_brief: ArtifactInput | None = None
+    harbor_transport: Literal["http", "unix-no-network"] = Field(
+        default="http", exclude_if=lambda value: value == "http"
+    )
     known_limits: tuple[str, ...] = (
         "Observable predicates do not certify unobserved effects or host containment.",
         "Authored or simulated behavior does not establish fidelity to a native production system.",

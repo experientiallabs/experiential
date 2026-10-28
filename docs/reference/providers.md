@@ -640,6 +640,12 @@ on the machine. Its state is `provider-admission.sqlite` in the same user-data d
 - **Refusals are resumable.** Both refusals happen before a dispatch-ledger slot is claimed and
   before any network I/O. They are recorded as not dispatched; the run stops incomplete and
   resumes in place. They are never scored as misses.
+- **Attempt receipts.** Each admitted request leaves an intent receipt holding the request body
+  and the digest of the exact body sent. Bodies are kept whole and must pass the credential
+  boundary, except embedding requests: their input texts are chunks of the project's own stored
+  evidence, so the receipt cites each by SHA-256 and length instead. Agent traces routinely quote
+  placeholder credentials, such as `Authorization: token ${GITHUB_TOKEN}`, and copying them
+  would refuse the build. Any other embedding field still passes the boundary.
 
 Override the limits in `provider-admission.toml` beside the database:
 

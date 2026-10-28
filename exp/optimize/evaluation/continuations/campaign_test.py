@@ -7,6 +7,7 @@ import pytest
 from typer.testing import CliRunner
 
 from exp.cli.app import app
+from exp.cli.evaluation.continuation_context_test import UNPRICED_SPEND
 from exp.cli.evaluation.continuations import ContinuationCommand
 from exp.common.core.artifacts import sha256_json
 from exp.common.project import ProjectStore
@@ -230,7 +231,9 @@ def test_campaign_cli_dry_run_execution_and_replay(
     )
     path = tmp_path / "campaign.json"
     path.write_text(
-        ContinuationCommand(action="run-continuation-campaign", campaign=spec).model_dump_json()
+        ContinuationCommand(
+            spend=UNPRICED_SPEND, action="run-continuation-campaign", campaign=spec
+        ).model_dump_json()
     )
     args = ["eval", "case", "--root", str(tmp_path), "--continuations", str(path)]
     dry = CliRunner().invoke(app, [*args, "--dry-run"])
@@ -290,7 +293,9 @@ def test_cli_finalizes_saved_cells_without_runtime_or_credentials(
     monkeypatch.delenv("HELD_OUT_TEST_KEY")
     path = tmp_path / "recover.json"
     path.write_text(
-        ContinuationCommand(action="run-continuation-campaign", campaign=spec).model_dump_json()
+        ContinuationCommand(
+            spend=UNPRICED_SPEND, action="run-continuation-campaign", campaign=spec
+        ).model_dump_json()
     )
     result = CliRunner().invoke(
         app, ["eval", "case", "--root", str(tmp_path), "--continuations", str(path)]

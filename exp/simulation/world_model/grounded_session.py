@@ -52,7 +52,7 @@ from exp.simulation.world_model.memory_projection import (
     project_research_request,
     without_research,
 )
-from exp.simulation.world_model.prediction_reading import PredictionResolver
+from exp.simulation.world_model.prediction_reading import PredictionPreparation
 from exp.simulation.world_model.resumption import Resumption
 from exp.simulation.world_model.runtime import GroundedWorldModel
 from exp.simulation.world_model.session_research import (
@@ -137,7 +137,7 @@ class GroundedTransitionEngine:
         facts: InstanceFacts | None = None,
         facts_version: int = 0,
         research_history: bool = True,
-        prediction_reader: PredictionResolver | None = None,
+        prediction_reader: PredictionPreparation | None = None,
     ) -> None:
         """Bind an existing predictor to a single public fixed-action task."""
         if maximum_output_tokens <= 0 or task.reference_answer is not None:
@@ -385,6 +385,9 @@ class GroundedTransitionEngine:
         if not self.research_history:
             prepared = replace(prepared, request=project_research_request(prepared.request))
         if self.prediction_reader is not None:
+            if operation_id is None and len(actions) == 1:
+                # The durable session's operation for one fixed action is its call ID.
+                operation_id = actions[0].call_id
             if operation_id is None:
                 raise ValueError("prediction reading requires an owned operation_id before calls")
             prepared = self.prediction_reader.resolve(prepared, operation_id)
@@ -497,6 +500,7 @@ def open_grounded_session(
     preparation_dispatches: bool = True,
     facts: InstanceFacts | None = None,
     facts_version: int = 0,
+    prediction_reader: PredictionPreparation | None = None,
 ) -> DurableWorldModelSession:
     """Open one candidate world using public context and the existing guarded store.
 
@@ -531,6 +535,8 @@ def open_grounded_session(
             or memory-recall decisions).
         facts: Validated instance facts, delivered in their own channel by state version.
         facts_version: State version of the session's first action.
+        prediction_reader: Optional durable step that rewrites each framed prediction request,
+            such as session-scoped guidance.
 
     Returns:
         Durable session; no reference state or tool outcomes are used to initialize it.
@@ -561,6 +567,7 @@ def open_grounded_session(
         served_model_id=served_model_id,
         facts=facts,
         facts_version=facts_version,
+        prediction_reader=prediction_reader,
     )
     research = None
     if research_selection is not None:
@@ -655,6 +662,8 @@ def open_grounded_session(
                         "task": task.model_dump(mode="json", exclude={"task_id"}),
                         "checkpoint": None if checkpoint is None else checkpoint.artifact_id,
                         "output_protocol": output_protocol,
+                        "json_object_output": json_object_output,
+                        "served_model_id": served_model_id,
                         "output_tokens": maximum_output_tokens,
                         "selection": None
                         if runtime.evidence_selector is None
