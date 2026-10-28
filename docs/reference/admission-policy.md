@@ -71,9 +71,11 @@ exp eval PROJECT --root ROOT --continuations policy.json             # prints th
 ```
 
 The identity is the policy content and `ADMISSION_POLICY_PROTOCOL`; re-registering identical
-content replays the original artifact and its original time. Every consumer refuses a policy
-registered after the study or comparison registration it judges, so register the policy first
-and generate results under it. A policy saved under another protocol fails closed and must be
+content replays the original artifact. Every consumer refuses a policy that the study or
+comparison registration it judges does not cite: the registration names the saved policy by
+identity and manifest digest, which it can only know once the policy exists, so the citation
+proves the order and no clock is compared. Register the policy first, pin it (`policy` in a
+comparison, `admission_policy` in a continuation study spec) and generate results under it. A policy saved under another protocol fails closed and must be
 registered again.
 
 ## Consumers
@@ -87,7 +89,8 @@ registered again.
   excess over the repeated reference to exceed the margin. Unknown pairs, fewer units than
   `minimum_units`, a reference that admits the dimension in too few units (both-fail panels) or
   an interval crossing the margin leave the dimension `unassessable`.
-- `export`: `export.policy` is required. Each branch keeps its per-dimension verdicts in the
+- `export`: `export.policy` is required, and every exported study must pin it as
+  `admission_policy`. Each branch keeps its per-dimension verdicts in the
   `continuation-admission` report, and a branch is admitted only when the independent
   specification and every gating dimension pass. A simulated branch uses the calibration of the
   comparison pinned in its training evidence when that comparison was registered under the same

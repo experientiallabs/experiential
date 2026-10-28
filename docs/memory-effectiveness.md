@@ -88,7 +88,9 @@ Before confirmation, save `registration.json` as an immutable artifact. Its obje
 `definition`, `threshold`, `minimum_support`, `maximum_error`, and `inventory`. Each inventory row
 contains `id`, `partition`, and `leakage_groups`. The definition binds student/readout, teacher,
 fallback, question, renderer, candidate builder, tools, knowledge and hard policy. Confirmation
-questions must postdate this registration. Their saved values include `question`, `candidates`,
+questions must follow this registration: save each with the registration among its manifest
+inputs (directly or through an input it cites). The citation proves the order; timestamps are
+never compared. Their saved values include `question`, `candidates`,
 `permitted_state`, `definition_sha256`, and `hard_allowed`. Predictions are exact saved
 `{"selected": ..., "probabilities": ...}` values; label locators resolve to the target identity.
 

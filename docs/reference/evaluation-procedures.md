@@ -19,7 +19,7 @@ registered procedure in three resolutions, run in order:
   `wilson_lower_bound`) and the development lineages, before any measurement is read. The
   development lineages must be held out, and at least one held-out lineage must stay untouched
   for confirmation. Registering the same procedure again returns the first registration, so its
-  time cannot move past earlier results.
+  place in the receipt order cannot move past earlier results.
 - `select` takes the printed `registration` reference and `development`: one audit receipt ID
   per measured grid count (`exp eval PROJECT --audit N`, after the memory has learned that many
   fit traces). Each receipt is measured from its saved results. The grid is walked in order and
@@ -32,6 +32,12 @@ registered procedure in three resolutions, run in order:
   count, coverage, failures and whether the criterion holds. A development receipt or lineage, a
   re-audit, an invalidated receipt or a changed configuration is refused, and a selection is
   confirmed on one receipt only.
+- Order is the audit receipt sequence, never a clock. Receipts are numbered while the root
+  exposure ledger is locked; the registration and the saved selection are written under the same
+  lock and record the latest receipt number, so only receipts numbered after them count as
+  development or confirmation evidence. A receipt minted before the selection is refused even
+  if its host's clock claims a later time. The selection cites the registration and every
+  development receipt, and the confirmation cites the selection and its receipt.
 
 ## Forgetting a stale summary: `forget-summary`
 
@@ -40,8 +46,9 @@ registered procedure in three resolutions, run in order:
  "forget": {"lineage": "LINEAGE", "block": "#0-3", "reason": "why the summary is stale"}}
 ```
 
-`block` is the summary ID memory views print. `lineage` may be omitted for the memory the
-recorded learning plan learned most recently. The forget is eligible only when:
+`block` is the summary ID memory views print. `lineage` may be omitted while only one recorded
+learning plan's memory has published; once both the all-traces and the fit-only memory have,
+name it, since nothing orders the two lineages. The forget is eligible only when:
 
 - the block is a complete aligned block of the head version's log and its current summary
   generation is built (an unbuilt or already forgotten block has nothing to forget);

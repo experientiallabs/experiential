@@ -31,6 +31,7 @@ from exp.common.project import (
     StoredArtifact,
     artifact_input,
 )
+from exp.common.project.causality import cites
 from exp.common.rollouts import (
     RolloutArtifact,
     SandboxSimulatorSnapshot,
@@ -208,7 +209,7 @@ class _ResolvedInputs:
     """Typed, digest-verified comparison dependencies loaded from the artifact store."""
 
     comparison_spec_input: ArtifactInput
-    lock_created_at: datetime
+    lock_input: ArtifactInput
     task_set_input: ArtifactInput
     text_plan_input: ArtifactInput
     sandbox_plan_input: ArtifactInput
@@ -261,7 +262,8 @@ def compare_text_and_sandbox(
     Args:
         spec: Already-persisted comparison protocol.
         store: Store containing every exact input and available rollout.
-        created_at: Aware report completion time after the comparison protocol was frozen.
+        created_at: Aware report completion time, informational; the report cites the
+            persisted protocol it was resolved from, which orders it after the protocol.
         code_revision: Exact source revision producing the report.
 
     Returns:
@@ -271,8 +273,6 @@ def compare_text_and_sandbox(
         SimulationComparisonError: Any hash, mode, lineage, lock, plan, or rollout binding drifts.
     """
     resolved = _resolve_inputs(spec, store)
-    if created_at < spec.created_at:
-        raise SimulationComparisonError("comparison report cannot predate its frozen protocol")
     text_ids = set(resolved.text_set.artifact_ids)
     sandbox_ids = set(resolved.sandbox_set.artifact_ids)
     outcomes = tuple(
@@ -353,7 +353,8 @@ def _resolve_inputs(spec: SimulationComparisonSpec, store: ArtifactStore) -> _Re
     sandbox_spec = _load_simulation_spec(store, spec.sandbox_simulation_spec_input)
     text_set = _load_artifact_set(store, spec.text_artifact_set_input)
     sandbox_set = _load_artifact_set(store, spec.sandbox_artifact_set_input)
-    if spec.created_at < lock.manifest.created_at:
+    del lock
+    if not cites(store, spec.comparison_id, spec.policy_lock_input):
         raise SimulationComparisonError("comparison protocol must be frozen after the policy lock")
     _validate_root_bindings(
         spec,
@@ -364,12 +365,12 @@ def _resolve_inputs(spec: SimulationComparisonSpec, store: ArtifactStore) -> _Re
         sandbox_spec,
         text_set,
         sandbox_set,
-        lock.manifest.created_at,
+        store,
     )
     tasks = {task.task_id: task for task in task_set.tasks}
     return _ResolvedInputs(
         comparison_spec_input=comparison_input,
-        lock_created_at=lock.manifest.created_at,
+        lock_input=spec.policy_lock_input,
         task_set_input=spec.task_set_input,
         text_plan_input=spec.text_evaluation_plan_input,
         sandbox_plan_input=spec.sandbox_evaluation_plan_input,
@@ -395,14 +396,19 @@ def _validate_root_bindings(
     sandbox_spec: SimulationSpec,
     text_set: SimulationArtifactSet,
     sandbox_set: SimulationArtifactSet,
-    locked_at: datetime,
+    store: ArtifactStore,
 ) -> None:
-    """Verify modes, task set, plans, specs, sets, and post-lock timestamps."""
+    """Verify modes, task set, plans, specs, sets, and that each spec and set follows the lock.
+
+    "Follows" is causal: the simulation spec cites the exact policy lock in its inputs, directly
+    or through an input it cites, and the artifact set cites the spec. Creation times are never
+    compared, so clock skew between writers cannot admit pre-lock evidence.
+    """
     if text_plan.task_set_id != task_set.task_set.task_set_id:
         raise SimulationComparisonError("text plan names a different task set")
     if sandbox_plan.task_set_id != task_set.task_set.task_set_id:
         raise SimulationComparisonError("sandbox plan names a different task set")
-    for label, plan, plan_input, simulation, simulation_input, artifact_set in (
+    for label, plan, plan_input, simulation, simulation_input, artifact_set, artifact_set_input in (
         (
             "text",
             text_plan,
@@ -410,6 +416,7 @@ def _validate_root_bindings(
             text_spec,
             comparison.text_simulation_spec_input,
             text_set,
+            comparison.text_artifact_set_input,
         ),
         (
             "sandbox",
@@ -418,6 +425,7 @@ def _validate_root_bindings(
             sandbox_spec,
             comparison.sandbox_simulation_spec_input,
             sandbox_set,
+            comparison.sandbox_artifact_set_input,
         ),
     ):
         expected_mode = SimulationMode.WORLD_MODEL if label == "text" else SimulationMode.SANDBOX
@@ -435,8 +443,15 @@ def _validate_root_bindings(
         required_set_inputs = {plan_input, comparison.task_set_input, simulation_input}
         if not required_set_inputs.issubset(set(artifact_set.inputs)):
             raise SimulationComparisonError(f"{label} artifact set omits an exact input")
-        if simulation.created_at < locked_at or artifact_set.created_at < locked_at:
-            raise SimulationComparisonError(f"{label} evidence predates the policy lock")
+        lock = comparison.policy_lock_input
+        if not cites(store, simulation_input.artifact_id, lock) or not cites(
+            store, artifact_set_input.artifact_id, lock
+        ):
+            raise SimulationComparisonError(
+                f"{label} evidence predates the policy lock: its simulation spec does not cite "
+                "the exact policy lock, so nothing shows it was planned after the lock; plan "
+                "held-out simulations with the lock among their inputs"
+            )
 
 
 def _pair_outcome(
@@ -473,9 +488,9 @@ def _pair_outcome(
         "sandbox",
     )
     if text is not None:
-        _validate_rollout(pair, text, resolved, SimulationMode.WORLD_MODEL)
+        _validate_rollout(pair, text, resolved, store, SimulationMode.WORLD_MODEL)
     if sandbox is not None:
-        _validate_rollout(pair, sandbox, resolved, SimulationMode.SANDBOX)
+        _validate_rollout(pair, sandbox, resolved, store, SimulationMode.SANDBOX)
     text_failure = (
         text.failure if text is not None else _missing_failure("text", pair.text_rollout_id)
     )
@@ -539,6 +554,7 @@ def _validate_rollout(
     pair: PairedSimulationCell,
     rollout: RolloutArtifact,
     resolved: _ResolvedInputs,
+    store: ArtifactStore,
     mode: SimulationMode,
 ) -> None:
     """Verify task, model, agent, simulator, spec, and per-cell binding identity."""
@@ -559,7 +575,7 @@ def _validate_rollout(
         or rollout.simulation_spec_sha256 != sha256_json(simulation)
     ):
         raise SimulationComparisonError(f"{mode.value} rollout identity does not match its pair")
-    if rollout.created_at < resolved.lock_created_at:
+    if not cites(store, rollout.rollout_id, resolved.lock_input):
         raise SimulationComparisonError(f"{mode.value} rollout predates the policy lock")
     if is_text:
         binding = rollout.simulation_binding

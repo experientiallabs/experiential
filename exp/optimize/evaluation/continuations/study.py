@@ -40,6 +40,7 @@ from exp.common.rollouts import StopReason
 from exp.common.tasks import TaskCase
 from exp.optimize.evaluation.continuations.critic import require_prediction_binding
 from exp.optimize.evaluation.continuations.deciders import RecordedDecider
+from exp.optimize.evaluation.equivalence.policy import load_admission_policy
 from exp.runtime.agents.cascade import (
     CascadeDecisionRecord,
     CascadeModelClient,
@@ -130,6 +131,9 @@ class ContinuationStudySpec(ContractModel):
             admission checks observed outcomes only and carries no task qualification.
         cascade: Opt-in decision cascade over the actor model, off when absent. Its decider
             decides accepted steps; the actor model stays responsible for every other step.
+        admission_policy: Saved admission policy pinned before any branch executes. The
+            registration cites it, which is what lets that policy admit the study's branches
+            later; a study without it cannot be admitted under any policy.
     """
 
     checkpoint: ArtifactInput
@@ -149,6 +153,9 @@ class ContinuationStudySpec(ContractModel):
     training_specification: ArtifactInput | None = None
     training_evidence: TrainingEvidence | None = None
     cascade: CascadePolicy | None = Field(default=None, exclude_if=lambda value: value is None)
+    admission_policy: ArtifactInput | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
 
     @model_validator(mode="after")
     def cascade_measures_behavior(self) -> "ContinuationStudySpec":
@@ -465,6 +472,8 @@ def run_continuation_study(
             verifier_sha256=sha256_json(spec.verifier),
             probe_sha256=spec.probe_sha256,
         )
+    if spec.admission_policy is not None:
+        load_admission_policy(store, spec.admission_policy)
     if spec.training_specification is not None:
         manifest = store.read(spec.training_specification.artifact_id).manifest
         if (
@@ -499,7 +508,8 @@ def run_continuation_study(
             + (() if spec.training_specification is None else (spec.training_specification,))
             + (() if spec.training_evidence is None else spec.training_evidence.sources())
             + (() if spec.critic_prediction is None else (spec.critic_prediction,))
-            + (() if spec.selection_plan is None else (spec.selection_plan,)),
+            + (() if spec.selection_plan is None else (spec.selection_plan,))
+            + (() if spec.admission_policy is None else (spec.admission_policy,)),
             code_revision,
         )
         registration = artifact_input(store.read(identity).manifest)

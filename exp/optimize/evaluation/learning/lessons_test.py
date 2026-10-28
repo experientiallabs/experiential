@@ -23,7 +23,7 @@ from exp.common.core.artifacts import (
     JsonValue,
     sha256_json,
 )
-from exp.common.project import ProjectStore
+from exp.common.project import ProjectStore, artifact_input
 from exp.optimize.evaluation.audit.panel import MemoryProfile, plan_held_out_panel
 from exp.optimize.evaluation.audit.panel_test import (
     LEARNABLE,
@@ -38,7 +38,7 @@ from exp.optimize.evaluation.audit.panel_test import (
     held_out_command,
     learn_fit,
 )
-from exp.optimize.evaluation.fidelity.memory_policy import LESSON_SET_TYPE
+from exp.optimize.evaluation.fidelity.memory_policy import LESSON_SET_TYPE, LessonSelection
 from exp.optimize.evaluation.learning import lesson_evolution, screening
 from exp.optimize.evaluation.learning.lessons import (
     latest_lesson_set,
@@ -390,3 +390,39 @@ def test_audit_memory_needs_the_audit_and_a_known_profile(tmp_path: Path) -> Non
     assert "--audit-memory applies only with --audit" in " ".join(result.output.split())
     result = CliRunner().invoke(app, ["eval", PROJECT, "--audit", "2", "--audit-memory", "x"])
     assert result.exit_code != 0
+
+
+def saved_lesson_set(
+    store: ProjectStore, name: str, *supersedes: ArtifactInput, at: datetime
+) -> ArtifactInput:
+    """Save a stub lesson set of memory ``fit-memory`` v3, citing the sets it supersedes."""
+    selection = LessonSelection(lineage="fit-memory", version=3, lessons=())
+    return artifact_input(
+        store.artifacts.write_json(
+            artifact_id=name,
+            artifact_type=LESSON_SET_TYPE,
+            envelope=ArtifactEnvelope(
+                schema_version=1,
+                created_at=at,
+                code_revision="test",
+                inputs=tuple(sorted(supersedes, key=lambda item: item.artifact_id)),
+            ),
+            files={"selection.json": selection.model_dump(mode="json")},
+        )
+    )
+
+
+def test_the_latest_lesson_set_is_the_one_no_other_supersedes_whatever_the_clocks_claim(
+    tmp_path: Path,
+) -> None:
+    """A superseding set wins although its clock claims it is older; unordered sets refuse."""
+    store = ProjectStore(tmp_path, "case")
+    now = datetime(2026, 1, 1, tzinfo=UTC)
+    first = saved_lesson_set(store, "lesson-set-first", at=now + timedelta(days=3))
+    second = saved_lesson_set(store, "lesson-set-second", first, at=now)
+    assert latest_lesson_set(store, "fit-memory", 3) == second
+    saved_lesson_set(store, "lesson-set-rival", first, at=now + timedelta(days=9))
+    with pytest.raises(ValueError, match="do not supersede one another"):
+        latest_lesson_set(store, "fit-memory", 3)
+    with pytest.raises(ValueError, match="no screened lesson set"):
+        latest_lesson_set(store, "fit-memory", 4)

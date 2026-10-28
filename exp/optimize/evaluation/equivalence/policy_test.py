@@ -131,21 +131,44 @@ def test_registration_is_content_addressed_and_replays_its_original_time(tmp_pat
     assert other != first
 
 
-def test_a_policy_registered_after_its_results_is_refused(tmp_path: Path) -> None:
-    """Margins chosen after seeing results cannot admit those results."""
+def results_registration(
+    store: ArtifactStore, name: str, *, at: datetime, cites: tuple[ArtifactInput, ...] = ()
+) -> str:
+    """Save a results registration at a claimed time, citing ``cites``, and return its ID."""
+    return store.write_json(
+        artifact_id=name,
+        artifact_type="continuation-study",
+        envelope=ArtifactEnvelope(
+            schema_version=1, created_at=at, code_revision="test", inputs=cites
+        ),
+        files={"record.json": {}},
+    ).artifact_id
+
+
+def test_a_policy_the_results_do_not_cite_is_refused_even_with_an_earlier_clock(
+    tmp_path: Path,
+) -> None:
+    """Margins chosen after seeing results cannot admit them, whatever the policy clock claims."""
     store = ProjectStore(tmp_path, "case").artifacts
     now = datetime.now(UTC)
-    results = store.write_json(
-        artifact_id="study-registration",
-        artifact_type="continuation-study",
-        envelope=ArtifactEnvelope(schema_version=1, created_at=now, code_revision="test"),
-        files={"record.json": {}},
-    )
-    before = registered_policy(store, at=now - timedelta(seconds=1))
-    require_policy_precedes(store, before, results.artifact_id, subject="study")
-    after = registered_policy(store, fixture_policy(margin=0.3), at=now + timedelta(seconds=1))
-    with pytest.raises(ValueError, match="registered after study study-registration"):
-        require_policy_precedes(store, after, results.artifact_id, subject="study")
+    results = results_registration(store, "study-registration", at=now)
+    # Registered after the results exist, on a host whose clock runs a day behind.
+    skewed = registered_policy(store, fixture_policy(margin=0.3), at=now - timedelta(days=1))
+    with pytest.raises(ValueError, match="not cited by study study-registration"):
+        require_policy_precedes(store, skewed, results, subject="study")
+
+
+def test_a_cited_policy_precedes_its_results_even_with_a_later_clock(tmp_path: Path) -> None:
+    """A registration citing the saved policy proves the order, so a fast policy clock is fine."""
+    store = ProjectStore(tmp_path, "case").artifacts
+    now = datetime.now(UTC)
+    # Registered first, on a host whose clock runs a day ahead of the results' host.
+    policy = registered_policy(store, at=now + timedelta(days=1))
+    results = results_registration(store, "study-registration", at=now, cites=(policy,))
+    require_policy_precedes(store, policy, results, subject="study")
+    other = registered_policy(store, fixture_policy(margin=0.3), at=now - timedelta(days=1))
+    with pytest.raises(ValueError, match="register it first"):
+        require_policy_precedes(store, other, results, subject="study")
 
 
 def test_loading_refuses_other_artifacts_and_changed_protocols(

@@ -3,7 +3,7 @@
 Every admission applies a registered policy; per-dimension verdicts stay with each branch.
 """
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -14,12 +14,15 @@ from exp.common.project import ProjectStore, artifact_input
 from exp.optimize.evaluation.continuations.admission import (
     ContinuationAdmission,
     admit_continuations,
+    require_pinned_policy,
 )
+from exp.optimize.evaluation.continuations.records import load_study
 from exp.optimize.evaluation.continuations.study import (
     ContinuationStudySpec,
     run_continuation_study,
 )
 from exp.optimize.evaluation.continuations.study_test import probe, workbook_runtime
+from exp.optimize.evaluation.equivalence import policy as policy_module
 from exp.optimize.evaluation.equivalence.policy import AdmissionPolicy
 from exp.optimize.evaluation.equivalence.policy_test import fixture_policy, registered_policy
 from exp.runtime.agents.chat_test import _Model, _response
@@ -44,7 +47,7 @@ def admitted_workbook_study(
 ) -> ArtifactInput:
     """Execute two native branches against independently specified workbook acceptance.
 
-    The admission policy is registered first, before the study it judges.
+    The admission policy is registered first and pinned in the study it judges.
     """
     store = project.artifacts
     policy_ref = registered_policy(store, policy)
@@ -103,6 +106,7 @@ def admitted_workbook_study(
         repeats=2,
         selector="all initial checkpoints",
         training_specification=specification if registered else None,
+        admission_policy=policy_ref,
     )
     actions = actor_actions or (
         AssistantAction(
@@ -225,13 +229,15 @@ def test_a_required_dimension_that_does_not_apply_is_never_silently_passed(
 
 
 def test_a_policy_registered_after_the_study_cannot_admit_it(tmp_path: Path) -> None:
-    """Margins and gates chosen after sampling refuse with an actionable message."""
+    """Margins chosen after sampling refuse, even when the late policy's clock claims earlier."""
     project = ProjectStore(tmp_path, "case")
     admission = ContinuationAdmission.model_validate_json(
         project.artifacts.read_bytes(admitted_workbook_study(project).artifact_id, "admission.json")
     )
-    late = registered_policy(project.artifacts, fixture_policy(margin=0.4))
-    with pytest.raises(ValueError, match="register it first and generate fresh results"):
+    late = registered_policy(
+        project.artifacts, fixture_policy(margin=0.4), at=datetime.now(UTC) - timedelta(days=1)
+    )
+    with pytest.raises(ValueError, match="only the policy a study pins"):
         admit_continuations(
             project.artifacts,
             admission.study,
@@ -239,3 +245,30 @@ def test_a_policy_registered_after_the_study_cannot_admit_it(tmp_path: Path) -> 
             created_at=datetime.now(UTC),
             code_revision="test",
         )
+
+
+def test_only_the_pinned_policy_admits_even_when_another_is_reached_by_citation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A policy the registration reaches through other evidence never stands in for the pin."""
+    project = ProjectStore(tmp_path, "case")
+    admission = ContinuationAdmission.model_validate_json(
+        project.artifacts.read_bytes(admitted_workbook_study(project).artifact_id, "admission.json")
+    )
+    other = registered_policy(project.artifacts, fixture_policy(margin=0.4))
+    # As if a comparison cited by the study's training evidence were registered under ``other``.
+    monkeypatch.setattr(policy_module, "require_cites", lambda *args, **kwargs: None)
+    with pytest.raises(ValueError, match=f"pins {admission.policy.artifact_id}, not "):
+        admit_continuations(
+            project.artifacts,
+            admission.study,
+            policy=other,
+            created_at=datetime.now(UTC),
+            code_revision="test",
+        )
+    study = load_study(project.artifacts, admission.study)
+    unpinned = study.model_copy(
+        update={"spec": study.spec.model_copy(update={"admission_policy": None})}
+    )
+    with pytest.raises(ValueError, match="pins no admission policy"):
+        require_pinned_policy(project.artifacts, admission.study, unpinned, other)

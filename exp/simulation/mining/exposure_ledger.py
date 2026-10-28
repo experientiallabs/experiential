@@ -20,6 +20,7 @@ SQLite file, and keys everything on content (:mod:`exp.simulation.mining.fingerp
 - Equivalence links join the nodes of one verified source under every scheme that fingerprinted
   it, for unexposed traces too, so edges recorded under any scheme stay valid.
 - Exposures mark nodes a person has seen, with the panel, receipt and report that showed them.
+  The ledger also notes which exposure rows it wrote itself; a merge never imports that note.
 - Reservations claim content for one audit receipt before any of its runs is registered; a
   release by that receipt's owner frees an unused reservation.
 
@@ -46,7 +47,6 @@ import sqlite3
 from collections import defaultdict, deque
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
-from datetime import datetime
 from pathlib import Path
 from typing import Final, Literal, Self
 
@@ -64,7 +64,7 @@ from exp.simulation.mining.lineage import LineageAssignment
 
 LEDGER_DIRECTORY = "exposure-ledger"
 LEDGER_FILE = "ledger.sqlite"
-SCHEMA_VERSION: Final = 1
+SCHEMA_VERSION: Final = 2
 TASK_LINEAGE_KEY = "task_lineage"
 DECLARED_PREFIX = "declared:"
 SAME_HOST_LIMIT = (
@@ -200,7 +200,7 @@ class LedgerExposure(ContractModel):
         receipt: Audit receipt recording the report.
         report: Report that showed per-trace results.
         project: Project the report ran in.
-        at: When the report was recorded.
+        at: When the report was recorded, by the recording host's clock; informational only.
     """
 
     vertices: tuple[Vertex, ...] = Field(min_length=1)
@@ -294,6 +294,9 @@ class LedgerExport(ContractModel):
         exposures: Exposure records.
         reservations: Content claimed by audit receipts.
         releases: Reservations their owners released.
+        recorded_here: Exposure record IDs and reserving receipts this ledger wrote itself, never
+            merged ones; local
+            provenance, so it is outside the identity and a merge never imports it.
     """
 
     identity: str
@@ -305,6 +308,7 @@ class LedgerExport(ContractModel):
     exposures: tuple[LedgerExposure, ...] = ()
     reservations: tuple[LedgerReservation, ...] = ()
     releases: tuple[LedgerRelease, ...] = ()
+    recorded_here: tuple[str, ...] = ()
 
 
 class LedgerSnapshot:
@@ -359,20 +363,25 @@ class LedgerSnapshot:
         return receipt in self.reservations and receipt not in self.released
 
     def exposure(
-        self, vertices: Iterable[Vertex], *, before: datetime | None = None
+        self,
+        vertices: Iterable[Vertex],
+        *,
+        counts: Callable[[LedgerExposure], bool] | None = None,
     ) -> ExposurePath | None:
         """The shortest path from any of ``vertices`` to exposed content, if one exists.
 
         Args:
             vertices: Content of one lineage's member traces, under every computable scheme.
-            before: Count only exposures recorded before this time.
+            counts: Which exposure records count, such as only those not provably recorded
+                after an audit receipt (late-link reassessment); every record when omitted.
+                Exposure times (``at``) are informational and never decide this.
 
         Returns:
             The path, or None when no member shares a component with exposed content.
         """
         marked: dict[Vertex, list[str]] = defaultdict(list)
         for item in self.records.exposures:
-            if before is None or item.at < before:
+            if counts is None or counts(item):
                 for vertex in item.vertices:
                     marked[vertex].append(item.record_id)
         return self._nearest(vertices, marked)
@@ -490,12 +499,13 @@ class LedgerTransaction:
         """Every row as of now, inside this transaction."""
         return LedgerSnapshot(_export(self._connection))
 
-    def record(self, kind: RecordKind, record: BaseModel) -> None:
-        """Add one content-addressed record unless it is already present."""
-        self._connection.execute(
+    def record(self, kind: RecordKind, record: BaseModel) -> bool:
+        """Add one content-addressed record unless it is already present; True when added."""
+        cursor = self._connection.execute(
             "INSERT OR IGNORE INTO records (kind, record_id, body) VALUES (?, ?, ?)",
             (kind, _record_id(record), _body(record)),
         )
+        return cursor.rowcount == 1
 
     def record_scheme(self, scheme: SchemeIdentity) -> None:
         """Record a scheme this code computes under, refusing a changed spec without a bump.
@@ -514,12 +524,22 @@ class LedgerTransaction:
                 )
         self.record("scheme", scheme)
 
-    def reserve(self, reservation: LedgerReservation) -> None:
-        """Claim content for one receipt; a receipt reserves at most once."""
+    def record_here(self, exposure: LedgerExposure) -> None:
+        """Note that this ledger, not a merge, recorded the exposure."""
+        self._connection.execute(
+            "INSERT OR IGNORE INTO recorded_here (record_id) VALUES (?)", (exposure.record_id,)
+        )
+
+    def reserve(self, reservation: LedgerReservation, *, here: bool = True) -> None:
+        """Claim content for one receipt, at most once; ``here`` is False when merged."""
         self._connection.execute(
             "INSERT INTO reservations (receipt, body) VALUES (?, ?)",
             (reservation.receipt, _body(reservation)),
         )
+        if here:
+            self._connection.execute(
+                "INSERT INTO recorded_here (record_id) VALUES (?)", (reservation.receipt,)
+            )
 
     def release(self, release: LedgerRelease) -> None:
         """Free a reservation; its owner must have checked that no slot was claimed."""
@@ -729,13 +749,16 @@ class ExposureLedger:
         return resolved
 
     def record_exposure(self, exposure: LedgerExposure) -> None:
-        """Mark content exposed; the row is permanent.
+        """Mark content exposed, and note that this ledger recorded it; both rows are permanent.
+
+        A row already present, for example from a merge, keeps its provenance.
 
         Args:
             exposure: What was shown, and how.
         """
         with self.transaction() as transaction:
-            transaction.record("exposure", exposure)
+            if transaction.record("exposure", exposure):
+                transaction.record_here(exposure)
 
     def snapshot(self) -> LedgerSnapshot:
         """Every row now in the ledger, as one queryable snapshot."""
@@ -781,7 +804,7 @@ class ExposureLedger:
                     transaction.record(kind, record)
             for reservation in export.reservations:
                 if reservation.receipt not in snapshot.reservations:
-                    transaction.reserve(reservation)
+                    transaction.reserve(reservation, here=False)
             for release in export.releases:
                 if release.receipt not in snapshot.released:
                     transaction.release(release)
@@ -910,13 +933,14 @@ def _require_schema(connection: sqlite3.Connection) -> None:
     connection.execute(
         "CREATE TABLE reservations (receipt TEXT PRIMARY KEY, body TEXT NOT NULL) STRICT"
     )
+    connection.execute("CREATE TABLE recorded_here (record_id TEXT PRIMARY KEY) STRICT")
     connection.execute(
         """CREATE TABLE releases (
             receipt TEXT PRIMARY KEY REFERENCES reservations (receipt),
             body TEXT NOT NULL
         ) STRICT"""
     )
-    for table in ("records", "reservations", "releases"):
+    for table in ("records", "reservations", "releases", "recorded_here"):
         for action in ("UPDATE", "DELETE"):
             connection.execute(
                 f"""CREATE TRIGGER {table}_no_{action.lower()} BEFORE {action} ON {table}
@@ -941,6 +965,10 @@ def _export(connection: sqlite3.Connection | None) -> LedgerExport:
             ):
                 rows[table].append(body)
                 keys.append(f"{table}/{receipt}/{sha256_json(body)[:16]}")
+        for (record_id,) in connection.execute(
+            "SELECT record_id FROM recorded_here ORDER BY record_id"
+        ):
+            rows["recorded_here"].append(record_id)
     return LedgerExport(
         identity="ledger-" + sha256_json(sorted(keys))[:20],
         schemes=_parse(rows["scheme"], SchemeIdentity),
@@ -951,6 +979,7 @@ def _export(connection: sqlite3.Connection | None) -> LedgerExport:
         exposures=_parse(rows["exposure"], LedgerExposure),
         reservations=_parse(rows["reservations"], LedgerReservation),
         releases=_parse(rows["releases"], LedgerRelease),
+        recorded_here=tuple(rows["recorded_here"]),
     )
 
 

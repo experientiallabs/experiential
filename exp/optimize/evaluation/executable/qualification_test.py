@@ -31,7 +31,7 @@ def qualified_fixture(
     monkeypatch: pytest.MonkeyPatch,
 ) -> tuple[ProjectStore, ArtifactInput, ExecutableQualificationSpec]:
     """Run a real feasible workbook branch and make explicit synthetic verifier controls."""
-    project, job, _ = job_fixture(tmp_path, monkeypatch)
+    project, job, _ = job_fixture(tmp_path, monkeypatch, pin_policy=True)
     result = execute_continuation_job(project, job, code_revision="test")
     study_id = next(
         key

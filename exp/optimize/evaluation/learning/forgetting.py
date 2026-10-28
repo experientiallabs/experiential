@@ -38,8 +38,8 @@ class SummaryForget(ContractModel):
     """An operator decision to forget one stale block summary of a memory lineage.
 
     Attributes:
-        lineage: Memory lineage; omitted, the recorded learning plan's memory that learned
-            most recently.
+        lineage: Memory lineage; omitted, the one recorded learning plan's memory that has
+            published (refused when both the all-traces and fit-only memories have).
         block: The block as memory views print it, ``#first-last`` (for example ``#0-3``).
         reason: Why the summary is stale; kept with the record.
     """

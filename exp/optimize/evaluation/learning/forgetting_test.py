@@ -25,6 +25,7 @@ def registered(project: ProjectStore, grid: tuple[int, ...]) -> None:
         criterion="point_estimate",
         development_lineages=("dev",),
         registered_at=NOW,
+        receipts_before=0,
     )
     project.artifacts.write_json(
         artifact_id=registration.identity,

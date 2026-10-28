@@ -596,7 +596,13 @@ reports. If they reveal exposure that predates the receipt, an undispatched rese
 released and the audit refuses to run independently; once execution began, an invalidation
 notice is appended instead and the headline becomes "independent, invalidated: predating
 exposure". The receipt and its snapshot are never rewritten, and exposure that
-happens only after the receipt was minted never invalidates it.
+happens only after the receipt was minted never invalidates it. "Before" and "after" are
+causal, never exposure times: the receipt lists every exposure in the snapshot it was minted
+against, and later exposure counts as after only when this root's ledger recorded both it,
+from a report run here, and the receipt's reservation (the ledger notes the rows it wrote
+itself; a merge never imports that note, so a moved project's receipt orders nothing here).
+Exposure merged from another ledger cannot be ordered against the receipt, so it counts as
+predating, whatever its recorded time, even when its receipt was copied into this root.
 
 An audit runs in a fixed order: reserve, register, claim a dispatch slot, call. Selection reads
 the ledger, then the panel's exclusive lease (an OS file lock, `panel in use` for any second
@@ -683,7 +689,7 @@ prediction. A trace's first saved measurement fixes its score, including unanswe
 misses. Later learning retries cannot replace that measurement, and the curve reports traces not
 learned separately. The retest covers learned traces only and preserves their first measurement
 as its baseline. A cancelled learning preflight records nothing; later commands read the memory
-that learned most recently. When every trace is already learned, learning replays its saved
+of the scope they name. When every trace is already learned, learning replays its saved
 results without asking for spend consent.
 
 Knowledge pinned in a simulator (built outside `exp build`, for example for `exp eval --fidelity`)

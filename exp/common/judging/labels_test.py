@@ -311,19 +311,13 @@ def test_a_later_review_needs_a_fresh_adjudication_and_corrections_still_work() 
 
 
 def test_review_history_refuses_one_reviewer_overwriting_or_hidden_disagreement() -> None:
-    """Repeat votes, partial adjudication, early adjudication and cross-target citations fail."""
+    """Repeat votes, partial adjudication and cross-target citations fail."""
     history = HumanScoreHistory().review(_review("review-a", "alice", 2))
     history = history.review(_review("review-b", "bob", 5))
     with pytest.raises(ValueError, match="one independent initial judgment"):
         history.review(_review("review-c", "alice", 4))
     with pytest.raises(ValueError, match="every independent review"):
         history.append(_adjudication("label-adj", 2, ("review-a",)))
-    with pytest.raises(ValueError, match="after the reviews"):
-        history.append(
-            _adjudication("label-adj", 2, ("review-a", "review-b")).model_copy(
-                update={"created_at": _TIME - timedelta(seconds=1)}
-            )
-        )
     other = _review("review-x", "carol", 3).model_copy(update={"dimension_id": "policy"})
     with pytest.raises(ValueError, match="same rollout and scale"):
         history.review(other).append(_adjudication("label-adj", 2, ("review-a", "review-x")))
@@ -331,6 +325,37 @@ def test_review_history_refuses_one_reviewer_overwriting_or_hidden_disagreement(
         history.append(_adjudication("label-adj", 2, ("review-a", "review-missing")))
     with pytest.raises(ValueError, match="must not repeat"):
         history.review(_review("review-a", "dave", 1))
+
+
+def test_recorded_order_decides_adjudication_coverage_whatever_the_clocks_claim() -> None:
+    """An adjudication covers the reviews recorded before it in the history, not by timestamps.
+
+    Its clock may claim a time before the reviews it resolves, and a review recorded after it may
+    claim a time before it; neither changes which reviews it had to name.
+    """
+    history = HumanScoreHistory().review(_review("review-a", "alice", 2))
+    early_clock = _adjudication("label-adj", 2, ("review-a",)).model_copy(
+        update={"created_at": _TIME - timedelta(days=1)}
+    )
+    history = history.append(early_clock)
+    assert history.reviewed_targets()[0].adjudicated
+    # Recorded after the adjudication on a host whose clock runs two days behind.
+    late = _review("review-b", "bob", 4, at=_TIME - timedelta(days=2))
+    history = history.review(late)
+    [reopened] = history.reviewed_targets()
+    assert not reopened.adjudicated, "review-b was recorded after the adjudication"
+    with pytest.raises(ValueError, match="every independent review"):
+        history.correct(
+            _adjudication("label-adj-2", 3, ("review-a",), supersedes="label-adj").model_copy(
+                update={"created_at": _TIME + timedelta(days=5)}
+            )
+        )
+    # A saved history whose adjudication skips the earlier review for a later one is refused.
+    with pytest.raises(ValueError, match="every independent review"):
+        HumanScoreHistory(
+            scores=(_adjudication("label-adj", 2, ("review-b",)),),
+            reviews=(_review("review-a", "alice", 2), _review("review-b", "bob", 4)),
+        )
 
 
 def test_direct_label_histories_keep_their_persisted_identity() -> None:

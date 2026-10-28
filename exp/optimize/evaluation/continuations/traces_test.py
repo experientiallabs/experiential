@@ -22,12 +22,18 @@ from exp.common.core.artifacts import (
 )
 from exp.common.models import AssistantAction, ModelMessage, ToolCall
 from exp.common.project import ArtifactStore, ProjectStore, artifact_input
-from exp.common.tasks import TaskCase, ToolSchema
+from exp.common.tasks import TaskCase, ToolSchema, load_task_set
 from exp.common.traces import Trace
 from exp.common.traces.ingest.otlp import TraceNormalizationResult
 from exp.common.traces.ingest.persistence import read_ingested_traces
 from exp.common.traces.sqlite import SQLiteTraceStore
 from exp.common.traces.sqlite_schema import trace_database_path
+from exp.optimize.evaluation.audit.panel_test import (
+    USERS,
+    SimulatedProvider,
+    build_project,
+    episode,
+)
 from exp.optimize.evaluation.continuations.records import load_study
 from exp.optimize.evaluation.continuations.study import (
     ContinuationStudySpec,
@@ -41,7 +47,8 @@ from exp.optimize.evaluation.continuations.traces import (
     export_trajectory_traces,
     trajectory_studies,
 )
-from exp.optimize.evaluation.equivalence.policy_test import registered_policy
+from exp.optimize.evaluation.equivalence import policy as policy_module
+from exp.optimize.evaluation.equivalence.policy_test import fixture_policy, registered_policy
 from exp.optimize.evaluation.fidelity.replay import recorded_exchanges
 from exp.runtime.agents.chat import ChatAgentRuntime
 from exp.runtime.agents.chat_test import _Model, _response
@@ -191,8 +198,12 @@ def study(
     verifier: TaskVerifier = ANSWERED,
     study_probe: Callable[[WorldCheckpoint], JsonObject] = empty_probe,
     probe_sha256: str = PROBE,
+    policy: ArtifactInput | None = None,
 ) -> ArtifactInput:
-    """Run one saved study, one branch per scripted fork, and return its result reference."""
+    """Run one saved study, one branch per scripted fork, and return its result reference.
+
+    The study pins ``policy``, by default the fixture admission policy, before any branch runs.
+    """
     spec = ContinuationStudySpec(
         checkpoint=checkpoint,
         actor_model=MODEL,
@@ -200,6 +211,7 @@ def study(
         probe_sha256=probe_sha256,
         repeats=len(forks),
         selector="fixture forks",
+        admission_policy=policy or registered_policy(store),
     )
     run_continuation_study(
         store,
@@ -529,6 +541,21 @@ def test_branches_without_world_evidence_are_skipped_and_generators_must_reach_s
         trajectory_studies(store, stale)
 
 
+def test_export_refuses_a_policy_the_study_did_not_pin(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Reaching a policy through a study's cited evidence never lets it judge the study."""
+    project = ProjectStore(tmp_path, PROJECT)
+    [result] = ticket_studies(project.artifacts, 1)
+    other = registered_policy(project.artifacts, fixture_policy(margin=0.4))
+    # As if a comparison cited by the study's training evidence were registered under ``other``.
+    monkeypatch.setattr(policy_module, "require_cites", lambda *args, **kwargs: None)
+    with pytest.raises(ValueError, match=f"not {other.artifact_id}; only the policy a study pins"):
+        export_trajectory_traces(
+            project, TrajectoryTraceExport(policy=other, generators=(result,)), dry_run=True
+        )
+
+
 def exchanges(traces: Sequence[Trace]) -> list[tuple[str, JsonValue, JsonValue]]:
     """Every recorded exchange of the exported traces, for a scripted simulator's truth."""
     return [
@@ -594,3 +621,45 @@ def test_authored_prefix_replies_are_never_proven_native(tmp_path: Path) -> None
     # Exported call IDs stay unique even though the actor reused call-1 across turns.
     call_ids = [row["call_id"] for row in steps(trace)]
     assert call_ids == ["a1", "call-1", "call-1~1"]
+
+
+def test_export_refuses_a_study_whose_lineage_a_rebuild_reserved(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A lineage fit when its study ran but held out by a later build is never exported.
+
+    A build of one lineage keeps it fit; a build of two holds out whichever ranks second, so a
+    rebuild with one more user can move the studied lineage to held out.
+    """
+
+    def partitions(project: ProjectStore) -> dict[str, str]:
+        """Each task lineage of the project's current build, with its partition."""
+        build = project.load_project().build
+        assert build is not None
+        tasks = load_task_set(project.artifacts, build.task_set.artifact_id).tasks
+        return {task.lineage_group_id: task.partition for task in tasks}
+
+    first = [episode(0)]
+    _, project, _ = build_project(
+        tmp_path, monkeypatch, SimulatedProvider(first), episodes=first, relative_traces=True
+    )
+    store = project.artifacts
+    policy = registered_policy(store)
+    ((lineage, partition),) = partitions(project).items()
+    assert partition == "fit"
+    task = ticket_task(0).model_copy(update={"lineage_group_id": lineage})
+    reference, _ = capture(store, ticket_case().runtime, task)
+    result = study(store, reference, ticket_case().runtime, [ticket_fork(0, 0)], policy=policy)
+    spec = TrajectoryTraceExport(policy=policy, generators=(result,))
+    assert export_trajectory_traces(project, spec, dry_run=True).native == 1
+    for user in range(1, USERS):
+        later = [episode(0), episode(user)]
+        project = build_project(
+            tmp_path, monkeypatch, SimulatedProvider(later), episodes=later, relative_traces=True
+        )[1]
+        if partitions(project)[lineage] == "held_out":
+            break
+    else:
+        pytest.fail("no second user ranked before the studied lineage")
+    with pytest.raises(ValueError, match="lineage is reserved by the frozen build"):
+        export_trajectory_traces(project, spec)

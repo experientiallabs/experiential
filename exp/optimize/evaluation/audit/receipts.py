@@ -24,14 +24,15 @@ invalidation notice adds "invalidated: predating exposure" after "independent". 
 fully saved receipt keeps the receipt's headline.
 """
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from datetime import datetime
 from typing import Literal
 
-from pydantic import AwareDatetime, Field
+from pydantic import AwareDatetime, Field, ValidationError
 
 from exp.common.core.artifacts import ArtifactEnvelope, ArtifactInput, ContractModel, stable_id
-from exp.common.project import ProjectStore
+from exp.common.project import ProjectStore, artifact_input
 from exp.common.traces.store import load_trace_dataset
 from exp.optimize.evaluation.audit.exposure import LineageExposure, held_out_members
 from exp.optimize.evaluation.audit.panel import (
@@ -100,8 +101,10 @@ class AuditReceipt(ContractModel):
     """The immutable root record of one held-out audit.
 
     Attributes:
-        sequence: Position among the project's receipts, from 1.
-        opened_at: When the receipt and its reservation were committed.
+        sequence: Position among the project's receipts, from 1, assigned inside the root
+            exposure ledger's transaction; it, not ``opened_at``, orders receipts.
+        opened_at: When the receipt and its reservation were committed, by the minting host's
+            clock; informational and part of the receipt identity only.
         project: Project audited.
         request: What the minting invocation asked for.
         basis: ``independent`` or ``development-re-audit``, fixed at minting.
@@ -112,6 +115,9 @@ class AuditReceipt(ContractModel):
         cases: Audited cases, in panel order.
         schemes: Full identity of every fingerprint scheme the exposure match used.
         ledger: Ledger snapshot identity the reservation was decided and committed against.
+        prior_exposures: Record IDs of every exposure in that snapshot, sorted: the exposure
+            already recorded when the receipt was minted. Late-link reassessment counts these,
+            and any exposure it cannot prove was recorded here after them.
         exposed: Every exposed or reserved held-out lineage at decision time, with its
             component size and the edge path to marked content.
         reaudited: Audited lineages that were exposed or reserved by another receipt.
@@ -132,6 +138,7 @@ class AuditReceipt(ContractModel):
     cases: tuple[AuditCase, ...] = Field(min_length=1)
     schemes: tuple[SchemeIdentity, ...] = Field(min_length=1)
     ledger: str
+    prior_exposures: tuple[str, ...]
     exposed: tuple[LineageExposure, ...] = ()
     reaudited: tuple[str, ...] = ()
     follows: str | None = None
@@ -258,9 +265,9 @@ class ReceiptView(ContractModel):
 
     Attributes:
         receipt: The immutable root record.
-        attempts: Replaced registrations, in time order.
-        reports: Invocations, in time order.
-        notices: Invalidation notices, in time order.
+        attempts: Replaced registrations, in recorded-time order (display only).
+        reports: Invocations, in recorded-time order (display only).
+        notices: Invalidation notices, in recorded-time order (display only).
     """
 
     receipt: AuditReceipt
@@ -283,11 +290,14 @@ class ReceiptView(ContractModel):
         """Steps re-dispatched after an unknown outcome, by stage, over the current runs.
 
         A run resumed more than once has one in-place child per resumption that grew its
-        retries; only its latest child counts.
+        retries; only its latest child counts. The run's durable recovery log only grows, so
+        the latest child is the one recording the most dispatches, never the latest clock.
         """
         latest: dict[str, AuditAttempt] = {}
         for attempt in self.reattempts:
-            if attempt.redispatched:
+            if attempt.redispatched and _dispatches(attempt) > _dispatches(
+                latest.get(attempt.replacement_run)
+            ):
                 latest[attempt.replacement_run] = attempt
         return stage_counts(row for attempt in latest.values() for row in attempt.redispatched)
 
@@ -313,6 +323,27 @@ class ReceiptView(ContractModel):
         return any(report.kind in ("evaluation", "replay") for report in self.reports)
 
 
+def _dispatches(attempt: AuditAttempt | None) -> tuple[int, int]:
+    """Dispatches an in-place child recorded, then its steps; grows with every resumption."""
+    if attempt is None:
+        return (0, 0)
+    return (sum(row.attempts for row in attempt.redispatched), len(attempt.redispatched))
+
+
+def _load_receipt(project: ProjectStore, identity: str) -> AuditReceipt:
+    """Parse one saved receipt; a receipt of an older contract fails closed with what to do."""
+    try:
+        return AuditReceipt.model_validate_json(
+            project.artifacts.read_bytes(identity, "receipt.json")
+        )
+    except ValidationError as error:
+        raise ValueError(
+            f"held-out audit receipt {identity} was saved under an older receipt contract that "
+            "did not record the exposure it was decided against, so its independence cannot be "
+            "reassessed; audit this build in a fresh project (exp build) to mint current receipts"
+        ) from error
+
+
 def audit_receipts(project: ProjectStore) -> tuple[AuditReceipt, ...]:
     """Every receipt of the project, in sequence order.
 
@@ -320,13 +351,49 @@ def audit_receipts(project: ProjectStore) -> tuple[AuditReceipt, ...]:
         project: Project holding the receipts.
 
     Returns:
-        Root receipts ordered by sequence, then time.
+        Root receipts ordered by sequence; ``opened_at`` never orders them.
     """
     receipts = (
-        AuditReceipt.model_validate_json(project.artifacts.read_bytes(identity, "receipt.json"))
+        _load_receipt(project, identity)
         for identity in project.artifacts.list_ids(artifact_type=RECEIPT_TYPE)
     )
-    return tuple(sorted(receipts, key=lambda receipt: (receipt.sequence, receipt.opened_at)))
+    return tuple(sorted(receipts, key=lambda receipt: (receipt.sequence, receipt.receipt_id)))
+
+
+@contextmanager
+def receipts_held(project: ProjectStore) -> Iterator[int]:
+    """Hold receipt minting and yield the latest receipt sequence of the project.
+
+    Receipts are minted, and their sequence assigned, only inside the root exposure ledger's
+    transaction, so while it is held here no receipt can be minted. A record written inside
+    this context that stores the yielded sequence proves causally that every receipt with a
+    larger sequence was minted after it was written, whatever any clock says.
+
+    Args:
+        project: Project whose receipts are held.
+
+    Yields:
+        The largest receipt sequence so far, or 0 before the first receipt.
+    """
+    with ExposureLedger(project.paths.root).transaction():
+        yield max((receipt.sequence for receipt in audit_receipts(project)), default=0)
+
+
+def receipt_reference(project: ProjectStore, receipt_id: str) -> ArtifactInput:
+    """The exact artifact reference of one saved receipt, for a record that cites it.
+
+    Args:
+        project: Project holding the receipt.
+        receipt_id: Receipt identity.
+
+    Returns:
+        The receipt's identity and manifest digest.
+
+    Raises:
+        ValueError: The project has no such audit receipt.
+    """
+    find_receipt(project, receipt_id)
+    return artifact_input(project.artifacts.read(receipt_id).manifest)
 
 
 def receipt_view(project: ProjectStore, receipt: AuditReceipt) -> ReceiptView:
@@ -385,9 +452,7 @@ def find_receipt(project: ProjectStore, receipt_id: str) -> AuditReceipt:
     if project.artifacts.exists(receipt_id):
         manifest = project.artifacts.read(receipt_id).manifest
         if manifest.artifact_type == RECEIPT_TYPE:
-            return AuditReceipt.model_validate_json(
-                project.artifacts.read_bytes(receipt_id, "receipt.json")
-            )
+            return _load_receipt(project, receipt_id)
     raise ValueError(
         f"no held-out audit receipt {receipt_id!r} in this project; exp eval PROJECT --audit N "
         "prints each receipt it opens"

@@ -1310,9 +1310,16 @@ def job(
     repeats: int,
     specification: ArtifactInput | None = None,
 ) -> ContinuationJob:
-    """One frozen continuation job under the shared actor policy."""
+    """One frozen continuation job under the shared actor policy.
+
+    The study pins the admission policy registered in stage 3a, so its later export can prove
+    the policy was fixed before the study ran.
+    """
     catalog = load_model_catalog(pipeline.project.model_catalog_path)
     model = RuntimeModelCatalog(catalog, environment={}).snapshot("world")[0]
+    policy = artifact_input(
+        pipeline.project.artifacts.read(policy_identity(fixture_policy())).manifest
+    )
     return ContinuationJob(
         study=ContinuationStudySpec(
             checkpoint=checkpoint,
@@ -1322,6 +1329,7 @@ def job(
             repeats=repeats,
             selector="acceptance development task",
             training_specification=specification,
+            admission_policy=policy,
         ),
         runtime_file=runtime_file,
         runtime_sha256=sha256_bytes(runtime_file.read_bytes()),

@@ -1,8 +1,9 @@
 """Independent, pre-registered acceptance of saved development continuations for SFT.
 
 Every branch is judged twice: against the independent training specification frozen before
-sampling, and dimension by dimension under a registered admission policy that predates the
-study. A branch is admitted only when both pass; its per-dimension verdicts stay in the report.
+sampling, and dimension by dimension under a registered admission policy the study pinned
+before sampling. A branch is admitted only when both pass; its per-dimension verdicts stay in
+the report.
 """
 
 from datetime import datetime
@@ -22,6 +23,7 @@ from exp.optimize.evaluation.continuations.evidence import (
     verify_training_evidence,
 )
 from exp.optimize.evaluation.continuations.records import load_study
+from exp.optimize.evaluation.continuations.study import ContinuationStudy
 from exp.optimize.evaluation.equivalence.policy import (
     load_admission_policy,
     require_policy_precedes,
@@ -80,6 +82,38 @@ class ContinuationAdmission(ContractModel):
     evidence: TrainingEvidenceAssessment | None = None
 
 
+def require_pinned_policy(
+    store: ArtifactStore, study_ref: ArtifactInput, study: ContinuationStudy, policy: ArtifactInput
+) -> None:
+    """Refuse any admission policy other than the one the study pinned before running.
+
+    Citation alone is not enough: the study registration also cites its training evidence,
+    whose comparisons cite their own policies, so a policy reached only that way was chosen for
+    other results and would let the gate be picked after the study's outcomes were seen.
+
+    Args:
+        store: Project artifact store.
+        study_ref: Exact saved study result.
+        study: That study, as loaded and verified.
+        policy: Registered policy asked to judge it.
+
+    Raises:
+        ValueError: The study pinned another policy or none, or its registration does not
+            cite the pinned one.
+    """
+    if study.spec.admission_policy != policy:
+        pinned = study.spec.admission_policy
+        raise ValueError(
+            f"continuation study {study_ref.artifact_id} "
+            + ("pins no admission policy" if pinned is None else f"pins {pinned.artifact_id}")
+            + f", not {policy.artifact_id}; only the policy a study pins as admission_policy "
+            "before running can judge it, so register a fresh study that pins this policy"
+        )
+    require_policy_precedes(
+        store, policy, study_ref.artifact_id.removesuffix("-result"), subject="continuation study"
+    )
+
+
 def admit_continuations(
     store: ArtifactStore,
     study_ref: ArtifactInput,
@@ -93,7 +127,7 @@ def admit_continuations(
     Args:
         store: Trusted artifact owner; no caller-supplied outcomes are accepted.
         study_ref: Complete saved development study.
-        policy: Registered admission policy, registered before the study.
+        policy: Registered admission policy, pinned in the study registration.
         created_at: Decision publication time.
         code_revision: Producing implementation identity.
 
@@ -101,13 +135,11 @@ def admit_continuations(
         Immutable report including rejected and unknown branches. No calls are dispatched.
 
     Raises:
-        ValueError: The policy is not registered or was registered after the study.
+        ValueError: The policy is not registered or is not the one the study pinned.
     """
     study = load_study(store, study_ref)
     rules = load_admission_policy(store, policy)
-    require_policy_precedes(
-        store, policy, study_ref.artifact_id.removesuffix("-result"), subject="continuation study"
-    )
+    require_pinned_policy(store, study_ref, study, policy)
     evidence = verify_training_evidence(
         store,
         study.spec,

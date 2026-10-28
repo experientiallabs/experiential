@@ -46,8 +46,13 @@ def save(
     )
 
 
-def study(tmp_path: Path) -> tuple[ArtifactStore, DecisionCalibration]:
-    """Keep one confident correct, one missing-candidate and one failed confirmation case."""
+def study(
+    tmp_path: Path, *, shared_source: bool = False
+) -> tuple[ArtifactStore, DecisionCalibration]:
+    """Keep one confident correct, one missing-candidate and one failed confirmation case.
+
+    With ``shared_source`` every case declares the same leakage group.
+    """
     project = ProjectStore(tmp_path, "decisions")
     project.initialize(ProjectConfig(project_id="decisions"))
     store = project.artifacts
@@ -62,6 +67,29 @@ def study(tmp_path: Path) -> tuple[ArtifactStore, DecisionCalibration]:
         knowledge_sha256="e" * 64,
         policy_sha256="f" * 64,
     )
+
+    def group(index: int) -> str:
+        """The declared leakage group of one case."""
+        return "same-source" if shared_source else f"source-{index}"
+
+    config = {
+        "definition": definition.model_dump(mode="json"),
+        "threshold": 0.8,
+        "minimum_support": 2,
+        "maximum_error": 0.2,
+    }
+    inventory = [
+        {"id": f"case-{index}", "partition": "confirmation", "leakage_groups": [group(index)]}
+        for index in range(3)
+    ]
+    # Registered first, on a host whose clock runs a day ahead of the questions' host.
+    registration = save(
+        store,
+        "registration",
+        {**config, "inventory": inventory},
+        file="registration.json",
+        offset=86_400,
+    )
     cases = []
     for index, target in enumerate(("a", "missing", "a")):
         question = save(
@@ -74,6 +102,7 @@ def study(tmp_path: Path) -> tuple[ArtifactStore, DecisionCalibration]:
                 "definition_sha256": sha256_json(definition),
                 "hard_allowed": True,
             },
+            inputs=(registration.source,),
         )
         prediction = {"selected": "a", "probabilities": {"a": 0.9, "b": 0.05, "OTHER": 0.05}}
         source = save(store, f"answer-{index}", prediction, offset=2)
@@ -82,7 +111,7 @@ def study(tmp_path: Path) -> tuple[ArtifactStore, DecisionCalibration]:
             DecisionCase(
                 id=f"case-{index}",
                 partition="confirmation",
-                leakage_groups=(f"source-{index}",),
+                leakage_groups=(group(index),),
                 question=question,
                 candidates=("a", "b"),
                 hard_allowed=True,
@@ -90,25 +119,6 @@ def study(tmp_path: Path) -> tuple[ArtifactStore, DecisionCalibration]:
                 label=DecisionLabel(source=label, target=target, authority="native_verifier"),
             )
         )
-    config = {
-        "definition": definition.model_dump(mode="json"),
-        "threshold": 0.8,
-        "minimum_support": 2,
-        "maximum_error": 0.2,
-    }
-    registration = save(
-        store,
-        "registration",
-        {
-            **config,
-            "inventory": [
-                c.model_dump(mode="json", include={"id", "partition", "leakage_groups"})
-                for c in cases
-            ],
-        },
-        file="registration.json",
-        offset=0,
-    )
     return store, DecisionCalibration(
         definition=definition,
         threshold=0.8,
@@ -173,14 +183,27 @@ def test_claimed_policy_allowance_must_match_saved_question(tmp_path: Path) -> N
 
 
 def test_confirmation_before_registration_is_not_prospective(tmp_path: Path) -> None:
-    """A correctly hashed registration still cannot legitimize earlier confirmation evidence."""
+    """A correctly hashed registration still cannot legitimize earlier confirmation evidence,
+    even when its clock claims it was saved before the questions."""
     import json
 
     store, spec = study(tmp_path)
     contents = json.loads(store.read_bytes(spec.registration.artifact_id, "registration.json"))
-    late = save(store, "late-registration", contents, file="registration.json", offset=5)
-    with pytest.raises(ValueError, match="predates frozen registration"):
+    late = save(store, "late-registration", contents, file="registration.json", offset=-86_400)
+    question = store.read(spec.cases[0].question.source.artifact_id).manifest
+    assert store.read(late.source.artifact_id).manifest.created_at < question.created_at
+    with pytest.raises(ValueError, match="does not cite the frozen registration"):
         calibrate_decisions(store, spec.model_copy(update={"registration": late.source}))
+
+
+def test_confirmation_citing_the_registration_follows_it_whatever_the_clocks_say(
+    tmp_path: Path,
+) -> None:
+    """Questions citing the registration are prospective although their clock claims earlier."""
+    store, spec = study(tmp_path)
+    question = store.read(spec.cases[0].question.source.artifact_id).manifest
+    assert question.created_at < store.read(spec.registration.artifact_id).manifest.created_at
+    assert calibrate_decisions(store, spec).partitions[-1].planned == 3
 
 
 def test_probability_scores_are_not_ordinal_relevance(tmp_path: Path) -> None:
@@ -196,19 +219,8 @@ def test_probability_scores_are_not_ordinal_relevance(tmp_path: Path) -> None:
 
 def test_correlated_rows_do_not_inflate_confirmation_support(tmp_path: Path) -> None:
     """Two accepted answers from the same source count as one risk-estimation unit."""
-    store, spec = study(tmp_path)
-    cases = tuple(
-        case.model_copy(update={"leakage_groups": ("same-source",)}) for case in spec.cases
-    )
-    registration = spec.model_dump(mode="json", exclude={"cases", "registration"})
-    registration["inventory"] = [
-        case.model_dump(mode="json", include={"id", "partition", "leakage_groups"})
-        for case in cases
-    ]
-    saved = save(store, "grouped-registration", registration, file="registration.json", offset=0)
-    result = calibrate_decisions(
-        store, spec.model_copy(update={"cases": cases, "registration": saved.source})
-    )
+    store, spec = study(tmp_path, shared_source=True)
+    result = calibrate_decisions(store, spec)
     row = result.partitions[-1]
     assert row.accepted_labelled == 2 and row.independent_units == 1
     assert row.error_upper_95 == pytest.approx(1)

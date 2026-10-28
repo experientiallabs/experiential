@@ -16,7 +16,7 @@ independent audit, since they could match any content; development re-audits may
 """
 
 from collections import defaultdict
-from datetime import datetime
+from collections.abc import Callable
 from typing import Literal
 
 from pydantic import Field
@@ -35,6 +35,7 @@ from exp.simulation.mining.exposure_ledger import (
     SAME_HOST_LIMIT,
     ExposureLedger,
     ExposurePath,
+    LedgerExposure,
     LedgerSnapshot,
     SourceRecord,
     UnknownScheme,
@@ -163,7 +164,7 @@ def held_out_exposure(
     owner: str | None = None,
     *,
     ledger: ExposureLedger | None = None,
-    before: datetime | None = None,
+    counts: Callable[[LedgerExposure], bool] | None = None,
 ) -> HeldOutExposure:
     """Decide which held-out lineages of the build are not independent.
 
@@ -172,7 +173,8 @@ def held_out_exposure(
         snapshot: Ledger snapshot to decide with; the current root ledger when omitted.
         owner: Receipt whose own reservation does not count against it.
         ledger: Ledger whose schemes to use; the project's root ledger when omitted.
-        before: Count only exposures recorded before this time (late-link reassessment).
+        counts: Which exposure records count (late-link reassessment counts only those not
+            provably recorded after the receipt); every record when omitted.
 
     Returns:
         The decision with the snapshot identity and schemes it used.
@@ -192,7 +194,7 @@ def held_out_exposure(
     computable = tuple(scheme.identity for scheme in ledger.computable)
     exposed = []
     for lineage, members in held_out_members(project, ledger).items():
-        path = snapshot.exposure(members.vertices, before=before)
+        path = snapshot.exposure(members.vertices, counts=counts)
         if path is not None:
             exposed.append(LineageExposure(lineage=lineage, kind="exposed", path=path))
             continue

@@ -46,9 +46,14 @@ class OutageTransport(ScriptedJsonTransport):
 
 
 def job_fixture(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, pin_policy: bool = False
 ) -> tuple[ProjectStore, ContinuationJob, ScriptedJsonTransport]:
-    """Configure an explicitly selected local runtime and three routed actor responses."""
+    """Configure an explicitly selected local runtime and three routed actor responses.
+
+    With ``pin_policy`` the job's study keeps the fixture admission policy pinned, so its
+    results can be admitted in this project; otherwise the job carries no pin and can run in
+    any project.
+    """
     project = ProjectStore(tmp_path, "case")
     acceptance = admitted_workbook_study(project)
     admission = ContinuationAdmission.model_validate_json(
@@ -69,7 +74,8 @@ def continuation_runtime(project, configuration):
     checkpoint = load_continuation_checkpoint(project.artifacts, reference)
     return ContinuationRuntime(workbook_runtime(checkpoint.world), probe, configuration["probe"])
 """)
-    spec = study.spec.model_copy(update={"actor_model": model.snapshot})
+    pinned = study.spec.admission_policy if pin_policy else None
+    spec = study.spec.model_copy(update={"actor_model": model.snapshot, "admission_policy": pinned})
     job = ContinuationJob(
         study=spec,
         runtime_file=runtime,
