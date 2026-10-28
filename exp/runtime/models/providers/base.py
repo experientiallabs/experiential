@@ -12,7 +12,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, ClassVar, Literal
 from uuid import uuid4
 
-from exp.common.core.artifacts import JsonObject
+from exp.common.core.artifacts import JsonObject, sha256_json
 from exp.common.models import (
     ChatMaxTokensField,
     ModelRequest,
@@ -56,6 +56,7 @@ from exp.runtime.models.providers.transport import (
     classify_retry,
     is_unbilled_attempt,
     propagate_request_attempt_evidence,
+    public_error_code,
 )
 
 if TYPE_CHECKING:
@@ -687,6 +688,8 @@ class ProviderHttpClient(abc.ABC):
                     status_code=response.status_code,
                     retry_after_seconds=response.retry_after_seconds,
                     known_unbilled=response.known_unbilled,
+                    error_code=public_error_code(response.body),
+                    request_sha256=sha256_json(payload),
                 )
             try:
                 return self._parse_response(

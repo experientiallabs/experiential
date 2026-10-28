@@ -9,6 +9,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
+from pydantic import JsonValue
 
 import exp
 import exp.runtime.models.registry as runtime_model_registry
@@ -23,12 +24,19 @@ from exp.common.project import (
     ProjectStoreError,
     ProjectTracePreparationSettings,
     artifact_input,
+    write_project_config,
 )
 from exp.common.project.paths import ProjectPaths
 from exp.common.project.testing import RawArtifact
 from exp.common.traces import Trace, TraceSource, TraceSpan
 from exp.common.traces.ingest.otlp import TraceNormalizationIssue, TraceNormalizationResult
-from exp.simulation.build import build_project, build_task_set
+from exp.simulation.build import (
+    SupersededBuildReviewError,
+    build_project,
+    build_task_set,
+    parse_build_review,
+    select_build_review,
+)
 from exp.simulation.mining.service import MiningSpec
 
 _PROVIDER_FREE_REVISION = "a" * 40
@@ -175,7 +183,13 @@ def test_package_root_prepares_and_reopens_exact_provider_free_project_stage(
     config = store.load_project()
     trace_manifest = store.artifacts.read(first.trace_dataset.artifact_id).manifest
     task_manifest = store.artifacts.read(first.task_set.artifact_id).manifest
-    assert set(first.model_dump()) == {"schema_version", "trace_dataset", "task_set"}
+    assert set(first.model_dump()) == {
+        "schema_version",
+        "trace_dataset",
+        "task_set",
+        "descriptor_embedder",
+    }
+    assert first.descriptor_embedder == "hashing-descriptor-v3"
     assert trace_manifest.source is not None
     assert trace_manifest.source.source_id == "platform-trace-source:source-123"
     assert trace_manifest.code_revision == _PROVIDER_FREE_REVISION
@@ -524,3 +538,110 @@ def test_build_project_keeps_unselected_candidates_local_and_verifies_replay_pay
             code_revision="test-revision",
             mining_spec=MiningSpec(fit_task_budget=1, held_out_task_budget=1),
         )
+
+
+def _superseded_review(
+    tmp_path: Path, version: str = "hashing-descriptor-v1"
+) -> tuple[ProjectStore, build_module.BuildReviewReadiness]:
+    """Store a review recorded under an earlier descriptor grouping, beside a current one.
+
+    Returns:
+        The project store holding the earlier review with build-scoped judge state, and a
+        review freshly mined under the current version.
+    """
+    store = ProjectStore(tmp_path, "project-a")
+    store.initialize(ProjectConfig(project_id="project-a"))
+    current = build_project(
+        TraceNormalizationResult(traces=tuple(_trace(index) for index in range(100)), issues=()),
+        store,
+        created_at=datetime(2026, 8, 11, tzinfo=UTC),
+        code_revision="test-revision",
+        mining_spec=MiningSpec(fit_task_budget=1, held_out_task_budget=1),
+    ).review
+    binding = current.model_dump(mode="json", exclude={"readiness_id"})
+    binding["descriptor_embedder"] = version
+    earlier = {**binding, "readiness_id": build_module._build_review_id(binding)}
+    store.write_review({"build_review": earlier, "manual_judge": {"bound": "earlier"}})
+    return store, current
+
+
+@pytest.mark.parametrize("version", ["hashing-descriptor-v1", "hashing-descriptor-v2"])
+def test_a_review_grouped_under_another_descriptor_version_is_refused_with_the_remedy(
+    tmp_path: Path,
+    version: str,
+) -> None:
+    """An earlier build's lineages are never reused or silently relabeled as current."""
+    store, current = _superseded_review(tmp_path, version)
+    stored = store.read_review()
+    assert isinstance(stored, dict)
+
+    with pytest.raises(SupersededBuildReviewError) as refused:
+        parse_build_review(stored["build_review"])
+
+    message = str(refused.value)
+    assert version in message and "hashing-descriptor-v3" in message
+    assert "run exp build" in message
+    assert parse_build_review(current.model_dump(mode="json")) == current
+
+
+def test_only_a_freshly_mined_review_replaces_one_grouped_under_another_version(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A rebuild replaces the earlier review and its judge state; a relabel is refused."""
+    store, current = _superseded_review(tmp_path)
+    monkeypatch.setattr(build_module, "_completed_build_matches_review", lambda *_: True)
+
+    with pytest.raises(SupersededBuildReviewError, match="run exp build"):
+        select_build_review(store, current)
+    stored = store.read_review()
+    assert isinstance(stored, dict)
+    assert stored["build_review"]["descriptor_embedder"] == "hashing-descriptor-v1"
+
+    select_build_review(store, current, replace_superseded=True)
+
+    assert store.read_review() == {"build_review": current.model_dump(mode="json")}
+
+
+@pytest.mark.parametrize("include_pin,pin", [(False, None), (True, None), (True, 7)])
+def test_stored_review_requires_an_explicit_descriptor_grouping_version(
+    tmp_path: Path, include_pin: bool, pin: JsonValue
+) -> None:
+    """A missing or invalid stored pin cannot inherit the fresh-construction default."""
+    _, current = _superseded_review(tmp_path)
+    binding = current.model_dump(mode="json")
+    if include_pin:
+        binding["descriptor_embedder"] = pin
+    else:
+        binding.pop("descriptor_embedder")
+
+    with pytest.raises(
+        SupersededBuildReviewError, match="no valid descriptor grouping.*run exp build"
+    ):
+        parse_build_review(binding)
+
+
+@pytest.mark.parametrize("version", [None, "hashing-descriptor-v2"])
+def test_a_provider_free_stage_mined_under_another_version_is_not_relabeled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, version: str | None
+) -> None:
+    """A hosted review of an older stage is refused, never stamped with the current version."""
+    _fix_provider_free_revision(monkeypatch)
+    root = tmp_path / ".exp"
+    stage = exp.prepare_project_traces(
+        "support-project",
+        _chat_export(tmp_path / "upload.json"),
+        root=root,
+        source_id="platform-trace-source:source-123",
+        settings=_provider_free_settings(),
+    )
+    store = ProjectStore(root, "support-project")
+    assert build_module.provider_free_build_review(store).descriptor_embedder == (
+        "hashing-descriptor-v3"
+    )
+    older = stage.model_copy(update={"descriptor_embedder": version})
+    write_project_config(
+        store.paths, store.load_project().model_copy(update={"provider_free_stage": older})
+    )
+
+    with pytest.raises(SupersededBuildReviewError, match="hashing-descriptor-v3.*new project"):
+        build_module.provider_free_build_review(store)

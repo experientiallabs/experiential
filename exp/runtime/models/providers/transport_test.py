@@ -21,6 +21,7 @@ from exp.runtime.models.providers.transport import (
     is_known_unbilled_failure,
     parse_retry_after,
     provider_ssl_context,
+    public_error_code,
     run_with_retry,
 )
 
@@ -340,3 +341,28 @@ def test_httpx_preserves_only_retry_delay_on_untrusted_response(body: bytes) -> 
         else:
             assert response.retry_after_seconds == 1
             assert not response.known_unbilled
+
+
+def test_a_refusal_keeps_only_its_identifier_code() -> None:
+    """A short ``error.code`` identifier is retained; messages and free text never are."""
+    transport = ScriptedJsonTransport(
+        [
+            JsonHttpResponse(
+                status_code=400,
+                body={"error": {"code": "invalid_provider_stream", "message": "private detail"}},
+            )
+        ]
+    )
+    with pytest.raises(ProviderTransportError) as raised:
+        get_json(
+            transport,
+            "https://provider.test/v1/models",
+            headers={},
+            timeout_seconds=1.0,
+            retry_policy=_IMMEDIATE_RETRY,
+        )
+    assert raised.value.error_code == "invalid_provider_stream"
+    assert "private detail" not in str(raised.value)
+    assert public_error_code({"error": {"code": "Not An Identifier, sk-123"}}) is None
+    assert public_error_code({"error": "flat"}) is None
+    assert ProviderTransportError("x", status_code=503, error_code="a b").error_code is None

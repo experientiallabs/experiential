@@ -17,9 +17,11 @@ from exp.simulation.world_model.dreaming import DreamSource, consolidate_memory
 from exp.simulation.world_model.experience_memory import (
     Eligibility,
     memory_view,
-    persist_trajectory_source,
     read_memory_version,
     reserved_task_lineages,
+)
+from exp.simulation.world_model.experience_sources import (
+    persist_trajectory_source,
 )
 from exp.simulation.world_model.resumption import Resumption
 

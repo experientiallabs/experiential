@@ -1,5 +1,10 @@
 """Customer executable-environment contracts."""
 
+from exp.runtime.environments.containment.contract import (
+    LocalProcessCleanupError,
+    LocalProcessCrashError,
+    ResourceLimits,
+)
 from exp.runtime.environments.harbor import (
     BOUNDED_CLEANUP_CONTRACT,
     HarborCleanupResult,
@@ -13,14 +18,13 @@ from exp.runtime.environments.harbor import (
     HarborTranscriptEntry,
 )
 from exp.runtime.environments.interface import (
+    ContainedEnvironmentRuntime,
     EnvironmentResetError,
     EnvironmentRuntime,
     EnvironmentSession,
     Observation,
 )
 from exp.runtime.environments.local import (
-    LocalProcessCleanupError,
-    LocalProcessCrashError,
     LocalProcessEnvironmentRuntime,
     LocalProcessLimits,
     LocalProcessProtocolError,
@@ -61,6 +65,7 @@ __all__ = [
     "AuthorityError",
     "BOUNDED_CLEANUP_CONTRACT",
     "CheckpointableSession",
+    "ContainedEnvironmentRuntime",
     "EnvironmentResetError",
     "EnvironmentRuntime",
     "EnvironmentSession",
@@ -86,6 +91,7 @@ __all__ = [
     "MixedRealityPolicy",
     "NativeImage",
     "Observation",
+    "ResourceLimits",
     "RestorableEnvironmentRuntime",
     "RestoreError",
     "StateDomain",

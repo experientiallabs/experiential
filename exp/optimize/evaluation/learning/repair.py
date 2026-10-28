@@ -1,15 +1,18 @@
-"""Explicit observation-only settlement of finalized failed fidelity investigations.
+"""Explicit operator settlements of learning runs that cannot complete on their own.
 
-Repair never redraws predictions or investigations. It retains the original report and paid
-responses, records an operator's decision to abstain from the missing hypotheses, and consumes
-the disclosed observations against an explicitly named memory head.
+Repair never redraws predictions or investigations. Observation retention keeps the original
+report and paid responses, records an operator's decision to abstain from the missing
+hypotheses, and consumes the disclosed observations against an explicitly named memory head.
+Trace retirement records an operator's decision never to learn one named trace: it stays
+unscored, every report counts it as not learned, and memory is not edited
+(:mod:`exp.optimize.evaluation.learning.retirement`).
 """
 
 import json
 from datetime import UTC, datetime
 from typing import Literal
 
-from filelock import FileLock
+from filelock import FileLock, Timeout
 from pydantic import Field
 
 from exp.common.core.artifacts import (
@@ -29,14 +32,31 @@ from exp.optimize.evaluation.fidelity.memory import (
     memory_lines,
     trajectory_record,
 )
+from exp.optimize.evaluation.fidelity.replay import DEADLINE
 from exp.optimize.evaluation.fidelity.runner import PreparedFidelity, saved_fidelity_report
+from exp.optimize.evaluation.learning.retirement import (
+    TraceRetirement,
+    retire,
+    retirement_of,
+    trace_refusals,
+)
+from exp.optimize.evaluation.learning.traces import (
+    Scope,
+    learning_cases,
+    learning_plan,
+    learning_spec,
+    recorded_plan,
+    registered_attempts,
+)
 from exp.simulation.world_model.experience_memory import (
     MemoryVersion,
-    consumed_trajectory_digest,
     memory_head,
     publish_trajectory,
     read_memory_version,
     require_memory_scope,
+)
+from exp.simulation.world_model.experience_sources import (
+    consumed_trajectory_digest,
 )
 from exp.simulation.world_model.runtime import load_grounded_world_model_artifact
 
@@ -57,6 +77,120 @@ class LearningRepairSpec(ContractModel):
     parent: ArtifactInput | None = None
     reason: str = Field(min_length=1, max_length=4000)
     resolution: Literal["retain-observations"] = "retain-observations"
+
+
+class TraceRetirementRequest(ContractModel):
+    """Operator retirement of one named learning trace that will never be learned.
+
+    Attributes:
+        resolution: Selects trace retirement in the ``repair-learning`` action.
+        scope: Learning memory to retire it from: the audit's ``fit`` memory or ``all``.
+        trace_id: Trace to retire; it must be in scope, unlearned and without a saved score.
+        reason: Operator's explanation, recorded with the retirement.
+    """
+
+    resolution: Literal["retire-trace"]
+    scope: Scope = "fit"
+    trace_id: str = Field(min_length=1, max_length=512)
+    reason: str = Field(min_length=1, max_length=4000)
+
+
+def retire_trace(
+    project: ProjectStore,
+    request: TraceRetirementRequest,
+    *,
+    code_revision: str,
+    dry_run: bool = False,
+) -> JsonObject:
+    """Retire one named trace from a learning memory, with no model calls and no memory edit.
+
+    The trace must be one of the scope's learning traces (held-out traces are never learned,
+    so they are never retired), not learned, without a saved measurement, and not running in
+    another process. Refusals recorded for it are attached as evidence. Retiring it again with
+    the same reason replays.
+
+    Args:
+        project: Project with a recorded learning plan in ``request.scope``.
+        request: The trace and the operator's reason.
+        code_revision: Producing implementation identity.
+        dry_run: Validate only; nothing is written.
+
+    Returns:
+        The recorded retirement, or a validated dry-run description.
+
+    Raises:
+        ValueError: The trace cannot be retired; the message says why.
+    """
+    if not request.reason.strip():
+        raise ValueError("trace retirement needs a nonblank operator reason")
+    if not recorded_plan(project, request.scope):
+        raise ValueError(f"no {request.scope} learning is recorded; learn before retiring")
+    plan = learning_plan(project, scope=request.scope)
+    case = next(
+        (row for row in learning_cases(project, plan.scope) if row.trace_id == request.trace_id),
+        None,
+    )
+    if case is None:
+        raise ValueError(
+            f"trace {request.trace_id} is not a {request.scope} learning trace of this build; "
+            "held-out traces are never learned, so they cannot be retired"
+        )
+    saved = retirement_of(project, plan.lineage, case.trace_id)
+    if saved is not None and saved.cause == "operator" and saved.reason == request.reason:
+        return _retired(saved, replayed=True)
+    head = memory_head(project.artifacts, plan.lineage)
+    spec = learning_spec(project, plan, case, deadline=datetime.now(UTC) + DEADLINE)
+    digest = consumed_trajectory_digest(trajectory_record(spec))
+    if head is not None and digest in head.consumed:
+        raise ValueError(f"trace {case.trace_id} is already learned into memory {plan.lineage}")
+    attempts = registered_attempts(project, plan, case)
+    if any(saved_fidelity_report(project, prepared) is not None for prepared in attempts):
+        raise ValueError(
+            f"trace {case.trace_id} already has a saved learning measurement; it is counted as "
+            "learned or not learned already and cannot be retired"
+        )
+    for prepared in attempts:
+        lock = FileLock(project.artifacts.project_directory / (prepared.id + ".lock"))
+        try:
+            lock.acquire(timeout=0)
+        except Timeout as error:
+            raise ValueError(
+                f"trace {case.trace_id} is being learned by another process; retry once it stops"
+            ) from error
+        lock.release()
+    refusals = trace_refusals(project, plan.lineage, case.trace_id)
+    retirement = TraceRetirement(
+        lineage=plan.lineage,
+        trace_id=case.trace_id,
+        cause="operator",
+        reason=request.reason,
+        run=attempts[-1].id if attempts else None,
+        refusals=refusals,
+        head_version=0 if head is None else head.version,
+    )
+    if dry_run:
+        return {"validated": True, **_retired(retirement, replayed=False)}
+    retire(
+        project,
+        retirement,
+        now=datetime.now(UTC),
+        code_revision=code_revision,
+        unconsumed=digest,
+    )
+    return _retired(retirement, replayed=False)
+
+
+def _retired(retirement: TraceRetirement, *, replayed: bool) -> JsonObject:
+    """The JSON result of a trace retirement."""
+    return {
+        "retired": retirement.trace_id,
+        "lineage": retirement.lineage,
+        "cause": retirement.cause,
+        "reason": retirement.reason,
+        "refusals": len(retirement.refusals),
+        "replayed": replayed,
+        "provider_calls": 0,
+    }
 
 
 def repair_learning(

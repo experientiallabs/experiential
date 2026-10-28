@@ -28,6 +28,7 @@ from exp.runtime.models.providers.transport import (
     is_unbilled_attempt,
     parse_retry_after,
     provider_ssl_context,
+    public_error_code,
     retain_request_attempt_evidence,
     retry_delay_seconds,
     transport_error_message,
@@ -680,4 +681,5 @@ def _successful_body(response: JsonHttpResponse) -> JsonObject:
         status_code=response.status_code,
         retry_after_seconds=response.retry_after_seconds,
         known_unbilled=response.known_unbilled,
+        error_code=public_error_code(response.body),
     )

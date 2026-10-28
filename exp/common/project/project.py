@@ -190,11 +190,16 @@ class ProjectTracePreparationSettings(ContractModel):
 
 
 class ProjectProviderFreeStage(ContractModel):
-    """Exact immutable trace and task pointers selected before provider-backed work."""
+    """Exact immutable trace and task pointers selected before provider-backed work.
+
+    ``descriptor_embedder`` is the descriptor grouping version the task set's lineages and
+    fit/held-out split were mined under; a stage selected before it was recorded has none.
+    """
 
     schema_version: int = 1
     trace_dataset: ArtifactInput
     task_set: ArtifactInput
+    descriptor_embedder: str | None = None
 
     @model_validator(mode="after")
     def _require_distinct_artifacts(self) -> ProjectProviderFreeStage:

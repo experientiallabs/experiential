@@ -50,9 +50,11 @@ from exp.optimize.evaluation.fidelity.replay import (
 )
 from exp.optimize.evaluation.fidelity.runner import FidelityMemory, FidelitySpec, PreparedFidelity
 from exp.optimize.evaluation.learning.lessons import latest_lesson_set
+from exp.optimize.evaluation.learning.retirement import RetiredTrace, retired_traces
 from exp.optimize.evaluation.learning.traces import (
     Scope,
     fit_calls,
+    fit_cases,
     learned_runs,
     learning_plan,
     recorded_plan,
@@ -77,6 +79,8 @@ class AuditCheckpoint(ContractModel):
         scope: Traces that memory learned; ``fit`` reserves every held-out lineage. An
             all-traces build learns into a different lineage, which this checkpoint is not.
         fit_traces_learned: Fit traces consumed into memory when the audit was planned.
+        retired: Fit traces retired from that memory, never learned and never scored, each
+            with its cause, reason and immutable retirement record.
         memory: What the replays read of the checkpoint: all of it, nothing, or its lessons.
         lessons: Lesson set read under the ``lessons`` memory profile.
     """
@@ -85,6 +89,7 @@ class AuditCheckpoint(ContractModel):
     version: int = Field(ge=1)
     scope: Scope
     fit_traces_learned: int = Field(ge=0)
+    retired: tuple[RetiredTrace, ...] = Field(default=(), exclude_if=lambda value: not value)
     memory: MemoryProfile = Field(default="learned", exclude_if=lambda value: value == "learned")
     lessons: ArtifactInput | None = Field(default=None, exclude_if=lambda value: value is None)
 
@@ -336,6 +341,9 @@ def plan_held_out_panel(
             version=head.version,
             scope=plan.scope,
             fit_traces_learned=len(learned_runs(project, plan)),
+            retired=retired_traces(
+                project, plan.lineage, tuple(case.trace_id for case in fit_cases(project))
+            ),
             memory=memory_profile,
             lessons=lessons,
         )

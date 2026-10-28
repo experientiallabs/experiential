@@ -41,6 +41,7 @@ from exp.runtime.environments import (
     EnvironmentSession,
     LocalProcessEnvironmentRuntime,
 )
+from exp.runtime.environments.containment.host import host_containment
 from exp.runtime.models import ResolvedModel
 from exp.simulation import (
     PairedSimulationCell,
@@ -71,6 +72,7 @@ _LOCK_AT = datetime(2026, 8, 12, 11, tzinfo=UTC)
 _EVIDENCE_AT = datetime(2026, 8, 12, 12, tzinfo=UTC)
 _COMPARISON_AT = datetime(2026, 8, 12, 13, tzinfo=UTC)
 _REPORT_AT = datetime(2026, 8, 12, 14, tzinfo=UTC)
+_LOCAL_REFUSAL = host_containment().report.refusal
 _ENVIRONMENT_SHA256 = "e" * 64
 
 
@@ -121,8 +123,8 @@ class _CountingEnvironmentRuntime:
 
 
 @pytest.mark.skipif(
-    sys.platform != "darwin",
-    reason="the bounded LocalProcessEnvironmentRuntime is intentionally Darwin-only",
+    _LOCAL_REFUSAL is not None,
+    reason=f"this host refuses local process containment: {_LOCAL_REFUSAL}",
 )
 def test_w16_actual_text_and_local_process_comparison_preserves_failure_denominator(
     tmp_path: Path,

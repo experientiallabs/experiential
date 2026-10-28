@@ -664,7 +664,11 @@ the re-dispatches by stage and the affected traces, and adds the score over unaf
 only and over re-attempted traces only, each with its denominator; nothing is dropped by
 default. A learning trace that saves a result but is
 not learned (for example after a failed investigation) is retried up to three times in the same
-pass; any trace still not learned is reported separately.
+pass; any trace still not learned is reported separately. A trace whose identical request the
+gateway refuses deterministically (`invalid_provider_stream`) is retired after three refusals
+under `--retry-incomplete`, and an operator can retire a stuck trace by name with the
+`repair-learning` `retire-trace` resolution; a retired trace is counted as not learned, never
+scored, and memory is unchanged ([reference](reference/learning-retirement.md)).
 Every trace is predicted whole before any of its replies is disclosed;
 investigations of its misses then run together, so a failed investigation never prevents a
 prediction. A trace's first saved measurement fixes its score, including unanswered turns as
@@ -944,3 +948,5 @@ studies and campaigns, witnessed SFT export, trajectory trace export, learning r
 screening and library evolution), saved-evidence analysis, environment comparison, task-factory
 authoring and executable Harbor tasks. Every action, its payload and the Harbor reward contract
 are documented in [docs/reference/continuations-and-harbor.md](reference/continuations-and-harbor.md).
+Trajectory-count selection (`sample-count`), summary forgetting (`forget-summary`) and judge
+challenge studies (`challenge-judges`) are in [evaluation-procedures.md](reference/evaluation-procedures.md).

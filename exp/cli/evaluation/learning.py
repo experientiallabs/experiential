@@ -20,6 +20,11 @@ from exp.cli.shared.progress import progress_display
 from exp.common.progress import ProgressHook
 from exp.common.project import ProjectStore
 from exp.optimize.evaluation.fidelity.replay import DEADLINE
+from exp.optimize.evaluation.learning.retirement import (
+    RETIREMENT_FAILURES,
+    SystemicRefusalError,
+    retired_traces,
+)
 from exp.optimize.evaluation.learning.traces import (
     LearningOutcome,
     Scope,
@@ -30,7 +35,7 @@ from exp.optimize.evaluation.learning.traces import (
     learning_progress,
     learning_spec,
 )
-from exp.simulation.evaluation.workflow import INFRASTRUCTURE_STOPS
+from exp.simulation.evaluation.workflow import INFRASTRUCTURE_STOPS, deterministic_refusal
 
 
 def run_learning(
@@ -119,7 +124,8 @@ def run_learning(
         f"(all traces need at most {ceiling:,})"
     )
     scored, _ = learning_progress(store, plan)
-    if len(scored) == len(cases) and all(learned for *_, learned in scored):
+    retired = retired_traces(store, plan.lineage, tuple(case.trace_id for case in cases))
+    if len(scored) + len(retired) == len(cases) and all(learned for *_, learned in scored):
         # Every trace is already learned: the pass replays saved runs without provider calls.
         console.print(Text("Saved results. No provider calls.", style="dim"))
     else:
@@ -155,8 +161,19 @@ def run_learning(
                 evidence_reading=evidence_reading,
                 dream_every=dream_every,
             )
+    except SystemicRefusalError as exc:
+        screen.print(f"[red]error[/red] {exc}")
+        screen.print("Learned and retired traces are saved; nothing more was retired.")
+        raise typer.Exit(code=1) from exc
     except INFRASTRUCTURE_STOPS as exc:
         screen.print(f"[red]error[/red] {stop_reason(exc)}")
+        refusal = deterministic_refusal(exc)
+        if refusal is not None:
+            screen.print(
+                f"The gateway refused this exact request ({refusal.error_code}). Resending it "
+                f"with --retry-incomplete retires the trace as not learned after "
+                f"{RETIREMENT_FAILURES} identical refusals, then learning continues."
+            )
         screen.print(
             "Learned traces are saved. The stopped trace is never bought again silently: "
             "run the same command with --retry-incomplete to resume it."
@@ -172,6 +189,11 @@ def run_learning(
             f"[yellow]warning[/yellow] {outcome.incomplete} trace(s) have incomplete saved "
             "results and were not learned. Saved predictions are never re-purchased. "
             "--retry-incomplete resumes interrupted runs, not finalized reports."
+        )
+    for row in retired_traces(store, plan.lineage, tuple(case.trace_id for case in cases)):
+        console.print(
+            f"[yellow]retired[/yellow] trace {row.trace_id} ({row.cause}): {row.reason}; "
+            "not learned and not scored"
         )
     if outcome.stopped is not None:
         console.print(f"[yellow]warning[/yellow] {outcome.stopped}")

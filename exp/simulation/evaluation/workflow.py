@@ -41,6 +41,33 @@ INFRASTRUCTURE_STOPS: tuple[type[BaseException], ...] = (
     RequestAdmissionRefused,
 )
 
+# Gateway error codes of a definite response that refuses the request itself, rather than an
+# outage: the provider's stream for this exact request could not be encoded as a valid reply.
+# Resending the identical request repeats it, so a learning pass may retire the trace after a
+# bounded number of identical failures. Transport outages, timeouts, overload and unknown
+# outcomes are never listed here: they stay resumable.
+DETERMINISTIC_REFUSALS: frozenset[str] = frozenset({"invalid_provider_stream"})
+
+
+def deterministic_refusal(error: BaseException) -> ProviderTransportError | None:
+    """The error, when it is a registered refusal of an identifiable request; else None.
+
+    Args:
+        error: A stop raised by a workflow.
+
+    Returns:
+        The provider error when it carries an HTTP status, a code in
+        ``DETERMINISTIC_REFUSALS`` and the digest of the request it refused.
+    """
+    if (
+        isinstance(error, ProviderTransportError)
+        and error.status_code is not None
+        and error.error_code in DETERMINISTIC_REFUSALS
+        and error.request_sha256 is not None
+    ):
+        return error
+    return None
+
 
 class FixedWorkflow(ContractModel):
     """Prospectively declared actions and task, independent of native reference outcomes.

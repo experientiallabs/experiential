@@ -78,7 +78,8 @@ on the exact release checkout.
 - W16 router evidence uses 100 normalized traces, 50 fit tasks, 20 held-out tasks, 140 planned
   cells, 130 deterministic text simulations, and 140 deterministic judgments under one finite
   simulation and judgment budget. Observed hosted-service spend is exactly $0.00.
-- W16 sandbox evidence compares two exact post-lock text and Darwin local-process pairs. It retains
+- W16 sandbox evidence compares two exact post-lock text and local-process pairs on a host that
+  provides local process containment (Darwin, or Linux with unprivileged namespaces). It retains
   one malformed sandbox failure in the denominator and claims structural terminal agreement only.
 - Exact-checkout CI supplies the full 40-hex Git revision, recursively verifies every evidence
   artifact and manifest input, and publishes machine-readable JSON plus JUnit evidence.

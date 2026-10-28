@@ -7,7 +7,7 @@ import json
 import math
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Final, Literal, Protocol
 
 from pydantic import JsonValue
 
@@ -20,6 +20,15 @@ from exp.common.routing.features import (
 )
 from exp.common.tasks import ToolSchema
 from exp.common.traces import Trace
+
+DescriptorEmbedding = Literal["hashing-descriptor-v3"]
+DESCRIPTOR_EMBEDDING: Final[DescriptorEmbedding] = "hashing-descriptor-v3"
+"""Version of the descriptor similarity input and its local hashing embedding.
+
+A build records it. Changes to source lineage assignment, the similarity text rendered by
+``RoutingDescriptor.similarity_text``, or the hashing embedding change grouping and need a new
+version.
+"""
 
 
 class DescriptorEmbedder(Protocol):
@@ -79,6 +88,20 @@ class RoutingDescriptor:
         """
         record = RouterFeatureRecord.model_validate(self.canonical_payload())
         return RouterFeatureExtractor().render(record)
+
+    def similarity_text(self) -> str:
+        """Return normalized task intent for leakage grouping and selection geometry.
+
+        Tool catalogues, initial context and tags can contain arbitrarily large shared agent
+        policies or environment descriptions. They remain part of exact request identity and
+        the materialized task contract, but cannot overwhelm the instruction in similarity.
+        Declared task identities and conversation boundaries are joined separately by source
+        lineage assignment, so replay metadata cannot separate their forks.
+
+        Returns:
+            The normalized initial instruction without shared environment fields.
+        """
+        return self.intent
 
     def fingerprint(self) -> str:
         """Return the exact duplicate fingerprint of request-visible content."""
@@ -190,6 +213,10 @@ def normalized_vectors(
 ) -> tuple[tuple[float, ...], ...]:
     """Validate and unit-normalize one embedding vector per routing descriptor.
 
+    Each descriptor is embedded from :meth:`RoutingDescriptor.similarity_text`, so duplicate
+    grouping, core-set selection and coverage distances compare task content, never the shared
+    tool catalogue.
+
     Args:
         embedder: Injected deterministic or configured embedding implementation.
         descriptors: Request-visible descriptors to embed in order.
@@ -200,7 +227,7 @@ def normalized_vectors(
     Raises:
         ValueError: The injected embedder returns the wrong count, shape, or non-finite values.
     """
-    vectors = embedder.embed(tuple(descriptor.embedding_text() for descriptor in descriptors))
+    vectors = embedder.embed(tuple(descriptor.similarity_text() for descriptor in descriptors))
     if len(vectors) != len(descriptors):
         raise ValueError("descriptor embedder returned a vector count different from its inputs")
     normalized: list[tuple[float, ...]] = []

@@ -32,6 +32,10 @@ def load_stored_build_import(
 def project_for_build(root: Path, proposed: ProjectConfig) -> ProjectStore:
     """Initialize one project or verify mutable build pointers are the only difference.
 
+    The selected corpus is a build pointer: its import ID and declared format change together
+    when a project is rebuilt from another import, such as trajectories exported from its own
+    continuation studies. The build selects both atomically with the completed graph.
+
     Args:
         root: Local EXP root.
         proposed: Complete project configuration for this build invocation.
@@ -47,9 +51,7 @@ def project_for_build(root: Path, proposed: ProjectConfig) -> ProjectStore:
         store.initialize(proposed)
         return store
     existing = store.load_project()
-    if (
-        existing.model_copy(update={"build": None, "trace_import_id": proposed.trace_import_id})
-        != proposed
-    ):
+    pointers = {"trace_import_id": proposed.trace_import_id, "trace_source": proposed.trace_source}
+    if existing.model_copy(update={"build": None, **pointers}) != proposed:
         raise ValueError("project configuration already exists with different build configuration")
     return store

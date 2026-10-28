@@ -42,6 +42,7 @@ from exp.optimize.evaluation.factory.proposals import load_task_proposals
 from exp.optimize.evaluation.factory.runner import TaskFactorySpec
 from exp.optimize.evaluation.factory.variants import load_task_variant
 from exp.optimize.evaluation.fidelity.retrieval_binding import index_embedder_alias
+from exp.optimize.evaluation.tasks.challenge_runs import ChallengeRunSpec, challenge_attempts
 from exp.runtime.gateway.decisions_contracts import (
     MAX_DECISION_CRITERIA,
     MAX_DECISION_INPUT_BYTES,
@@ -91,6 +92,7 @@ CostedSpec = (
     | EquivalenceSpec
     | CandidateBatchSpec
     | TaskFactorySpec
+    | ChallengeRunSpec
 )
 
 
@@ -348,6 +350,11 @@ def evaluation_costs(project: ProjectStore, spec: CostedSpec) -> tuple[CostCompo
                     )
                 ),
             )
+        )
+    if isinstance(spec, ChallengeRunSpec):
+        return tuple(
+            model_cost(project, alias, attempts, spec.output_tokens)
+            for alias, attempts in challenge_attempts(spec).items()
         )
     raise ValueError(f"no cost inventory is defined for {type(spec).__name__}")
 

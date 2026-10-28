@@ -431,6 +431,7 @@ def build(
                     maximum_build_cost_usd=max(maximum_build_cost_usd, estimate or 0.0),
                     provider_spend_authorized=True,
                     trace_import_id=import_id,
+                    trace_source=source.strip().casefold(),
                     progress=pipeline.phase("index"),
                 )
             except BaseException:
@@ -773,6 +774,7 @@ def _complete_grounded_build(
     provider_spend_authorized: bool,
     progress: ProgressHook | None = None,
     trace_import_id: str | None = None,
+    trace_source: str | None = None,
 ) -> GroundedBuildCompletion:
     """Select matching grounded artifacts or execute their bounded embedding work.
 
@@ -788,6 +790,7 @@ def _complete_grounded_build(
         maximum_build_cost_usd: Invocation ceiling covering the explicitly approved estimate.
         provider_spend_authorized: Whether new embedding calls are authorized.
         trace_import_id: Exact stored corpus selected atomically with the completed graph.
+        trace_source: Declared format of that corpus, selected with it.
         progress: Optional observer of embedding, RAG, and finalization stages.
 
     Returns:
@@ -831,7 +834,13 @@ def _complete_grounded_build(
         )
     save_grounded_checkpoint(store, built)
     report(progress, "finalization")
-    select_completed_build(store, built, completed.review, trace_import_id=trace_import_id)
+    select_completed_build(
+        store,
+        built,
+        completed.review,
+        trace_import_id=trace_import_id,
+        trace_source=trace_source,
+    )
     return GroundedBuildCompletion(artifacts=built, reused=reused)
 
 

@@ -4,6 +4,7 @@ from datetime import UTC, datetime
 
 from exp.cli.evaluation.continuation_context import ContinuationContext
 from exp.common.progress import ProgressEvent
+from exp.common.project import artifact_input
 from exp.optimize.evaluation.equivalence.prefixes import (
     ActorPrefixSpec,
     admit_actor_prefix,
@@ -25,7 +26,7 @@ def handle_compare_environments(context: ContinuationContext, spec: EquivalenceS
         spec: Paired reference, repeated-reference and candidate studies with their council.
 
     Returns:
-        None. The measurements, judgments and analyses are printed to the console.
+        None. The saved report's reference, measurements, judgments and analyses are printed.
     """
     store, console, revision = context.store, context.console, context.revision
     saved = saved_equivalence(store, spec, code_revision=revision)
@@ -56,8 +57,11 @@ def handle_compare_environments(context: ContinuationContext, spec: EquivalenceS
         console.print(f"{event.stage}: {event.detail or ''}")
 
     result = saved or run_equivalence(store, spec, code_revision=revision, progress=progress)
+    # The exact saved report is a trajectory generator: export-traces takes this reference.
+    reference = artifact_input(store.artifacts.read(spec.identity(revision) + "-result").manifest)
     console.print_json(
         data={
+            "reference": reference.model_dump(mode="json"),
             "scope": result.scope,
             "metrics": result.metrics,
             "semantic_judgments": [
@@ -78,9 +82,7 @@ def handle_compare_environments(context: ContinuationContext, spec: EquivalenceS
             "analysis_failures": result.analysis_failures,
         }
     )
-    console.print(
-        f"Saved paired evidence: {spec.identity(revision)}-result. No training or promotion."
-    )
+    console.print(f"Saved paired evidence: {reference.artifact_id}. No training or promotion.")
 
 
 def handle_admit_actor_prefix(context: ContinuationContext, spec: ActorPrefixSpec) -> None:

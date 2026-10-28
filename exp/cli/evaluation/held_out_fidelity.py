@@ -376,7 +376,13 @@ def checkpoint_lines(checkpoint: AuditCheckpoint, simulator: str) -> tuple[str, 
     return (
         f"Audited checkpoint: memory {checkpoint.lineage} v{checkpoint.version}, "
         f"scope {checkpoint.scope}, {checkpoint.fit_traces_learned} fit traces learned, "
-        f"simulator {simulator} (held-out lineages reserved before learning)"
+        + (
+            f"{len(checkpoint.retired)} retired and not learned "
+            f"({', '.join(row.trace_id for row in checkpoint.retired)}), "
+            if checkpoint.retired
+            else ""
+        )
+        + f"simulator {simulator} (held-out lineages reserved before learning)"
         + _memory_note(checkpoint),
         "The build's all-traces memory is a different checkpoint "
         "and was not independently evaluated.",

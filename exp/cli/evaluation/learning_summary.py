@@ -68,6 +68,11 @@ def learning_lines(learning: LearningSummary, noun: str = "traces") -> tuple[str
             f"[yellow]warning[/yellow] {outcome.incomplete} trace(s) stopped on every allowed "
             "attempt and were not learned"
         )
+    if outcome.retired:
+        lines.append(
+            f"[yellow]warning[/yellow] {outcome.retired} trace(s) retired after deterministic "
+            "refusals or by an operator: not learned and not scored (named in the report)"
+        )
     if outcome.stopped is not None:
         lines.append(f"[yellow]warning[/yellow] {outcome.stopped}")
     retest = learning.retest
