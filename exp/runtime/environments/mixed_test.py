@@ -1,12 +1,13 @@
 """Behavioral tests for independently owned native and candidate sessions."""
 
+import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
 
 import pytest
 from pydantic import ValidationError
 
-from exp.common.core.artifacts import sha256_json
+from exp.common.core.artifacts import JsonObject, JsonValue, sha256_json
 from exp.common.models import NumericMeasurement, OperationEconomics, ToolCall
 from exp.common.tasks import TaskCase, ToolSchema
 from exp.runtime.environments.interface import Observation
@@ -17,6 +18,16 @@ from exp.runtime.environments.mixed import (
     StepPrediction,
     StepResult,
     ToolRoute,
+)
+from exp.runtime.environments.record_world import RecordTool, RecordWorldFactory
+from exp.runtime.environments.worlds import (
+    ExecutableWorldRuntime,
+    RestoreError,
+    StateDomain,
+    ToolEffectPolicy,
+    WorldAccess,
+    WorldContext,
+    WorldManifest,
 )
 
 
@@ -494,3 +505,203 @@ def test_failed_prediction_persistence_prevents_native_dispatch() -> None:
             session.execute(ToolCall(call_id="again", name="write"))
     assert len(candidate.actions) == 1
     assert not native.actions
+
+
+ORDERS_SCHEMA = "CREATE TABLE orders (id INTEGER PRIMARY KEY, item TEXT NOT NULL);"
+REFUNDS_SCHEMA = "CREATE TABLE refunds (id INTEGER PRIMARY KEY, amount INTEGER NOT NULL);"
+
+
+def _orders(arguments: JsonObject) -> WorldAccess:
+    """Orders are native records."""
+    del arguments
+    return WorldAccess(reads=frozenset({"orders"}), writes=frozenset({"orders"}))
+
+
+def _refunds(arguments: JsonObject) -> WorldAccess:
+    """Refunds are simulated records."""
+    del arguments
+    return WorldAccess(reads=frozenset({"refunds"}), writes=frozenset({"refunds"}))
+
+
+def place_order(db: sqlite3.Connection, arguments: JsonObject, context: WorldContext) -> JsonValue:
+    """Insert one native order."""
+    del context
+    cursor = db.execute("INSERT INTO orders (item) VALUES (?)", (arguments["item"],))
+    return {"order": cursor.lastrowid}
+
+
+def refund(db: sqlite3.Connection, arguments: JsonObject, context: WorldContext) -> JsonValue:
+    """Insert one simulated refund."""
+    del context
+    cursor = db.execute("INSERT INTO refunds (amount) VALUES (?)", (arguments["amount"],))
+    return {"refund": cursor.lastrowid}
+
+
+WORLD = WorldManifest(
+    domains=(
+        StateDomain(name="orders", owner="native"),
+        StateDomain(name="refunds", owner="simulated"),
+    ),
+    tools=(
+        ToolEffectPolicy(name="place_order", reads=("orders",), writes=("orders",)),
+        ToolEffectPolicy(name="refund", reads=("refunds",), writes=("refunds",), duration=2),
+    ),
+)
+
+
+def _world_policy(world: WorldManifest | None = WORLD, **modes: str) -> MixedRealityPolicy:
+    """Route orders natively and refunds to the candidate under one ownership contract."""
+    return MixedRealityPolicy.model_validate(
+        {
+            "native_identity": sha256_json({"native": "orders"}),
+            "candidate_identity": sha256_json({"candidate": "refunds"}),
+            "routes": [
+                {
+                    "name": "place_order",
+                    "mode": modes.get("place_order", "real"),
+                    "effect": "write",
+                },
+                {"name": "refund", "mode": modes.get("refund", "simulated"), "effect": "write"},
+            ],
+            "world": world,
+        }
+    )
+
+
+def _world_runtime(
+    events: list[StepIntent | StepPrediction | StepResult],
+) -> MixedRealityEnvironmentRuntime:
+    """Bind a native SQLite orders world and a simulated SQLite refunds world."""
+    native = ExecutableWorldRuntime(
+        WORLD,
+        RecordWorldFactory(
+            service={"name": "orders"},
+            schema=ORDERS_SCHEMA,
+            tools={"place_order": RecordTool(access=_orders, run=place_order)},
+        ),
+    )
+    candidate = ExecutableWorldRuntime(
+        WORLD,
+        RecordWorldFactory(
+            service={"name": "refunds"},
+            schema=REFUNDS_SCHEMA,
+            tools={"refund": RecordTool(access=_refunds, run=refund)},
+        ),
+        owner="simulated",
+    )
+    return MixedRealityEnvironmentRuntime(
+        policy=_world_policy(), native=native, candidate=candidate, record=events.append
+    )
+
+
+def _order(call_id: str, item: str = "lamp") -> ToolCall:
+    """Place one native order."""
+    return ToolCall(call_id=call_id, name="place_order", arguments={"item": item})
+
+
+def _refund(call_id: str, amount: int = 5) -> ToolCall:
+    """Issue one simulated refund."""
+    return ToolCall(call_id=call_id, name="refund", arguments={"amount": amount})
+
+
+def test_world_manifest_admits_disjoint_mixed_routes_and_refuses_overlap() -> None:
+    """Native and simulated routes coexist only when each touches its own domains."""
+    assert _world_policy().world == WORLD
+    with pytest.raises(ValidationError, match="state ownership"):
+        _world_policy(world=None)
+    with pytest.raises(ValidationError, match="does not own"):
+        _world_policy(place_order="simulated")
+    with pytest.raises(ValidationError, match="does not own"):
+        _world_policy(refund="shadow")
+    reads_only = WORLD.model_copy(
+        update={"tools": (WORLD.tools[0].model_copy(update={"writes": ()}), WORLD.tools[1])}
+    )
+    with pytest.raises(ValidationError, match="disagrees"):
+        _world_policy(world=reads_only)
+    partial = WORLD.model_copy(update={"tools": WORLD.tools[:1]})
+    with pytest.raises(ValidationError, match="no declared world effect policy"):
+        _world_policy(world=partial)
+    with pytest.raises(ValueError, match="policy's world manifest"):
+        MixedRealityEnvironmentRuntime(
+            policy=_world_policy(),
+            native=ExecutableWorldRuntime(
+                WORLD,
+                RecordWorldFactory(
+                    service={"name": "orders"},
+                    schema=ORDERS_SCHEMA,
+                    tools={"place_order": RecordTool(access=_orders, run=place_order)},
+                ),
+                owner="simulated",
+            ),
+            candidate=_Runtime([]),
+            record=lambda event: None,
+        )
+
+
+def test_mixed_episode_checkpoints_and_forks_across_native_and_simulated_domains() -> None:
+    """A fork's native and simulated effects never reach the parent or a sibling."""
+    events: list[StepIntent | StepPrediction | StepResult] = []
+    runtime = _world_runtime(events)
+    task = _task("place_order", "refund")
+    with runtime.open(task) as parent:
+        parent.execute(_order("o1"))
+        parent.execute(_refund("r1"))
+        saved = parent.checkpoint()
+        assert saved.sequence == 2
+        assert saved.native is not None and saved.candidate is not None
+        assert saved.native.clock == saved.candidate.clock == 3
+        with runtime.restore(task, saved) as left, runtime.restore(task, saved) as right:
+            left.execute(_order("o2", "desk"))
+            right.execute(_refund("r2", 9))
+            assert parent.checkpoint() == saved
+            left_state, right_state = left.checkpoint(), right.checkpoint()
+            assert left_state.native != saved.native and left_state.candidate is not None
+            assert left_state.candidate.image == saved.candidate.image
+            assert right_state.native is not None and right_state.candidate is not None
+            assert right_state.native.image == saved.native.image
+            assert right_state.candidate.image != saved.candidate.image
+            assert left_state.native is not None
+            assert left_state.native.clock == left_state.candidate.clock == 4
+            assert right_state.native.clock == right_state.candidate.clock == 5
+            assert {left_state.episode_id, right_state.episode_id}.isdisjoint({saved.episode_id})
+    intents = [event for event in events if isinstance(event, StepIntent)]
+    assert [intent.operation_id.rsplit("-", 1)[1] for intent in intents] == ["1", "2", "3", "3"]
+    assert len({intent.operation_id for intent in intents}) == 4
+
+
+def test_mixed_restore_refuses_foreign_checkpoints_and_unrestorable_backends() -> None:
+    """Checkpoints bind policy and task; backends outside the contract cannot checkpoint."""
+    events: list[StepIntent | StepPrediction | StepResult] = []
+    runtime = _world_runtime(events)
+    task = _task("place_order", "refund")
+    with runtime.open(task) as session:
+        session.execute(_order("o1"))
+        saved = session.checkpoint()
+    foreign = saved.model_copy(update={"policy_sha256": "0" * 64})
+    with pytest.raises(RestoreError, match="routing policy"), runtime.restore(task, foreign):
+        pass
+    no_native = saved.model_copy(update={"native": None})
+    with pytest.raises(RestoreError, match="no native world"), runtime.restore(task, no_native):
+        pass
+    plain = MixedRealityEnvironmentRuntime(
+        policy=_policy(ToolRoute(name="read", mode="real", effect="read")),
+        native=_Runtime([_observation("ok")]),
+        candidate=None,
+        record=events.append,
+    )
+    with plain.open(_task("read")) as session:
+        session.execute(ToolCall(call_id="read-1", name="read", arguments={}))
+        with pytest.raises(RuntimeError, match="cannot checkpoint"):
+            session.checkpoint()
+
+
+def test_candidate_world_failure_stops_the_mixed_episode() -> None:
+    """A failed candidate-world call is rolled back there and the episode stops, unretried."""
+    events: list[StepIntent | StepPrediction | StepResult] = []
+    runtime = _world_runtime(events)
+    with runtime.open(_task("place_order", "refund")) as session:
+        session.execute(_refund("r1"))
+        with pytest.raises(RuntimeError, match="session is stopped"):
+            session.execute(ToolCall(call_id="bad", name="refund", arguments={}))
+        with pytest.raises(RuntimeError, match="cannot be checkpointed"):
+            session.checkpoint()

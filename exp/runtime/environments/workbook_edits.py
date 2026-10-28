@@ -26,6 +26,7 @@ from exp.common.core.artifacts import (
 )
 from exp.common.models import ToolCall
 from exp.runtime.environments.artifact_edits import MAX_ARTIFACT_BYTES, NativeArtifactOutput
+from exp.runtime.environments.worlds import WorldAccess
 
 _ALLOWED_PART = re.compile(
     r"(?:\[Content_Types\]\.xml|_rels/\.rels|docProps/(?:app|core)\.xml|"
@@ -88,6 +89,15 @@ class WorkbookEditAdapter:
             "normalization": "sorted ZIP members, fixed ZIP timestamps and core modified timestamp",
             "effects": "detached artifact bytes only",
         }
+
+    def access(self, action: ToolCall) -> WorldAccess:
+        """Resolve the workbook one edit reads and the workbook it writes, without applying it."""
+        if action.name != "edit_workbook":
+            raise ValueError("unsupported native tool; this adapter only accepts edit_workbook")
+        arguments = WorkbookEditArguments.model_validate(action.arguments)
+        return WorldAccess(
+            reads=frozenset({arguments.source}), writes=frozenset({arguments.destination})
+        )
 
     def apply(
         self,

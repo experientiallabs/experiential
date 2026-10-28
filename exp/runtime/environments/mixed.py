@@ -3,8 +3,15 @@
 Native results are authoritative for real and shadow routes. Shadow predictions use the
 candidate's own carried state and return before the native call. Their initial state
 correspondence is unverified; observed equality is not full-state fidelity. This runtime
-never publishes training memory, retries native calls, or restores interrupted episodes.
-The enclosing simulator owns episode leases and provider admission.
+never publishes training memory or retries native calls. The enclosing simulator owns episode
+leases and provider admission.
+
+Native and simulated routes may share one episode only under a world manifest that gives
+every state domain one owner and every routed tool domains of the owner that executes it
+(see ``worlds.py``). When both backends are executable worlds, the episode keeps one logical
+clock across them and can checkpoint and fork as a whole: a restore opens fresh, isolated
+backends and continues the step sequence under a new episode identity. Cross-ownership
+writes (branch or sync) remain refused by the manifest validator.
 """
 
 from __future__ import annotations
@@ -12,7 +19,7 @@ from __future__ import annotations
 import threading
 import time
 from collections.abc import Callable, Iterator
-from contextlib import ExitStack, contextmanager
+from contextlib import AbstractContextManager, ExitStack, contextmanager
 from typing import Literal, Never
 from uuid import uuid4
 
@@ -22,6 +29,19 @@ from exp.common.core.artifacts import ContractModel, Sha256, sha256_json
 from exp.common.models import NumericMeasurement, OperationEconomics, ToolCall, combine_economics
 from exp.common.tasks import TaskCase
 from exp.runtime.environments.interface import EnvironmentRuntime, EnvironmentSession, Observation
+from exp.runtime.environments.worlds import (
+    CheckpointableSession,
+    ExecutableCheckpoint,
+    ExecutableWorld,
+    ExecutableWorldRuntime,
+    RestorableEnvironmentRuntime,
+    RestoreError,
+    WorldManifest,
+)
+
+ComparisonScope = Literal[
+    "initial_correspondence_unverified", "divergent_prefix", "unpaired_prefix"
+]
 
 
 class ToolRoute(ContractModel):
@@ -44,17 +64,20 @@ class MixedRealityPolicy(ContractModel):
     Attributes:
         native_identity: Digest of native source, baseline state, and setup binding.
         candidate_identity: Digest of the frozen simulator and initialization binding.
-        routes: Unique exact routes. Candidate-only tools cannot share a native world
-            until a cross-store state ownership contract is implemented.
+        routes: Unique exact routes.
+        world: State ownership contract. Required when native and simulated routes share
+            an episode; when present, every route must be declared and execute only on the
+            owner of all its domains.
     """
 
     native_identity: Sha256 | None = None
     candidate_identity: Sha256 | None = None
     routes: tuple[ToolRoute, ...] = Field(min_length=1)
+    world: WorldManifest | None = None
 
     @model_validator(mode="after")
     def validate_authority(self) -> MixedRealityPolicy:
-        """Reject ambiguous tool names, absent identities, and unsupported state mixing."""
+        """Reject ambiguous tool names, absent identities, and unowned state mixing."""
         if len({route.name for route in self.routes}) != len(self.routes):
             raise ValueError("tool routes must have unique names")
         native = any(route.mode != "simulated" for route in self.routes)
@@ -63,8 +86,31 @@ class MixedRealityPolicy(ContractModel):
             raise ValueError("native routes require a frozen native identity")
         if candidate and self.candidate_identity is None:
             raise ValueError("candidate routes require a frozen candidate identity")
-        if native and any(route.mode == "simulated" for route in self.routes):
-            raise ValueError("mixed simulated/native routes require a state ownership contract")
+        if native and candidate and self.world is None:
+            if any(route.mode == "simulated" for route in self.routes):
+                raise ValueError(
+                    "mixed simulated/native routes require a state ownership contract; "
+                    "declare a world manifest that gives every domain one owner"
+                )
+        if self.world is not None:
+            owners = self.world.ownership()
+            declared = {tool.name: tool for tool in self.world.tools}
+            for route in self.routes:
+                tool = declared.get(route.name)
+                if tool is None:
+                    raise ValueError(f"route {route.name!r} has no declared world effect policy")
+                expected = "simulated" if route.mode == "simulated" else "native"
+                foreign = sorted(name for name in tool.domains() if owners[name] != expected)
+                if foreign:
+                    raise ValueError(
+                        f"{route.mode} route {route.name!r} touches {foreign!r}, which the "
+                        f"{expected} backend does not own; change the route or the ownership"
+                    )
+                if (route.effect == "write") != bool(tool.writes):
+                    raise ValueError(
+                        f"route {route.name!r} declares effect {route.effect!r} but its world "
+                        "policy disagrees"
+                    )
         return self
 
 
@@ -140,6 +186,30 @@ class StepResult(ContractModel):
     accounting_failure: str | None
 
 
+class MixedCheckpoint(ContractModel):
+    """A whole mixed episode, resumable in fresh, isolated backends.
+
+    Attributes:
+        policy_sha256: Complete routing, identity and ownership policy.
+        task_id: Public task identity used to open both sessions.
+        episode_id: Episode that was checkpointed; a restore starts a new one.
+        sequence: Steps already dispatched; a restore continues numbering after them.
+        native: Native backend world, absent when no route is native.
+        candidate: Candidate backend world, absent when no route uses the candidate.
+        scope: Candidate correspondence qualification carried into later shadow steps.
+        shadow_halted: Whether an earlier shadow failure halted the shadow track.
+    """
+
+    policy_sha256: Sha256
+    task_id: str
+    episode_id: str
+    sequence: int = Field(ge=0)
+    native: ExecutableCheckpoint | None
+    candidate: ExecutableCheckpoint | None
+    scope: ComparisonScope
+    shadow_halted: bool
+
+
 class MixedRealityEnvironmentRuntime:
     """Compose existing environment owners with required pre/post dispatch evidence.
 
@@ -164,14 +234,46 @@ class MixedRealityEnvironmentRuntime:
             raise ValueError("native routes require an executable native runtime")
         if any(route.mode != "real" for route in policy.routes) and candidate is None:
             raise ValueError("candidate routes require an executable candidate runtime")
+        if policy.world is not None:
+            for runtime, owner in ((native, "native"), (candidate, "simulated")):
+                if isinstance(runtime, ExecutableWorldRuntime) and (
+                    runtime.manifest != policy.world or runtime.owner != owner
+                ):
+                    raise ValueError(
+                        f"the {owner} executable world must use the policy's world manifest "
+                        f"and {owner} authority"
+                    )
         self.policy = policy
         self._native = native
         self._candidate = candidate
         self._record = record
 
     @contextmanager
-    def open(self, task: TaskCase) -> Iterator[EnvironmentSession]:
+    def open(self, task: TaskCase) -> Iterator[_MixedSession]:
         """Open independent sessions and remove evaluator-only answers from both inputs."""
+        with self._sessions(task, None) as session:
+            yield session
+
+    @contextmanager
+    def restore(self, task: TaskCase, checkpoint: MixedCheckpoint) -> Iterator[_MixedSession]:
+        """Resume a whole mixed episode in fresh, isolated backends under a new episode identity.
+
+        Raises:
+            RestoreError: The checkpoint belongs to another policy or task, or a bound
+                backend cannot restore executable-world checkpoints.
+        """
+        if checkpoint.policy_sha256 != sha256_json(self.policy):
+            raise RestoreError("mixed checkpoint was taken under another routing policy")
+        if checkpoint.task_id != task.task_id:
+            raise RestoreError("mixed checkpoint belongs to another task")
+        with self._sessions(task, checkpoint) as session:
+            yield session
+
+    @contextmanager
+    def _sessions(
+        self, task: TaskCase, checkpoint: MixedCheckpoint | None
+    ) -> Iterator[_MixedSession]:
+        """Open or restore both backends and compose them into one serialized session."""
         routed = {route.name for route in self.policy.routes}
         unavailable = {tool.name for tool in task.tools} - routed
         if unavailable:
@@ -185,14 +287,16 @@ class MixedRealityEnvironmentRuntime:
             if any(route.mode != "simulated" for route in self.policy.routes):
                 if self._native is None:
                     raise RuntimeError("native runtime binding is missing")
-                native = stack.enter_context(self._native.open(public_task.model_copy(deep=True)))
+                native = stack.enter_context(_open(self._native, public_task, checkpoint, "native"))
             if any(route.mode != "real" for route in self.policy.routes):
                 if self._candidate is None:
                     raise RuntimeError("candidate runtime binding is missing")
                 candidate = stack.enter_context(
-                    self._candidate.open(public_task.model_copy(deep=True))
+                    _open(self._candidate, public_task, checkpoint, "candidate")
                 )
             session = _MixedSession(self.policy, public_task, native, candidate, self._record)
+            if checkpoint is not None:
+                session.resume(checkpoint)
             try:
                 yield session
             finally:
@@ -211,6 +315,7 @@ class _MixedSession:
         record: Callable[[StepIntent | StepPrediction | StepResult], None],
     ) -> None:
         """Allocate a fresh episode; replay is exclusively the enclosing simulator's job."""
+        self._policy = policy
         self._policy_hash = sha256_json(policy)
         self._task_id = task.task_id
         permitted = {tool.name for tool in task.tools}
@@ -222,9 +327,7 @@ class _MixedSession:
         self._sequence = 0
         self._stopped = False
         self._shadow_halted = False
-        self._scope: Literal[
-            "initial_correspondence_unverified", "divergent_prefix", "unpaired_prefix"
-        ] = "initial_correspondence_unverified"
+        self._scope: ComparisonScope = "initial_correspondence_unverified"
         self._lock = threading.Lock()
 
     def execute(self, action: ToolCall) -> Observation:
@@ -253,6 +356,37 @@ class _MixedSession:
             except BaseException:
                 self._stopped = True
                 raise
+
+    def checkpoint(self) -> MixedCheckpoint:
+        """Checkpoint both backends and the episode's step and shadow state.
+
+        Raises:
+            RuntimeError: The session stopped, or a bound backend is not an executable world.
+        """
+        with self._lock:
+            if self._stopped:
+                raise RuntimeError("a stopped mixed episode cannot be checkpointed")
+            native = _checkpoint(self._native, "native")
+            candidate = _checkpoint(self._candidate, "candidate")
+            if native is not None and candidate is not None and native.clock != candidate.clock:
+                raise RuntimeError("native and candidate clocks diverged; the episode is unsound")
+            return MixedCheckpoint(
+                policy_sha256=self._policy_hash,
+                task_id=self._task_id,
+                episode_id=self._episode_id,
+                sequence=self._sequence,
+                native=native,
+                candidate=candidate,
+                scope=self._scope,
+                shadow_halted=self._shadow_halted,
+            )
+
+    def resume(self, checkpoint: MixedCheckpoint) -> None:
+        """Continue a checkpoint's step numbering and shadow state in this fresh episode."""
+        with self._lock:
+            self._sequence = checkpoint.sequence
+            self._scope = checkpoint.scope
+            self._shadow_halted = checkpoint.shadow_halted
 
     def stop(self) -> None:
         """Refuse execution before the owning context releases either backend."""
@@ -345,6 +479,8 @@ class _MixedSession:
             self._scope = "divergent_prefix"
         if intent.route.mode == "real" and intent.route.effect == "write":
             self._scope = "unpaired_prefix"
+        if failure is None:
+            self._align_clocks(intent, authority)
         if failure is not None:
             _raise_backend_failure("execution", failure)
         if accounting_failure is not None:
@@ -357,12 +493,51 @@ class _MixedSession:
             metadata={"economics": economics.model_dump(mode="json"), "authority": authority},
         )
 
+    def _align_clocks(self, intent: StepIntent, authority: Literal["native", "simulated"]) -> None:
+        """Advance the backend that did not execute, keeping one episode clock across worlds."""
+        if self._policy.world is None or intent.route.mode == "shadow":
+            return
+        idle = self._native if authority == "simulated" else self._candidate
+        if isinstance(idle, ExecutableWorld):
+            idle.advance(self._policy.world.tool(intent.action.name).duration)
+
     @staticmethod
     def _call(backend: EnvironmentSession | None, action: ToolCall) -> Observation:
         """Give a backend its own public action copy, without mutating the other's request."""
         if backend is None:
             raise RuntimeError("selected environment backend is not bound")
         return backend.execute(action.model_copy(deep=True))
+
+
+def _open(
+    runtime: EnvironmentRuntime,
+    task: TaskCase,
+    checkpoint: MixedCheckpoint | None,
+    side: Literal["native", "candidate"],
+) -> AbstractContextManager[EnvironmentSession]:
+    """Open a fresh backend session, or restore one side of a mixed checkpoint."""
+    if checkpoint is None:
+        return runtime.open(task.model_copy(deep=True))
+    world = checkpoint.native if side == "native" else checkpoint.candidate
+    if world is None:
+        raise RestoreError(f"mixed checkpoint has no {side} world for a bound {side} route")
+    if not isinstance(runtime, RestorableEnvironmentRuntime):
+        raise RestoreError(
+            f"the {side} runtime cannot restore checkpoints; bind an executable world"
+        )
+    return runtime.restore(task.model_copy(deep=True), world)
+
+
+def _checkpoint(session: EnvironmentSession | None, side: str) -> ExecutableCheckpoint | None:
+    """Checkpoint one bound backend, refusing backends outside the executable-world contract."""
+    if session is None:
+        return None
+    if not isinstance(session, CheckpointableSession):
+        raise RuntimeError(
+            f"the {side} session cannot checkpoint; bind an executable world that implements "
+            "the restorable environment contract"
+        )
+    return session.checkpoint()
 
 
 def _economics(observation: Observation | None) -> OperationEconomics:
