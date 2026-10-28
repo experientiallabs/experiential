@@ -188,6 +188,44 @@ def test_named_tool_output_uses_actual_schema_and_validates_response(tmp_path: P
     assert isinstance(refused.value.__cause__, ValidationError)
 
 
+@pytest.mark.parametrize(
+    "output",
+    [
+        AssistantAction(content='{"value": "current"}'),
+        AssistantAction(
+            tool_calls=(
+                ToolCall(call_id="one", name="submit_proposal", arguments={"value": "a"}),
+                ToolCall(call_id="two", name="submit_proposal", arguments={"value": "b"}),
+            )
+        ),
+    ],
+)
+def test_named_tool_output_refuses_what_an_automatic_choice_can_return(
+    tmp_path: Path, output: AssistantAction
+) -> None:
+    """A model steered to the tool by ``auto`` must still return exactly one call.
+
+    Text alone or a second call is retained, refused, and never bought again on replay.
+    """
+    complete, client, budget = setup(tmp_path, output)
+    caps = complete.plan.capabilities.model_copy(
+        update={"supports_tools": True, "supports_forced_tool_choice": False}
+    )
+    model = complete.plan.model.model_copy(update={"capabilities_sha256": caps.identity_sha256()})
+    client.model = model
+    complete.plan = complete.plan.model_copy(
+        update={"capabilities": caps, "model": model, "output_protocol": "tool"}
+    )
+    body: JsonObject = {
+        "messages": [{"role": "user", "content": "Submit JSON."}],
+        "response_schema": {"type": "object"},
+    }
+    for _ in range(2):
+        with pytest.raises(ReturnedOutputRejected, match="exactly one named"):
+            complete(body, "steered-answer")
+    assert len(client.requests) == 1 and budget.accounted_usd == 1
+
+
 def test_response_under_the_catalog_served_model_id_is_admitted(tmp_path: Path) -> None:
     """A provider may answer under its pinned served model ID, and under no other ID."""
     complete, client, _ = setup(tmp_path, AssistantAction(content="{}"))

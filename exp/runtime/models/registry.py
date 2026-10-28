@@ -428,6 +428,7 @@ class RuntimeModelCatalog:
                     supports_top_k=_supports_flag(capabilities, "supports_top_k"),
                     supports_reasoning=capabilities.supports_reasoning,
                     reasoning_effort=capabilities.reasoning_effort,
+                    supports_forced_tool_choice=capabilities.supports_forced_tool_choice,
                 )
                 return ResolvedModel(
                     alias,
@@ -574,6 +575,7 @@ class RuntimeModelCatalog:
                     ),
                     supports_reasoning=capabilities.supports_reasoning,
                     reasoning_effort=capabilities.reasoning_effort,
+                    supports_forced_tool_choice=capabilities.supports_forced_tool_choice,
                 )
                 return ResolvedModel(
                     alias,
@@ -703,6 +705,8 @@ class RuntimeModelCatalog:
                     "supports_presence_penalty": _supports_flag(
                         capabilities, "supports_presence_penalty"
                     ),
+                    "supports_reasoning": capabilities.supports_reasoning,
+                    "reasoning_effort": capabilities.reasoning_effort,
                 }
             )
         if provider in {"openrouter", "openai-compatible"}:
@@ -711,13 +715,6 @@ class RuntimeModelCatalog:
             # Audio only: no sampling or reasoning facts apply, but the
             # configured dispatch timeout does.
             http_kwargs["timeout_seconds"] = self._http_timeout_seconds
-        if provider in {"anthropic", "gemini", "openrouter", "openai-compatible"}:
-            http_kwargs.update(
-                {
-                    "supports_reasoning": capabilities.supports_reasoning,
-                    "reasoning_effort": capabilities.reasoning_effort,
-                }
-            )
         if provider in {"openrouter", "openai-compatible"}:
             http_kwargs["sampling_requires_reasoning_none"] = (
                 capabilities.sampling_requires_reasoning_none
@@ -733,6 +730,7 @@ class RuntimeModelCatalog:
             )
         if provider == "anthropic":
             http_kwargs["inference_geo"] = connection.inference_geo
+            http_kwargs["supports_forced_tool_choice"] = capabilities.supports_forced_tool_choice
         http_client = factory(**http_kwargs)
         embedding_client = (
             http_client
@@ -838,6 +836,7 @@ class RuntimeModelCatalog:
                     supports_top_k=_supports_flag(capabilities, "supports_top_k"),
                     supports_reasoning=capabilities.supports_reasoning,
                     reasoning_effort=capabilities.reasoning_effort,
+                    supports_forced_tool_choice=capabilities.supports_forced_tool_choice,
                 )
             case None:
                 raise ModelConnectionError(f"connection {connection_id!r} is not a plan sign-in")
