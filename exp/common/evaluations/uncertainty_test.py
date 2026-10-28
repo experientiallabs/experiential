@@ -5,6 +5,7 @@ import pytest
 from exp.common.evaluations.uncertainty import (
     Z95_ONE_SIDED,
     missing_outcome_bounds,
+    paired_bootstrap_summary,
     proportion_summary,
     unit_difference_summary,
     unit_mean_summary,
@@ -77,3 +78,27 @@ def test_missing_outcomes_are_bounds_not_intervals() -> None:
     assert missing_outcome_bounds(0, 0, 0) is None
     with pytest.raises(ValueError, match="planned denominator"):
         missing_outcome_bounds(5, 6, 10)
+
+
+def test_paired_bootstrap_resamples_whole_units_reproducibly() -> None:
+    """Repeats average within a unit; a seeded resample gives the same percentile interval."""
+    first = {"a": [1, 1], "b": [1, 0], "c": [1, 1], "d": [0, 0], "e": []}
+    second = {"a": [0, 0], "b": [0, 0], "c": [1, 1], "d": [0, 0]}
+    summary = paired_bootstrap_summary(first, second, resamples=500, seed=3)
+    assert summary["independent_units"] == 4
+    assert summary["units_without_paired_outcomes"] == 1
+    assert summary["unit_differences"] == {"a": 1.0, "b": 0.5, "c": 0.0, "d": 0.0}
+    assert summary["estimate"] == 0.375
+    interval = summary["bootstrap_95"]
+    assert isinstance(interval, list) and 0 <= interval[0] < 0.375 < interval[1] <= 1
+    assert paired_bootstrap_summary(first, second, resamples=500, seed=3) == summary
+    constant = paired_bootstrap_summary({"a": [1], "b": [1]}, {"a": [0], "b": [0]})
+    assert constant["bootstrap_95"] == [1.0, 1.0]
+    empty = paired_bootstrap_summary({"a": [1]}, {"b": [0]})
+    assert empty["estimate"] is None and empty["bootstrap_95"] is None
+
+
+def test_paired_bootstrap_refuses_too_few_resamples() -> None:
+    """A handful of resamples cannot estimate a 95 percent interval."""
+    with pytest.raises(ValueError, match="at least 100 resamples"):
+        paired_bootstrap_summary({"a": [1]}, {"a": [0]}, resamples=10)

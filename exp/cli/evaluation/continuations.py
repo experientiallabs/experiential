@@ -16,6 +16,8 @@ from exp.cli.evaluation.analysis import (
     handle_analyse_failures,
     handle_analyse_memory,
     handle_check_failure_research,
+    handle_confirm_decision_cascade,
+    handle_fit_decision_cascade,
     handle_inspect_memory,
     handle_measure_decisions,
     handle_probe_actor_decisions,
@@ -58,10 +60,18 @@ from exp.cli.evaluation.factory import (
     handle_register_brief,
     handle_search_scenarios,
 )
+from exp.cli.evaluation.hill_climb import (
+    handle_climb_report,
+    handle_climb_round,
+    handle_propose_edits,
+)
+from exp.cli.evaluation.induction import handle_induce_transitions, handle_validate_transitions
+from exp.cli.evaluation.instance_facts import handle_derive_facts
 from exp.cli.evaluation.judge_challenges import handle_challenge_judges
 from exp.cli.evaluation.learning_repair import handle_repair_learning
 from exp.cli.evaluation.memory_forget import handle_forget_summary
 from exp.cli.evaluation.sample_count import handle_sample_count
+from exp.cli.evaluation.task_hardening import handle_check_task_validity, handle_harden_tasks
 from exp.cli.evaluation.trajectory_traces import handle_export_traces
 from exp.cli.shared.options import usage_error
 from exp.cli.shared.theme import EXP_THEME
@@ -69,7 +79,9 @@ from exp.common.core.artifacts import ArtifactInput, ContractModel
 from exp.common.project import ArtifactStoreError, ProjectStore
 from exp.common.release_revision import installed_execution_revision
 from exp.optimize.evaluation.analysis.actor_decisions import ActorDecisionSpec
+from exp.optimize.evaluation.analysis.cascade_confirmation import CascadeConfirmationSpec
 from exp.optimize.evaluation.analysis.decision_calibration import DecisionCalibration
+from exp.optimize.evaluation.analysis.decision_cascade import CascadeFitSpec
 from exp.optimize.evaluation.analysis.memory_analyst import MemoryAnalystSpec
 from exp.optimize.evaluation.analysis.memory_evidence import MemoryInspection
 from exp.optimize.evaluation.analysis.research import FailureResearchSpec
@@ -91,9 +103,16 @@ from exp.optimize.evaluation.equivalence.runner import EquivalenceSpec
 from exp.optimize.evaluation.executable.controls import SpecificationRegistration
 from exp.optimize.evaluation.executable.scenarios import RecordScenarioSpec, RecordWitnessSpec
 from exp.optimize.evaluation.factory.candidates import CandidateBatchSpec
+from exp.optimize.evaluation.factory.hardening import TaskHardeningSpec
 from exp.optimize.evaluation.factory.proposals import TaskProposalSpec
 from exp.optimize.evaluation.factory.scenario_search import ScenarioSearchSpec
+from exp.optimize.evaluation.factory.validity import TaskValiditySpec
 from exp.optimize.evaluation.factory.variants import TaskVariantSpec
+from exp.optimize.evaluation.fidelity.fact_derivation import FactsDerivation
+from exp.optimize.evaluation.hillclimb.proposals import EditProposalSpec
+from exp.optimize.evaluation.hillclimb.report import ClimbReportSpec
+from exp.optimize.evaluation.hillclimb.rounds import ClimbRound
+from exp.optimize.evaluation.induction.service import InductionSpec, TransitionValidationSpec
 from exp.optimize.evaluation.learning.forgetting import SummaryForget
 from exp.optimize.evaluation.learning.lessons import LearningRepair
 from exp.optimize.evaluation.learning.sample_count import SampleCountRequest
@@ -129,6 +148,10 @@ CONTINUATION_ACTIONS = (
     ContinuationAction("forget-summary", "forget", handle_forget_summary),
     ContinuationAction("measure-decisions", "decisions", handle_measure_decisions),
     ContinuationAction("challenge-judges", "challenge", handle_challenge_judges),
+    ContinuationAction("fit-decision-cascade", "cascade_fit", handle_fit_decision_cascade),
+    ContinuationAction(
+        "confirm-decision-cascade", "cascade_confirmation", handle_confirm_decision_cascade
+    ),
     ContinuationAction("analyse-memory", "memory_analyst", handle_analyse_memory),
     ContinuationAction("analyse-failures", "analysis", handle_analyse_failures),
     ContinuationAction("compare-observations", "observations", handle_compare_observations),
@@ -154,6 +177,16 @@ CONTINUATION_ACTIONS = (
     ContinuationAction("register-specification", "specification", handle_register_specification),
     ContinuationAction("development-tasks", "development_tasks", handle_development_tasks),
     ContinuationAction("ground-runtime", "grounded", handle_ground_runtime),
+    ContinuationAction("climb-round", "climb_round", handle_climb_round),
+    ContinuationAction("propose-edits", "edit_proposals", handle_propose_edits),
+    ContinuationAction("climb-report", "climb_report", handle_climb_report),
+    ContinuationAction("check-task-validity", "task_validity", handle_check_task_validity),
+    ContinuationAction("harden-tasks", "hardening", handle_harden_tasks),
+    ContinuationAction("derive-facts", "facts", handle_derive_facts),
+    ContinuationAction("induce-transitions", "induction", handle_induce_transitions),
+    ContinuationAction(
+        "validate-transitions", "transition_validation", handle_validate_transitions
+    ),
 )
 _ACTIONS_BY_NAME = {action.name: action for action in CONTINUATION_ACTIONS}
 
@@ -196,6 +229,8 @@ class ContinuationCommand(ContractModel):
         forget: One stale memory summary to forget from the next version, with its reason.
         decisions: Frozen fixed-question calibration inventory, never a serving approval.
         challenge: Registered fixed-output judge challenge study with one model per arm.
+        cascade_fit: Development trajectories, decider, grid and objective for a cascade fit.
+        cascade_confirmation: Saved cascade fit and held-out cases for closed-loop confirmation.
         memory_analyst: Opt-in bounded diagnostic using the existing trace-analysis rubric.
         actor_decisions: Trace-only next-decision probes with a repeated-reference control.
         prefix: Extract a complete retained actor input and bind a saved simulator observation.
@@ -208,6 +243,14 @@ class ContinuationCommand(ContractModel):
         specification: Independent acceptance specification and its source evidence to save.
         development_tasks: Build fit tasks to print, optionally one with its public tools.
         grounded: Simulated world over the build's simulator, emitted as a capture operation.
+        climb_round: One prompt edit screened on train and confirmed on test lineages.
+        edit_proposals: Analyst edits from train failures and keep bits only, never applied.
+        climb_report: Baseline against the best kept prompt on fresh test repeats.
+        task_validity: Leak, closed-book and control checks for one qualified variant.
+        hardening: Bounded harder-world levels for one qualified seed until a panel separates.
+        facts: Backend-derived instance facts for declared task input files.
+        induction: Fit-evidence induction of exact per-tool transition programs.
+        transition_validation: Provider-free re-validation of saved programs on fit evidence.
     """
 
     action: ContinuationActionName
@@ -236,6 +279,8 @@ class ContinuationCommand(ContractModel):
     forget: SummaryForget | None = None
     decisions: DecisionCalibration | None = None
     challenge: ChallengeRunSpec | None = None
+    cascade_fit: CascadeFitSpec | None = None
+    cascade_confirmation: CascadeConfirmationSpec | None = None
     memory_analyst: MemoryAnalystSpec | None = None
     actor_decisions: ActorDecisionSpec | None = None
     prefix: ActorPrefixSpec | None = None
@@ -248,6 +293,14 @@ class ContinuationCommand(ContractModel):
     specification: SpecificationRegistration | None = None
     development_tasks: DevelopmentTaskQuery | None = None
     grounded: GroundRuntime | None = None
+    climb_round: ClimbRound | None = None
+    edit_proposals: EditProposalSpec | None = None
+    climb_report: ClimbReportSpec | None = None
+    task_validity: TaskValiditySpec | None = None
+    hardening: TaskHardeningSpec | None = None
+    facts: FactsDerivation | None = None
+    induction: InductionSpec | None = None
+    transition_validation: TransitionValidationSpec | None = None
 
     @model_validator(mode="after")
     def exact_payload(self) -> "ContinuationCommand":

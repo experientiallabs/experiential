@@ -33,22 +33,35 @@ from exp.optimize.evaluation.executable.deferral import (
     deferred_execution,
     record_execution_deferral,
 )
+from exp.runtime.agents.cascade import CascadePolicy
+from exp.runtime.agents.chat import ChatAgentRuntime
 from exp.runtime.models.registry import RuntimeModelCatalog
-from exp.simulation.continuations import load_continuation_checkpoint
+from exp.simulation.continuations import ContinuationCheckpoint, load_continuation_checkpoint
 
 
 class PanelActor(ContractModel):
-    """One exact actor binding with a descriptive, unverified capability label.
+    """One exact actor policy with a descriptive, unverified capability label.
 
     Attributes:
         alias: Configured model entry.
         model: Snapshot verified before execution and on every returned response.
         label: Declared capability tier; never treated as measured evidence.
+        system_prompt: Actor instruction replacing every case's own, or None to keep each case's
+            instruction. One model may appear under several distinct instructions.
+        checkpoints: With a system prompt, each case's initial checkpoint re-instructed by
+            ``instructed_checkpoint``, in case order. The instruction is part of the actor's
+            saved context, so a changed instruction starts from its own saved checkpoint.
+        cascade: Opt-in decision cascade over this actor model, off when absent.
     """
 
     alias: str = Field(min_length=1)
     model: ModelSnapshot
     label: str = Field(min_length=1)
+    system_prompt: str | None = Field(default=None, exclude_if=lambda value: value is None)
+    checkpoints: tuple[ArtifactInput, ...] | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    cascade: CascadePolicy | None = Field(default=None, exclude_if=lambda value: value is None)
 
 
 class ActorPanelSpec(ContractModel):
@@ -56,7 +69,8 @@ class ActorPanelSpec(ContractModel):
 
     Attributes:
         cases: Base jobs with identical actor runtime policy for the compared models.
-        actors: Two to ten model snapshots in expected weak-to-strong order.
+        actors: Two to ten actor policies in expected weak-to-strong order: distinct model
+            snapshots, or one snapshot under distinct system prompts.
         minimum_difference: Required absolute pass-rate difference on this fixed panel.
             This is not a population confidence threshold or an independence certificate.
     """
@@ -68,10 +82,25 @@ class ActorPanelSpec(ContractModel):
     @model_validator(mode="after")
     def finite(self) -> "ActorPanelSpec":
         """Reject duplicate comparisons and bound the complete pre-registered provider schedule."""
-        if len({actor.alias for actor in self.actors}) != len(self.actors) or len(
-            {sha256_json(actor.model) for actor in self.actors}
-        ) != len(self.actors):
-            raise ValueError("actor panel requires distinct aliases and frozen models")
+        bindings = [
+            (actor.alias, actor.system_prompt, sha256_json(actor.cascade)) for actor in self.actors
+        ]
+        models = [
+            (sha256_json(actor.model), actor.system_prompt, sha256_json(actor.cascade))
+            for actor in self.actors
+        ]
+        if len(set(bindings)) != len(self.actors) or len(set(models)) != len(self.actors):
+            raise ValueError(
+                "actor panel requires distinct aliases and frozen models for each system prompt "
+                "and cascade"
+            )
+        for actor in self.actors:
+            if (actor.system_prompt is None) != (actor.checkpoints is None) or (
+                actor.checkpoints is not None and len(actor.checkpoints) != len(self.cases)
+            ):
+                raise ValueError(
+                    "an actor with a system prompt needs one re-instructed checkpoint per case"
+                )
         attempts = sum(job.maximum_physical_attempts for job in self.cases) * len(self.actors)
         if attempts > MAXIMUM_PHYSICAL_ATTEMPTS:
             raise ValueError(
@@ -135,7 +164,11 @@ def panel_jobs(spec: ActorPanelSpec, code_revision: str) -> tuple[PanelCell, ...
             actor = spec.actors[index]
             study = base.study.model_copy(
                 update={
+                    "checkpoint": base.study.checkpoint
+                    if actor.checkpoints is None
+                    else actor.checkpoints[case],
                     "actor_model": actor.model,
+                    "cascade": actor.cascade,
                     "predicted_success": None,
                     "critic_prediction": None,
                     "selection_plan": None,
@@ -150,6 +183,9 @@ def panel_jobs(spec: ActorPanelSpec, code_revision: str) -> tuple[PanelCell, ...
                         update={
                             "study": study,
                             "actor_alias": actor.alias,
+                            "system_prompt": base.system_prompt
+                            if actor.system_prompt is None
+                            else actor.system_prompt,
                         }
                     ),
                 )
@@ -163,16 +199,87 @@ def preflight_actor_panel(project: ProjectStore, spec: ActorPanelSpec) -> None:
     for actor in spec.actors:
         if catalog.snapshot(actor.alias)[0] != actor.model:
             raise ValueError("actor panel alias differs from its registered snapshot")
-    groups: set[str] = set()
-    traces: set[str] = set()
+    for actor in spec.actors:
+        if actor.system_prompt is None or actor.checkpoints is None:
+            continue
+        for job, reference in zip(spec.cases, actor.checkpoints, strict=True):
+            saved = load_continuation_checkpoint(project.artifacts, reference)
+            if saved != instructed_checkpoint(project, job, actor.system_prompt):
+                raise ValueError(
+                    "actor checkpoint is not its case's initial checkpoint under that system "
+                    "prompt; save it with instructed_checkpoint"
+                )
     for cell in panel_jobs(spec, "preflight"):
         preflight_continuation_job(project, cell.job)
-    for job in spec.cases:
+    case_lineages(project, spec.cases)
+
+
+def case_lineages(project: ProjectStore, cases: tuple[ContinuationJob, ...]) -> tuple[str, ...]:
+    """Resolve each case's declared lineage, refusing cases that share a lineage or a trace.
+
+    Args:
+        project: Project whose saved checkpoints the cases start from.
+        cases: Jobs whose checkpoints declare the task lineage and source traces.
+
+    Returns:
+        Each case's lineage, in case order; every case is one independent unit.
+
+    Raises:
+        ValueError: Two cases share a declared lineage or a source trace.
+    """
+    groups: list[str] = []
+    traces: set[str] = set()
+    for job in cases:
         task = load_continuation_checkpoint(project.artifacts, job.study.checkpoint).task
         if task.lineage_group_id in groups or traces.intersection(task.source_trace_ids):
             raise ValueError("actor panel cases must have disjoint declared source lineages")
-        groups.add(task.lineage_group_id)
+        groups.append(task.lineage_group_id)
         traces.update(task.source_trace_ids)
+    return tuple(groups)
+
+
+def instructed_checkpoint(
+    project: ProjectStore, job: ContinuationJob, system_prompt: str
+) -> ContinuationCheckpoint:
+    """Re-instruct a case's initial checkpoint: same task, world and sources, a new instruction.
+
+    The chat actor saves its instruction in its context and binds it into its policy identity,
+    so a different instruction cannot resume a checkpoint taken under another one. Before the
+    first actor call nothing depends on the instruction yet, and the re-instructed checkpoint is
+    exactly the initial context the actor would build under ``system_prompt``.
+
+    Args:
+        project: Project holding the case checkpoint.
+        job: Case whose checkpoint and model-call ceiling are kept.
+        system_prompt: Instruction of the compared actor policy.
+
+    Returns:
+        The checkpoint to save and pass in ``PanelActor.checkpoints``.
+
+    Raises:
+        ValueError: The case checkpoint is past the actor's first call or was not taken under
+            the job's own instruction.
+    """
+    base = load_continuation_checkpoint(project.artifacts, job.study.checkpoint)
+    original = ChatAgentRuntime(
+        maximum_model_calls=job.maximum_model_calls, system_prompt=job.system_prompt
+    )
+    if base.actor != original.initial_checkpoint(base.task):
+        raise ValueError(
+            "a system prompt can only vary at an initial checkpoint taken under the job's own "
+            "instruction; capture the case before its first actor call"
+        )
+    variant = ChatAgentRuntime(
+        maximum_model_calls=job.maximum_model_calls, system_prompt=system_prompt
+    )
+    return base.model_copy(update={"actor": variant.initial_checkpoint(base.task)})
+
+
+def _panel_checkpoints(spec: ActorPanelSpec) -> set[ArtifactInput]:
+    """Every checkpoint the panel registers: the cases' own and each actor's re-instructed ones."""
+    return {job.study.checkpoint for job in spec.cases} | {
+        reference for actor in spec.actors for reference in actor.checkpoints or ()
+    }
 
 
 def panel_metrics(
@@ -262,7 +369,7 @@ def saved_actor_panel(
     )
     registration_manifest = store.read(identity).manifest
     registration = artifact_input(registration_manifest)
-    if set(registration_manifest.inputs) != {job.study.checkpoint for job in spec.cases}:
+    if set(registration_manifest.inputs) != _panel_checkpoints(spec):
         raise ValueError("actor panel registration lost its exact source cases")
     if ActorPanelSpec.model_validate_json(store.read_bytes(identity, "spec.json")) != spec:
         raise ValueError("actor panel registration differs")
@@ -321,11 +428,7 @@ def run_actor_panel(
             schema_version=1,
             created_at=datetime.now(UTC),
             code_revision=code_revision,
-            inputs=tuple(
-                sorted(
-                    {job.study.checkpoint for job in spec.cases}, key=lambda row: row.artifact_id
-                )
-            ),
+            inputs=tuple(sorted(_panel_checkpoints(spec), key=lambda row: row.artifact_id)),
         )
         if not store.exists(identity):
             store.write_json(

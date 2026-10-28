@@ -17,6 +17,7 @@ from exp.optimize.evaluation.executable.task import load_executable_task
 from exp.optimize.evaluation.factory.scenario_search_test import workbook_search_fixture
 from exp.optimize.evaluation.factory.worlds import (
     WorldCandidates,
+    WorldHardening,
     WorldProposal,
     WorldProposalSpec,
     preflight_world_proposals,
@@ -320,3 +321,22 @@ def test_the_generic_author_prompt_takes_layout_facts_from_the_spec(
     system, user = request.messages
     assert "xlsx" not in str(system.content).lower()
     assert json.loads(str(user.content))["asset_requirements"] == spec.asset_requirements
+
+
+def test_hardening_context_must_cite_a_saved_actor_panel(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A harder-world request cannot cite arbitrary evidence as its saturated panel."""
+    project, spec, transport = world_fixture(tmp_path, monkeypatch)
+    hardened = spec.model_copy(
+        update={
+            "hardening": WorldHardening(
+                level=1, assets=spec.template.capture.sources[0], panel=spec.acceptance
+            )
+        }
+    )
+    assert hardened.identity("test") != spec.identity("test")
+    assert "hardening" not in spec.model_dump(mode="json")
+    with pytest.raises(ValueError, match="actor-panel report"):
+        world_proposal_request(project, hardened)
+    assert not transport.requests

@@ -14,6 +14,7 @@ from exp.common.core.artifacts import (
     ArtifactEnvelope,
     ArtifactInput,
     ContractModel,
+    JsonObject,
     redact_secret_text,
     sha256_bytes,
     sha256_json,
@@ -22,6 +23,7 @@ from exp.common.core.artifacts import (
 from exp.common.models import ModelMessage, ModelRequest, ModelResponse, ToolChoice
 from exp.common.project import ProjectStore, artifact_input
 from exp.common.tasks import ToolSchema
+from exp.optimize.evaluation.continuations.actors import ActorPanelReport
 from exp.optimize.evaluation.continuations.capture import preflight_capture
 from exp.optimize.evaluation.executable.construction import ConstructionBinding, bind_construction
 from exp.optimize.evaluation.executable.deferral import (
@@ -54,6 +56,31 @@ from exp.simulation.world_construction import (
     persist_construction,
 )
 
+HARDENING_GUIDANCE = (
+    "Hardening: every strong actor on a registered panel solved the previous world of this same "
+    "case. Propose harder worlds for the same intent, instruction, tools and permissions by "
+    "changing the world, never the wording: more state (rows, records, tables or sheets), "
+    "plausible distractors (near-miss values and decoy records the instruction excludes) and "
+    "multi-step dependencies (facts that must be combined across tables or earlier results). "
+    "Keep exactly one correct result determined by the instruction and obtainable information; "
+    "do not make the task ambiguous, contradictory or impossible."
+)
+
+
+class WorldHardening(ContractModel):
+    """A saturated world and its panel, cited so the author can make the same case harder.
+
+    Attributes:
+        level: Hardening level being requested, starting at one for the first harder world.
+        assets: Compiled construction of the saturated world; its plan is shown to the author.
+        panel: Saved actor-panel report whose actors all solved that world; only counts reach
+            the author, never trajectories, verifier text or acceptance.
+    """
+
+    level: int = Field(ge=1, le=8, strict=True)
+    assets: ArtifactInput
+    panel: ArtifactInput
+
 
 class WorldProposalSpec(AuthorSettings):
     """Frozen author experiment and trusted native binding, without hidden-label disclosure.
@@ -69,6 +96,8 @@ class WorldProposalSpec(AuthorSettings):
             runtime, header semantics and paths such as /files/input.xlsx); the author prompt
             itself stays runtime-neutral. Do not put secrets, checker code, protected examples
             or expected answers here.
+        hardening: Optional saturated predecessor; the author then proposes harder worlds of
+            the same case instead of new research challenges.
     """
 
     base: ArtifactInput
@@ -77,6 +106,7 @@ class WorldProposalSpec(AuthorSettings):
     template: RecordScenarioSpec
     acceptance: ArtifactInput
     asset_requirements: str = Field(min_length=1, max_length=16000)
+    hardening: WorldHardening | None = Field(default=None, exclude_if=lambda value: value is None)
 
     def identity(self, revision: str) -> str:
         """Bind the whole experiment before purchasing its one logical author draw."""
@@ -155,6 +185,8 @@ class WorldProposals(ContractModel):
 def _sources(project: ProjectStore, spec: WorldProposalSpec) -> tuple[ArtifactInput, ...]:
     """Resolve all references and research quotes without granting them independent authority."""
     refs = {spec.base, spec.brief, spec.acceptance, *spec.template.capture.sources}
+    if spec.hardening is not None:
+        refs.update((spec.hardening.assets, spec.hardening.panel))
     for observation in spec.target.failure.observations:
         observation.read(project.artifacts)
         refs.add(observation.source)
@@ -164,7 +196,31 @@ def _sources(project: ProjectStore, spec: WorldProposalSpec) -> tuple[ArtifactIn
     authority = project.artifacts.read(spec.acceptance.artifact_id).manifest
     if authority.artifact_type != "evaluation-specification":
         raise ValueError("world proposals require an independent evaluation specification")
+    if spec.hardening is not None:
+        if project.artifacts.read(spec.hardening.panel.artifact_id).manifest.artifact_type != (
+            "actor-panel-report"
+        ):
+            raise ValueError("world hardening must cite a saved actor-panel report")
+        load_construction(project.artifacts, spec.hardening.assets)
     return tuple(sorted(refs, key=lambda ref: ref.artifact_id))
+
+
+def _hardening_context(project: ProjectStore, hardening: WorldHardening) -> JsonObject:
+    """Show the saturated world's own plan and panel counts, never actor or grader text."""
+    construction = load_construction(project.artifacts, hardening.assets)
+    report = ActorPanelReport.model_validate_json(
+        project.artifacts.read_bytes(hardening.panel.artifact_id, "report.json")
+    )
+    actors = report.metrics.get("actors")
+    return {
+        "level": hardening.level,
+        "previous_world": construction.model_dump(mode="json", exclude={"sources"}),
+        "panel": [
+            {key: row.get(key) for key in ("declared_tier", "planned", "successes", "unknown")}
+            for row in (actors if isinstance(actors, list) else [])
+            if isinstance(row, dict)
+        ],
+    }
 
 
 def world_proposal_request(project: ProjectStore, spec: WorldProposalSpec) -> ModelRequest:
@@ -196,6 +252,8 @@ def world_proposal_request(project: ProjectStore, spec: WorldProposalSpec) -> Mo
         "research": spec.target.model_dump(mode="json"),
         "evidence": [row.read(project.artifacts) for row in spec.target.failure.observations],
     }
+    if spec.hardening is not None:
+        public["hardening"] = _hardening_context(project, spec.hardening)
     request = ModelRequest(
         messages=(
             ModelMessage(
@@ -225,6 +283,7 @@ def world_proposal_request(project: ProjectStore, spec: WorldProposalSpec) -> Mo
                     "Control roles "
                     "are hypotheses, not correctness labels. Independent acceptance is withheld. "
                     "Do not select a winner, invent external evidence or claim native fidelity."
+                    + ("" if spec.hardening is None else " " + HARDENING_GUIDANCE)
                 ),
             ),
             ModelMessage(role="user", content=json.dumps(public, sort_keys=True)),

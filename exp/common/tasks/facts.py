@@ -14,7 +14,8 @@ Two visibility classes exist. ``conditioning`` facts may condition simulation.
 ``verifier_private`` facts are evidence for verifiers only: no simulator or actor request ever
 receives them, and :class:`ConditioningFacts` refuses them.
 
-Environment adapters implement :class:`InstanceFactsProvider`. Domain decoding (spreadsheet
+Environment adapters implement :class:`InstanceFactsProvider`, and a backend that decodes its own
+declared input files implements :class:`InstanceFactsDeriver`. Domain decoding (spreadsheet
 XML, database snapshots, API reads) belongs in the adapter; this module only validates and
 carries the decoded facts.
 """
@@ -232,6 +233,38 @@ class InstanceFactsProvider(Protocol):
 
         Returns:
             Facts with provenance; validation status is checked by the caller.
+        """
+        ...
+
+
+class InstanceFactsDeriver(Protocol):
+    """An environment backend's decoder from one declared input file to instance facts.
+
+    A backend that can read its own starting files (a workbook, a database snapshot) declares
+    one deriver. The deriver decodes the exact bytes, validates the decoded facts against the
+    backend's own reader, and refuses with :class:`InstanceFactsError` any content it cannot
+    represent exactly, so a caller never receives facts with silent gaps.
+    """
+
+    @property
+    def kind(self) -> str:
+        """Stable deriver name, as declared in a derivation spec."""
+        ...
+
+    def derive(self, path: str, payload: bytes) -> InstanceFacts:
+        """Validated starting-state facts about one input file.
+
+        Args:
+            path: The file's canonical path inside the task's world, such as ``input.xlsx``.
+                It names the facts and their provenance source; host paths never appear.
+            payload: Exact file bytes.
+
+        Returns:
+            Validated conditioning facts at state version 0.
+
+        Raises:
+            InstanceFactsError: The file has content the deriver cannot represent exactly,
+                exceeds the deriver's bounds, or fails validation.
         """
         ...
 

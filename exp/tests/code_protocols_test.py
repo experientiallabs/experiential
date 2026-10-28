@@ -1,11 +1,16 @@
 """Protocol versions stand in for source text in saved-result identities; this guards them.
 
-Calibration, the actor council, task refinement, private workbook views, the restorable
-environment backends and local process containment bind their saved results to a protocol
-constant instead of hashing their own source. Saved results then survive moves, formatting and
-unrelated edits, and re-key only when the protocol is bumped. Provider attempt timeouts follow
-the same rule: each admitted physical attempt records the protocol of the derivation that
-bounded it.
+Calibration, the actor council, task refinement, prompt hill climbing, private workbook views, the
+restorable environment backends and local process containment bind their saved results to a
+protocol constant instead of hashing their own source. Saved results then survive moves,
+formatting and unrelated edits, and re-key only when the protocol is bumped. Provider attempt
+timeouts follow the same rule: each admitted physical attempt records the protocol of the
+derivation that bounded it.
+Calibration, the actor council, task refinement, private workbook views, workbook instance facts
+and the restorable environment backends bind their saved results to a protocol constant instead
+of hashing their own source. Saved results then survive moves, formatting and unrelated edits,
+and re-key only when the protocol is bumped. Provider attempt timeouts follow the same rule:
+each admitted physical attempt records the protocol of the derivation that bounded it.
 
 This test keeps that honest. Each protocol lists the source that decides its behavior, with that
 source's digest at the protocol's current value. When the covered source changes, the test fails
@@ -128,6 +133,27 @@ PROTOCOLS = (
         "89ba387276193e7a3435a0e5617821c0b37db5ad2654aff1509f2a00051f0a74",
     ),
     Protocol(
+        "exp.optimize.evaluation.hillclimb.design:HILL_CLIMB_PROTOCOL",
+        "hill-climb-v3",
+        (
+            "exp.optimize.evaluation.hillclimb.design:climb_split",
+            "exp.optimize.evaluation.hillclimb.measurement",
+            "exp.optimize.evaluation.hillclimb.stages",
+            "exp.optimize.evaluation.hillclimb.rounds:run_climb_round",
+        ),
+        "0a8bed3a95de3534e0a74c48a9caba76df3be5c9b9dee9094886041389c421a6",
+    ),
+    Protocol(
+        "exp.optimize.evaluation.hillclimb.proposals:EDIT_PROPOSAL_PROTOCOL",
+        "prompt-edit-proposal-v1",
+        (
+            "exp.optimize.evaluation.hillclimb.proposals:train_evidence",
+            "exp.optimize.evaluation.hillclimb.proposals:proposal_request",
+            "exp.optimize.evaluation.hillclimb.proposals:_validate",
+        ),
+        "8b96977f5e07a23d8466599ca270d36d70a767474aa2f508853961e3ca03b172",
+    ),
+    Protocol(
         "exp.runtime.models.providers.attempt_timeouts:ATTEMPT_TIMEOUT_PROTOCOL",
         "provider-attempt-timeout-v2",
         ("exp.runtime.models.providers.attempt_timeouts",),
@@ -138,6 +164,12 @@ PROTOCOLS = (
         "xlsx-row-edits-v3",
         ("exp.runtime.environments.workbook_edits",),
         "977a23f451e187c67db9052c5eaa226a49b433727821a904d3708ea648ff6242",
+    ),
+    Protocol(
+        "exp.runtime.environments.workbook_facts:WORKBOOK_FACTS_PROTOCOL",
+        "xlsx-instance-facts-v1",
+        ("exp.runtime.environments.workbook_facts",),
+        "ec81b006c8fb988e53ef5fcff1b001fc3648ed7604be31c9fa1b378f597392d2",
     ),
     Protocol(
         "exp.runtime.environments.artifact_world:ARTIFACT_WORLD_PROTOCOL",
@@ -170,10 +202,62 @@ PROTOCOLS = (
         "693bb76a1249204e492feaca8ae8508ed914ade3334792a6b008048dfcbf0375",
     ),
     Protocol(
+        "exp.runtime.agents.cascade:CASCADE_VERSION",
+        "decision-cascade-v3",
+        (
+            "exp.runtime.agents.cascade:action_key",
+            "exp.runtime.agents.cascade:action_projection",
+            "exp.runtime.agents.cascade:decision_candidates",
+            "exp.runtime.agents.cascade:delegates",
+            "exp.runtime.agents.cascade:CascadeModelClient",
+            "exp.runtime.agents.cascade:admitted_draft",
+        ),
+        "6b6acd94daf56c93c0056fae980169889d050ffb6b49f518f81255f9052a9d2d",
+    ),
+    Protocol(
+        "exp.optimize.evaluation.analysis.decision_cascade:CASCADE_FIT_PROTOCOL",
+        "decision-cascade-fit-v6",
+        (
+            "exp.optimize.evaluation.analysis.decision_cascade:CascadeObjective.non_inferior",
+            "exp.optimize.evaluation.analysis.decision_cascade:estimate_threshold",
+            "exp.optimize.evaluation.analysis.decision_cascade:refused_drafts",
+            "exp.optimize.evaluation.analysis.decision_cascade:select_threshold",
+            "exp.optimize.evaluation.analysis.decision_points:DecisionPointSet.labels",
+            "exp.optimize.evaluation.analysis.decision_points:state_request",
+        ),
+        "3c1a106e375bd744bbb42a0a0351d6d1b9b0c62e8c02c49209b2f03b84a028af",
+    ),
+    Protocol(
+        "exp.runtime.agents.cascade_deciders:DECIDER_PROTOCOL",
+        "cascade-decider-v1",
+        (
+            "exp.runtime.agents.cascade_deciders:next_action_request",
+            "exp.runtime.agents.cascade_deciders:next_action_answer",
+            "exp.runtime.agents.cascade_deciders:SampledDraftDecider.decide",
+        ),
+        "0adbb5717f465ad401271fc664c2270658049130acec59e248c986caaf6d7651",
+    ),
+    Protocol(
         "exp.runtime.environments.record_world:RECORD_WORLD_PROTOCOL",
         "sqlite-record-world-v1",
         ("exp.runtime.environments.record_world",),
         "8fb247418212f90d8963088e1323a0b4581dbaf937fc8cda590d784a31867b99",
+    ),
+    Protocol(
+        "exp.simulation.induction.runner:RUNNER_PROTOCOL",
+        "induced-program-runner-v7",
+        ("exp.simulation.induction.runner", "exp.simulation.induction.sandbox"),
+        "6fe35ac98d15b2722319ef70c22d9b9998be01c8a88492a16417242bc3528b1a",
+    ),
+    Protocol(
+        "exp.simulation.induction.backend:INDUCED_WORLD_PROTOCOL",
+        "induced-world-v1",
+        (
+            "exp.simulation.induction.backend",
+            "exp.simulation.induction.contracts:ProgramDomain",
+            "exp.simulation.induction.validation:induced_partition",
+        ),
+        "9b738d7a815e3b23db372a80bb2c8f848a14c2d7d768b88e3b7d2bc4cca70f4e",
     ),
 )
 

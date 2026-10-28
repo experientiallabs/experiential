@@ -74,3 +74,33 @@ def test_native_factory_is_zero_and_custom_code_is_never_executed(tmp_path: Path
     arbitrary.write_text('raise AssertionError("must not import during costing")')
     rows = runtime_costs(project, sha256_bytes(arbitrary.read_bytes()), {})
     assert total_cost(rows) is None and "undeclared" in rows[0].name
+
+
+def test_hardening_inventory_counts_every_level_candidate_and_validity_draw(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The seed is priced once; each harder level prices one author and four full candidates."""
+    from exp.common.project import artifact_input
+    from exp.optimize.evaluation.executable.costs import evaluation_costs
+    from exp.optimize.evaluation.factory.hardening import seed_proposals
+    from exp.optimize.evaluation.factory.hardening_test import workbook_hardening
+    from exp.optimize.evaluation.factory.validity import TaskValiditySpec
+
+    project, spec, _ = workbook_hardening(tmp_path, monkeypatch, levels=2)
+    seed = seed_proposals(project, spec)
+    assert seed.search is not None
+    search = artifact_input(
+        project.artifacts.read(seed.search.spec.identity("test") + "-result").manifest
+    )
+    validity = evaluation_costs(
+        project, TaskValiditySpec(**spec.validity.model_dump(), search=search, cell=1)
+    )
+    draws = spec.validity.leak_judge.maximum_physical_attempts * (
+        1 + spec.validity.closed_book_attempts
+    )
+    assert sum(row.attempts for row in validity) == draws
+    rows = evaluation_costs(project, spec)
+    job = 3 * len(spec.actors)
+    level = spec.author.maximum_physical_attempts + 4 * (draws + job)
+    assert sum(row.attempts for row in rows) == draws + job + spec.maximum_levels * level
+    assert total_cost(rows) is None

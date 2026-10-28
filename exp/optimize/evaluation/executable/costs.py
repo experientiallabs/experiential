@@ -15,9 +15,14 @@ from exp.common.models.pricing import completion_cost_reservation
 from exp.common.models.token_cost import schedule_maximum_cost_nano_usd
 from exp.common.project import ProjectStore
 from exp.optimize.evaluation.analysis.actor_decisions import ActorDecisionSpec
+from exp.optimize.evaluation.analysis.cascade_confirmation import (
+    CascadeConfirmationSpec,
+    confirmation_panel,
+)
+from exp.optimize.evaluation.analysis.decision_cascade import CascadeFitSpec
 from exp.optimize.evaluation.analysis.memory_analyst import MemoryAnalystSpec
 from exp.optimize.evaluation.continuations.action_contrast import ActionContrastSpec
-from exp.optimize.evaluation.continuations.actors import ActorPanelSpec
+from exp.optimize.evaluation.continuations.actors import ActorPanelSpec, panel_jobs
 from exp.optimize.evaluation.continuations.campaign import ContinuationCampaignSpec
 from exp.optimize.evaluation.continuations.capture import CaptureDefinition
 from exp.optimize.evaluation.continuations.critic import CriticSpec
@@ -33,16 +38,28 @@ from exp.optimize.evaluation.continuations.proposals import CheckpointProposalSp
 from exp.optimize.evaluation.continuations.selection import load_selection_plan, selection_jobs
 from exp.optimize.evaluation.equivalence.runner import EquivalenceSpec
 from exp.optimize.evaluation.executable import grounded as grounded_runtime
+from exp.optimize.evaluation.executable import induced as induced_runtime
 from exp.optimize.evaluation.executable import mixed as mixed_runtime
 from exp.optimize.evaluation.executable import workbook as workbook_runtime
 from exp.optimize.evaluation.executable.task import load_executable_task
 from exp.optimize.evaluation.factory.authoring import AuthorSettings
 from exp.optimize.evaluation.factory.candidates import CandidateBatchSpec
+from exp.optimize.evaluation.factory.hardening import (
+    TaskHardeningSpec,
+    hardening_panel,
+    seed_proposals,
+)
 from exp.optimize.evaluation.factory.proposals import load_task_proposals
 from exp.optimize.evaluation.factory.runner import TaskFactorySpec
+from exp.optimize.evaluation.factory.validity import TaskValiditySpec, ValiditySettings
 from exp.optimize.evaluation.factory.variants import load_task_variant
 from exp.optimize.evaluation.fidelity.retrieval_binding import index_embedder_alias
+from exp.optimize.evaluation.hillclimb.proposals import EditProposalSpec
+from exp.optimize.evaluation.hillclimb.report import ClimbReportSpec, report_jobs
+from exp.optimize.evaluation.hillclimb.rounds import ClimbRound, round_jobs
+from exp.optimize.evaluation.induction.service import InductionSpec
 from exp.optimize.evaluation.tasks.challenge_runs import ChallengeRunSpec, challenge_attempts
+from exp.runtime.agents.cascade import DeciderDefinition
 from exp.runtime.gateway.decisions_contracts import (
     MAX_DECISION_CRITERIA,
     MAX_DECISION_INPUT_BYTES,
@@ -93,6 +110,14 @@ CostedSpec = (
     | CandidateBatchSpec
     | TaskFactorySpec
     | ChallengeRunSpec
+    | ClimbRound
+    | EditProposalSpec
+    | ClimbReportSpec
+    | TaskValiditySpec
+    | TaskHardeningSpec
+    | InductionSpec
+    | CascadeFitSpec
+    | CascadeConfirmationSpec
 )
 
 
@@ -169,6 +194,11 @@ def runtime_costs(
             *runtime_costs(project, mixed.native.runtime_sha256, mixed.native.configuration),
             *_grounded_costs(project, mixed.simulated),
         )
+    if digest == sha256_bytes(Path(induced_runtime.__file__).read_bytes()):
+        # Induced calls make no provider request; the predictor's allowance is the upper bound.
+        return _grounded_costs(
+            project, induced_runtime.InducedRuntimeDefinition.model_validate(configuration).grounded
+        )
     if digest == sha256_bytes(Path(grounded_runtime.__file__).read_bytes()):
         return _grounded_costs(
             project, grounded_runtime.GroundedRuntimeDefinition.model_validate(configuration)
@@ -206,13 +236,33 @@ def _grounded_costs(
 
 
 def job_costs(project: ProjectStore, job: ContinuationJob) -> tuple[CostComponent, ...]:
-    """Include actor attempts and the runtime's independent lifetime allowance."""
+    """Include actor attempts, any cascade decider and the runtime's lifetime allowance."""
     return (
         model_cost(
             project, job.actor_alias, job.maximum_physical_attempts, job.study.maximum_output_tokens
         ),
+        *decider_costs(
+            project,
+            None if job.study.cascade is None else job.study.cascade.decider,
+            job.maximum_physical_attempts,
+        ),
         *runtime_costs(project, job.runtime_sha256, job.configuration),
     )
+
+
+def decider_costs(
+    project: ProjectStore, decider: DeciderDefinition | None, attempts: int
+) -> tuple[CostComponent, ...]:
+    """Price a cascade decider at the attempt ceiling its decisions draw from.
+
+    In an episode the actor and its decider share one ledger, so pricing each at the whole
+    ceiling overestimates the mixture but cannot assume a favorable split of the attempts.
+    """
+    if decider is None:
+        return ()
+    if decider.kind == "systemone":
+        return (decision_cost(project, decider.alias, attempts),)
+    return (model_cost(project, decider.alias, attempts, decider.maximum_output_tokens),)
 
 
 def evaluation_costs(project: ProjectStore, spec: CostedSpec) -> tuple[CostComponent, ...]:
@@ -232,6 +282,15 @@ def evaluation_costs(project: ProjectStore, spec: CostedSpec) -> tuple[CostCompo
                 spec.critic_alias,
                 spec.maximum_physical_attempts,
                 spec.critic_output_tokens,
+            ),
+        )
+    if isinstance(spec, InductionSpec):
+        return (
+            model_cost(
+                project,
+                spec.inducer_alias,
+                spec.maximum_physical_attempts,
+                spec.settings.maximum_output_tokens,
             ),
         )
     if isinstance(spec, MemoryAnalystSpec):
@@ -271,11 +330,12 @@ def evaluation_costs(project: ProjectStore, spec: CostedSpec) -> tuple[CostCompo
         return tuple(row.scaled(2 * spec.pairs) for row in job_costs(project, effect.spec.base))
     if isinstance(spec, ActorPanelSpec):
         return tuple(
-            row
-            for job in spec.cases
-            for actor in spec.actors
-            for row in job_costs(project, job.model_copy(update={"actor_alias": actor.alias}))
+            row for cell in panel_jobs(spec, "estimate") for row in job_costs(project, cell.job)
         )
+    if isinstance(spec, CascadeFitSpec):
+        return decider_costs(project, spec.decider, spec.maximum_physical_attempts)
+    if isinstance(spec, CascadeConfirmationSpec):
+        return evaluation_costs(project, confirmation_panel(project, spec)[1])
     if isinstance(spec, CheckpointExperimentSpec):
         plan = load_selection_plan(project, spec.selection)
         revision = project.artifacts.read(spec.selection.artifact_id).manifest.code_revision
@@ -356,7 +416,49 @@ def evaluation_costs(project: ProjectStore, spec: CostedSpec) -> tuple[CostCompo
             model_cost(project, alias, attempts, spec.output_tokens)
             for alias, attempts in challenge_attempts(spec).items()
         )
+    if isinstance(spec, ClimbRound):
+        # Both stages, both arms: confirmation is priced although screening may stop the round.
+        return tuple(row for job in round_jobs(project, spec) for row in job_costs(project, job))
+    if isinstance(spec, ClimbReportSpec):
+        return tuple(row for job in report_jobs(project, spec) for row in job_costs(project, job))
+    if isinstance(spec, EditProposalSpec):
+        return (
+            model_cost(
+                project, spec.analyst_alias, spec.maximum_physical_attempts, spec.output_tokens
+            ),
+        )
+    if isinstance(spec, TaskValiditySpec):
+        return _validity_costs(project, spec)
+    if isinstance(spec, TaskHardeningSpec):
+        # Level zero checks one seed candidate; each harder level buys one author draw and
+        # may qualify all four proposed worlds, each priced at the seed variant's actor job.
+        seed = seed_proposals(project, spec)
+        candidate = (
+            *_validity_costs(project, spec.validity),
+            *evaluation_costs(project, hardening_panel(project, spec)),
+        )
+        level = (
+            *evaluation_costs(project, spec.author),
+            *runtime_costs(
+                project,
+                seed.spec.template.capture.runtime_sha256,
+                seed.spec.template.capture.configuration,
+            ),
+            *(row.scaled(4) for row in candidate),
+        )
+        return (*candidate, *(row.scaled(spec.maximum_levels) for row in level))
     raise ValueError(f"no cost inventory is defined for {type(spec).__name__}")
+
+
+def _validity_costs(project: ProjectStore, spec: ValiditySettings) -> tuple[CostComponent, ...]:
+    """One leak-judge draw plus every registered closed-book attempt."""
+    return (
+        *evaluation_costs(project, spec.leak_judge),
+        *(
+            row.scaled(spec.closed_book_attempts)
+            for row in evaluation_costs(project, spec.closed_book)
+        ),
+    )
 
 
 def total_cost(components: tuple[CostComponent, ...]) -> float | None:

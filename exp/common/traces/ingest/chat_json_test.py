@@ -5,8 +5,11 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from exp.common.core.artifacts import JsonObject, SourceIdentity
-from exp.common.traces.ingest.chat_json import CHAT_JSON_SOURCE
+from exp.common.traces.ingest.chat_json import CHAT_JSON_SOURCE, attach_request_context
+from exp.common.traces.ingest.vendor_records import VendorTraceFormatError
 from exp.common.traces.ingest.vendor_trace import SYNTHETIC_TIME_ATTRIBUTE
 
 
@@ -178,3 +181,44 @@ def test_reused_call_id_keeps_each_unnamed_result_with_its_preceding_tool() -> N
     assert extract_result.parent_span_id == extract_call.span_id
     assert all(span.attributes["gen_ai.tool.call.id"] == "call-1" for span in tool_spans)
     assert json.dumps(conversation, sort_keys=True) == original
+
+
+def test_attach_request_context_reaches_trace_instance_facts_in_json_and_jsonl(
+    tmp_path: Path,
+) -> None:
+    """Matched conversations gain the entry; import moves it out of the request context."""
+    first = {**_conversation(), "exp.request.context": {"task_lineage": "a"}}
+    second = {**_conversation(), "trace_id": "conversation-2"}
+    facts = {"facts": [{"key": "input.xlsx/workbook", "value": 1}]}
+    for name, payload in (
+        ("chat.json", json.dumps({"conversations": [first, second]}).encode()),
+        ("chat.jsonl", (json.dumps(first) + "\nnot json\n" + json.dumps(second)).encode()),
+    ):
+        annotated, matched = attach_request_context(
+            payload, "instance_facts", {"conversation-1": facts}
+        )
+        assert matched == frozenset({"conversation-1"})
+        path = tmp_path / name
+        path.write_bytes(annotated)
+        traces = {
+            trace.spans[0].attributes["exp.source.trace.id"]: trace
+            for trace in CHAT_JSON_SOURCE.load(path).traces
+        }
+        assert traces["conversation-1"].instance_facts == facts
+        assert traces["conversation-1"].initial_context["task_lineage"] == "a"
+        assert "instance_facts" not in traces["conversation-1"].initial_context
+        assert traces["conversation-2"].instance_facts is None
+    assert b"not json" in annotated
+
+
+def test_attach_request_context_refuses_ambiguous_or_existing_entries() -> None:
+    """A repeated conversation key or an existing entry stops instead of guessing."""
+    conversation = _conversation()
+    twice = json.dumps([conversation, conversation]).encode()
+    with pytest.raises(VendorTraceFormatError, match="declared twice"):
+        attach_request_context(twice, "instance_facts", {"conversation-1": {}})
+    existing = json.dumps({**conversation, "exp.request.context": {"instance_facts": {}}}).encode()
+    with pytest.raises(VendorTraceFormatError, match="already declares 'instance_facts'"):
+        attach_request_context(existing, "instance_facts", {"conversation-1": {}})
+    with pytest.raises(VendorTraceFormatError, match="not UTF-8"):
+        attach_request_context(b"\xff", "instance_facts", {})
