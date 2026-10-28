@@ -518,7 +518,8 @@ class RetryPolicy:
         maximum_attempts: Maximum potentially billable attempts. The async loop may separately
             wait for certified non-dispatch responses until its fixed request deadline.
         initial_delay_seconds: Initial backoff for ordinary transport failures.
-        maximum_delay_seconds: Exponential backoff and jitter ceiling. Async server-directed
+        maximum_delay_seconds: Registered cap of the exponential backoff window and its
+            jitter. Ordinary retries wait a full-jitter sample of the window. Async server-directed
             minimum waits may exceed it within the existing absolute request deadline. The
             sync helper has no request deadline, so this remains its total per-retry wait bound.
     """
@@ -629,7 +630,12 @@ def retry_delay_seconds(
     random_sample: Callable[[], float],
     server_wait_ceiling_seconds: float | None = None,
 ) -> float | None:
-    """Respect a server minimum and add bounded jitter only to directed throttling.
+    """Respect a server minimum, otherwise wait a full-jitter share of the exponential backoff.
+
+    Ordinary failures wait a uniform sample of ``[0, delay]`` (full jitter), so processes that
+    failed together under load do not retry together. A server Retry-After (honoured on 429,
+    503 and every other retryable status) or a certified non-dispatch refusal is a minimum:
+    the wait never starts before it, and bounded jitter is added above it.
 
     Args:
         error: The preceding attempt's safe failure metadata.
@@ -651,11 +657,11 @@ def retry_delay_seconds(
     floor = max(delay, hint or 0.0)
     if floor > ceiling:
         return None
-    if hint is None and not is_unbilled_attempt(error):
-        return floor
     sample = random_sample()
     if not math.isfinite(sample) or not 0 <= sample <= 1:
         raise ValueError("retry random sample must be finite and between zero and one")
+    if hint is None and not is_unbilled_attempt(error):
+        return floor * sample
     headroom = min(ceiling - floor, floor, policy.maximum_delay_seconds)
     return floor + headroom * sample
 
