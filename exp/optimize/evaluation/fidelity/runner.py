@@ -27,23 +27,23 @@ from exp.common.models.model import ReasoningEffort
 from exp.common.progress import ProgressHook, report
 from exp.common.project import ProjectStore, artifact_input
 from exp.common.tasks import TaskCase
-from exp.optimize.evaluation.decision_access import decision_caller
-from exp.optimize.evaluation.fidelity_memory import (
+from exp.optimize.evaluation.fidelity.decision_access import decision_caller
+from exp.optimize.evaluation.fidelity.instance_facts import ReplayFacts, require_fact_scope
+from exp.optimize.evaluation.fidelity.knowledge_exposure import require_unexposed_task
+from exp.optimize.evaluation.fidelity.memory import (
     check_partition,
     consume_trajectory,
     maintain_memory,
     trajectory_record,
 )
-from exp.optimize.evaluation.fidelity_recovery import (
+from exp.optimize.evaluation.fidelity.recovery import (
     JUDGE_OPERATION,
     RecoveryLog,
     UnknownOutcome,
     recorded_outcomes,
 )
-from exp.optimize.evaluation.instance_facts import ReplayFacts, require_fact_scope
-from exp.optimize.evaluation.knowledge_exposure import require_unexposed_task
-from exp.optimize.evaluation.resumable_judge import ResumableJudge
-from exp.optimize.evaluation.retrieval_binding import (
+from exp.optimize.evaluation.fidelity.resumable_judge import ResumableJudge
+from exp.optimize.evaluation.fidelity.retrieval_binding import (
     bind_index_embedder,
     index_embedder_alias,
     require_unindexed_held_out_task,

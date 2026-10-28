@@ -5,13 +5,13 @@ from pathlib import Path
 import pytest
 
 from exp.common.models import load_model_catalog
-from exp.optimize.evaluation.held_out_fidelity_test import (
+from exp.optimize.evaluation.audit.panel_test import (
     USERS,
     SimulatedProvider,
     build_project,
     episode,
 )
-from exp.optimize.evaluation.retrieval_binding import index_embedder_alias
+from exp.optimize.evaluation.fidelity.retrieval_binding import index_embedder_alias
 from exp.simulation.world_model.runtime import (
     load_grounded_world_model_artifact,
     persist_memory_first_world_model,

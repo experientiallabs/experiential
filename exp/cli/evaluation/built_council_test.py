@@ -7,15 +7,15 @@ from typer.testing import CliRunner
 
 from exp.cli.app import app
 from exp.common.models import load_model_catalog, write_model_catalog
-from exp.optimize.evaluation.built_council import BuiltCouncil
-from exp.optimize.evaluation.held_out_fidelity import source_rag_inputs
-from exp.optimize.evaluation.held_out_fidelity_test import (
+from exp.optimize.evaluation.audit.panel import source_rag_inputs
+from exp.optimize.evaluation.audit.panel_test import (
     PROJECT,
     USERS,
     SimulatedProvider,
     build_project,
     episode,
 )
+from exp.optimize.evaluation.built_council import BuiltCouncil
 from exp.simulation.world_model.runtime import load_grounded_world_model_artifact
 
 

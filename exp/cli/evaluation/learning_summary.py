@@ -14,11 +14,11 @@ from typing import TYPE_CHECKING
 from exp.common.core.files import write_text_atomic
 from exp.common.project import ProjectStore
 from exp.common.project.paths import validate_local_id
-from exp.optimize.evaluation.fidelity_recovery import QUALIFICATION
+from exp.optimize.evaluation.fidelity.recovery import QUALIFICATION
 
 if TYPE_CHECKING:
     from exp.cli.evaluation.miss_retest import RetestOutcome
-    from exp.optimize.evaluation.trace_learning import LearningCurve, LearningOutcome
+    from exp.optimize.evaluation.learning.traces import LearningCurve, LearningOutcome
 
 
 @dataclass(frozen=True)

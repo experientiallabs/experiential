@@ -22,38 +22,38 @@ from exp.common.models import load_model_catalog
 from exp.common.progress import ProgressHook
 from exp.common.project import ProjectStore
 from exp.common.release_revision import installed_release_revision
-from exp.optimize.evaluation.fidelity import (
-    execute_fidelity_evaluation,
-    saved_fidelity_report,
-)
-from exp.optimize.evaluation.fidelity_recovery import stage_line
-from exp.optimize.evaluation.held_out_audit import (
+from exp.optimize.evaluation.audit.exposure import LIMITS, LineageExposure
+from exp.optimize.evaluation.audit.lifecycle import (
     HeldOutAudit,
     open_held_out_audit,
     outcome_unknown,
     require_held_out_selection,
 )
-from exp.optimize.evaluation.held_out_exposure import LIMITS, LineageExposure
-from exp.optimize.evaluation.held_out_fidelity import AuditCheckpoint, saved_held_out_results
-from exp.optimize.evaluation.held_out_receipts import (
+from exp.optimize.evaluation.audit.panel import AuditCheckpoint, saved_held_out_results
+from exp.optimize.evaluation.audit.receipts import (
     AuditReceipt,
     AuditReport,
     ReceiptView,
     ReportKind,
     record_report,
 )
-from exp.optimize.evaluation.replay_panel import PANEL_STAGE, require_resumable
-from exp.optimize.evaluation.trace_learning import (
+from exp.optimize.evaluation.fidelity.panel import PANEL_STAGE, require_resumable
+from exp.optimize.evaluation.fidelity.recovery import stage_line
+from exp.optimize.evaluation.fidelity.replay import (
+    ReplayResult,
+    aggregate,
+)
+from exp.optimize.evaluation.fidelity.runner import (
+    execute_fidelity_evaluation,
+    saved_fidelity_report,
+)
+from exp.optimize.evaluation.learning.traces import (
     fit_cases,
     learned_runs,
     learning_curve,
     learning_plan,
     recorded_plan,
     resolve_memory_recall,
-)
-from exp.optimize.evaluation.trace_replay import (
-    ReplayResult,
-    aggregate,
 )
 from exp.simulation.mining.exposure_ledger import PanelInUseError
 

@@ -45,22 +45,14 @@ from exp.common.progress import ProgressHook, report
 from exp.common.project import ProjectBuildArtifacts, ProjectStore
 from exp.common.tasks import TaskCase
 from exp.common.traces.store import load_trace_dataset
-from exp.optimize.evaluation.fidelity import (
-    FidelityMemory,
-    FidelityRetrieval,
-    FidelitySpec,
-    PreparedFidelity,
-    execute_fidelity_evaluation,
-    saved_fidelity_report,
-)
-from exp.optimize.evaluation.fidelity_memory import (
+from exp.optimize.evaluation.fidelity.memory import (
     DUPLICATE,
     INCOMPLETE,
     saved_memory_receipt,
     trajectory_record,
 )
-from exp.optimize.evaluation.fidelity_recovery import QUALIFICATION, Qualification, qualify
-from exp.optimize.evaluation.trace_replay import (
+from exp.optimize.evaluation.fidelity.recovery import QUALIFICATION, Qualification, qualify
+from exp.optimize.evaluation.fidelity.replay import (
     DEADLINE,
     INVESTIGATION_TOKENS,
     PREDICTION_TOKENS,
@@ -76,6 +68,14 @@ from exp.optimize.evaluation.trace_replay import (
     replay_case,
     replay_result,
     replay_spec,
+)
+from exp.optimize.evaluation.fidelity.runner import (
+    FidelityMemory,
+    FidelityRetrieval,
+    FidelitySpec,
+    PreparedFidelity,
+    execute_fidelity_evaluation,
+    saved_fidelity_report,
 )
 from exp.runtime.models.providers.transport import RetryPolicy
 from exp.simulation.retrieval.build_inputs import load_completed_build_rag_lineage_bindings

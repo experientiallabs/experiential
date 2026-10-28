@@ -5,7 +5,7 @@ from pathlib import Path
 
 from exp.common.models import ToolCall
 from exp.common.project import ProjectStore
-from exp.optimize.evaluation.fidelity_recovery import (
+from exp.optimize.evaluation.fidelity.recovery import (
     JUDGE_OPERATION,
     RecoveryLog,
     UnknownOutcome,

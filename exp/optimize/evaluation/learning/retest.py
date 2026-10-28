@@ -16,10 +16,8 @@ from datetime import datetime
 from exp.common.core.artifacts import ArtifactInput, ContractModel
 from exp.common.evaluations.reconstruction import DualReport
 from exp.common.project import ProjectStore
-from exp.optimize.evaluation.fidelity import FidelityMemory, PreparedFidelity
-from exp.optimize.evaluation.held_out_fidelity import PANEL_JUDGE_EFFORT
-from exp.optimize.evaluation.trace_learning import learned_runs, learning_plan
-from exp.optimize.evaluation.trace_replay import (
+from exp.optimize.evaluation.audit.panel import PANEL_JUDGE_EFFORT
+from exp.optimize.evaluation.fidelity.replay import (
     DEADLINE,
     ReplayCase,
     ReplayResult,
@@ -27,6 +25,8 @@ from exp.optimize.evaluation.trace_replay import (
     replay_spec,
     saved_results,
 )
+from exp.optimize.evaluation.fidelity.runner import FidelityMemory, PreparedFidelity
+from exp.optimize.evaluation.learning.traces import learned_runs, learning_plan
 from exp.simulation.world_model.experience_memory import memory_head
 
 LABEL = "retest"

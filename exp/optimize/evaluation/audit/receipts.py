@@ -32,19 +32,19 @@ from pydantic import AwareDatetime, Field
 
 from exp.common.core.artifacts import ArtifactEnvelope, ArtifactInput, ContractModel, stable_id
 from exp.common.project import ProjectStore
-from exp.optimize.evaluation.fidelity import PreparedFidelity, unknown_outcomes
-from exp.optimize.evaluation.fidelity_recovery import (
-    QUALIFICATION,
-    UnknownOutcome,
-    stage_counts,
-)
-from exp.optimize.evaluation.held_out_exposure import LineageExposure, held_out_members
-from exp.optimize.evaluation.held_out_fidelity import (
+from exp.optimize.evaluation.audit.exposure import LineageExposure, held_out_members
+from exp.optimize.evaluation.audit.panel import (
     AuditCheckpoint,
     HeldOutPanel,
     Profile,
     run_slots,
 )
+from exp.optimize.evaluation.fidelity.recovery import (
+    QUALIFICATION,
+    UnknownOutcome,
+    stage_counts,
+)
+from exp.optimize.evaluation.fidelity.runner import PreparedFidelity, unknown_outcomes
 from exp.simulation.mining.exposure_ledger import ExposureLedger, LedgerExposure
 from exp.simulation.mining.fingerprint import SchemeIdentity
 from exp.simulation.world_model.resumption import RecoveryStage

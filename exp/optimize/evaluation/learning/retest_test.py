@@ -7,7 +7,7 @@ import pytest
 from typer.testing import CliRunner
 
 from exp.cli.app import app
-from exp.optimize.evaluation.held_out_fidelity_test import (
+from exp.optimize.evaluation.audit.panel_test import (
     PROJECT,
     REVISION,
     USERS,
@@ -17,15 +17,15 @@ from exp.optimize.evaluation.held_out_fidelity_test import (
     build_report,
     episode,
 )
-from exp.optimize.evaluation.miss_retest import register_miss_retest
-from exp.optimize.evaluation.trace_learning import (
+from exp.optimize.evaluation.learning.retest import register_miss_retest
+from exp.optimize.evaluation.learning.traces import (
     learn_from_traces,
     learning_cases,
     learning_curve,
     learning_plan,
     recorded_plan,
 )
-from exp.optimize.evaluation.trace_learning_test import memory_delivered
+from exp.optimize.evaluation.learning.traces_test import memory_delivered
 
 STEPS = 3  # replayed exchanges per fixture trace, after its one-call public prefix
 

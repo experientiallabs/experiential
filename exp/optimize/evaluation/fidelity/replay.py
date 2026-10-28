@@ -24,7 +24,7 @@ result without provider calls. An earlier attempt that never bought a call and c
 complete (its deadline passed, or its execution stopped with no process holding it) is retired
 and the next attempt gets a fresh generation suffix. An interrupted attempt that bought calls
 is never replaced: it stops visibly, and ``--retry-incomplete`` resumes it in place (see
-:mod:`exp.optimize.evaluation.fidelity_recovery`).
+:mod:`exp.optimize.evaluation.fidelity.recovery`).
 """
 
 import json
@@ -56,7 +56,10 @@ from exp.common.tasks import TaskCase
 from exp.common.tasks.facts import InstanceFacts, InstanceFactsProvider
 from exp.common.traces import Trace
 from exp.common.traces.facts import TracePackageFacts
-from exp.optimize.evaluation.fidelity import (
+from exp.optimize.evaluation.fidelity.instance_facts import ReplayFacts
+from exp.optimize.evaluation.fidelity.memory import INCOMPLETE, saved_memory_receipt
+from exp.optimize.evaluation.fidelity.recovery import UnknownOutcome
+from exp.optimize.evaluation.fidelity.runner import (
     FidelityMemory,
     FidelityRetrieval,
     FidelitySpec,
@@ -67,9 +70,6 @@ from exp.optimize.evaluation.fidelity import (
     saved_fidelity_report,
     unknown_outcomes,
 )
-from exp.optimize.evaluation.fidelity_memory import INCOMPLETE, saved_memory_receipt
-from exp.optimize.evaluation.fidelity_recovery import UnknownOutcome
-from exp.optimize.evaluation.instance_facts import ReplayFacts
 from exp.runtime.models import RuntimeModelCatalog
 from exp.runtime.models.providers.transport import RetryPolicy
 from exp.runtime.sessions.dispatch_ledger import DispatchLedger

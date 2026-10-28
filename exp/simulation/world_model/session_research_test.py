@@ -11,12 +11,12 @@ from exp.common.core.artifacts import JsonObject
 from exp.common.models import ToolCall
 from exp.common.models.unknown_outcome import DispatchOutcomeUnknown
 from exp.common.project import ArtifactStore, ProjectPaths
-from exp.optimize.evaluation import fidelity
-from exp.optimize.evaluation.fidelity import (
+from exp.optimize.evaluation.fidelity import runner as fidelity
+from exp.optimize.evaluation.fidelity.runner import (
     execute_fidelity_evaluation,
     prepare_fidelity_evaluation,
 )
-from exp.optimize.evaluation.fidelity_test import source_project, transition_reply
+from exp.optimize.evaluation.fidelity.runner_test import source_project, transition_reply
 from exp.runtime.gateway.decisions_contracts import DecisionRequest
 from exp.runtime.models.providers.transport import JsonHttpResponse, ScriptedJsonTransport
 from exp.runtime.sessions.store import SessionBinding, SessionNotFoundError, SessionStore

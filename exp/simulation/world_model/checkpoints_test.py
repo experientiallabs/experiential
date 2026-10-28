@@ -22,7 +22,7 @@ from exp.common.project import (
     restore_project_bundle,
 )
 from exp.common.project.project import write_project_config
-from exp.optimize.evaluation.fidelity_test import source_project
+from exp.optimize.evaluation.fidelity.runner_test import source_project
 from exp.runtime.models import RuntimeModelCatalog
 from exp.runtime.sessions.store import SessionStore
 from exp.simulation.world_model.checkpoints import (

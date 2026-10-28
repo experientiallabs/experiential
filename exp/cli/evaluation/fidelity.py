@@ -16,18 +16,18 @@ from exp.cli.shared.theme import EXP_THEME
 from exp.common.evaluations.reconstruction import DualReport, JudgeConfig
 from exp.common.project import ProjectStore
 from exp.common.release_revision import installed_release_revision
-from exp.optimize.evaluation.fidelity import (
+from exp.optimize.evaluation.fidelity.memory import (
+    fidelity_decision_trace,
+    fidelity_memory_plan,
+    saved_maintenance_receipt,
+    saved_memory_receipt,
+)
+from exp.optimize.evaluation.fidelity.runner import (
     FidelitySpec,
     PreparedFidelity,
     execute_fidelity_evaluation,
     prepare_fidelity_evaluation,
     saved_fidelity_report,
-)
-from exp.optimize.evaluation.fidelity_memory import (
-    fidelity_decision_trace,
-    fidelity_memory_plan,
-    saved_maintenance_receipt,
-    saved_memory_receipt,
 )
 
 

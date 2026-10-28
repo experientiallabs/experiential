@@ -1,7 +1,7 @@
 """The held-out aggregate line states every denominator."""
 
 from exp.cli.evaluation.replay_view import aggregate_line
-from exp.optimize.evaluation.trace_replay import ReplayAggregate
+from exp.optimize.evaluation.fidelity.replay import ReplayAggregate
 
 
 def test_aggregate_line_reports_replies_fields_judge_and_coverage() -> None:

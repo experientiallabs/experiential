@@ -2,10 +2,10 @@
 
 from exp.cli.evaluation.learning_summary import LearningSummary, learning_lines
 from exp.cli.evaluation.miss_retest import RetestOutcome
-from exp.optimize.evaluation.fidelity_recovery import QUALIFICATION, Qualification
-from exp.optimize.evaluation.miss_retest import TurnChanges
-from exp.optimize.evaluation.trace_learning import LearningOutcome
-from exp.optimize.evaluation.trace_replay import ReplayAggregate
+from exp.optimize.evaluation.fidelity.recovery import QUALIFICATION, Qualification
+from exp.optimize.evaluation.fidelity.replay import ReplayAggregate
+from exp.optimize.evaluation.learning.retest import TurnChanges
+from exp.optimize.evaluation.learning.traces import LearningOutcome
 
 
 def _retest(qualification: Qualification | None) -> RetestOutcome:

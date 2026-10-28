@@ -35,8 +35,7 @@ from filelock import FileLock
 
 from exp.common.core.artifacts import stable_id
 from exp.common.project import ProjectStore
-from exp.optimize.evaluation.fidelity import PreparedFidelity, saved_fidelity_report
-from exp.optimize.evaluation.held_out_exposure import (
+from exp.optimize.evaluation.audit.exposure import (
     HeldOutExposure,
     LineageExposure,
     held_out_exposure,
@@ -44,7 +43,7 @@ from exp.optimize.evaluation.held_out_exposure import (
     refresh_ledger,
     unknown_scheme_refusal,
 )
-from exp.optimize.evaluation.held_out_fidelity import (
+from exp.optimize.evaluation.audit.panel import (
     HeldOutPanel,
     PlannedPanel,
     Profile,
@@ -54,7 +53,7 @@ from exp.optimize.evaluation.held_out_fidelity import (
     register_planned_panel,
     run_slots,
 )
-from exp.optimize.evaluation.held_out_receipts import (
+from exp.optimize.evaluation.audit.receipts import (
     AuditCase,
     AuditNotice,
     AuditReceipt,
@@ -70,7 +69,8 @@ from exp.optimize.evaluation.held_out_receipts import (
     record_redispatches,
     save_receipt,
 )
-from exp.optimize.evaluation.trace_learning import fit_calls
+from exp.optimize.evaluation.fidelity.runner import PreparedFidelity, saved_fidelity_report
+from exp.optimize.evaluation.learning.traces import fit_calls
 from exp.simulation.mining.exposure_ledger import (
     ExposureLedger,
     LedgerRelease,

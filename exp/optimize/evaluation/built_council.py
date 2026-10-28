@@ -16,13 +16,14 @@ from exp.common.models import load_model_catalog
 from exp.common.progress import ProgressHook, report
 from exp.common.project import ProjectStore, artifact_input
 from exp.common.tasks.store import load_task_set
-from exp.optimize.evaluation.fidelity import (
+from exp.optimize.evaluation.audit.panel import source_rag_inputs
+from exp.optimize.evaluation.fidelity.replay import DEADLINE, replay_spec
+from exp.optimize.evaluation.fidelity.runner import (
     FidelityRetrieval,
     PreparedFidelity,
     execute_fidelity_evaluation,
     prepare_fidelity_evaluation,
 )
-from exp.optimize.evaluation.held_out_fidelity import source_rag_inputs
 from exp.optimize.evaluation.trace_council import (
     CouncilActor,
     TraceCouncilSpec,
@@ -30,7 +31,6 @@ from exp.optimize.evaluation.trace_council import (
     prepare_trace_council,
     validate_council_models,
 )
-from exp.optimize.evaluation.trace_replay import DEADLINE, replay_spec
 from exp.runtime.models.providers.transport import RetryPolicy
 from exp.simulation.retrieval.jev import JEVPolicy
 from exp.simulation.trace_counterfactuals import RecordedEpisode, RecordedStep

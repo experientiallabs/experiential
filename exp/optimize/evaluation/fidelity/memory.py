@@ -34,7 +34,7 @@ from exp.simulation.world_model.memory_tree import (
 )
 
 if TYPE_CHECKING:
-    from exp.optimize.evaluation.fidelity import FidelitySpec, PreparedFidelity
+    from exp.optimize.evaluation.fidelity.runner import FidelitySpec, PreparedFidelity
 
 
 INCOMPLETE = "incomplete trajectory is not consumed"

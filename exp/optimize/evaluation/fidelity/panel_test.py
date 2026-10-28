@@ -6,9 +6,9 @@ from typing import cast
 import pytest
 
 from exp.common.project import ProjectStore
-from exp.optimize.evaluation import replay_panel
-from exp.optimize.evaluation.fidelity import PreparedFidelity
-from exp.optimize.evaluation.replay_panel import PANEL_CONCURRENCY, execute_panel
+from exp.optimize.evaluation.fidelity import panel as replay_panel
+from exp.optimize.evaluation.fidelity.panel import PANEL_CONCURRENCY, execute_panel
+from exp.optimize.evaluation.fidelity.runner import PreparedFidelity
 from exp.runtime.models.providers.transport import ProviderTransportError
 
 

@@ -8,7 +8,7 @@ from pydantic import Field
 from exp.common.core.artifacts import ArtifactInput, ContractModel, JsonObject, sha256_json
 from exp.common.evaluations.reconstruction import DualReport, WorkflowEvidence, mechanical_checks
 from exp.common.project import ProjectStore, artifact_input
-from exp.optimize.evaluation.fidelity import PreparedFidelity
+from exp.optimize.evaluation.fidelity.runner import PreparedFidelity
 
 
 class _Step(ContractModel):

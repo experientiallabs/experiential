@@ -23,7 +23,7 @@ from exp.common.models import (
     load_model_catalog,
 )
 from exp.common.project import artifact_input
-from exp.optimize.evaluation.fidelity_test import source_project
+from exp.optimize.evaluation.fidelity.runner_test import source_project
 from exp.optimize.evaluation.harbor_bridge import serve_harbor_trial
 from exp.optimize.evaluation.harbor_export import export_harbor_task, verify_harbor_export
 from exp.optimize.evaluation.harbor_trial import HarborTrial
