@@ -184,6 +184,20 @@ class DurableWorldModelSession:
         """Read the current complete session envelope from the authoritative store."""
         return SessionSnapshot.model_validate(self._store.read_session(self.session_id).state)
 
+    def outcome_unknown(self, operation_id: str) -> bool:
+        """Whether one logical operation was left open after dispatch with no known outcome.
+
+        A failed step that never reached the provider is rejected or released, so a step
+        still open after its failure was dispatched and its provider outcome is unknown.
+
+        Args:
+            operation_id: Caller-owned logical operation identity.
+
+        Returns:
+            True while the operation's step remains open or ambiguous.
+        """
+        return operation_id in self._store.open_steps(self.session_id)
+
     def execute(self, action: ToolCall) -> Observation:
         """Execute one tool call using its caller-owned logical operation identity."""
         return self.step((action,), operation_id=action.call_id)[0]

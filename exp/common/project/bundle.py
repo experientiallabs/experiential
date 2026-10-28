@@ -107,6 +107,9 @@ class ProjectBundleManifest(ContractModel):
     producer_revision: str = Field(min_length=1, max_length=256)
     selected_artifacts: tuple[ArtifactInput, ...]
     completed_stages: tuple[ProjectStage, ...]
+    evaluation_tasks: tuple[ArtifactInput, ...] = Field(
+        default=(), exclude_if=lambda value: not value
+    )
     members: tuple[ProjectBundleMember, ...] = Field(
         min_length=1,
         max_length=_MAX_BUNDLE_MEMBERS,
@@ -144,8 +147,6 @@ class ProjectBundleManifest(ContractModel):
         cls, value: tuple[ProjectStage, ...]
     ) -> tuple[ProjectStage, ...]:
         """Require completed durable stages in the canonical workflow order."""
-        if not value:
-            raise ValueError("project bundle needs at least one completed durable stage")
         if len(set(value)) != len(value):
             raise ValueError("completed project stages must not repeat")
         if value != tuple(sorted(value, key=_STAGE_ORDER.__getitem__)):
@@ -167,6 +168,14 @@ class ProjectBundleManifest(ContractModel):
     @model_validator(mode="after")
     def _require_exact_expansion_totals(self) -> ProjectBundleManifest:
         """Bind the declared expansion bounds to the complete member list."""
+        if not self.completed_stages and not self.evaluation_tasks:
+            raise ValueError("project bundle needs a completed durable stage or evaluation tasks")
+        task_ids = tuple(item.artifact_id for item in self.evaluation_tasks)
+        if task_ids != tuple(sorted(set(task_ids))):
+            raise ValueError("evaluation task roots must be unique and sorted")
+        selected = {item.artifact_id: item for item in self.selected_artifacts}
+        if any(selected.get(item.artifact_id) != item for item in self.evaluation_tasks):
+            raise ValueError("evaluation task roots must belong to the selected artifact closure")
         if self.expanded_file_count != len(self.members):
             raise ValueError("bundle expanded_file_count differs from its member list")
         if self.expanded_size_bytes != sum(item.size_bytes for item in self.members):
@@ -235,6 +244,7 @@ def export_project_bundle(
             producer_revision=producer_revision,
             selected_artifacts=selected_artifacts,
             completed_stages=completed_stages,
+            evaluation_tasks=project.evaluation_tasks,
             members=members,
             expanded_file_count=len(members),
             expanded_size_bytes=sum(item.size_bytes for item in members),
@@ -460,6 +470,8 @@ def _load_and_verify_bundle(handle: BinaryIO) -> _LoadedBundle:
         raise ProjectBundleError("bundle contains an unselected artifact directory")
     if _completed_stages(project) != manifest.completed_stages:
         raise ProjectBundleError("completed durable stage selection differs from bundle.json")
+    if project.evaluation_tasks != manifest.evaluation_tasks:
+        raise ProjectBundleError("evaluation task selection differs from bundle.json")
     _validate_catalog_from_payloads(project, closure, payloads)
     return _LoadedBundle(
         manifest=manifest,
@@ -781,6 +793,8 @@ def _verify_restored_project(store: ProjectStore, loaded: _LoadedBundle) -> None
     project = store.load_project()
     if project != loaded.project:
         raise ProjectBundleError("restored Project configuration changed")
+    if project.evaluation_tasks != loaded.manifest.evaluation_tasks:
+        raise ProjectBundleError("restored evaluation task selection changed")
     if project.provider_free_stage is not None:
         store.bind_provider_free_stage(project.provider_free_stage)
     if project.build is not None:

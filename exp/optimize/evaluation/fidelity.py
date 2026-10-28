@@ -180,6 +180,7 @@ class FidelitySpec(ContractModel):
         references: Evaluator-only outcomes; never passed into prediction or retrieval.
         judge: Frozen five-axis rubric and prompt.
         judge_alias: Configured model used only for independent judging.
+        judge_output_protocol: Explicit JSON text or named-tool response framing for judging.
         deadline: Absolute dispatch and commit cutoff.
         maximum_physical_attempts: Global ceiling including provider retries and judging.
         maximum_output_tokens: Explicit per-generation output allowance.
@@ -204,6 +205,9 @@ class FidelitySpec(ContractModel):
     references: EvaluationReferences
     judge: JudgeConfig
     judge_alias: str = Field(min_length=1)
+    judge_output_protocol: Literal["json", "tool"] = Field(
+        default="tool", exclude_if=lambda value: value == "tool"
+    )
     deadline: AwareDatetime
     maximum_physical_attempts: int = Field(gt=0, strict=True)
     maximum_output_tokens: int = Field(gt=0, strict=True)
@@ -348,8 +352,10 @@ def prepare_fidelity_evaluation(
         _check_budget(role, spec.budget(role), caps)
     if predictor != artifact.model:
         raise ValueError("configured predictor differs from the simulation; bind a new artifact")
-    if spec.judge.model_identity != judge_model.model_id or judge_caps.supports_tools is not True:
-        raise ValueError("judge must match the rubric model and support named structured output")
+    if spec.judge.model_identity != judge_model.model_id:
+        raise ValueError("judge must match the registered rubric model")
+    if spec.judge_output_protocol == "tool" and judge_caps.supports_tools is not True:
+        raise ValueError("named-tool judging requires declared tool support; use JSON text instead")
     for alias in (artifact.model_alias, spec.judge_alias):
         connection = catalog.connections[catalog.models[alias].connection]
         if connection.provider != "openai-compatible":
@@ -662,7 +668,7 @@ def execute_fidelity_evaluation(
         investigating = role_model(registry, catalog, artifact.model_alias, spec, "investigation")
         judging = completion(
             role_model(registry, catalog, spec.judge_alias, spec, "judging"),
-            structured=True,
+            structured=spec.judge_output_protocol == "tool",
             role="judging",
         )
         runtime = load_grounded_world_model(
@@ -726,19 +732,17 @@ def execute_fidelity_evaluation(
             clock=now,
         )
 
-        def judge_call(body: JsonObject, logical_id: str) -> JsonObject:
-            """Expose the real judging stage without adding a retry or scoring loop."""
-            if not spec.judged:
-                raise JudgeNotRun("judging is skipped for this run; it is scored by exact replies")
-            report(progress, "Judging")
-            return judging(body, logical_id)
+        def skipped_judge(body: JsonObject, logical_id: str) -> JsonObject:
+            """Record an unjudged run (learning is scored by exact replies) as not run."""
+            del body, logical_id
+            raise JudgeNotRun("judging is skipped for this run; it is scored by exact replies")
 
         result = evaluate_workflow(
             session,
             spec.workload,
             references=spec.references,
             judge=spec.judge,
-            judge_complete=judge_call,
+            judge_complete=judging if spec.judged else skipped_judge,
             artifacts=project.artifacts,
             clock=now,
             code_revision=prepared.code_revision,

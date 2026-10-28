@@ -13,6 +13,7 @@ from exp.common.core.artifacts import (
     ArtifactEnvelope,
     ContractModel,
     JsonObject,
+    Sha256,
     sha256_json,
     stable_id,
 )
@@ -113,6 +114,27 @@ class StructuredCompletion:
         self.plan = plan
         self._client, self._budget = client, budget
         self._artifacts, self._clock = artifacts, clock or _utc_now
+
+    @property
+    def model_identity(self) -> str:
+        """Return the configured model whose returned snapshot is verified at admission."""
+        return self.plan.model.model_id
+
+    @property
+    def completion_profile_sha256(self) -> Sha256:
+        """Bind inference-affecting settings independently of scheduling and cost authority."""
+        return sha256_json(
+            self.plan.model_dump(
+                mode="json",
+                include={
+                    "model",
+                    "capabilities",
+                    "output_tokens",
+                    "output_protocol",
+                    "json_object_output",
+                },
+            )
+        )
 
     def __call__(self, body: JsonObject, logical_id: str) -> JsonObject:
         """Dispatch one structured request or return its exact saved proposal.

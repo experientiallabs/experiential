@@ -9,6 +9,7 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 
 from exp.common.core.artifacts import sha256_json
+from exp.common.models.client import RequestAdmissionRefused
 from exp.common.project import ProjectStore
 from exp.common.project.request_budget import RequestBudgetStore, RequestReceipt
 from exp.runtime.models.providers.transport import (
@@ -17,7 +18,7 @@ from exp.runtime.models.providers.transport import (
 )
 
 
-class SpendLimitReached(BaseException):
+class SpendLimitReached(RequestAdmissionRefused):
     """Pause execution before an unaffordable request, without producing a failed rollout.
 
     Attributes:
