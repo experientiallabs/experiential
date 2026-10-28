@@ -216,9 +216,16 @@ except sandbox.SandboxUnavailableError as error:
 
 
 def test_a_fresh_worker_is_admitted_when_its_hard_limit_fits_exactly_one_request() -> None:
-    """A two-second hard limit fits one one-second budget at startup, so the worker runs it."""
+    """A two-second hard limit fits one one-second budget at startup, so the worker runs it.
+
+    A one-second limit never runs the program. The worker usually refuses it by name, but its
+    startup imports count against the limit too, and a slow host can spend the whole second
+    there, so the kernel stops the worker first and the sandbox reports the generic exit.
+    """
     assert _contained_run(_ADMISSION_SCRIPT, "2") == "reply"
-    assert "hard CPU limit" in _contained_run(_ADMISSION_SCRIPT, "1")
+    refused = _contained_run(_ADMISSION_SCRIPT, "1")
+    assert refused.startswith("unavailable:")
+    assert "hard CPU limit" in refused or "a CPU or memory limit may have been hit" in refused
 
 
 _FAKE_WORKER = """
