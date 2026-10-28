@@ -739,3 +739,79 @@ def test_registry_is_the_one_list_of_actions_and_payloads() -> None:
     assert get_args(ContinuationCommand.model_fields["action"].annotation) == tuple(names)
     with pytest.raises(ValueError, match="harbor requires only its harbor payload"):
         ContinuationCommand.model_validate({"action": "harbor"})
+
+
+def test_registry_runs_generic_actions_without_the_artifact_edits_extra(tmp_path: Path) -> None:
+    """A fresh interpreter without openpyxl imports every action and refuses only workbooks."""
+    import json
+    import os
+    import subprocess
+    import sys
+
+    from exp.simulation.capability_briefs_test import brief
+
+    generic = tmp_path / "brief.json"
+    generic.write_text(
+        ContinuationCommand(
+            spend=UNPRICED_SPEND, action="register-brief", brief=brief()
+        ).model_dump_json()
+    )
+    workbook = tmp_path / "workbook.json"
+    workbook.write_text(
+        json.dumps(
+            {
+                "action": "native-workbook",
+                "spend": UNPRICED_SPEND.model_dump(mode="json"),
+                "native_workbook": {
+                    "task_id": "fit-0",
+                    "files": {"input.xlsx": str(tmp_path / "input.xlsx")},
+                    "maximum_model_calls": 1,
+                },
+            }
+        )
+    )
+    script = """
+import importlib.abc,sys
+class NoWorkbook(importlib.abc.MetaPathFinder):
+    def find_spec(self,fullname,path=None,target=None):
+        top=fullname.split('.')[0]
+        if top in ('openpyxl','et_xmlfile'):
+            raise ModuleNotFoundError('optional workbook dependency unavailable',name=top)
+sys.meta_path.insert(0,NoWorkbook())
+from pydantic import TypeAdapter
+from typer.testing import CliRunner
+from exp.cli.app import app
+from exp.cli.evaluation.continuations import CONTINUATION_ACTIONS
+from exp.runtime.environments.facts_derivers import FactsDeriverDefinition
+root,generic,workbook=sys.argv[1:]
+assert {'native-workbook','derive-facts'} <= {action.name for action in CONTINUATION_ACTIONS}
+def run(spec):
+    return CliRunner().invoke(
+        app,['eval','case','--root',root,'--continuations',spec,'--non-interactive']
+    )
+result=run(generic)
+assert result.exit_code==0,(result.output,result.exception)
+result=run(workbook)
+assert result.exit_code==2,(result.output,result.exception)
+assert 'install experiential[artifact-edits]' in result.output,result.output
+deriver=TypeAdapter(FactsDeriverDefinition).validate_python({'kind':'xlsx-workbook'})
+assert 'openpyxl' not in sys.modules
+try:
+    deriver.derive('input.xlsx',b'')
+except ValueError as error:
+    assert 'install experiential[artifact-edits]' in str(error),error
+else:
+    raise AssertionError('a selected workbook deriver must still require its optional dependency')
+"""
+    environment = dict(os.environ)
+    environment["PYTHONPATH"] = str(Path(__file__).resolve().parents[3])
+    environment["COLUMNS"] = "400"
+    result = subprocess.run(
+        [sys.executable, "-B", "-c", script, str(tmp_path / "root"), str(generic), str(workbook)],
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=180,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr

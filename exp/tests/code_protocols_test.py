@@ -168,8 +168,8 @@ PROTOCOLS = (
     Protocol(
         "exp.runtime.environments.workbook_facts:WORKBOOK_FACTS_PROTOCOL",
         "xlsx-instance-facts-v1",
-        ("exp.runtime.environments.workbook_facts",),
-        "ec81b006c8fb988e53ef5fcff1b001fc3648ed7604be31c9fa1b378f597392d2",
+        ("exp.runtime.environments.facts_derivers", "exp.runtime.environments.workbook_facts"),
+        "91377a65f4925f490e8196c206140ab96837223ef71472d2f3ff91d4ee1034d9",
     ),
     Protocol(
         "exp.runtime.environments.artifact_world:ARTIFACT_WORLD_PROTOCOL",

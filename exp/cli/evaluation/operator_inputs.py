@@ -17,14 +17,13 @@ None of them calls a provider.
 """
 
 import json
-from pathlib import Path
+from collections.abc import Iterator
+from contextlib import contextmanager
+from typing import Annotated
 
-from pydantic import Field
+from pydantic import AfterValidator, Field
 
-from exp.cli.evaluation.continuation_context import (
-    ContinuationContext,
-    require_new_operation_file,
-)
+from exp.cli.evaluation.continuation_context import ContinuationContext
 from exp.common.core.artifacts import ArtifactInput, ContractModel, JsonObject, sha256_json
 from exp.common.models import load_model_catalog
 from exp.common.project import artifact_input
@@ -32,10 +31,6 @@ from exp.optimize.evaluation.analysis.source_access import declare_source_access
 from exp.optimize.evaluation.equivalence.rubric import (
     RubricTrajectory,
     register_rubric_trajectory,
-)
-from exp.optimize.evaluation.executable.workbook_operator import (
-    NativeWorkbook,
-    native_workbook_capture,
 )
 from exp.runtime.models import RuntimeModelCatalog
 
@@ -86,15 +81,44 @@ REVIEWABLE_TYPES = frozenset(
 MAXIMUM_PRINTED_BYTES = 1_000_000
 
 
-class NativeWorkbookOperation(NativeWorkbook):
-    """A native workbook world for one development task, and where to save its capture.
+def native_workbook_payload(value: JsonObject) -> JsonObject:
+    """Validate one ``native-workbook`` payload and return its canonical JSON.
 
-    Attributes:
-        operation_file: Optional new JSON file for the ready ``capture`` operation. Existing
-            files are never overwritten; dry-run does not create it.
+    The payload's world types need the artifact-edits extra, so they are imported only when a
+    spec selects the action; the canonical dump keeps operation identities stable.
+
+    Args:
+        value: The spec's ``native_workbook`` object.
+
+    Returns:
+        The validated ``NativeWorkbookOperation`` with its defaults, as JSON.
+
+    Raises:
+        ValueError: The payload is invalid or the artifact-edits extra is not installed.
     """
+    with _artifact_edits_extra():
+        from exp.cli.evaluation.native_workbook import NativeWorkbookOperation
+    return NativeWorkbookOperation.model_validate(value).model_dump(mode="json")
 
-    operation_file: Path | None = None
+
+NativeWorkbookPayload = Annotated[JsonObject, AfterValidator(native_workbook_payload)]
+
+
+@contextmanager
+def _artifact_edits_extra() -> Iterator[None]:
+    """Name the extra to install when the workbook owner's dependencies are missing.
+
+    Raises:
+        ValueError: openpyxl or et-xmlfile is not installed.
+    """
+    try:
+        yield
+    except ModuleNotFoundError as error:
+        if error.name not in {"openpyxl", "et_xmlfile"}:
+            raise
+        raise ValueError(
+            "native-workbook needs the artifact-edits extra; install experiential[artifact-edits]"
+        ) from error
 
 
 class RubricTrajectoryRegistration(ContractModel):
@@ -190,27 +214,21 @@ def handle_artifact_reference(context: ContinuationContext, query: ArtifactRefer
     context.console.print_json(data={"artifacts": rows})
 
 
-def handle_native_workbook(context: ContinuationContext, request: NativeWorkbookOperation) -> None:
-    """Publish the starting workbooks and print a ready native capture operation.
+def handle_native_workbook(context: ContinuationContext, payload: JsonObject) -> None:
+    """Run the ``native-workbook`` action from its validated payload.
 
     Args:
-        context: Validated ``--continuations`` invocation; ``dry_run`` publishes nothing and
-            reports a placeholder input reference and no projection.
-        request: Development task, starting files, views, reference answers and output file.
+        context: Validated ``--continuations`` invocation.
+        payload: Canonical JSON from ``native_workbook_payload``.
 
     Returns:
-        None. ``input_artifact``, ``capture``, ``verifier`` and ``initial_projection`` are
-        printed; the capture operation is saved to ``operation_file`` unless dry-run.
+        None. ``exp.cli.evaluation.native_workbook.handle_native_workbook`` prints the result.
     """
-    require_new_operation_file(request.operation_file)
-    prepared = native_workbook_capture(
-        context.store, request, revision=context.revision, publish=not context.dry_run
+    with _artifact_edits_extra():
+        from exp.cli.evaluation import native_workbook
+    native_workbook.handle_native_workbook(
+        context, native_workbook.NativeWorkbookOperation.model_validate(payload)
     )
-    if request.operation_file is not None and not context.dry_run:
-        with request.operation_file.open("x", encoding="utf-8") as stream:
-            json.dump(prepared["capture"], stream, indent=2)
-            stream.write("\n")
-    context.console.print_json(data=prepared)
 
 
 def handle_register_rubric_trajectory(

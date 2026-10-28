@@ -4,8 +4,11 @@ import pytest
 from pydantic import TypeAdapter, ValidationError
 
 from exp.common.tasks.facts import InstanceFactsDeriver
-from exp.runtime.environments.facts_derivers import FactsDeriverDefinition
-from exp.runtime.environments.workbook_facts import DEFAULT_MAX_FACT_BYTES, WorkbookFactsDeriver
+from exp.runtime.environments.facts_derivers import (
+    DEFAULT_MAX_FACT_BYTES,
+    FactsDeriverDefinition,
+    WorkbookFactsDeriver,
+)
 
 
 def test_definition_selects_the_workbook_deriver_and_its_bounds() -> None:

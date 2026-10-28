@@ -82,7 +82,7 @@ from exp.cli.evaluation.memory_forget import handle_forget_summary
 from exp.cli.evaluation.operator_inputs import (
     ArtifactReferenceQuery,
     ModelSnapshotQuery,
-    NativeWorkbookOperation,
+    NativeWorkbookPayload,
     RubricTrajectoryRegistration,
     handle_artifact_reference,
     handle_model_snapshots,
@@ -371,7 +371,7 @@ class ContinuationCommand(ContractModel):
     spend: SpendPolicy = SpendPolicy()
     snapshots: ModelSnapshotQuery | None = None
     references: ArtifactReferenceQuery | None = None
-    native_workbook: NativeWorkbookOperation | None = None
+    native_workbook: NativeWorkbookPayload | None = None
     rubric_trajectory: RubricTrajectoryRegistration | None = None
 
     @model_validator(mode="after")
