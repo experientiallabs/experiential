@@ -191,7 +191,8 @@ def test_episode_stickiness_uses_caller_identity_and_tools_affect_request_hash()
     assert next_turn.request_sha256 != first.request_sha256
     assert separate.selected_alias == "baseline"
     assert separate.episode_id_sha256 != first.episode_id_sha256
-    assert client.embed_calls == 2
+    # The enabled cache-switch gate embeds the later turn to weigh a fresh proposal.
+    assert client.embed_calls == 3
     assert set(runtime._episode_decisions) == {  # noqa: SLF001 - privacy regression
         hashlib.sha256(b"episode-a").hexdigest(),
         hashlib.sha256(b"episode-b").hexdigest(),
@@ -333,6 +334,34 @@ def test_large_fitted_gain_switches_the_sticky_episode_and_is_recorded() -> None
     assert retained.switch_outcome == "switched"
     assert later.selected_alias == "cheap"
     assert later.switch_outcome is None
+    assert client.embed_calls == 3
+
+
+def test_ordinary_later_turn_reaches_the_cache_switch_gate() -> None:
+    """A later episode turn computes a fresh proposal and can switch through select."""
+    runtime, client = _cache_runtime(
+        prices=(
+            CandidateTokenPrice(
+                candidate_alias="baseline",
+                input_usd_per_million_tokens=0.5,
+                output_usd_per_million_tokens=1.5,
+            ),
+            CandidateTokenPrice(
+                candidate_alias="cheap",
+                input_usd_per_million_tokens=0.1,
+                output_usd_per_million_tokens=0.4,
+            ),
+        ),
+    )
+    client.embedding_values = RuntimeError("embed failed")
+    first = runtime.select(_request(), episode_id="episode-later")
+    assert first.selected_alias == "baseline"
+    client.embedding_values = (Embedding(values=(1.0, 0.0)),)
+
+    later = runtime.select(_request(tool_name="write"), episode_id="episode-later")
+
+    assert later.selected_alias == "cheap"
+    assert later.switch_outcome == "switched"
     assert client.embed_calls == 2
 
 

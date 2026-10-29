@@ -355,7 +355,8 @@ class RouterRuntime:
             episode_id: Stable caller-owned episode identity.
 
         Returns:
-            One cached or sticky decision, or ``None`` when selection needs an embedding.
+            One cached or sticky decision, or ``None`` when selection needs an embedding,
+            including every later episode turn while the cache-switch gate is enabled.
         """
         if not episode_id.strip() or len(episode_id) > 512:
             raise ValueError("episode_id must be 1 to 512 non-blank characters")
@@ -370,7 +371,9 @@ class RouterRuntime:
                 self._request_decisions.move_to_end(request_key)
                 return existing
             episode_decision = self._episode_decisions.get(identity_sha256)
-            if episode_decision is None:
+            if episode_decision is None or self.policy.guard.cache_switch.enabled:
+                # An enabled cache-switch gate weighs a fresh proposal on every
+                # later turn, so only a disabled gate may reuse stickiness here.
                 return None
             decision = _sticky_decision(episode_decision, request_sha256)
             return self._publish_decision(

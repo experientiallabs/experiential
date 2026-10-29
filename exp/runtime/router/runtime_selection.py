@@ -63,7 +63,7 @@ def retained_selection(
                     disposition=runtime._request_embedding_dispositions[request_key],  # noqa: SLF001
                 )
             episode_decision = runtime._episode_decisions.get(identity_sha256)  # noqa: SLF001
-            if episode_decision is not None:
+            if episode_decision is not None and not runtime.policy.guard.cache_switch.enabled:
                 decision = sticky_decision(episode_decision, request_sha256)
                 economics = zero_operation_economics()
                 disposition = RoutedSpendDisposition.DEFINITELY_NOT_INCURRED
